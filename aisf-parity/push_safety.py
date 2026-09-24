@@ -160,23 +160,35 @@ def parse_push(command: list[str]) -> dict:
     return {"remote": remote, "refspecs": refspecs, "forces": forces}
 
 
-def commit_range(repo: Path, remote: str, branch: str) -> tuple[str, list[str], str]:
-    """The commits this push would send, and the base they were measured against.
+def commit_range(
+    repo: Path, remote: str, src_rev: str, dst_branch: str
+) -> tuple[str, list[str], str]:
+    """The commits ONE refspec would send, and the base they were measured against.
+
+    Both ends are per-refspec on purpose. An earlier version measured
+    `remote-tracking-ref-of-the-CURRENT-branch..HEAD` no matter which ref the command
+    named. Pushing an ancestor branch while sitting on a descendant then resolved a
+    base that equalled HEAD, so the range was empty and the secret, path and
+    attribution scans all passed over a population of zero while printing
+    `0 commit(s)` as though that were a clean result.
 
     The base is PRINTED by the caller because a silent fallback to a different ref is
     fail-open: it once published 24 controls as 16 and exited 0. If no base resolves,
     the caller fails rather than scanning all of history and calling that a measurement.
     """
     for candidate, how in (
-        (f"refs/remotes/{remote}/{branch}", "the remote-tracking ref for this branch"),
+        (
+            f"refs/remotes/{remote}/{dst_branch}",
+            "the remote-tracking ref for the branch being landed on",
+        ),
         (
             f"refs/remotes/{remote}/main",
-            f"{remote}/main (this branch is not on the remote yet)",
+            f"{remote}/main ({dst_branch} is not on the remote yet)",
         ),
     ):
         rc, _ = git(repo, "rev-parse", "--verify", "--quiet", candidate)
         if rc == 0:
-            rc, out = git(repo, "rev-list", f"{candidate}..HEAD")
+            rc, out = git(repo, "rev-list", f"{candidate}..{src_rev}")
             if rc != 0:
                 continue
             return candidate, [line for line in out.splitlines() if line], how
@@ -404,15 +416,59 @@ def main() -> int:
         f"tests for {UPSTREAM_MARKER!r} with the slash.",
     )
 
-    base, commits, how = commit_range(repo, remote, branch)
-    if not base:
-        die(
-            f"no base ref resolved for {remote}/{branch} or {remote}/main, so the set of "
-            "commits about to be pushed cannot be measured. Scanning all of history "
-            "instead would be a different measurement reported under the same name.",
-            USAGE,
+    # One range per refspec. A single range measured against the current branch scanned
+    # zero commits whenever the ref being pushed was not the current branch, so the
+    # pair being measured has to come from the command, not from HEAD.
+    pairs: list[tuple[str, str]] = []
+    for spec in push["refspecs"]:
+        src, _, dst = spec.lstrip("+").partition(":")
+        if not src:
+            # A delete refspec sends no content. The ancestry assertion below fails it.
+            continue
+        pairs.append((src, (dst or src).removeprefix("refs/heads/")))
+    if not pairs:
+        pairs = [("HEAD", branch)]
+
+    commits: list[str] = []
+    unmeasured: list[str] = []
+    for src_rev, dst in pairs:
+        base, part, how = commit_range(repo, remote, src_rev, dst)
+        if not base:
+            die(
+                f"no base ref resolved for {remote}/{dst} or {remote}/main, so the set of "
+                "commits about to be pushed cannot be measured. Scanning all of history "
+                "instead would be a different measurement reported under the same name.",
+                USAGE,
+            )
+        print(
+            f"  range    {base}..{src_rev} -- {len(part)} commit(s), "
+            f"base chosen as {how}"
         )
-    print(f"  range    {base}..HEAD -- {len(commits)} commit(s), base chosen as {how}")
+        commits += [sha for sha in part if sha not in commits]
+        if part:
+            continue
+        # An empty range is sound only when the remote ref already holds exactly what
+        # is being pushed. Otherwise the push publishes commits that nothing scanned.
+        rc_d, dst_sha = git(
+            repo, "rev-parse", "--verify", "--quiet", f"refs/remotes/{remote}/{dst}"
+        )
+        rc_s, src_sha = git(
+            repo, "rev-parse", "--verify", "--quiet", f"{src_rev}^{{commit}}"
+        )
+        if rc_d != 0 or rc_s != 0 or dst_sha != src_sha:
+            where = "absent from the remote" if rc_d != 0 else f"at {dst_sha[:12]}"
+            unmeasured.append(
+                f"{src_rev} -> {dst}: 0 commit(s) measured from {base}, yet the "
+                f"destination is {where}, not {src_sha[:12] if rc_s == 0 else '(unresolved)'}"
+            )
+
+    report.check(
+        "every ref being pushed contributed a measured commit population",
+        not unmeasured,
+        f"{len(pairs)} refspec(s) measured, {len(commits)} distinct commit(s) to scan; "
+        f"an empty range is sound only where the destination already equals the source; "
+        f"unmeasured: {unmeasured or 'none'}",
+    )
     scan = scan_commits(repo, commits)
 
     report.check(
@@ -511,7 +567,7 @@ def main() -> int:
         "  - whether the remote branch moved since the recording: nothing here fetches."
     )
     print(
-        "  - a secret already committed BEFORE the base ref above; only the range is read."
+        "  - a secret already committed BEFORE a base ref above; only those ranges are read."
     )
     print(
         "  - a secret whose shape is not in the pattern lists, and anything behind an"
