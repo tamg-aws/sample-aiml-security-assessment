@@ -2571,12 +2571,14 @@ class TestBR20KnowledgeBaseKMS:
 # knowledge base is readable, so the check asserts on it instead of
 # deferring to manual review.
 #
-# These cases pin the shape a read-only probe measured in a live
-# account: 9 of 9 knowledge bases used S3_VECTORS, every vector bucket
-# returned {"sseType": "AES256"}, and every GetVectorBucketPolicy
-# raised NotFoundException. While this branch abstained, BR-20 emitted
-# 9 findings and all 9 were N/A -- a covered control producing a
-# verdict for zero resources.
+# What motivated the branch: while S3_VECTORS fell through to manual
+# review, a read-only probe found 9 of 9 knowledge bases on S3_VECTORS
+# and BR-20 emitted 9 findings, all 9 N/A -- a covered control
+# producing a verdict for zero resources. The cases below pin what the
+# check does with each input shape. What an account holds is measured
+# in aisf-parity/LIVE-FIXTURES.md and is not asserted here; the
+# previous version of this header described one account's vector
+# buckets in the present tense, and a case below now contradicts it.
 # ===================================================================
 class TestBR20S3VectorsStore:
     """BR-20: assess the S3 Vectors bucket holding a knowledge base."""
