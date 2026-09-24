@@ -887,15 +887,52 @@ end-to-end. Concrete steps:
    clash with `--warning` (used by "By Lens"), `--accent` (used by "By
    Industry"), or `--success` (used by OWASP).
 
-7. **Caller routing is data-driven.** The report generator
+7. **Wire up the two sites the loops do not cover.** Routing itself is
+   data-driven: the report generator
    (`aiml-security-assessment/functions/security/generate_consolidated_report/app.py`)
    and the multi-account consolidator (`consolidate_html_reports.py`) both
    iterate `COMPLIANCE_STANDARDS` to initialise `service_stats` /
-   `service_findings` and to route by Check_ID prefix, so appending a new
-   entry in step 6 is sufficient — no edits needed in these files.
+   `service_findings` and to route by Check_ID prefix. Two things sit outside
+   those loops and must be handled by hand:
+   - **The S3 read path.** `app.py` turns every registry slug into an
+     `s3:ListBucket` prefix, and the report Lambda's `s3:prefix` condition in
+     both SAM templates names the producing artifacts explicitly. A standard
+     that writes a CSV needs its prefix added to that condition (and to the
+     `GetObject` list), or the listing returns `AccessDenied`, the
+     `except ClientError` re-raises, and report generation fails for every
+     category, not only the new one. `tests/test_sam_role_least_privilege.py`
+     asserts the prefixes are present.
+   - **Artifact validation.** `validate_assessment_artifacts()` in `app.py`
+     builds its expected-CSV list from a hardcoded `per_region_categories`
+     dict plus the opt-in flags, not from the registry. A producing standard
+     that is not added there is never noticed as missing; its section simply
+     renders empty.
 
 8. **Update docs**: add a `SECURITY_CHECKS_<STANDARD>.md` in the OWASP
    style, bump the check count in `README.md` and `docs/SECURITY_CHECKS.md`.
+
+### Variant: a derived standard (AISF-style)
+
+A **derived** standard publishes a framework view over checks that already
+ship, so it has no Lambda, no CSV, no Step Functions branch and no IAM change.
+`AI-` rows are produced by `derive_aisf_findings()` in
+`generate_consolidated_report/aisf_mappings.py`, called from both consolidators
+after their source rows are collected. Steps 1 through 5 and the S3 wiring in
+step 7 do not apply; instead:
+
+- Add `"derived": True` to the registry entry. That key is read in exactly one
+  place, the `category_slugs` comprehension in `app.py`, to keep the slug out of
+  the S3 prefix list. Every other consumer keeps the slug so the section still
+  renders and routes.
+- Register the standard and its first rows in the same change. A registered
+  standard with zero rows renders nothing at all (`if _total <= 0: continue`),
+  which looks exactly like a wiring bug.
+- Exclude the derived rows from the check-count total, and say so where the
+  count is published. They restate verdicts that are already counted.
+- Gate the mapping. `aisf-parity/check_ledger.py` gates 11 and 12 assert that
+  every mapped control is fully covered by its named incumbents and that the
+  control text and published figures have not drifted. See
+  [SECURITY_CHECKS_AISF.md](SECURITY_CHECKS_AISF.md).
 
 9. **Add tests**: mapping emission, native-check behavior, routing, and
    report-template rendering. See `tests/test_owasp_checks.py` and
