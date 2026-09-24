@@ -2627,8 +2627,14 @@ class TestBR20S3VectorsStore:
         if bucket_error is not None:
             vectors_client.get_vector_bucket.side_effect = bucket_error
         else:
-            vectors_client.get_vector_bucket.return_value = {
-                "vectorBucket": {"encryptionConfiguration": encryption or {}}
+            # GetVectorBucket nests the encryption under `vectorBucket`, and
+            # echoes the ARN it was asked for. Answering from the keyword also
+            # asserts the call passes `vectorBucketArn` rather than a positional.
+            vectors_client.get_vector_bucket.side_effect = lambda **kwargs: {
+                "vectorBucket": {
+                    "vectorBucketArn": kwargs["vectorBucketArn"],
+                    "encryptionConfiguration": encryption or {},
+                }
             }
         if policy_error is not None:
             vectors_client.get_vector_bucket_policy.side_effect = policy_error
@@ -2870,6 +2876,60 @@ class TestBR20S3VectorsStore:
         assert [f["Status"] for f in findings] == ["Failed", "Passed", "N/A"]
         for kb, finding in zip(arns, findings, strict=True):
             assert kb in finding["Finding_Details"]
+
+    @patch("bedrock_app.boto3.client")
+    def test_br20_s3_vectors_live_mix_of_nine_sse_s3_and_one_cmk(self, mock_client):
+        # The probed account's shape on 2026-09-24: ten knowledge bases in one
+        # region, nine vector buckets on AES256 and one on aws:kms with a
+        # kmsKeyArn, and all ten raising NotFoundException from
+        # GetVectorBucketPolicy. The access leg therefore fails for all ten,
+        # the CMK bucket included: a customer-managed key with no bucket policy
+        # satisfies half of this control, and half is not a pass.
+        cmk_kb = "kb10"
+        arns = {
+            f"kb{i}": f"arn:aws:s3vectors:us-east-1:ACCOUNT_ID:bucket/b{i}"
+            for i in range(1, 11)
+        }
+        vectors_client = MagicMock()
+        vectors_client.get_vector_bucket.side_effect = lambda **kwargs: {
+            "vectorBucket": {
+                "vectorBucketArn": kwargs["vectorBucketArn"],
+                "encryptionConfiguration": (
+                    self._CMK
+                    if kwargs["vectorBucketArn"] == arns[cmk_kb]
+                    else {"sseType": "AES256"}
+                ),
+            }
+        }
+        vectors_client.get_vector_bucket_policy.side_effect = self._client_error(
+            "NotFoundException", "GetVectorBucketPolicy"
+        )
+        mock_client.side_effect = self._by_service(
+            self._agent_client_for(
+                {kb: self._s3_vectors_kb_body(arn) for kb, arn in arns.items()}
+            ),
+            vectors_client,
+            [],
+        )
+
+        findings = extract_csv_data(
+            bedrock_app.check_bedrock_knowledge_base_kms_encryption(region="us-east-1")
+        )
+        assert len(findings) == 10
+        assert {f["Status"] for f in findings} == {"Failed"}
+        assert all(
+            "no vector bucket policy is attached" in f["Finding_Details"]
+            for f in findings
+        )
+        # The encryption leg reaches both of its outcomes over this population.
+        cmk_rows = [
+            f for f in findings if self._CMK["kmsKeyArn"] in f["Finding_Details"]
+        ]
+        assert len(cmk_rows) == 1
+        assert f"KB-{cmk_kb}" in cmk_rows[0]["Finding_Details"]
+        assert (
+            len([f for f in findings if "sseType=AES256" in f["Finding_Details"]]) == 9
+        )
 
     @patch("bedrock_app.boto3.client")
     def test_br20_s3_vectors_sdk_gap_costs_one_kb_not_the_region(self, mock_client):
