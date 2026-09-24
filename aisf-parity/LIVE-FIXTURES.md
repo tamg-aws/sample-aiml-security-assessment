@@ -112,6 +112,77 @@ Tearing these down returns AISF-01 and AISF-05 to ONE_ONLY, which fails the gate
 for both. That is the intended behaviour: the gate reports what the account can
 actually prove, so removing a fixture must remove the proof.
 
+## Also standing: the stack deployed to read the rows in a real report
+
+The gate above measures the account. Reading the derived `AISF-` rows in a
+generated HTML report needs the assessment itself deployed, and that deploy is not
+a fixture: it leaves three stacks, three versioned buckets and a fixed-name IAM
+role behind. It is recorded here because this file is the teardown inventory, and a
+tag query cannot see any of it. `deployment/aiml-security-single-account.yaml` sets
+no tags at all, so the fixture tag filter returns none of these.
+
+Deployed 2026-09-24 21:23 UTC from branch `feature/aisf-report-section`, build
+`AIMLSecurityCodeBuild:8fb19587`, which produced
+`security_assessment_single_account_20260924_213330.html`.
+
+| Stack | Created by | Holds |
+|---|---|---|
+| `aiml-security-aisf-parity` | `aws cloudformation deploy` of `deployment/aiml-security-single-account.yaml` | CodeBuild project `AIMLSecurityCodeBuild`, IAM role `CodeBuildRole`, bucket `aiml-security-aisf-parity-assessmentbucket-7za0aaaa3dfo` |
+| `aiml-sec-ACCOUNT_ID` | `sam deploy` inside the CodeBuild run (`buildspec.yml:318`) | the assessment Lambdas, the Step Functions state machine, bucket `aiml-sec-ACCOUNT_ID-aimlassessmentbucket-gywyxnvqxpvx` |
+| `aws-sam-cli-managed-default` | the same `sam deploy`, first time SAM ran in this account and region | bucket `aws-sam-cli-managed-default-samclisourcebucket-mddfu3hfvyes` |
+
+Two things that make this harder to remove than it looks.
+
+**All three buckets have versioning Enabled**, and both assessment buckets carry
+`DeletionPolicy` default `Delete`. `aws s3 rm --recursive` leaves every noncurrent
+version and delete marker in place, the bucket stays non-empty, and the stack
+delete then fails on `BucketNotEmpty` after it has already removed the other
+resources. Empty the versions, not the objects.
+
+**`CodeBuildRole` is a fixed name** at path `/service-role/`, so a second copy of
+this template cannot be deployed into the same account while this stack exists.
+Checked before deploying: no role of that name pre-existed, so nothing else in the
+account owns it.
+
+```bash
+export AWS_PROFILE=delegated-admin AWS_REGION=us-east-1
+
+# Save anything still wanted first: the HTML report and the four source CSVs
+# live under the account-id prefix in the parent stack's bucket.
+aws s3 sync s3://aiml-security-aisf-parity-assessmentbucket-7za0aaaa3dfo/ ./report-archive/
+
+empty_versioned() {   # $1 = bucket. Versions AND delete markers, or the stack delete fails.
+  local b="$1" q
+  for q in Versions DeleteMarkers; do
+    while :; do
+      local payload
+      payload=$(aws s3api list-object-versions --bucket "$b" --max-items 500 \
+        --query "{Objects: ${q}[].{Key:Key,VersionId:VersionId}}" --output json)
+      case "$payload" in *'"Objects": null'*|*'"Objects":null'*) break ;; esac
+      aws s3api delete-objects --bucket "$b" --delete "$payload" >/dev/null
+    done
+  done
+}
+
+empty_versioned aiml-sec-ACCOUNT_ID-aimlassessmentbucket-gywyxnvqxpvx
+aws cloudformation delete-stack --stack-name aiml-sec-ACCOUNT_ID
+aws cloudformation wait stack-delete-complete --stack-name aiml-sec-ACCOUNT_ID
+
+empty_versioned aiml-security-aisf-parity-assessmentbucket-7za0aaaa3dfo
+aws cloudformation delete-stack --stack-name aiml-security-aisf-parity
+aws cloudformation wait stack-delete-complete --stack-name aiml-security-aisf-parity
+
+# Optional and account-wide. SAM recreates it on the next `sam deploy` in this
+# region, so leaving it costs the storage of 12 packaged artifacts and nothing else.
+# empty_versioned aws-sam-cli-managed-default-samclisourcebucket-mddfu3hfvyes
+# aws cloudformation delete-stack --stack-name aws-sam-cli-managed-default
+```
+
+Removing these stacks does not change any gate. `probe_live.py` reads the account
+through the checks' own source and never through a deployed assessment, so the
+BOTH/ONE_ONLY figures above survive the teardown. The two fixtures in the sections
+above are the ones that must stay for the gate to stay green.
+
 ## What is NOT a fixture
 
 The 36 `prowlerlive*` resources in this account belong to the Prowler check
