@@ -455,6 +455,50 @@ def main() -> int:
         f"{push['forces'] or 'none'}",
     )
 
+    # Everything above, and the whole battery self-audit below, measures HEAD. The
+    # command names a ref, and nothing so far compares the two, so a battery recorded
+    # on a green branch would vouch for pushing a different, ungated one. An empty
+    # source is caught here too: `git push origin :branch` deletes the remote ref
+    # while carrying neither a leading + nor --delete, so the force check is blind
+    # to it.
+    rc, head_sha = git(repo, "rev-parse", "HEAD")
+    if rc != 0 or not head_sha:
+        die("cannot resolve HEAD")
+    sources = [spec.lstrip("+").split(":")[0] for spec in push["refspecs"]]
+    compared: list[str] = []
+    off_head: list[str] = []
+    for src in sources:
+        if not src:
+            off_head.append("(empty source): deletes the remote ref")
+            continue
+        rc, resolved = git(
+            repo, "rev-parse", "--verify", "--quiet", f"{src}^{{commit}}"
+        )
+        if rc != 0 or not resolved:
+            off_head.append(f"{src}: does not resolve to a commit")
+            continue
+        rc, _ = git(repo, "merge-base", "--is-ancestor", resolved, head_sha)
+        if rc == 0:
+            compared.append(f"{src}={resolved[:12]}")
+        else:
+            off_head.append(f"{src}: {resolved[:12]} is not HEAD nor an ancestor of it")
+    if sources:
+        detail = (
+            f"{len(compared)} of {len(sources)} refspec source(s) are HEAD "
+            f"{head_sha[:12]} or an ancestor: {compared or 'none'}; "
+            f"off-HEAD: {off_head or 'none'}"
+        )
+    else:
+        detail = (
+            f"no refspec given, so git pushes the current branch {branch!r}, which is "
+            f"HEAD {head_sha[:12]} by definition; 0 source(s) needed comparing"
+        )
+    report.check(
+        "every ref being pushed is HEAD or an ancestor of it",
+        not off_head,
+        detail,
+    )
+
     print()
     print("=== battery self-audit ===")
     audit_battery(
