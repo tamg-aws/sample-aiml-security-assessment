@@ -925,7 +925,16 @@ def build():
     return doc
 
 
-def write_markdown(doc):
+def render_markdown(doc):
+    """Render the markdown view of a ledger doc. Pure: reads nothing, writes nothing.
+
+    Separate from write_markdown so check_ledger.py's gate 10 can render the json
+    and compare the result against the file on disk. That gate used to compare
+    mtimes, which measures checkout order and not content: a clone writes every
+    file within the same second, ordered by the git index, so the uppercase
+    markdown name always lands before the lowercase json and the gate failed in
+    every fresh clone while passing in the tree the ledger was generated in.
+    """
     s = doc["summary"]
     out = []
     out.append("# AISF parity work ledger")
@@ -990,8 +999,12 @@ def write_markdown(doc):
                 f"| `{r['control']}`{wa} | {r['verdict']} | {do} | {mod} | {inc} | {gap} |"
             )
         out.append("")
+    return "\n".join(out)
+
+
+def write_markdown(doc):
     with open(os.path.join(HERE, "AISF-WORK-LEDGER.md"), "w") as f:
-        f.write("\n".join(out))
+        f.write(render_markdown(doc))
 
 
 if __name__ == "__main__":

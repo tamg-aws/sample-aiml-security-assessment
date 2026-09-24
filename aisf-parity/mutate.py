@@ -54,6 +54,8 @@ MAPPINGS = (
 
 BEDROCK = "aiml-security-assessment/functions/security/bedrock_assessments/app.py"
 
+BUILD_LEDGER = "aisf-parity/build_ledger.py"
+
 # Each find-string must occur EXACTLY ONCE in its file; the run aborts otherwise.
 # That replaces the `nth` occurrence selector the prowler harness carries, whose
 # 0-based field and 1-based display have mutated the wrong arm of a duplicated
@@ -113,6 +115,18 @@ MUTATIONS = [
         "find": '        if error_code == "NotFoundException":\n',
         "replace": '        if error_code == "NotFoundException":\n'
         "            policy_unreadable = error_code\n",
+    },
+    {
+        "name": "ledger markdown renders a figure from the wrong summary key",
+        "file": BUILD_LEDGER,
+        "defect": "the generated markdown reports the total control count where "
+        "the covered count belongs, and the committed markdown is not "
+        "regenerated -- the mtime version of gate 10 could not see this at all, "
+        "because a renderer edit does not touch either artifact",
+        "find": "        f\"| covered | {s['covered']} | an incumbent already "
+        'asserts this; nothing to write |"\n',
+        "replace": "        f\"| covered | {s['total']} | an incumbent already "
+        'asserts this; nothing to write |"\n',
     },
 ]
 

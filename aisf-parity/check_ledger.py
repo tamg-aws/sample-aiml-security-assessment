@@ -39,15 +39,22 @@ AISF_DOC = os.path.join(REPO, "docs", "SECURITY_CHECKS_AISF.md")
 # passed while the file on disk carried the new one. A gate that reads a stale
 # copy of the thing it is gating fails open, so drop any cache entry for these
 # two modules and write none.
+#
+# build_ledger is in the same list for the same reason: gate 10 renders the
+# markdown through it, so a stale copy of the renderer would compare the json
+# against yesterday's layout and pass.
 sys.dont_write_bytecode = True
-for _name in ("report_template", "aisf_mappings"):
-    _cached = importlib.util.cache_from_source(
-        os.path.join(REPORT_APP_DIR, _name + ".py")
-    )
+for _dir, _name in (
+    (REPORT_APP_DIR, "report_template"),
+    (REPORT_APP_DIR, "aisf_mappings"),
+    (HERE, "build_ledger"),
+):
+    _cached = importlib.util.cache_from_source(os.path.join(_dir, _name + ".py"))
     if os.path.exists(_cached):
         os.remove(_cached)
 
 sys.path.insert(0, REPORT_APP_DIR)
+sys.path.insert(0, HERE)
 
 from aisf_mappings import (  # noqa: E402
     AISF_COVERAGE_CHECK_ID,
@@ -56,6 +63,7 @@ from aisf_mappings import (  # noqa: E402
     SEVERITY_COLLAPSE_NOTE,
     derive_aisf_findings,
 )
+from build_ledger import render_markdown  # noqa: E402
 from report_template import COMPLIANCE_STANDARDS  # noqa: E402
 
 # target_module directory -> the SAM function logical id that runs it
@@ -322,16 +330,42 @@ def main():
         f"new functions {summary['new_check_functions']}",
     )
 
-    # ---- gate 10: the markdown view is current with the JSON.
+    # ---- gate 10: the markdown view is the json, rendered.
+    # Content, not mtimes. The mtime version of this gate failed in every fresh
+    # clone and passed in the tree the ledger was built in, because a checkout
+    # writes both files inside the same second in git-index order, which puts
+    # uppercase AISF-WORK-LEDGER.md before lowercase aisf-work-ledger.json. It
+    # also passed for a `touch`, and failed for a regeneration that produced a
+    # byte-identical file. Nothing here writes the markdown: a gate that
+    # regenerates the artifact it is gating cannot fail.
     md = os.path.join(HERE, "AISF-WORK-LEDGER.md")
-    stale = not os.path.exists(md) or os.path.getmtime(md) < os.path.getmtime(
-        os.path.join(HERE, "aisf-work-ledger.json")
-    )
-    gate(
-        "markdown view is not older than the json",
-        not stale,
-        "regenerate with build_ledger.py" if stale else "current",
-    )
+    expected = render_markdown(doc).split("\n")
+    if os.path.exists(md):
+        with open(md) as f:
+            actual = f.read().split("\n")
+    else:
+        actual = None
+    if actual is None:
+        detail = f"{os.path.basename(md)} is missing; run build_ledger.py"
+    elif actual == expected:
+        detail = f"{len(expected)} rendered line(s) identical to the file on disk"
+    else:
+        first = next(
+            (
+                i
+                for i in range(max(len(expected), len(actual)))
+                if expected[i : i + 1] != actual[i : i + 1]
+            ),
+            0,
+        )
+        detail = (
+            f"first difference at line {first + 1} of "
+            f"{len(actual)} on disk vs {len(expected)} rendered: "
+            f"disk={actual[first : first + 1] or ['<end of file>']!r} "
+            f"rendered={expected[first : first + 1] or ['<end of file>']!r}; "
+            "regenerate with build_ledger.py"
+        )
+    gate("markdown view renders from the json", actual == expected, detail)
 
     # ---- gate 11: the shipped AISF framework view restates covered controls only,
     # and names the same incumbents the ledger names.
