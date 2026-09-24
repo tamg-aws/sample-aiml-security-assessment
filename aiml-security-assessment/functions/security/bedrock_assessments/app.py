@@ -4117,6 +4117,212 @@ def check_bedrock_prompt_flow_validation(region: str = "") -> Dict[str, Any]:
         }
 
 
+KB_ENCRYPTION_REFERENCE = (
+    "https://docs.aws.amazon.com/bedrock/latest/userguide/encryption-kb.html"
+)
+
+S3_VECTORS_RESOLUTION = (
+    "1. S3 Vectors sets encryption at creation only (the API has CreateVectorBucket "
+    "and CreateIndex with an encryptionConfiguration, and no Put*Encryption "
+    "operation), so move the knowledge base to a vector bucket created with "
+    "encryptionConfiguration.sseType=aws:kms and a customer-managed "
+    "kmsKeyArn, then re-ingest the data sources.\n"
+    "2. Attach a vector bucket policy (s3vectors:PutVectorBucketPolicy) that grants "
+    "the knowledge base service role only the vector operations it needs and denies "
+    "everyone else."
+)
+
+
+def _vector_bucket_region(vector_bucket_arn: str) -> str:
+    """Return the region embedded in an S3 Vectors bucket ARN, or "" if unreadable.
+
+    A knowledge base can point at a vector bucket in a different region from the
+    one being scanned, and an s3vectors client built for the scan region fails on
+    a bucket that is perfectly readable. The ARN shape is fixed by the service
+    model: arn:aws[-a-z0-9]*:s3vectors:<region>:<account>:bucket/<name>.
+    """
+    parts = vector_bucket_arn.split(":")
+    if len(parts) < 6 or parts[0] != "arn" or parts[2] != "s3vectors":
+        return ""
+    return parts[3]
+
+
+def _assess_s3_vectors_store(
+    storage_config: Dict[str, Any], region: str
+) -> Dict[str, str]:
+    """Assess the S3 Vectors bucket behind a knowledge base for BR-20.
+
+    Two legs, both read from the vector bucket itself:
+      - encryption: GetVectorBucket. sseType=aws:kms WITH a kmsKeyArn is the
+        customer-managed case and passes. AES256 is SSE-S3: encrypted, but not
+        with a customer-managed key, which is the bar every other BR-20 storage
+        type is held to, so it fails. The service model documents kmsKeyArn as
+        the "customer managed key" and allows it if and only if sseType is
+        aws:kms, so the pair is the whole test.
+      - access restriction: GetVectorBucketPolicy. NotFoundException means no
+        policy is attached, which is a Failed for this leg and explicitly NOT an
+        N/A. Abstaining here is what made this control read as unassessed while
+        every knowledge base in the account used S3 Vectors.
+
+    An AccessDenied on either call is neither of those: it is an assessment
+    prerequisite problem, reported as a could-not-assess that names the missing
+    permission, so a permission gap stays visible instead of being restated as a
+    verdict about the workload.
+
+    Returns a dict with `status`, `severity`, `detail` and `resolution`.
+    """
+    s3_vectors_config = storage_config.get("s3VectorsConfiguration") or {}
+    vector_bucket_arn = s3_vectors_config.get("vectorBucketArn") or ""
+    index_arn = s3_vectors_config.get("indexArn") or ""
+
+    if not vector_bucket_arn:
+        return {
+            "status": "N/A",
+            "severity": "Informational",
+            "detail": (
+                "uses S3 Vectors storage, but the knowledge base does not report "
+                "storageConfiguration.s3VectorsConfiguration.vectorBucketArn"
+                + (f" (indexArn: {index_arn})" if index_arn else "")
+                + ", so the vector bucket could not be identified and its "
+                "encryption and access policy could not be assessed."
+            ),
+            "resolution": COULD_NOT_ASSESS_RESOLUTION,
+        }
+
+    bucket_region = _vector_bucket_region(vector_bucket_arn)
+    if not bucket_region:
+        return {
+            "status": "N/A",
+            "severity": "Informational",
+            "detail": (
+                f"uses S3 Vectors bucket '{vector_bucket_arn}', whose ARN does not "
+                "carry a readable region, so the vector bucket could not be queried."
+            ),
+            "resolution": COULD_NOT_ASSESS_RESOLUTION,
+        }
+
+    # The bucket's own region, not the scan region: see _vector_bucket_region.
+    s3_vectors_client = boto3.client(
+        "s3vectors", config=boto3_config, region_name=bucket_region
+    )
+    located = f"S3 Vectors bucket '{vector_bucket_arn}' ({bucket_region})"
+
+    try:
+        bucket = s3_vectors_client.get_vector_bucket(
+            vectorBucketArn=vector_bucket_arn
+        ).get("vectorBucket", {})
+    except ClientError as e:
+        error_code = e.response.get("Error", {}).get("Code", "")
+        needed = "s3vectors:GetVectorBucket"
+        if error_code in ACCESS_DENIED_ERROR_CODES:
+            detail = (
+                f"uses {located}. Its encryption configuration could not be read: "
+                f"{error_code} on GetVectorBucket. Grant {needed} to assess this "
+                "knowledge base."
+            )
+        else:
+            detail = (
+                f"uses {located}. Its encryption configuration could not be read: "
+                f"{describe_api_error(e, 'GetVectorBucket', bucket_region)}."
+            )
+        return {
+            "status": "N/A",
+            "severity": "Informational",
+            "detail": detail,
+            "resolution": COULD_NOT_ASSESS_RESOLUTION,
+        }
+
+    encryption = bucket.get("encryptionConfiguration") or {}
+    sse_type = encryption.get("sseType") or "AES256 (service default)"
+    kms_key_arn = encryption.get("kmsKeyArn") or ""
+    encryption_ok = encryption.get("sseType") == "aws:kms" and bool(kms_key_arn)
+    if encryption_ok:
+        encryption_detail = (
+            f"vector bucket encryption is SSE-KMS with customer-managed key "
+            f"{kms_key_arn}"
+        )
+    else:
+        encryption_detail = (
+            f"vector bucket encryption is sseType={sse_type}"
+            + (f" with kmsKeyArn={kms_key_arn}" if kms_key_arn else "")
+            + ", not a customer-managed KMS key"
+        )
+
+    policy_unreadable = ""
+    policy_ok = False
+    try:
+        policy = s3_vectors_client.get_vector_bucket_policy(
+            vectorBucketArn=vector_bucket_arn
+        ).get("policy")
+        policy_ok = bool(policy)
+        policy_detail = (
+            "a vector bucket policy is attached (its statements are not evaluated "
+            "by this check)"
+            if policy_ok
+            else "GetVectorBucketPolicy returned an empty policy, so access to the "
+            "vector store is not restricted by a resource policy"
+        )
+    except ClientError as e:
+        error_code = e.response.get("Error", {}).get("Code", "")
+        if error_code == "NotFoundException":
+            # No policy exists. A Failed leg, not an N/A: the vector store holding
+            # the knowledge base's embeddings carries no resource policy.
+            policy_detail = (
+                "no vector bucket policy is attached (GetVectorBucketPolicy "
+                "returned NotFoundException), so access to the vector store is "
+                "not restricted by a resource policy"
+            )
+        elif error_code in ACCESS_DENIED_ERROR_CODES:
+            policy_unreadable = error_code
+            policy_detail = (
+                f"the vector bucket policy could not be read: {error_code} on "
+                "GetVectorBucketPolicy. Grant s3vectors:GetVectorBucketPolicy to "
+                "assess the access-restriction half of this control"
+            )
+        else:
+            policy_unreadable = get_assessment_error_label(e)
+            policy_detail = (
+                "the vector bucket policy could not be read: "
+                f"{describe_api_error(e, 'GetVectorBucketPolicy', bucket_region)}"
+            )
+
+    detail = f"uses {located}. Assessed: {encryption_detail}; {policy_detail}."
+    if not encryption_ok:
+        # Positive evidence of a failing leg outranks an unreadable second leg.
+        return {
+            "status": "Failed",
+            "severity": "High",
+            "detail": detail,
+            "resolution": S3_VECTORS_RESOLUTION,
+        }
+    if policy_unreadable:
+        return {
+            "status": "N/A",
+            "severity": "Informational",
+            "detail": detail,
+            "resolution": COULD_NOT_ASSESS_RESOLUTION,
+        }
+    if not policy_ok:
+        return {
+            "status": "Failed",
+            "severity": "High",
+            "detail": detail,
+            "resolution": S3_VECTORS_RESOLUTION,
+        }
+    return {
+        "status": "Passed",
+        "severity": "Medium",
+        "detail": (
+            f"{detail} Index-level encryption overrides (CreateIndex accepts its own "
+            "encryptionConfiguration) are not read by this check."
+        ),
+        "resolution": (
+            "No action required on the vector bucket. Confirm the vector index was "
+            "not created with an encryptionConfiguration that overrides the bucket."
+        ),
+    }
+
+
 def check_bedrock_knowledge_base_kms_encryption(region: str = "") -> Dict[str, Any]:
     """
     BR-20: Verify Knowledge Base vector stores use customer-managed KMS keys (extends BR-09)
@@ -4162,6 +4368,7 @@ def check_bedrock_knowledge_base_kms_encryption(region: str = "") -> Dict[str, A
             kbs_with_customer_keys = []
             kbs_storage_layer_review = []
             kbs_indeterminate = []
+            kbs_s3_vectors = []
 
             for kb_summary in knowledge_bases:
                 kb_id = kb_summary.get("knowledgeBaseId")
@@ -4220,6 +4427,36 @@ def check_bedrock_knowledge_base_kms_encryption(region: str = "") -> Dict[str, A
                                     "storage_type": "Managed (Amazon Bedrock)",
                                 }
                             )
+                    elif storage_type == "S3_VECTORS":
+                        # S3 Vectors is the one custom store whose encryption and
+                        # access policy ARE readable, one ARN hop away, so this
+                        # branch asserts instead of deferring to manual review.
+                        try:
+                            assessment = _assess_s3_vectors_store(
+                                storage_config, region
+                            )
+                        except Exception as vector_error:
+                            # A vector bucket the assessment cannot reach at all (an
+                            # SDK with no s3vectors model, an unreachable endpoint)
+                            # costs one knowledge base its verdict. Without this the
+                            # outer handler would replace every row for the region
+                            # with a single ERROR.
+                            logger.warning(
+                                f"S3 Vectors assessment failed for KB {kb_name}: "
+                                f"{get_assessment_error_label(vector_error)}"
+                            )
+                            assessment = {
+                                "status": "N/A",
+                                "severity": "Informational",
+                                "detail": (
+                                    "uses S3 Vectors storage, but the vector bucket "
+                                    "could not be queried. Assessment error: "
+                                    f"{get_assessment_error_label(vector_error)}."
+                                ),
+                                "resolution": COULD_NOT_ASSESS_RESOLUTION,
+                            }
+                        assessment.update({"name": kb_name, "id": kb_id})
+                        kbs_s3_vectors.append(assessment)
                     else:
                         # Custom vector store (VECTOR / SQL / KENDRA): encryption is
                         # managed at the storage layer and cannot be validated from
@@ -4255,6 +4492,45 @@ def check_bedrock_knowledge_base_kms_encryption(region: str = "") -> Dict[str, A
                             reference="https://docs.aws.amazon.com/bedrock/latest/userguide/encryption-kb.html",
                             severity="High",
                             status="Failed",
+                            region=region,
+                        )
+                    )
+
+            if kbs_s3_vectors:
+                failed_s3_vectors = [
+                    kb for kb in kbs_s3_vectors if kb["status"] == "Failed"
+                ]
+                if failed_s3_vectors:
+                    findings["status"] = "WARN"
+                    findings["details"] = (
+                        f"{len(failed_s3_vectors)} knowledge bases on S3 Vectors do "
+                        "not meet customer-managed encryption or access restriction"
+                    )
+                elif findings["status"] == "PASS" and any(
+                    kb["status"] == "N/A" for kb in kbs_s3_vectors
+                ):
+                    findings["status"] = "WARN"
+
+                # One finding per knowledge base, in list order. An all-or-nothing
+                # summary row would make either Passed or Failed unreachable for the
+                # whole region as soon as one knowledge base disagreed.
+                for kb in kbs_s3_vectors:
+                    findings["csv_data"].append(
+                        create_finding(
+                            check_id="BR-20",
+                            finding_name=(
+                                "Knowledge Base Customer-Managed KMS Encryption Review"
+                                if kb["status"] == "N/A"
+                                else "Knowledge Base Customer-Managed KMS Encryption Check"
+                            ),
+                            finding_details=(
+                                f"Knowledge base '{kb['name']}' (ID: {kb['id']}) "
+                                f"{kb['detail']}"
+                            ),
+                            resolution=kb["resolution"],
+                            reference=KB_ENCRYPTION_REFERENCE,
+                            severity=kb["severity"],
+                            status=kb["status"],
                             region=region,
                         )
                     )

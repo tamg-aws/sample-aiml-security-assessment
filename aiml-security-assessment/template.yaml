@@ -381,6 +381,15 @@ Resources:
               Action:
                 - bedrock:GetKnowledgeBase
               Resource: !Sub 'arn:${AWS::Partition}:bedrock:*:${AWS::AccountId}:knowledge-base/*'
+            - Sid: S3VectorsKnowledgeBaseStoreRead
+              # BR-20 follows a knowledge base's s3VectorsConfiguration.vectorBucketArn
+              # to the vector bucket. The region is wildcarded because a knowledge base
+              # can point at a vector bucket in another region.
+              Effect: Allow
+              Action:
+                - s3vectors:GetVectorBucket # BR-20
+                - s3vectors:GetVectorBucketPolicy # BR-20
+              Resource: !Sub 'arn:${AWS::Partition}:s3vectors:*:${AWS::AccountId}:bucket/*'
             - Sid: BedrockImportedModelRead
               Effect: Allow
               Action:

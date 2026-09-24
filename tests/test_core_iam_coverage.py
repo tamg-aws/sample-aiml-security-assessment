@@ -20,6 +20,8 @@ _SECTION_CHECKS = [
             "bedrock:GetModelInvocationLoggingConfiguration",
             "bedrock:ListKnowledgeBases",
             "bedrock:GetKnowledgeBase",
+            "s3vectors:GetVectorBucket",  # BR-20
+            "s3vectors:GetVectorBucketPolicy",  # BR-20
             "bedrock:ListEvaluationJobs",  # BR-18
             "bedrock:ListImportedModels",  # BR-30
             "bedrock:GetImportedModel",  # BR-30
@@ -49,6 +51,8 @@ _SECTION_CHECKS = [
             "bedrock:GetModelInvocationLoggingConfiguration",
             "bedrock:ListKnowledgeBases",
             "bedrock:GetKnowledgeBase",
+            "s3vectors:GetVectorBucket",  # BR-20
+            "s3vectors:GetVectorBucketPolicy",  # BR-20
             "bedrock:ListEvaluationJobs",  # BR-18
             "bedrock:ListImportedModels",  # BR-30
             "bedrock:GetImportedModel",  # BR-30

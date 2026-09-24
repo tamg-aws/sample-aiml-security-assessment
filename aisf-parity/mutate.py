@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Mutate the AISF derived-standard code and require the local gates to catch it.
 
-A gate that stays green when the code is wrong is decoration. This applies four
+A gate that stays green when the code is wrong is decoration. This applies the
 defects this work could plausibly have shipped, one at a time, and requires that
 something goes red: either a gate in `aisf-parity/check_ledger.py` or a test.
 The catcher is OBSERVED, never assumed -- the gate name and the test node id are
@@ -52,6 +52,8 @@ MAPPINGS = (
     "generate_consolidated_report/aisf_mappings.py"
 )
 
+BEDROCK = "aiml-security-assessment/functions/security/bedrock_assessments/app.py"
+
 # Each find-string must occur EXACTLY ONCE in its file; the run aborts otherwise.
 # That replaces the `nth` occurrence selector the prowler harness carries, whose
 # 0-based field and 1-based display have mutated the wrong arm of a duplicated
@@ -91,6 +93,26 @@ MUTATIONS = [
         "check_id.split('-')[0] and misfiles silently under a wrong service",
         "find": '        "check_id": "AISF-05",\n',
         "replace": '        "check_id": "AI-05",\n',
+    },
+    {
+        "name": "S3 Vectors CMK test accepts any sseType",
+        "file": BEDROCK,
+        "defect": "AES256 (SSE-S3) passes BR-20's encryption leg, so a vector "
+        "store on the service default key reports as customer-managed -- the "
+        "exact configuration the probed account runs on all 9 knowledge bases",
+        "find": '    encryption_ok = encryption.get("sseType") == "aws:kms" '
+        "and bool(kms_key_arn)\n",
+        "replace": '    encryption_ok = bool(encryption.get("sseType"))\n',
+    },
+    {
+        "name": "S3 Vectors missing bucket policy reverted to N/A",
+        "file": BEDROCK,
+        "defect": "NotFoundException from GetVectorBucketPolicy is laundered "
+        "into a could-not-assess, which is how BR-20 came to emit 9 N/A rows "
+        "for 9 knowledge bases it could in fact assess",
+        "find": '        if error_code == "NotFoundException":\n',
+        "replace": '        if error_code == "NotFoundException":\n'
+        "            policy_unreadable = error_code\n",
     },
 ]
 
@@ -411,7 +433,12 @@ def main() -> int:
     print(f"catchers  ledger gates (aisf-parity/check_ledger.py) + pytest {args.tests}")
     print(f"          pytest cwd: {tests_cwd}")
     print(f"snapshot  {len(touched)} file(s), backups written as *.mutate-backup")
-    print(f"bytecode  {purge_bytecode(python, repo / touched[0])}")
+    # Every target, not just the first: a stale .pyc for the SECOND file would
+    # serve the pre-mutation bytecode to the baseline run and to any mutation
+    # whose byte count matches, and the length-identical `critical` mutation is
+    # exactly that case.
+    for rel in touched:
+        print(f"bytecode  {rel}\n          {purge_bytecode(python, repo / rel)}")
 
     base_prints = fingerprint(repo)
     base_artifacts = artifact_bytes(repo)

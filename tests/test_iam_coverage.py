@@ -574,6 +574,12 @@ _VERIFIED_REMEDIATION_IAM_ACTIONS = {
     "servicequotas:ListServiceQuotas",
 }
 
+# Verified from the vendored service model's own permission documentation
+# (botocore s3vectors 2025-07-15: "You must have the
+# s3vectors:PutVectorBucketPolicy permission to use this operation"), not from
+# AWS Knowledge like the block above.
+_VERIFIED_REMEDIATION_IAM_ACTIONS |= {"s3vectors:PutVectorBucketPolicy"}
+
 _VERIFIED_REMEDIATION_CONDITION_KEYS = {
     "bedrock:GuardrailIdentifier",
     "iam:AWSServiceName",
@@ -619,8 +625,17 @@ def _runtime_resolution_iam_tokens():
                     targets = (
                         node.targets if isinstance(node, ast.Assign) else [node.target]
                     )
+                    # A resolution held in a module constant (BR-20's
+                    # S3_VECTORS_RESOLUTION) reaches create_finding as a Name, so the
+                    # call-site scan above reads the identifier and never sees the
+                    # text. Collect the constants too, or an unverified action name
+                    # ships by being factored out of the call.
                     if any(
-                        isinstance(target, ast.Name) and target.id == "resolution"
+                        isinstance(target, ast.Name)
+                        and (
+                            target.id == "resolution"
+                            or target.id.endswith("_RESOLUTION")
+                        )
                         for target in targets
                     ):
                         resolution_values.append(node.value)

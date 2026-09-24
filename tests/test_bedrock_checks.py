@@ -14,7 +14,11 @@ import sys
 import os
 import importlib.util
 from unittest.mock import patch, MagicMock
-from botocore.exceptions import EndpointConnectionError, ClientError
+from botocore.exceptions import (
+    EndpointConnectionError,
+    ClientError,
+    UnknownServiceError,
+)
 
 import pytest
 
@@ -2559,6 +2563,378 @@ class TestBR20KnowledgeBaseKMS:
             result = check(region="us-east-1")
 
         for f in extract_csv_data(result):
+            assert_finding_schema(f)
+
+
+# ===================================================================
+# BR-20, S3 Vectors leg: the vector bucket behind an S3_VECTORS
+# knowledge base is readable, so the check asserts on it instead of
+# deferring to manual review.
+#
+# These cases pin the shape a read-only probe measured in a live
+# account: 9 of 9 knowledge bases used S3_VECTORS, every vector bucket
+# returned {"sseType": "AES256"}, and every GetVectorBucketPolicy
+# raised NotFoundException. While this branch abstained, BR-20 emitted
+# 9 findings and all 9 were N/A -- a covered control producing a
+# verdict for zero resources.
+# ===================================================================
+class TestBR20S3VectorsStore:
+    """BR-20: assess the S3 Vectors bucket holding a knowledge base."""
+
+    _BUCKET_ARN = "arn:aws:s3vectors:us-east-1:123456789012:bucket/kb-vectors"
+    _CMK = {
+        "sseType": "aws:kms",
+        "kmsKeyArn": "arn:aws:kms:us-east-1:123456789012:key/abc",
+    }
+
+    @staticmethod
+    def _client_error(code, operation):
+        return ClientError({"Error": {"Code": code, "Message": code}}, operation)
+
+    @staticmethod
+    def _s3_vectors_kb_body(bucket_arn):
+        """A VECTOR knowledge base whose storage is an S3 Vectors bucket."""
+        storage = {"type": "S3_VECTORS"}
+        if bucket_arn is not None:
+            storage["s3VectorsConfiguration"] = {"vectorBucketArn": bucket_arn}
+        return {
+            "knowledgeBaseConfiguration": {
+                "type": "VECTOR",
+                "vectorKnowledgeBaseConfiguration": {},
+            },
+            "storageConfiguration": storage,
+        }
+
+    @staticmethod
+    def _agent_client_for(bodies):
+        """bodies: {kb_id: knowledgeBase body}, answered per knowledgeBaseId."""
+        agent_client = MagicMock()
+        agent_client.list_knowledge_bases.return_value = {
+            "knowledgeBaseSummaries": [
+                {"knowledgeBaseId": kb_id, "name": f"KB-{kb_id}"} for kb_id in bodies
+            ]
+        }
+        agent_client.get_knowledge_base.side_effect = lambda **kwargs: {
+            "knowledgeBase": bodies[kwargs["knowledgeBaseId"]]
+        }
+        return agent_client
+
+    @staticmethod
+    def _vectors_client(
+        encryption=None, bucket_error=None, policy="", policy_error=None
+    ):
+        vectors_client = MagicMock()
+        if bucket_error is not None:
+            vectors_client.get_vector_bucket.side_effect = bucket_error
+        else:
+            vectors_client.get_vector_bucket.return_value = {
+                "vectorBucket": {"encryptionConfiguration": encryption or {}}
+            }
+        if policy_error is not None:
+            vectors_client.get_vector_bucket_policy.side_effect = policy_error
+        else:
+            vectors_client.get_vector_bucket_policy.return_value = {"policy": policy}
+        return vectors_client
+
+    @staticmethod
+    def _by_service(agent_client, vectors_client, clients_built):
+        """Dispatch boto3.client by service name, recording each construction.
+
+        Every other test in this file hands one MagicMock to every boto3.client
+        call, which cannot express "bedrock-agent answers while s3vectors
+        raises", and cannot show which region the s3vectors client was built
+        for. `vectors_client` may be an Exception, for the case where the
+        deployed SDK has no s3vectors model at all.
+        """
+
+        def factory(service_name, *_args, **kwargs):
+            clients_built.append((service_name, kwargs.get("region_name")))
+            if service_name != "s3vectors":
+                return agent_client
+            if isinstance(vectors_client, Exception):
+                raise vectors_client
+            return vectors_client
+
+        return factory
+
+    def _run_one(
+        self, mock_client, *, bucket_arn=_BUCKET_ARN, scan_region="us-east-1", **vectors
+    ):
+        """Run BR-20 over a single S3 Vectors knowledge base.
+
+        Returns (findings, clients_built).
+        """
+        clients_built = []
+        mock_client.side_effect = self._by_service(
+            self._agent_client_for({"kb1": self._s3_vectors_kb_body(bucket_arn)}),
+            self._vectors_client(**vectors),
+            clients_built,
+        )
+        result = bedrock_app.check_bedrock_knowledge_base_kms_encryption(
+            region=scan_region
+        )
+        return extract_csv_data(result), clients_built
+
+    @patch("bedrock_app.boto3.client")
+    def test_br20_s3_vectors_sse_s3_without_a_policy_returns_failed(self, mock_client):
+        # The live shape. AES256 is SSE-S3: encrypted, but not with a
+        # customer-managed key, which is the bar every other BR-20 storage type
+        # is held to. NotFoundException means no bucket policy exists.
+        findings, _ = self._run_one(
+            mock_client,
+            encryption={"sseType": "AES256"},
+            policy_error=self._client_error(
+                "NotFoundException", "GetVectorBucketPolicy"
+            ),
+        )
+        assert [f["Status"] for f in findings] == ["Failed"]
+        assert findings[0]["Check_ID"] == "BR-20"
+        assert findings[0]["Severity"] == "High"
+        assert "sseType=AES256" in findings[0]["Finding_Details"]
+        assert "no vector bucket policy is attached" in findings[0]["Finding_Details"]
+
+    @patch("bedrock_app.boto3.client")
+    def test_br20_s3_vectors_cmk_with_a_policy_returns_passed(self, mock_client):
+        findings, _ = self._run_one(
+            mock_client, encryption=self._CMK, policy='{"Statement": []}'
+        )
+        assert [f["Status"] for f in findings] == ["Passed"]
+        assert findings[0]["Severity"] == "Medium"
+        assert self._CMK["kmsKeyArn"] in findings[0]["Finding_Details"]
+        # The index carries its own encryptionConfiguration, which this check
+        # does not read. A Passed row that did not say so would overclaim.
+        assert "Index-level encryption overrides" in findings[0]["Finding_Details"]
+
+    @patch("bedrock_app.boto3.client")
+    def test_br20_s3_vectors_missing_policy_fails_and_is_never_na(self, mock_client):
+        # Encryption passes, so the verdict turns entirely on the policy leg:
+        # if NotFoundException were laundered into N/A, this row would be N/A.
+        # It is not a could-not-assess -- the answer was read successfully and
+        # the answer is "no policy".
+        findings, _ = self._run_one(
+            mock_client,
+            encryption=self._CMK,
+            policy_error=self._client_error(
+                "NotFoundException", "GetVectorBucketPolicy"
+            ),
+        )
+        assert [f["Status"] for f in findings] == ["Failed"]
+        assert findings[0]["Severity"] == "High"
+        assert "customer-managed key" in findings[0]["Finding_Details"]
+        assert "NotFoundException" in findings[0]["Finding_Details"]
+
+    @patch("bedrock_app.boto3.client")
+    def test_br20_s3_vectors_empty_policy_response_returns_failed(self, mock_client):
+        findings, _ = self._run_one(mock_client, encryption=self._CMK, policy="")
+        assert [f["Status"] for f in findings] == ["Failed"]
+        assert "empty policy" in findings[0]["Finding_Details"]
+
+    @patch("bedrock_app.boto3.client")
+    def test_br20_s3_vectors_bucket_access_denied_names_the_permission(
+        self, mock_client
+    ):
+        # A permission gap is neither a pass nor a fail. It must stay visible as
+        # a could-not-assess that names the action, or the deployment looks
+        # compliant because it cannot see.
+        findings, _ = self._run_one(
+            mock_client,
+            bucket_error=self._client_error("AccessDeniedException", "GetVectorBucket"),
+        )
+        assert [f["Status"] for f in findings] == ["N/A"]
+        assert findings[0]["Severity"] == "Informational"
+        assert "s3vectors:GetVectorBucket" in findings[0]["Finding_Details"]
+        assert findings[0]["Finding"].endswith("Review")
+
+    @patch("bedrock_app.boto3.client")
+    def test_br20_s3_vectors_policy_access_denied_does_not_pass_on_one_leg(
+        self, mock_client
+    ):
+        findings, _ = self._run_one(
+            mock_client,
+            encryption=self._CMK,
+            policy_error=self._client_error(
+                "AccessDeniedException", "GetVectorBucketPolicy"
+            ),
+        )
+        assert [f["Status"] for f in findings] == ["N/A"]
+        assert "s3vectors:GetVectorBucketPolicy" in findings[0]["Finding_Details"]
+
+    @patch("bedrock_app.boto3.client")
+    def test_br20_s3_vectors_failed_encryption_outranks_an_unreadable_policy(
+        self, mock_client
+    ):
+        # One leg read and failing is a verdict. Downgrading it to N/A because
+        # the second leg was unreadable would hide a confirmed failure behind a
+        # permission gap.
+        findings, _ = self._run_one(
+            mock_client,
+            encryption={"sseType": "AES256"},
+            policy_error=self._client_error(
+                "AccessDeniedException", "GetVectorBucketPolicy"
+            ),
+        )
+        assert [f["Status"] for f in findings] == ["Failed"]
+
+    @patch("bedrock_app.boto3.client")
+    def test_br20_s3_vectors_client_is_built_for_the_bucket_region(self, mock_client):
+        # A knowledge base can point at a vector bucket in another region. A
+        # client built for the scan region fails on a perfectly readable bucket.
+        findings, clients_built = self._run_one(
+            mock_client,
+            bucket_arn="arn:aws:s3vectors:eu-west-1:123456789012:bucket/kb-vectors",
+            scan_region="us-east-1",
+            encryption=self._CMK,
+            policy='{"Statement": []}',
+        )
+        assert ("s3vectors", "eu-west-1") in clients_built
+        assert ("s3vectors", "us-east-1") not in clients_built
+        assert ("bedrock-agent", "us-east-1") in clients_built
+        assert [f["Status"] for f in findings] == ["Passed"]
+
+    @patch("bedrock_app.boto3.client")
+    def test_br20_s3_vectors_without_a_bucket_arn_returns_na(self, mock_client):
+        findings, clients_built = self._run_one(mock_client, bucket_arn=None)
+        assert [f["Status"] for f in findings] == ["N/A"]
+        assert "vectorBucketArn" in findings[0]["Finding_Details"]
+        assert not [c for c in clients_built if c[0] == "s3vectors"]
+
+    @patch("bedrock_app.boto3.client")
+    def test_br20_s3_vectors_unreadable_bucket_arn_returns_na(self, mock_client):
+        findings, clients_built = self._run_one(mock_client, bucket_arn="kb-vectors")
+        assert [f["Status"] for f in findings] == ["N/A"]
+        assert "readable region" in findings[0]["Finding_Details"]
+        assert not [c for c in clients_built if c[0] == "s3vectors"]
+
+    @patch("bedrock_app.boto3.client")
+    def test_br20_s3_vectors_does_not_defer_to_storage_layer_review(self, mock_client):
+        # The regression this change fixes: S3_VECTORS used to fall through to
+        # the generic "verify it at the storage layer" row, which is an N/A.
+        findings, _ = self._run_one(
+            mock_client,
+            encryption={"sseType": "AES256"},
+            policy_error=self._client_error(
+                "NotFoundException", "GetVectorBucketPolicy"
+            ),
+        )
+        assert all("storage layer" not in f["Finding_Details"] for f in findings)
+        assert all(f["Status"] != "N/A" for f in findings)
+
+    @patch("bedrock_app.boto3.client")
+    def test_br20_s3_vectors_emits_one_row_per_knowledge_base(self, mock_client):
+        # Three knowledge bases, three verdicts. A single summary row, or a loop
+        # that emitted only the first entry, would lose two of them -- and with
+        # 9 knowledge bases in the probed account, eight.
+        arns = {
+            kb: f"arn:aws:s3vectors:us-east-1:123456789012:bucket/{kb}"
+            for kb in ("kb1", "kb2", "kb3")
+        }
+        encryption = {
+            arns["kb1"]: {"sseType": "AES256"},
+            arns["kb2"]: self._CMK,
+            arns["kb3"]: self._CMK,
+        }
+        policies = {
+            arns["kb1"]: self._client_error(
+                "NotFoundException", "GetVectorBucketPolicy"
+            ),
+            arns["kb2"]: {"policy": '{"Statement": []}'},
+            arns["kb3"]: self._client_error(
+                "AccessDeniedException", "GetVectorBucketPolicy"
+            ),
+        }
+
+        def get_policy(**kwargs):
+            answer = policies[kwargs["vectorBucketArn"]]
+            if isinstance(answer, Exception):
+                raise answer
+            return answer
+
+        vectors_client = MagicMock()
+        vectors_client.get_vector_bucket.side_effect = lambda **kwargs: {
+            "vectorBucket": {
+                "encryptionConfiguration": encryption[kwargs["vectorBucketArn"]]
+            }
+        }
+        vectors_client.get_vector_bucket_policy.side_effect = get_policy
+        mock_client.side_effect = self._by_service(
+            self._agent_client_for(
+                {kb: self._s3_vectors_kb_body(arn) for kb, arn in arns.items()}
+            ),
+            vectors_client,
+            [],
+        )
+
+        findings = extract_csv_data(
+            bedrock_app.check_bedrock_knowledge_base_kms_encryption(region="us-east-1")
+        )
+        assert [f["Status"] for f in findings] == ["Failed", "Passed", "N/A"]
+        for kb, finding in zip(arns, findings, strict=True):
+            assert kb in finding["Finding_Details"]
+
+    @patch("bedrock_app.boto3.client")
+    def test_br20_s3_vectors_sdk_gap_costs_one_kb_not_the_region(self, mock_client):
+        # An SDK with no s3vectors model raises at client construction. Without
+        # the per-KB guard the outer handler replaces every row for the region
+        # with one ERROR, including the managed knowledge base it could assess.
+        bodies = {
+            "kb1": self._s3_vectors_kb_body(self._BUCKET_ARN),
+            "kb2": {
+                "knowledgeBaseConfiguration": {
+                    "type": "MANAGED",
+                    "managedKnowledgeBaseConfiguration": {
+                        "serverSideEncryptionConfiguration": {
+                            "kmsKeyArn": self._CMK["kmsKeyArn"]
+                        }
+                    },
+                }
+            },
+        }
+        mock_client.side_effect = self._by_service(
+            self._agent_client_for(bodies),
+            UnknownServiceError(
+                service_name="s3vectors", known_service_names=["s3", "s3control"]
+            ),
+            [],
+        )
+
+        findings = extract_csv_data(
+            bedrock_app.check_bedrock_knowledge_base_kms_encryption(region="us-east-1")
+        )
+        statuses = [f["Status"] for f in findings]
+        assert statuses.count("N/A") == 1
+        assert statuses.count("Passed") == 1
+        assert "Error during check" not in " ".join(
+            f["Finding_Details"] for f in findings
+        )
+
+    @pytest.mark.parametrize(
+        ("bucket_arn", "expected"),
+        [
+            ("arn:aws:s3vectors:us-east-1:123456789012:bucket/v", "us-east-1"),
+            (
+                "arn:aws-us-gov:s3vectors:us-gov-west-1:123456789012:bucket/v",
+                "us-gov-west-1",
+            ),
+            ("arn:aws:s3:us-east-1:123456789012:bucket/v", ""),
+            ("arn:aws:s3vectors::123456789012:bucket/v", ""),
+            ("bucket/v", ""),
+            ("", ""),
+        ],
+    )
+    def test_vector_bucket_region_reads_the_arn(self, bucket_arn, expected):
+        assert bedrock_app._vector_bucket_region(bucket_arn) == expected
+
+    @patch("bedrock_app.boto3.client")
+    def test_br20_s3_vectors_schema_valid(self, mock_client):
+        findings, _ = self._run_one(
+            mock_client,
+            encryption={"sseType": "AES256"},
+            policy_error=self._client_error(
+                "NotFoundException", "GetVectorBucketPolicy"
+            ),
+        )
+        assert findings
+        for f in findings:
             assert_finding_schema(f)
 
 
