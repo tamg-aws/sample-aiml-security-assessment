@@ -383,6 +383,40 @@ FinServ module pass status into a shared helper, so the id and the status litera
 functions and 136 of 164 ids come back undetermined. Undetermined is not a clean bill: the same
 question is open for those three modules and needs a data-flow pass, not a grep.
 
+### 4.6 Which denominator to publish
+
+105 and 83 are not competing figures. They measure different axes, and the cross-tab reconciles both:
+
+| | workload-agnostic | workload-specific | total |
+|---|---|---|---|
+| hosted (BDR/SGM/ACR) | 58 | 9 | **67** |
+| unhosted (FND/SLF/PHY) | 25 | 13 | **38** |
+| total | **83** | **22** | **105** |
+
+Hosting decides which module the code goes in. Workload dependence decides whether the check needs an
+operator-supplied baseline to mean anything. The section 4.4 dedup is a third, orthogonal axis. So the
+26 net-new check functions split 19 workload-agnostic and 7 workload-specific, the latter being
+`ACR-EVAL-04`, `ACR-MEM-07`, `ACR-POL-06`, `ACR-RT-04`, and `BDR-MDL-01/03/04`. Those last three are
+the model-allowlist controls, which is the same set section 4.4 found has no incumbent at all and
+section 4.3 needs a deploy-time parameter for. They are the highest-value and highest-cost checks in
+the port at once.
+
+**Recommendation: publish 83 and 22 as two tiers and never sum them.** A workload-agnostic check has a
+right answer from configuration alone. A workload-specific one compares configuration against an
+operator's approved list, so with no list supplied it has no verdict: it must emit the equivalent of
+`N/A` and must never emit `Passed`, because "no approved-model list configured" is not evidence that
+model access is correctly scoped. The repo has the vocabulary for this already, and `AR-04` at
+`agent_registry_assessments/app.py` shows the shape works in the other direction too, emitting only
+`Failed`. Summing the tiers into one "105 controls covered" claim is what would make the report
+misleading.
+
+Of the 83, four are not implementable as written, all four confirmed inside the 83:
+`AIR-BDR-KB-05`, `KB-08`, `MDL-08`, and `SGM-EP-03` (section 4.4). So **79** is the largest defensible
+unconditional figure. A further reduction to 70, on the grounds that 9 of the agnostic controls still
+need an operator baseline, was reported but is not adopted here: it contradicts the ledger's own
+`workload_agnostic` flag for those 9, so either the flag is wrong or the two are counting different
+things. Resolve it against the ledger before quoting 70.
+
 ## 5. Constraints, measured
 
 ### 5.1 What is not a constraint
@@ -539,7 +573,11 @@ These change the work materially and are yours to make.
    or an integer, so the existing deploy-time parameter pattern covers them. Only one incumbent check
    (SM-30) uses that pattern as an allow-list today, so this is 20 new parameters at roughly 13 files
    each, not a reuse. Recommend picking the subset by value, not porting all 20. `FND-IAM-09` and
-   `SLF-CMP-08` should be declared manual per section 4.3.
+   `SLF-CMP-08` should be declared manual per section 4.3. Whichever subset is chosen, section 4.6
+   asks that it ship as a separate tier that never sums with the 83 and never emits `Passed` on an
+   empty baseline. Note that 7 of the 26 net-new functions are in this tier, including the three
+   model-allowlist checks, so deferring the 22 entirely also defers the port's highest-value
+   detection.
 5. **Whether to measure the Step Functions payload ceiling first.** Recommended before phase 4,
    which is the largest single batch at 37 checks.
 
