@@ -107,9 +107,16 @@ mirrored in `template-multi-account.yaml`. Both are asserted by
 
 ### 3.5 The id-encoding problem, and why it is not a blocker
 
-AISF ids are four-segment (`AIR-BDR-MDL-01`). Every Finding schema validates `Check_ID` against
-`^[A-Z]{2,3}-\d{2}$`, present in six copies plus a test constant at
-`responsible_ai_grc_tests/test_legacy_contracts.py:123`. `AIR-BDR-MDL-01` is rejected by all of them.
+AISF ids are four-segment (`AIR-BDR-MDL-01`). The six **producer** schemas validate `Check_ID` against
+`^[A-Z]{2,3}-\d{2}$`, plus a test constant at
+`responsible_ai_grc_tests/test_legacy_contracts.py:123`. `AIR-BDR-MDL-01` is rejected by all six.
+
+The validation is producer-side only. Of the 8 `schema.py` files, `generate_consolidated_report` and
+`iam_permission_caching` have no `Check_ID` field at all, so nothing re-validates the id where rows are
+consolidated. Combined with the routing chain in `consolidate_html_reports.py:165-197`, which falls
+through to `else: service = "bedrock"`, an id with an unregistered prefix is not rejected anywhere: it
+is silently filed under Bedrock. That is the failure mode to watch in phase 1, and it argues for
+registering the prefix in `COMPLIANCE_STANDARDS` in the same change that first emits an AISF row.
 
 This does not need a regex change. The AISF id belongs in the `Compliance_Frameworks` text, which is
 unvalidated free text, while the repo-side check keeps its native `BR-`/`SM-`/`AC-` id. A row then
@@ -347,7 +354,7 @@ configuration: `AIR-BDR-KB-05` and `KB-08` depend on customer Lambda code, and `
 needs a published-versus-DRAFT distinction `GetPrompt` does not return. With `AIR-SGM-EP-03` that is
 4 of 105. The 105 figure is a ledger claim, not an implementability claim.
 
-### 4.5 One published check cannot fire
+### 4.5 Published checks that cannot report a problem
 
 `BR-14` is in the published 208 and has no live call site. Its sole invocation
 (`bedrock_assessments/app.py:7983-7986`) is commented out; a repo-wide grep for
@@ -355,6 +362,26 @@ needs a published-versus-DRAFT distinction `GetPrompt` does not return. With `AI
 and that commented call. This matters for the port in one specific way: an AISF stale-access control
 has no working incumbent to dedup against, so it should be treated as net new even though a
 same-named check exists.
+
+Two more checks run but can never report a problem. An AST pass over each module, collecting the
+`StatusEnum` values reachable in any function that mentions each id, gives:
+
+- **`AC-13` emits only `NA` and `PASSED`.** Its single passing path is
+  `finding_details=f"Found {len(gateways)} Gateway resources"` at `agentcore_assessments/app.py:3422`.
+  "AgentCore Gateway Configuration Check" passes whenever a gateway exists and is `NA` otherwise, so it
+  is an inventory counter, not a configuration assertion. It is the strongest case in the repo of a
+  check whose name overstates it, and it is why `GW-08` and `GW-10` are net new despite a
+  gateway-configuration check appearing to exist.
+- **`AR-06` emits only `PASSED`**, describing the auto-detection config it found
+  (`agent_registry_assessments/app.py:980`) without failing on any value.
+- `AR-04` is the mirror image: it emits only `FAILED`, never `PASSED`.
+
+Neither `AC-13` nor `AR-06` was used as an incumbent in the section 4.4 dedup, so those verdicts do
+not change. Scope limit on this pass: it resolves only `agentcore_assessments` and
+`agent_registry_assessments`, which inline `StatusEnum` beside the check id. Bedrock, SageMaker and the
+FinServ module pass status into a shared helper, so the id and the status literal sit in different
+functions and 136 of 164 ids come back undetermined. Undetermined is not a clean bill: the same
+question is open for those three modules and needs a data-flow pass, not a grep.
 
 ## 5. Constraints, measured
 
