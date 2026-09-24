@@ -205,7 +205,15 @@ reading both sides: the AISF assertion and the incumbent check's actual comparis
 |---|---|---|---|---|---|
 | BDR | 19 | 4 | 7 | 5 | 3 |
 | SGM | 11 | 2 | 4 | 4 | 1 |
-| ACR | 37 | pending | pending | pending | pending |
+| ACR | 37 | 2 | 18 | 17 | 0 |
+| **total** | **67** | **8** | **29** | **26** | **4** |
+
+The 67 is the hosted set from section 4.1; 67 + the 38 of section 4.2 = 105. So **26 of the 105 need a
+new check function, 29 extend a check that already exists, 8 are already covered, and 4 are flagged
+machine-checkable but are not.** The earlier draft warned against extrapolating the BDR and
+SGM ratio onto ACR, and that warning was right: ACR tightens an existing check 49% of the time
+(18/37) against 37% for BDR and SGM (11/30), so extrapolation would have understated the
+extend-an-incumbent work by about a third.
 
 **Bedrock, 19 controls, reconciles exactly.** Already covered: `GRD-01` by BR-10, `GRD-03` by BR-26,
 `KB-03` by BR-20, `MDL-10` by BR-37 (same `GetAccountDataRetention` call). Tightenings: `GRD-02`
@@ -223,6 +231,83 @@ leg, not the `VpcConfig` leg), `EP-02`, `GOV-01` (SM-22 has approval status, not
 `TRN-02` (SM-03 has the KMS legs, not inter-container encryption). Net new: `EP-06`
 (`DataCaptureConfig`), `GOV-10` (Config recorder), `TRN-01` (training-job network isolation, which
 SM-21 does only for AutoML), `TRN-08` (SCP).
+
+**AgentCore, 37 controls, reconciles exactly.** The native surface is `AC-00`..`AC-17` plus
+`AG-15`..`AG-32` and `AR-01`..`AR-08`.
+
+Already covered, 2: `GW-01` by `AG-24` (`AG-24` accepts `authorizerType` in `{AWS_IAM, CUSTOM_JWT}`,
+or `AUTHENTICATE_ONLY` with a policy engine in `ENFORCE`, which is `GW-01`'s assertion exactly) and
+`RT-09` by `AC-06` (`recording.enabled is True` plus an S3 bucket).
+
+Tightenings, 18: `EVAL-01`, `ID-10`, `PAY-01`, and `RT-03` all sit on `AC-02`, which detects
+AgentCore full-access and wildcard grants only, so a role holding a single over-broad *named* action
+passes it; `EVAL-05` and `EVAL-06` on `AC-17`, which tests `status == ACTIVE`,
+`executionStatus == ENABLED` and `bool(evaluators)` but never reads a sampling rate and never asks
+*which* evaluators; `OBS-03` on `AC-04`, which is X-Ray `tracingConfig.enabled` on runtimes only,
+while `OBS-03` is about Gateway, Memory, Policy and Identity; `GW-03` and `RT-13` on `AC-10`;
+`GW-04` on `AC-08`; `GW-05` on `AG-27` (WAF leg only, the rate-limit leg needs
+`ListGatewayRateLimits`, so botocore >= 1.43.66); `ID-05` on `AC-14` (CMK leg only: the string
+`secret` appears 0 times in the module, so the secret-scan leg is unwritten); `MEM-01` on `AC-07`,
+`POL-04` on `AC-11`, `POL-01` and `POL-07` on `AG-25` (mode `ENFORCE` plus `status`/`enforcementMode`
+`ACTIVE`, with no default-deny or decision-log leg and nothing session-aware); `REG-02` on `AR-03`
+(auto-approval only, no curator/publisher separation, no EventBridge rule); `RT-08` on `AC-15` and
+`AC-16`, which require `networkMode == "VPC"` with non-empty `subnets` and `securityGroups` and never
+read what the rules permit, so VPC placement is proven and egress filtering is not.
+
+Net new, 17: `EVAL-02`, `EVAL-03`, `EVAL-04`, `EVAL-07`, `GW-02`, `GW-08`, `GW-10`, `ID-04`, `ID-08`,
+`ID-11`, `MEM-07`, `MEM-12`, `OBS-02`, `OBS-04`, `OBS-06`, `POL-06`, `RT-04`. Four of these read no
+AgentCore API at all: `MEM-12` and `OBS-02` are CloudTrail event selectors, `OBS-04` is a CloudWatch
+Logs data-protection policy, `OBS-06` is an OAM sink policy.
+
+`GW-02` and `ID-04` assert an SCP, and are counted net new rather than unverifiable for the same
+reason `TRN-08` is: the corpus already enumerates SCPs in two modules,
+`bedrock_assessments/app.py:3125` and `responsible_ai_grc_assessments/app.py:1992`, both with
+`Filter="SERVICE_CONTROL_POLICY"`. Their cost is the Organizations read, not a new mechanism. One
+disambiguation, because the name collides: `agentcore_assessments/app.py:3669` also calls
+`list_policies`, but that is the AgentCore policy-engine API listing Cedar policies, not Organizations.
+Five of the 37 are workload-specific in the ledger, against 32 workload-agnostic: `EVAL-04`, `GW-04`,
+`MEM-07`, `POL-06`, `RT-04`. That bears on the section 7 question about the 22.
+
+**The inbound-authentication surface is the largest single gap, and it is a value-depth gap.** The
+whole corpus reads `authorizerType` exactly once, at `agentcore_assessments/app.py:3578`, and only
+for gateways. It never reads `authorizerConfiguration`. Botocore 1.43.85 puts
+`customJWTAuthorizer.{allowedAudience, allowedClients, allowedScopes, customClaims, discoveryUrl}`
+inside that shape, so every field `ID-11` needs is present in the API and unread: a gateway that
+trusts any issuer passes `AG-24` today. `GetAgentRuntime.authorizerConfiguration` also exists and is
+never read anywhere, which makes `ID-08` net new rather than a duplicate of `AG-24` — `AG-24` is
+gateway-only, and `ID-08` is about the runtime.
+
+**Two more incumbents are weaker than their names.** `AC-10` "Resource-Based Policies Check" reports
+only that a policy is present (`"Resource-based policies configured on: ..."` at `:3026`) and never
+evaluates its conditions, so `GW-03`'s confused-deputy leg and `RT-13`'s `aws:SourceVpc`/`SourceVpce`
+leg are unasserted. `AC-08` "VPC Endpoints Check" tests endpoint existence and `available` state, not
+endpoint policy or security-group scope; it does hold one leg `GW-04` lacks, endpoint health, so that
+pair is not a strict ordering in one direction.
+
+**`PassRole` and confused-deputy conditions are absent by measurement.** `PassRole` returns 0 across
+all six modules' `app.py`. `SourceAccount`/`SourceArn` return exactly 1 hit, in
+`sagemaker_assessments`, none in AgentCore. The positive control is `AssumeRolePolicyDocument`, which
+*is* read once in the AgentCore module at `:2725` — but only to match `principal.Service` against
+`bedrock-agentcore` for role discovery, never to check a condition. So the module parses trust
+policies and still asserts nothing about the confused deputy. `EVAL-02` and `EVAL-03` are therefore
+net new.
+
+**Presence-only CMK checks are sound here, which settles two verdicts.** `AC-07`, `AC-11` and the
+gateway KMS leg all decide customer-managed on `if encryption_key_arn` with no `kms:DescribeKey`
+(`describe_key` appears once corpus-wide, in `bedrock_assessments/app.py:7730`, as positive control).
+That is sound rather than sloppy: `encryptionKeyArn` on `CreateMemory` and `CreatePolicyEngine`, and
+`kmsKeyArn` on `CreateGateway`, are all optional customer-supplied inputs, so the field is absent
+under service-managed encryption and its presence does mean a customer key. AWS's own
+`BedrockAgentCore.3` control asserts the same way. `AC-14` is the one case with a true enum,
+`kmsConfiguration.keyType` in `{CustomerManagedKey, ServiceManagedKey}`. Both `MEM-01`/`AC-07` and
+`POL-04`/`AC-11` are still tightenings, because each AISF control carries legs beyond the key:
+`MEM-01` adds per-actor/namespace access scoping and `POL-04` adds key-policy scoping plus a
+disable/delete alarm. The sub-question resolved toward equivalent; the controls did not.
+
+One field read is dead but harmless: `AC-07` tries `memory_details.get("kmsKeyArn")` as a fallback,
+and the `memory` shape has no such member. `GetMemory` nests its whole payload under `memory`, so the
+`_unwrap_agentcore_detail` call there is load-bearing; `GetPolicyEngine` and `GetGateway` are flat, so
+`AC-11` and `AC-08` reading them raw is correct.
 
 **Three allow-list dimensions have no incumbent at all, verified by grep.** `aws:RequestedRegion`,
 `aws:SourceVpc`, `aws:SourceVpce`, and `aws:PrincipalOrgID` each return **0** hits across all six
@@ -382,6 +467,12 @@ Phase 1 should land a non-empty section on day one. `report_template.py:1317-131
 nav item, no card, no section. That is indistinguishable from a wiring bug, so phase 1 and the first
 batch of rows should ship together.
 
+Phases 3 to 5 are not uniform in kind. Per section 4.4 they are 26 new check functions and 29
+extensions of checks that already ship, and the two carry different obligations: a new function needs
+an id, a dispatch site, and the doc count lockstep, while an extension needs none of those and instead
+changes the meaning of a shipped `Check_ID` and may move rows in the frozen baseline. Phase 4 is the
+largest either way, at 17 new and 18 extensions.
+
 Per-check obligations for phases 3 to 5, from the traced BR-37 example: the check function,
 `create_finding(..., region=region)`, a dispatch site, IAM in **both** SAM templates, the matching
 `_EXPECTED_ACTIONS` entry (set equality at `tests/test_sam_role_least_privilege.py:325-331`), at
@@ -434,9 +525,12 @@ Stated so these are not read as settled:
 - The report Lambda's memory ceiling at scale. It is `MemorySize: 1024` with a 600 s timeout
   (`template.yaml:238-239`) and reads every CSV into memory. No test asserts its footprint, unlike
   the FinServ module.
-- The ACR dedup, 37 of the 105. BDR and SGM are done per control in section 4.4 and reconcile
-  exactly; ACR is still count-level. Until it lands, the total net-new figure is unknown, and the
-  BDR and SGM pattern (9 of 30 net new) should not be extrapolated onto it.
+- Whether the 29 tightenings are better served by extending the incumbent check or by adding a second
+  check id beside it. Section 4.4 counts them as extensions, which is what keeps the new-function
+  figure at 26. Extending changes the meaning of a `Check_ID` that already ships and may move rows in
+  the frozen baseline; adding ids beside them avoids that but spends 29 ids and needs the section 3.5
+  id-encoding decision first. This is the single largest open design question in the proposal and it is
+  a judgment call, not a measurement.
 - Assertion sufficiency of the API mapping. 42 of the API strings across the 83 workload-agnostic
   controls were derived from the control's classification basis rather than read from an artifact
   `check_api` field. Those name the right service and the APIs exist; whether each is sufficient to
