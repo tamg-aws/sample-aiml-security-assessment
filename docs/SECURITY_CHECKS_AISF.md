@@ -221,5 +221,20 @@ Reference: <https://docs.aws.amazon.com/whitepapers/latest/sagemaker-studio-admi
    and the coverage sentence in this file. Gate 12 compares both against
    `AISF_DERIVED_MAP` and the ledger, so a stale figure fails the gate.
 4. Add the row to the check catalogue above with its own per-control section.
-5. Run `python3 aisf-parity/check_ledger.py` (expects 13 of 13) and
-   `.venv/bin/python -m pytest tests/test_aisf_derived_standard.py -v`.
+5. Run the whole local battery: `bash aisf-parity/gate_all.sh --out
+   /tmp/battery.txt`. It wraps the ledger gates, the three pytest sessions CI
+   runs and both ruff commands, and prints the denominator beside every verdict.
+   Run it with bash: under zsh `PIPESTATUS` is empty and a failing run would be
+   read as clean. A bare `pytest responsible_ai_grc_tests/` collects nothing and
+   exits 4 while looking like a pass, so gate 3 runs that path as a positive
+   control and fails if it ever succeeds.
+6. Run `.venv/bin/python aisf-parity/mutate.py`. It breaks the mapping four
+   ways and requires a ledger gate or a test to go red for each one, naming the
+   catcher it observed. A mutation nothing catches means the new control's
+   assertions are missing; the answer is an assertion, not a gentler mutation.
+7. Before any push, run `.venv/bin/python aisf-parity/push_safety.py
+   --battery-output /tmp/battery.txt -- git push origin <branch>`. It pushes
+   nothing: it asserts the remote is the fork and not `aws-samples`, that no
+   commit in the range carries a secret or an attribution line, that the push is
+   neither a force nor aimed at `main`, and it re-reads the recorded battery run
+   to confirm every gate that file claims actually reported at this commit.
