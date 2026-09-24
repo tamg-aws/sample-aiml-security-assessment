@@ -16,6 +16,13 @@
 #   bash aisf-parity/gate_all.sh --list          # gate ids and names, from this file
 #   bash aisf-parity/gate_all.sh --out FILE      # also record the run for push_safety.py
 #
+# A recording push_safety.py will accept needs this script's own exit code in it, and
+# only the caller can capture that:
+#   bash aisf-parity/gate_all.sh --out FILE; echo "BATTERY_EXIT=$?" >>FILE
+# This script does not write that line itself. The last line it prints is the run's
+# denominator, and a second BATTERY_EXIT line from an appending caller would leave two
+# answers to one question.
+#
 # Exit codes: 0 every selected gate passed; 1 at least one failed or fell silent;
 #             2 usage/environment error, or zero gates ran.
 set -uo pipefail

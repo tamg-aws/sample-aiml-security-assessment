@@ -221,13 +221,20 @@ Reference: <https://docs.aws.amazon.com/whitepapers/latest/sagemaker-studio-admi
    and the coverage sentence in this file. Gate 12 compares both against
    `AISF_DERIVED_MAP` and the ledger, so a stale figure fails the gate.
 4. Add the row to the check catalogue above with its own per-control section.
-5. Run the whole local battery: `bash aisf-parity/gate_all.sh --out
-   /tmp/battery.txt`. It wraps the ledger gates, the three pytest sessions CI
-   runs and both ruff commands, and prints the denominator beside every verdict.
-   Run it with bash: under zsh `PIPESTATUS` is empty and a failing run would be
-   read as clean. A bare `pytest responsible_ai_grc_tests/` collects nothing and
-   exits 4 while looking like a pass, so gate 3 runs that path as a positive
-   control and fails if it ever succeeds.
+5. Run the whole local battery, recording its exit code into the same file
+   because step 7 reads it:
+
+   ```bash
+   bash aisf-parity/gate_all.sh --out /tmp/battery.txt
+   echo "BATTERY_EXIT=$?" >>/tmp/battery.txt
+   ```
+
+   It wraps the ledger gates, the three pytest sessions CI runs and both ruff
+   commands, and prints the denominator beside every verdict. Run it with bash:
+   under zsh `PIPESTATUS` is empty and a failing run would be read as clean. A
+   bare `pytest responsible_ai_grc_tests/` collects nothing and exits 4 while
+   looking like a pass, so gate 3 runs that path as a positive control and fails
+   if it ever succeeds.
 6. Run `.venv/bin/python aisf-parity/mutate.py`. It breaks the mapping four
    ways and requires a ledger gate or a test to go red for each one, naming the
    catcher it observed. A mutation nothing catches means the new control's
