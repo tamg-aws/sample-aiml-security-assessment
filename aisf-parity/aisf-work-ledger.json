@@ -1,0 +1,1660 @@
+{
+  "generated": "2026-09-24",
+  "generator": "aisf-parity/build_ledger.py",
+  "aisf_repo": "/Users/tamg/WorkDocs/Builder/aws-ai-security-framework-assessment",
+  "summary": {
+    "hosted": 67,
+    "fnd_ai_subject": 11,
+    "total": 78,
+    "covered": 8,
+    "tighten": 28,
+    "tighten_extend": 22,
+    "tighten_new_id": 6,
+    "new": 27,
+    "not_implementable": 4,
+    "unassessed": 11,
+    "new_check_functions": 44,
+    "extensions": 22,
+    "extra_iam_actions": [
+      "cloudtrail:GetEventSelectors",
+      "cloudtrail:ListTrails",
+      "config:DescribeConfigRules",
+      "config:DescribeConfigurationRecorders",
+      "ec2:DescribeSecurityGroups",
+      "logs:DescribeAccountPolicies",
+      "logs:GetDataProtectionPolicy",
+      "macie2:GetAutomatedDiscoveryConfiguration",
+      "macie2:GetMacieSession",
+      "oam:GetSinkPolicy",
+      "oam:ListSinks",
+      "organizations:DescribeEffectivePolicy",
+      "organizations:DescribePolicy",
+      "organizations:ListPolicies",
+      "s3:GetBucketPolicy"
+    ]
+  },
+  "rows": [
+    {
+      "control": "AIR-BDR-GRD-01",
+      "area": "BDR",
+      "question": "Is a content-safety guardrail applied to model input and output for every production use case, rather than left optional per application?",
+      "assert": "Guardrail attachment confirmed on input and output path",
+      "workload_agnostic": true,
+      "verdict": "covered",
+      "disposition": null,
+      "target_modules": [
+        "bedrock_assessments"
+      ],
+      "incumbents": [
+        "BR-10"
+      ],
+      "incumbent_names": [
+        "Bedrock Guardrail IAM Enforcement Check"
+      ],
+      "gap": "",
+      "extra_iam": [],
+      "phase": 3,
+      "source": "controls/ai-specific/bedrock-guardrails.yaml"
+    },
+    {
+      "control": "AIR-BDR-GRD-03",
+      "area": "BDR",
+      "question": "Is leakage of sensitive data types (PII, secrets, credentials) through model output specifically checked for and blocked or redacted?",
+      "assert": "Sensitive-data output filter configuration",
+      "workload_agnostic": true,
+      "verdict": "covered",
+      "disposition": null,
+      "target_modules": [
+        "bedrock_assessments"
+      ],
+      "incumbents": [
+        "BR-26"
+      ],
+      "incumbent_names": [
+        "Guardrail Sensitive Information Filter Check"
+      ],
+      "gap": "",
+      "extra_iam": [],
+      "phase": 3,
+      "source": "controls/ai-specific/bedrock-guardrails.yaml"
+    },
+    {
+      "control": "AIR-BDR-KB-03",
+      "area": "BDR",
+      "question": "Is the underlying vector store / index for a knowledge base encrypted and access-restricted the same way as the source data it was built from?",
+      "assert": "Vector store encryption/access configuration",
+      "workload_agnostic": true,
+      "verdict": "covered",
+      "disposition": null,
+      "target_modules": [
+        "bedrock_assessments"
+      ],
+      "incumbents": [
+        "BR-20"
+      ],
+      "incumbent_names": [
+        "Knowledge Base Customer-Managed KMS Encryption Check"
+      ],
+      "gap": "",
+      "extra_iam": [],
+      "phase": 3,
+      "source": "controls/ai-specific/bedrock-knowledge-bases.yaml"
+    },
+    {
+      "control": "AIR-BDR-MDL-10",
+      "area": "BDR",
+      "question": "Is the Amazon Bedrock data-retention mode explicitly set and pinned org-wide, so no account or project can opt into sharing prompts and outputs with a model provider?",
+      "assert": "GetAccountDataRetention output showing the explicitly-set mode + SCP denying non-approved modes on both the bedrock and bedrock-mantle write actions",
+      "workload_agnostic": true,
+      "verdict": "covered",
+      "disposition": null,
+      "target_modules": [
+        "bedrock_assessments"
+      ],
+      "incumbents": [
+        "BR-37"
+      ],
+      "incumbent_names": [
+        "Bedrock Account Data Retention"
+      ],
+      "gap": "same GetAccountDataRetention call",
+      "extra_iam": [],
+      "phase": 3,
+      "source": "controls/ai-specific/bedrock-model-access.yaml"
+    },
+    {
+      "control": "AIR-BDR-GRD-02",
+      "area": "BDR",
+      "question": "Are attempts to bypass safety controls through prompt injection or jailbreak techniques specifically detected, not just generic harmful-content filtering?",
+      "assert": "Prompt-attack detection configuration + example catch",
+      "workload_agnostic": true,
+      "verdict": "tighten",
+      "disposition": "extend",
+      "target_modules": [
+        "bedrock_assessments"
+      ],
+      "incumbents": [
+        "BR-34"
+      ],
+      "incumbent_names": [
+        "Guardrail Prompt Attack Filter"
+      ],
+      "gap": "BR-34 tests the BLOCK action; AISF tests inputStrength HIGH",
+      "extra_iam": [],
+      "phase": 3,
+      "source": "controls/ai-specific/bedrock-guardrails.yaml"
+    },
+    {
+      "control": "AIR-BDR-GRD-04",
+      "area": "BDR",
+      "question": "When a guardrail blocks or modifies a request, is that event logged as a security-relevant signal that feeds detection/monitoring?",
+      "assert": "Guardrail intervention log/metric feeding monitoring",
+      "workload_agnostic": true,
+      "verdict": "tighten",
+      "disposition": "extend",
+      "target_modules": [
+        "bedrock_assessments"
+      ],
+      "incumbents": [
+        "BR-32"
+      ],
+      "incumbent_names": [
+        "Bedrock CloudWatch Alarm Check"
+      ],
+      "gap": "BR-32 accepts any AWS/Bedrock alarm; AISF wants the guardrail-intervention metric filter",
+      "extra_iam": [],
+      "phase": 3,
+      "source": "controls/ai-specific/bedrock-guardrails.yaml"
+    },
+    {
+      "control": "AIR-BDR-GRD-09",
+      "area": "BDR",
+      "question": "Is model output validated for factual grounding in its provided source context, so ungrounded or off-topic (hallucinated) responses are detected or blocked rather than returned as authoritative?",
+      "assert": "Contextual-grounding filter configuration + a scored/blocked ungrounded response example",
+      "workload_agnostic": true,
+      "verdict": "tighten",
+      "disposition": "extend",
+      "target_modules": [
+        "bedrock_assessments"
+      ],
+      "incumbents": [
+        "BR-27"
+      ],
+      "incumbent_names": [
+        "Guardrail Contextual Grounding Check"
+      ],
+      "gap": "BR-27 tests presence; AISF tests the grounding and relevance thresholds",
+      "extra_iam": [],
+      "phase": 3,
+      "source": "controls/ai-specific/bedrock-guardrails.yaml"
+    },
+    {
+      "control": "AIR-BDR-GRD-10",
+      "area": "BDR",
+      "question": "Is a single approved guardrail enforced centrally across the organization, rather than left to each application to attach the right one?",
+      "assert": "Organizations bedrock policy (auto-apply) or SCP with bedrock:GuardrailIdentifier + cross-account share",
+      "workload_agnostic": true,
+      "verdict": "tighten",
+      "disposition": "new_id",
+      "target_modules": [
+        "bedrock_assessments"
+      ],
+      "incumbents": [
+        "BR-15"
+      ],
+      "incumbent_names": [
+        "Cross-Account Guardrails Enforcement Check"
+      ],
+      "gap": "BR-15 is named \"Cross-Account Guardrails Enforcement Check\" but only tests that an org policy exists; AISF requires it be non-DRAFT, which is what enforcement means here",
+      "extra_iam": [],
+      "phase": 3,
+      "source": "controls/ai-specific/bedrock-guardrails.yaml"
+    },
+    {
+      "control": "AIR-BDR-KB-06",
+      "area": "BDR",
+      "question": "Can a specific retrieved chunk that informed a given model response be traced back to its source document and version, for audit purposes?",
+      "assert": "Retrieval-to-response trace example",
+      "workload_agnostic": true,
+      "verdict": "tighten",
+      "disposition": "extend",
+      "target_modules": [
+        "bedrock_assessments"
+      ],
+      "incumbents": [
+        "BR-06"
+      ],
+      "incumbent_names": [
+        "Bedrock CloudTrail Logging Check"
+      ],
+      "gap": "BR-06 tests that a trail covers Bedrock; AISF wants named data-event resource types",
+      "extra_iam": [],
+      "phase": 3,
+      "source": "controls/ai-specific/bedrock-knowledge-bases.yaml"
+    },
+    {
+      "control": "AIR-BDR-MDL-07",
+      "area": "BDR",
+      "question": "For high-autonomy use cases, can inference be traced end to end from the invoking identity through to the specific model version and response, for forensic reconstruction?",
+      "assert": "End-to-end trace example for a single invocation",
+      "workload_agnostic": true,
+      "verdict": "tighten",
+      "disposition": "extend",
+      "target_modules": [
+        "bedrock_assessments"
+      ],
+      "incumbents": [
+        "BR-06"
+      ],
+      "incumbent_names": [
+        "Bedrock CloudTrail Logging Check"
+      ],
+      "gap": "BR-06 tests that a trail covers Bedrock; AISF wants named data-event resource types",
+      "extra_iam": [],
+      "phase": 3,
+      "source": "controls/ai-specific/bedrock-model-access.yaml"
+    },
+    {
+      "control": "AIR-BDR-MDL-02",
+      "area": "BDR",
+      "question": "Is model invocation logging enabled and retained so every prompt/response pair can be reviewed after the fact?",
+      "assert": "Invocation logging configuration + retention setting",
+      "workload_agnostic": true,
+      "verdict": "tighten",
+      "disposition": "extend",
+      "target_modules": [
+        "bedrock_assessments"
+      ],
+      "incumbents": [
+        "BR-04",
+        "BR-12"
+      ],
+      "incumbent_names": [
+        "Bedrock Model Invocation Logging Check",
+        "Bedrock Invocation Log Encryption"
+      ],
+      "gap": "BR-04 and BR-12 cover logging and destination encryption; AISF adds retention",
+      "extra_iam": [],
+      "phase": 3,
+      "source": "controls/ai-specific/bedrock-model-access.yaml"
+    },
+    {
+      "control": "AIR-BDR-KB-01",
+      "area": "BDR",
+      "question": "Is sensitive data in RAG / knowledge-base sources discovered and classified before it is ingested into a knowledge base?",
+      "assert": "Ingestion pipeline classification step evidence",
+      "workload_agnostic": true,
+      "verdict": "new",
+      "disposition": null,
+      "target_modules": [
+        "bedrock_assessments"
+      ],
+      "incumbents": [],
+      "incumbent_names": [],
+      "gap": "no incumbent in this module reads macie2",
+      "extra_iam": [
+        "macie2:GetAutomatedDiscoveryConfiguration",
+        "macie2:GetMacieSession"
+      ],
+      "phase": 3,
+      "source": "controls/ai-specific/bedrock-knowledge-bases.yaml"
+    },
+    {
+      "control": "AIR-BDR-MDL-01",
+      "area": "BDR",
+      "question": "Is access to foundation models restricted to an approved list, rather than allowing invocation of any model available in the account?",
+      "assert": "Policy showing model-ID scoping",
+      "workload_agnostic": false,
+      "verdict": "new",
+      "disposition": null,
+      "target_modules": [
+        "bedrock_assessments"
+      ],
+      "incumbents": [],
+      "incumbent_names": [],
+      "gap": "no check asserts model-ARN scoping on bedrock:InvokeModel; aws:RequestedRegion, aws:SourceVpc, aws:SourceVpce and aws:PrincipalOrgID are 0 hits corpus-wide",
+      "extra_iam": [],
+      "phase": 3,
+      "source": "controls/ai-specific/bedrock-model-access.yaml"
+    },
+    {
+      "control": "AIR-BDR-MDL-03",
+      "area": "BDR",
+      "question": "Is cross-region or cross-account model invocation explicitly controlled, rather than left to default routing behavior?",
+      "assert": "Inference-profile/region configuration review",
+      "workload_agnostic": false,
+      "verdict": "new",
+      "disposition": null,
+      "target_modules": [
+        "bedrock_assessments"
+      ],
+      "incumbents": [],
+      "incumbent_names": [],
+      "gap": "model allow-list; FS-12 is not a dedup risk, its whole test is 'bedrock' in json.dumps(doc).lower() over every SCP",
+      "extra_iam": [],
+      "phase": 3,
+      "source": "controls/ai-specific/bedrock-model-access.yaml"
+    },
+    {
+      "control": "AIR-BDR-MDL-04",
+      "area": "BDR",
+      "question": "Is there a technical control preventing use of unapproved third-party or marketplace models alongside first-party foundation models?",
+      "assert": "Marketplace/model-access control configuration",
+      "workload_agnostic": false,
+      "verdict": "new",
+      "disposition": null,
+      "target_modules": [
+        "bedrock_assessments"
+      ],
+      "incumbents": [],
+      "incumbent_names": [],
+      "gap": "model allow-list dimension with no incumbent",
+      "extra_iam": [],
+      "phase": 3,
+      "source": "controls/ai-specific/bedrock-model-access.yaml"
+    },
+    {
+      "control": "AIR-BDR-MDL-09",
+      "area": "BDR",
+      "question": "Are Amazon Bedrock API keys governed so production access uses short-term keys, and long-term keys \u2014 which create a standing IAM user with a static credential \u2014 cannot be created without an expiration or used in production?",
+      "assert": "Inventory of bedrock.amazonaws.com service-specific credentials with expiration dates + SCP/IAM policy capping key age and restricting bearerTokenType",
+      "workload_agnostic": true,
+      "verdict": "new",
+      "disposition": null,
+      "target_modules": [
+        "bedrock_assessments"
+      ],
+      "incumbents": [],
+      "incumbent_names": [],
+      "gap": "",
+      "extra_iam": [],
+      "phase": 3,
+      "source": "controls/ai-specific/bedrock-model-access.yaml"
+    },
+    {
+      "control": "AIR-BDR-KB-05",
+      "area": "BDR",
+      "question": "Is ingestion of new documents into a knowledge base screened to prevent injection of malicious instructions embedded in the content (indirect prompt injection)?",
+      "assert": "Content-screening step in the ingestion pipeline",
+      "workload_agnostic": true,
+      "verdict": "not_implementable",
+      "disposition": null,
+      "target_modules": [],
+      "incumbents": [],
+      "incumbent_names": [],
+      "gap": "depends on customer Lambda code, not configuration",
+      "extra_iam": [],
+      "phase": null,
+      "source": "controls/ai-specific/bedrock-knowledge-bases.yaml"
+    },
+    {
+      "control": "AIR-BDR-KB-08",
+      "area": "BDR",
+      "question": "Is PII/PHI redacted or masked from knowledge-base content before it reaches a model?",
+      "assert": "Ingestion/retrieval redaction step evidence",
+      "workload_agnostic": true,
+      "verdict": "not_implementable",
+      "disposition": null,
+      "target_modules": [],
+      "incumbents": [],
+      "incumbent_names": [],
+      "gap": "depends on customer Lambda code, not configuration",
+      "extra_iam": [],
+      "phase": null,
+      "source": "controls/ai-specific/bedrock-knowledge-bases.yaml"
+    },
+    {
+      "control": "AIR-BDR-MDL-08",
+      "area": "BDR",
+      "question": "Are the production prompts that drive model behavior managed as controlled, versioned artifacts in a central catalog, rather than hardcoded ad hoc in application code?",
+      "assert": "Prompt catalog + immutable production version reference + access/encryption configuration",
+      "workload_agnostic": true,
+      "verdict": "not_implementable",
+      "disposition": null,
+      "target_modules": [],
+      "incumbents": [],
+      "incumbent_names": [],
+      "gap": "needs a published-versus-DRAFT distinction GetPrompt does not return",
+      "extra_iam": [],
+      "phase": null,
+      "source": "controls/ai-specific/bedrock-model-access.yaml"
+    },
+    {
+      "control": "AIR-SGM-EP-08",
+      "area": "SGM",
+      "question": "Are batch (offline) inference jobs that process data in bulk held to the same private-network and encryption standard as real-time inference?",
+      "assert": "Batch transform model VPC/isolation config + job KMS configuration review",
+      "workload_agnostic": true,
+      "verdict": "covered",
+      "disposition": null,
+      "target_modules": [
+        "sagemaker_assessments"
+      ],
+      "incumbents": [
+        "SM-18"
+      ],
+      "incumbent_names": [
+        "SageMaker Transform Job Encryption Check"
+      ],
+      "gap": "",
+      "extra_iam": [],
+      "phase": 3,
+      "source": "controls/ai-specific/sagemaker-endpoints.yaml"
+    },
+    {
+      "control": "AIR-SGM-TRN-05",
+      "area": "SGM",
+      "question": "Is access to notebook instances and development environments used for model experimentation restricted and monitored the same way as production access?",
+      "assert": "Notebook environment access-control review",
+      "workload_agnostic": true,
+      "verdict": "covered",
+      "disposition": null,
+      "target_modules": [
+        "sagemaker_assessments"
+      ],
+      "incumbents": [
+        "SM-09",
+        "SM-01",
+        "SM-03"
+      ],
+      "incumbent_names": [
+        "SageMaker Notebook Root Access Check",
+        "SageMaker Internet Access Check",
+        "SageMaker Data Protection Check"
+      ],
+      "gap": "all three legs present",
+      "extra_iam": [],
+      "phase": 3,
+      "source": "controls/ai-specific/sagemaker-training.yaml"
+    },
+    {
+      "control": "AIR-SGM-EP-01",
+      "area": "SGM",
+      "question": "Are inference endpoints reachable only through a private network path, without requiring a public internet-facing endpoint?",
+      "assert": "Endpoint network configuration review",
+      "workload_agnostic": true,
+      "verdict": "tighten",
+      "disposition": "extend",
+      "target_modules": [
+        "sagemaker_assessments"
+      ],
+      "incumbents": [
+        "SM-11"
+      ],
+      "incumbent_names": [
+        "SageMaker Model Network Isolation Check"
+      ],
+      "gap": "SM-11 has the EnableNetworkIsolation leg, not the VpcConfig leg",
+      "extra_iam": [],
+      "phase": 3,
+      "source": "controls/ai-specific/sagemaker-endpoints.yaml"
+    },
+    {
+      "control": "AIR-SGM-EP-02",
+      "area": "SGM",
+      "question": "Is access to invoke an inference endpoint restricted to specific, authorized callers rather than any identity in the account?",
+      "assert": "Endpoint invocation policy scoping",
+      "workload_agnostic": false,
+      "verdict": "tighten",
+      "disposition": "extend",
+      "target_modules": [
+        "sagemaker_assessments"
+      ],
+      "incumbents": [
+        "SM-02"
+      ],
+      "incumbent_names": [
+        "SageMaker IAM Permissions"
+      ],
+      "gap": "SM-02 scans IAM permissions but never tests resource-scoped sagemaker:InvokeEndpoint against a named endpoint ARN; SageMaker endpoints carry no resource-based policy, so the identity policy is the whole surface",
+      "extra_iam": [],
+      "phase": 3,
+      "source": "controls/ai-specific/sagemaker-endpoints.yaml"
+    },
+    {
+      "control": "AIR-SGM-GOV-01",
+      "area": "SGM",
+      "question": "Is there a central registry recording every model version, its approval status, and who approved it for production use?",
+      "assert": "Model registry entries with approver/status",
+      "workload_agnostic": true,
+      "verdict": "tighten",
+      "disposition": "extend",
+      "target_modules": [
+        "sagemaker_assessments"
+      ],
+      "incumbents": [
+        "SM-22"
+      ],
+      "incumbent_names": [
+        "Model Approval Workflow Check"
+      ],
+      "gap": "SM-22 has approval status, not approver metadata",
+      "extra_iam": [],
+      "phase": 3,
+      "source": "controls/ai-specific/sagemaker-governance.yaml"
+    },
+    {
+      "control": "AIR-SGM-TRN-02",
+      "area": "SGM",
+      "question": "Is training data encrypted at rest and in transit throughout the pipeline, from source storage through to the training job?",
+      "assert": "Encryption configuration across pipeline stages",
+      "workload_agnostic": true,
+      "verdict": "tighten",
+      "disposition": "extend",
+      "target_modules": [
+        "sagemaker_assessments"
+      ],
+      "incumbents": [
+        "SM-03"
+      ],
+      "incumbent_names": [
+        "SageMaker Data Protection Check"
+      ],
+      "gap": "SM-03 has the KMS legs, not inter-container traffic encryption",
+      "extra_iam": [],
+      "phase": 3,
+      "source": "controls/ai-specific/sagemaker-training.yaml"
+    },
+    {
+      "control": "AIR-SGM-EP-06",
+      "area": "SGM",
+      "question": "Is model performance and output monitored for drift or anomalous behavior that could indicate tampering, degradation, or adversarial input?",
+      "assert": "Drift/anomaly monitoring configuration + recent report",
+      "workload_agnostic": true,
+      "verdict": "new",
+      "disposition": null,
+      "target_modules": [
+        "sagemaker_assessments"
+      ],
+      "incumbents": [],
+      "incumbent_names": [],
+      "gap": "DataCaptureConfig; SM-23 reads monitoring schedules, not data capture",
+      "extra_iam": [],
+      "phase": 3,
+      "source": "controls/ai-specific/sagemaker-endpoints.yaml"
+    },
+    {
+      "control": "AIR-SGM-GOV-10",
+      "area": "SGM",
+      "question": "Is the configuration state of SageMaker resources continuously assessed against required controls, with non-compliant resources flagged?",
+      "assert": "Continuous config-compliance evaluation + non-compliant-resource report",
+      "workload_agnostic": true,
+      "verdict": "new",
+      "disposition": null,
+      "target_modules": [
+        "sagemaker_assessments"
+      ],
+      "incumbents": [],
+      "incumbent_names": [],
+      "gap": "Config recorder state; no incumbent in this module reads config",
+      "extra_iam": [
+        "config:DescribeConfigurationRecorders",
+        "config:DescribeConfigRules"
+      ],
+      "phase": 3,
+      "source": "controls/ai-specific/sagemaker-governance.yaml"
+    },
+    {
+      "control": "AIR-SGM-TRN-01",
+      "area": "SGM",
+      "question": "Do training jobs run inside a private network boundary with no direct internet access unless explicitly required and approved?",
+      "assert": "Training job network configuration review",
+      "workload_agnostic": true,
+      "verdict": "new",
+      "disposition": null,
+      "target_modules": [
+        "sagemaker_assessments"
+      ],
+      "incumbents": [],
+      "incumbent_names": [],
+      "gap": "training-job network isolation; SM-21 does this for AutoML jobs only",
+      "extra_iam": [],
+      "phase": 3,
+      "source": "controls/ai-specific/sagemaker-training.yaml"
+    },
+    {
+      "control": "AIR-SGM-TRN-08",
+      "area": "SGM",
+      "question": "Is the creation of non-compliant SageMaker resources (no encryption key, internet-enabled, or outside the approved network) prevented at creation time, rather than only detected after the fact?",
+      "assert": "Preventive policy enforcing encryption / no-internet / VPC at resource creation",
+      "workload_agnostic": true,
+      "verdict": "new",
+      "disposition": null,
+      "target_modules": [
+        "sagemaker_assessments"
+      ],
+      "incumbents": [],
+      "incumbent_names": [],
+      "gap": "SCP asserting encryption/no-internet/VPC at creation; the corpus already enumerates SCPs in two modules, so the cost is the Organizations read, not a new mechanism",
+      "extra_iam": [
+        "organizations:ListPolicies",
+        "organizations:DescribePolicy"
+      ],
+      "phase": 3,
+      "source": "controls/ai-specific/sagemaker-training.yaml"
+    },
+    {
+      "control": "AIR-SGM-EP-03",
+      "area": "SGM",
+      "question": "Is traffic to and from inference endpoints encrypted end-to-end, including any inter-container traffic for multi-container deployments?",
+      "assert": "Encryption configuration including inter-container traffic",
+      "workload_agnostic": true,
+      "verdict": "not_implementable",
+      "disposition": null,
+      "target_modules": [],
+      "incumbents": [],
+      "incumbent_names": [],
+      "gap": "slug names sagemaker_endpoint_intercontainer_encryption_enabled but EnableInterContainerTrafficEncryption is absent from DescribeEndpointConfig and present only on DescribeTrainingJob; do not port as written, fix in the AISF repo first",
+      "extra_iam": [],
+      "phase": null,
+      "source": "controls/ai-specific/sagemaker-endpoints.yaml"
+    },
+    {
+      "control": "AIR-ACR-GW-01",
+      "area": "ACR",
+      "question": "When the gateway exposes tools or APIs to a model, does it enforce its own inbound authentication and authorization, independent of what the model requests?",
+      "assert": "Gateway inbound authorizer config (CUSTOM_JWT/AWS_IAM) + authorization enforcement",
+      "workload_agnostic": true,
+      "verdict": "covered",
+      "disposition": null,
+      "target_modules": [
+        "agentcore_assessments"
+      ],
+      "incumbents": [
+        "AG-24"
+      ],
+      "incumbent_names": [
+        "Agentic AI Gateway Inbound Authorization"
+      ],
+      "gap": "AG-24 accepts authorizerType in {AWS_IAM, CUSTOM_JWT}, or AUTHENTICATE_ONLY with a policy engine in ENFORCE, which is GW-01's assertion exactly",
+      "extra_iam": [],
+      "phase": 4,
+      "source": "controls/ai-specific/agentcore-gateway.yaml"
+    },
+    {
+      "control": "AIR-ACR-RT-09",
+      "area": "ACR",
+      "question": "For browser-based agent tools, is there a forensic record of what the agent did in the browser session (pages visited, actions taken)?",
+      "assert": "Browser-session capture/replay example",
+      "workload_agnostic": true,
+      "verdict": "covered",
+      "disposition": null,
+      "target_modules": [
+        "agentcore_assessments"
+      ],
+      "incumbents": [
+        "AC-06"
+      ],
+      "incumbent_names": [
+        "AgentCore Browser Session Recording"
+      ],
+      "gap": "recording.enabled is True plus an S3 bucket",
+      "extra_iam": [],
+      "phase": 4,
+      "source": "controls/ai-specific/agentcore-runtime.yaml"
+    },
+    {
+      "control": "AIR-ACR-EVAL-01",
+      "area": "ACR",
+      "question": "Do the people and roles that administer agent evaluations use permissions scoped to just the evaluation actions, rather than a broad agent-platform admin grant?",
+      "assert": "Evaluation-admin IAM policy showing action-scoped (non-wildcard) grants",
+      "workload_agnostic": true,
+      "verdict": "tighten",
+      "disposition": "extend",
+      "target_modules": [
+        "agentcore_assessments"
+      ],
+      "incumbents": [
+        "AC-02"
+      ],
+      "incumbent_names": [
+        "AgentCore IAM Full Access Check"
+      ],
+      "gap": "AC-02 detects AgentCore full-access and wildcard grants only, so a role holding a single over-broad named action passes it",
+      "extra_iam": [],
+      "phase": 4,
+      "source": "controls/ai-specific/agentcore-evaluations.yaml"
+    },
+    {
+      "control": "AIR-ACR-ID-10",
+      "area": "ACR",
+      "question": "Is agent code prevented from directly minting or retrieving its own access tokens, so a compromised agent cannot extract credentials for other users?",
+      "assert": "Service-managed identity confirmation / token-issuance API restriction",
+      "workload_agnostic": true,
+      "verdict": "tighten",
+      "disposition": "extend",
+      "target_modules": [
+        "agentcore_assessments"
+      ],
+      "incumbents": [
+        "AC-02"
+      ],
+      "incumbent_names": [
+        "AgentCore IAM Full Access Check"
+      ],
+      "gap": "AC-02 detects full-access and wildcard grants only",
+      "extra_iam": [],
+      "phase": 4,
+      "source": "controls/ai-specific/agentcore-identity.yaml"
+    },
+    {
+      "control": "AIR-ACR-PAY-01",
+      "area": "ACR",
+      "question": "For agents that make payments, is a separation-of-duties model enforced so no single role can both set spending limits and execute payments?",
+      "assert": "Payments four-role IAM model: ManagementRole denies ProcessPayment; ProcessPaymentRole cannot create sessions",
+      "workload_agnostic": true,
+      "verdict": "tighten",
+      "disposition": "extend",
+      "target_modules": [
+        "agentcore_assessments"
+      ],
+      "incumbents": [
+        "AC-02"
+      ],
+      "incumbent_names": [
+        "AgentCore IAM Full Access Check"
+      ],
+      "gap": "AC-02 detects full-access and wildcard grants only",
+      "extra_iam": [],
+      "phase": 4,
+      "source": "controls/ai-specific/agentcore-registry-optimization-payments.yaml"
+    },
+    {
+      "control": "AIR-ACR-RT-03",
+      "area": "ACR",
+      "question": "Is the execution role available to code-execution and browser tools scoped to least privilege, on the assumption that any code in the sandbox can assume it?",
+      "assert": "Tool execution-role policy showing resource-scoped, least-privilege grants",
+      "workload_agnostic": true,
+      "verdict": "tighten",
+      "disposition": "extend",
+      "target_modules": [
+        "agentcore_assessments"
+      ],
+      "incumbents": [
+        "AC-02"
+      ],
+      "incumbent_names": [
+        "AgentCore IAM Full Access Check"
+      ],
+      "gap": "AC-02 detects full-access and wildcard grants only",
+      "extra_iam": [],
+      "phase": 4,
+      "source": "controls/ai-specific/agentcore-runtime.yaml"
+    },
+    {
+      "control": "AIR-ACR-EVAL-05",
+      "area": "ACR",
+      "question": "Is a continuous evaluation running against production agent traffic at a defined sampling rate, so quality and safety regressions are caught in production rather than only before deployment?",
+      "assert": "Online evaluation configuration with a defined sampling rate on production traffic",
+      "workload_agnostic": true,
+      "verdict": "tighten",
+      "disposition": "new_id",
+      "target_modules": [
+        "agentcore_assessments"
+      ],
+      "incumbents": [
+        "AC-17"
+      ],
+      "incumbent_names": [
+        "AgentCore Online Evaluation Coverage"
+      ],
+      "gap": "AC-17 is named \"Online Evaluation Coverage\" but tests only status == ACTIVE, executionStatus == ENABLED and bool(evaluators); it never reads a sampling rate and never asks which evaluators, so coverage is the one thing it does not measure",
+      "extra_iam": [],
+      "phase": 4,
+      "source": "controls/ai-specific/agentcore-evaluations.yaml"
+    },
+    {
+      "control": "AIR-ACR-EVAL-06",
+      "area": "ACR",
+      "question": "Are safety- and security-relevant evaluators (harmful output, unauthorized tool selection) enabled and alerted on, not just quality-of-answer scores?",
+      "assert": "Harmfulness/Stereotyping/Tool-Selection evaluators enabled + score-drop alarm",
+      "workload_agnostic": true,
+      "verdict": "tighten",
+      "disposition": "new_id",
+      "target_modules": [
+        "agentcore_assessments"
+      ],
+      "incumbents": [
+        "AC-17"
+      ],
+      "incumbent_names": [
+        "AgentCore Online Evaluation Coverage"
+      ],
+      "gap": "AC-17 is named \"Online Evaluation Coverage\" and never asks which evaluators are attached, so it cannot distinguish a safety evaluator from a latency one",
+      "extra_iam": [],
+      "phase": 4,
+      "source": "controls/ai-specific/agentcore-evaluations.yaml"
+    },
+    {
+      "control": "AIR-ACR-GW-03",
+      "area": "ACR",
+      "question": "Do the gateway's resource-based policy and target execution-role trust prevent a confused-deputy attack when an AWS service or another account is allowed to invoke it?",
+      "assert": "Gateway resource policy + execution-role trust with SourceAccount/SourceArn conditions",
+      "workload_agnostic": true,
+      "verdict": "tighten",
+      "disposition": "new_id",
+      "target_modules": [
+        "agentcore_assessments"
+      ],
+      "incumbents": [
+        "AC-10"
+      ],
+      "incumbent_names": [
+        "AgentCore Resource-Based Policies Check"
+      ],
+      "gap": "AC-10 is named \"Resource-Based Policies Check\" but reports only that a policy is present and never evaluates its conditions, so the confused-deputy leg is unasserted",
+      "extra_iam": [],
+      "phase": 4,
+      "source": "controls/ai-specific/agentcore-gateway.yaml"
+    },
+    {
+      "control": "AIR-ACR-RT-13",
+      "area": "ACR",
+      "question": "Is invocation of the agent runtime restricted to an approved network path AND an approved caller, so neither the internet nor a direct call that bypasses the gateway can reach the agent?",
+      "assert": "Runtime VPCE + Private DNS + SG scope + resource-policy aws:SourceVpc/SourceVpce deny; plus gateway-source restriction (SigV4 resource policy scoped to the gateway role, or allowedWorkloadConfiguration on customJWTAuthorizer)",
+      "workload_agnostic": true,
+      "verdict": "tighten",
+      "disposition": "new_id",
+      "target_modules": [
+        "agentcore_assessments"
+      ],
+      "incumbents": [
+        "AC-10"
+      ],
+      "incumbent_names": [
+        "AgentCore Resource-Based Policies Check"
+      ],
+      "gap": "AC-10 is named \"Resource-Based Policies Check\" but never evaluates policy conditions, so the aws:SourceVpc / aws:SourceVpce leg is unasserted; both keys are 0 hits corpus-wide",
+      "extra_iam": [],
+      "phase": 4,
+      "source": "controls/ai-specific/agentcore-runtime.yaml"
+    },
+    {
+      "control": "AIR-ACR-GW-04",
+      "area": "ACR",
+      "question": "Is the network path to the gateway restricted to approved private endpoints, rather than reachable over any network path?",
+      "assert": "Gateway VPCE + endpoint policy + SG scope + resource-policy network conditions",
+      "workload_agnostic": false,
+      "verdict": "tighten",
+      "disposition": "extend",
+      "target_modules": [
+        "agentcore_assessments"
+      ],
+      "incumbents": [
+        "AC-08"
+      ],
+      "incumbent_names": [
+        "AgentCore VPC Endpoints Check"
+      ],
+      "gap": "AC-08 tests endpoint existence and available state, not endpoint policy or security-group scope; it does hold one leg GW-04 lacks, endpoint health",
+      "extra_iam": [],
+      "phase": 4,
+      "source": "controls/ai-specific/agentcore-gateway.yaml"
+    },
+    {
+      "control": "AIR-ACR-GW-05",
+      "area": "ACR",
+      "question": "Is the gateway protected against volumetric abuse and malicious requests with rate limiting and a web-application firewall, given it is a public-facing agent entry point?",
+      "assert": "ListGatewayRateLimits showing an ACTIVE limit on a bounded dimension + WAF web ACL associated to the gateway",
+      "workload_agnostic": true,
+      "verdict": "tighten",
+      "disposition": "extend",
+      "target_modules": [
+        "agentcore_assessments"
+      ],
+      "incumbents": [
+        "AG-27"
+      ],
+      "incumbent_names": [
+        "Agentic AI Gateway WAF Protection"
+      ],
+      "gap": "AG-27 has the WAF leg; the rate-limit leg needs ListGatewayRateLimits, so botocore >= 1.43.66",
+      "extra_iam": [],
+      "phase": 4,
+      "source": "controls/ai-specific/agentcore-gateway.yaml"
+    },
+    {
+      "control": "AIR-ACR-ID-05",
+      "area": "ACR",
+      "question": "Are credentials and tokens used by agents stored in a vault protected by keys the organization controls, rather than embedded in agent code or config?",
+      "assert": "Vault encryption configuration + secret-scan result",
+      "workload_agnostic": true,
+      "verdict": "tighten",
+      "disposition": "extend",
+      "target_modules": [
+        "agentcore_assessments"
+      ],
+      "incumbents": [
+        "AC-14"
+      ],
+      "incumbent_names": [
+        "AgentCore Identity Token Vault CMK Encryption"
+      ],
+      "gap": "AC-14 has the CMK leg; the string 'secret' appears 0 times in the module, so the secret-scan leg is unwritten",
+      "extra_iam": [],
+      "phase": 4,
+      "source": "controls/ai-specific/agentcore-identity.yaml"
+    },
+    {
+      "control": "AIR-ACR-MEM-01",
+      "area": "ACR",
+      "question": "Is an agent's persisted memory (conversation history, learned facts) encrypted with organization-controlled keys and partitioned so one agent or user cannot read another's records?",
+      "assert": "Memory CMK encryption + per-actor/namespace access-scope configuration",
+      "workload_agnostic": true,
+      "verdict": "tighten",
+      "disposition": "extend",
+      "target_modules": [
+        "agentcore_assessments"
+      ],
+      "incumbents": [
+        "AC-07"
+      ],
+      "incumbent_names": [
+        "AgentCore Memory Encryption"
+      ],
+      "gap": "AC-07's presence-only CMK test is sound (encryptionKeyArn is an optional customer-supplied CreateMemory input); MEM-01 adds per-actor and namespace access scoping",
+      "extra_iam": [],
+      "phase": 4,
+      "source": "controls/ai-specific/agentcore-memory.yaml"
+    },
+    {
+      "control": "AIR-ACR-POL-04",
+      "area": "ACR",
+      "question": "Is the Policy Engine encrypted with an organization-controlled key, and are the operational failure modes of that key understood and guarded?",
+      "assert": "Policy Engine CMK config + key-policy scoping + disable/delete alarm + break-glass runbook",
+      "workload_agnostic": true,
+      "verdict": "tighten",
+      "disposition": "extend",
+      "target_modules": [
+        "agentcore_assessments"
+      ],
+      "incumbents": [
+        "AC-11"
+      ],
+      "incumbent_names": [
+        "AgentCore Policy Engine Encryption Check"
+      ],
+      "gap": "AC-11's presence-only CMK test is sound; POL-04 adds key-policy scoping plus a disable/delete alarm",
+      "extra_iam": [],
+      "phase": 4,
+      "source": "controls/ai-specific/agentcore-policy.yaml"
+    },
+    {
+      "control": "AIR-ACR-POL-01",
+      "area": "ACR",
+      "question": "Are agent-to-tool authorization decisions made by a deterministic, default-deny policy engine outside the agent's own reasoning, rather than trusting the model to only request permitted actions?",
+      "assert": "Cedar policies in ENFORCE mode with default-deny + a sample decision log",
+      "workload_agnostic": true,
+      "verdict": "tighten",
+      "disposition": "extend",
+      "target_modules": [
+        "agentcore_assessments"
+      ],
+      "incumbents": [
+        "AG-25"
+      ],
+      "incumbent_names": [
+        "Agentic AI Gateway Tool Policy Enforcement"
+      ],
+      "gap": "AG-25 tests mode ENFORCE plus status/enforcementMode ACTIVE, with no default-deny leg, no decision log, and nothing session-aware",
+      "extra_iam": [],
+      "phase": 4,
+      "source": "controls/ai-specific/agentcore-policy.yaml"
+    },
+    {
+      "control": "AIR-ACR-POL-07",
+      "area": "ACR",
+      "question": "For risks that are only visible across a sequence of actions \u2014 an unverified payee, a skipped prerequisite, a reused approval, a cumulative overspend \u2014 are those rules enforced as session-aware policy at the gateway, rather than as state tracking inside the agent or tool code?",
+      "assert": "ListPolicies showing a temporal policy in ACTIVE enforcementMode + the session-id propagation path",
+      "workload_agnostic": true,
+      "verdict": "tighten",
+      "disposition": "extend",
+      "target_modules": [
+        "agentcore_assessments"
+      ],
+      "incumbents": [
+        "AG-25"
+      ],
+      "incumbent_names": [
+        "Agentic AI Gateway Tool Policy Enforcement"
+      ],
+      "gap": "AG-25 has no session-aware leg",
+      "extra_iam": [],
+      "phase": 4,
+      "source": "controls/ai-specific/agentcore-policy.yaml"
+    },
+    {
+      "control": "AIR-ACR-REG-02",
+      "area": "ACR",
+      "question": "Do registry entries require curator approval before they become discoverable, and is the approval action restricted to curators with its events monitored?",
+      "assert": "Auto-approval disabled + curator/publisher role separation + EventBridge approval rule",
+      "workload_agnostic": true,
+      "verdict": "tighten",
+      "disposition": "new_id",
+      "target_modules": [
+        "agent_registry_assessments"
+      ],
+      "incumbents": [
+        "AR-03"
+      ],
+      "incumbent_names": [
+        "AWS Agent Registry Publication Approval Governance"
+      ],
+      "gap": "AR-03 is named \"Publication Approval Governance\" but covers auto-approval only, behind the REQUIRE_AGENT_REGISTRY_MANUAL_APPROVAL env gate; no curator/publisher separation and no EventBridge rule",
+      "extra_iam": [],
+      "phase": 4,
+      "source": "controls/ai-specific/agentcore-registry-optimization-payments.yaml"
+    },
+    {
+      "control": "AIR-ACR-RT-08",
+      "area": "ACR",
+      "question": "Is outbound network access from code-execution and browser tools restricted to only what the workload needs, rather than open internet egress?",
+      "assert": "Tool network-mode / egress-filtering configuration",
+      "workload_agnostic": true,
+      "verdict": "tighten",
+      "disposition": "extend",
+      "target_modules": [
+        "agentcore_assessments"
+      ],
+      "incumbents": [
+        "AC-01"
+      ],
+      "incumbent_names": [
+        "AgentCore Runtime VPC Configuration"
+      ],
+      "gap": "AC-01 requires VPC placement and flags public subnets but never reads what the security-group rules permit; describe_security_groups is 0 hits in the module, so VPC placement is proven and egress filtering is not",
+      "extra_iam": [
+        "ec2:DescribeSecurityGroups"
+      ],
+      "phase": 4,
+      "source": "controls/ai-specific/agentcore-runtime.yaml"
+    },
+    {
+      "control": "AIR-ACR-EVAL-02",
+      "area": "ACR",
+      "question": "Is the ability to hand the evaluation service an IAM role (PassRole) restricted to the specific evaluation execution role, rather than any role?",
+      "assert": "iam:PassRole policy with resource + PassedToService condition",
+      "workload_agnostic": true,
+      "verdict": "new",
+      "disposition": null,
+      "target_modules": [
+        "agentcore_assessments"
+      ],
+      "incumbents": [],
+      "incumbent_names": [],
+      "gap": "PassRole returns 0 across all six modules; AssumeRolePolicyDocument is read once at :2725 but only to match principal.Service for role discovery, never a condition",
+      "extra_iam": [],
+      "phase": 4,
+      "source": "controls/ai-specific/agentcore-evaluations.yaml"
+    },
+    {
+      "control": "AIR-ACR-EVAL-03",
+      "area": "ACR",
+      "question": "Does the evaluation execution role's trust policy prevent a confused-deputy attack from another account?",
+      "assert": "Evaluation execution-role trust policy with SourceAccount/SourceArn conditions",
+      "workload_agnostic": true,
+      "verdict": "new",
+      "disposition": null,
+      "target_modules": [
+        "agentcore_assessments"
+      ],
+      "incumbents": [],
+      "incumbent_names": [],
+      "gap": "confused-deputy conditions absent: SourceAccount/SourceArn are 1 hit corpus-wide, in sagemaker_assessments, none in AgentCore",
+      "extra_iam": [],
+      "phase": 4,
+      "source": "controls/ai-specific/agentcore-evaluations.yaml"
+    },
+    {
+      "control": "AIR-ACR-EVAL-04",
+      "area": "ACR",
+      "question": "For custom LLM-as-a-judge evaluators, is the model-invocation permission scoped to only the specific models the evaluators use?",
+      "assert": "Evaluator role bedrock:InvokeModel scoped to specific model ARNs",
+      "workload_agnostic": false,
+      "verdict": "new",
+      "disposition": null,
+      "target_modules": [
+        "agentcore_assessments"
+      ],
+      "incumbents": [],
+      "incumbent_names": [],
+      "gap": "",
+      "extra_iam": [],
+      "phase": 4,
+      "source": "controls/ai-specific/agentcore-evaluations.yaml"
+    },
+    {
+      "control": "AIR-ACR-EVAL-07",
+      "area": "ACR",
+      "question": "Are evaluation results treated as sensitive data \u2014 encrypted with organization-controlled keys, retained to a compliance schedule, and free of PII in tags or free-form fields?",
+      "assert": "Evaluation-results CMK config (evaluation-scoped encryption context) + retention + no-PII-in-tags check",
+      "workload_agnostic": true,
+      "verdict": "new",
+      "disposition": null,
+      "target_modules": [
+        "agentcore_assessments"
+      ],
+      "incumbents": [],
+      "incumbent_names": [],
+      "gap": "",
+      "extra_iam": [],
+      "phase": 4,
+      "source": "controls/ai-specific/agentcore-evaluations.yaml"
+    },
+    {
+      "control": "AIR-ACR-GW-02",
+      "area": "ACR",
+      "question": "Is there an org-wide preventive control that blocks creating or updating a gateway with no inbound authorizer?",
+      "assert": "SCP denying CreateGateway/UpdateGateway when GatewayAuthorizerType is NONE",
+      "workload_agnostic": true,
+      "verdict": "new",
+      "disposition": null,
+      "target_modules": [
+        "agentcore_assessments"
+      ],
+      "incumbents": [],
+      "incumbent_names": [],
+      "gap": "asserts an SCP; the corpus already enumerates SCPs in two modules, so the cost is the Organizations read",
+      "extra_iam": [
+        "organizations:ListPolicies",
+        "organizations:DescribePolicy"
+      ],
+      "phase": 4,
+      "source": "controls/ai-specific/agentcore-gateway.yaml"
+    },
+    {
+      "control": "AIR-ACR-GW-08",
+      "area": "ACR",
+      "question": "Does each gateway target use an appropriate, least-privilege outbound authentication method, with no unauthenticated targets in production and no wildcard target permissions?",
+      "assert": "Per-target outbound-auth enumeration + Lambda target scoped to specific function ARN",
+      "workload_agnostic": true,
+      "verdict": "new",
+      "disposition": null,
+      "target_modules": [
+        "agentcore_assessments"
+      ],
+      "incumbents": [],
+      "incumbent_names": [],
+      "gap": "",
+      "extra_iam": [],
+      "phase": 4,
+      "source": "controls/ai-specific/agentcore-gateway.yaml"
+    },
+    {
+      "control": "AIR-ACR-GW-10",
+      "area": "ACR",
+      "question": "Is every call made through the gateway logged with enough detail (caller, target, parameters, result) to support a security investigation, with the encryption of that data under organization control?",
+      "assert": "Gateway application-log config + retention + CMK key-policy scoping",
+      "workload_agnostic": true,
+      "verdict": "new",
+      "disposition": null,
+      "target_modules": [
+        "agentcore_assessments"
+      ],
+      "incumbents": [],
+      "incumbent_names": [],
+      "gap": "",
+      "extra_iam": [],
+      "phase": 4,
+      "source": "controls/ai-specific/agentcore-gateway.yaml"
+    },
+    {
+      "control": "AIR-ACR-ID-04",
+      "area": "ACR",
+      "question": "Is there an org-wide preventive control preventing an agent runtime from being deployed with an authentication mode that does not propagate a real user identity?",
+      "assert": "Preventive guardrail configuration/policy",
+      "workload_agnostic": true,
+      "verdict": "new",
+      "disposition": null,
+      "target_modules": [
+        "agentcore_assessments"
+      ],
+      "incumbents": [],
+      "incumbent_names": [],
+      "gap": "asserts an SCP; same Organizations read as GW-02",
+      "extra_iam": [
+        "organizations:ListPolicies",
+        "organizations:DescribePolicy"
+      ],
+      "phase": 4,
+      "source": "controls/ai-specific/agentcore-identity.yaml"
+    },
+    {
+      "control": "AIR-ACR-ID-08",
+      "area": "ACR",
+      "question": "Is every request to invoke an agent authenticated and its identity claims validated before the agent's code runs?",
+      "assert": "Inbound authorizer configuration (validated claims / signed-request enforcement)",
+      "workload_agnostic": true,
+      "verdict": "new",
+      "disposition": null,
+      "target_modules": [
+        "agentcore_assessments"
+      ],
+      "incumbents": [],
+      "incumbent_names": [],
+      "gap": "GetAgentRuntime.authorizerConfiguration exists in botocore 1.43.85 and is never read anywhere; AG-24 is gateway-only, ID-08 is about the runtime",
+      "extra_iam": [],
+      "phase": 4,
+      "source": "controls/ai-specific/agentcore-identity.yaml"
+    },
+    {
+      "control": "AIR-ACR-ID-11",
+      "area": "ACR",
+      "question": "Is inbound access to agents restricted to only your approved identity provider(s) and client applications, so a validly-signed token from an unapproved issuer cannot invoke them?",
+      "assert": "Inbound authorizer issuer/audience/client allow-lists + InboundJwtClaim condition keys pinning the IdP",
+      "workload_agnostic": true,
+      "verdict": "new",
+      "disposition": null,
+      "target_modules": [
+        "agentcore_assessments"
+      ],
+      "incumbents": [],
+      "incumbent_names": [],
+      "gap": "the corpus reads authorizerType exactly once, at :3578, and never reads authorizerConfiguration; customJWTAuthorizer.{allowedAudience, allowedClients, allowedScopes, customClaims, discoveryUrl} are all present in the API and unread, so a gateway that trusts any issuer passes AG-24 today",
+      "extra_iam": [],
+      "phase": 4,
+      "source": "controls/ai-specific/agentcore-identity.yaml"
+    },
+    {
+      "control": "AIR-ACR-MEM-07",
+      "area": "ACR",
+      "question": "Is there a defined limit on how much cross-session context an agent can accumulate over time, to bound the blast radius of a single compromised session?",
+      "assert": "Memory retention/scope limit configuration",
+      "workload_agnostic": false,
+      "verdict": "new",
+      "disposition": null,
+      "target_modules": [
+        "agentcore_assessments"
+      ],
+      "incumbents": [],
+      "incumbent_names": [],
+      "gap": "",
+      "extra_iam": [],
+      "phase": 4,
+      "source": "controls/ai-specific/agentcore-memory.yaml"
+    },
+    {
+      "control": "AIR-ACR-MEM-12",
+      "area": "ACR",
+      "question": "Are session-level memory operations (record reads/writes, extraction jobs) captured in an audit trail, not just management events?",
+      "assert": "CloudTrail data-event selector covering Memory Events + Records",
+      "workload_agnostic": true,
+      "verdict": "new",
+      "disposition": null,
+      "target_modules": [
+        "agentcore_assessments"
+      ],
+      "incumbents": [],
+      "incumbent_names": [],
+      "gap": "CloudTrail event selectors; reads no AgentCore API",
+      "extra_iam": [
+        "cloudtrail:GetEventSelectors",
+        "cloudtrail:ListTrails"
+      ],
+      "phase": 4,
+      "source": "controls/ai-specific/agentcore-memory.yaml"
+    },
+    {
+      "control": "AIR-ACR-OBS-02",
+      "area": "ACR",
+      "question": "Are CloudTrail data events enabled for AgentCore Runtime, Memory, and tool invocations, not just management events?",
+      "assert": "CloudTrail advanced event selector covering AgentCore Runtime/Memory/Tools data events",
+      "workload_agnostic": true,
+      "verdict": "new",
+      "disposition": null,
+      "target_modules": [
+        "agentcore_assessments"
+      ],
+      "incumbents": [],
+      "incumbent_names": [],
+      "gap": "CloudTrail event selectors; reads no AgentCore API",
+      "extra_iam": [
+        "cloudtrail:GetEventSelectors",
+        "cloudtrail:ListTrails"
+      ],
+      "phase": 4,
+      "source": "controls/ai-specific/agentcore-observability.yaml"
+    },
+    {
+      "control": "AIR-ACR-OBS-03",
+      "area": "ACR",
+      "question": "Is observability explicitly enabled and its log destination configured for each AgentCore service in use, not just Runtime?",
+      "assert": "Per-service observability + log-destination configuration (Gateway/Memory/Policy/Identity)",
+      "workload_agnostic": true,
+      "verdict": "new",
+      "disposition": null,
+      "target_modules": [
+        "agentcore_assessments"
+      ],
+      "incumbents": [],
+      "incumbent_names": [],
+      "gap": "AC-04 is X-Ray tracingConfig.enabled over list_agent_runtimes only, so it cannot cover Gateway, Memory, Policy or Identity, which is OBS-03's whole subject; this row was a tightening in an earlier draft and the resource-scope check moved it",
+      "extra_iam": [],
+      "phase": 4,
+      "source": "controls/ai-specific/agentcore-observability.yaml"
+    },
+    {
+      "control": "AIR-ACR-OBS-04",
+      "area": "ACR",
+      "question": "Is sensitive data (PII/PHI) that agents write to their own logs masked, and are those log groups encrypted and access-restricted, not just filtered at the model boundary?",
+      "assert": "CloudWatch Logs data-protection policy + CMK log encryption + logs:Unmask restriction",
+      "workload_agnostic": true,
+      "verdict": "new",
+      "disposition": null,
+      "target_modules": [
+        "agentcore_assessments"
+      ],
+      "incumbents": [],
+      "incumbent_names": [],
+      "gap": "CloudWatch Logs data-protection policy",
+      "extra_iam": [
+        "logs:GetDataProtectionPolicy",
+        "logs:DescribeAccountPolicies"
+      ],
+      "phase": 4,
+      "source": "controls/ai-specific/agentcore-observability.yaml"
+    },
+    {
+      "control": "AIR-ACR-OBS-06",
+      "area": "ACR",
+      "question": "For multi-account agent deployments, is telemetry aggregated into a central monitoring account with the cross-account sharing link scoped to your organization?",
+      "assert": "OAM sink policy scoped by aws:PrincipalOrgID + least-privilege cross-account view",
+      "workload_agnostic": true,
+      "verdict": "new",
+      "disposition": null,
+      "target_modules": [
+        "agentcore_assessments"
+      ],
+      "incumbents": [],
+      "incumbent_names": [],
+      "gap": "OAM sink policy",
+      "extra_iam": [
+        "oam:ListSinks",
+        "oam:GetSinkPolicy"
+      ],
+      "phase": 4,
+      "source": "controls/ai-specific/agentcore-observability.yaml"
+    },
+    {
+      "control": "AIR-ACR-POL-06",
+      "area": "ACR",
+      "question": "For content-safety decisions on agent actions, are Bedrock Guardrails composed into the policy engine so harmful content, prompt injection, or PII is scored and enforced at the same authorization boundary?",
+      "assert": "Cedar guardrails-block config + gateway role bedrock:InvokeGuardrailChecks grant",
+      "workload_agnostic": false,
+      "verdict": "new",
+      "disposition": null,
+      "target_modules": [
+        "agentcore_assessments"
+      ],
+      "incumbents": [],
+      "incumbent_names": [],
+      "gap": "",
+      "extra_iam": [],
+      "phase": 4,
+      "source": "controls/ai-specific/agentcore-policy.yaml"
+    },
+    {
+      "control": "AIR-ACR-RT-04",
+      "area": "ACR",
+      "question": "Are resource limits (time, memory, cost) enforced per agent session to prevent a single runaway task from consuming disproportionate resources?",
+      "assert": "Per-session resource limit configuration",
+      "workload_agnostic": false,
+      "verdict": "new",
+      "disposition": null,
+      "target_modules": [
+        "agentcore_assessments"
+      ],
+      "incumbents": [],
+      "incumbent_names": [],
+      "gap": "",
+      "extra_iam": [],
+      "phase": 4,
+      "source": "controls/ai-specific/agentcore-runtime.yaml"
+    },
+    {
+      "control": "AIR-FND-DAT-01",
+      "area": "FND",
+      "question": "Is data used to train, fine-tune, or ground AI models encrypted at rest with keys the organization controls?",
+      "assert": "Storage encryption configuration + key ownership",
+      "workload_agnostic": true,
+      "verdict": "unassessed",
+      "disposition": null,
+      "target_modules": [
+        "bedrock_assessments",
+        "responsible_ai_grc_assessments"
+      ],
+      "incumbents": [
+        "BR-20",
+        "FS-65"
+      ],
+      "incumbent_names": [
+        "Knowledge Base Customer-Managed KMS Encryption Check",
+        "KB Data Source Buckets Missing S3 Event Notifications"
+      ],
+      "gap": "candidate incumbents only; dedup not run. Spans two modules: BR-20 covers knowledge base CMK, FS-65 covers the data-source buckets",
+      "extra_iam": [],
+      "phase": 5,
+      "source": "controls/baseline/data-protection.yaml"
+    },
+    {
+      "control": "AIR-FND-DAT-02",
+      "area": "FND",
+      "question": "Is all traffic carrying prompts, model outputs, or training data encrypted in transit end to end?",
+      "assert": "Network/config review confirming TLS enforcement",
+      "workload_agnostic": true,
+      "verdict": "unassessed",
+      "disposition": null,
+      "target_modules": [
+        "bedrock_assessments"
+      ],
+      "incumbents": [],
+      "incumbent_names": [],
+      "gap": "needs s3:GetBucketPolicy, which no function is granted",
+      "extra_iam": [
+        "s3:GetBucketPolicy"
+      ],
+      "phase": 5,
+      "source": "controls/baseline/data-protection.yaml"
+    },
+    {
+      "control": "AIR-FND-DAT-03",
+      "area": "FND",
+      "question": "Is sensitive data (PII, PHI, financial, or classified) discovered and classified before it is used as AI input, training data, or grounding context?",
+      "assert": "Classification/discovery scan results for AI data sources",
+      "workload_agnostic": true,
+      "verdict": "unassessed",
+      "disposition": null,
+      "target_modules": [
+        "responsible_ai_grc_assessments"
+      ],
+      "incumbents": [],
+      "incumbent_names": [],
+      "gap": "macie2 already granted to this function",
+      "extra_iam": [],
+      "phase": 5,
+      "source": "controls/baseline/data-protection.yaml"
+    },
+    {
+      "control": "AIR-FND-DAT-09",
+      "area": "FND",
+      "question": "Where the AI pipeline uses AWS AI services covered by the AI services opt-out policy, has the organization opted out of content use for service improvement, and is that choice locked so a member account cannot override it?",
+      "assert": "DescribeEffectivePolicy output for AISERVICES_OPT_OUT_POLICY on a member account",
+      "workload_agnostic": true,
+      "verdict": "unassessed",
+      "disposition": null,
+      "target_modules": [
+        "bedrock_assessments"
+      ],
+      "incumbents": [],
+      "incumbent_names": [],
+      "gap": "AISERVICES_OPT_OUT_POLICY via DescribeEffectivePolicy, which no function is granted; the AI-services opt-out is the most AI-specific control in the FND area",
+      "extra_iam": [
+        "organizations:DescribeEffectivePolicy"
+      ],
+      "phase": 5,
+      "source": "controls/baseline/data-protection.yaml"
+    },
+    {
+      "control": "AIR-FND-DET-01",
+      "area": "FND",
+      "question": "Are prompts, model invocations, and model responses logged in enough detail to reconstruct what happened during a security investigation?",
+      "assert": "Logging configuration + sample retained log entry",
+      "workload_agnostic": true,
+      "verdict": "unassessed",
+      "disposition": null,
+      "target_modules": [
+        "bedrock_assessments"
+      ],
+      "incumbents": [
+        "BR-04",
+        "BR-12"
+      ],
+      "incumbent_names": [
+        "Bedrock Model Invocation Logging Check",
+        "Bedrock Invocation Log Encryption"
+      ],
+      "gap": "candidate incumbents only; dedup not run",
+      "extra_iam": [],
+      "phase": 5,
+      "source": "controls/baseline/threat-detection.yaml"
+    },
+    {
+      "control": "AIR-FND-DET-04",
+      "area": "FND",
+      "question": "Are attempts to manipulate a model through its input (prompt injection, jailbreak patterns) detected and logged as security-relevant events?",
+      "assert": "Detection rule + example flagged event",
+      "workload_agnostic": true,
+      "verdict": "unassessed",
+      "disposition": null,
+      "target_modules": [
+        "bedrock_assessments"
+      ],
+      "incumbents": [
+        "BR-34"
+      ],
+      "incumbent_names": [
+        "Guardrail Prompt Attack Filter"
+      ],
+      "gap": "candidate incumbent only; dedup not run",
+      "extra_iam": [],
+      "phase": 5,
+      "source": "controls/baseline/threat-detection.yaml"
+    },
+    {
+      "control": "AIR-FND-IAM-05",
+      "area": "FND",
+      "question": "When an AI workload calls another AWS service or third-party API, does it present its own distinct identity rather than inheriting or reusing broader credentials?",
+      "assert": "IAM role/identity mapping per AI workload",
+      "workload_agnostic": true,
+      "verdict": "unassessed",
+      "disposition": null,
+      "target_modules": [
+        "agentcore_assessments"
+      ],
+      "incumbents": [
+        "AC-02"
+      ],
+      "incumbent_names": [
+        "AgentCore IAM Full Access Check"
+      ],
+      "gap": "candidate incumbent only; dedup not run",
+      "extra_iam": [],
+      "phase": 5,
+      "source": "controls/baseline/identity-access.yaml"
+    },
+    {
+      "control": "AIR-FND-NET-01",
+      "area": "FND",
+      "question": "Do AI workloads run inside a private network boundary, without requiring direct public internet exposure for normal operation?",
+      "assert": "Network diagram / config showing private placement",
+      "workload_agnostic": true,
+      "verdict": "unassessed",
+      "disposition": null,
+      "target_modules": [
+        "agentcore_assessments",
+        "sagemaker_assessments"
+      ],
+      "incumbents": [
+        "AC-01",
+        "SM-11"
+      ],
+      "incumbent_names": [
+        "AgentCore Runtime VPC Configuration",
+        "SageMaker Model Network Isolation Check"
+      ],
+      "gap": "spans two modules; candidate incumbents only. 'AI workloads run privately' has no single host, which is why the FND area has no module of its own",
+      "extra_iam": [],
+      "phase": 5,
+      "source": "controls/baseline/network-isolation.yaml"
+    },
+    {
+      "control": "AIR-FND-NET-02",
+      "area": "FND",
+      "question": "Is traffic between AI workloads and the AWS services they call kept off the public internet (private connectivity), rather than routing over the open internet?",
+      "assert": "Route table / endpoint configuration review",
+      "workload_agnostic": true,
+      "verdict": "unassessed",
+      "disposition": null,
+      "target_modules": [
+        "agentcore_assessments"
+      ],
+      "incumbents": [
+        "AC-08"
+      ],
+      "incumbent_names": [
+        "AgentCore VPC Endpoints Check"
+      ],
+      "gap": "candidate incumbent only; dedup not run",
+      "extra_iam": [],
+      "phase": 5,
+      "source": "controls/baseline/network-isolation.yaml"
+    },
+    {
+      "control": "AIR-FND-NET-04",
+      "area": "FND",
+      "question": "Is inbound and outbound traffic to AI endpoints inspected for known attack patterns (e.g., injection attempts, exfiltration signatures)?",
+      "assert": "Protection layer configuration + recent detections",
+      "workload_agnostic": true,
+      "verdict": "unassessed",
+      "disposition": null,
+      "target_modules": [
+        "responsible_ai_grc_assessments",
+        "agentcore_assessments"
+      ],
+      "incumbents": [
+        "AG-27"
+      ],
+      "incumbent_names": [
+        "Agentic AI Gateway WAF Protection"
+      ],
+      "gap": "wafv2 is already granted to the GRC function, but the AG-27 incumbent lives in the AgentCore module; pick one before writing it",
+      "extra_iam": [],
+      "phase": 5,
+      "source": "controls/baseline/network-isolation.yaml"
+    },
+    {
+      "control": "AIR-FND-NET-06",
+      "area": "FND",
+      "question": "Can an autonomous agent's ability to reach arbitrary network destinations or invoke arbitrary tools be constrained to an explicit allow-list, rather than open-ended reachability?",
+      "assert": "Agent runtime network policy / allow-list configuration",
+      "workload_agnostic": true,
+      "verdict": "unassessed",
+      "disposition": null,
+      "target_modules": [
+        "agentcore_assessments"
+      ],
+      "incumbents": [
+        "AC-01"
+      ],
+      "incumbent_names": [
+        "AgentCore Runtime VPC Configuration"
+      ],
+      "gap": "overlaps RT-08; resolve the two together",
+      "extra_iam": [
+        "ec2:DescribeSecurityGroups"
+      ],
+      "phase": 5,
+      "source": "controls/baseline/network-isolation.yaml"
+    }
+  ]
+}

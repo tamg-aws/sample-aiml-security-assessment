@@ -212,15 +212,20 @@ reading both sides: the AISF assertion and the incumbent check's actual comparis
 |---|---|---|---|---|---|
 | BDR | 19 | 4 | 7 | 5 | 3 |
 | SGM | 11 | 2 | 4 | 4 | 1 |
-| ACR | 37 | 2 | 18 | 17 | 0 |
-| **total** | **67** | **8** | **29** | **26** | **4** |
+| ACR | 37 | 2 | 17 | 18 | 0 |
+| **total** | **67** | **8** | **28** | **27** | **4** |
 
-The 67 is the hosted set from section 4.1; 67 + the 38 of section 4.2 = 105. So **26 of the 105 need a
-new check function, 29 extend a check that already exists, 8 are already covered, and 4 are flagged
+The 67 is the hosted set from section 4.1; 67 + the 38 of section 4.2 = 105. So **27 of the 105 need a
+new check function, 28 extend a check that already exists, 8 are already covered, and 4 are flagged
 machine-checkable but are not.** The earlier draft warned against extrapolating the BDR and
-SGM ratio onto ACR, and that warning was right: ACR tightens an existing check 49% of the time
-(18/37) against 37% for BDR and SGM (11/30), so extrapolation would have understated the
-extend-an-incumbent work by about a third.
+SGM ratio onto ACR, and that warning was right: ACR tightens an existing check 46% of the time
+(17/37) against 37% for BDR and SGM (11/30), so extrapolation would have understated the
+extend-an-incumbent work by about a quarter.
+
+These four counts are now generated and gated rather than asserted: `aisf-parity/build_ledger.py`
+emits one row per control and `aisf-parity/check_ledger.py` reconciles the partition against the
+AISF classification ledger in both directions. Two verdicts below were corrected by that pass; both
+corrections are noted where they occur.
 
 **Bedrock, 19 controls, reconciles exactly.** Already covered: `GRD-01` by BR-10, `GRD-03` by BR-26,
 `KB-03` by BR-20, `MDL-10` by BR-37 (same `GetAccountDataRetention` call). Tightenings: `GRD-02`
@@ -246,25 +251,35 @@ Already covered, 2: `GW-01` by `AG-24` (`AG-24` accepts `authorizerType` in `{AW
 or `AUTHENTICATE_ONLY` with a policy engine in `ENFORCE`, which is `GW-01`'s assertion exactly) and
 `RT-09` by `AC-06` (`recording.enabled is True` plus an S3 bucket).
 
-Tightenings, 18: `EVAL-01`, `ID-10`, `PAY-01`, and `RT-03` all sit on `AC-02`, which detects
+Tightenings, 17: `EVAL-01`, `ID-10`, `PAY-01`, and `RT-03` all sit on `AC-02`, which detects
 AgentCore full-access and wildcard grants only, so a role holding a single over-broad *named* action
 passes it; `EVAL-05` and `EVAL-06` on `AC-17`, which tests `status == ACTIVE`,
 `executionStatus == ENABLED` and `bool(evaluators)` but never reads a sampling rate and never asks
-*which* evaluators; `OBS-03` on `AC-04`, which is X-Ray `tracingConfig.enabled` on runtimes only,
-while `OBS-03` is about Gateway, Memory, Policy and Identity; `GW-03` and `RT-13` on `AC-10`;
+*which* evaluators; `GW-03` and `RT-13` on `AC-10`;
 `GW-04` on `AC-08`; `GW-05` on `AG-27` (WAF leg only, the rate-limit leg needs
 `ListGatewayRateLimits`, so botocore >= 1.43.66); `ID-05` on `AC-14` (CMK leg only: the string
 `secret` appears 0 times in the module, so the secret-scan leg is unwritten); `MEM-01` on `AC-07`,
 `POL-04` on `AC-11`, `POL-01` and `POL-07` on `AG-25` (mode `ENFORCE` plus `status`/`enforcementMode`
 `ACTIVE`, with no default-deny or decision-log leg and nothing session-aware); `REG-02` on `AR-03`
-(auto-approval only, no curator/publisher separation, no EventBridge rule); `RT-08` on `AC-15` and
-`AC-16`, which require `networkMode == "VPC"` with non-empty `subnets` and `securityGroups` and never
-read what the rules permit, so VPC placement is proven and egress filtering is not.
+(auto-approval only, no curator/publisher separation, no EventBridge rule); and `RT-08` on `AC-01`.
 
-Net new, 17: `EVAL-02`, `EVAL-03`, `EVAL-04`, `EVAL-07`, `GW-02`, `GW-08`, `GW-10`, `ID-04`, `ID-08`,
-`ID-11`, `MEM-07`, `MEM-12`, `OBS-02`, `OBS-04`, `OBS-06`, `POL-06`, `RT-04`. Four of these read no
-AgentCore API at all: `MEM-12` and `OBS-02` are CloudTrail event selectors, `OBS-04` is a CloudWatch
-Logs data-protection policy, `OBS-06` is an OAM sink policy.
+**Correction, `RT-08`'s incumbent.** An earlier draft put `RT-08` on `AC-15` and `AC-16`. Those two
+iterate `list_code_interpreters` and the browser API, so neither inspects a runtime. The runtime
+network check is `AC-01` (`check_agentcore_vpc_configuration`, `:838`), which requires VPC placement
+and flags public subnets but never reads what the security-group rules permit: `describe_security_groups`
+is 0 hits in the module, and `ec2:DescribeSecurityGroups` is absent from the AgentCore function's
+grant. So VPC placement is proven, egress filtering is not, and this row carries an IAM change.
+
+Net new, 18: `EVAL-02`, `EVAL-03`, `EVAL-04`, `EVAL-07`, `GW-02`, `GW-08`, `GW-10`, `ID-04`, `ID-08`,
+`ID-11`, `MEM-07`, `MEM-12`, `OBS-02`, `OBS-03`, `OBS-04`, `OBS-06`, `POL-06`, `RT-04`. Four of these
+read no AgentCore API at all: `MEM-12` and `OBS-02` are CloudTrail event selectors, `OBS-04` is a
+CloudWatch Logs data-protection policy, `OBS-06` is an OAM sink policy.
+
+**Correction, `OBS-03` is net new, not a tightening.** An earlier draft filed it against `AC-04`.
+`AC-04` iterates `list_agent_runtimes` only, so it cannot say anything about Gateway, Memory, Policy
+or Identity, which is `OBS-03`'s whole subject. This is the same different-resource error as `ID-08`
+against `AG-24`, and it is why the ledger gate checks that an incumbent lives in the row's target
+module and iterates the row's resource.
 
 `GW-02` and `ID-04` assert an SCP, and are counted net new rather than unverifiable for the same
 reason `TRN-08` is: the corpus already enumerates SCPs in two modules,
@@ -395,7 +410,7 @@ question is open for those three modules and needs a data-flow pass, not a grep.
 
 Hosting decides which module the code goes in. Workload dependence decides whether the check needs an
 operator-supplied baseline to mean anything. The section 4.4 dedup is a third, orthogonal axis. So the
-26 net-new check functions split 19 workload-agnostic and 7 workload-specific, the latter being
+27 net-new check functions split 20 workload-agnostic and 7 workload-specific, the latter being
 `ACR-EVAL-04`, `ACR-MEM-07`, `ACR-POL-06`, `ACR-RT-04`, and `BDR-MDL-01/03/04`. Those last three are
 the model-allowlist controls, which is the same set section 4.4 found has no incumbent at all and
 section 4.3 needs a deploy-time parameter for. They are the highest-value and highest-cost checks in
@@ -528,11 +543,12 @@ Phase 1 should land a non-empty section on day one. `report_template.py:1317-131
 nav item, no card, no section. That is indistinguishable from a wiring bug, so phase 1 and the first
 batch of rows should ship together.
 
-Phases 3 to 5 are not uniform in kind. Per section 4.4 they are 26 new check functions and 29
+Phases 3 to 5 are not uniform in kind. Per section 4.4 they are 27 new check functions and 28
 extensions of checks that already ship, and the two carry different obligations: a new function needs
 an id, a dispatch site, and the doc count lockstep, while an extension needs none of those and instead
 changes the meaning of a shipped `Check_ID` and may move rows in the frozen baseline. Phase 4 is the
-largest either way, at 17 new and 18 extensions.
+largest either way, at 18 new and 17 extensions. Section 9 splits the 28 extensions again, into the
+22 that extend in place and the 6 that get an id of their own.
 
 Per-check obligations for phases 3 to 5, from the traced BR-37 example: the check function,
 `create_finding(..., region=region)`, a dispatch site, IAM in **both** SAM templates, the matching
@@ -563,9 +579,18 @@ These change the work materially and are yours to make.
    read Organizations policy documents, IAM policy documents, S3, and CloudWatch. That is generic
    account posture, which is a reasonable thing for an AI/ML assessment tool to decline. It also
    means they do not need an AI host module, so if you do want them, they can go wherever the service
-   already lives. The 8 that do touch an AI service are `FND-DAT-01/02/03`, `FND-DET-01/04`,
-   `FND-IAM-05`, `FND-NET-01`, `FND-NET-06`. A middle option: port those 8, decline the other 30, and
-   ship 75 of 105.
+   already lives.
+
+   **Decided: port the AI-subject subset, which is 11 controls, not the 8 an earlier draft named.**
+   A keyword scan for an AI service name is the wrong instrument here: all 19 workload-agnostic FND
+   controls mention Bedrock, SageMaker or AgentCore somewhere, but every one of those mentions is in
+   `steps` or `rec`, never in the assertion (`ev`). The criterion that survives is whether the
+   *subject* of the assertion is an AI resource. That splits the 19 exactly: 11 in, 8 out. In:
+   `FND-DAT-01/02/03/09`, `FND-DET-01/04`, `FND-IAM-05`, `FND-NET-01/02/04/06`. Out, as generic
+   account posture: `FND-ACC-09`, `FND-DET-02/09`, `FND-GOV-02`, `FND-IAM-02/03`, `FND-NET-07/08`.
+   The earlier "8" matched the size of the excluded set, not the included one, and omitted
+   `FND-DAT-09`, the AI-services opt-out policy, which is the most AI-specific control in the area.
+   Scope is therefore 67 + 11 = **78 of 105**.
 2. **Prefix.** `AI-` is recommended. Confirm, or pick another 2-character prefix.
 3. **Whether to touch the frozen baseline** in phase 2. Tagging existing FS rows with AISF rewrites
    66 frozen tuples. The alternative is to tag only non-FS checks, leaving the FinServ module alone.
@@ -575,7 +600,7 @@ These change the work materially and are yours to make.
    each, not a reuse. Recommend picking the subset by value, not porting all 20. `FND-IAM-09` and
    `SLF-CMP-08` should be declared manual per section 4.3. Whichever subset is chosen, section 4.6
    asks that it ship as a separate tier that never sums with the 83 and never emits `Passed` on an
-   empty baseline. Note that 7 of the 26 net-new functions are in this tier, including the three
+   empty baseline. Note that 7 of the 27 net-new functions are in this tier, including the three
    model-allowlist checks, so deferring the 22 entirely also defers the port's highest-value
    detection.
 5. **Whether to measure the Step Functions payload ceiling first.** Recommended before phase 4,
@@ -590,12 +615,8 @@ Stated so these are not read as settled:
 - The report Lambda's memory ceiling at scale. It is `MemorySize: 1024` with a 600 s timeout
   (`template.yaml:238-239`) and reads every CSV into memory. No test asserts its footprint, unlike
   the FinServ module.
-- Whether the 29 tightenings are better served by extending the incumbent check or by adding a second
-  check id beside it. Section 4.4 counts them as extensions, which is what keeps the new-function
-  figure at 26. Extending changes the meaning of a `Check_ID` that already ships and may move rows in
-  the frozen baseline; adding ids beside them avoids that but spends 29 ids and needs the section 3.5
-  id-encoding decision first. This is the single largest open design question in the proposal and it is
-  a judgment call, not a measurement.
+- ~~Whether the 29 tightenings are better served by extending the incumbent check or by adding a
+  second check id beside it.~~ Decided; see section 9.
 - Assertion sufficiency of the API mapping. 42 of the API strings across the 83 workload-agnostic
   controls were derived from the control's classification basis rather than read from an artifact
   `check_api` field. Those name the right service and the APIs exist; whether each is sufficient to
@@ -607,3 +628,72 @@ Stated so these are not read as settled:
   it, so the grant set on the multi-account path needs separate confirmation before phase 6.
 - Whether any real estate crosses the Step Functions 256 KB state-payload quota, repeated from above
   because it is the one unmeasured item that could force rework rather than just more work.
+
+## 9. Decisions taken, and what they cost
+
+Three decisions were made on 2026-09-24. Each is recorded with the consequence that follows from it,
+because the consequence is the part that constrains the next phase.
+
+**Scope: 78 of 105.** The 67 hosted controls plus the 11 FND controls whose assertion subject is an
+AI resource. Section 7 decision 1 carries the derivation and the two corrections to the earlier "8".
+The remaining 27 of the 105 are 8 generic-posture FND controls and the 19 SLF and PHY controls, all
+declined. Any published figure must therefore say 78 of 105, never "all machine-verifiable checks."
+
+**Tightenings split by whether the incumbent is sound, not uniformly.** The rule: extend the shipped
+check where its published finding name is honest and its assertion is merely narrower; allocate a new
+id where the name claims more than the check asserts. Applied to all 28, that is **22 extensions and
+6 new ids**. The 6, with the name each one is a claim about:
+
+| control | incumbent | the incumbent's published name | what it actually asserts |
+|---|---|---|---|
+| `BDR-GRD-10` | `BR-15` | Cross-Account Guardrails Enforcement Check | only that an org policy exists, not that it is non-DRAFT |
+| `ACR-EVAL-05` | `AC-17` | AgentCore Online Evaluation Coverage | never reads a sampling rate, so coverage is the one thing unmeasured |
+| `ACR-EVAL-06` | `AC-17` | AgentCore Online Evaluation Coverage | never asks which evaluators are attached |
+| `ACR-GW-03` | `AC-10` | AgentCore Resource-Based Policies Check | policy presence only, never its conditions |
+| `ACR-RT-13` | `AC-10` | AgentCore Resource-Based Policies Check | same; the `aws:SourceVpc`/`SourceVpce` leg is unasserted |
+| `ACR-REG-02` | `AR-03` | AWS Agent Registry Publication Approval Governance | one env-gated auto-approval flag |
+
+The rule is applied case by case, so it can be argued case by case. `AC-02` is the closest call and
+went the other way: four controls ride on it, and its names ("IAM Full Access Check", "IAM Wildcard
+Permissions") describe exactly what it tests, so it is narrow rather than misleading and gets extended.
+
+The cost of this split: 22 shipped `Check_ID`s change meaning and will move rows in the frozen
+baseline, and 6 new ids are spent that a uniform extend-everything policy would not have spent. The
+benefit is that no published check keeps a name that overstates it.
+
+**Total build: 44 new check functions and 22 extensions.** 27 net new, plus the 6 tightenings that
+get their own id, plus the 11 FND controls. 44 fits the 100-id budget a 2-character prefix allows
+(section 3.5) with room to spare.
+
+**One analytical task remains.** The 11 FND rows carry `verdict: "unassessed"` in the ledger. The
+dedup for the 67 was done by reading both sides of every pair; that work has not been done for these
+11. Their rows name candidate incumbents only. Two of the 11 already look like they will move: three
+of them span two modules, which no hosted control does, and `FND-NET-06` overlaps `ACR-RT-08` closely
+enough that the two should be resolved together. Do not treat the 11 as 11 new functions until that
+pass runs.
+
+### The ledger
+
+`aisf-parity/aisf-work-ledger.json` is the machine-readable form: one row per control with its
+verdict, disposition, target modules, incumbents and their published names, the gap to close, the
+extra IAM actions, and the phase. `aisf-parity/AISF-WORK-LEDGER.md` is a generated view of the same
+data. Neither is hand-edited: change `ROWS` in `build_ledger.py` and re-run.
+
+`aisf-parity/check_ledger.py` gates it with 10 checks, each printing its denominator. The two that
+matter most are the ones a scan over the ledger's own rows cannot perform: a **backward** check that
+every machine-checkable hosted control in the AISF classification ledger has a row (catching a
+control silently dropped), and a check that each named incumbent both exists and lives in the row's
+target module (which is what caught the `OBS-03` and `RT-08` errors above). All 10 gates were
+mutation-tested with 6 deliberate corruptions: a dropped row, an invented incumbent, an IAM action
+already granted, a workload-specific control smuggled into the FND tier, inflated arithmetic, and a
+tightening with no disposition. All 6 were caught by the intended gate; none survived.
+
+**15 new IAM actions** fall out of the ledger across 22 action-claims, each verified as not already
+granted to the function that would need it: `cloudtrail:GetEventSelectors`, `cloudtrail:ListTrails`,
+`config:DescribeConfigRules`, `config:DescribeConfigurationRecorders`, `ec2:DescribeSecurityGroups`,
+`logs:DescribeAccountPolicies`, `logs:GetDataProtectionPolicy`,
+`macie2:GetAutomatedDiscoveryConfiguration`, `macie2:GetMacieSession`, `oam:GetSinkPolicy`,
+`oam:ListSinks`, `organizations:DescribeEffectivePolicy`, `organizations:DescribePolicy`,
+`organizations:ListPolicies`, `s3:GetBucketPolicy`. Each needs adding to **both** SAM templates and
+to the matching `_EXPECTED_ACTIONS` entry, which is a set equality at
+`tests/test_sam_role_least_privilege.py:325-331`.
