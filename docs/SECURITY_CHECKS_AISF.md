@@ -207,6 +207,35 @@ leg.
 
 Reference: <https://docs.aws.amazon.com/whitepapers/latest/sagemaker-studio-admin-best-practices/permissions-management.html>
 
+## Live verification
+
+The local battery proves the mapping is internally consistent. It cannot prove a
+row reports anything against real infrastructure, and a row that only ever
+returns one verdict is indistinguishable from a working one in every offline
+test. `aisf-parity/probe_live.py` measures that separately: it runs each
+incumbent check against an account and records, per `AISF-` row, whether the
+findings reach **BOTH** verdicts, **ONE_ONLY**, **NONE**, or are **VACUOUS**
+(emitted by a short-circuit rather than by exercising the check's logic).
+
+A ONE_ONLY row is excused only when the check's own source makes the second
+verdict unreachable. The probe recomputes that from the AST every run
+(`REACHABLE`, `ELSE_GUARDED`, `SINGLETON`, `NO_VERDICT_PATH`), so no excuse
+survives an edit that makes the missing verdict reachable, and nothing has to be
+kept in sync by hand.
+
+It is not part of `gate_all.sh`, because it needs AWS credentials and measures an
+account rather than this tree. The battery prints `live leg: NOT RUN here` on
+every run so a green battery is never mistaken for live evidence.
+
+```bash
+AWS_PROFILE=<profile> .venv/bin/python aisf-parity/probe_live.py --region us-east-1
+aisf-parity/probe_live.py --selftest    # 11 classifier cases, no credentials
+```
+
+Two rows need a fixture that no ordinary account has, both documented with their
+cost and teardown in `aisf-parity/LIVE-FIXTURES.md`. Measured at the current
+head: BOTH=4, ONE_ONLY=4, NONE=0, VACUOUS=0.
+
 ## Adding a control
 
 1. Confirm the control's ledger verdict is `covered` in
@@ -245,3 +274,7 @@ Reference: <https://docs.aws.amazon.com/whitepapers/latest/sagemaker-studio-admi
    commit in the range carries a secret or an attribution line, that the push is
    neither a force nor aimed at `main`, and it re-reads the recorded battery run
    to confirm every gate that file claims actually reported at this commit.
+8. Run `probe_live.py` against an account that has a resource on each side of the
+   new control. If the new row comes back ONE_ONLY with a `REACHABLE`
+   classification, the missing verdict is a missing fixture, not a waiver: add it
+   to `aisf-parity/LIVE-FIXTURES.md` with its cost and its teardown.
