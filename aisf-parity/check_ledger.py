@@ -53,6 +53,8 @@ from aisf_mappings import (  # noqa: E402
     AISF_COVERAGE_CHECK_ID,
     AISF_DERIVED_MAP,
     AISF_RISK_TO_SEVERITY,
+    SEVERITY_COLLAPSE_NOTE,
+    derive_aisf_findings,
 )
 from report_template import COMPLIANCE_STANDARDS  # noqa: E402
 
@@ -380,7 +382,15 @@ def main():
             continue
         # Severity is the documented collapse of AISF's five risk bands onto this
         # repository's four-level SeverityEnum, not an identity match: there is no
-        # `Critical` here (see the note on AISF_RISK_TO_SEVERITY).
+        # `Critical` here (see the note on AISF_RISK_TO_SEVERITY). The map carries
+        # the pre-collapse band as data because the rows disclose it, so the band
+        # itself is compared against the source too: a control upgraded upstream
+        # from high to critical must change the note the rows carry, and only the
+        # `risk` comparison notices that while the collapsed severity holds still.
+        if m["risk"] != item["risk"]:
+            drift.append(
+                f"{m['check_id']}: risk={m['risk']} but the control is {item['risk']}"
+            )
         expected_severity = AISF_RISK_TO_SEVERITY.get(item["risk"])
         if expected_severity is None:
             drift.append(f"{m['check_id']}: risk={item['risk']} has no severity band")
@@ -395,6 +405,44 @@ def main():
             drift.append(
                 f"{m['check_id']}: reference={m['reference']} != {item['src'][0]['u']}"
             )
+
+    # A risk band whose name does not survive the collapse is disclosed in every
+    # row it produces. Read off the derivation's output rather than the note
+    # constant: the constant being right is not the claim, the row carrying it is,
+    # and a change to how details are assembled could drop it while the constant
+    # still reads correctly. Both status branches are exercised, because an `N/A`
+    # row carries Informational and takes the other wording path.
+    collapsed = [m for m in AISF_DERIVED_MAP if m["risk"] in SEVERITY_COLLAPSE_NOTE]
+    for m in collapsed:
+        for status in ("Passed", "N/A"):
+            emitted = derive_aisf_findings(
+                [
+                    {
+                        "Check_ID": cid,
+                        "Status": status,
+                        "Region": "us-east-1",
+                        "Account_ID": "000000000000",
+                    }
+                    for cid in m["sources"]
+                ]
+            )
+            row_out = next((r for r in emitted if r["Check_ID"] == m["check_id"]), None)
+            if row_out is None:
+                drift.append(f"{m['check_id']}: no row derived for status={status}")
+            elif SEVERITY_COLLAPSE_NOTE[m["risk"]] not in row_out["Finding_Details"]:
+                drift.append(
+                    f"{m['check_id']}: {status} row does not disclose risk={m['risk']}"
+                )
+            elif row_out["Severity"] not in row_out["Finding_Details"]:
+                # The disclosure names a severity, so the row has to name the one
+                # it is actually carrying. On the N/A path those differ: the note
+                # says High and the row is Informational, and without this the
+                # gate would pass a row that reads as a claim about its own
+                # severity while contradicting the Severity column beside it.
+                drift.append(
+                    f"{m['check_id']}: {status} row carries "
+                    f"{row_out['Severity']} without naming it"
+                )
 
     aisf_entry = next((s for s in COMPLIANCE_STANDARDS if s["slug"] == "aisf"), None)
     figures = scope_figures((aisf_entry or {}).get("scope_text", ""))
@@ -435,7 +483,8 @@ def main():
     gate(
         "baked AISF control text and published figures match their sources",
         not drift,
-        f"{len(AISF_DERIVED_MAP)} mappings x 3 baked fields + "
+        f"{len(AISF_DERIVED_MAP)} mappings x 4 baked fields + "
+        f"{len(collapsed)} collapsed-band disclosures x 2 status paths + "
         f"{len(figures)} figures in the report section + "
         f"{len(doc_figures)} in SECURITY_CHECKS_AISF.md checked, "
         f"figures={figures}" + (f", drift={drift}" if drift else ""),

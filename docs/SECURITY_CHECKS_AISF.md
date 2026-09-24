@@ -87,8 +87,12 @@ row. An `AI-` row is a verdict on an AISF control, and one incumbent check's
 severity is not that control's risk rating; `AI-08` makes that concrete, since
 its three source checks carry different severities. AISF uses five risk bands
 and this framework's `SeverityEnum` has four, so `critical` and `high` both
-report as `High`, following the decision recorded in
-[SECURITY_CHECKS_RESPONSIBLE_AI_GRC_SEVERITY_METHODOLOGY.md](SECURITY_CHECKS_RESPONSIBLE_AI_GRC_SEVERITY_METHODOLOGY.md).
+report as `High`, following section 6 of
+[SECURITY_CHECKS_RESPONSIBLE_AI_GRC_SEVERITY_METHODOLOGY.md](SECURITY_CHECKS_RESPONSIBLE_AI_GRC_SEVERITY_METHODOLOGY.md),
+which keeps four levels and accepts that a genuinely critical risk is reported
+as `High`. The three controls AISF rates `critical` (`AI-01`, `AI-03`, `AI-04`)
+name that band and the downgrade in their `Finding_Details`, so a reader who
+sees `High` against a critical control learns why from the finding itself.
 A row with `Status=N/A` always reports `Informational`.
 
 ## Check catalogue

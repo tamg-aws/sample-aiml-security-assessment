@@ -96,6 +96,29 @@ single_account = _load_module(
     "aisf_single_report_app", os.path.join(REPORT_APP_DIR, "app.py")
 )
 
+# The four severity bands a finding may carry, read from the shipped schema
+# instead of transcribed. The GRC drift-guard
+# (responsible_ai_grc_tests/test_severity_register.py) asserts the same property
+# over SEVERITY_REGISTER, which the derived map is invisible to, so the derived
+# rows need their own assertion. Reading the enum means a `Critical` added
+# upstream fails here instead of being silently permitted by a copied literal.
+severity_schema = _load_module(
+    "aisf_severity_schema",
+    os.path.join(
+        REPO_ROOT,
+        "aiml-security-assessment",
+        "functions",
+        "security",
+        "bedrock_assessments",
+        "schema.py",
+    ),
+)
+ALLOWED_SEVERITIES = {band.value for band in severity_schema.SeverityEnum}
+
+METHODOLOGY_DOC = os.path.join(
+    REPO_ROOT, "docs", "SECURITY_CHECKS_RESPONSIBLE_AI_GRC_SEVERITY_METHODOLOGY.md"
+)
+
 
 def _entry(slug):
     return next(s for s in report_template.COMPLIANCE_STANDARDS if s["slug"] == slug)
@@ -118,6 +141,21 @@ def _source_row(check_id, status="Passed", region="us-east-1", account="11112222
 
 def _derived_by_id(rows):
     return {r["Check_ID"]: r for r in rows}
+
+
+def _all_mappings_derived(status):
+    """Every mapping's emitted row, with all source checks present at `status`.
+
+    Assertions about severity and about what a row discloses are made here, on
+    the derivation's output, and not on `AISF_DERIVED_MAP`: the map being right
+    is not the shipped claim, the row is.
+    """
+    every_source = sorted(
+        {cid for m in aisf_mappings.AISF_DERIVED_MAP for cid in m["sources"]}
+    )
+    return aisf_mappings.derive_aisf_findings(
+        [_source_row(cid, status) for cid in every_source]
+    )
 
 
 class TestRegistryEntry(unittest.TestCase):
@@ -310,17 +348,125 @@ class TestDerivedRowShape(unittest.TestCase):
         )
         self.assertEqual(rows["AI-05"]["Severity"], expected)
 
-    def test_severity_values_are_all_in_the_schema_enum(self):
-        """SeverityEnum has four bands and no Critical."""
-        allowed = {"High", "Medium", "Low", "Informational"}
+    def test_no_emitted_severity_is_outside_the_schema_enum(self):
+        """Asserted on emitted rows, so a bug in the collapse is caught at output."""
+        self.assertNotIn("Critical", ALLOWED_SEVERITIES)
+        seen = set()
+        for status in ("Passed", "Failed", "N/A"):
+            rows = _all_mappings_derived(status)
+            self.assertEqual(len(rows), len(aisf_mappings.AISF_DERIVED_MAP), msg=status)
+            for row in rows:
+                self.assertIn(
+                    row["Severity"],
+                    ALLOWED_SEVERITIES,
+                    msg=f"{row['Check_ID']} at {status}",
+                )
+                seen.add(row["Severity"])
+        # Three distinct bands come out of these inputs, so a derivation that
+        # emitted one constant value could not have produced this set.
+        self.assertGreaterEqual(len(seen), 3, msg=sorted(seen))
+
+    def test_baked_severity_is_the_collapse_of_the_declared_risk(self):
         for mapping in aisf_mappings.AISF_DERIVED_MAP:
-            self.assertIn(mapping["severity"], allowed, msg=mapping["check_id"])
+            self.assertIn(
+                mapping["risk"],
+                aisf_mappings.AISF_RISK_TO_SEVERITY,
+                msg=mapping["check_id"],
+            )
+            self.assertEqual(
+                mapping["severity"],
+                aisf_mappings.AISF_RISK_TO_SEVERITY[mapping["risk"]],
+                msg=mapping["check_id"],
+            )
 
     def test_a_malformed_source_row_drops_only_itself(self):
         rows = aisf_mappings.derive_aisf_findings(
             [None, _source_row("BR-10", "Failed"), 42]
         )
         self.assertIn("AI-03", _derived_by_id(rows))
+
+
+class TestSeverityCollapseDisclosure(unittest.TestCase):
+    """A risk band renamed by the collapse is disclosed in every row it produces.
+
+    Methodology section 6 keeps four severity levels and accepts, as the cost of
+    that, "a genuinely critical Responsible AI GRC risk is reported as High". The
+    person reading a finding reads the finding and not the methodology, so the
+    row states the pre-collapse band. These tests hold that on emitted rows: a
+    disclosure that lives only in the constant has not reached anyone.
+    """
+
+    # Pinned deliberately. A fourth control in a renamed band also changes the
+    # sentence in docs/SECURITY_CHECKS_AISF.md that names these three, so the
+    # addition should fail here until that sentence is updated.
+    CRITICAL_IDS = {"AI-01", "AI-03", "AI-04"}
+
+    def _critical(self):
+        return [m for m in aisf_mappings.AISF_DERIVED_MAP if m["risk"] == "critical"]
+
+    def test_the_critical_controls_are_the_three_the_docs_name(self):
+        self.assertEqual({m["check_id"] for m in self._critical()}, self.CRITICAL_IDS)
+
+    def test_every_critical_row_names_its_pre_collapse_risk(self):
+        note = aisf_mappings.SEVERITY_COLLAPSE_NOTE["critical"]
+        for status, expected_severity in (
+            ("Passed", "High"),
+            ("Failed", "High"),
+            ("N/A", "Informational"),
+        ):
+            rows = _derived_by_id(_all_mappings_derived(status))
+            for mapping in self._critical():
+                row = rows[mapping["check_id"]]
+                label = f"{mapping['check_id']} at {status}"
+                self.assertEqual(row["Severity"], expected_severity, msg=label)
+                self.assertIn(note, row["Finding_Details"], msg=label)
+                self.assertIn("critical", row["Finding_Details"], msg=label)
+
+    def test_an_na_row_says_which_severity_it_is_carrying(self):
+        """Otherwise "reported as High" reads as a claim about an Informational row."""
+        rows = _derived_by_id(_all_mappings_derived("N/A"))
+        for mapping in self._critical():
+            details = rows[mapping["check_id"]]["Finding_Details"]
+            self.assertIn("carries Informational", details, msg=mapping["check_id"])
+
+    def test_a_band_that_survives_the_collapse_carries_no_disclosure(self):
+        """Negative control: the note is attached by band, not to every row."""
+        rows = _derived_by_id(_all_mappings_derived("Passed"))
+        uncollapsed = [
+            m
+            for m in aisf_mappings.AISF_DERIVED_MAP
+            if m["risk"] not in aisf_mappings.SEVERITY_COLLAPSE_NOTE
+        ]
+        self.assertTrue(uncollapsed, "no uncollapsed mapping left to discriminate on")
+        for mapping in uncollapsed:
+            self.assertNotIn(
+                "AISF risk:",
+                rows[mapping["check_id"]]["Finding_Details"],
+                msg=mapping["check_id"],
+            )
+
+    def test_every_band_the_collapse_renames_has_a_note(self):
+        renamed = {
+            risk
+            for risk, severity in aisf_mappings.AISF_RISK_TO_SEVERITY.items()
+            if severity.lower() != risk
+        }
+        self.assertEqual(renamed, {"critical"})
+        self.assertTrue(
+            renamed.issubset(set(aisf_mappings.SEVERITY_COLLAPSE_NOTE)),
+            msg=sorted(renamed),
+        )
+
+    def test_the_note_cites_a_methodology_section_that_exists(self):
+        note = aisf_mappings.SEVERITY_COLLAPSE_NOTE["critical"]
+        self.assertIn(
+            "SECURITY_CHECKS_RESPONSIBLE_AI_GRC_SEVERITY_METHODOLOGY.md", note
+        )
+        self.assertIn("section 6", note)
+        with open(METHODOLOGY_DOC) as handle:
+            methodology = handle.read()
+        self.assertRegex(methodology, r"(?m)^#+\s*6\.\s")
+        self.assertIn("keep four levels", methodology)
 
 
 class TestMultiLegAggregation(unittest.TestCase):

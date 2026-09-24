@@ -28,6 +28,11 @@ section.
   - An informational `AI-00` row appears per account and region where
     AISF-relevant checks ran but a mapped source check was absent, so partial
     coverage reads as unassessed instead of compliant.
+  - Severity comes from the AISF control's own risk band. The three controls
+    AISF rates `critical` (`AI-01`, `AI-03`, `AI-04`) report as `High`, because
+    this framework has four severity levels and no `Critical`; each of their
+    rows states the pre-collapse risk in `Finding_Details`, so the downgrade is
+    visible in the finding and not only in the methodology.
   - The mappings are preliminary and illustrative. Validate them with your
     security and compliance team before using a row as audit evidence.
     `docs/SECURITY_CHECKS_AISF.md` documents every row and its source checks.
