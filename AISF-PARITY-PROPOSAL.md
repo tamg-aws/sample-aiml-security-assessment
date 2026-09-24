@@ -17,7 +17,13 @@ Every figure below was measured, not quoted.
 | of those, workload-specific | 22 | 83 + 22 = 105, reconciles |
 | This repo's published checks | 208 | 214 distinct `^[A-Z]{2,3}-\d{2}$` ids minus 6 `XX-00` marker rows |
 | Cross-check on 208 | agrees | `docs/SECURITY_CHECKS.md:7`, `README.md:9` |
+| of the 208, independent probes | 164 | 34 AG and 10 OW rows re-project another check's verdict |
+| of those, able to fire today | 163 | BR-14's only call site is commented out (section 4.5) |
 | Test baseline | 1,846 passed, 0 failed, 0 skipped | three pytest sessions, Python 3.12.14, repo-local `.venv` |
+
+The 208 figure is correct as published and should not be changed: every AG and OW row is a real report row a
+reader sees. It is the wrong denominator for a dedup, though, because a re-projected row cannot duplicate an
+AISF control independently of the check it re-projects. Section 4.4 dedups against 163.
 
 Baseline command set, for reproduction:
 
@@ -159,9 +165,13 @@ contents only the workload owner knows (model ARNs, account ids, regions, FQDNs,
 scanner can catch a blanket allow but cannot confirm the list is right.
 
 This repo already solves that with deploy-time parameters, and the pattern is fully wired and
-tested. Eight slots exist today: `RequireBedrockZeroDataRetention`, `RequireMarketplaceEndpointCMK`,
-`RequireAgentCoreOnlineEvaluation`, `RequireAgentRegistryManualApproval`, `RequireAgentRegistryCMK`,
-`AgentCoreTokenVaultId`, `ApprovedExternalAccountIds`, `ApprovedOrganizationIds`.
+tested. Eight slots exist today, but only two are allow-lists: `ApprovedExternalAccountIds` and
+`ApprovedOrganizationIds`, both consumed by the single check SM-30. The other six carry no value
+list. `RequireBedrockZeroDataRetention` (BR-37), `RequireMarketplaceEndpointCMK` (BR-40),
+`RequireAgentCoreOnlineEvaluation` (AC-17), `RequireAgentRegistryManualApproval` (AR-03), and
+`RequireAgentRegistryCMK` (AR-05) are booleans that flip a verdict; `AgentCoreTokenVaultId` (AC-14)
+names one vault. So the mechanism is proven, but there is one precedent for the shape AISF needs, not
+eight.
 
 The chain for `ApprovedExternalAccountIds` runs: CFN parameter
 (`template.yaml:87`, `template-multi-account.yaml:87`) to Lambda env var
@@ -176,8 +186,90 @@ renamed three times along the chain (CFN parameter, CodeBuild variable, Lambda e
 (`tests/test_optional_policy_baseline_wiring.py:14-47`) is an explicit dict, so a parameter that is
 not registered there is not checked at all.
 
-So the 22 are portable, at a price. Recommend porting them only where they share an existing
-parameter, and deferring those that would need a new one.
+So the 22 are portable, at a price, and the price is a new parameter for almost every one of them.
+Recommend selecting a subset by value rather than porting all of them; section 7 states this as a
+decision.
+
+Two of the 22 do not reduce to a parameter at all. `AIR-FND-IAM-09` needs a per-principal,
+per-resource-type action matrix, which no flat list expresses; without it the check degrades to the
+generic `service:*` wildcard test the repo already has. `AIR-SLF-CMP-08` needs an expected
+model-weight digest, a build artifact held in no AWS API that changes per model version. Leave both
+manual. The other 20 reduce to a list of strings, a small map, or an integer.
+
+### 4.4 Dedup against what already ships
+
+This is the section the earlier draft could not write. Verdicts below are per control, assigned by
+reading both sides: the AISF assertion and the incumbent check's actual comparison.
+
+| AISF area | controls | already covered | tightens an existing check | net new | flagged machine-checkable but is not |
+|---|---|---|---|---|---|
+| BDR | 19 | 4 | 7 | 5 | 3 |
+| SGM | 11 | 2 | 4 | 4 | 1 |
+| ACR | 37 | pending | pending | pending | pending |
+
+**Bedrock, 19 controls, reconciles exactly.** Already covered: `GRD-01` by BR-10, `GRD-03` by BR-26,
+`KB-03` by BR-20, `MDL-10` by BR-37 (same `GetAccountDataRetention` call). Tightenings: `GRD-02`
+(BR-34 tests the BLOCK action, AISF tests `inputStrength` HIGH), `GRD-04` (BR-32 accepts any
+`AWS/Bedrock` alarm, AISF wants the intervention metric filter), `GRD-09` (BR-27 tests presence,
+AISF tests thresholds), `GRD-10` (BR-15 tests that an org policy exists, AISF tests it is non-DRAFT),
+`KB-06` and `MDL-07` (BR-06 tests that a trail covers Bedrock, AISF wants named data-event resource
+types), `MDL-02` (BR-04 plus BR-12 cover logging and destination encryption, AISF adds retention).
+Net new: `KB-01` (Macie, no incumbent reads `macie2` in this module), `MDL-01`, `MDL-03`, `MDL-04`,
+`MDL-09`.
+
+**SageMaker, 11 controls, reconciles exactly.** Already covered: `EP-08` by SM-18, `TRN-05` by
+SM-09 plus SM-01 plus SM-03 (all three legs). Tightenings: `EP-01` (SM-11 has the network-isolation
+leg, not the `VpcConfig` leg), `EP-02`, `GOV-01` (SM-22 has approval status, not approver metadata),
+`TRN-02` (SM-03 has the KMS legs, not inter-container encryption). Net new: `EP-06`
+(`DataCaptureConfig`), `GOV-10` (Config recorder), `TRN-01` (training-job network isolation, which
+SM-21 does only for AutoML), `TRN-08` (SCP).
+
+**Three allow-list dimensions have no incumbent at all, verified by grep.** `aws:RequestedRegion`,
+`aws:SourceVpc`, `aws:SourceVpce`, and `aws:PrincipalOrgID` each return **0** hits across all six
+modules' `app.py`, against 3 hits for `GuardrailIdentifier` as a positive control, so the zeros are
+the absence of the feature and not a broken pattern. No check asserts model-ARN scoping on
+`bedrock:InvokeModel`, and none tests an FQDN egress list. That makes `BDR-MDL-01/03/04`,
+`FND-ACC-02`, `FND-DAT-04`, `FND-NET-03`, and `SLF-RT-02` net-new detection rather than dedup risk.
+
+**Where the incumbent is weaker than its name suggests.** Worth knowing before writing a check that
+looks redundant:
+
+- `FS-12`'s entire test is `"bedrock" in json.dumps(doc).lower()` over every SCP
+  (`responsible_ai_grc_assessments/app.py:2016`). An SCP that *allows* all of Bedrock passes it. The
+  allow-list language lives in the resolution string at `:2035`, not in any assertion. An AISF
+  model-allowlist control does not duplicate it.
+- `FS-07` tests exact membership in `["iam:*", "s3:*", "ec2:*", "lambda:*", "*"]` (`:1529`), so
+  `iam:Put*` passes.
+- 13 of the 64 FinServ checks assert nothing about the account (11 read nothing at all; `FS-24` and
+  `FS-58` read an inventory slice and still emit an advisory).
+- All 64 FinServ rows are stamped `Region="Global"` by `_stamp_unscoped_findings_global`, because the
+  module runs once with region-less clients (`app.py:7949`). An AISF control needing per-region
+  evidence is not covered by an FS row even when the subject matches.
+- The CMK family (21 checks) asserts customer-managed against AWS-owned, never a specific approved
+  key. `AC-10` and `BR-15` are presence-only.
+
+**Two defects on the AISF side**, surfaced by this pass and worth fixing in the source repo:
+
+1. `AIR-SGM-EP-03` carries the slug `sagemaker_endpoint_intercontainer_encryption_enabled`, but
+   `EnableInterContainerTrafficEncryption` is absent from `DescribeEndpointConfig` and present only
+   on `DescribeTrainingJob` (botocore 1.42.97 shape probe). The slug names a field the endpoint API
+   does not have. Do not port it as written.
+2. `AIR-FND-DET-09` is assertable: `deletionProtectionEnabled` *is* a `DescribeLogGroups` member, so
+   `CONTRIBUTION-PROGRAM.md` section 8 is wrong to list it as mis-specified.
+
+Three AISF controls are flagged `machine_checkable` in the ledger but are not checkable from
+configuration: `AIR-BDR-KB-05` and `KB-08` depend on customer Lambda code, and `AIR-BDR-MDL-08`
+needs a published-versus-DRAFT distinction `GetPrompt` does not return. With `AIR-SGM-EP-03` that is
+4 of 105. The 105 figure is a ledger claim, not an implementability claim.
+
+### 4.5 One published check cannot fire
+
+`BR-14` is in the published 208 and has no live call site. Its sole invocation
+(`bedrock_assessments/app.py:7983-7986`) is commented out; a repo-wide grep for
+`check_stale_bedrock_access` returns only the definition at `:723`, an error-log string at `:896`,
+and that commented call. This matters for the port in one specific way: an AISF stale-access control
+has no working incumbent to dedup against, so it should be treated as net new even though a
+same-named check exists.
 
 ## 5. Constraints, measured
 
@@ -223,6 +315,18 @@ yields a partial report rather than a failure.
 `Informational`, never `Failed`. A missing IAM grant is therefore indistinguishable from
 "no resources found" (`AGENTS.md:94-99`). Every new check inherits this, so the IAM grant must be
 added in the same change or the check silently reports nothing.
+
+**Nine new IAM service prefixes for the unhosted 38.** `template.yaml` grants exactly 28 service
+prefixes across 158 action entries, with no wildcard action anywhere and 37 statements scoped to
+`Resource: "*"`. The 38 unhosted controls span 26 prefixes, of which 17 are already granted and
+**9 are not**: `backup`, `cognito-idp`, `ecs`, `eks`, `elasticloadbalancing`, `iot`,
+`network-firewall`, `route53resolver`, `secretsmanager`. Each needs a statement on the right role in
+both SAM templates, since grants are per-function and not shared.
+
+`kms` is the trap in that list, because it looks already granted. Only `kms:DescribeKey` is granted
+(`template.yaml:409`, scoped to `key/*` in-account), so `AIR-FND-DAT-10`, which reads key policies,
+needs a new action even though `kms` is in the union. `AIR-FND-DAT-01` resolving a key to
+customer-managed is covered by the existing grant.
 
 **Step Functions payload, unresolved.** Three handlers return the full findings list inline
 (`bedrock_assessments/app.py:8286`, `sagemaker_assessments/app.py:5029`,
@@ -284,6 +388,12 @@ Per-check obligations for phases 3 to 5, from the traced BR-37 example: the chec
 least 4 tests per `docs/DEVELOPER_GUIDE.md:610-638`, and the doc count lockstep at `AGENTS.md:147`.
 No ASL change is needed for a check inside an existing module.
 
+One id-allocation trap. `docs/DEVELOPER_GUIDE.md:739` offers `AG-33` as an example of a new check id,
+but `AG-33` is already taken: it is `AR-03`'s lens row (`agent_registry_assessments/app.py:93`). AG
+ids run `AG-01` through `AG-38` with no gaps, so the next free one is `AG-39`. The line is an example
+inside verification instructions and not an allocation register, so it is a stale example rather than
+a wrong rule, but a contributor who copies it collides.
+
 The count lockstep has 9 live "208" claims: `README.md:9,56,101,139,640`, `AGENTS.md:7`,
 `docs/SECURITY_CHECKS.md:3` and `:7`, `docs/SECURITY_CHECKS_RESPONSIBLE_AI_GRC.md:218`. Six section
 headings in `docs/SECURITY_CHECKS.md` carry their own counts and double as URL anchors
@@ -296,11 +406,22 @@ These change the work materially and are yours to make.
 1. **Scope of the 38 unhosted controls.** Port them (phase 6, a new module), or declare FND/SLF/PHY
    out of scope for this repo and ship 67 of 105. Shipping 67 is defensible and much cheaper; it
    should then be stated as 67, not as "all machine-verifiable checks."
+
+   One fact sharpens this: **30 of the 38 call no Bedrock, SageMaker, or AgentCore API at all.** They
+   read Organizations policy documents, IAM policy documents, S3, and CloudWatch. That is generic
+   account posture, which is a reasonable thing for an AI/ML assessment tool to decline. It also
+   means they do not need an AI host module, so if you do want them, they can go wherever the service
+   already lives. The 8 that do touch an AI service are `FND-DAT-01/02/03`, `FND-DET-01/04`,
+   `FND-IAM-05`, `FND-NET-01`, `FND-NET-06`. A middle option: port those 8, decline the other 30, and
+   ship 75 of 105.
 2. **Prefix.** `AI-` is recommended. Confirm, or pick another 2-character prefix.
 3. **Whether to touch the frozen baseline** in phase 2. Tagging existing FS rows with AISF rewrites
    66 frozen tuples. The alternative is to tag only non-FS checks, leaving the FinServ module alone.
-4. **The 22 workload-specific controls.** Port only those reusing an existing parameter, or accept
-   roughly 13 files of plumbing per new parameter.
+4. **The 22 workload-specific controls.** 20 of the 22 reduce to a flat list of strings, a small map,
+   or an integer, so the existing deploy-time parameter pattern covers them. Only one incumbent check
+   (SM-30) uses that pattern as an allow-list today, so this is 20 new parameters at roughly 13 files
+   each, not a reuse. Recommend picking the subset by value, not porting all 20. `FND-IAM-09` and
+   `SLF-CMP-08` should be declared manual per section 4.3.
 5. **Whether to measure the Step Functions payload ceiling first.** Recommended before phase 4,
    which is the largest single batch at 37 checks.
 
@@ -313,6 +434,17 @@ Stated so these are not read as settled:
 - The report Lambda's memory ceiling at scale. It is `MemorySize: 1024` with a 600 s timeout
   (`template.yaml:238-239`) and reads every CSV into memory. No test asserts its footprint, unlike
   the FinServ module.
-- The per-control AWS API mapping for the 105 controls, and the dedup against the 208 checks already
-  shipped here. Two inventory passes were still running when this draft was written. Section 4.1 is
-  a count-level plan; it does not yet prove that no proposed check duplicates an existing one.
+- The ACR dedup, 37 of the 105. BDR and SGM are done per control in section 4.4 and reconcile
+  exactly; ACR is still count-level. Until it lands, the total net-new figure is unknown, and the
+  BDR and SGM pattern (9 of 30 net new) should not be extrapolated onto it.
+- Assertion sufficiency of the API mapping. 42 of the API strings across the 83 workload-agnostic
+  controls were derived from the control's classification basis rather than read from an artifact
+  `check_api` field. Those name the right service and the APIs exist; whether each is sufficient to
+  implement its control was not checked.
+- Three API details behind specific controls: `bedrock:InvokeGuardrailChecks` as an IAM action name,
+  `AWS::BedrockAgentCore::Memory` as a CloudTrail resource type (the AISF artifact itself says
+  "confirm exact type string"), and the `bedrock ListInferenceProfiles` response shape.
+- IAM grants were read in `template.yaml` only. `template-multi-account.yaml` was not diffed against
+  it, so the grant set on the multi-account path needs separate confirmation before phase 6.
+- Whether any real estate crosses the Step Functions 256 KB state-payload quota, repeated from above
+  because it is the one unmeasured item that could force rework rather than just more work.
