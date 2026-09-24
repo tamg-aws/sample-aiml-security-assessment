@@ -552,6 +552,71 @@ class TestMultiLegAggregation(unittest.TestCase):
         self.assertNotEqual(row["Status"], "Passed")
 
 
+class TestSeveralFindingsPerSourceCheck(unittest.TestCase):
+    """One incumbent check emits one finding per resource, so a leg holds many.
+
+    Measured against a real account: 16 findings for `AG-24` and 11 across the
+    `SM-09`/`SM-01`/`SM-03` leg in a single account and region. Every case here
+    puts the `Failed` row FIRST, because a fixture in `Passed`-then-`Failed`
+    order cannot tell the aggregation from a collapse that keeps the last row.
+    """
+
+    def _aisf05(self, statuses):
+        rows = aisf_mappings.derive_aisf_findings(
+            [_source_row("BR-20", status) for status in statuses]
+        )
+        return _derived_by_id(rows)["AISF-05"]
+
+    def test_a_failed_finding_before_a_passed_one_is_failed(self):
+        self.assertEqual(self._aisf05(["Failed", "Passed"])["Status"], "Failed")
+
+    def test_a_failed_finding_after_a_passed_one_is_also_failed(self):
+        """Order-independent, so neither direction of collapse can pass."""
+        self.assertEqual(self._aisf05(["Passed", "Failed"])["Status"], "Failed")
+
+    def test_the_live_br20_emission_order_does_not_publish_a_pass(self):
+        """BR-20 emits its per-resource rows, then one summary `Passed` LAST.
+
+        Nine `Failed` knowledge bases, one unassessable, then the summary row:
+        the shape the check produced against ACCOUNT_ID/us-east-1.
+        """
+        row = self._aisf05(["Failed"] * 9 + ["N/A", "Passed"])
+        self.assertEqual(row["Status"], "Failed")
+        self.assertEqual(row["Severity"], "High")
+
+    def test_every_finding_passed_is_still_a_pass(self):
+        self.assertEqual(self._aisf05(["Passed"] * 3)["Status"], "Passed")
+
+    def test_one_leg_of_a_multi_leg_control_carries_several_findings(self):
+        rows = aisf_mappings.derive_aisf_findings(
+            [
+                _source_row("SM-09", "Failed"),
+                _source_row("SM-09", "Passed"),
+                _source_row("SM-01", "Passed"),
+                _source_row("SM-03", "Passed"),
+            ]
+        )
+        self.assertEqual(_derived_by_id(rows)["AISF-08"]["Status"], "Failed")
+
+    def test_the_details_count_the_findings_behind_the_verdict(self):
+        details = self._aisf05(["Failed", "Passed", "Failed"])["Finding_Details"]
+        self.assertIn("BR-20 (3 findings: 2 Failed, 1 Passed)", details)
+        # A list held per check id reaches this field as a repr if it is
+        # formatted straight into the sentence, which ships to the reader.
+        self.assertNotIn("[", details)
+
+    def test_a_single_finding_still_reads_as_one_verdict(self):
+        details = self._aisf05(["Failed"])["Finding_Details"]
+        self.assertIn("BR-20 (Failed)", details)
+        self.assertNotIn("1 findings", details)
+
+    def test_the_breakdown_does_not_depend_on_the_row_order(self):
+        first = self._aisf05(["Failed", "N/A", "Passed"])["Finding_Details"]
+        second = self._aisf05(["Passed", "Failed", "N/A"])["Finding_Details"]
+        self.assertEqual(first, second)
+        self.assertIn("BR-20 (3 findings: 1 Failed, 1 Passed, 1 N/A)", first)
+
+
 class TestNotApplicableSeverity(unittest.TestCase):
     def test_no_na_row_carries_a_scored_severity(self):
         # One AISF-relevant source present, so every other mapping is absent

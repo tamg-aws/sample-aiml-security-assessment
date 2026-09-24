@@ -214,6 +214,39 @@ def _collapse_note(risk: str, status: str) -> str:
     return note
 
 
+def _legs_txt(present: Dict[str, List[str]], have: List[str]) -> str:
+    """Name each present leg with its verdicts, multiplicity included.
+
+    One incumbent check emits one finding per resource, so a leg routinely holds
+    several statuses for one account and region: 16 for `AG-24` and 11 for the
+    `SM-09`/`SM-01`/`SM-03` leg in one account and region, measured against a
+    real account. Quoting one status per leg would credit a Failed resource to
+    whichever verdict happened to be listed last, and the derived status is
+    aggregated over all of them, so the sentence that explains the status has to
+    show the same population.
+    """
+    order = {"failed": 0, "passed": 1, "n/a": 2}
+    parts = []
+    for cid in have:
+        statuses = present[cid]
+        if len(statuses) == 1:
+            parts.append(f"{cid} ({statuses[0]})")
+            continue
+        counts: Dict[str, int] = {}
+        for status in statuses:
+            counts[status] = counts.get(status, 0) + 1
+        # Sorted by verdict, not by the order the rows arrived in, so the same
+        # findings in a different CSV order produce the same sentence.
+        breakdown = ", ".join(
+            f"{n} {s or 'blank'}"
+            for s, n in sorted(
+                counts.items(), key=lambda kv: (order.get(kv[0].lower(), 3), kv[0])
+            )
+        )
+        parts.append(f"{cid} ({len(statuses)} findings: {breakdown})")
+    return ", ".join(parts)
+
+
 def _aggregate_status(statuses: List[str]) -> str:
     """Failed if any leg failed; Passed only if every leg passed; else N/A."""
     lowered = [s.lower() for s in statuses]
@@ -272,15 +305,22 @@ def derive_aisf_findings(source_rows: List[Dict[str, Any]]) -> List[Dict[str, st
     row drops only itself.
     """
     relevant = _source_check_ids()
-    # (account_id, region) -> {source check id: status}
-    legs: Dict[tuple, Dict[str, str]] = {}
+    # (account_id, region) -> {source check id: [status per source finding]}
+    # A list, not a status: an incumbent check emits one finding per resource, so
+    # one check id contributes several statuses to one key. Keeping only the last
+    # one published a Passed for a key that held a Failed resource whenever the
+    # check emitted its summary Passed row after its per-resource rows, which is
+    # the order BR-20 emits in.
+    legs: Dict[tuple, Dict[str, List[str]]] = {}
     for raw in source_rows:
         try:
             row = _normalise(raw)
             if row["check_id"].upper() not in relevant:
                 continue
             key = (row["account_id"], row["region"])
-            legs.setdefault(key, {})[row["check_id"].upper()] = row["status"]
+            legs.setdefault(key, {}).setdefault(row["check_id"].upper(), []).append(
+                row["status"]
+            )
         except Exception as e:
             logger.warning(f"AISF: skipping unreadable source row: {e}")
             continue
@@ -303,7 +343,7 @@ def derive_aisf_findings(source_rows: List[Dict[str, Any]]) -> List[Dict[str, st
                         f"sources {', '.join(sources)})"
                     )
                     continue
-                legs_txt = ", ".join(f"{cid} ({present[cid]})" for cid in have)
+                legs_txt = _legs_txt(present, have)
                 if missing:
                     status = "N/A"
                     details = (
@@ -313,7 +353,9 @@ def derive_aisf_findings(source_rows: List[Dict[str, Any]]) -> List[Dict[str, st
                         "incomplete, so no verdict is asserted for this control."
                     )
                 else:
-                    status = _aggregate_status([present[cid] for cid in have])
+                    status = _aggregate_status(
+                        [s for cid in have for s in present[cid]]
+                    )
                     details = (
                         f"AISF control {mapping['control']}. Derived from "
                         f"{legs_txt}. This row restates existing check verdicts "

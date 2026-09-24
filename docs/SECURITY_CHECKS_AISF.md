@@ -77,6 +77,13 @@ omits the key.
 | some source checks present for the account and region, others absent | `N/A`, `Informational`, naming the absent `Check_ID`s |
 | no source check for the control present at all | no `AISF-` row for that control; the absence is reported once per account and region by `AISF-00` |
 
+A source check emits one finding per resource, so a leg normally carries several
+verdicts for one account and region. All of them are aggregated, and
+`Finding_Details` names the count per leg (`BR-20 (10 findings: 9 Failed, 1
+Passed)`), so a failing resource cannot be hidden behind a later `Passed` row
+from the same check. BR-20 emits its summary `Passed` row after its per-resource
+rows, which is the order that made this concrete.
+
 `AISF-00` is a report-completeness marker, not an AISF control. It lists every
 derived control that had no source check for that account and region, so an
 incomplete scan reads as unassessed instead of silently omitting rows.

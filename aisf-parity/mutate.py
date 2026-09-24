@@ -117,6 +117,20 @@ MUTATIONS = [
         "            policy_unreadable = error_code\n",
     },
     {
+        "name": "source findings collapsed to one status per check id",
+        "file": MAPPINGS,
+        "defect": "a check's findings overwrite each other, so a Failed resource "
+        "followed by the check's summary Passed row publishes Passed -- BR-20 "
+        "emits in exactly that order, and one account showed 16 findings on a "
+        "single leg",
+        "find": "            legs.setdefault(key, {})."
+        'setdefault(row["check_id"].upper(), []).append(\n'
+        '                row["status"]\n'
+        "            )\n",
+        "replace": "            legs.setdefault(key, {})["
+        'row["check_id"].upper()] = [row["status"]]\n',
+    },
+    {
         "name": "ledger markdown renders a figure from the wrong summary key",
         "file": BUILD_LEDGER,
         "defect": "the generated markdown reports the total control count where "
