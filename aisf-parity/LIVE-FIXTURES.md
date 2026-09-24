@@ -5,8 +5,16 @@ reaches both a Passed and a Failed verdict against a real account. Two rows coul
 not reach both from the account's standing resources, so two fixtures exist
 purely to exercise the missing branch.
 
-Account **ACCOUNT_ID**, region **us-east-1**. Every resource below is tagged
+Account **ACCOUNT_ID**, region **us-east-1**. The id is redacted because this file
+ships in a public fork; the profile in the commands below resolves it. Every resource
+is named with the `aisflive` prefix and tagged
 `purpose=aisf-live-verifiability-fixture` and `temporary=true`.
+
+Do not use a tag query as the teardown inventory. Measured against the standing
+fixtures, `resourcegroupstaggingapi get-resources --tag-filters
+Key=purpose,Values=aisf-live-verifiability-fixture` returns two of them, the KMS key
+and the knowledge base, and none of the vector bucket, the vector index, the gateway,
+or the IAM roles. The lists below are the inventory.
 
 The gate is not part of `gate_all.sh`. It needs AWS credentials, and it measures
 an account rather than this tree, so a green battery says nothing about it. Run it
@@ -24,9 +32,9 @@ aisf-parity/probe_live.py --selftest    # 11 classifier cases, no credentials ne
 | AISF-01 | AG-24 | `elif authorizer_type == "AUTHENTICATE_ONLY"` → Failed (`agentcore_assessments/app.py:3617-3619`) | ONE_ONLY. All 15 standing gateways are `AWS_IAM` or `CUSTOM_JWT`, so only Passed fires. |
 | AISF-05 | BR-20 | the S3 Vectors Passed path: `aws:kms` + `kmsKeyArn` **and** an attached bucket policy | ONE_ONLY. All 9 standing knowledge bases sit on `AES256` vector buckets with no bucket policy, so only Failed fires. |
 
-Measured at `d7c3baa` with both fixtures in place: BOTH=4, ONE_ONLY=4, NONE=0,
-VACUOUS=0, exit 0. The four remaining ONE_ONLY rows are excused by construction,
-not by a waiver — see the last section.
+Measured at `f65f948` with both fixtures in place: BOTH=4, ONE_ONLY=4, NONE=0,
+VACUOUS=0, exit 0, over 19 legs. The four remaining ONE_ONLY rows are excused by
+construction and not by a waiver. The last section says why for each one.
 
 ## AISF-01: an AUTHENTICATE_ONLY gateway
 
