@@ -574,11 +574,14 @@ class TestSeveralFindingsPerSourceCheck(unittest.TestCase):
         """Order-independent, so neither direction of collapse can pass."""
         self.assertEqual(self._aisf05(["Passed", "Failed"])["Status"], "Failed")
 
-    def test_the_live_br20_emission_order_does_not_publish_a_pass(self):
-        """BR-20 emits its per-resource rows, then one summary `Passed` LAST.
+    def test_a_trailing_summary_pass_after_failures_and_an_na_is_failed(self):
+        """A long `Failed` run, an unassessable row, then a trailing `Passed`.
 
-        Nine `Failed` knowledge bases, one unassessable, then the summary row:
-        the shape the check produced against ACCOUNT_ID/us-east-1.
+        The shape that defeats a consumer keeping one status per check id: the
+        aggregate has to read the whole run and not the last row. An `N/A`
+        between them must not end the run either. What shape a given account
+        actually produces is measured in `aisf-parity/LIVE-FIXTURES.md`, not
+        claimed here, and it has already changed once.
         """
         row = self._aisf05(["Failed"] * 9 + ["N/A", "Passed"])
         self.assertEqual(row["Status"], "Failed")

@@ -100,8 +100,11 @@ MUTATIONS = [
         "name": "S3 Vectors CMK test accepts any sseType",
         "file": BEDROCK,
         "defect": "AES256 (SSE-S3) passes BR-20's encryption leg, so a vector "
-        "store on the service default key reports as customer-managed -- the "
-        "exact configuration the probed account runs on all 9 knowledge bases",
+        "store on the service default key reports as customer-managed. SSE-S3 is "
+        "the default for any vector bucket created without an "
+        "encryptionConfiguration, and S3 Vectors has no Put*Encryption operation "
+        "to fix one afterwards, so this mutation reports the rows a customer can "
+        "only remediate by re-ingesting as already compliant",
         "find": '    encryption_ok = encryption.get("sseType") == "aws:kms" '
         "and bool(kms_key_arn)\n",
         "replace": '    encryption_ok = bool(encryption.get("sseType"))\n',

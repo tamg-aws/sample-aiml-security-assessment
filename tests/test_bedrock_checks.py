@@ -2879,8 +2879,9 @@ class TestBR20S3VectorsStore:
     @patch("bedrock_app.boto3.client")
     def test_br20_s3_vectors_emits_one_row_per_knowledge_base(self, mock_client):
         # Three knowledge bases, three verdicts. A single summary row, or a loop
-        # that emitted only the first entry, would lose two of them -- and with
-        # 9 knowledge bases in the probed account, eight.
+        # that emitted only the first entry, would lose two of them, and the loss
+        # grows with the population. How many knowledge bases an account holds is
+        # measured in aisf-parity/LIVE-FIXTURES.md and is not claimed here.
         arns = {
             kb: f"arn:aws:s3vectors:us-east-1:123456789012:bucket/{kb}"
             for kb in ("kb1", "kb2", "kb3")
