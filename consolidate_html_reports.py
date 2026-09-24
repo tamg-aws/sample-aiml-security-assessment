@@ -232,7 +232,7 @@ def consolidate_html_reports():
                     print(f"Error parsing CSV file {csv_file}: {str(e)}")
                     continue
 
-    # AISF is a derived standard: no CSV carries an AI-* row, so restate the
+    # AISF is a derived standard: no CSV carries an AISF-* row, so restate the
     # verdicts gathered above under AISF control ids once every account has been
     # read. derive_aisf_findings accepts either key casing, which matters here
     # because the rows built above are lowercase-keyed while the Lambda hands it

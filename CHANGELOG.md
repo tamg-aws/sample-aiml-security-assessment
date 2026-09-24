@@ -14,25 +14,25 @@ section.
 
 - Added an **AWS AI Security Framework (AISF)** section to the HTML report,
   alongside OWASP Top 10 for LLM under "By Compliance Standard". It reports 8
-  of the 78 in-scope AISF controls as `AI-01` through `AI-08`. Behavior worth
-  knowing:
+  of the 78 in-scope AISF controls as `AISF-01` through `AISF-08`. Behavior
+  worth knowing:
   - The section is always on. It needs no deployment parameter, runs no
     additional AWS API calls, and adds no scan time, because each row restates
     the verdict of a check that already ran under an AISF control id.
-  - `AI-` rows are excluded from the 208-check catalog total, from the report
+  - `AISF-` rows are excluded from the 208-check catalog total, from the report
     pass rate, and from Open Action Items, for the same reason OWASP-mapped
     rows are: the underlying check is already counted.
-  - `AI-08` aggregates three SageMaker checks (`SM-09`, `SM-01`, `SM-03`). It
+  - `AISF-08` aggregates three SageMaker checks (`SM-09`, `SM-01`, `SM-03`). It
     reports `Passed` only when all three passed, `Failed` when any failed, and
     `N/A` naming the absent checks when coverage is incomplete.
-  - An informational `AI-00` row appears per account and region where
+  - An informational `AISF-00` row appears per account and region where
     AISF-relevant checks ran but a mapped source check was absent, so partial
     coverage reads as unassessed instead of compliant.
   - Severity comes from the AISF control's own risk band. The three controls
-    AISF rates `critical` (`AI-01`, `AI-03`, `AI-04`) report as `High`, because
-    this framework has four severity levels and no `Critical`; each of their
-    rows states the pre-collapse risk in `Finding_Details`, so the downgrade is
-    visible in the finding and not only in the methodology.
+    AISF rates `critical` (`AISF-01`, `AISF-03`, `AISF-04`) report as `High`,
+    because this framework has four severity levels and no `Critical`; each of
+    their rows states the pre-collapse risk in `Finding_Details`, so the
+    downgrade is visible in the finding and not only in the methodology.
   - The mappings are preliminary and illustrative. Validate them with your
     security and compliance team before using a row as audit evidence.
     `docs/SECURITY_CHECKS_AISF.md` documents every row and its source checks.

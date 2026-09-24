@@ -1,4 +1,4 @@
-"""AISF framework view: derive `AI-*` rows from check verdicts that already ship.
+"""AISF framework view: derive `AISF-*` rows from check verdicts that already ship.
 
 The AWS AI Security Framework (AISF) is registered in
 `report_template.COMPLIANCE_STANDARDS` as a **derived** standard. No Lambda runs
@@ -16,9 +16,9 @@ AISF control id would publish a false pass. `aisf-parity/check_ledger.py`
 gate 11 fails if that happens.
 
 **Ids are allocated once and never renumbered.** `AISF_DERIVED_MAP` is
-append-only: a new control takes the next free `AI-` number. Reusing or
+append-only: a new control takes the next free `AISF-` number. Reusing or
 resequencing an id silently rewrites the meaning of every archived report and
-CSV that already carries it. `AI-00` is reserved for the coverage marker row
+CSV that already carries it. `AISF-00` is reserved for the coverage marker row
 emitted by `derive_aisf_findings()` and must never be allocated to a control.
 
 The control text (risk, severity, resolution, reference) is baked into the literal
@@ -39,13 +39,13 @@ logger = logging.getLogger(__name__)
 AISF_SERVICE_SLUG = "aisf"
 
 # Reserved for the coverage marker row (the `OW-00` analogue). Never a control.
-AISF_COVERAGE_CHECK_ID = "AI-00"
+AISF_COVERAGE_CHECK_ID = "AISF-00"
 
 # Severity comes from the AISF control's own `risk` field, NOT from the source
 # check's severity. This deviates from OWASP, which inherits the source row's
-# severity (AGENTS.md:132). The deviation is deliberate: an `AI-` row is a
+# severity (AGENTS.md:132). The deviation is deliberate: an `AISF-` row is a
 # verdict on an AISF control, and the severity of one incumbent check is not
-# that control's risk rating. AI-08 makes the difference concrete: it derives
+# that control's risk rating. AISF-08 makes the difference concrete: it derives
 # from three source checks whose own severities differ, so there is no single
 # source severity to inherit.
 #
@@ -88,7 +88,7 @@ NA_SEVERITY = "Informational"
 # Append-only. See the module docstring: ids are allocated once, never renumbered.
 AISF_DERIVED_MAP: List[Dict[str, Any]] = [
     {
-        "check_id": "AI-01",
+        "check_id": "AISF-01",
         "control": "AIR-ACR-GW-01",
         # ledger verdict: covered. incumbents: AG-24
         "sources": ["AG-24"],
@@ -99,7 +99,7 @@ AISF_DERIVED_MAP: List[Dict[str, Any]] = [
         "reference": "https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/gateway-inbound-auth.html",
     },
     {
-        "check_id": "AI-02",
+        "check_id": "AISF-02",
         "control": "AIR-ACR-RT-09",
         # ledger verdict: covered. incumbents: AC-06
         "sources": ["AC-06"],
@@ -110,7 +110,7 @@ AISF_DERIVED_MAP: List[Dict[str, Any]] = [
         "reference": "https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/browser-session-recording.html",
     },
     {
-        "check_id": "AI-03",
+        "check_id": "AISF-03",
         "control": "AIR-BDR-GRD-01",
         # ledger verdict: covered. incumbents: BR-10
         "sources": ["BR-10"],
@@ -121,7 +121,7 @@ AISF_DERIVED_MAP: List[Dict[str, Any]] = [
         "reference": "https://docs.aws.amazon.com/bedrock/latest/userguide/guardrails-permissions-id.html",
     },
     {
-        "check_id": "AI-04",
+        "check_id": "AISF-04",
         "control": "AIR-BDR-GRD-03",
         # ledger verdict: covered. incumbents: BR-26
         "sources": ["BR-26"],
@@ -132,7 +132,7 @@ AISF_DERIVED_MAP: List[Dict[str, Any]] = [
         "reference": "https://docs.aws.amazon.com/bedrock/latest/userguide/guardrails-sensitive-filters.html",
     },
     {
-        "check_id": "AI-05",
+        "check_id": "AISF-05",
         "control": "AIR-BDR-KB-03",
         # ledger verdict: covered. incumbents: BR-20
         "sources": ["BR-20"],
@@ -143,7 +143,7 @@ AISF_DERIVED_MAP: List[Dict[str, Any]] = [
         "reference": "https://docs.aws.amazon.com/bedrock/latest/userguide/encryption-kb.html",
     },
     {
-        "check_id": "AI-06",
+        "check_id": "AISF-06",
         "control": "AIR-BDR-MDL-10",
         # ledger verdict: covered. incumbents: BR-37
         "sources": ["BR-37"],
@@ -154,7 +154,7 @@ AISF_DERIVED_MAP: List[Dict[str, Any]] = [
         "reference": "https://docs.aws.amazon.com/bedrock/latest/userguide/data-retention.html",
     },
     {
-        "check_id": "AI-07",
+        "check_id": "AISF-07",
         "control": "AIR-SGM-EP-08",
         # ledger verdict: covered. incumbents: SM-18
         "sources": ["SM-18"],
@@ -165,7 +165,7 @@ AISF_DERIVED_MAP: List[Dict[str, Any]] = [
         "reference": "https://docs.aws.amazon.com/sagemaker/latest/dg/batch-vpc.html",
     },
     {
-        "check_id": "AI-08",
+        "check_id": "AISF-08",
         "control": "AIR-SGM-TRN-05",
         # ledger verdict: covered. incumbents: SM-09, SM-01, SM-03
         "sources": ["SM-09", "SM-01", "SM-03"],
@@ -257,7 +257,7 @@ def _row(
 
 
 def derive_aisf_findings(source_rows: List[Dict[str, Any]]) -> List[Dict[str, str]]:
-    """Restate incumbent verdicts as `AI-` rows, one per control per join key.
+    """Restate incumbent verdicts as `AISF-` rows, one per control per join key.
 
     The join key is `(Account_ID, Region)`. All ten source checks are regional
     (none is tagged with the `Global` sentinel), so a control's legs share a key.
@@ -295,7 +295,7 @@ def derive_aisf_findings(source_rows: List[Dict[str, Any]]) -> List[Dict[str, st
                 missing = [cid for cid in sources if cid not in present]
                 if not have:
                     # No leg at all for this key. Reported once per key by the
-                    # AI-00 row below rather than as a per-control N/A, so an
+                    # AISF-00 row below rather than as a per-control N/A, so an
                     # account that never ran a service does not get a wall of
                     # rows for controls that were never in play.
                     absent_controls.append(

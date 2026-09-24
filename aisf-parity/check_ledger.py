@@ -448,7 +448,7 @@ def main():
     figures = scope_figures((aisf_entry or {}).get("scope_text", ""))
     with open(AISF_DOC) as f:
         doc_figures = scope_figures(f.read())
-    # AI-00 is the coverage marker row, never a control, so it is not in the map
+    # AISF-00 is the coverage marker row, never a control, so it is not in the map
     # and must not be counted among the derivable controls.
     allocated = [m["check_id"] for m in AISF_DERIVED_MAP]
     if AISF_COVERAGE_CHECK_ID in allocated:
@@ -488,6 +488,35 @@ def main():
         f"{len(figures)} figures in the report section + "
         f"{len(doc_figures)} in SECURITY_CHECKS_AISF.md checked, "
         f"figures={figures}" + (f", drift={drift}" if drift else ""),
+    )
+
+    # ---- gate 13: the published id shape. Every id carries the registered prefix
+    # and is documented. The prefix is four letters where every producing prefix is
+    # two, so an id spelled with a different prefix length still looks plausible;
+    # what it actually does is route to `else: service = "bedrock"` in both
+    # consolidators, filing the row under Bedrock with no error anywhere. The doc
+    # leg is here because a rename that misses the catalog leaves a published id
+    # undocumented, which is the same evidence gap as an unregistered prefix.
+    registered_prefix = (aisf_entry or {}).get("prefix", "")
+    with open(AISF_DOC) as f:
+        aisf_doc_text = f.read()
+    shape = []
+    all_ids = [m["check_id"] for m in AISF_DERIVED_MAP] + [AISF_COVERAGE_CHECK_ID]
+    if registered_prefix != "AISF-":
+        shape.append(f"registry prefix is {registered_prefix!r}, not 'AISF-'")
+    for cid in all_ids:
+        if not re.fullmatch(r"AISF-\d{2}", cid):
+            shape.append(f"{cid} does not match ^AISF-\\d{{2}}$")
+        if not cid.startswith(registered_prefix):
+            shape.append(f"{cid} does not carry the registered prefix")
+        if cid not in aisf_doc_text:
+            shape.append(f"{cid} is not documented in SECURITY_CHECKS_AISF.md")
+    gate(
+        "every derived id has the published AISF- shape",
+        not shape,
+        f"{len(all_ids)} ids ({len(AISF_DERIVED_MAP)} mapped + the coverage marker) "
+        f"x 3 legs (^AISF-\\d{{2}}$, registered prefix {registered_prefix!r}, "
+        "documented) checked" + (f", bad={shape}" if shape else ""),
     )
 
     failed = [n for n, ok, _ in results if not ok]

@@ -57,6 +57,10 @@ SAM_TEMPLATE = os.path.join(REPO_ROOT, "aiml-security-assessment", "template.yam
 # per-service branches before the registry is consulted.
 LIVE_CHECK_PREFIXES = {"AC", "AG", "AR", "BR", "FS", "SM"}
 
+# The published id shape. Four letters, where every producing prefix has two:
+# see test_the_report_layer_does_not_validate_check_id for why that is legal.
+AISF_ID_PATTERN = r"^AISF-\d{2}$"
+
 REQUIRED_REGISTRY_KEYS = {
     "slug",
     "name",
@@ -165,13 +169,13 @@ class TestRegistryEntry(unittest.TestCase):
             set(entry), REQUIRED_REGISTRY_KEYS | {"derived"}, msg=sorted(entry)
         )
         self.assertIs(entry["derived"], True)
-        self.assertEqual(entry["prefix"], "AI-")
+        self.assertEqual(entry["prefix"], "AISF-")
         self.assertEqual(entry["name"], "AWS AI Security Framework")
         self.assertEqual(entry["section_title"], "AWS AI Security Framework Findings")
 
     def test_prefix_does_not_collide_with_a_live_check_prefix(self):
         prefix = _entry("aisf")["prefix"].rstrip("-").upper()
-        self.assertEqual(prefix, "AI")
+        self.assertEqual(prefix, "AISF")
         self.assertNotIn(prefix, LIVE_CHECK_PREFIXES)
         # AC-06 and AG-24 are AISF sources and both start with "A": the routing
         # branches compare the full prefix, not the first letter.
@@ -214,7 +218,46 @@ class TestRegistryEntry(unittest.TestCase):
         self.assertEqual(len(ids), len(set(ids)))
         self.assertNotIn(aisf_mappings.AISF_COVERAGE_CHECK_ID, ids)
         for check_id in ids:
-            self.assertRegex(check_id, r"^AI-\d{2}$")
+            self.assertRegex(check_id, AISF_ID_PATTERN)
+
+    def test_every_id_including_the_coverage_marker_has_the_aisf_shape(self):
+        """The published id shape, and the pre-release spelling it replaced.
+
+        The ids were renamed before the first push, so the two-letter spelling
+        has never been published. The negative assertion holds the rename: it
+        reddens if any id reverts to it.
+        """
+        ids = [m["check_id"] for m in aisf_mappings.AISF_DERIVED_MAP]
+        ids.append(aisf_mappings.AISF_COVERAGE_CHECK_ID)
+        self.assertEqual(len(ids), 9)
+        for check_id in ids:
+            self.assertRegex(check_id, AISF_ID_PATTERN)
+            self.assertTrue(check_id.startswith(_entry("aisf")["prefix"]), check_id)
+        self.assertNotRegex("AI-05", AISF_ID_PATTERN)
+
+    def test_the_report_layer_does_not_validate_check_id(self):
+        """Why a 4-letter prefix is safe here.
+
+        Every assessment Lambda validates `Check_ID` against
+        `^[A-Z]{2,3}-\\d{2}$`, which `AISF-01` does not satisfy. Derived rows
+        never reach one: they are built in the report layer, whose `Finding`
+        model has no `Check_ID` field at all. If that changes, the regex has to
+        be widened in the same change.
+        """
+        report_schema = _load_module(
+            "aisf_report_schema", os.path.join(REPORT_APP_DIR, "schema.py")
+        )
+        self.assertNotIn("Check_ID", report_schema.Finding.model_fields)
+        with self.assertRaises(ValueError):
+            severity_schema.create_finding(
+                check_id=aisf_mappings.AISF_DERIVED_MAP[0]["check_id"],
+                finding_name="Test",
+                finding_details="Details",
+                resolution="Fix",
+                reference="https://docs.aws.amazon.com/test",
+                severity="Low",
+                status="Passed",
+            )
 
 
 class TestSectionRendering(unittest.TestCase):
@@ -284,7 +327,7 @@ class TestSectionRendering(unittest.TestCase):
             for r in aisf_mappings.derive_aisf_findings(
                 [_source_row("BR-10", "Failed")]
             )
-            if r["Check_ID"] == "AI-03"
+            if r["Check_ID"] == "AISF-03"
         ]
         self.assertEqual(len(derived), 1)
         kwargs["all_findings"] = [direct, *derived]
@@ -322,7 +365,7 @@ class TestDerivedRowShape(unittest.TestCase):
                 ]
             )
         )
-        details = rows["AI-08"]["Finding_Details"]
+        details = rows["AISF-08"]["Finding_Details"]
         self.assertIn("AIR-SGM-TRN-05", details)
         for source in ("SM-09", "SM-01", "SM-03"):
             self.assertIn(source, details)
@@ -331,22 +374,22 @@ class TestDerivedRowShape(unittest.TestCase):
         rows = _derived_by_id(
             aisf_mappings.derive_aisf_findings([_source_row("BR-10")])
         )
-        self.assertIn("AIR-BDR-GRD-01", rows["AI-03"]["Finding"])
-        self.assertNotIn("incumbent", rows["AI-03"]["Finding"])
+        self.assertIn("AIR-BDR-GRD-01", rows["AISF-03"]["Finding"])
+        self.assertNotIn("incumbent", rows["AISF-03"]["Finding"])
 
     def test_severity_comes_from_the_control_not_the_source_row(self):
-        """BR-20's own severity is irrelevant: AI-05 carries AISF's risk band."""
+        """BR-20's own severity is irrelevant: AISF-05 carries AISF's risk band."""
         expected = next(
             m["severity"]
             for m in aisf_mappings.AISF_DERIVED_MAP
-            if m["check_id"] == "AI-05"
+            if m["check_id"] == "AISF-05"
         )
         rows = _derived_by_id(
             aisf_mappings.derive_aisf_findings(
                 [_source_row("BR-20", "Passed") | {"Severity": "Low"}]
             )
         )
-        self.assertEqual(rows["AI-05"]["Severity"], expected)
+        self.assertEqual(rows["AISF-05"]["Severity"], expected)
 
     def test_no_emitted_severity_is_outside_the_schema_enum(self):
         """Asserted on emitted rows, so a bug in the collapse is caught at output."""
@@ -383,7 +426,7 @@ class TestDerivedRowShape(unittest.TestCase):
         rows = aisf_mappings.derive_aisf_findings(
             [None, _source_row("BR-10", "Failed"), 42]
         )
-        self.assertIn("AI-03", _derived_by_id(rows))
+        self.assertIn("AISF-03", _derived_by_id(rows))
 
 
 class TestSeverityCollapseDisclosure(unittest.TestCase):
@@ -399,7 +442,7 @@ class TestSeverityCollapseDisclosure(unittest.TestCase):
     # Pinned deliberately. A fourth control in a renamed band also changes the
     # sentence in docs/SECURITY_CHECKS_AISF.md that names these three, so the
     # addition should fail here until that sentence is updated.
-    CRITICAL_IDS = {"AI-01", "AI-03", "AI-04"}
+    CRITICAL_IDS = {"AISF-01", "AISF-03", "AISF-04"}
 
     def _critical(self):
         return [m for m in aisf_mappings.AISF_DERIVED_MAP if m["risk"] == "critical"]
@@ -470,7 +513,7 @@ class TestSeverityCollapseDisclosure(unittest.TestCase):
 
 
 class TestMultiLegAggregation(unittest.TestCase):
-    """AI-08 is the only multi-leg mapping: SM-09, SM-01 and SM-03."""
+    """AISF-08 is the only multi-leg mapping: SM-09, SM-01 and SM-03."""
 
     LEGS = ("SM-09", "SM-01", "SM-03")
 
@@ -478,7 +521,7 @@ class TestMultiLegAggregation(unittest.TestCase):
         rows = aisf_mappings.derive_aisf_findings(
             [_source_row(cid, status) for cid, status in statuses.items()]
         )
-        return _derived_by_id(rows).get("AI-08")
+        return _derived_by_id(rows).get("AISF-08")
 
     def test_every_leg_passed_is_passed(self):
         row = self._ai08({cid: "Passed" for cid in self.LEGS})
@@ -499,7 +542,7 @@ class TestMultiLegAggregation(unittest.TestCase):
 
     def test_a_missing_leg_is_reported_not_dropped(self):
         row = self._ai08({"SM-09": "Passed", "SM-03": "Passed"})
-        self.assertIsNotNone(row, "AI-08 was dropped instead of reported as N/A")
+        self.assertIsNotNone(row, "AISF-08 was dropped instead of reported as N/A")
         self.assertEqual(row["Status"], "N/A")
         self.assertIn("SM-01", row["Finding_Details"])
         self.assertIn("SM-09", row["Finding_Details"])
@@ -512,7 +555,7 @@ class TestMultiLegAggregation(unittest.TestCase):
 class TestNotApplicableSeverity(unittest.TestCase):
     def test_no_na_row_carries_a_scored_severity(self):
         # One AISF-relevant source present, so every other mapping is absent
-        # and the coverage row plus a partial AI-08 are produced.
+        # and the coverage row plus a partial AISF-08 are produced.
         rows = aisf_mappings.derive_aisf_findings([_source_row("SM-09", "Passed")])
         na_rows = [r for r in rows if r["Status"] == "N/A"]
         self.assertTrue(na_rows)
@@ -532,7 +575,7 @@ class TestNotApplicableSeverity(unittest.TestCase):
         coverage = _derived_by_id(partial)[aisf_mappings.AISF_COVERAGE_CHECK_ID]
         self.assertEqual(coverage["Status"], "N/A")
         self.assertEqual(coverage["Severity"], "Informational")
-        self.assertIn("AI-08", coverage["Finding_Details"])
+        self.assertIn("AISF-08", coverage["Finding_Details"])
 
     def test_no_rows_at_all_when_no_source_check_is_aisf_relevant(self):
         rows = aisf_mappings.derive_aisf_findings(
@@ -547,7 +590,7 @@ class TestNotApplicableSeverity(unittest.TestCase):
                 _source_row("BR-10", "Failed", region="eu-west-1"),
             ]
         )
-        by_region = {r["Region"]: r for r in rows if r["Check_ID"] == "AI-03"}
+        by_region = {r["Region"]: r for r in rows if r["Check_ID"] == "AISF-03"}
         self.assertEqual(by_region["us-east-1"]["Status"], "Passed")
         self.assertEqual(by_region["eu-west-1"]["Status"], "Failed")
 
@@ -558,7 +601,7 @@ class TestNotApplicableSeverity(unittest.TestCase):
                 _source_row("BR-10", "Failed", account="444455556666"),
             ]
         )
-        by_account = {r["Account_ID"]: r for r in rows if r["Check_ID"] == "AI-03"}
+        by_account = {r["Account_ID"]: r for r in rows if r["Check_ID"] == "AISF-03"}
         self.assertEqual(by_account["111122223333"]["Status"], "Passed")
         self.assertEqual(by_account["444455556666"]["Status"], "Failed")
 
@@ -661,8 +704,8 @@ class TestSingleAccountRouting(unittest.TestCase):
             }
         )
         derived = _derived_by_id(captured["service_findings"]["aisf"])
-        self.assertEqual(derived["AI-03"]["Status"], "Failed")
-        self.assertEqual(derived["AI-05"]["Status"], "Passed")
+        self.assertEqual(derived["AISF-03"]["Status"], "Failed")
+        self.assertEqual(derived["AISF-05"]["Status"], "Passed")
         self.assertEqual(captured["service_stats"]["aisf"]["failed"], 1)
         self.assertEqual(captured["service_stats"]["aisf"]["passed"], 1)
         # And the source rows keep their own service.
@@ -672,17 +715,17 @@ class TestSingleAccountRouting(unittest.TestCase):
         )
 
     def test_an_ai_prefixed_csv_row_routes_to_aisf_not_the_csv_category(self):
-        """A stale or foreign artifact must not file AI-* under bedrock."""
+        """A stale or foreign artifact must not file AISF-* under bedrock."""
         captured = self._render(
             {
                 "account_id": "111122223333",
                 "bedrock": {
-                    "bedrock_security_report_exec_us-east-1": [_source_row("AI-01")]
+                    "bedrock_security_report_exec_us-east-1": [_source_row("AISF-01")]
                 },
             }
         )
         self.assertEqual(
-            {f["Check_ID"] for f in captured["service_findings"]["aisf"]}, {"AI-01"}
+            {f["Check_ID"] for f in captured["service_findings"]["aisf"]}, {"AISF-01"}
         )
         self.assertEqual(captured["service_findings"]["bedrock"], [])
 
@@ -702,7 +745,9 @@ class TestSingleAccountRouting(unittest.TestCase):
             }
         )
         ai_03 = [
-            f for f in captured["service_findings"]["aisf"] if f["Check_ID"] == "AI-03"
+            f
+            for f in captured["service_findings"]["aisf"]
+            if f["Check_ID"] == "AISF-03"
         ]
         self.assertEqual(len(ai_03), 1)
 
@@ -755,9 +800,9 @@ class TestMultiAccountConsolidator(unittest.TestCase):
         captured = self._consolidate()
 
         derived = _derived_by_id(captured["service_findings"]["aisf"])
-        self.assertEqual(derived["AI-04"]["Status"], "Failed")
-        self.assertEqual(derived["AI-04"]["Account_ID"], self.ACCT)
-        self.assertEqual(derived["AI-04"]["Region"], "us-east-1")
+        self.assertEqual(derived["AISF-04"]["Status"], "Failed")
+        self.assertEqual(derived["AISF-04"]["Account_ID"], self.ACCT)
+        self.assertEqual(derived["AISF-04"]["Region"], "us-east-1")
         self.assertEqual(captured["service_stats"]["aisf"]["failed"], 1)
 
     def test_multi_leg_aggregation_survives_the_lowercase_path(self):
@@ -771,17 +816,17 @@ class TestMultiAccountConsolidator(unittest.TestCase):
         captured = self._consolidate()
 
         derived = _derived_by_id(captured["service_findings"]["aisf"])
-        self.assertEqual(derived["AI-08"]["Status"], "Passed")
+        self.assertEqual(derived["AISF-08"]["Status"], "Passed")
 
     def test_ai_prefix_routes_to_aisf_and_not_to_the_bedrock_fallback(self):
-        row = _source_row("AI-01")
+        row = _source_row("AISF-01")
         row.pop("Account_ID")
         self._write("bedrock_security_report_exec_us-east-1.csv", [row])
 
         captured = self._consolidate()
 
         self.assertEqual(
-            {f["check_id"] for f in captured["service_findings"]["aisf"]}, {"AI-01"}
+            {f["check_id"] for f in captured["service_findings"]["aisf"]}, {"AISF-01"}
         )
         self.assertEqual(captured["service_findings"]["bedrock"], [])
 

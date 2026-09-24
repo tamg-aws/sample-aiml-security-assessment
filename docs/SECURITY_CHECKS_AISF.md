@@ -1,8 +1,8 @@
 # AWS AI Security Framework (AISF) Checks
 
-This document catalogs the `AI-XX` rows the report renders under "By Compliance
-Standard", the AWS AI Security Framework control each one reports on, and the
-shipped BR/SM/AC/AG check every row is derived from.
+This document catalogs the `AISF-XX` rows the report renders under "By
+Compliance Standard", the AWS AI Security Framework control each one reports on,
+and the shipped BR/SM/AC/AG check every row is derived from.
 
 - **Reference:** [AWS Well-Architected Generative AI Lens](https://docs.aws.amazon.com/wellarchitected/latest/generative-ai-lens/generative-ai-lens.html),
   plus the control-specific AWS documentation linked in the per-control tables
@@ -21,8 +21,8 @@ shipped BR/SM/AC/AG check every row is derived from.
 > **These mappings are PRELIMINARY and ILLUSTRATIVE.** They have not been
 > reviewed by AWS Security Assurance Services or external auditors. Validate
 > each mapping against your own reading of the AISF control before relying on
-> an `AI-` row as audit evidence. A control that is absent from this catalog is
-> unassessed, which is not evidence of compliance.
+> an `AISF-` row as audit evidence. A control that is absent from this catalog
+> is unassessed, which is not evidence of compliance.
 
 ## Design
 
@@ -41,16 +41,17 @@ verdict is `tighten` is deliberately excluded: its incumbent asserts only part
 of the control, so republishing that incumbent's `Passed` under the AISF
 control id would publish a pass the assessment never earned.
 `aisf-parity/check_ledger.py` gate 11 fails if a `tighten` control reaches the
-map, and gate 12 fails if the control text baked into the map drifts from the
-AISF control definition.
+map, gate 12 fails if the control text baked into the map drifts from the
+AISF control definition, and gate 13 fails if an id does not carry the
+registered `AISF-` prefix or is missing from this catalogue.
 
-**`AI-` rows are not counted in the framework's 208-check total.** They carry no
-new assertion, so counting them would double-count the incumbent check. They
+**`AISF-` rows are not counted in the framework's 208-check total.** They carry
+no new assertion, so counting them would double-count the incumbent check. They
 are excluded from the report's pass-rate denominator and from Open Action Items
 for the same reason, which is how OWASP-mapped rows already behave.
 
 **Ids are allocated once and never renumbered.** `AISF_DERIVED_MAP` is
-append-only: a new control takes the next free `AI-` number. Reusing or
+append-only: a new control takes the next free `AISF-` number. Reusing or
 resequencing an id rewrites the meaning of every archived report that already
 carries it.
 
@@ -74,42 +75,42 @@ omits the key.
 | any source check for the control failed | `Failed` |
 | a source check reported `N/A`, so no verdict is available | `N/A`, `Informational` |
 | some source checks present for the account and region, others absent | `N/A`, `Informational`, naming the absent `Check_ID`s |
-| no source check for the control present at all | no `AI-` row for that control; the absence is reported once per account and region by `AI-00` |
+| no source check for the control present at all | no `AISF-` row for that control; the absence is reported once per account and region by `AISF-00` |
 
-`AI-00` is a report-completeness marker, not an AISF control. It lists every
+`AISF-00` is a report-completeness marker, not an AISF control. It lists every
 derived control that had no source check for that account and region, so an
 incomplete scan reads as unassessed instead of silently omitting rows.
 
 ### Severity
 
 Severity comes from the AISF control's own `risk` band, not from the source
-row. An `AI-` row is a verdict on an AISF control, and one incumbent check's
-severity is not that control's risk rating; `AI-08` makes that concrete, since
-its three source checks carry different severities. AISF uses five risk bands
-and this framework's `SeverityEnum` has four, so `critical` and `high` both
-report as `High`, following section 6 of
+row. An `AISF-` row is a verdict on an AISF control, and one incumbent check's
+severity is not that control's risk rating; `AISF-08` makes that concrete,
+since its three source checks carry different severities. AISF uses five risk
+bands and this framework's `SeverityEnum` has four, so `critical` and `high`
+both report as `High`, following section 6 of
 [SECURITY_CHECKS_RESPONSIBLE_AI_GRC_SEVERITY_METHODOLOGY.md](SECURITY_CHECKS_RESPONSIBLE_AI_GRC_SEVERITY_METHODOLOGY.md),
 which keeps four levels and accepts that a genuinely critical risk is reported
-as `High`. The three controls AISF rates `critical` (`AI-01`, `AI-03`, `AI-04`)
-name that band and the downgrade in their `Finding_Details`, so a reader who
-sees `High` against a critical control learns why from the finding itself.
-A row with `Status=N/A` always reports `Informational`.
+as `High`. The three controls AISF rates `critical` (`AISF-01`, `AISF-03`,
+`AISF-04`) name that band and the downgrade in their `Finding_Details`, so a
+reader who sees `High` against a critical control learns why from the finding
+itself. A row with `Status=N/A` always reports `Informational`.
 
 ## Check catalogue
 
 | Check | AISF control | Severity | Source checks |
 | ------- | -------------- | ---------- | --------------- |
-| AI-00 | none (coverage marker) | Informational | none |
-| AI-01 | AIR-ACR-GW-01 | High | `AG-24` |
-| AI-02 | AIR-ACR-RT-09 | Medium | `AC-06` |
-| AI-03 | AIR-BDR-GRD-01 | High | `BR-10` |
-| AI-04 | AIR-BDR-GRD-03 | High | `BR-26` |
-| AI-05 | AIR-BDR-KB-03 | High | `BR-20` |
-| AI-06 | AIR-BDR-MDL-10 | High | `BR-37` |
-| AI-07 | AIR-SGM-EP-08 | High | `SM-18` |
-| AI-08 | AIR-SGM-TRN-05 | Medium | `SM-09`, `SM-01`, `SM-03` |
+| AISF-00 | none (coverage marker) | Informational | none |
+| AISF-01 | AIR-ACR-GW-01 | High | `AG-24` |
+| AISF-02 | AIR-ACR-RT-09 | Medium | `AC-06` |
+| AISF-03 | AIR-BDR-GRD-01 | High | `BR-10` |
+| AISF-04 | AIR-BDR-GRD-03 | High | `BR-26` |
+| AISF-05 | AIR-BDR-KB-03 | High | `BR-20` |
+| AISF-06 | AIR-BDR-MDL-10 | High | `BR-37` |
+| AISF-07 | AIR-SGM-EP-08 | High | `SM-18` |
+| AISF-08 | AIR-SGM-TRN-05 | Medium | `SM-09`, `SM-01`, `SM-03` |
 
-### AI-01 AIR-ACR-GW-01 Gateway Inbound Authorization
+### AISF-01 AIR-ACR-GW-01 Gateway Inbound Authorization
 
 When the gateway exposes tools or APIs to a model, does it enforce its own
 inbound authentication and authorization, independent of what the model
@@ -121,7 +122,7 @@ requests?
 
 Reference: <https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/gateway-inbound-auth.html>
 
-### AI-02 AIR-ACR-RT-09 Agent Browser Session Forensic Record
+### AISF-02 AIR-ACR-RT-09 Agent Browser Session Forensic Record
 
 For browser-based agent tools, is there a forensic record of what the agent did
 in the browser session (pages visited, actions taken)?
@@ -132,7 +133,7 @@ in the browser session (pages visited, actions taken)?
 
 Reference: <https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/browser-session-recording.html>
 
-### AI-03 AIR-BDR-GRD-01 Guardrail Enforced on Model Input and Output
+### AISF-03 AIR-BDR-GRD-01 Guardrail Enforced on Model Input and Output
 
 Is a content-safety guardrail applied to model input and output for every
 production use case, instead of being left optional per application?
@@ -143,7 +144,7 @@ production use case, instead of being left optional per application?
 
 Reference: <https://docs.aws.amazon.com/bedrock/latest/userguide/guardrails-permissions-id.html>
 
-### AI-04 AIR-BDR-GRD-03 Sensitive Data Output Filtering
+### AISF-04 AIR-BDR-GRD-03 Sensitive Data Output Filtering
 
 Is leakage of sensitive data types (PII, secrets, credentials) through model
 output specifically checked for and blocked or redacted?
@@ -154,7 +155,7 @@ output specifically checked for and blocked or redacted?
 
 Reference: <https://docs.aws.amazon.com/bedrock/latest/userguide/guardrails-sensitive-filters.html>
 
-### AI-05 AIR-BDR-KB-03 Knowledge Base Vector Store Encryption
+### AISF-05 AIR-BDR-KB-03 Knowledge Base Vector Store Encryption
 
 Is the underlying vector store or index for a knowledge base encrypted and
 access-restricted the same way as the source data it was built from?
@@ -165,7 +166,7 @@ access-restricted the same way as the source data it was built from?
 
 Reference: <https://docs.aws.amazon.com/bedrock/latest/userguide/encryption-kb.html>
 
-### AI-06 AIR-BDR-MDL-10 Bedrock Data Retention Mode Pinned
+### AISF-06 AIR-BDR-MDL-10 Bedrock Data Retention Mode Pinned
 
 Is the Amazon Bedrock data-retention mode explicitly set and pinned org-wide,
 so no account or project can opt into sharing prompts and outputs with a model
@@ -177,7 +178,7 @@ provider?
 
 Reference: <https://docs.aws.amazon.com/bedrock/latest/userguide/data-retention.html>
 
-### AI-07 AIR-SGM-EP-08 Batch Inference Network and Encryption Parity
+### AISF-07 AIR-SGM-EP-08 Batch Inference Network and Encryption Parity
 
 Are batch (offline) inference jobs that process data in bulk held to the same
 private-network and encryption standard as real-time inference?
@@ -188,13 +189,13 @@ private-network and encryption standard as real-time inference?
 
 Reference: <https://docs.aws.amazon.com/sagemaker/latest/dg/batch-vpc.html>
 
-### AI-08 AIR-SGM-TRN-05 Notebook and Development Environment Access Control
+### AISF-08 AIR-SGM-TRN-05 Notebook and Development Environment Access Control
 
 Is access to notebook instances and development environments used for model
 experimentation restricted and monitored the same way as production access?
 
 This is the one control with several source checks. All three legs must report
-`Passed` for `AI-08` to report `Passed`; any `Failed` leg makes it `Failed`;
+`Passed` for `AISF-08` to report `Passed`; any `Failed` leg makes it `Failed`;
 a leg that is missing or `N/A` makes it `N/A` and the finding details name the
 leg.
 
@@ -212,7 +213,7 @@ Reference: <https://docs.aws.amazon.com/whitepapers/latest/sagemaker-studio-admi
    `aisf-parity/aisf-work-ledger.json`. A `tighten` verdict means the incumbent
    asserts less than the control does; close the gap in the incumbent check
    first.
-2. Append an entry to `AISF_DERIVED_MAP` with the next free `AI-` number, the
+2. Append an entry to `AISF_DERIVED_MAP` with the next free `AISF-` number, the
    incumbent `Check_ID`s exactly as the ledger row names them, and the
    control's `risk`, `rec`, and first `src` URL copied from the AISF control
    YAML.
@@ -220,5 +221,5 @@ Reference: <https://docs.aws.amazon.com/whitepapers/latest/sagemaker-studio-admi
    and the coverage sentence in this file. Gate 12 compares both against
    `AISF_DERIVED_MAP` and the ledger, so a stale figure fails the gate.
 4. Add the row to the check catalogue above with its own per-control section.
-5. Run `python3 aisf-parity/check_ledger.py` (expects 12 of 12) and
+5. Run `python3 aisf-parity/check_ledger.py` (expects 13 of 13) and
    `.venv/bin/python -m pytest tests/test_aisf_derived_standard.py -v`.

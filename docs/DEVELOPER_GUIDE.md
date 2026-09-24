@@ -915,7 +915,7 @@ end-to-end. Concrete steps:
 
 A **derived** standard publishes a framework view over checks that already
 ship, so it has no Lambda, no CSV, no Step Functions branch and no IAM change.
-`AI-` rows are produced by `derive_aisf_findings()` in
+`AISF-` rows are produced by `derive_aisf_findings()` in
 `generate_consolidated_report/aisf_mappings.py`, called from both consolidators
 after their source rows are collected. Steps 1 through 5 and the S3 wiring in
 step 7 do not apply; instead:
@@ -929,9 +929,10 @@ step 7 do not apply; instead:
   which looks exactly like a wiring bug.
 - Exclude the derived rows from the check-count total, and say so where the
   count is published. They restate verdicts that are already counted.
-- Gate the mapping. `aisf-parity/check_ledger.py` gates 11 and 12 assert that
-  every mapped control is fully covered by its named incumbents and that the
-  control text and published figures have not drifted. See
+- Gate the mapping. `aisf-parity/check_ledger.py` gates 11 to 13 assert that
+  every mapped control is fully covered by its named incumbents, that the
+  control text and published figures have not drifted, and that every id
+  carries the registered prefix and is documented. See
   [SECURITY_CHECKS_AISF.md](SECURITY_CHECKS_AISF.md).
 
 9. **Add tests**: mapping emission, native-check behavior, routing, and

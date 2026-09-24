@@ -122,15 +122,25 @@ This does not need a regex change. The AISF id belongs in the `Compliance_Framew
 unvalidated free text, while the repo-side check keeps its native `BR-`/`SM-`/`AC-` id. A row then
 reads `AISF AIR-BDR-MDL-01`, and the crosswalk is data rather than schema.
 
-For the checks with no existing host (section 4.2), a new 2-digit prefix is needed.
-`tests/test_schema.py:114-125` proves a 3-letter prefix validates (`ACX-01` passes), so both `AI-`
-and `AIR-` are schema-legal. **Recommend `AI-`**, for one measurable reason: OWASP's mapping parser
-extracts a source id with `row["Finding_Details"].split("Source check ", 1)[1][:5]`
-(`tests/test_owasp_checks.py:352`), a 5-character assumption. `AI-01` is 5 characters and `AIR-01`
-is 6, so `AIR-` would be silently truncated to `AIR-0` if AISF rows ever feed OWASP mappings.
-`AI-` is also unused: the live prefixes are AC, AG, AR, BR, FS, OW, SM.
+For the checks with no existing host (section 4.2), a new prefix is needed. **Decided: `AISF-`**,
+which reads as the framework's name in a report column where `AI-` reads as a category. The live
+prefixes are AC, AG, AR, BR, FS, OW, SM, so it collides with none of them.
 
-Capacity check: the regex allows 2 digits, so 100 ids per prefix. 38 new checks fit in `AI-`. All
+Two consequences of a 4-letter prefix, both measured:
+
+- `AISF-01` does not satisfy `^[A-Z]{2,3}-\d{2}$`, so a producer schema would reject it
+  (`tests/test_schema.py:114-125` shows 3 letters is the ceiling). The derived rows never reach one:
+  they are built in the report layer, whose `Finding` model has no `Check_ID` field, which is the
+  same asymmetry this section opened with. A producing AISF check keeps its native `BR-`/`SM-`/`AC-`
+  id per the paragraph above; emitting `AISF-` from a Lambda means widening the regex in all six
+  schemas plus the test constant, in that change. `tests/test_aisf_derived_standard.py` pins both
+  halves: the id shape, and the absence of `Check_ID` from the report-layer model.
+- The `[:5]` source-id slice at `tests/test_owasp_checks.py:278,352` would truncate `AISF-01` to
+  `AISF-`. It parses OWASP's own emitted rows only, and four modules *write* that sentence while
+  nothing in production reads it back, so no shipped path truncates an id. If AISF rows are ever fed
+  to a mapping parser, that slice is the line to change.
+
+Capacity check: the regex allows 2 digits, so 100 ids per prefix. 38 new checks fit in `AISF-`. All
 105 would not, which is the argument against giving AISF a single prefix for the whole framework.
 
 ## 4. Piece 2: the machine-verifiable checks
@@ -522,7 +532,7 @@ the single-account path (`generate_consolidated_report/app.py:231-232`) drops th
 line instead. Same input, two different wrong answers. A prefix registered in
 `COMPLIANCE_STANDARDS` is routed correctly before that fallback, because the lookup is keyed by
 `prefix.upper().rstrip("-")` (`consolidate_html_reports.py:110-112`), so this bites only an
-unregistered prefix. Registering `AI-` avoids it.
+unregistered prefix. Registering `AISF-` avoids it.
 
 ## 6. Proposed phasing and branches
 
@@ -531,7 +541,7 @@ Each phase is independently shippable and leaves the suite green.
 | Phase | Branch | Content | Blast radius |
 |---|---|---|---|
 | 0 | `chore/aisf-parity-proposal` | this document, the crosswalk data, no code | none |
-| 1 | `feature/aisf-report-section` | register `AI-` in `COMPLIANCE_STANDARDS`, wire `per_region_categories`, artifact prefixes, report IAM | report layer only |
+| 1 | `feature/aisf-report-section` | register `AISF-` in `COMPLIANCE_STANDARDS`, wire `per_region_categories`, artifact prefixes, report IAM | report layer only |
 | 2 | `feature/aisf-compliance-column` | add `Compliance_Frameworks` to the 5 schemas that lack it, plus per-module AISF maps for the 67 hosted controls | 5 schemas, rewrites the frozen baseline |
 | 3 | `feature/aisf-checks-bedrock` | BDR 19 into `bedrock_assessments` | one module |
 | 4 | `feature/aisf-checks-agentcore` | ACR 37 into `agentcore_assessments` / `agent_registry_assessments` | two modules |
@@ -591,7 +601,7 @@ These change the work materially and are yours to make.
    The earlier "8" matched the size of the excluded set, not the included one, and omitted
    `FND-DAT-09`, the AI-services opt-out policy, which is the most AI-specific control in the area.
    Scope is therefore 67 + 11 = **78 of 105**.
-2. **Prefix.** `AI-` is recommended. Confirm, or pick another 2-character prefix.
+2. **Prefix.** Decided: `AISF-` (section 3.5).
 3. **Whether to touch the frozen baseline** in phase 2. Tagging existing FS rows with AISF rewrites
    66 frozen tuples. The alternative is to tag only non-FS checks, leaving the FinServ module alone.
 4. **The 22 workload-specific controls.** 20 of the 22 reduce to a flat list of strings, a small map,

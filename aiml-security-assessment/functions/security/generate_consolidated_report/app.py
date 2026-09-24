@@ -396,7 +396,7 @@ def generate_html_report(
                     if region and region != GLOBAL_REGION_LABEL and "," not in region:
                         regions.add(region)
 
-    # AISF is a derived standard: no assessment Lambda produced AI-* rows, so
+    # AISF is a derived standard: no assessment Lambda produced AISF-* rows, so
     # they are computed here from the verdicts collected above. The input list
     # is snapshotted by the call, so appending to all_findings below is safe.
     # Derived rows run through the same seen_findings key as CSV rows so a
