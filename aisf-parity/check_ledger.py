@@ -1045,6 +1045,19 @@ def main():
     # ---- gate 14: the per-module AISF tag maps agree with the ledger, in both
     # directions, and no tag overstates what its check asserts.
     #
+    # This block emits three verdicts, 14a/14b/14c, over three separate problem
+    # lists. One boolean under one name used to cover all three, and four
+    # mutations with unrelated causes -- a dropped qualifier, a tag in the wrong
+    # module, a reworded documentation sentence -- all printed the same gate name
+    # as their first red, so the name told a reader nothing about which of the
+    # three broke.
+    #
+    # Lettered instead of renumbered: `docs/SECURITY_CHECKS_AISF.md` cites
+    # "gate 14" in seven places, the four generated aisf_compliance_*.py headers
+    # and gen_compliance_maps.py cite it in five more, and figure_drift's own
+    # messages name it. Renumbering would also move gates 15 and 16, so the
+    # letters keep every existing citation true while the printed names separate.
+    #
     # Phase 2 tags rows the producers already emit, so unlike the derived map in
     # gate 11 it *may* reference a `tighten` control. What makes that sound is the
     # qualifier: `(partial)` says the check asserts less than the control needs,
@@ -1121,12 +1134,12 @@ def main():
     # four of them, so a stale paragraph shipped under a green gate that printed the
     # right numbers two lines further down.
     #
-    # Asserted in gate 14 and not in a gate of its own, because these are the same
-    # values the predicate above already computes. A separate gate would recompute
-    # them and could then disagree with the line printed here.
+    # Gate 14b reads `computed` rather than deriving its own copy: the values are
+    # what 14a's predicate already builds, and a second derivation could disagree
+    # with the line 14a prints. Separate verdict, one computation.
     #
-    # The qualifier census is asserted here too, against the paragraph sixteen lines
-    # below the one above. It was printed unasserted under a parenthetical saying no
+    # The qualifier census is gate 14c, against the paragraph sixteen lines below
+    # the one above. It was printed unasserted under a parenthetical saying no
     # document published it; the paragraph publishes five figures, and the two
     # verdict counts among them have already drifted on phase 3's branch.
     computed = {
@@ -1143,7 +1156,7 @@ def main():
     with open(AISF_DOC) as f:
         published_text = f.read()
     published, published_hits = tag_column_figures(published_text)
-    tag_problems += figure_drift(
+    figure_problems_14b = figure_drift(
         "SECURITY_CHECKS_AISF.md", published, published_hits, computed
     )
     per_module = " ".join(f"{k}={v}" for k, v in sorted(computed["per_module"].items()))
@@ -1180,14 +1193,19 @@ def main():
     census_slice, census_paragraphs, census_slice_problems = census_paragraph(
         published_text
     )
-    tag_problems += census_slice_problems
     census_published, census_hits = census_figures(census_slice)
-    tag_problems += figure_drift(
+    census_problems = census_slice_problems + figure_drift(
         "SECURITY_CHECKS_AISF.md's census paragraph",
         census_published,
         census_hits,
         computed_census,
     )
+    # 14a first, so a defect that violates more than one of the three claims names
+    # the most specific one in mutate.py's first-red line. Deleting a map entry is
+    # the case, measured: it loses a pair here, moves the `tagged` figure 14b
+    # asserts, and moves 14c's bare/partial census, so all three red and all three
+    # are true. Dropping a qualifier reds 14a and 14c and not 14b, because the tag
+    # is still there to count.
     gate(
         "per-module AISF tag maps agree with the ledger both ways",
         not tag_problems,
@@ -1195,14 +1213,24 @@ def main():
         f"{sum(len(m) for m in maps.values())} tagged checks in {len(maps)} modules, "
         f"naming {len({c for _, c in found_pairs})} distinct controls; "
         f"checks per module {per_module}; each checked for module ownership, ledger "
-        f"verdict and qualifier; {len(published) - 1} scalar figure(s) + "
-        f"{len(published['per_module'] or {})} per-module figure(s) + "
-        f"{len(census_published)} census figure(s) asserted against "
-        f"SECURITY_CHECKS_AISF.md, doc={published} vs computed={computed}, "
-        f"copies [{copies_note(published_hits)}]; census from {census_paragraphs} "
-        f"paragraph(s) matching {CENSUS_ANCHOR!r}, doc={census_published} vs "
+        f"verdict and qualifier" + (f", bad={tag_problems}" if tag_problems else ""),
+    )
+    gate(
+        "the tag-column figures SECURITY_CHECKS_AISF.md publishes match the maps",
+        not figure_problems_14b,
+        f"{len(published) - 1} scalar figure(s) + "
+        f"{len(published['per_module'] or {})} per-module figure(s) asserted, "
+        f"doc={published} vs computed={computed}, "
+        f"copies [{copies_note(published_hits)}]"
+        + (f", bad={figure_problems_14b}" if figure_problems_14b else ""),
+    )
+    gate(
+        "the SECURITY_CHECKS_AISF.md census paragraph is one slice, five figures",
+        not census_problems,
+        f"census from {census_paragraphs} paragraph(s) matching {CENSUS_ANCHOR!r}, "
+        f"{len(census_published)} figure(s) asserted, doc={census_published} vs "
         f"computed={computed_census}, copies [{copies_note(census_hits)}]"
-        + (f", bad={tag_problems}" if tag_problems else ""),
+        + (f", bad={census_problems}" if census_problems else ""),
     )
 
     # ---- gate 15: the shipped maps are what the generator renders from the
