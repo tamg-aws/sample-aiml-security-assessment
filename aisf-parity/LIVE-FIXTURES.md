@@ -25,6 +25,59 @@ AWS_PROFILE=delegated-admin .venv/bin/python aisf-parity/probe_live.py --region 
 aisf-parity/probe_live.py --selftest    # 11 classifier cases, no credentials needed
 ```
 
+## The second live leg: the tag column
+
+`aisf-parity/probe_live_tags.py` is the live leg for phase 2's
+`Compliance_Frameworks` column. It needs no fixture, because it reads the CSVs a
+run already left in the assessment bucket, and it answers the one question the 41
+offline tests structurally cannot.
+
+Those tests build every finding from a check id they read out of the map under
+test. The round trip proves the lookup and says nothing about whether the key is
+an id a producer actually emits. `test_a_tag_names_a_check_its_own_module_emits`
+narrows it to a substring search over `app.py`, which is weaker than it looks:
+the `AG-` ids are split across three producers (bedrock emits `AG-01`-`AG-14` and
+`AG-30`, agentcore `AG-15`-`AG-29` plus `AG-31`-`AG-32`, agent_registry
+`AG-33`-`AG-38`), so the string is present in modules that do not emit it. A key
+filed under the wrong module ships a permanently empty column for that check with
+every offline test green.
+
+```bash
+AWS_PROFILE=delegated-admin .venv/bin/python aisf-parity/probe_live_tags.py \
+    --bucket aiml-sec-ACCOUNT_ID-aimlassessmentbucket-gywyxnvqxpvx --region us-east-1
+.venv/bin/python aisf-parity/probe_live_tags.py --selftest   # 8 cases, no credentials
+```
+
+Measured at `a89c8c8` against execution `aff591e7` in us-east-1: **9/9 assertions,
+31/31 map keys confirmed against an id the module really emitted, 0 unproven, 0
+misplaced, 115 of 356 real rows tagged.** Qualifier forms on real rows: 33 bare,
+101 `(partial)`, 11 joint, 28 pipe-joined multi-control, 0 unparseable. A key the
+run did not emit is counted UNPROVEN and never as a pass, because an account with
+no SageMaker notebook emits no `SM-09` and that is an evidence gap, not a defect.
+
+The probe deliberately does **not** judge whether a qualifier is correct. It
+compares each replayed row against the same map, so a wrong qualifier agrees with
+itself; that is gate 14's job, which derives the expected qualifier from the
+ledger row instead. The probe covers the plumbing: the key resolving to a real
+emitted id, the 9-column header, no row gained or lost, and every row's tag
+equalling the map's answer.
+
+### Positive controls, and why they are not a gate
+
+`31/31` and `0 misplaced` is a 100% result, which is also what a probe that
+measures nothing prints. Both live assertions were therefore driven red once,
+against the same real CSVs, and both restored byte-identically:
+
+| Injected | Result |
+|---|---|
+| `"BR-10"` added to agentcore's map | `PROBE FAIL 8/9`, 1 misplaced, naming agentcore |
+| bedrock's `compliance_frameworks` default changed from `None` to `""` | `PROBE FAIL 8/9`, tagged rows 115 → 92, the 23 bedrock rows |
+
+This stays a manual control rather than a `mutate.py` entry because it needs a
+run's CSVs, and those carry account ids and resource ARNs, so they cannot be
+committed as a fixture. `--selftest` covers the classifiers with synthetic input;
+the table above is what proves the live wiring calls them.
+
 ## What each fixture unblocks
 
 | Row | Incumbent | Branch it exercises | Without the fixture |

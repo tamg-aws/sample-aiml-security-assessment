@@ -328,6 +328,32 @@ Two rows need a fixture that no ordinary account has, both documented with their
 cost and teardown in `aisf-parity/LIVE-FIXTURES.md`. Measured at the current
 head: BOTH=4, ONE_ONLY=4, NONE=0, VACUOUS=0.
 
+The tag column has its own live leg, `aisf-parity/probe_live_tags.py`, because
+the offline tests cannot reach the question it asks. Each of them builds its
+findings from check ids read out of the map being tested, so the round trip proves
+the lookup and not that the key is an id a producer emits. The `AG-` ids are split
+across three producers, which makes the substring check in
+`test_a_tag_names_a_check_its_own_module_emits` weaker than it looks: the string is
+present in modules that do not emit it, so a key filed under the wrong module
+ships a permanently empty column with every test green. The probe reads the CSVs a
+real run left in the assessment bucket, which are the authoritative set of emitted
+ids, replays those rows through the real `create_finding` and `generate_csv_report`,
+and reports a key the run did not emit as UNPROVEN rather than as a pass.
+
+```bash
+AWS_PROFILE=<profile> .venv/bin/python aisf-parity/probe_live_tags.py \
+    --bucket <assessment bucket> --region us-east-1
+aisf-parity/probe_live_tags.py --selftest   # 8 classifier cases, no credentials
+```
+
+Measured at the current head: 9/9 assertions, 31/31 map keys confirmed against an
+id the module really emitted, 0 unproven, 0 misplaced, 115 of 356 real rows tagged.
+Because a 100% result is also what a probe measuring nothing prints, both live
+assertions were driven red once against the same CSVs; the two injections and their
+observed failures are tabulated in `aisf-parity/LIVE-FIXTURES.md`. Neither probe
+proves the **deployed** Lambda carries this code: the running artifact is built by
+CodeBuild from a GitHub branch, so only a deploy of this branch tests that hop.
+
 ## Adding a control
 
 1. Confirm the control's ledger verdict is `covered` in
@@ -376,3 +402,8 @@ head: BOTH=4, ONE_ONLY=4, NONE=0, VACUOUS=0.
    new control. If the new row comes back ONE_ONLY with a `REACHABLE`
    classification, the missing verdict is a missing fixture, not a waiver: add it
    to `aisf-parity/LIVE-FIXTURES.md` with its cost and its teardown.
+10. Run `probe_live_tags.py --bucket <assessment bucket>` against the CSVs of a
+    run that scanned an account holding the new control's resource. A new map key
+    that comes back UNPROVEN has not been confirmed against a real emitted id, so
+    it is unverified rather than passing; a key reported MISPLACED is filed under a
+    producer that does not emit it and ships an empty column.

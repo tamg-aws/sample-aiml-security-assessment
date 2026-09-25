@@ -254,12 +254,13 @@ if [[ -n "$SILENT" ]]; then
 fi
 [[ "$SKIPPED" -gt 0 ]] && echo "  NOTE: $SKIPPED gate(s) skipped -- a skip is not a pass."
 
-# The live-verifiability gate is deliberately NOT one of the gates above: it needs AWS
-# credentials and it measures an account, not this tree. Printed on every run, pass or
-# fail, so a green battery is never read as evidence that any AISF- row was shown to
-# reach both verdicts against a real account. Not a verdict line by design -- it names
-# something that did not run, and the self-audit counts verdicts.
-echo "  live leg:  NOT RUN here. aisf-parity/probe_live.py needs credentials; see aisf-parity/LIVE-FIXTURES.md"
+# The two live legs are deliberately NOT gates above: they need AWS credentials and they
+# measure an account, not this tree. Printed on every run, pass or fail, so a green
+# battery is never read as evidence that any AISF- row reached both verdicts, nor that
+# any tag was confirmed against a check id a producer really emits. Kept to ONE line
+# with the existing prefix: push_safety.py's self-audit counts verdict lines and matches
+# gate names against this file, and this is not a verdict line by design.
+echo "  live leg:  NOT RUN here. aisf-parity/probe_live.py (AISF- rows) and probe_live_tags.py (tag column) need credentials; see aisf-parity/LIVE-FIXTURES.md"
 
 TOTALS="$PASSED/$EXPECTED gates passed, $SUBGATES ledger sub-gates, $TESTS tests across $SUITES suite(s)"
 # An empty run is the failure this battery exists to prevent, and this check comes before
