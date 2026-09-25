@@ -1,25 +1,41 @@
 """Which S3 keys `aisf-parity/probe_live_tags.py` reads, and how it groups them.
 
-Two stacks write the same report CSVs under two layouts: one at the bucket root, one
-under an account id. `REPORT_RE` was anchored with a bare `^`, so `[a-z_]+` landed on
-the account id, no prefixed key matched, and the probe refused with "no report CSVs at
-all". It failed closed, so no wrong figure was ever published, and the message named a
-cause that was not true: the bucket held a complete set from one execution.
+`REPORT_RE` read three parts of the key more narrowly than the keys are written, and
+each one produced the same refusal: "no report CSVs at all", failing closed on a
+cause that was not true while the bucket held a complete set.
 
-Widening the anchor has a second-order cost, and both halves are asserted here.
+  * The prefix. Two stacks write the same CSVs under two layouts, one at the bucket
+    root and one under an account id, and a bare `^` put `[a-z_]+` against that
+    account id.
+  * The execution. `[0-9a-f-]{36}` is a uuid, which is what StartExecution invents
+    when nobody passes `--name`. A run named `grc-owasp-payload-probe-20260925-173028`
+    wrote six report CSVs and none of them matched.
+  * The region. `responsible_ai_grc_security_report_<execution>.csv` has no region
+    segment at all, and bedrock and agentcore write that shape from their fallback
+    branches. The reader is what widens: the shipped key is not changed to suit it.
 
-  * Loosening only the prefix. A widening that also starts matching non-reports is a
-    worse defect than the one it fixes, because the probe would then read a file it
-    cannot parse as a report. The negative controls below carry that half, and they
-    are prefixed, so they exercise the new branch of the pattern and not the old one.
-  * Grouping. Once any prefix matches, one bucket can hold reports for more than one
-    account, and `runs[key][module]` is last-write-wins. Pooled, one CSV from each of
-    two accounts assembles a set that neither account completed, and the probe would
-    print one figure over two accounts' rows with nothing to say so. The probe groups
-    on the prefix, so a spread set is partial for each prefix and refused.
+Widening has a second-order cost, and both halves of it are asserted here.
 
-The two-prefix listing is the only input that separates those two designs: a
-single-prefix fixture passes under both, so it cannot tell them apart.
+  * Matching a non-report is worse than missing a report, because the probe would
+    read a file it cannot parse. The negative controls below carry that half, and
+    they are prefixed, so they exercise the widened branch of the pattern. Two of the
+    three are the same controls as before the execution and region groups widened; the
+    third, a 35-character execution id, is now a positive case, because the exact
+    count is the constraint that was removed.
+  * The two loose groups must not eat each other. An execution named `probe_20260925`
+    against a loose `[a-z0-9-]+` region gave up its trailing digits to the region
+    group, so the run would have been reported under a region that does not exist.
+
+Grouping is asserted separately. Once any prefix matches, one bucket can hold reports
+for more than one account, and `runs[key][module]` is last-write-wins: pooled, one CSV
+from each of two accounts assembles a set that neither completed and the probe prints
+one figure over two accounts' rows with nothing to say so. Keys with no region segment
+group apart for the same reason in the other direction -- one such key exists per
+prefix and execution, so it cannot be attributed to either region of a run executed
+twice -- and the refusal names any producer found only under one.
+
+The two-prefix listing is the only input that separates the pooled design from the
+grouped one: a single-prefix fixture passes under both.
 """
 
 import datetime
@@ -35,6 +51,10 @@ REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 PROBE = os.path.join(REPO_ROOT, "aisf-parity", "probe_live_tags.py")
 USAGE = 2
 EXECUTION = "2654a727-0000-4000-8000-000000000000"
+# The name the measured run carried. Not a uuid, 39 characters, and it is what the
+# execution group has to read: `aws stepfunctions start-execution --name` takes any
+# name, and the console's own re-run button sets one.
+NAMED_EXECUTION = "grc-owasp-payload-probe-20260925-173028"
 STAMP = datetime.datetime(2026, 9, 25, 12, 0)
 
 
@@ -51,7 +71,14 @@ probe = load_probe()
 
 
 def report_key(prefix, module, execution=EXECUTION, region="us-east-1"):
-    return f"{prefix}{module}_security_report_{execution}_{region}.csv"
+    """One key, region optional. `region=None` is the GRC shape, written verbatim.
+
+    Built by concatenation and not by dropping a segment from the region-bearing form,
+    so the region-less key here is the string the handler writes rather than a
+    derivative of the other case.
+    """
+    tail = f"_{region}" if region is not None else ""
+    return f"{prefix}{module}_security_report_{execution}{tail}.csv"
 
 
 class FakeS3:
@@ -132,6 +159,91 @@ def test_a_deep_prefix_belongs_to_the_prefix_and_the_module_starts_after_it():
     assert found.group("module") == "sagemaker"
 
 
+# The shapes one bucket holds, written out as literal keys instead of built by the
+# helper above. A helper that constructs both sides of a comparison agrees with
+# itself, and all three defects here were defects in reading a literal key. Measured
+# against account 178113193057, bucket
+# aiml-sec-178113193057-aimlassessmentbucket-gywyxnvqxpvx, where the run named below
+# wrote six report CSVs and every one of them missed the pattern.
+RAW_KEYS = [
+    (
+        "123456789012/bedrock_security_report_2654a727-0000-4000-8000-"
+        "000000000000_us-east-1.csv",
+        ("123456789012/", "bedrock", EXECUTION, "us-east-1"),
+        "prefixed, uuid execution, region-bearing: the shape that already worked",
+    ),
+    (
+        "sagemaker_security_report_2654a727-0000-4000-8000-000000000000_eu-west-1.csv",
+        ("", "sagemaker", EXECUTION, "eu-west-1"),
+        "the root layout, and a region that is not the default",
+    ),
+    (
+        "agentcore_security_report_grc-owasp-payload-probe-20260925-"
+        "173028_us-east-1.csv",
+        ("", "agentcore", NAMED_EXECUTION, "us-east-1"),
+        "a named execution, which is exactly what the {36} count refused",
+    ),
+    (
+        "123456789012/agent_registry_security_report_grc-owasp-payload-probe-"
+        "20260925-173028_ap-southeast-2.csv",
+        ("123456789012/", "agent_registry", NAMED_EXECUTION, "ap-southeast-2"),
+        "a named execution under a prefix, with an underscore inside the module name",
+    ),
+    (
+        "responsible_ai_grc_security_report_grc-owasp-payload-probe-20260925-"
+        "173028.csv",
+        ("", "responsible_ai_grc", NAMED_EXECUTION, None),
+        "the GRC key, which carries no region segment at all",
+    ),
+    (
+        "owasp_security_report_probe_20260925_us-east-1.csv",
+        ("", "owasp", "probe_20260925", "us-east-1"),
+        "an underscore inside the execution name, which the split has to keep on the "
+        "execution side of the last region-shaped tail",
+    ),
+    (
+        "bedrock_security_report_probe_20260925.csv",
+        ("", "bedrock", "probe_20260925", None),
+        "no region and an underscore inside the execution name, which is the input "
+        "the region's shape is tight for: against `[a-z0-9-]+` the optional group "
+        "matches `_20260925`, and the run is reported under a region 20260925 that "
+        "does not exist. The same name WITH a region parses correctly under both "
+        "shapes, because a loose region still has to be followed by `.csv`, so the "
+        "region-bearing case above cannot tell the two apart",
+    ),
+]
+
+
+@pytest.mark.parametrize("key,expected,why", RAW_KEYS)
+def test_every_shape_the_bucket_holds_parses_into_its_parts(key, expected, why):
+    found = probe.REPORT_RE.match(key)
+    assert found, f"{key!r} misses the pattern: {why}"
+    parts = (
+        found.group("prefix"),
+        found.group("module"),
+        found.group("execution"),
+        found.group("region"),
+    )
+    assert parts == expected, f"{key!r} parsed as {parts}, expected {expected}: {why}"
+
+
+def test_the_35_character_execution_id_is_now_a_positive_case():
+    """The one negative control the fix removes, kept as a positive.
+
+    The exact count was the constraint, so a key one character short of a uuid has to
+    parse now: it is what a named execution looks like to the pattern. Dropping this
+    case instead of flipping it would leave no record that the boundary moved.
+    """
+    short = (
+        "123456789012/bedrock_security_report_2654a727-0000-4000-8000-"
+        "00000000000_us-east-1.csv"
+    )
+    found = probe.REPORT_RE.match(short)
+    assert found, "an execution id that is not 36 characters has to parse now"
+    assert found.group("execution") == "2654a727-0000-4000-8000-00000000000"
+    assert found.group("region") == "us-east-1"
+
+
 @pytest.mark.parametrize(
     "key,why",
     [
@@ -150,9 +262,9 @@ def test_a_deep_prefix_belongs_to_the_prefix_and_the_module_starts_after_it():
             "of a filename and let a module name hold a hyphen",
         ),
         (
-            "123456789012/bedrock_security_report_2654a727-0000-4000-8000-"
-            "00000000000_us-east-1.csv",
-            "a 35-character execution id: the {36} count is still exact",
+            "123456789012/bedrock_security_report_.csv",
+            "no execution at all: the group is non-greedy, not optional, so a key "
+            "with nothing between the literal and the extension still misses",
         ),
     ],
 )
@@ -224,6 +336,117 @@ def test_between_two_complete_prefixes_the_newer_one_is_read_whole(monkeypatch, 
 
     assert fake.fetched == [report_key(newer, m) for m in probe.PRODUCERS]
     assert f"prefix    {newer}" in capsys.readouterr().out
+
+
+def test_a_named_execution_is_measured_and_not_only_parsed(monkeypatch, capsys):
+    """The end-to-end half of the execution widening.
+
+    The pattern test above proves the key parses. This proves the run assembles,
+    survives the completeness rule and is read: the defect was that a named run read
+    as an empty bucket, and a pattern fix that left the grouping key wrong would still
+    print that refusal.
+    """
+    prefix = "178113193057/"
+    fake = install_s3(
+        monkeypatch,
+        {
+            report_key(prefix, m, execution=NAMED_EXECUTION): STAMP
+            for m in probe.PRODUCERS
+        },
+    )
+
+    texts = probe.newest_execution("named-run", None)
+
+    assert sorted(texts) == sorted(probe.PRODUCERS)
+    assert fake.fetched == [
+        report_key(prefix, m, execution=NAMED_EXECUTION) for m in probe.PRODUCERS
+    ]
+    assert f"execution {NAMED_EXECUTION}" in capsys.readouterr().out
+
+
+def test_a_producer_found_only_under_a_regionless_key_is_named_in_the_refusal(
+    monkeypatch, capsys
+):
+    """The grouping decision, and the message it exists to produce.
+
+    A key with no region segment forms its own group, so this listing holds no
+    complete set: one producer is in a region-less group of its own and the rest are
+    in a region-bearing group without it. The refusal has to name the producer and the
+    reason, because "no execution has a CSV for all of" reads as a run that never
+    finished, and the repair is in the key shape.
+    """
+    prefix = "178113193057/"
+    orphan, *rest = probe.PRODUCERS
+    stamped = {report_key(prefix, m): STAMP for m in rest}
+    stamped[report_key(prefix, orphan, region=None)] = STAMP
+    fake = install_s3(monkeypatch, stamped)
+
+    with pytest.raises(SystemExit) as raised:
+        probe.newest_execution("regionless-producer", None)
+
+    assert raised.value.code == USAGE
+    err = capsys.readouterr().err
+    assert f"'{orphan}'] appear only under a key with no region segment" in err, (
+        f"{orphan} is the whole cause and the refusal does not name it:\n{err}"
+    )
+    assert "no key matched a report CSV name" not in err, (
+        "the region-less key parsed, so the refusal must not report an unreadable "
+        f"layout:\n{err}"
+    )
+    assert fake.fetched == []
+
+
+def test_a_regionless_key_does_not_join_two_regions_of_one_run_name(monkeypatch):
+    """Why the region-less group stays apart, as the input that makes it matter.
+
+    One run name executed in two regions writes two region-bearing sets and one
+    region-less key, because the region-less name has nowhere to put the second. A
+    design that attached it to every region group would report it as part of whichever
+    set won, measuring one region's CSV against another region's run. Kept apart, both
+    region-bearing sets are complete on their own and the region-less key is a group of
+    one that completes nothing.
+    """
+    prefix = "178113193057/"
+    stamped = {
+        report_key(prefix, m, region=region): STAMP
+        for region in ("us-east-1", "eu-west-1")
+        for m in probe.PRODUCERS
+    }
+    grc = f"{prefix}responsible_ai_grc_security_report_{EXECUTION}.csv"
+    stamped[grc] = STAMP + datetime.timedelta(hours=2)
+    fake = install_s3(monkeypatch, stamped)
+
+    texts = probe.newest_execution("two-regions", "eu-west-1")
+
+    assert sorted(texts) == sorted(probe.PRODUCERS)
+    assert fake.fetched == [
+        report_key(prefix, m, region="eu-west-1") for m in probe.PRODUCERS
+    ]
+    assert grc not in fake.fetched, (
+        "the region-less key was read as part of a region's set, which is the "
+        "attribution the grouping refuses"
+    )
+
+
+def test_the_region_filter_counts_the_keys_it_excluded(monkeypatch, capsys):
+    """A filter that removes everything and a bucket that held nothing print the same
+    refusal otherwise, and only one of them is repaired by passing a different
+    --region."""
+    prefix = "178113193057/"
+    fake = install_s3(
+        monkeypatch,
+        {report_key(prefix, m, region="us-east-1"): STAMP for m in probe.PRODUCERS},
+    )
+
+    with pytest.raises(SystemExit) as raised:
+        probe.newest_execution("wrong-region", "eu-west-1")
+
+    assert raised.value.code == USAGE
+    err = capsys.readouterr().err
+    assert (
+        f"--region eu-west-1 excluded {len(probe.PRODUCERS)} matching key(s)" in err
+    ), f"the refusal does not say the filter is what emptied the listing:\n{err}"
+    assert fake.fetched == []
 
 
 def test_a_listing_with_no_matching_key_says_so_and_counts_what_it_saw(

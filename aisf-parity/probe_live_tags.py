@@ -133,20 +133,45 @@ LEGACY_COLUMNS = [
 ]
 EXPECTED_COLUMNS = LEGACY_COLUMNS + ["Compliance_Frameworks"]
 
-# [<prefix>/]<module>_security_report_<execution id>_<region>.csv
+# [<prefix>/]<module>_security_report_<execution>[_<region>].csv
+#
+# Three groups are looser than the shapes these keys were first read as, and each
+# one was measured missing a key a real bucket held.
 #
 # The prefix is optional because two stacks write the same CSVs under two layouts:
 # one at the bucket root, one under an account id. `^` alone put `[a-z_]+` against
 # that account id, so every prefixed key missed the pattern and the probe refused
 # with "no report CSVs at all" -- closed, but on a cause that was not true.
 #
-# Only the prefix is loose. It has to end in `/`, so it cannot eat part of a
-# filename, and a key that is not a report CSV still misses on `_security_report_`,
-# on the 36-character execution id, or on `\.csv$`. It is captured rather than
-# skipped because newest_execution() groups on it.
+# The execution is any run of non-slash characters and not 36 hex-and-hyphen ones.
+# StartExecution takes `--name`, so an execution id is a uuid only when nobody
+# passed one: a run named `grc-owasp-payload-probe-20260925-173028` wrote six
+# report CSVs that all missed the pattern, and the probe printed the same untrue
+# "no report CSVs at all".
+#
+# The region is optional because one shipped key has no region segment,
+# `responsible_ai_grc_security_report_<execution>.csv`, and bedrock's and
+# agentcore's fallback branches write that shape too when `Region` arrives
+# explicitly empty. The reader widens; the shipped key shape is not changed to suit
+# the reader.
+#
+# What keeps the two loose groups from eating each other is the region's shape.
+# `xx-word-N` and not `[a-z0-9-]+`, and the case that needs it is a key with no
+# region: `bedrock_security_report_probe_20260925.csv` gives `_20260925` to a loose
+# optional region group, and the run is then reported under a region that does not
+# exist. The same execution name WITH a region parses correctly under either shape,
+# because a loose region still has to be followed by `.csv`, so only the region-less
+# form discriminates. `execution` is non-greedy and the region optional, so the split
+# lands on the last region-shaped tail, and a key without one parses with region None
+# instead of not parsing at all.
+#
+# Everything else stays exact. A key that is not a report CSV still misses on
+# `_security_report_`, on the prefix having to end in `/`, or on `\.csv$`. The
+# prefix and the region are captured rather than skipped because newest_execution()
+# groups on both.
 REPORT_RE = re.compile(
     r"^(?P<prefix>(?:.*/)?)(?P<module>[a-z_]+)_security_report_"
-    r"(?P<execution>[0-9a-f-]{36})_(?P<region>[a-z0-9-]+)\.csv$"
+    r"(?P<execution>[^/]+?)(?:_(?P<region>[a-z]{2}(?:-[a-z]+)+-\d+))?\.csv$"
 )
 
 ELEMENT_RE = re.compile(
@@ -348,6 +373,22 @@ def newest_execution(bucket: str, region: str | None):
 
     A run is identified by key prefix as well as execution id and region, so a set
     whose four CSVs live under two prefixes is partial for each prefix and refused.
+
+    A key with no region segment forms its own group and does not join the
+    region-bearing groups of the same prefix and execution. The bucket can hold only
+    one such key per (prefix, execution) -- there is no region in the name to write a
+    second one under -- so attaching it to a region group would assert a scanned
+    region the key does not state, and for one run name executed in two regions it
+    would attach the single CSV to both. That costs nothing today: the region-less
+    key the estate holds is the GRC report, and GRC ships no aisf_compliance_*.py, so
+    it is not in PRODUCERS. bedrock and agentcore do have a region-less fallback
+    branch, so the refusal below names any producer found only under such a key. The
+    incomplete set is then reported with its cause instead of reading as an estate
+    that never ran.
+
+    --region filters the keys that carry a region and leaves the rest, because
+    excluding a key with no region segment would be asserting a region for it. The
+    count of keys the filter removed is printed with the refusal.
     """
     import boto3
 
@@ -366,11 +407,13 @@ def newest_execution(bucket: str, region: str | None):
 
     runs = collections.defaultdict(dict)
     stamps = {}
+    filtered_out = 0
     for obj in objects:
         found = REPORT_RE.match(obj["Key"])
         if not found:
             continue
-        if region and found.group("region") != region:
+        if region and found.group("region") not in (None, region):
+            filtered_out += 1
             continue
         # The prefix is part of a run's identity, not decoration. Once any prefix
         # matches, one bucket can hold reports for more than one account -- in the
@@ -391,6 +434,22 @@ def newest_execution(bucket: str, region: str | None):
         # to print the same sentence, which is how the anchor bug above read as an
         # empty estate. The object count and a sample key separate the two.
         detail = f"listed {len(objects)} object(s)"
+        if filtered_out:
+            detail += f"; --region {region} excluded {filtered_out} matching key(s)"
+        # A producer whose only key carries no region segment is a grouping outcome
+        # and not a missing report, and the two have different repairs. Named here,
+        # because the set it would have completed is the one reported partial.
+        with_region = {m for k, v in runs.items() if k[2] is not None for m in v}
+        regionless_only = sorted(
+            set(PRODUCERS)
+            & ({m for k, v in runs.items() if k[2] is None for m in v} - with_region)
+        )
+        if regionless_only:
+            detail += (
+                f"; {regionless_only} appear only under a key with no region "
+                "segment, which groups apart from the region-bearing keys of the "
+                "same run"
+            )
         if not partial:
             detail += f"; first: {[obj['Key'] for obj in objects[:3]]}"
         die(
@@ -405,7 +464,11 @@ def newest_execution(bucket: str, region: str | None):
     prefix, execution, scanned = chosen
     print(f"bucket    s3://{bucket}")
     print(f"prefix    {prefix or '(bucket root)'}  one prefix carries the whole set")
-    print(f"execution {execution}  region {scanned}  written {stamps[chosen]}")
+    print(
+        f"execution {execution}  region "
+        f"{scanned if scanned is not None else '(none in the key)'}  "
+        f"written {stamps[chosen]}"
+    )
     print("          the timestamp is printed so a stale run is visible, not assumed")
     out = {}
     for module in PRODUCERS:
