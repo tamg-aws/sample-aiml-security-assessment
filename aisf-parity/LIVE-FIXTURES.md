@@ -7,22 +7,38 @@ purely to exercise the missing branch.
 
 Account **ACCOUNT_ID**, region **us-east-1**. The id is redacted because this file
 ships in a public fork; the profile in the commands below resolves it. Every resource
-is named with the `aisflive` prefix and tagged
-`purpose=aisf-live-verifiability-fixture` and `temporary=true`.
+is named with the `aisflive` prefix. Four of the seven that can carry tags also carry
+`purpose=aisf-live-verifiability-fixture` and `temporary=true`: the KMS key, the
+knowledge base and both IAM roles. The gateway, the vector bucket and the vector index
+carry no tags at all.
 
-Do not use a tag query as the teardown inventory: it is wrong in both directions.
-Measured on 2026-09-25, `resourcegroupstaggingapi get-resources --tag-filters
-Key=purpose,Values=aisf-live-verifiability-fixture` returns two of the fixtures, the
-KMS key and the knowledge base, and none of the vector bucket, the vector index, the
-gateway, or the IAM roles. It also returns four resources that are **not**
-fixtures, and `Key=temporary,Values=true` returns the identical six: the CodeBuild
-project `AIMLSecurityCodeBuild`, its start-build Lambda, the assessment bucket
+Neither tag is a teardown selector. Measured on 2026-09-25,
+`resourcegroupstaggingapi get-resources --tag-filters
+Key=purpose,Values=aisf-live-verifiability-fixture` returns six ARNs, and
+`Key=temporary,Values=true` returns the identical six. The result is wrong in both
+directions at once.
+
+**Four of the six hits are not fixtures.** Only the KMS key and the knowledge base are.
+The rest is the assessment pipeline: the CodeBuild project `AIMLSecurityCodeBuild`, its
+start-build Lambda, the versioned assessment bucket
 `aiml-security-aisf-parity-assessmentbucket-7za0aaaa3dfo`, and the
-`aiml-security-aisf-parity` stack that owns all three, which are the pipeline
-recorded under **Also standing** below and carry these tags because the deploy passed
-them as stack tags. A teardown driven by either tag deletes the project the
-post-merge validation build runs on and the versioned bucket holding its reports, so
-neither tag selects a safe set. The lists below are the inventory.
+`aiml-security-aisf-parity` stack that owns all three, recorded under **Also standing**
+below. They answer the filter because that `cloudformation deploy` passed these two
+tags as stack tags and CloudFormation propagated them, so selecting on either tag
+deletes the project the post-merge validation build runs on and a versioned bucket of
+reports.
+
+**Five of the seven taggable fixture resources are absent from the same result, for two
+unrelated reasons.** The gateway
+(`arn:aws:bedrock-agentcore:us-east-1:ACCOUNT_ID:gateway/aisflive-gw-authonly-vmwcsepglu`),
+the vector bucket and the vector index carry no tags at all: `list-tags-for-resource`
+returns `{}` for each, and both services expose `tag-resource`, so that is an omission
+at creation and not a gap in the tagging API. Both IAM roles do carry the two tags and
+the tagging API returns neither. A clean tag query therefore reads as an empty estate
+while the AISF-01 gateway is `AUTHENTICATE_ONLY` and `READY`, so reach for the gateway
+by the name above. Tagging the three untagged resources would close this direction and
+leave the four false hits exactly as they are, so a tag is not the fix. The lists below
+are the inventory.
 
 The gate is not part of `gate_all.sh`. It needs AWS credentials, and it measures
 an account rather than this tree, so a green battery says nothing about it. Run it
