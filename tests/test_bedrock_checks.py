@@ -10,6 +10,7 @@ Each check is tested for:
 """
 
 import contextlib
+import json
 import sys
 import os
 import importlib.util
@@ -352,6 +353,248 @@ class TestBR04LoggingConfiguration:
         assert len(findings) >= 1
         assert findings[0]["Status"] == "Passed"
 
+    # --- Retention leg: AIR-BDR-MDL-02 -------------------------------------
+    RETENTION_FINDING = "Bedrock Invocation Log Retention"
+
+    @staticmethod
+    def _retention_clients(logging_config, log_group_pages=None, lifecycle=None):
+        """Dispatch the bedrock, logs and s3 clients the retention leg reads."""
+        mock_bedrock = MagicMock()
+        mock_bedrock.get_model_invocation_logging_configuration.return_value = {
+            "loggingConfig": logging_config
+        }
+
+        mock_logs = MagicMock()
+        pages = list(log_group_pages or [{"logGroups": []}])
+
+        def describe_log_groups(**kwargs):
+            index = 1 if kwargs.get("nextToken") else 0
+            return pages[index] if index < len(pages) else {"logGroups": []}
+
+        mock_logs.describe_log_groups.side_effect = describe_log_groups
+
+        mock_s3 = MagicMock()
+        if lifecycle is None:
+            mock_s3.get_bucket_lifecycle_configuration.side_effect = ClientError(
+                {
+                    "Error": {
+                        "Code": "NoSuchLifecycleConfiguration",
+                        "Message": "The lifecycle configuration does not exist",
+                    }
+                },
+                "GetBucketLifecycleConfiguration",
+            )
+        else:
+            mock_s3.get_bucket_lifecycle_configuration.return_value = lifecycle
+
+        clients = {"bedrock": mock_bedrock, "logs": mock_logs, "s3": mock_s3}
+        return (lambda service_name, **kwargs: clients[service_name]), clients
+
+    def _retention_findings(self, findings):
+        return [f for f in findings if f["Finding"] == self.RETENTION_FINDING]
+
+    @patch("boto3.client")
+    @patch("bedrock_app.detect_bedrock_regional_footprint", return_value=True)
+    def test_br04_retention_is_judged_per_destination(
+        self, mock_footprint, mock_client
+    ):
+        # Two destinations, one with a stated period and one without: the
+        # bucket lifecycle expires objects, the log group never expires events.
+        mock_client.side_effect, _ = self._retention_clients(
+            {
+                "s3Config": {"bucketName": "log-bucket"},
+                "cloudWatchConfig": {"logGroupName": "/aws/bedrock/invocations"},
+            },
+            log_group_pages=[
+                {"logGroups": [{"logGroupName": "/aws/bedrock/invocations"}]}
+            ],
+            lifecycle={
+                "Rules": [
+                    {
+                        "ID": "expire-logs",
+                        "Status": "Enabled",
+                        "Expiration": {"Days": 90},
+                    }
+                ]
+            },
+        )
+
+        retention = self._retention_findings(
+            extract_csv_data(bedrock_app.check_bedrock_logging_configuration())
+        )
+
+        failed = [f for f in retention if f["Status"] == "Failed"]
+        passed = [f for f in retention if f["Status"] == "Passed"]
+        assert len(failed) == 1
+        assert failed[0]["Check_ID"] == "BR-04"
+        assert (
+            "'/aws/bedrock/invocations' has no retentionInDays"
+            in (failed[0]["Finding_Details"])
+        )
+        assert len(passed) == 1
+        assert (
+            "expire-logs expires objects after 90 day(s)"
+            in (passed[0]["Finding_Details"])
+        )
+        assert "log-bucket" in passed[0]["Finding_Details"]
+        assert "1 destination(s)" in passed[0]["Finding_Details"]
+
+    @patch("boto3.client")
+    @patch("bedrock_app.detect_bedrock_regional_footprint", return_value=True)
+    def test_br04_bucket_without_lifecycle_fails_while_log_group_passes(
+        self, mock_footprint, mock_client
+    ):
+        mock_client.side_effect, _ = self._retention_clients(
+            {
+                "s3Config": {"bucketName": "forever-bucket"},
+                "cloudWatchConfig": {"logGroupName": "/aws/bedrock/invocations"},
+            },
+            log_group_pages=[
+                {
+                    "logGroups": [
+                        {
+                            "logGroupName": "/aws/bedrock/invocations",
+                            "retentionInDays": 365,
+                        }
+                    ]
+                }
+            ],
+            lifecycle=None,
+        )
+
+        retention = self._retention_findings(
+            extract_csv_data(bedrock_app.check_bedrock_logging_configuration())
+        )
+
+        failed = [f for f in retention if f["Status"] == "Failed"]
+        passed = [f for f in retention if f["Status"] == "Passed"]
+        assert len(failed) == 1
+        assert (
+            "'forever-bucket' has no enabled lifecycle rule"
+            in (failed[0]["Finding_Details"])
+        )
+        assert len(passed) == 1
+        assert "expires events after 365 day(s)" in passed[0]["Finding_Details"]
+
+    @patch("boto3.client")
+    @patch("bedrock_app.detect_bedrock_regional_footprint", return_value=True)
+    def test_br04_disabled_lifecycle_rule_is_not_a_retention_period(
+        self, mock_footprint, mock_client
+    ):
+        mock_client.side_effect, _ = self._retention_clients(
+            {"s3Config": {"bucketName": "log-bucket"}, "cloudWatchConfig": {}},
+            lifecycle={
+                "Rules": [
+                    {"ID": "draft", "Status": "Disabled", "Expiration": {"Days": 30}}
+                ]
+            },
+        )
+
+        retention = self._retention_findings(
+            extract_csv_data(bedrock_app.check_bedrock_logging_configuration())
+        )
+
+        assert [f["Status"] for f in retention] == ["Failed"]
+        assert "no enabled lifecycle rule" in retention[0]["Finding_Details"]
+
+    @patch("boto3.client")
+    @patch("bedrock_app.detect_bedrock_regional_footprint", return_value=True)
+    def test_br04_log_group_not_visible_is_not_a_missing_period(
+        self, mock_footprint, mock_client
+    ):
+        mock_client.side_effect, _ = self._retention_clients(
+            {
+                "s3Config": {},
+                "cloudWatchConfig": {"logGroupName": "/aws/bedrock/invocations"},
+            },
+            log_group_pages=[{"logGroups": [{"logGroupName": "/aws/bedrock/other"}]}],
+        )
+
+        retention = self._retention_findings(
+            extract_csv_data(bedrock_app.check_bedrock_logging_configuration())
+        )
+
+        assert [f["Status"] for f in retention] == ["N/A"]
+        assert (
+            "was not returned by DescribeLogGroups" in (retention[0]["Finding_Details"])
+        )
+
+    @patch("boto3.client")
+    @patch("bedrock_app.detect_bedrock_regional_footprint", return_value=True)
+    def test_br04_reads_log_groups_from_all_pages(self, mock_footprint, mock_client):
+        mock_client.side_effect, clients = self._retention_clients(
+            {
+                "s3Config": {},
+                "cloudWatchConfig": {"logGroupName": "/aws/bedrock/invocations"},
+            },
+            log_group_pages=[
+                {
+                    "logGroups": [{"logGroupName": "/aws/bedrock/invocations-other"}],
+                    "nextToken": "page-2",
+                },
+                {
+                    "logGroups": [
+                        {
+                            "logGroupName": "/aws/bedrock/invocations",
+                            "retentionInDays": 30,
+                        }
+                    ]
+                },
+            ],
+        )
+
+        retention = self._retention_findings(
+            extract_csv_data(bedrock_app.check_bedrock_logging_configuration())
+        )
+
+        clients["logs"].describe_log_groups.assert_any_call(
+            limit=50,
+            logGroupNamePrefix="/aws/bedrock/invocations",
+            nextToken="page-2",
+        )
+        assert [f["Status"] for f in retention] == ["Passed"]
+        assert "expires events after 30 day(s)" in retention[0]["Finding_Details"]
+
+    @patch("boto3.client")
+    @patch("bedrock_app.detect_bedrock_regional_footprint", return_value=True)
+    def test_br04_unreadable_lifecycle_is_not_a_missing_period(
+        self, mock_footprint, mock_client
+    ):
+        factory, clients = self._retention_clients(
+            {"s3Config": {"bucketName": "log-bucket"}, "cloudWatchConfig": {}}
+        )
+        clients["s3"].get_bucket_lifecycle_configuration.side_effect = ClientError(
+            {"Error": {"Code": "AccessDenied", "Message": "Access Denied"}},
+            "GetBucketLifecycleConfiguration",
+        )
+        mock_client.side_effect = factory
+
+        retention = self._retention_findings(
+            extract_csv_data(bedrock_app.check_bedrock_logging_configuration())
+        )
+
+        assert [f["Status"] for f in retention] == ["N/A"]
+        assert "log-bucket" in retention[0]["Finding_Details"]
+
+    @patch("boto3.client")
+    @patch("bedrock_app.detect_bedrock_regional_footprint", return_value=True)
+    def test_br04_retention_findings_schema_valid(self, mock_footprint, mock_client):
+        mock_client.side_effect, _ = self._retention_clients(
+            {
+                "s3Config": {"bucketName": "log-bucket"},
+                "cloudWatchConfig": {"logGroupName": "/aws/bedrock/invocations"},
+            },
+            log_group_pages=[
+                {"logGroups": [{"logGroupName": "/aws/bedrock/invocations"}]}
+            ],
+            lifecycle={"Rules": [{"Status": "Enabled", "Expiration": {"Days": 7}}]},
+        )
+
+        findings = extract_csv_data(bedrock_app.check_bedrock_logging_configuration())
+        assert self._retention_findings(findings)
+        for finding in findings:
+            assert_finding_schema(finding)
+
 
 # ===================================================================
 # BR-05: check_bedrock_guardrails
@@ -553,6 +796,198 @@ class TestBR06CloudTrailLogging:
         result = check()
         for f in extract_csv_data(result):
             assert_finding_schema(f)
+
+    # --- Data-event legs: AIR-BDR-KB-06 and AIR-BDR-MDL-07 -----------------
+    KB_TYPE = "AWS::Bedrock::KnowledgeBase"
+    MODEL_TYPE = "AWS::Bedrock::Model"
+
+    @staticmethod
+    def _data_event_selector(resource_types):
+        return {
+            "Name": "bedrock data events",
+            "FieldSelectors": [
+                {"Field": "eventCategory", "Equals": ["Data"]},
+                {"Field": "resources.type", "Equals": list(resource_types)},
+            ],
+        }
+
+    @staticmethod
+    def _trail_client(trails, knowledge_bases=()):
+        """trails: {name: {"logging": bool, "selectors": [...]}}."""
+
+        def trail_name(arn):
+            return arn.rsplit("/", 1)[-1]
+
+        mock_ct = MagicMock()
+        mock_ct.list_trails.return_value = {
+            "Trails": [
+                {
+                    "TrailARN": f"arn:aws:cloudtrail:us-east-1:123:trail/{name}",
+                    "Name": name,
+                }
+                for name in trails
+            ]
+        }
+        mock_ct.get_trail.side_effect = lambda Name: {
+            "Trail": {"IsMultiRegionTrail": True}
+        }
+        mock_ct.get_trail_status.side_effect = lambda Name: {
+            "IsLogging": trails[trail_name(Name)]["logging"]
+        }
+        mock_ct.get_event_selectors.side_effect = lambda TrailName: {
+            "EventSelectors": [],
+            "AdvancedEventSelectors": trails[trail_name(TrailName)]["selectors"],
+        }
+        mock_ct.list_knowledge_bases.return_value = {
+            "knowledgeBaseSummaries": list(knowledge_bases)
+        }
+        return mock_ct
+
+    @staticmethod
+    def _by_finding_name(findings, name):
+        matches = [f for f in findings if f["Finding"] == name]
+        assert len(matches) == 1, f"{name}: {[f['Finding'] for f in findings]}"
+        return matches[0]
+
+    @patch("boto3.client")
+    @patch("bedrock_app.detect_bedrock_regional_footprint", return_value=True)
+    def test_br06_named_data_event_types_pass_per_resource_type(
+        self, mock_footprint, mock_client
+    ):
+        mock_client.return_value = self._trail_client(
+            {
+                "kb-trail": {
+                    "logging": True,
+                    "selectors": [self._data_event_selector([self.KB_TYPE])],
+                },
+                "model-trail": {
+                    "logging": True,
+                    "selectors": [self._data_event_selector([self.MODEL_TYPE])],
+                },
+            },
+            knowledge_bases=[{"knowledgeBaseId": "kb-1"}, {"knowledgeBaseId": "kb-2"}],
+        )
+
+        findings = extract_csv_data(bedrock_app.check_bedrock_cloudtrail_logging())
+
+        kb = self._by_finding_name(
+            findings, "Bedrock Knowledge Base Retrieval Data Event Logging"
+        )
+        assert kb["Status"] == "Passed"
+        assert kb["Check_ID"] == "BR-06"
+        assert "kb-trail" in kb["Finding_Details"]
+        assert "model-trail" not in kb["Finding_Details"]
+        assert "2 knowledge base(s)" in kb["Finding_Details"]
+
+        model = self._by_finding_name(
+            findings, "Bedrock Model Invocation Data Event Logging"
+        )
+        assert model["Status"] == "Passed"
+        assert "model-trail" in model["Finding_Details"]
+        assert "kb-trail" not in model["Finding_Details"]
+
+    @patch("boto3.client")
+    @patch("bedrock_app.detect_bedrock_regional_footprint", return_value=True)
+    def test_br06_knowledge_base_selector_does_not_cover_model_invocation(
+        self, mock_footprint, mock_client
+    ):
+        mock_client.return_value = self._trail_client(
+            {
+                "kb-only": {
+                    "logging": True,
+                    "selectors": [self._data_event_selector([self.KB_TYPE])],
+                }
+            },
+            knowledge_bases=[{"knowledgeBaseId": "kb-1"}],
+        )
+
+        findings = extract_csv_data(bedrock_app.check_bedrock_cloudtrail_logging())
+
+        assert (
+            self._by_finding_name(
+                findings, "Bedrock Knowledge Base Retrieval Data Event Logging"
+            )["Status"]
+            == "Passed"
+        )
+        model = self._by_finding_name(
+            findings, "Bedrock Model Invocation Data Event Logging"
+        )
+        assert model["Status"] == "Failed"
+        assert self.MODEL_TYPE in model["Finding_Details"]
+        assert (
+            f"observed data-event resource types: {self.KB_TYPE}"
+            in (model["Finding_Details"])
+        )
+        assert self.MODEL_TYPE in model["Resolution"]
+
+    @patch("boto3.client")
+    @patch("bedrock_app.detect_bedrock_regional_footprint", return_value=True)
+    def test_br06_no_knowledge_base_makes_the_retrieval_leg_not_applicable(
+        self, mock_footprint, mock_client
+    ):
+        mock_client.return_value = self._trail_client(
+            {
+                "management-only": {
+                    "logging": True,
+                    "selectors": [
+                        {
+                            "Name": "management",
+                            "FieldSelectors": [
+                                {"Field": "eventCategory", "Equals": ["Management"]}
+                            ],
+                        }
+                    ],
+                }
+            },
+            knowledge_bases=[],
+        )
+
+        findings = extract_csv_data(bedrock_app.check_bedrock_cloudtrail_logging())
+
+        kb = self._by_finding_name(
+            findings, "Bedrock Knowledge Base Retrieval Data Event Logging"
+        )
+        assert kb["Status"] == "N/A"
+        assert kb["Severity"] == "Informational"
+        assert "No knowledge base exists in this region" in kb["Finding_Details"]
+
+        model = self._by_finding_name(
+            findings, "Bedrock Model Invocation Data Event Logging"
+        )
+        assert model["Status"] == "Failed"
+        assert "observed data-event resource types: none" in model["Finding_Details"]
+
+    @patch("boto3.client")
+    @patch("bedrock_app.detect_bedrock_regional_footprint", return_value=True)
+    def test_br06_stopped_trail_data_events_are_not_coverage(
+        self, mock_footprint, mock_client
+    ):
+        mock_client.return_value = self._trail_client(
+            {
+                "stopped-trail": {
+                    "logging": False,
+                    "selectors": [
+                        self._data_event_selector([self.KB_TYPE, self.MODEL_TYPE])
+                    ],
+                }
+            },
+            knowledge_bases=[{"knowledgeBaseId": "kb-1"}],
+        )
+
+        findings = extract_csv_data(bedrock_app.check_bedrock_cloudtrail_logging())
+
+        for name in (
+            "Bedrock Knowledge Base Retrieval Data Event Logging",
+            "Bedrock Model Invocation Data Event Logging",
+        ):
+            finding = self._by_finding_name(findings, name)
+            assert finding["Status"] == "Failed"
+            assert (
+                "observed data-event resource types: none"
+                in (finding["Finding_Details"])
+            )
+        for finding in findings:
+            assert_finding_schema(finding)
 
 
 # ===================================================================
@@ -1513,6 +1948,16 @@ class TestBedrockHandlerMultiRegion:
         "check_inspector_lambda_code_scanning": "BR-33",
     }
 
+    # Checks that read a global surface (the IAM permissions cache or the
+    # organization's policy documents) and so run once, tagged Global.
+    GLOBAL_CHECKS = (
+        "check_bedrock_central_guardrail_enforcement",  # BR-41
+        "check_bedrock_model_allow_list",  # BR-42
+        "check_bedrock_region_invocation_control",  # BR-43
+        "check_bedrock_marketplace_model_control",  # BR-44
+        "check_bedrock_api_key_governance",  # BR-45
+    )
+
     def _run_handler_with_check_spies(self, event):
         """Drive the handler down the full regional path with every check function
         replaced by a spy that records the region it was called with. The probe
@@ -1553,6 +1998,12 @@ class TestBedrockHandlerMultiRegion:
             "check_bedrock_invocation_log_encryption",
             "check_bedrock_flows_guardrails",
             "check_bedrock_cross_account_guardrails",  # BR-15 (global)
+            "check_bedrock_central_guardrail_enforcement",  # BR-41 (global)
+            "check_bedrock_model_allow_list",  # BR-42 (global)
+            "check_bedrock_region_invocation_control",  # BR-43 (global)
+            "check_bedrock_marketplace_model_control",  # BR-44 (global)
+            "check_bedrock_api_key_governance",  # BR-45 (global)
+            "check_bedrock_knowledge_base_source_classification",  # BR-46
             "check_bedrock_guardrail_tier",
             "check_bedrock_custom_model_kms_encryption",
             "check_bedrock_model_evaluations",
@@ -1604,6 +2055,15 @@ class TestBedrockHandlerMultiRegion:
             )
         # BR-15 (cross-account guardrails) is global -> skipped on non-primary.
         assert "check_bedrock_cross_account_guardrails" not in recorded
+        # BR-41, BR-43 and BR-45 read organization policy documents and BR-42 and
+        # BR-44 read the IAM permissions cache, so all five are global.
+        for fn_name in self.GLOBAL_CHECKS:
+            assert fn_name not in recorded
+        # BR-46 is regional: it reads the knowledge bases in the scanned region.
+        assert (
+            recorded.get("check_bedrock_knowledge_base_source_classification")
+            == "eu-west-3"
+        )
 
     def test_new_regional_checks_run_per_region_primary(self):
         # On the primary region, BR-26..32 run with region=<scanned> and the
@@ -1618,6 +2078,14 @@ class TestBedrockHandlerMultiRegion:
             )
         # Global check runs once, tagged Global.
         assert recorded.get("check_bedrock_cross_account_guardrails") == "Global"
+        for fn_name in self.GLOBAL_CHECKS:
+            assert recorded.get(fn_name) == "Global", (
+                f"{fn_name} not run as a global check: {recorded.get(fn_name)}"
+            )
+        assert (
+            recorded.get("check_bedrock_knowledge_base_source_classification")
+            == "us-east-1"
+        )
 
 
 # ===================================================================
@@ -1900,6 +2368,1412 @@ class TestBR15CrossAccountGuardrails:
 
         for f in extract_csv_data(result):
             assert_finding_schema(f)
+
+
+# ===================================================================
+# BR-41: check_bedrock_central_guardrail_enforcement
+# ===================================================================
+class TestBR41CentralGuardrailEnforcement:
+    """BR-41: Read the enforced guardrail version out of the policy document."""
+
+    GUARDRAIL_ARN = "arn:aws:bedrock:us-east-1:123456789012:guardrail/abcd1234efgh"
+    OTHER_GUARDRAIL_ARN = (
+        "arn:aws:bedrock:us-east-1:123456789012:guardrail/zzzz9999yyyy"
+    )
+
+    @staticmethod
+    def _bedrock_policy_document(guardrail_arn, guardrail_version):
+        return {
+            "bedrock": {
+                "guardrails_configuration": {
+                    "@@assign": {
+                        "guardrail_identifier": guardrail_arn,
+                        "guardrail_version": guardrail_version,
+                    }
+                }
+            }
+        }
+
+    @staticmethod
+    def _deny_without_guardrail(operator, condition_value):
+        return {
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Sid": "RequireApprovedGuardrail",
+                    "Effect": "Deny",
+                    "Action": [
+                        "bedrock:InvokeModel",
+                        "bedrock:InvokeModelWithResponseStream",
+                    ],
+                    "Resource": "*",
+                    "Condition": {
+                        operator: {"bedrock:GuardrailIdentifier": condition_value}
+                    },
+                }
+            ],
+        }
+
+    def _client_factory(self, bedrock_policies, scps, targets, contents, account):
+        org_client = MagicMock()
+        org_client.describe_organization.return_value = {
+            "Organization": {"MasterAccountId": "123456789012"}
+        }
+
+        def list_policies(**kwargs):
+            if kwargs.get("Filter") == "BEDROCK_POLICY":
+                return {"Policies": list(bedrock_policies)}
+            return {"Policies": list(scps)}
+
+        org_client.list_policies.side_effect = list_policies
+        org_client.list_targets_for_policy.side_effect = lambda **kwargs: {
+            "Targets": targets.get(kwargs["PolicyId"], [])
+        }
+        org_client.describe_policy.side_effect = lambda **kwargs: {
+            "Policy": {"Content": json.dumps(contents.get(kwargs["PolicyId"], {}))}
+        }
+
+        sts_client = MagicMock()
+        sts_client.get_caller_identity.return_value = {"Account": account}
+
+        return org_client, lambda service, **kwargs: {
+            "organizations": org_client,
+            "sts": sts_client,
+        }[service]
+
+    def _run(
+        self,
+        bedrock_policies=(),
+        scps=(),
+        targets=None,
+        contents=None,
+        account="123456789012",
+    ):
+        org_client, factory = self._client_factory(
+            bedrock_policies, scps, targets or {}, contents or {}, account
+        )
+        with patch("bedrock_app.boto3.client", side_effect=factory):
+            result = bedrock_app.check_bedrock_central_guardrail_enforcement(
+                region="Global"
+            )
+        return org_client, extract_csv_data(result)
+
+    def test_br41_draft_version_fails_while_published_version_passes(self):
+        org_client, findings = self._run(
+            bedrock_policies=[
+                {"Id": "p-published", "Name": "PublishedGuardrail"},
+                {"Id": "p-draft", "Name": "DraftGuardrail"},
+            ],
+            targets={
+                "p-published": [{"TargetId": "r-abc123", "Type": "ROOT"}],
+                "p-draft": [{"TargetId": "ou-1234", "Type": "ORGANIZATIONAL_UNIT"}],
+            },
+            contents={
+                "p-published": self._bedrock_policy_document(self.GUARDRAIL_ARN, "3"),
+                "p-draft": self._bedrock_policy_document(
+                    self.OTHER_GUARDRAIL_ARN, "DRAFT"
+                ),
+            },
+        )
+
+        failed = [f for f in findings if f["Status"] == "Failed"]
+        passed = [f for f in findings if f["Status"] == "Passed"]
+
+        assert len(failed) == 1
+        assert failed[0]["Check_ID"] == "BR-41"
+        assert "DraftGuardrail" in failed[0]["Finding_Details"]
+        assert "p-draft" in failed[0]["Finding_Details"]
+        assert "DRAFT guardrail version" in failed[0]["Finding_Details"]
+        assert self.OTHER_GUARDRAIL_ARN in failed[0]["Finding_Details"]
+
+        assert len(passed) == 1
+        assert "PublishedGuardrail" in passed[0]["Finding_Details"]
+        assert "ROOT r-abc123" in passed[0]["Finding_Details"]
+        assert "version 3" in passed[0]["Finding_Details"]
+        assert "aws:PrincipalOrgID" in passed[0]["Finding_Details"]
+        # An enforcing Bedrock policy short-circuits the SCP fallback.
+        assert all(
+            call.kwargs.get("Filter") == "BEDROCK_POLICY"
+            for call in org_client.list_policies.call_args_list
+        )
+
+    def test_br41_unattached_policy_is_not_enforcement(self):
+        _, findings = self._run(
+            bedrock_policies=[{"Id": "p-orphan", "Name": "OrphanGuardrail"}],
+            targets={"p-orphan": []},
+            contents={
+                "p-orphan": self._bedrock_policy_document(self.GUARDRAIL_ARN, "2")
+            },
+        )
+
+        failed = [f for f in findings if f["Status"] == "Failed"]
+        assert len(failed) == 1
+        assert "OrphanGuardrail" in failed[0]["Finding_Details"]
+        assert "no attached root" in failed[0]["Finding_Details"]
+        assert not [f for f in findings if f["Status"] == "Passed"]
+
+    def test_br41_policy_naming_no_guardrail_is_not_enforcement(self):
+        _, findings = self._run(
+            bedrock_policies=[{"Id": "p-empty", "Name": "EmptyGuardrailPolicy"}],
+            targets={"p-empty": [{"TargetId": "r-abc123", "Type": "ROOT"}]},
+            contents={"p-empty": {"bedrock": {"guardrails_configuration": {}}}},
+        )
+
+        failed = [f for f in findings if f["Status"] == "Failed"]
+        assert len(failed) == 1
+        assert "names no guardrail ARN" in failed[0]["Finding_Details"]
+        assert "attached to ROOT r-abc123" in failed[0]["Finding_Details"]
+
+    def test_br41_negated_scp_condition_is_enforcement(self):
+        _, findings = self._run(
+            scps=[
+                {"Id": "p-unrelated", "Name": "DenyRegions"},
+                {"Id": "p-guardrail", "Name": "RequireGuardrail"},
+            ],
+            contents={
+                "p-unrelated": {
+                    "Version": "2012-10-17",
+                    "Statement": [
+                        {
+                            "Effect": "Deny",
+                            "Action": "ec2:*",
+                            "Resource": "*",
+                        }
+                    ],
+                },
+                "p-guardrail": self._deny_without_guardrail(
+                    "StringNotEquals", self.GUARDRAIL_ARN
+                ),
+            },
+        )
+
+        passed = [f for f in findings if f["Status"] == "Passed"]
+        assert len(passed) == 1
+        assert "RequireGuardrail" in passed[0]["Finding_Details"]
+        assert "DenyRegions" not in passed[0]["Finding_Details"]
+        assert not [f for f in findings if f["Status"] == "Failed"]
+
+    def test_br41_stringequals_deny_is_not_enforcement(self):
+        _, findings = self._run(
+            scps=[{"Id": "p-backwards", "Name": "BackwardsGuardrailDeny"}],
+            contents={
+                "p-backwards": self._deny_without_guardrail(
+                    "StringEquals", self.GUARDRAIL_ARN
+                )
+            },
+        )
+
+        failed = [f for f in findings if f["Status"] == "Failed"]
+        assert len(failed) == 1
+        assert "bedrock:guardrailidentifier" in failed[0]["Finding_Details"]
+        assert not [f for f in findings if f["Status"] == "Passed"]
+
+    def test_br41_null_condition_on_wildcard_action_is_enforcement(self):
+        document = self._deny_without_guardrail("Null", "true")
+        document["Statement"][0]["Action"] = "bedrock:Invoke*"
+        _, findings = self._run(
+            scps=[{"Id": "p-null", "Name": "RequireGuardrailPresent"}],
+            contents={"p-null": document},
+        )
+
+        passed = [f for f in findings if f["Status"] == "Passed"]
+        assert len(passed) == 1
+        assert "RequireGuardrailPresent" in passed[0]["Finding_Details"]
+
+    def test_br41_no_policy_of_either_kind_returns_failed(self):
+        _, findings = self._run()
+
+        assert len(findings) == 1
+        assert findings[0]["Status"] == "Failed"
+        assert findings[0]["Severity"] == "High"
+        assert (
+            "each application chooses its own guardrail"
+            in (findings[0]["Finding_Details"])
+        )
+        assert "bedrock:GuardrailIdentifier" in findings[0]["Resolution"]
+
+    def test_br41_unreadable_policies_are_not_absence(self):
+        org_client = MagicMock()
+        org_client.describe_organization.return_value = {
+            "Organization": {"MasterAccountId": "123456789012"}
+        }
+        org_client.list_policies.side_effect = ClientError(
+            {"Error": {"Code": "AccessDeniedException"}}, "ListPolicies"
+        )
+        sts_client = MagicMock()
+        sts_client.get_caller_identity.return_value = {"Account": "123456789012"}
+
+        with patch(
+            "bedrock_app.boto3.client",
+            side_effect=lambda service, **kwargs: {
+                "organizations": org_client,
+                "sts": sts_client,
+            }[service],
+        ):
+            findings = extract_csv_data(
+                bedrock_app.check_bedrock_central_guardrail_enforcement(region="Global")
+            )
+
+        assert len(findings) == 1
+        assert findings[0]["Status"] == "N/A"
+        assert "undetermined" in findings[0]["Finding_Details"]
+        assert "organizations:DescribePolicy" in findings[0]["Resolution"]
+
+    def test_br41_reads_policies_from_all_pages(self):
+        org_client = MagicMock()
+        org_client.describe_organization.return_value = {
+            "Organization": {"MasterAccountId": "123456789012"}
+        }
+        org_client.list_policies.side_effect = [
+            {
+                "Policies": [{"Id": "p-draft", "Name": "DraftGuardrail"}],
+                "NextToken": "policy-page-2",
+            },
+            {"Policies": [{"Id": "p-published", "Name": "PublishedGuardrail"}]},
+        ]
+        org_client.list_targets_for_policy.side_effect = lambda **kwargs: {
+            "Targets": [{"TargetId": "r-abc123", "Type": "ROOT"}]
+        }
+        org_client.describe_policy.side_effect = lambda **kwargs: {
+            "Policy": {
+                "Content": json.dumps(
+                    self._bedrock_policy_document(
+                        self.GUARDRAIL_ARN,
+                        "DRAFT" if kwargs["PolicyId"] == "p-draft" else "4",
+                    )
+                )
+            }
+        }
+        sts_client = MagicMock()
+        sts_client.get_caller_identity.return_value = {"Account": "123456789012"}
+
+        with patch(
+            "bedrock_app.boto3.client",
+            side_effect=lambda service, **kwargs: {
+                "organizations": org_client,
+                "sts": sts_client,
+            }[service],
+        ):
+            findings = extract_csv_data(
+                bedrock_app.check_bedrock_central_guardrail_enforcement(region="Global")
+            )
+
+        assert org_client.list_policies.call_count == 2
+        org_client.list_policies.assert_any_call(
+            MaxResults=20, Filter="BEDROCK_POLICY", NextToken="policy-page-2"
+        )
+        assert [f["Status"] for f in findings].count("Failed") == 1
+        assert [f["Status"] for f in findings].count("Passed") == 1
+
+    def test_br41_member_account_returns_na(self):
+        _, findings = self._run(account="222222222222")
+
+        assert len(findings) == 1
+        assert findings[0]["Status"] == "N/A"
+        assert "222222222222" in findings[0]["Finding_Details"]
+        assert "management account" in findings[0]["Finding_Details"]
+
+    def test_br41_organizations_not_in_use_returns_na(self):
+        org_client = MagicMock()
+        org_client.describe_organization.side_effect = ClientError(
+            {"Error": {"Code": "AWSOrganizationsNotInUseException"}},
+            "DescribeOrganization",
+        )
+        with patch("bedrock_app.boto3.client", return_value=org_client):
+            findings = extract_csv_data(
+                bedrock_app.check_bedrock_central_guardrail_enforcement(region="Global")
+            )
+
+        assert len(findings) == 1
+        assert findings[0]["Status"] == "N/A"
+        assert "BR-15" in findings[0]["Finding_Details"]
+
+    def test_br41_schema_valid(self):
+        _, findings = self._run(
+            bedrock_policies=[
+                {"Id": "p-published", "Name": "PublishedGuardrail"},
+                {"Id": "p-draft", "Name": "DraftGuardrail"},
+            ],
+            targets={
+                "p-published": [{"TargetId": "r-abc123", "Type": "ROOT"}],
+                "p-draft": [{"TargetId": "ou-1234", "Type": "ORGANIZATIONAL_UNIT"}],
+            },
+            contents={
+                "p-published": self._bedrock_policy_document(self.GUARDRAIL_ARN, "3"),
+                "p-draft": self._bedrock_policy_document(self.GUARDRAIL_ARN, "DRAFT"),
+            },
+        )
+
+        assert findings
+        for finding in findings:
+            assert_finding_schema(finding)
+
+
+def _identity_cache(roles=None, users=None):
+    """Build a permission cache from {identity: [(policy_name, document)]}."""
+
+    def entry(policies):
+        return {
+            "attached_policies": [
+                {
+                    "name": name,
+                    "arn": f"arn:aws:iam::123456789012:policy/{name}",
+                    "document": document,
+                }
+                for name, document in policies
+            ],
+            "inline_policies": [],
+            "permission_boundary": None,
+        }
+
+    return {
+        "role_permissions": {
+            name: entry(policies) for name, policies in (roles or {}).items()
+        },
+        "user_permissions": {
+            name: entry(policies) for name, policies in (users or {}).items()
+        },
+    }
+
+
+def _allow(actions, resources, condition=None):
+    statement = {"Effect": "Allow", "Action": actions, "Resource": resources}
+    if condition:
+        statement["Condition"] = condition
+    return {"Version": "2012-10-17", "Statement": [statement]}
+
+
+# ===================================================================
+# BR-42: check_bedrock_model_allow_list
+# ===================================================================
+class TestBR42ModelAllowList:
+    """BR-42: Model invocation must name the model ARNs it allows."""
+
+    MODEL_ARN = (
+        "arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-3-5-sonnet-v1:0"
+    )
+
+    def _run(self, cache):
+        return extract_csv_data(
+            bedrock_app.check_bedrock_model_allow_list(cache, region="Global")
+        )
+
+    def test_br42_named_arn_passes_while_wildcard_fails(self):
+        findings = self._run(
+            _identity_cache(
+                roles={
+                    "ScopedRole": [
+                        ("ScopedInvoke", _allow("bedrock:InvokeModel", self.MODEL_ARN))
+                    ],
+                    "OpenRole": [
+                        ("OpenInvoke", _allow("bedrock:InvokeModel", "*")),
+                    ],
+                }
+            )
+        )
+
+        failed = [f for f in findings if f["Status"] == "Failed"]
+        passed = [f for f in findings if f["Status"] == "Passed"]
+
+        assert len(failed) == 1
+        assert failed[0]["Check_ID"] == "BR-42"
+        assert "Role 'OpenRole'" in failed[0]["Finding_Details"]
+        assert "policy 'OpenInvoke'" in failed[0]["Finding_Details"]
+        assert "every model available in the account" in failed[0]["Finding_Details"]
+
+        assert len(passed) == 1
+        assert "ScopedRole" in passed[0]["Finding_Details"]
+        assert self.MODEL_ARN in passed[0]["Finding_Details"]
+        assert (
+            "confirm these ARNs are the approved list" in (passed[0]["Finding_Details"])
+        )
+
+    def test_br42_foundation_model_wildcard_arn_is_not_an_allow_list(self):
+        findings = self._run(
+            _identity_cache(
+                roles={
+                    "WildcardArnRole": [
+                        (
+                            "WildcardArn",
+                            _allow(
+                                ["bedrock:InvokeModel"],
+                                ["arn:aws:bedrock:*::foundation-model/*"],
+                            ),
+                        )
+                    ]
+                }
+            )
+        )
+
+        failed = [f for f in findings if f["Status"] == "Failed"]
+        assert len(failed) == 1
+        assert "arn:aws:bedrock:*::foundation-model/*" in failed[0]["Finding_Details"]
+        assert not [f for f in findings if f["Status"] == "Passed"]
+
+    def test_br42_model_arn_condition_does_not_scope_the_streaming_action(self):
+        condition = {"StringEquals": {"bedrock:ModelArn": self.MODEL_ARN}}
+        findings = self._run(
+            _identity_cache(
+                roles={
+                    "StreamingRole": [
+                        (
+                            "StreamingCondition",
+                            _allow(
+                                [
+                                    "bedrock:InvokeModel",
+                                    "bedrock:InvokeModelWithResponseStream",
+                                ],
+                                "*",
+                                condition,
+                            ),
+                        )
+                    ],
+                    "NonStreamingRole": [
+                        (
+                            "NonStreamingCondition",
+                            _allow("bedrock:InvokeModel", "*", condition),
+                        )
+                    ],
+                }
+            )
+        )
+
+        failed = [f for f in findings if f["Status"] == "Failed"]
+        passed = [f for f in findings if f["Status"] == "Passed"]
+        assert len(failed) == 1
+        assert "StreamingRole" in failed[0]["Finding_Details"]
+        assert "bedrock:invokemodelwithresponsestream" in failed[0]["Finding_Details"]
+        assert "which that operation does not support" in failed[0]["Finding_Details"]
+        assert len(passed) == 1
+        assert "NonStreamingRole" in passed[0]["Finding_Details"]
+
+    def test_br42_wildcard_action_on_all_resources_fails(self):
+        findings = self._run(
+            _identity_cache(
+                users={"AdminUser": [("Admin", _allow("*", "*"))]},
+            )
+        )
+
+        failed = [f for f in findings if f["Status"] == "Failed"]
+        assert len(failed) == 1
+        assert "User 'AdminUser'" in failed[0]["Finding_Details"]
+
+    def test_br42_no_invocation_grant_returns_na(self):
+        findings = self._run(
+            _identity_cache(
+                roles={
+                    "ReadOnlyRole": [
+                        ("ReadOnly", _allow("bedrock:ListFoundationModels", "*"))
+                    ]
+                }
+            )
+        )
+
+        assert [f["Status"] for f in findings] == ["N/A"]
+        assert "no model invocation grant to restrict" in findings[0]["Finding_Details"]
+
+    def test_br42_schema_valid(self):
+        findings = self._run(
+            _identity_cache(
+                roles={
+                    "ScopedRole": [
+                        ("ScopedInvoke", _allow("bedrock:InvokeModel", self.MODEL_ARN))
+                    ],
+                    "OpenRole": [("OpenInvoke", _allow("bedrock:InvokeModel", "*"))],
+                }
+            )
+        )
+        assert findings
+        for finding in findings:
+            assert_finding_schema(finding)
+
+
+# ===================================================================
+# BR-43: check_bedrock_region_invocation_control
+# ===================================================================
+class TestBR43RegionInvocationControl:
+    """BR-43: A Region condition on Bedrock invocation, read from the SCPs."""
+
+    @staticmethod
+    def _region_scp(operator, regions, action="bedrock:InvokeModel"):
+        return {
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Effect": "Deny",
+                    "Action": action,
+                    "Resource": "*",
+                    "Condition": {operator: {"aws:RequestedRegion": regions}},
+                }
+            ],
+        }
+
+    @staticmethod
+    def _inventory(policies):
+        return {
+            "items": [
+                {"name": name, "id": f"p-{name}", "content": json.dumps(document)}
+                for name, document in policies
+            ],
+            "errors": [],
+            "list_error": None,
+        }
+
+    def _run(self, inventory, account="123456789012"):
+        org_client = MagicMock()
+        org_client.describe_organization.return_value = {
+            "Organization": {"MasterAccountId": "123456789012"}
+        }
+        sts_client = MagicMock()
+        sts_client.get_caller_identity.return_value = {"Account": account}
+        with patch(
+            "bedrock_app.boto3.client",
+            side_effect=lambda service, **kwargs: {
+                "organizations": org_client,
+                "sts": sts_client,
+            }[service],
+        ):
+            return extract_csv_data(
+                bedrock_app.check_bedrock_region_invocation_control(
+                    region="Global", scp_inventory=inventory
+                )
+            )
+
+    def test_br43_region_allow_list_passes_and_names_the_global_literal(self):
+        findings = self._run(
+            self._inventory(
+                [
+                    (
+                        "ApprovedRegions",
+                        self._region_scp(
+                            "StringNotEquals", ["us-east-1", "unspecified"]
+                        ),
+                    ),
+                    (
+                        "UnrelatedDeny",
+                        {
+                            "Version": "2012-10-17",
+                            "Statement": [
+                                {"Effect": "Deny", "Action": "ec2:*", "Resource": "*"}
+                            ],
+                        },
+                    ),
+                ]
+            )
+        )
+
+        assert [f["Status"] for f in findings] == ["Passed"]
+        assert findings[0]["Check_ID"] == "BR-43"
+        assert "ApprovedRegions" in findings[0]["Finding_Details"]
+        assert "UnrelatedDeny" not in findings[0]["Finding_Details"]
+        assert "includes the literal 'unspecified'" in findings[0]["Finding_Details"]
+
+    def test_br43_allow_list_without_the_global_literal_says_so(self):
+        findings = self._run(
+            self._inventory(
+                [
+                    (
+                        "ApprovedRegions",
+                        self._region_scp("StringNotEquals", ["us-east-1"]),
+                    )
+                ]
+            )
+        )
+
+        assert [f["Status"] for f in findings] == ["Passed"]
+        assert "omits the literal 'unspecified'" in findings[0]["Finding_Details"]
+        assert (
+            "every global inference profile call is denied"
+            in (findings[0]["Finding_Details"])
+        )
+
+    def test_br43_no_region_condition_returns_failed(self):
+        findings = self._run(
+            self._inventory(
+                [
+                    (
+                        "GuardrailOnly",
+                        {
+                            "Version": "2012-10-17",
+                            "Statement": [
+                                {
+                                    "Effect": "Deny",
+                                    "Action": "bedrock:InvokeModel",
+                                    "Resource": "*",
+                                    "Condition": {
+                                        "Null": {"bedrock:GuardrailIdentifier": "true"}
+                                    },
+                                }
+                            ],
+                        },
+                    )
+                ]
+            )
+        )
+
+        assert [f["Status"] for f in findings] == ["Failed"]
+        assert "1 service control policy document(s)" in findings[0]["Finding_Details"]
+        assert "aws:RequestedRegion" in findings[0]["Resolution"]
+
+    def test_br43_batch_inference_action_counts_as_control(self):
+        findings = self._run(
+            self._inventory(
+                [
+                    (
+                        "BatchRegions",
+                        self._region_scp(
+                            "StringNotEquals",
+                            ["eu-west-1", "unspecified"],
+                            action="bedrock:CreateModelInvocationJob",
+                        ),
+                    )
+                ]
+            )
+        )
+
+        assert [f["Status"] for f in findings] == ["Passed"]
+        assert "bedrock:createmodelinvocationjob" in findings[0]["Finding_Details"]
+
+    def test_br43_unreadable_policies_are_not_absence(self):
+        inventory = {
+            "items": [],
+            "errors": ["policy 'Secret': AccessDenied"],
+            "list_error": None,
+        }
+        findings = self._run(inventory)
+
+        assert [f["Status"] for f in findings] == ["N/A"]
+        assert "undetermined" in findings[0]["Finding_Details"]
+        assert "policy 'Secret'" in findings[0]["Finding_Details"]
+
+    def test_br43_member_account_returns_na(self):
+        findings = self._run(self._inventory([]), account="222222222222")
+
+        assert [f["Status"] for f in findings] == ["N/A"]
+        assert "222222222222" in findings[0]["Finding_Details"]
+
+    def test_br43_builds_its_own_inventory_when_not_given_one(self):
+        org_client = MagicMock()
+        org_client.describe_organization.return_value = {
+            "Organization": {"MasterAccountId": "123456789012"}
+        }
+        org_client.list_policies.return_value = {
+            "Policies": [{"Id": "p-1", "Name": "ApprovedRegions"}]
+        }
+        org_client.describe_policy.return_value = {
+            "Policy": {
+                "Content": json.dumps(
+                    self._region_scp("StringNotEquals", ["us-east-1", "unspecified"])
+                )
+            }
+        }
+        sts_client = MagicMock()
+        sts_client.get_caller_identity.return_value = {"Account": "123456789012"}
+
+        with patch(
+            "bedrock_app.boto3.client",
+            side_effect=lambda service, **kwargs: {
+                "organizations": org_client,
+                "sts": sts_client,
+            }[service],
+        ):
+            findings = extract_csv_data(
+                bedrock_app.check_bedrock_region_invocation_control(region="Global")
+            )
+
+        org_client.list_policies.assert_called_once_with(
+            MaxResults=20, Filter="SERVICE_CONTROL_POLICY"
+        )
+        assert [f["Status"] for f in findings] == ["Passed"]
+
+    def test_br43_schema_valid(self):
+        findings = self._run(
+            self._inventory(
+                [("ApprovedRegions", self._region_scp("StringEquals", ["cn-north-1"]))]
+            )
+        )
+        assert findings
+        for finding in findings:
+            assert_finding_schema(finding)
+
+
+# ===================================================================
+# BR-44: check_bedrock_marketplace_model_control
+# ===================================================================
+class TestBR44MarketplaceModelControl:
+    """BR-44: Marketplace subscription must be scoped by product."""
+
+    PRODUCT_ID = "prod-abcdefghijklm"
+
+    def _run(self, cache):
+        return extract_csv_data(
+            bedrock_app.check_bedrock_marketplace_model_control(cache, region="Global")
+        )
+
+    def test_br44_product_condition_passes_while_bare_subscribe_fails(self):
+        findings = self._run(
+            _identity_cache(
+                roles={
+                    "ScopedRole": [
+                        (
+                            "ScopedSubscribe",
+                            _allow(
+                                "aws-marketplace:Subscribe",
+                                "*",
+                                {
+                                    "StringEquals": {
+                                        "aws-marketplace:ProductId": self.PRODUCT_ID
+                                    }
+                                },
+                            ),
+                        )
+                    ],
+                    "OpenRole": [
+                        ("OpenSubscribe", _allow("aws-marketplace:Subscribe", "*"))
+                    ],
+                }
+            )
+        )
+
+        failed = [f for f in findings if f["Status"] == "Failed"]
+        passed = [f for f in findings if f["Status"] == "Passed"]
+
+        assert len(failed) == 1
+        assert failed[0]["Check_ID"] == "BR-44"
+        assert "Role 'OpenRole'" in failed[0]["Finding_Details"]
+        assert (
+            "without an aws-marketplace:productid condition"
+            in (failed[0]["Finding_Details"])
+        )
+        assert "BR-42" in failed[0]["Resolution"]
+
+        assert len(passed) == 1
+        assert "ScopedRole" in passed[0]["Finding_Details"]
+        assert self.PRODUCT_ID in passed[0]["Finding_Details"]
+        assert "BR-42" in passed[0]["Finding_Details"]
+
+    def test_br44_deny_naming_products_positively_fails_open(self):
+        document = {
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Effect": "Allow",
+                    "Action": "aws-marketplace:Subscribe",
+                    "Resource": "*",
+                    "Condition": {
+                        "StringEquals": {"aws-marketplace:ProductId": self.PRODUCT_ID}
+                    },
+                },
+                {
+                    "Effect": "Deny",
+                    "Action": "aws-marketplace:Subscribe",
+                    "Resource": "*",
+                    "Condition": {
+                        "StringEquals": {"aws-marketplace:ProductId": "prod-blocked"}
+                    },
+                },
+            ],
+        }
+        findings = self._run(
+            _identity_cache(roles={"DenyListRole": [("DenyList", document)]})
+        )
+
+        failed = [f for f in findings if f["Status"] == "Failed"]
+        assert len(failed) == 1
+        assert (
+            "leaves every product that is not named allowed"
+            in (failed[0]["Finding_Details"])
+        )
+        assert not [f for f in findings if f["Status"] == "Passed"]
+
+    def test_br44_negated_deny_is_an_allow_list(self):
+        document = {
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Effect": "Deny",
+                    "Action": "aws-marketplace:Subscribe",
+                    "Resource": "*",
+                    "Condition": {
+                        "StringNotEquals": {
+                            "aws-marketplace:ProductId": self.PRODUCT_ID
+                        }
+                    },
+                }
+            ],
+        }
+        findings = self._run(
+            _identity_cache(roles={"AllowListRole": [("AllowList", document)]})
+        )
+
+        assert [f["Status"] for f in findings] == ["Passed"]
+        assert "Deny scoped by stringnotequals" in findings[0]["Finding_Details"]
+
+    def test_br44_qualified_operator_is_the_form_iam_accepts(self):
+        # aws-marketplace:ProductId is multi-valued, so IAM Access Analyzer
+        # rejects a bare StringEquals on it with MISSING_QUALIFIER. The
+        # qualified operator must therefore read as scoping, and its negated
+        # form must still read as a Deny allow-list.
+        findings = self._run(
+            _identity_cache(
+                roles={
+                    "QualifiedAllowRole": [
+                        (
+                            "QualifiedAllow",
+                            _allow(
+                                "aws-marketplace:Subscribe",
+                                "*",
+                                {
+                                    "ForAllValues:StringEquals": {
+                                        "aws-marketplace:ProductId": [self.PRODUCT_ID]
+                                    }
+                                },
+                            ),
+                        )
+                    ],
+                    "QualifiedDenyRole": [
+                        (
+                            "QualifiedDeny",
+                            {
+                                "Version": "2012-10-17",
+                                "Statement": [
+                                    {
+                                        "Effect": "Deny",
+                                        "Action": "aws-marketplace:Subscribe",
+                                        "Resource": "*",
+                                        "Condition": {
+                                            "ForAnyValue:StringNotEquals": {
+                                                "aws-marketplace:ProductId": [
+                                                    self.PRODUCT_ID
+                                                ]
+                                            }
+                                        },
+                                    }
+                                ],
+                            },
+                        )
+                    ],
+                }
+            )
+        )
+
+        assert [f["Status"] for f in findings] == ["Passed"]
+        assert "forallvalues:stringequals" in findings[0]["Finding_Details"]
+        assert "foranyvalue:stringnotequals" in findings[0]["Finding_Details"]
+
+    def test_br44_resolution_names_the_multi_value_qualifier(self):
+        findings = self._run(
+            _identity_cache(
+                roles={
+                    "OpenRole": [
+                        ("OpenSubscribe", _allow("aws-marketplace:Subscribe", "*"))
+                    ]
+                }
+            )
+        )
+
+        failed = [f for f in findings if f["Status"] == "Failed"]
+        assert len(failed) == 1
+        assert "ForAllValues:StringEquals" in failed[0]["Resolution"]
+
+    def test_br44_no_subscribe_grant_returns_na(self):
+        findings = self._run(
+            _identity_cache(
+                roles={
+                    "ReadOnlyRole": [("ReadOnly", _allow("bedrock:ListAgents", "*"))]
+                }
+            )
+        )
+
+        assert [f["Status"] for f in findings] == ["N/A"]
+        assert "no identity can subscribe" in findings[0]["Finding_Details"]
+
+    def test_br44_schema_valid(self):
+        findings = self._run(
+            _identity_cache(
+                roles={
+                    "OpenRole": [
+                        ("OpenSubscribe", _allow("aws-marketplace:Subscribe", "*"))
+                    ]
+                },
+                users={
+                    "ScopedUser": [
+                        (
+                            "ScopedSubscribe",
+                            _allow(
+                                "aws-marketplace:Subscribe",
+                                "*",
+                                {
+                                    "StringEquals": {
+                                        "aws-marketplace:ProductId": self.PRODUCT_ID
+                                    }
+                                },
+                            ),
+                        )
+                    ]
+                },
+            )
+        )
+        assert findings
+        for finding in findings:
+            assert_finding_schema(finding)
+
+
+# ===================================================================
+# BR-45: check_bedrock_api_key_governance
+# ===================================================================
+class TestBR45ApiKeyGovernance:
+    """BR-45: Bedrock API key inventory and the preventive age/token control."""
+
+    INVENTORY_FINDING = "Bedrock API Key Inventory"
+    PREVENTION_FINDING = "Bedrock API Key Age And Token Type Control"
+
+    @staticmethod
+    def _age_scp(operator="NumericGreaterThan", value="7"):
+        return {
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Effect": "Deny",
+                    "Action": "iam:CreateServiceSpecificCredential",
+                    "Resource": "*",
+                    "Condition": {
+                        "StringEquals": {
+                            "iam:ServiceSpecificCredentialServiceName": "bedrock.amazonaws.com"
+                        },
+                        operator: {"iam:ServiceSpecificCredentialAgeDays": value},
+                    },
+                }
+            ],
+        }
+
+    @staticmethod
+    def _bearer_token_scp():
+        return {
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Effect": "Deny",
+                    "Action": "bedrock:CallWithBearerToken",
+                    "Resource": "*",
+                    "Condition": {
+                        "StringEquals": {"bedrock:BearerTokenType": "LONG_TERM"}
+                    },
+                }
+            ],
+        }
+
+    def _run(self, credentials, inventory=None, account="123456789012", users=None):
+        """credentials: {user_name: [credential dicts]}."""
+        iam_client = MagicMock()
+
+        def list_credentials(**kwargs):
+            return {
+                "ServiceSpecificCredentials": list(
+                    credentials.get(kwargs["UserName"], [])
+                )
+            }
+
+        iam_client.list_service_specific_credentials.side_effect = list_credentials
+
+        org_client = MagicMock()
+        org_client.describe_organization.return_value = {
+            "Organization": {"MasterAccountId": "123456789012"}
+        }
+        sts_client = MagicMock()
+        sts_client.get_caller_identity.return_value = {"Account": account}
+
+        cache = _identity_cache(
+            users={name: [] for name in (users or credentials.keys())}
+        )
+        with patch(
+            "bedrock_app.boto3.client",
+            side_effect=lambda service, **kwargs: {
+                "iam": iam_client,
+                "organizations": org_client,
+                "sts": sts_client,
+            }[service],
+        ):
+            findings = extract_csv_data(
+                bedrock_app.check_bedrock_api_key_governance(
+                    cache,
+                    region="Global",
+                    scp_inventory=inventory
+                    if inventory is not None
+                    else {"items": [], "errors": [], "list_error": None},
+                )
+            )
+        return iam_client, findings
+
+    def _by_name(self, findings, name):
+        return [f for f in findings if f["Finding"] == name]
+
+    def test_br45_key_without_expiry_fails_while_expiring_key_passes(self):
+        iam_client, findings = self._run(
+            {
+                "StandingKeyUser": [
+                    {
+                        "ServiceSpecificCredentialId": "ACCA-standing",
+                        "Status": "Active",
+                    }
+                ],
+                "ExpiringKeyUser": [
+                    {
+                        "ServiceSpecificCredentialId": "ACCA-expiring",
+                        "Status": "Active",
+                        "ExpirationDate": "2026-01-01T00:00:00Z",
+                    }
+                ],
+            }
+        )
+
+        inventory_rows = self._by_name(findings, self.INVENTORY_FINDING)
+        failed = [f for f in inventory_rows if f["Status"] == "Failed"]
+        passed = [f for f in inventory_rows if f["Status"] == "Passed"]
+
+        assert len(failed) == 1
+        assert failed[0]["Check_ID"] == "BR-45"
+        assert "StandingKeyUser" in failed[0]["Finding_Details"]
+        assert "ACCA-standing" in failed[0]["Finding_Details"]
+        assert "no expiration date" in failed[0]["Finding_Details"]
+
+        assert len(passed) == 1
+        assert "ACCA-expiring" in passed[0]["Finding_Details"]
+        assert "2026-01-01" in passed[0]["Finding_Details"]
+
+        iam_client.list_service_specific_credentials.assert_any_call(
+            UserName="StandingKeyUser", ServiceName="bedrock.amazonaws.com"
+        )
+
+    def test_br45_inactive_credential_is_not_a_standing_key(self):
+        _, findings = self._run(
+            {
+                "RetiredKeyUser": [
+                    {
+                        "ServiceSpecificCredentialId": "ACCA-retired",
+                        "Status": "Inactive",
+                    }
+                ]
+            }
+        )
+
+        inventory_rows = self._by_name(findings, self.INVENTORY_FINDING)
+        assert [f["Status"] for f in inventory_rows] == ["N/A"]
+        assert "no Bedrock API key is in use" in inventory_rows[0]["Finding_Details"]
+
+    def test_br45_age_cap_scp_passes_the_prevention_leg(self):
+        _, findings = self._run(
+            {},
+            inventory={
+                "items": [
+                    {
+                        "name": "CapKeyAge",
+                        "id": "p-1",
+                        "content": json.dumps(self._age_scp()),
+                    }
+                ],
+                "errors": [],
+                "list_error": None,
+            },
+        )
+
+        prevention = self._by_name(findings, self.PREVENTION_FINDING)
+        assert [f["Status"] for f in prevention] == ["Passed"]
+        assert "CapKeyAge" in prevention[0]["Finding_Details"]
+        assert (
+            "iam:servicespecificcredentialagedays" in prevention[0]["Finding_Details"]
+        )
+
+    def test_br45_bearer_token_type_deny_passes_the_prevention_leg(self):
+        _, findings = self._run(
+            {},
+            inventory={
+                "items": [
+                    {
+                        "name": "DenyLongTermToken",
+                        "id": "p-2",
+                        "content": json.dumps(self._bearer_token_scp()),
+                    }
+                ],
+                "errors": [],
+                "list_error": None,
+            },
+        )
+
+        prevention = self._by_name(findings, self.PREVENTION_FINDING)
+        assert [f["Status"] for f in prevention] == ["Passed"]
+        assert "bedrock:bearertokentype" in prevention[0]["Finding_Details"]
+
+    def test_br45_no_preventive_policy_returns_failed(self):
+        _, findings = self._run(
+            {},
+            inventory={
+                "items": [
+                    {
+                        "name": "UnrelatedDeny",
+                        "id": "p-3",
+                        "content": json.dumps(
+                            {
+                                "Version": "2012-10-17",
+                                "Statement": [
+                                    {
+                                        "Effect": "Deny",
+                                        "Action": "iam:CreateUser",
+                                        "Resource": "*",
+                                    }
+                                ],
+                            }
+                        ),
+                    }
+                ],
+                "errors": [],
+                "list_error": None,
+            },
+        )
+
+        prevention = self._by_name(findings, self.PREVENTION_FINDING)
+        assert [f["Status"] for f in prevention] == ["Failed"]
+        assert (
+            "1 service control policy document(s)" in (prevention[0]["Finding_Details"])
+        )
+        assert "LONG_TERM" in prevention[0]["Resolution"]
+
+    def test_br45_unreadable_credentials_are_not_absence(self):
+        iam_client = MagicMock()
+        iam_client.list_service_specific_credentials.side_effect = ClientError(
+            {"Error": {"Code": "AccessDenied"}}, "ListServiceSpecificCredentials"
+        )
+        org_client = MagicMock()
+        org_client.describe_organization.return_value = {
+            "Organization": {"MasterAccountId": "123456789012"}
+        }
+        sts_client = MagicMock()
+        sts_client.get_caller_identity.return_value = {"Account": "123456789012"}
+
+        with patch(
+            "bedrock_app.boto3.client",
+            side_effect=lambda service, **kwargs: {
+                "iam": iam_client,
+                "organizations": org_client,
+                "sts": sts_client,
+            }[service],
+        ):
+            findings = extract_csv_data(
+                bedrock_app.check_bedrock_api_key_governance(
+                    _identity_cache(users={"KeyUser": []}),
+                    region="Global",
+                    scp_inventory={"items": [], "errors": [], "list_error": None},
+                )
+            )
+
+        inventory_rows = self._by_name(findings, self.INVENTORY_FINDING)
+        assert [f["Status"] for f in inventory_rows] == ["N/A"]
+        assert "could not be inventoried" in inventory_rows[0]["Finding_Details"]
+        assert "iam:ListServiceSpecificCredentials" in inventory_rows[0]["Resolution"]
+
+    def test_br45_member_account_still_inventories_keys(self):
+        _, findings = self._run(
+            {
+                "StandingKeyUser": [
+                    {"ServiceSpecificCredentialId": "ACCA-x", "Status": "Active"}
+                ]
+            },
+            account="222222222222",
+        )
+
+        assert [
+            f["Status"] for f in self._by_name(findings, self.INVENTORY_FINDING)
+        ] == ["Failed"]
+        prevention = self._by_name(findings, self.PREVENTION_FINDING)
+        assert [f["Status"] for f in prevention] == ["N/A"]
+        assert "222222222222" in prevention[0]["Finding_Details"]
+
+    def test_br45_reads_credentials_from_all_pages(self):
+        iam_client = MagicMock()
+        iam_client.list_service_specific_credentials.side_effect = [
+            {
+                "ServiceSpecificCredentials": [
+                    {"ServiceSpecificCredentialId": "ACCA-1", "Status": "Inactive"}
+                ],
+                "Marker": "page-2",
+            },
+            {
+                "ServiceSpecificCredentials": [
+                    {"ServiceSpecificCredentialId": "ACCA-2", "Status": "Active"}
+                ]
+            },
+        ]
+        org_client = MagicMock()
+        org_client.describe_organization.return_value = {
+            "Organization": {"MasterAccountId": "123456789012"}
+        }
+        sts_client = MagicMock()
+        sts_client.get_caller_identity.return_value = {"Account": "123456789012"}
+
+        with patch(
+            "bedrock_app.boto3.client",
+            side_effect=lambda service, **kwargs: {
+                "iam": iam_client,
+                "organizations": org_client,
+                "sts": sts_client,
+            }[service],
+        ):
+            findings = extract_csv_data(
+                bedrock_app.check_bedrock_api_key_governance(
+                    _identity_cache(users={"KeyUser": []}),
+                    region="Global",
+                    scp_inventory={"items": [], "errors": [], "list_error": None},
+                )
+            )
+
+        iam_client.list_service_specific_credentials.assert_any_call(
+            UserName="KeyUser",
+            ServiceName="bedrock.amazonaws.com",
+            Marker="page-2",
+        )
+        inventory_rows = self._by_name(findings, self.INVENTORY_FINDING)
+        assert [f["Status"] for f in inventory_rows] == ["Failed"]
+        assert "ACCA-2" in inventory_rows[0]["Finding_Details"]
+
+    def test_br45_schema_valid(self):
+        _, findings = self._run(
+            {
+                "StandingKeyUser": [
+                    {"ServiceSpecificCredentialId": "ACCA-x", "Status": "Active"}
+                ],
+                "ExpiringKeyUser": [
+                    {
+                        "ServiceSpecificCredentialId": "ACCA-y",
+                        "Status": "Active",
+                        "ExpirationDate": "2026-05-05T00:00:00Z",
+                    }
+                ],
+            },
+            inventory={
+                "items": [
+                    {
+                        "name": "CapKeyAge",
+                        "id": "p-1",
+                        "content": json.dumps(self._age_scp()),
+                    }
+                ],
+                "errors": [],
+                "list_error": None,
+            },
+        )
+        assert findings
+        for finding in findings:
+            assert_finding_schema(finding)
+
+
+# ===================================================================
+# BR-46: check_bedrock_knowledge_base_source_classification
+# ===================================================================
+class TestBR46KnowledgeBaseSourceClassification:
+    """BR-46: Macie must classify knowledge base sources before ingestion."""
+
+    def _run(
+        self,
+        knowledge_bases=(),
+        session_status="ENABLED",
+        discovery_status="ENABLED",
+        session_error=None,
+        discovery_error=None,
+    ):
+        agent_client = MagicMock()
+        agent_client.list_knowledge_bases.return_value = {
+            "knowledgeBaseSummaries": list(knowledge_bases)
+        }
+
+        macie_client = MagicMock()
+        if session_error:
+            macie_client.get_macie_session.side_effect = session_error
+        else:
+            macie_client.get_macie_session.return_value = {"status": session_status}
+        if discovery_error:
+            macie_client.get_automated_discovery_configuration.side_effect = (
+                discovery_error
+            )
+        else:
+            macie_client.get_automated_discovery_configuration.return_value = {
+                "status": discovery_status,
+                "classificationScopeId": "scope-1",
+            }
+
+        with patch(
+            "bedrock_app.boto3.client",
+            side_effect=lambda service, **kwargs: {
+                "bedrock-agent": agent_client,
+                "macie2": macie_client,
+            }[service],
+        ):
+            return extract_csv_data(
+                bedrock_app.check_bedrock_knowledge_base_source_classification(
+                    region="us-east-1"
+                )
+            )
+
+    def test_br46_macie_enabled_with_discovery_passes(self):
+        findings = self._run(knowledge_bases=[{"knowledgeBaseId": "kb-1"}])
+
+        assert [f["Status"] for f in findings] == ["Passed"]
+        assert findings[0]["Check_ID"] == "BR-46"
+        assert "1 knowledge base(s)" in findings[0]["Finding_Details"]
+        assert "the Macie session is ENABLED" in findings[0]["Finding_Details"]
+        assert "scope-1" in findings[0]["Finding_Details"]
+        assert "per-document metadata" in findings[0]["Finding_Details"]
+
+    def test_br46_discovery_disabled_fails_while_session_passes(self):
+        findings = self._run(
+            knowledge_bases=[{"knowledgeBaseId": "kb-1"}, {"knowledgeBaseId": "kb-2"}],
+            discovery_status="DISABLED",
+        )
+
+        failed = [f for f in findings if f["Status"] == "Failed"]
+        passed = [f for f in findings if f["Status"] == "Passed"]
+        assert len(failed) == 1
+        assert "2 knowledge base(s)" in failed[0]["Finding_Details"]
+        assert (
+            "automated sensitive data discovery is DISABLED"
+            in (failed[0]["Finding_Details"])
+        )
+        assert len(passed) == 1
+        assert "the Macie session is ENABLED" in passed[0]["Finding_Details"]
+
+    def test_br46_paused_session_fails(self):
+        findings = self._run(
+            knowledge_bases=[{"knowledgeBaseId": "kb-1"}],
+            session_status="PAUSED",
+            discovery_status="DISABLED",
+        )
+
+        assert [f["Status"] for f in findings] == ["Failed", "Failed"]
+        assert "the Macie session status is PAUSED" in findings[0]["Finding_Details"]
+
+    def test_br46_no_knowledge_base_returns_na(self):
+        findings = self._run()
+
+        assert [f["Status"] for f in findings] == ["N/A"]
+        assert "no ingestion source to classify" in findings[0]["Finding_Details"]
+
+    def test_br46_macie_unreadable_is_not_absence(self):
+        findings = self._run(
+            knowledge_bases=[{"knowledgeBaseId": "kb-1"}],
+            session_error=_make_client_error("AccessDeniedException"),
+        )
+
+        assert [f["Status"] for f in findings] == ["N/A"]
+        assert "undetermined" in findings[0]["Finding_Details"]
+        assert "macie2:GetMacieSession" in findings[0]["Resolution"]
+
+    def test_br46_schema_valid(self):
+        findings = self._run(
+            knowledge_bases=[{"knowledgeBaseId": "kb-1"}],
+            discovery_status="DISABLED",
+        )
+        assert findings
+        for finding in findings:
+            assert_finding_schema(finding)
 
 
 # ===================================================================
@@ -3567,7 +5441,18 @@ class TestBR27ContextualGrounding:
             "guardrail": {
                 "contextualGroundingPolicy": {
                     "filters": [
-                        {"type": "GROUNDING", "threshold": 0.75, "enabled": True}
+                        {
+                            "type": "GROUNDING",
+                            "threshold": 0.75,
+                            "action": "BLOCK",
+                            "enabled": True,
+                        },
+                        {
+                            "type": "RELEVANCE",
+                            "threshold": 0.75,
+                            "action": "BLOCK",
+                            "enabled": True,
+                        },
                     ]
                 }
             }
@@ -3596,6 +5481,86 @@ class TestBR27ContextualGrounding:
         findings = extract_csv_data(result)
         assert findings[0]["Status"] == "Failed"
         assert findings[0]["Check_ID"] == "BR-27"
+
+    @staticmethod
+    def _grounding_filters(grounding, relevance):
+        filters = []
+        if grounding is not None:
+            filters.append(dict(grounding, type="GROUNDING", enabled=True))
+        if relevance is not None:
+            filters.append(dict(relevance, type="RELEVANCE", enabled=True))
+        return {"guardrail": {"contextualGroundingPolicy": {"filters": filters}}}
+
+    @patch("bedrock_app.boto3.client")
+    def test_br27_reports_the_threshold_and_action_it_observed(self, mock_client):
+        """AIR-BDR-GRD-09: both filter types must block inside the 0-0.99 range."""
+        check = bedrock_app.check_bedrock_guardrail_contextual_grounding
+        bedrock_client = MagicMock()
+        bedrock_client.list_guardrails.return_value = {
+            "guardrails": [
+                {"id": "gr1", "name": "BlockingBoth"},
+                {"id": "gr2", "name": "DetectOnlyRelevance"},
+                {"id": "gr3", "name": "GroundingOnly"},
+                {"id": "gr4", "name": "ZeroThreshold"},
+            ]
+        }
+        bedrock_client.get_guardrail.side_effect = [
+            self._grounding_filters(
+                {"threshold": 0.85, "action": "BLOCK"},
+                {"threshold": 0.7, "action": "BLOCK"},
+            ),
+            self._grounding_filters(
+                {"threshold": 0.85, "action": "BLOCK"},
+                {"threshold": 0.7, "action": "NONE"},
+            ),
+            self._grounding_filters({"threshold": 0.85, "action": "BLOCK"}, None),
+            self._grounding_filters(
+                {"threshold": 0.0, "action": "BLOCK"},
+                {"threshold": 0.7, "action": "BLOCK"},
+            ),
+        ]
+        mock_client.return_value = bedrock_client
+
+        findings = extract_csv_data(check(region="us-east-1"))
+        by_status = {}
+        for finding in findings:
+            by_status.setdefault(finding["Status"], []).append(finding)
+
+        passed = by_status["Passed"]
+        assert len(passed) == 1
+        assert (
+            "1 guardrails block on both GROUNDING and RELEVANCE"
+            in passed[0]["Finding_Details"]
+        )
+
+        failed_details = {finding["Finding_Details"] for finding in by_status["Failed"]}
+        assert len(failed_details) == 3
+        detect_only = next(d for d in failed_details if "DetectOnlyRelevance" in d)
+        assert "does not block on RELEVANCE" in detect_only
+        assert "RELEVANCE threshold=0.7 action=NONE" in detect_only
+        grounding_only = next(d for d in failed_details if "GroundingOnly" in d)
+        assert "does not block on RELEVANCE" in grounding_only
+        zero_threshold = next(d for d in failed_details if "ZeroThreshold" in d)
+        assert "does not block on GROUNDING" in zero_threshold
+        assert "GROUNDING threshold=0.0 action=BLOCK" in zero_threshold
+        for finding in findings:
+            assert_finding_schema(finding)
+
+    @patch("bedrock_app.boto3.client")
+    def test_br27_omitted_action_is_read_as_block(self, mock_client):
+        """action postdates the filter, so an omitted action still blocks."""
+        check = bedrock_app.check_bedrock_guardrail_contextual_grounding
+        bedrock_client = MagicMock()
+        bedrock_client.list_guardrails.return_value = {
+            "guardrails": [{"id": "gr1", "name": "LegacyGuardrail"}]
+        }
+        bedrock_client.get_guardrail.return_value = self._grounding_filters(
+            {"threshold": 0.8}, {"threshold": 0.8}
+        )
+        mock_client.return_value = bedrock_client
+
+        findings = extract_csv_data(check(region="us-east-1"))
+        assert [f["Status"] for f in findings] == ["Passed"]
 
     def test_br27_schema_valid(self):
         check = bedrock_app.check_bedrock_guardrail_contextual_grounding
@@ -4027,6 +5992,185 @@ class TestBR32CloudWatchAlarms:
         assert findings[0]["Check_ID"] == "BR-32"
         assert findings[0]["Severity"] == "Medium"
 
+    @staticmethod
+    def _alarm_clients(alarms, logging_config=None, metric_filters=None):
+        """Build cloudwatch/bedrock/logs mocks for the intervention-signal leg."""
+        cw_client = MagicMock()
+        paginator = MagicMock()
+        paginator.paginate.return_value = [{"MetricAlarms": alarms}]
+        cw_client.get_paginator.return_value = paginator
+
+        bedrock_client = MagicMock()
+        bedrock_client.get_model_invocation_logging_configuration.return_value = (
+            {"loggingConfig": logging_config} if logging_config is not None else {}
+        )
+
+        logs_client = MagicMock()
+        logs_client.describe_metric_filters.return_value = {
+            "metricFilters": metric_filters or []
+        }
+
+        def client_factory(service, **kwargs):
+            if service == "bedrock":
+                return bedrock_client
+            if service == "logs":
+                return logs_client
+            return cw_client
+
+        return client_factory, logs_client
+
+    @patch("bedrock_app.detect_bedrock_regional_footprint", return_value=True)
+    @patch("bedrock_app.boto3.client")
+    def test_br32_guardrail_namespace_alarm_reports_the_signal(
+        self, mock_client, mock_footprint
+    ):
+        """AIR-BDR-GRD-04: an intervention alarm is a distinct signal from AWS/Bedrock."""
+        check = bedrock_app.check_bedrock_cloudwatch_alarms
+        client_factory, _ = self._alarm_clients(
+            [
+                {"AlarmName": "bedrock-throttle", "Namespace": "AWS/Bedrock"},
+                {
+                    "AlarmName": "guardrail-intervened",
+                    "Namespace": "AWS/Bedrock/Guardrails",
+                },
+            ]
+        )
+        mock_client.side_effect = client_factory
+
+        findings = extract_csv_data(check(region="us-east-1"))
+        signal = [
+            f
+            for f in findings
+            if f["Finding"] == "Guardrail Intervention Monitoring Signal"
+        ]
+        assert len(signal) == 1
+        assert signal[0]["Status"] == "Passed"
+        assert (
+            "1 CloudWatch alarm(s) on the AWS/Bedrock/Guardrails namespace "
+            "(guardrail-intervened)" in signal[0]["Finding_Details"]
+        )
+        for finding in findings:
+            assert_finding_schema(finding)
+
+    @patch("bedrock_app.detect_bedrock_regional_footprint", return_value=True)
+    @patch("bedrock_app.boto3.client")
+    def test_br32_intervention_metric_filter_reports_the_signal(
+        self, mock_client, mock_footprint
+    ):
+        check = bedrock_app.check_bedrock_cloudwatch_alarms
+        client_factory, logs_client = self._alarm_clients(
+            [{"AlarmName": "bedrock-throttle", "Namespace": "AWS/Bedrock"}],
+            logging_config={
+                "cloudWatchConfig": {
+                    "logGroupName": "/aws/bedrock/invocations",
+                    "roleArn": "arn:aws:iam::123456789012:role/BedrockLogs",
+                }
+            },
+            metric_filters=[
+                {
+                    "filterName": "GuardrailIntervened",
+                    "filterPattern": '{ $.["amazon-bedrock-guardrailAction"] = "INTERVENED" }',
+                },
+                {"filterName": "Unrelated", "filterPattern": "{ $.errorCode = * }"},
+            ],
+        )
+        mock_client.side_effect = client_factory
+
+        findings = extract_csv_data(check(region="us-east-1"))
+        signal = [
+            f
+            for f in findings
+            if f["Finding"] == "Guardrail Intervention Monitoring Signal"
+        ]
+        assert signal[0]["Status"] == "Passed"
+        assert (
+            "1 metric filter(s) on log group '/aws/bedrock/invocations' matching a "
+            "guardrail intervention field (GuardrailIntervened)"
+            in signal[0]["Finding_Details"]
+        )
+        logs_client.describe_metric_filters.assert_called_once_with(
+            logGroupName="/aws/bedrock/invocations"
+        )
+
+    @patch("bedrock_app.detect_bedrock_regional_footprint", return_value=True)
+    @patch("bedrock_app.boto3.client")
+    def test_br32_no_intervention_signal_names_what_was_missing(
+        self, mock_client, mock_footprint
+    ):
+        check = bedrock_app.check_bedrock_cloudwatch_alarms
+        client_factory, _ = self._alarm_clients(
+            [{"AlarmName": "bedrock-throttle", "Namespace": "AWS/Bedrock"}],
+            logging_config={
+                "cloudWatchConfig": {
+                    "logGroupName": "/aws/bedrock/invocations",
+                    "roleArn": "arn:aws:iam::123456789012:role/BedrockLogs",
+                }
+            },
+            metric_filters=[
+                {"filterName": "Unrelated", "filterPattern": "{ $.errorCode = * }"}
+            ],
+        )
+        mock_client.side_effect = client_factory
+
+        findings = extract_csv_data(check(region="us-east-1"))
+        assert findings[0]["Status"] == "Passed"
+        signal = findings[1]
+        assert signal["Finding"] == "Guardrail Intervention Monitoring Signal"
+        assert signal["Status"] == "Failed"
+        assert (
+            "no metric filter on invocation log group '/aws/bedrock/invocations' "
+            "matches an intervention field" in signal["Finding_Details"]
+        )
+
+    @patch("bedrock_app.detect_bedrock_regional_footprint", return_value=True)
+    @patch("bedrock_app.boto3.client")
+    def test_br32_s3_only_logging_names_the_missing_destination(
+        self, mock_client, mock_footprint
+    ):
+        check = bedrock_app.check_bedrock_cloudwatch_alarms
+        client_factory, logs_client = self._alarm_clients(
+            [{"AlarmName": "bedrock-throttle", "Namespace": "AWS/Bedrock"}],
+            logging_config={"s3Config": {"bucketName": "bedrock-logs"}},
+        )
+        mock_client.side_effect = client_factory
+
+        findings = extract_csv_data(check(region="us-east-1"))
+        signal = findings[1]
+        assert signal["Status"] == "Failed"
+        assert (
+            "model invocation logging has no CloudWatch Logs destination"
+            in signal["Finding_Details"]
+        )
+        logs_client.describe_metric_filters.assert_not_called()
+
+    @patch("bedrock_app.detect_bedrock_regional_footprint", return_value=True)
+    @patch("bedrock_app.boto3.client")
+    def test_br32_unreadable_metric_filters_are_not_absence(
+        self, mock_client, mock_footprint
+    ):
+        check = bedrock_app.check_bedrock_cloudwatch_alarms
+        client_factory, logs_client = self._alarm_clients(
+            [{"AlarmName": "bedrock-throttle", "Namespace": "AWS/Bedrock"}],
+            logging_config={
+                "cloudWatchConfig": {
+                    "logGroupName": "/aws/bedrock/invocations",
+                    "roleArn": "arn:aws:iam::123456789012:role/BedrockLogs",
+                }
+            },
+        )
+        logs_client.describe_metric_filters.side_effect = ClientError(
+            {"Error": {"Code": "AccessDeniedException", "Message": "denied"}},
+            "DescribeMetricFilters",
+        )
+        mock_client.side_effect = client_factory
+
+        findings = extract_csv_data(check(region="us-east-1"))
+        signal = findings[1]
+        assert signal["Status"] == "N/A"
+        assert signal["Severity"] == "Informational"
+        assert "AccessDeniedException" in signal["Finding_Details"]
+        assert "logs:DescribeMetricFilters" in signal["Resolution"]
+
     @patch("bedrock_app.detect_bedrock_regional_footprint", return_value=True)
     @patch("bedrock_app.boto3.client")
     def test_br32_schema_valid(self, mock_client, mock_footprint):
@@ -4426,6 +6570,84 @@ class TestProposedBedrockChecks:
             ),
         )
         assert extract_csv_data(result)[0]["Status"] == "Failed"
+
+    @staticmethod
+    def _two_guardrail_inventory(first_filters, second_filters):
+        def entry(guardrail_id, name, filters):
+            return {
+                "summary": {"id": guardrail_id, "name": name},
+                "detail": {
+                    "contentPolicy": {
+                        "filters": filters,
+                        "tier": {"tierName": "STANDARD"},
+                    }
+                },
+            }
+
+        return {
+            "items": [
+                entry("gr-1", "HighStrengthGuardrail", first_filters),
+                entry("gr-2", "MediumStrengthGuardrail", second_filters),
+            ],
+            "errors": [],
+            "list_error": None,
+        }
+
+    def test_br34_requires_high_input_strength(self):
+        """AIR-BDR-GRD-02: a blocking filter below HIGH strength is not preventive."""
+        result = bedrock_app.check_bedrock_guardrail_prompt_attack_filter(
+            region="us-east-1",
+            guardrail_inventory=self._two_guardrail_inventory(
+                [
+                    {
+                        "type": "PROMPT_ATTACK",
+                        "inputEnabled": True,
+                        "inputAction": "BLOCK",
+                        "inputStrength": "HIGH",
+                    }
+                ],
+                [
+                    {
+                        "type": "PROMPT_ATTACK",
+                        "inputEnabled": True,
+                        "inputAction": "BLOCK",
+                        "inputStrength": "MEDIUM",
+                    }
+                ],
+            ),
+        )
+        findings = extract_csv_data(result)
+        assert [f["Status"] for f in findings] == ["Passed", "Failed"]
+        assert (
+            "has a preventive PROMPT_ATTACK input filter at HIGH strength"
+            in findings[0]["Finding_Details"]
+        )
+        assert (
+            "does not have a preventive PROMPT_ATTACK input filter at HIGH strength "
+            "(observed strength/action/state: MEDIUM/BLOCK/enabled)"
+        ) in findings[1]["Finding_Details"]
+        assert findings[1]["Resolution"].endswith("inputStrength=HIGH.")
+        for finding in findings:
+            assert_finding_schema(finding)
+
+    def test_br34_names_a_missing_prompt_attack_filter(self):
+        result = bedrock_app.check_bedrock_guardrail_prompt_attack_filter(
+            region="us-east-1",
+            guardrail_inventory=self._two_guardrail_inventory(
+                [
+                    {
+                        "type": "PROMPT_ATTACK",
+                        "inputEnabled": True,
+                        "inputAction": "BLOCK",
+                        "inputStrength": "HIGH",
+                    }
+                ],
+                [{"type": "HATE", "inputStrength": "HIGH"}],
+            ),
+        )
+        findings = extract_csv_data(result)
+        assert findings[1]["Status"] == "Failed"
+        assert "no PROMPT_ATTACK filter is configured" in findings[1]["Finding_Details"]
 
     def test_br35_image_gap_is_advisory(self):
         result = bedrock_app.check_bedrock_guardrail_image_content_filters(

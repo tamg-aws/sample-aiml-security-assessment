@@ -447,10 +447,43 @@ Resources:
               Resource:
                 - !Sub 'arn:${AWS::Partition}:organizations::*:policy/*/*/*'
                 - !Sub 'arn:${AWS::Partition}:organizations::aws:policy/*/*'
+            - Sid: OrganizationsPolicyDocumentRead
+              # BR-41, BR-43 and BR-45 read the policy document itself, which
+              # only DescribePolicy returns.
+              Effect: Allow
+              Action:
+                - organizations:DescribePolicy # BR-41, BR-43, BR-45
+              Resource:
+                - !Sub 'arn:${AWS::Partition}:organizations::*:policy/*/*/*'
+                - !Sub 'arn:${AWS::Partition}:organizations::aws:policy/*/*'
+            - Sid: BedrockApiKeyInventoryRead
+              # BR-45 lists the bedrock.amazonaws.com service-specific
+              # credentials of each cached IAM user.
+              Effect: Allow
+              Action:
+                - iam:ListServiceSpecificCredentials # BR-45
+              Resource: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:user/*'
+            - Sid: BedrockInvocationLogInspection
+              # BR-04 reads the retention period of the invocation log group and
+              # BR-32 reads the metric filters defined on it.
+              Effect: Allow
+              Action:
+                - logs:DescribeLogGroups # BR-04
+                - logs:DescribeMetricFilters # BR-32
+              Resource: !Sub 'arn:${AWS::Partition}:logs:*:${AWS::AccountId}:log-group:*'
+            - Sid: MaciePermissions
+              # macie2 GetMacieSession and GetAutomatedDiscoveryConfiguration are
+              # account-level reads with no resource-level authorization in IAM.
+              Effect: Allow
+              Action:
+                - macie2:GetMacieSession # BR-46
+                - macie2:GetAutomatedDiscoveryConfiguration # BR-46
+              Resource: '*'
             - Sid: S3BucketEncryptionPermissions
               Effect: Allow
               Action:
                 - s3:GetEncryptionConfiguration
+                - s3:GetLifecycleConfiguration # BR-04
               Resource: !Sub 'arn:${AWS::Partition}:s3:::*'
             - Sid: CloudTrailPermissions
               Effect: Allow

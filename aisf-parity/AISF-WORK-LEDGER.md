@@ -1,19 +1,19 @@
 # AISF parity work ledger
 
-Generated 2026-09-24 by `aisf-parity/build_ledger.py`. Do not hand-edit: change `ROWS` in the generator and re-run.
+Generated 2026-09-25 by `aisf-parity/build_ledger.py`. Do not hand-edit: change `ROWS` in the generator and re-run.
 
 78 controls in scope: 67 hosted (BDR, SGM, ACR) plus 11 FND controls whose assertion subject is an AI resource.
 
 | verdict | rows | meaning |
 |---|---|---|
-| covered | 8 | an incumbent already asserts this; nothing to write |
-| tighten / extend | 22 | incumbent name is honest, its assertion is narrower; extend it in place |
-| tighten / new_id | 6 | incumbent name claims more than it asserts; allocate a new id beside it |
-| new | 27 | no incumbent asserts any part of it |
+| covered | 20 | an incumbent already asserts this; nothing to write |
+| tighten / extend | 16 | incumbent name is honest, its assertion is narrower; extend it in place |
+| tighten / new_id | 5 | incumbent name claims more than it asserts; allocate a new id beside it |
+| new | 22 | no incumbent asserts any part of it |
 | not_implementable | 4 | flagged machine_checkable in the ledger but is not checkable from configuration |
 | unassessed | 11 | in scope, dedup pass not yet run |
 
-**44 new check functions and 22 extensions to existing checks.**
+**38 new check functions and 16 extensions to existing checks.**
 
 ## New IAM actions required
 
@@ -24,8 +24,6 @@ Generated 2026-09-24 by `aisf-parity/build_ledger.py`. Do not hand-edit: change 
 - `ec2:DescribeSecurityGroups` — AIR-ACR-RT-08, AIR-FND-NET-06
 - `logs:DescribeAccountPolicies` — AIR-ACR-OBS-04
 - `logs:GetDataProtectionPolicy` — AIR-ACR-OBS-04
-- `macie2:GetAutomatedDiscoveryConfiguration` — AIR-BDR-KB-01
-- `macie2:GetMacieSession` — AIR-BDR-KB-01
 - `oam:GetSinkPolicy` — AIR-ACR-OBS-06
 - `oam:ListSinks` — AIR-ACR-OBS-06
 - `organizations:DescribeEffectivePolicy` — AIR-FND-DAT-09
@@ -38,21 +36,21 @@ Generated 2026-09-24 by `aisf-parity/build_ledger.py`. Do not hand-edit: change 
 | control | verdict | do | module | incumbent | gap |
 |---|---|---|---|---|---|
 | `AIR-BDR-GRD-01` | covered | — | `bedrock_assessments` | `BR-10` | — |
+| `AIR-BDR-GRD-02` | covered | — | `bedrock_assessments` | `BR-34` | — |
 | `AIR-BDR-GRD-03` | covered | — | `bedrock_assessments` | `BR-26` | — |
+| `AIR-BDR-GRD-04` | covered | — | `bedrock_assessments` | `BR-32` | — |
+| `AIR-BDR-GRD-09` | covered | — | `bedrock_assessments` | `BR-27` | — |
+| `AIR-BDR-GRD-10` | covered | — | `bedrock_assessments` | `BR-41` | — |
+| `AIR-BDR-KB-01` | covered | — | `bedrock_assessments` | `BR-46` | — |
 | `AIR-BDR-KB-03` | covered | — | `bedrock_assessments` | `BR-20` | — |
+| `AIR-BDR-KB-06` | covered | — | `bedrock_assessments` | `BR-06` | — |
+| `AIR-BDR-MDL-01` *(workload-specific)* | covered | — | `bedrock_assessments` | `BR-42` | — |
+| `AIR-BDR-MDL-02` | covered | — | `bedrock_assessments` | `BR-04`, `BR-12` | — |
+| `AIR-BDR-MDL-03` *(workload-specific)* | covered | — | `bedrock_assessments` | `BR-43` | — |
+| `AIR-BDR-MDL-04` *(workload-specific)* | covered | — | `bedrock_assessments` | `BR-44` | — |
+| `AIR-BDR-MDL-07` | covered | — | `bedrock_assessments` | `BR-06` | — |
+| `AIR-BDR-MDL-09` | covered | — | `bedrock_assessments` | `BR-45` | — |
 | `AIR-BDR-MDL-10` | covered | — | `bedrock_assessments` | `BR-37` | same GetAccountDataRetention call |
-| `AIR-BDR-GRD-02` | tighten | extend | `bedrock_assessments` | `BR-34` | BR-34 tests the BLOCK action; AISF tests inputStrength HIGH |
-| `AIR-BDR-GRD-04` | tighten | extend | `bedrock_assessments` | `BR-32` | BR-32 accepts any AWS/Bedrock alarm; AISF wants the guardrail-intervention metric filter |
-| `AIR-BDR-GRD-09` | tighten | extend | `bedrock_assessments` | `BR-27` | BR-27 tests presence; AISF tests the grounding and relevance thresholds |
-| `AIR-BDR-GRD-10` | tighten | new_id | `bedrock_assessments` | `BR-15` | BR-15 is named "Cross-Account Guardrails Enforcement Check" but only tests that an org policy exists; AISF requires it be non-DRAFT, which is what enforcement means here |
-| `AIR-BDR-KB-06` | tighten | extend | `bedrock_assessments` | `BR-06` | BR-06 tests that a trail covers Bedrock; AISF wants named data-event resource types |
-| `AIR-BDR-MDL-02` | tighten | extend | `bedrock_assessments` | `BR-04`, `BR-12` | BR-04 and BR-12 cover logging and destination encryption; AISF adds retention |
-| `AIR-BDR-MDL-07` | tighten | extend | `bedrock_assessments` | `BR-06` | BR-06 tests that a trail covers Bedrock; AISF wants named data-event resource types |
-| `AIR-BDR-KB-01` | new | — | `bedrock_assessments` | — | no incumbent in this module reads macie2 |
-| `AIR-BDR-MDL-01` *(workload-specific)* | new | — | `bedrock_assessments` | — | no check asserts model-ARN scoping on bedrock:InvokeModel; aws:RequestedRegion, aws:SourceVpc, aws:SourceVpce and aws:PrincipalOrgID are 0 hits corpus-wide |
-| `AIR-BDR-MDL-03` *(workload-specific)* | new | — | `bedrock_assessments` | — | model allow-list; FS-12 is not a dedup risk, its whole test is 'bedrock' in json.dumps(doc).lower() over every SCP |
-| `AIR-BDR-MDL-04` *(workload-specific)* | new | — | `bedrock_assessments` | — | model allow-list dimension with no incumbent |
-| `AIR-BDR-MDL-09` | new | — | `bedrock_assessments` | — | — |
 | `AIR-BDR-KB-05` | not_implementable | — | — | — | depends on customer Lambda code, not configuration |
 | `AIR-BDR-KB-08` | not_implementable | — | — | — | depends on customer Lambda code, not configuration |
 | `AIR-BDR-MDL-08` | not_implementable | — | — | — | needs a published-versus-DRAFT distinction GetPrompt does not return |

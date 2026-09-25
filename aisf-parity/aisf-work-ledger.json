@@ -1,20 +1,20 @@
 {
-  "generated": "2026-09-24",
+  "generated": "2026-09-25",
   "generator": "aisf-parity/build_ledger.py",
   "aisf_repo": "/Users/tamg/WorkDocs/Builder/aws-ai-security-framework-assessment",
   "summary": {
     "hosted": 67,
     "fnd_ai_subject": 11,
     "total": 78,
-    "covered": 8,
-    "tighten": 28,
-    "tighten_extend": 22,
-    "tighten_new_id": 6,
-    "new": 27,
+    "covered": 20,
+    "tighten": 21,
+    "tighten_extend": 16,
+    "tighten_new_id": 5,
+    "new": 22,
     "not_implementable": 4,
     "unassessed": 11,
-    "new_check_functions": 44,
-    "extensions": 22,
+    "new_check_functions": 38,
+    "extensions": 16,
     "extra_iam_actions": [
       "cloudtrail:GetEventSelectors",
       "cloudtrail:ListTrails",
@@ -23,8 +23,6 @@
       "ec2:DescribeSecurityGroups",
       "logs:DescribeAccountPolicies",
       "logs:GetDataProtectionPolicy",
-      "macie2:GetAutomatedDiscoveryConfiguration",
-      "macie2:GetMacieSession",
       "oam:GetSinkPolicy",
       "oam:ListSinks",
       "organizations:DescribeEffectivePolicy",
@@ -128,8 +126,8 @@
       "question": "Are attempts to bypass safety controls through prompt injection or jailbreak techniques specifically detected, not just generic harmful-content filtering?",
       "assert": "Prompt-attack detection configuration + example catch",
       "workload_agnostic": true,
-      "verdict": "tighten",
-      "disposition": "extend",
+      "verdict": "covered",
+      "disposition": null,
       "target_modules": [
         "bedrock_assessments"
       ],
@@ -139,7 +137,7 @@
       "incumbent_names": [
         "Guardrail Prompt Attack Filter"
       ],
-      "gap": "BR-34 tests the BLOCK action; AISF tests inputStrength HIGH",
+      "gap": "",
       "extra_iam": [],
       "phase": 3,
       "source": "controls/ai-specific/bedrock-guardrails.yaml"
@@ -150,8 +148,8 @@
       "question": "When a guardrail blocks or modifies a request, is that event logged as a security-relevant signal that feeds detection/monitoring?",
       "assert": "Guardrail intervention log/metric feeding monitoring",
       "workload_agnostic": true,
-      "verdict": "tighten",
-      "disposition": "extend",
+      "verdict": "covered",
+      "disposition": null,
       "target_modules": [
         "bedrock_assessments"
       ],
@@ -161,7 +159,7 @@
       "incumbent_names": [
         "Bedrock CloudWatch Alarm Check"
       ],
-      "gap": "BR-32 accepts any AWS/Bedrock alarm; AISF wants the guardrail-intervention metric filter",
+      "gap": "",
       "extra_iam": [],
       "phase": 3,
       "source": "controls/ai-specific/bedrock-guardrails.yaml"
@@ -172,8 +170,8 @@
       "question": "Is model output validated for factual grounding in its provided source context, so ungrounded or off-topic (hallucinated) responses are detected or blocked rather than returned as authoritative?",
       "assert": "Contextual-grounding filter configuration + a scored/blocked ungrounded response example",
       "workload_agnostic": true,
-      "verdict": "tighten",
-      "disposition": "extend",
+      "verdict": "covered",
+      "disposition": null,
       "target_modules": [
         "bedrock_assessments"
       ],
@@ -183,7 +181,7 @@
       "incumbent_names": [
         "Guardrail Contextual Grounding Check"
       ],
-      "gap": "BR-27 tests presence; AISF tests the grounding and relevance thresholds",
+      "gap": "",
       "extra_iam": [],
       "phase": 3,
       "source": "controls/ai-specific/bedrock-guardrails.yaml"
@@ -194,18 +192,16 @@
       "question": "Is a single approved guardrail enforced centrally across the organization, rather than left to each application to attach the right one?",
       "assert": "Organizations bedrock policy (auto-apply) or SCP with bedrock:GuardrailIdentifier + cross-account share",
       "workload_agnostic": true,
-      "verdict": "tighten",
-      "disposition": "new_id",
+      "verdict": "covered",
+      "disposition": null,
       "target_modules": [
         "bedrock_assessments"
       ],
       "incumbents": [
-        "BR-15"
+        "BR-41"
       ],
-      "incumbent_names": [
-        "Cross-Account Guardrails Enforcement Check"
-      ],
-      "gap": "BR-15 is named \"Cross-Account Guardrails Enforcement Check\" but only tests that an org policy exists; AISF requires it be non-DRAFT, which is what enforcement means here",
+      "incumbent_names": [],
+      "gap": "",
       "extra_iam": [],
       "phase": 3,
       "source": "controls/ai-specific/bedrock-guardrails.yaml"
@@ -216,8 +212,8 @@
       "question": "Can a specific retrieved chunk that informed a given model response be traced back to its source document and version, for audit purposes?",
       "assert": "Retrieval-to-response trace example",
       "workload_agnostic": true,
-      "verdict": "tighten",
-      "disposition": "extend",
+      "verdict": "covered",
+      "disposition": null,
       "target_modules": [
         "bedrock_assessments"
       ],
@@ -227,7 +223,7 @@
       "incumbent_names": [
         "Bedrock CloudTrail Logging Check"
       ],
-      "gap": "BR-06 tests that a trail covers Bedrock; AISF wants named data-event resource types",
+      "gap": "",
       "extra_iam": [],
       "phase": 3,
       "source": "controls/ai-specific/bedrock-knowledge-bases.yaml"
@@ -238,8 +234,8 @@
       "question": "For high-autonomy use cases, can inference be traced end to end from the invoking identity through to the specific model version and response, for forensic reconstruction?",
       "assert": "End-to-end trace example for a single invocation",
       "workload_agnostic": true,
-      "verdict": "tighten",
-      "disposition": "extend",
+      "verdict": "covered",
+      "disposition": null,
       "target_modules": [
         "bedrock_assessments"
       ],
@@ -249,7 +245,7 @@
       "incumbent_names": [
         "Bedrock CloudTrail Logging Check"
       ],
-      "gap": "BR-06 tests that a trail covers Bedrock; AISF wants named data-event resource types",
+      "gap": "",
       "extra_iam": [],
       "phase": 3,
       "source": "controls/ai-specific/bedrock-model-access.yaml"
@@ -260,8 +256,8 @@
       "question": "Is model invocation logging enabled and retained so every prompt/response pair can be reviewed after the fact?",
       "assert": "Invocation logging configuration + retention setting",
       "workload_agnostic": true,
-      "verdict": "tighten",
-      "disposition": "extend",
+      "verdict": "covered",
+      "disposition": null,
       "target_modules": [
         "bedrock_assessments"
       ],
@@ -273,7 +269,7 @@
         "Bedrock Model Invocation Logging Check",
         "Bedrock Invocation Log Encryption"
       ],
-      "gap": "BR-04 and BR-12 cover logging and destination encryption; AISF adds retention",
+      "gap": "",
       "extra_iam": [],
       "phase": 3,
       "source": "controls/ai-specific/bedrock-model-access.yaml"
@@ -284,18 +280,17 @@
       "question": "Is sensitive data in RAG / knowledge-base sources discovered and classified before it is ingested into a knowledge base?",
       "assert": "Ingestion pipeline classification step evidence",
       "workload_agnostic": true,
-      "verdict": "new",
+      "verdict": "covered",
       "disposition": null,
       "target_modules": [
         "bedrock_assessments"
       ],
-      "incumbents": [],
-      "incumbent_names": [],
-      "gap": "no incumbent in this module reads macie2",
-      "extra_iam": [
-        "macie2:GetAutomatedDiscoveryConfiguration",
-        "macie2:GetMacieSession"
+      "incumbents": [
+        "BR-46"
       ],
+      "incumbent_names": [],
+      "gap": "",
+      "extra_iam": [],
       "phase": 3,
       "source": "controls/ai-specific/bedrock-knowledge-bases.yaml"
     },
@@ -305,14 +300,16 @@
       "question": "Is access to foundation models restricted to an approved list, rather than allowing invocation of any model available in the account?",
       "assert": "Policy showing model-ID scoping",
       "workload_agnostic": false,
-      "verdict": "new",
+      "verdict": "covered",
       "disposition": null,
       "target_modules": [
         "bedrock_assessments"
       ],
-      "incumbents": [],
+      "incumbents": [
+        "BR-42"
+      ],
       "incumbent_names": [],
-      "gap": "no check asserts model-ARN scoping on bedrock:InvokeModel; aws:RequestedRegion, aws:SourceVpc, aws:SourceVpce and aws:PrincipalOrgID are 0 hits corpus-wide",
+      "gap": "",
       "extra_iam": [],
       "phase": 3,
       "source": "controls/ai-specific/bedrock-model-access.yaml"
@@ -323,14 +320,16 @@
       "question": "Is cross-region or cross-account model invocation explicitly controlled, rather than left to default routing behavior?",
       "assert": "Inference-profile/region configuration review",
       "workload_agnostic": false,
-      "verdict": "new",
+      "verdict": "covered",
       "disposition": null,
       "target_modules": [
         "bedrock_assessments"
       ],
-      "incumbents": [],
+      "incumbents": [
+        "BR-43"
+      ],
       "incumbent_names": [],
-      "gap": "model allow-list; FS-12 is not a dedup risk, its whole test is 'bedrock' in json.dumps(doc).lower() over every SCP",
+      "gap": "",
       "extra_iam": [],
       "phase": 3,
       "source": "controls/ai-specific/bedrock-model-access.yaml"
@@ -341,14 +340,16 @@
       "question": "Is there a technical control preventing use of unapproved third-party or marketplace models alongside first-party foundation models?",
       "assert": "Marketplace/model-access control configuration",
       "workload_agnostic": false,
-      "verdict": "new",
+      "verdict": "covered",
       "disposition": null,
       "target_modules": [
         "bedrock_assessments"
       ],
-      "incumbents": [],
+      "incumbents": [
+        "BR-44"
+      ],
       "incumbent_names": [],
-      "gap": "model allow-list dimension with no incumbent",
+      "gap": "",
       "extra_iam": [],
       "phase": 3,
       "source": "controls/ai-specific/bedrock-model-access.yaml"
@@ -359,12 +360,14 @@
       "question": "Are Amazon Bedrock API keys governed so production access uses short-term keys, and long-term keys \u2014 which create a standing IAM user with a static credential \u2014 cannot be created without an expiration or used in production?",
       "assert": "Inventory of bedrock.amazonaws.com service-specific credentials with expiration dates + SCP/IAM policy capping key age and restricting bearerTokenType",
       "workload_agnostic": true,
-      "verdict": "new",
+      "verdict": "covered",
       "disposition": null,
       "target_modules": [
         "bedrock_assessments"
       ],
-      "incumbents": [],
+      "incumbents": [
+        "BR-45"
+      ],
       "incumbent_names": [],
       "gap": "",
       "extra_iam": [],

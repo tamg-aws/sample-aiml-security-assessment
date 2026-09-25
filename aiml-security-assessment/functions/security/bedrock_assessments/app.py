@@ -1376,6 +1376,199 @@ def check_bedrock_guardrails(region: str = "") -> Dict[str, Any]:
         }
 
 
+INVOCATION_LOG_RETENTION_FINDING = "Bedrock Invocation Log Retention"
+
+INVOCATION_LOG_RETENTION_REFERENCE = (
+    "https://docs.aws.amazon.com/bedrock/latest/userguide/model-invocation-logging.html"
+)
+
+INVOCATION_LOG_RETENTION_RESOLUTION = (
+    "State a retention period on every invocation-log destination: set "
+    "logs:PutRetentionPolicy retentionInDays on the CloudWatch Logs log group, "
+    "and add an S3 lifecycle rule that expires objects in the log bucket. A "
+    "destination with no stated period keeps prompt and response records "
+    "indefinitely."
+)
+
+
+def _log_group_retention_days(log_group_name: str, region: str) -> Dict[str, Any]:
+    """Report what DescribeLogGroups says about one log group's retention.
+
+    ``found`` False means the named group was not returned to this account, which
+    is indeterminate: it is never reported as a missing retention period.
+    """
+    logs_client = boto3.client("logs", config=boto3_config, region_name=region)
+    groups = _list_all_items(
+        logs_client,
+        "describe_log_groups",
+        "logGroups",
+        max_results_param="limit",
+        token_param="nextToken",
+        token_response_keys=("nextToken",),
+        max_results=50,
+        logGroupNamePrefix=log_group_name,
+    )
+    for group in groups:
+        if group.get("logGroupName") == log_group_name:
+            return {"found": True, "retention_days": group.get("retentionInDays")}
+    return {"found": False, "retention_days": None}
+
+
+def _bucket_expiration_rules(bucket_name: str, region: str) -> List[str]:
+    """Return a description of each enabled lifecycle rule that expires objects."""
+    s3_client = boto3.client("s3", config=boto3_config, region_name=region)
+    try:
+        response = s3_client.get_bucket_lifecycle_configuration(Bucket=bucket_name)
+    except ClientError as error:
+        if error.response["Error"]["Code"] == "NoSuchLifecycleConfiguration":
+            return []
+        raise
+
+    expirations = []
+    for rule in response.get("Rules", []):
+        if rule.get("Status") != "Enabled":
+            continue
+        rule_id = rule.get("ID") or "unnamed rule"
+        expiration = rule.get("Expiration") or {}
+        noncurrent = rule.get("NoncurrentVersionExpiration") or {}
+        if expiration.get("Days"):
+            expirations.append(
+                f"{rule_id} expires objects after {expiration['Days']} day(s)"
+            )
+        elif expiration.get("Date"):
+            expirations.append(f"{rule_id} expires objects on {expiration['Date']}")
+        elif noncurrent.get("NoncurrentDays"):
+            expirations.append(
+                f"{rule_id} expires noncurrent versions after "
+                f"{noncurrent['NoncurrentDays']} day(s)"
+            )
+    return expirations
+
+
+def _invocation_log_retention_findings(
+    s3_bucket_name: Optional[str],
+    log_group_name: Optional[str],
+    region: str,
+) -> List[Dict[str, Any]]:
+    """Assess a stated retention period on each configured logging destination.
+
+    AIR-BDR-MDL-02 asks whether the prompt/response record is retained for a
+    defined period, so each destination is read on its own: a CloudWatch log
+    group with no retentionInDays and an S3 bucket with no expiring lifecycle
+    rule both keep the record forever.
+    """
+    retained: List[str] = []
+    unretained: List[str] = []
+    undetermined: List[str] = []
+
+    if log_group_name:
+        try:
+            retention = _log_group_retention_days(log_group_name, region)
+            if not retention["found"]:
+                undetermined.append(
+                    f"CloudWatch Logs group '{log_group_name}' was not returned by "
+                    "DescribeLogGroups for this account"
+                )
+            elif retention["retention_days"]:
+                retained.append(
+                    f"CloudWatch Logs group '{log_group_name}' expires events after "
+                    f"{retention['retention_days']} day(s)"
+                )
+            else:
+                unretained.append(
+                    f"CloudWatch Logs group '{log_group_name}' has no retentionInDays, "
+                    "so events never expire"
+                )
+        except Exception as error:
+            logger.warning(
+                f"Unable to read retention for log group {log_group_name}: {error}"
+            )
+            undetermined.append(
+                f"CloudWatch Logs group '{log_group_name}': "
+                f"{describe_api_error(error, 'logs:DescribeLogGroups', region)}"
+            )
+
+    if s3_bucket_name:
+        try:
+            expirations = _bucket_expiration_rules(s3_bucket_name, region)
+            if expirations:
+                retained.append(
+                    f"S3 bucket '{s3_bucket_name}' lifecycle: {'; '.join(expirations)}"
+                )
+            else:
+                unretained.append(
+                    f"S3 bucket '{s3_bucket_name}' has no enabled lifecycle rule that "
+                    "expires objects, so logs are kept indefinitely"
+                )
+        except Exception as error:
+            logger.warning(
+                f"Unable to read lifecycle configuration for bucket "
+                f"{s3_bucket_name}: {error}"
+            )
+            undetermined.append(
+                f"S3 bucket '{s3_bucket_name}': "
+                f"{describe_api_error(error, 's3:GetLifecycleConfiguration', region)}"
+            )
+
+    retention_findings = []
+    for deficiency in unretained:
+        retention_findings.append(
+            create_finding(
+                check_id="BR-04",
+                finding_name=INVOCATION_LOG_RETENTION_FINDING,
+                finding_details=(
+                    f"Invocation logs have no stated retention period: {deficiency}."
+                ),
+                resolution=INVOCATION_LOG_RETENTION_RESOLUTION,
+                reference=INVOCATION_LOG_RETENTION_REFERENCE,
+                severity="Medium",
+                status="Failed",
+                region=region,
+            )
+        )
+
+    if retained:
+        retention_findings.append(
+            create_finding(
+                check_id="BR-04",
+                finding_name=INVOCATION_LOG_RETENTION_FINDING,
+                finding_details=(
+                    "Invocation log retention is stated on "
+                    f"{len(retained)} destination(s): {'; '.join(retained)}. "
+                    "Confirm the stated period meets your own record-retention "
+                    "policy."
+                ),
+                resolution="No action required",
+                reference=INVOCATION_LOG_RETENTION_REFERENCE,
+                severity="Medium",
+                status="Passed",
+                region=region,
+            )
+        )
+
+    for gap in undetermined:
+        retention_findings.append(
+            create_finding(
+                check_id="BR-04",
+                finding_name=INVOCATION_LOG_RETENTION_FINDING,
+                finding_details=(
+                    f"Invocation log retention could not be assessed: {gap}."
+                ),
+                resolution=(
+                    "Grant the assessment role logs:DescribeLogGroups and "
+                    "s3:GetLifecycleConfiguration on the invocation-log "
+                    "destinations, then re-run the assessment."
+                ),
+                reference=INVOCATION_LOG_RETENTION_REFERENCE,
+                severity="Informational",
+                status="N/A",
+                region=region,
+            )
+        )
+
+    return retention_findings
+
+
 def check_bedrock_logging_configuration(region: str = "") -> Dict[str, Any]:
     """
     Check if model invocation logging is enabled for Amazon Bedrock
@@ -1428,7 +1621,8 @@ def check_bedrock_logging_configuration(region: str = "") -> Dict[str, Any]:
 
             # Check S3 logging configuration
             s3_config = response.get("loggingConfig", {}).get("s3Config")
-            if _extract_s3_bucket_name(s3_config):
+            s3_bucket_name = _extract_s3_bucket_name(s3_config)
+            if s3_bucket_name:
                 logging_enabled = True
                 enabled_destinations.append("Amazon S3")
 
@@ -1436,7 +1630,8 @@ def check_bedrock_logging_configuration(region: str = "") -> Dict[str, Any]:
             cloudwatch_config = response.get("loggingConfig", {}).get(
                 "cloudWatchConfig"
             )
-            if cloudwatch_config and cloudwatch_config.get("logGroupName"):
+            log_group_name = (cloudwatch_config or {}).get("logGroupName")
+            if log_group_name:
                 logging_enabled = True
                 enabled_destinations.append("CloudWatch Logs")
 
@@ -1471,6 +1666,15 @@ def check_bedrock_logging_configuration(region: str = "") -> Dict[str, Any]:
                         region=region,
                     )
                 )
+
+            # AIR-BDR-MDL-02 also asks whether the recorded prompt/response
+            # pairs are retained for a defined period, which is a property of
+            # each delivery destination rather than of the logging switch.
+            findings["csv_data"].extend(
+                _invocation_log_retention_findings(
+                    s3_bucket_name, log_group_name, region
+                )
+            )
 
         except bedrock_client.exceptions.ValidationException:
             findings["status"] = "FAIL"
@@ -1511,6 +1715,132 @@ def check_bedrock_logging_configuration(region: str = "") -> Dict[str, Any]:
                 )
             ],
         }
+
+
+BEDROCK_KNOWLEDGE_BASE_DATA_EVENT_TYPE = "AWS::Bedrock::KnowledgeBase"
+
+BEDROCK_MODEL_DATA_EVENT_TYPE = "AWS::Bedrock::Model"
+
+CLOUDTRAIL_DATA_EVENT_RESOLUTION = (
+    "Add an advanced event selector with resources.type Equals {} to a "
+    "multi-region trail. Bedrock data events are not logged by default, so "
+    "management events alone do not record individual requests."
+)
+
+
+def _advanced_selector_resource_types(advanced_selectors: Any) -> List[str]:
+    """Collect every resources.type value named in advanced event selectors.
+
+    Bedrock data events (Retrieve, RetrieveAndGenerate, InvokeModel) are
+    expressible only through advanced event selectors, so this is the whole
+    surface on which a data-event claim can be made.
+    """
+    resource_types = set()
+    if not isinstance(advanced_selectors, list):
+        return []
+    for selector in advanced_selectors:
+        if not isinstance(selector, dict):
+            continue
+        for field in selector.get("FieldSelectors", []) or []:
+            if not isinstance(field, dict) or field.get("Field") != "resources.type":
+                continue
+            values = field.get("Equals") or []
+            if isinstance(values, list):
+                resource_types.update(str(value) for value in values)
+    return sorted(resource_types)
+
+
+def _bedrock_data_event_findings(
+    data_event_trails: Dict[str, List[str]],
+    knowledge_base_count: Optional[int],
+    region: str,
+) -> List[Dict[str, Any]]:
+    """
+    BR-06 data-event legs: knowledge base retrieval traceability
+    (AIR-BDR-KB-06) and end-to-end inference traceability (AIR-BDR-MDL-07).
+    """
+    observed = ", ".join(sorted(data_event_trails)) or "none"
+    data_event_findings = []
+
+    kb_trails = data_event_trails.get(BEDROCK_KNOWLEDGE_BASE_DATA_EVENT_TYPE, [])
+    kb_inventory = (
+        f" {knowledge_base_count} knowledge base(s) exist in this region."
+        if knowledge_base_count
+        else ""
+    )
+    if kb_trails:
+        data_event_findings.append(
+            create_finding(
+                check_id="BR-06",
+                finding_name="Bedrock Knowledge Base Retrieval Data Event Logging",
+                finding_details=f"Trail(s) {', '.join(sorted(set(kb_trails)))} name {BEDROCK_KNOWLEDGE_BASE_DATA_EVENT_TYPE} in a resources.type field selector, so each Retrieve and RetrieveAndGenerate call is recorded with the knowledge base that served it.{kb_inventory}",
+                resolution="No action required. Retain the data events long enough to answer which source document informed a past response.",
+                reference="https://docs.aws.amazon.com/bedrock/latest/userguide/logging-using-cloudtrail.html",
+                severity="Medium",
+                status="Passed",
+                region=region,
+            )
+        )
+    elif knowledge_base_count == 0:
+        data_event_findings.append(
+            create_finding(
+                check_id="BR-06",
+                finding_name="Bedrock Knowledge Base Retrieval Data Event Logging",
+                finding_details="No knowledge base exists in this region, so there is no retrieval to trace back to a source document.",
+                resolution="No action required",
+                reference="https://docs.aws.amazon.com/bedrock/latest/userguide/logging-using-cloudtrail.html",
+                severity="Informational",
+                status="N/A",
+                region=region,
+            )
+        )
+    else:
+        data_event_findings.append(
+            create_finding(
+                check_id="BR-06",
+                finding_name="Bedrock Knowledge Base Retrieval Data Event Logging",
+                finding_details=f"No logging multi-region trail names {BEDROCK_KNOWLEDGE_BASE_DATA_EVENT_TYPE} in a resources.type field selector, so a retrieved chunk cannot be traced back to the knowledge base and source document that produced it (observed data-event resource types: {observed}).{kb_inventory}",
+                resolution=CLOUDTRAIL_DATA_EVENT_RESOLUTION.format(
+                    BEDROCK_KNOWLEDGE_BASE_DATA_EVENT_TYPE
+                ),
+                reference="https://docs.aws.amazon.com/bedrock/latest/userguide/logging-using-cloudtrail.html",
+                severity="Medium",
+                status="Failed",
+                region=region,
+            )
+        )
+
+    model_trails = data_event_trails.get(BEDROCK_MODEL_DATA_EVENT_TYPE, [])
+    if model_trails:
+        data_event_findings.append(
+            create_finding(
+                check_id="BR-06",
+                finding_name="Bedrock Model Invocation Data Event Logging",
+                finding_details=f"Trail(s) {', '.join(sorted(set(model_trails)))} name {BEDROCK_MODEL_DATA_EVENT_TYPE} in a resources.type field selector, so each invocation is attributable to the calling identity and the model it invoked.",
+                resolution="No action required. Continue retaining Bedrock data events for forensic reconstruction.",
+                reference="https://docs.aws.amazon.com/bedrock/latest/userguide/logging-using-cloudtrail.html",
+                severity="Medium",
+                status="Passed",
+                region=region,
+            )
+        )
+    else:
+        data_event_findings.append(
+            create_finding(
+                check_id="BR-06",
+                finding_name="Bedrock Model Invocation Data Event Logging",
+                finding_details=f"No logging multi-region trail names {BEDROCK_MODEL_DATA_EVENT_TYPE} in a resources.type field selector, so an individual inference cannot be traced from the invoking identity to the model that answered it (observed data-event resource types: {observed}).",
+                resolution=CLOUDTRAIL_DATA_EVENT_RESOLUTION.format(
+                    BEDROCK_MODEL_DATA_EVENT_TYPE
+                ),
+                reference="https://docs.aws.amazon.com/bedrock/latest/userguide/logging-using-cloudtrail.html",
+                severity="Medium",
+                status="Failed",
+                region=region,
+            )
+        )
+
+    return data_event_findings
 
 
 def check_bedrock_cloudtrail_logging(region: str = "") -> Dict[str, Any]:
@@ -1569,6 +1899,7 @@ def check_bedrock_cloudtrail_logging(region: str = "") -> Dict[str, Any]:
 
             bedrock_logging_enabled = False
             logging_trails = []
+            data_event_trails: Dict[str, List[str]] = {}
 
             for trail in trails:
                 trail_arn = trail["TrailARN"]
@@ -1594,6 +1925,15 @@ def check_bedrock_cloudtrail_logging(region: str = "") -> Dict[str, Any]:
                         "AdvancedEventSelectors", []
                     )
                     basic_selectors = event_selectors.get("EventSelectors", [])
+
+                    # Record which Bedrock data-event resource types this trail
+                    # names, for the knowledge base and model traceability legs.
+                    for resource_type in _advanced_selector_resource_types(
+                        advanced_selectors
+                    ):
+                        data_event_trails.setdefault(resource_type, []).append(
+                            trail_name
+                        )
 
                     # Check if Bedrock events are being logged
                     for selector in advanced_selectors:
@@ -1652,6 +1992,32 @@ def check_bedrock_cloudtrail_logging(region: str = "") -> Dict[str, Any]:
                         region=region,
                     )
                 )
+
+            # The management-event legs above cannot say which knowledge base
+            # served a retrieval or which model answered an invocation. Both are
+            # data events, which have to be selected by resource type.
+            knowledge_base_count = None
+            try:
+                bedrock_agent_client = boto3.client(
+                    "bedrock-agent", config=boto3_config, region_name=region
+                )
+                knowledge_base_count = len(
+                    _list_all_items(
+                        bedrock_agent_client,
+                        "list_knowledge_bases",
+                        "knowledgeBaseSummaries",
+                    )
+                )
+            except Exception as error:
+                logger.warning(
+                    f"Knowledge base inventory unavailable for the CloudTrail data event legs: {str(error)}"
+                )
+
+            findings["csv_data"].extend(
+                _bedrock_data_event_findings(
+                    data_event_trails, knowledge_base_count, region
+                )
+            )
 
         except ClientError as e:
             findings["status"] = "ERROR"
@@ -3317,6 +3683,406 @@ def check_bedrock_cross_account_guardrails(
                     finding_details=build_could_not_assess_detail(e, region),
                     resolution=COULD_NOT_ASSESS_RESOLUTION,
                     reference="https://docs.aws.amazon.com/bedrock/latest/userguide/guardrails-enforcements.html",
+                    severity="Informational",
+                    status="N/A",
+                    region=region,
+                )
+            ],
+        }
+
+
+GUARDRAIL_ARN_FRAGMENT = ":guardrail/"
+
+GUARDRAIL_DRAFT_VERSION = "DRAFT"
+
+GUARDRAIL_CONDITION_KEY = "bedrock:guardrailidentifier"
+
+GUARDRAIL_INVOKE_ACTIONS = (
+    "bedrock:invokemodel",
+    "bedrock:invokemodelwithresponsestream",
+)
+
+
+def _summarize_guardrail_policy_document(document: Any) -> Dict[str, Any]:
+    """
+    Describe the guardrails an Organizations Bedrock policy document names.
+
+    The policy document is free-form JSON (organizations DescribePolicy returns
+    Policy.Content as a string), so the walk is key-agnostic: a value carrying
+    ":guardrail/" is a guardrail ARN, and a value of "DRAFT" is a guardrail
+    version that was never published.
+    """
+    observed = {"guardrail_arns": set(), "draft_versions": 0, "versions": set()}
+
+    def walk(node: Any, key: str) -> None:
+        if isinstance(node, dict):
+            for child_key, child in node.items():
+                walk(child, child_key if isinstance(child_key, str) else key)
+        elif isinstance(node, list):
+            for child in node:
+                walk(child, key)
+        elif isinstance(node, str):
+            value = node.strip()
+            if GUARDRAIL_ARN_FRAGMENT in value:
+                observed["guardrail_arns"].add(value)
+            elif value.upper() == GUARDRAIL_DRAFT_VERSION:
+                observed["draft_versions"] += 1
+                observed["versions"].add(GUARDRAIL_DRAFT_VERSION)
+            elif "version" in key.lower() and value.isdigit():
+                observed["versions"].add(value)
+
+    if isinstance(document, str):
+        document = json.loads(document)
+    walk(document, "")
+    return {
+        "guardrail_arns": sorted(observed["guardrail_arns"]),
+        "draft_versions": observed["draft_versions"],
+        "versions": sorted(observed["versions"]),
+    }
+
+
+def _action_pattern_covers(pattern: str, action: str) -> bool:
+    """Return True if an IAM Action entry covers a specific lowercase action."""
+    if not isinstance(pattern, str):
+        return False
+    pattern = pattern.strip().lower()
+    if pattern in ("*", action):
+        return True
+    return pattern.endswith("*") and action.startswith(pattern[:-1])
+
+
+def _scp_requires_approved_guardrail(document: Any) -> bool:
+    """
+    Return True if a service control policy denies model invocation unless the
+    request carries an approved bedrock:GuardrailIdentifier.
+
+    Only a negated or Null condition test enforces: StringEquals on a Deny would
+    reject the approved guardrail and allow every other one.
+    """
+    try:
+        if isinstance(document, str):
+            document = json.loads(document)
+        if not isinstance(document, dict):
+            return False
+
+        statements = document.get("Statement", [])
+        if isinstance(statements, dict):
+            statements = [statements]
+
+        for statement in statements:
+            if not isinstance(statement, dict):
+                continue
+            if str(statement.get("Effect", "")).upper() != "DENY":
+                continue
+
+            actions = statement.get("Action", [])
+            if isinstance(actions, str):
+                actions = [actions]
+            if not any(
+                _action_pattern_covers(action, invoke_action)
+                for action in actions
+                for invoke_action in GUARDRAIL_INVOKE_ACTIONS
+            ):
+                continue
+
+            condition = statement.get("Condition", {})
+            if not isinstance(condition, dict):
+                continue
+            for operator, condition_keys in condition.items():
+                operator = str(operator).lower()
+                if "not" not in operator and operator != "null":
+                    continue
+                if isinstance(condition_keys, dict) and any(
+                    GUARDRAIL_CONDITION_KEY in str(key).lower()
+                    for key in condition_keys
+                ):
+                    return True
+        return False
+    except Exception as e:
+        logger.warning(f"Error parsing service control policy: {str(e)}")
+        return False
+
+
+def check_bedrock_central_guardrail_enforcement(
+    region: str = "", scp_inventory: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
+    """
+    BR-41: Verify a published guardrail is enforced centrally, through an
+    attached Organizations Bedrock policy that names a non-DRAFT guardrail or a
+    service control policy denying invocation without an approved
+    bedrock:GuardrailIdentifier.
+    """
+    logger.debug("Starting check for central guardrail enforcement policy content")
+    check_name = "Central Guardrail Enforcement Policy Check"
+    reference = "https://docs.aws.amazon.com/organizations/latest/userguide/orgs_manage_policies_bedrock.html"
+    try:
+        findings = {
+            "check_name": check_name,
+            "status": "PASS",
+            "details": "",
+            "csv_data": [],
+        }
+
+        orgs_client = boto3.client("organizations", config=boto3_config)
+        try:
+            org_info = orgs_client.describe_organization()
+            master_account_id = org_info["Organization"]["MasterAccountId"]
+            sts_client = boto3.client("sts", config=boto3_config)
+            current_account = sts_client.get_caller_identity()["Account"]
+        except ClientError as e:
+            error_code = e.response.get("Error", {}).get("Code", "")
+            if error_code == "AWSOrganizationsNotInUseException":
+                findings["details"] = (
+                    "AWS Organizations is not enabled for this account"
+                )
+                findings["csv_data"].append(
+                    create_finding(
+                        check_id="BR-41",
+                        finding_name=check_name,
+                        finding_details="AWS Organizations is not in use, so no organization policy can enforce a central guardrail. Account-level enforced guardrails are assessed by BR-15.",
+                        resolution="Enable AWS Organizations if central guardrail enforcement across accounts is required.",
+                        reference=reference,
+                        severity="Informational",
+                        status="N/A",
+                        region=region,
+                    )
+                )
+                return findings
+            if error_code in ACCESS_DENIED_ERROR_CODES:
+                findings["csv_data"].append(
+                    create_finding(
+                        check_id="BR-41",
+                        finding_name=check_name,
+                        finding_details=describe_api_error(
+                            e, "Organizations policy content check", region
+                        ),
+                        resolution="Grant organizations:DescribeOrganization, organizations:ListPolicies, organizations:ListTargetsForPolicy, and organizations:DescribePolicy to the assessment role.",
+                        reference=reference,
+                        severity="Medium",
+                        status="N/A",
+                        region=region,
+                    )
+                )
+                return findings
+            raise
+
+        if current_account != master_account_id:
+            findings["csv_data"].append(
+                create_finding(
+                    check_id="BR-41",
+                    finding_name=check_name,
+                    finding_details=f"Organization policy documents are readable only from the management account. This assessment ran in account {current_account}, so the guardrail version enforced by an inherited policy could not be read.",
+                    resolution="Run the assessment from the management account to confirm the enforced guardrail is a published version.",
+                    reference=reference,
+                    severity="Informational",
+                    status="N/A",
+                    region=region,
+                )
+            )
+            return findings
+
+        enforcing_policies = []
+        deficient_policies = []
+        policy_errors = []
+
+        try:
+            bedrock_policies = _list_all_items(
+                orgs_client,
+                "list_policies",
+                "Policies",
+                max_results_param="MaxResults",
+                token_param="NextToken",
+                token_response_keys=("NextToken",),
+                max_results=20,
+                Filter="BEDROCK_POLICY",
+            )
+        except Exception as error:
+            bedrock_policies = []
+            policy_errors.append(f"BEDROCK_POLICY listing: {str(error)}")
+
+        for policy in bedrock_policies:
+            policy_id = policy.get("Id")
+            if not policy_id:
+                continue
+            policy_name = policy.get("Name") or policy_id
+            try:
+                targets = _list_all_items(
+                    orgs_client,
+                    "list_targets_for_policy",
+                    "Targets",
+                    max_results_param="MaxResults",
+                    token_param="NextToken",
+                    token_response_keys=("NextToken",),
+                    max_results=20,
+                    PolicyId=policy_id,
+                )
+                policy_detail = orgs_client.describe_policy(PolicyId=policy_id)
+                content = (
+                    policy_detail.get("Policy", {}).get("Content")
+                    if isinstance(policy_detail, dict)
+                    else None
+                )
+                summary = _summarize_guardrail_policy_document(content or "{}")
+            except Exception as error:
+                policy_errors.append(f"policy '{policy_name}': {str(error)}")
+                continue
+
+            target_names = [
+                f"{target.get('Type', 'target')} {target.get('TargetId', 'unknown')}"
+                for target in targets
+            ]
+            if not target_names:
+                deficient_policies.append(
+                    {
+                        "name": policy_name,
+                        "id": policy_id,
+                        "reason": "it has no attached root, organizational unit, or account target",
+                        "observed": ", ".join(summary["guardrail_arns"])
+                        or "no guardrail ARN in the policy document",
+                    }
+                )
+            elif not summary["guardrail_arns"]:
+                deficient_policies.append(
+                    {
+                        "name": policy_name,
+                        "id": policy_id,
+                        "reason": "its document names no guardrail ARN, so nothing is auto-applied",
+                        "observed": f"attached to {', '.join(target_names)}",
+                    }
+                )
+            elif summary["draft_versions"]:
+                deficient_policies.append(
+                    {
+                        "name": policy_name,
+                        "id": policy_id,
+                        "reason": f"its document enforces the DRAFT guardrail version, which changes with every unpublished edit ({summary['draft_versions']} DRAFT value(s))",
+                        "observed": "versions {}; guardrails {}".format(
+                            ", ".join(summary["versions"]),
+                            ", ".join(summary["guardrail_arns"]),
+                        ),
+                    }
+                )
+            else:
+                enforcing_policies.append(
+                    "Bedrock policy '{}' attached to {} enforcing {} at version {}".format(
+                        policy_name,
+                        ", ".join(target_names),
+                        ", ".join(summary["guardrail_arns"]),
+                        ", ".join(summary["versions"]) or "unspecified",
+                    )
+                )
+
+        # The service control policy fallback is read only when no Bedrock
+        # policy enforces, because it costs one DescribePolicy per SCP.
+        enforcing_scps = []
+        if not enforcing_policies:
+            scps = (
+                scp_inventory
+                if scp_inventory is not None
+                else get_service_control_policy_inventory()
+            )
+            if scps["list_error"]:
+                policy_errors.append(
+                    f"SERVICE_CONTROL_POLICY listing: {scps['list_error']}"
+                )
+            policy_errors.extend(scps["errors"])
+            for item in scps["items"]:
+                if item["content"] and _scp_requires_approved_guardrail(
+                    item["content"]
+                ):
+                    enforcing_scps.append(item["name"])
+
+        for policy in deficient_policies:
+            findings["status"] = "WARN"
+            findings["csv_data"].append(
+                create_finding(
+                    check_id="BR-41",
+                    finding_name=check_name,
+                    finding_details="Organizations Bedrock policy '{}' (ID: {}) does not enforce a published guardrail because {} (observed: {}).".format(
+                        policy["name"],
+                        policy["id"],
+                        policy["reason"],
+                        policy["observed"],
+                    ),
+                    resolution="Attach the policy to the root, an organizational unit, or an account, and name a published numeric guardrail version instead of DRAFT.",
+                    reference=reference,
+                    severity="High",
+                    status="Failed",
+                    region=region,
+                )
+            )
+
+        if enforcing_policies or enforcing_scps:
+            mechanisms = list(enforcing_policies) + [
+                f"service control policy '{name}' denying model invocation without an approved bedrock:GuardrailIdentifier"
+                for name in enforcing_scps
+            ]
+            findings["details"] = "Central guardrail enforcement is configured"
+            findings["csv_data"].append(
+                create_finding(
+                    check_id="BR-41",
+                    finding_name=check_name,
+                    finding_details="A published guardrail is enforced centrally by {} mechanism(s): {}. Confirm the guardrail is shared with member accounts through a resource policy scoped by aws:PrincipalOrgID.".format(
+                        len(mechanisms), "; ".join(mechanisms)
+                    ),
+                    resolution="No action required. Re-publish and re-point the policy whenever the approved guardrail changes.",
+                    reference=reference,
+                    severity="Medium",
+                    status="Passed",
+                    region=region,
+                )
+            )
+
+        if not enforcing_policies and not enforcing_scps and not deficient_policies:
+            if policy_errors:
+                findings["csv_data"].append(
+                    create_finding(
+                        check_id="BR-41",
+                        finding_name=check_name,
+                        finding_details="Organization policies could not be read, so central guardrail enforcement is undetermined: {}.".format(
+                            "; ".join(policy_errors[:5])
+                        ),
+                        resolution="Grant organizations:ListPolicies, organizations:ListTargetsForPolicy, and organizations:DescribePolicy and retry before concluding that no enforcement exists.",
+                        reference=reference,
+                        severity="Informational",
+                        status="N/A",
+                        region=region,
+                    )
+                )
+            else:
+                findings["status"] = "WARN"
+                findings["details"] = "No central guardrail enforcement found"
+                findings["csv_data"].append(
+                    create_finding(
+                        check_id="BR-41",
+                        finding_name=check_name,
+                        finding_details=f"No Organizations Bedrock policy names a guardrail and none of the organization's service control policies deny bedrock:InvokeModel without an approved {GUARDRAIL_CONDITION_KEY}, so each application chooses its own guardrail.",
+                        resolution="Create a Bedrock policy that auto-applies a published guardrail version, or an SCP denying bedrock:InvokeModel and bedrock:InvokeModelWithResponseStream unless bedrock:GuardrailIdentifier matches the approved guardrail ARN.",
+                        reference=reference,
+                        severity="High",
+                        status="Failed",
+                        region=region,
+                    )
+                )
+
+        return findings
+
+    except Exception as e:
+        logger.error(
+            f"Error in check_bedrock_central_guardrail_enforcement: {str(e)}",
+            exc_info=True,
+        )
+        return {
+            "check_name": check_name,
+            "status": "ERROR",
+            "details": f"Error during check: {str(e)}",
+            "csv_data": [
+                create_finding(
+                    check_id="BR-41",
+                    finding_name=check_name,
+                    finding_details=build_could_not_assess_detail(e, region),
+                    resolution=COULD_NOT_ASSESS_RESOLUTION,
+                    reference=reference,
                     severity="Informational",
                     status="N/A",
                     region=region,
@@ -5328,11 +6094,30 @@ def check_bedrock_guardrail_prompt_attack_filter(
             for filter_item in (detail.get("contentPolicy") or {}).get("filters", [])
             if filter_item.get("type") == "PROMPT_ATTACK"
         ]
+        # inputStrength is a required member of GuardrailContentFilter with enum
+        # NONE|LOW|MEDIUM|HIGH. HIGH is required here because a weaker strength
+        # leaves jailbreak and prompt-injection attempts below the filter
+        # threshold even when the action is BLOCK.
         preventive = any(
             filter_item.get("inputEnabled") is True
             and filter_item.get("inputAction") == "BLOCK"
-            and filter_item.get("inputStrength", "NONE") != "NONE"
+            and filter_item.get("inputStrength") == "HIGH"
             for filter_item in prompt_filters
+        )
+        observed = (
+            ", ".join(
+                sorted(
+                    "{}/{}/{}".format(
+                        filter_item.get("inputStrength", "unspecified"),
+                        filter_item.get("inputAction", "unspecified"),
+                        "enabled"
+                        if filter_item.get("inputEnabled") is True
+                        else "not enabled",
+                    )
+                    for filter_item in prompt_filters
+                )
+            )
+            or "no PROMPT_ATTACK filter is configured"
         )
         tier = (
             (detail.get("contentPolicy") or {})
@@ -5344,14 +6129,14 @@ def check_bedrock_guardrail_prompt_attack_filter(
                 check_id="BR-34",
                 finding_name="Guardrail Prompt Attack Filter",
                 finding_details=(
-                    f"Guardrail '{summary.get('name', 'unknown')}' has a preventive PROMPT_ATTACK input filter (tier: {tier})."
+                    f"Guardrail '{summary.get('name', 'unknown')}' has a preventive PROMPT_ATTACK input filter at HIGH strength (tier: {tier})."
                     if preventive
-                    else f"Guardrail '{summary.get('name', 'unknown')}' does not have a preventive PROMPT_ATTACK input filter."
+                    else f"Guardrail '{summary.get('name', 'unknown')}' does not have a preventive PROMPT_ATTACK input filter at HIGH strength (observed strength/action/state: {observed})."
                 ),
                 resolution=(
                     "No action required. Use Standard tier where prompt-leakage detection is required."
                     if preventive
-                    else "Configure PROMPT_ATTACK with inputEnabled=true, inputAction=BLOCK, and a non-NONE inputStrength."
+                    else "Configure PROMPT_ATTACK with inputEnabled=true, inputAction=BLOCK, and inputStrength=HIGH."
                 ),
                 reference="https://docs.aws.amazon.com/bedrock/latest/userguide/guardrails-prompt-attack.html",
                 severity="High",
@@ -6286,6 +7071,7 @@ def check_bedrock_guardrail_contextual_grounding(region: str = "") -> Dict[str, 
 
             guardrails_without_grounding = []
             guardrails_with_grounding = []
+            guardrails_with_incomplete_grounding = []
             unassessed_guardrails = []
 
             for guardrail_summary in guardrails:
@@ -6325,12 +7111,51 @@ def check_bedrock_guardrail_contextual_grounding(region: str = "") -> Dict[str, 
                     f for f in grounding_filters if f.get("enabled", True)
                 ]
 
-                if active_filters:
-                    guardrails_with_grounding.append(guardrail_name)
-                else:
+                if not active_filters:
                     guardrails_without_grounding.append(
                         {"name": guardrail_name, "id": guardrail_id}
                     )
+                    continue
+
+                # Both filter types have to block for an ungrounded or
+                # off-topic response to be stopped rather than scored and
+                # returned. threshold is a required member; the documented
+                # range is 0 to 0.99, where 0 blocks nothing and 1 is not a
+                # valid threshold. action is optional and postdates the
+                # feature, so an omitted action is the original BLOCK
+                # behaviour.
+                blocking_types = {
+                    filter_item.get("type")
+                    for filter_item in active_filters
+                    if filter_item.get("action", "BLOCK") == "BLOCK"
+                    and isinstance(filter_item.get("threshold"), (int, float))
+                    and 0 < filter_item["threshold"] <= 0.99
+                }
+                missing_types = [
+                    filter_type
+                    for filter_type in ("GROUNDING", "RELEVANCE")
+                    if filter_type not in blocking_types
+                ]
+                if missing_types:
+                    guardrails_with_incomplete_grounding.append(
+                        {
+                            "name": guardrail_name,
+                            "id": guardrail_id,
+                            "missing": ", ".join(missing_types),
+                            "observed": ", ".join(
+                                sorted(
+                                    "{} threshold={} action={}".format(
+                                        filter_item.get("type", "unspecified"),
+                                        filter_item.get("threshold", "unspecified"),
+                                        filter_item.get("action", "BLOCK (omitted)"),
+                                    )
+                                    for filter_item in active_filters
+                                )
+                            ),
+                        }
+                    )
+                else:
+                    guardrails_with_grounding.append(guardrail_name)
 
             if guardrails_without_grounding:
                 findings["status"] = "WARN"
@@ -6352,12 +7177,31 @@ def check_bedrock_guardrail_contextual_grounding(region: str = "") -> Dict[str, 
                         )
                     )
 
+            if guardrails_with_incomplete_grounding:
+                findings["status"] = "WARN"
+                for gr in guardrails_with_incomplete_grounding:
+                    findings["csv_data"].append(
+                        create_finding(
+                            check_id="BR-27",
+                            finding_name="Guardrail Contextual Grounding Check",
+                            finding_details=(
+                                f"Guardrail '{gr['name']}' (ID: {gr['id']}) has contextual grounding enabled but does not block on {gr['missing']} "
+                                f"with a threshold in the 0-0.99 range (observed: {gr['observed']}). An ungrounded or off-topic response is scored but still returned."
+                            ),
+                            resolution="Configure both the GROUNDING and RELEVANCE contextual grounding filter types with action=BLOCK and a threshold above 0 and no higher than 0.99 (1 is not a valid threshold).",
+                            reference="https://docs.aws.amazon.com/bedrock/latest/userguide/guardrails-contextual-grounding-check.html",
+                            severity="Medium",
+                            status="Failed",
+                            region=region,
+                        )
+                    )
+
             if guardrails_with_grounding:
                 findings["csv_data"].append(
                     create_finding(
                         check_id="BR-27",
                         finding_name="Guardrail Contextual Grounding Check",
-                        finding_details=f"{len(guardrails_with_grounding)} guardrails have contextual grounding checks enabled",
+                        finding_details=f"{len(guardrails_with_grounding)} guardrails block on both GROUNDING and RELEVANCE contextual grounding filters with thresholds in the 0-0.99 range",
                         resolution="No action required. Review grounding and relevance thresholds periodically to balance hallucination detection against false positives.",
                         reference="https://docs.aws.amazon.com/bedrock/latest/userguide/guardrails-contextual-grounding-check.html",
                         severity="Low",
@@ -7114,10 +7958,66 @@ def check_bedrock_batch_inference_output_encryption(
         }
 
 
+GUARDRAIL_METRIC_NAMESPACE = "AWS/Bedrock/Guardrails"
+
+# A metric filter feeds guardrail interventions to monitoring by matching the
+# field the runtime API returns: InvokeModel and InvokeModelWithResponseStream
+# emit amazon-bedrock-guardrailAction=INTERVENED, Converse and ConverseStream
+# emit stopReason=guardrail_intervened.
+GUARDRAIL_INTERVENTION_PATTERN_TOKENS = (
+    "guardrailaction",
+    "guardrail_intervened",
+    "intervened",
+)
+
+
+def _get_invocation_log_group_name(region: str = "") -> Optional[str]:
+    """Return the CloudWatch log group that receives Bedrock invocation logs."""
+    client = boto3.client("bedrock", config=boto3_config, region_name=region)
+    response = client.get_model_invocation_logging_configuration()
+    if not isinstance(response, dict):
+        return None
+    logging_config = response.get("loggingConfig")
+    if not isinstance(logging_config, dict):
+        return None
+    cloudwatch_config = logging_config.get("cloudWatchConfig")
+    if not isinstance(cloudwatch_config, dict):
+        return None
+    log_group_name = cloudwatch_config.get("logGroupName")
+    if isinstance(log_group_name, str) and log_group_name:
+        return log_group_name
+    return None
+
+
+def _find_guardrail_intervention_metric_filters(
+    log_group_name: str, region: str = ""
+) -> List[str]:
+    """Name the metric filters on a log group that match a guardrail intervention."""
+    client = boto3.client("logs", config=boto3_config, region_name=region)
+    matched = []
+    next_token = None
+    while True:
+        request = {"logGroupName": log_group_name}
+        if next_token:
+            request["nextToken"] = next_token
+        response = client.describe_metric_filters(**request)
+        if not isinstance(response, dict):
+            break
+        for metric_filter in response.get("metricFilters", []):
+            pattern = (metric_filter.get("filterPattern") or "").lower()
+            if any(token in pattern for token in GUARDRAIL_INTERVENTION_PATTERN_TOKENS):
+                matched.append(metric_filter.get("filterName") or "unnamed")
+        next_token = response.get("nextToken")
+        if not next_token:
+            break
+    return matched
+
+
 def check_bedrock_cloudwatch_alarms(region: str = "") -> Dict[str, Any]:
     """
     BR-32: Verify CloudWatch alarms exist on Amazon Bedrock runtime metrics
-    (AWS/Bedrock namespace) to detect abuse, throttling, and cost spikes.
+    (AWS/Bedrock namespace) to detect abuse, throttling, and cost spikes, and
+    that guardrail interventions reach monitoring as their own signal.
     """
     logger.debug("Starting check for CloudWatch alarms on Bedrock metrics")
     try:
@@ -7156,20 +8056,22 @@ def check_bedrock_cloudwatch_alarms(region: str = "") -> Dict[str, Any]:
 
         try:
             bedrock_alarms = []
+            guardrail_alarms = []
             paginator = cloudwatch_client.get_paginator("describe_alarms")
             for page in paginator.paginate(AlarmTypes=["MetricAlarm"]):
                 for alarm in page.get("MetricAlarms", []):
                     # A metric alarm targets Bedrock either directly (Namespace)
                     # or via a metric-math expression referencing AWS/Bedrock.
-                    if alarm.get("Namespace") == "AWS/Bedrock":
-                        bedrock_alarms.append(alarm.get("AlarmName"))
-                        continue
+                    namespaces = {alarm.get("Namespace") or ""}
                     for metric in alarm.get("Metrics", []):
                         metric_stat = metric.get("MetricStat", {})
-                        namespace = metric_stat.get("Metric", {}).get("Namespace", "")
-                        if namespace == "AWS/Bedrock":
-                            bedrock_alarms.append(alarm.get("AlarmName"))
-                            break
+                        namespaces.add(
+                            metric_stat.get("Metric", {}).get("Namespace", "")
+                        )
+                    if "AWS/Bedrock" in namespaces:
+                        bedrock_alarms.append(alarm.get("AlarmName"))
+                    if GUARDRAIL_METRIC_NAMESPACE in namespaces:
+                        guardrail_alarms.append(alarm.get("AlarmName"))
 
             if bedrock_alarms:
                 findings["details"] = (
@@ -7197,6 +8099,84 @@ def check_bedrock_cloudwatch_alarms(region: str = "") -> Dict[str, Any]:
                         finding_details="No CloudWatch alarms are configured on Amazon Bedrock runtime metrics (AWS/Bedrock namespace). Without alarms, abuse, denial-of-wallet, sustained throttling, and content-filter spikes can go undetected.",
                         resolution="Create CloudWatch alarms on AWS/Bedrock runtime metrics such as Invocations, InvocationThrottles, InputTokenCount, OutputTokenCount, and ContentFilteredCount, and route them to an Amazon SNS topic for notification.",
                         reference="https://docs.aws.amazon.com/bedrock/latest/userguide/monitoring-runtime-metrics.html",
+                        severity="Medium",
+                        status="Failed",
+                        region=region,
+                    )
+                )
+
+            # A guardrail intervention is a separate signal from the runtime
+            # metrics above: it reaches monitoring either as an alarm on the
+            # AWS/Bedrock/Guardrails namespace or as a metric filter over the
+            # invocation log group.
+            log_group_name = None
+            intervention_filters = []
+            signal_error = None
+            try:
+                log_group_name = _get_invocation_log_group_name(region)
+                if log_group_name:
+                    intervention_filters = _find_guardrail_intervention_metric_filters(
+                        log_group_name, region
+                    )
+            except Exception as error:  # noqa: BLE001 - reported as N/A below
+                signal_error = error
+
+            intervention_reference = "https://docs.aws.amazon.com/bedrock/latest/userguide/guardrails-enforcements.html"
+            if guardrail_alarms or intervention_filters:
+                observed = []
+                if guardrail_alarms:
+                    observed.append(
+                        f"{len(guardrail_alarms)} CloudWatch alarm(s) on the {GUARDRAIL_METRIC_NAMESPACE} namespace ({', '.join(sorted(name for name in guardrail_alarms if name))})"
+                    )
+                if intervention_filters:
+                    observed.append(
+                        f"{len(intervention_filters)} metric filter(s) on log group '{log_group_name}' matching a guardrail intervention field ({', '.join(sorted(intervention_filters))})"
+                    )
+                findings["csv_data"].append(
+                    create_finding(
+                        check_id="BR-32",
+                        finding_name="Guardrail Intervention Monitoring Signal",
+                        finding_details=f"Guardrail interventions feed monitoring through {' and '.join(observed)}.",
+                        resolution="No action required. Confirm the alarm or metric filter routes to the security monitoring destination that is actually reviewed.",
+                        reference=intervention_reference,
+                        severity="Low",
+                        status="Passed",
+                        region=region,
+                    )
+                )
+            elif signal_error is not None:
+                findings["csv_data"].append(
+                    create_finding(
+                        check_id="BR-32",
+                        finding_name="Guardrail Intervention Monitoring Signal",
+                        finding_details=(
+                            f"No CloudWatch alarm on the {GUARDRAIL_METRIC_NAMESPACE} namespace was found, and whether a metric filter "
+                            f"matches guardrail interventions could not be determined: {get_assessment_error_label(signal_error)}."
+                        ),
+                        resolution="Grant bedrock:GetModelInvocationLoggingConfiguration and logs:DescribeMetricFilters and retry before concluding that no intervention signal exists.",
+                        reference=intervention_reference,
+                        severity="Informational",
+                        status="N/A",
+                        region=region,
+                    )
+                )
+            else:
+                findings["status"] = "WARN"
+                findings["csv_data"].append(
+                    create_finding(
+                        check_id="BR-32",
+                        finding_name="Guardrail Intervention Monitoring Signal",
+                        finding_details=(
+                            f"No guardrail-intervention signal reaches monitoring: no CloudWatch alarm uses the {GUARDRAIL_METRIC_NAMESPACE} namespace, and "
+                            + (
+                                f"no metric filter on invocation log group '{log_group_name}' matches an intervention field."
+                                if log_group_name
+                                else "model invocation logging has no CloudWatch Logs destination, so no metric filter can match an intervention field."
+                            )
+                            + " A blocked or modified request is therefore not distinguishable from a normal one in monitoring."
+                        ),
+                        resolution="Alarm on InvocationsIntervened in the AWS/Bedrock/Guardrails namespace, or send model invocation logs to CloudWatch Logs and add a metric filter on amazon-bedrock-guardrailAction=INTERVENED (Converse: stopReason=guardrail_intervened) with an alarm on the derived metric.",
+                        reference=intervention_reference,
                         severity="Medium",
                         status="Failed",
                         region=region,
@@ -8087,6 +9067,1365 @@ def check_bedrock_marketplace_endpoint_cmk(
     return findings
 
 
+def _organization_policy_context() -> Dict[str, Any]:
+    """
+    Resolve whether organization policy documents can be read from this account.
+
+    ListPolicies and DescribePolicy answer only in the management account or a
+    delegated administrator, so a member-account run has to report the control as
+    unassessed instead of reporting the policy as absent.
+    """
+    context = {"readable": False, "detail": "", "resolution": "", "account": ""}
+
+    orgs_client = boto3.client("organizations", config=boto3_config)
+    try:
+        org_info = orgs_client.describe_organization()
+        master_account_id = org_info["Organization"]["MasterAccountId"]
+        context["account"] = boto3.client(
+            "sts", config=boto3_config
+        ).get_caller_identity()["Account"]
+    except ClientError as error:
+        error_code = error.response.get("Error", {}).get("Code", "")
+        if error_code == "AWSOrganizationsNotInUseException":
+            context["detail"] = (
+                "AWS Organizations is not in use for this account, so no service "
+                "control policy can exist to enforce this control"
+            )
+            context["resolution"] = (
+                "Enable AWS Organizations if an organization-wide preventive "
+                "control is required."
+            )
+            return context
+        if error_code in ACCESS_DENIED_ERROR_CODES:
+            context["detail"] = (
+                "the organization could not be read "
+                f"({get_assessment_error_label(error)}), so service control "
+                "policies were not enumerated"
+            )
+            context["resolution"] = (
+                "Grant organizations:DescribeOrganization, "
+                "organizations:ListPolicies and organizations:DescribePolicy to "
+                "the assessment role."
+            )
+            return context
+        raise
+
+    if context["account"] != master_account_id:
+        context["detail"] = (
+            "service control policy documents are readable only from the "
+            "organization management account or a delegated administrator, and "
+            f"this assessment ran in account {context['account']}"
+        )
+        context["resolution"] = (
+            "Run the assessment from the organization management account to "
+            "assess this preventive control."
+        )
+        return context
+
+    context["readable"] = True
+    return context
+
+
+def get_service_control_policy_inventory() -> Dict[str, Any]:
+    """
+    Read every service control policy document once.
+
+    BR-41, BR-43 and BR-45 test different predicates against the same corpus, so
+    the ListPolicies and per-policy DescribePolicy pass is made once and shared.
+    """
+    inventory = {"items": [], "errors": [], "list_error": None}
+    orgs_client = boto3.client("organizations", config=boto3_config)
+
+    try:
+        policies = _list_all_items(
+            orgs_client,
+            "list_policies",
+            "Policies",
+            max_results_param="MaxResults",
+            token_param="NextToken",
+            token_response_keys=("NextToken",),
+            max_results=20,
+            Filter="SERVICE_CONTROL_POLICY",
+        )
+    except Exception as error:
+        inventory["list_error"] = str(error)
+        return inventory
+
+    for policy in policies:
+        policy_id = policy.get("Id")
+        if not policy_id:
+            continue
+        policy_name = policy.get("Name") or policy_id
+        try:
+            policy_detail = orgs_client.describe_policy(PolicyId=policy_id)
+            content = (
+                policy_detail.get("Policy", {}).get("Content")
+                if isinstance(policy_detail, dict)
+                else None
+            )
+        except Exception as error:
+            inventory["errors"].append(f"policy '{policy_name}': {str(error)}")
+            continue
+        inventory["items"].append(
+            {"name": policy_name, "id": policy_id, "content": content}
+        )
+
+    return inventory
+
+
+def _policy_statements(document: Any) -> List[Dict[str, Any]]:
+    """Return the statement list of a policy document given as JSON or text."""
+    if isinstance(document, str):
+        document = json.loads(document)
+    if not isinstance(document, dict):
+        return []
+    statements = document.get("Statement", [])
+    if isinstance(statements, dict):
+        statements = [statements]
+    return [statement for statement in statements if isinstance(statement, dict)]
+
+
+def _as_list(value: Any) -> List[Any]:
+    """Normalize an IAM element that may be a single value or a list."""
+    if value is None:
+        return []
+    return value if isinstance(value, list) else [value]
+
+
+def _condition_keys_by_operator(statement: Dict[str, Any]) -> List[tuple]:
+    """Flatten a statement Condition block into (operator, key, values) tuples."""
+    condition = statement.get("Condition", {})
+    if not isinstance(condition, dict):
+        return []
+    flattened = []
+    for operator, condition_keys in condition.items():
+        if not isinstance(condition_keys, dict):
+            continue
+        for key, values in condition_keys.items():
+            flattened.append(
+                (str(operator).lower(), str(key).lower(), _as_list(values))
+            )
+    return flattened
+
+
+MODEL_INVOKE_ACTIONS = (
+    "bedrock:invokemodel",
+    "bedrock:invokemodelwithresponsestream",
+)
+
+MODEL_STREAMING_INVOKE_ACTION = "bedrock:invokemodelwithresponsestream"
+
+MODEL_ARN_CONDITION_KEY = "bedrock:modelarn"
+
+MODEL_ALLOW_LIST_REFERENCE = "https://docs.aws.amazon.com/bedrock/latest/userguide/security_iam_id-based-policy-examples.html"
+
+
+def _resource_is_unscoped(resource: Any) -> bool:
+    """Return True when a Resource entry covers every model rather than naming one."""
+    if not isinstance(resource, str):
+        return False
+    resource = resource.strip()
+    return resource == "*" or resource.endswith("/*") or resource.endswith(":*")
+
+
+def _statement_model_invocation_scoping(
+    statement: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    """
+    Describe how one Allow statement scopes Bedrock model invocation.
+
+    Returns None when the statement allows neither invoke action, so a policy
+    that never grants invocation is not judged against this control.
+    """
+    if str(statement.get("Effect", "")).upper() != "ALLOW":
+        return None
+
+    covered = [
+        invoke_action
+        for invoke_action in MODEL_INVOKE_ACTIONS
+        if any(
+            _action_pattern_covers(action, invoke_action)
+            for action in _as_list(statement.get("Action"))
+        )
+    ]
+    if not covered:
+        return None
+
+    resources = [
+        resource
+        for resource in _as_list(statement.get("Resource"))
+        if isinstance(resource, str)
+    ]
+    unscoped = [resource for resource in resources if _resource_is_unscoped(resource)]
+    named = [resource for resource in resources if not _resource_is_unscoped(resource)]
+    has_model_arn_condition = any(
+        MODEL_ARN_CONDITION_KEY in key
+        for _, key, _ in _condition_keys_by_operator(statement)
+    )
+
+    return {
+        "actions": covered,
+        "unscoped_resources": unscoped,
+        "named_resources": named,
+        "has_model_arn_condition": has_model_arn_condition,
+    }
+
+
+def _model_invocation_statement_deficiency(scoping: Dict[str, Any]) -> Optional[str]:
+    """Explain why an invoke statement is not restricted to an approved model."""
+    if not scoping["unscoped_resources"]:
+        return None
+
+    observed = ", ".join(scoping["unscoped_resources"])
+    if not scoping["has_model_arn_condition"]:
+        return (
+            f"it allows {', '.join(scoping['actions'])} on {observed}, so every "
+            "model available in the account can be invoked"
+        )
+    if MODEL_STREAMING_INVOKE_ACTION in scoping["actions"]:
+        return (
+            f"it allows {MODEL_STREAMING_INVOKE_ACTION} on {observed} and relies on "
+            f"a {MODEL_ARN_CONDITION_KEY} condition, which that operation does not "
+            "support, so the streaming call is unrestricted"
+        )
+    return None
+
+
+def check_bedrock_model_allow_list(
+    permission_cache, region: str = ""
+) -> Dict[str, Any]:
+    """
+    BR-42: Verify identity policies restrict Bedrock model invocation to named
+    model or inference-profile ARNs instead of every model in the account.
+    """
+    logger.debug("Starting check for Bedrock model invocation allow-list scoping")
+    check_name = "Foundation Model Invocation Allow-List"
+    try:
+        findings = {
+            "check_name": check_name,
+            "status": "PASS",
+            "details": "",
+            "csv_data": [],
+        }
+
+        unrestricted = []
+        scoped = []
+
+        identities = [
+            ("role", name, permissions)
+            for name, permissions in permission_cache["role_permissions"].items()
+        ] + [
+            ("user", name, permissions)
+            for name, permissions in permission_cache["user_permissions"].items()
+        ]
+
+        for identity_type, identity_name, permissions in identities:
+            grants_invocation = False
+            deficiencies = []
+            scoped_resources = set()
+
+            for policy in (
+                permissions["attached_policies"] + permissions["inline_policies"]
+            ):
+                try:
+                    statements = _policy_statements(policy["document"])
+                except Exception as error:
+                    logger.warning(
+                        f"Unable to parse policy {policy['name']} on "
+                        f"{identity_type} {identity_name}: {error}"
+                    )
+                    continue
+
+                for statement in statements:
+                    scoping = _statement_model_invocation_scoping(statement)
+                    if scoping is None:
+                        continue
+                    grants_invocation = True
+                    scoped_resources.update(scoping["named_resources"])
+                    deficiency = _model_invocation_statement_deficiency(scoping)
+                    if deficiency:
+                        deficiencies.append(f"policy '{policy['name']}': {deficiency}")
+
+            if not grants_invocation:
+                continue
+            if deficiencies:
+                unrestricted.append(
+                    {
+                        "type": identity_type,
+                        "name": identity_name,
+                        "reasons": deficiencies,
+                    }
+                )
+            else:
+                scoped.append(
+                    "{} '{}' scoped to {}".format(
+                        identity_type,
+                        identity_name,
+                        ", ".join(sorted(scoped_resources)) or "no resource",
+                    )
+                )
+
+        for identity in unrestricted:
+            findings["status"] = "WARN"
+            findings["csv_data"].append(
+                create_finding(
+                    check_id="BR-42",
+                    finding_name=check_name,
+                    finding_details=(
+                        "{} '{}' can invoke any foundation model because {}.".format(
+                            identity["type"].capitalize(),
+                            identity["name"],
+                            "; ".join(identity["reasons"][:3]),
+                        )
+                    ),
+                    resolution=(
+                        "Scope bedrock:InvokeModel and "
+                        "bedrock:InvokeModelWithResponseStream to the approved "
+                        "foundation-model and inference-profile ARNs in the Resource "
+                        "element. The streaming operation does not support the "
+                        "bedrock:ModelArn condition key, so a condition alone does "
+                        "not restrict it."
+                    ),
+                    reference=MODEL_ALLOW_LIST_REFERENCE,
+                    severity="High",
+                    status="Failed",
+                    region=region,
+                )
+            )
+
+        if scoped:
+            findings["csv_data"].append(
+                create_finding(
+                    check_id="BR-42",
+                    finding_name=check_name,
+                    finding_details=(
+                        "{} identity policy grant(s) restrict model invocation to "
+                        "named ARNs: {}. The assessment does not know which models "
+                        "your workload approved, so confirm these ARNs are the "
+                        "approved list.".format(len(scoped), "; ".join(scoped[:10]))
+                    ),
+                    resolution="No action required. Review the named ARNs whenever the approved model list changes.",
+                    reference=MODEL_ALLOW_LIST_REFERENCE,
+                    severity="Medium",
+                    status="Passed",
+                    region=region,
+                )
+            )
+
+        if not scoped and not unrestricted:
+            findings["details"] = "No cached identity grants Bedrock model invocation"
+            findings["csv_data"].append(
+                create_finding(
+                    check_id="BR-42",
+                    finding_name=check_name,
+                    finding_details=(
+                        "No role or user in the IAM permissions cache allows "
+                        "bedrock:InvokeModel or "
+                        "bedrock:InvokeModelWithResponseStream, so there is no "
+                        "model invocation grant to restrict."
+                    ),
+                    resolution="No action required",
+                    reference=MODEL_ALLOW_LIST_REFERENCE,
+                    severity="Informational",
+                    status="N/A",
+                    region=region,
+                )
+            )
+
+        return findings
+
+    except Exception as e:
+        logger.error(
+            f"Error in check_bedrock_model_allow_list: {str(e)}", exc_info=True
+        )
+        return {
+            "check_name": check_name,
+            "status": "ERROR",
+            "details": f"Error during check: {str(e)}",
+            "csv_data": [
+                create_finding(
+                    check_id="BR-42",
+                    finding_name=check_name,
+                    finding_details=build_could_not_assess_detail(e, region),
+                    resolution=COULD_NOT_ASSESS_RESOLUTION,
+                    reference=MODEL_ALLOW_LIST_REFERENCE,
+                    severity="Informational",
+                    status="N/A",
+                    region=region,
+                )
+            ],
+        }
+
+
+REGION_CONDITION_KEY = "aws:requestedregion"
+
+REGION_CONTROL_ACTIONS = (
+    "bedrock:invokemodel",
+    "bedrock:invokemodelwithresponsestream",
+    "bedrock:createmodelinvocationjob",
+)
+
+GLOBAL_INFERENCE_REGION_VALUE = "unspecified"
+
+REGION_CONTROL_REFERENCE = "https://docs.aws.amazon.com/bedrock/latest/userguide/inference-profiles-support.html"
+
+
+def _scp_region_controls(document: Any) -> List[Dict[str, Any]]:
+    """
+    Describe every statement that conditions Bedrock invocation on the request
+    Region.
+
+    A Deny with a negated Region test is an allow-list of Regions; a Deny with a
+    positive test is a deny-list. Both control routing, and both are reported
+    with the Region values observed so the reader can see which form is in use.
+    """
+    controls = []
+    for statement in _policy_statements(document):
+        if str(statement.get("Effect", "")).upper() != "DENY":
+            continue
+        covered = [
+            action_name
+            for action_name in REGION_CONTROL_ACTIONS
+            if any(
+                _action_pattern_covers(action, action_name)
+                for action in _as_list(statement.get("Action"))
+            )
+        ]
+        if not covered:
+            continue
+        for operator, key, values in _condition_keys_by_operator(statement):
+            if REGION_CONDITION_KEY not in key:
+                continue
+            regions = [str(value).lower() for value in values]
+            controls.append(
+                {
+                    "actions": covered,
+                    "operator": operator,
+                    "regions": regions,
+                    "negated": "not" in operator,
+                    "allows_global": GLOBAL_INFERENCE_REGION_VALUE in regions,
+                }
+            )
+    return controls
+
+
+def check_bedrock_region_invocation_control(
+    region: str = "", scp_inventory: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
+    """
+    BR-43: Verify a service control policy conditions Bedrock model invocation on
+    aws:RequestedRegion, so cross-region routing is an explicit decision.
+    """
+    logger.debug("Starting check for Bedrock Region invocation control")
+    check_name = "Bedrock Region Invocation Control"
+    try:
+        findings = {
+            "check_name": check_name,
+            "status": "PASS",
+            "details": "",
+            "csv_data": [],
+        }
+
+        context = _organization_policy_context()
+        if not context["readable"]:
+            findings["csv_data"].append(
+                create_finding(
+                    check_id="BR-43",
+                    finding_name=check_name,
+                    finding_details=(
+                        "Region control over Bedrock model invocation was not "
+                        f"assessed because {context['detail']}."
+                    ),
+                    resolution=context["resolution"],
+                    reference=REGION_CONTROL_REFERENCE,
+                    severity="Informational",
+                    status="N/A",
+                    region=region,
+                )
+            )
+            return findings
+
+        inventory = (
+            scp_inventory
+            if scp_inventory is not None
+            else get_service_control_policy_inventory()
+        )
+
+        enforcing = []
+        for item in inventory["items"]:
+            try:
+                controls = _scp_region_controls(item["content"] or "{}")
+            except Exception as error:
+                logger.warning(
+                    f"Unable to parse service control policy {item['name']}: {error}"
+                )
+                inventory["errors"].append(f"policy '{item['name']}': {str(error)}")
+                continue
+            for control in controls:
+                enforcing.append(
+                    "policy '{}' denies {} when {} {} {}{}".format(
+                        item["name"],
+                        ", ".join(control["actions"]),
+                        REGION_CONDITION_KEY,
+                        control["operator"],
+                        ", ".join(control["regions"]) or "no Region value",
+                        ""
+                        if not control["negated"]
+                        else (
+                            ", and the allowed Region list includes the literal "
+                            f"'{GLOBAL_INFERENCE_REGION_VALUE}'"
+                            if control["allows_global"]
+                            else ", and the allowed Region list omits the literal "
+                            f"'{GLOBAL_INFERENCE_REGION_VALUE}', so every global "
+                            "inference profile call is denied"
+                        ),
+                    )
+                )
+
+        read_errors = list(inventory["errors"])
+        if inventory["list_error"]:
+            read_errors.append(
+                f"SERVICE_CONTROL_POLICY listing: {inventory['list_error']}"
+            )
+
+        if enforcing:
+            findings["details"] = "Bedrock invocation is constrained by Region"
+            findings["csv_data"].append(
+                create_finding(
+                    check_id="BR-43",
+                    finding_name=check_name,
+                    finding_details=(
+                        "{} service control policy statement(s) condition Bedrock "
+                        "invocation on the request Region: {}. The approved Region "
+                        "list is workload-specific, so confirm it matches the data "
+                        "residency your use case requires.".format(
+                            len(enforcing), "; ".join(enforcing[:5])
+                        )
+                    ),
+                    resolution="No action required. A Region allow-list must include the literal 'unspecified' to keep global inference profiles usable.",
+                    reference=REGION_CONTROL_REFERENCE,
+                    severity="Medium",
+                    status="Passed",
+                    region=region,
+                )
+            )
+        elif read_errors:
+            findings["csv_data"].append(
+                create_finding(
+                    check_id="BR-43",
+                    finding_name=check_name,
+                    finding_details=(
+                        "Region control over Bedrock model invocation is "
+                        "undetermined because organization policies could not be "
+                        f"read: {'; '.join(read_errors[:5])}."
+                    ),
+                    resolution="Grant organizations:ListPolicies and organizations:DescribePolicy and retry before concluding that no Region control exists.",
+                    reference=REGION_CONTROL_REFERENCE,
+                    severity="Informational",
+                    status="N/A",
+                    region=region,
+                )
+            )
+        else:
+            findings["status"] = "WARN"
+            findings["details"] = "No Region control on Bedrock model invocation"
+            findings["csv_data"].append(
+                create_finding(
+                    check_id="BR-43",
+                    finding_name=check_name,
+                    finding_details=(
+                        "None of the {} service control policy document(s) read "
+                        "denies bedrock:InvokeModel, "
+                        "bedrock:InvokeModelWithResponseStream or "
+                        "bedrock:CreateModelInvocationJob on aws:RequestedRegion, so "
+                        "cross-region routing follows the default inference-profile "
+                        "behavior.".format(len(inventory["items"]))
+                    ),
+                    resolution=(
+                        "Add a service control policy denying Bedrock invocation "
+                        "outside the approved Regions with StringNotEquals on "
+                        "aws:RequestedRegion, and include the literal 'unspecified' "
+                        "in the allowed values so global inference profiles keep "
+                        "working."
+                    ),
+                    reference=REGION_CONTROL_REFERENCE,
+                    severity="Medium",
+                    status="Failed",
+                    region=region,
+                )
+            )
+
+        return findings
+
+    except Exception as e:
+        logger.error(
+            f"Error in check_bedrock_region_invocation_control: {str(e)}", exc_info=True
+        )
+        return {
+            "check_name": check_name,
+            "status": "ERROR",
+            "details": f"Error during check: {str(e)}",
+            "csv_data": [
+                create_finding(
+                    check_id="BR-43",
+                    finding_name=check_name,
+                    finding_details=build_could_not_assess_detail(e, region),
+                    resolution=COULD_NOT_ASSESS_RESOLUTION,
+                    reference=REGION_CONTROL_REFERENCE,
+                    severity="Informational",
+                    status="N/A",
+                    region=region,
+                )
+            ],
+        }
+
+
+MARKETPLACE_SUBSCRIBE_ACTION = "aws-marketplace:subscribe"
+
+MARKETPLACE_PRODUCT_CONDITION_KEY = "aws-marketplace:productid"
+
+MARKETPLACE_MODEL_CONTROL_REFERENCE = "https://docs.aws.amazon.com/bedrock/latest/userguide/security-iam-awsmanpol.html#security-iam-awsmanpol-bedrock-marketplace"
+
+
+def _marketplace_subscription_scoping(document: Any) -> Dict[str, Any]:
+    """
+    Describe how one policy document controls Marketplace model subscription.
+
+    A Deny that names approved products positively fails open, because a product
+    that is not named is not denied. Only an Allow carrying the product condition,
+    or a Deny with a negated test, restricts the set of subscribable models.
+    """
+    observed = {"grants": 0, "unconditioned": 0, "scoped": [], "fails_open": []}
+
+    for statement in _policy_statements(document):
+        covers_subscribe = any(
+            _action_pattern_covers(action, MARKETPLACE_SUBSCRIBE_ACTION)
+            for action in _as_list(statement.get("Action"))
+        )
+        if not covers_subscribe:
+            continue
+
+        effect = str(statement.get("Effect", "")).upper()
+        product_conditions = [
+            (operator, values)
+            for operator, key, values in _condition_keys_by_operator(statement)
+            if MARKETPLACE_PRODUCT_CONDITION_KEY in key
+        ]
+
+        if effect == "ALLOW":
+            observed["grants"] += 1
+            if product_conditions:
+                for operator, values in product_conditions:
+                    observed["scoped"].append(
+                        "Allow scoped by {} {} to {}".format(
+                            operator,
+                            MARKETPLACE_PRODUCT_CONDITION_KEY,
+                            ", ".join(str(value) for value in values) or "no product",
+                        )
+                    )
+            else:
+                observed["unconditioned"] += 1
+        elif effect == "DENY":
+            for operator, values in product_conditions:
+                if "not" in operator or operator == "null":
+                    observed["scoped"].append(
+                        "Deny scoped by {} {} to {}".format(
+                            operator,
+                            MARKETPLACE_PRODUCT_CONDITION_KEY,
+                            ", ".join(str(value) for value in values) or "no product",
+                        )
+                    )
+                else:
+                    observed["fails_open"].append(
+                        "Deny tests {} with {}, which leaves every product that is "
+                        "not named allowed".format(
+                            MARKETPLACE_PRODUCT_CONDITION_KEY, operator
+                        )
+                    )
+
+    return observed
+
+
+def check_bedrock_marketplace_model_control(
+    permission_cache, region: str = ""
+) -> Dict[str, Any]:
+    """
+    BR-44: Verify Marketplace model subscription is restricted to approved
+    products by an aws-marketplace:ProductId condition on the Allow side.
+    """
+    logger.debug("Starting check for Marketplace model subscription control")
+    check_name = "Marketplace Model Subscription Control"
+    try:
+        findings = {
+            "check_name": check_name,
+            "status": "PASS",
+            "details": "",
+            "csv_data": [],
+        }
+
+        deficient = []
+        scoped = []
+
+        identities = [
+            ("role", name, permissions)
+            for name, permissions in permission_cache["role_permissions"].items()
+        ] + [
+            ("user", name, permissions)
+            for name, permissions in permission_cache["user_permissions"].items()
+        ]
+
+        for identity_type, identity_name, permissions in identities:
+            reasons = []
+            scoped_statements = []
+            grants_subscribe = False
+
+            for policy in (
+                permissions["attached_policies"] + permissions["inline_policies"]
+            ):
+                try:
+                    observed = _marketplace_subscription_scoping(policy["document"])
+                except Exception as error:
+                    logger.warning(
+                        f"Unable to parse policy {policy['name']} on "
+                        f"{identity_type} {identity_name}: {error}"
+                    )
+                    continue
+
+                if observed["grants"]:
+                    grants_subscribe = True
+                if observed["unconditioned"]:
+                    reasons.append(
+                        "policy '{}' allows {} without an {} condition".format(
+                            policy["name"],
+                            MARKETPLACE_SUBSCRIBE_ACTION,
+                            MARKETPLACE_PRODUCT_CONDITION_KEY,
+                        )
+                    )
+                for fails_open in observed["fails_open"]:
+                    reasons.append(f"policy '{policy['name']}': {fails_open}")
+                for scoped_statement in observed["scoped"]:
+                    scoped_statements.append(
+                        f"policy '{policy['name']}': {scoped_statement}"
+                    )
+
+            if not grants_subscribe and not reasons and not scoped_statements:
+                continue
+            if reasons:
+                deficient.append(
+                    {"type": identity_type, "name": identity_name, "reasons": reasons}
+                )
+            elif scoped_statements:
+                scoped.append(
+                    "{} '{}' ({})".format(
+                        identity_type, identity_name, "; ".join(scoped_statements[:2])
+                    )
+                )
+
+        for identity in deficient:
+            findings["status"] = "WARN"
+            findings["csv_data"].append(
+                create_finding(
+                    check_id="BR-44",
+                    finding_name=check_name,
+                    finding_details=(
+                        "{} '{}' can subscribe to unapproved Marketplace models "
+                        "because {}.".format(
+                            identity["type"].capitalize(),
+                            identity["name"],
+                            "; ".join(identity["reasons"][:3]),
+                        )
+                    ),
+                    resolution=(
+                        "Put the aws-marketplace:ProductId condition on the Allow "
+                        "statement that grants aws-marketplace:Subscribe, naming the "
+                        "approved product identifiers. That key carries multiple "
+                        "values, so qualify the operator (ForAllValues:StringEquals) "
+                        "or IAM rejects the statement. A subscription restriction "
+                        "does not stop invocation of a model that is already "
+                        "subscribed, so pair it with the model-ARN allow-list "
+                        "asserted by BR-42."
+                    ),
+                    reference=MARKETPLACE_MODEL_CONTROL_REFERENCE,
+                    severity="High",
+                    status="Failed",
+                    region=region,
+                )
+            )
+
+        if scoped:
+            findings["csv_data"].append(
+                create_finding(
+                    check_id="BR-44",
+                    finding_name=check_name,
+                    finding_details=(
+                        "{} identity policy grant(s) restrict Marketplace "
+                        "subscription by product: {}. The approved product list is "
+                        "workload-specific, so confirm these identifiers are the "
+                        "models your use case approved. Subscription scoping does "
+                        "not prevent invocation of an already-subscribed model, "
+                        "which BR-42 asserts.".format(
+                            len(scoped), "; ".join(scoped[:5])
+                        )
+                    ),
+                    resolution="No action required. Update the product identifiers whenever the approved model list changes.",
+                    reference=MARKETPLACE_MODEL_CONTROL_REFERENCE,
+                    severity="Medium",
+                    status="Passed",
+                    region=region,
+                )
+            )
+
+        if not scoped and not deficient:
+            findings["details"] = "No cached identity grants Marketplace subscription"
+            findings["csv_data"].append(
+                create_finding(
+                    check_id="BR-44",
+                    finding_name=check_name,
+                    finding_details=(
+                        "No role or user in the IAM permissions cache allows "
+                        f"{MARKETPLACE_SUBSCRIBE_ACTION}, so no identity can "
+                        "subscribe to a third-party or Marketplace model."
+                    ),
+                    resolution="No action required",
+                    reference=MARKETPLACE_MODEL_CONTROL_REFERENCE,
+                    severity="Informational",
+                    status="N/A",
+                    region=region,
+                )
+            )
+
+        return findings
+
+    except Exception as e:
+        logger.error(
+            f"Error in check_bedrock_marketplace_model_control: {str(e)}", exc_info=True
+        )
+        return {
+            "check_name": check_name,
+            "status": "ERROR",
+            "details": f"Error during check: {str(e)}",
+            "csv_data": [
+                create_finding(
+                    check_id="BR-44",
+                    finding_name=check_name,
+                    finding_details=build_could_not_assess_detail(e, region),
+                    resolution=COULD_NOT_ASSESS_RESOLUTION,
+                    reference=MARKETPLACE_MODEL_CONTROL_REFERENCE,
+                    severity="Informational",
+                    status="N/A",
+                    region=region,
+                )
+            ],
+        }
+
+
+BEDROCK_CREDENTIAL_SERVICE_NAME = "bedrock.amazonaws.com"
+
+BEDROCK_API_KEY_INVENTORY_FINDING = "Bedrock API Key Inventory"
+
+BEDROCK_API_KEY_PREVENTION_FINDING = "Bedrock API Key Age And Token Type Control"
+
+BEDROCK_API_KEY_REFERENCE = (
+    "https://docs.aws.amazon.com/bedrock/latest/userguide/api-keys.html"
+)
+
+BEDROCK_CREDENTIAL_AGE_CONDITION_KEY = "iam:servicespecificcredentialagedays"
+
+BEDROCK_BEARER_TOKEN_CONDITION_KEYS = (
+    "bedrock:bearertokentype",
+    "bedrock-mantle:bearertokentype",
+)
+
+BEDROCK_CREDENTIAL_CREATE_ACTIONS = (
+    "iam:createservicespecificcredential",
+    "bedrock:callwithbearertoken",
+    "bedrock-mantle:callwithbearertoken",
+)
+
+
+def _scp_controls_bedrock_api_keys(document: Any) -> List[str]:
+    """Describe every Deny statement that caps API key age or bearer token type."""
+    controls = []
+    for statement in _policy_statements(document):
+        if str(statement.get("Effect", "")).upper() != "DENY":
+            continue
+        covered = [
+            action_name
+            for action_name in BEDROCK_CREDENTIAL_CREATE_ACTIONS
+            if any(
+                _action_pattern_covers(action, action_name)
+                for action in _as_list(statement.get("Action"))
+            )
+        ]
+        if not covered:
+            continue
+        for operator, key, values in _condition_keys_by_operator(statement):
+            if BEDROCK_CREDENTIAL_AGE_CONDITION_KEY in key or any(
+                token_key in key for token_key in BEDROCK_BEARER_TOKEN_CONDITION_KEYS
+            ):
+                controls.append(
+                    "denies {} when {} {} {}".format(
+                        ", ".join(covered),
+                        key,
+                        operator,
+                        ", ".join(str(value) for value in values) or "no value",
+                    )
+                )
+    return controls
+
+
+def check_bedrock_api_key_governance(
+    permission_cache,
+    region: str = "",
+    scp_inventory: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """
+    BR-45: Inventory bedrock.amazonaws.com service-specific credentials and check
+    for a preventive policy capping their age and restricting the bearer token
+    type, so a long-term API key cannot become a standing static credential.
+    """
+    logger.debug("Starting check for Bedrock API key governance")
+    try:
+        findings = {
+            "check_name": BEDROCK_API_KEY_INVENTORY_FINDING,
+            "status": "PASS",
+            "details": "",
+            "csv_data": [],
+        }
+
+        iam_client = boto3.client("iam", config=boto3_config)
+        expiring = []
+        standing = []
+        inventory_errors = []
+
+        for user_name in permission_cache["user_permissions"]:
+            try:
+                credentials = _list_all_items(
+                    iam_client,
+                    "list_service_specific_credentials",
+                    "ServiceSpecificCredentials",
+                    max_results_param=None,
+                    token_param="Marker",
+                    token_response_keys=("Marker",),
+                    UserName=user_name,
+                    ServiceName=BEDROCK_CREDENTIAL_SERVICE_NAME,
+                )
+            except Exception as error:
+                inventory_errors.append(f"user '{user_name}': {str(error)}")
+                continue
+
+            for credential in credentials:
+                credential_id = credential.get("ServiceSpecificCredentialId", "unknown")
+                if str(credential.get("Status", "")).lower() != "active":
+                    continue
+                if credential.get("ExpirationDate"):
+                    expiring.append(
+                        f"user '{user_name}' credential {credential_id} expires "
+                        f"{credential['ExpirationDate']}"
+                    )
+                else:
+                    standing.append(
+                        f"user '{user_name}' credential {credential_id} has no "
+                        "expiration date"
+                    )
+
+        for credential_detail in standing:
+            findings["status"] = "WARN"
+            findings["csv_data"].append(
+                create_finding(
+                    check_id="BR-45",
+                    finding_name=BEDROCK_API_KEY_INVENTORY_FINDING,
+                    finding_details=(
+                        f"A long-term Bedrock API key is active with no expiry: "
+                        f"{credential_detail}. The key is a static credential on a "
+                        "standing IAM user."
+                    ),
+                    resolution=(
+                        "Replace the long-term key with a short-term key generated "
+                        "from the console session, or recreate it with an expiration, "
+                        "then delete the service-specific credential."
+                    ),
+                    reference=BEDROCK_API_KEY_REFERENCE,
+                    severity="High",
+                    status="Failed",
+                    region=region,
+                )
+            )
+
+        if expiring:
+            findings["csv_data"].append(
+                create_finding(
+                    check_id="BR-45",
+                    finding_name=BEDROCK_API_KEY_INVENTORY_FINDING,
+                    finding_details=(
+                        "{} active Bedrock API key(s) carry an expiration date: "
+                        "{}.".format(len(expiring), "; ".join(expiring[:5]))
+                    ),
+                    resolution="No action required. Confirm the expiration matches your credential-rotation policy.",
+                    reference=BEDROCK_API_KEY_REFERENCE,
+                    severity="Medium",
+                    status="Passed",
+                    region=region,
+                )
+            )
+
+        if not expiring and not standing:
+            detail = (
+                "No IAM user in the permissions cache holds an active "
+                f"{BEDROCK_CREDENTIAL_SERVICE_NAME} service-specific credential, so "
+                "no Bedrock API key is in use."
+            )
+            if inventory_errors:
+                detail = (
+                    "Bedrock API keys could not be inventoried: "
+                    f"{'; '.join(inventory_errors[:5])}."
+                )
+            findings["csv_data"].append(
+                create_finding(
+                    check_id="BR-45",
+                    finding_name=BEDROCK_API_KEY_INVENTORY_FINDING,
+                    finding_details=detail,
+                    resolution=(
+                        "Grant iam:ListServiceSpecificCredentials and retry."
+                        if inventory_errors
+                        else "No action required"
+                    ),
+                    reference=BEDROCK_API_KEY_REFERENCE,
+                    severity="Informational",
+                    status="N/A",
+                    region=region,
+                )
+            )
+
+        context = _organization_policy_context()
+        if not context["readable"]:
+            findings["csv_data"].append(
+                create_finding(
+                    check_id="BR-45",
+                    finding_name=BEDROCK_API_KEY_PREVENTION_FINDING,
+                    finding_details=(
+                        "A preventive control on Bedrock API key age and bearer "
+                        f"token type was not assessed because {context['detail']}."
+                    ),
+                    resolution=context["resolution"],
+                    reference=BEDROCK_API_KEY_REFERENCE,
+                    severity="Informational",
+                    status="N/A",
+                    region=region,
+                )
+            )
+            return findings
+
+        inventory = (
+            scp_inventory
+            if scp_inventory is not None
+            else get_service_control_policy_inventory()
+        )
+
+        preventive = []
+        for item in inventory["items"]:
+            try:
+                controls = _scp_controls_bedrock_api_keys(item["content"] or "{}")
+            except Exception as error:
+                logger.warning(
+                    f"Unable to parse service control policy {item['name']}: {error}"
+                )
+                inventory["errors"].append(f"policy '{item['name']}': {str(error)}")
+                continue
+            for control in controls:
+                preventive.append(f"policy '{item['name']}' {control}")
+
+        read_errors = list(inventory["errors"])
+        if inventory["list_error"]:
+            read_errors.append(
+                f"SERVICE_CONTROL_POLICY listing: {inventory['list_error']}"
+            )
+
+        if preventive:
+            findings["csv_data"].append(
+                create_finding(
+                    check_id="BR-45",
+                    finding_name=BEDROCK_API_KEY_PREVENTION_FINDING,
+                    finding_details=(
+                        "{} service control policy statement(s) restrict Bedrock API "
+                        "key creation or use: {}.".format(
+                            len(preventive), "; ".join(preventive[:5])
+                        )
+                    ),
+                    resolution="No action required",
+                    reference=BEDROCK_API_KEY_REFERENCE,
+                    severity="Medium",
+                    status="Passed",
+                    region=region,
+                )
+            )
+        elif read_errors:
+            findings["csv_data"].append(
+                create_finding(
+                    check_id="BR-45",
+                    finding_name=BEDROCK_API_KEY_PREVENTION_FINDING,
+                    finding_details=(
+                        "A preventive control on Bedrock API keys is undetermined "
+                        "because organization policies could not be read: "
+                        f"{'; '.join(read_errors[:5])}."
+                    ),
+                    resolution="Grant organizations:ListPolicies and organizations:DescribePolicy and retry before concluding that no control exists.",
+                    reference=BEDROCK_API_KEY_REFERENCE,
+                    severity="Informational",
+                    status="N/A",
+                    region=region,
+                )
+            )
+        else:
+            findings["status"] = "WARN"
+            findings["csv_data"].append(
+                create_finding(
+                    check_id="BR-45",
+                    finding_name=BEDROCK_API_KEY_PREVENTION_FINDING,
+                    finding_details=(
+                        "None of the {} service control policy document(s) read caps "
+                        "iam:ServiceSpecificCredentialAgeDays on "
+                        "iam:CreateServiceSpecificCredential or denies "
+                        "bedrock:CallWithBearerToken for a LONG_TERM bearer token "
+                        "type, so a long-term Bedrock API key can be created with no "
+                        "expiry.".format(len(inventory["items"]))
+                    ),
+                    resolution=(
+                        "Add a service control policy denying "
+                        "iam:CreateServiceSpecificCredential when "
+                        "iam:ServiceSpecificCredentialServiceName is "
+                        "bedrock.amazonaws.com and "
+                        "iam:ServiceSpecificCredentialAgeDays exceeds your maximum, "
+                        "and denying bedrock:CallWithBearerToken and "
+                        "bedrock-mantle:CallWithBearerToken for the LONG_TERM bearer "
+                        "token type in production accounts."
+                    ),
+                    reference=BEDROCK_API_KEY_REFERENCE,
+                    severity="High",
+                    status="Failed",
+                    region=region,
+                )
+            )
+
+        return findings
+
+    except Exception as e:
+        logger.error(
+            f"Error in check_bedrock_api_key_governance: {str(e)}", exc_info=True
+        )
+        return {
+            "check_name": BEDROCK_API_KEY_INVENTORY_FINDING,
+            "status": "ERROR",
+            "details": f"Error during check: {str(e)}",
+            "csv_data": [
+                create_finding(
+                    check_id="BR-45",
+                    finding_name=BEDROCK_API_KEY_INVENTORY_FINDING,
+                    finding_details=build_could_not_assess_detail(e, region),
+                    resolution=COULD_NOT_ASSESS_RESOLUTION,
+                    reference=BEDROCK_API_KEY_REFERENCE,
+                    severity="Informational",
+                    status="N/A",
+                    region=region,
+                )
+            ],
+        }
+
+
+KNOWLEDGE_BASE_CLASSIFICATION_REFERENCE = (
+    "https://docs.aws.amazon.com/macie/latest/user/discovery-asdd.html"
+)
+
+
+def check_bedrock_knowledge_base_source_classification(
+    region: str = "",
+) -> Dict[str, Any]:
+    """
+    BR-46: Verify Amazon Macie is discovering and classifying sensitive data in
+    the account holding knowledge base sources, so classification happens before
+    ingestion rather than after a retrieval leaks it.
+    """
+    logger.debug("Starting check for knowledge base source data classification")
+    check_name = "Knowledge Base Source Data Classification"
+    try:
+        findings = {
+            "check_name": check_name,
+            "status": "PASS",
+            "details": "",
+            "csv_data": [],
+        }
+
+        try:
+            bedrock_agent_client = boto3.client(
+                "bedrock-agent", config=boto3_config, region_name=region
+            )
+            knowledge_bases = _list_all_items(
+                bedrock_agent_client, "list_knowledge_bases", "knowledgeBaseSummaries"
+            )
+        except Exception as error:
+            findings["csv_data"].append(
+                create_finding(
+                    check_id="BR-46",
+                    finding_name=check_name,
+                    finding_details=(
+                        "Knowledge bases could not be listed, so source data "
+                        "classification was not assessed: "
+                        f"{get_assessment_error_label(error)}."
+                    ),
+                    resolution="Grant bedrock:ListKnowledgeBases and retry.",
+                    reference=KNOWLEDGE_BASE_CLASSIFICATION_REFERENCE,
+                    severity="Informational",
+                    status="N/A",
+                    region=region,
+                )
+            )
+            return findings
+
+        if not knowledge_bases:
+            findings["csv_data"].append(
+                create_finding(
+                    check_id="BR-46",
+                    finding_name=check_name,
+                    finding_details=(
+                        f"No knowledge base exists in region {region or 'this region'}, "
+                        "so there is no ingestion source to classify."
+                    ),
+                    resolution="No action required",
+                    reference=KNOWLEDGE_BASE_CLASSIFICATION_REFERENCE,
+                    severity="Informational",
+                    status="N/A",
+                    region=region,
+                )
+            )
+            return findings
+
+        macie_client = boto3.client("macie2", config=boto3_config, region_name=region)
+        deficiencies = []
+        observations = []
+
+        try:
+            session = macie_client.get_macie_session()
+            session_status = str(session.get("status", "")).upper()
+        except ClientError as error:
+            error_code = error.response.get("Error", {}).get("Code", "")
+            findings["csv_data"].append(
+                create_finding(
+                    check_id="BR-46",
+                    finding_name=check_name,
+                    finding_details=(
+                        f"{len(knowledge_bases)} knowledge base(s) exist, but Amazon "
+                        "Macie could not be read, so classification of their sources "
+                        f"is undetermined: {get_assessment_error_label(error)} "
+                        f"({error_code})."
+                    ),
+                    resolution="Grant macie2:GetMacieSession and macie2:GetAutomatedDiscoveryConfiguration, then retry.",
+                    reference=KNOWLEDGE_BASE_CLASSIFICATION_REFERENCE,
+                    severity="Informational",
+                    status="N/A",
+                    region=region,
+                )
+            )
+            return findings
+
+        if session_status == "ENABLED":
+            observations.append("the Macie session is ENABLED")
+        else:
+            deficiencies.append(
+                f"the Macie session status is {session_status or 'unknown'} rather "
+                "than ENABLED"
+            )
+
+        try:
+            discovery = macie_client.get_automated_discovery_configuration()
+            discovery_status = str(discovery.get("status", "")).upper()
+        except ClientError as error:
+            discovery_status = ""
+            deficiencies.append(
+                "automated sensitive data discovery could not be read "
+                f"({get_assessment_error_label(error)})"
+            )
+
+        if discovery_status == "ENABLED":
+            observations.append(
+                "automated sensitive data discovery is ENABLED using "
+                f"classification scope {discovery.get('classificationScopeId', 'unknown')}"
+            )
+        elif discovery_status:
+            deficiencies.append(
+                f"automated sensitive data discovery is {discovery_status}"
+            )
+
+        for deficiency in deficiencies:
+            findings["status"] = "WARN"
+            findings["csv_data"].append(
+                create_finding(
+                    check_id="BR-46",
+                    finding_name=check_name,
+                    finding_details=(
+                        f"{len(knowledge_bases)} knowledge base(s) ingest data in this "
+                        f"region and {deficiency}, so sensitive data in the sources is "
+                        "not classified before ingestion."
+                    ),
+                    resolution=(
+                        "Enable Amazon Macie and automated sensitive data discovery, "
+                        "then add the knowledge base source buckets to the "
+                        "classification scope. Carry the classification result into "
+                        "per-document metadata so retrieval can filter on it."
+                    ),
+                    reference=KNOWLEDGE_BASE_CLASSIFICATION_REFERENCE,
+                    severity="High",
+                    status="Failed",
+                    region=region,
+                )
+            )
+
+        if observations:
+            findings["csv_data"].append(
+                create_finding(
+                    check_id="BR-46",
+                    finding_name=check_name,
+                    finding_details=(
+                        "{} knowledge base(s) ingest data in this region and {}. "
+                        "Confirm the source buckets are inside the classification "
+                        "scope and that the classification result is carried into "
+                        "per-document metadata.".format(
+                            len(knowledge_bases), "; ".join(observations)
+                        )
+                    ),
+                    resolution="No action required. Review the classification scope whenever a knowledge base data source is added.",
+                    reference=KNOWLEDGE_BASE_CLASSIFICATION_REFERENCE,
+                    severity="Medium",
+                    status="Passed",
+                    region=region,
+                )
+            )
+
+        return findings
+
+    except Exception as e:
+        logger.error(
+            f"Error in check_bedrock_knowledge_base_source_classification: {str(e)}",
+            exc_info=True,
+        )
+        return {
+            "check_name": check_name,
+            "status": "ERROR",
+            "details": f"Error during check: {str(e)}",
+            "csv_data": [
+                create_finding(
+                    check_id="BR-46",
+                    finding_name=check_name,
+                    finding_details=build_could_not_assess_detail(e, region),
+                    resolution=COULD_NOT_ASSESS_RESOLUTION,
+                    reference=KNOWLEDGE_BASE_CLASSIFICATION_REFERENCE,
+                    severity="Informational",
+                    status="N/A",
+                    region=region,
+                )
+            ],
+        }
+
+
 def generate_csv_report(findings: List[Dict[str, Any]]) -> str:
     """
     Generate CSV report from all security check findings
@@ -8257,6 +10596,22 @@ def lambda_handler(event, context):
                     )
                 )
 
+                logger.info("Running foundation model allow-list check (BR-42)")
+                all_findings.append(
+                    check_bedrock_model_allow_list(
+                        permission_cache, region=GLOBAL_REGION_LABEL
+                    )
+                )
+
+                logger.info(
+                    "Running Marketplace model subscription control check (BR-44)"
+                )
+                all_findings.append(
+                    check_bedrock_marketplace_model_control(
+                        permission_cache, region=GLOBAL_REGION_LABEL
+                    )
+                )
+
             # logger.info("Running global stale Bedrock access check (BR-14)")
             # all_findings.append(
             #     check_stale_bedrock_access(permission_cache, region=GLOBAL_REGION_LABEL)
@@ -8400,6 +10755,36 @@ def lambda_handler(event, context):
             )
             all_findings.append(cross_account_guardrails_findings)
 
+            # BR-41, BR-43 and BR-45 all read the same service control policy
+            # documents, so the organization-wide pass is made once here.
+            scp_inventory = get_service_control_policy_inventory()
+
+            logger.info("Running central guardrail enforcement check (BR-41)")
+            central_guardrail_findings = check_bedrock_central_guardrail_enforcement(
+                region=GLOBAL_REGION_LABEL, scp_inventory=scp_inventory
+            )
+            all_findings.append(central_guardrail_findings)
+
+            logger.info("Running Region invocation control check (BR-43)")
+            all_findings.append(
+                check_bedrock_region_invocation_control(
+                    region=GLOBAL_REGION_LABEL, scp_inventory=scp_inventory
+                )
+            )
+
+            logger.info("Running Bedrock API key governance check (BR-45)")
+            all_findings.append(
+                _permission_cache_unavailable_result(
+                    "BR-45", "Bedrock API Key Governance Check", GLOBAL_REGION_LABEL
+                )
+                if permission_cache is None
+                else check_bedrock_api_key_governance(
+                    permission_cache,
+                    region=GLOBAL_REGION_LABEL,
+                    scp_inventory=scp_inventory,
+                )
+            )
+
         # Regional checks (BR-16 through BR-25)
         logger.info("Running guardrail tier validation check (BR-16)")
         guardrail_tier_findings = check_bedrock_guardrail_tier(region=region)
@@ -8538,6 +10923,11 @@ def lambda_handler(event, context):
             check_bedrock_marketplace_endpoint_cmk(
                 region=region, endpoint_inventory=marketplace_endpoint_inventory
             )
+        )
+
+        logger.info("Running knowledge base source classification check (BR-46)")
+        all_findings.append(
+            check_bedrock_knowledge_base_source_classification(region=region)
         )
 
         logger.info("Building Agentic AI Security findings from Bedrock results")

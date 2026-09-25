@@ -580,10 +580,40 @@ _VERIFIED_REMEDIATION_IAM_ACTIONS = {
 # AWS Knowledge like the block above.
 _VERIFIED_REMEDIATION_IAM_ACTIONS |= {"s3vectors:PutVectorBucketPolicy"}
 
+# Verified on 2026-09-25 by submitting a policy naming each action to
+# iam-access-analyzer ValidatePolicy (a read-only call that creates nothing):
+# an action the service does not define comes back as INVALID_ACTION, and every
+# action below came back clean.
+_VERIFIED_REMEDIATION_IAM_ACTIONS |= {
+    "aws-marketplace:Subscribe",
+    "bedrock:CallWithBearerToken",
+    "bedrock-mantle:CallWithBearerToken",
+    "iam:CreateServiceSpecificCredential",
+    "iam:ListServiceSpecificCredentials",
+    "logs:DescribeLogGroups",
+    "logs:DescribeMetricFilters",
+    "logs:PutRetentionPolicy",
+    "organizations:DescribePolicy",
+    "s3:GetLifecycleConfiguration",
+}
+
 _VERIFIED_REMEDIATION_CONDITION_KEYS = {
     "bedrock:GuardrailIdentifier",
     "iam:AWSServiceName",
     "kms:ViaService",
+}
+
+# Verified the same way and on the same date: ValidatePolicy reports an
+# undefined condition key as INVALID_CONDITION_KEY, and reported none of these.
+# It also reported MISSING_QUALIFIER for aws-marketplace:ProductId, which is
+# multi-valued, so BR-44's remediation text names ForAllValues:StringEquals.
+_VERIFIED_REMEDIATION_CONDITION_KEYS |= {
+    "aws-marketplace:ProductId",
+    "aws:RequestedRegion",
+    "bedrock:BearerTokenType",
+    "bedrock:ModelArn",
+    "iam:ServiceSpecificCredentialAgeDays",
+    "iam:ServiceSpecificCredentialServiceName",
 }
 
 _NON_IAM_REMEDIATION_TOKENS = {
