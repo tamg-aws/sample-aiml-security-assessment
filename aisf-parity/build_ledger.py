@@ -368,11 +368,15 @@ ROWS = [
     ),
     (
         "AIR-ACR-RT-03",
-        TIGHTEN,
-        EXTEND,
+        COVERED,
+        None,
         "agentcore_assessments",
-        ["AC-02"],
-        "AC-02 detects full-access and wildcard grants only",
+        ["AC-02", "AC-45"],
+        "AC-45 reads the execution role of every code interpreter and browser in the account "
+        "and fails a role whose Allow statements reach every resource, name a NotResource, or "
+        "carry a service-wide or bare action wildcard. AC-02 judges the same wildcards but "
+        "only over the bedrock-agentcore namespace and only on the assessment's own roles, so "
+        "a tool role granting s3:* on every bucket is a verdict it cannot reach",
         [],
         4,
     ),
@@ -423,13 +427,16 @@ ROWS = [
     ),
     (
         "AIR-ACR-RT-13",
-        TIGHTEN,
-        NEW_ID,
+        COVERED,
+        None,
         "agentcore_assessments",
-        ["AC-10"],
-        'AC-10 is named "Resource-Based Policies Check" but never evaluates policy conditions, '
-        "so the aws:SourceVpc / aws:SourceVpce leg is unasserted; both keys are 0 hits "
-        "corpus-wide",
+        ["AC-08", "AC-10", "AC-47"],
+        "AC-47 fails a runtime whose resource policy restricts neither the network path nor "
+        "the caller: the network leg reads aws:SourceVpc, aws:SourceVpce, aws:VpcSourceIp and "
+        "aws:SourceIp on any statement, the caller leg reads a named principal or an "
+        "allowedWorkloadConfiguration on the JWT authorizer. AC-08 fails an AgentCore "
+        "interface endpoint with private DNS off, which is the leg that keeps the runtime's "
+        "own callers off the public endpoint name. AC-10 reports only that a policy exists",
         [],
         4,
     ),
@@ -544,13 +551,17 @@ ROWS = [
     ),
     (
         "AIR-ACR-RT-08",
-        TIGHTEN,
-        EXTEND,
+        COVERED,
+        None,
         "agentcore_assessments",
         ["AC-01"],
-        "AC-01 requires VPC placement and flags public subnets but never reads what the "
-        "security-group rules permit; ec2:DescribeSecurityGroups is now granted to this "
-        "function for AC-08's endpoint scope leg, so RT-08 costs no further permission",
+        "AC-01 now reads the outbound rules of every security group attached to a VPC runtime, "
+        "code interpreter or browser and fails a group permitting 0.0.0.0/0 or ::/0 egress. A "
+        "tool in PUBLIC network mode fails without a describe call, because the service grants "
+        "it open internet egress by configuration; SANDBOX passes at Medium, because the "
+        "sandbox reaches no network the workload can name. A group the describe did not return "
+        "and a denied ec2:DescribeSecurityGroups are both reported N/A on their own line, so "
+        "an unread group is never counted as closed",
         [],
         4,
     ),
@@ -787,7 +798,21 @@ ROWS = [
         [],
         4,
     ),
-    ("AIR-ACR-RT-04", NEW, None, "agentcore_assessments", [], "", [], 4),
+    (
+        "AIR-ACR-RT-04",
+        COVERED,
+        None,
+        "agentcore_assessments",
+        ["AC-46"],
+        "AC-46 fails a runtime that configures neither idleRuntimeSessionTimeout nor "
+        "maxLifetime, or that sets either at the service ceiling of 1209600 seconds, which is "
+        "the setting that lets one runaway session hold its resources for 14 days. AgentCore "
+        "exposes no per-session memory or cost limit to read, so the time bound is the only "
+        "limit the API can answer for, and every verdict says which values it found so the "
+        "workload owner can judge whether the bound suits the task",
+        [],
+        4,
+    ),
     # ------- FND, AI-resource subject: 11 controls, dedup pass not yet run -------
     (
         "AIR-FND-DAT-01",
@@ -947,6 +972,9 @@ INCUMBENT_NAMES = {
     "AC-42": "AgentCore Evaluation Pass Role Scope",
     "AC-43": "AgentCore Evaluation Role Trust",
     "AC-44": "AgentCore Evaluation Judge Model Scope",
+    "AC-45": "AgentCore Tool Execution Role Scope",
+    "AC-46": "AgentCore Runtime Session Limits",
+    "AC-47": "AgentCore Runtime Invocation Path",
     "AG-24": "Agentic AI Gateway Inbound Authorization",
     "AG-25": "Agentic AI Gateway Tool Policy Enforcement",
     "AG-27": "Agentic AI Gateway WAF Protection",

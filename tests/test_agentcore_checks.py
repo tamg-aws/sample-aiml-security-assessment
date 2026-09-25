@@ -11057,3 +11057,1395 @@ class TestEvaluationCheckRegistration:
     def test_the_handler_registers_each_evaluation_check_once(self, function_name):
         source = textwrap.dedent(inspect.getsource(agentcore_app.lambda_handler))
         assert source.count(function_name) == 1
+
+
+# ===================================================================
+# Runtime isolation: AC-01's egress leg, AC-08's private DNS leg, AC-45 to AC-47
+# ===================================================================
+_OPEN_V4_EGRESS = {"IpProtocol": "-1", "IpRanges": [{"CidrIp": "0.0.0.0/0"}]}
+_OPEN_V6_EGRESS = {"IpProtocol": "-1", "Ipv6Ranges": [{"CidrIpv6": "::/0"}]}
+_NAMED_EGRESS = {"IpProtocol": "tcp", "IpRanges": [{"CidrIp": "10.0.0.0/16"}]}
+
+
+def _security_group(group_id, egress=(), ingress=()):
+    return {
+        "GroupId": group_id,
+        "IpPermissions": list(ingress),
+        "IpPermissionsEgress": list(egress),
+    }
+
+
+def _runtime_arn(runtime_id):
+    return f"arn:aws:bedrock-agentcore:us-east-1:123456789012:runtime/{runtime_id}"
+
+
+def _vpc_runtime(runtime_id="rt-1", security_groups=("sg-runtime",), **detail):
+    """Return one VPC-mode runtime as a (summary, detail) pair.
+
+    networkModeConfig is where the API reports a runtime's security groups.
+    subnetIds is left out: it drives the incumbent public-subnet leg, and a
+    fixture that sets both would make one assertion answer for two legs.
+    """
+    network = {"networkMode": "VPC"}
+    if security_groups is not None:
+        network["networkModeConfig"] = {
+            "securityGroups": list(security_groups),
+            "subnets": ["subnet-runtime"],
+        }
+    return (
+        {"agentRuntimeId": runtime_id, "agentRuntimeName": runtime_id},
+        {
+            "agentRuntimeArn": _runtime_arn(runtime_id),
+            "networkConfiguration": network,
+            **detail,
+        },
+    )
+
+
+def _wire_runtimes(mock_ac, runtimes):
+    """Stub list_agent_runtimes and get_agent_runtime from (summary, detail)."""
+    mock_ac.list_agent_runtimes.return_value = {
+        "agentRuntimes": [summary for summary, _ in runtimes]
+    }
+    details = {summary["agentRuntimeId"]: detail for summary, detail in runtimes}
+    mock_ac.get_agent_runtime.side_effect = lambda agentRuntimeId: details[
+        agentRuntimeId
+    ]
+
+
+def _code_interpreter(
+    interpreter_id="ci-1",
+    network_mode="VPC",
+    security_groups=("sg-tool",),
+    **detail,
+):
+    """Return one custom Code Interpreter detail. Tools report vpcConfig."""
+    network = {"networkMode": network_mode}
+    if security_groups is not None:
+        network["vpcConfig"] = {
+            "securityGroups": list(security_groups),
+            "subnets": ["subnet-tool"],
+        }
+    return {
+        "codeInterpreterId": interpreter_id,
+        "name": interpreter_id,
+        "networkConfiguration": network,
+        **detail,
+    }
+
+
+def _browser(
+    browser_id="br-1",
+    network_mode="VPC",
+    security_groups=("sg-tool",),
+    **detail,
+):
+    """Return one custom Browser detail."""
+    network = {"networkMode": network_mode}
+    if security_groups is not None:
+        network["vpcConfig"] = {
+            "securityGroups": list(security_groups),
+            "subnets": ["subnet-tool"],
+        }
+    return {
+        "browserId": browser_id,
+        "name": browser_id,
+        "networkConfiguration": network,
+        **detail,
+    }
+
+
+def _wire_tools(mock_ac, interpreters=(), browsers=()):
+    """Stub both custom built-in tool inventories.
+
+    An unstubbed list API returns a MagicMock the paginator reads as an empty
+    page, so a test that means "no tools" has to say so here for the same
+    reason `_empty_agentcore_inventory` exists.
+    """
+    interpreters = list(interpreters)
+    browsers = list(browsers)
+    mock_ac.list_code_interpreters.return_value = {
+        "codeInterpreterSummaries": [
+            {"codeInterpreterId": item["codeInterpreterId"], "name": item["name"]}
+            for item in interpreters
+        ]
+    }
+    by_interpreter = {item["codeInterpreterId"]: item for item in interpreters}
+    mock_ac.get_code_interpreter.side_effect = lambda codeInterpreterId: by_interpreter[
+        codeInterpreterId
+    ]
+    mock_ac.list_browsers.return_value = {
+        "browserSummaries": [
+            {"browserId": item["browserId"], "name": item["name"]} for item in browsers
+        ]
+    }
+    by_browser = {item["browserId"]: item for item in browsers}
+    mock_ac.get_browser.side_effect = lambda browserId: by_browser[browserId]
+
+
+class TestAC01EgressFiltering:
+    """AC-01 judges what each VPC-mode agent resource reaches outbound."""
+
+    def _egress(self, result):
+        return [
+            finding
+            for finding in extract_csv_data(result)
+            if finding["Finding"].startswith("AgentCore Egress")
+        ]
+
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_an_open_outbound_rule_on_a_runtime_fails(self, mock_ac, mock_ec2):
+        _wire_runtimes(mock_ac, [_vpc_runtime()])
+        _wire_tools(mock_ac)
+        mock_ec2.describe_security_groups.return_value = {
+            "SecurityGroups": [_security_group("sg-runtime", [_OPEN_V4_EGRESS])]
+        }
+
+        egress = self._egress(agentcore_app.check_agentcore_vpc_configuration())
+
+        assert len(egress) == 1
+        assert egress[0]["Check_ID"] == "AC-01"
+        assert egress[0]["Status"] == "Failed"
+        assert egress[0]["Severity"] == "High"
+        assert egress[0]["Finding"] == "AgentCore Egress Unrestricted"
+        assert "0.0.0.0/0" in egress[0]["Finding_Details"]
+        assert "rt-1" in egress[0]["Finding_Details"]
+        assert_finding_schema(egress[0])
+
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_an_open_ipv6_outbound_rule_fails(self, mock_ac, mock_ec2):
+        _wire_runtimes(mock_ac, [_vpc_runtime()])
+        _wire_tools(mock_ac)
+        mock_ec2.describe_security_groups.return_value = {
+            "SecurityGroups": [_security_group("sg-runtime", [_OPEN_V6_EGRESS])]
+        }
+
+        egress = self._egress(agentcore_app.check_agentcore_vpc_configuration())
+
+        assert egress[0]["Status"] == "Failed"
+        assert "::/0" in egress[0]["Finding_Details"]
+
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_named_outbound_destinations_pass(self, mock_ac, mock_ec2):
+        _wire_runtimes(mock_ac, [_vpc_runtime()])
+        _wire_tools(mock_ac)
+        mock_ec2.describe_security_groups.return_value = {
+            "SecurityGroups": [_security_group("sg-runtime", [_NAMED_EGRESS])]
+        }
+
+        egress = self._egress(agentcore_app.check_agentcore_vpc_configuration())
+
+        assert len(egress) == 1
+        assert egress[0]["Status"] == "Passed"
+        assert egress[0]["Severity"] == "High"
+        assert_finding_schema(egress[0])
+
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_an_open_inbound_rule_does_not_fail_the_egress_leg(self, mock_ac, mock_ec2):
+        # The devguide states inbound rules are not required because the
+        # runtime only initiates outbound connections. A group open inbound and
+        # closed outbound has to read as a pass here, or this leg is a second
+        # copy of the endpoint inbound leg under a different name.
+        _wire_runtimes(mock_ac, [_vpc_runtime()])
+        _wire_tools(mock_ac)
+        mock_ec2.describe_security_groups.return_value = {
+            "SecurityGroups": [
+                _security_group(
+                    "sg-runtime", egress=[_NAMED_EGRESS], ingress=[_OPEN_V4_EGRESS]
+                )
+            ]
+        }
+
+        egress = self._egress(agentcore_app.check_agentcore_vpc_configuration())
+
+        assert [finding["Status"] for finding in egress] == ["Passed"]
+
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_public_mode_tool_fails_with_no_group_to_read(self, mock_ac, mock_ec2):
+        _wire_runtimes(mock_ac, [])
+        _wire_tools(
+            mock_ac,
+            interpreters=[
+                _code_interpreter(network_mode="PUBLIC", security_groups=None)
+            ],
+        )
+
+        egress = self._egress(agentcore_app.check_agentcore_vpc_configuration())
+
+        assert len(egress) == 1
+        assert egress[0]["Status"] == "Failed"
+        assert egress[0]["Severity"] == "High"
+        assert "Code Interpreter 'ci-1'" in egress[0]["Finding_Details"]
+        assert mock_ec2.describe_security_groups.call_count == 0
+
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_sandbox_code_interpreter_passes(self, mock_ac, mock_ec2):
+        # SANDBOX is the service-managed environment with limited external
+        # network access and no customer security group, so there is no
+        # outbound rule to name and nothing for the customer to fix.
+        _wire_runtimes(mock_ac, [])
+        _wire_tools(
+            mock_ac,
+            interpreters=[
+                _code_interpreter(network_mode="SANDBOX", security_groups=None)
+            ],
+        )
+
+        egress = self._egress(agentcore_app.check_agentcore_vpc_configuration())
+
+        assert len(egress) == 1
+        assert egress[0]["Status"] == "Passed"
+        assert egress[0]["Severity"] == "Medium"
+        assert "SANDBOX" in egress[0]["Finding_Details"]
+
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_browsers_outbound_rules_are_judged_too(self, mock_ac, mock_ec2):
+        _wire_runtimes(mock_ac, [])
+        _wire_tools(mock_ac, browsers=[_browser(security_groups=["sg-browser"])])
+        mock_ec2.describe_security_groups.return_value = {
+            "SecurityGroups": [_security_group("sg-browser", [_OPEN_V4_EGRESS])]
+        }
+
+        egress = self._egress(agentcore_app.check_agentcore_vpc_configuration())
+
+        assert len(egress) == 1
+        assert egress[0]["Status"] == "Failed"
+        assert "Browser 'br-1'" in egress[0]["Finding_Details"]
+
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_every_target_is_judged_from_one_describe_call(self, mock_ac, mock_ec2):
+        _wire_runtimes(
+            mock_ac,
+            [
+                _vpc_runtime("rt-open", security_groups=["sg-open"]),
+                _vpc_runtime("rt-closed", security_groups=["sg-closed"]),
+            ],
+        )
+        _wire_tools(
+            mock_ac, interpreters=[_code_interpreter(security_groups=["sg-open"])]
+        )
+        mock_ec2.describe_security_groups.return_value = {
+            "SecurityGroups": [
+                _security_group("sg-open", [_OPEN_V4_EGRESS]),
+                _security_group("sg-closed", [_NAMED_EGRESS]),
+            ]
+        }
+
+        egress = self._egress(agentcore_app.check_agentcore_vpc_configuration())
+
+        assert sorted(finding["Status"] for finding in egress) == [
+            "Failed",
+            "Failed",
+            "Passed",
+        ]
+        assert mock_ec2.describe_security_groups.call_count == 1
+        assert mock_ec2.describe_security_groups.call_args.kwargs["GroupIds"] == [
+            "sg-closed",
+            "sg-open",
+        ]
+
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_the_security_group_pages_are_followed(self, mock_ac, mock_ec2):
+        _wire_runtimes(
+            mock_ac, [_vpc_runtime(security_groups=["sg-first", "sg-second"])]
+        )
+        _wire_tools(mock_ac)
+        mock_ec2.describe_security_groups.side_effect = [
+            {
+                "SecurityGroups": [_security_group("sg-first", [_NAMED_EGRESS])],
+                "NextToken": "page-2",
+            },
+            {"SecurityGroups": [_security_group("sg-second", [_OPEN_V4_EGRESS])]},
+        ]
+
+        egress = self._egress(agentcore_app.check_agentcore_vpc_configuration())
+
+        # Without the second page sg-second reads as a group that was not
+        # returned, which reports N/A instead of the open rule it holds.
+        assert egress[0]["Status"] == "Failed"
+        assert mock_ec2.describe_security_groups.call_count == 2
+
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_vpc_runtime_with_no_security_group_is_na(self, mock_ac, mock_ec2):
+        _wire_runtimes(mock_ac, [_vpc_runtime(security_groups=None)])
+        _wire_tools(mock_ac)
+
+        egress = self._egress(agentcore_app.check_agentcore_vpc_configuration())
+
+        assert len(egress) == 1
+        assert egress[0]["Status"] == "N/A"
+        assert egress[0]["Severity"] == "Informational"
+
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_an_unreadable_security_group_is_na(self, mock_ac, mock_ec2):
+        _wire_runtimes(mock_ac, [_vpc_runtime()])
+        _wire_tools(mock_ac)
+        mock_ec2.describe_security_groups.side_effect = _make_client_error(
+            "UnauthorizedOperation", "not authorized"
+        )
+
+        egress = self._egress(agentcore_app.check_agentcore_vpc_configuration())
+
+        assert len(egress) == 1
+        assert egress[0]["Status"] == "N/A"
+        assert "ec2:DescribeSecurityGroups" in egress[0]["Resolution"]
+        # A denied describe and a group the describe did not return produce the
+        # same resolution, so the details have to say which one happened.
+        assert "could not be read" in egress[0]["Finding_Details"]
+
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_group_that_was_not_returned_is_na(self, mock_ac, mock_ec2):
+        _wire_runtimes(mock_ac, [_vpc_runtime()])
+        _wire_tools(mock_ac)
+        mock_ec2.describe_security_groups.return_value = {"SecurityGroups": []}
+
+        egress = self._egress(agentcore_app.check_agentcore_vpc_configuration())
+
+        assert len(egress) == 1
+        assert egress[0]["Status"] == "N/A"
+        assert "sg-runtime" in egress[0]["Finding_Details"]
+        assert "were not returned" in egress[0]["Finding_Details"]
+
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_an_open_rule_beside_a_missing_group_still_fails(self, mock_ac, mock_ec2):
+        # A stale group id on a resource that also has an open rule is the case
+        # where an unknown group must not downgrade a rule that was read.
+        _wire_runtimes(mock_ac, [_vpc_runtime(security_groups=["sg-open", "sg-gone"])])
+        _wire_tools(mock_ac)
+        mock_ec2.describe_security_groups.return_value = {
+            "SecurityGroups": [_security_group("sg-open", [_OPEN_V4_EGRESS])]
+        }
+
+        egress = self._egress(agentcore_app.check_agentcore_vpc_configuration())
+
+        assert len(egress) == 1
+        assert egress[0]["Status"] == "Failed"
+
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_an_unlistable_tool_inventory_is_na(self, mock_ac, mock_ec2):
+        _wire_runtimes(mock_ac, [])
+        _wire_tools(mock_ac)
+        mock_ac.list_code_interpreters.side_effect = _make_client_error(
+            "AccessDeniedException", "denied"
+        )
+
+        egress = self._egress(agentcore_app.check_agentcore_vpc_configuration())
+
+        assert len(egress) == 1
+        assert egress[0]["Status"] == "N/A"
+        assert "ListCodeInterpreters" in egress[0]["Resolution"]
+
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_one_unreadable_tool_does_not_hide_the_others(self, mock_ac, mock_ec2):
+        _wire_runtimes(mock_ac, [])
+        _wire_tools(
+            mock_ac,
+            interpreters=[
+                _code_interpreter("ci-broken"),
+                _code_interpreter("ci-open"),
+            ],
+        )
+        mock_ec2.describe_security_groups.return_value = {
+            "SecurityGroups": [_security_group("sg-tool", [_OPEN_V4_EGRESS])]
+        }
+        broken = _make_client_error("AccessDeniedException", "denied")
+        mock_ac.get_code_interpreter.side_effect = lambda codeInterpreterId: (
+            _code_interpreter("ci-open")
+            if codeInterpreterId == "ci-open"
+            else _raise(broken)
+        )
+
+        egress = self._egress(agentcore_app.check_agentcore_vpc_configuration())
+
+        assert sorted(finding["Status"] for finding in egress) == ["Failed", "N/A"]
+        unreadable = next(f for f in egress if f["Status"] == "N/A")
+        assert "GetCodeInterpreter" in unreadable["Resolution"]
+        assert "ci-broken" in unreadable["Finding_Details"]
+
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_public_runtime_is_not_judged_twice(self, mock_ac, mock_ec2):
+        # The incumbent leg already fails a PUBLIC runtime, and it carries no
+        # security group, so a second finding would report one setting twice.
+        mock_ac.list_agent_runtimes.return_value = {
+            "agentRuntimes": [{"agentRuntimeId": "rt-1", "agentRuntimeName": "rt-1"}]
+        }
+        mock_ac.get_agent_runtime.return_value = {
+            "networkConfiguration": {"networkMode": "PUBLIC"}
+        }
+        _wire_tools(mock_ac)
+
+        result = agentcore_app.check_agentcore_vpc_configuration()
+
+        assert self._egress(result) == []
+        assert extract_csv_data(result)[0]["Status"] == "Failed"
+
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_the_handlers_browser_inventory_is_reused(self, mock_ac, mock_ec2):
+        # The handler lists custom browsers once and passes the inventory down.
+        # A check that ignored it would list them again per check.
+        _wire_runtimes(mock_ac, [])
+        _wire_tools(mock_ac)
+        inventory = {
+            "items": [
+                {
+                    "summary": {"browserId": "br-9", "name": "br-9"},
+                    "detail": _browser("br-9", network_mode="PUBLIC"),
+                }
+            ],
+            "errors": [],
+            "list_error": None,
+        }
+
+        egress = self._egress(
+            agentcore_app.check_agentcore_vpc_configuration(browser_inventory=inventory)
+        )
+
+        assert len(egress) == 1
+        assert "br-9" in egress[0]["Finding_Details"]
+        assert mock_ac.list_browsers.call_count == 0
+
+
+def _raise(error):
+    """Raise from inside a lambda, so one side_effect can mix outcomes."""
+    raise error
+
+
+class TestAC08EndpointPrivateDns:
+    """AC-08 reports whether callers reach AgentCore through the endpoint."""
+
+    def _run(self, mock_ac, mock_ec2, endpoint):
+        mock_ac.list_agent_runtimes.return_value = {
+            "agentRuntimes": [{"agentRuntimeId": "rt-1"}]
+        }
+        mock_ec2.describe_vpcs.return_value = {"Vpcs": [{"VpcId": "vpc-1"}]}
+        mock_ec2.describe_vpc_endpoints.return_value = {"VpcEndpoints": [endpoint]}
+        mock_ec2.describe_security_groups.return_value = {"SecurityGroups": []}
+        return [
+            finding
+            for finding in extract_csv_data(
+                agentcore_app.check_agentcore_vpc_endpoints()
+            )
+            if "Private DNS" in finding["Finding"]
+        ]
+
+    def _interface_endpoint(self, **extra):
+        return {
+            "VpcEndpointId": "vpce-1",
+            "VpcId": "vpc-1",
+            "State": "available",
+            "VpcEndpointType": "Interface",
+            "ServiceName": "com.amazonaws.us-east-1.bedrock-agentcore",
+            "PolicyDocument": json.dumps(
+                {
+                    "Statement": [
+                        {
+                            "Effect": "Allow",
+                            "Principal": {"AWS": "arn:aws:iam::123456789012:role/a"},
+                            "Action": "bedrock-agentcore:InvokeAgentRuntime",
+                            "Resource": "*",
+                        }
+                    ]
+                }
+            ),
+            **extra,
+        }
+
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_private_dns_enabled_passes(self, mock_ac, mock_ec2):
+        findings = self._run(
+            mock_ac, mock_ec2, self._interface_endpoint(PrivateDnsEnabled=True)
+        )
+
+        assert len(findings) == 1
+        assert findings[0]["Check_ID"] == "AC-08"
+        assert findings[0]["Status"] == "Passed"
+        assert findings[0]["Severity"] == "Medium"
+        assert_finding_schema(findings[0])
+
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_private_dns_disabled_fails(self, mock_ac, mock_ec2):
+        findings = self._run(
+            mock_ac, mock_ec2, self._interface_endpoint(PrivateDnsEnabled=False)
+        )
+
+        assert len(findings) == 1
+        assert findings[0]["Status"] == "Failed"
+        assert findings[0]["Severity"] == "Medium"
+        assert findings[0]["Finding"].endswith("Disabled")
+        assert "public endpoint" in findings[0]["Finding_Details"]
+        assert_finding_schema(findings[0])
+
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_an_unreported_private_dns_setting_is_na(self, mock_ac, mock_ec2):
+        # An absent field is not a disabled setting: publishing it as one
+        # reports a failure the account may not have.
+        findings = self._run(mock_ac, mock_ec2, self._interface_endpoint())
+
+        assert len(findings) == 1
+        assert findings[0]["Status"] == "N/A"
+        assert findings[0]["Severity"] == "Informational"
+
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_gateway_endpoint_reports_no_private_dns_finding(self, mock_ac, mock_ec2):
+        # Gateway endpoints have no private DNS setting and report the field as
+        # False, which would otherwise read as a misconfiguration.
+        endpoint = self._interface_endpoint(
+            VpcEndpointType="Gateway", PrivateDnsEnabled=False
+        )
+
+        assert self._run(mock_ac, mock_ec2, endpoint) == []
+
+
+def _tool_policy(name, document):
+    return {"name": name, "document": document}
+
+
+def _tool_cache(role_name, policies, inline=None):
+    return {
+        "role_permissions": {
+            role_name: {
+                "attached_policies": list(policies),
+                "inline_policies": list(inline or []),
+            }
+        }
+    }
+
+
+class TestAC45ToolExecutionRoleScope:
+    """AC-45: the role code written by the model runs with."""
+
+    _ROLE_ARN = "arn:aws:iam::123456789012:role/ToolRole"
+
+    def _statement(self, action, resource=None, **extra):
+        statement = {"Effect": "Allow", "Action": action}
+        if resource is not None:
+            statement["Resource"] = resource
+        statement.update(extra)
+        return {"Statement": [statement]}
+
+    @patch("agentcore_app.agentcore_client", None)
+    def test_no_client_is_na(self):
+        findings = agentcore_app.check_agentcore_tool_execution_role_scope({})
+
+        assert len(findings) == 1
+        assert findings[0]["Check_ID"] == "AC-45"
+        assert findings[0]["Status"] == "N/A"
+        assert_finding_schema(findings[0])
+
+    @patch("agentcore_app.agentcore_client")
+    def test_no_custom_tool_is_na(self, mock_ac):
+        _wire_tools(mock_ac)
+
+        findings = agentcore_app.check_agentcore_tool_execution_role_scope({})
+
+        assert len(findings) == 1
+        assert findings[0]["Status"] == "N/A"
+        assert "no tool execution role was assessed" in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_tool_with_no_execution_role_passes(self, mock_ac):
+        _wire_tools(mock_ac, interpreters=[_code_interpreter()])
+
+        findings = agentcore_app.check_agentcore_tool_execution_role_scope({})
+
+        assert len(findings) == 1
+        assert findings[0]["Status"] == "Passed"
+        assert findings[0]["Severity"] == "High"
+        assert "no AWS credentials" in findings[0]["Finding_Details"]
+        assert_finding_schema(findings[0])
+
+    @pytest.mark.parametrize(
+        "document,leg",
+        [
+            (
+                {
+                    "Statement": [
+                        {"Effect": "Allow", "Action": "s3:GetObject", "Resource": "*"}
+                    ]
+                },
+                "grants an action on every resource",
+            ),
+            (
+                {
+                    "Statement": [
+                        {
+                            "Effect": "Allow",
+                            "Action": "s3:GetObject",
+                            "NotResource": "arn:aws:s3:::secrets/*",
+                        }
+                    ]
+                },
+                "grants every resource except the ones it names",
+            ),
+            (
+                {
+                    "Statement": [
+                        {
+                            "Effect": "Allow",
+                            "Action": "s3:*",
+                            "Resource": "arn:aws:s3:::app-bucket/*",
+                        }
+                    ]
+                },
+                "grants every action of a service",
+            ),
+            (
+                {
+                    "Statement": [
+                        {
+                            "Effect": "Allow",
+                            "Action": "*",
+                            "Resource": "arn:aws:s3:::app-bucket/*",
+                        }
+                    ]
+                },
+                "grants every action of a service",
+            ),
+        ],
+        ids=["every-resource", "not-resource", "service-wildcard", "action-star"],
+    )
+    @patch("agentcore_app.agentcore_client")
+    def test_an_unscoped_grant_fails(self, mock_ac, document, leg):
+        _wire_tools(
+            mock_ac,
+            interpreters=[_code_interpreter(executionRoleArn=self._ROLE_ARN)],
+        )
+        cache = _tool_cache("ToolRole", [_tool_policy("ToolPolicy", document)])
+
+        findings = agentcore_app.check_agentcore_tool_execution_role_scope(cache)
+
+        assert len(findings) == 1
+        assert findings[0]["Status"] == "Failed"
+        assert findings[0]["Severity"] == "High"
+        assert findings[0]["Finding"].endswith("Unscoped")
+        assert leg in findings[0]["Finding_Details"]
+        assert_finding_schema(findings[0])
+
+    @patch("agentcore_app.agentcore_client")
+    def test_an_unscoped_inline_grant_fails(self, mock_ac):
+        # Inline and attached policies are both read: a role whose only wide
+        # grant is inline is the case where reading one list is enough to pass.
+        _wire_tools(
+            mock_ac,
+            interpreters=[_code_interpreter(executionRoleArn=self._ROLE_ARN)],
+        )
+        cache = _tool_cache(
+            "ToolRole",
+            [],
+            inline=[_tool_policy("ToolInline", self._statement("s3:GetObject", "*"))],
+        )
+
+        findings = agentcore_app.check_agentcore_tool_execution_role_scope(cache)
+
+        assert len(findings) == 1
+        assert findings[0]["Status"] == "Failed"
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_named_resource_and_action_passes(self, mock_ac):
+        _wire_tools(
+            mock_ac,
+            interpreters=[_code_interpreter(executionRoleArn=self._ROLE_ARN)],
+        )
+        cache = _tool_cache(
+            "ToolRole",
+            [],
+            inline=[
+                _tool_policy(
+                    "ToolInline",
+                    self._statement("s3:GetObject", "arn:aws:s3:::app-bucket/*"),
+                )
+            ],
+        )
+
+        findings = agentcore_app.check_agentcore_tool_execution_role_scope(cache)
+
+        assert len(findings) == 1
+        assert findings[0]["Status"] == "Passed"
+        assert findings[0]["Severity"] == "High"
+        assert "ToolRole" in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_deny_of_every_resource_is_not_a_grant(self, mock_ac):
+        # Only Allow statements grant anything, so a Deny on every resource is
+        # the opposite of the finding this check reports.
+        _wire_tools(
+            mock_ac,
+            interpreters=[_code_interpreter(executionRoleArn=self._ROLE_ARN)],
+        )
+        cache = _tool_cache(
+            "ToolRole",
+            [
+                _tool_policy(
+                    "ToolPolicy",
+                    {
+                        "Statement": [
+                            {
+                                "Effect": "Deny",
+                                "Action": "s3:*",
+                                "Resource": "*",
+                            }
+                        ]
+                    },
+                )
+            ],
+        )
+
+        findings = agentcore_app.check_agentcore_tool_execution_role_scope(cache)
+
+        assert findings[0]["Status"] == "Passed"
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_role_outside_the_cache_is_na(self, mock_ac):
+        _wire_tools(
+            mock_ac,
+            interpreters=[_code_interpreter(executionRoleArn=self._ROLE_ARN)],
+        )
+
+        findings = agentcore_app.check_agentcore_tool_execution_role_scope(
+            {"role_permissions": {}}
+        )
+
+        assert len(findings) == 1
+        assert findings[0]["Status"] == "N/A"
+        assert "permissions cache" in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_an_unparseable_document_is_reported_beside_the_verdict(self, mock_ac):
+        _wire_tools(
+            mock_ac,
+            interpreters=[_code_interpreter(executionRoleArn=self._ROLE_ARN)],
+        )
+        cache = _tool_cache(
+            "ToolRole",
+            [
+                _tool_policy("Broken", "{not json"),
+                _tool_policy(
+                    "Wide",
+                    {
+                        "Statement": [
+                            {"Effect": "Allow", "Action": "s3:Get*", "Resource": "*"}
+                        ]
+                    },
+                ),
+            ],
+        )
+
+        findings = agentcore_app.check_agentcore_tool_execution_role_scope(cache)
+
+        assert len(findings) == 2
+        assert findings[0]["Status"] == "N/A"
+        assert findings[0]["Finding"].endswith("Scope Incomplete")
+        assert findings[1]["Status"] == "Failed"
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_browser_role_is_judged_as_well(self, mock_ac):
+        _wire_tools(mock_ac, browsers=[_browser(executionRoleArn=self._ROLE_ARN)])
+        cache = _tool_cache(
+            "ToolRole",
+            [
+                _tool_policy(
+                    "ToolPolicy",
+                    self._statement("bedrock:InvokeModel", "*"),
+                )
+            ],
+        )
+
+        findings = agentcore_app.check_agentcore_tool_execution_role_scope(cache)
+
+        assert len(findings) == 1
+        assert findings[0]["Status"] == "Failed"
+        assert "Browser 'br-1'" in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_every_tool_is_judged(self, mock_ac):
+        _wire_tools(
+            mock_ac,
+            interpreters=[
+                _code_interpreter("ci-wide", executionRoleArn=self._ROLE_ARN)
+            ],
+            browsers=[_browser("br-scoped")],
+        )
+        cache = _tool_cache(
+            "ToolRole", [_tool_policy("ToolPolicy", self._statement("s3:*", "*"))]
+        )
+
+        findings = agentcore_app.check_agentcore_tool_execution_role_scope(cache)
+
+        assert sorted(finding["Status"] for finding in findings) == [
+            "Failed",
+            "Passed",
+        ]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_an_unlistable_inventory_is_reported(self, mock_ac):
+        _wire_tools(mock_ac)
+        mock_ac.list_browsers.side_effect = _make_client_error(
+            "AccessDeniedException", "denied"
+        )
+
+        findings = agentcore_app.check_agentcore_tool_execution_role_scope({})
+
+        assert [finding["Status"] for finding in findings] == ["N/A", "N/A"]
+        assert "ListBrowsers" in findings[0]["Resolution"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_an_unlistable_interpreter_inventory_does_not_end_the_check(self, mock_ac):
+        # Each inventory is listed separately, so a denied ListCodeInterpreters
+        # still leaves the browsers to judge.
+        _wire_tools(mock_ac, browsers=[_browser(executionRoleArn=self._ROLE_ARN)])
+        mock_ac.list_code_interpreters.side_effect = TypeError("boom")
+        cache = _tool_cache(
+            "ToolRole", [_tool_policy("ToolPolicy", self._statement("s3:*", "*"))]
+        )
+
+        findings = agentcore_app.check_agentcore_tool_execution_role_scope(cache)
+
+        assert [finding["Status"] for finding in findings] == ["N/A", "Failed"]
+        assert "ListCodeInterpreters" in findings[0]["Resolution"]
+
+
+class TestAC46RuntimeSessionLimits:
+    """AC-46: how long one runtime session can hold its microVM."""
+
+    def _lifecycle(self, **fields):
+        summary, detail = _vpc_runtime()
+        detail["lifecycleConfiguration"] = fields
+        return [(summary, detail)]
+
+    @patch("agentcore_app.agentcore_client", None)
+    def test_no_client_is_na(self):
+        findings = agentcore_app.check_agentcore_runtime_session_limits()
+
+        assert len(findings) == 1
+        assert findings[0]["Check_ID"] == "AC-46"
+        assert findings[0]["Status"] == "N/A"
+        assert_finding_schema(findings[0])
+
+    @patch("agentcore_app.agentcore_client")
+    def test_no_runtimes_is_na(self, mock_ac):
+        _wire_runtimes(mock_ac, [])
+
+        findings = agentcore_app.check_agentcore_runtime_session_limits()
+
+        assert len(findings) == 1
+        assert findings[0]["Status"] == "N/A"
+
+    @patch("agentcore_app.agentcore_client")
+    def test_an_unlistable_region_is_na(self, mock_ac):
+        mock_ac.list_agent_runtimes.side_effect = _make_client_error(
+            "AccessDeniedException", "denied"
+        )
+
+        findings = agentcore_app.check_agentcore_runtime_session_limits()
+
+        assert len(findings) == 1
+        assert findings[0]["Status"] == "N/A"
+        assert findings[0]["Severity"] == "Informational"
+
+    @patch("agentcore_app.agentcore_client")
+    def test_the_documented_defaults_pass(self, mock_ac):
+        _wire_runtimes(
+            mock_ac, self._lifecycle(idleRuntimeSessionTimeout=900, maxLifetime=28800)
+        )
+
+        findings = agentcore_app.check_agentcore_runtime_session_limits()
+
+        assert len(findings) == 1
+        assert findings[0]["Status"] == "Passed"
+        assert findings[0]["Severity"] == "Medium"
+        assert "900s" in findings[0]["Finding_Details"]
+        assert "28800s" in findings[0]["Finding_Details"]
+        assert "memory" in findings[0]["Resolution"]
+        assert "spend" in findings[0]["Resolution"]
+        assert_finding_schema(findings[0])
+
+    @pytest.mark.parametrize(
+        "field,name",
+        [
+            ("idleRuntimeSessionTimeout", "idle session timeout"),
+            ("maxLifetime", "maximum session lifetime"),
+        ],
+    )
+    @patch("agentcore_app.agentcore_client")
+    def test_either_field_at_the_ceiling_fails(self, mock_ac, field, name):
+        _wire_runtimes(
+            mock_ac,
+            self._lifecycle(
+                **{field: agentcore_app.AGENTCORE_LIFECYCLE_CEILING_SECONDS}
+            ),
+        )
+
+        findings = agentcore_app.check_agentcore_runtime_session_limits()
+
+        assert len(findings) == 1
+        assert findings[0]["Status"] == "Failed"
+        assert findings[0]["Severity"] == "Medium"
+        assert findings[0]["Finding"].endswith("Unbounded")
+        assert name in findings[0]["Finding_Details"]
+        assert_finding_schema(findings[0])
+
+    @patch("agentcore_app.agentcore_client")
+    def test_one_second_below_the_ceiling_passes(self, mock_ac):
+        # The assertion is the service ceiling itself, not a duration this
+        # check would prefer: a shorter limit is the workload's decision.
+        _wire_runtimes(
+            mock_ac,
+            self._lifecycle(
+                maxLifetime=agentcore_app.AGENTCORE_LIFECYCLE_CEILING_SECONDS - 1
+            ),
+        )
+
+        findings = agentcore_app.check_agentcore_runtime_session_limits()
+
+        assert findings[0]["Status"] == "Passed"
+
+    @patch("agentcore_app.agentcore_client")
+    def test_an_absent_lifecycle_block_is_na(self, mock_ac):
+        _wire_runtimes(mock_ac, [_vpc_runtime()])
+
+        findings = agentcore_app.check_agentcore_runtime_session_limits()
+
+        assert len(findings) == 1
+        assert findings[0]["Status"] == "N/A"
+        assert "could not be judged" in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_non_integer_value_is_na(self, mock_ac):
+        _wire_runtimes(mock_ac, self._lifecycle(maxLifetime="28800"))
+
+        findings = agentcore_app.check_agentcore_runtime_session_limits()
+
+        assert findings[0]["Status"] == "N/A"
+
+    @patch("agentcore_app.agentcore_client")
+    def test_an_unreadable_runtime_is_na(self, mock_ac):
+        _wire_runtimes(mock_ac, [_vpc_runtime()])
+        mock_ac.get_agent_runtime.side_effect = _make_client_error(
+            "AccessDeniedException", "denied"
+        )
+
+        findings = agentcore_app.check_agentcore_runtime_session_limits()
+
+        assert len(findings) == 1
+        assert findings[0]["Status"] == "N/A"
+        assert "GetAgentRuntime" in findings[0]["Resolution"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_every_runtime_is_judged(self, mock_ac):
+        bounded_summary, bounded = _vpc_runtime("rt-bounded")
+        bounded["lifecycleConfiguration"] = {"maxLifetime": 3600}
+        unbounded_summary, unbounded = _vpc_runtime("rt-unbounded")
+        unbounded["lifecycleConfiguration"] = {
+            "maxLifetime": agentcore_app.AGENTCORE_LIFECYCLE_CEILING_SECONDS
+        }
+        _wire_runtimes(
+            mock_ac,
+            [(bounded_summary, bounded), (unbounded_summary, unbounded)],
+        )
+
+        findings = agentcore_app.check_agentcore_runtime_session_limits()
+
+        assert [finding["Status"] for finding in findings] == ["Passed", "Failed"]
+
+    def test_the_ceiling_is_the_one_the_api_models(self):
+        # A ceiling that drifts from the service would either fail every
+        # runtime or be unreachable, and the check would read as clean.
+        credentials = {
+            "region_name": "us-east-1",
+            "aws_access_key_id": "testing",
+            "aws_secret_access_key": "testing",  # pragma: allowlist secret - synthetic test credential
+        }
+        model = agentcore_app.boto3.client(
+            "bedrock-agentcore-control", **credentials
+        ).meta.service_model
+        lifecycle = model.operation_model("GetAgentRuntime").output_shape.members[
+            "lifecycleConfiguration"
+        ]
+        assert set(lifecycle.members) == {
+            field for field, _ in agentcore_app.AGENTCORE_LIFECYCLE_FIELDS
+        }
+        for member in lifecycle.members.values():
+            assert (
+                member.metadata["max"]
+                == agentcore_app.AGENTCORE_LIFECYCLE_CEILING_SECONDS
+            )
+
+
+class TestAC47RuntimeInvocationPath:
+    """AC-47: which callers and which network paths reach a runtime."""
+
+    def _legs(self, findings):
+        return {
+            finding["Finding"].replace("AgentCore Runtime ", ""): finding
+            for finding in findings
+        }
+
+    def _wire(self, mock_ac, policy=None, **detail):
+        summary, runtime = _vpc_runtime(**detail)
+        _wire_runtimes(mock_ac, [(summary, runtime)])
+        mock_ac.get_resource_policy.return_value = {
+            "policy": json.dumps(policy) if policy is not None else ""
+        }
+
+    @patch("agentcore_app.agentcore_client", None)
+    def test_no_client_is_na(self):
+        findings = agentcore_app.check_agentcore_runtime_invocation_path()
+
+        assert len(findings) == 1
+        assert findings[0]["Check_ID"] == "AC-47"
+        assert findings[0]["Status"] == "N/A"
+        assert_finding_schema(findings[0])
+
+    @patch("agentcore_app.agentcore_client")
+    def test_no_runtimes_is_na(self, mock_ac):
+        _wire_runtimes(mock_ac, [])
+
+        findings = agentcore_app.check_agentcore_runtime_invocation_path()
+
+        assert len(findings) == 1
+        assert findings[0]["Status"] == "N/A"
+
+    @patch("agentcore_app.agentcore_client")
+    def test_an_unlistable_region_is_na(self, mock_ac):
+        mock_ac.list_agent_runtimes.side_effect = _make_client_error(
+            "AccessDeniedException", "denied"
+        )
+
+        findings = agentcore_app.check_agentcore_runtime_invocation_path()
+
+        assert len(findings) == 1
+        assert findings[0]["Status"] == "N/A"
+        assert findings[0]["Severity"] == "Informational"
+
+    @patch("agentcore_app.agentcore_client")
+    def test_no_policy_and_no_allowed_workload_fails_both_legs(self, mock_ac):
+        self._wire(mock_ac)
+
+        findings = agentcore_app.check_agentcore_runtime_invocation_path()
+        legs = self._legs(findings)
+
+        assert len(findings) == 2
+        assert legs["Network Path Unrestricted"]["Status"] == "Failed"
+        assert legs["Network Path Unrestricted"]["Severity"] == "Medium"
+        assert legs["Caller Unrestricted"]["Status"] == "Failed"
+        assert legs["Caller Unrestricted"]["Severity"] == "High"
+        for finding in findings:
+            assert_finding_schema(finding)
+
+    @pytest.mark.parametrize(
+        "condition_key",
+        ["aws:SourceVpc", "aws:SourceVpce", "aws:VpcSourceIp", "aws:SourceIp"],
+    )
+    @patch("agentcore_app.agentcore_client")
+    def test_a_deny_network_condition_passes_the_network_leg(
+        self, mock_ac, condition_key
+    ):
+        # "Deny unless aws:SourceVpce is the approved endpoint" is the documented
+        # form of this restriction. Reading Allow statements only would report
+        # the account that wrote it as having no restriction at all.
+        self._wire(
+            mock_ac,
+            policy={
+                "Statement": [
+                    {
+                        "Effect": "Deny",
+                        "Principal": "*",
+                        "Action": "bedrock-agentcore:InvokeAgentRuntime",
+                        "Resource": "*",
+                        "Condition": {
+                            "StringNotEquals": {condition_key: "vpce-123"},
+                        },
+                    }
+                ]
+            },
+        )
+
+        legs = self._legs(agentcore_app.check_agentcore_runtime_invocation_path())
+
+        assert legs["Network Path Scope"]["Status"] == "Passed"
+        assert condition_key.lower() in legs["Network Path Scope"]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_an_unrelated_condition_does_not_pass_the_network_leg(self, mock_ac):
+        self._wire(
+            mock_ac,
+            policy={
+                "Statement": [
+                    {
+                        "Effect": "Allow",
+                        "Principal": {"AWS": "arn:aws:iam::123456789012:role/gw"},
+                        "Action": "bedrock-agentcore:InvokeAgentRuntime",
+                        "Resource": "*",
+                        "Condition": {
+                            "StringEquals": {"aws:PrincipalOrgID": "o-123"},
+                        },
+                    }
+                ]
+            },
+        )
+
+        legs = self._legs(agentcore_app.check_agentcore_runtime_invocation_path())
+
+        assert legs["Network Path Unrestricted"]["Status"] == "Failed"
+        assert legs["Caller Scope"]["Status"] == "Passed"
+
+    @pytest.mark.parametrize(
+        "allowed",
+        [
+            {"hostingEnvironments": ["arn:aws:bedrock-agentcore:us-east-1::gw/g"]},
+            {"workloadIdentities": ["arn:aws:bedrock-agentcore:us-east-1::wi/w"]},
+        ],
+        ids=["hosting-environments", "workload-identities"],
+    )
+    @patch("agentcore_app.agentcore_client")
+    def test_an_allowed_workload_configuration_passes_the_caller_leg(
+        self, mock_ac, allowed
+    ):
+        self._wire(
+            mock_ac,
+            authorizerConfiguration={
+                "customJWTAuthorizer": {
+                    "discoveryUrl": "https://example.com/.well-known/openid-configuration",
+                    "allowedWorkloadConfiguration": allowed,
+                }
+            },
+        )
+
+        legs = self._legs(agentcore_app.check_agentcore_runtime_invocation_path())
+
+        assert legs["Caller Scope"]["Status"] == "Passed"
+        assert legs["Caller Scope"]["Severity"] == "High"
+        assert "allowedWorkloadConfiguration" in legs["Caller Scope"]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_an_empty_allowed_workload_configuration_restricts_nothing(self, mock_ac):
+        self._wire(
+            mock_ac,
+            authorizerConfiguration={
+                "customJWTAuthorizer": {
+                    "allowedWorkloadConfiguration": {
+                        "hostingEnvironments": [],
+                        "workloadIdentities": [],
+                    }
+                }
+            },
+        )
+
+        legs = self._legs(agentcore_app.check_agentcore_runtime_invocation_path())
+
+        assert legs["Caller Unrestricted"]["Status"] == "Failed"
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_named_principal_passes_the_caller_leg(self, mock_ac):
+        self._wire(
+            mock_ac,
+            policy={
+                "Statement": [
+                    {
+                        "Effect": "Allow",
+                        "Principal": {"AWS": "arn:aws:iam::123456789012:role/gw"},
+                        "Action": "bedrock-agentcore:InvokeAgentRuntime",
+                        "Resource": "*",
+                    }
+                ]
+            },
+        )
+
+        legs = self._legs(agentcore_app.check_agentcore_runtime_invocation_path())
+
+        assert legs["Caller Scope"]["Status"] == "Passed"
+        assert "1 principal" in legs["Caller Scope"]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_wildcard_principal_fails_the_caller_leg(self, mock_ac):
+        self._wire(
+            mock_ac,
+            policy={
+                "Statement": [
+                    {
+                        "Effect": "Allow",
+                        "Principal": "*",
+                        "Action": "bedrock-agentcore:InvokeAgentRuntime",
+                        "Resource": "*",
+                    }
+                ]
+            },
+        )
+
+        legs = self._legs(agentcore_app.check_agentcore_runtime_invocation_path())
+
+        assert legs["Caller Unrestricted"]["Status"] == "Failed"
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_deny_principal_is_not_a_caller_restriction(self, mock_ac):
+        # A Deny naming one principal leaves every other principal allowed, so
+        # it does not name who may invoke the runtime.
+        self._wire(
+            mock_ac,
+            policy={
+                "Statement": [
+                    {
+                        "Effect": "Deny",
+                        "Principal": {"AWS": "arn:aws:iam::123456789012:role/other"},
+                        "Action": "bedrock-agentcore:InvokeAgentRuntime",
+                        "Resource": "*",
+                    }
+                ]
+            },
+        )
+
+        legs = self._legs(agentcore_app.check_agentcore_runtime_invocation_path())
+
+        assert legs["Caller Unrestricted"]["Status"] == "Failed"
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_missing_resource_policy_is_read_as_no_policy(self, mock_ac):
+        summary, runtime = _vpc_runtime()
+        _wire_runtimes(mock_ac, [(summary, runtime)])
+        mock_ac.get_resource_policy.side_effect = _make_client_error(
+            "ResourceNotFoundException", "no policy"
+        )
+
+        legs = self._legs(agentcore_app.check_agentcore_runtime_invocation_path())
+
+        assert legs["Network Path Unrestricted"]["Status"] == "Failed"
+        assert legs["Caller Unrestricted"]["Status"] == "Failed"
+
+    @patch("agentcore_app.agentcore_client")
+    def test_an_unreadable_resource_policy_is_na(self, mock_ac):
+        summary, runtime = _vpc_runtime()
+        _wire_runtimes(mock_ac, [(summary, runtime)])
+        mock_ac.get_resource_policy.side_effect = _make_client_error(
+            "AccessDeniedException", "denied"
+        )
+
+        findings = agentcore_app.check_agentcore_runtime_invocation_path()
+
+        assert len(findings) == 1
+        assert findings[0]["Status"] == "N/A"
+        assert "GetResourcePolicy" in findings[0]["Resolution"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_an_unreadable_runtime_is_na(self, mock_ac):
+        _wire_runtimes(mock_ac, [_vpc_runtime()])
+        mock_ac.get_agent_runtime.side_effect = _make_client_error(
+            "AccessDeniedException", "denied"
+        )
+
+        findings = agentcore_app.check_agentcore_runtime_invocation_path()
+
+        assert len(findings) == 1
+        assert findings[0]["Status"] == "N/A"
+        assert "GetAgentRuntime" in findings[0]["Resolution"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_runtime_with_no_arn_is_judged_without_a_policy_call(self, mock_ac):
+        summary, runtime = _vpc_runtime()
+        del runtime["agentRuntimeArn"]
+        _wire_runtimes(mock_ac, [(summary, runtime)])
+
+        legs = self._legs(agentcore_app.check_agentcore_runtime_invocation_path())
+
+        assert legs["Network Path Unrestricted"]["Status"] == "Failed"
+        assert mock_ac.get_resource_policy.call_count == 0
+
+    @patch("agentcore_app.agentcore_client")
+    def test_every_runtime_is_judged(self, mock_ac):
+        open_summary, open_runtime = _vpc_runtime("rt-open")
+        scoped_summary, scoped_runtime = _vpc_runtime(
+            "rt-scoped",
+            authorizerConfiguration={
+                "customJWTAuthorizer": {
+                    "allowedWorkloadConfiguration": {
+                        "hostingEnvironments": ["arn:aws:bedrock-agentcore:::gw/g"]
+                    }
+                }
+            },
+        )
+        _wire_runtimes(
+            mock_ac,
+            [(open_summary, open_runtime), (scoped_summary, scoped_runtime)],
+        )
+        mock_ac.get_resource_policy.return_value = {"policy": ""}
+
+        findings = agentcore_app.check_agentcore_runtime_invocation_path()
+
+        assert len(findings) == 4
+        assert [finding["Status"] for finding in findings] == [
+            "Failed",
+            "Failed",
+            "Failed",
+            "Passed",
+        ]
+
+    def test_the_allowed_workload_fields_are_the_ones_the_api_models(self):
+        credentials = {
+            "region_name": "us-east-1",
+            "aws_access_key_id": "testing",
+            "aws_secret_access_key": "testing",  # pragma: allowlist secret - synthetic test credential
+        }
+        model = agentcore_app.boto3.client(
+            "bedrock-agentcore-control", **credentials
+        ).meta.service_model
+        authorizer = model.operation_model("GetAgentRuntime").output_shape.members[
+            "authorizerConfiguration"
+        ]
+        allowed = authorizer.members["customJWTAuthorizer"].members[
+            "allowedWorkloadConfiguration"
+        ]
+        assert set(allowed.members) == {"hostingEnvironments", "workloadIdentities"}
+        assert "GetResourcePolicy" in model.operation_names
+
+
+class TestRuntimeIsolationCheckRegistration:
+    """AC-45 to AC-47 are regional runtime checks."""
+
+    _CHECKS = {
+        "AC-45": "check_agentcore_tool_execution_role_scope",
+        "AC-46": "check_agentcore_runtime_session_limits",
+        "AC-47": "check_agentcore_runtime_invocation_path",
+    }
+
+    @pytest.mark.parametrize("check_id", sorted(_CHECKS))
+    def test_the_checks_are_in_both_regional_tuples(self, check_id):
+        assert check_id in agentcore_app.REGIONAL_AGENTCORE_CHECK_IDS
+        assert check_id in agentcore_app.AGENTCORE_RUNTIME_CHECK_IDS
+
+    @pytest.mark.parametrize("check_id", sorted(_CHECKS))
+    def test_timeout_backfill_emits_the_checks(self, check_id):
+        findings = agentcore_app.build_agentcore_timeout_findings("us-east-1", [])
+        assert check_id in {finding["Check_ID"] for finding in findings}
+
+    @pytest.mark.parametrize("function_name", sorted(_CHECKS.values()))
+    def test_the_handler_registers_each_check_once(self, function_name):
+        source = textwrap.dedent(inspect.getsource(agentcore_app.lambda_handler))
+        assert source.count(function_name) == 1
+
+    def test_the_handler_lists_custom_browsers_once_for_every_check(self):
+        # AC-01 and AC-45 both read the custom browser inventory. The handler
+        # takes it once and passes it down, so a new check that called
+        # get_custom_browser_inventory() itself would double the list calls.
+        source = textwrap.dedent(inspect.getsource(agentcore_app.lambda_handler))
+        assert source.count("get_custom_browser_inventory()") == 1
+        assert source.count("browser_inventory") >= 3

@@ -6,14 +6,14 @@ Generated 2026-09-25 by `aisf-parity/build_ledger.py`. Do not hand-edit: change 
 
 | verdict | rows | meaning |
 |---|---|---|
-| covered | 36 | an incumbent already asserts this; nothing to write |
-| tighten / extend | 13 | incumbent name is honest, its assertion is narrower; extend it in place |
-| tighten / new_id | 3 | incumbent name claims more than it asserts; allocate a new id beside it |
-| new | 11 | no incumbent asserts any part of it |
+| covered | 40 | an incumbent already asserts this; nothing to write |
+| tighten / extend | 11 | incumbent name is honest, its assertion is narrower; extend it in place |
+| tighten / new_id | 2 | incumbent name claims more than it asserts; allocate a new id beside it |
+| new | 10 | no incumbent asserts any part of it |
 | not_implementable | 4 | flagged machine_checkable in the ledger but is not checkable from configuration |
 | unassessed | 11 | in scope, dedup pass not yet run |
 
-**25 new check functions and 13 extensions to existing checks.**
+**23 new check functions and 11 extensions to existing checks.**
 
 ## New IAM actions required
 
@@ -99,14 +99,14 @@ Generated 2026-09-25 by `aisf-parity/build_ledger.py`. Do not hand-edit: change 
 | `AIR-ACR-POL-04` | covered | — | `agentcore_assessments` | `AC-11`, `AC-36` | AC-11 asserts the engine names a customer managed key, AC-36 asserts the key policy names who may decrypt with it and who may disable it or schedule it for deletion; the key cannot be added to or changed on an existing engine, so the key policy is the whole guard. The disable/delete alarm and the break-glass runbook are not readable from the key, and AC-36's passing resolution says so |
 | `AIR-ACR-POL-06` *(workload-specific)* | covered | — | `agentcore_assessments` | `AC-37` | AC-37 asserts the workload-independent half: a policy carrying a guardrails condition needs bedrock:InvokeGuardrailChecks on the gateway execution role, because the Policy data plane calls Bedrock Guardrails with that role's forward access session. Whether this workload's content belongs at the authorization boundary at all, and which safeguard categories and thresholds apply, is the workload owner's decision, which AC-37 reports and does not judge |
 | `AIR-ACR-POL-07` | covered | — | `agentcore_assessments` | `AG-25`, `AC-38` | AG-25 counts enforcing policies, AC-38 asserts a temporal policy exists and that the gateway carrying it authenticates callers with CUSTOM_JWT or AWS_IAM, the two authorizer types the devguide names as binding a session to the caller's identity; the session-id propagation path is fail-closed by the service, since a request to an engine holding a temporal policy fails validation without the header |
+| `AIR-ACR-RT-03` | covered | — | `agentcore_assessments` | `AC-02`, `AC-45` | AC-45 reads the execution role of every code interpreter and browser in the account and fails a role whose Allow statements reach every resource, name a NotResource, or carry a service-wide or bare action wildcard. AC-02 judges the same wildcards but only over the bedrock-agentcore namespace and only on the assessment's own roles, so a tool role granting s3:* on every bucket is a verdict it cannot reach |
+| `AIR-ACR-RT-04` *(workload-specific)* | covered | — | `agentcore_assessments` | `AC-46` | AC-46 fails a runtime that configures neither idleRuntimeSessionTimeout nor maxLifetime, or that sets either at the service ceiling of 1209600 seconds, which is the setting that lets one runaway session hold its resources for 14 days. AgentCore exposes no per-session memory or cost limit to read, so the time bound is the only limit the API can answer for, and every verdict says which values it found so the workload owner can judge whether the bound suits the task |
+| `AIR-ACR-RT-08` | covered | — | `agentcore_assessments` | `AC-01` | AC-01 now reads the outbound rules of every security group attached to a VPC runtime, code interpreter or browser and fails a group permitting 0.0.0.0/0 or ::/0 egress. A tool in PUBLIC network mode fails without a describe call, because the service grants it open internet egress by configuration; SANDBOX passes at Medium, because the sandbox reaches no network the workload can name. A group the describe did not return and a denied ec2:DescribeSecurityGroups are both reported N/A on their own line, so an unread group is never counted as closed |
 | `AIR-ACR-RT-09` | covered | — | `agentcore_assessments` | `AC-06` | recording.enabled is True plus an S3 bucket |
+| `AIR-ACR-RT-13` | covered | — | `agentcore_assessments` | `AC-08`, `AC-10`, `AC-47` | AC-47 fails a runtime whose resource policy restricts neither the network path nor the caller: the network leg reads aws:SourceVpc, aws:SourceVpce, aws:VpcSourceIp and aws:SourceIp on any statement, the caller leg reads a named principal or an allowedWorkloadConfiguration on the JWT authorizer. AC-08 fails an AgentCore interface endpoint with private DNS off, which is the leg that keeps the runtime's own callers off the public endpoint name. AC-10 reports only that a policy exists |
 | `AIR-ACR-PAY-01` | tighten | extend | `agentcore_assessments` | `AC-02` | AC-02 detects full-access and wildcard grants only |
 | `AIR-ACR-REG-02` | tighten | new_id | `agent_registry_assessments` | `AR-03` | AR-03 is named "Publication Approval Governance" but covers auto-approval only, behind the REQUIRE_AGENT_REGISTRY_MANUAL_APPROVAL env gate; no curator/publisher separation and no EventBridge rule |
-| `AIR-ACR-RT-03` | tighten | extend | `agentcore_assessments` | `AC-02` | AC-02 detects full-access and wildcard grants only |
-| `AIR-ACR-RT-08` | tighten | extend | `agentcore_assessments` | `AC-01` | AC-01 requires VPC placement and flags public subnets but never reads what the security-group rules permit; ec2:DescribeSecurityGroups is now granted to this function for AC-08's endpoint scope leg, so RT-08 costs no further permission |
-| `AIR-ACR-RT-13` | tighten | new_id | `agentcore_assessments` | `AC-10` | AC-10 is named "Resource-Based Policies Check" but never evaluates policy conditions, so the aws:SourceVpc / aws:SourceVpce leg is unasserted; both keys are 0 hits corpus-wide |
 | `AIR-ACR-MEM-07` *(workload-specific)* | new | — | `agentcore_assessments` | — | — |
-| `AIR-ACR-RT-04` *(workload-specific)* | new | — | `agentcore_assessments` | — | — |
 
 ## FND (11 controls)
 

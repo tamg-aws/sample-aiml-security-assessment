@@ -6,15 +6,15 @@
     "hosted": 67,
     "fnd_ai_subject": 11,
     "total": 78,
-    "covered": 36,
-    "tighten": 16,
-    "tighten_extend": 13,
-    "tighten_new_id": 3,
-    "new": 11,
+    "covered": 40,
+    "tighten": 13,
+    "tighten_extend": 11,
+    "tighten_new_id": 2,
+    "new": 10,
     "not_implementable": 4,
     "unassessed": 11,
-    "new_check_functions": 25,
-    "extensions": 13,
+    "new_check_functions": 23,
+    "extensions": 11,
     "extra_iam_actions": [
       "config:DescribeConfigRules",
       "config:DescribeConfigurationRecorders",
@@ -758,18 +758,20 @@
       "question": "Is the execution role available to code-execution and browser tools scoped to least privilege, on the assumption that any code in the sandbox can assume it?",
       "assert": "Tool execution-role policy showing resource-scoped, least-privilege grants",
       "workload_agnostic": true,
-      "verdict": "tighten",
-      "disposition": "extend",
+      "verdict": "covered",
+      "disposition": null,
       "target_modules": [
         "agentcore_assessments"
       ],
       "incumbents": [
-        "AC-02"
+        "AC-02",
+        "AC-45"
       ],
       "incumbent_names": [
-        "AgentCore IAM Full Access Check"
+        "AgentCore IAM Full Access Check",
+        "AgentCore Tool Execution Role Scope"
       ],
-      "gap": "AC-02 detects full-access and wildcard grants only",
+      "gap": "AC-45 reads the execution role of every code interpreter and browser in the account and fails a role whose Allow statements reach every resource, name a NotResource, or carry a service-wide or bare action wildcard. AC-02 judges the same wildcards but only over the bedrock-agentcore namespace and only on the assessment's own roles, so a tool role granting s3:* on every bucket is a verdict it cannot reach",
       "extra_iam": [],
       "phase": 4,
       "source": "controls/ai-specific/agentcore-runtime.yaml"
@@ -852,18 +854,22 @@
       "question": "Is invocation of the agent runtime restricted to an approved network path AND an approved caller, so neither the internet nor a direct call that bypasses the gateway can reach the agent?",
       "assert": "Runtime VPCE + Private DNS + SG scope + resource-policy aws:SourceVpc/SourceVpce deny; plus gateway-source restriction (SigV4 resource policy scoped to the gateway role, or allowedWorkloadConfiguration on customJWTAuthorizer)",
       "workload_agnostic": true,
-      "verdict": "tighten",
-      "disposition": "new_id",
+      "verdict": "covered",
+      "disposition": null,
       "target_modules": [
         "agentcore_assessments"
       ],
       "incumbents": [
-        "AC-10"
+        "AC-08",
+        "AC-10",
+        "AC-47"
       ],
       "incumbent_names": [
-        "AgentCore Resource-Based Policies Check"
+        "AgentCore VPC Endpoints Check",
+        "AgentCore Resource-Based Policies Check",
+        "AgentCore Runtime Invocation Path"
       ],
-      "gap": "AC-10 is named \"Resource-Based Policies Check\" but never evaluates policy conditions, so the aws:SourceVpc / aws:SourceVpce leg is unasserted; both keys are 0 hits corpus-wide",
+      "gap": "AC-47 fails a runtime whose resource policy restricts neither the network path nor the caller: the network leg reads aws:SourceVpc, aws:SourceVpce, aws:VpcSourceIp and aws:SourceIp on any statement, the caller leg reads a named principal or an allowedWorkloadConfiguration on the JWT authorizer. AC-08 fails an AgentCore interface endpoint with private DNS off, which is the leg that keeps the runtime's own callers off the public endpoint name. AC-10 reports only that a policy exists",
       "extra_iam": [],
       "phase": 4,
       "source": "controls/ai-specific/agentcore-runtime.yaml"
@@ -1066,8 +1072,8 @@
       "question": "Is outbound network access from code-execution and browser tools restricted to only what the workload needs, rather than open internet egress?",
       "assert": "Tool network-mode / egress-filtering configuration",
       "workload_agnostic": true,
-      "verdict": "tighten",
-      "disposition": "extend",
+      "verdict": "covered",
+      "disposition": null,
       "target_modules": [
         "agentcore_assessments"
       ],
@@ -1077,7 +1083,7 @@
       "incumbent_names": [
         "AgentCore Runtime VPC Configuration"
       ],
-      "gap": "AC-01 requires VPC placement and flags public subnets but never reads what the security-group rules permit; ec2:DescribeSecurityGroups is now granted to this function for AC-08's endpoint scope leg, so RT-08 costs no further permission",
+      "gap": "AC-01 now reads the outbound rules of every security group attached to a VPC runtime, code interpreter or browser and fails a group permitting 0.0.0.0/0 or ::/0 egress. A tool in PUBLIC network mode fails without a describe call, because the service grants it open internet egress by configuration; SANDBOX passes at Medium, because the sandbox reaches no network the workload can name. A group the describe did not return and a denied ec2:DescribeSecurityGroups are both reported N/A on their own line, so an unread group is never counted as closed",
       "extra_iam": [],
       "phase": 4,
       "source": "controls/ai-specific/agentcore-runtime.yaml"
@@ -1470,14 +1476,18 @@
       "question": "Are resource limits (time, memory, cost) enforced per agent session to prevent a single runaway task from consuming disproportionate resources?",
       "assert": "Per-session resource limit configuration",
       "workload_agnostic": false,
-      "verdict": "new",
+      "verdict": "covered",
       "disposition": null,
       "target_modules": [
         "agentcore_assessments"
       ],
-      "incumbents": [],
-      "incumbent_names": [],
-      "gap": "",
+      "incumbents": [
+        "AC-46"
+      ],
+      "incumbent_names": [
+        "AgentCore Runtime Session Limits"
+      ],
+      "gap": "AC-46 fails a runtime that configures neither idleRuntimeSessionTimeout nor maxLifetime, or that sets either at the service ceiling of 1209600 seconds, which is the setting that lets one runaway session hold its resources for 14 days. AgentCore exposes no per-session memory or cost limit to read, so the time bound is the only limit the API can answer for, and every verdict says which values it found so the workload owner can judge whether the bound suits the task",
       "extra_iam": [],
       "phase": 4,
       "source": "controls/ai-specific/agentcore-runtime.yaml"

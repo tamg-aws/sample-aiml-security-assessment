@@ -199,6 +199,29 @@ AGENTCORE_EVALUATORS_REFERENCE_URL = (
 IAM_PASS_ROLE_REFERENCE_URL = (
     "https://docs.aws.amazon.com/IAM/latest/UserGuide/id_roles_use_passrole.html"
 )
+AGENTCORE_VPC_SECURITY_GROUP_REFERENCE_URL = (
+    "https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/agentcore-vpc.html"
+)
+AGENTCORE_CODE_INTERPRETER_NETWORK_REFERENCE_URL = (
+    "https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/"
+    "code-interpreter-create.html"
+)
+AGENTCORE_TOOL_EXECUTION_ROLE_REFERENCE_URL = (
+    "https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/"
+    "code-interpreter-s3-integration.html"
+)
+AGENTCORE_RUNTIME_LIFECYCLE_REFERENCE_URL = (
+    "https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/"
+    "runtime-lifecycle-settings.html"
+)
+AGENTCORE_VPC_INTERFACE_ENDPOINT_REFERENCE_URL = (
+    "https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/"
+    "vpc-interface-endpoints.html"
+)
+AGENTCORE_ALLOWED_WORKLOAD_REFERENCE_URL = (
+    "https://docs.aws.amazon.com/bedrock-agentcore-control/latest/APIReference/"
+    "API_AllowedWorkloadConfiguration.html"
+)
 
 
 def _assessment_error_label(error: Exception) -> str:
@@ -389,6 +412,9 @@ REGIONAL_AGENTCORE_CHECK_IDS = (
     "AC-42",
     "AC-43",
     "AC-44",
+    "AC-45",
+    "AC-46",
+    "AC-47",
 )
 
 AGENTCORE_RUNTIME_CHECK_IDS = (
@@ -427,6 +453,9 @@ AGENTCORE_RUNTIME_CHECK_IDS = (
     "AC-42",
     "AC-43",
     "AC-44",
+    "AC-45",
+    "AC-46",
+    "AC-47",
 )
 
 NATIVE_AGENTIC_AGENTCORE_CHECK_NAMES = {
@@ -1157,7 +1186,347 @@ def write_to_s3(
         raise
 
 
-def check_agentcore_vpc_configuration() -> List[Dict[str, Any]]:
+# Network modes a built-in tool can run in. VPC places the tool's network
+# interfaces in customer subnets, where security groups decide what it reaches.
+# SANDBOX is the service-managed environment the devguide describes as "limited
+# external network access" and carries no customer security group. PUBLIC
+# "allows access to public internet resources", which is the absence of an
+# egress filter expressed as a network mode instead of a rule.
+AGENTCORE_SANDBOX_NETWORK_MODE = "SANDBOX"
+AGENTCORE_PUBLIC_NETWORK_MODE = "PUBLIC"
+AGENTCORE_EGRESS_FINDING_NAME = "AgentCore Egress Filtering"
+
+
+def _agentcore_tool_details(
+    browser_inventory: Dict[str, Any] = None,
+) -> Tuple[List[Tuple[str, Dict[str, Any]]], List[Tuple[str, Exception, str]]]:
+    """Return each custom built-in tool's detail, labelled for reports.
+
+    Code execution and browsing are the two places where model-chosen input
+    becomes a network request or a call with the tool's own credentials, and the
+    devguide lists Code Interpreter and Browser Tool as separate primitives with
+    their own network mode and execution role, so both are enumerated here
+    instead of being inferred from the runtime that calls them. SYSTEM tools are
+    left out: their configuration is AWS's, not the customer's.
+
+    A per-tool read error is returned rather than raised so one unreadable tool
+    does not hide the rest. Each error carries the IAM action that would answer
+    it, because the list call and the get call are granted separately.
+    """
+    details: List[Tuple[str, Dict[str, Any]]] = []
+    errors: List[Tuple[str, Exception, str]] = []
+
+    try:
+        interpreters = _agentcore_list_all(
+            "list_code_interpreters", ["codeInterpreterSummaries"], type="CUSTOM"
+        )
+    except Exception as error:
+        interpreters = []
+        logger.warning(f"Could not list custom Code Interpreters: {error}")
+        errors.append(
+            (
+                "The list of custom Code Interpreters",
+                error,
+                "bedrock-agentcore:ListCodeInterpreters",
+            )
+        )
+
+    for summary in interpreters:
+        interpreter_id = summary.get("codeInterpreterId")
+        name = summary.get("name") or interpreter_id or "unknown"
+        label = f"Code Interpreter '{name}' ({interpreter_id or 'unknown'})"
+        try:
+            details.append(
+                (
+                    label,
+                    _unwrap_agentcore_detail(
+                        agentcore_client.get_code_interpreter(
+                            codeInterpreterId=interpreter_id
+                        ),
+                        "codeInterpreter",
+                    ),
+                )
+            )
+        except Exception as error:
+            logger.warning(f"Could not read Code Interpreter {interpreter_id}: {error}")
+            errors.append((label, error, "bedrock-agentcore:GetCodeInterpreter"))
+
+    inventory = browser_inventory or get_custom_browser_inventory()
+    if inventory.get("list_error") is not None:
+        errors.append(
+            (
+                "The list of custom browsers",
+                inventory["list_error"],
+                "bedrock-agentcore:ListBrowsers",
+            )
+        )
+    for item in inventory.get("items") or []:
+        summary = item["summary"]
+        browser_id = summary.get("browserId") or "unknown"
+        details.append(
+            (
+                f"Browser '{summary.get('name') or browser_id}' ({browser_id})",
+                item["detail"],
+            )
+        )
+    for item in inventory.get("errors") or []:
+        summary = item["summary"]
+        browser_id = summary.get("browserId") or "unknown"
+        errors.append(
+            (
+                f"Browser '{summary.get('name') or browser_id}' ({browser_id})",
+                item["error"],
+                "bedrock-agentcore:GetBrowser",
+            )
+        )
+
+    return details, errors
+
+
+def _agentcore_tool_read_findings(
+    check_id: str,
+    finding_name: str,
+    errors: List[Tuple[str, Exception, str]],
+    reference: str,
+) -> List[Dict[str, Any]]:
+    """Report each built-in tool that could not be read."""
+    return [
+        create_finding(
+            check_id=check_id,
+            finding_name=finding_name,
+            finding_details=(
+                f"{label} could not be read: {_assessment_error_label(error)}."
+            ),
+            resolution=f"Grant {action} and retry.",
+            reference=reference,
+            severity=SeverityEnum.INFORMATIONAL,
+            status=StatusEnum.NA,
+        )
+        for label, error, action in errors
+    ]
+
+
+def _agentcore_egress_findings(
+    runtime_targets: List[Tuple[str, str, List[str]]],
+    browser_inventory: Dict[str, Any] = None,
+) -> List[Dict[str, Any]]:
+    """AC-01 egress leg: judge what each agent resource may reach outbound.
+
+    VPC placement decides where a network interface sits; the security groups on
+    that interface decide what the workload behind it can reach. The devguide
+    names the outbound rules as the control ("Security groups attached to the
+    ENIs control which resources your runtime and tools can communicate with")
+    and states that inbound rules are not required because the runtime only
+    initiates outbound connections, so this leg reads outbound rules.
+
+    Which destinations a workload needs is the workload's decision, so the
+    assertion is the workload-independent one: the outbound rules do not name
+    every address on the internet.
+    """
+    details, errors = _agentcore_tool_details(browser_inventory)
+    findings = _agentcore_tool_read_findings(
+        "AC-01",
+        AGENTCORE_EGRESS_FINDING_NAME,
+        errors,
+        AGENTCORE_VPC_SECURITY_GROUP_REFERENCE_URL,
+    )
+    tool_targets = [
+        (
+            label,
+            str((detail.get("networkConfiguration") or {}).get("networkMode") or ""),
+            ((detail.get("networkConfiguration") or {}).get("vpcConfig") or {}).get(
+                "securityGroups"
+            )
+            or [],
+        )
+        for label, detail in details
+    ]
+    targets = [*runtime_targets, *tool_targets]
+    if not targets:
+        return findings
+
+    group_ids = sorted(
+        {
+            str(group_id)
+            for _, _, security_groups in targets
+            for group_id in security_groups
+            if group_id
+        }
+    )
+    security_groups: Dict[str, Dict[str, Any]] = {}
+    describe_error = None
+    if group_ids:
+        try:
+            for security_group in _paginate_aws_list(
+                ec2_client,
+                "describe_security_groups",
+                "SecurityGroups",
+                token_request_key="NextToken",
+                token_response_key="NextToken",
+                GroupIds=group_ids,
+            ):
+                security_groups[security_group.get("GroupId")] = security_group
+        except Exception as error:
+            logger.warning(f"Could not describe AgentCore security groups: {error}")
+            describe_error = error
+
+    for label, network_mode, target_groups in targets:
+        if network_mode == AGENTCORE_SANDBOX_NETWORK_MODE:
+            findings.append(
+                create_finding(
+                    check_id="AC-01",
+                    finding_name=AGENTCORE_EGRESS_FINDING_NAME,
+                    finding_details=(
+                        f"{label} runs in SANDBOX network mode, which the devguide "
+                        "describes as limited external network access and which "
+                        "attaches no customer security group."
+                    ),
+                    resolution=(
+                        "No action required. A workload that has to allow or deny "
+                        "named destinations needs VPC mode, where security group "
+                        "outbound rules express the destination list."
+                    ),
+                    reference=AGENTCORE_CODE_INTERPRETER_NETWORK_REFERENCE_URL,
+                    severity=SeverityEnum.MEDIUM,
+                    status=StatusEnum.PASSED,
+                )
+            )
+            continue
+
+        if network_mode == AGENTCORE_PUBLIC_NETWORK_MODE:
+            findings.append(
+                create_finding(
+                    check_id="AC-01",
+                    finding_name="AgentCore Egress Unrestricted",
+                    finding_details=(
+                        f"{label} runs in PUBLIC network mode, which allows access "
+                        "to public internet resources and attaches no security "
+                        "group, so nothing limits the destinations it reaches."
+                    ),
+                    resolution=(
+                        "Move the resource to VPC network mode and attach security "
+                        "groups whose outbound rules name only the destinations "
+                        "this workload needs."
+                    ),
+                    reference=AGENTCORE_VPC_SECURITY_GROUP_REFERENCE_URL,
+                    severity=SeverityEnum.HIGH,
+                    status=StatusEnum.FAILED,
+                )
+            )
+            continue
+
+        if not target_groups:
+            findings.append(
+                create_finding(
+                    check_id="AC-01",
+                    finding_name=AGENTCORE_EGRESS_FINDING_NAME,
+                    finding_details=(
+                        f"{label} reported network mode "
+                        f"'{network_mode or 'unknown'}' with no security group, so "
+                        "what it reaches outbound could not be judged."
+                    ),
+                    resolution=(
+                        "Grant bedrock-agentcore:GetAgentRuntime, "
+                        "bedrock-agentcore:GetCodeInterpreter and "
+                        "bedrock-agentcore:GetBrowser and retry."
+                    ),
+                    reference=AGENTCORE_VPC_SECURITY_GROUP_REFERENCE_URL,
+                    severity=SeverityEnum.INFORMATIONAL,
+                    status=StatusEnum.NA,
+                )
+            )
+            continue
+
+        if describe_error is not None:
+            findings.append(
+                create_finding(
+                    check_id="AC-01",
+                    finding_name=AGENTCORE_EGRESS_FINDING_NAME,
+                    finding_details=(
+                        f"{label} has {len(target_groups)} security group(s) whose "
+                        "outbound rules could not be read: "
+                        f"{_assessment_error_label(describe_error)}."
+                    ),
+                    resolution="Grant ec2:DescribeSecurityGroups and retry.",
+                    reference=AGENTCORE_VPC_SECURITY_GROUP_REFERENCE_URL,
+                    severity=SeverityEnum.INFORMATIONAL,
+                    status=StatusEnum.NA,
+                )
+            )
+            continue
+
+        open_ranges: List[str] = []
+        unreadable: List[str] = []
+        for group_id in target_groups:
+            security_group = security_groups.get(str(group_id))
+            if security_group is None:
+                unreadable.append(str(group_id))
+                continue
+            open_ranges.extend(_security_group_open_egress(security_group))
+
+        if open_ranges:
+            findings.append(
+                create_finding(
+                    check_id="AC-01",
+                    finding_name="AgentCore Egress Unrestricted",
+                    finding_details=(
+                        f"{label} permits outbound traffic to "
+                        f"{', '.join(sorted(set(open_ranges)))} on its "
+                        f"{len(target_groups)} security group(s), so code running "
+                        "there reaches any address on the internet the subnet can "
+                        "route to."
+                    ),
+                    resolution=(
+                        "Replace the open outbound rule with rules that name the "
+                        "prefix lists, security groups or CIDR ranges this workload "
+                        "has to reach."
+                    ),
+                    reference=AGENTCORE_VPC_SECURITY_GROUP_REFERENCE_URL,
+                    severity=SeverityEnum.HIGH,
+                    status=StatusEnum.FAILED,
+                )
+            )
+        elif unreadable:
+            findings.append(
+                create_finding(
+                    check_id="AC-01",
+                    finding_name=AGENTCORE_EGRESS_FINDING_NAME,
+                    finding_details=(
+                        f"{label} references security group(s) "
+                        f"{', '.join(unreadable)} that were not returned, so its "
+                        "outbound rules are unknown."
+                    ),
+                    resolution="Grant ec2:DescribeSecurityGroups and retry.",
+                    reference=AGENTCORE_VPC_SECURITY_GROUP_REFERENCE_URL,
+                    severity=SeverityEnum.INFORMATIONAL,
+                    status=StatusEnum.NA,
+                )
+            )
+        else:
+            findings.append(
+                create_finding(
+                    check_id="AC-01",
+                    finding_name=AGENTCORE_EGRESS_FINDING_NAME,
+                    finding_details=(
+                        f"{label} permits no outbound traffic to 0.0.0.0/0 or ::/0 "
+                        f"on any of its {len(target_groups)} security group(s)."
+                    ),
+                    resolution=(
+                        "No action required. Confirm the outbound rules name only "
+                        "the destinations this workload needs."
+                    ),
+                    reference=AGENTCORE_VPC_SECURITY_GROUP_REFERENCE_URL,
+                    severity=SeverityEnum.HIGH,
+                    status=StatusEnum.PASSED,
+                )
+            )
+
+    return findings
+
+
+def check_agentcore_vpc_configuration(
+    browser_inventory: Dict[str, Any] = None,
+) -> List[Dict[str, Any]]:
     """
     Check VPC configuration for AgentCore Runtimes, Code Interpreters, and Browser Tools.
 
@@ -1166,11 +1535,13 @@ def check_agentcore_vpc_configuration() -> List[Dict[str, Any]]:
     - Subnets are private (not public)
     - Required VPC endpoints exist
     - NAT gateway configuration
+    - What the security groups of each VPC-mode resource permit outbound
 
     Returns:
         List of findings
     """
     findings = []
+    egress_targets: List[Tuple[str, str, List[str]]] = []
 
     if agentcore_client is None:
         logger.error("AgentCore client not available")
@@ -1226,6 +1597,22 @@ def check_agentcore_vpc_configuration() -> List[Dict[str, Any]]:
                                 )
                             )
                         else:
+                            # A VPC-mode runtime reaches the network through the
+                            # security groups of networkModeConfig, so the egress
+                            # leg below judges what they permit outbound. PUBLIC
+                            # runtimes are already reported above and carry no
+                            # security group to read.
+                            egress_targets.append(
+                                (
+                                    f"Runtime '{runtime_name}' ({runtime_id})",
+                                    network_mode,
+                                    (network_config.get("networkModeConfig") or {}).get(
+                                        "securityGroups"
+                                    )
+                                    or [],
+                                )
+                            )
+
                             # Validate VPC configuration
                             subnet_ids = network_config.get("subnetIds", [])
 
@@ -1283,10 +1670,6 @@ def check_agentcore_vpc_configuration() -> List[Dict[str, Any]]:
                 logger.error(f"Error listing runtimes: {e}")
                 raise
 
-        # Note: Code Interpreters and Browser Tools are configured as part of Runtime
-        # They don't have separate list/describe APIs in bedrock-agentcore-control
-        # VPC configuration for these tools is inherited from the Runtime configuration
-
         # Return appropriate status based on whether resources were found
         if not findings:
             if resources_found:
@@ -1313,6 +1696,8 @@ def check_agentcore_vpc_configuration() -> List[Dict[str, Any]]:
                         status=StatusEnum.NA,
                     )
                 )
+
+        findings.extend(_agentcore_egress_findings(egress_targets, browser_inventory))
 
     except Exception as e:
         logger.error(f"Error in VPC configuration check: {e}")
@@ -3212,6 +3597,21 @@ def _security_group_open_ingress(security_group: Dict[str, Any]) -> List[str]:
     return sorted(set(open_ranges))
 
 
+def _security_group_open_egress(security_group: Dict[str, Any]) -> List[str]:
+    """Return the internet-open outbound CIDR ranges of one security group."""
+    open_ranges: List[str] = []
+    for permission in security_group.get("IpPermissionsEgress") or []:
+        if not isinstance(permission, dict):
+            continue
+        for ip_range in permission.get("IpRanges") or []:
+            if isinstance(ip_range, dict) and ip_range.get("CidrIp") == "0.0.0.0/0":
+                open_ranges.append("0.0.0.0/0")
+        for ip_range in permission.get("Ipv6Ranges") or []:
+            if isinstance(ip_range, dict) and ip_range.get("CidrIpv6") == "::/0":
+                open_ranges.append("::/0")
+    return sorted(set(open_ranges))
+
+
 def _agentcore_endpoint_scope_findings(
     endpoints: List[Dict[str, Any]],
 ) -> List[Dict[str, Any]]:
@@ -3320,6 +3720,76 @@ def _agentcore_endpoint_scope_findings(
                     status=StatusEnum.PASSED,
                 )
             )
+
+        if endpoint.get("VpcEndpointType") == "Interface":
+            # "If you enable private DNS for the interface endpoint, you can
+            # make API requests to AgentCore using its default Regional DNS
+            # name." Without it, the default name still resolves to the public
+            # endpoint, so an SDK caller that was not reconfigured with the
+            # endpoint-specific name leaves the VPC and the endpoint carries no
+            # traffic to govern. Gateway-type endpoints have no private DNS
+            # setting, so the leg is scoped to interface endpoints.
+            private_dns = endpoint.get("PrivateDnsEnabled")
+            if not isinstance(private_dns, bool):
+                findings.append(
+                    create_finding(
+                        check_id="AC-08",
+                        finding_name="AgentCore VPC Endpoint Private DNS",
+                        finding_details=(
+                            f"AgentCore VPC {label} reported no private DNS "
+                            "setting, so whether callers reach AgentCore through "
+                            "it by default could not be assessed."
+                        ),
+                        resolution=(
+                            "Grant ec2:DescribeVpcEndpoints on this endpoint and "
+                            "rerun the assessment."
+                        ),
+                        reference=AGENTCORE_VPC_INTERFACE_ENDPOINT_REFERENCE_URL,
+                        severity=SeverityEnum.INFORMATIONAL,
+                        status=StatusEnum.NA,
+                    )
+                )
+            elif private_dns:
+                findings.append(
+                    create_finding(
+                        check_id="AC-08",
+                        finding_name="AgentCore VPC Endpoint Private DNS",
+                        finding_details=(
+                            f"AgentCore VPC {label} has private DNS enabled, so "
+                            "callers using the default Regional DNS name reach "
+                            "AgentCore through this endpoint."
+                        ),
+                        resolution=(
+                            "No action required. Confirm the VPC also has DNS "
+                            "hostnames and DNS support enabled."
+                        ),
+                        reference=AGENTCORE_VPC_INTERFACE_ENDPOINT_REFERENCE_URL,
+                        severity=SeverityEnum.MEDIUM,
+                        status=StatusEnum.PASSED,
+                    )
+                )
+            else:
+                findings.append(
+                    create_finding(
+                        check_id="AC-08",
+                        finding_name="AgentCore VPC Endpoint Private DNS Disabled",
+                        finding_details=(
+                            f"AgentCore VPC {label} has private DNS disabled, so "
+                            "the default Regional DNS name still resolves to the "
+                            "public endpoint and any caller that was not given "
+                            "the endpoint-specific DNS name reaches AgentCore "
+                            "over the internet instead."
+                        ),
+                        resolution=(
+                            "Enable private DNS on the interface endpoint, or "
+                            "confirm every caller is configured with the "
+                            "endpoint-specific DNS name."
+                        ),
+                        reference=AGENTCORE_VPC_INTERFACE_ENDPOINT_REFERENCE_URL,
+                        severity=SeverityEnum.MEDIUM,
+                        status=StatusEnum.FAILED,
+                    )
+                )
 
         groups = [
             group
@@ -10873,6 +11343,655 @@ def check_agentcore_evaluation_judge_model_scope(
     return findings
 
 
+# The three ways a tool execution role stops being resource-scoped. Each is a
+# grant whose breadth does not depend on which workload holds the role, so each
+# is reportable without knowing what the tool is for.
+TOOL_ROLE_EVERY_RESOURCE_LEG = "grants an action on every resource"
+TOOL_ROLE_ALLOW_EXCEPT_LEG = "grants every resource except the ones it names"
+TOOL_ROLE_EVERY_ACTION_LEG = "grants every action of a service"
+
+
+def _tool_execution_role_problems(
+    permissions: Dict[str, Any],
+) -> Tuple[List[str], int]:
+    """Return one tool execution role's unscoped grants and unreadable count.
+
+    Which resources a tool needs is the workload's decision, so the three
+    problems reported here are the ones that hold whatever the workload is: a
+    Resource of "*", an Allow written as NotResource, and a service-wide action
+    wildcard. AC-02 reads the same documents for the AgentCore namespace only, so
+    a tool role granting s3:* on every bucket passes it.
+    """
+    problems: List[str] = []
+    unreadable = 0
+
+    for policy in [
+        *(permissions.get("attached_policies") or []),
+        *(permissions.get("inline_policies") or []),
+    ]:
+        try:
+            statements = list(_allow_statements(policy))
+        except Exception as error:
+            unreadable += 1
+            logger.warning(f"Error parsing tool execution role policy: {error}")
+            continue
+
+        for statement in statements:
+            resources = _statement_resources(statement)
+            if any(resource == "*" for resource in resources):
+                problems.append(TOOL_ROLE_EVERY_RESOURCE_LEG)
+            if not resources and statement.get("NotResource"):
+                problems.append(TOOL_ROLE_ALLOW_EXCEPT_LEG)
+            for action in _statement_actions(statement):
+                if action == "*" or action.endswith(":*"):
+                    problems.append(TOOL_ROLE_EVERY_ACTION_LEG)
+
+    return sorted(set(problems)), unreadable
+
+
+def check_agentcore_tool_execution_role_scope(
+    permission_cache: Dict[str, Any],
+    browser_inventory: Dict[str, Any] = None,
+) -> List[Dict[str, Any]]:
+    """AC-45: Judge the execution role a code interpreter or browser can use.
+
+    Code the model writes runs in the sandbox with the tool's execution role, and
+    a browser session follows the pages it is pointed at with the same role, so
+    the role has to be read as available to whatever the sandbox ends up running.
+    A grant of every resource there is a grant to anything the agent can be
+    talked into doing.
+
+    executionRoleArn is optional on CreateCodeInterpreter and CreateBrowser, so a
+    tool that names no role holds no credentials to misuse and passes.
+    """
+    if agentcore_client is None:
+        return [
+            create_finding(
+                check_id="AC-45",
+                finding_name="AgentCore Tool Execution Role Scope",
+                finding_details="AgentCore client not available in this region.",
+                resolution="No action required unless AgentCore runs in this region.",
+                reference=AGENTCORE_TOOL_EXECUTION_ROLE_REFERENCE_URL,
+                severity=SeverityEnum.INFORMATIONAL,
+                status=StatusEnum.NA,
+            )
+        ]
+
+    # _agentcore_tool_details catches its own list and get failures and returns
+    # them per tool, because a browser has to be read even when the code
+    # interpreter list is denied. So there is no whole-check failure to catch
+    # here, and each unreadable tool is reported on its own line below.
+    details, errors = _agentcore_tool_details(browser_inventory)
+    findings = _agentcore_tool_read_findings(
+        "AC-45",
+        "AgentCore Tool Execution Role Scope",
+        errors,
+        AGENTCORE_TOOL_EXECUTION_ROLE_REFERENCE_URL,
+    )
+
+    if not details:
+        findings.append(
+            create_finding(
+                check_id="AC-45",
+                finding_name="AgentCore Tool Execution Role Scope",
+                finding_details=(
+                    "No custom Code Interpreter or Browser Tool in this region, so "
+                    "no tool execution role was assessed."
+                ),
+                resolution="No action required for this check.",
+                reference=AGENTCORE_TOOL_EXECUTION_ROLE_REFERENCE_URL,
+                severity=SeverityEnum.INFORMATIONAL,
+                status=StatusEnum.NA,
+            )
+        )
+        return findings
+
+    role_permissions = (permission_cache or {}).get("role_permissions") or {}
+
+    for label, detail in details:
+        role_arn = detail.get("executionRoleArn")
+        if not role_arn:
+            findings.append(
+                create_finding(
+                    check_id="AC-45",
+                    finding_name="AgentCore Tool Execution Role Scope",
+                    finding_details=(
+                        f"{label} names no execution role, so code running in it "
+                        "holds no AWS credentials of its own."
+                    ),
+                    resolution=(
+                        "No action required. A tool that has to read or write AWS "
+                        "resources needs an execution role scoped to those "
+                        "resources."
+                    ),
+                    reference=AGENTCORE_TOOL_EXECUTION_ROLE_REFERENCE_URL,
+                    severity=SeverityEnum.HIGH,
+                    status=StatusEnum.PASSED,
+                )
+            )
+            continue
+
+        role_name = str(role_arn).rsplit("/", 1)[-1]
+        permissions = role_permissions.get(role_name)
+        if not isinstance(permissions, dict):
+            findings.append(
+                create_finding(
+                    check_id="AC-45",
+                    finding_name="AgentCore Tool Execution Role Scope",
+                    finding_details=(
+                        f"{label} uses execution role {role_name}, which is not in "
+                        "the IAM permissions cache, so what code in the sandbox "
+                        "could reach was not judged."
+                    ),
+                    resolution=(
+                        "No action is required on the assessed workload based on "
+                        "this result. Confirm the role exists in this account and "
+                        "rerun the assessment."
+                    ),
+                    reference=AGENTCORE_TOOL_EXECUTION_ROLE_REFERENCE_URL,
+                    severity=SeverityEnum.INFORMATIONAL,
+                    status=StatusEnum.NA,
+                )
+            )
+            continue
+
+        problems, unreadable = _tool_execution_role_problems(permissions)
+
+        if unreadable:
+            findings.append(
+                create_finding(
+                    check_id="AC-45",
+                    finding_name="AgentCore Tool Execution Role Scope Incomplete",
+                    finding_details=(
+                        f"{unreadable} cached policy document(s) on execution role "
+                        f"{role_name} could not be parsed, so a grant inside one of "
+                        "them was not judged."
+                    ),
+                    resolution=(
+                        "No action is required on the assessed workload based on "
+                        "this result. Repair the unreadable policy documents in the "
+                        "IAM permission cache and rerun the assessment."
+                    ),
+                    reference=AGENTCORE_TOOL_EXECUTION_ROLE_REFERENCE_URL,
+                    severity=SeverityEnum.INFORMATIONAL,
+                    status=StatusEnum.NA,
+                )
+            )
+
+        if problems:
+            findings.append(
+                create_finding(
+                    check_id="AC-45",
+                    finding_name="AgentCore Tool Execution Role Unscoped",
+                    finding_details=(
+                        f"{label} uses execution role {role_name}, which "
+                        f"{'; '.join(problems)}. Code the model writes runs with "
+                        "this role, so the sandbox reaches everything the role "
+                        "reaches."
+                    ),
+                    resolution=(
+                        "Rewrite the role's policies to name the ARNs this tool "
+                        "reads and writes, and the actions it performs on each."
+                    ),
+                    reference=AGENTCORE_TOOL_EXECUTION_ROLE_REFERENCE_URL,
+                    severity=SeverityEnum.HIGH,
+                    status=StatusEnum.FAILED,
+                )
+            )
+        else:
+            findings.append(
+                create_finding(
+                    check_id="AC-45",
+                    finding_name="AgentCore Tool Execution Role Scope",
+                    finding_details=(
+                        f"{label} uses execution role {role_name}, whose Allow "
+                        "statements name their resources and actions instead of "
+                        "granting every resource or every action of a service."
+                    ),
+                    resolution=(
+                        "No action required for this check. Confirm the named "
+                        "resources are the ones this tool needs, which is a "
+                        "decision this check does not make."
+                    ),
+                    reference=AGENTCORE_TOOL_EXECUTION_ROLE_REFERENCE_URL,
+                    severity=SeverityEnum.HIGH,
+                    status=StatusEnum.PASSED,
+                )
+            )
+
+    return findings
+
+
+# Both lifecycle fields accept 60 to 1209600 seconds. A value at the ceiling is
+# 14 days, which for a per-session microVM is the same as no limit, and it is the
+# one value that is over-broad whatever the workload does: the defaults, 900 for
+# the idle timeout and 28800 for the maximum lifetime, are AWS's own
+# recommendation and a shorter setting is the workload's business.
+AGENTCORE_LIFECYCLE_CEILING_SECONDS = 1209600
+AGENTCORE_LIFECYCLE_FIELDS = (
+    ("idleRuntimeSessionTimeout", "idle session timeout"),
+    ("maxLifetime", "maximum session lifetime"),
+)
+
+
+def check_agentcore_runtime_session_limits() -> List[Dict[str, Any]]:
+    """AC-46: Judge the per-session lifetime limits of each agent runtime.
+
+    Each runtimeSessionId gets its own microVM with independent lifecycle timers,
+    so lifecycleConfiguration is the per-session bound: the idle timeout ends a
+    session that stopped being used and the maximum lifetime ends one that never
+    stops. A runaway task holds its session, its filesystem and its accumulated
+    context until one of the two fires.
+
+    How long this workload's sessions should live is the workload owner's
+    decision, so the assertion is the one that holds regardless: a limit set to
+    the service ceiling of 14 days bounds nothing a session could do. The control
+    plane carries no per-session memory or cost limit, so those two halves of the
+    control are named in the finding for the owner to confirm elsewhere.
+    """
+    if agentcore_client is None:
+        return [
+            create_finding(
+                check_id="AC-46",
+                finding_name="AgentCore Runtime Session Limits",
+                finding_details="AgentCore client not available in this region.",
+                resolution="No action required unless AgentCore runs in this region.",
+                reference=AGENTCORE_RUNTIME_LIFECYCLE_REFERENCE_URL,
+                severity=SeverityEnum.INFORMATIONAL,
+                status=StatusEnum.NA,
+            )
+        ]
+
+    try:
+        runtimes = _agentcore_list_all("list_agent_runtimes", ["agentRuntimes"])
+    except Exception as error:
+        return [
+            _incomplete_check_finding(
+                check_id="AC-46",
+                finding_name="AgentCore Runtime Session Limits",
+                error=error,
+                reference=AGENTCORE_RUNTIME_LIFECYCLE_REFERENCE_URL,
+            )
+        ]
+
+    if not runtimes:
+        return [
+            create_finding(
+                check_id="AC-46",
+                finding_name="AgentCore Runtime Session Limits",
+                finding_details="No AgentCore runtimes found in this region.",
+                resolution="No action required.",
+                reference=AGENTCORE_RUNTIME_LIFECYCLE_REFERENCE_URL,
+                severity=SeverityEnum.INFORMATIONAL,
+                status=StatusEnum.NA,
+            )
+        ]
+
+    findings = []
+    for runtime in runtimes:
+        runtime_id = runtime.get("agentRuntimeId", "unknown")
+        runtime_name = runtime.get("agentRuntimeName", runtime_id)
+        label = f"Runtime '{runtime_name}' ({runtime_id})"
+
+        try:
+            detail = agentcore_client.get_agent_runtime(agentRuntimeId=runtime_id)
+        except Exception as error:
+            findings.append(
+                create_finding(
+                    check_id="AC-46",
+                    finding_name="AgentCore Runtime Session Limits",
+                    finding_details=(
+                        f"{label} session limits could not be read: "
+                        f"{_assessment_error_label(error)}."
+                    ),
+                    resolution=(
+                        "Grant bedrock-agentcore:GetAgentRuntime on this runtime "
+                        "and retry."
+                    ),
+                    reference=AGENTCORE_RUNTIME_LIFECYCLE_REFERENCE_URL,
+                    severity=SeverityEnum.INFORMATIONAL,
+                    status=StatusEnum.NA,
+                )
+            )
+            continue
+
+        lifecycle = detail.get("lifecycleConfiguration") or {}
+        values = {
+            field: lifecycle.get(field)
+            for field, _ in AGENTCORE_LIFECYCLE_FIELDS
+            if isinstance(lifecycle.get(field), int)
+        }
+        if not values:
+            findings.append(
+                create_finding(
+                    check_id="AC-46",
+                    finding_name="AgentCore Runtime Session Limits",
+                    finding_details=(
+                        f"{label} reported no idleRuntimeSessionTimeout and no "
+                        "maxLifetime, so how long one session can hold its microVM "
+                        "could not be judged."
+                    ),
+                    resolution=(
+                        "Grant bedrock-agentcore:GetAgentRuntime on this runtime "
+                        "and retry."
+                    ),
+                    reference=AGENTCORE_RUNTIME_LIFECYCLE_REFERENCE_URL,
+                    severity=SeverityEnum.INFORMATIONAL,
+                    status=StatusEnum.NA,
+                )
+            )
+            continue
+
+        at_ceiling = [
+            name
+            for field, name in AGENTCORE_LIFECYCLE_FIELDS
+            if values.get(field) is not None
+            and values[field] >= AGENTCORE_LIFECYCLE_CEILING_SECONDS
+        ]
+        reported = ", ".join(
+            f"{name} {values[field]}s"
+            for field, name in AGENTCORE_LIFECYCLE_FIELDS
+            if field in values
+        )
+
+        if at_ceiling:
+            findings.append(
+                create_finding(
+                    check_id="AC-46",
+                    finding_name="AgentCore Runtime Session Limit Unbounded",
+                    finding_details=(
+                        f"{label} sets its {' and '.join(at_ceiling)} to the "
+                        f"service ceiling of "
+                        f"{AGENTCORE_LIFECYCLE_CEILING_SECONDS} seconds (14 days), "
+                        f"so one session holds its microVM, its filesystem and its "
+                        f"accumulated context for two weeks: {reported}."
+                    ),
+                    resolution=(
+                        "Set idleRuntimeSessionTimeout and maxLifetime to the "
+                        "longest a single task in this workload legitimately runs."
+                    ),
+                    reference=AGENTCORE_RUNTIME_LIFECYCLE_REFERENCE_URL,
+                    severity=SeverityEnum.MEDIUM,
+                    status=StatusEnum.FAILED,
+                )
+            )
+        else:
+            findings.append(
+                create_finding(
+                    check_id="AC-46",
+                    finding_name="AgentCore Runtime Session Limits",
+                    finding_details=(
+                        f"{label} bounds each session below the service ceiling of "
+                        f"{AGENTCORE_LIFECYCLE_CEILING_SECONDS} seconds: "
+                        f"{reported}."
+                    ),
+                    resolution=(
+                        "No action required for this check. Confirm these values "
+                        "are the longest a single task should run, and that memory "
+                        "and spend are bounded outside AgentCore: the control plane "
+                        "carries no per-session limit for either."
+                    ),
+                    reference=AGENTCORE_RUNTIME_LIFECYCLE_REFERENCE_URL,
+                    severity=SeverityEnum.MEDIUM,
+                    status=StatusEnum.PASSED,
+                )
+            )
+
+    return findings
+
+
+def check_agentcore_runtime_invocation_path() -> List[Dict[str, Any]]:
+    """AC-47: Judge the network path and the caller allowed to invoke a runtime.
+
+    A gateway in front of an agent enforces the tool policy, the rate limits and
+    the audit trail, and none of that binds if the runtime also answers a direct
+    call. Two settings decide whether it does: the resource policy's network
+    conditions, which say where a call may come from, and the caller
+    restriction, which says who may make it. AC-10 reports that a resource policy
+    exists; the conditions inside it are what restrict anything.
+
+    allowedWorkloadConfiguration is the service's own answer for the caller leg.
+    The API documents it as restricting "which workloads in the request's
+    identity chain are allowed to invoke the target", supported for AgentCore
+    Runtime targets, where "the allowed workloads are AgentCore Gateways".
+    """
+    if agentcore_client is None:
+        return [
+            create_finding(
+                check_id="AC-47",
+                finding_name="AgentCore Runtime Invocation Path",
+                finding_details="AgentCore client not available in this region.",
+                resolution="No action required unless AgentCore runs in this region.",
+                reference=AGENTCORE_ALLOWED_WORKLOAD_REFERENCE_URL,
+                severity=SeverityEnum.INFORMATIONAL,
+                status=StatusEnum.NA,
+            )
+        ]
+
+    try:
+        runtimes = _agentcore_list_all("list_agent_runtimes", ["agentRuntimes"])
+    except Exception as error:
+        return [
+            _incomplete_check_finding(
+                check_id="AC-47",
+                finding_name="AgentCore Runtime Invocation Path",
+                error=error,
+                reference=AGENTCORE_ALLOWED_WORKLOAD_REFERENCE_URL,
+            )
+        ]
+
+    if not runtimes:
+        return [
+            create_finding(
+                check_id="AC-47",
+                finding_name="AgentCore Runtime Invocation Path",
+                finding_details="No AgentCore runtimes found in this region.",
+                resolution="No action required.",
+                reference=AGENTCORE_ALLOWED_WORKLOAD_REFERENCE_URL,
+                severity=SeverityEnum.INFORMATIONAL,
+                status=StatusEnum.NA,
+            )
+        ]
+
+    findings = []
+    for runtime in runtimes:
+        runtime_id = runtime.get("agentRuntimeId", "unknown")
+        runtime_name = runtime.get("agentRuntimeName", runtime_id)
+        label = f"Runtime '{runtime_name}' ({runtime_id})"
+
+        try:
+            detail = agentcore_client.get_agent_runtime(agentRuntimeId=runtime_id)
+        except Exception as error:
+            findings.append(
+                create_finding(
+                    check_id="AC-47",
+                    finding_name="AgentCore Runtime Invocation Path",
+                    finding_details=(
+                        f"{label} could not be read, so the callers and network "
+                        "paths that reach it were not judged: "
+                        f"{_assessment_error_label(error)}."
+                    ),
+                    resolution=(
+                        "Grant bedrock-agentcore:GetAgentRuntime on this runtime "
+                        "and retry."
+                    ),
+                    reference=AGENTCORE_ALLOWED_WORKLOAD_REFERENCE_URL,
+                    severity=SeverityEnum.INFORMATIONAL,
+                    status=StatusEnum.NA,
+                )
+            )
+            continue
+
+        runtime_arn = detail.get("agentRuntimeArn")
+        try:
+            policy = _get_agentcore_resource_policy(runtime_arn) if runtime_arn else ""
+        except ClientError as error:
+            if (
+                error.response.get("Error", {}).get("Code")
+                == "ResourceNotFoundException"
+            ):
+                policy = ""
+            else:
+                findings.append(
+                    create_finding(
+                        check_id="AC-47",
+                        finding_name="AgentCore Runtime Invocation Path",
+                        finding_details=(
+                            f"{label} resource policy could not be read: "
+                            f"{_assessment_error_label(error)}."
+                        ),
+                        resolution=(
+                            "Grant bedrock-agentcore:GetResourcePolicy and retry."
+                        ),
+                        reference=AGENTCORE_ALLOWED_WORKLOAD_REFERENCE_URL,
+                        severity=SeverityEnum.INFORMATIONAL,
+                        status=StatusEnum.NA,
+                    )
+                )
+                continue
+        except Exception as error:
+            findings.append(
+                create_finding(
+                    check_id="AC-47",
+                    finding_name="AgentCore Runtime Invocation Path",
+                    finding_details=(
+                        f"{label} resource policy could not be read: "
+                        f"{_assessment_error_label(error)}."
+                    ),
+                    resolution="Grant bedrock-agentcore:GetResourcePolicy and retry.",
+                    reference=AGENTCORE_ALLOWED_WORKLOAD_REFERENCE_URL,
+                    severity=SeverityEnum.INFORMATIONAL,
+                    status=StatusEnum.NA,
+                )
+            )
+            continue
+
+        # Allow and Deny both restrict a network path: "Deny unless
+        # aws:SourceVpce is the approved endpoint" is the form AWS documents for
+        # this, and reading Allow alone would report it as no restriction at all.
+        statements = list(_document_statements(policy))
+        network_keys = sorted(
+            {
+                key
+                for statement in statements
+                for key in _statement_condition_keys(statement)
+                if key in NETWORK_PATH_CONDITION_KEYS
+            }
+        )
+        if network_keys:
+            findings.append(
+                create_finding(
+                    check_id="AC-47",
+                    finding_name="AgentCore Runtime Network Path Scope",
+                    finding_details=(
+                        f"{label} binds invocation to a network path with "
+                        f"{', '.join(network_keys)} in its resource policy."
+                    ),
+                    resolution=(
+                        "No action required. Confirm the VPC, VPC endpoint or "
+                        "address range named in the condition is the approved "
+                        "private path for this workload."
+                    ),
+                    reference=AGENTCORE_VPC_INTERFACE_ENDPOINT_REFERENCE_URL,
+                    severity=SeverityEnum.MEDIUM,
+                    status=StatusEnum.PASSED,
+                )
+            )
+        else:
+            findings.append(
+                create_finding(
+                    check_id="AC-47",
+                    finding_name="AgentCore Runtime Network Path Unrestricted",
+                    finding_details=(
+                        f"{label} carries no aws:SourceVpc, aws:SourceVpce, "
+                        "aws:VpcSourceIp or aws:SourceIp condition in its resource "
+                        "policy, so a caller that satisfies its inbound "
+                        "authentication reaches it over any network path, "
+                        "including the public internet."
+                    ),
+                    resolution=(
+                        "Attach a runtime resource policy that denies invocation "
+                        "whose aws:SourceVpce is not the approved interface "
+                        "endpoint, or express the same restriction in a service "
+                        "control policy."
+                    ),
+                    reference=AGENTCORE_VPC_INTERFACE_ENDPOINT_REFERENCE_URL,
+                    severity=SeverityEnum.MEDIUM,
+                    status=StatusEnum.FAILED,
+                )
+            )
+
+        jwt_authorizer = (detail.get("authorizerConfiguration") or {}).get(
+            "customJWTAuthorizer"
+        ) or {}
+        allowed_workload = jwt_authorizer.get("allowedWorkloadConfiguration") or {}
+        restrictions = []
+        hosting_environments = allowed_workload.get("hostingEnvironments") or []
+        workload_identities = allowed_workload.get("workloadIdentities") or []
+        if hosting_environments or workload_identities:
+            restrictions.append(
+                "an allowedWorkloadConfiguration naming "
+                f"{len(hosting_environments)} hosting environment(s) and "
+                f"{len(workload_identities)} workload identity(ies)"
+            )
+
+        allow_principals = [
+            principal
+            for statement in _document_statements(policy, effect="Allow")
+            for principal in _statement_principals(statement)
+        ]
+        if allow_principals and "*" not in allow_principals:
+            restrictions.append(
+                f"a resource policy naming {len(set(allow_principals))} principal(s)"
+            )
+
+        if restrictions:
+            findings.append(
+                create_finding(
+                    check_id="AC-47",
+                    finding_name="AgentCore Runtime Caller Scope",
+                    finding_details=(
+                        f"{label} restricts who may invoke it through "
+                        f"{' and '.join(restrictions)}."
+                    ),
+                    resolution=(
+                        "No action required. Confirm the named workloads or "
+                        "principals are the gateway this agent is meant to be "
+                        "reached through."
+                    ),
+                    reference=AGENTCORE_ALLOWED_WORKLOAD_REFERENCE_URL,
+                    severity=SeverityEnum.HIGH,
+                    status=StatusEnum.PASSED,
+                )
+            )
+        else:
+            findings.append(
+                create_finding(
+                    check_id="AC-47",
+                    finding_name="AgentCore Runtime Caller Unrestricted",
+                    finding_details=(
+                        f"{label} carries neither an allowedWorkloadConfiguration "
+                        "on its JWT authorizer nor a resource policy naming the "
+                        "principals allowed to invoke it, so a caller that "
+                        "satisfies its inbound authentication reaches the agent "
+                        "directly and the tool policy, rate limits and audit trail "
+                        "of the gateway in front of it do not apply."
+                    ),
+                    resolution=(
+                        "Set allowedWorkloadConfiguration on the runtime's JWT "
+                        "authorizer to the gateways allowed to invoke it, or attach "
+                        "a resource policy whose Principal is the gateway's "
+                        "execution role for SigV4 callers."
+                    ),
+                    reference=AGENTCORE_ALLOWED_WORKLOAD_REFERENCE_URL,
+                    severity=SeverityEnum.HIGH,
+                    status=StatusEnum.FAILED,
+                )
+            )
+
+    return findings
+
+
 def check_agentcore_gateway_agentic_security() -> List[Dict[str, Any]]:
     """
     Check API-provable AgentCore Gateway controls for agentic tool execution.
@@ -11541,7 +12660,11 @@ def lambda_handler(event, context):
         # global service-linked role check AC-09 are run separately, once, on the
         # primary region above)
         checks = [
-            (["AC-01"], "VPC Configuration", check_agentcore_vpc_configuration),
+            (
+                ["AC-01"],
+                "VPC Configuration",
+                lambda: check_agentcore_vpc_configuration(browser_inventory),
+            ),
             (["AC-04"], "Observability", check_agentcore_observability),
             (["AC-05"], "Encryption", check_agentcore_encryption),
             (
@@ -11692,6 +12815,23 @@ def lambda_handler(event, context):
                 ["AC-44"],
                 "Evaluation Judge Model Scope",
                 lambda: check_agentcore_evaluation_judge_model_scope(permission_cache),
+            ),
+            (
+                ["AC-45"],
+                "Tool Execution Role Scope",
+                lambda: check_agentcore_tool_execution_role_scope(
+                    permission_cache, browser_inventory
+                ),
+            ),
+            (
+                ["AC-46"],
+                "Runtime Session Limits",
+                check_agentcore_runtime_session_limits,
+            ),
+            (
+                ["AC-47"],
+                "Runtime Invocation Path",
+                check_agentcore_runtime_invocation_path,
             ),
         ]
 

@@ -717,8 +717,9 @@ Resources:
                 - ec2:DescribeVpcEndpoints
                 - ec2:DescribeVpcs
                 # AC-08 reads the inbound rules of each AgentCore endpoint's
-                # security groups. DescribeSecurityGroups has no resource-level
-                # authorization.
+                # security groups, and AC-01 the outbound rules of each VPC
+                # runtime and built-in tool group. DescribeSecurityGroups has no
+                # resource-level authorization.
                 - ec2:DescribeSecurityGroups
               Resource: '*'
             - Sid: ECRPermissions
