@@ -21,11 +21,20 @@ authoritative set of ids each producer emits, so this script:
   1. confirms every map key against the ids its own module really emitted, and
      reports a key another module emitted as MISPLACED, which is the failure the
      substring test cannot see;
-  2. replays the real rows through the real `create_finding` and the real
+  2. reads the `Compliance_Frameworks` value the run itself wrote on every row and
+     requires it to equal this tree's map, which is the only assertion here that
+     can see a deployed artifact built from source older than this tree;
+  3. replays the real rows through the real `create_finding` and the real
      `generate_csv_report`, asserting the 9-column header, that no row is gained
      or lost, and that every row's tag equals the map's answer for its id;
-  3. counts which qualifier forms appear on real rows, so the vocabulary is known
+  4. counts which qualifier forms appear on real rows, so the vocabulary is known
      to be exercised in production and not only in fixtures.
+
+(2) and (3) differ in what they can catch. The replay rebuilds each row through
+this tree's producers, so it compares the map against itself and would pass
+whatever the deployed Lambda wrote; it covers the rendering path instead. Only (2)
+reads the shipped bytes. A CSV predating the column fails (2) rather than skipping
+it, because a pass on that ground leaves the deployed hop unmeasured.
 
 A key the run did not emit is reported UNPROVEN, never as a pass. An account with
 no SageMaker notebook emits no `SM-09`, which is a gap in the evidence and not a
@@ -151,6 +160,33 @@ def tag_mismatches(mapping: dict, rows: list[dict]) -> list[str]:
                 f"row {index} ({row['Check_ID']}) tag {actual!r} != {expected!r}"
             )
     return wrong
+
+
+def written_tag_audit(mapping: dict, rows: list[dict], header: list[str]):
+    """Audit the column the run itself wrote, not a replay of it.
+
+    The replay assertion below rebuilds each row through this tree's producers, so
+    it compares the map against itself and passes whatever the deployed Lambda
+    actually wrote. This reads the shipped bytes instead, which is the only
+    assertion here that can see a deployed artifact built from stale source.
+
+    A missing column is a failure and not a skip. A run without it evidences
+    nothing about phase 2, and a pass on that ground is how the one hop the offline
+    suite cannot reach would go unmeasured.
+    """
+    if "Compliance_Frameworks" not in header:
+        return False, (
+            f"the source CSV has no Compliance_Frameworks column ({len(header)} "
+            f"column(s): {header}). Either the run predates phase 2 or the deployed "
+            "code does not carry it. Not a skip: nothing here evidences the column."
+        )
+    wrong = tag_mismatches(mapping, rows)
+    tagged = sum(1 for row in rows if row.get("Compliance_Frameworks"))
+    return not wrong, (
+        f"{len(rows)} row(s) as the run wrote them, {tagged} tagged, "
+        f"{len(wrong)} disagreeing with this tree's map"
+        + (f": {wrong[:3]}" if wrong else "")
+    )
 
 
 def qualifier_census(tags) -> collections.Counter:
@@ -359,6 +395,28 @@ def selftest() -> int:
         ("a missing tag field fails", len(tag_mismatches(mapping, rows_nofield)) == 1)
     )
 
+    # The as-written audit, whose whole point is the case the replay cannot reach:
+    # a deployed artifact built from source older than this tree.
+    full_header = list(EXPECTED_COLUMNS)
+    ok_written, detail_written = written_tag_audit(mapping, rows_ok, full_header)
+    cases.append(("an as-written column matching the map passes", ok_written))
+    cases.append(
+        (
+            "an as-written value the map disagrees with fails",
+            not written_tag_audit(mapping, rows_dropped, full_header)[0],
+        )
+    )
+    cases.append(
+        (
+            "a pre-phase-2 CSV fails instead of skipping",
+            not written_tag_audit(mapping, rows_ok, LEGACY_COLUMNS)[0]
+            and "predates" in written_tag_audit(mapping, rows_ok, LEGACY_COLUMNS)[1],
+        )
+    )
+    cases.append(
+        ("the passing audit still prints its denominator", "1 row(s)" in detail_written)
+    )
+
     census = qualifier_census(
         [
             "AISF AIR-BDR-GRD-01",
@@ -412,16 +470,24 @@ def main() -> int:
 
     emitted = {}
     source_rows = {}
+    source_header = {}
     for module, text in texts.items():
-        rows = list(csv.DictReader(text.splitlines()))
+        lines = text.splitlines()
+        source_header[module] = next(csv.reader(lines), [])
+        rows = list(csv.DictReader(lines))
         source_rows[module] = rows
         emitted[module] = {row["Check_ID"] for row in rows}
+
+    # Loaded once. Each producer seeds its own `schema` into sys.modules, so
+    # re-importing per section would give a later section whichever schema the
+    # previous import left behind.
+    loaded = {module: producer(module) for module in PRODUCERS}
 
     report = Report()
     print("\n=== every map key is a check its own module really emits ===")
     totals = collections.Counter()
     for module in PRODUCERS:
-        _, _, mapping = producer(module)
+        _, _, mapping = loaded[module]
         others = {m: ids for m, ids in emitted.items() if m != module}
         confirmed, unproven, misplaced = classify_map_keys(
             mapping, emitted[module], others
@@ -440,10 +506,26 @@ def main() -> int:
             f"misplaced: {'; '.join(misplaced) if misplaced else 'none'}",
         )
 
+    print("\n=== the tag column the deployed run actually wrote ===")
+    for module in PRODUCERS:
+        _, _, mapping = loaded[module]
+        ok, detail = written_tag_audit(
+            mapping, source_rows[module], source_header[module]
+        )
+        totals["written_rows"] += len(source_rows[module])
+        totals["written_tagged"] += sum(
+            1 for row in source_rows[module] if row.get("Compliance_Frameworks")
+        )
+        if not ok:
+            totals["written_bad"] += 1
+        report.check(
+            f"{module}: the shipped column agrees with this tree's map", ok, detail
+        )
+
     print("\n=== the real rows, replayed through the production path ===")
     census = collections.Counter()
     for module in PRODUCERS:
-        schema, app, mapping = producer(module)
+        schema, app, mapping = loaded[module]
         text = replay(module, schema, app, source_rows[module])
         header = next(csv.reader(text.splitlines()))
         rows = list(csv.DictReader(text.splitlines()))
@@ -476,9 +558,9 @@ def main() -> int:
     print("\n=== what this cannot see ===")
     print("  - a map key no run has emitted yet: counted as unproven above, and an")
     print("    account without the resource can never confirm it.")
-    print("  - whether the DEPLOYED Lambda carries this code. It replays the real")
-    print("    rows through the tree's producers, so it proves the mapping against a")
-    print("    real id population, not the running artifact.")
+    print("  - WHEN the run happened. The as-written section proves the artifact that")
+    print("    wrote these CSVs agrees with this tree; it cannot date them. --bucket")
+    print("    prints the run's timestamp for that reason, and --csv-dir cannot.")
     print("  - whether a check's verdict is correct; only the tag beside it.")
 
     print()
@@ -491,7 +573,9 @@ def main() -> int:
         f"{report.passed}/{report.total} assertions passed; "
         f"{totals['confirmed']}/{totals['keys']} map keys confirmed live, "
         f"{totals['unproven']} unproven, {totals['misplaced']} misplaced; "
-        f"{totals['tagged']}/{totals['rows']} real rows tagged"
+        f"{totals['written_tagged']}/{totals['written_rows']} rows tagged as the run "
+        f"wrote them, {totals['written_bad']} producer(s) disagreeing; "
+        f"{totals['tagged']}/{totals['rows']} replayed rows tagged"
     )
     if report.failed:
         print(f"PROBE FAIL  {summary}")

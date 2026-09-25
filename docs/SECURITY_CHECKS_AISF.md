@@ -337,22 +337,34 @@ across three producers, which makes the substring check in
 present in modules that do not emit it, so a key filed under the wrong module
 ships a permanently empty column with every test green. The probe reads the CSVs a
 real run left in the assessment bucket, which are the authoritative set of emitted
-ids, replays those rows through the real `create_finding` and `generate_csv_report`,
-and reports a key the run did not emit as UNPROVEN rather than as a pass.
+ids, and reports a key the run did not emit as UNPROVEN rather than as a pass. It
+then reads each row's shipped `Compliance_Frameworks` value and requires it to equal
+this tree's map, and separately replays the rows through the real `create_finding`
+and `generate_csv_report`. The replay compares the map against itself and so covers
+the rendering path; the as-written comparison is the one that can see a deployed
+artifact built from stale source.
 
 ```bash
 AWS_PROFILE=<profile> .venv/bin/python aisf-parity/probe_live_tags.py \
     --bucket <assessment bucket> --region us-east-1
-aisf-parity/probe_live_tags.py --selftest   # 8 classifier cases, no credentials
+aisf-parity/probe_live_tags.py --selftest   # 12 classifier cases, no credentials
 ```
 
-Measured at the current head: 9/9 assertions, 31/31 map keys confirmed against an
-id the module really emitted, 0 unproven, 0 misplaced, 115 of 356 real rows tagged.
-Because a 100% result is also what a probe measuring nothing prints, both live
-assertions were driven red once against the same CSVs; the two injections and their
-observed failures are tabulated in `aisf-parity/LIVE-FIXTURES.md`. Neither probe
-proves the **deployed** Lambda carries this code: the running artifact is built by
-CodeBuild from a GitHub branch, so only a deploy of this branch tests that hop.
+Measured at the current head against execution `2654a727`, written by a deploy of
+this branch: 13/13 assertions, 31/31 map keys confirmed against an id the module
+really emitted, 0 unproven, 0 misplaced, 115 of 356 rows tagged as the run wrote
+them, 0 producers disagreeing. Because a 100% result is also what a probe measuring
+nothing prints, every live assertion was driven red once against real CSVs; the four
+injections and their observed failures are tabulated in
+`aisf-parity/LIVE-FIXTURES.md`.
+
+That deploy is what closes the last hop. The running artifact is built by CodeBuild
+from a GitHub branch, so the tree alone could never evidence it; the build resolved
+to commit `6ac8dca` and the CSVs it produced carry the 9-column header and a tag
+column that agrees with this tree on all 356 rows. What remains unproven is the
+run's currency: a pass says the artifact that wrote those CSVs agrees with this
+tree, not that the run is recent, which is why `--bucket` prints the execution's
+timestamp and `--csv-dir` says it cannot.
 
 ## Adding a control
 
@@ -406,4 +418,7 @@ CodeBuild from a GitHub branch, so only a deploy of this branch tests that hop.
     run that scanned an account holding the new control's resource. A new map key
     that comes back UNPROVEN has not been confirmed against a real emitted id, so
     it is unverified rather than passing; a key reported MISPLACED is filed under a
-    producer that does not emit it and ships an empty column.
+    producer that does not emit it and ships an empty column. The run has to be a
+    deploy of the branch under test: the as-written section compares the shipped
+    column against this tree, so CSVs from an earlier build fail it, and that
+    failure is the point rather than a nuisance.

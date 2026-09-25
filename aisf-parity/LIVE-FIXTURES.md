@@ -45,15 +45,32 @@ every offline test green.
 ```bash
 AWS_PROFILE=delegated-admin .venv/bin/python aisf-parity/probe_live_tags.py \
     --bucket aiml-sec-ACCOUNT_ID-aimlassessmentbucket-gywyxnvqxpvx --region us-east-1
-.venv/bin/python aisf-parity/probe_live_tags.py --selftest   # 8 cases, no credentials
+.venv/bin/python aisf-parity/probe_live_tags.py --selftest   # 12 cases, no credentials
 ```
 
-Measured at `a89c8c8` against execution `aff591e7` in us-east-1: **9/9 assertions,
-31/31 map keys confirmed against an id the module really emitted, 0 unproven, 0
-misplaced, 115 of 356 real rows tagged.** Qualifier forms on real rows: 33 bare,
-101 `(partial)`, 11 joint, 28 pipe-joined multi-control, 0 unparseable. A key the
-run did not emit is counted UNPROVEN and never as a pass, because an account with
-no SageMaker notebook emits no `SM-09` and that is an evidence gap, not a defect.
+Measured against execution `2654a727` in us-east-1, written 2026-09-25 12:51 UTC
+by a deploy of this branch: **13/13 assertions, 31/31 map keys confirmed against an
+id the module really emitted, 0 unproven, 0 misplaced, 115 of 356 rows tagged as
+the run wrote them, 0 producers disagreeing.** Qualifier forms on real rows: 33
+bare, 101 `(partial)`, 11 joint, 28 pipe-joined multi-control, 0 unparseable. A key
+the run did not emit is counted UNPROVEN and never as a pass, because an account
+with no SageMaker notebook emits no `SM-09` and that is an evidence gap, not a
+defect.
+
+Two of the three sections read the same CSVs and catch different things, which is
+why both exist:
+
+- **as written** compares the `Compliance_Frameworks` value the run itself shipped
+  against this tree's map. This is the only assertion in either probe that can see
+  a deployed artifact built from source older than this tree.
+- **replayed** rebuilds every row through the real `create_finding` and
+  `generate_csv_report`. It compares the map against itself, so it would pass
+  whatever the Lambda wrote; it covers the rendering path instead — the 9-column
+  header and no row gained or lost.
+
+A CSV predating the column **fails** the as-written section rather than skipping
+it. A skip there would read as a pass for the one hop the offline suite cannot
+reach.
 
 The probe deliberately does **not** judge whether a qualifier is correct. It
 compares each replayed row against the same map, so a wrong qualifier agrees with
@@ -64,19 +81,28 @@ equalling the map's answer.
 
 ### Positive controls, and why they are not a gate
 
-`31/31` and `0 misplaced` is a 100% result, which is also what a probe that
-measures nothing prints. Both live assertions were therefore driven red once,
-against the same real CSVs, and both restored byte-identically:
+`31/31`, `0 misplaced` and `0 disagreeing` is a 100% result, which is also what a
+probe that measures nothing prints. Every live assertion was therefore driven red
+once against real CSVs:
 
 | Injected | Result |
 |---|---|
-| `"BR-10"` added to agentcore's map | `PROBE FAIL 8/9`, 1 misplaced, naming agentcore |
-| bedrock's `compliance_frameworks` default changed from `None` to `""` | `PROBE FAIL 8/9`, tagged rows 115 → 92, the 23 bedrock rows |
+| `"BR-10"` added to agentcore's map | `PROBE FAIL`, 1 misplaced, naming agentcore |
+| bedrock's `compliance_frameworks` default changed from `None` to `""` | `PROBE FAIL`, replayed tags 115 → 92, the 23 bedrock rows |
+| one shipped `AC-02` tag blanked in a **copy** of agentcore's CSV, tree map untouched | `PROBE FAIL 12/13`, exit 1, as-written red for agentcore **only**, all four replays still green, tagged 115 → 114 |
+| the column dropped from a **copy** of sagemaker's CSV | `PROBE FAIL 12/13`, exit 1, the "predates phase 2" branch, tagged 115 → 96 |
+
+The first two edit the tree and were restored byte-identically. The last two edit a
+copy of the CSVs instead, so the measured set is never mutated and there is no
+restore to verify. They are the discriminating pair: the third shows the as-written
+assertion fails where **every replay passes**, so it is not riding on the replay,
+which is the whole reason it was added.
 
 This stays a manual control rather than a `mutate.py` entry because it needs a
 run's CSVs, and those carry account ids and resource ARNs, so they cannot be
-committed as a fixture. `--selftest` covers the classifiers with synthetic input;
-the table above is what proves the live wiring calls them.
+committed as a fixture. `--selftest` covers the classifiers with synthetic input
+(12 cases, no credentials); the table above is what proves the live wiring calls
+them.
 
 ## What each fixture unblocks
 
@@ -174,9 +200,26 @@ role behind. It is recorded here because this file is the teardown inventory, an
 tag query cannot see any of it. `deployment/aiml-security-single-account.yaml` sets
 no tags at all, so the fixture tag filter returns none of these.
 
-Deployed 2026-09-24 21:23 UTC from branch `feature/aisf-report-section`, build
-`AIMLSecurityCodeBuild:8fb19587`, which produced
-`security_assessment_single_account_20260924_213330.html`.
+Deployed twice, into the same three stacks:
+
+| When | Branch | Build | Produced |
+|---|---|---|---|
+| 2026-09-24 21:23 UTC | `feature/aisf-report-section` | `AIMLSecurityCodeBuild:8fb19587` | `security_assessment_single_account_20260924_213330.html` |
+| 2026-09-25 12:45 UTC | `feature/aisf-compliance-column` | `AIMLSecurityCodeBuild:a9a53ea5` | execution `2654a727`, the four 9-column CSVs the tag probe measures |
+
+The second deploy passed `--source-version feature/aisf-compliance-column` to
+`start-build` rather than changing the stack's `GitHubBranch` parameter:
+
+```bash
+aws codebuild start-build --project-name AIMLSecurityCodeBuild \
+    --source-version feature/aisf-compliance-column
+```
+
+`buildspec.yml` never reads `GITHUB_BRANCH`; CodeBuild's own checkout decides what
+is built, so the override needs no CloudFormation change and reverts by simply not
+passing it again. The build reported `resolvedSourceVersion
+6ac8dca1498efe559b04712be961cac3017e9dde`, which is what ties the CSVs above to a
+commit instead of to a branch name that moves.
 
 | Stack | Created by | Holds |
 |---|---|---|
