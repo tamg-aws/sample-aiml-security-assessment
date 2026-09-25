@@ -165,13 +165,22 @@ EXPECTED_COLUMNS = LEGACY_COLUMNS + ["Compliance_Frameworks"]
 # lands on the last region-shaped tail, and a key without one parses with region None
 # instead of not parsing at all.
 #
+# The execution cannot start with `_`, which is how an empty execution id stays
+# rejected once the region is optional. A handler given `execution_id=""` writes
+# `bedrock_security_report__us-east-1.csv`; with the region required that key simply
+# could not parse, but optional it reads as a region-less run named `_us-east-1`, so
+# the leading character is constrained instead. The cost is stated rather than
+# hidden: an execution someone names `_nightly` is then unreadable and the probe
+# refuses on it. That refusal prints the unmatched keys it saw, which is the half the
+# uuid defect did not have.
+#
 # Everything else stays exact. A key that is not a report CSV still misses on
 # `_security_report_`, on the prefix having to end in `/`, or on `\.csv$`. The
 # prefix and the region are captured rather than skipped because newest_execution()
 # groups on both.
 REPORT_RE = re.compile(
     r"^(?P<prefix>(?:.*/)?)(?P<module>[a-z_]+)_security_report_"
-    r"(?P<execution>[^/]+?)(?:_(?P<region>[a-z]{2}(?:-[a-z]+)+-\d+))?\.csv$"
+    r"(?P<execution>[^/_][^/]*?)(?:_(?P<region>[a-z]{2}(?:-[a-z]+)+-\d+))?\.csv$"
 )
 
 ELEMENT_RE = re.compile(

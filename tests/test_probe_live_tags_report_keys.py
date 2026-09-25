@@ -266,6 +266,14 @@ def test_the_35_character_execution_id_is_now_a_positive_case():
             "no execution at all: the group is non-greedy, not optional, so a key "
             "with nothing between the literal and the extension still misses",
         ),
+        (
+            "bedrock_security_report__us-east-1.csv",
+            "an empty execution id, which the handler writes as a doubled "
+            "underscore. With the region required this key could not parse at all; "
+            "with it optional the execution group would read `_us-east-1` and the "
+            "run would be reported under that name, so the execution may not begin "
+            "with an underscore",
+        ),
     ],
 )
 def test_a_key_that_is_not_a_report_csv_still_misses(key, why):

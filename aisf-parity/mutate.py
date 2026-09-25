@@ -215,7 +215,7 @@ MUTATIONS = [
     },
     # ------------------------------------------------------ the census paragraph
     # The first mutation of a document rather than of code, and it breaks the
-    # anchor instead of a figure. Gate 14 reads its five census figures out of one
+    # anchor instead of a figure. Gate 14 reads its six census figures out of one
     # paragraph, located by this sentence, and returns an empty slice when the
     # sentence is not found exactly once. Nothing proved that fail-closed path
     # fired.
