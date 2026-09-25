@@ -10,10 +10,12 @@ derives its sub-gate count from the output and cross-checks it against the
 summary, so both numbers move together and stay consistent.
 
 Read from check_ledger.py alone, which is what makes this merge-safe. It asserts
-no gate number, no letter, no position and no denominator. All four of those move
-legitimately: the split lettered its legs rather than renumbering because 37
-citations name gate 14 by number, and the two gates that follow it now print
-17th and 18th while their comments still call them 15 and 16.
+no gate number, no letter, no printed position and no denominator. All four move
+legitimately. The split gave its legs letters instead of new numbers, because the
+number they share is cited throughout the documentation and the generated map
+headers; the gates that follow them now print later than the numbers their own
+comments use; and the sub-gate total changes whenever a gate is added. So no
+count of any of those appears below, in an assertion or in this note.
 
 Source and not stdout, for a measured reason. check_ledger.py's main() calls
 load_aisf_classification() before it prints anything, and that opens a path under
@@ -25,11 +27,11 @@ on every pull request to main against a bare checkout with no sibling clone
 red there on every run for a reason unrelated to the gate. Skipping when the
 clone is absent would retire the test exactly where it is cheapest to break.
 
-The first substring is "per-module AISF tag maps" and not "tag maps" because two
-of the eighteen gate names contain "tag maps": this leg's, and the one that
-renders the maps fresh and compares them. Requiring one match for the shorter
-string would red at green, and loosening the rule to at-least-one would stop the
-count of three from meaning anything.
+The first substring is "per-module AISF tag maps" and not "tag maps". The gate
+that renders the maps fresh from the ledger and compares them carries "tag maps"
+in its own name, so requiring one match for the shorter string reds at green.
+Loosening the rule to at-least-one instead would stop the count of three from
+meaning three separate verdicts, which is the property.
 
 Not covered: that the three calls are reached. A call site guarded out of the
 run would satisfy every assertion below. gate_all.sh closes that leg from the
