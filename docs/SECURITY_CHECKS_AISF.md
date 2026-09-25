@@ -406,10 +406,19 @@ timestamp and `--csv-dir` says it cannot.
    bare `pytest responsible_ai_grc_tests/` collects nothing and exits 4 while
    looking like a pass, so gate 3 runs that path as a positive control and fails
    if it ever succeeds.
-7. Run `.venv/bin/python aisf-parity/mutate.py`. It breaks the mapping four
-   ways and requires a ledger gate or a test to go red for each one, naming the
-   catcher it observed. A mutation nothing catches means the new control's
-   assertions are missing; the answer is an assertion, not a gentler mutation.
+7. Run `.venv/bin/python aisf-parity/mutate.py`. Before it mutates anything it
+   validates every entry's find-string against its file and prints
+   `entries 17/17 find-strings validated`, aborting and naming each entry whose
+   string no longer occurs exactly once, so a battery that lost entries to a
+   refactor cannot report a clean run on the entries it still reached. It then
+   breaks the code 17 ways and requires a ledger gate or a test to go red for
+   each one, naming the catcher it observed: 5 defects in the derived mapping, 6
+   in `BR-20`'s S3 Vectors legs, 5 in the tag column and 1 in the ledger's
+   markdown renderer. The `(partial)` entry reads its target check out of the
+   shipped maps at run time, because a branch that respells one qualifier would
+   otherwise silently cost the battery that entry. A mutation nothing catches
+   means the new control's assertions are missing; the answer is an assertion,
+   not a gentler mutation.
 8. Before any push, run `.venv/bin/python aisf-parity/push_safety.py
    --battery-output /tmp/battery.txt -- git push origin <branch>`. It pushes
    nothing: it asserts the remote is the fork and not `aws-samples`, that no

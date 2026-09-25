@@ -11,6 +11,11 @@ has already been wrong in this project, in the flattering direction.
 A mutation nothing catches is a FAILURE OF THE SUITE, not of the mutation. The
 defect is shippable; the answer is an assertion, not a gentler mutation.
 
+Every find-string is validated before the first mutation applies, and the run
+prints `entries N/N find-strings validated`. A stale string is therefore one loud
+failure naming every stale entry, never a battery that stops partway and reads as
+a shorter complete run, which is how a 12-of-15 run came to be quoted as 12/12.
+
 Safety. This script never restores with git. It snapshots bytes in memory and to
 a `*.mutate-backup` file beside the target, restores from that, and proves the
 restore with `diff -q` against the backup AND `git status --porcelain`. It also
@@ -34,6 +39,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -63,6 +69,25 @@ MAP_SAGEMAKER = f"{SECURITY}/sagemaker_assessments/aisf_compliance_sagemaker.py"
 MAP_AGENTCORE = f"{SECURITY}/agentcore_assessments/aisf_compliance_agentcore.py"
 SCHEMA_BEDROCK = f"{SECURITY}/bedrock_assessments/schema.py"
 AGENTCORE = f"{SECURITY}/agentcore_assessments/app.py"
+
+# The generated tag maps, in the order partial_qualifier_mutation() reads them.
+# Sorted paths, so two clones derive the same entry, and the sort happens to put
+# agent_registry first, which is the map neither branch in flight rewrites.
+TAG_MAP_GLOB = "*_assessments/aisf_compliance_*.py"
+
+# One map entry whose value is a single tag carrying the `(partial)` qualifier.
+# Anchored on the dict-entry shape because every map's module docstring documents
+# the vocabulary with a bare "AISF <control> (partial)" line, and a scan that
+# matched prose mutated a comment and left gate 14 green.
+PARTIAL_ENTRY = re.compile(
+    r'^(?P<indent>[ ]+)"(?P<check>[A-Z]{2,3}-\d{2})": '
+    r'"AISF (?P<control>AIR(?:-[A-Z0-9]+)+) \(partial\)",$'
+)
+
+# Placeholder for the derived `(partial)` entry, replaced in resolve_mutations()
+# before anything reads a find-string. A sentinel rather than an append, because
+# the position of the entry is the position of the comment that explains it.
+DERIVED_PARTIAL_QUALIFIER = "derive: the (partial) qualifier entry"
 
 # Each find-string must occur EXACTLY ONCE in its file; the run aborts otherwise.
 # That replaces the `nth` occurrence selector the prowler harness carries, whose
@@ -197,32 +222,20 @@ MUTATIONS = [
     # The tag column. The next two entries are the two halves of the qualifier
     # vocabulary and are both here because they fail different branches of the
     # same gate: a `tighten` row wants `(partial)`, a multi-leg `covered` row
-    # wants `(1 of N checks)`, and an earlier hand-run of the first hit the
+    # wants `(1 of N checks)`. An earlier hand-run of the first hit the
     # `(partial)` in a map's own module docstring instead of a map entry, which
-    # left gate 14 green and looked like a weak gate. The find-strings below name
-    # the check id, so they cannot drift onto prose. They are referred to by name
-    # and not by position: inserting a mutation renumbers every one after it.
-    {
-        # This entry named BR-04's `(partial)` until 8faf24f retired the whole
-        # (partial) vocabulary from the bedrock map, and it was not refreshed with
-        # it, so every run since aborted at this entry and the ones after it never
-        # ran (measured 2026-09-25: twelve printed CAUGHT, then the abort, and
-        # five entries carried no verdict). agentcore's map is the surface that
-        # still carries the qualifier, so the entry moves there instead of being
-        # re-pointed at a `(N of M checks)` tag, which is the next entry's branch.
-        # Gate 14 runs the same comparison for all three maps, so the branch is
-        # covered wherever the qualifier lives; bedrock's map now has no entry of
-        # its own, and duplicating one there would buy a second run of the same
-        # code path.
-        "name": "a (partial) qualifier dropped from a tighten row's tag",
-        "file": MAP_AGENTCORE,
-        "defect": "AC-07's tag reads as a full assertion of AIR-ACR-MEM-01, a "
-        "control the ledger says it only partly covers, so a Passed AC-07 row "
-        "publishes a pass against the whole control -- the same overclaim gate "
-        "11 refuses for the derived AISF- rows, arriving by the other surface",
-        "find": '    "AC-07": "AISF AIR-ACR-MEM-01 (partial)",\n',
-        "replace": '    "AC-07": "AISF AIR-ACR-MEM-01",\n',
-    },
+    # left gate 14 green and looked like a weak gate, so both find-strings carry
+    # the whole map entry including its check id and cannot drift onto prose.
+    # They are referred to by name and not by position: inserting a mutation
+    # renumbers every one after it.
+    #
+    # The `(partial)` half is DERIVED at run time, not written here. Naming a
+    # check id has gone stale twice: the entry named BR-04 until 8faf24f retired
+    # bedrock's qualifiers, and AC-07, which replaced it, is one of the three
+    # agentcore tags feature/aisf-phase4-acr converts to `(1 of N checks)`. The
+    # vocabulary is being retired map by map, so this reads the maps instead of
+    # naming one. See partial_qualifier_mutation().
+    DERIVED_PARTIAL_QUALIFIER,
     {
         "name": "a (1 of N checks) qualifier dropped from a joint leg",
         "file": MAP_SAGEMAKER,
@@ -274,6 +287,59 @@ WALK_SKIP = {".git", ".venv", "node_modules", "__pycache__", ".pytest_cache"}
 def die(msg: str, code: int = USAGE) -> None:
     print(f"ERROR: {msg}", file=sys.stderr)
     raise SystemExit(code)
+
+
+def partial_qualifier_mutation(repo: Path) -> dict[str, str]:
+    """Build the `(partial)` mutation from whichever map still carries one.
+
+    Reads the maps in sorted path order and takes the first single-tag
+    `(partial)` entry, so the entry survives a rename, a re-hosting, and the
+    conversion of any one map's qualifiers. When no map carries one, this fails
+    loudly instead of skipping: an absent qualifier means gate 14's qualifier
+    branch has nothing left to break, which is a fact about the maps that the
+    reader of a mutation report has to be told, not a mutation to drop.
+    """
+    maps = sorted((repo / SECURITY).glob(TAG_MAP_GLOB))
+    if not maps:
+        die(f"no tag maps under {repo / SECURITY}/{TAG_MAP_GLOB}")
+    for path in maps:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            found = PARTIAL_ENTRY.match(line)
+            if not found:
+                continue
+            check, control = found["check"], found["control"]
+            return {
+                "name": f"a (partial) qualifier dropped from {check}'s tag",
+                "file": path.relative_to(repo).as_posix(),
+                "defect": (
+                    f"{check}'s tag reads as a full assertion of {control}, a "
+                    "control the ledger says it only partly covers, so a Passed "
+                    f"{check} row publishes a pass against the whole control, "
+                    "the same overclaim gate 11 refuses for the derived AISF- "
+                    "rows, arriving by the other surface"
+                ),
+                "find": f"{line}\n",
+                "replace": f'{found["indent"]}"{check}": "AISF {control}",\n',
+            }
+    die(
+        "no tag map carries a single-tag (partial) entry, so this mutation has "
+        f"nothing to break. Maps read, in order: "
+        f"{', '.join(p.relative_to(repo).as_posix() for p in maps)}.\n"
+        "  If the qualifier has been retired on purpose, delete the derived "
+        "entry and say so in the commit; do not leave a mutation that cannot "
+        "apply, because the run would abort partway and read as a short pass."
+    )
+    raise AssertionError("unreachable: die() raises")
+
+
+def resolve_mutations(repo: Path) -> list[dict[str, str]]:
+    """MUTATIONS with every derived entry built against this tree."""
+    return [
+        partial_qualifier_mutation(repo)
+        if entry == DERIVED_PARTIAL_QUALIFIER
+        else entry
+        for entry in MUTATIONS
+    ]
 
 
 def child_env() -> dict[str, str]:
@@ -504,15 +570,17 @@ def main() -> int:
     ap.add_argument("--list", action="store_true", help="print the mutations and exit")
     args = ap.parse_args()
 
+    repo = args.repo.expanduser().resolve()
+    mutations = resolve_mutations(repo)
+
     if args.list:
-        for index, mutation in enumerate(MUTATIONS, 1):
+        for index, mutation in enumerate(mutations, 1):
             print(
                 f"  [{index}] {mutation['name']}\n        defect: {mutation['defect']}"
             )
-        print(f"\n{len(MUTATIONS)} mutation(s) defined")
+        print(f"\n{len(mutations)} mutation(s) defined")
         return 0
 
-    repo = args.repo.expanduser().resolve()
     python = repo / ".venv" / "bin" / "python"
     if not python.is_file():
         die(f"no interpreter at {python} (python3 -m venv .venv)")
@@ -521,7 +589,7 @@ def main() -> int:
         die(f"--tests-cwd {tests_cwd} is not a directory")
 
     # ---------------------------------------------------------------- snapshot
-    touched = sorted({m["file"] for m in MUTATIONS})
+    touched = sorted({m["file"] for m in mutations})
     snapshots: dict[str, str] = {}
     for rel in touched:
         path = repo / rel
@@ -581,6 +649,29 @@ def main() -> int:
     print(f"catchers  ledger gates (aisf-parity/check_ledger.py) + pytest {args.tests}")
     print(f"          pytest cwd: {tests_cwd}")
     print(f"snapshot  {len(touched)} file(s), backups written as *.mutate-backup")
+
+    # ------------------------------------------------------------- pre-flight
+    # Every find-string, validated before the first mutation applies. This check
+    # used to sit inside the mutation loop, where one stale string aborted the
+    # battery partway and the run read as a shorter complete one: on 2026-09-25 a
+    # dead entry 13 of 15 printed twelve CAUGHT lines above the abort and was
+    # quoted as 12/12. Validating up front turns that into one loud failure that
+    # names every stale entry, and the count below is what a report should quote.
+    stale = [
+        f"[{index}] {mutation['name']}: {occurrences} occurrence(s) in "
+        f"{mutation['file']}"
+        for index, mutation in enumerate(mutations, 1)
+        if (occurrences := snapshots[mutation["file"]].count(mutation["find"])) != 1
+    ]
+    if stale:
+        abort(
+            f"{len(stale)} of {len(mutations)} find-string(s) do not occur exactly "
+            "once in their file, so this battery cannot run. Refresh each against "
+            "the current code; do not guess which occurrence was meant:\n  "
+            + "\n  ".join(stale)
+        )
+    print(f"entries   {len(mutations)}/{len(mutations)} find-strings validated")
+
     # Every target, not just the first: a stale .pyc for the SECOND file would
     # serve the pre-mutation bytecode to the baseline run and to any mutation
     # whose byte count matches, and the length-identical `critical` mutation is
@@ -620,20 +711,13 @@ def main() -> int:
 
     # --------------------------------------------------------------- mutations
     print(
-        f"\n=== {len(MUTATIONS)} mutation(s); each must be caught by a gate or a test ==="
+        f"\n=== {len(mutations)} mutation(s); each must be caught by a gate or a test ==="
     )
     uncaught: list[str] = []
     artifacts_cleaned = 0
-    for index, mutation in enumerate(MUTATIONS, 1):
+    for index, mutation in enumerate(mutations, 1):
         rel = mutation["file"]
         text = snapshots[rel]
-        occurrences = text.count(mutation["find"])
-        if occurrences != 1:
-            abort(
-                f"mutation {index} ({mutation['name']}): its find-string occurs "
-                f"{occurrences} time(s) in {rel} and must occur exactly once. "
-                f"Refresh it against the current code; do not guess which one."
-            )
         mutated = text.replace(mutation["find"], mutation["replace"])
         if mutated == text:
             abort(f"mutation {index} changed nothing -- find and replace are identical")
@@ -748,10 +832,10 @@ def main() -> int:
             "a catcher is red AFTER restore -- the tree is not what it was. Investigate."
         )
 
-    caught = len(MUTATIONS) - len(uncaught)
+    caught = len(mutations) - len(uncaught)
     totals = (
-        f"{caught}/{len(MUTATIONS)} mutations caught, "
-        f"{2 * len(MUTATIONS)} catcher run(s) (2 per mutation), "
+        f"{caught}/{len(mutations)} mutations caught, "
+        f"{2 * len(mutations)} catcher run(s) (2 per mutation), "
         f"{artifacts_cleaned} generated artifact(s) cleaned"
     )
     print()

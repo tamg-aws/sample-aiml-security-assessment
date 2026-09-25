@@ -738,9 +738,10 @@ target module (which is what caught the `OBS-03` and `RT-08` errors above). `ais
 carries the counter-evidence a green gate cannot give: 17 deliberate defects, 5 in the derived
 mapping, 6 in `BR-20`'s S3 Vectors legs, 5 in the tag column (three tag-map entries, the bedrock
 finding schema's sentinel, and agentcore's empty-report header) and 1 in the ledger's markdown
-renderer. Each find-string must occur exactly once in its file or the run aborts, and the harness
-prints the gate or test that caught each defect instead of the one assumed while the defect was
-written.
+renderer. Every find-string is validated against its file before the first mutation runs, so an
+entry a refactor has stranded aborts the whole battery by name instead of letting the entries above
+it report a clean run, and the harness prints the gate or test that caught each defect instead of
+the one assumed while the defect was written.
 
 **14 new IAM actions** fall out of the ledger across 19 action-claims on 12 rows, each verified by
 gate 6 as not already granted to the function that would need it: `cloudtrail:GetEventSelectors`,
