@@ -213,24 +213,33 @@ MUTATIONS = [
         "find": '                "Region",\n                "Compliance_Frameworks",\n',
         "replace": '                "Region",\n',
     },
-    # ----------------------------------------------------- the published census
-    # The first mutation of a document rather than of code. Gate 14 asserts five
-    # census figures against the paragraph under the tag-shape table, all five
-    # hand-transcribed, and until this entry not one of them had a mutation
-    # behind it -- the gate was as good as its own author's arithmetic. This
-    # find-string names the verdict figure, which gate 14 takes from
-    # build_ledger.ROWS, and it is the `remaining N are tighten` spelling, so it
-    # also proves the tighten pool reaches that half of the pair.
+    # ------------------------------------------------------ the census paragraph
+    # The first mutation of a document rather than of code, and it breaks the
+    # anchor instead of a figure. Gate 14 reads its five census figures out of one
+    # paragraph, located by this sentence, and returns an empty slice when the
+    # sentence is not found exactly once. Nothing proved that fail-closed path
+    # fired.
+    #
+    # The anchor is the find-string because it is the only candidate unique at
+    # every ref this battery runs at. Counted as raw bytes, no flattening:
+    # "Census at the current head" is 1 at this base, on this branch, at phase 3's
+    # head and in the merge tree, while a figure phrase moves with the branch --
+    # "; the remaining 28 are `tighten`.\n" is 1/1/0/0 because phase 3 rewords the
+    # clause, and "the 28 `covered` controls" is 0 everywhere because the document
+    # wraps inside the phrase, which a flattened extractor finds and a find-string
+    # never will.
     {
-        "name": "the published census drops a tighten control",
+        "name": "the census anchor sentence is reworded",
         "file": AISF_DOC,
-        "defect": "the census sentence publishes one tighten control fewer than "
-        "the ledger carries, which is the drift that already shipped once: the "
-        "figures move whenever an entry is added to any aisf_compliance_*.py or "
-        "a verdict changes in build_ledger.ROWS, and nothing in the file changes "
-        "with them",
-        "find": "; the remaining 28 are `tighten`.\n",
-        "replace": "; the remaining 27 are `tighten`.\n",
+        "defect": "gate 14 locates the census paragraph by this sentence and "
+        "reads its five published figures from that slice alone. A reworded "
+        "anchor has to return zero paragraphs, report the count and the sentence "
+        "it looked for, and leave the five figures absent; the failure it must "
+        "not become is a widening back to the whole 23 KB document, where at "
+        "phase 3's head a coverage bullet 239 lines above the anchor answers the "
+        "covered pattern with a different population",
+        "find": "Census at the current head",
+        "replace": "Census at the present head",
     },
 ]
 
