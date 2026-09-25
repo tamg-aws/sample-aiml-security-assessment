@@ -6,15 +6,15 @@
     "hosted": 67,
     "fnd_ai_subject": 11,
     "total": 78,
-    "covered": 29,
-    "tighten": 19,
-    "tighten_extend": 14,
-    "tighten_new_id": 5,
-    "new": 15,
+    "covered": 36,
+    "tighten": 16,
+    "tighten_extend": 13,
+    "tighten_new_id": 3,
+    "new": 11,
     "not_implementable": 4,
     "unassessed": 11,
-    "new_check_functions": 31,
-    "extensions": 14,
+    "new_check_functions": 25,
+    "extensions": 13,
     "extra_iam_actions": [
       "config:DescribeConfigRules",
       "config:DescribeConfigurationRecorders",
@@ -692,8 +692,8 @@
       "question": "Do the people and roles that administer agent evaluations use permissions scoped to just the evaluation actions, rather than a broad agent-platform admin grant?",
       "assert": "Evaluation-admin IAM policy showing action-scoped (non-wildcard) grants",
       "workload_agnostic": true,
-      "verdict": "tighten",
-      "disposition": "extend",
+      "verdict": "covered",
+      "disposition": null,
       "target_modules": [
         "agentcore_assessments"
       ],
@@ -703,7 +703,7 @@
       "incumbent_names": [
         "AgentCore IAM Full Access Check"
       ],
-      "gap": "AC-02 detects AgentCore full-access and wildcard grants only, so a role holding a single over-broad named action passes it",
+      "gap": "AC-02 now reads wildcard action patterns at any resource scope, on cached roles and users alike, so bedrock-agentcore:* narrowed to one evaluation ARN is reported where the full-access legs saw nothing. A pattern reaching any one of the six evaluator and online-evaluation-config writes grants all six, and a principal that can delete an evaluation can stop the measurement of the agent it watches. A bare Action \"*\" stays with the existing legs as a service-agnostic administrator grant",
       "extra_iam": [],
       "phase": 4,
       "source": "controls/ai-specific/agentcore-evaluations.yaml"
@@ -780,18 +780,20 @@
       "question": "Is a continuous evaluation running against production agent traffic at a defined sampling rate, so quality and safety regressions are caught in production rather than only before deployment?",
       "assert": "Online evaluation configuration with a defined sampling rate on production traffic",
       "workload_agnostic": true,
-      "verdict": "tighten",
-      "disposition": "new_id",
+      "verdict": "covered",
+      "disposition": null,
       "target_modules": [
         "agentcore_assessments"
       ],
       "incumbents": [
-        "AC-17"
+        "AC-17",
+        "AC-39"
       ],
       "incumbent_names": [
-        "AgentCore Online Evaluation Coverage"
+        "AgentCore Online Evaluation Coverage",
+        "AgentCore Online Evaluation Operation"
       ],
-      "gap": "AC-17 is named \"Online Evaluation Coverage\" but tests only status == ACTIVE, executionStatus == ENABLED and bool(evaluators); it never reads a sampling rate and never asks which evaluators, so coverage is the one thing it does not measure",
+      "gap": "AC-39 judges every online evaluation configuration that exists whatever REQUIRE_AGENTCORE_ONLINE_EVALUATION is set to, and names the setting that stops it running: a status other than ACTIVE, an executionStatus other than ENABLED, no sampling percentage above zero, no input log group or service, no output log group, or no evaluator attached. AC-17 reads the same settings and returns N/A with that variable unset, so Failed is the verdict it cannot reach by default",
       "extra_iam": [],
       "phase": 4,
       "source": "controls/ai-specific/agentcore-evaluations.yaml"
@@ -802,18 +804,20 @@
       "question": "Are safety- and security-relevant evaluators (harmful output, unauthorized tool selection) enabled and alerted on, not just quality-of-answer scores?",
       "assert": "Harmfulness/Stereotyping/Tool-Selection evaluators enabled + score-drop alarm",
       "workload_agnostic": true,
-      "verdict": "tighten",
-      "disposition": "new_id",
+      "verdict": "covered",
+      "disposition": null,
       "target_modules": [
         "agentcore_assessments"
       ],
       "incumbents": [
-        "AC-17"
+        "AC-17",
+        "AC-40"
       ],
       "incumbent_names": [
-        "AgentCore Online Evaluation Coverage"
+        "AgentCore Online Evaluation Coverage",
+        "AgentCore Evaluation Safety Coverage"
       ],
-      "gap": "AC-17 is named \"Online Evaluation Coverage\" and never asks which evaluators are attached, so it cannot distinguish a safety evaluator from a latency one",
+      "gap": "AC-40 classifies the evaluators each configuration attaches against the account's own catalogue, which marks a service-authored evaluator's category in its description and reports the level it scores at, and fails a configuration attaching no safety evaluator or none at TOOL_CALL level. Evaluators written in this account are named for the owner to classify, because their descriptions are prose no check can verify. AgentCore publishes no evaluation score metric, so an alarm on a falling score is a metric filter over the results log group whose pattern and threshold belong to the workload, and every AC-40 verdict says so",
       "extra_iam": [],
       "phase": 4,
       "source": "controls/ai-specific/agentcore-evaluations.yaml"
@@ -1084,14 +1088,18 @@
       "question": "Is the ability to hand the evaluation service an IAM role (PassRole) restricted to the specific evaluation execution role, rather than any role?",
       "assert": "iam:PassRole policy with resource + PassedToService condition",
       "workload_agnostic": true,
-      "verdict": "new",
+      "verdict": "covered",
       "disposition": null,
       "target_modules": [
         "agentcore_assessments"
       ],
-      "incumbents": [],
-      "incumbent_names": [],
-      "gap": "PassRole returns 0 across all six modules; AssumeRolePolicyDocument is read once at :2725 but only to match principal.Service for role discovery, never a condition",
+      "incumbents": [
+        "AC-42"
+      ],
+      "incumbent_names": [
+        "AgentCore Evaluation Pass Role Scope"
+      ],
+      "gap": "AC-42 reads iam:PassRole on every cached role and user against the execution roles the region's online evaluation configurations name, and judges the widest statement that reaches one of them: a Resource pattern wider than the role itself, or a grant carrying no iam:PassedToService condition, lets the holder run a role it could not assume by writing a configuration that names it",
       "extra_iam": [],
       "phase": 4,
       "source": "controls/ai-specific/agentcore-evaluations.yaml"
@@ -1102,14 +1110,18 @@
       "question": "Does the evaluation execution role's trust policy prevent a confused-deputy attack from another account?",
       "assert": "Evaluation execution-role trust policy with SourceAccount/SourceArn conditions",
       "workload_agnostic": true,
-      "verdict": "new",
+      "verdict": "covered",
       "disposition": null,
       "target_modules": [
         "agentcore_assessments"
       ],
-      "incumbents": [],
-      "incumbent_names": [],
-      "gap": "confused-deputy conditions absent: SourceAccount/SourceArn are 1 hit corpus-wide, in sagemaker_assessments, none in AgentCore",
+      "incumbents": [
+        "AC-43"
+      ],
+      "incumbent_names": [
+        "AgentCore Evaluation Role Trust"
+      ],
+      "gap": "AC-43 reads each evaluation execution role's own trust policy and reports every Allow statement trusting an AWS service principal, or every principal, with no aws:SourceAccount and no aws:SourceArn condition. The role can read the scored traces and invoke the judge model, so a service acting for another customer's configuration reaches both. AC-27 makes the same assertion on gateway execution roles and reaches no evaluation role, because it reads the roles gateways name",
       "extra_iam": [],
       "phase": 4,
       "source": "controls/ai-specific/agentcore-evaluations.yaml"
@@ -1120,14 +1132,18 @@
       "question": "For custom LLM-as-a-judge evaluators, is the model-invocation permission scoped to only the specific models the evaluators use?",
       "assert": "Evaluator role bedrock:InvokeModel scoped to specific model ARNs",
       "workload_agnostic": false,
-      "verdict": "new",
+      "verdict": "covered",
       "disposition": null,
       "target_modules": [
         "agentcore_assessments"
       ],
-      "incumbents": [],
-      "incumbent_names": [],
-      "gap": "",
+      "incumbents": [
+        "AC-44"
+      ],
+      "incumbent_names": [
+        "AgentCore Evaluation Judge Model Scope"
+      ],
+      "gap": "AC-44 reports whether each evaluation execution role's model-invocation grant names models at all: a Resource pattern ending in a bare wildcard reaches every model the account can invoke, and the judge prompt carries the agent output being scored, so every model it reaches is one attacker-influenced text can be sent to. Which models a workload's judges may use is the workload owner's decision, so the check names the patterns it found and asserts only that they are bounded",
       "extra_iam": [],
       "phase": 4,
       "source": "controls/ai-specific/agentcore-evaluations.yaml"
@@ -1138,14 +1154,22 @@
       "question": "Are evaluation results treated as sensitive data \u2014 encrypted with organization-controlled keys, retained to a compliance schedule, and free of PII in tags or free-form fields?",
       "assert": "Evaluation-results CMK config (evaluation-scoped encryption context) + retention + no-PII-in-tags check",
       "workload_agnostic": true,
-      "verdict": "new",
+      "verdict": "covered",
       "disposition": null,
       "target_modules": [
         "agentcore_assessments"
       ],
-      "incumbents": [],
-      "incumbent_names": [],
-      "gap": "",
+      "incumbents": [
+        "AC-20",
+        "AC-26",
+        "AC-41"
+      ],
+      "incumbent_names": [
+        "AgentCore Log Data Protection",
+        "AgentCore Log Retention and Key Scope",
+        "AgentCore Evaluation Result Protection"
+      ],
+      "gap": "AC-41 anchors on the log group each configuration's outputConfig names and asserts a retention period, a customer managed key, and membership of the AgentCore log group prefixes, so a results group whose creator chose a name outside them is reported rather than skipped. AC-20 and AC-26 judge masking and key policy on the groups under those prefixes and neither reaches a group outside them. Tag values and the configuration's own description are free-form text AC-41 discloses instead of judging",
       "extra_iam": [],
       "phase": 4,
       "source": "controls/ai-specific/agentcore-evaluations.yaml"

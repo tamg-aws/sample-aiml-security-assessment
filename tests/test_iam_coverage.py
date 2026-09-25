@@ -694,6 +694,29 @@ _VERIFIED_REMEDIATION_IAM_ACTIONS |= {
     "bedrock:InvokeGuardrailChecks",
 }
 
+# Verified on 2026-09-25 with two IDENTITY_POLICY Access Analyzer validate-policy
+# runs for the evaluation controls AC-39 through AC-44. The first run covered the
+# nine evaluation actions with two negative controls,
+# bedrock-agentcore:NotARealEvaluationAction and the plausible
+# bedrock-agentcore:UpdateEvaluatorConfig; the second covered iam:PassRole with
+# iam:PassedToService against three negative controls, iam:PassRoleNotReal,
+# iam:PassedToServiceNotReal and the plausible iam:PassedToRole. All five were
+# reported and none of the names below was.
+#
+# The six writes in EVALUATION_ADMINISTRATION_ACTIONS reach AC-02's resolution
+# text through that constant, so the token scan below does not see them. They are
+# classified here for the same reason InvokeGuardrailChecks is.
+_VERIFIED_REMEDIATION_IAM_ACTIONS |= {
+    "bedrock-agentcore:ListEvaluators",
+    "bedrock-agentcore:CreateEvaluator",
+    "bedrock-agentcore:UpdateEvaluator",
+    "bedrock-agentcore:DeleteEvaluator",
+    "bedrock-agentcore:CreateOnlineEvaluationConfig",
+    "bedrock-agentcore:UpdateOnlineEvaluationConfig",
+    "bedrock-agentcore:DeleteOnlineEvaluationConfig",
+    "iam:PassRole",
+}
+
 _VERIFIED_REMEDIATION_CONDITION_KEYS = {
     "bedrock:GuardrailIdentifier",
     "iam:AWSServiceName",
@@ -712,6 +735,8 @@ _VERIFIED_REMEDIATION_CONDITION_KEYS = {
     # scan stops at the slash.
     "bedrock-agentcore:RuntimeAuthorizerType",
     "bedrock-agentcore:InboundJwtClaim",
+    # Same second run as the AC-42 action block above.
+    "iam:PassedToService",
 }
 
 _NON_IAM_REMEDIATION_TOKENS = {

@@ -193,6 +193,12 @@ AGENTCORE_POLICY_ENCRYPTION_REFERENCE_URL = (
     "https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/"
     "policy-encryption.html"
 )
+AGENTCORE_EVALUATORS_REFERENCE_URL = (
+    "https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/evaluators.html"
+)
+IAM_PASS_ROLE_REFERENCE_URL = (
+    "https://docs.aws.amazon.com/IAM/latest/UserGuide/id_roles_use_passrole.html"
+)
 
 
 def _assessment_error_label(error: Exception) -> str:
@@ -377,6 +383,12 @@ REGIONAL_AGENTCORE_CHECK_IDS = (
     "AC-36",
     "AC-37",
     "AC-38",
+    "AC-39",
+    "AC-40",
+    "AC-41",
+    "AC-42",
+    "AC-43",
+    "AC-44",
 )
 
 AGENTCORE_RUNTIME_CHECK_IDS = (
@@ -409,6 +421,12 @@ AGENTCORE_RUNTIME_CHECK_IDS = (
     "AC-36",
     "AC-37",
     "AC-38",
+    "AC-39",
+    "AC-40",
+    "AC-41",
+    "AC-42",
+    "AC-43",
+    "AC-44",
 )
 
 NATIVE_AGENTIC_AGENTCORE_CHECK_NAMES = {
@@ -1501,6 +1519,84 @@ def _permissions_include_agent_platform_access(
     return False
 
 
+# The six control-plane writes that decide what an evaluation measures and
+# whether it runs. Each one is a valid IAM action: Access Analyzer's policy
+# validation accepts all six and rejects an invented seventh. Holding any of them
+# is how a principal changes the assurance mechanism rather than the workload, so
+# they are the actions an evaluation administrator's grant should name.
+EVALUATION_ADMINISTRATION_ACTIONS = (
+    "bedrock-agentcore:CreateEvaluator",
+    "bedrock-agentcore:UpdateEvaluator",
+    "bedrock-agentcore:DeleteEvaluator",
+    "bedrock-agentcore:CreateOnlineEvaluationConfig",
+    "bedrock-agentcore:UpdateOnlineEvaluationConfig",
+    "bedrock-agentcore:DeleteOnlineEvaluationConfig",
+)
+
+
+def _evaluation_admin_wildcard_actions(policy: Dict[str, Any]) -> List[str]:
+    """Return each wildcard Action pattern reaching an evaluation write.
+
+    The wildcard leg above only reads statements whose Resource is a bare `*`, so
+    `bedrock-agentcore:*` narrowed to one evaluation ARN is invisible to it while
+    granting every write in EVALUATION_ADMINISTRATION_ACTIONS. Resource scope is
+    not read here for that reason: a pattern that reaches DeleteEvaluator reaches
+    it on whichever evaluator the Resource names.
+
+    A pattern with no service segment stays out of scope, which is what keeps a
+    bare `Action: "*"` a service-agnostic administrator grant here as it is there.
+    The service segment is not matched against AGENT_PLATFORM_IAM_NAMESPACES
+    separately: every action below carries the platform's own namespace, an action
+    string holds one colon, and a pattern matching one of them has to align its
+    colon with that colon, so the segment before it already matched the namespace.
+    """
+    reaching: List[str] = []
+    for statement in _allow_statements(policy):
+        for action in _statement_actions(statement):
+            if ":" not in action:
+                continue
+            if not any(wildcard in action for wildcard in ("*", "?")):
+                continue
+            if any(
+                fnmatchcase(admin_action.lower(), action)
+                for admin_action in EVALUATION_ADMINISTRATION_ACTIONS
+            ):
+                reaching.append(action)
+    return sorted(set(reaching))
+
+
+def _evaluation_admin_wildcard_principals(
+    permissions_by_name: Dict[str, Any],
+    principal_kind: str,
+) -> List[str]:
+    """Return each principal reaching an evaluation write through a wildcard."""
+    labels: List[str] = []
+    for principal_name, permissions in permissions_by_name.items():
+        if not isinstance(permissions, dict):
+            continue
+        patterns: List[str] = []
+        for policy in [
+            *(permissions.get("attached_policies") or []),
+            *(permissions.get("inline_policies") or []),
+        ]:
+            try:
+                patterns.extend(_evaluation_admin_wildcard_actions(policy))
+            except Exception as error:
+                # Counted and reported by the wildcard leg above, which reads the
+                # same documents. Counting it again would report one unreadable
+                # document twice.
+                logger.warning(
+                    f"Error parsing policy for {principal_kind} "
+                    f"{principal_name}: {error}"
+                )
+        if patterns:
+            labels.append(
+                f"{principal_kind} {principal_name} "
+                f"({', '.join(sorted(set(patterns)))})"
+            )
+    return sorted(labels)
+
+
 def check_agentcore_full_access_roles(
     permission_cache: Dict[str, Any],
 ) -> List[Dict[str, Any]]:
@@ -1510,6 +1606,7 @@ def check_agentcore_full_access_roles(
     Identifies:
     - Roles with BedrockAgentCoreFullAccess
     - Roles with wildcard or allow-except AgentCore permissions
+    - Roles and users reaching an evaluation write through a wildcard action
 
     Args:
         permission_cache: Cached IAM permissions data
@@ -1523,14 +1620,15 @@ def check_agentcore_full_access_roles(
         logger.info("Checking for AgentCore full access roles")
 
         role_permissions = permission_cache.get("role_permissions", {})
+        user_permissions = permission_cache.get("user_permissions", {})
 
-        if not role_permissions:
-            logger.info("No role permissions in cache")
+        if not role_permissions and not user_permissions:
+            logger.info("No role or user permissions in cache")
             findings.append(
                 create_finding(
                     check_id="AC-02",
                     finding_name="AgentCore IAM Full Access Check",
-                    finding_details="No IAM role permissions found in cache",
+                    finding_details="No IAM role or user permissions found in cache",
                     resolution="No action required",
                     reference="https://docs.aws.amazon.com/bedrock/latest/userguide/security-iam-awsmanpol.html",
                     severity=SeverityEnum.INFORMATIONAL,
@@ -1593,6 +1691,39 @@ def check_agentcore_full_access_roles(
                     finding_name="AgentCore IAM Wildcard Permissions",
                     finding_details=f"The following roles have wildcard or allow-except AgentCore permissions on all resources: {', '.join(sorted(wildcard_roles))}",
                     resolution="Replace wildcard or allow-except permissions with required AgentCore actions and scope resources using ARNs",
+                    reference="https://docs.aws.amazon.com/bedrock/latest/userguide/security-iam-awsmanpol.html",
+                    severity=SeverityEnum.HIGH,
+                    status=StatusEnum.FAILED,
+                )
+            )
+
+        # Who can change what the evaluations measure. A wildcard action pattern
+        # reaching one of the six evaluation writes grants all of them, so a
+        # principal that only administers evaluations should name the actions it
+        # needs instead.
+        evaluation_admins = [
+            *_evaluation_admin_wildcard_principals(role_permissions, "role"),
+            *_evaluation_admin_wildcard_principals(user_permissions, "user"),
+        ]
+        if evaluation_admins:
+            findings.append(
+                create_finding(
+                    check_id="AC-02",
+                    finding_name="AgentCore Evaluation Administration Wildcard",
+                    finding_details=(
+                        "The following principals reach an AgentCore evaluation "
+                        "write action through a wildcard action pattern, so they can "
+                        "create, change and delete evaluators and online evaluation "
+                        f"configurations alike: {', '.join(evaluation_admins)}. A "
+                        "principal that can delete an evaluation can stop the "
+                        "measurement of the agent it is watching."
+                    ),
+                    resolution=(
+                        "Name the evaluation actions each principal needs, from "
+                        f"{', '.join(EVALUATION_ADMINISTRATION_ACTIONS)}, instead of "
+                        "a wildcard that reaches all six, and scope each to the "
+                        "evaluator and configuration ARNs it maintains."
+                    ),
                     reference="https://docs.aws.amazon.com/bedrock/latest/userguide/security-iam-awsmanpol.html",
                     severity=SeverityEnum.HIGH,
                     status=StatusEnum.FAILED,
@@ -9380,6 +9511,1368 @@ def check_agentcore_policy_session_binding() -> List[Dict[str, Any]]:
     return findings
 
 
+def _online_evaluation_details() -> Tuple[
+    List[Tuple[str, Dict[str, Any]]], List[Tuple[str, Exception]]
+]:
+    """Return each online evaluation configuration's detail, labelled for reports.
+
+    ListOnlineEvaluationConfigs returns summaries carrying no settings, so every
+    question about an evaluation is answered from GetOnlineEvaluationConfig. A
+    per-configuration read error is returned rather than raised so one unreadable
+    configuration does not hide the rest.
+    """
+    details: List[Tuple[str, Dict[str, Any]]] = []
+    errors: List[Tuple[str, Exception]] = []
+    for summary in _agentcore_list_all(
+        "list_online_evaluation_configs", ["onlineEvaluationConfigs"]
+    ):
+        config_id = summary.get("onlineEvaluationConfigId")
+        name = summary.get("onlineEvaluationConfigName") or config_id or "unknown"
+        label = f"Online evaluation '{name}' ({config_id or 'unknown'})"
+        try:
+            details.append(
+                (
+                    label,
+                    agentcore_client.get_online_evaluation_config(
+                        onlineEvaluationConfigId=config_id
+                    ),
+                )
+            )
+        except Exception as error:
+            logger.warning(f"Could not read online evaluation {config_id}: {error}")
+            errors.append((label, error))
+    return details, errors
+
+
+def _online_evaluation_read_findings(
+    check_id: str,
+    finding_name: str,
+    errors: List[Tuple[str, Exception]],
+    reference: str,
+) -> List[Dict[str, Any]]:
+    """Report each online evaluation configuration that could not be read."""
+    return [
+        create_finding(
+            check_id=check_id,
+            finding_name=finding_name,
+            finding_details=(
+                f"{label} could not be read: {_assessment_error_label(error)}."
+            ),
+            resolution=("Grant bedrock-agentcore:GetOnlineEvaluationConfig and retry."),
+            reference=reference,
+            severity=SeverityEnum.INFORMATIONAL,
+            status=StatusEnum.NA,
+        )
+        for label, error in errors
+    ]
+
+
+# GetOnlineEvaluationConfig reports the build and the run separately. `status`
+# reaches ACTIVE once the configuration is built, against CREATING, CREATE_FAILED,
+# UPDATING, UPDATE_FAILED, DELETING and ERROR, and `executionStatus` is ENABLED or
+# DISABLED whatever the build says, so a configuration can be ACTIVE and score
+# nothing.
+ONLINE_EVALUATION_BUILT_STATUS = "ACTIVE"
+ONLINE_EVALUATION_RUNNING_STATUS = "ENABLED"
+
+
+def check_agentcore_online_evaluation_operation() -> List[Dict[str, Any]]:
+    """AC-39: Judge whether each online evaluation samples live agent traffic.
+
+    AC-17 reads the same settings but reports N/A unless the assessment
+    environment sets REQUIRE_AGENTCORE_ONLINE_EVALUATION, so the one verdict it
+    cannot return by default is Failed: an evaluation left DISABLED, or built and
+    sampling nothing, passes an unconfigured scan. A configuration that exists is a
+    commitment to evaluate something whatever the scanner was told, so this check
+    judges it unconditionally and names the setting that stops it running.
+    """
+    if agentcore_client is None:
+        return [
+            create_finding(
+                check_id="AC-39",
+                finding_name="AgentCore Online Evaluation Operation",
+                finding_details="AgentCore client not available in this region.",
+                resolution="No action required unless AgentCore runs in this region.",
+                reference=AGENTCORE_ONLINE_EVALUATION_REFERENCE_URL,
+                severity=SeverityEnum.INFORMATIONAL,
+                status=StatusEnum.NA,
+            )
+        ]
+
+    try:
+        details, errors = _online_evaluation_details()
+    except Exception as error:
+        return [
+            _incomplete_check_finding(
+                check_id="AC-39",
+                finding_name="AgentCore Online Evaluation Operation",
+                error=error,
+                reference=AGENTCORE_ONLINE_EVALUATION_REFERENCE_URL,
+            )
+        ]
+
+    if not details and not errors:
+        return [
+            create_finding(
+                check_id="AC-39",
+                finding_name="AgentCore Online Evaluation Operation",
+                finding_details=(
+                    "No AgentCore online evaluation configurations found in this "
+                    "region, so there is none to judge. AC-17 reports whether one "
+                    "is expected."
+                ),
+                resolution="No action required for this check.",
+                reference=AGENTCORE_ONLINE_EVALUATION_REFERENCE_URL,
+                severity=SeverityEnum.INFORMATIONAL,
+                status=StatusEnum.NA,
+            )
+        ]
+
+    findings = _online_evaluation_read_findings(
+        "AC-39",
+        "AgentCore Online Evaluation Operation",
+        errors,
+        AGENTCORE_ONLINE_EVALUATION_REFERENCE_URL,
+    )
+
+    for label, detail in details:
+        problems: List[str] = []
+
+        status = detail.get("status")
+        if status != ONLINE_EVALUATION_BUILT_STATUS:
+            failure_reason = detail.get("failureReason")
+            problems.append(
+                f"reports status {status or 'unspecified'} rather than "
+                f"{ONLINE_EVALUATION_BUILT_STATUS}"
+                + (f" ({failure_reason})" if failure_reason else "")
+            )
+
+        execution_status = detail.get("executionStatus")
+        if execution_status != ONLINE_EVALUATION_RUNNING_STATUS:
+            problems.append(
+                f"reports executionStatus {execution_status or 'unspecified'} rather "
+                f"than {ONLINE_EVALUATION_RUNNING_STATUS}, so it scores no traffic"
+            )
+
+        sampling = ((detail.get("rule") or {}).get("samplingConfig") or {}).get(
+            "samplingPercentage"
+        )
+        if not isinstance(sampling, (int, float)) or sampling <= 0:
+            problems.append(
+                "defines no sampling percentage above zero, so it scores none of the "
+                "traffic it is attached to"
+            )
+
+        data_source = (detail.get("dataSourceConfig") or {}).get("cloudWatchLogs") or {}
+        input_groups = data_source.get("logGroupNames") or []
+        input_services = data_source.get("serviceNames") or []
+        if not input_groups and not input_services:
+            problems.append(
+                "names no input log group and no service, so it has no traffic to read"
+            )
+
+        output = (detail.get("outputConfig") or {}).get("cloudWatchConfig") or {}
+        if not output.get("logGroupName"):
+            problems.append("writes its results to no log group")
+
+        evaluators = detail.get("evaluators") or []
+        if not evaluators:
+            problems.append("attaches no evaluator, so it scores nothing")
+
+        if problems:
+            findings.append(
+                create_finding(
+                    check_id="AC-39",
+                    finding_name="AgentCore Online Evaluation Not Running",
+                    finding_details=(
+                        f"{label} {'; '.join(problems)}. A configuration that does "
+                        "not score live traffic leaves production behaviour "
+                        "unmeasured between deployments, and this check reports it "
+                        "whatever REQUIRE_AGENTCORE_ONLINE_EVALUATION is set to."
+                    ),
+                    resolution=(
+                        "Set the configuration ACTIVE and ENABLED with a sampling "
+                        "percentage above zero, an input log group or service, at "
+                        "least one evaluator and an output log group, or delete the "
+                        "configuration if the workload it points at is gone."
+                    ),
+                    reference=AGENTCORE_ONLINE_EVALUATION_REFERENCE_URL,
+                    severity=SeverityEnum.MEDIUM,
+                    status=StatusEnum.FAILED,
+                )
+            )
+        else:
+            findings.append(
+                create_finding(
+                    check_id="AC-39",
+                    finding_name="AgentCore Online Evaluation Operation",
+                    finding_details=(
+                        f"{label} is {ONLINE_EVALUATION_BUILT_STATUS} and "
+                        f"{ONLINE_EVALUATION_RUNNING_STATUS}, samples {sampling} "
+                        f"percent of the traffic from {len(input_groups)} log "
+                        f"group(s) and {len(input_services)} service(s), and writes "
+                        f"the scores of {len(evaluators)} evaluator(s) to a log "
+                        "group."
+                    ),
+                    resolution=(
+                        "No action required for this check. The sampling percentage "
+                        "and the rule filters decide which requests are scored, so "
+                        "confirm they cover the traffic this workload's assurance "
+                        "commitment names. AC-40 judges which evaluators are "
+                        "attached."
+                    ),
+                    reference=AGENTCORE_ONLINE_EVALUATION_REFERENCE_URL,
+                    severity=SeverityEnum.MEDIUM,
+                    status=StatusEnum.PASSED,
+                )
+            )
+
+    return findings
+
+
+# The catalogue marks a safety evaluator in its own description, which is the only
+# machine-readable statement of what an evaluator scores: EvaluatorSummary carries
+# evaluatorType, provider and level, and none of those separates a safety metric
+# from an answer-quality one. The marker is read on the service-authored entries
+# only, because a customer-authored description is prose this check cannot verify.
+EVALUATOR_SAFETY_DESCRIPTION_MARKER = "safety metric"
+SERVICE_AUTHORED_EVALUATOR_TYPES = ("Builtin", "ThirdParty")
+# EvaluatorSummary.level: an evaluator at TOOL_CALL level scores one tool call,
+# which is where a wrong tool choice or a wrong tool argument shows up. The other
+# two levels, TRACE and SESSION, score a whole response or conversation.
+EVALUATOR_TOOL_CALL_LEVEL = "TOOL_CALL"
+
+# AgentCore publishes no evaluation score metric of its own, and an evaluation
+# writes its scores to a log group, so alarming on a falling score means a metric
+# filter whose pattern and threshold belong to the workload. Every verdict of
+# AC-40 says so rather than leaving the reader to assume a score is watched.
+EVALUATION_SCORE_ALARM_NOTE = (
+    "A score nobody watches changes nothing: the evaluation writes its results to "
+    "a log group and AgentCore publishes no evaluation score metric, so an alarm "
+    "on a falling score is a metric filter over the results log group whose "
+    "pattern and threshold this check cannot read."
+)
+
+
+def check_agentcore_evaluation_safety_coverage() -> List[Dict[str, Any]]:
+    """AC-40: Judge whether an online evaluation scores safety and tool choice.
+
+    AC-17 and AC-39 count the evaluators a configuration attaches without asking
+    what any of them scores, so ten answer-quality judges read the same as a
+    harmful-content judge. The catalogue answers the question itself: ListEvaluators
+    marks each service-authored evaluator's category in its description and reports
+    the level it scores at, so a configuration attaching neither a safety evaluator
+    nor a tool-call one measures how good the answers are and not whether the agent
+    is safe or reached for the right tool.
+    """
+    if agentcore_client is None:
+        return [
+            create_finding(
+                check_id="AC-40",
+                finding_name="AgentCore Evaluation Safety Coverage",
+                finding_details="AgentCore client not available in this region.",
+                resolution="No action required unless AgentCore runs in this region.",
+                reference=AGENTCORE_EVALUATORS_REFERENCE_URL,
+                severity=SeverityEnum.INFORMATIONAL,
+                status=StatusEnum.NA,
+            )
+        ]
+
+    try:
+        details, errors = _online_evaluation_details()
+    except Exception as error:
+        return [
+            _incomplete_check_finding(
+                check_id="AC-40",
+                finding_name="AgentCore Evaluation Safety Coverage",
+                error=error,
+                reference=AGENTCORE_EVALUATORS_REFERENCE_URL,
+            )
+        ]
+
+    if not details and not errors:
+        return [
+            create_finding(
+                check_id="AC-40",
+                finding_name="AgentCore Evaluation Safety Coverage",
+                finding_details=(
+                    "No AgentCore online evaluation configurations found in this "
+                    "region, so no evaluator is attached to anything. AC-17 reports "
+                    "whether an evaluation is expected."
+                ),
+                resolution="No action required for this check.",
+                reference=AGENTCORE_EVALUATORS_REFERENCE_URL,
+                severity=SeverityEnum.INFORMATIONAL,
+                status=StatusEnum.NA,
+            )
+        ]
+
+    findings = _online_evaluation_read_findings(
+        "AC-40",
+        "AgentCore Evaluation Safety Coverage",
+        errors,
+        AGENTCORE_EVALUATORS_REFERENCE_URL,
+    )
+
+    try:
+        catalogue = _agentcore_list_all("list_evaluators", ["evaluators"])
+    except Exception as error:
+        findings.append(
+            create_finding(
+                check_id="AC-40",
+                finding_name="AgentCore Evaluation Safety Coverage",
+                finding_details=(
+                    "The evaluator catalogue could not be read, so the evaluators "
+                    "these configurations attach could not be classified: "
+                    f"{_assessment_error_label(error)}."
+                ),
+                resolution="Grant bedrock-agentcore:ListEvaluators and retry.",
+                reference=AGENTCORE_EVALUATORS_REFERENCE_URL,
+                severity=SeverityEnum.INFORMATIONAL,
+                status=StatusEnum.NA,
+            )
+        )
+        return findings
+
+    safety_ids: Set[str] = set()
+    tool_call_ids: Set[str] = set()
+    service_authored_ids: Set[str] = set()
+    for evaluator in catalogue:
+        evaluator_id = evaluator.get("evaluatorId")
+        if not evaluator_id:
+            continue
+        if evaluator.get("evaluatorType") not in SERVICE_AUTHORED_EVALUATOR_TYPES:
+            continue
+        service_authored_ids.add(evaluator_id)
+        description = str(evaluator.get("description") or "").lower()
+        if EVALUATOR_SAFETY_DESCRIPTION_MARKER in description:
+            safety_ids.add(evaluator_id)
+        if evaluator.get("level") == EVALUATOR_TOOL_CALL_LEVEL:
+            tool_call_ids.add(evaluator_id)
+
+    if not safety_ids or not tool_call_ids:
+        # Neither category can be read out of this catalogue, so judging the
+        # configurations against it would fail every one of them for a fact about
+        # the catalogue. The drift is reported instead of charged to the workload.
+        findings.append(
+            create_finding(
+                check_id="AC-40",
+                finding_name="AgentCore Evaluation Safety Coverage",
+                finding_details=(
+                    f"The catalogue returned {len(catalogue)} evaluator(s), of which "
+                    f"{len(safety_ids)} carry '"
+                    f"{EVALUATOR_SAFETY_DESCRIPTION_MARKER}' in a service-authored "
+                    f"description and {len(tool_call_ids)} score at "
+                    f"{EVALUATOR_TOOL_CALL_LEVEL} level. With one of those two "
+                    "categories empty the catalogue cannot say which attached "
+                    "evaluator scores safety, so no configuration is judged here."
+                ),
+                resolution=(
+                    "No action is required on the assessed workload based on this "
+                    "result. Compare the evaluator catalogue against the two "
+                    "categories this check reads, and rerun the assessment."
+                ),
+                reference=AGENTCORE_EVALUATORS_REFERENCE_URL,
+                severity=SeverityEnum.INFORMATIONAL,
+                status=StatusEnum.NA,
+            )
+        )
+        return findings
+
+    for label, detail in details:
+        attached = [
+            str(reference.get("evaluatorId"))
+            for reference in detail.get("evaluators") or []
+            if reference.get("evaluatorId")
+        ]
+        safety_attached = sorted(set(attached) & safety_ids)
+        tool_call_attached = sorted(set(attached) & tool_call_ids)
+        unclassifiable = sorted(set(attached) - service_authored_ids)
+
+        owner_note = (
+            f" The {len(unclassifiable)} attached evaluator(s) written in this "
+            f"account ({', '.join(unclassifiable)}) carry customer-authored "
+            "descriptions, so what each one scores is the workload owner's to state."
+            if unclassifiable
+            else ""
+        )
+
+        missing: List[str] = []
+        if not safety_attached:
+            missing.append(
+                "attaches no evaluator the catalogue marks as a safety metric, so "
+                "harmful, biased or personal-data-bearing output goes unscored"
+            )
+        if not tool_call_attached:
+            missing.append(
+                f"attaches no evaluator at {EVALUATOR_TOOL_CALL_LEVEL} level, so a "
+                "wrong tool choice or a wrong tool argument goes unscored"
+            )
+
+        if missing:
+            findings.append(
+                create_finding(
+                    check_id="AC-40",
+                    finding_name="AgentCore Evaluation Safety Coverage Incomplete",
+                    finding_details=(
+                        f"{label} attaches {len(attached)} evaluator(s) and "
+                        f"{' and '.join(missing)}.{owner_note}"
+                    ),
+                    resolution=(
+                        "Attach a safety evaluator and a tool-call evaluator from "
+                        "the catalogue, or record which of this account's own "
+                        f"evaluators scores each category. {EVALUATION_SCORE_ALARM_NOTE}"
+                    ),
+                    reference=AGENTCORE_EVALUATORS_REFERENCE_URL,
+                    severity=SeverityEnum.MEDIUM,
+                    status=StatusEnum.FAILED,
+                )
+            )
+        else:
+            findings.append(
+                create_finding(
+                    check_id="AC-40",
+                    finding_name="AgentCore Evaluation Safety Coverage",
+                    finding_details=(
+                        f"{label} scores safety with {', '.join(safety_attached)} and "
+                        f"tool choice with {', '.join(tool_call_attached)}."
+                        f"{owner_note}"
+                    ),
+                    resolution=(
+                        "No action required for this check. "
+                        f"{EVALUATION_SCORE_ALARM_NOTE}"
+                    ),
+                    reference=AGENTCORE_EVALUATORS_REFERENCE_URL,
+                    severity=SeverityEnum.MEDIUM,
+                    status=StatusEnum.PASSED,
+                )
+            )
+
+    return findings
+
+
+def check_agentcore_evaluation_result_protection() -> List[Dict[str, Any]]:
+    """AC-41: Judge the log group each online evaluation writes its results to.
+
+    An evaluation result carries the agent output that was scored and the judge's
+    reasoning about it, so the results group holds the same content as the traces
+    it read. AC-20 and AC-26 judge encryption and retention on log groups whose
+    names start with an AgentCore prefix, and outputConfig names whichever log
+    group the configuration's creator chose, so a results group outside those
+    prefixes is judged by neither. This check anchors on the configuration instead
+    of on the name.
+    """
+    if agentcore_client is None or logs_client is None:
+        return [
+            create_finding(
+                check_id="AC-41",
+                finding_name="AgentCore Evaluation Result Protection",
+                finding_details=(
+                    "AgentCore or CloudWatch Logs client not available in this region."
+                ),
+                resolution="No action required unless AgentCore runs in this region.",
+                reference=LOGS_RETENTION_REFERENCE_URL,
+                severity=SeverityEnum.INFORMATIONAL,
+                status=StatusEnum.NA,
+            )
+        ]
+
+    try:
+        details, errors = _online_evaluation_details()
+    except Exception as error:
+        return [
+            _incomplete_check_finding(
+                check_id="AC-41",
+                finding_name="AgentCore Evaluation Result Protection",
+                error=error,
+                reference=LOGS_RETENTION_REFERENCE_URL,
+            )
+        ]
+
+    if not details and not errors:
+        return [
+            create_finding(
+                check_id="AC-41",
+                finding_name="AgentCore Evaluation Result Protection",
+                finding_details=(
+                    "No AgentCore online evaluation configurations found in this "
+                    "region, so no evaluation results are stored."
+                ),
+                resolution="No action required for this check.",
+                reference=LOGS_RETENTION_REFERENCE_URL,
+                severity=SeverityEnum.INFORMATIONAL,
+                status=StatusEnum.NA,
+            )
+        ]
+
+    findings = _online_evaluation_read_findings(
+        "AC-41",
+        "AgentCore Evaluation Result Protection",
+        errors,
+        LOGS_RETENTION_REFERENCE_URL,
+    )
+
+    for label, detail in details:
+        output = (detail.get("outputConfig") or {}).get("cloudWatchConfig") or {}
+        group_name = output.get("logGroupName")
+        if not group_name:
+            findings.append(
+                create_finding(
+                    check_id="AC-41",
+                    finding_name="AgentCore Evaluation Result Protection",
+                    finding_details=(
+                        f"{label} names no results log group, so there is no results "
+                        "store to judge. AC-39 reports the missing output "
+                        "configuration."
+                    ),
+                    resolution="No action required for this check. Resolve AC-39.",
+                    reference=LOGS_RETENTION_REFERENCE_URL,
+                    severity=SeverityEnum.INFORMATIONAL,
+                    status=StatusEnum.NA,
+                )
+            )
+            continue
+
+        try:
+            candidates = _paginate_aws_list(
+                logs_client,
+                "describe_log_groups",
+                "logGroups",
+                logGroupNamePrefix=group_name,
+            )
+        except Exception as error:
+            findings.append(
+                create_finding(
+                    check_id="AC-41",
+                    finding_name="AgentCore Evaluation Result Protection",
+                    finding_details=(
+                        f"{label} writes results to log group '{group_name}', which "
+                        f"could not be read: {_assessment_error_label(error)}."
+                    ),
+                    resolution="Grant logs:DescribeLogGroups and retry.",
+                    reference=LOGS_RETENTION_REFERENCE_URL,
+                    severity=SeverityEnum.INFORMATIONAL,
+                    status=StatusEnum.NA,
+                )
+            )
+            continue
+
+        group = next(
+            (
+                candidate
+                for candidate in candidates
+                if candidate.get("logGroupName") == group_name
+            ),
+            None,
+        )
+        if group is None:
+            findings.append(
+                create_finding(
+                    check_id="AC-41",
+                    finding_name="AgentCore Evaluation Results Unprotected",
+                    finding_details=(
+                        f"{label} writes results to log group '{group_name}', which "
+                        "does not exist in this region. CloudWatch Logs creates a "
+                        "log group on first write with no encryption key and no "
+                        "retention period, so the first results this configuration "
+                        "produces are stored under a key the account does not "
+                        "control and kept forever."
+                    ),
+                    resolution=(
+                        "Create the results log group before the next evaluation run "
+                        "with a customer managed key and a retention period, or "
+                        "point the configuration at a log group that already has "
+                        "both."
+                    ),
+                    reference=LOGS_RETENTION_REFERENCE_URL,
+                    severity=SeverityEnum.MEDIUM,
+                    status=StatusEnum.FAILED,
+                )
+            )
+            continue
+
+        problems: List[str] = []
+        confirmations: List[str] = []
+
+        retention = group.get("retentionInDays")
+        if retention:
+            confirmations.append(f"expires results after {retention} day(s)")
+        else:
+            problems.append(
+                "has no retention period, so every scored prompt, response and "
+                "judge rationale is kept indefinitely"
+            )
+
+        key_id = group.get("kmsKeyId")
+        if key_id:
+            confirmations.append(f"is encrypted with {key_id}")
+        else:
+            problems.append(
+                "has no customer managed encryption key, so who can read the stored "
+                "results is bounded by CloudWatch Logs permissions alone and no key "
+                "policy can narrow it"
+            )
+
+        if group_name.startswith(AGENTCORE_LOG_GROUP_PREFIXES):
+            confirmations.append(
+                "sits under an AgentCore log group prefix, so AC-20 judges its "
+                "masking policy and AC-26 judges its key policy"
+            )
+        else:
+            problems.append(
+                "sits outside the AgentCore log group prefixes "
+                f"({', '.join(AGENTCORE_LOG_GROUP_PREFIXES)}), so the masking and "
+                "key-policy controls that sweep log groups by name do not reach it"
+            )
+
+        if problems:
+            findings.append(
+                create_finding(
+                    check_id="AC-41",
+                    finding_name="AgentCore Evaluation Results Unprotected",
+                    finding_details=(
+                        f"{label} writes results to log group '{group_name}', which "
+                        f"{' and '.join(problems)}."
+                    ),
+                    resolution=(
+                        "Set a retention period matching the schedule this workload "
+                        "commits to, encrypt the group with a customer managed key, "
+                        "and keep the results under an AgentCore log group prefix so "
+                        "the masking and key-scope controls cover it."
+                    ),
+                    reference=LOGS_RETENTION_REFERENCE_URL,
+                    severity=SeverityEnum.MEDIUM,
+                    status=StatusEnum.FAILED,
+                )
+            )
+        else:
+            findings.append(
+                create_finding(
+                    check_id="AC-41",
+                    finding_name="AgentCore Evaluation Result Protection",
+                    finding_details=(
+                        f"{label} writes results to log group '{group_name}', which "
+                        f"{' and '.join(confirmations)}."
+                    ),
+                    resolution=(
+                        "No action required for this check. Tag values and the "
+                        "configuration's own description are free-form text this "
+                        "check cannot judge, so confirm neither carries personal "
+                        "data."
+                    ),
+                    reference=LOGS_RETENTION_REFERENCE_URL,
+                    severity=SeverityEnum.MEDIUM,
+                    status=StatusEnum.PASSED,
+                )
+            )
+
+    return findings
+
+
+IAM_PASS_ROLE_ACTION = "iam:passrole"
+IAM_PASSED_TO_SERVICE_CONDITION_KEY = "iam:passedtoservice"
+
+PASS_ROLE_WIDE_RESOURCE_LEG = "its Resource pattern also reaches other roles"
+PASS_ROLE_MISSING_CONDITION_LEG = "it carries no iam:PassedToService condition"
+
+
+def _evaluation_pass_role_grants(
+    permissions_by_name: Dict[str, Any],
+    principal_kind: str,
+    role_arns: List[str],
+) -> Tuple[List[Tuple[str, List[str]]], int]:
+    """Return every principal that can pass an evaluation execution role.
+
+    Each entry pairs a principal's label with the guards its widest reaching
+    PassRole statement is missing, so an entry with no missing guard is bounded. A
+    principal holding no PassRole statement that reaches one of the named roles is
+    absent from the result: it is neither reported nor counted as passing. A narrow
+    statement elsewhere in the same policy set does not narrow a wide one, which is
+    why the widest is the one judged.
+    """
+    grants: List[Tuple[str, List[str]]] = []
+    unreadable = 0
+
+    for principal_name, permissions in permissions_by_name.items():
+        if not isinstance(permissions, dict):
+            continue
+        label = f"{principal_kind} {principal_name}"
+        widest: List[str] = []
+        reaches = False
+
+        for policy in [
+            *(permissions.get("attached_policies") or []),
+            *(permissions.get("inline_policies") or []),
+        ]:
+            try:
+                statements = list(_allow_statements(policy))
+            except Exception as error:
+                unreadable += 1
+                logger.warning(f"Error parsing policy for {label}: {error}")
+                continue
+
+            for statement in statements:
+                if not _statement_matches_action(statement, IAM_PASS_ROLE_ACTION):
+                    continue
+                reaching = [
+                    resource
+                    for resource in _statement_resources(statement)
+                    if any(fnmatchcase(role_arn, resource) for role_arn in role_arns)
+                ]
+                if not reaching:
+                    continue
+
+                missing: List[str] = []
+                if any("*" in resource or "?" in resource for resource in reaching):
+                    missing.append(PASS_ROLE_WIDE_RESOURCE_LEG)
+                if IAM_PASSED_TO_SERVICE_CONDITION_KEY not in _statement_condition_keys(
+                    statement
+                ):
+                    missing.append(PASS_ROLE_MISSING_CONDITION_LEG)
+
+                if not reaches or len(missing) > len(widest):
+                    widest = missing
+                reaches = True
+
+        if reaches:
+            grants.append((label, widest))
+
+    return grants, unreadable
+
+
+def check_agentcore_evaluation_pass_role_scope(
+    permission_cache: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    """AC-42: Judge who can hand a role to the evaluation service, and which role.
+
+    An online evaluation runs under the role named in its
+    evaluationExecutionRoleArn, and creating or updating a configuration means
+    passing that role to AgentCore. iam:PassRole on a pattern wider than the one
+    role turns evaluation administration into a way to run a role the caller could
+    not assume: the caller writes a configuration naming it and the service assumes
+    it. iam:PassedToService narrows the same grant to the service the role was
+    written for, so a role meant for evaluations cannot be handed to another
+    service that trusts it.
+    """
+    if agentcore_client is None:
+        return [
+            create_finding(
+                check_id="AC-42",
+                finding_name="AgentCore Evaluation Pass Role Scope",
+                finding_details="AgentCore client not available in this region.",
+                resolution="No action required unless AgentCore runs in this region.",
+                reference=IAM_PASS_ROLE_REFERENCE_URL,
+                severity=SeverityEnum.INFORMATIONAL,
+                status=StatusEnum.NA,
+            )
+        ]
+
+    try:
+        details, errors = _online_evaluation_details()
+    except Exception as error:
+        return [
+            _incomplete_check_finding(
+                check_id="AC-42",
+                finding_name="AgentCore Evaluation Pass Role Scope",
+                error=error,
+                reference=IAM_PASS_ROLE_REFERENCE_URL,
+            )
+        ]
+
+    findings = _online_evaluation_read_findings(
+        "AC-42",
+        "AgentCore Evaluation Pass Role Scope",
+        errors,
+        IAM_PASS_ROLE_REFERENCE_URL,
+    )
+
+    role_arns = sorted(
+        {
+            str(detail.get("evaluationExecutionRoleArn"))
+            for _, detail in details
+            if detail.get("evaluationExecutionRoleArn")
+        }
+    )
+    if not role_arns:
+        findings.append(
+            create_finding(
+                check_id="AC-42",
+                finding_name="AgentCore Evaluation Pass Role Scope",
+                finding_details=(
+                    "No AgentCore online evaluation configuration in this region "
+                    "names an execution role, so no role is passed to the evaluation "
+                    "service."
+                ),
+                resolution="No action required for this check.",
+                reference=IAM_PASS_ROLE_REFERENCE_URL,
+                severity=SeverityEnum.INFORMATIONAL,
+                status=StatusEnum.NA,
+            )
+        )
+        return findings
+
+    role_permissions = (permission_cache or {}).get("role_permissions") or {}
+    user_permissions = (permission_cache or {}).get("user_permissions") or {}
+    if not role_permissions and not user_permissions:
+        findings.append(
+            create_finding(
+                check_id="AC-42",
+                finding_name="AgentCore Evaluation Pass Role Scope",
+                finding_details=(
+                    "No IAM permissions found in cache, so who can pass "
+                    f"{len(role_arns)} evaluation execution role(s) could not be "
+                    "read."
+                ),
+                resolution=(
+                    "No action is required on the assessed workload based on this "
+                    "result. Resolve the IAM permission cache and rerun the "
+                    "assessment."
+                ),
+                reference=IAM_PASS_ROLE_REFERENCE_URL,
+                severity=SeverityEnum.INFORMATIONAL,
+                status=StatusEnum.NA,
+            )
+        )
+        return findings
+
+    role_grants, role_unreadable = _evaluation_pass_role_grants(
+        role_permissions, "role", role_arns
+    )
+    user_grants, user_unreadable = _evaluation_pass_role_grants(
+        user_permissions, "user", role_arns
+    )
+    grants = sorted(role_grants + user_grants)
+    unbounded = [(label, missing) for label, missing in grants if missing]
+    bounded = [label for label, missing in grants if not missing]
+    named_roles = ", ".join(role_arns)
+
+    if unbounded:
+        findings.append(
+            create_finding(
+                check_id="AC-42",
+                finding_name="AgentCore Evaluation Pass Role Unbounded",
+                finding_details=(
+                    "The following principals can pass an evaluation execution role "
+                    f"({named_roles}) through a grant that is wider than the role it "
+                    "is needed for: "
+                    + "; ".join(
+                        f"{label}, where {' and '.join(missing)}"
+                        for label, missing in unbounded
+                    )
+                    + "."
+                ),
+                resolution=(
+                    "Scope iam:PassRole to the evaluation execution role's own ARN "
+                    "and add an iam:PassedToService condition naming "
+                    "bedrock-agentcore.amazonaws.com, so the grant passes that role "
+                    "to evaluations and nothing else."
+                ),
+                reference=IAM_PASS_ROLE_REFERENCE_URL,
+                severity=SeverityEnum.HIGH,
+                status=StatusEnum.FAILED,
+            )
+        )
+
+    if bounded:
+        findings.append(
+            create_finding(
+                check_id="AC-42",
+                finding_name="AgentCore Evaluation Pass Role Scope",
+                finding_details=(
+                    "The following principals can pass an evaluation execution role "
+                    f"({named_roles}) only by its own ARN and only to a named "
+                    f"service: {', '.join(bounded)}."
+                ),
+                resolution=(
+                    "No action required. Confirm the iam:PassedToService value names "
+                    "the evaluation service rather than every service this role "
+                    "trusts."
+                ),
+                reference=IAM_PASS_ROLE_REFERENCE_URL,
+                severity=SeverityEnum.HIGH,
+                status=StatusEnum.PASSED,
+            )
+        )
+
+    if not grants:
+        findings.append(
+            create_finding(
+                check_id="AC-42",
+                finding_name="AgentCore Evaluation Pass Role Scope",
+                finding_details=(
+                    "No cached IAM role or user can pass an evaluation execution "
+                    f"role ({named_roles}), so no principal in this snapshot can "
+                    "point an evaluation at a different role."
+                ),
+                resolution=(
+                    "No action required. Grant iam:PassRole on the evaluation "
+                    "execution role only to the principal that maintains the "
+                    "evaluation configurations."
+                ),
+                reference=IAM_PASS_ROLE_REFERENCE_URL,
+                severity=SeverityEnum.HIGH,
+                status=StatusEnum.PASSED,
+            )
+        )
+
+    if role_unreadable or user_unreadable:
+        findings.append(
+            create_finding(
+                check_id="AC-42",
+                finding_name="AgentCore Evaluation Pass Role Scope Incomplete",
+                finding_details=(
+                    f"{role_unreadable + user_unreadable} cached policy document(s) "
+                    "could not be parsed, so a PassRole grant inside one of them was "
+                    "not judged."
+                ),
+                resolution=(
+                    "No action is required on the assessed workload based on this "
+                    "result. Repair the unreadable policy documents in the IAM "
+                    "permission cache and rerun the assessment."
+                ),
+                reference=IAM_PASS_ROLE_REFERENCE_URL,
+                severity=SeverityEnum.INFORMATIONAL,
+                status=StatusEnum.NA,
+            )
+        )
+
+    return findings
+
+
+def check_agentcore_evaluation_role_trust() -> List[Dict[str, Any]]:
+    """AC-43: Judge each evaluation execution role's trust for a deputy guard.
+
+    An evaluation execution role trusts the AgentCore service principal so the
+    service can read the traces and invoke the judge model on the account's behalf.
+    Without aws:SourceAccount or aws:SourceArn that same service principal assumes
+    the role while acting for another customer's configuration, which is the
+    confused-deputy problem AC-27 judges on gateway execution roles. No evaluation
+    role falls inside AC-27's scope, because it reads the roles that gateways name.
+    """
+    if agentcore_client is None:
+        return [
+            create_finding(
+                check_id="AC-43",
+                finding_name="AgentCore Evaluation Role Trust",
+                finding_details="AgentCore client not available in this region.",
+                resolution="No action required unless AgentCore runs in this region.",
+                reference=CONFUSED_DEPUTY_REFERENCE_URL,
+                severity=SeverityEnum.INFORMATIONAL,
+                status=StatusEnum.NA,
+            )
+        ]
+
+    try:
+        details, errors = _online_evaluation_details()
+    except Exception as error:
+        return [
+            _incomplete_check_finding(
+                check_id="AC-43",
+                finding_name="AgentCore Evaluation Role Trust",
+                error=error,
+                reference=CONFUSED_DEPUTY_REFERENCE_URL,
+            )
+        ]
+
+    if not details and not errors:
+        return [
+            create_finding(
+                check_id="AC-43",
+                finding_name="AgentCore Evaluation Role Trust",
+                finding_details=(
+                    "No AgentCore online evaluation configurations found in this "
+                    "region, so no evaluation execution role is trusted by the "
+                    "service."
+                ),
+                resolution="No action required for this check.",
+                reference=CONFUSED_DEPUTY_REFERENCE_URL,
+                severity=SeverityEnum.INFORMATIONAL,
+                status=StatusEnum.NA,
+            )
+        ]
+
+    findings = _online_evaluation_read_findings(
+        "AC-43",
+        "AgentCore Evaluation Role Trust",
+        errors,
+        CONFUSED_DEPUTY_REFERENCE_URL,
+    )
+
+    trust_cache: Dict[str, Any] = {}
+    for label, detail in details:
+        role_arn = detail.get("evaluationExecutionRoleArn")
+        if not role_arn:
+            findings.append(
+                create_finding(
+                    check_id="AC-43",
+                    finding_name="AgentCore Evaluation Role Trust",
+                    finding_details=(
+                        f"{label} names no execution role, so there is no trust "
+                        "policy to guard."
+                    ),
+                    resolution="No action required for this check.",
+                    reference=CONFUSED_DEPUTY_REFERENCE_URL,
+                    severity=SeverityEnum.INFORMATIONAL,
+                    status=StatusEnum.NA,
+                )
+            )
+            continue
+
+        role_name = str(role_arn).rsplit("/", 1)[-1]
+        if role_name not in trust_cache:
+            try:
+                trust_cache[role_name] = iam_client.get_role(RoleName=role_name)[
+                    "Role"
+                ]["AssumeRolePolicyDocument"]
+            except Exception as error:
+                logger.warning(f"Could not read trust policy for {role_name}: {error}")
+                trust_cache[role_name] = error
+
+        document = trust_cache[role_name]
+        if isinstance(document, Exception):
+            findings.append(
+                create_finding(
+                    check_id="AC-43",
+                    finding_name="AgentCore Evaluation Role Trust",
+                    finding_details=(
+                        f"{label} runs as {role_name}, whose trust policy could not "
+                        f"be read: {_assessment_error_label(document)}."
+                    ),
+                    resolution="Grant iam:GetRole on the role and retry.",
+                    reference=CONFUSED_DEPUTY_REFERENCE_URL,
+                    severity=SeverityEnum.INFORMATIONAL,
+                    status=StatusEnum.NA,
+                )
+            )
+            continue
+
+        statements = _document_statements(document, effect="Allow")
+        exposed = [
+            statement
+            for statement in statements
+            if _statement_is_confused_deputy_exposed(statement)
+        ]
+
+        if exposed:
+            findings.append(
+                create_finding(
+                    check_id="AC-43",
+                    finding_name="AgentCore Evaluation Role Trust Guard Missing",
+                    finding_details=(
+                        f"{label} runs as {role_name}, which has {len(exposed)} of "
+                        f"{len(statements)} Allow statement(s) trusting an AWS "
+                        "service principal or every principal with no "
+                        "aws:SourceAccount or aws:SourceArn condition. The role can "
+                        "read the scored traces and invoke the judge model, so a "
+                        "service acting for somebody else's evaluation reaches both."
+                    ),
+                    resolution=(
+                        "Add aws:SourceAccount for this account and aws:SourceArn "
+                        "for this account's evaluator and online-evaluation-config "
+                        "ARNs to every statement of the trust policy, or delete the "
+                        "unguarded statement."
+                    ),
+                    reference=CONFUSED_DEPUTY_REFERENCE_URL,
+                    severity=SeverityEnum.HIGH,
+                    status=StatusEnum.FAILED,
+                )
+            )
+        else:
+            findings.append(
+                create_finding(
+                    check_id="AC-43",
+                    finding_name="AgentCore Evaluation Role Trust",
+                    finding_details=(
+                        f"{label} runs as {role_name}, whose {len(statements)} Allow "
+                        "statement(s) each carry an aws:SourceAccount or "
+                        "aws:SourceArn condition, or name no service or wildcard "
+                        "principal."
+                    ),
+                    resolution=(
+                        "No action required. Confirm the aws:SourceArn pattern names "
+                        "this account's evaluation resources rather than every "
+                        "AgentCore resource in the account."
+                    ),
+                    reference=CONFUSED_DEPUTY_REFERENCE_URL,
+                    severity=SeverityEnum.HIGH,
+                    status=StatusEnum.PASSED,
+                )
+            )
+
+    return findings
+
+
+# The two IAM actions that send a prompt to a model. The Converse and
+# ConverseStream APIs authorize against these rather than carrying actions of
+# their own, which Access Analyzer's policy validation confirms by rejecting
+# bedrock:Converse and bedrock:ConverseStream as actions that do not exist.
+BEDROCK_MODEL_INVOCATION_ACTIONS = (
+    "bedrock:invokemodel",
+    "bedrock:invokemodelwithresponsestream",
+)
+
+
+def _bedrock_model_resource_is_unbounded(resource: str) -> bool:
+    """Return whether one Resource pattern reaches every model id.
+
+    A model's id is the last segment of its ARN, so a pattern ending in a bare
+    wildcard reaches every model of that resource type and a bare `*` reaches
+    every model of every type. A pattern naming part of an id, such as one
+    provider's prefix, is narrower, and which models belong inside it is the
+    workload owner's decision and not this check's to assert.
+    """
+    return resource == "*" or resource.endswith("/*")
+
+
+def _model_invocation_scope(
+    permissions: Dict[str, Any],
+) -> Tuple[List[str], List[str], int]:
+    """Split one principal's model-invocation Resource patterns by model scope.
+
+    Returns the unbounded patterns, the bounded ones, and the count of policy
+    documents that could not be parsed. A statement whose action list reaches a
+    model-invocation action by any pattern counts, including a bare wildcard: on
+    an evaluation execution role a grant of every action is a grant of every
+    model, unlike on the administrator roles AC-02 leaves alone.
+    """
+    unbounded: List[str] = []
+    bounded: List[str] = []
+    unreadable = 0
+
+    for policy in [
+        *(permissions.get("attached_policies") or []),
+        *(permissions.get("inline_policies") or []),
+    ]:
+        try:
+            statements = list(_allow_statements(policy))
+        except Exception as error:
+            unreadable += 1
+            logger.warning(f"Error parsing evaluation role policy: {error}")
+            continue
+
+        for statement in statements:
+            if not any(
+                _statement_matches_action(statement, action)
+                for action in BEDROCK_MODEL_INVOCATION_ACTIONS
+            ):
+                continue
+            for resource in _statement_resources(statement):
+                if _bedrock_model_resource_is_unbounded(resource):
+                    unbounded.append(resource)
+                else:
+                    bounded.append(resource)
+
+    return sorted(set(unbounded)), sorted(set(bounded)), unreadable
+
+
+def check_agentcore_evaluation_judge_model_scope(
+    permission_cache: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    """AC-44: Judge which models an evaluation execution role can invoke.
+
+    An LLM-as-a-judge evaluator scores agent output by prompting a model, and the
+    prompt it sends carries the agent's own output, so the judge reads attacker
+    influenced text by design. The role that invokes it needs the judge models and
+    nothing else: a grant reaching every foundation model lets a changed evaluator
+    configuration run inference on any model the account can reach, at that model's
+    price, and puts the scored content in front of it.
+
+    Which models a workload's judges are allowed to use is the workload owner's
+    decision, so this check asserts only that the grant names models at all and
+    reports the patterns it found for the owner to confirm.
+    """
+    if agentcore_client is None:
+        return [
+            create_finding(
+                check_id="AC-44",
+                finding_name="AgentCore Evaluation Judge Model Scope",
+                finding_details="AgentCore client not available in this region.",
+                resolution="No action required unless AgentCore runs in this region.",
+                reference=AGENTCORE_EVALUATORS_REFERENCE_URL,
+                severity=SeverityEnum.INFORMATIONAL,
+                status=StatusEnum.NA,
+            )
+        ]
+
+    try:
+        details, errors = _online_evaluation_details()
+    except Exception as error:
+        return [
+            _incomplete_check_finding(
+                check_id="AC-44",
+                finding_name="AgentCore Evaluation Judge Model Scope",
+                error=error,
+                reference=AGENTCORE_EVALUATORS_REFERENCE_URL,
+            )
+        ]
+
+    findings = _online_evaluation_read_findings(
+        "AC-44",
+        "AgentCore Evaluation Judge Model Scope",
+        errors,
+        AGENTCORE_EVALUATORS_REFERENCE_URL,
+    )
+
+    role_arns = sorted(
+        {
+            str(detail.get("evaluationExecutionRoleArn"))
+            for _, detail in details
+            if detail.get("evaluationExecutionRoleArn")
+        }
+    )
+    if not role_arns:
+        findings.append(
+            create_finding(
+                check_id="AC-44",
+                finding_name="AgentCore Evaluation Judge Model Scope",
+                finding_details=(
+                    "No AgentCore online evaluation configuration in this region "
+                    "names an execution role, so no role invokes a judge model."
+                ),
+                resolution="No action required for this check.",
+                reference=AGENTCORE_EVALUATORS_REFERENCE_URL,
+                severity=SeverityEnum.INFORMATIONAL,
+                status=StatusEnum.NA,
+            )
+        )
+        return findings
+
+    role_permissions = (permission_cache or {}).get("role_permissions") or {}
+    if not role_permissions:
+        findings.append(
+            create_finding(
+                check_id="AC-44",
+                finding_name="AgentCore Evaluation Judge Model Scope",
+                finding_details=(
+                    "No IAM role permissions found in cache, so the model grants of "
+                    f"{len(role_arns)} evaluation execution role(s) could not be "
+                    "read."
+                ),
+                resolution=(
+                    "No action is required on the assessed workload based on this "
+                    "result. Resolve the IAM permission cache and rerun the "
+                    "assessment."
+                ),
+                reference=AGENTCORE_EVALUATORS_REFERENCE_URL,
+                severity=SeverityEnum.INFORMATIONAL,
+                status=StatusEnum.NA,
+            )
+        )
+        return findings
+
+    for role_arn in role_arns:
+        role_name = role_arn.rsplit("/", 1)[-1]
+        permissions = role_permissions.get(role_name)
+        if not isinstance(permissions, dict):
+            findings.append(
+                create_finding(
+                    check_id="AC-44",
+                    finding_name="AgentCore Evaluation Judge Model Scope",
+                    finding_details=(
+                        f"Evaluation execution role {role_name} is not in the IAM "
+                        "permissions cache, so the models it can invoke could not be "
+                        "read."
+                    ),
+                    resolution=(
+                        "No action is required on the assessed workload based on "
+                        "this result. Confirm the role exists in this account and "
+                        "rerun the assessment."
+                    ),
+                    reference=AGENTCORE_EVALUATORS_REFERENCE_URL,
+                    severity=SeverityEnum.INFORMATIONAL,
+                    status=StatusEnum.NA,
+                )
+            )
+            continue
+
+        unbounded, bounded, unreadable = _model_invocation_scope(permissions)
+
+        if unreadable:
+            findings.append(
+                create_finding(
+                    check_id="AC-44",
+                    finding_name="AgentCore Evaluation Judge Model Scope Incomplete",
+                    finding_details=(
+                        f"{unreadable} cached policy document(s) on evaluation "
+                        f"execution role {role_name} could not be parsed, so a model "
+                        "grant inside one of them was not judged."
+                    ),
+                    resolution=(
+                        "No action is required on the assessed workload based on "
+                        "this result. Repair the unreadable policy documents in the "
+                        "IAM permission cache and rerun the assessment."
+                    ),
+                    reference=AGENTCORE_EVALUATORS_REFERENCE_URL,
+                    severity=SeverityEnum.INFORMATIONAL,
+                    status=StatusEnum.NA,
+                )
+            )
+
+        if unbounded:
+            findings.append(
+                create_finding(
+                    check_id="AC-44",
+                    finding_name="AgentCore Evaluation Judge Model Unbounded",
+                    finding_details=(
+                        f"Evaluation execution role {role_name} can invoke a model "
+                        f"through {len(unbounded)} Resource pattern(s) that name no "
+                        f"model: {', '.join(unbounded)}. The judge prompt carries "
+                        "the agent output being scored, so every model this reaches "
+                        "is a model attacker-influenced text can be sent to."
+                    ),
+                    resolution=(
+                        "Replace the pattern with the ARNs of the models this "
+                        "workload's judges use, naming each foundation model or "
+                        "inference profile."
+                    ),
+                    reference=AGENTCORE_EVALUATORS_REFERENCE_URL,
+                    severity=SeverityEnum.MEDIUM,
+                    status=StatusEnum.FAILED,
+                )
+            )
+        elif bounded:
+            findings.append(
+                create_finding(
+                    check_id="AC-44",
+                    finding_name="AgentCore Evaluation Judge Model Scope",
+                    finding_details=(
+                        f"Evaluation execution role {role_name} can invoke a model "
+                        f"only through {len(bounded)} Resource pattern(s) that name "
+                        f"a model: {', '.join(bounded)}."
+                    ),
+                    resolution=(
+                        "No action required for this check. Confirm the named models "
+                        "are the judges this workload approved, which is a decision "
+                        "this check does not make."
+                    ),
+                    reference=AGENTCORE_EVALUATORS_REFERENCE_URL,
+                    severity=SeverityEnum.MEDIUM,
+                    status=StatusEnum.PASSED,
+                )
+            )
+        else:
+            findings.append(
+                create_finding(
+                    check_id="AC-44",
+                    finding_name="AgentCore Evaluation Judge Model Scope",
+                    finding_details=(
+                        f"Evaluation execution role {role_name} holds no "
+                        "model-invocation grant, so it invokes no judge model at all."
+                    ),
+                    resolution=(
+                        "No action required for this check. An evaluator that scores "
+                        "with a model needs bedrock:InvokeModel on that model's ARN; "
+                        "AC-39 reports whether the evaluation runs."
+                    ),
+                    reference=AGENTCORE_EVALUATORS_REFERENCE_URL,
+                    severity=SeverityEnum.MEDIUM,
+                    status=StatusEnum.PASSED,
+                )
+            )
+
+    return findings
+
+
 def check_agentcore_gateway_agentic_security() -> List[Dict[str, Any]]:
     """
     Check API-provable AgentCore Gateway controls for agentic tool execution.
@@ -10169,6 +11662,36 @@ def lambda_handler(event, context):
                 ["AC-38"],
                 "Policy Session Binding",
                 check_agentcore_policy_session_binding,
+            ),
+            (
+                ["AC-39"],
+                "Online Evaluation Operation",
+                check_agentcore_online_evaluation_operation,
+            ),
+            (
+                ["AC-40"],
+                "Evaluation Safety Coverage",
+                check_agentcore_evaluation_safety_coverage,
+            ),
+            (
+                ["AC-41"],
+                "Evaluation Result Protection",
+                check_agentcore_evaluation_result_protection,
+            ),
+            (
+                ["AC-42"],
+                "Evaluation Pass Role Scope",
+                lambda: check_agentcore_evaluation_pass_role_scope(permission_cache),
+            ),
+            (
+                ["AC-43"],
+                "Evaluation Role Trust",
+                check_agentcore_evaluation_role_trust,
+            ),
+            (
+                ["AC-44"],
+                "Evaluation Judge Model Scope",
+                lambda: check_agentcore_evaluation_judge_model_scope(permission_cache),
             ),
         ]
 

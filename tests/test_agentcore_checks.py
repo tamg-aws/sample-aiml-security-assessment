@@ -522,6 +522,253 @@ class TestAC02FullAccessRoles:
         for f in extract_csv_data(result):
             assert_finding_schema(f)
 
+    # --- EVAL-01: evaluation administration reached through a wildcard ---
+
+    _EVALUATION_CONFIG_ARN = "arn:aws:bedrock-agentcore:us-east-1:123456789012:online-evaluation-config/oec-1"
+
+    @staticmethod
+    def _evaluation_admin_cache(action, resource, principal_kind="role_permissions"):
+        return {
+            principal_kind: {
+                "EvaluationAdmin": {
+                    "attached_policies": [],
+                    "inline_policies": [
+                        {
+                            "name": "EvaluationAdminPolicy",
+                            "document": {
+                                "Statement": {
+                                    "Effect": "Allow",
+                                    "Action": action,
+                                    "Resource": resource,
+                                }
+                            },
+                        }
+                    ],
+                }
+            }
+        }
+
+    @pytest.mark.parametrize(
+        "action",
+        [
+            "bedrock-agentcore:*",
+            "bedrock-agentcore:Delete*",
+            "bedrock-agentcore:*Evaluat*",
+            "bedrock-agentcore:DeleteOnlineEvaluationConfi?",
+            "bedrock-*:*OnlineEvaluationConfig",
+        ],
+        ids=["all", "delete-prefix", "embedded", "question-mark", "service-pattern"],
+    )
+    def test_ac02_reports_a_wildcard_reaching_an_evaluation_write_on_a_scoped_resource(
+        self, action
+    ):
+        # The wildcard leg above only reads statements whose Resource is a bare
+        # `*`, so each of these patterns passes AC-02 today while granting every
+        # evaluation write on the named configuration.
+        permission_cache = self._evaluation_admin_cache(
+            action, self._EVALUATION_CONFIG_ARN
+        )
+
+        findings = agentcore_app.check_agentcore_full_access_roles(permission_cache)
+
+        evaluation_finding = next(
+            finding
+            for finding in findings
+            if finding["Finding"] == "AgentCore Evaluation Administration Wildcard"
+        )
+        assert evaluation_finding["Status"] == "Failed"
+        assert evaluation_finding["Severity"] == "High"
+        assert "role EvaluationAdmin" in evaluation_finding["Finding_Details"]
+        assert action.lower() in evaluation_finding["Finding_Details"]
+        assert (
+            "bedrock-agentcore:DeleteOnlineEvaluationConfig"
+            in evaluation_finding["Resolution"]
+        )
+        assert_finding_schema(evaluation_finding)
+
+    def test_ac02_reports_an_iam_user_reaching_an_evaluation_write(self):
+        permission_cache = self._evaluation_admin_cache(
+            "bedrock-agentcore:*",
+            self._EVALUATION_CONFIG_ARN,
+            principal_kind="user_permissions",
+        )
+
+        findings = agentcore_app.check_agentcore_full_access_roles(permission_cache)
+
+        evaluation_finding = next(
+            finding
+            for finding in findings
+            if finding["Finding"] == "AgentCore Evaluation Administration Wildcard"
+        )
+        assert "user EvaluationAdmin" in evaluation_finding["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "action",
+        [
+            "bedrock-agentcore:DeleteOnlineEvaluationConfig",
+            "bedrock-agentcore:Get*",
+            "bedrock-agentcore:*Runtime*",
+            "unrelated-service:*Evaluator",
+            "*",
+        ],
+        ids=[
+            "named-write",
+            "read-prefix",
+            "other-resource-family",
+            "other-service",
+            "service-agnostic",
+        ],
+    )
+    def test_ac02_ignores_patterns_that_reach_no_evaluation_write(self, action):
+        permission_cache = self._evaluation_admin_cache(
+            action, self._EVALUATION_CONFIG_ARN
+        )
+
+        findings = agentcore_app.check_agentcore_full_access_roles(permission_cache)
+
+        assert [finding["Finding"] for finding in findings] == [
+            "AgentCore IAM Full Access Check"
+        ]
+        assert findings[0]["Status"] == "Passed"
+
+    def test_ac02_reads_a_deny_statement_as_no_grant(self):
+        permission_cache = {
+            "role_permissions": {
+                "EvaluationAdmin": {
+                    "attached_policies": [],
+                    "inline_policies": [
+                        {
+                            "name": "EvaluationAdminPolicy",
+                            "document": {
+                                "Statement": {
+                                    "Effect": "Deny",
+                                    "Action": "bedrock-agentcore:*",
+                                    "Resource": self._EVALUATION_CONFIG_ARN,
+                                }
+                            },
+                        }
+                    ],
+                }
+            }
+        }
+
+        findings = agentcore_app.check_agentcore_full_access_roles(permission_cache)
+
+        assert len(findings) == 1
+        assert findings[0]["Status"] == "Passed"
+
+    def test_ac02_judges_every_principal_not_only_the_first(self):
+        permission_cache = {
+            "role_permissions": {
+                "FirstRole": {"attached_policies": [], "inline_policies": []},
+                "SecondRole": {
+                    "attached_policies": [],
+                    "inline_policies": [
+                        {
+                            "name": "EvaluationAdminPolicy",
+                            "document": {
+                                "Statement": {
+                                    "Effect": "Allow",
+                                    "Action": "bedrock-agentcore:*Evaluator",
+                                    "Resource": self._EVALUATION_CONFIG_ARN,
+                                }
+                            },
+                        }
+                    ],
+                },
+            }
+        }
+
+        findings = agentcore_app.check_agentcore_full_access_roles(permission_cache)
+
+        evaluation_finding = next(
+            finding
+            for finding in findings
+            if finding["Finding"] == "AgentCore Evaluation Administration Wildcard"
+        )
+        assert "role SecondRole" in evaluation_finding["Finding_Details"]
+
+    def test_ac02_reads_attached_and_inline_documents_for_the_evaluation_leg(self):
+        permission_cache = {
+            "role_permissions": {
+                "EvaluationAdmin": {
+                    "attached_policies": [
+                        {
+                            "name": "AttachedPolicy",
+                            "document": {
+                                "Statement": {
+                                    "Effect": "Allow",
+                                    "Action": "bedrock-agentcore:Create*",
+                                    "Resource": self._EVALUATION_CONFIG_ARN,
+                                }
+                            },
+                        }
+                    ],
+                    "inline_policies": [
+                        {
+                            "name": "InlinePolicy",
+                            "document": {
+                                "Statement": {
+                                    "Effect": "Allow",
+                                    "Action": "bedrock-agentcore:Delete*",
+                                    "Resource": self._EVALUATION_CONFIG_ARN,
+                                }
+                            },
+                        }
+                    ],
+                }
+            }
+        }
+
+        findings = agentcore_app.check_agentcore_full_access_roles(permission_cache)
+
+        evaluation_finding = next(
+            finding
+            for finding in findings
+            if finding["Finding"] == "AgentCore Evaluation Administration Wildcard"
+        )
+        assert "bedrock-agentcore:create*" in evaluation_finding["Finding_Details"]
+        assert "bedrock-agentcore:delete*" in evaluation_finding["Finding_Details"]
+
+    def test_ac02_user_documents_alone_are_still_assessed(self):
+        # The early return reads both dicts, so a cache holding only users is
+        # assessed rather than reported as an empty cache.
+        permission_cache = {
+            "role_permissions": {},
+            "user_permissions": {
+                "EvaluationAdmin": {"attached_policies": [], "inline_policies": []}
+            },
+        }
+
+        findings = agentcore_app.check_agentcore_full_access_roles(permission_cache)
+
+        assert len(findings) == 1
+        assert findings[0]["Status"] == "Passed"
+
+    def test_the_evaluation_admin_actions_are_the_modelled_writes(self):
+        model = agentcore_app.boto3.client(
+            "bedrock-agentcore-control",
+            region_name="us-east-1",
+            aws_access_key_id="testing",
+            aws_secret_access_key="testing",  # pragma: allowlist secret - synthetic test credential
+        ).meta.service_model
+        modelled = {
+            operation
+            for operation in model.operation_names
+            if operation.startswith(("Create", "Update", "Delete"))
+            and ("Evaluator" in operation or "OnlineEvaluationConfig" in operation)
+        }
+        assert {
+            action.split(":", 1)[1]
+            for action in agentcore_app.EVALUATION_ADMINISTRATION_ACTIONS
+        } == modelled
+        # The service segment carries the scope the check no longer matches
+        # separately, so it has to be the agent platform's own namespace.
+        assert {
+            action.split(":", 1)[0]
+            for action in agentcore_app.EVALUATION_ADMINISTRATION_ACTIONS
+        } <= agentcore_app.AGENT_PLATFORM_IAM_NAMESPACES
+
 
 # ===================================================================
 # AC-03: check_stale_agentcore_access
@@ -9230,3 +9477,1583 @@ class TestAC38CheckRegistration:
         # The failing legs are the authorizer types left over, so the check has
         # something to fail on.
         assert modelled - set(agentcore_app.GATEWAY_SESSION_BINDING_AUTHORIZERS)
+
+
+# ===================================================================
+# AC-39 to AC-44: online evaluation checks
+# ===================================================================
+_EVALUATION_ROLE_ARN = "arn:aws:iam::123456789012:role/EvaluationRole"
+_EVALUATION_RESULTS_GROUP = "/aws/bedrock-agentcore/evaluations/results/oec-1"
+
+
+def _online_evaluation_summary(config_id="oec-1", name="continuous"):
+    return {
+        "onlineEvaluationConfigId": config_id,
+        "onlineEvaluationConfigName": name,
+    }
+
+
+def _online_evaluation_detail(**overrides):
+    """A configuration that satisfies every leg of AC-39, AC-40 and AC-41."""
+    detail = {
+        "onlineEvaluationConfigId": "oec-1",
+        "onlineEvaluationConfigName": "continuous",
+        "status": "ACTIVE",
+        "executionStatus": "ENABLED",
+        "rule": {"samplingConfig": {"samplingPercentage": 100.0}},
+        "dataSourceConfig": {
+            "cloudWatchLogs": {
+                "logGroupNames": ["/aws/bedrock-agentcore/runtimes/agent-DEFAULT"],
+                "serviceNames": ["agent"],
+            }
+        },
+        "evaluators": [
+            {"evaluatorId": "Builtin.Harmfulness"},
+            {"evaluatorId": "Builtin.ToolSelectionAccuracy"},
+        ],
+        "outputConfig": {
+            "cloudWatchConfig": {"logGroupName": _EVALUATION_RESULTS_GROUP}
+        },
+        "evaluationExecutionRoleArn": _EVALUATION_ROLE_ARN,
+    }
+    detail.update(overrides)
+    return detail
+
+
+def _evaluator_catalogue():
+    """The three classes the live catalogue holds, in their live spellings."""
+    return [
+        {
+            "evaluatorId": "Builtin.Harmfulness",
+            "evaluatorType": "Builtin",
+            "level": "TRACE",
+            "description": "Safety Metric. Evaluates whether the response contains harmful content",
+        },
+        {
+            "evaluatorId": "Builtin.ToolSelectionAccuracy",
+            "evaluatorType": "Builtin",
+            "level": "TOOL_CALL",
+            "description": "Component Level Metric. Evaluates whether the agent selected the tool",
+        },
+        {
+            "evaluatorId": "Builtin.Helpfulness",
+            "evaluatorType": "Builtin",
+            "level": "TRACE",
+            "description": "Quality Metric. Evaluates how helpful the response is",
+        },
+        {
+            "evaluatorId": "custom_tool_fidelity-abc",
+            "evaluatorType": "Custom",
+            "level": "TOOL_CALL",
+            "description": "Safety Metric. Written in this account",
+        },
+    ]
+
+
+def _online_evaluation_client(mock_ac, details=None, catalogue=None):
+    details = details or [_online_evaluation_detail()]
+    mock_ac.list_online_evaluation_configs.return_value = {
+        "onlineEvaluationConfigs": [
+            _online_evaluation_summary(
+                detail["onlineEvaluationConfigId"],
+                detail.get("onlineEvaluationConfigName", "continuous"),
+            )
+            for detail in details
+        ]
+    }
+    by_id = {detail["onlineEvaluationConfigId"]: detail for detail in details}
+    mock_ac.get_online_evaluation_config.side_effect = lambda onlineEvaluationConfigId: (
+        by_id[onlineEvaluationConfigId]
+    )
+    mock_ac.list_evaluators.return_value = {
+        "evaluators": catalogue if catalogue is not None else _evaluator_catalogue()
+    }
+    return mock_ac
+
+
+class TestAC39OnlineEvaluationOperation:
+    """AC-39: a configuration that exists is judged whatever the scanner was told."""
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_running_evaluation_passes(self, mock_ac):
+        _online_evaluation_client(mock_ac)
+
+        findings = agentcore_app.check_agentcore_online_evaluation_operation()
+
+        assert len(findings) == 1
+        assert findings[0]["Check_ID"] == "AC-39"
+        assert findings[0]["Status"] == "Passed"
+        assert findings[0]["Severity"] == "Medium"
+        assert "samples 100.0 percent" in findings[0]["Finding_Details"]
+        assert "1 log group(s) and 1 service(s)" in findings[0]["Finding_Details"]
+        assert "2 evaluator(s)" in findings[0]["Finding_Details"]
+        assert_finding_schema(findings[0])
+
+    @pytest.mark.parametrize(
+        ("overrides", "expected"),
+        [
+            ({"status": "CREATE_FAILED"}, "rather than ACTIVE"),
+            ({"executionStatus": "DISABLED"}, "it scores no traffic"),
+            ({"rule": {"samplingConfig": {"samplingPercentage": 0}}}, "above zero"),
+            ({"rule": {}}, "above zero"),
+            ({"rule": {"samplingConfig": {"samplingPercentage": "100"}}}, "above zero"),
+            ({"dataSourceConfig": {"cloudWatchLogs": {}}}, "no traffic to read"),
+            ({"outputConfig": {}}, "writes its results to no log group"),
+            ({"evaluators": []}, "attaches no evaluator"),
+        ],
+        ids=[
+            "not-built",
+            "disabled",
+            "zero-sampling",
+            "no-sampling",
+            "string-sampling",
+            "no-input",
+            "no-output",
+            "no-evaluator",
+        ],
+    )
+    @patch("agentcore_app.agentcore_client")
+    def test_each_setting_that_stops_it_running_fails(
+        self, mock_ac, overrides, expected
+    ):
+        _online_evaluation_client(mock_ac, [_online_evaluation_detail(**overrides)])
+
+        findings = agentcore_app.check_agentcore_online_evaluation_operation()
+
+        assert len(findings) == 1
+        assert findings[0]["Status"] == "Failed"
+        assert findings[0]["Severity"] == "Medium"
+        assert findings[0]["Finding"].endswith("Not Running")
+        assert expected in findings[0]["Finding_Details"]
+        assert_finding_schema(findings[0])
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_failure_reason_is_reported_with_the_status(self, mock_ac):
+        _online_evaluation_client(
+            mock_ac,
+            [
+                _online_evaluation_detail(
+                    status="ERROR", failureReason="evaluator deleted"
+                )
+            ],
+        )
+
+        findings = agentcore_app.check_agentcore_online_evaluation_operation()
+
+        assert "evaluator deleted" in findings[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "cloud_watch_logs",
+        [
+            {"logGroupNames": ["/aws/bedrock-agentcore/runtimes/agent-DEFAULT"]},
+            {"serviceNames": ["agent"]},
+        ],
+        ids=["log-groups-only", "services-only"],
+    )
+    @patch("agentcore_app.agentcore_client")
+    def test_either_input_source_alone_is_traffic_to_read(
+        self, mock_ac, cloud_watch_logs
+    ):
+        _online_evaluation_client(
+            mock_ac,
+            [
+                _online_evaluation_detail(
+                    dataSourceConfig={"cloudWatchLogs": cloud_watch_logs}
+                )
+            ],
+        )
+
+        findings = agentcore_app.check_agentcore_online_evaluation_operation()
+
+        assert findings[0]["Status"] == "Passed"
+
+    @patch("agentcore_app.agentcore_client")
+    def test_every_configuration_unreadable_reports_the_read_failure(self, mock_ac):
+        # Zero readable configurations is not zero configurations: the absence
+        # branch would report nothing to judge for an account that has two.
+        mock_ac.list_online_evaluation_configs.return_value = {
+            "onlineEvaluationConfigs": [_online_evaluation_summary()]
+        }
+        mock_ac.get_online_evaluation_config.side_effect = ClientError(
+            {"Error": {"Code": "AccessDeniedException"}}, "GetOnlineEvaluationConfig"
+        )
+
+        findings = agentcore_app.check_agentcore_online_evaluation_operation()
+
+        assert len(findings) == 1
+        assert findings[0]["Status"] == "N/A"
+        assert "could not be read" in findings[0]["Finding_Details"]
+        assert (
+            "AC-17 reports whether one is expected"
+            not in (findings[0]["Finding_Details"])
+        )
+
+    @patch("agentcore_app.agentcore_client")
+    def test_every_failing_setting_is_named_not_only_the_first(self, mock_ac):
+        _online_evaluation_client(
+            mock_ac,
+            [
+                _online_evaluation_detail(
+                    executionStatus="DISABLED", evaluators=[], outputConfig={}
+                )
+            ],
+        )
+
+        findings = agentcore_app.check_agentcore_online_evaluation_operation()
+
+        details = findings[0]["Finding_Details"]
+        assert "it scores no traffic" in details
+        assert "attaches no evaluator" in details
+        assert "writes its results to no log group" in details
+
+    @patch.dict(os.environ, {}, clear=True)
+    @patch("agentcore_app.agentcore_client")
+    def test_a_disabled_evaluation_fails_where_ac17_abstains(self, mock_ac):
+        # AC-17 reports N/A for the same configuration unless the environment
+        # sets REQUIRE_AGENTCORE_ONLINE_EVALUATION, which is the verdict gap
+        # AC-39 closes.
+        _online_evaluation_client(
+            mock_ac, [_online_evaluation_detail(executionStatus="DISABLED")]
+        )
+
+        incumbent = agentcore_app.check_agentcore_online_evaluation_coverage()
+        findings = agentcore_app.check_agentcore_online_evaluation_operation()
+
+        assert incumbent[0]["Status"] == "N/A"
+        assert findings[0]["Status"] == "Failed"
+
+    @patch("agentcore_app.agentcore_client")
+    def test_every_configuration_is_judged_not_only_the_first(self, mock_ac):
+        _online_evaluation_client(
+            mock_ac,
+            [
+                _online_evaluation_detail(),
+                _online_evaluation_detail(
+                    onlineEvaluationConfigId="oec-2",
+                    onlineEvaluationConfigName="second",
+                    executionStatus="DISABLED",
+                ),
+            ],
+        )
+
+        findings = agentcore_app.check_agentcore_online_evaluation_operation()
+
+        assert [finding["Status"] for finding in findings] == ["Passed", "Failed"]
+        assert "second" in findings[1]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_the_configuration_list_is_paginated(self, mock_ac):
+        mock_ac.list_online_evaluation_configs.side_effect = [
+            {
+                "onlineEvaluationConfigs": [_online_evaluation_summary("oec-1")],
+                "nextToken": "page-2",
+            },
+            {
+                "onlineEvaluationConfigs": [
+                    _online_evaluation_summary("oec-2", "second")
+                ]
+            },
+        ]
+        mock_ac.get_online_evaluation_config.side_effect = (
+            lambda onlineEvaluationConfigId: _online_evaluation_detail(
+                onlineEvaluationConfigId=onlineEvaluationConfigId
+            )
+        )
+
+        findings = agentcore_app.check_agentcore_online_evaluation_operation()
+
+        assert len(findings) == 2
+
+    @patch("agentcore_app.agentcore_client")
+    def test_no_configuration_is_na(self, mock_ac):
+        mock_ac.list_online_evaluation_configs.return_value = {
+            "onlineEvaluationConfigs": []
+        }
+
+        findings = agentcore_app.check_agentcore_online_evaluation_operation()
+
+        assert len(findings) == 1
+        assert findings[0]["Status"] == "N/A"
+        assert "AC-17 reports whether one is expected" in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_one_unreadable_configuration_does_not_hide_the_rest(self, mock_ac):
+        mock_ac.list_online_evaluation_configs.return_value = {
+            "onlineEvaluationConfigs": [
+                _online_evaluation_summary("oec-1"),
+                _online_evaluation_summary("oec-2", "second"),
+            ]
+        }
+
+        def _detail(onlineEvaluationConfigId):
+            if onlineEvaluationConfigId == "oec-1":
+                raise ClientError(
+                    {"Error": {"Code": "AccessDeniedException"}},
+                    "GetOnlineEvaluationConfig",
+                )
+            return _online_evaluation_detail(
+                onlineEvaluationConfigId="oec-2", onlineEvaluationConfigName="second"
+            )
+
+        mock_ac.get_online_evaluation_config.side_effect = _detail
+
+        findings = agentcore_app.check_agentcore_online_evaluation_operation()
+
+        assert [finding["Status"] for finding in findings] == ["N/A", "Passed"]
+        assert "could not be read" in findings[0]["Finding_Details"]
+        assert "GetOnlineEvaluationConfig" in findings[0]["Resolution"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_list_failure_is_incomplete(self, mock_ac):
+        mock_ac.list_online_evaluation_configs.side_effect = ClientError(
+            {"Error": {"Code": "AccessDeniedException"}}, "ListOnlineEvaluationConfigs"
+        )
+
+        findings = agentcore_app.check_agentcore_online_evaluation_operation()
+
+        assert findings[0]["Status"] == "N/A"
+        assert findings[0]["Check_ID"] == "AC-39"
+
+    def test_no_client_is_na(self):
+        findings = agentcore_app.check_agentcore_online_evaluation_operation()
+        assert findings[0]["Status"] == "N/A"
+        assert findings[0]["Check_ID"] == "AC-39"
+
+    def test_the_judged_statuses_are_modelled_enum_values(self):
+        model = agentcore_app.boto3.client(
+            "bedrock-agentcore-control",
+            region_name="us-east-1",
+            aws_access_key_id="testing",
+            aws_secret_access_key="testing",  # pragma: allowlist secret - synthetic test credential
+        ).meta.service_model
+        members = model.operation_model(
+            "GetOnlineEvaluationConfig"
+        ).output_shape.members
+        built = set(members["status"].metadata["enum"])
+        running = set(members["executionStatus"].metadata["enum"])
+        assert agentcore_app.ONLINE_EVALUATION_BUILT_STATUS in built
+        assert agentcore_app.ONLINE_EVALUATION_RUNNING_STATUS in running
+        # The other values are what the check fails on, so it has something to
+        # fail on in both dimensions.
+        assert built - {agentcore_app.ONLINE_EVALUATION_BUILT_STATUS}
+        assert running - {agentcore_app.ONLINE_EVALUATION_RUNNING_STATUS}
+
+
+class TestAC40EvaluationSafetyCoverage:
+    """AC-40: what the attached evaluators score, read from the catalogue."""
+
+    @patch("agentcore_app.agentcore_client")
+    def test_safety_and_tool_call_evaluators_pass(self, mock_ac):
+        _online_evaluation_client(mock_ac)
+
+        findings = agentcore_app.check_agentcore_evaluation_safety_coverage()
+
+        assert len(findings) == 1
+        assert findings[0]["Check_ID"] == "AC-40"
+        assert findings[0]["Status"] == "Passed"
+        assert "Builtin.Harmfulness" in findings[0]["Finding_Details"]
+        assert "Builtin.ToolSelectionAccuracy" in findings[0]["Finding_Details"]
+        assert agentcore_app.EVALUATION_SCORE_ALARM_NOTE in findings[0]["Resolution"]
+        assert_finding_schema(findings[0])
+
+    @patch("agentcore_app.agentcore_client")
+    def test_quality_evaluators_alone_fail_on_both_legs(self, mock_ac):
+        _online_evaluation_client(
+            mock_ac,
+            [
+                _online_evaluation_detail(
+                    evaluators=[{"evaluatorId": "Builtin.Helpfulness"}]
+                )
+            ],
+        )
+
+        findings = agentcore_app.check_agentcore_evaluation_safety_coverage()
+
+        assert findings[0]["Status"] == "Failed"
+        assert findings[0]["Severity"] == "Medium"
+        assert findings[0]["Finding"].endswith("Incomplete")
+        assert "safety metric" in findings[0]["Finding_Details"]
+        assert "TOOL_CALL level" in findings[0]["Finding_Details"]
+        assert agentcore_app.EVALUATION_SCORE_ALARM_NOTE in findings[0]["Resolution"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_safety_evaluator_without_a_tool_call_one_fails_on_one_leg(self, mock_ac):
+        _online_evaluation_client(
+            mock_ac,
+            [
+                _online_evaluation_detail(
+                    evaluators=[{"evaluatorId": "Builtin.Harmfulness"}]
+                )
+            ],
+        )
+
+        findings = agentcore_app.check_agentcore_evaluation_safety_coverage()
+
+        assert findings[0]["Status"] == "Failed"
+        assert "TOOL_CALL level" in findings[0]["Finding_Details"]
+        assert "no evaluator the catalogue marks" not in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_customer_authored_evaluator_is_named_for_its_owner_to_classify(
+        self, mock_ac
+    ):
+        _online_evaluation_client(
+            mock_ac,
+            [
+                _online_evaluation_detail(
+                    evaluators=[
+                        {"evaluatorId": "Builtin.Harmfulness"},
+                        {"evaluatorId": "Builtin.ToolSelectionAccuracy"},
+                        {"evaluatorId": "custom_tool_fidelity-abc"},
+                    ]
+                )
+            ],
+        )
+
+        findings = agentcore_app.check_agentcore_evaluation_safety_coverage()
+
+        assert findings[0]["Status"] == "Passed"
+        assert "custom_tool_fidelity-abc" in findings[0]["Finding_Details"]
+        assert "workload owner's to state" in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_customer_authored_safety_description_does_not_count_as_safety(
+        self, mock_ac
+    ):
+        # custom_tool_fidelity-abc carries both the safety marker and TOOL_CALL
+        # level, and neither counts: its description is prose this check cannot
+        # verify.
+        _online_evaluation_client(
+            mock_ac,
+            [
+                _online_evaluation_detail(
+                    evaluators=[{"evaluatorId": "custom_tool_fidelity-abc"}]
+                )
+            ],
+        )
+
+        findings = agentcore_app.check_agentcore_evaluation_safety_coverage()
+
+        assert findings[0]["Status"] == "Failed"
+        assert "safety metric" in findings[0]["Finding_Details"]
+        assert "TOOL_CALL level" in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_third_party_evaluator_is_service_authored(self, mock_ac):
+        # The catalogue's third-party entries carry the same service-written
+        # descriptions as the built-in ones, so a workload scoring safety with a
+        # third-party judge is covered.
+        catalogue = [
+            {
+                "evaluatorId": "ThirdParty.DeepEval.Toxicity",
+                "evaluatorType": "ThirdParty",
+                "level": "TRACE",
+                "description": "Safety Metric. Evaluates toxic content",
+            },
+            {
+                "evaluatorId": "Builtin.ToolSelectionAccuracy",
+                "evaluatorType": "Builtin",
+                "level": "TOOL_CALL",
+                "description": "Component Level Metric.",
+            },
+        ]
+        _online_evaluation_client(
+            mock_ac,
+            [
+                _online_evaluation_detail(
+                    evaluators=[
+                        {"evaluatorId": "ThirdParty.DeepEval.Toxicity"},
+                        {"evaluatorId": "Builtin.ToolSelectionAccuracy"},
+                    ]
+                )
+            ],
+            catalogue=catalogue,
+        )
+
+        findings = agentcore_app.check_agentcore_evaluation_safety_coverage()
+
+        assert findings[0]["Status"] == "Passed"
+        assert "ThirdParty.DeepEval.Toxicity" in findings[0]["Finding_Details"]
+        assert "workload owner's to state" not in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_the_safety_marker_is_matched_case_insensitively(self, mock_ac):
+        catalogue = [
+            {
+                "evaluatorId": "Builtin.Harmfulness",
+                "evaluatorType": "Builtin",
+                "level": "TRACE",
+                "description": "SAFETY METRIC. Harmful content",
+            },
+            {
+                "evaluatorId": "Builtin.ToolSelectionAccuracy",
+                "evaluatorType": "Builtin",
+                "level": "TOOL_CALL",
+                "description": "Component Level Metric.",
+            },
+        ]
+        _online_evaluation_client(mock_ac, catalogue=catalogue)
+
+        findings = agentcore_app.check_agentcore_evaluation_safety_coverage()
+
+        assert findings[0]["Status"] == "Passed"
+
+    @pytest.mark.parametrize(
+        "catalogue",
+        [
+            [
+                {
+                    "evaluatorId": "Builtin.ToolSelectionAccuracy",
+                    "evaluatorType": "Builtin",
+                    "level": "TOOL_CALL",
+                    "description": "Component Level Metric.",
+                }
+            ],
+            [
+                {
+                    "evaluatorId": "Builtin.Harmfulness",
+                    "evaluatorType": "Builtin",
+                    "level": "TRACE",
+                    "description": "Safety Metric.",
+                }
+            ],
+            [],
+        ],
+        ids=["no-safety-class", "no-tool-call-class", "empty"],
+    )
+    @patch("agentcore_app.agentcore_client")
+    def test_a_catalogue_missing_a_category_reports_drift_and_judges_nobody(
+        self, mock_ac, catalogue
+    ):
+        _online_evaluation_client(mock_ac, catalogue=catalogue)
+
+        findings = agentcore_app.check_agentcore_evaluation_safety_coverage()
+
+        assert len(findings) == 1
+        assert findings[0]["Status"] == "N/A"
+        assert findings[0]["Severity"] == "Informational"
+        assert "no configuration is judged here" in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_catalogue_read_failure_is_na(self, mock_ac):
+        _online_evaluation_client(mock_ac)
+        mock_ac.list_evaluators.side_effect = ClientError(
+            {"Error": {"Code": "AccessDeniedException"}}, "ListEvaluators"
+        )
+
+        findings = agentcore_app.check_agentcore_evaluation_safety_coverage()
+
+        assert len(findings) == 1
+        assert findings[0]["Status"] == "N/A"
+        assert "ListEvaluators" in findings[0]["Resolution"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_the_catalogue_is_paginated(self, mock_ac):
+        _online_evaluation_client(mock_ac)
+        mock_ac.list_evaluators.side_effect = [
+            {"evaluators": _evaluator_catalogue()[:1], "nextToken": "page-2"},
+            {"evaluators": _evaluator_catalogue()[1:]},
+        ]
+
+        findings = agentcore_app.check_agentcore_evaluation_safety_coverage()
+
+        assert findings[0]["Status"] == "Passed"
+
+    @patch("agentcore_app.agentcore_client")
+    def test_every_configuration_is_judged_not_only_the_first(self, mock_ac):
+        _online_evaluation_client(
+            mock_ac,
+            [
+                _online_evaluation_detail(),
+                _online_evaluation_detail(
+                    onlineEvaluationConfigId="oec-2",
+                    onlineEvaluationConfigName="second",
+                    evaluators=[{"evaluatorId": "Builtin.Helpfulness"}],
+                ),
+            ],
+        )
+
+        findings = agentcore_app.check_agentcore_evaluation_safety_coverage()
+
+        assert [finding["Status"] for finding in findings] == ["Passed", "Failed"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_no_configuration_is_na(self, mock_ac):
+        mock_ac.list_online_evaluation_configs.return_value = {
+            "onlineEvaluationConfigs": []
+        }
+
+        findings = agentcore_app.check_agentcore_evaluation_safety_coverage()
+
+        assert len(findings) == 1
+        assert findings[0]["Status"] == "N/A"
+
+    def test_no_client_is_na(self):
+        findings = agentcore_app.check_agentcore_evaluation_safety_coverage()
+        assert findings[0]["Status"] == "N/A"
+        assert findings[0]["Check_ID"] == "AC-40"
+
+    def test_the_read_classes_are_modelled_enum_values(self):
+        model = agentcore_app.boto3.client(
+            "bedrock-agentcore-control",
+            region_name="us-east-1",
+            aws_access_key_id="testing",
+            aws_secret_access_key="testing",  # pragma: allowlist secret - synthetic test credential
+        ).meta.service_model
+        members = (
+            model.operation_model("ListEvaluators")
+            .output_shape.members["evaluators"]
+            .member.members
+        )
+        types = set(members["evaluatorType"].metadata["enum"])
+        levels = set(members["level"].metadata["enum"])
+        assert set(agentcore_app.SERVICE_AUTHORED_EVALUATOR_TYPES) <= types
+        assert agentcore_app.EVALUATOR_TOOL_CALL_LEVEL in levels
+        # The customer-authored types are the ones left over, so the owner note
+        # has a population to describe.
+        assert types - set(agentcore_app.SERVICE_AUTHORED_EVALUATOR_TYPES)
+
+
+class TestAC41EvaluationResultProtection:
+    """AC-41: the results log group the configuration names, not one swept by prefix."""
+
+    @staticmethod
+    def _log_group(name=_EVALUATION_RESULTS_GROUP, **overrides):
+        group = {
+            "logGroupName": name,
+            "retentionInDays": 365,
+            "kmsKeyId": "arn:aws:kms:us-east-1:123456789012:key/abcd",
+        }
+        group.update(overrides)
+        return group
+
+    @patch("agentcore_app.logs_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_retained_encrypted_prefixed_group_passes(self, mock_ac, mock_logs):
+        _online_evaluation_client(mock_ac)
+        mock_logs.describe_log_groups.return_value = {"logGroups": [self._log_group()]}
+
+        findings = agentcore_app.check_agentcore_evaluation_result_protection()
+
+        assert len(findings) == 1
+        assert findings[0]["Check_ID"] == "AC-41"
+        assert findings[0]["Status"] == "Passed"
+        assert "expires results after 365 day(s)" in findings[0]["Finding_Details"]
+        assert "AC-20 judges its masking policy" in findings[0]["Finding_Details"]
+        assert "Tag values" in findings[0]["Resolution"]
+        assert_finding_schema(findings[0])
+
+    @pytest.mark.parametrize(
+        ("overrides", "expected"),
+        [
+            ({"retentionInDays": None}, "kept indefinitely"),
+            ({"kmsKeyId": None}, "no customer managed encryption key"),
+        ],
+        ids=["no-retention", "no-key"],
+    )
+    @patch("agentcore_app.logs_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_an_unprotected_group_fails(self, mock_ac, mock_logs, overrides, expected):
+        _online_evaluation_client(mock_ac)
+        group = self._log_group()
+        for key, value in overrides.items():
+            if value is None:
+                group.pop(key)
+        mock_logs.describe_log_groups.return_value = {"logGroups": [group]}
+
+        findings = agentcore_app.check_agentcore_evaluation_result_protection()
+
+        assert findings[0]["Status"] == "Failed"
+        assert findings[0]["Severity"] == "Medium"
+        assert findings[0]["Finding"].endswith("Unprotected")
+        assert expected in findings[0]["Finding_Details"]
+        assert_finding_schema(findings[0])
+
+    @patch("agentcore_app.logs_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_group_outside_the_agentcore_prefixes_fails(self, mock_ac, mock_logs):
+        # AC-20 and AC-26 sweep log groups by name, so a customer-chosen results
+        # group is judged by neither however well it is configured.
+        _online_evaluation_client(
+            mock_ac,
+            [
+                _online_evaluation_detail(
+                    outputConfig={"cloudWatchConfig": {"logGroupName": "/team/results"}}
+                )
+            ],
+        )
+        mock_logs.describe_log_groups.return_value = {
+            "logGroups": [self._log_group("/team/results")]
+        }
+
+        findings = agentcore_app.check_agentcore_evaluation_result_protection()
+
+        assert findings[0]["Status"] == "Failed"
+        assert (
+            "sits outside the AgentCore log group prefixes"
+            in (findings[0]["Finding_Details"])
+        )
+        for prefix in agentcore_app.AGENTCORE_LOG_GROUP_PREFIXES:
+            assert prefix in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.logs_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_an_absent_group_fails(self, mock_ac, mock_logs):
+        _online_evaluation_client(mock_ac)
+        mock_logs.describe_log_groups.return_value = {"logGroups": []}
+
+        findings = agentcore_app.check_agentcore_evaluation_result_protection()
+
+        assert findings[0]["Status"] == "Failed"
+        assert "does not exist in this region" in findings[0]["Finding_Details"]
+        assert (
+            "no encryption key and no retention period"
+            in (findings[0]["Finding_Details"])
+        )
+
+    @patch("agentcore_app.logs_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_longer_group_sharing_the_prefix_is_not_the_named_group(
+        self, mock_ac, mock_logs
+    ):
+        # DescribeLogGroups filters by prefix, so the named group is the one that
+        # matches exactly.
+        _online_evaluation_client(mock_ac)
+        mock_logs.describe_log_groups.return_value = {
+            "logGroups": [self._log_group(f"{_EVALUATION_RESULTS_GROUP}-other")]
+        }
+
+        findings = agentcore_app.check_agentcore_evaluation_result_protection()
+
+        assert findings[0]["Status"] == "Failed"
+        assert "does not exist in this region" in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.logs_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_no_output_group_defers_to_ac39(self, mock_ac, mock_logs):
+        _online_evaluation_client(mock_ac, [_online_evaluation_detail(outputConfig={})])
+
+        findings = agentcore_app.check_agentcore_evaluation_result_protection()
+
+        assert findings[0]["Status"] == "N/A"
+        assert "Resolve AC-39" in findings[0]["Resolution"]
+        mock_logs.describe_log_groups.assert_not_called()
+
+    @patch("agentcore_app.logs_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_describe_failure_is_na(self, mock_ac, mock_logs):
+        _online_evaluation_client(mock_ac)
+        mock_logs.describe_log_groups.side_effect = ClientError(
+            {"Error": {"Code": "AccessDeniedException"}}, "DescribeLogGroups"
+        )
+
+        findings = agentcore_app.check_agentcore_evaluation_result_protection()
+
+        assert findings[0]["Status"] == "N/A"
+        assert "DescribeLogGroups" in findings[0]["Resolution"]
+
+    @patch("agentcore_app.logs_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_the_group_lookup_is_paginated(self, mock_ac, mock_logs):
+        _online_evaluation_client(mock_ac)
+        mock_logs.describe_log_groups.side_effect = [
+            {
+                "logGroups": [self._log_group(f"{_EVALUATION_RESULTS_GROUP}-other")],
+                "nextToken": "page-2",
+            },
+            {"logGroups": [self._log_group()]},
+        ]
+
+        findings = agentcore_app.check_agentcore_evaluation_result_protection()
+
+        assert findings[0]["Status"] == "Passed"
+
+    @patch("agentcore_app.logs_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_every_configuration_is_judged_not_only_the_first(self, mock_ac, mock_logs):
+        _online_evaluation_client(
+            mock_ac,
+            [
+                _online_evaluation_detail(),
+                _online_evaluation_detail(
+                    onlineEvaluationConfigId="oec-2",
+                    onlineEvaluationConfigName="second",
+                    outputConfig={
+                        "cloudWatchConfig": {
+                            "logGroupName": "/aws/bedrock-agentcore/evaluations/results/oec-2"
+                        }
+                    },
+                ),
+            ],
+        )
+        mock_logs.describe_log_groups.side_effect = lambda logGroupNamePrefix: {
+            "logGroups": [
+                self._log_group(
+                    logGroupNamePrefix,
+                    **(
+                        {} if logGroupNamePrefix.endswith("oec-1") else {"kmsKeyId": ""}
+                    ),
+                )
+            ]
+        }
+
+        findings = agentcore_app.check_agentcore_evaluation_result_protection()
+
+        assert [finding["Status"] for finding in findings] == ["Passed", "Failed"]
+
+    @patch("agentcore_app.logs_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_no_configuration_is_na(self, mock_ac, mock_logs):
+        mock_ac.list_online_evaluation_configs.return_value = {
+            "onlineEvaluationConfigs": []
+        }
+
+        findings = agentcore_app.check_agentcore_evaluation_result_protection()
+
+        assert len(findings) == 1
+        assert findings[0]["Status"] == "N/A"
+
+    @patch("agentcore_app.logs_client", None)
+    @patch("agentcore_app.agentcore_client")
+    def test_no_logs_client_is_na(self, mock_ac):
+        findings = agentcore_app.check_agentcore_evaluation_result_protection()
+        assert findings[0]["Status"] == "N/A"
+        assert findings[0]["Check_ID"] == "AC-41"
+
+    def test_no_client_is_na(self):
+        findings = agentcore_app.check_agentcore_evaluation_result_protection()
+        assert findings[0]["Status"] == "N/A"
+        assert findings[0]["Check_ID"] == "AC-41"
+
+
+def _pass_role_policy(resource, condition=None, action="iam:PassRole"):
+    statement = {"Effect": "Allow", "Action": action, "Resource": resource}
+    if condition:
+        statement["Condition"] = condition
+    return {"name": "PassRolePolicy", "document": {"Statement": statement}}
+
+
+_PASSED_TO_SERVICE = {
+    "StringEquals": {"iam:PassedToService": "bedrock-agentcore.amazonaws.com"}
+}
+
+
+class TestAC42EvaluationPassRoleScope:
+    """AC-42: who can hand the evaluation service a role, and which role."""
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_bounded_grant_passes(self, mock_ac):
+        _online_evaluation_client(mock_ac)
+        cache = {
+            "role_permissions": {
+                "EvaluationDeployer": {
+                    "attached_policies": [
+                        _pass_role_policy(_EVALUATION_ROLE_ARN, _PASSED_TO_SERVICE)
+                    ],
+                    "inline_policies": [],
+                }
+            }
+        }
+
+        findings = agentcore_app.check_agentcore_evaluation_pass_role_scope(cache)
+
+        assert len(findings) == 1
+        assert findings[0]["Check_ID"] == "AC-42"
+        assert findings[0]["Status"] == "Passed"
+        assert findings[0]["Severity"] == "High"
+        assert "role EvaluationDeployer" in findings[0]["Finding_Details"]
+        assert _EVALUATION_ROLE_ARN in findings[0]["Finding_Details"]
+        assert_finding_schema(findings[0])
+
+    @pytest.mark.parametrize(
+        ("resource", "condition", "expected"),
+        [
+            ("*", None, ["also reaches other roles", "no iam:PassedToService"]),
+            (
+                "arn:aws:iam::123456789012:role/*",
+                _PASSED_TO_SERVICE,
+                ["also reaches other roles"],
+            ),
+            (_EVALUATION_ROLE_ARN, None, ["no iam:PassedToService"]),
+        ],
+        ids=["all-roles", "wide-pattern", "no-condition"],
+    )
+    @patch("agentcore_app.agentcore_client")
+    def test_an_unbounded_grant_fails_on_the_leg_it_is_missing(
+        self, mock_ac, resource, condition, expected
+    ):
+        _online_evaluation_client(mock_ac)
+        cache = {
+            "role_permissions": {
+                "EvaluationDeployer": {
+                    "attached_policies": [_pass_role_policy(resource, condition)],
+                    "inline_policies": [],
+                }
+            }
+        }
+
+        findings = agentcore_app.check_agentcore_evaluation_pass_role_scope(cache)
+
+        assert findings[0]["Status"] == "Failed"
+        assert findings[0]["Severity"] == "High"
+        assert findings[0]["Finding"].endswith("Unbounded")
+        for phrase in expected:
+            assert phrase in findings[0]["Finding_Details"]
+        if "no iam:PassedToService" not in expected:
+            assert "no iam:PassedToService" not in findings[0]["Finding_Details"]
+        assert_finding_schema(findings[0])
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_user_holding_the_grant_is_reported_as_a_user(self, mock_ac):
+        _online_evaluation_client(mock_ac)
+        cache = {
+            "role_permissions": {},
+            "user_permissions": {
+                "Deployer": {
+                    "attached_policies": [],
+                    "inline_policies": [_pass_role_policy("*")],
+                }
+            },
+        }
+
+        findings = agentcore_app.check_agentcore_evaluation_pass_role_scope(cache)
+
+        assert findings[0]["Status"] == "Failed"
+        assert "user Deployer" in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_the_widest_statement_decides_the_verdict(self, mock_ac):
+        # A narrow statement elsewhere in the same policy set does not narrow a
+        # wide one, so the principal is reported on the wide grant.
+        _online_evaluation_client(mock_ac)
+        cache = {
+            "role_permissions": {
+                "EvaluationDeployer": {
+                    "attached_policies": [
+                        _pass_role_policy(_EVALUATION_ROLE_ARN, _PASSED_TO_SERVICE)
+                    ],
+                    "inline_policies": [_pass_role_policy("*")],
+                }
+            }
+        }
+
+        findings = agentcore_app.check_agentcore_evaluation_pass_role_scope(cache)
+
+        assert len(findings) == 1
+        assert findings[0]["Status"] == "Failed"
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_wildcard_action_reaching_passrole_is_judged(self, mock_ac):
+        _online_evaluation_client(mock_ac)
+        cache = {
+            "role_permissions": {
+                "EvaluationDeployer": {
+                    "attached_policies": [
+                        _pass_role_policy(_EVALUATION_ROLE_ARN, action="iam:Pass*")
+                    ],
+                    "inline_policies": [],
+                }
+            }
+        }
+
+        findings = agentcore_app.check_agentcore_evaluation_pass_role_scope(cache)
+
+        assert findings[0]["Status"] == "Failed"
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_grant_on_another_role_is_not_reported(self, mock_ac):
+        _online_evaluation_client(mock_ac)
+        cache = {
+            "role_permissions": {
+                "OtherDeployer": {
+                    "attached_policies": [
+                        _pass_role_policy("arn:aws:iam::123456789012:role/Unrelated")
+                    ],
+                    "inline_policies": [],
+                }
+            }
+        }
+
+        findings = agentcore_app.check_agentcore_evaluation_pass_role_scope(cache)
+
+        assert len(findings) == 1
+        assert findings[0]["Status"] == "Passed"
+        assert "No cached IAM role or user can pass" in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_both_verdicts_are_reported_when_principals_differ(self, mock_ac):
+        _online_evaluation_client(mock_ac)
+        cache = {
+            "role_permissions": {
+                "BoundedDeployer": {
+                    "attached_policies": [
+                        _pass_role_policy(_EVALUATION_ROLE_ARN, _PASSED_TO_SERVICE)
+                    ],
+                    "inline_policies": [],
+                },
+                "WideDeployer": {
+                    "attached_policies": [_pass_role_policy("*")],
+                    "inline_policies": [],
+                },
+            }
+        }
+
+        findings = agentcore_app.check_agentcore_evaluation_pass_role_scope(cache)
+
+        assert [finding["Status"] for finding in findings] == ["Failed", "Passed"]
+        assert "WideDeployer" in findings[0]["Finding_Details"]
+        assert "BoundedDeployer" in findings[1]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_malformed_document_is_reported_without_a_verdict(self, mock_ac):
+        _online_evaluation_client(mock_ac)
+        cache = {
+            "role_permissions": {
+                "EvaluationDeployer": {
+                    "attached_policies": [{"document": "{not-json"}],
+                    "inline_policies": [],
+                }
+            }
+        }
+
+        findings = agentcore_app.check_agentcore_evaluation_pass_role_scope(cache)
+
+        statuses = [finding["Status"] for finding in findings]
+        assert statuses == ["Passed", "N/A"]
+        assert "1 cached policy document(s)" in findings[1]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_an_empty_cache_is_na(self, mock_ac):
+        _online_evaluation_client(mock_ac)
+
+        findings = agentcore_app.check_agentcore_evaluation_pass_role_scope(
+            {"role_permissions": {}, "user_permissions": {}}
+        )
+
+        assert len(findings) == 1
+        assert findings[0]["Status"] == "N/A"
+        assert "1 evaluation execution role(s)" in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_configuration_with_no_execution_role_is_na(self, mock_ac):
+        _online_evaluation_client(
+            mock_ac, [_online_evaluation_detail(evaluationExecutionRoleArn="")]
+        )
+
+        findings = agentcore_app.check_agentcore_evaluation_pass_role_scope(
+            {"role_permissions": {"Any": {}}}
+        )
+
+        assert len(findings) == 1
+        assert findings[0]["Status"] == "N/A"
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_list_failure_is_incomplete(self, mock_ac):
+        mock_ac.list_online_evaluation_configs.side_effect = ClientError(
+            {"Error": {"Code": "AccessDeniedException"}}, "ListOnlineEvaluationConfigs"
+        )
+
+        findings = agentcore_app.check_agentcore_evaluation_pass_role_scope({})
+
+        assert findings[0]["Status"] == "N/A"
+        assert findings[0]["Check_ID"] == "AC-42"
+
+    def test_no_client_is_na(self):
+        findings = agentcore_app.check_agentcore_evaluation_pass_role_scope({})
+        assert findings[0]["Status"] == "N/A"
+        assert findings[0]["Check_ID"] == "AC-42"
+
+
+class TestAC43EvaluationRoleTrust:
+    """AC-43: the evaluation execution role's own trust policy."""
+
+    _GUARDED_TRUST = {
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Effect": "Allow",
+                "Principal": {"Service": "bedrock-agentcore.amazonaws.com"},
+                "Action": "sts:AssumeRole",
+                "Condition": {"StringEquals": {"aws:SourceAccount": "123456789012"}},
+            }
+        ],
+    }
+    _OPEN_TRUST = {
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Effect": "Allow",
+                "Principal": {
+                    "Service": [
+                        "bedrock.amazonaws.com",
+                        "bedrock-agentcore.amazonaws.com",
+                    ]
+                },
+                "Action": "sts:AssumeRole",
+            }
+        ],
+    }
+
+    @patch("agentcore_app.iam_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_guarded_trust_policy_passes(self, mock_ac, mock_iam):
+        _online_evaluation_client(mock_ac)
+        mock_iam.get_role.return_value = {
+            "Role": {"AssumeRolePolicyDocument": self._GUARDED_TRUST}
+        }
+
+        findings = agentcore_app.check_agentcore_evaluation_role_trust()
+
+        assert len(findings) == 1
+        assert findings[0]["Check_ID"] == "AC-43"
+        assert findings[0]["Status"] == "Passed"
+        assert findings[0]["Severity"] == "High"
+        assert "EvaluationRole" in findings[0]["Finding_Details"]
+        assert_finding_schema(findings[0])
+
+    @patch("agentcore_app.iam_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_an_unguarded_trust_policy_fails(self, mock_ac, mock_iam):
+        _online_evaluation_client(mock_ac)
+        mock_iam.get_role.return_value = {
+            "Role": {"AssumeRolePolicyDocument": self._OPEN_TRUST}
+        }
+
+        findings = agentcore_app.check_agentcore_evaluation_role_trust()
+
+        assert findings[0]["Status"] == "Failed"
+        assert findings[0]["Severity"] == "High"
+        assert findings[0]["Finding"].endswith("Guard Missing")
+        assert "1 of 1 Allow statement(s)" in findings[0]["Finding_Details"]
+        assert "aws:SourceArn" in findings[0]["Resolution"]
+        assert_finding_schema(findings[0])
+
+    @patch("agentcore_app.iam_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_the_role_name_is_read_from_the_arn(self, mock_ac, mock_iam):
+        _online_evaluation_client(mock_ac)
+        mock_iam.get_role.return_value = {
+            "Role": {"AssumeRolePolicyDocument": self._GUARDED_TRUST}
+        }
+
+        agentcore_app.check_agentcore_evaluation_role_trust()
+
+        mock_iam.get_role.assert_called_once_with(RoleName="EvaluationRole")
+
+    @patch("agentcore_app.iam_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_two_configurations_sharing_a_role_read_the_trust_policy_once(
+        self, mock_ac, mock_iam
+    ):
+        _online_evaluation_client(
+            mock_ac,
+            [
+                _online_evaluation_detail(),
+                _online_evaluation_detail(
+                    onlineEvaluationConfigId="oec-2",
+                    onlineEvaluationConfigName="second",
+                ),
+            ],
+        )
+        mock_iam.get_role.return_value = {
+            "Role": {"AssumeRolePolicyDocument": self._OPEN_TRUST}
+        }
+
+        findings = agentcore_app.check_agentcore_evaluation_role_trust()
+
+        assert [finding["Status"] for finding in findings] == ["Failed", "Failed"]
+        assert mock_iam.get_role.call_count == 1
+
+    @patch("agentcore_app.iam_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_trust_read_failure_is_na(self, mock_ac, mock_iam):
+        _online_evaluation_client(mock_ac)
+        mock_iam.get_role.side_effect = ClientError(
+            {"Error": {"Code": "AccessDenied"}}, "GetRole"
+        )
+
+        findings = agentcore_app.check_agentcore_evaluation_role_trust()
+
+        assert findings[0]["Status"] == "N/A"
+        assert "iam:GetRole" in findings[0]["Resolution"]
+
+    @patch("agentcore_app.iam_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_configuration_with_no_execution_role_is_na(self, mock_ac, mock_iam):
+        _online_evaluation_client(
+            mock_ac, [_online_evaluation_detail(evaluationExecutionRoleArn="")]
+        )
+
+        findings = agentcore_app.check_agentcore_evaluation_role_trust()
+
+        assert findings[0]["Status"] == "N/A"
+        mock_iam.get_role.assert_not_called()
+
+    @patch("agentcore_app.agentcore_client")
+    def test_no_configuration_is_na(self, mock_ac):
+        mock_ac.list_online_evaluation_configs.return_value = {
+            "onlineEvaluationConfigs": []
+        }
+
+        findings = agentcore_app.check_agentcore_evaluation_role_trust()
+
+        assert len(findings) == 1
+        assert findings[0]["Status"] == "N/A"
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_list_failure_is_incomplete(self, mock_ac):
+        mock_ac.list_online_evaluation_configs.side_effect = ClientError(
+            {"Error": {"Code": "AccessDeniedException"}}, "ListOnlineEvaluationConfigs"
+        )
+
+        findings = agentcore_app.check_agentcore_evaluation_role_trust()
+
+        assert findings[0]["Status"] == "N/A"
+        assert findings[0]["Check_ID"] == "AC-43"
+
+    def test_no_client_is_na(self):
+        findings = agentcore_app.check_agentcore_evaluation_role_trust()
+        assert findings[0]["Status"] == "N/A"
+        assert findings[0]["Check_ID"] == "AC-43"
+
+
+def _model_policy(resource, action=None):
+    return {
+        "name": "EvaluationPolicy",
+        "document": {
+            "Statement": {
+                "Effect": "Allow",
+                "Action": action
+                or ["bedrock:InvokeModel", "bedrock:InvokeModelWithResponseStream"],
+                "Resource": resource,
+            }
+        },
+    }
+
+
+class TestAC44EvaluationJudgeModelScope:
+    """AC-44: which models the judge can be pointed at."""
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_named_model_passes(self, mock_ac):
+        _online_evaluation_client(mock_ac)
+        cache = {
+            "role_permissions": {
+                "EvaluationRole": {
+                    "attached_policies": [],
+                    "inline_policies": [
+                        _model_policy(
+                            "arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-3"
+                        )
+                    ],
+                }
+            }
+        }
+
+        findings = agentcore_app.check_agentcore_evaluation_judge_model_scope(cache)
+
+        assert len(findings) == 1
+        assert findings[0]["Check_ID"] == "AC-44"
+        assert findings[0]["Status"] == "Passed"
+        assert findings[0]["Severity"] == "Medium"
+        assert "anthropic.claude-3" in findings[0]["Finding_Details"]
+        assert "this check does not make" in findings[0]["Resolution"]
+        assert_finding_schema(findings[0])
+
+    @pytest.mark.parametrize(
+        "resource",
+        [
+            "*",
+            "arn:aws:bedrock:*::foundation-model/*",
+            "arn:aws:bedrock:*:123456789012:inference-profile/*",
+        ],
+        ids=["all", "all-foundation-models", "all-inference-profiles"],
+    )
+    @patch("agentcore_app.agentcore_client")
+    def test_an_unbounded_model_grant_fails(self, mock_ac, resource):
+        _online_evaluation_client(mock_ac)
+        cache = {
+            "role_permissions": {
+                "EvaluationRole": {
+                    "attached_policies": [_model_policy(resource)],
+                    "inline_policies": [],
+                }
+            }
+        }
+
+        findings = agentcore_app.check_agentcore_evaluation_judge_model_scope(cache)
+
+        assert findings[0]["Status"] == "Failed"
+        assert findings[0]["Severity"] == "Medium"
+        assert findings[0]["Finding"].endswith("Unbounded")
+        assert resource in findings[0]["Finding_Details"]
+        assert "attacker-influenced text" in findings[0]["Finding_Details"]
+        assert_finding_schema(findings[0])
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_partial_model_id_is_bounded(self, mock_ac):
+        # A pattern naming part of a model id is narrower than every model, and
+        # which models belong inside it is the workload owner's decision.
+        _online_evaluation_client(mock_ac)
+        cache = {
+            "role_permissions": {
+                "EvaluationRole": {
+                    "attached_policies": [
+                        _model_policy(
+                            "arn:aws:bedrock:*::foundation-model/anthropic.claude-*"
+                        )
+                    ],
+                    "inline_policies": [],
+                }
+            }
+        }
+
+        findings = agentcore_app.check_agentcore_evaluation_judge_model_scope(cache)
+
+        assert findings[0]["Status"] == "Passed"
+
+    @pytest.mark.parametrize(
+        "action",
+        ["bedrock:InvokeModel", "bedrock:InvokeModelWithResponseStream"],
+        ids=["invoke", "invoke-stream"],
+    )
+    @patch("agentcore_app.agentcore_client")
+    def test_either_invocation_action_alone_is_judged(self, mock_ac, action):
+        _online_evaluation_client(mock_ac)
+        cache = {
+            "role_permissions": {
+                "EvaluationRole": {
+                    "attached_policies": [_model_policy("*", action=action)],
+                    "inline_policies": [],
+                }
+            }
+        }
+
+        findings = agentcore_app.check_agentcore_evaluation_judge_model_scope(cache)
+
+        assert findings[0]["Status"] == "Failed"
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_wildcard_action_reaching_invoke_model_is_judged(self, mock_ac):
+        _online_evaluation_client(mock_ac)
+        cache = {
+            "role_permissions": {
+                "EvaluationRole": {
+                    "attached_policies": [_model_policy("*", action="bedrock:*")],
+                    "inline_policies": [],
+                }
+            }
+        }
+
+        findings = agentcore_app.check_agentcore_evaluation_judge_model_scope(cache)
+
+        assert findings[0]["Status"] == "Failed"
+
+    @patch("agentcore_app.agentcore_client")
+    def test_an_unbounded_pattern_decides_even_beside_a_named_one(self, mock_ac):
+        _online_evaluation_client(mock_ac)
+        cache = {
+            "role_permissions": {
+                "EvaluationRole": {
+                    "attached_policies": [
+                        _model_policy(
+                            [
+                                "arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-3",
+                                "*",
+                            ]
+                        )
+                    ],
+                    "inline_policies": [],
+                }
+            }
+        }
+
+        findings = agentcore_app.check_agentcore_evaluation_judge_model_scope(cache)
+
+        assert len(findings) == 1
+        assert findings[0]["Status"] == "Failed"
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_role_with_no_model_grant_passes(self, mock_ac):
+        _online_evaluation_client(mock_ac)
+        cache = {
+            "role_permissions": {
+                "EvaluationRole": {
+                    "attached_policies": [
+                        _model_policy("*", action="logs:PutLogEvents")
+                    ],
+                    "inline_policies": [],
+                }
+            }
+        }
+
+        findings = agentcore_app.check_agentcore_evaluation_judge_model_scope(cache)
+
+        assert findings[0]["Status"] == "Passed"
+        assert "holds no model-invocation grant" in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_role_outside_the_snapshot_is_na(self, mock_ac):
+        _online_evaluation_client(mock_ac)
+        cache = {"role_permissions": {"SomeOtherRole": {}}}
+
+        findings = agentcore_app.check_agentcore_evaluation_judge_model_scope(cache)
+
+        assert findings[0]["Status"] == "N/A"
+        assert "not in the IAM permissions cache" in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_malformed_document_is_reported_without_a_verdict(self, mock_ac):
+        _online_evaluation_client(mock_ac)
+        cache = {
+            "role_permissions": {
+                "EvaluationRole": {
+                    "attached_policies": [{"document": "{not-json"}],
+                    "inline_policies": [],
+                }
+            }
+        }
+
+        findings = agentcore_app.check_agentcore_evaluation_judge_model_scope(cache)
+
+        statuses = [finding["Status"] for finding in findings]
+        assert statuses == ["N/A", "Passed"]
+        assert "1 cached policy document(s)" in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_every_execution_role_is_judged_not_only_the_first(self, mock_ac):
+        _online_evaluation_client(
+            mock_ac,
+            [
+                _online_evaluation_detail(),
+                _online_evaluation_detail(
+                    onlineEvaluationConfigId="oec-2",
+                    onlineEvaluationConfigName="second",
+                    evaluationExecutionRoleArn="arn:aws:iam::123456789012:role/SecondRole",
+                ),
+            ],
+        )
+        cache = {
+            "role_permissions": {
+                "EvaluationRole": {
+                    "attached_policies": [
+                        _model_policy(
+                            "arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-3"
+                        )
+                    ],
+                    "inline_policies": [],
+                },
+                "SecondRole": {
+                    "attached_policies": [_model_policy("*")],
+                    "inline_policies": [],
+                },
+            }
+        }
+
+        findings = agentcore_app.check_agentcore_evaluation_judge_model_scope(cache)
+
+        assert [finding["Status"] for finding in findings] == ["Passed", "Failed"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_an_empty_cache_is_na(self, mock_ac):
+        _online_evaluation_client(mock_ac)
+
+        findings = agentcore_app.check_agentcore_evaluation_judge_model_scope(
+            {"role_permissions": {}}
+        )
+
+        assert len(findings) == 1
+        assert findings[0]["Status"] == "N/A"
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_configuration_with_no_execution_role_is_na(self, mock_ac):
+        _online_evaluation_client(
+            mock_ac, [_online_evaluation_detail(evaluationExecutionRoleArn="")]
+        )
+
+        findings = agentcore_app.check_agentcore_evaluation_judge_model_scope(
+            {"role_permissions": {"Any": {}}}
+        )
+
+        assert len(findings) == 1
+        assert findings[0]["Status"] == "N/A"
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_list_failure_is_incomplete(self, mock_ac):
+        mock_ac.list_online_evaluation_configs.side_effect = ClientError(
+            {"Error": {"Code": "AccessDeniedException"}}, "ListOnlineEvaluationConfigs"
+        )
+
+        findings = agentcore_app.check_agentcore_evaluation_judge_model_scope({})
+
+        assert findings[0]["Status"] == "N/A"
+        assert findings[0]["Check_ID"] == "AC-44"
+
+    def test_no_client_is_na(self):
+        findings = agentcore_app.check_agentcore_evaluation_judge_model_scope({})
+        assert findings[0]["Status"] == "N/A"
+        assert findings[0]["Check_ID"] == "AC-44"
+
+    @pytest.mark.parametrize(
+        ("resource", "unbounded"),
+        [
+            ("*", True),
+            ("arn:aws:bedrock:*::foundation-model/*", True),
+            ("arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-3", False),
+            ("arn:aws:bedrock:*::foundation-model/anthropic.*", False),
+            ("arn:aws:bedrock:*:123456789012:inference-profile/global.claude", False),
+        ],
+    )
+    def test_the_model_scope_predicate(self, resource, unbounded):
+        assert agentcore_app._bedrock_model_resource_is_unbounded(resource) is unbounded
+
+    def test_the_model_invocation_actions_are_the_two_that_exist(self):
+        model = agentcore_app.boto3.client(
+            "bedrock-runtime",
+            region_name="us-east-1",
+            aws_access_key_id="testing",
+            aws_secret_access_key="testing",  # pragma: allowlist secret - synthetic test credential
+        ).meta.service_model
+        operations = set(model.operation_names)
+        assert {
+            action.split(":", 1)[1]
+            for action in agentcore_app.BEDROCK_MODEL_INVOCATION_ACTIONS
+        } == {"invokemodel", "invokemodelwithresponsestream"}
+        assert {"InvokeModel", "InvokeModelWithResponseStream"} <= operations
+        # Converse is an operation of the same client and not an IAM action: it
+        # authorizes against InvokeModel, which Access Analyzer confirms by
+        # rejecting bedrock:Converse as an action that does not exist.
+        assert "Converse" in operations
+        assert "bedrock:converse" not in agentcore_app.BEDROCK_MODEL_INVOCATION_ACTIONS
+
+    def test_the_lookup_actions_are_lowercase_for_statement_matching(self):
+        for action in agentcore_app.BEDROCK_MODEL_INVOCATION_ACTIONS:
+            assert action == action.lower()
+
+
+class TestEvaluationCheckRegistration:
+    """AC-39 to AC-44 read regional evaluation configurations."""
+
+    _CHECKS = {
+        "AC-39": "check_agentcore_online_evaluation_operation",
+        "AC-40": "check_agentcore_evaluation_safety_coverage",
+        "AC-41": "check_agentcore_evaluation_result_protection",
+        "AC-42": "check_agentcore_evaluation_pass_role_scope",
+        "AC-43": "check_agentcore_evaluation_role_trust",
+        "AC-44": "check_agentcore_evaluation_judge_model_scope",
+    }
+
+    @pytest.mark.parametrize("check_id", sorted(_CHECKS))
+    def test_the_evaluation_checks_are_in_both_regional_tuples(self, check_id):
+        assert check_id in agentcore_app.REGIONAL_AGENTCORE_CHECK_IDS
+        assert check_id in agentcore_app.AGENTCORE_RUNTIME_CHECK_IDS
+
+    @pytest.mark.parametrize("check_id", sorted(_CHECKS))
+    def test_timeout_backfill_emits_the_evaluation_checks(self, check_id):
+        findings = agentcore_app.build_agentcore_timeout_findings("us-east-1", [])
+        assert check_id in {finding["Check_ID"] for finding in findings}
+
+    @pytest.mark.parametrize("function_name", sorted(_CHECKS.values()))
+    def test_the_handler_registers_each_evaluation_check_once(self, function_name):
+        source = textwrap.dedent(inspect.getsource(agentcore_app.lambda_handler))
+        assert source.count(function_name) == 1

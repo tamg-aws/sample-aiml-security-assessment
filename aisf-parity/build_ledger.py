@@ -326,12 +326,16 @@ ROWS = [
     ),
     (
         "AIR-ACR-EVAL-01",
-        TIGHTEN,
-        EXTEND,
+        COVERED,
+        None,
         "agentcore_assessments",
         ["AC-02"],
-        "AC-02 detects AgentCore full-access and wildcard grants only, so a role holding a "
-        "single over-broad named action passes it",
+        "AC-02 now reads wildcard action patterns at any resource scope, on cached roles and "
+        "users alike, so bedrock-agentcore:* narrowed to one evaluation ARN is reported where "
+        "the full-access legs saw nothing. A pattern reaching any one of the six evaluator and "
+        "online-evaluation-config writes grants all six, and a principal that can delete an "
+        'evaluation can stop the measurement of the agent it watches. A bare Action "*" stays '
+        "with the existing legs as a service-agnostic administrator grant",
         [],
         4,
     ),
@@ -374,24 +378,33 @@ ROWS = [
     ),
     (
         "AIR-ACR-EVAL-05",
-        TIGHTEN,
-        NEW_ID,
+        COVERED,
+        None,
         "agentcore_assessments",
-        ["AC-17"],
-        'AC-17 is named "Online Evaluation Coverage" but tests only status == ACTIVE, '
-        "executionStatus == ENABLED and bool(evaluators); it never reads a sampling rate and "
-        "never asks which evaluators, so coverage is the one thing it does not measure",
+        ["AC-17", "AC-39"],
+        "AC-39 judges every online evaluation configuration that exists whatever "
+        "REQUIRE_AGENTCORE_ONLINE_EVALUATION is set to, and names the setting that stops it "
+        "running: a status other than ACTIVE, an executionStatus other than ENABLED, no "
+        "sampling percentage above zero, no input log group or service, no output log group, "
+        "or no evaluator attached. AC-17 reads the same settings and returns N/A with that "
+        "variable unset, so Failed is the verdict it cannot reach by default",
         [],
         4,
     ),
     (
         "AIR-ACR-EVAL-06",
-        TIGHTEN,
-        NEW_ID,
+        COVERED,
+        None,
         "agentcore_assessments",
-        ["AC-17"],
-        'AC-17 is named "Online Evaluation Coverage" and never asks which evaluators are '
-        "attached, so it cannot distinguish a safety evaluator from a latency one",
+        ["AC-17", "AC-40"],
+        "AC-40 classifies the evaluators each configuration attaches against the account's own "
+        "catalogue, which marks a service-authored evaluator's category in its description and "
+        "reports the level it scores at, and fails a configuration attaching no safety "
+        "evaluator or none at TOOL_CALL level. Evaluators written in this account are named for "
+        "the owner to classify, because their descriptions are prose no check can verify. "
+        "AgentCore publishes no evaluation score metric, so an alarm on a falling score is a "
+        "metric filter over the results log group whose pattern and threshold belong to the "
+        "workload, and every AC-40 verdict says so",
         [],
         4,
     ),
@@ -543,28 +556,63 @@ ROWS = [
     ),
     (
         "AIR-ACR-EVAL-02",
-        NEW,
+        COVERED,
         None,
         "agentcore_assessments",
-        [],
-        "PassRole returns 0 across all six modules; AssumeRolePolicyDocument is read once at "
-        ":2725 but only to match principal.Service for role discovery, never a condition",
+        ["AC-42"],
+        "AC-42 reads iam:PassRole on every cached role and user against the execution roles the "
+        "region's online evaluation configurations name, and judges the widest statement that "
+        "reaches one of them: a Resource pattern wider than the role itself, or a grant "
+        "carrying no iam:PassedToService condition, lets the holder run a role it could not "
+        "assume by writing a configuration that names it",
         [],
         4,
     ),
     (
         "AIR-ACR-EVAL-03",
-        NEW,
+        COVERED,
         None,
         "agentcore_assessments",
-        [],
-        "confused-deputy conditions absent: SourceAccount/SourceArn are 1 hit corpus-wide, "
-        "in sagemaker_assessments, none in AgentCore",
+        ["AC-43"],
+        "AC-43 reads each evaluation execution role's own trust policy and reports every Allow "
+        "statement trusting an AWS service principal, or every principal, with no "
+        "aws:SourceAccount and no aws:SourceArn condition. The role can read the scored traces "
+        "and invoke the judge model, so a service acting for another customer's configuration "
+        "reaches both. AC-27 makes the same assertion on gateway execution roles and reaches no "
+        "evaluation role, because it reads the roles gateways name",
         [],
         4,
     ),
-    ("AIR-ACR-EVAL-04", NEW, None, "agentcore_assessments", [], "", [], 4),
-    ("AIR-ACR-EVAL-07", NEW, None, "agentcore_assessments", [], "", [], 4),
+    (
+        "AIR-ACR-EVAL-04",
+        COVERED,
+        None,
+        "agentcore_assessments",
+        ["AC-44"],
+        "AC-44 reports whether each evaluation execution role's model-invocation grant names "
+        "models at all: a Resource pattern ending in a bare wildcard reaches every model the "
+        "account can invoke, and the judge prompt carries the agent output being scored, so "
+        "every model it reaches is one attacker-influenced text can be sent to. Which models a "
+        "workload's judges may use is the workload owner's decision, so the check names the "
+        "patterns it found and asserts only that they are bounded",
+        [],
+        4,
+    ),
+    (
+        "AIR-ACR-EVAL-07",
+        COVERED,
+        None,
+        "agentcore_assessments",
+        ["AC-20", "AC-26", "AC-41"],
+        "AC-41 anchors on the log group each configuration's outputConfig names and asserts a "
+        "retention period, a customer managed key, and membership of the AgentCore log group "
+        "prefixes, so a results group whose creator chose a name outside them is reported "
+        "rather than skipped. AC-20 and AC-26 judge masking and key policy on the groups under "
+        "those prefixes and neither reaches a group outside them. Tag values and the "
+        "configuration's own description are free-form text AC-41 discloses instead of judging",
+        [],
+        4,
+    ),
     (
         "AIR-ACR-GW-02",
         COVERED,
@@ -893,6 +941,12 @@ INCUMBENT_NAMES = {
     "AC-36": "AgentCore Policy Engine Key Scope",
     "AC-37": "AgentCore Policy Guardrail Wiring",
     "AC-38": "AgentCore Policy Session Binding",
+    "AC-39": "AgentCore Online Evaluation Operation",
+    "AC-40": "AgentCore Evaluation Safety Coverage",
+    "AC-41": "AgentCore Evaluation Result Protection",
+    "AC-42": "AgentCore Evaluation Pass Role Scope",
+    "AC-43": "AgentCore Evaluation Role Trust",
+    "AC-44": "AgentCore Evaluation Judge Model Scope",
     "AG-24": "Agentic AI Gateway Inbound Authorization",
     "AG-25": "Agentic AI Gateway Tool Policy Enforcement",
     "AG-27": "Agentic AI Gateway WAF Protection",

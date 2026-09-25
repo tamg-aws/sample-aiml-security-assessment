@@ -229,6 +229,7 @@ _EXPECTED_ACTIONS = {
         "bedrock-agentcore:ListAgentRuntimes",
         "bedrock-agentcore:ListBrowsers",
         "bedrock-agentcore:ListCodeInterpreters",
+        "bedrock-agentcore:ListEvaluators",
         "bedrock-agentcore:ListGatewayRateLimits",
         "bedrock-agentcore:ListGatewayTargets",
         "bedrock-agentcore:ListGateways",
