@@ -446,13 +446,13 @@ ROWS = [
     ),
     (
         "AIR-ACR-MEM-01",
-        TIGHTEN,
-        EXTEND,
+        COVERED,
+        None,
         "agentcore_assessments",
-        ["AC-07"],
-        "AC-07's presence-only CMK test is sound (encryptionKeyArn is an optional "
-        "customer-supplied CreateMemory input); MEM-01 adds per-actor and namespace "
-        "access scoping",
+        ["AC-07", "AC-23"],
+        "AC-07 asserts a customer managed key and an {actorId} namespace per memory, "
+        "AC-23 asserts that no cached role or user reads memory records without a "
+        "namespace, strategy, actor or session condition",
         [],
         4,
     ),
@@ -782,6 +782,7 @@ INCUMBENT_NAMES = {
     "AC-20": "AgentCore Log Data Protection",
     "AC-21": "AgentCore Log Unmask Restriction",
     "AC-22": "AgentCore Telemetry Sink Scope",
+    "AC-23": "AgentCore Memory Record Access Scope",
     "AG-24": "Agentic AI Gateway Inbound Authorization",
     "AG-25": "Agentic AI Gateway Tool Policy Enforcement",
     "AG-27": "Agentic AI Gateway WAF Protection",

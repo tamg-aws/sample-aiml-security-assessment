@@ -80,6 +80,10 @@ AGENTCORE_MEMORY_REFERENCE_URL = (
     "https://aws.github.io/bedrock-agentcore-starter-toolkit/"
     "user-guide/memory/quickstart.html"
 )
+AGENTCORE_MEMORY_NAMESPACE_REFERENCE_URL = (
+    "https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/"
+    "specify-long-term-memory-organization.html"
+)
 AGENTCORE_GATEWAY_REFERENCE_URL = (
     "https://aws.github.io/bedrock-agentcore-starter-toolkit/"
     "user-guide/gateway/quickstart.html"
@@ -390,6 +394,43 @@ SINK_PRINCIPAL_SCOPE_CONDITION_KEYS = {
     "aws:principalorgid",
     "aws:principalorgpaths",
 }
+
+# Namespace variable that partitions long-term memory records per end user. AWS
+# documents "/strategy/{memoryStrategyId}/" and "/" as valid namespace
+# granularities, so a strategy whose namespace carries no actor variable stores
+# every actor's records in one namespace that a single retrieval returns.
+MEMORY_ACTOR_NAMESPACE_VARIABLE = "{actorid}"
+
+# Memory read actions that return stored records or events and that IAM can bind
+# to one actor, session, strategy or namespace. Each action below publishes at
+# least one of those condition keys, so a policy author can express the scope.
+# GetMemoryRecord and ListActors read the same records but publish no scoping
+# condition key at all, and their only resource type is the whole memory, so
+# demanding a scope on them would fail a policy that cannot be written.
+MEMORY_RECORD_READ_ACTIONS = (
+    "retrievememoryrecords",
+    "listmemoryrecords",
+    "listevents",
+    "getevent",
+    "listsessions",
+)
+
+# Condition keys that bind a memory read to one actor, session, strategy or
+# namespace. bedrock-agentcore:namespacePath and namespaceVariable/<key> are
+# published in the devguide read-path and tenant-isolation examples but appear
+# in neither the IAM service authorization reference nor the policy model as of
+# 2026-09-25, so Access Analyzer reports them as unknown keys. Counting them as
+# scoping intent is safe under both readings: if the key exists it scopes the
+# grant, and if it does not the condition can never match and the Allow grants
+# nothing.
+MEMORY_SCOPE_CONDITION_KEYS = {
+    "bedrock-agentcore:namespace",
+    "bedrock-agentcore:namespacepath",
+    "bedrock-agentcore:strategyid",
+    "bedrock-agentcore:actorid",
+    "bedrock-agentcore:sessionid",
+}
+MEMORY_SCOPE_CONDITION_KEY_PREFIXES = ("bedrock-agentcore:namespacevariable/",)
 
 # Error codes that establish the target region is not enabled for the account.
 # AWS returns these credential-shaped codes when a request is signed for a
@@ -2579,13 +2620,125 @@ def check_agentcore_online_evaluation_coverage() -> List[Dict[str, Any]]:
         ]
 
 
+def _memory_strategy_namespaces(strategy: Dict[str, Any]) -> List[str]:
+    """Return every namespace one memory strategy writes records into.
+
+    A strategy carries the newer ``namespaceTemplates`` and the older
+    ``namespaces``, and either list can hold namespaces the other does not, so
+    both are read: a namespace without an actor variable flattens records no
+    matter which member declares it.
+    """
+    namespaces: List[str] = []
+    for member in ("namespaceTemplates", "namespaces"):
+        values = strategy.get(member)
+        if not isinstance(values, list):
+            continue
+        for value in values:
+            if isinstance(value, str) and value not in namespaces:
+                namespaces.append(value)
+    return namespaces
+
+
+def _memory_namespace_scope_finding(
+    memory_label: str,
+    memory_details: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Judge whether one memory partitions long-term records per actor."""
+    strategies = memory_details.get("strategies")
+    if not isinstance(strategies, list) or not strategies:
+        return create_finding(
+            check_id="AC-07",
+            finding_name="AgentCore Memory Access Scope",
+            finding_details=(
+                f"Memory {memory_label} has no memory strategy, so it extracts no "
+                "long-term records to partition."
+            ),
+            resolution=(
+                "No action required. Add an actor variable to the namespace of any "
+                "strategy added later."
+            ),
+            reference=AGENTCORE_MEMORY_NAMESPACE_REFERENCE_URL,
+            severity=SeverityEnum.INFORMATIONAL,
+            status=StatusEnum.NA,
+        )
+
+    unpartitioned: List[str] = []
+    assessed = 0
+    for strategy in strategies:
+        if not isinstance(strategy, dict):
+            continue
+        strategy_label = strategy.get("name") or strategy.get("strategyId") or "unnamed"
+        namespaces = _memory_strategy_namespaces(strategy)
+        if not namespaces:
+            continue
+        assessed += 1
+        if any(
+            MEMORY_ACTOR_NAMESPACE_VARIABLE not in namespace.lower()
+            for namespace in namespaces
+        ):
+            unpartitioned.append(str(strategy_label))
+
+    if not assessed:
+        return create_finding(
+            check_id="AC-07",
+            finding_name="AgentCore Memory Access Scope",
+            finding_details=(
+                f"Memory {memory_label} reports no namespace for any of its "
+                f"{len(strategies)} strategies, so the record partitioning could "
+                "not be read."
+            ),
+            resolution=(
+                "Review the namespace of each memory strategy in the AgentCore "
+                "console and rerun the assessment."
+            ),
+            reference=AGENTCORE_MEMORY_NAMESPACE_REFERENCE_URL,
+            severity=SeverityEnum.INFORMATIONAL,
+            status=StatusEnum.NA,
+        )
+
+    if unpartitioned:
+        return create_finding(
+            check_id="AC-07",
+            finding_name="AgentCore Memory Access Scope",
+            finding_details=(
+                f"Memory {memory_label} stores long-term records in a namespace "
+                "that carries no actor variable, so one retrieval returns every "
+                f"actor's records. Strategies: {', '.join(sorted(unpartitioned))}."
+            ),
+            resolution=(
+                "Include {actorId} in the namespace of each memory strategy so "
+                "records are partitioned per end user, then confirm the retrieval "
+                "calls pass the caller's actor id."
+            ),
+            reference=AGENTCORE_MEMORY_NAMESPACE_REFERENCE_URL,
+            severity=SeverityEnum.HIGH,
+            status=StatusEnum.FAILED,
+        )
+
+    return create_finding(
+        check_id="AC-07",
+        finding_name="AgentCore Memory Access Scope",
+        finding_details=(
+            f"Memory {memory_label} partitions the records of all {assessed} "
+            "strategies by actor namespace."
+        ),
+        resolution=(
+            "No action required. Confirm each retrieval call passes the actor id of "
+            "the caller rather than a shared value."
+        ),
+        reference=AGENTCORE_MEMORY_NAMESPACE_REFERENCE_URL,
+        severity=SeverityEnum.HIGH,
+        status=StatusEnum.PASSED,
+    )
+
+
 def check_agentcore_memory_configuration() -> List[Dict[str, Any]]:
     """
     Check Memory resource configuration.
 
     Validates:
-    - IAM role permissions are least-privilege
-    - Encryption is configured
+    - Encryption uses a customer managed key
+    - Long-term records are partitioned into a per-actor namespace
 
     Returns:
         List of findings
@@ -2633,46 +2786,76 @@ def check_agentcore_memory_configuration() -> List[Dict[str, Any]]:
             memory_name = (
                 memory.get("name", memory_id) if memory.get("name") else memory_id
             )
+            memory_label = f"'{memory_name}' ({memory_id})"
 
             try:
                 memory_details = _unwrap_agentcore_detail(
                     agentcore_client.get_memory(memoryId=memory_id), "memory"
                 )
-
-                # Check encryption configuration
-                encryption_key_arn = memory_details.get(
-                    "encryptionKeyArn"
-                ) or memory_details.get("kmsKeyArn")
-
-                if not encryption_key_arn:
-                    findings.append(
-                        create_finding(
-                            check_id="AC-07",
-                            finding_name="AgentCore Memory Encryption",
-                            finding_details=f"Memory '{memory_name}' ({memory_id}) does not have customer-managed encryption configured",
-                            resolution="Enable encryption with customer-managed KMS keys",
-                            reference=AGENTCORE_MEMORY_REFERENCE_URL,
-                            severity=SeverityEnum.MEDIUM,
-                            status=StatusEnum.FAILED,
-                        )
-                    )
-
             except ClientError as e:
-                if e.response["Error"]["Code"] != "ResourceNotFoundException":
-                    logger.error(f"Error describing memory {memory_id}: {e}")
-
-        # If no findings, return passed
-        if not findings:
-            findings.append(
-                create_finding(
-                    check_id="AC-07",
-                    finding_name="AgentCore Memory Configuration Check",
-                    finding_details=f"All {len(memories)} Memory resources have proper configuration",
-                    resolution="No action required",
-                    reference=AGENTCORE_MEMORY_REFERENCE_URL,
-                    severity=SeverityEnum.HIGH,
-                    status=StatusEnum.PASSED,
+                # A memory that cannot be described is reported per resource. An
+                # earlier revision swallowed this error, so a run where every
+                # GetMemory call failed reported the same aggregate pass as a run
+                # that read every memory.
+                logger.error(f"Error describing memory {memory_id}: {e}")
+                findings.append(
+                    create_finding(
+                        check_id="AC-07",
+                        finding_name="AgentCore Memory Configuration Check",
+                        finding_details=(
+                            f"Memory {memory_label} could not be described. "
+                            f"Assessment error: {_assessment_error_label(e)}."
+                        ),
+                        resolution=(
+                            "Grant bedrock-agentcore:GetMemory on this memory, or "
+                            "remove a memory deleted mid-assessment from the "
+                            "inventory, then rerun the assessment."
+                        ),
+                        reference=AGENTCORE_MEMORY_REFERENCE_URL,
+                        severity=SeverityEnum.INFORMATIONAL,
+                        status=StatusEnum.NA,
+                    )
                 )
+                continue
+
+            encryption_key_arn = memory_details.get(
+                "encryptionKeyArn"
+            ) or memory_details.get("kmsKeyArn")
+
+            if encryption_key_arn:
+                findings.append(
+                    create_finding(
+                        check_id="AC-07",
+                        finding_name="AgentCore Memory Encryption",
+                        finding_details=(
+                            f"Memory {memory_label} encrypts stored records with "
+                            "the customer managed key "
+                            f"{encryption_key_arn}."
+                        ),
+                        resolution="No action required.",
+                        reference=AGENTCORE_MEMORY_REFERENCE_URL,
+                        severity=SeverityEnum.MEDIUM,
+                        status=StatusEnum.PASSED,
+                    )
+                )
+            else:
+                findings.append(
+                    create_finding(
+                        check_id="AC-07",
+                        finding_name="AgentCore Memory Encryption",
+                        finding_details=(
+                            f"Memory {memory_label} does not have customer-managed "
+                            "encryption configured"
+                        ),
+                        resolution="Enable encryption with customer-managed KMS keys",
+                        reference=AGENTCORE_MEMORY_REFERENCE_URL,
+                        severity=SeverityEnum.MEDIUM,
+                        status=StatusEnum.FAILED,
+                    )
+                )
+
+            findings.append(
+                _memory_namespace_scope_finding(memory_label, memory_details)
             )
 
     except Exception as e:
@@ -4757,6 +4940,211 @@ def check_agentcore_telemetry_sink_scope() -> List[Dict[str, Any]]:
     return findings
 
 
+def _statement_condition_keys(statement: Dict[str, Any]) -> List[str]:
+    """Return the normalized condition keys of one IAM statement."""
+    conditions = statement.get("Condition")
+    if not isinstance(conditions, dict):
+        return []
+    keys: List[str] = []
+    for condition_values in conditions.values():
+        if not isinstance(condition_values, dict):
+            continue
+        keys.extend(str(key).strip().lower() for key in condition_values)
+    return keys
+
+
+def _statement_scopes_memory_records(statement: Dict[str, Any]) -> bool:
+    """Return whether one statement binds a memory read to one actor or namespace."""
+    for condition_key in _statement_condition_keys(statement):
+        if condition_key in MEMORY_SCOPE_CONDITION_KEYS:
+            return True
+        if condition_key.startswith(MEMORY_SCOPE_CONDITION_KEY_PREFIXES):
+            return True
+    return False
+
+
+def _statement_grants_memory_record_read(statement: Dict[str, Any]) -> bool:
+    """Return whether one statement grants a scopable memory read action."""
+    for action in _statement_actions(statement):
+        action_parts = action.split(":", 1)
+        if len(action_parts) != 2:
+            continue
+        service_namespace, action_pattern = action_parts
+        if service_namespace not in AGENT_PLATFORM_IAM_NAMESPACES:
+            continue
+        if any(
+            fnmatchcase(read_action, action_pattern)
+            for read_action in MEMORY_RECORD_READ_ACTIONS
+        ):
+            return True
+    return False
+
+
+def _principals_reading_memory_records(
+    permissions_by_name: Dict[str, Any],
+    principal_kind: str,
+) -> Tuple[List[str], List[str]]:
+    """Split principals reading memory records into unscoped and scoped grants.
+
+    The only resource type these actions accept is the whole memory, so naming a
+    memory ARN still reads every actor's records inside it. A condition on the
+    namespace, strategy, actor or session is the one way a policy narrows the
+    read, which is why the resource element is not consulted here.
+    """
+    unscoped: List[str] = []
+    scoped: List[str] = []
+
+    for principal_name, permissions in permissions_by_name.items():
+        if not isinstance(permissions, dict):
+            continue
+        label = f"{principal_kind} {principal_name}"
+        attached_policies = permissions.get("attached_policies", [])
+        inline_policies = permissions.get("inline_policies", [])
+        if not isinstance(attached_policies, list):
+            attached_policies = []
+        if not isinstance(inline_policies, list):
+            inline_policies = []
+
+        reads_records = False
+        reads_records_unscoped = False
+
+        for policy in [*attached_policies, *inline_policies]:
+            try:
+                for statement in _allow_statements(policy):
+                    if not _statement_grants_memory_record_read(statement):
+                        continue
+                    reads_records = True
+                    if not _statement_scopes_memory_records(statement):
+                        reads_records_unscoped = True
+            except Exception as error:
+                logger.warning(f"Error parsing policy for {label}: {error}")
+
+        if reads_records_unscoped:
+            unscoped.append(label)
+        elif reads_records:
+            scoped.append(label)
+
+    return unscoped, scoped
+
+
+def check_agentcore_memory_record_access_scope(
+    permission_cache: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    """AC-23: Report who can read memory records across every actor.
+
+    Partitioning long-term memory into a per-actor namespace only separates the
+    records if the retrieval is also bound to one actor: a principal holding
+    RetrieveMemoryRecords with no namespace or actor condition reads every end
+    user's records out of the same memory.
+    """
+    findings = []
+
+    try:
+        role_permissions = permission_cache.get("role_permissions", {})
+        user_permissions = permission_cache.get("user_permissions", {})
+
+        if not role_permissions and not user_permissions:
+            return [
+                create_finding(
+                    check_id="AC-23",
+                    finding_name="AgentCore Memory Record Access Scope",
+                    finding_details="No IAM permissions found in cache.",
+                    resolution="No action required.",
+                    reference=AGENTCORE_MEMORY_NAMESPACE_REFERENCE_URL,
+                    severity=SeverityEnum.INFORMATIONAL,
+                    status=StatusEnum.NA,
+                    region=GLOBAL_REGION_LABEL,
+                )
+            ]
+
+        unscoped_roles, scoped_roles = _principals_reading_memory_records(
+            role_permissions, "role"
+        )
+        unscoped_users, scoped_users = _principals_reading_memory_records(
+            user_permissions, "user"
+        )
+        unscoped = sorted(unscoped_roles + unscoped_users)
+        scoped = sorted(scoped_roles + scoped_users)
+
+        if unscoped:
+            findings.append(
+                create_finding(
+                    check_id="AC-23",
+                    finding_name="AgentCore Memory Record Access Scope",
+                    finding_details=(
+                        "The following principals can read memory records and "
+                        "events without a namespace, strategy, actor or session "
+                        "condition, so one call returns every actor's stored "
+                        f"records: {', '.join(unscoped)}."
+                    ),
+                    resolution=(
+                        "Add a bedrock-agentcore:namespace, strategyId, actorId or "
+                        "sessionId condition that binds the read to the caller, for "
+                        "example by matching the actor id against the session tag "
+                        "carried by the agent identity."
+                    ),
+                    reference=AGENTCORE_MEMORY_NAMESPACE_REFERENCE_URL,
+                    severity=SeverityEnum.HIGH,
+                    status=StatusEnum.FAILED,
+                    region=GLOBAL_REGION_LABEL,
+                )
+            )
+
+        if scoped:
+            findings.append(
+                create_finding(
+                    check_id="AC-23",
+                    finding_name="AgentCore Memory Record Access Scope",
+                    finding_details=(
+                        "The following principals read memory records only under a "
+                        "namespace, strategy, actor or session condition: "
+                        f"{', '.join(scoped)}."
+                    ),
+                    resolution=(
+                        "No action required. Confirm the condition resolves to the "
+                        "end user the caller is acting for rather than to a fixed "
+                        "value shared by every session."
+                    ),
+                    reference=AGENTCORE_MEMORY_NAMESPACE_REFERENCE_URL,
+                    severity=SeverityEnum.HIGH,
+                    status=StatusEnum.PASSED,
+                    region=GLOBAL_REGION_LABEL,
+                )
+            )
+
+        if not unscoped and not scoped:
+            findings.append(
+                create_finding(
+                    check_id="AC-23",
+                    finding_name="AgentCore Memory Record Access Scope",
+                    finding_details=(
+                        "No cached IAM role or user grants a memory record or event "
+                        "read action, so no principal reads stored memory through "
+                        "IAM policy."
+                    ),
+                    resolution="No action required.",
+                    reference=AGENTCORE_MEMORY_NAMESPACE_REFERENCE_URL,
+                    severity=SeverityEnum.HIGH,
+                    status=StatusEnum.PASSED,
+                    region=GLOBAL_REGION_LABEL,
+                )
+            )
+
+    except Exception as error:
+        logger.error(f"Error in memory record access scope check: {error}")
+        findings.append(
+            _incomplete_check_finding(
+                check_id="AC-23",
+                finding_name="AgentCore Memory Record Access Scope",
+                error=error,
+                reference=AGENTCORE_MEMORY_NAMESPACE_REFERENCE_URL,
+                region=GLOBAL_REGION_LABEL,
+            )
+        )
+
+    return findings
+
+
 def check_agentcore_gateway_agentic_security() -> List[Dict[str, Any]]:
     """
     Check API-provable AgentCore Gateway controls for agentic tool execution.
@@ -5138,6 +5526,7 @@ def lambda_handler(event, context):
                     ("AC-02", "AgentCore IAM Full Access Check"),
                     ("AC-03", "AgentCore Stale Access Check"),
                     ("AC-21", "AgentCore Log Unmask Restriction"),
+                    ("AC-23", "AgentCore Memory Record Access Scope"),
                 ):
                     all_findings.append(
                         create_finding(
@@ -5184,6 +5573,16 @@ def lambda_handler(event, context):
                         ["AC-21"],
                         "Log Unmask Restriction",
                         lambda: check_agentcore_log_unmask_restriction(
+                            permission_cache
+                        ),
+                    ),
+                    # AC-23 reads the same global IAM cache: who can read another
+                    # actor's memory records does not vary by region, and the
+                    # namespace partitioning of each memory is judged by AC-07.
+                    (
+                        ["AC-23"],
+                        "Memory Record Access Scope",
+                        lambda: check_agentcore_memory_record_access_scope(
                             permission_cache
                         ),
                     ),

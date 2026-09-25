@@ -6,15 +6,15 @@
     "hosted": 67,
     "fnd_ai_subject": 11,
     "total": 78,
-    "covered": 13,
-    "tighten": 28,
-    "tighten_extend": 22,
+    "covered": 14,
+    "tighten": 27,
+    "tighten_extend": 21,
     "tighten_new_id": 6,
     "new": 22,
     "not_implementable": 4,
     "unassessed": 11,
     "new_check_functions": 39,
-    "extensions": 22,
+    "extensions": 21,
     "extra_iam_actions": [
       "config:DescribeConfigRules",
       "config:DescribeConfigurationRecorders",
@@ -935,18 +935,20 @@
       "question": "Is an agent's persisted memory (conversation history, learned facts) encrypted with organization-controlled keys and partitioned so one agent or user cannot read another's records?",
       "assert": "Memory CMK encryption + per-actor/namespace access-scope configuration",
       "workload_agnostic": true,
-      "verdict": "tighten",
-      "disposition": "extend",
+      "verdict": "covered",
+      "disposition": null,
       "target_modules": [
         "agentcore_assessments"
       ],
       "incumbents": [
-        "AC-07"
+        "AC-07",
+        "AC-23"
       ],
       "incumbent_names": [
-        "AgentCore Memory Encryption"
+        "AgentCore Memory Encryption",
+        "AgentCore Memory Record Access Scope"
       ],
-      "gap": "AC-07's presence-only CMK test is sound (encryptionKeyArn is an optional customer-supplied CreateMemory input); MEM-01 adds per-actor and namespace access scoping",
+      "gap": "AC-07 asserts a customer managed key and an {actorId} namespace per memory, AC-23 asserts that no cached role or user reads memory records without a namespace, strategy, actor or session condition",
       "extra_iam": [],
       "phase": 4,
       "source": "controls/ai-specific/agentcore-memory.yaml"

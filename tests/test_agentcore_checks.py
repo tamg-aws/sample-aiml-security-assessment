@@ -1375,6 +1375,252 @@ class TestAC07MemoryConfiguration:
         for f in extract_csv_data(result):
             assert_finding_schema(f)
 
+    # --- AC-07 namespace partitioning leg (AIR-ACR-MEM-01) ---
+
+    _ACTOR_NAMESPACE = (
+        "/strategies/{memoryStrategyId}/actors/{actorId}/sessions/{sessionId}"
+    )
+
+    @staticmethod
+    def _memory_detail(**overrides):
+        detail = {
+            "id": "mem-123456789012",
+            "encryptionKeyArn": "arn:aws:kms:us-east-1:123:key/abc",
+            "strategies": [
+                {
+                    "strategyId": "strat-1",
+                    "name": "summary",
+                    "namespaceTemplates": [
+                        TestAC07MemoryConfiguration._ACTOR_NAMESPACE
+                    ],
+                }
+            ],
+        }
+        detail.update(overrides)
+        return detail
+
+    @classmethod
+    def _one_memory(cls, mock_ac, **overrides):
+        mock_ac.list_memories.return_value = {
+            "memories": [{"id": "mem-123456789012", "name": "TestMemory"}]
+        }
+        mock_ac.get_memory.return_value = {"memory": cls._memory_detail(**overrides)}
+
+    @patch("agentcore_app.agentcore_client")
+    def test_ac07_actor_scoped_namespace_passes(self, mock_ac):
+        self._one_memory(mock_ac)
+
+        findings = extract_csv_data(
+            agentcore_app.check_agentcore_memory_configuration()
+        )
+
+        assert [f["Status"] for f in findings] == ["Passed", "Passed"]
+        assert findings[1]["Finding"] == "AgentCore Memory Access Scope"
+        for finding in findings:
+            assert_finding_schema(finding)
+
+    @patch("agentcore_app.agentcore_client")
+    def test_ac07_namespace_without_an_actor_variable_fails(self, mock_ac):
+        self._one_memory(
+            mock_ac,
+            strategies=[
+                {
+                    "strategyId": "strat-1",
+                    "name": "summary",
+                    "namespaceTemplates": ["/"],
+                }
+            ],
+        )
+
+        findings = extract_csv_data(
+            agentcore_app.check_agentcore_memory_configuration()
+        )
+
+        assert [f["Status"] for f in findings] == ["Passed", "Failed"]
+        assert findings[1]["Severity"] == "High"
+        assert "summary" in findings[1]["Finding_Details"]
+        assert "{actorId}" in findings[1]["Resolution"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_ac07_legacy_namespaces_member_is_read(self, mock_ac):
+        # A strategy created before namespaceTemplates existed reports only
+        # namespaces, so reading one member alone would judge the wrong field.
+        self._one_memory(
+            mock_ac,
+            strategies=[
+                {
+                    "strategyId": "strat-1",
+                    "name": "summary",
+                    "namespaces": [self._ACTOR_NAMESPACE],
+                }
+            ],
+        )
+
+        findings = extract_csv_data(
+            agentcore_app.check_agentcore_memory_configuration()
+        )
+
+        assert [f["Status"] for f in findings] == ["Passed", "Passed"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_ac07_a_flat_legacy_namespace_beside_a_scoped_template_fails(self, mock_ac):
+        # Both members are read because either list can name a namespace the
+        # other does not, and records land in whichever one the strategy uses.
+        self._one_memory(
+            mock_ac,
+            strategies=[
+                {
+                    "strategyId": "strat-1",
+                    "name": "summary",
+                    "namespaceTemplates": [self._ACTOR_NAMESPACE],
+                    "namespaces": ["/"],
+                }
+            ],
+        )
+
+        findings = extract_csv_data(
+            agentcore_app.check_agentcore_memory_configuration()
+        )
+
+        assert [f["Status"] for f in findings] == ["Passed", "Failed"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_ac07_memory_without_a_strategy_is_na(self, mock_ac):
+        self._one_memory(mock_ac, strategies=[])
+
+        findings = extract_csv_data(
+            agentcore_app.check_agentcore_memory_configuration()
+        )
+
+        assert [f["Status"] for f in findings] == ["Passed", "N/A"]
+        assert "no memory strategy" in findings[1]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_ac07_strategy_without_a_namespace_is_na(self, mock_ac):
+        self._one_memory(
+            mock_ac, strategies=[{"strategyId": "strat-1", "name": "summary"}]
+        )
+
+        findings = extract_csv_data(
+            agentcore_app.check_agentcore_memory_configuration()
+        )
+
+        assert [f["Status"] for f in findings] == ["Passed", "N/A"]
+        assert "reports no namespace" in findings[1]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_ac07_malformed_strategies_value_is_na(self, mock_ac):
+        self._one_memory(mock_ac, strategies={"unexpected": "shape"})
+
+        findings = extract_csv_data(
+            agentcore_app.check_agentcore_memory_configuration()
+        )
+
+        assert [f["Status"] for f in findings] == ["Passed", "N/A"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_ac07_missing_key_and_flat_namespace_fail_independently(self, mock_ac):
+        self._one_memory(
+            mock_ac,
+            encryptionKeyArn=None,
+            strategies=[
+                {
+                    "strategyId": "strat-1",
+                    "name": "summary",
+                    "namespaceTemplates": ["/"],
+                }
+            ],
+        )
+
+        findings = extract_csv_data(
+            agentcore_app.check_agentcore_memory_configuration()
+        )
+
+        assert [f["Status"] for f in findings] == ["Failed", "Failed"]
+        assert [f["Finding"] for f in findings] == [
+            "AgentCore Memory Encryption",
+            "AgentCore Memory Access Scope",
+        ]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_ac07_emits_one_verdict_pair_per_memory(self, mock_ac):
+        # The aggregate "all memories are fine" row is gone: two memories mean
+        # two encryption verdicts and two access-scope verdicts.
+        mock_ac.list_memories.return_value = {
+            "memories": [
+                {"id": "mem-1", "name": "First"},
+                {"id": "mem-2", "name": "Second"},
+            ]
+        }
+        mock_ac.get_memory.return_value = {"memory": self._memory_detail()}
+
+        findings = extract_csv_data(
+            agentcore_app.check_agentcore_memory_configuration()
+        )
+
+        assert len(findings) == 4
+        names = [f["Finding"] for f in findings]
+        assert names.count("AgentCore Memory Encryption") == 2
+        assert names.count("AgentCore Memory Access Scope") == 2
+
+    @patch("agentcore_app.agentcore_client")
+    def test_ac07_unreadable_memory_does_not_hide_a_readable_one(self, mock_ac):
+        # An earlier revision swallowed this error and emitted the aggregate
+        # pass, so a run that could read nothing looked identical to a clean one.
+        mock_ac.list_memories.return_value = {
+            "memories": [
+                {"id": "mem-1", "name": "Gone"},
+                {"id": "mem-2", "name": "Readable"},
+            ]
+        }
+        mock_ac.get_memory.side_effect = [
+            _make_client_error("ResourceNotFoundException", "gone"),
+            {"memory": self._memory_detail()},
+        ]
+
+        findings = extract_csv_data(
+            agentcore_app.check_agentcore_memory_configuration()
+        )
+
+        assert [f["Status"] for f in findings] == ["N/A", "Passed", "Passed"]
+        assert "ResourceNotFoundException" in findings[0]["Finding_Details"]
+        assert "'Gone' (mem-1)" in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_ac07_access_denied_on_every_memory_never_reads_as_clean(self, mock_ac):
+        mock_ac.list_memories.return_value = {"memories": [{"id": "mem-1"}]}
+        mock_ac.get_memory.side_effect = _make_client_error(
+            "AccessDeniedException", "no"
+        )
+
+        findings = extract_csv_data(
+            agentcore_app.check_agentcore_memory_configuration()
+        )
+
+        assert [f["Status"] for f in findings] == ["N/A"]
+        assert "bedrock-agentcore:GetMemory" in findings[0]["Resolution"]
+
+    def test_memory_namespace_is_a_customer_supplied_input(self):
+        # The Failed verdict is only reachable because the namespace is an
+        # optional CreateMemory input: if the service required an actor-scoped
+        # template, the check could never discriminate.
+        model = agentcore_app.boto3.client(
+            "bedrock-agentcore-control",
+            region_name="us-east-1",
+            aws_access_key_id="testing",
+            aws_secret_access_key="testing",  # pragma: allowlist secret - synthetic test credential
+        ).meta.service_model
+        strategy_input = (
+            model.operation_model("CreateMemory")
+            .input_shape.members["memoryStrategies"]
+            .member
+        )
+        assert strategy_input.members
+        for wrapper in strategy_input.members.values():
+            assert "namespaceTemplates" in wrapper.members
+            assert "namespaces" in wrapper.members
+            assert set(wrapper.metadata.get("required") or []) == {"name"}
+
 
 # ===================================================================
 # AC-08: check_agentcore_vpc_endpoints
@@ -3386,6 +3632,260 @@ class TestAC22TelemetrySinkScope:
 
 
 # ===================================================================
+# AC-23: check_agentcore_memory_record_access_scope
+# ===================================================================
+class TestAC23MemoryRecordAccessScope:
+    """AC-23: Who can read memory records across every actor."""
+
+    _MEMORY_ARN = "arn:aws:bedrock-agentcore:us-east-1:123456789012:memory/mem-1"
+
+    @staticmethod
+    def _cache(
+        actions,
+        condition=None,
+        resource="*",
+        principal="agent-role",
+        effect="Allow",
+    ):
+        statement = {"Effect": effect, "Action": actions, "Resource": resource}
+        if condition:
+            statement["Condition"] = condition
+        return {
+            "role_permissions": {
+                principal: {
+                    "attached_policies": [
+                        {"name": "p", "document": {"Statement": [statement]}}
+                    ],
+                    "inline_policies": [],
+                }
+            },
+            "user_permissions": {},
+        }
+
+    def test_unscoped_record_read_fails(self):
+        findings = agentcore_app.check_agentcore_memory_record_access_scope(
+            self._cache(["bedrock-agentcore:RetrieveMemoryRecords"])
+        )
+        assert [f["Status"] for f in findings] == ["Failed"]
+        assert findings[0]["Check_ID"] == "AC-23"
+        assert findings[0]["Severity"] == "High"
+        assert "role agent-role" in findings[0]["Finding_Details"]
+        for finding in findings:
+            assert_finding_schema(finding)
+
+    def test_namespace_condition_passes(self):
+        findings = agentcore_app.check_agentcore_memory_record_access_scope(
+            self._cache(
+                ["bedrock-agentcore:RetrieveMemoryRecords"],
+                condition={
+                    "StringLike": {
+                        "bedrock-agentcore:namespace": (
+                            "/actors/${aws:PrincipalTag/actorId}/*"
+                        )
+                    }
+                },
+            )
+        )
+        assert [f["Status"] for f in findings] == ["Passed"]
+        assert "role agent-role" in findings[0]["Finding_Details"]
+
+    def test_actor_condition_on_event_read_passes(self):
+        findings = agentcore_app.check_agentcore_memory_record_access_scope(
+            self._cache(
+                ["bedrock-agentcore:ListEvents", "bedrock-agentcore:GetEvent"],
+                condition={
+                    "StringEquals": {
+                        "bedrock-agentcore:actorId": "${aws:PrincipalTag/actorId}"
+                    }
+                },
+            )
+        )
+        assert [f["Status"] for f in findings] == ["Passed"]
+
+    def test_devguide_namespace_variable_key_counts_as_scope(self):
+        # namespaceVariable/<key> is published in the devguide tenant-isolation
+        # example but is absent from the IAM service authorization reference. The
+        # verdict is the same either way: the key scopes the read if it exists,
+        # and the condition can never match if it does not.
+        findings = agentcore_app.check_agentcore_memory_record_access_scope(
+            self._cache(
+                ["bedrock-agentcore:ListMemoryRecords"],
+                condition={
+                    "StringEquals": {
+                        "bedrock-agentcore:namespaceVariable/tenantId": (
+                            "${aws:PrincipalTag/tenantId}"
+                        )
+                    }
+                },
+            )
+        )
+        assert [f["Status"] for f in findings] == ["Passed"]
+
+    def test_memory_arn_resource_without_a_condition_still_fails(self):
+        # The only resource type these actions accept is the memory itself, so
+        # naming the ARN still reads every actor's records inside it.
+        findings = agentcore_app.check_agentcore_memory_record_access_scope(
+            self._cache(
+                ["bedrock-agentcore:RetrieveMemoryRecords"], resource=self._MEMORY_ARN
+            )
+        )
+        assert [f["Status"] for f in findings] == ["Failed"]
+
+    def test_agentcore_namespace_wildcard_is_detected(self):
+        findings = agentcore_app.check_agentcore_memory_record_access_scope(
+            self._cache(["bedrock-agentcore:*"])
+        )
+        assert [f["Status"] for f in findings] == ["Failed"]
+
+    def test_bare_wildcard_action_is_ignored(self):
+        findings = agentcore_app.check_agentcore_memory_record_access_scope(
+            self._cache(["*"])
+        )
+        assert [f["Status"] for f in findings] == ["Passed"]
+        assert "No cached IAM role or user" in findings[0]["Finding_Details"]
+
+    def test_actions_iam_cannot_scope_are_not_assessed(self):
+        # IAM publishes no namespace, actor, session or strategy condition key
+        # for GetMemoryRecord or ListActors, so a Failed verdict on them would
+        # demand a policy that cannot be written.
+        findings = agentcore_app.check_agentcore_memory_record_access_scope(
+            self._cache(
+                [
+                    "bedrock-agentcore:GetMemoryRecord",
+                    "bedrock-agentcore:ListActors",
+                ]
+            )
+        )
+        assert [f["Status"] for f in findings] == ["Passed"]
+        assert "No cached IAM role or user" in findings[0]["Finding_Details"]
+
+    def test_deny_statement_is_ignored(self):
+        findings = agentcore_app.check_agentcore_memory_record_access_scope(
+            self._cache(["bedrock-agentcore:RetrieveMemoryRecords"], effect="Deny")
+        )
+        assert [f["Status"] for f in findings] == ["Passed"]
+        assert "No cached IAM role or user" in findings[0]["Finding_Details"]
+
+    def test_another_service_read_is_ignored(self):
+        findings = agentcore_app.check_agentcore_memory_record_access_scope(
+            self._cache(["qbusiness:ListEvents"])
+        )
+        assert [f["Status"] for f in findings] == ["Passed"]
+        assert "No cached IAM role or user" in findings[0]["Finding_Details"]
+
+    def test_a_scoped_statement_does_not_excuse_an_unscoped_one(self):
+        cache = self._cache(
+            ["bedrock-agentcore:ListMemoryRecords"],
+            condition={"StringEquals": {"bedrock-agentcore:strategyId": "strat-1"}},
+        )
+        cache["role_permissions"]["agent-role"]["inline_policies"] = [
+            {
+                "name": "wide",
+                "document": {
+                    "Statement": [
+                        {
+                            "Effect": "Allow",
+                            "Action": "bedrock-agentcore:RetrieveMemoryRecords",
+                            "Resource": "*",
+                        }
+                    ]
+                },
+            }
+        ]
+
+        findings = agentcore_app.check_agentcore_memory_record_access_scope(cache)
+
+        assert [f["Status"] for f in findings] == ["Failed"]
+
+    def test_users_are_evaluated_alongside_roles(self):
+        cache = self._cache(["bedrock-agentcore:RetrieveMemoryRecords"])
+        cache["user_permissions"] = cache["role_permissions"]
+        cache["role_permissions"] = {}
+
+        findings = agentcore_app.check_agentcore_memory_record_access_scope(cache)
+
+        assert [f["Status"] for f in findings] == ["Failed"]
+        assert "user agent-role" in findings[0]["Finding_Details"]
+
+    def test_scoped_and_unscoped_principals_are_reported_separately(self):
+        cache = self._cache(["bedrock-agentcore:RetrieveMemoryRecords"])
+        cache["role_permissions"]["scoped-role"] = {
+            "attached_policies": [
+                {
+                    "name": "p",
+                    "document": {
+                        "Statement": [
+                            {
+                                "Effect": "Allow",
+                                "Action": "bedrock-agentcore:RetrieveMemoryRecords",
+                                "Resource": "*",
+                                "Condition": {
+                                    "StringLike": {
+                                        "bedrock-agentcore:namespace": "/actors/a-1/*"
+                                    }
+                                },
+                            }
+                        ]
+                    },
+                }
+            ],
+            "inline_policies": [],
+        }
+
+        findings = agentcore_app.check_agentcore_memory_record_access_scope(cache)
+
+        assert {finding["Status"] for finding in findings} == {"Failed", "Passed"}
+
+    def test_findings_are_tagged_global(self):
+        findings = agentcore_app.check_agentcore_memory_record_access_scope(
+            self._cache(["bedrock-agentcore:RetrieveMemoryRecords"])
+        )
+        assert all(
+            finding["Region"] == agentcore_app.GLOBAL_REGION_LABEL
+            for finding in findings
+        )
+
+    def test_empty_cache_is_na(self):
+        findings = agentcore_app.check_agentcore_memory_record_access_scope(
+            {"role_permissions": {}, "user_permissions": {}}
+        )
+        assert findings[0]["Status"] == "N/A"
+
+    def test_unparseable_policy_does_not_hide_a_sibling_grant(self):
+        cache = self._cache(["bedrock-agentcore:RetrieveMemoryRecords"])
+        cache["role_permissions"]["agent-role"]["inline_policies"] = [
+            {"name": "broken", "document": "{not json"}
+        ]
+
+        findings = agentcore_app.check_agentcore_memory_record_access_scope(cache)
+
+        assert [f["Status"] for f in findings] == ["Failed"]
+
+    def test_unusable_cache_is_reported_incomplete(self):
+        findings = agentcore_app.check_agentcore_memory_record_access_scope(None)
+
+        assert [f["Status"] for f in findings] == ["N/A"]
+        assert findings[0]["Finding"].endswith("Incomplete")
+
+    def test_read_actions_name_real_api_operations(self):
+        # A typo in this tuple would silently narrow the check to nothing.
+        model = agentcore_app.boto3.client(
+            "bedrock-agentcore",
+            region_name="us-east-1",
+            aws_access_key_id="testing",
+            aws_secret_access_key="testing",  # pragma: allowlist secret - synthetic test credential
+        ).meta.service_model
+        operations = {name.lower() for name in model.operation_names}
+        assert set(agentcore_app.MEMORY_RECORD_READ_ACTIONS) <= operations
+        # The two deliberately excluded reads exist as well, so their absence
+        # from the tuple is a scoping decision and not a misspelling.
+        assert {"getmemoryrecord", "listactors"} <= operations
+        assert {"getmemoryrecord", "listactors"}.isdisjoint(
+            agentcore_app.MEMORY_RECORD_READ_ACTIONS
+        )
+
+
+# ===================================================================
 # AC-18..AC-22 registration and API contracts
 # ===================================================================
 class TestObservabilityCheckRegistration:
@@ -3396,9 +3896,12 @@ class TestObservabilityCheckRegistration:
             assert check_id in agentcore_app.REGIONAL_AGENTCORE_CHECK_IDS
             assert check_id in agentcore_app.AGENTCORE_RUNTIME_CHECK_IDS
 
-    def test_the_global_unmask_check_is_not_in_the_regional_tuples(self):
-        assert "AC-21" not in agentcore_app.REGIONAL_AGENTCORE_CHECK_IDS
-        assert "AC-21" not in agentcore_app.AGENTCORE_RUNTIME_CHECK_IDS
+    def test_the_global_iam_checks_are_not_in_the_regional_tuples(self):
+        # A regional registration would report the same IAM grant once per
+        # scanned region.
+        for check_id in ("AC-21", "AC-23"):
+            assert check_id not in agentcore_app.REGIONAL_AGENTCORE_CHECK_IDS
+            assert check_id not in agentcore_app.AGENTCORE_RUNTIME_CHECK_IDS
 
     def test_timeout_backfill_emits_the_new_regional_ids(self):
         findings = agentcore_app.build_agentcore_timeout_findings("us-east-1", [])

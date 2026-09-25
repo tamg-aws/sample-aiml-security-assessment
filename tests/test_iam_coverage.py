@@ -601,6 +601,16 @@ _VERIFIED_REMEDIATION_IAM_ACTIONS |= {
     "oam:ListSinks",
 }
 
+# Verified on 2026-09-25 with a second Access Analyzer validate-policy run whose
+# negative controls were two invented actions
+# (bedrock-agentcore:GetMemoryThatDoesNotExist,
+# bedrock-agentcore:NotARealMemoryAction) and one invented condition key
+# (bedrock-agentcore:memoryNamespaceThatDoesNotExist). All three were reported
+# and GetMemory was not, alongside the memory read actions AC-23 assesses and
+# the bedrock-agentcore namespace, strategyId, actorId and sessionId condition
+# keys it accepts as scoping.
+_VERIFIED_REMEDIATION_IAM_ACTIONS |= {"bedrock-agentcore:GetMemory"}
+
 _VERIFIED_REMEDIATION_CONDITION_KEYS = {
     "bedrock:GuardrailIdentifier",
     "iam:AWSServiceName",

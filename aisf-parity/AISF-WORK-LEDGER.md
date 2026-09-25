@@ -6,14 +6,14 @@ Generated 2026-09-25 by `aisf-parity/build_ledger.py`. Do not hand-edit: change 
 
 | verdict | rows | meaning |
 |---|---|---|
-| covered | 13 | an incumbent already asserts this; nothing to write |
-| tighten / extend | 22 | incumbent name is honest, its assertion is narrower; extend it in place |
+| covered | 14 | an incumbent already asserts this; nothing to write |
+| tighten / extend | 21 | incumbent name is honest, its assertion is narrower; extend it in place |
 | tighten / new_id | 6 | incumbent name claims more than it asserts; allocate a new id beside it |
 | new | 22 | no incumbent asserts any part of it |
 | not_implementable | 4 | flagged machine_checkable in the ledger but is not checkable from configuration |
 | unassessed | 11 | in scope, dedup pass not yet run |
 
-**39 new check functions and 22 extensions to existing checks.**
+**39 new check functions and 21 extensions to existing checks.**
 
 ## New IAM actions required
 
@@ -72,6 +72,7 @@ Generated 2026-09-25 by `aisf-parity/build_ledger.py`. Do not hand-edit: change 
 | control | verdict | do | module | incumbent | gap |
 |---|---|---|---|---|---|
 | `AIR-ACR-GW-01` | covered | — | `agentcore_assessments` | `AG-24` | AG-24 accepts authorizerType in {AWS_IAM, CUSTOM_JWT}, or AUTHENTICATE_ONLY with a policy engine in ENFORCE, which is GW-01's assertion exactly |
+| `AIR-ACR-MEM-01` | covered | — | `agentcore_assessments` | `AC-07`, `AC-23` | AC-07 asserts a customer managed key and an {actorId} namespace per memory, AC-23 asserts that no cached role or user reads memory records without a namespace, strategy, actor or session condition |
 | `AIR-ACR-MEM-12` | covered | — | `agentcore_assessments` | `AC-18` | AC-18 asserts that a CloudTrail advanced event selector logs data events for AWS::BedrockAgentCore::Memory whenever the region holds a memory resource |
 | `AIR-ACR-OBS-02` | covered | — | `agentcore_assessments` | `AC-18` | AC-18 asserts data-event coverage per resource family, so a trail that logs only the runtime types still fails for memory and for the built-in tools |
 | `AIR-ACR-OBS-03` | covered | — | `agentcore_assessments` | `AC-19` | AC-04 is X-Ray tracingConfig.enabled over list_agent_runtimes only, so it cannot cover Gateway, Memory, Policy or Identity, which is OBS-03's whole subject. AC-19 asserts an APPLICATION_LOGS delivery source wired to a destination per gateway and per memory; runtime logging is service-managed, WorkloadIdentity delivery is configured on the associated runtime or gateway resource, and policy engines have no log-destination surface, so those three legs need no separate assertion |
@@ -86,7 +87,6 @@ Generated 2026-09-25 by `aisf-parity/build_ledger.py`. Do not hand-edit: change 
 | `AIR-ACR-GW-05` | tighten | extend | `agentcore_assessments` | `AG-27` | AG-27 has the WAF leg; the rate-limit leg needs ListGatewayRateLimits, so botocore >= 1.43.66 |
 | `AIR-ACR-ID-05` | tighten | extend | `agentcore_assessments` | `AC-14` | AC-14 has the CMK leg; the string 'secret' appears 0 times in the module, so the secret-scan leg is unwritten |
 | `AIR-ACR-ID-10` | tighten | extend | `agentcore_assessments` | `AC-02` | AC-02 detects full-access and wildcard grants only |
-| `AIR-ACR-MEM-01` | tighten | extend | `agentcore_assessments` | `AC-07` | AC-07's presence-only CMK test is sound (encryptionKeyArn is an optional customer-supplied CreateMemory input); MEM-01 adds per-actor and namespace access scoping |
 | `AIR-ACR-PAY-01` | tighten | extend | `agentcore_assessments` | `AC-02` | AC-02 detects full-access and wildcard grants only |
 | `AIR-ACR-POL-01` | tighten | extend | `agentcore_assessments` | `AG-25` | AG-25 tests mode ENFORCE plus status/enforcementMode ACTIVE, with no default-deny leg, no decision log, and nothing session-aware |
 | `AIR-ACR-POL-04` | tighten | extend | `agentcore_assessments` | `AC-11` | AC-11's presence-only CMK test is sound; POL-04 adds key-policy scoping plus a disable/delete alarm |
