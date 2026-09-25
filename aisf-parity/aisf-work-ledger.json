@@ -18,6 +18,8 @@
     "extra_iam_actions": [
       "config:DescribeConfigRules",
       "config:DescribeConfigurationRecorders",
+      "events:ListRules",
+      "events:ListTargetsByRule",
       "macie2:GetAutomatedDiscoveryConfiguration",
       "macie2:GetMacieSession",
       "organizations:DescribeEffectivePolicy",
@@ -1056,13 +1058,18 @@
         "agent_registry_assessments"
       ],
       "incumbents": [
-        "AR-03"
+        "AR-03",
+        "AR-09"
       ],
       "incumbent_names": [
-        "AWS Agent Registry Publication Approval Governance"
+        "AWS Agent Registry Publication Approval Governance",
+        "AWS Agent Registry Approval Authority Separation"
       ],
-      "gap": "AR-03 is named \"Publication Approval Governance\" but covers auto-approval only, behind the REQUIRE_AGENT_REGISTRY_MANUAL_APPROVAL env gate; no curator/publisher separation and no EventBridge rule",
-      "extra_iam": [],
+      "gap": "AR-03 is named \"Publication Approval Governance\" but covers auto-approval only, behind the REQUIRE_AGENT_REGISTRY_MANUAL_APPROVAL env gate, so a default deployment skips it. AR-09 now asserts the separation leg: it fails any role or user whose effective policy reaches both a record write (CreateRegistryRecord, UpdateRegistryRecord, SubmitRegistryRecordForApproval) and UpdateRegistryRecordStatus, the one operation that can set a record to APPROVED, in either the agent-registry namespace or the public-preview bedrock-agentcore spelling of it. The EventBridge leg stays unasserted: no check reads whether an enabled rule matches the aws.agent-registry approval state-change events and carries a target, which needs events:ListRules and events:ListTargetsByRule on AgentRegistrySecurityAssessmentFunction",
+      "extra_iam": [
+        "events:ListRules",
+        "events:ListTargetsByRule"
+      ],
       "phase": 4,
       "source": "controls/ai-specific/agentcore-registry-optimization-payments.yaml"
     },

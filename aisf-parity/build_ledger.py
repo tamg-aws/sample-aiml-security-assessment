@@ -549,11 +549,19 @@ ROWS = [
         TIGHTEN,
         NEW_ID,
         "agent_registry_assessments",
-        ["AR-03"],
+        ["AR-03", "AR-09"],
         'AR-03 is named "Publication Approval Governance" but covers auto-approval only, '
-        "behind the REQUIRE_AGENT_REGISTRY_MANUAL_APPROVAL env gate; no curator/publisher "
-        "separation and no EventBridge rule",
-        [],
+        "behind the REQUIRE_AGENT_REGISTRY_MANUAL_APPROVAL env gate, so a default "
+        "deployment skips it. AR-09 now asserts the separation leg: it fails any role or "
+        "user whose effective policy reaches both a record write (CreateRegistryRecord, "
+        "UpdateRegistryRecord, SubmitRegistryRecordForApproval) and "
+        "UpdateRegistryRecordStatus, the one operation that can set a record to APPROVED, "
+        "in either the agent-registry namespace or the public-preview bedrock-agentcore "
+        "spelling of it. The EventBridge leg stays unasserted: no check reads whether an "
+        "enabled rule matches the aws.agent-registry approval state-change events and "
+        "carries a target, which needs events:ListRules and events:ListTargetsByRule on "
+        "AgentRegistrySecurityAssessmentFunction",
+        ["events:ListRules", "events:ListTargetsByRule"],
         4,
     ),
     (
@@ -986,6 +994,7 @@ INCUMBENT_NAMES = {
     "AG-25": "Agentic AI Gateway Tool Policy Enforcement",
     "AG-27": "Agentic AI Gateway WAF Protection",
     "AR-03": "AWS Agent Registry Publication Approval Governance",
+    "AR-09": "AWS Agent Registry Approval Authority Separation",
     "BR-04": "Bedrock Model Invocation Logging Check",
     "BR-06": "Bedrock CloudTrail Logging Check",
     "BR-10": "Bedrock Guardrail IAM Enforcement Check",

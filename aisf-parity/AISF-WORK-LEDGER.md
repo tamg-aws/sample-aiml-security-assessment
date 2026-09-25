@@ -19,6 +19,8 @@ Generated 2026-09-25 by `aisf-parity/build_ledger.py`. Do not hand-edit: change 
 
 - `config:DescribeConfigRules` — AIR-SGM-GOV-10
 - `config:DescribeConfigurationRecorders` — AIR-SGM-GOV-10
+- `events:ListRules` — AIR-ACR-REG-02
+- `events:ListTargetsByRule` — AIR-ACR-REG-02
 - `macie2:GetAutomatedDiscoveryConfiguration` — AIR-BDR-KB-01
 - `macie2:GetMacieSession` — AIR-BDR-KB-01
 - `organizations:DescribeEffectivePolicy` — AIR-FND-DAT-09
@@ -105,7 +107,7 @@ Generated 2026-09-25 by `aisf-parity/build_ledger.py`. Do not hand-edit: change 
 | `AIR-ACR-RT-08` | covered | — | `agentcore_assessments` | `AC-01` | AC-01 now reads the outbound rules of every security group attached to a VPC runtime, code interpreter or browser and fails a group permitting 0.0.0.0/0 or ::/0 egress. A tool in PUBLIC network mode fails without a describe call, because the service grants it open internet egress by configuration; SANDBOX passes at Medium, because the sandbox reaches no network the workload can name. A group the describe did not return and a denied ec2:DescribeSecurityGroups are both reported N/A on their own line, so an unread group is never counted as closed |
 | `AIR-ACR-RT-09` | covered | — | `agentcore_assessments` | `AC-06` | recording.enabled is True plus an S3 bucket |
 | `AIR-ACR-RT-13` | covered | — | `agentcore_assessments` | `AC-08`, `AC-10`, `AC-47` | AC-47 fails a runtime whose resource policy restricts neither the network path nor the caller: the network leg reads aws:SourceVpc, aws:SourceVpce, aws:VpcSourceIp and aws:SourceIp on any statement, the caller leg reads a named principal or an allowedWorkloadConfiguration on the JWT authorizer. AC-08 fails an AgentCore interface endpoint with private DNS off, which is the leg that keeps the runtime's own callers off the public endpoint name. AC-10 reports only that a policy exists |
-| `AIR-ACR-REG-02` | tighten | new_id | `agent_registry_assessments` | `AR-03` | AR-03 is named "Publication Approval Governance" but covers auto-approval only, behind the REQUIRE_AGENT_REGISTRY_MANUAL_APPROVAL env gate; no curator/publisher separation and no EventBridge rule |
+| `AIR-ACR-REG-02` | tighten | new_id | `agent_registry_assessments` | `AR-03`, `AR-09` | AR-03 is named "Publication Approval Governance" but covers auto-approval only, behind the REQUIRE_AGENT_REGISTRY_MANUAL_APPROVAL env gate, so a default deployment skips it. AR-09 now asserts the separation leg: it fails any role or user whose effective policy reaches both a record write (CreateRegistryRecord, UpdateRegistryRecord, SubmitRegistryRecordForApproval) and UpdateRegistryRecordStatus, the one operation that can set a record to APPROVED, in either the agent-registry namespace or the public-preview bedrock-agentcore spelling of it. The EventBridge leg stays unasserted: no check reads whether an enabled rule matches the aws.agent-registry approval state-change events and carries a target, which needs events:ListRules and events:ListTargetsByRule on AgentRegistrySecurityAssessmentFunction |
 | `AIR-ACR-MEM-07` *(workload-specific)* | new | — | `agentcore_assessments` | — | — |
 
 ## FND (11 controls)
