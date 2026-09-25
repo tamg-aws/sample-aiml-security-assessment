@@ -410,7 +410,7 @@ def census_paragraph(text):
     Exactly one paragraph, fail-closed both ways. Zero means the anchor sentence
     was reworded or deleted; two means the figures would be read across two
     paragraphs that need not agree. Both return an empty slice rather than the
-    whole file, so the five figures below also report as absent, and the message
+    whole file, so every figure below also reports as absent, and the message
     names the count and the anchor so the repair is the sentence, not the gate.
 
     Spelled with findall and not two str.index calls, which is shorter and
@@ -426,21 +426,130 @@ def census_paragraph(text):
         len(found),
         [
             f"SECURITY_CHECKS_AISF.md holds {len(found)} paragraph(s) beginning "
-            f"{CENSUS_ANCHOR!r}, not 1; the five census figures are read from "
+            f"{CENSUS_ANCHOR!r}, not 1; the census figures are read from "
             "exactly one"
         ],
     )
 
 
+# Number words the jointly-covered-control count is allowed to be spelled as. A
+# digit is what every other figure pattern in this file requires, and requiring one
+# here would mean editing the published paragraph to suit the gate: this base spells
+# the count `the single control that carries all 3 joint legs`, so a digit-only
+# pattern reads the figure as absent and reds a correct document. `single` is the
+# word actually published. The numerals are here because the count reaches 16 at the
+# three-way merge, where `sixteen` is a spelling a maintainer may well reach for and
+# one this has to read rather than ignore. A token outside this table is reported by
+# name, so an unanticipated spelling is a red carrying the word and never a skip.
+CENSUS_COUNT_WORDS = {
+    word: value
+    for value, word in enumerate(
+        "zero one two three four five six seven eight nine ten eleven twelve "
+        "thirteen fourteen fifteen sixteen seventeen eighteen nineteen twenty".split()
+    )
+}
+CENSUS_COUNT_WORDS["single"] = 1
+
+
+def census_count_tokens(tokens):
+    """(digit strings, the tokens this cannot read) for a count spelled either way.
+
+    Digits pass straight through, so agreed_figure() pools this count under the
+    same agreement rule as the other five and compares it as an integer. A word is
+    translated into that same form rather than admitted as a second kind of value.
+
+    The unreadable tokens are returned instead of dropped. Dropping them leaves the
+    pool empty, which figure_drift() reports as a paragraph publishing no such
+    figure -- a true statement about the pattern and a false one about the
+    document, and the repair for a word this table lacks is not the repair for a
+    deleted sentence.
+    """
+    digits, unreadable = [], []
+    for token in tokens:
+        if token.isdigit():
+            digits.append(token)
+        elif token.lower() in CENSUS_COUNT_WORDS:
+            digits.append(str(CENSUS_COUNT_WORDS[token.lower()]))
+        else:
+            unreadable.append(token)
+    return digits, unreadable
+
+
+def census_relations(values, found):
+    """One message per sum the census paragraph asserts and does not add up to.
+
+    The paragraph publishes six figures and then builds two claims out of them.
+    Asserting each figure against the computation leaves the claims themselves
+    ungated, which is how `the 40 bare tags plus the two jointly covered controls
+    ... account for the 56 `covered` controls` passes: every numeral in it is
+    gated and right, and the sentence says 40 + 2 = 56. Measured on the three-way
+    merge dry run, where a numerals-only update left the spelled-out `two` behind.
+
+    The two relations are not equally load-bearing, and the weaker one is the sum:
+
+    Gate 7 forbids a `covered` or `tighten` row without an incumbent, and gate 14a
+    fixes the tags to exactly one per (incumbent, control) pair with the qualifier
+    the verdict implies. Under those two, `bare + jointly covered == covered` is a
+    theorem about the computed side, so this leg can only fail together with a
+    figure that has already drifted from the computation. What it adds is the
+    sentence: the failure names the arithmetic a reader was given instead of naming
+    a transcription, and it is the line that makes the middle term worth reading
+    out of the document at all.
+
+    The one-tag-each leg does have its own catch, because it compares two figures
+    that count different populations and that nothing else here compares: partial
+    counts tag elements, tighten counts ROWS verdicts. A `tighten` row with two
+    incumbents carries two `(partial)` tags, which is legal, passes 14a, and makes
+    the claim false while both figures still match their own computation. That
+    state is not hypothetical -- it is this base, 29 partial tags over 28 tighten
+    controls, `AIR-BDR-MDL-02` carrying two.
+
+    Which is also why that leg is conditional on the clause being published. This
+    base does not claim one tag each, and asserting it unconditionally would red a
+    correct document. A conditional assertion is a skip when the condition is
+    false, so the condition is printed: copies_note() puts `one_tag_each x0` beside
+    the figures here and `x1` at phase 3's head, in the verdict line either way.
+    """
+    problems = []
+    sum_terms = ("bare", "joint_controls", "covered")
+    missing = [label for label in sum_terms if values[label] is None]
+    if missing:
+        problems.append(
+            f"the census sentence's sum cannot be checked: {missing} absent from "
+            "the paragraph or published in copies that disagree"
+        )
+    elif values["bare"] + values["joint_controls"] != values["covered"]:
+        problems.append(
+            f"the census sentence says {values['bare']} bare tags plus "
+            f"{values['joint_controls']} jointly covered control(s) account for the "
+            f"{values['covered']} `covered` controls, which sums to "
+            f"{values['bare'] + values['joint_controls']}"
+        )
+    if found["one_tag_each"]:
+        pair = [label for label in ("partial", "tighten") if values[label] is None]
+        if pair:
+            problems.append(
+                f"the census sentence claims one `(partial)` tag per `tighten` "
+                f"control and {pair} cannot be read to check it"
+            )
+        elif values["partial"] != values["tighten"]:
+            problems.append(
+                f"the census sentence claims one `(partial)` tag per `tighten` "
+                f"control, and publishes {values['partial']} tags over "
+                f"{values['tighten']} controls"
+            )
+    return problems
+
+
 def census_figures(text):
     """The qualifier and verdict census a piece of prose publishes, and its copies.
 
-    Five figures in one paragraph of docs/SECURITY_CHECKS_AISF.md, directly under
-    the tag-shape table: the bare/partial/joint qualifier counts, and the
-    covered/tighten verdict counts the sentence reconciles them against. Gate 14
-    computed the first three already and printed them beside a parenthetical
-    claiming no document published them, which was false in the output of the gate
-    the claim was meant to make trustworthy.
+    Six figures in one paragraph of docs/SECURITY_CHECKS_AISF.md, directly under
+    the tag-shape table: the bare/partial/joint qualifier counts, the number of
+    those joint tags' distinct controls, and the covered/tighten verdict counts the
+    sentence reconciles them against. Gate 14 computed the first three already and
+    printed them beside a parenthetical claiming no document published them, which
+    was false in the output of the gate the claim was meant to make trustworthy.
 
     The text handed in is that paragraph alone, cut out of the raw file by
     census_paragraph() before this flattens it.
@@ -477,6 +586,29 @@ def census_figures(text):
     tighten controls that carry no AISF- row. That is a different population
     agreeing at 18 today, and a pattern that cannot tell the two apart publishes
     the wrong one the day they diverge.
+
+    The sixth figure is the count of controls those joint tags name, which is not
+    the joint element count and must not be pooled with it: `joint` is what gate
+    14's `pairs` reconciliation adds up, and at this base the two are 3 and 1. It
+    is the middle term of the sentence's own sum, and it was the one term of that
+    sum no pattern could reach, so the sum was unassertable. Two spellings again,
+    pooled, each tight to the phrase published at the ref that writes it -- `plus
+    the single control that carries` here, `plus the two jointly covered controls`
+    at phase 3's head. Neither carries the `(?<![-\\w])` anchor the digits carry,
+    because the token slot is preceded by the literal `plus the ` and a check id's
+    suffix cannot reach it.
+
+    Adding it forced a trailing guard onto the joint element pattern, measured and
+    not foreseen: `(\\d+) joint` also matches `plus the 16 jointly covered
+    controls`, so the day the count is written as the digit the sum wants, the
+    joint pool reads ['36', '16'], resolves to None and reds gate 14 over a correct
+    paragraph. `joint(?![a-z])` is the narrowing. The word spellings hid it, which
+    is why the repaired-paragraph test in tests/test_census_paragraph_slice.py
+    writes the count as a digit rather than only asserting that a digit is read.
+
+    The one-tag-each clause is read for presence only and is not a figure: the two
+    numbers in it are already the partial and tighten figures above. What its
+    presence decides is whether census_relations() asserts that those two agree.
     """
     found = figure_occurrences(
         text,
@@ -484,19 +616,44 @@ def census_figures(text):
             ("bare", r"(?<![-\w])(\d+) bare"),
             ("partial", r"(?<![-\w])(\d+) `?\(partial\)`?"),
             ("joint_as_checks", r"(?<![-\w])(\d+) `?\(1 of \d+ checks\)`?"),
-            ("joint_as_word", r"(?<![-\w])(\d+) joint"),
+            ("joint_as_word", r"(?<![-\w])(\d+) joint(?![a-z])"),
+            (
+                "joint_controls_as_carrier",
+                r"plus the ([a-z]+|\d+) control that carries",
+            ),
+            (
+                "joint_controls_as_jointly",
+                r"plus the ([a-z]+|\d+) jointly covered controls",
+            ),
             ("covered", r"(?<![-\w])(\d+) `?covered`? controls"),
             ("tighten_as_remaining", r"remaining (\d+) are `?tighten`?"),
             ("tighten_as_controls", r"(?<![-\w])(\d+) `?tighten`? controls"),
+            ("one_tag_each", r"tags are the \d+ `?tighten`? controls, one tag each"),
         ),
     )
     found["joint"] = found["joint_as_checks"] + found["joint_as_word"]
     found["tighten"] = found["tighten_as_remaining"] + found["tighten_as_controls"]
+    found["joint_controls"], unreadable = census_count_tokens(
+        found["joint_controls_as_carrier"] + found["joint_controls_as_jointly"]
+    )
     values = {
         label: agreed_figure(found[label])
-        for label in ("bare", "partial", "joint", "covered", "tighten")
+        for label in (
+            "bare",
+            "partial",
+            "joint",
+            "joint_controls",
+            "covered",
+            "tighten",
+        )
     }
-    return values, found
+    problems = census_relations(values, found)
+    if unreadable:
+        problems.append(
+            "the census sentence spells the jointly covered control count "
+            f"{unreadable}, which is neither a digit nor a number word this reads"
+        )
+    return values, found, problems
 
 
 def load_aisf_control(rel_path, control_id):
@@ -1141,8 +1298,11 @@ def main():
     #
     # The qualifier census is gate 14c, against the paragraph sixteen lines below
     # the one above. It was printed unasserted under a parenthetical saying no
-    # document published it; the paragraph publishes five figures, and the two
-    # verdict counts among them have already drifted on phase 3's branch.
+    # document published it; the paragraph publishes six figures, and the two
+    # verdict counts among them have already drifted on phase 3's branch. 14c also
+    # asserts the two sums the paragraph builds out of those figures, which is a
+    # separate claim: every numeral in a sentence can be gated and right while the
+    # sentence adds them up wrong.
     computed = {
         "pairs": len(found_pairs),
         "tagged": sum(len(m) for m in maps.values()),
@@ -1162,16 +1322,24 @@ def main():
     )
     per_module = " ".join(f"{k}={v}" for k, v in sorted(computed["per_module"].items()))
     census = collections.Counter()
+    # The joint tags' distinct controls, which is the sixth census figure and not
+    # the joint element count beside it: one control can carry several joint legs,
+    # and at this base 3 legs sit on 1 control. It is the middle term of the sum the
+    # paragraph states, so it is computed here and read out of the document too.
+    joint_controls = set()
     for module_dir, mapping in maps.items():
         for tag in mapping.values():
             for element in tag.split(" | "):
                 m = element_re.fullmatch(element)
                 if m:
-                    census[
+                    kind = (
                         "bare"
                         if m.group(2) is None
                         else ("partial" if m.group(2) == "partial" else "joint")
-                    ] += 1
+                    )
+                    census[kind] += 1
+                    if kind == "joint":
+                        joint_controls.add(m.group(1))
     # The covered/tighten half of that sentence comes from build_ledger.ROWS, the
     # hand-authored verdict table, and not from the ledger json rendered out of it:
     # the json is a generated copy, and gate 15's --check leg is what keeps the two
@@ -1184,22 +1352,27 @@ def main():
         "bare": census["bare"],
         "partial": census["partial"],
         "joint": census["joint"],
+        "joint_controls": len(joint_controls),
         "covered": verdict_census["covered"],
         "tighten": verdict_census["tighten"],
     }
     # Sliced here, on the raw text, because census_figures() flattens what it is
     # given and the paragraph delimiters do not survive that. The count comes back
     # for the verdict line: a census read from no paragraph, or from two, prints as
-    # such beside the figures instead of looking like five figures nobody published.
+    # such beside the figures instead of looking like figures nobody published.
     census_slice, census_paragraphs, census_slice_problems = census_paragraph(
         published_text
     )
-    census_published, census_hits = census_figures(census_slice)
-    census_problems = census_slice_problems + figure_drift(
-        "SECURITY_CHECKS_AISF.md's census paragraph",
-        census_published,
-        census_hits,
-        computed_census,
+    census_published, census_hits, census_sum_problems = census_figures(census_slice)
+    census_problems = (
+        census_slice_problems
+        + figure_drift(
+            "SECURITY_CHECKS_AISF.md's census paragraph",
+            census_published,
+            census_hits,
+            computed_census,
+        )
+        + census_sum_problems
     )
     # 14a first, so a defect that violates more than one of the three claims names
     # the most specific one in mutate.py's first-red line. Deleting a map entry is
@@ -1226,11 +1399,15 @@ def main():
         + (f", bad={figure_problems_14b}" if figure_problems_14b else ""),
     )
     gate(
-        "the SECURITY_CHECKS_AISF.md census paragraph is one slice, five figures",
+        "the SECURITY_CHECKS_AISF.md census paragraph is one slice, six figures, "
+        "and its own arithmetic",
         not census_problems,
         f"census from {census_paragraphs} paragraph(s) matching {CENSUS_ANCHOR!r}, "
         f"{len(census_published)} figure(s) asserted, doc={census_published} vs "
-        f"computed={computed_census}, copies [{copies_note(census_hits)}]"
+        f"computed={computed_census}, the sentence's own sum "
+        f"{census_published['bare']}+{census_published['joint_controls']} vs "
+        f"covered {census_published['covered']}, "
+        f"copies [{copies_note(census_hits)}]"
         + (f", bad={census_problems}" if census_problems else ""),
     )
 

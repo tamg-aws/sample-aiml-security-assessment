@@ -21,11 +21,14 @@ Source and not stdout, for a measured reason. check_ledger.py's main() calls
 load_aisf_classification() before it prints anything, and that opens a path under
 AISF_REPO, which is os.path.expanduser'd into a sibling clone. Run with that
 clone unreachable, main() raises FileNotFoundError at its first statement and
-prints zero verdict lines -- not just these three. `tests/` runs in GitHub Actions
-on every pull request to main against a bare checkout with no sibling clone
-(.github/workflows/python-tests.yml), so a test that executes the ledger would
-red there on every run for a reason unrelated to the gate. Skipping when the
-clone is absent would retire the test exactly where it is cheapest to break.
+prints zero verdict lines -- not just these three. The runner has no sibling clone:
+.github/workflows/python-tests.yml checks out this repository alone. It runs
+`tests/` on `push` to `branches: [main, develop]` and on `pull_request` to
+`branches: [main]`, each behind a paths filter that lists `tests/**`, so a push of
+this feature branch to the fork runs nothing at all and the first CI run this
+suite sees is the pull request that merges it -- where a test that executes the
+ledger would red for a reason unrelated to the gate. Skipping when the clone is
+absent would retire the test exactly where it is cheapest to break.
 
 The first substring is "per-module AISF tag maps" and not "tag maps". The gate
 that renders the maps fresh from the ledger and compares them carries "tag maps"
