@@ -27,6 +27,7 @@ AISF_REPO = os.path.expanduser(
 MODULES = os.path.join(REPO, "aiml-security-assessment", "functions", "security")
 TEMPLATE = os.path.join(REPO, "aiml-security-assessment", "template.yaml")
 REPORT_APP_DIR = os.path.join(MODULES, "generate_consolidated_report")
+README_DOC = os.path.join(REPO, "README.md")
 SECURITY_CHECKS_DOC = os.path.join(REPO, "docs", "SECURITY_CHECKS.md")
 AISF_DOC = os.path.join(REPO, "docs", "SECURITY_CHECKS_AISF.md")
 OWASP_DOC = os.path.join(REPO, "docs", "SECURITY_CHECKS_OWASP.md")
@@ -264,6 +265,75 @@ def scope_figures(text):
         ),
     )
     return {label: agreed_figure(hits) for label, hits in found.items()}, found
+
+
+README_CATALOG_PATTERNS = (
+    ("run_checks_link", r"(\d+) checks\]\(docs/SECURITY_CHECKS\.md\)"),
+    ("security_checks_link", r"\[(\d+) Security Checks\]"),
+    ("standardized", r"Standardized (\d+)-check assessment"),
+    ("across_seven", r"\*\*(\d+) checks across seven areas"),
+    ("reference_for_all", r"reference for all (\d+) security checks"),
+    ("excluded_from", r"excluded from the (\d+)-check total"),
+)
+
+
+def readme_catalog_figures(text):
+    """The check total README publishes, every copy of it, and a message per dead
+    pattern.
+
+    README publishes the catalog total six times and gate 12 read none of them.
+    A badge line, a feature bullet, a positioning table row, the scope
+    paragraph, and twice in the documentation section -- one of which is the
+    same `reference for all N security checks` sentence the gate already reads
+    out of SECURITY_CHECKS.md, so the pattern was in the gate and the file was
+    not. Six copies in the most-read file in the repository, none of them under
+    a gate.
+
+    Pooled into one label for the value. They are six copies of one figure, so
+    the agreement rule carries it: a partial bump, the badge moved and the scope
+    paragraph left behind, resolves to None and reds gate 12 instead of shipping
+    two totals in one file. The pooled list is in the order of the tuple above,
+    so the position of the odd value in the failure message names which copy
+    moved without a second lookup.
+
+    Pooling alone cannot notice that the pool shrank, which is why each pattern
+    is also required to match on its own. Five copies agreeing is agreement:
+    rewording one sentence away leaves the figure resolvable, the gate green and
+    the verdict line reading `run_checks_link x0 readme_total x5`, asserting five
+    sixths of what the side claims to cover. Measured -- the copies note printed
+    it and nothing failed. The per-side zero-is-not-agreement guard further down
+    does not reach this, because the side is not empty.
+
+    Per-pattern absence is a failure here and is not one in census_figures(),
+    which is a difference in the documents and not an inconsistency. That pool
+    holds two spellings of one sentence and exactly one of them matches at any
+    ref, so a zero there is normal. These six are six different sentences, each
+    resolving exactly one hit at every ref measured: this base, this branch,
+    phase 3, phase 4, and both merge trees.
+
+    Six patterns and not one loose one, measured at four refs. A bare
+    `(\\d+) checks` reads ['208', '07', '208', '07'] here and the same shape at
+    phase 3's head, because `two native LLM07 checks` puts a check id's own
+    suffix in front of the word: the pooled figure would never agree and the
+    gate would red permanently on a correct README. Adding the `(?<![-\\w])`
+    anchor census_figures() uses does fix that one, and is still wrong for a
+    different reason -- it reads 2 of the 6 copies, so the four it cannot see
+    are the four a partial bump leaves behind.
+    """
+    found = figure_occurrences(text, README_CATALOG_PATTERNS)
+    found["readme_total"] = [
+        value for label, _ in README_CATALOG_PATTERNS for value in found[label]
+    ]
+    dead = [label for label, _ in README_CATALOG_PATTERNS if not found[label]]
+    problems = []
+    if dead:
+        problems.append(
+            f"README.md publishes the check total in {len(README_CATALOG_PATTERNS)} "
+            f"places and {len(dead)} of them no longer match: {dead}; the pooled "
+            "figure agrees across the copies that are left, so the side reads as "
+            "asserted while it is not"
+        )
+    return agreed_figure(found["readme_total"]), found, problems
 
 
 def tag_column_figures(text):
@@ -808,6 +878,8 @@ def main():
             f.read(), (("sc_total", r"reference for all (\d+) security checks"),)
         )
     catalog_total = agreed_figure(sc_hits["sc_total"])
+    with open(README_DOC) as f:
+        readme_total, readme_hits, readme_dead = readme_catalog_figures(f.read())
     # Each figure above is the value all of its copies agree on, and a figure whose
     # copies disagree is a failure of its own, named here with every value found.
     # These three reads used to take the earliest match over the whole file, so a
@@ -819,6 +891,8 @@ def main():
     drift += figure_problems("the report section's scope_text", figures, figure_hits)
     drift += figure_problems("SECURITY_CHECKS_AISF.md", doc_figures, doc_hits)
     drift += figure_problems("SECURITY_CHECKS.md", {"sc_total": catalog_total}, sc_hits)
+    drift += figure_problems("README.md", {"readme_total": readme_total}, readme_hits)
+    drift += readme_dead
     if figures["derivable"] != len(AISF_DERIVED_MAP):
         drift.append(
             f"scope_text claims {figures['derivable']} derivable, map has "
@@ -840,6 +914,15 @@ def main():
     # already happened: the two read 208 to each other's satisfaction while the
     # producers emitted 218, and ten check ids shipped undocumented.
     #
+    # README is the fourth side and the most-read one, publishing the total six
+    # times over. Nothing is broken at this head -- all four sides read 208, and
+    # 218 on the branch that raises it -- but this drift has shipped: 80f9864
+    # dropped SECURITY_CHECKS.md to 51 in a BR-14 cleanup and left README at 52,
+    # where it stood for 46 days until an unrelated bump reset both to 116. The
+    # three README copies that existed then agreed with each other at 52
+    # throughout, so README's own agreement rule would have passed it and only a
+    # comparison against another side catches it.
+    #
     # Derived through gen_compliance_maps.check_owners() and not a regex written
     # here. It runs both call spellings, and agent_registry_assessments passes
     # check_id positionally, so a `check_id=` keyword scan resolves 0 of that
@@ -856,6 +939,7 @@ def main():
         "emitted": len(emitted_catalog_ids),
         "scope_text": figures["catalog"],
         "SECURITY_CHECKS.md": catalog_total,
+        "README.md": readme_total,
     }
     if not emitted_catalog_ids:
         # Zero is not agreement with a prose figure of zero either: it means the
@@ -867,7 +951,8 @@ def main():
         )
     elif len(set(catalog_sides.values())) != 1:
         drift.append(
-            f"the catalog total disagrees across its three sides: {catalog_sides}"
+            f"the catalog total disagrees across its {len(catalog_sides)} sides: "
+            f"{catalog_sides}"
         )
     if doc_figures != figures:
         drift.append(
@@ -883,11 +968,14 @@ def main():
         f"{len(doc_figures)} in SECURITY_CHECKS_AISF.md checked, "
         f"figures={figures}, copies scope_text [{copies_note(figure_hits)}] "
         f"SECURITY_CHECKS_AISF.md [{copies_note(doc_hits)}] "
-        f"SECURITY_CHECKS.md [{copies_note(sc_hits)}], "
-        f"catalog 3 sides: emitted {len(emitted_catalog_ids)} "
+        f"SECURITY_CHECKS.md [{copies_note(sc_hits)}] "
+        f"README.md [{copies_note(readme_hits)}], "
+        f"catalog {len(catalog_sides)} sides: emitted {len(emitted_catalog_ids)} "
         f"({len(catalog_owners)} distinct ids minus {len(marker_ids)} "
         f"{marker_ids} markers) vs scope_text {figures['catalog']} vs "
-        f"SECURITY_CHECKS.md {catalog_total}" + (f", drift={drift}" if drift else ""),
+        f"SECURITY_CHECKS.md {catalog_total} vs README.md {readme_total} over "
+        f"{len(readme_hits['readme_total'])} copies"
+        + (f", drift={drift}" if drift else ""),
     )
 
     # ---- gate 13: the published id shape. Every id carries the registered prefix
