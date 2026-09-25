@@ -43,8 +43,9 @@ import os
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LEDGER = os.path.join(REPO, "aisf-parity", "check_ledger.py")
 
-# Each identifies one leg and appears in exactly one gate name. Semantic, not
-# positional: a reword that keeps the claim keeps the substring.
+# Each identifies one leg and appears in exactly one gate name. Each is drawn
+# from the claim its leg makes, so a reword that keeps the claim keeps the
+# substring, and no substring depends on where the leg prints.
 LEG_SUBSTRINGS = (
     "per-module AISF tag maps",
     "tag-column figures",
@@ -74,7 +75,7 @@ def named_gates():
     """(name, call) for every gate call whose name is a plain string literal.
 
     A name built at runtime is skipped here and so drops out of the counts
-    below, which reds rather than passing quietly.
+    below. That reds; it does not pass.
     """
     out = []
     for call in gate_calls():
