@@ -475,33 +475,45 @@ ROWS = [
     ),
     (
         "AIR-ACR-POL-04",
-        TIGHTEN,
-        EXTEND,
+        COVERED,
+        None,
         "agentcore_assessments",
-        ["AC-11"],
-        "AC-11's presence-only CMK test is sound; POL-04 adds key-policy scoping plus a "
-        "disable/delete alarm",
+        ["AC-11", "AC-36"],
+        "AC-11 asserts the engine names a customer managed key, AC-36 asserts the key "
+        "policy names who may decrypt with it and who may disable it or schedule it for "
+        "deletion; the key cannot be added to or changed on an existing engine, so the "
+        "key policy is the whole guard. The disable/delete alarm and the break-glass "
+        "runbook are not readable from the key, and AC-36's passing resolution says so",
         [],
         4,
     ),
     (
         "AIR-ACR-POL-01",
-        TIGHTEN,
-        EXTEND,
+        COVERED,
+        None,
         "agentcore_assessments",
-        ["AG-25"],
-        "AG-25 tests mode ENFORCE plus status/enforcementMode ACTIVE, with no default-deny "
-        "leg, no decision log, and nothing session-aware",
+        ["AG-25", "AC-19", "AC-35"],
+        "AG-25 asserts mode ENFORCE plus status/enforcementMode ACTIVE, AC-19 asserts the "
+        "gateway delivers APPLICATION_LOGS, which is where a policy decision record "
+        "lands, and AC-35 asserts no enforcing permit leaves the action position "
+        "unconstrained; default-deny and forbid-wins are engine behaviour and not a "
+        "setting to read, so a permit over every tool is the only way to restore "
+        "allow-all",
         [],
         4,
     ),
     (
         "AIR-ACR-POL-07",
-        TIGHTEN,
-        EXTEND,
+        COVERED,
+        None,
         "agentcore_assessments",
-        ["AG-25"],
-        "AG-25 has no session-aware leg",
+        ["AG-25", "AC-38"],
+        "AG-25 counts enforcing policies, AC-38 asserts a temporal policy exists and that "
+        "the gateway carrying it authenticates callers with CUSTOM_JWT or AWS_IAM, the "
+        "two authorizer types the devguide names as binding a session to the caller's "
+        "identity; the session-id propagation path is fail-closed by the service, since a "
+        "request to an engine holding a temporal policy fails validation without the "
+        "header",
         [],
         4,
     ),
@@ -712,7 +724,21 @@ ROWS = [
         [],
         4,
     ),
-    ("AIR-ACR-POL-06", NEW, None, "agentcore_assessments", [], "", [], 4),
+    (
+        "AIR-ACR-POL-06",
+        COVERED,
+        None,
+        "agentcore_assessments",
+        ["AC-37"],
+        "AC-37 asserts the workload-independent half: a policy carrying a guardrails "
+        "condition needs bedrock:InvokeGuardrailChecks on the gateway execution role, "
+        "because the Policy data plane calls Bedrock Guardrails with that role's forward "
+        "access session. Whether this workload's content belongs at the authorization "
+        "boundary at all, and which safeguard categories and thresholds apply, is the "
+        "workload owner's decision, which AC-37 reports and does not judge",
+        [],
+        4,
+    ),
     ("AIR-ACR-RT-04", NEW, None, "agentcore_assessments", [], "", [], 4),
     # ------- FND, AI-resource subject: 11 controls, dedup pass not yet run -------
     (
@@ -863,6 +889,10 @@ INCUMBENT_NAMES = {
     "AC-32": "AgentCore Inbound JWT Issuer Conditions",
     "AC-33": "AgentCore Token Issuance Scope",
     "AC-34": "AgentCore Runtime Inline Credentials",
+    "AC-35": "AgentCore Policy Tool Scope",
+    "AC-36": "AgentCore Policy Engine Key Scope",
+    "AC-37": "AgentCore Policy Guardrail Wiring",
+    "AC-38": "AgentCore Policy Session Binding",
     "AG-24": "Agentic AI Gateway Inbound Authorization",
     "AG-25": "Agentic AI Gateway Tool Policy Enforcement",
     "AG-27": "Agentic AI Gateway WAF Protection",

@@ -678,6 +678,22 @@ _VERIFIED_REMEDIATION_IAM_ACTIONS |= {
     "bedrock-agentcore:UpdateAgentRuntime",
 }
 
+# Verified on 2026-09-25 with one more IDENTITY_POLICY Access Analyzer
+# validate-policy run for the policy controls AC-36 and AC-37. Its negative
+# controls were bedrock-agentcore:GetPolicyEngineNotReal,
+# bedrock:InvokeGuardrailChecksNotReal and the singular
+# bedrock:InvokeGuardrailCheck, which settles the plural spelling; all three were
+# reported and neither name below was.
+#
+# InvokeGuardrailChecks reaches AC-37's resolution text through the
+# GUARDRAIL_CHECK_ACTION constant, so the token scan below does not see it. It is
+# classified here anyway, because the scan reading a Name instead of a string is
+# a property of the scan and not a statement about the action.
+_VERIFIED_REMEDIATION_IAM_ACTIONS |= {
+    "bedrock-agentcore:GetPolicyEngine",
+    "bedrock:InvokeGuardrailChecks",
+}
+
 _VERIFIED_REMEDIATION_CONDITION_KEYS = {
     "bedrock:GuardrailIdentifier",
     "iam:AWSServiceName",

@@ -177,6 +177,22 @@ AGENTCORE_RUNTIME_SECRET_REFERENCE_URL = (
     "https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/"
     "runtime-security-best-practices.html"
 )
+AGENTCORE_POLICY_CORE_CONCEPTS_REFERENCE_URL = (
+    "https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/"
+    "policy-core-concepts.html"
+)
+AGENTCORE_POLICY_SESSION_REFERENCE_URL = (
+    "https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/"
+    "policy-session-based-temporal.html"
+)
+AGENTCORE_POLICY_GUARDRAIL_REFERENCE_URL = (
+    "https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/"
+    "policy-guardrails-in-policies.html"
+)
+AGENTCORE_POLICY_ENCRYPTION_REFERENCE_URL = (
+    "https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/"
+    "policy-encryption.html"
+)
 
 
 def _assessment_error_label(error: Exception) -> str:
@@ -357,6 +373,10 @@ REGIONAL_AGENTCORE_CHECK_IDS = (
     "AC-30",
     "AC-31",
     "AC-34",
+    "AC-35",
+    "AC-36",
+    "AC-37",
+    "AC-38",
 )
 
 AGENTCORE_RUNTIME_CHECK_IDS = (
@@ -385,6 +405,10 @@ AGENTCORE_RUNTIME_CHECK_IDS = (
     "AC-30",
     "AC-31",
     "AC-34",
+    "AC-35",
+    "AC-36",
+    "AC-37",
+    "AC-38",
 )
 
 NATIVE_AGENTIC_AGENTCORE_CHECK_NAMES = {
@@ -8224,6 +8248,1138 @@ def check_agentcore_runtime_inline_credentials() -> List[Dict[str, Any]]:
     return findings
 
 
+# The three Cedar scope positions, in the order they appear in a policy head.
+CEDAR_SCOPE_POSITIONS = ("principal", "action", "resource")
+# The Cedar effects that decide an authorization request. policy-guardrails-in-
+# policies.html adds suppressOutput, which "operates on the data an action
+# returns" after the action was already authorized, so it decides no request.
+CEDAR_AUTHORIZING_EFFECTS = ("permit", "forbid")
+# The qualifier that makes a condition block session-aware.
+CEDAR_TEMPORAL_QUALIFIER = "temporal"
+# The qualifier that hands the condition to Bedrock Guardrails.
+CEDAR_GUARDRAIL_QUALIFIER = "guardrails"
+CEDAR_CONDITION_KEYWORDS = ("when", "unless")
+# The one Bedrock action the Policy data plane calls with the gateway execution
+# role's FAS credentials when a guardrail condition is evaluated.
+GUARDRAIL_CHECK_ACTION = "bedrock:InvokeGuardrailChecks"
+# `_statement_matches_action` matches against normalized patterns, so the lookup
+# spelling is lowercase while the spelling above is the one a finding shows.
+GUARDRAIL_CHECK_ACTION_LOOKUP = GUARDRAIL_CHECK_ACTION.lower()
+# ListPolicies reports a lifecycle status and an enforcement mode separately. A
+# policy changes a caller's response only when both say ACTIVE.
+POLICY_ACTIVE_STATUS = "ACTIVE"
+POLICY_ENFORCING_MODE = "ACTIVE"
+# The gateway-level mode that makes the engine's decisions binding.
+POLICY_ENGINE_ENFORCE_MODE = "ENFORCE"
+# policy-session-based-temporal.html names these two authorizer types as the ones
+# where "the Gateway binds the session to the caller's authenticated identity".
+GATEWAY_SESSION_BINDING_AUTHORIZERS = ("CUSTOM_JWT", "AWS_IAM")
+# The KMS actions that make the policy engine's key unusable. Losing the key
+# makes every stored Cedar policy unreadable, which is a different failure from
+# the plaintext exposure AC-26 reads out of a log group's key.
+KMS_KEY_DISABLING_ACTIONS = (
+    "disablekey",
+    "schedulekeydeletion",
+    "putkeypolicy",
+    "disablekeyrotation",
+)
+
+
+def _cedar_without_comments(statement: str) -> str:
+    """Strip Cedar line comments, leaving string literals untouched.
+
+    A comment can hold a semicolon or a brace, so the policy splitter below
+    would mis-read the statement if the comments were still in it.
+    """
+    kept: List[str] = []
+    in_string = False
+    escaped = False
+    index = 0
+    while index < len(statement):
+        character = statement[index]
+        if in_string:
+            kept.append(character)
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == '"':
+                in_string = False
+            index += 1
+            continue
+        if character == '"':
+            in_string = True
+            kept.append(character)
+            index += 1
+            continue
+        if character == "/" and statement[index + 1 : index + 2] == "/":
+            while index < len(statement) and statement[index] != "\n":
+                index += 1
+            continue
+        kept.append(character)
+        index += 1
+    return "".join(kept)
+
+
+def _cedar_split(text: str, separator: str) -> List[str]:
+    """Split on a separator that is outside every bracket and string literal."""
+    parts: List[str] = []
+    current: List[str] = []
+    depth = 0
+    in_string = False
+    escaped = False
+    for character in text:
+        if in_string:
+            current.append(character)
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == '"':
+                in_string = False
+            continue
+        if character == '"':
+            in_string = True
+            current.append(character)
+            continue
+        if character in "([{":
+            depth += 1
+        elif character in ")]}":
+            depth -= 1
+        if character == separator and depth == 0:
+            parts.append("".join(current))
+            current = []
+            continue
+        current.append(character)
+    parts.append("".join(current))
+    return parts
+
+
+def _cedar_policies(statement: str) -> List[Tuple[str, List[str], str]]:
+    """Read one policy statement into (effect, scope parts, condition text).
+
+    One statement can hold several policies, so this returns a list. A policy
+    whose head cannot be found is skipped: reporting a parse guess as a verdict
+    would be worse than reporting that the statement was not judged, which the
+    callers do by comparing the policy count with what they could read.
+    """
+    policies: List[Tuple[str, List[str], str]] = []
+    for fragment in _cedar_split(_cedar_without_comments(statement), ";"):
+        head, separator, remainder = fragment.partition("(")
+        if not separator:
+            continue
+        effect = head.strip()
+        if not effect:
+            continue
+        depth = 1
+        in_string = False
+        escaped = False
+        for index, character in enumerate(remainder):
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif character == "\\":
+                    escaped = True
+                elif character == '"':
+                    in_string = False
+                continue
+            if character == '"':
+                in_string = True
+                continue
+            if character in "([{":
+                depth += 1
+            elif character in ")]}":
+                depth -= 1
+                if depth == 0:
+                    scope = [
+                        part.strip() for part in _cedar_split(remainder[:index], ",")
+                    ]
+                    policies.append((effect, scope, remainder[index + 1 :].strip()))
+                    break
+    return policies
+
+
+def _cedar_condition_qualifiers(conditions: str) -> Set[str]:
+    """Return the qualifier of every when/unless block, "" for a plain block.
+
+    `when { ... }` is a plain Cedar condition, `when temporal { ... }` is
+    session-aware and `when guardrails { ... }` calls Bedrock Guardrails.
+    """
+    qualifiers: Set[str] = set()
+    tokens = conditions.replace("{", " { ").split()
+    for index, token in enumerate(tokens):
+        if token not in CEDAR_CONDITION_KEYWORDS:
+            continue
+        following = tokens[index + 1] if index + 1 < len(tokens) else "{"
+        qualifiers.add("" if following == "{" else following)
+    return qualifiers
+
+
+def _cedar_scope_is_unconstrained(scope: List[str], position: str) -> bool:
+    """Return whether one scope position names no specific entity.
+
+    Cedar reads a bare `action` as every action, so a permit written that way
+    authorizes every tool the gateway exposes now and every tool added later.
+    """
+    try:
+        part = scope[CEDAR_SCOPE_POSITIONS.index(position)]
+    except IndexError:
+        return False
+    return part == position
+
+
+def _policy_statement_text(policy: Dict[str, Any]) -> str:
+    """Return the Cedar text of a listed policy.
+
+    ListPolicies reports the definition under `cedar` for a Cedar policy and
+    under `policy` for a Dogwood policy; a policy still being generated carries
+    `policyGeneration` and no text at all.
+    """
+    definition = policy.get("definition") or {}
+    for key in ("cedar", "policy"):
+        section = definition.get(key)
+        if isinstance(section, dict) and section.get("statement"):
+            return section["statement"]
+    return ""
+
+
+def _enforcing_policies(
+    policy_engine_id: str, cache: Dict[str, List[Dict[str, Any]]]
+) -> List[Dict[str, Any]]:
+    """List the policies of one engine that change a caller's response.
+
+    Several gateways can enforce one engine, and three checks ask the same engine
+    a different question, so the caller passes a cache to keep one ListPolicies
+    walk per engine per check.
+    """
+    if policy_engine_id not in cache:
+        policies = _agentcore_list_all(
+            "list_policies", ["policies"], policyEngineId=policy_engine_id
+        )
+        cache[policy_engine_id] = [
+            policy
+            for policy in policies
+            if policy.get("status") == POLICY_ACTIVE_STATUS
+            and policy.get("enforcementMode") == POLICY_ENFORCING_MODE
+        ]
+    return cache[policy_engine_id]
+
+
+def _gateway_policy_engine_id(detail: Dict[str, Any]) -> str:
+    """Return the policy engine id a gateway's ENFORCE configuration names.
+
+    GatewayPolicyEngineConfiguration carries an ARN and a mode and no id, so the
+    id comes off the ARN tail. An empty string means the gateway enforces no
+    policy: LOG_ONLY records a decision it does not apply, which is AG-25's
+    verdict to give.
+    """
+    configuration = detail.get("policyEngineConfiguration") or {}
+    if configuration.get("mode") != POLICY_ENGINE_ENFORCE_MODE:
+        return ""
+    return (configuration.get("arn") or "").rsplit("/", 1)[-1]
+
+
+def check_agentcore_policy_tool_scope() -> List[Dict[str, Any]]:
+    """AC-35: Judge whether each enforcing permit names the tools it authorizes.
+
+    policy-core-concepts.html states the engine "enforces default-deny and
+    forbid-wins semantics automatically", so default-deny is not a setting to
+    read; what a customer can still write is a permit that restores allow-all.
+    The same page names the defect: Cedar analysis identifies "policies that
+    always allow (no conditions restrict access)". AG-25 counts enforcing
+    policies without reading one, so a single permit over every tool passes it.
+    """
+    if agentcore_client is None:
+        return [
+            create_finding(
+                check_id="AC-35",
+                finding_name="AgentCore Policy Tool Scope",
+                finding_details="AgentCore client not available in this region.",
+                resolution="No action required unless AgentCore runs in this region.",
+                reference=AGENTCORE_POLICY_CORE_CONCEPTS_REFERENCE_URL,
+                severity=SeverityEnum.INFORMATIONAL,
+                status=StatusEnum.NA,
+            )
+        ]
+
+    try:
+        gateways = _agentcore_list_all("list_gateways", ["items", "gateways"])
+    except Exception as error:
+        return [
+            _incomplete_check_finding(
+                check_id="AC-35",
+                finding_name="AgentCore Policy Tool Scope",
+                error=error,
+                reference=AGENTCORE_POLICY_CORE_CONCEPTS_REFERENCE_URL,
+            )
+        ]
+
+    if not gateways:
+        return [
+            create_finding(
+                check_id="AC-35",
+                finding_name="AgentCore Policy Tool Scope",
+                finding_details="No AgentCore gateways found in this region.",
+                resolution="No action required.",
+                reference=AGENTCORE_POLICY_CORE_CONCEPTS_REFERENCE_URL,
+                severity=SeverityEnum.INFORMATIONAL,
+                status=StatusEnum.NA,
+            )
+        ]
+
+    policy_cache: Dict[str, List[Dict[str, Any]]] = {}
+    findings = []
+    for gateway in gateways:
+        gateway_id = gateway.get("gatewayId", "unknown")
+        gateway_name = gateway.get("name", gateway_id)
+        label = f"Gateway '{gateway_name}' ({gateway_id})"
+
+        try:
+            detail = agentcore_client.get_gateway(gatewayIdentifier=gateway_id)
+            policy_engine_id = _gateway_policy_engine_id(detail)
+            policies = (
+                _enforcing_policies(policy_engine_id, policy_cache)
+                if policy_engine_id
+                else []
+            )
+        except Exception as error:
+            findings.append(
+                create_finding(
+                    check_id="AC-35",
+                    finding_name="AgentCore Policy Tool Scope",
+                    finding_details=(
+                        f"{label} policy scope could not be read: "
+                        f"{_assessment_error_label(error)}."
+                    ),
+                    resolution=(
+                        "Grant bedrock-agentcore:GetGateway and "
+                        "bedrock-agentcore:ListPolicies, then retry."
+                    ),
+                    reference=AGENTCORE_POLICY_CORE_CONCEPTS_REFERENCE_URL,
+                    severity=SeverityEnum.INFORMATIONAL,
+                    status=StatusEnum.NA,
+                )
+            )
+            continue
+
+        if not policy_engine_id:
+            findings.append(
+                create_finding(
+                    check_id="AC-35",
+                    finding_name="AgentCore Policy Tool Scope",
+                    finding_details=(
+                        f"{label} enforces no policy engine, so it has no permit "
+                        "to scope. AG-25 judges whether an engine is attached in "
+                        "ENFORCE mode."
+                    ),
+                    resolution="No action required for this check. Resolve AG-25.",
+                    reference=AGENTCORE_POLICY_CORE_CONCEPTS_REFERENCE_URL,
+                    severity=SeverityEnum.INFORMATIONAL,
+                    status=StatusEnum.NA,
+                )
+            )
+            continue
+
+        always_allow: List[str] = []
+        tool_wide: List[str] = []
+        unreadable: List[str] = []
+        scoped: List[str] = []
+        readable = 0
+        for policy in policies:
+            policy_name = policy.get("name") or policy.get("policyId") or "unnamed"
+            parsed = _cedar_policies(_policy_statement_text(policy))
+            if not parsed:
+                unreadable.append(policy_name)
+                continue
+            readable += 1
+            for effect, scope, conditions in parsed:
+                if effect != "permit":
+                    continue
+                if not _cedar_scope_is_unconstrained(scope, "action"):
+                    scoped.append(policy_name)
+                elif _cedar_condition_qualifiers(conditions):
+                    tool_wide.append(policy_name)
+                else:
+                    always_allow.append(policy_name)
+
+        if always_allow:
+            findings.append(
+                create_finding(
+                    check_id="AC-35",
+                    finding_name="AgentCore Policy Tool Scope Unbounded",
+                    finding_details=(
+                        f"{label} enforces policy engine {policy_engine_id}, whose "
+                        f"policy {', '.join(sorted(set(always_allow)))} permits an "
+                        "unnamed action with no condition, so every tool the "
+                        "gateway exposes is authorized for every caller the scope "
+                        "admits and the engine's default-deny decides nothing."
+                    ),
+                    resolution=(
+                        "Name the tools each permit authorizes with "
+                        'action == AgentCore::Action::"<target>___<tool>" or '
+                        "action in [ ... ], and keep one policy per group of tools "
+                        "that share a caller population."
+                    ),
+                    reference=AGENTCORE_POLICY_CORE_CONCEPTS_REFERENCE_URL,
+                    severity=SeverityEnum.HIGH,
+                    status=StatusEnum.FAILED,
+                )
+            )
+        elif tool_wide:
+            findings.append(
+                create_finding(
+                    check_id="AC-35",
+                    finding_name="AgentCore Policy Tool Scope Unbounded",
+                    finding_details=(
+                        f"{label} enforces policy engine {policy_engine_id}, whose "
+                        f"policy {', '.join(sorted(set(tool_wide)))} permits an "
+                        "unnamed action under a condition, so the one condition "
+                        "gates every tool the gateway exposes today and every tool "
+                        "added to it later."
+                    ),
+                    resolution=(
+                        "Name the tools each permit authorizes so a new target does "
+                        "not inherit an existing caller population, and keep the "
+                        "condition that bounds who the permit applies to."
+                    ),
+                    reference=AGENTCORE_POLICY_CORE_CONCEPTS_REFERENCE_URL,
+                    severity=SeverityEnum.MEDIUM,
+                    status=StatusEnum.FAILED,
+                )
+            )
+        elif readable:
+            bounded = (
+                f"every one of its {len(set(scoped))} enforcing permit policies "
+                "names the actions it authorizes"
+                if scoped
+                else f"none of its {readable} readable enforcing policies permits "
+                "an action at all"
+            )
+            findings.append(
+                create_finding(
+                    check_id="AC-35",
+                    finding_name="AgentCore Policy Tool Scope",
+                    finding_details=(
+                        f"{label} enforces policy engine {policy_engine_id}, and "
+                        f"{bounded}, so a tool no policy names is denied by "
+                        "default."
+                    ),
+                    resolution=(
+                        "No action required. Confirm the named actions match the "
+                        "targets this gateway exposes after each target change."
+                    ),
+                    reference=AGENTCORE_POLICY_CORE_CONCEPTS_REFERENCE_URL,
+                    severity=SeverityEnum.HIGH,
+                    status=StatusEnum.PASSED,
+                )
+            )
+        elif not unreadable:
+            findings.append(
+                create_finding(
+                    check_id="AC-35",
+                    finding_name="AgentCore Policy Tool Scope",
+                    finding_details=(
+                        f"{label} enforces policy engine {policy_engine_id}, which "
+                        "holds no active enforcing policy, so this check has no "
+                        "permit to read. AG-25 judges whether the engine enforces "
+                        "a policy at all."
+                    ),
+                    resolution="No action required for this check. Resolve AG-25.",
+                    reference=AGENTCORE_POLICY_CORE_CONCEPTS_REFERENCE_URL,
+                    severity=SeverityEnum.INFORMATIONAL,
+                    status=StatusEnum.NA,
+                )
+            )
+
+        if unreadable:
+            findings.append(
+                create_finding(
+                    check_id="AC-35",
+                    finding_name="AgentCore Policy Tool Scope",
+                    finding_details=(
+                        f"{label} enforces policy "
+                        f"{', '.join(sorted(set(unreadable)))}, whose definition "
+                        "carries no policy text to read: a policy still being "
+                        "generated reports only its generation id."
+                    ),
+                    resolution=(
+                        "Rerun the assessment once policy generation has finished, "
+                        "then confirm the generated policy names its actions."
+                    ),
+                    reference=AGENTCORE_POLICY_CORE_CONCEPTS_REFERENCE_URL,
+                    severity=SeverityEnum.INFORMATIONAL,
+                    status=StatusEnum.NA,
+                )
+            )
+
+    return findings
+
+
+def _kms_key_policy_open_actions(
+    policy_document: Any, actions: Tuple[str, ...]
+) -> List[str]:
+    """Return which of these KMS actions any principal may take unconditioned.
+
+    AC-26 asks the same question of a log group's key for the decrypt actions;
+    this asks it for the actions that take the key away.
+    """
+    opened: List[str] = []
+    for statement in _document_statements(policy_document, effect="Allow"):
+        if statement.get("Condition"):
+            continue
+        if "*" not in _statement_principals(statement):
+            continue
+        for pattern in _statement_actions(statement):
+            if pattern == "*":
+                return sorted(actions)
+            namespace, _, action_pattern = pattern.partition(":")
+            if namespace != "kms":
+                continue
+            opened.extend(
+                action for action in actions if fnmatchcase(action, action_pattern)
+            )
+    return sorted(set(opened))
+
+
+def check_agentcore_policy_engine_key_scope() -> List[Dict[str, Any]]:
+    """AC-36: Report who may use and who may take away a policy engine's key.
+
+    AC-11 asserts that a policy engine names a customer managed key, which is
+    presence only. policy-encryption.html states the key cannot be added to or
+    changed on an existing engine, so the key policy is the whole guard: a
+    principal who can schedule the key for deletion can make every stored Cedar
+    policy unreadable, and the engine cannot be repointed at a new key.
+    """
+    if agentcore_client is None:
+        return [
+            create_finding(
+                check_id="AC-36",
+                finding_name="AgentCore Policy Engine Key Scope",
+                finding_details="AgentCore client not available in this region.",
+                resolution="No action required unless AgentCore runs in this region.",
+                reference=AGENTCORE_POLICY_ENCRYPTION_REFERENCE_URL,
+                severity=SeverityEnum.INFORMATIONAL,
+                status=StatusEnum.NA,
+            )
+        ]
+
+    try:
+        engines = _agentcore_list_all("list_policy_engines", ["policyEngines"])
+    except Exception as error:
+        return [
+            _incomplete_check_finding(
+                check_id="AC-36",
+                finding_name="AgentCore Policy Engine Key Scope",
+                error=error,
+                reference=AGENTCORE_POLICY_ENCRYPTION_REFERENCE_URL,
+            )
+        ]
+
+    if not engines:
+        return [
+            create_finding(
+                check_id="AC-36",
+                finding_name="AgentCore Policy Engine Key Scope",
+                finding_details="No AgentCore policy engines found in this region.",
+                resolution="No action required.",
+                reference=AGENTCORE_POLICY_ENCRYPTION_REFERENCE_URL,
+                severity=SeverityEnum.INFORMATIONAL,
+                status=StatusEnum.NA,
+            )
+        ]
+
+    key_policy_cache: Dict[str, Any] = {}
+    findings = []
+    for engine in engines:
+        engine_id = engine.get("policyEngineId", "unknown")
+        engine_name = engine.get("name", engine_id)
+        label = f"Policy engine '{engine_name}' ({engine_id})"
+
+        try:
+            detail = agentcore_client.get_policy_engine(policyEngineId=engine_id)
+        except Exception as error:
+            findings.append(
+                create_finding(
+                    check_id="AC-36",
+                    finding_name="AgentCore Policy Engine Key Scope",
+                    finding_details=(
+                        f"{label} encryption key could not be read: "
+                        f"{_assessment_error_label(error)}."
+                    ),
+                    resolution="Grant bedrock-agentcore:GetPolicyEngine and retry.",
+                    reference=AGENTCORE_POLICY_ENCRYPTION_REFERENCE_URL,
+                    severity=SeverityEnum.INFORMATIONAL,
+                    status=StatusEnum.NA,
+                )
+            )
+            continue
+
+        key_arn = detail.get("encryptionKeyArn")
+        if not key_arn:
+            findings.append(
+                create_finding(
+                    check_id="AC-36",
+                    finding_name="AgentCore Policy Engine Key Scope",
+                    finding_details=(
+                        f"{label} uses no customer managed key, so it has no key "
+                        "policy to scope. AC-11 reports the missing key."
+                    ),
+                    resolution="No action required for this check. Resolve AC-11.",
+                    reference=AGENTCORE_POLICY_ENCRYPTION_REFERENCE_URL,
+                    severity=SeverityEnum.INFORMATIONAL,
+                    status=StatusEnum.NA,
+                )
+            )
+            continue
+
+        if key_arn not in key_policy_cache:
+            try:
+                key_policy_cache[key_arn] = kms_client.get_key_policy(KeyId=key_arn)[
+                    "Policy"
+                ]
+            except Exception as error:
+                logger.warning(f"Could not read key policy for {key_arn}: {error}")
+                key_policy_cache[key_arn] = error
+        key_policy = key_policy_cache[key_arn]
+
+        if isinstance(key_policy, Exception):
+            findings.append(
+                create_finding(
+                    check_id="AC-36",
+                    finding_name="AgentCore Policy Engine Key Scope",
+                    finding_details=(
+                        f"{label} is encrypted with {key_arn}, whose key policy "
+                        f"could not be read: {_assessment_error_label(key_policy)}."
+                    ),
+                    resolution="Grant kms:GetKeyPolicy on the key and retry.",
+                    reference=KMS_KEY_POLICY_REFERENCE_URL,
+                    severity=SeverityEnum.INFORMATIONAL,
+                    status=StatusEnum.NA,
+                )
+            )
+            continue
+
+        problems: List[str] = []
+        if _kms_key_policy_allows_open_decrypt(key_policy):
+            problems.append(
+                "lets every principal decrypt with no condition, so the stored "
+                "authorization rules are readable by every principal the account "
+                "trusts"
+            )
+        disabling = _kms_key_policy_open_actions(key_policy, KMS_KEY_DISABLING_ACTIONS)
+        if disabling:
+            problems.append(
+                f"lets every principal call {', '.join(disabling)} with no "
+                "condition, so any of them can make every stored policy "
+                "unreadable, and the engine cannot be repointed at a new key"
+            )
+
+        if problems:
+            findings.append(
+                create_finding(
+                    check_id="AC-36",
+                    finding_name="AgentCore Policy Engine Key Scope Unbounded",
+                    finding_details=(
+                        f"{label} is encrypted with {key_arn}, whose key policy "
+                        f"{' and '.join(problems)}."
+                    ),
+                    resolution=(
+                        "Name the principals allowed to decrypt with this key and "
+                        "the administrators allowed to disable or schedule it for "
+                        "deletion, and constrain the service grants with "
+                        "kms:ViaService for "
+                        "bedrock-agentcore.<region>.amazonaws.com."
+                    ),
+                    reference=KMS_KEY_POLICY_REFERENCE_URL,
+                    severity=SeverityEnum.HIGH,
+                    status=StatusEnum.FAILED,
+                )
+            )
+        else:
+            findings.append(
+                create_finding(
+                    check_id="AC-36",
+                    finding_name="AgentCore Policy Engine Key Scope",
+                    finding_details=(
+                        f"{label} is encrypted with {key_arn}, whose key policy "
+                        "names the principals allowed to decrypt with it and the "
+                        "administrators allowed to disable it or schedule it for "
+                        "deletion."
+                    ),
+                    resolution=(
+                        "No action required. This check reads the key policy; "
+                        "confirm separately that an alarm covers the key's "
+                        "disable and delete events and that the break-glass "
+                        "runbook has been rehearsed, neither of which is readable "
+                        "from the key."
+                    ),
+                    reference=KMS_KEY_POLICY_REFERENCE_URL,
+                    severity=SeverityEnum.HIGH,
+                    status=StatusEnum.PASSED,
+                )
+            )
+
+    return findings
+
+
+def check_agentcore_policy_guardrail_wiring(
+    permission_cache: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    """AC-37: Assert a guardrail policy's gateway role can call the guardrail.
+
+    policy-guardrails-in-policies.html states the Policy data plane "uses FAS
+    (Forward Access Session) credentials derived from the gateway's execution
+    role to call the Bedrock Guardrails API", and that
+    bedrock:InvokeGuardrailChecks is required for it. A `when guardrails` policy
+    whose gateway role lacks that permission cannot score the content it claims
+    to score. Whether this workload's content-safety decisions belong at the
+    authorization boundary at all is the workload owner's call; this check
+    judges only the wiring of the guardrail policies that exist.
+    """
+    if agentcore_client is None:
+        return [
+            create_finding(
+                check_id="AC-37",
+                finding_name="AgentCore Policy Guardrail Wiring",
+                finding_details="AgentCore client not available in this region.",
+                resolution="No action required unless AgentCore runs in this region.",
+                reference=AGENTCORE_POLICY_GUARDRAIL_REFERENCE_URL,
+                severity=SeverityEnum.INFORMATIONAL,
+                status=StatusEnum.NA,
+            )
+        ]
+
+    role_permissions = (permission_cache or {}).get("role_permissions") or {}
+    if not role_permissions:
+        return [
+            create_finding(
+                check_id="AC-37",
+                finding_name="AgentCore Policy Guardrail Wiring",
+                finding_details=(
+                    "No IAM role permissions are in the cache, so the gateway "
+                    "execution role behind a guardrail policy could not be read."
+                ),
+                resolution=(
+                    "Review the IAM Permission Caching task and rerun the assessment."
+                ),
+                reference=AGENTCORE_POLICY_GUARDRAIL_REFERENCE_URL,
+                severity=SeverityEnum.INFORMATIONAL,
+                status=StatusEnum.NA,
+            )
+        ]
+
+    try:
+        gateways = _agentcore_list_all("list_gateways", ["items", "gateways"])
+    except Exception as error:
+        return [
+            _incomplete_check_finding(
+                check_id="AC-37",
+                finding_name="AgentCore Policy Guardrail Wiring",
+                error=error,
+                reference=AGENTCORE_POLICY_GUARDRAIL_REFERENCE_URL,
+            )
+        ]
+
+    if not gateways:
+        return [
+            create_finding(
+                check_id="AC-37",
+                finding_name="AgentCore Policy Guardrail Wiring",
+                finding_details="No AgentCore gateways found in this region.",
+                resolution="No action required.",
+                reference=AGENTCORE_POLICY_GUARDRAIL_REFERENCE_URL,
+                severity=SeverityEnum.INFORMATIONAL,
+                status=StatusEnum.NA,
+            )
+        ]
+
+    policy_cache: Dict[str, List[Dict[str, Any]]] = {}
+    findings = []
+    for gateway in gateways:
+        gateway_id = gateway.get("gatewayId", "unknown")
+        gateway_name = gateway.get("name", gateway_id)
+        label = f"Gateway '{gateway_name}' ({gateway_id})"
+
+        try:
+            detail = agentcore_client.get_gateway(gatewayIdentifier=gateway_id)
+            policy_engine_id = _gateway_policy_engine_id(detail)
+            policies = (
+                _enforcing_policies(policy_engine_id, policy_cache)
+                if policy_engine_id
+                else []
+            )
+        except Exception as error:
+            findings.append(
+                create_finding(
+                    check_id="AC-37",
+                    finding_name="AgentCore Policy Guardrail Wiring",
+                    finding_details=(
+                        f"{label} guardrail policies could not be read: "
+                        f"{_assessment_error_label(error)}."
+                    ),
+                    resolution=(
+                        "Grant bedrock-agentcore:GetGateway and "
+                        "bedrock-agentcore:ListPolicies, then retry."
+                    ),
+                    reference=AGENTCORE_POLICY_GUARDRAIL_REFERENCE_URL,
+                    severity=SeverityEnum.INFORMATIONAL,
+                    status=StatusEnum.NA,
+                )
+            )
+            continue
+
+        guardrail_policies = []
+        for policy in policies:
+            for _, _, conditions in _cedar_policies(_policy_statement_text(policy)):
+                if CEDAR_GUARDRAIL_QUALIFIER in _cedar_condition_qualifiers(conditions):
+                    guardrail_policies.append(
+                        policy.get("name") or policy.get("policyId") or "unnamed"
+                    )
+                    break
+
+        if not guardrail_policies:
+            findings.append(
+                create_finding(
+                    check_id="AC-37",
+                    finding_name="AgentCore Policy Guardrail Wiring",
+                    finding_details=(
+                        f"{label} enforces no policy with a guardrails condition, "
+                        "so no content-safety score is consulted at the "
+                        "authorization boundary. Whether harmful content, prompt "
+                        "injection or sensitive information needs to be scored "
+                        "here depends on what this gateway's tools accept and "
+                        "return, which no API reports."
+                    ),
+                    resolution=(
+                        "Decide whether this gateway's tools carry model-supplied "
+                        "or user-supplied content. If they do, add a forbid policy "
+                        "with a when guardrails condition on the PromptAttack, "
+                        "ContentFilter or SensitiveInformation safeguard, and "
+                        "record the decision either way."
+                    ),
+                    reference=AGENTCORE_POLICY_GUARDRAIL_REFERENCE_URL,
+                    severity=SeverityEnum.INFORMATIONAL,
+                    status=StatusEnum.NA,
+                )
+            )
+            continue
+
+        role_arn = detail.get("roleArn") or ""
+        role_name = role_arn.rsplit("/", 1)[-1]
+        named = ", ".join(sorted(set(guardrail_policies)))
+        if role_name not in role_permissions:
+            findings.append(
+                create_finding(
+                    check_id="AC-37",
+                    finding_name="AgentCore Policy Guardrail Wiring",
+                    finding_details=(
+                        f"{label} enforces guardrail policy {named}, and its "
+                        f"execution role {role_arn or 'is unreported'}, which is "
+                        "not in the IAM permissions snapshot, so the "
+                        f"{GUARDRAIL_CHECK_ACTION} grant could not be read."
+                    ),
+                    resolution=(
+                        "Confirm the gateway execution role is in the account the "
+                        "assessment caches IAM for, then rerun the assessment."
+                    ),
+                    reference=AGENTCORE_POLICY_GUARDRAIL_REFERENCE_URL,
+                    severity=SeverityEnum.INFORMATIONAL,
+                    status=StatusEnum.NA,
+                )
+            )
+            continue
+
+        permissions = role_permissions[role_name]
+        documents = [
+            *(permissions.get("attached_policies") or []),
+            *(permissions.get("inline_policies") or []),
+        ]
+        granted = False
+        unreadable_documents = 0
+        for document in documents:
+            try:
+                granted = granted or any(
+                    _statement_matches_action(statement, GUARDRAIL_CHECK_ACTION_LOOKUP)
+                    for statement in _allow_statements(document)
+                )
+            except Exception as error:
+                unreadable_documents += 1
+                logger.warning(f"Error parsing policy for role {role_name}: {error}")
+
+        if granted:
+            findings.append(
+                create_finding(
+                    check_id="AC-37",
+                    finding_name="AgentCore Policy Guardrail Wiring",
+                    finding_details=(
+                        f"{label} enforces guardrail policy {named}, and its "
+                        f"execution role '{role_name}' grants "
+                        f"{GUARDRAIL_CHECK_ACTION}, so the policy engine can "
+                        "score the content the policy names."
+                    ),
+                    resolution=(
+                        "No action required. Confirm the safeguard categories and "
+                        "confidence thresholds in the policy match what this "
+                        "workload treats as harmful; guardrail scores are "
+                        "non-deterministic, so the same input can score "
+                        "differently."
+                    ),
+                    reference=AGENTCORE_POLICY_GUARDRAIL_REFERENCE_URL,
+                    severity=SeverityEnum.HIGH,
+                    status=StatusEnum.PASSED,
+                )
+            )
+        elif unreadable_documents:
+            findings.append(
+                create_finding(
+                    check_id="AC-37",
+                    finding_name="AgentCore Policy Guardrail Wiring",
+                    finding_details=(
+                        f"{label} enforces guardrail policy {named}, and "
+                        f"{unreadable_documents} of the "
+                        f"{len(documents)} policy document(s) on its execution "
+                        f"role '{role_name}' could not be parsed, so whether the "
+                        f"role grants {GUARDRAIL_CHECK_ACTION} is unknown."
+                    ),
+                    resolution=(
+                        "Review the IAM Permission Caching task for this role, "
+                        "then rerun the assessment."
+                    ),
+                    reference=AGENTCORE_POLICY_GUARDRAIL_REFERENCE_URL,
+                    severity=SeverityEnum.INFORMATIONAL,
+                    status=StatusEnum.NA,
+                )
+            )
+        else:
+            findings.append(
+                create_finding(
+                    check_id="AC-37",
+                    finding_name="AgentCore Policy Guardrail Wiring Incomplete",
+                    finding_details=(
+                        f"{label} enforces guardrail policy {named}, but its "
+                        f"execution role '{role_name}' does not grant "
+                        f"{GUARDRAIL_CHECK_ACTION}, so the guardrail call the "
+                        "Policy data plane makes with that role's forward access "
+                        "session is denied. The devguide does not state whether "
+                        "the policy then fails open or closed, so the content "
+                        "safety this policy claims is either absent or the tool "
+                        "is unreachable."
+                    ),
+                    resolution=(
+                        f"Grant {GUARDRAIL_CHECK_ACTION} to the gateway execution "
+                        "role, then invoke the gateway once and confirm the "
+                        "decision record in the gateway's application logs shows "
+                        "the guardrail policy among its determining policies."
+                    ),
+                    reference=AGENTCORE_POLICY_GUARDRAIL_REFERENCE_URL,
+                    severity=SeverityEnum.HIGH,
+                    status=StatusEnum.FAILED,
+                )
+            )
+
+    return findings
+
+
+def check_agentcore_policy_session_binding() -> List[Dict[str, Any]]:
+    """AC-38: Judge session-aware policy and whether a session binds to a caller.
+
+    A rule that only reads across a sequence of actions, such as an unverified
+    payee or a cumulative overspend, is a temporal policy evaluated against a
+    policy session. policy-session-based-temporal.html states the Gateway binds
+    a session to the caller's authenticated identity "on authenticated gateways
+    (CUSTOM_JWT or AWS_IAM)", so on a gateway that authenticates no caller two
+    callers presenting the same session id share one accumulated history, and a
+    per-session limit is reset or consumed by someone else. AG-25 counts
+    enforcing policies without reading whether any is session-aware.
+    """
+    if agentcore_client is None:
+        return [
+            create_finding(
+                check_id="AC-38",
+                finding_name="AgentCore Policy Session Binding",
+                finding_details="AgentCore client not available in this region.",
+                resolution="No action required unless AgentCore runs in this region.",
+                reference=AGENTCORE_POLICY_SESSION_REFERENCE_URL,
+                severity=SeverityEnum.INFORMATIONAL,
+                status=StatusEnum.NA,
+            )
+        ]
+
+    try:
+        gateways = _agentcore_list_all("list_gateways", ["items", "gateways"])
+    except Exception as error:
+        return [
+            _incomplete_check_finding(
+                check_id="AC-38",
+                finding_name="AgentCore Policy Session Binding",
+                error=error,
+                reference=AGENTCORE_POLICY_SESSION_REFERENCE_URL,
+            )
+        ]
+
+    if not gateways:
+        return [
+            create_finding(
+                check_id="AC-38",
+                finding_name="AgentCore Policy Session Binding",
+                finding_details="No AgentCore gateways found in this region.",
+                resolution="No action required.",
+                reference=AGENTCORE_POLICY_SESSION_REFERENCE_URL,
+                severity=SeverityEnum.INFORMATIONAL,
+                status=StatusEnum.NA,
+            )
+        ]
+
+    policy_cache: Dict[str, List[Dict[str, Any]]] = {}
+    findings = []
+    for gateway in gateways:
+        gateway_id = gateway.get("gatewayId", "unknown")
+        gateway_name = gateway.get("name", gateway_id)
+        label = f"Gateway '{gateway_name}' ({gateway_id})"
+
+        try:
+            detail = agentcore_client.get_gateway(gatewayIdentifier=gateway_id)
+            policy_engine_id = _gateway_policy_engine_id(detail)
+            policies = (
+                _enforcing_policies(policy_engine_id, policy_cache)
+                if policy_engine_id
+                else []
+            )
+        except Exception as error:
+            findings.append(
+                create_finding(
+                    check_id="AC-38",
+                    finding_name="AgentCore Policy Session Binding",
+                    finding_details=(
+                        f"{label} session-aware policies could not be read: "
+                        f"{_assessment_error_label(error)}."
+                    ),
+                    resolution=(
+                        "Grant bedrock-agentcore:GetGateway and "
+                        "bedrock-agentcore:ListPolicies, then retry."
+                    ),
+                    reference=AGENTCORE_POLICY_SESSION_REFERENCE_URL,
+                    severity=SeverityEnum.INFORMATIONAL,
+                    status=StatusEnum.NA,
+                )
+            )
+            continue
+
+        if not policy_engine_id:
+            findings.append(
+                create_finding(
+                    check_id="AC-38",
+                    finding_name="AgentCore Policy Session Binding",
+                    finding_details=(
+                        f"{label} enforces no policy engine, so it evaluates no "
+                        "session-aware policy. AG-25 judges whether an engine is "
+                        "attached in ENFORCE mode."
+                    ),
+                    resolution="No action required for this check. Resolve AG-25.",
+                    reference=AGENTCORE_POLICY_SESSION_REFERENCE_URL,
+                    severity=SeverityEnum.INFORMATIONAL,
+                    status=StatusEnum.NA,
+                )
+            )
+            continue
+
+        temporal_policies = []
+        for policy in policies:
+            for effect, _, conditions in _cedar_policies(
+                _policy_statement_text(policy)
+            ):
+                if effect not in CEDAR_AUTHORIZING_EFFECTS:
+                    continue
+                if CEDAR_TEMPORAL_QUALIFIER in _cedar_condition_qualifiers(conditions):
+                    temporal_policies.append(
+                        policy.get("name") or policy.get("policyId") or "unnamed"
+                    )
+                    break
+
+        authorizer_type = detail.get("authorizerType") or gateway.get("authorizerType")
+
+        if not temporal_policies:
+            findings.append(
+                create_finding(
+                    check_id="AC-38",
+                    finding_name="AgentCore Policy Session Binding Absent",
+                    finding_details=(
+                        f"{label} enforces policy engine {policy_engine_id} with "
+                        f"{len(policies)} active enforcing policy or policies, "
+                        "none of which carries a temporal condition, so every "
+                        "request is judged on its own. A rule that spans a "
+                        "sequence, such as requiring a prior approval or holding "
+                        "a running total under a threshold, is enforced by the "
+                        "agent or tool code here and not by the gateway."
+                    ),
+                    resolution=(
+                        "Add a temporal policy for each rule that reads across a "
+                        "session, or record that this gateway's tools carry no "
+                        "such rule and that each call is independently safe."
+                    ),
+                    reference=AGENTCORE_POLICY_SESSION_REFERENCE_URL,
+                    severity=SeverityEnum.MEDIUM,
+                    status=StatusEnum.FAILED,
+                )
+            )
+        elif authorizer_type in GATEWAY_SESSION_BINDING_AUTHORIZERS:
+            findings.append(
+                create_finding(
+                    check_id="AC-38",
+                    finding_name="AgentCore Policy Session Binding",
+                    finding_details=(
+                        f"{label} enforces temporal policy "
+                        f"{', '.join(sorted(set(temporal_policies)))} and "
+                        f"authenticates callers with {authorizer_type}, so the "
+                        "gateway binds each policy session to the caller's own "
+                        "identity and two callers presenting the same session id "
+                        "accumulate separate histories."
+                    ),
+                    resolution=(
+                        "No action required. The session id rides inside the "
+                        "workload access token across Gateway to Runtime hops "
+                        "within one account and region; confirm the first caller "
+                        "in the chain sends "
+                        "x-amzn-bedrock-agentcore-policy-session-id, without "
+                        "which a request to an engine holding a temporal policy "
+                        "fails validation."
+                    ),
+                    reference=AGENTCORE_POLICY_SESSION_REFERENCE_URL,
+                    severity=SeverityEnum.HIGH,
+                    status=StatusEnum.PASSED,
+                )
+            )
+        else:
+            findings.append(
+                create_finding(
+                    check_id="AC-38",
+                    finding_name="AgentCore Policy Session Binding Unauthenticated",
+                    finding_details=(
+                        f"{label} enforces temporal policy "
+                        f"{', '.join(sorted(set(temporal_policies)))} but uses "
+                        f"authorizerType {authorizer_type or 'unspecified'}. The "
+                        "devguide names CUSTOM_JWT and AWS_IAM as the authorizer "
+                        "types where the gateway binds a session to the caller's "
+                        "authenticated identity, so on this gateway the session id "
+                        "in the request header is the only thing separating one "
+                        "caller's accumulated history from another's, and a caller "
+                        "who reuses someone else's session id inherits it."
+                    ),
+                    resolution=(
+                        "Set the gateway authorizerType to CUSTOM_JWT or AWS_IAM "
+                        "so each policy session is keyed by an authenticated "
+                        "identity, or move the sequence rule to a boundary that "
+                        "knows who the caller is."
+                    ),
+                    reference=AGENTCORE_POLICY_SESSION_REFERENCE_URL,
+                    severity=SeverityEnum.HIGH,
+                    status=StatusEnum.FAILED,
+                )
+            )
+
+    return findings
+
+
 def check_agentcore_gateway_agentic_security() -> List[Dict[str, Any]]:
     """
     Check API-provable AgentCore Gateway controls for agentic tool execution.
@@ -8993,6 +10149,26 @@ def lambda_handler(event, context):
                 ["AC-34"],
                 "Runtime Inline Credentials",
                 check_agentcore_runtime_inline_credentials,
+            ),
+            (
+                ["AC-35"],
+                "Policy Tool Scope",
+                check_agentcore_policy_tool_scope,
+            ),
+            (
+                ["AC-36"],
+                "Policy Engine Key Scope",
+                check_agentcore_policy_engine_key_scope,
+            ),
+            (
+                ["AC-37"],
+                "Policy Guardrail Wiring",
+                lambda: check_agentcore_policy_guardrail_wiring(permission_cache),
+            ),
+            (
+                ["AC-38"],
+                "Policy Session Binding",
+                check_agentcore_policy_session_binding,
             ),
         ]
 

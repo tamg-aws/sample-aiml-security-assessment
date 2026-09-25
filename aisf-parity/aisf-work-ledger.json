@@ -6,15 +6,15 @@
     "hosted": 67,
     "fnd_ai_subject": 11,
     "total": 78,
-    "covered": 25,
-    "tighten": 22,
-    "tighten_extend": 17,
+    "covered": 29,
+    "tighten": 19,
+    "tighten_extend": 14,
     "tighten_new_id": 5,
-    "new": 16,
+    "new": 15,
     "not_implementable": 4,
     "unassessed": 11,
-    "new_check_functions": 32,
-    "extensions": 17,
+    "new_check_functions": 31,
+    "extensions": 14,
     "extra_iam_actions": [
       "config:DescribeConfigRules",
       "config:DescribeConfigurationRecorders",
@@ -966,18 +966,20 @@
       "question": "Is the Policy Engine encrypted with an organization-controlled key, and are the operational failure modes of that key understood and guarded?",
       "assert": "Policy Engine CMK config + key-policy scoping + disable/delete alarm + break-glass runbook",
       "workload_agnostic": true,
-      "verdict": "tighten",
-      "disposition": "extend",
+      "verdict": "covered",
+      "disposition": null,
       "target_modules": [
         "agentcore_assessments"
       ],
       "incumbents": [
-        "AC-11"
+        "AC-11",
+        "AC-36"
       ],
       "incumbent_names": [
-        "AgentCore Policy Engine Encryption Check"
+        "AgentCore Policy Engine Encryption Check",
+        "AgentCore Policy Engine Key Scope"
       ],
-      "gap": "AC-11's presence-only CMK test is sound; POL-04 adds key-policy scoping plus a disable/delete alarm",
+      "gap": "AC-11 asserts the engine names a customer managed key, AC-36 asserts the key policy names who may decrypt with it and who may disable it or schedule it for deletion; the key cannot be added to or changed on an existing engine, so the key policy is the whole guard. The disable/delete alarm and the break-glass runbook are not readable from the key, and AC-36's passing resolution says so",
       "extra_iam": [],
       "phase": 4,
       "source": "controls/ai-specific/agentcore-policy.yaml"
@@ -988,18 +990,22 @@
       "question": "Are agent-to-tool authorization decisions made by a deterministic, default-deny policy engine outside the agent's own reasoning, rather than trusting the model to only request permitted actions?",
       "assert": "Cedar policies in ENFORCE mode with default-deny + a sample decision log",
       "workload_agnostic": true,
-      "verdict": "tighten",
-      "disposition": "extend",
+      "verdict": "covered",
+      "disposition": null,
       "target_modules": [
         "agentcore_assessments"
       ],
       "incumbents": [
-        "AG-25"
+        "AG-25",
+        "AC-19",
+        "AC-35"
       ],
       "incumbent_names": [
-        "Agentic AI Gateway Tool Policy Enforcement"
+        "Agentic AI Gateway Tool Policy Enforcement",
+        "AgentCore Log Delivery Configuration",
+        "AgentCore Policy Tool Scope"
       ],
-      "gap": "AG-25 tests mode ENFORCE plus status/enforcementMode ACTIVE, with no default-deny leg, no decision log, and nothing session-aware",
+      "gap": "AG-25 asserts mode ENFORCE plus status/enforcementMode ACTIVE, AC-19 asserts the gateway delivers APPLICATION_LOGS, which is where a policy decision record lands, and AC-35 asserts no enforcing permit leaves the action position unconstrained; default-deny and forbid-wins are engine behaviour and not a setting to read, so a permit over every tool is the only way to restore allow-all",
       "extra_iam": [],
       "phase": 4,
       "source": "controls/ai-specific/agentcore-policy.yaml"
@@ -1010,18 +1016,20 @@
       "question": "For risks that are only visible across a sequence of actions \u2014 an unverified payee, a skipped prerequisite, a reused approval, a cumulative overspend \u2014 are those rules enforced as session-aware policy at the gateway, rather than as state tracking inside the agent or tool code?",
       "assert": "ListPolicies showing a temporal policy in ACTIVE enforcementMode + the session-id propagation path",
       "workload_agnostic": true,
-      "verdict": "tighten",
-      "disposition": "extend",
+      "verdict": "covered",
+      "disposition": null,
       "target_modules": [
         "agentcore_assessments"
       ],
       "incumbents": [
-        "AG-25"
+        "AG-25",
+        "AC-38"
       ],
       "incumbent_names": [
-        "Agentic AI Gateway Tool Policy Enforcement"
+        "Agentic AI Gateway Tool Policy Enforcement",
+        "AgentCore Policy Session Binding"
       ],
-      "gap": "AG-25 has no session-aware leg",
+      "gap": "AG-25 counts enforcing policies, AC-38 asserts a temporal policy exists and that the gateway carrying it authenticates callers with CUSTOM_JWT or AWS_IAM, the two authorizer types the devguide names as binding a session to the caller's identity; the session-id propagation path is fail-closed by the service, since a request to an engine holding a temporal policy fails validation without the header",
       "extra_iam": [],
       "phase": 4,
       "source": "controls/ai-specific/agentcore-policy.yaml"
@@ -1416,14 +1424,18 @@
       "question": "For content-safety decisions on agent actions, are Bedrock Guardrails composed into the policy engine so harmful content, prompt injection, or PII is scored and enforced at the same authorization boundary?",
       "assert": "Cedar guardrails-block config + gateway role bedrock:InvokeGuardrailChecks grant",
       "workload_agnostic": false,
-      "verdict": "new",
+      "verdict": "covered",
       "disposition": null,
       "target_modules": [
         "agentcore_assessments"
       ],
-      "incumbents": [],
-      "incumbent_names": [],
-      "gap": "",
+      "incumbents": [
+        "AC-37"
+      ],
+      "incumbent_names": [
+        "AgentCore Policy Guardrail Wiring"
+      ],
+      "gap": "AC-37 asserts the workload-independent half: a policy carrying a guardrails condition needs bedrock:InvokeGuardrailChecks on the gateway execution role, because the Policy data plane calls Bedrock Guardrails with that role's forward access session. Whether this workload's content belongs at the authorization boundary at all, and which safeguard categories and thresholds apply, is the workload owner's decision, which AC-37 reports and does not judge",
       "extra_iam": [],
       "phase": 4,
       "source": "controls/ai-specific/agentcore-policy.yaml"

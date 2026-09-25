@@ -6,14 +6,14 @@ Generated 2026-09-25 by `aisf-parity/build_ledger.py`. Do not hand-edit: change 
 
 | verdict | rows | meaning |
 |---|---|---|
-| covered | 25 | an incumbent already asserts this; nothing to write |
-| tighten / extend | 17 | incumbent name is honest, its assertion is narrower; extend it in place |
+| covered | 29 | an incumbent already asserts this; nothing to write |
+| tighten / extend | 14 | incumbent name is honest, its assertion is narrower; extend it in place |
 | tighten / new_id | 5 | incumbent name claims more than it asserts; allocate a new id beside it |
-| new | 16 | no incumbent asserts any part of it |
+| new | 15 | no incumbent asserts any part of it |
 | not_implementable | 4 | flagged machine_checkable in the ledger but is not checkable from configuration |
 | unassessed | 11 | in scope, dedup pass not yet run |
 
-**32 new check functions and 17 extensions to existing checks.**
+**31 new check functions and 14 extensions to existing checks.**
 
 ## New IAM actions required
 
@@ -88,14 +88,15 @@ Generated 2026-09-25 by `aisf-parity/build_ledger.py`. Do not hand-edit: change 
 | `AIR-ACR-OBS-03` | covered | — | `agentcore_assessments` | `AC-19` | AC-04 is X-Ray tracingConfig.enabled over list_agent_runtimes only, so it cannot cover Gateway, Memory, Policy or Identity, which is OBS-03's whole subject. AC-19 asserts an APPLICATION_LOGS delivery source wired to a destination per gateway and per memory; runtime logging is service-managed, WorkloadIdentity delivery is configured on the associated runtime or gateway resource, and policy engines have no log-destination surface, so those three legs need no separate assertion |
 | `AIR-ACR-OBS-04` | covered | — | `agentcore_assessments` | `AC-20`, `AC-21` | AC-20 asserts a Deidentify data-protection policy and a customer managed key on the AgentCore log groups, AC-21 asserts that no cached role or user holds logs:Unmask on every resource |
 | `AIR-ACR-OBS-06` | covered | — | `agentcore_assessments` | `AC-22` | AC-22 asserts that every Allow statement on an OAM sink policy either names its principals or carries an organization condition key |
+| `AIR-ACR-POL-01` | covered | — | `agentcore_assessments` | `AG-25`, `AC-19`, `AC-35` | AG-25 asserts mode ENFORCE plus status/enforcementMode ACTIVE, AC-19 asserts the gateway delivers APPLICATION_LOGS, which is where a policy decision record lands, and AC-35 asserts no enforcing permit leaves the action position unconstrained; default-deny and forbid-wins are engine behaviour and not a setting to read, so a permit over every tool is the only way to restore allow-all |
+| `AIR-ACR-POL-04` | covered | — | `agentcore_assessments` | `AC-11`, `AC-36` | AC-11 asserts the engine names a customer managed key, AC-36 asserts the key policy names who may decrypt with it and who may disable it or schedule it for deletion; the key cannot be added to or changed on an existing engine, so the key policy is the whole guard. The disable/delete alarm and the break-glass runbook are not readable from the key, and AC-36's passing resolution says so |
+| `AIR-ACR-POL-06` *(workload-specific)* | covered | — | `agentcore_assessments` | `AC-37` | AC-37 asserts the workload-independent half: a policy carrying a guardrails condition needs bedrock:InvokeGuardrailChecks on the gateway execution role, because the Policy data plane calls Bedrock Guardrails with that role's forward access session. Whether this workload's content belongs at the authorization boundary at all, and which safeguard categories and thresholds apply, is the workload owner's decision, which AC-37 reports and does not judge |
+| `AIR-ACR-POL-07` | covered | — | `agentcore_assessments` | `AG-25`, `AC-38` | AG-25 counts enforcing policies, AC-38 asserts a temporal policy exists and that the gateway carrying it authenticates callers with CUSTOM_JWT or AWS_IAM, the two authorizer types the devguide names as binding a session to the caller's identity; the session-id propagation path is fail-closed by the service, since a request to an engine holding a temporal policy fails validation without the header |
 | `AIR-ACR-RT-09` | covered | — | `agentcore_assessments` | `AC-06` | recording.enabled is True plus an S3 bucket |
 | `AIR-ACR-EVAL-01` | tighten | extend | `agentcore_assessments` | `AC-02` | AC-02 detects AgentCore full-access and wildcard grants only, so a role holding a single over-broad named action passes it |
 | `AIR-ACR-EVAL-05` | tighten | new_id | `agentcore_assessments` | `AC-17` | AC-17 is named "Online Evaluation Coverage" but tests only status == ACTIVE, executionStatus == ENABLED and bool(evaluators); it never reads a sampling rate and never asks which evaluators, so coverage is the one thing it does not measure |
 | `AIR-ACR-EVAL-06` | tighten | new_id | `agentcore_assessments` | `AC-17` | AC-17 is named "Online Evaluation Coverage" and never asks which evaluators are attached, so it cannot distinguish a safety evaluator from a latency one |
 | `AIR-ACR-PAY-01` | tighten | extend | `agentcore_assessments` | `AC-02` | AC-02 detects full-access and wildcard grants only |
-| `AIR-ACR-POL-01` | tighten | extend | `agentcore_assessments` | `AG-25` | AG-25 tests mode ENFORCE plus status/enforcementMode ACTIVE, with no default-deny leg, no decision log, and nothing session-aware |
-| `AIR-ACR-POL-04` | tighten | extend | `agentcore_assessments` | `AC-11` | AC-11's presence-only CMK test is sound; POL-04 adds key-policy scoping plus a disable/delete alarm |
-| `AIR-ACR-POL-07` | tighten | extend | `agentcore_assessments` | `AG-25` | AG-25 has no session-aware leg |
 | `AIR-ACR-REG-02` | tighten | new_id | `agent_registry_assessments` | `AR-03` | AR-03 is named "Publication Approval Governance" but covers auto-approval only, behind the REQUIRE_AGENT_REGISTRY_MANUAL_APPROVAL env gate; no curator/publisher separation and no EventBridge rule |
 | `AIR-ACR-RT-03` | tighten | extend | `agentcore_assessments` | `AC-02` | AC-02 detects full-access and wildcard grants only |
 | `AIR-ACR-RT-08` | tighten | extend | `agentcore_assessments` | `AC-01` | AC-01 requires VPC placement and flags public subnets but never reads what the security-group rules permit; ec2:DescribeSecurityGroups is now granted to this function for AC-08's endpoint scope leg, so RT-08 costs no further permission |
@@ -105,7 +106,6 @@ Generated 2026-09-25 by `aisf-parity/build_ledger.py`. Do not hand-edit: change 
 | `AIR-ACR-EVAL-04` *(workload-specific)* | new | — | `agentcore_assessments` | — | — |
 | `AIR-ACR-EVAL-07` | new | — | `agentcore_assessments` | — | — |
 | `AIR-ACR-MEM-07` *(workload-specific)* | new | — | `agentcore_assessments` | — | — |
-| `AIR-ACR-POL-06` *(workload-specific)* | new | — | `agentcore_assessments` | — | — |
 | `AIR-ACR-RT-04` *(workload-specific)* | new | — | `agentcore_assessments` | — | — |
 
 ## FND (11 controls)
