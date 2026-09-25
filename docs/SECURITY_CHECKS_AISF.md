@@ -50,7 +50,7 @@ map, gate 12 fails if the control text baked into the map drifts from the
 AISF control definition, and gate 13 fails if an id does not carry the
 registered `AISF-` prefix or is missing from this catalogue.
 
-**`AISF-` rows are not counted in the framework's 208-check total.** They carry
+**`AISF-` rows are not counted in the framework's 218-check total.** They carry
 no new assertion, so counting them would double-count the incumbent check. They
 are excluded from the report's pass-rate denominator and from Open Action Items
 for the same reason, which is how OWASP-mapped rows already behave.

@@ -1,10 +1,10 @@
 # Security Checks Reference
 
-This document provides a comprehensive reference for all 208 security checks performed by the AI/ML Security Assessment framework (94 core checks across Amazon Bedrock, Amazon SageMaker AI, Amazon Bedrock AgentCore, and AWS Agent Registry, 38 Agentic AI Security checks, 64 Responsible AI GRC checks, and 12 OWASP Top 10 for LLM checks).
+This document provides a comprehensive reference for all 218 security checks performed by the AI/ML Security Assessment framework (104 core checks across Amazon Bedrock, Amazon SageMaker AI, Amazon Bedrock AgentCore, and AWS Agent Registry, 38 Agentic AI Security checks, 64 Responsible AI GRC checks, and 12 OWASP Top 10 for LLM checks).
 
 Sources differ by bucket and are not interchangeable: the core Bedrock, SageMaker, AgentCore, and AWS Agent Registry checks derive from the AWS Well-Architected **Generative AI Lens** security best practices (`gensec*`) and service security documentation; the Agentic AI Security checks from the AWS Well-Architected **Agentic AI Lens**; the `FS-*` **Responsible AI GRC** checks from the AWS GRC User Guide; and the `OW-*` checks from the OWASP Top 10 for LLM. The AWS Well-Architected **Responsible AI Lens** is not a source for any of them — see [Responsible AI GRC — scope, sources, and compatibility](RESPONSIBLE_AI_GRC_SCOPE.md).
 
-The 64 Responsible AI GRC checks occupy 69 `FS-*` numbers: 64 ship as standalone checks and 5 are merged into upstream Bedrock/SageMaker checks. The framework also emits `BR-00`, `SM-00`, `AC-00`, `AR-00`, `FS-00`, `OW-00`, and `AISF-00` operational marker rows at runtime; these are not controls and are excluded from the 208-check total. `AISF-01` through `AISF-08` are AWS AI Security Framework view rows: each one restates the verdict of a check already counted above under an AISF control id, so they are excluded from the 208-check total for the same reason ([AWS AI Security Framework (AISF) Checks](SECURITY_CHECKS_AISF.md)). Per-control provenance, including which controls are project extensions rather than guide-derived, is recorded in [`provenance.json`](../aiml-security-assessment/functions/security/responsible_ai_grc_assessments/provenance.json).
+The 64 Responsible AI GRC checks occupy 69 `FS-*` numbers: 64 ship as standalone checks and 5 are merged into upstream Bedrock/SageMaker checks. The framework also emits `BR-00`, `SM-00`, `AC-00`, `AR-00`, `FS-00`, `OW-00`, and `AISF-00` operational marker rows at runtime; these are not controls and are excluded from the 218-check total. `AISF-01` through `AISF-08` are AWS AI Security Framework view rows: each one restates the verdict of a check already counted above under an AISF control id, so they are excluded from the 218-check total for the same reason ([AWS AI Security Framework (AISF) Checks](SECURITY_CHECKS_AISF.md)). Per-control provenance, including which controls are project extensions rather than guide-derived, is recorded in [`provenance.json`](../aiml-security-assessment/functions/security/responsible_ai_grc_assessments/provenance.json).
 
 ## Table of Contents
 
@@ -13,8 +13,8 @@ The 64 Responsible AI GRC checks occupy 69 `FS-*` numbers: 64 ship as standalone
 - [Report Scoring](#report-scoring)
 - [Severity Levels](#severity-levels)
 - [Status Values](#status-values)
-- [Amazon SageMaker AI Security Checks (29)](#amazon-sagemaker-ai-security-checks-29)
-- [Amazon Bedrock Security Checks (40)](#amazon-bedrock-security-checks-40)
+- [Amazon SageMaker AI Security Checks (33)](#amazon-sagemaker-ai-security-checks-33)
+- [Amazon Bedrock Security Checks (46)](#amazon-bedrock-security-checks-46)
 - [Amazon Bedrock AgentCore Security Checks (17)](#amazon-bedrock-agentcore-security-checks-17)
 - [AWS Agent Registry Security Checks (8)](#aws-agent-registry-security-checks-8)
 - [Agentic AI Security Checks (38)](#agentic-ai-security-checks-38)
@@ -29,8 +29,8 @@ The framework evaluates your AI/ML workloads against AWS security best practices
 
 | Service | Number of Checks | Focus Areas |
 | --------- | ------------------ | ------------- |
-| Amazon SageMaker AI | 29 | Security Hub controls, encryption, network isolation, GuardDuty AI Protection, HyperPod, IAM, MLOps, Model Registry policy exposure |
-| Amazon Bedrock | 40 | Guardrails, prompt-attack/image filters, retention, inference profiles, automated reasoning and Marketplace endpoint governance, encryption, networking, IAM, logging, monitoring, and evaluation |
+| Amazon SageMaker AI | 33 | Security Hub controls, encryption, network isolation, GuardDuty AI Protection, HyperPod, IAM, MLOps, Model Registry policy exposure, inference data capture, Config compliance evaluation, training VPC boundary, creation guardrails |
+| Amazon Bedrock | 46 | Guardrails, prompt-attack/image filters, retention, inference profiles, automated reasoning and Marketplace endpoint governance, encryption, networking, IAM, logging, monitoring, evaluation, central guardrail enforcement, model allow-lists, Region and Marketplace subscription control, API key governance, knowledge base source classification |
 | Amazon Bedrock AgentCore | 17 | Runtime/tool VPC isolation, encryption, browser recording, observability, resource policies, Identity token vaults, and online evaluation |
 | AWS Agent Registry | 8 | IAM access, approval governance, discovery authorization, encryption, organization auto-detection, record lifecycle, and provenance |
 | Agentic AI Security | 38 | Bounded autonomy, agent identity, tool authorization, Registry governance and provenance, guardrail enforcement, prompt/input protection, memory privacy, auditability, continuous assurance, abuse protection |
@@ -45,8 +45,8 @@ Each security check has a unique identifier with a service prefix:
 
 | Prefix | Service | Example |
 | -------- | --------- | --------- |
-| **SM-XX** | Amazon SageMaker | SM-01, SM-30 (`SM-29` reserved) |
-| **BR-XX** | Amazon Bedrock | BR-01, BR-40 |
+| **SM-XX** | Amazon SageMaker | SM-01, SM-34 (`SM-29` reserved) |
+| **BR-XX** | Amazon Bedrock | BR-01, BR-46 |
 | **AC-XX** | Amazon Bedrock AgentCore | AC-01, AC-17 |
 | **AR-XX** | AWS Agent Registry | AR-01, AR-08 |
 | **AG-XX** | Agentic AI Security | AG-01, AG-38 |
@@ -116,7 +116,7 @@ investigation and remediation.
 
 ---
 
-## Amazon SageMaker AI Security Checks (29)
+## Amazon SageMaker AI Security Checks (33)
 
 ### SM-01: Internet Access
 
@@ -274,9 +274,29 @@ investigation and remediation.
 - **Severity:** High for public or configured-boundary violations; Informational for unclassified external sharing
 - **Description:** Parses model package group resource policies to identify public wildcard principals and external accounts or organizations outside optional `AIML_APPROVED_EXTERNAL_ACCOUNT_IDS` / `AIML_APPROVED_ORG_IDS` boundaries. Configure those boundaries through the `ApprovedExternalAccountIds` and `ApprovedOrganizationIds` deployment parameters, respectively; both default to empty. Wildcard principals constrained by exact `aws:PrincipalAccount` or `aws:PrincipalOrgID` values, fixed-account `aws:PrincipalArn` patterns, or fixed-organization `aws:PrincipalOrgPaths` patterns are treated as bounded. Wildcard account/organization identifiers remain public; `ForAllValues` organization-path conditions count as boundaries only when a matching `Null: false` condition requires the key to be present. Because AWS supports `NotPrincipal` only with `Deny`, an `Allow` statement containing `NotPrincipal` is reported as unsupported and `N/A` rather than silently passing or being treated as public. Valid `Deny` statements do not create exposure and are ignored. If `sts:GetCallerIdentity` is unavailable, public wildcard statements are still reported, but account principals that cannot be distinguished as same-account or external produce `N/A` instead of an external-access finding. This is a conservative heuristic, not a complete IAM authorization simulator.
 
+### SM-31: Endpoint Inference Data Capture
+
+- **Severity:** Medium
+- **Description:** Requires each SageMaker endpoint to capture inference requests and responses. `DescribeEndpoint` reports the live capture state as `DataCaptureConfig.EnableCapture` plus `CaptureStatus`, so an endpoint whose configuration enables capture but whose `CaptureStatus` is `Stopped` is reported as a failure and not as compliant.
+
+### SM-32: SageMaker Configuration Compliance Evaluation
+
+- **Severity:** Medium
+- **Description:** Two independent legs, each with its own finding. `SageMaker Configuration Recording` requires an AWS Config recorder whose recording group covers SageMaker resource types. `SageMaker Config Rule Compliance` requires at least one active Config rule evaluating SageMaker and reports that rule's current compliance result. Neither verdict implies the other: a recorder with no rules evaluates nothing, and a rule with no recorder cannot see configuration changes.
+
+### SM-33: Training Job Network Boundary
+
+- **Severity:** Medium
+- **Description:** Requires training jobs to run inside a customer VPC. Network isolation and `VpcConfig` are reported separately, because a job can set `EnableNetworkIsolation` with no VPC attachment, and an isolated job without a VPC attachment still has no private path to Amazon S3 or Amazon ECR. SM-21 asserts the same VPC boundary for AutoML jobs only.
+
+### SM-34: SageMaker Creation Guardrails
+
+- **Severity:** Medium
+- **Description:** Requires a service control policy that denies creation of unencrypted, internet-exposed, or non-VPC SageMaker resources, with one verdict per guardrail category: `encryption` (`sagemaker:VolumeKmsKey`, `sagemaker:OutputKmsKey`, `sagemaker:InterContainerTrafficEncryption`), `approved network` (`sagemaker:VpcSubnets`, `sagemaker:VpcSecurityGroupIds`, `sagemaker:NetworkIsolation`), and `no direct internet access` (`sagemaker:DirectInternetAccess`). Categories are reported separately because an organization commonly guards encryption at creation and leaves the network parameters unguarded. A Deny that fires when the parameter is absent or holds a non-approved value counts as enforced; a Deny naming one specific value is reported as ambiguous, because whether that value is the non-compliant one depends on the value and this check does not interpret it. An unreadable organization view produces `N/A`.
+
 ---
 
-## Amazon Bedrock Security Checks (40)
+## Amazon Bedrock Security Checks (46)
 
 ### BR-01: AWS IAM Least Privilege
 
@@ -502,6 +522,36 @@ inventory is never treated as evidence of compliance.
 
 - **Severity:** Medium by default
 - **Description:** Resolves the Marketplace endpoint `kmsEncryptionKey` with `kms:DescribeKey` and requires `KeyMetadata.KeyManager` to be `CUSTOMER`; AWS-managed keys do not pass. The `RequireMarketplaceEndpointCMK` deployment parameter defaults to `true` (`REQUIRE_MARKETPLACE_ENDPOINT_CMK` in the Lambda). Set it to `false` to make a missing or AWS-managed key an `N/A`/Informational hardening advisory rather than a failure. An inconclusive KMS lookup is always `N/A`/Informational.
+
+### BR-41: Central Guardrail Enforcement
+
+- **Severity:** High
+- **Description:** Requires a published guardrail to apply to every model the account can invoke. Three independent legs satisfy it: an account-enforced guardrail configuration whose model and content scope covers all models, an attached Organizations Bedrock policy naming a non-`DRAFT` guardrail version, or a service control policy denying invocation unless an approved `bedrock:GuardrailIdentifier` is supplied. `ListEnforcedGuardrailsConfiguration` is the leg that runs from any account, and its `owner` field enumerates `ACCOUNT` alone, so a configuration inherited from an Organizations policy never appears in it; an unreadable organization view therefore produces `N/A` instead of being reported as an absence. BR-15 reads the same API but decides on how many configurations exist, while this check reads the model and content scope inside each one.
+
+### BR-42: Foundation Model Invocation Allow-List
+
+- **Severity:** High
+- **Description:** Requires identity policies to scope `bedrock:InvokeModel` and `bedrock:InvokeModelWithResponseStream` to named foundation model or inference-profile ARNs. Only Allow statements that cover an invoke action are judged, so a policy that never grants invocation is not counted against this control. An unscoped resource with no `bedrock:ModelArn` condition fails, because every model available in the account can then be invoked. An unscoped resource carrying a `bedrock:ModelArn` condition also fails for the streaming action, which does not support that condition key.
+
+### BR-43: Region Invocation Control
+
+- **Severity:** Medium
+- **Description:** Reads two halves of cross-Region invocation, because neither answers the other. Service control policies conditioned on `aws:RequestedRegion` bound the Region a request is sent to, and the inference profiles the account can route through determine where the inference is then served. A global profile call presents the literal `unspecified` for that condition key, so a Region allow-list bounds a global profile only when it excludes `unspecified`. A direct invocation bounded by an SCP alongside an unbounded global profile is reported as a failure.
+
+### BR-44: Marketplace Model Subscription Control
+
+- **Severity:** High
+- **Description:** Requires an `aws-marketplace:ProductId` condition to restrict `aws-marketplace:Subscribe` to approved products. An Allow statement granting the action with no product condition fails. A Deny that names approved products positively is reported as failing open, because a product the statement does not name is not denied; only an Allow carrying the product condition, or a Deny with a negated or `Null` test, restricts the set of subscribable models.
+
+### BR-45: API Key Governance
+
+- **Severity:** High
+- **Description:** Two findings. `Bedrock API Key Inventory` lists the `bedrock.amazonaws.com` service-specific credentials in the account. `Bedrock API Key Age And Token Type Control` requires a Deny statement on `iam:CreateServiceSpecificCredential` or `bedrock:CallWithBearerToken` conditioned on `iam:ServiceSpecificCredentialAgeDays` or `bedrock:BearerTokenType`, so a long-term API key cannot become a standing static credential. An unreadable organization view produces `N/A`.
+
+### BR-46: Knowledge Base Source Data Classification
+
+- **Severity:** High
+- **Description:** Requires Amazon Macie automated discovery to monitor every S3 bucket a knowledge base ingests from, read from `DescribeBuckets[].automatedDiscoveryMonitoringStatus`. The assertion is per source bucket, and the coverage figure counts knowledge base source buckets, not every bucket Macie reports. `GetClassificationScope` is deliberately not used: its `s3` member is `excludes.bucketNames`, an exclusion list, so a check built on it would pass precisely when the knowledge base buckets are excluded from discovery. `GetDataSource` describes are capped at 50 per invocation; reaching the cap adds an `N/A` row recording the truncation and still reports the verdict for the sources that were read. When Macie is not enabled in the Region, the check reports `N/A` and no bucket failure. FS-44 asserts the two account-level Macie legs and disclaims bucket-level coverage, which is what this check supplies.
 
 ---
 

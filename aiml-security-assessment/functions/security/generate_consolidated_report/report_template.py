@@ -213,7 +213,7 @@ COMPLIANCE_STANDARDS: List[Dict[str, Any]] = [
             "assessed, and their absence from this section is not evidence of "
             "compliance. These rows restate existing check verdicts under AISF "
             "control ids, so they are <strong>not</strong> counted in the "
-            "framework's 208-check total. AISF-00 marks an account and region "
+            "framework's 218-check total. AISF-00 marks an account and region "
             "where AISF-relevant checks ran but a mapped source check was "
             "absent. Preliminary and illustrative: validate the control "
             "mapping with your Security/Compliance team before using it as "

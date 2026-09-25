@@ -221,7 +221,7 @@ class TestRegistryEntry(unittest.TestCase):
         self.assertEqual(derivable + remaining, in_scope)
         self.assertIn("not evidence of compliance", scope)
         self.assertIn("<strong>not</strong> counted", scope)
-        self.assertIn("208-check total", scope)
+        self.assertIn("218-check total", scope)
 
     def test_ids_are_unique_and_the_coverage_id_is_not_allocated(self):
         ids = [m["check_id"] for m in aisf_mappings.AISF_DERIVED_MAP]
