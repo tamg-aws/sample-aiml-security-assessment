@@ -777,6 +777,23 @@ Resources:
               Action:
                 - kms:GetKeyPolicy
               Resource: !Sub 'arn:${AWS::Partition}:kms:*:${AWS::AccountId}:key/*'
+            # AC-28 reads the organization's service control policies to see
+            # whether one denies creating a gateway with no inbound authorizer.
+            # ListPolicies takes no resource; DescribePolicy is scoped to the
+            # policy resource type, whose ARN carries the management account and
+            # the organization id, neither of which is known in this template.
+            - Sid: OrganizationsInventoryPermissions
+              Effect: Allow
+              Action:
+                - organizations:ListPolicies
+              Resource: '*'
+            - Sid: OrganizationsPolicyRead
+              Effect: Allow
+              Action:
+                - organizations:DescribePolicy
+              Resource:
+                - !Sub 'arn:${AWS::Partition}:organizations::*:policy/*/*/*'
+                - !Sub 'arn:${AWS::Partition}:organizations::aws:policy/*/*'
             - Sid: CloudWatchPermissions
               Effect: Allow
               Action:

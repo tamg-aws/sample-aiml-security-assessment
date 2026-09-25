@@ -41,6 +41,7 @@ AISF_COMPLIANCE_MAP = {
     "AC-25": "AISF AIR-ACR-GW-08",
     "AC-26": "AISF AIR-ACR-GW-10 (1 of 3 checks)",
     "AC-27": "AISF AIR-ACR-GW-03 (1 of 2 checks) | AISF AIR-ACR-GW-04 (1 of 2 checks)",
+    "AC-28": "AISF AIR-ACR-GW-02",
     "AG-24": "AISF AIR-ACR-GW-01",
     "AG-25": "AISF AIR-ACR-POL-01 (partial) | AISF AIR-ACR-POL-07 (partial)",
     "AG-27": "AISF AIR-ACR-GW-05 (1 of 2 checks)",

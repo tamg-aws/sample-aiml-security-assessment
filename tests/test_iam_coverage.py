@@ -634,6 +634,27 @@ _VERIFIED_REMEDIATION_IAM_ACTIONS |= {
     "kms:GetKeyPolicy",
 }
 
+# Verified on 2026-09-25 with a fourth Access Analyzer validate-policy run, this
+# one against policyType SERVICE_CONTROL_POLICY because AC-28's remediation text
+# describes an SCP. Its negative controls were three invented actions
+# (bedrock-agentcore:CreateGatewayNotReal,
+# bedrock-agentcore:UpdateGatewayThatDoesNotExist,
+# organizations:DescribePolicyDocumentNotReal) and one invented condition key
+# (bedrock-agentcore:GatewayAuthorizerModeNotReal). All four were reported and
+# none of the names below was.
+#
+# The run is an oracle for name existence only, not for which actions a condition
+# key applies to: a control statement pairing bedrock-agentcore:CreateGateway
+# with bedrock-agentcore:RuntimeAuthorizerType, a pairing no reference declares,
+# drew no finding either. The GatewayAuthorizerType-to-CreateGateway wiring rests
+# on the AgentCore devguide, which the AISF work ledger's GW-02 row records as
+# disagreeing with the two IAM reference surfaces.
+_VERIFIED_REMEDIATION_IAM_ACTIONS |= {
+    "bedrock-agentcore:CreateGateway",
+    "bedrock-agentcore:UpdateGateway",
+    "organizations:DescribePolicy",
+}
+
 _VERIFIED_REMEDIATION_CONDITION_KEYS = {
     "bedrock:GuardrailIdentifier",
     "iam:AWSServiceName",
@@ -645,6 +666,8 @@ _VERIFIED_REMEDIATION_CONDITION_KEYS = {
     "aws:SourceAccount",
     "aws:SourceArn",
     "aws:SourceVpce",
+    # Same SERVICE_CONTROL_POLICY run as the AC-28 action block above.
+    "bedrock-agentcore:GatewayAuthorizerType",
 }
 
 _NON_IAM_REMEDIATION_TOKENS = {

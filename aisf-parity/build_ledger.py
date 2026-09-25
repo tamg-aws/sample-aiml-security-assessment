@@ -544,18 +544,22 @@ ROWS = [
     ("AIR-ACR-EVAL-07", NEW, None, "agentcore_assessments", [], "", [], 4),
     (
         "AIR-ACR-GW-02",
-        NEW,
+        COVERED,
         None,
         "agentcore_assessments",
+        ["AC-28"],
+        "AC-28 requires a service control policy that denies both CreateGateway and "
+        "UpdateGateway when bedrock-agentcore:GatewayAuthorizerType is NONE, either by naming "
+        "NONE in an equals-family condition or by omitting it from a not-equals-family one, "
+        "so no approved-authorizer list has to be invented; attachment targets are outside "
+        "the grant and the finding says so. The condition key carries a documentation drift: "
+        "the AgentCore devguide wires GatewayAuthorizerType to CreateGateway and UpdateGateway "
+        "and shows sibling gateway keys used this way in SCPs, while the machine-readable "
+        "service reference and the service authorization reference page wire it to zero "
+        "actions. The devguide wins for feature availability. Access Analyzer validate-policy "
+        "accepts the key name but is no oracle for the wiring: it also accepts "
+        "RuntimeAuthorizerType on CreateGateway, a pairing neither surface declares",
         [],
-        "blocked, not merely unbuilt: bedrock-agentcore:GatewayAuthorizerType is declared as "
-        "a condition key of the service but is wired to zero actions, on both the "
-        "machine-readable service reference and the service authorization reference page, "
-        "while the sibling RuntimeAuthorizerType is wired to CreateAgentRuntime and "
-        "UpdateAgentRuntime. A Deny on CreateGateway or UpdateGateway conditioned on it can "
-        "never match, so the only expressible SCP is a blanket prohibition on gateways, which "
-        "is a different control. Recheck the per-action key list before implementing",
-        ["organizations:ListPolicies", "organizations:DescribePolicy"],
         4,
     ),
     (
@@ -590,8 +594,9 @@ ROWS = [
         None,
         "agentcore_assessments",
         [],
-        "asserts an SCP; same Organizations read as GW-02",
-        ["organizations:ListPolicies", "organizations:DescribePolicy"],
+        "asserts an SCP; organizations:ListPolicies and organizations:DescribePolicy are now "
+        "granted to this function for GW-02's AC-28, so ID-04 costs no further permission",
+        [],
         4,
     ),
     (
@@ -823,6 +828,7 @@ INCUMBENT_NAMES = {
     "AC-25": "AgentCore Gateway Target Authorization",
     "AC-26": "AgentCore Log Retention and Key Scope",
     "AC-27": "AgentCore Gateway Policy Conditions",
+    "AC-28": "AgentCore Gateway Authorizer Guardrail",
     "AG-24": "Agentic AI Gateway Inbound Authorization",
     "AG-25": "Agentic AI Gateway Tool Policy Enforcement",
     "AG-27": "Agentic AI Gateway WAF Protection",

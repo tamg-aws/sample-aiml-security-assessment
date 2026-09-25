@@ -6,14 +6,14 @@ Generated 2026-09-25 by `aisf-parity/build_ledger.py`. Do not hand-edit: change 
 
 | verdict | rows | meaning |
 |---|---|---|
-| covered | 19 | an incumbent already asserts this; nothing to write |
+| covered | 20 | an incumbent already asserts this; nothing to write |
 | tighten / extend | 19 | incumbent name is honest, its assertion is narrower; extend it in place |
 | tighten / new_id | 5 | incumbent name claims more than it asserts; allocate a new id beside it |
-| new | 20 | no incumbent asserts any part of it |
+| new | 19 | no incumbent asserts any part of it |
 | not_implementable | 4 | flagged machine_checkable in the ledger but is not checkable from configuration |
 | unassessed | 11 | in scope, dedup pass not yet run |
 
-**36 new check functions and 19 extensions to existing checks.**
+**35 new check functions and 19 extensions to existing checks.**
 
 ## New IAM actions required
 
@@ -22,8 +22,8 @@ Generated 2026-09-25 by `aisf-parity/build_ledger.py`. Do not hand-edit: change 
 - `macie2:GetAutomatedDiscoveryConfiguration` — AIR-BDR-KB-01
 - `macie2:GetMacieSession` — AIR-BDR-KB-01
 - `organizations:DescribeEffectivePolicy` — AIR-FND-DAT-09
-- `organizations:DescribePolicy` — AIR-SGM-TRN-08, AIR-ACR-GW-02, AIR-ACR-ID-04
-- `organizations:ListPolicies` — AIR-SGM-TRN-08, AIR-ACR-GW-02, AIR-ACR-ID-04
+- `organizations:DescribePolicy` — AIR-SGM-TRN-08
+- `organizations:ListPolicies` — AIR-SGM-TRN-08
 - `s3:GetBucketPolicy` — AIR-FND-DAT-02
 
 ## BDR (19 controls)
@@ -71,6 +71,7 @@ Generated 2026-09-25 by `aisf-parity/build_ledger.py`. Do not hand-edit: change 
 | control | verdict | do | module | incumbent | gap |
 |---|---|---|---|---|---|
 | `AIR-ACR-GW-01` | covered | — | `agentcore_assessments` | `AG-24` | AG-24 accepts authorizerType in {AWS_IAM, CUSTOM_JWT}, or AUTHENTICATE_ONLY with a policy engine in ENFORCE, which is GW-01's assertion exactly |
+| `AIR-ACR-GW-02` | covered | — | `agentcore_assessments` | `AC-28` | AC-28 requires a service control policy that denies both CreateGateway and UpdateGateway when bedrock-agentcore:GatewayAuthorizerType is NONE, either by naming NONE in an equals-family condition or by omitting it from a not-equals-family one, so no approved-authorizer list has to be invented; attachment targets are outside the grant and the finding says so. The condition key carries a documentation drift: the AgentCore devguide wires GatewayAuthorizerType to CreateGateway and UpdateGateway and shows sibling gateway keys used this way in SCPs, while the machine-readable service reference and the service authorization reference page wire it to zero actions. The devguide wins for feature availability. Access Analyzer validate-policy accepts the key name but is no oracle for the wiring: it also accepts RuntimeAuthorizerType on CreateGateway, a pairing neither surface declares |
 | `AIR-ACR-GW-03` | covered | — | `agentcore_assessments` | `AC-10`, `AC-27` | AC-10 reports that a gateway resource policy is present; AC-27 judges whether its Allow statements and the gateway execution role's trust policy carry aws:SourceAccount or aws:SourceArn, and fails an unconditioned statement even when a guarded sibling sits beside it in the same document |
 | `AIR-ACR-GW-04` *(workload-specific)* | covered | — | `agentcore_assessments` | `AC-08`, `AC-27` | AC-08 now judges each AgentCore endpoint's policy against the default allow-everything document and reads its security groups for 0.0.0.0/0 and ::/0 inbound rules, alongside the existence and health legs it already held; AC-27 adds the gateway resource policy's aws:SourceVpc / aws:SourceVpce / aws:VpcSourceIp / aws:SourceIp leg |
 | `AIR-ACR-GW-05` | covered | — | `agentcore_assessments` | `AG-27`, `AC-24` | AG-27 holds the WAF leg; AC-24 requires an ACTIVE gateway rate limit carrying a requests, tokens or connections ceiling, because dimensions is the only required member of a limit entry and a limit can therefore name a dimension and bound nothing |
@@ -100,8 +101,7 @@ Generated 2026-09-25 by `aisf-parity/build_ledger.py`. Do not hand-edit: change 
 | `AIR-ACR-EVAL-03` | new | — | `agentcore_assessments` | — | confused-deputy conditions absent: SourceAccount/SourceArn are 1 hit corpus-wide, in sagemaker_assessments, none in AgentCore |
 | `AIR-ACR-EVAL-04` *(workload-specific)* | new | — | `agentcore_assessments` | — | — |
 | `AIR-ACR-EVAL-07` | new | — | `agentcore_assessments` | — | — |
-| `AIR-ACR-GW-02` | new | — | `agentcore_assessments` | — | blocked, not merely unbuilt: bedrock-agentcore:GatewayAuthorizerType is declared as a condition key of the service but is wired to zero actions, on both the machine-readable service reference and the service authorization reference page, while the sibling RuntimeAuthorizerType is wired to CreateAgentRuntime and UpdateAgentRuntime. A Deny on CreateGateway or UpdateGateway conditioned on it can never match, so the only expressible SCP is a blanket prohibition on gateways, which is a different control. Recheck the per-action key list before implementing |
-| `AIR-ACR-ID-04` | new | — | `agentcore_assessments` | — | asserts an SCP; same Organizations read as GW-02 |
+| `AIR-ACR-ID-04` | new | — | `agentcore_assessments` | — | asserts an SCP; organizations:ListPolicies and organizations:DescribePolicy are now granted to this function for GW-02's AC-28, so ID-04 costs no further permission |
 | `AIR-ACR-ID-08` | new | — | `agentcore_assessments` | — | GetAgentRuntime.authorizerConfiguration exists in botocore 1.43.85 and is never read anywhere; AG-24 is gateway-only, ID-08 is about the runtime |
 | `AIR-ACR-ID-11` | new | — | `agentcore_assessments` | — | the corpus reads authorizerType exactly once, at :3578, and never reads authorizerConfiguration; customJWTAuthorizer.{allowedAudience, allowedClients, allowedScopes, customClaims, discoveryUrl} are all present in the API and unread, so a gateway that trusts any issuer passes AG-24 today |
 | `AIR-ACR-MEM-07` *(workload-specific)* | new | — | `agentcore_assessments` | — | — |

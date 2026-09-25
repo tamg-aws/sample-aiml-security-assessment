@@ -40,6 +40,7 @@ cloudtrail_client = None
 oam_client = None
 agentcore_client = None
 kms_client = None
+organizations_client = None
 
 # Environment variables
 BUCKET_NAME = os.environ.get("AIML_ASSESSMENT_BUCKET_NAME")
@@ -152,6 +153,10 @@ CONFUSED_DEPUTY_REFERENCE_URL = (
 )
 VPC_ENDPOINT_POLICY_REFERENCE_URL = (
     "https://docs.aws.amazon.com/vpc/latest/privatelink/vpc-endpoints-access.html"
+)
+AGENTCORE_GATEWAY_CONDITION_KEY_REFERENCE_URL = (
+    "https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/"
+    "security-gateway-condition-keys.html"
 )
 
 
@@ -6433,6 +6438,336 @@ def _gateway_role_trust_findings(
     ]
 
 
+# Lowercased for matching against `_statement_actions`, which normalizes case,
+# mapped to the spelling used in report text.
+GATEWAY_WRITE_ACTIONS = {
+    "bedrock-agentcore:creategateway": "CreateGateway",
+    "bedrock-agentcore:updategateway": "UpdateGateway",
+}
+
+GATEWAY_AUTHORIZER_CONDITION_KEY = "bedrock-agentcore:gatewayauthorizertype"
+
+# NONE is the authorizer type that means no inbound authorizer, so it is the
+# value an effective guardrail has to exclude. The devguide lists AWS_IAM,
+# CUSTOM_JWT and NONE; the CreateGateway API model carries a fourth value,
+# AUTHENTICATE_ONLY, which is still an authorizer and is not this control's
+# concern.
+GATEWAY_AUTHORIZER_UNAUTHENTICATED_VALUE = "NONE"
+
+# A Deny fires when the operator matches, so an equals-family operator naming
+# NONE and a not-equals-family operator that omits NONE both deny NONE. A Null
+# test cannot: authorizerType is a required member of CreateGateway, so the key
+# is always present and `Null: true` never matches.
+SCP_DENY_VALUE_INCLUDES_OPERATORS = (
+    "stringequals",
+    "stringequalsignorecase",
+    "stringlike",
+)
+SCP_DENY_VALUE_EXCLUDES_OPERATORS = (
+    "stringnotequals",
+    "stringnotequalsignorecase",
+    "stringnotlike",
+)
+SCP_SET_OPERATOR_PREFIXES = ("forallvalues:", "foranyvalue:")
+
+# The codes Organizations raises when this account cannot see the organization's
+# policies at all, as opposed to seeing them and finding no guardrail. Both
+# spellings of the denial code are accepted because the service model declares
+# AccessDeniedException while the shorter form is what a member account's SCP
+# denial reports.
+ORGANIZATIONS_UNREADABLE_ERROR_CODES = {
+    "AccessDenied",
+    "AccessDeniedException",
+    "AWSOrganizationsNotInUseException",
+}
+
+
+def _statement_matches_action(statement: Dict[str, Any], action: str) -> bool:
+    """Return whether a Deny statement reaches one action.
+
+    `Action` reaches the actions its patterns match. A Deny written with
+    `NotAction` denies everything its list omits, so it reaches an action that
+    matches none of the exclusions: an SCP denying all but a read-only
+    allow-list under an authorizer condition does block the gateway write, and
+    one that names the write in `NotAction` exempts it. The IAM grammar forbids
+    both keys in one statement, so `Action` is read first and a statement
+    carrying neither reaches nothing. fnmatchcase carries the IAM wildcard
+    grammar and is linear in the pattern, unlike a translated regular
+    expression.
+    """
+    if "Action" in statement:
+        return any(
+            fnmatchcase(action, pattern) for pattern in _statement_actions(statement)
+        )
+    if "NotAction" in statement:
+        return not any(
+            fnmatchcase(action, pattern)
+            for pattern in _statement_not_actions(statement)
+        )
+    return False
+
+
+def _condition_values(raw: Any) -> List[str]:
+    """Return one condition entry's values as a list of strings."""
+    if isinstance(raw, (list, tuple)):
+        return [str(value) for value in raw]
+    return [str(raw)]
+
+
+def _statement_denies_unauthenticated_gateway(statement: Dict[str, Any]) -> bool:
+    """Return whether a Deny statement's condition excludes authorizer type NONE."""
+    condition = statement.get("Condition")
+    if not isinstance(condition, dict):
+        return False
+
+    for operator, entries in condition.items():
+        if not isinstance(entries, dict):
+            continue
+        name = str(operator).strip().lower()
+        for prefix in SCP_SET_OPERATOR_PREFIXES:
+            if name.startswith(prefix):
+                name = name[len(prefix) :]
+                break
+        for key, raw in entries.items():
+            if str(key).strip().lower() != GATEWAY_AUTHORIZER_CONDITION_KEY:
+                continue
+            values = {value.strip().upper() for value in _condition_values(raw)}
+            if name in SCP_DENY_VALUE_INCLUDES_OPERATORS:
+                if GATEWAY_AUTHORIZER_UNAUTHENTICATED_VALUE in values:
+                    return True
+            elif name in SCP_DENY_VALUE_EXCLUDES_OPERATORS:
+                if GATEWAY_AUTHORIZER_UNAUTHENTICATED_VALUE not in values:
+                    return True
+    return False
+
+
+def _scp_gateway_authorizer_coverage(document: Any) -> Tuple[Set[str], bool]:
+    """Return which gateway write actions one SCP guards, and whether it tries.
+
+    The second value separates a policy that never mentions the authorizer type
+    from one that mentions it in a shape that cannot deny NONE, because the two
+    need different remediation.
+    """
+    covered: Set[str] = set()
+    names_key = False
+    for statement in _document_statements(document, effect="Deny"):
+        if GATEWAY_AUTHORIZER_CONDITION_KEY in _statement_condition_keys(statement):
+            names_key = True
+        if not _statement_denies_unauthenticated_gateway(statement):
+            continue
+        for action in GATEWAY_WRITE_ACTIONS:
+            if _statement_matches_action(statement, action):
+                covered.add(action)
+    return covered, names_key
+
+
+def check_agentcore_gateway_authorizer_scp() -> List[Dict[str, Any]]:
+    """AC-28: Require an SCP that denies creating a gateway with no authorizer.
+
+    AG-24 reads the authorizer type of the gateways that exist now, which says
+    nothing about the next gateway somebody creates. The preventive control is a
+    service control policy that denies CreateGateway and UpdateGateway when
+    bedrock-agentcore:GatewayAuthorizerType is NONE. Update matters as much as
+    create: a Deny on create alone leaves an authenticated gateway one
+    UpdateGateway call away from being open.
+
+    The check reads policy content only. Whether a policy is attached to the
+    root, to one organizational unit, or to nothing needs
+    organizations:ListTargetsForPolicy, which this function is not granted, so
+    every finding says that attachment is still the reader's to confirm.
+    """
+    if organizations_client is None:
+        return [
+            create_finding(
+                check_id="AC-28",
+                finding_name="AgentCore Gateway Authorizer Guardrail",
+                finding_details="Organizations client not available.",
+                resolution="No action required unless this account is in an organization.",
+                reference=AGENTCORE_GATEWAY_CONDITION_KEY_REFERENCE_URL,
+                severity=SeverityEnum.INFORMATIONAL,
+                status=StatusEnum.NA,
+            )
+        ]
+
+    try:
+        policies = _paginate_aws_list(
+            organizations_client,
+            "list_policies",
+            "Policies",
+            token_request_key="NextToken",
+            token_response_key="NextToken",
+            Filter="SERVICE_CONTROL_POLICY",
+        )
+    except Exception as error:
+        if _assessment_error_label(error) in ORGANIZATIONS_UNREADABLE_ERROR_CODES:
+            return [
+                create_finding(
+                    check_id="AC-28",
+                    finding_name="AgentCore Gateway Authorizer Guardrail",
+                    finding_details=(
+                        "Service control policies could not be listed from this "
+                        f"account: {_assessment_error_label(error)}. A member "
+                        "account cannot read the organization's policies."
+                    ),
+                    resolution=(
+                        "Run the assessment from the management account or an "
+                        "Organizations delegated administrator, with "
+                        "organizations:ListPolicies and organizations:DescribePolicy."
+                    ),
+                    reference=AGENTCORE_GATEWAY_CONDITION_KEY_REFERENCE_URL,
+                    severity=SeverityEnum.INFORMATIONAL,
+                    status=StatusEnum.NA,
+                )
+            ]
+        return [
+            _incomplete_check_finding(
+                check_id="AC-28",
+                finding_name="AgentCore Gateway Authorizer Guardrail",
+                error=error,
+                reference=AGENTCORE_GATEWAY_CONDITION_KEY_REFERENCE_URL,
+            )
+        ]
+
+    covered_actions: Set[str] = set()
+    guarding_policies: List[str] = []
+    attempting_policies: List[str] = []
+    read_errors: List[Tuple[str, Exception]] = []
+
+    for policy in policies:
+        policy_name = policy.get("Name", policy.get("Id", "unknown"))
+        try:
+            detail = organizations_client.describe_policy(PolicyId=policy["Id"])
+        except Exception as error:
+            read_errors.append((policy_name, error))
+            continue
+
+        content = (detail.get("Policy") or {}).get("Content", "")
+        covered, names_key = _scp_gateway_authorizer_coverage(content)
+        if covered:
+            covered_actions |= covered
+            guarding_policies.append(policy_name)
+        elif names_key:
+            attempting_policies.append(policy_name)
+
+    findings: List[Dict[str, Any]] = []
+    for policy_name, error in read_errors:
+        findings.append(
+            create_finding(
+                check_id="AC-28",
+                finding_name="AgentCore Gateway Authorizer Guardrail",
+                finding_details=(
+                    f"Service control policy '{policy_name}' could not be read: "
+                    f"{_assessment_error_label(error)}, so it was not judged."
+                ),
+                resolution="Grant organizations:DescribePolicy and retry.",
+                reference=AGENTCORE_GATEWAY_CONDITION_KEY_REFERENCE_URL,
+                severity=SeverityEnum.INFORMATIONAL,
+                status=StatusEnum.NA,
+            )
+        )
+
+    missing = [
+        name
+        for action, name in GATEWAY_WRITE_ACTIONS.items()
+        if action not in covered_actions
+    ]
+    guarding_label = ", ".join(sorted(guarding_policies))
+
+    if not missing:
+        findings.append(
+            create_finding(
+                check_id="AC-28",
+                finding_name="AgentCore Gateway Authorizer Guardrail",
+                finding_details=(
+                    "CreateGateway and UpdateGateway are both denied when "
+                    "bedrock-agentcore:GatewayAuthorizerType is NONE, by service "
+                    f"control policy: {guarding_label}."
+                ),
+                resolution=(
+                    "No action required. Confirm the policy is attached to the root "
+                    "or to every organizational unit that hosts gateways, because "
+                    "this check reads policy content and not attachment targets."
+                ),
+                reference=AGENTCORE_GATEWAY_CONDITION_KEY_REFERENCE_URL,
+                severity=SeverityEnum.HIGH,
+                status=StatusEnum.PASSED,
+            )
+        )
+        return findings
+
+    if covered_actions:
+        covered_label = ", ".join(
+            sorted(GATEWAY_WRITE_ACTIONS[action] for action in covered_actions)
+        )
+        findings.append(
+            create_finding(
+                check_id="AC-28",
+                finding_name="AgentCore Gateway Authorizer Guardrail Partial",
+                finding_details=(
+                    f"Authorizer type NONE is denied on {covered_label} but not on "
+                    f"{', '.join(missing)}, by service control policy: "
+                    f"{guarding_label}. An existing gateway can still be moved to "
+                    "authorizer type NONE."
+                ),
+                resolution=(
+                    "Add the uncovered action to the same Deny statement, keeping "
+                    "the bedrock-agentcore:GatewayAuthorizerType condition."
+                ),
+                reference=AGENTCORE_GATEWAY_CONDITION_KEY_REFERENCE_URL,
+                severity=SeverityEnum.HIGH,
+                status=StatusEnum.FAILED,
+            )
+        )
+        return findings
+
+    if attempting_policies:
+        findings.append(
+            create_finding(
+                check_id="AC-28",
+                finding_name="AgentCore Gateway Authorizer Guardrail Ineffective",
+                finding_details=(
+                    "bedrock-agentcore:GatewayAuthorizerType is conditioned on in a "
+                    "shape that cannot deny the value NONE, by service control "
+                    f"policy: {', '.join(sorted(attempting_policies))}. A Null test "
+                    "is one such shape: the authorizer type is a required member of "
+                    "CreateGateway, so it is never absent from the request."
+                ),
+                resolution=(
+                    "Deny CreateGateway and UpdateGateway with StringEquals on "
+                    "NONE, or with StringNotEquals on the authorizer types the "
+                    "organization approves."
+                ),
+                reference=AGENTCORE_GATEWAY_CONDITION_KEY_REFERENCE_URL,
+                severity=SeverityEnum.HIGH,
+                status=StatusEnum.FAILED,
+            )
+        )
+        return findings
+
+    findings.append(
+        create_finding(
+            check_id="AC-28",
+            finding_name="AgentCore Gateway Authorizer Guardrail Missing",
+            finding_details=(
+                f"None of the {len(policies)} service control policy(s) readable "
+                "from this account denies CreateGateway or UpdateGateway when "
+                "bedrock-agentcore:GatewayAuthorizerType is NONE, so the next "
+                "gateway created can accept unauthenticated requests."
+            ),
+            resolution=(
+                "Attach a service control policy that denies "
+                "bedrock-agentcore:CreateGateway and "
+                "bedrock-agentcore:UpdateGateway with StringEquals on "
+                "bedrock-agentcore:GatewayAuthorizerType NONE."
+            ),
+            reference=AGENTCORE_GATEWAY_CONDITION_KEY_REFERENCE_URL,
+            severity=SeverityEnum.HIGH,
+            status=StatusEnum.FAILED,
+        )
+    )
+    return findings
+
+
 def check_agentcore_gateway_agentic_security() -> List[Dict[str, Any]]:
     """
     Check API-provable AgentCore Gateway controls for agentic tool execution.
@@ -6765,7 +7100,7 @@ def lambda_handler(event, context):
     """
     global start_time, iam_client, ec2_client, ecr_client, logs_client
     global cloudwatch_client, cloudtrail_client, oam_client, agentcore_client
-    global kms_client
+    global kms_client, organizations_client
     start_time = time.time()
 
     try:
@@ -6791,6 +7126,8 @@ def lambda_handler(event, context):
         oam_client = boto3.client("oam", config=boto3_config, region_name=region)
         # A log group's encryption key lives in the log group's own region.
         kms_client = boto3.client("kms", config=boto3_config, region_name=region)
+        # Organizations resolves to one global endpoint whatever region is passed.
+        organizations_client = boto3.client("organizations", config=boto3_config)
 
         # Collect all findings
         all_findings = []
@@ -6844,7 +7181,14 @@ def lambda_handler(event, context):
                         ["AC-09"],
                         "Service-Linked Role",
                         check_agentcore_service_linked_role,
-                    )
+                    ),
+                    # AC-28 reads service control policies, not the IAM cache, so a
+                    # missing cache does not stop it.
+                    (
+                        ["AC-28"],
+                        "Gateway Authorizer Guardrail",
+                        check_agentcore_gateway_authorizer_scp,
+                    ),
                 ]
             else:
                 global_checks = [
@@ -6883,6 +7227,13 @@ def lambda_handler(event, context):
                         ["AC-09"],
                         "Service-Linked Role",
                         check_agentcore_service_linked_role,
+                    ),
+                    # AC-28 judges an organization-wide service control policy, which
+                    # is the same document whatever region a gateway is created in.
+                    (
+                        ["AC-28"],
+                        "Gateway Authorizer Guardrail",
+                        check_agentcore_gateway_authorizer_scp,
                     ),
                 ]
             for check_ids, check_name, check_func in global_checks:

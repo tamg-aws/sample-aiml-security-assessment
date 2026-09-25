@@ -6,14 +6,14 @@
     "hosted": 67,
     "fnd_ai_subject": 11,
     "total": 78,
-    "covered": 19,
+    "covered": 20,
     "tighten": 24,
     "tighten_extend": 19,
     "tighten_new_id": 5,
-    "new": 20,
+    "new": 19,
     "not_implementable": 4,
     "unassessed": 11,
-    "new_check_functions": 36,
+    "new_check_functions": 35,
     "extensions": 19,
     "extra_iam_actions": [
       "config:DescribeConfigRules",
@@ -1146,18 +1146,19 @@
       "question": "Is there an org-wide preventive control that blocks creating or updating a gateway with no inbound authorizer?",
       "assert": "SCP denying CreateGateway/UpdateGateway when GatewayAuthorizerType is NONE",
       "workload_agnostic": true,
-      "verdict": "new",
+      "verdict": "covered",
       "disposition": null,
       "target_modules": [
         "agentcore_assessments"
       ],
-      "incumbents": [],
-      "incumbent_names": [],
-      "gap": "blocked, not merely unbuilt: bedrock-agentcore:GatewayAuthorizerType is declared as a condition key of the service but is wired to zero actions, on both the machine-readable service reference and the service authorization reference page, while the sibling RuntimeAuthorizerType is wired to CreateAgentRuntime and UpdateAgentRuntime. A Deny on CreateGateway or UpdateGateway conditioned on it can never match, so the only expressible SCP is a blanket prohibition on gateways, which is a different control. Recheck the per-action key list before implementing",
-      "extra_iam": [
-        "organizations:ListPolicies",
-        "organizations:DescribePolicy"
+      "incumbents": [
+        "AC-28"
       ],
+      "incumbent_names": [
+        "AgentCore Gateway Authorizer Guardrail"
+      ],
+      "gap": "AC-28 requires a service control policy that denies both CreateGateway and UpdateGateway when bedrock-agentcore:GatewayAuthorizerType is NONE, either by naming NONE in an equals-family condition or by omitting it from a not-equals-family one, so no approved-authorizer list has to be invented; attachment targets are outside the grant and the finding says so. The condition key carries a documentation drift: the AgentCore devguide wires GatewayAuthorizerType to CreateGateway and UpdateGateway and shows sibling gateway keys used this way in SCPs, while the machine-readable service reference and the service authorization reference page wire it to zero actions. The devguide wins for feature availability. Access Analyzer validate-policy accepts the key name but is no oracle for the wiring: it also accepts RuntimeAuthorizerType on CreateGateway, a pairing neither surface declares",
+      "extra_iam": [],
       "phase": 4,
       "source": "controls/ai-specific/agentcore-gateway.yaml"
     },
@@ -1222,11 +1223,8 @@
       ],
       "incumbents": [],
       "incumbent_names": [],
-      "gap": "asserts an SCP; same Organizations read as GW-02",
-      "extra_iam": [
-        "organizations:ListPolicies",
-        "organizations:DescribePolicy"
-      ],
+      "gap": "asserts an SCP; organizations:ListPolicies and organizations:DescribePolicy are now granted to this function for GW-02's AC-28, so ID-04 costs no further permission",
+      "extra_iam": [],
       "phase": 4,
       "source": "controls/ai-specific/agentcore-identity.yaml"
     },

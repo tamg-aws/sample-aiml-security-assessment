@@ -256,6 +256,8 @@ _EXPECTED_ACTIONS = {
         "logs:GetDataProtectionPolicy",
         "oam:GetSinkPolicy",
         "oam:ListSinks",
+        "organizations:DescribePolicy",
+        "organizations:ListPolicies",
         "s3:GetObject",
         "s3:PutObject",
     },

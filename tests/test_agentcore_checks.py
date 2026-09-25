@@ -14,10 +14,13 @@ Each check is tested for:
 - Output schema validity
 """
 
+import ast
 import sys
 import json
+import inspect
 import os
 import importlib.util
+import textwrap
 from unittest.mock import patch, MagicMock
 
 import pytest
@@ -4842,6 +4845,547 @@ class TestAC27GatewayPolicyConditions:
         assert findings[0]["Status"] == "N/A"
 
 
+def _scp(statements):
+    """Return an Organizations DescribePolicy response body for one SCP."""
+    return {
+        "Policy": {
+            "Content": json.dumps({"Version": "2012-10-17", "Statement": statements})
+        }
+    }
+
+
+_GATEWAY_WRITE = ["bedrock-agentcore:CreateGateway", "bedrock-agentcore:UpdateGateway"]
+
+
+class TestAC28GatewayAuthorizerSCP:
+    """AC-28: an SCP has to deny gateway writes when the authorizer type is NONE."""
+
+    def _wire(self, mock_orgs, documents):
+        """Serve one named SCP per entry in `documents`."""
+        mock_orgs.list_policies.return_value = {
+            "Policies": [
+                {"Id": f"p-{index}", "Name": name}
+                for index, name in enumerate(documents)
+            ]
+        }
+        by_id = {
+            f"p-{index}": statements
+            for index, statements in enumerate(documents.values())
+        }
+
+        def describe_policy(PolicyId):
+            return _scp(by_id[PolicyId])
+
+        mock_orgs.describe_policy.side_effect = describe_policy
+
+    @patch("agentcore_app.organizations_client")
+    def test_an_equals_deny_on_both_writes_passes(self, mock_orgs):
+        self._wire(
+            mock_orgs,
+            {
+                "DenyOpenGateway": [
+                    {
+                        "Effect": "Deny",
+                        "Action": _GATEWAY_WRITE,
+                        "Resource": "*",
+                        "Condition": {
+                            "StringEquals": {
+                                "bedrock-agentcore:GatewayAuthorizerType": "NONE"
+                            }
+                        },
+                    }
+                ]
+            },
+        )
+
+        findings = agentcore_app.check_agentcore_gateway_authorizer_scp()
+
+        assert len(findings) == 1
+        assert findings[0]["Check_ID"] == "AC-28"
+        assert findings[0]["Status"] == "Passed"
+        assert "DenyOpenGateway" in findings[0]["Finding_Details"]
+        assert "attachment targets" in findings[0]["Resolution"]
+        assert_finding_schema(findings[0])
+
+    @patch("agentcore_app.organizations_client")
+    def test_a_not_equals_allow_list_that_omits_none_passes(self, mock_orgs):
+        self._wire(
+            mock_orgs,
+            {
+                "RequireApprovedAuthorizer": [
+                    {
+                        "Effect": "Deny",
+                        "Action": _GATEWAY_WRITE,
+                        "Resource": "*",
+                        "Condition": {
+                            "StringNotEquals": {
+                                "bedrock-agentcore:GatewayAuthorizerType": [
+                                    "AWS_IAM",
+                                    "CUSTOM_JWT",
+                                ]
+                            }
+                        },
+                    }
+                ]
+            },
+        )
+
+        findings = agentcore_app.check_agentcore_gateway_authorizer_scp()
+
+        assert findings[0]["Status"] == "Passed"
+
+    @patch("agentcore_app.organizations_client")
+    def test_a_not_equals_list_that_includes_none_leaves_none_allowed(self, mock_orgs):
+        # StringNotEquals NONE denies every authorizer type except NONE, which is
+        # the opposite of the control. A check that only looked for the key and
+        # the two actions would call this compliant.
+        self._wire(
+            mock_orgs,
+            {
+                "Inverted": [
+                    {
+                        "Effect": "Deny",
+                        "Action": _GATEWAY_WRITE,
+                        "Resource": "*",
+                        "Condition": {
+                            "StringNotEquals": {
+                                "bedrock-agentcore:GatewayAuthorizerType": "NONE"
+                            }
+                        },
+                    }
+                ]
+            },
+        )
+
+        findings = agentcore_app.check_agentcore_gateway_authorizer_scp()
+
+        assert findings[0]["Status"] == "Failed"
+        assert findings[0]["Finding"].endswith("Ineffective")
+
+    @patch("agentcore_app.organizations_client")
+    def test_a_deny_on_create_only_is_reported_as_partial(self, mock_orgs):
+        self._wire(
+            mock_orgs,
+            {
+                "CreateOnly": [
+                    {
+                        "Effect": "Deny",
+                        "Action": "bedrock-agentcore:CreateGateway",
+                        "Resource": "*",
+                        "Condition": {
+                            "StringEquals": {
+                                "bedrock-agentcore:GatewayAuthorizerType": "NONE"
+                            }
+                        },
+                    }
+                ]
+            },
+        )
+
+        findings = agentcore_app.check_agentcore_gateway_authorizer_scp()
+
+        assert findings[0]["Status"] == "Failed"
+        assert findings[0]["Finding"].endswith("Partial")
+        assert "CreateGateway" in findings[0]["Finding_Details"]
+        assert "UpdateGateway" in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.organizations_client")
+    def test_a_null_condition_is_reported_as_ineffective(self, mock_orgs):
+        self._wire(
+            mock_orgs,
+            {
+                "NullTest": [
+                    {
+                        "Effect": "Deny",
+                        "Action": _GATEWAY_WRITE,
+                        "Resource": "*",
+                        "Condition": {
+                            "Null": {"bedrock-agentcore:GatewayAuthorizerType": "true"}
+                        },
+                    }
+                ]
+            },
+        )
+
+        findings = agentcore_app.check_agentcore_gateway_authorizer_scp()
+
+        assert findings[0]["Status"] == "Failed"
+        assert findings[0]["Finding"].endswith("Ineffective")
+        assert "required member" in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.organizations_client")
+    def test_an_organization_with_no_matching_policy_is_reported_missing(
+        self, mock_orgs
+    ):
+        self._wire(
+            mock_orgs,
+            {
+                "FullAWSAccess": [{"Effect": "Allow", "Action": "*", "Resource": "*"}],
+                "DenyOtherThings": [
+                    {
+                        "Effect": "Deny",
+                        "Action": "s3:DeleteBucket",
+                        "Resource": "*",
+                    }
+                ],
+            },
+        )
+
+        findings = agentcore_app.check_agentcore_gateway_authorizer_scp()
+
+        assert findings[0]["Status"] == "Failed"
+        assert findings[0]["Finding"].endswith("Missing")
+        assert "2 service control policy(s)" in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.organizations_client")
+    def test_an_allow_statement_carrying_the_condition_is_not_coverage(self, mock_orgs):
+        # Only a Deny prevents the call; an Allow with the same condition is the
+        # SCP allow-list half and blocks nothing on its own.
+        self._wire(
+            mock_orgs,
+            {
+                "AllowShaped": [
+                    {
+                        "Effect": "Allow",
+                        "Action": _GATEWAY_WRITE,
+                        "Resource": "*",
+                        "Condition": {
+                            "StringEquals": {
+                                "bedrock-agentcore:GatewayAuthorizerType": "NONE"
+                            }
+                        },
+                    }
+                ]
+            },
+        )
+
+        findings = agentcore_app.check_agentcore_gateway_authorizer_scp()
+
+        assert findings[0]["Status"] == "Failed"
+        assert findings[0]["Finding"].endswith("Missing")
+
+    @patch("agentcore_app.organizations_client")
+    def test_a_deny_of_all_but_a_read_allow_list_covers_both_writes(self, mock_orgs):
+        # A Deny written with NotAction denies everything the list omits, so a
+        # gateway write absent from the exclusions is denied under the
+        # condition as surely as if it had been named in Action.
+        self._wire(
+            mock_orgs,
+            {
+                "DenyAllButReads": [
+                    {
+                        "Effect": "Deny",
+                        "NotAction": ["bedrock-agentcore:GetGateway"],
+                        "Resource": "*",
+                        "Condition": {
+                            "StringEquals": {
+                                "bedrock-agentcore:GatewayAuthorizerType": "NONE"
+                            }
+                        },
+                    }
+                ]
+            },
+        )
+
+        findings = agentcore_app.check_agentcore_gateway_authorizer_scp()
+
+        assert findings[0]["Status"] == "Passed"
+        assert "DenyAllButReads" in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.organizations_client")
+    def test_a_not_action_that_exempts_the_writes_is_not_coverage(self, mock_orgs):
+        # The same shape with the writes inside NotAction exempts them from the
+        # Deny, which is the opposite outcome from the same policy grammar.
+        self._wire(
+            mock_orgs,
+            {
+                "DenyAllButTheWrites": [
+                    {
+                        "Effect": "Deny",
+                        "NotAction": [
+                            "bedrock-agentcore:CreateGateway",
+                            "bedrock-agentcore:UpdateGateway",
+                        ],
+                        "Resource": "*",
+                        "Condition": {
+                            "StringEquals": {
+                                "bedrock-agentcore:GatewayAuthorizerType": "NONE"
+                            }
+                        },
+                    }
+                ]
+            },
+        )
+
+        findings = agentcore_app.check_agentcore_gateway_authorizer_scp()
+
+        assert findings[0]["Status"] == "Failed"
+        assert findings[0]["Finding"].endswith("Ineffective")
+
+    @patch("agentcore_app.organizations_client")
+    def test_a_not_action_wildcard_over_the_namespace_is_not_coverage(self, mock_orgs):
+        # A namespace wildcard in NotAction exempts every gateway write.
+        self._wire(
+            mock_orgs,
+            {
+                "DenyAllButAgentCore": [
+                    {
+                        "Effect": "Deny",
+                        "NotAction": ["bedrock-agentcore:*"],
+                        "Resource": "*",
+                        "Condition": {
+                            "StringEquals": {
+                                "bedrock-agentcore:GatewayAuthorizerType": "NONE"
+                            }
+                        },
+                    }
+                ]
+            },
+        )
+
+        findings = agentcore_app.check_agentcore_gateway_authorizer_scp()
+
+        assert findings[0]["Status"] == "Failed"
+        assert findings[0]["Finding"].endswith("Ineffective")
+
+    @patch("agentcore_app.organizations_client")
+    def test_a_statement_naming_neither_action_key_is_not_coverage(self, mock_orgs):
+        # A Deny with no Action and no NotAction reaches nothing, however
+        # exactly its condition describes the authorizer type.
+        self._wire(
+            mock_orgs,
+            {
+                "ConditionOnly": [
+                    {
+                        "Effect": "Deny",
+                        "Resource": "*",
+                        "Condition": {
+                            "StringEquals": {
+                                "bedrock-agentcore:GatewayAuthorizerType": "NONE"
+                            }
+                        },
+                    }
+                ]
+            },
+        )
+
+        findings = agentcore_app.check_agentcore_gateway_authorizer_scp()
+
+        assert findings[0]["Status"] == "Failed"
+        assert findings[0]["Finding"].endswith("Ineffective")
+
+    @patch("agentcore_app.organizations_client")
+    def test_a_wildcard_action_covers_both_writes(self, mock_orgs):
+        self._wire(
+            mock_orgs,
+            {
+                "WildcardShaped": [
+                    {
+                        "Effect": "Deny",
+                        "Action": "bedrock-agentcore:*Gateway",
+                        "Resource": "*",
+                        "Condition": {
+                            "StringEquals": {
+                                "bedrock-agentcore:GatewayAuthorizerType": "NONE"
+                            }
+                        },
+                    }
+                ]
+            },
+        )
+
+        findings = agentcore_app.check_agentcore_gateway_authorizer_scp()
+
+        assert findings[0]["Status"] == "Passed"
+
+    @patch("agentcore_app.organizations_client")
+    def test_the_key_name_is_matched_case_insensitively(self, mock_orgs):
+        # IAM condition key names are not case-sensitive, so a lower-cased
+        # spelling in the policy document is the same control.
+        self._wire(
+            mock_orgs,
+            {
+                "LowerCased": [
+                    {
+                        "Effect": "Deny",
+                        "Action": _GATEWAY_WRITE,
+                        "Resource": "*",
+                        "Condition": {
+                            "ForAnyValue:StringEquals": {
+                                "bedrock-agentcore:gatewayauthorizertype": "none"
+                            }
+                        },
+                    }
+                ]
+            },
+        )
+
+        findings = agentcore_app.check_agentcore_gateway_authorizer_scp()
+
+        assert findings[0]["Status"] == "Passed"
+
+    @patch("agentcore_app.organizations_client")
+    def test_two_policies_together_cover_both_writes(self, mock_orgs):
+        self._wire(
+            mock_orgs,
+            {
+                "DenyCreate": [
+                    {
+                        "Effect": "Deny",
+                        "Action": "bedrock-agentcore:CreateGateway",
+                        "Resource": "*",
+                        "Condition": {
+                            "StringEquals": {
+                                "bedrock-agentcore:GatewayAuthorizerType": "NONE"
+                            }
+                        },
+                    }
+                ],
+                "DenyUpdate": [
+                    {
+                        "Effect": "Deny",
+                        "Action": "bedrock-agentcore:UpdateGateway",
+                        "Resource": "*",
+                        "Condition": {
+                            "StringEquals": {
+                                "bedrock-agentcore:GatewayAuthorizerType": "NONE"
+                            }
+                        },
+                    }
+                ],
+            },
+        )
+
+        findings = agentcore_app.check_agentcore_gateway_authorizer_scp()
+
+        assert findings[0]["Status"] == "Passed"
+        assert "DenyCreate, DenyUpdate" in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.organizations_client")
+    def test_policies_are_read_from_every_page(self, mock_orgs):
+        mock_orgs.list_policies.side_effect = [
+            {"Policies": [{"Id": "p-1", "Name": "First"}], "NextToken": "page-2"},
+            {"Policies": [{"Id": "p-2", "Name": "Second"}]},
+        ]
+        mock_orgs.describe_policy.return_value = _scp(
+            [
+                {
+                    "Effect": "Deny",
+                    "Action": _GATEWAY_WRITE,
+                    "Resource": "*",
+                    "Condition": {
+                        "StringEquals": {
+                            "bedrock-agentcore:GatewayAuthorizerType": "NONE"
+                        }
+                    },
+                }
+            ]
+        )
+
+        findings = agentcore_app.check_agentcore_gateway_authorizer_scp()
+
+        assert mock_orgs.list_policies.call_count == 2
+        assert findings[0]["Status"] == "Passed"
+        assert "First, Second" in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.organizations_client")
+    def test_a_member_account_denial_reads_na(self, mock_orgs):
+        mock_orgs.list_policies.side_effect = ClientError(
+            {"Error": {"Code": "AccessDeniedException", "Message": "no"}},
+            "ListPolicies",
+        )
+
+        findings = agentcore_app.check_agentcore_gateway_authorizer_scp()
+
+        assert findings[0]["Check_ID"] == "AC-28"
+        assert findings[0]["Status"] == "N/A"
+        assert "AccessDeniedException" in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.organizations_client")
+    def test_an_account_outside_an_organization_reads_na(self, mock_orgs):
+        mock_orgs.list_policies.side_effect = ClientError(
+            {"Error": {"Code": "AWSOrganizationsNotInUseException", "Message": "no"}},
+            "ListPolicies",
+        )
+
+        findings = agentcore_app.check_agentcore_gateway_authorizer_scp()
+
+        assert findings[0]["Status"] == "N/A"
+
+    @patch("agentcore_app.organizations_client")
+    def test_a_throttled_list_is_incomplete_not_failed(self, mock_orgs):
+        mock_orgs.list_policies.side_effect = ClientError(
+            {"Error": {"Code": "TooManyRequestsException", "Message": "slow down"}},
+            "ListPolicies",
+        )
+
+        findings = agentcore_app.check_agentcore_gateway_authorizer_scp()
+
+        assert findings[0]["Status"] == "N/A"
+        assert findings[0]["Finding"].endswith("Incomplete")
+
+    @patch("agentcore_app.organizations_client")
+    def test_one_unreadable_policy_does_not_hide_the_population_verdict(
+        self, mock_orgs
+    ):
+        mock_orgs.list_policies.return_value = {
+            "Policies": [
+                {"Id": "p-1", "Name": "Unreadable"},
+                {"Id": "p-2", "Name": "DenyOpenGateway"},
+            ]
+        }
+
+        def describe_policy(PolicyId):
+            if PolicyId == "p-1":
+                raise ClientError(
+                    {"Error": {"Code": "AccessDeniedException", "Message": "no"}},
+                    "DescribePolicy",
+                )
+            return _scp(
+                [
+                    {
+                        "Effect": "Deny",
+                        "Action": _GATEWAY_WRITE,
+                        "Resource": "*",
+                        "Condition": {
+                            "StringEquals": {
+                                "bedrock-agentcore:GatewayAuthorizerType": "NONE"
+                            }
+                        },
+                    }
+                ]
+            )
+
+        mock_orgs.describe_policy.side_effect = describe_policy
+
+        findings = agentcore_app.check_agentcore_gateway_authorizer_scp()
+
+        assert len(findings) == 2
+        assert findings[0]["Status"] == "N/A"
+        assert "Unreadable" in findings[0]["Finding_Details"]
+        assert findings[1]["Status"] == "Passed"
+        for finding in findings:
+            assert_finding_schema(finding)
+
+    @patch("agentcore_app.organizations_client")
+    def test_a_policy_that_is_not_json_does_not_stop_the_check(self, mock_orgs):
+        mock_orgs.list_policies.return_value = {
+            "Policies": [{"Id": "p-1", "Name": "Corrupt"}]
+        }
+        mock_orgs.describe_policy.return_value = {"Policy": {"Content": "not json"}}
+
+        findings = agentcore_app.check_agentcore_gateway_authorizer_scp()
+
+        assert findings[0]["Status"] == "Failed"
+        assert findings[0]["Finding"].endswith("Missing")
+
+    @patch("agentcore_app.organizations_client", None)
+    def test_no_client_is_na(self):
+        findings = agentcore_app.check_agentcore_gateway_authorizer_scp()
+        assert findings[0]["Check_ID"] == "AC-28"
+        assert findings[0]["Status"] == "N/A"
+
+
 class TestGatewayCheckRegistration:
     """AC-24..AC-27 must reach the backfill paths, and the API must answer them."""
 
@@ -4910,3 +5454,85 @@ class TestGatewayCheckRegistration:
         assert set(agentcore_app.GATEWAY_TARGET_CREDENTIAL_PROVIDER_TYPES) == set(
             provider_type.enum
         )
+
+
+class TestAC28CheckRegistration:
+    """AC-28 is organization-wide, so it runs once and not per scanned region."""
+
+    def test_the_scp_check_is_not_in_the_regional_tuples(self):
+        assert "AC-28" not in agentcore_app.REGIONAL_AGENTCORE_CHECK_IDS
+        assert "AC-28" not in agentcore_app.AGENTCORE_RUNTIME_CHECK_IDS
+
+    def test_the_handler_registers_the_scp_check_on_both_cache_paths(self):
+        # The check reads Organizations and not the IAM permission cache, so a
+        # missing cache must not skip it. Without this assertion the check can
+        # exist, pass its own tests, and never run.
+        source = textwrap.dedent(inspect.getsource(agentcore_app.lambda_handler))
+        registrations = [
+            node
+            for node in ast.walk(ast.parse(source))
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name) and target.id == "global_checks"
+                for target in node.targets
+            )
+        ]
+        assert len(registrations) == 2
+        for registration in registrations:
+            assert "check_agentcore_gateway_authorizer_scp" in ast.unparse(
+                registration.value
+            )
+
+    def test_the_organizations_operation_contracts_exist(self):
+        credentials = {
+            "region_name": "us-east-1",
+            "aws_access_key_id": "testing",
+            "aws_secret_access_key": "testing",  # pragma: allowlist secret - synthetic test credential
+        }
+        model = agentcore_app.boto3.client(
+            "organizations", **credentials
+        ).meta.service_model
+        list_policies = model.operation_model("ListPolicies")
+        assert list_policies.input_shape.required_members == ["Filter"]
+        assert "SERVICE_CONTROL_POLICY" in (
+            list_policies.input_shape.members["Filter"].enum
+        )
+        assert "NextToken" in list_policies.input_shape.members
+        assert "NextToken" in list_policies.output_shape.members
+        assert "Content" in (
+            model.operation_model("DescribePolicy")
+            .output_shape.members["Policy"]
+            .members
+        )
+
+    def test_the_authorizer_type_is_a_required_member_of_create_gateway(self):
+        # This is what makes a Null condition on the key inert, which AC-28
+        # reports as an ineffective guardrail rather than as coverage.
+        credentials = {
+            "region_name": "us-east-1",
+            "aws_access_key_id": "testing",
+            "aws_secret_access_key": "testing",  # pragma: allowlist secret - synthetic test credential
+        }
+        model = agentcore_app.boto3.client(
+            "bedrock-agentcore-control", **credentials
+        ).meta.service_model
+        create_gateway = model.operation_model("CreateGateway").input_shape
+        assert "authorizerType" in create_gateway.required_members
+        enum = create_gateway.members["authorizerType"].enum
+        assert agentcore_app.GATEWAY_AUTHORIZER_UNAUTHENTICATED_VALUE in enum
+
+    def test_organizations_resolves_to_one_global_endpoint(self):
+        # The handler builds this client without a region because Organizations
+        # answers from a single endpoint; a region-scoped client would read the
+        # same policies twice under a multi-region scan.
+        credentials = {
+            "aws_access_key_id": "testing",
+            "aws_secret_access_key": "testing",  # pragma: allowlist secret - synthetic test credential
+        }
+        endpoints = {
+            agentcore_app.boto3.client(
+                "organizations", region_name=region, **credentials
+            ).meta.endpoint_url
+            for region in ("us-east-1", "us-west-2", "eu-west-1")
+        }
+        assert len(endpoints) == 1
