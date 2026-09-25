@@ -66,6 +66,18 @@ sys.dont_write_bytecode = True
 FAIL = 1
 USAGE = 2
 
+
+# Every refusal goes through here, because `raise SystemExit("<message>")` prints the
+# message and exits **1** -- the code this file's docstring reserves for "at least one
+# assertion failed". All three refusals below are nothing-could-be-measured
+# conditions, so each one spent that whole distinction on a wrapper that would read
+# them as a triageable failure. Spelled as mutate.py and push_safety.py already spell
+# it, so the three scripts refuse the same way.
+def die(msg: str, code: int = USAGE) -> None:
+    print(f"ERROR: {msg}", file=sys.stderr)
+    raise SystemExit(code)
+
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 MODULES = REPO_ROOT / "aiml-security-assessment" / "functions" / "security"
 
@@ -99,7 +111,7 @@ def producers_from_shipped_maps() -> tuple[str, ...]:
         for path in MODULES.glob("*/aisf_compliance_*.py")
     )
     if not found:
-        raise SystemExit(
+        die(
             f"no aisf_compliance_*.py under {MODULES}: there is no producer to "
             "measure. Not an empty measurement: an empty producer set marks every "
             "run in the bucket complete, because all([]) is True."
@@ -354,7 +366,7 @@ def newest_execution(bucket: str, region: str | None):
     complete = [k for k, v in runs.items() if all(p in v for p in PRODUCERS)]
     if not complete:
         partial = {k: sorted(v) for k, v in runs.items()}
-        raise SystemExit(
+        die(
             f"no execution in s3://{bucket} has a CSV for all of {PRODUCERS}.\n"
             f"found: {partial or 'no report CSVs at all'}\n"
             "Refusing to measure a partial set: it would report a pass for the "
@@ -379,7 +391,7 @@ def from_directory(path: Path):
     for module in PRODUCERS:
         candidates = sorted(path.glob(f"{module}*.csv"))
         if not candidates:
-            raise SystemExit(
+            die(
                 f"{path} has no CSV matching {module}*.csv; a partial set is not "
                 "measured, because a pass would cover the producer it never read."
             )
