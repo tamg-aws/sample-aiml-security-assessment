@@ -56,6 +56,15 @@ BEDROCK = "aiml-security-assessment/functions/security/bedrock_assessments/app.p
 
 BUILD_LEDGER = "aisf-parity/build_ledger.py"
 
+# Phase 2's surfaces: the generated tag maps, the schema that looks a tag up, and
+# the CSV fieldnames list a tag has to reach.
+SECURITY = "aiml-security-assessment/functions/security"
+MAP_BEDROCK = f"{SECURITY}/bedrock_assessments/aisf_compliance_bedrock.py"
+MAP_SAGEMAKER = f"{SECURITY}/sagemaker_assessments/aisf_compliance_sagemaker.py"
+MAP_AGENTCORE = f"{SECURITY}/agentcore_assessments/aisf_compliance_agentcore.py"
+SCHEMA_BEDROCK = f"{SECURITY}/bedrock_assessments/schema.py"
+AGENTCORE = f"{SECURITY}/agentcore_assessments/app.py"
+
 # Each find-string must occur EXACTLY ONCE in its file; the run aborts otherwise.
 # That replaces the `nth` occurrence selector the prowler harness carries, whose
 # 0-based field and 1-based display have mutated the wrong arm of a duplicated
@@ -144,6 +153,63 @@ MUTATIONS = [
         'asserts this; nothing to write |"\n',
         "replace": "        f\"| covered | {s['total']} | an incumbent already "
         'asserts this; nothing to write |"\n',
+    },
+    # ---------------------------------------------------------------- phase 2
+    # The tag column. Mutations 9 and 10 are the two halves of the qualifier
+    # vocabulary and are both here because they fail different branches of the
+    # same gate: a `tighten` row wants `(partial)`, a multi-leg `covered` row
+    # wants `(1 of N checks)`, and an earlier hand-run of 9 hit the `(partial)`
+    # in this file's own module docstring instead of a map entry, which left gate
+    # 14 green and looked like a weak gate. The find-strings below name the
+    # check id, so they cannot drift onto prose.
+    {
+        "name": "a (partial) qualifier dropped from a tighten row's tag",
+        "file": MAP_BEDROCK,
+        "defect": "BR-04's tag reads as a full assertion of AIR-BDR-MDL-02, a "
+        "control the ledger says it only partly covers, so a Passed BR-20 row "
+        "publishes a pass against the whole control -- the same overclaim gate "
+        "11 refuses for the derived AISF- rows, arriving by the other surface",
+        "find": '    "BR-04": "AISF AIR-BDR-MDL-02 (partial)",\n',
+        "replace": '    "BR-04": "AISF AIR-BDR-MDL-02",\n',
+    },
+    {
+        "name": "a (1 of N checks) qualifier dropped from a joint leg",
+        "file": MAP_SAGEMAKER,
+        "defect": "SM-01 claims to assert AIR-SGM-TRN-05 alone, when the ledger "
+        "names three incumbents for it; a reader who sees SM-01 Passed concludes "
+        "the control is met without SM-03 or SM-09 having run",
+        "find": '    "SM-01": "AISF AIR-SGM-TRN-05 (1 of 3 checks)",\n',
+        "replace": '    "SM-01": "AISF AIR-SGM-TRN-05",\n',
+    },
+    {
+        "name": "a tag placed in a module that does not emit the check",
+        "file": MAP_AGENTCORE,
+        "defect": "the lookup runs inside the producer that emits the check, so "
+        "a BR-10 entry in agentcore's map is never consulted and BR-10's rows "
+        "ship untagged. The symptom is an empty column, not an error, which is "
+        "why ownership is asserted rather than assumed",
+        "find": '    "AC-02": ',
+        "replace": '    "BR-10": "AISF AIR-BDR-GRD-01",\n    "AC-02": ',
+    },
+    {
+        "name": "the tag sentinel defaults to empty instead of None (length-identical)",
+        "file": SCHEMA_BEDROCK,
+        "defect": "create_finding only looks a tag up when the argument is None, "
+        'so defaulting to "" makes every bedrock row untagged while the column '
+        "still exists and every CSV still validates. Same byte count, so a stale "
+        "pyc keyed on mtime and size cannot see the edit either",
+        "find": "    compliance_frameworks: Optional[str] = None,\n",
+        "replace": '    compliance_frameworks: Optional[str] = "",\n',
+    },
+    {
+        "name": "agentcore's empty-report header loses the column",
+        "file": AGENTCORE,
+        "defect": "agentcore builds its fieldnames twice, and only the "
+        "no-findings branch is mutated here: an empty report ships 8 columns and "
+        "a populated one 9, so a consumer concatenating reports across accounts "
+        "sees the column appear and disappear rather than a failure",
+        "find": '                "Region",\n                "Compliance_Frameworks",\n',
+        "replace": '                "Region",\n',
     },
 ]
 
