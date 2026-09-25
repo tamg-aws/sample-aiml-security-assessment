@@ -737,7 +737,23 @@ ROWS = [
         [],
         4,
     ),
-    ("AIR-ACR-MEM-07", NEW, None, "agentcore_assessments", [], "", [], 4),
+    (
+        "AIR-ACR-MEM-07",
+        NEW,
+        None,
+        "agentcore_assessments",
+        [],
+        "Left open in phase 4: no workload-independent invariant here reaches Failed per "
+        "memory. eventExpiryDuration is required at CreateMemory, 3 to 365 days in the "
+        "pinned 2023-06-05 model, and required again on the Memory shape GetMemory "
+        "returns, so every memory carries a retention bound and a presence check passes "
+        "unconditionally. Which value is short enough is the workload owner's judgment, "
+        "and this row will not invent a ceiling. The namespace-scope half of the control "
+        "is asserted under AIR-ACR-MEM-01 by AC-07 and AC-23, and its log-retention "
+        "clause asks for a compliance schedule only the workload owner can name",
+        [],
+        4,
+    ),
     (
         "AIR-ACR-MEM-12",
         COVERED,
