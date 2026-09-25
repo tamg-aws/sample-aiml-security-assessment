@@ -6,14 +6,14 @@ Generated 2026-09-25 by `aisf-parity/build_ledger.py`. Do not hand-edit: change 
 
 | verdict | rows | meaning |
 |---|---|---|
-| covered | 20 | an incumbent already asserts this; nothing to write |
-| tighten / extend | 19 | incumbent name is honest, its assertion is narrower; extend it in place |
+| covered | 25 | an incumbent already asserts this; nothing to write |
+| tighten / extend | 17 | incumbent name is honest, its assertion is narrower; extend it in place |
 | tighten / new_id | 5 | incumbent name claims more than it asserts; allocate a new id beside it |
-| new | 19 | no incumbent asserts any part of it |
+| new | 16 | no incumbent asserts any part of it |
 | not_implementable | 4 | flagged machine_checkable in the ledger but is not checkable from configuration |
 | unassessed | 11 | in scope, dedup pass not yet run |
 
-**35 new check functions and 19 extensions to existing checks.**
+**32 new check functions and 17 extensions to existing checks.**
 
 ## New IAM actions required
 
@@ -77,6 +77,11 @@ Generated 2026-09-25 by `aisf-parity/build_ledger.py`. Do not hand-edit: change 
 | `AIR-ACR-GW-05` | covered | — | `agentcore_assessments` | `AG-27`, `AC-24` | AG-27 holds the WAF leg; AC-24 requires an ACTIVE gateway rate limit carrying a requests, tokens or connections ceiling, because dimensions is the only required member of a limit entry and a limit can therefore name a dimension and bound nothing |
 | `AIR-ACR-GW-08` | covered | — | `agentcore_assessments` | `AC-25` | AC-25 reads credentialProviderConfigurations per target through GetGatewayTarget, which is the only surface that carries it: the ListGatewayTargets summary omits the field. The control's second leg, a Lambda target scoped to one function ARN, is not expressible because the target ARN members reject a wildcard |
 | `AIR-ACR-GW-10` | covered | — | `agentcore_assessments` | `AC-19`, `AC-20`, `AC-26` | AC-19 pairs each AgentCore delivery source with its delivery and AC-20 asserts masking plus a customer managed key; AC-26 adds the two legs neither held, an explicitly configured retentionInDays and a key policy that does not let every principal decrypt without a condition |
+| `AIR-ACR-ID-04` | covered | — | `agentcore_assessments` | `AC-29` | AC-29 requires a service control policy that denies both CreateAgentRuntime and UpdateAgentRuntime when bedrock-agentcore:RuntimeAuthorizerType is AWS_IAM, so a runtime cannot be created on, or moved back to, the SigV4 mode that authenticates the hosting application's shared role instead of the end user; a policy written the other way round, denying CUSTOM_JWT, is reported separately because it reads as configured to anyone counting policies. organizations:ListPolicies and organizations:DescribePolicy are granted to this function for GW-02's AC-28, so ID-04 costs no further permission. Attachment targets are outside the grant and every finding says so |
+| `AIR-ACR-ID-05` | covered | — | `agentcore_assessments` | `AC-14`, `AC-34` | AC-14 has the token vault CMK leg; AC-34 adds the secret-scan leg, reading GetAgentRuntime.environmentVariables and failing a runtime whose definition holds an access key id or a PEM private key inline. Only variable names reach the finding because the API models the map as sensitive, and the resolution states the blind spot: a value holding a slash reads as a secret name, so the remaining values are the reader's to confirm |
+| `AIR-ACR-ID-08` | covered | — | `agentcore_assessments` | `AC-30` | AC-30 reads GetAgentRuntime.authorizerConfiguration per runtime: an absent configuration means every invoke is SigV4-signed, and a customJWTAuthorizer that pins neither allowedAudience nor allowedClients accepts every token its issuer minted for every application registered there, so the claims are validated but not against this agent. allowedScopes and customClaims are credited in the detail and cannot substitute, because a scope bounds what a token may ask for and not who it was minted for |
+| `AIR-ACR-ID-10` | covered | — | `agentcore_assessments` | `AC-33` | AC-33 judges the resource element on the five token issuance actions per cached role and user: a resource ending in a wildcard mints a token for every workload identity in the account, while a resource naming one identity bounds the grant to that agent. A grant that names only the workload identity directory is reported separately at medium, because the service authorization reference marks both the directory and the identity required on these actions and never says whether the directory alone authorizes the call, so that grant either reaches every identity the directory holds or authorizes nothing |
+| `AIR-ACR-ID-11` | covered | — | `agentcore_assessments` | `AC-31`, `AC-32` | AG-24 passed every CUSTOM_JWT gateway on the authorizer type alone. AC-31 reads the authorizer's allow-lists and fails a gateway that pins neither allowedAudience nor allowedClients, because it then honours any token its issuer minted for any application registered there; allowedScopes and customClaims bound what a token may ask for and not who minted it for whom, so they are credited but do not substitute. AC-32 covers the second door, where the token-exchange APIs take an end user's JWT without passing a gateway authorizer at all, and fails a cached principal holding GetWorkloadAccessTokenForJWT or CompleteResourceTokenAuth with no InboundJwtClaim condition |
 | `AIR-ACR-MEM-01` | covered | — | `agentcore_assessments` | `AC-07`, `AC-23` | AC-07 asserts a customer managed key and an {actorId} namespace per memory, AC-23 asserts that no cached role or user reads memory records without a namespace, strategy, actor or session condition |
 | `AIR-ACR-MEM-12` | covered | — | `agentcore_assessments` | `AC-18` | AC-18 asserts that a CloudTrail advanced event selector logs data events for AWS::BedrockAgentCore::Memory whenever the region holds a memory resource |
 | `AIR-ACR-OBS-02` | covered | — | `agentcore_assessments` | `AC-18` | AC-18 asserts data-event coverage per resource family, so a trail that logs only the runtime types still fails for memory and for the built-in tools |
@@ -87,8 +92,6 @@ Generated 2026-09-25 by `aisf-parity/build_ledger.py`. Do not hand-edit: change 
 | `AIR-ACR-EVAL-01` | tighten | extend | `agentcore_assessments` | `AC-02` | AC-02 detects AgentCore full-access and wildcard grants only, so a role holding a single over-broad named action passes it |
 | `AIR-ACR-EVAL-05` | tighten | new_id | `agentcore_assessments` | `AC-17` | AC-17 is named "Online Evaluation Coverage" but tests only status == ACTIVE, executionStatus == ENABLED and bool(evaluators); it never reads a sampling rate and never asks which evaluators, so coverage is the one thing it does not measure |
 | `AIR-ACR-EVAL-06` | tighten | new_id | `agentcore_assessments` | `AC-17` | AC-17 is named "Online Evaluation Coverage" and never asks which evaluators are attached, so it cannot distinguish a safety evaluator from a latency one |
-| `AIR-ACR-ID-05` | tighten | extend | `agentcore_assessments` | `AC-14` | AC-14 has the CMK leg; the string 'secret' appears 0 times in the module, so the secret-scan leg is unwritten |
-| `AIR-ACR-ID-10` | tighten | extend | `agentcore_assessments` | `AC-02` | AC-02 detects full-access and wildcard grants only |
 | `AIR-ACR-PAY-01` | tighten | extend | `agentcore_assessments` | `AC-02` | AC-02 detects full-access and wildcard grants only |
 | `AIR-ACR-POL-01` | tighten | extend | `agentcore_assessments` | `AG-25` | AG-25 tests mode ENFORCE plus status/enforcementMode ACTIVE, with no default-deny leg, no decision log, and nothing session-aware |
 | `AIR-ACR-POL-04` | tighten | extend | `agentcore_assessments` | `AC-11` | AC-11's presence-only CMK test is sound; POL-04 adds key-policy scoping plus a disable/delete alarm |
@@ -101,9 +104,6 @@ Generated 2026-09-25 by `aisf-parity/build_ledger.py`. Do not hand-edit: change 
 | `AIR-ACR-EVAL-03` | new | — | `agentcore_assessments` | — | confused-deputy conditions absent: SourceAccount/SourceArn are 1 hit corpus-wide, in sagemaker_assessments, none in AgentCore |
 | `AIR-ACR-EVAL-04` *(workload-specific)* | new | — | `agentcore_assessments` | — | — |
 | `AIR-ACR-EVAL-07` | new | — | `agentcore_assessments` | — | — |
-| `AIR-ACR-ID-04` | new | — | `agentcore_assessments` | — | asserts an SCP; organizations:ListPolicies and organizations:DescribePolicy are now granted to this function for GW-02's AC-28, so ID-04 costs no further permission |
-| `AIR-ACR-ID-08` | new | — | `agentcore_assessments` | — | GetAgentRuntime.authorizerConfiguration exists in botocore 1.43.85 and is never read anywhere; AG-24 is gateway-only, ID-08 is about the runtime |
-| `AIR-ACR-ID-11` | new | — | `agentcore_assessments` | — | the corpus reads authorizerType exactly once, at :3578, and never reads authorizerConfiguration; customJWTAuthorizer.{allowedAudience, allowedClients, allowedScopes, customClaims, discoveryUrl} are all present in the API and unread, so a gateway that trusts any issuer passes AG-24 today |
 | `AIR-ACR-MEM-07` *(workload-specific)* | new | — | `agentcore_assessments` | — | — |
 | `AIR-ACR-POL-06` *(workload-specific)* | new | — | `agentcore_assessments` | — | — |
 | `AIR-ACR-RT-04` *(workload-specific)* | new | — | `agentcore_assessments` | — | — |

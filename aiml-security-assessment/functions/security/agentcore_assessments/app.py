@@ -158,6 +158,25 @@ AGENTCORE_GATEWAY_CONDITION_KEY_REFERENCE_URL = (
     "https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/"
     "security-gateway-condition-keys.html"
 )
+AGENTCORE_RUNTIME_INBOUND_AUTH_REFERENCE_URL = (
+    "https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/runtime-oauth.html"
+)
+AGENTCORE_GATEWAY_INBOUND_AUTH_REFERENCE_URL = (
+    "https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/"
+    "gateway-inbound-auth.html"
+)
+AGENTCORE_IAM_CONDITION_KEY_REFERENCE_URL = (
+    "https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/"
+    "security_iam_service-with-iam.html"
+)
+AGENTCORE_WORKLOAD_IDENTITY_SCOPE_REFERENCE_URL = (
+    "https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/"
+    "scope-credential-provider-access.html"
+)
+AGENTCORE_RUNTIME_SECRET_REFERENCE_URL = (
+    "https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/"
+    "runtime-security-best-practices.html"
+)
 
 
 def _assessment_error_label(error: Exception) -> str:
@@ -335,6 +354,9 @@ REGIONAL_AGENTCORE_CHECK_IDS = (
     "AC-25",
     "AC-26",
     "AC-27",
+    "AC-30",
+    "AC-31",
+    "AC-34",
 )
 
 AGENTCORE_RUNTIME_CHECK_IDS = (
@@ -360,6 +382,9 @@ AGENTCORE_RUNTIME_CHECK_IDS = (
     "AC-25",
     "AC-26",
     "AC-27",
+    "AC-30",
+    "AC-31",
+    "AC-34",
 )
 
 NATIVE_AGENTIC_AGENTCORE_CHECK_NAMES = {
@@ -6455,9 +6480,10 @@ GATEWAY_AUTHORIZER_CONDITION_KEY = "bedrock-agentcore:gatewayauthorizertype"
 GATEWAY_AUTHORIZER_UNAUTHENTICATED_VALUE = "NONE"
 
 # A Deny fires when the operator matches, so an equals-family operator naming
-# NONE and a not-equals-family operator that omits NONE both deny NONE. A Null
-# test cannot: authorizerType is a required member of CreateGateway, so the key
-# is always present and `Null: true` never matches.
+# the value and a not-equals-family operator that omits it both deny that value.
+# A Null test can do neither here: the authorizer type is a required member of
+# the create request, so the key is always present and `Null: true` never
+# matches.
 SCP_DENY_VALUE_INCLUDES_OPERATORS = (
     "stringequals",
     "stringequalsignorecase",
@@ -6469,6 +6495,26 @@ SCP_DENY_VALUE_EXCLUDES_OPERATORS = (
     "stringnotlike",
 )
 SCP_SET_OPERATOR_PREFIXES = ("forallvalues:", "foranyvalue:")
+
+RUNTIME_WRITE_ACTIONS = {
+    "bedrock-agentcore:createagentruntime": "CreateAgentRuntime",
+    "bedrock-agentcore:updateagentruntime": "UpdateAgentRuntime",
+}
+
+RUNTIME_AUTHORIZER_CONDITION_KEY = "bedrock-agentcore:runtimeauthorizertype"
+
+# A runtime carries one of two inbound auth modes, "either IAM SigV4 or JWT
+# Bearer Token based inbound auth, but not both simultaneously". Only the JWT
+# path proves who the end user is: it "validates the token's issuer, signature,
+# and expiry", while the SigV4 path authenticates the calling AWS principal and
+# takes the end user from a request header that "does not verify the userId
+# against an authenticated end-user identity". Both spellings are the service's
+# own: no API member carries a runtime authorizer type and no page documents
+# this condition key's values, but the three enums that do name these modes,
+# AuthorizerType for gateways plus PaymentsAuthorizerType and
+# RegistryAuthorizerType, spell them AWS_IAM and CUSTOM_JWT.
+RUNTIME_AUTHORIZER_UNVERIFIED_USER_VALUE = "AWS_IAM"
+RUNTIME_AUTHORIZER_VERIFIED_USER_VALUE = "CUSTOM_JWT"
 
 # The codes Organizations raises when this account cannot see the organization's
 # policies at all, as opposed to seeing them and finding no guardrail. Both
@@ -6514,8 +6560,10 @@ def _condition_values(raw: Any) -> List[str]:
     return [str(raw)]
 
 
-def _statement_denies_unauthenticated_gateway(statement: Dict[str, Any]) -> bool:
-    """Return whether a Deny statement's condition excludes authorizer type NONE."""
+def _statement_condition_denies_value(
+    statement: Dict[str, Any], key: str, value: str
+) -> bool:
+    """Return whether a Deny statement's condition fires for one key value."""
     condition = statement.get("Condition")
     if not isinstance(condition, dict):
         return False
@@ -6528,34 +6576,37 @@ def _statement_denies_unauthenticated_gateway(statement: Dict[str, Any]) -> bool
             if name.startswith(prefix):
                 name = name[len(prefix) :]
                 break
-        for key, raw in entries.items():
-            if str(key).strip().lower() != GATEWAY_AUTHORIZER_CONDITION_KEY:
+        for entry_key, raw in entries.items():
+            if str(entry_key).strip().lower() != key:
                 continue
-            values = {value.strip().upper() for value in _condition_values(raw)}
+            values = {entry.strip().upper() for entry in _condition_values(raw)}
             if name in SCP_DENY_VALUE_INCLUDES_OPERATORS:
-                if GATEWAY_AUTHORIZER_UNAUTHENTICATED_VALUE in values:
+                if value in values:
                     return True
             elif name in SCP_DENY_VALUE_EXCLUDES_OPERATORS:
-                if GATEWAY_AUTHORIZER_UNAUTHENTICATED_VALUE not in values:
+                if value not in values:
                     return True
     return False
 
 
-def _scp_gateway_authorizer_coverage(document: Any) -> Tuple[Set[str], bool]:
-    """Return which gateway write actions one SCP guards, and whether it tries.
+def _scp_authorizer_deny_coverage(
+    document: Any, actions: Dict[str, str], key: str, value: str
+) -> Tuple[Set[str], bool]:
+    """Return which of `actions` one SCP denies for `key` = `value`, and whether
+    the policy conditions on the key at all.
 
     The second value separates a policy that never mentions the authorizer type
-    from one that mentions it in a shape that cannot deny NONE, because the two
-    need different remediation.
+    from one that mentions it in a shape that cannot deny the value, because the
+    two need different remediation.
     """
     covered: Set[str] = set()
     names_key = False
     for statement in _document_statements(document, effect="Deny"):
-        if GATEWAY_AUTHORIZER_CONDITION_KEY in _statement_condition_keys(statement):
+        if key in _statement_condition_keys(statement):
             names_key = True
-        if not _statement_denies_unauthenticated_gateway(statement):
+        if not _statement_condition_denies_value(statement, key, value):
             continue
-        for action in GATEWAY_WRITE_ACTIONS:
+        for action in actions:
             if _statement_matches_action(statement, action):
                 covered.add(action)
     return covered, names_key
@@ -6642,7 +6693,12 @@ def check_agentcore_gateway_authorizer_scp() -> List[Dict[str, Any]]:
             continue
 
         content = (detail.get("Policy") or {}).get("Content", "")
-        covered, names_key = _scp_gateway_authorizer_coverage(content)
+        covered, names_key = _scp_authorizer_deny_coverage(
+            content,
+            GATEWAY_WRITE_ACTIONS,
+            GATEWAY_AUTHORIZER_CONDITION_KEY,
+            GATEWAY_AUTHORIZER_UNAUTHENTICATED_VALUE,
+        )
         if covered:
             covered_actions |= covered
             guarding_policies.append(policy_name)
@@ -6765,6 +6821,1406 @@ def check_agentcore_gateway_authorizer_scp() -> List[Dict[str, Any]]:
             status=StatusEnum.FAILED,
         )
     )
+    return findings
+
+
+def check_agentcore_runtime_authorizer_scp() -> List[Dict[str, Any]]:
+    """AC-29: Require an SCP that keeps a runtime off SigV4-only inbound auth.
+
+    A runtime deployed with the default IAM SigV4 inbound auth authenticates the
+    calling AWS principal, which for a hosting application is one shared role
+    for every end user. The end user then arrives in the
+    X-Amzn-Bedrock-AgentCore-Runtime-User-Id header, which the service does not
+    verify against an authenticated identity, so one caller can ask for another
+    user's tokens. The preventive control is a service control policy that
+    denies CreateAgentRuntime and UpdateAgentRuntime when
+    bedrock-agentcore:RuntimeAuthorizerType is AWS_IAM. Update matters as much
+    as create: a Deny on create alone leaves a JWT runtime one
+    UpdateAgentRuntime call away from SigV4.
+
+    A policy written the other way round, denying the JWT mode and admitting
+    SigV4, is reported separately: it is a guardrail pointed at the wrong value
+    and reads as configured to anyone counting policies.
+
+    The check reads policy content only, so every finding says that attachment
+    is still the reader's to confirm.
+    """
+    if organizations_client is None:
+        return [
+            create_finding(
+                check_id="AC-29",
+                finding_name="AgentCore Runtime Authorizer Guardrail",
+                finding_details="Organizations client not available.",
+                resolution="No action required unless this account is in an organization.",
+                reference=AGENTCORE_RUNTIME_INBOUND_AUTH_REFERENCE_URL,
+                severity=SeverityEnum.INFORMATIONAL,
+                status=StatusEnum.NA,
+            )
+        ]
+
+    try:
+        policies = _paginate_aws_list(
+            organizations_client,
+            "list_policies",
+            "Policies",
+            token_request_key="NextToken",
+            token_response_key="NextToken",
+            Filter="SERVICE_CONTROL_POLICY",
+        )
+    except Exception as error:
+        if _assessment_error_label(error) in ORGANIZATIONS_UNREADABLE_ERROR_CODES:
+            return [
+                create_finding(
+                    check_id="AC-29",
+                    finding_name="AgentCore Runtime Authorizer Guardrail",
+                    finding_details=(
+                        "Service control policies could not be listed from this "
+                        f"account: {_assessment_error_label(error)}. A member "
+                        "account cannot read the organization's policies."
+                    ),
+                    resolution=(
+                        "Run the assessment from the management account or an "
+                        "Organizations delegated administrator, with "
+                        "organizations:ListPolicies and organizations:DescribePolicy."
+                    ),
+                    reference=AGENTCORE_RUNTIME_INBOUND_AUTH_REFERENCE_URL,
+                    severity=SeverityEnum.INFORMATIONAL,
+                    status=StatusEnum.NA,
+                )
+            ]
+        return [
+            _incomplete_check_finding(
+                check_id="AC-29",
+                finding_name="AgentCore Runtime Authorizer Guardrail",
+                error=error,
+                reference=AGENTCORE_RUNTIME_INBOUND_AUTH_REFERENCE_URL,
+            )
+        ]
+
+    covered_actions: Set[str] = set()
+    inverted_actions: Set[str] = set()
+    guarding_policies: List[str] = []
+    inverted_policies: List[str] = []
+    attempting_policies: List[str] = []
+    read_errors: List[Tuple[str, Exception]] = []
+
+    for policy in policies:
+        policy_name = policy.get("Name", policy.get("Id", "unknown"))
+        try:
+            detail = organizations_client.describe_policy(PolicyId=policy["Id"])
+        except Exception as error:
+            read_errors.append((policy_name, error))
+            continue
+
+        content = (detail.get("Policy") or {}).get("Content", "")
+        covered, names_key = _scp_authorizer_deny_coverage(
+            content,
+            RUNTIME_WRITE_ACTIONS,
+            RUNTIME_AUTHORIZER_CONDITION_KEY,
+            RUNTIME_AUTHORIZER_UNVERIFIED_USER_VALUE,
+        )
+        inverted, _ = _scp_authorizer_deny_coverage(
+            content,
+            RUNTIME_WRITE_ACTIONS,
+            RUNTIME_AUTHORIZER_CONDITION_KEY,
+            RUNTIME_AUTHORIZER_VERIFIED_USER_VALUE,
+        )
+        if covered:
+            covered_actions |= covered
+            guarding_policies.append(policy_name)
+        elif inverted:
+            inverted_actions |= inverted
+            inverted_policies.append(policy_name)
+        elif names_key:
+            attempting_policies.append(policy_name)
+
+    findings: List[Dict[str, Any]] = []
+    for policy_name, error in read_errors:
+        findings.append(
+            create_finding(
+                check_id="AC-29",
+                finding_name="AgentCore Runtime Authorizer Guardrail",
+                finding_details=(
+                    f"Service control policy '{policy_name}' could not be read: "
+                    f"{_assessment_error_label(error)}, so it was not judged."
+                ),
+                resolution="Grant organizations:DescribePolicy and retry.",
+                reference=AGENTCORE_RUNTIME_INBOUND_AUTH_REFERENCE_URL,
+                severity=SeverityEnum.INFORMATIONAL,
+                status=StatusEnum.NA,
+            )
+        )
+
+    missing = [
+        name
+        for action, name in RUNTIME_WRITE_ACTIONS.items()
+        if action not in covered_actions
+    ]
+    guarding_label = ", ".join(sorted(guarding_policies))
+
+    if not missing:
+        findings.append(
+            create_finding(
+                check_id="AC-29",
+                finding_name="AgentCore Runtime Authorizer Guardrail",
+                finding_details=(
+                    "CreateAgentRuntime and UpdateAgentRuntime are both denied "
+                    "when bedrock-agentcore:RuntimeAuthorizerType is AWS_IAM, by "
+                    f"service control policy: {guarding_label}, so a new runtime "
+                    "has to carry a JWT authorizer that validates the end user's "
+                    "token."
+                ),
+                resolution=(
+                    "No action required. Confirm the policy is attached to the "
+                    "root or to every organizational unit that hosts runtimes, "
+                    "because this check reads policy content and not attachment "
+                    "targets."
+                ),
+                reference=AGENTCORE_RUNTIME_INBOUND_AUTH_REFERENCE_URL,
+                severity=SeverityEnum.HIGH,
+                status=StatusEnum.PASSED,
+            )
+        )
+        return findings
+
+    if covered_actions:
+        covered_label = ", ".join(
+            sorted(RUNTIME_WRITE_ACTIONS[action] for action in covered_actions)
+        )
+        findings.append(
+            create_finding(
+                check_id="AC-29",
+                finding_name="AgentCore Runtime Authorizer Guardrail Partial",
+                finding_details=(
+                    f"Authorizer type AWS_IAM is denied on {covered_label} but "
+                    f"not on {', '.join(missing)}, by service control policy: "
+                    f"{guarding_label}. An existing runtime can still be moved "
+                    "to SigV4-only inbound auth."
+                ),
+                resolution=(
+                    "Add the uncovered action to the same Deny statement, keeping "
+                    "the bedrock-agentcore:RuntimeAuthorizerType condition."
+                ),
+                reference=AGENTCORE_RUNTIME_INBOUND_AUTH_REFERENCE_URL,
+                severity=SeverityEnum.HIGH,
+                status=StatusEnum.FAILED,
+            )
+        )
+        return findings
+
+    if inverted_policies:
+        inverted_label = ", ".join(
+            sorted(RUNTIME_WRITE_ACTIONS[action] for action in inverted_actions)
+        )
+        findings.append(
+            create_finding(
+                check_id="AC-29",
+                finding_name="AgentCore Runtime Authorizer Guardrail Inverted",
+                finding_details=(
+                    f"Service control policy {', '.join(sorted(inverted_policies))} "
+                    f"denies {inverted_label} when "
+                    "bedrock-agentcore:RuntimeAuthorizerType is CUSTOM_JWT, which "
+                    "forbids the JWT mode and leaves SigV4-only inbound auth as "
+                    "the only way to deploy a runtime."
+                ),
+                resolution=(
+                    "Point the condition at AWS_IAM instead, or list CUSTOM_JWT "
+                    "in a StringNotEquals on the approved authorizer types."
+                ),
+                reference=AGENTCORE_RUNTIME_INBOUND_AUTH_REFERENCE_URL,
+                severity=SeverityEnum.HIGH,
+                status=StatusEnum.FAILED,
+            )
+        )
+        return findings
+
+    if attempting_policies:
+        findings.append(
+            create_finding(
+                check_id="AC-29",
+                finding_name="AgentCore Runtime Authorizer Guardrail Ineffective",
+                finding_details=(
+                    "bedrock-agentcore:RuntimeAuthorizerType is conditioned on in "
+                    "a shape that denies neither AWS_IAM nor CUSTOM_JWT, by "
+                    "service control policy: "
+                    f"{', '.join(sorted(attempting_policies))}. A Null test is one "
+                    "such shape: the authorizer type is a required member of the "
+                    "create request, so it is never absent."
+                ),
+                resolution=(
+                    "Deny CreateAgentRuntime and UpdateAgentRuntime with "
+                    "StringEquals on AWS_IAM, or with StringNotEquals on the "
+                    "authorizer types the organization approves."
+                ),
+                reference=AGENTCORE_RUNTIME_INBOUND_AUTH_REFERENCE_URL,
+                severity=SeverityEnum.HIGH,
+                status=StatusEnum.FAILED,
+            )
+        )
+        return findings
+
+    findings.append(
+        create_finding(
+            check_id="AC-29",
+            finding_name="AgentCore Runtime Authorizer Guardrail Missing",
+            finding_details=(
+                f"None of the {len(policies)} service control policy(s) readable "
+                "from this account denies CreateAgentRuntime or "
+                "UpdateAgentRuntime when bedrock-agentcore:RuntimeAuthorizerType "
+                "is AWS_IAM, so the next runtime can be deployed with SigV4-only "
+                "inbound auth and take its end user from an unverified header."
+            ),
+            resolution=(
+                "Attach a service control policy that denies "
+                "bedrock-agentcore:CreateAgentRuntime and "
+                "bedrock-agentcore:UpdateAgentRuntime with StringEquals on "
+                "bedrock-agentcore:RuntimeAuthorizerType AWS_IAM."
+            ),
+            reference=AGENTCORE_RUNTIME_INBOUND_AUTH_REFERENCE_URL,
+            severity=SeverityEnum.HIGH,
+            status=StatusEnum.FAILED,
+        )
+    )
+    return findings
+
+
+# The claims a CUSTOM_JWT authorizer can be told to validate, split by what
+# each one binds. Audience and client id bind which application's token is
+# accepted; scopes and custom claims bind what the token may ask for. The
+# inbound-authorizer guide states at least one of the four is required, so
+# "validates nothing" is not the state to report: "validates a claim, but not
+# which application the token was minted for" is, and the live estate has one.
+JWT_AUTHORIZER_CALLER_CLAIMS = {
+    "allowedAudience": "audience",
+    "allowedClients": "client id",
+}
+JWT_AUTHORIZER_OTHER_CLAIMS = {
+    "allowedScopes": "scope",
+    "customClaims": "custom claim",
+}
+
+
+def _jwt_authorizer_claims(
+    authorizer: Dict[str, Any], members: Dict[str, str]
+) -> List[str]:
+    """Return the claims a JWT authorizer pins out of one group."""
+    return [
+        label for member, label in sorted(members.items()) if authorizer.get(member)
+    ]
+
+
+def check_agentcore_runtime_inbound_authorization() -> List[Dict[str, Any]]:
+    """AC-30: Report how each runtime authenticates the caller that invokes it.
+
+    authorizerConfiguration is optional on CreateAgentRuntime, so a runtime
+    either enforces SigV4 on every invoke or carries a JWT authorizer. A JWT
+    authorizer that pins neither allowedAudience nor allowedClients accepts
+    every token its issuer minted for every application registered with that
+    issuer, so a token issued to a different application reaches this agent.
+    AG-24 asks this of a gateway; a runtime that callers invoke directly never
+    passes through one.
+    """
+    if agentcore_client is None:
+        return [
+            create_finding(
+                check_id="AC-30",
+                finding_name="AgentCore Runtime Inbound Authorization",
+                finding_details="AgentCore client not available in this region.",
+                resolution="No action required unless AgentCore runs in this region.",
+                reference=AGENTCORE_RUNTIME_INBOUND_AUTH_REFERENCE_URL,
+                severity=SeverityEnum.INFORMATIONAL,
+                status=StatusEnum.NA,
+            )
+        ]
+
+    try:
+        runtimes = _agentcore_list_all("list_agent_runtimes", ["agentRuntimes"])
+    except Exception as error:
+        return [
+            _incomplete_check_finding(
+                check_id="AC-30",
+                finding_name="AgentCore Runtime Inbound Authorization",
+                error=error,
+                reference=AGENTCORE_RUNTIME_INBOUND_AUTH_REFERENCE_URL,
+            )
+        ]
+
+    if not runtimes:
+        return [
+            create_finding(
+                check_id="AC-30",
+                finding_name="AgentCore Runtime Inbound Authorization",
+                finding_details="No AgentCore runtimes found in this region.",
+                resolution="No action required.",
+                reference=AGENTCORE_RUNTIME_INBOUND_AUTH_REFERENCE_URL,
+                severity=SeverityEnum.INFORMATIONAL,
+                status=StatusEnum.NA,
+            )
+        ]
+
+    findings = []
+    for runtime in runtimes:
+        runtime_id = runtime.get("agentRuntimeId", "unknown")
+        runtime_name = runtime.get("agentRuntimeName", runtime_id)
+        label = f"Runtime '{runtime_name}' ({runtime_id})"
+
+        try:
+            details = agentcore_client.get_agent_runtime(agentRuntimeId=runtime_id)
+        except Exception as error:
+            findings.append(
+                create_finding(
+                    check_id="AC-30",
+                    finding_name="AgentCore Runtime Inbound Authorization",
+                    finding_details=(
+                        f"{label} inbound authorizer could not be read: "
+                        f"{_assessment_error_label(error)}."
+                    ),
+                    resolution=(
+                        "Grant bedrock-agentcore:GetAgentRuntime on this runtime "
+                        "and retry."
+                    ),
+                    reference=AGENTCORE_RUNTIME_INBOUND_AUTH_REFERENCE_URL,
+                    severity=SeverityEnum.INFORMATIONAL,
+                    status=StatusEnum.NA,
+                )
+            )
+            continue
+
+        authorizer_configuration = details.get("authorizerConfiguration") or {}
+        jwt_authorizer = authorizer_configuration.get("customJWTAuthorizer") or {}
+
+        if not authorizer_configuration:
+            findings.append(
+                create_finding(
+                    check_id="AC-30",
+                    finding_name="AgentCore Runtime Inbound Authorization",
+                    finding_details=(
+                        f"{label} carries no inbound authorizer, so every invoke "
+                        "must be SigV4-signed and IAM decides which principal may "
+                        "reach the agent."
+                    ),
+                    resolution=(
+                        "No action required. Confirm the IAM principals allowed to "
+                        "call InvokeAgentRuntime are the intended callers, because "
+                        "SigV4 proves the caller's AWS identity and not an end "
+                        "user's."
+                    ),
+                    reference=AGENTCORE_RUNTIME_INBOUND_AUTH_REFERENCE_URL,
+                    severity=SeverityEnum.HIGH,
+                    status=StatusEnum.PASSED,
+                )
+            )
+            continue
+
+        if not jwt_authorizer:
+            findings.append(
+                create_finding(
+                    check_id="AC-30",
+                    finding_name="AgentCore Runtime Inbound Authorization",
+                    finding_details=(
+                        f"{label} carries an inbound authorizer this assessment "
+                        "cannot read: authorizerConfiguration holds "
+                        f"{', '.join(sorted(authorizer_configuration))} and not "
+                        "customJWTAuthorizer, the only member botocore 1.43.85 "
+                        "defines."
+                    ),
+                    resolution=(
+                        "Upgrade the assessment's botocore so the new authorizer "
+                        "member can be judged, then re-run."
+                    ),
+                    reference=AGENTCORE_RUNTIME_INBOUND_AUTH_REFERENCE_URL,
+                    severity=SeverityEnum.INFORMATIONAL,
+                    status=StatusEnum.NA,
+                )
+            )
+            continue
+
+        discovery_url = jwt_authorizer.get("discoveryUrl", "an unnamed issuer")
+        caller_claims = _jwt_authorizer_claims(
+            jwt_authorizer, JWT_AUTHORIZER_CALLER_CLAIMS
+        )
+        other_claims = _jwt_authorizer_claims(
+            jwt_authorizer, JWT_AUTHORIZER_OTHER_CLAIMS
+        )
+        if caller_claims:
+            validated = caller_claims + other_claims
+            findings.append(
+                create_finding(
+                    check_id="AC-30",
+                    finding_name="AgentCore Runtime Inbound Authorization",
+                    finding_details=(
+                        f"{label} accepts JWTs from {discovery_url} and validates "
+                        f"the {', '.join(validated)} claim(s) before the agent's "
+                        "code runs."
+                    ),
+                    resolution=(
+                        "No action required. Confirm the pinned values name this "
+                        "workload's own audience, clients and scopes."
+                    ),
+                    reference=AGENTCORE_RUNTIME_INBOUND_AUTH_REFERENCE_URL,
+                    severity=SeverityEnum.HIGH,
+                    status=StatusEnum.PASSED,
+                )
+            )
+        else:
+            validated = (
+                f"validates the {', '.join(other_claims)} claim(s) but"
+                if other_claims
+                else "validates"
+            )
+            findings.append(
+                create_finding(
+                    check_id="AC-30",
+                    finding_name="AgentCore Runtime Inbound Authorization Unbounded",
+                    finding_details=(
+                        f"{label} accepts JWTs from {discovery_url}, {validated} "
+                        "neither the audience nor the client id, so a token that "
+                        "issuer minted for a different application invokes this "
+                        "agent."
+                    ),
+                    resolution=(
+                        "Set allowedAudience or allowedClients on the runtime's "
+                        "customJWTAuthorizer, and keep allowedScopes or "
+                        "customClaims where the agent's actions differ per caller."
+                    ),
+                    reference=AGENTCORE_RUNTIME_INBOUND_AUTH_REFERENCE_URL,
+                    severity=SeverityEnum.HIGH,
+                    status=StatusEnum.FAILED,
+                )
+            )
+
+    return findings
+
+
+# The two gateway authorizer types that authenticate a SigV4 signature. Neither
+# carries a bearer token, so neither has an issuer or a client application to
+# allow-list: gateway-inbound-auth.html states token passthrough "requires a
+# JWT-bearing inbound type" and "is not available with AUTHENTICATE_ONLY, which
+# is SigV4-based and carries no bearer token".
+GATEWAY_AUTHORIZER_SIGV4_VALUES = ("AWS_IAM", "AUTHENTICATE_ONLY")
+GATEWAY_AUTHORIZER_JWT_VALUE = "CUSTOM_JWT"
+
+
+def check_agentcore_gateway_inbound_allow_lists() -> List[Dict[str, Any]]:
+    """AC-31: Judge which issuers and applications each gateway accepts tokens from.
+
+    AG-24 passes every CUSTOM_JWT gateway on the authorizer type alone, without
+    reading the authorizer's allow-lists, so a gateway that honours any token its
+    issuer minted for any registered application passes it today. The allow-lists
+    that bind the calling application are allowedAudience and allowedClients; a
+    scope or custom-claim constraint bounds what a token may ask for and not who
+    minted it for whom. AC-30 asks this of a runtime.
+    """
+    if agentcore_client is None:
+        return [
+            create_finding(
+                check_id="AC-31",
+                finding_name="AgentCore Gateway Inbound Allow Lists",
+                finding_details="AgentCore client not available in this region.",
+                resolution="No action required unless AgentCore runs in this region.",
+                reference=AGENTCORE_GATEWAY_INBOUND_AUTH_REFERENCE_URL,
+                severity=SeverityEnum.INFORMATIONAL,
+                status=StatusEnum.NA,
+            )
+        ]
+
+    try:
+        gateways = _agentcore_list_all("list_gateways", ["items", "gateways"])
+    except Exception as error:
+        return [
+            _incomplete_check_finding(
+                check_id="AC-31",
+                finding_name="AgentCore Gateway Inbound Allow Lists",
+                error=error,
+                reference=AGENTCORE_GATEWAY_INBOUND_AUTH_REFERENCE_URL,
+            )
+        ]
+
+    if not gateways:
+        return [
+            create_finding(
+                check_id="AC-31",
+                finding_name="AgentCore Gateway Inbound Allow Lists",
+                finding_details="No AgentCore gateways found in this region.",
+                resolution="No action required.",
+                reference=AGENTCORE_GATEWAY_INBOUND_AUTH_REFERENCE_URL,
+                severity=SeverityEnum.INFORMATIONAL,
+                status=StatusEnum.NA,
+            )
+        ]
+
+    findings = []
+    for gateway in gateways:
+        gateway_id = gateway.get("gatewayId", "unknown")
+        gateway_name = gateway.get("name", gateway_id)
+        label = f"Gateway '{gateway_name}' ({gateway_id})"
+
+        try:
+            detail = agentcore_client.get_gateway(gatewayIdentifier=gateway_id)
+        except Exception as error:
+            findings.append(
+                create_finding(
+                    check_id="AC-31",
+                    finding_name="AgentCore Gateway Inbound Allow Lists",
+                    finding_details=(
+                        f"{label} inbound authorizer could not be read: "
+                        f"{_assessment_error_label(error)}."
+                    ),
+                    resolution="Grant bedrock-agentcore:GetGateway and retry.",
+                    reference=AGENTCORE_GATEWAY_INBOUND_AUTH_REFERENCE_URL,
+                    severity=SeverityEnum.INFORMATIONAL,
+                    status=StatusEnum.NA,
+                )
+            )
+            continue
+
+        authorizer_type = detail.get("authorizerType") or gateway.get("authorizerType")
+
+        if authorizer_type in GATEWAY_AUTHORIZER_SIGV4_VALUES:
+            findings.append(
+                create_finding(
+                    check_id="AC-31",
+                    finding_name="AgentCore Gateway Inbound Allow Lists",
+                    finding_details=(
+                        f"{label} authenticates callers by SigV4 signature "
+                        f"({authorizer_type}), so it accepts no bearer token and "
+                        "has no issuer or client application to allow-list."
+                    ),
+                    resolution=(
+                        "No action required for the issuer allow-list. Confirm the "
+                        "IAM principals allowed to invoke this gateway are the "
+                        "intended callers."
+                    ),
+                    reference=AGENTCORE_GATEWAY_INBOUND_AUTH_REFERENCE_URL,
+                    severity=SeverityEnum.HIGH,
+                    status=StatusEnum.PASSED,
+                )
+            )
+            continue
+
+        if authorizer_type == GATEWAY_AUTHORIZER_UNAUTHENTICATED_VALUE:
+            findings.append(
+                create_finding(
+                    check_id="AC-31",
+                    finding_name="AgentCore Gateway Inbound Allow Lists Absent",
+                    finding_details=(
+                        f"{label} uses authorizerType "
+                        f"{GATEWAY_AUTHORIZER_UNAUTHENTICATED_VALUE}, so it performs "
+                        "no inbound authentication: there is no issuer allow-list to "
+                        "hold, every caller reaches the tools, and a token "
+                        "passthrough target forwards whatever bearer token the "
+                        "caller sent."
+                    ),
+                    resolution=(
+                        "Set the gateway's authorizerType to CUSTOM_JWT and pin "
+                        "allowedAudience or allowedClients, or to AWS_IAM where the "
+                        "callers are AWS principals."
+                    ),
+                    reference=AGENTCORE_GATEWAY_INBOUND_AUTH_REFERENCE_URL,
+                    severity=SeverityEnum.HIGH,
+                    status=StatusEnum.FAILED,
+                )
+            )
+            continue
+
+        if authorizer_type != GATEWAY_AUTHORIZER_JWT_VALUE:
+            findings.append(
+                create_finding(
+                    check_id="AC-31",
+                    finding_name="AgentCore Gateway Inbound Allow Lists",
+                    finding_details=(
+                        f"{label} reported authorizerType "
+                        f"{authorizer_type or 'unspecified'}, which this assessment "
+                        "cannot judge against an issuer allow-list."
+                    ),
+                    resolution=(
+                        "Upgrade the assessment's botocore so the new authorizer "
+                        "type can be judged, then re-run."
+                    ),
+                    reference=AGENTCORE_GATEWAY_INBOUND_AUTH_REFERENCE_URL,
+                    severity=SeverityEnum.INFORMATIONAL,
+                    status=StatusEnum.NA,
+                )
+            )
+            continue
+
+        authorizer_configuration = detail.get("authorizerConfiguration") or {}
+        jwt_authorizer = authorizer_configuration.get("customJWTAuthorizer") or {}
+        if not jwt_authorizer:
+            findings.append(
+                create_finding(
+                    check_id="AC-31",
+                    finding_name="AgentCore Gateway Inbound Allow Lists",
+                    finding_details=(
+                        f"{label} uses authorizerType "
+                        f"{GATEWAY_AUTHORIZER_JWT_VALUE} but reported no "
+                        "customJWTAuthorizer, so its allow-lists could not be read."
+                    ),
+                    resolution="Grant bedrock-agentcore:GetGateway and retry.",
+                    reference=AGENTCORE_GATEWAY_INBOUND_AUTH_REFERENCE_URL,
+                    severity=SeverityEnum.INFORMATIONAL,
+                    status=StatusEnum.NA,
+                )
+            )
+            continue
+
+        discovery_url = jwt_authorizer.get("discoveryUrl", "an unnamed issuer")
+        caller_claims = _jwt_authorizer_claims(
+            jwt_authorizer, JWT_AUTHORIZER_CALLER_CLAIMS
+        )
+        other_claims = _jwt_authorizer_claims(
+            jwt_authorizer, JWT_AUTHORIZER_OTHER_CLAIMS
+        )
+        if caller_claims:
+            allow_listed = caller_claims + other_claims
+            findings.append(
+                create_finding(
+                    check_id="AC-31",
+                    finding_name="AgentCore Gateway Inbound Allow Lists",
+                    finding_details=(
+                        f"{label} accepts JWTs from {discovery_url} and allow-lists "
+                        f"the {', '.join(allow_listed)} claim(s), so a token minted "
+                        "for another application is rejected at the gateway."
+                    ),
+                    resolution=(
+                        "No action required. Confirm the pinned values name this "
+                        "workload's own identity provider, audience and clients."
+                    ),
+                    reference=AGENTCORE_GATEWAY_INBOUND_AUTH_REFERENCE_URL,
+                    severity=SeverityEnum.HIGH,
+                    status=StatusEnum.PASSED,
+                )
+            )
+        else:
+            bounded = (
+                f"allow-lists the {', '.join(other_claims)} claim(s) but"
+                if other_claims
+                else "allow-lists"
+            )
+            findings.append(
+                create_finding(
+                    check_id="AC-31",
+                    finding_name="AgentCore Gateway Inbound Allow Lists Absent",
+                    finding_details=(
+                        f"{label} accepts JWTs from {discovery_url}, {bounded} "
+                        "neither the audience nor the client id, so any application "
+                        "registered with that issuer can reach this gateway's tools."
+                    ),
+                    resolution=(
+                        "Set allowedAudience or allowedClients on the gateway's "
+                        "customJWTAuthorizer to the audience and client ids this "
+                        "workload issues tokens to."
+                    ),
+                    reference=AGENTCORE_GATEWAY_INBOUND_AUTH_REFERENCE_URL,
+                    severity=SeverityEnum.HIGH,
+                    status=StatusEnum.FAILED,
+                )
+            )
+
+    return findings
+
+
+# The two operations that accept an end user's JWT and hand back a workload
+# access token. The service reference wires every bedrock-agentcore:InboundJwtClaim
+# key to exactly these two, so they are the only IAM surface on which an issuer
+# can be pinned.
+INBOUND_JWT_EXCHANGE_ACTIONS = (
+    "completeresourcetokenauth",
+    "getworkloadaccesstokenforjwt",
+)
+
+# The claims that bind which identity provider minted the token and which
+# application it was minted for. scope and sub bound what the token may ask for
+# and which end user it speaks for, so neither keeps a token from an unapproved
+# issuer out. client_id is available only when the JWT carries that claim under
+# that exact name, which is why the resolution names all three.
+INBOUND_JWT_ISSUER_CONDITION_KEYS = (
+    "bedrock-agentcore:inboundjwtclaim/aud",
+    "bedrock-agentcore:inboundjwtclaim/client_id",
+    "bedrock-agentcore:inboundjwtclaim/iss",
+)
+
+
+def _statement_grants_inbound_jwt_exchange(statement: Dict[str, Any]) -> bool:
+    """Return whether one statement grants an inbound JWT token exchange."""
+    for action in _statement_actions(statement):
+        action_parts = action.split(":", 1)
+        if len(action_parts) != 2:
+            continue
+        service_namespace, action_pattern = action_parts
+        if service_namespace not in AGENT_PLATFORM_IAM_NAMESPACES:
+            continue
+        if any(
+            fnmatchcase(exchange_action, action_pattern)
+            for exchange_action in INBOUND_JWT_EXCHANGE_ACTIONS
+        ):
+            return True
+    return False
+
+
+def _statement_pins_inbound_jwt_issuer(statement: Dict[str, Any]) -> bool:
+    """Return whether one statement binds the exchange to named issuers or clients."""
+    return any(
+        condition_key in INBOUND_JWT_ISSUER_CONDITION_KEYS
+        for condition_key in _statement_condition_keys(statement)
+    )
+
+
+def _principals_exchanging_inbound_jwts(
+    permissions_by_name: Dict[str, Any],
+    principal_kind: str,
+) -> Tuple[List[str], List[str]]:
+    """Split principals exchanging inbound JWTs into unpinned and pinned grants.
+
+    The resource element cannot answer this question: both actions take the
+    workload identity as their resource, so naming one workload still accepts a
+    token from any issuer that workload's authorizer trusts. Only a condition on
+    the issuer, audience or client id narrows which tokens the exchange accepts.
+    """
+    unpinned: List[str] = []
+    pinned: List[str] = []
+
+    for principal_name, permissions in permissions_by_name.items():
+        if not isinstance(permissions, dict):
+            continue
+        label = f"{principal_kind} {principal_name}"
+        attached_policies = permissions.get("attached_policies", [])
+        inline_policies = permissions.get("inline_policies", [])
+        if not isinstance(attached_policies, list):
+            attached_policies = []
+        if not isinstance(inline_policies, list):
+            inline_policies = []
+
+        exchanges_tokens = False
+        exchanges_tokens_unpinned = False
+
+        for policy in [*attached_policies, *inline_policies]:
+            try:
+                for statement in _allow_statements(policy):
+                    if not _statement_grants_inbound_jwt_exchange(statement):
+                        continue
+                    exchanges_tokens = True
+                    if not _statement_pins_inbound_jwt_issuer(statement):
+                        exchanges_tokens_unpinned = True
+            except Exception as error:
+                logger.warning(f"Error parsing policy for {label}: {error}")
+
+        if exchanges_tokens_unpinned:
+            unpinned.append(label)
+        elif exchanges_tokens:
+            pinned.append(label)
+
+    return unpinned, pinned
+
+
+def check_agentcore_inbound_jwt_issuer_conditions(
+    permission_cache: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    """AC-32: Report who can exchange a JWT from any issuer for a workload token.
+
+    AC-31 pins the issuer at the gateway's front door. This is the second leg:
+    the token-exchange APIs accept an end user's JWT directly, so a principal
+    holding GetWorkloadAccessTokenForJWT or CompleteResourceTokenAuth with no
+    InboundJwtClaim condition trades a token from any issuer the workload trusts
+    for a workload access token, without passing through a gateway authorizer.
+    An action element of "*" is a service-agnostic administrator grant and is
+    left to AC-02; this check reads the grants that name the bedrock-agentcore
+    namespace.
+    """
+    findings = []
+
+    try:
+        role_permissions = permission_cache.get("role_permissions", {})
+        user_permissions = permission_cache.get("user_permissions", {})
+
+        if not role_permissions and not user_permissions:
+            return [
+                create_finding(
+                    check_id="AC-32",
+                    finding_name="AgentCore Inbound JWT Issuer Conditions",
+                    finding_details="No IAM permissions found in cache.",
+                    resolution="No action required.",
+                    reference=AGENTCORE_IAM_CONDITION_KEY_REFERENCE_URL,
+                    severity=SeverityEnum.INFORMATIONAL,
+                    status=StatusEnum.NA,
+                    region=GLOBAL_REGION_LABEL,
+                )
+            ]
+
+        unpinned_roles, pinned_roles = _principals_exchanging_inbound_jwts(
+            role_permissions, "role"
+        )
+        unpinned_users, pinned_users = _principals_exchanging_inbound_jwts(
+            user_permissions, "user"
+        )
+        unpinned = sorted(unpinned_roles + unpinned_users)
+        pinned = sorted(pinned_roles + pinned_users)
+
+        if unpinned:
+            findings.append(
+                create_finding(
+                    check_id="AC-32",
+                    finding_name="AgentCore Inbound JWT Issuer Conditions",
+                    finding_details=(
+                        "The following principals can exchange an end user's JWT "
+                        "for a workload access token with no condition on the "
+                        "token's issuer, audience or client id, so a token minted "
+                        "by any issuer the workload trusts is accepted: "
+                        f"{', '.join(unpinned)}."
+                    ),
+                    resolution=(
+                        "Add a bedrock-agentcore:InboundJwtClaim/iss condition "
+                        "naming the approved identity providers, and "
+                        "InboundJwtClaim/aud or InboundJwtClaim/client_id for the "
+                        "approved applications, to every statement granting "
+                        "GetWorkloadAccessTokenForJWT or CompleteResourceTokenAuth. "
+                        "client_id resolves only where the JWT carries that claim "
+                        "under that exact name, and aud arrives as a multi-valued "
+                        "key, so qualify it with ForAllValues to keep one approved "
+                        "audience from admitting a token that also carries others."
+                    ),
+                    reference=AGENTCORE_IAM_CONDITION_KEY_REFERENCE_URL,
+                    severity=SeverityEnum.HIGH,
+                    status=StatusEnum.FAILED,
+                    region=GLOBAL_REGION_LABEL,
+                )
+            )
+
+        if pinned:
+            findings.append(
+                create_finding(
+                    check_id="AC-32",
+                    finding_name="AgentCore Inbound JWT Issuer Conditions",
+                    finding_details=(
+                        "The following principals exchange inbound JWTs only under "
+                        "an issuer, audience or client id condition: "
+                        f"{', '.join(pinned)}."
+                    ),
+                    resolution=(
+                        "No action required. Confirm the pinned values name this "
+                        "workload's own identity providers and client applications."
+                    ),
+                    reference=AGENTCORE_IAM_CONDITION_KEY_REFERENCE_URL,
+                    severity=SeverityEnum.HIGH,
+                    status=StatusEnum.PASSED,
+                    region=GLOBAL_REGION_LABEL,
+                )
+            )
+
+        if not unpinned and not pinned:
+            findings.append(
+                create_finding(
+                    check_id="AC-32",
+                    finding_name="AgentCore Inbound JWT Issuer Conditions",
+                    finding_details=(
+                        "No cached IAM role or user grants "
+                        "GetWorkloadAccessTokenForJWT or CompleteResourceTokenAuth, "
+                        "so no principal exchanges an inbound JWT for a workload "
+                        "access token through IAM policy."
+                    ),
+                    resolution="No action required.",
+                    reference=AGENTCORE_IAM_CONDITION_KEY_REFERENCE_URL,
+                    severity=SeverityEnum.HIGH,
+                    status=StatusEnum.PASSED,
+                    region=GLOBAL_REGION_LABEL,
+                )
+            )
+
+    except Exception as error:
+        logger.error(f"Error in inbound JWT issuer conditions check: {error}")
+        findings.append(
+            _incomplete_check_finding(
+                check_id="AC-32",
+                finding_name="AgentCore Inbound JWT Issuer Conditions",
+                error=error,
+                reference=AGENTCORE_IAM_CONDITION_KEY_REFERENCE_URL,
+                region=GLOBAL_REGION_LABEL,
+            )
+        )
+
+    return findings
+
+
+# The actions that hand an agent a token or a stored credential. The reference
+# Runtime execution role grants the first three under one Sid and the documented
+# caller requirements include all three, so the control is not "remove them": it
+# is which resources they may be used against.
+TOKEN_ISSUANCE_ACTIONS = (
+    "completeresourcetokenauth",
+    "getresourceoauth2token",
+    "getworkloadaccesstoken",
+    "getworkloadaccesstokenforjwt",
+    "getworkloadaccesstokenforuserid",
+)
+
+# A workload identity's ARN nests under its directory's, so this segment is what
+# separates "this agent's identity" from "the directory that holds every agent's".
+WORKLOAD_IDENTITY_ARN_SEGMENT = "workload-identity/"
+
+
+def _statement_grants_token_issuance(statement: Dict[str, Any]) -> bool:
+    """Return whether one statement grants an agent token or credential read."""
+    for action in _statement_actions(statement):
+        action_parts = action.split(":", 1)
+        if len(action_parts) != 2:
+            continue
+        service_namespace, action_pattern = action_parts
+        if service_namespace not in AGENT_PLATFORM_IAM_NAMESPACES:
+            continue
+        if any(
+            fnmatchcase(issuance_action, action_pattern)
+            for issuance_action in TOKEN_ISSUANCE_ACTIONS
+        ):
+            return True
+    return False
+
+
+def _resource_names_one_workload_identity(resource: str) -> bool:
+    """Return whether one resource element names a single workload identity.
+
+    A workload identity's ARN nests under its directory's, so the directory ARN
+    ends at `workload-identity-directory/<name>` and never carries this segment:
+    `workload-identity-directory/` does not contain `workload-identity/`.
+    """
+    _, separator, identity_name = resource.partition(WORKLOAD_IDENTITY_ARN_SEGMENT)
+    if not separator:
+        return False
+    return bool(identity_name) and "*" not in identity_name
+
+
+def _token_issuance_scope_verdict(statement: Dict[str, Any]) -> str:
+    """Classify one token-issuance statement's resource element.
+
+    AWS's own scoped example lists the directory ARN alongside the workload
+    identity's, because both resource types are required on these actions, so a
+    directory ARN in the list is not the widening. A trailing wildcard is: it
+    reaches every identity, vault or provider under that prefix. A wildcard
+    earlier in the ARN, in the region or the account, leaves the named identity
+    named, so it is read as scoped.
+    """
+    resources = _statement_resources(statement)
+    if any(resource.endswith("*") for resource in resources):
+        return "unbounded"
+    if any(_resource_names_one_workload_identity(resource) for resource in resources):
+        return "scoped"
+    return "directory_only"
+
+
+def _principals_issuing_agent_tokens(
+    permissions_by_name: Dict[str, Any],
+    principal_kind: str,
+) -> Tuple[List[str], List[str], List[str]]:
+    """Group principals holding token-issuance actions by how narrow the grant is.
+
+    A principal is judged on the union of its resource elements, so `scoped`
+    outranks `directory_only`: AWS's own scoped policy lists the directory ARN
+    beside the workload identity's, and splitting those two ARNs into two
+    statements is the same grant.
+    """
+    unbounded: List[str] = []
+    directory_only: List[str] = []
+    scoped: List[str] = []
+
+    for principal_name, permissions in permissions_by_name.items():
+        if not isinstance(permissions, dict):
+            continue
+        label = f"{principal_kind} {principal_name}"
+        attached_policies = permissions.get("attached_policies", [])
+        inline_policies = permissions.get("inline_policies", [])
+        if not isinstance(attached_policies, list):
+            attached_policies = []
+        if not isinstance(inline_policies, list):
+            inline_policies = []
+
+        verdicts = set()
+        for policy in [*attached_policies, *inline_policies]:
+            try:
+                for statement in _allow_statements(policy):
+                    if not _statement_grants_token_issuance(statement):
+                        continue
+                    verdicts.add(_token_issuance_scope_verdict(statement))
+            except Exception as error:
+                logger.warning(f"Error parsing policy for {label}: {error}")
+
+        if "unbounded" in verdicts:
+            unbounded.append(label)
+        elif "scoped" in verdicts:
+            scoped.append(label)
+        elif "directory_only" in verdicts:
+            directory_only.append(label)
+
+    return unbounded, directory_only, scoped
+
+
+def check_agentcore_token_issuance_scope(
+    permission_cache: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    """AC-33: Report which resources each principal may mint agent tokens against.
+
+    AgentCore blocks a service-linked workload identity from retrieving its own
+    access token, and Runtime hands the token to agent code in the invocation
+    payload instead, so this control is not enforced by removing the actions: the
+    reference execution role grants all three GetWorkloadAccessToken* actions and
+    an agent breaks without them. What a policy can do is bound which workload
+    identity, vault and credential provider they reach. AWS's own consent-portal
+    execution role allows three of them on Resource "*", so the widest grant on
+    the page is one a customer may have copied forward.
+    """
+    findings = []
+
+    try:
+        role_permissions = permission_cache.get("role_permissions", {})
+        user_permissions = permission_cache.get("user_permissions", {})
+
+        if not role_permissions and not user_permissions:
+            return [
+                create_finding(
+                    check_id="AC-33",
+                    finding_name="AgentCore Token Issuance Scope",
+                    finding_details="No IAM permissions found in cache.",
+                    resolution="No action required.",
+                    reference=AGENTCORE_WORKLOAD_IDENTITY_SCOPE_REFERENCE_URL,
+                    severity=SeverityEnum.INFORMATIONAL,
+                    status=StatusEnum.NA,
+                    region=GLOBAL_REGION_LABEL,
+                )
+            ]
+
+        role_groups = _principals_issuing_agent_tokens(role_permissions, "role")
+        user_groups = _principals_issuing_agent_tokens(user_permissions, "user")
+        unbounded = sorted(role_groups[0] + user_groups[0])
+        directory_only = sorted(role_groups[1] + user_groups[1])
+        scoped = sorted(role_groups[2] + user_groups[2])
+
+        if unbounded:
+            findings.append(
+                create_finding(
+                    check_id="AC-33",
+                    finding_name="AgentCore Token Issuance Scope",
+                    finding_details=(
+                        "The following principals can mint agent access tokens or "
+                        "read stored credentials against a wildcard resource, so "
+                        "one compromised agent reaches every workload identity, "
+                        "token vault and credential provider in the account: "
+                        f"{', '.join(unbounded)}."
+                    ),
+                    resolution=(
+                        "Replace the wildcard resource with the agent's own "
+                        "workload-identity ARN, its token vault and its credential "
+                        "provider, keeping the workload-identity-directory ARN in "
+                        "the list, which the service authorization reference also "
+                        "marks required on these actions."
+                    ),
+                    reference=AGENTCORE_WORKLOAD_IDENTITY_SCOPE_REFERENCE_URL,
+                    severity=SeverityEnum.HIGH,
+                    status=StatusEnum.FAILED,
+                    region=GLOBAL_REGION_LABEL,
+                )
+            )
+
+        if directory_only:
+            findings.append(
+                create_finding(
+                    check_id="AC-33",
+                    finding_name="AgentCore Token Issuance Scope",
+                    finding_details=(
+                        "The following principals hold agent token-issuance actions "
+                        "on named resources, none of which is a workload identity: "
+                        f"{', '.join(directory_only)}. The service authorization "
+                        "reference marks both workload-identity and "
+                        "workload-identity-directory as required on these actions "
+                        "and does not say whether allowing only the directory "
+                        "authorizes the call, so this grant either reaches every "
+                        "identity the directory holds or authorizes nothing."
+                    ),
+                    resolution=(
+                        "Add the agent's own workload-identity ARN "
+                        "(workload-identity-directory/<directory>/workload-identity/"
+                        "<name>) to the resource list beside the directory ARN, "
+                        "which settles both readings."
+                    ),
+                    reference=AGENTCORE_WORKLOAD_IDENTITY_SCOPE_REFERENCE_URL,
+                    severity=SeverityEnum.MEDIUM,
+                    status=StatusEnum.FAILED,
+                    region=GLOBAL_REGION_LABEL,
+                )
+            )
+
+        if scoped:
+            findings.append(
+                create_finding(
+                    check_id="AC-33",
+                    finding_name="AgentCore Token Issuance Scope",
+                    finding_details=(
+                        "The following principals hold agent token-issuance actions "
+                        "only against named workload identities: "
+                        f"{', '.join(scoped)}."
+                    ),
+                    resolution=(
+                        "No action required. Confirm each named workload identity is "
+                        "the one that principal's own agent runs as, and Deny "
+                        "GetWorkloadAccessTokenForUserId and "
+                        "InvokeAgentRuntimeForUser where a JWT is always available."
+                    ),
+                    reference=AGENTCORE_WORKLOAD_IDENTITY_SCOPE_REFERENCE_URL,
+                    severity=SeverityEnum.HIGH,
+                    status=StatusEnum.PASSED,
+                    region=GLOBAL_REGION_LABEL,
+                )
+            )
+
+        if not unbounded and not directory_only and not scoped:
+            findings.append(
+                create_finding(
+                    check_id="AC-33",
+                    finding_name="AgentCore Token Issuance Scope",
+                    finding_details=(
+                        "No cached IAM role or user grants an AgentCore token "
+                        "issuance or stored-credential action, so no principal "
+                        "mints an agent token through IAM policy."
+                    ),
+                    resolution="No action required.",
+                    reference=AGENTCORE_WORKLOAD_IDENTITY_SCOPE_REFERENCE_URL,
+                    severity=SeverityEnum.HIGH,
+                    status=StatusEnum.PASSED,
+                    region=GLOBAL_REGION_LABEL,
+                )
+            )
+
+    except Exception as error:
+        logger.error(f"Error in token issuance scope check: {error}")
+        findings.append(
+            _incomplete_check_finding(
+                check_id="AC-33",
+                finding_name="AgentCore Token Issuance Scope",
+                error=error,
+                reference=AGENTCORE_WORKLOAD_IDENTITY_SCOPE_REFERENCE_URL,
+                region=GLOBAL_REGION_LABEL,
+            )
+        )
+
+    return findings
+
+
+# Lowercased fragments that name a credential in an environment-variable name,
+# so AWS_SECRET_ACCESS_KEY, dbPassword and OPENAI_APIKEY all hit.
+CREDENTIAL_VARIABLE_NAME_FRAGMENTS = (
+    "apikey",
+    "api_key",
+    "credential",
+    "passphrase",
+    "password",
+    "privatekey",
+    "private_key",
+    "secret",
+    "token",
+)
+
+# The two access key id prefixes: AKIA for a long-term key, ASIA for a session
+# key. Both are followed by 16 uppercase alphanumerics.
+AWS_ACCESS_KEY_ID_PREFIXES = ("AKIA", "ASIA")
+AWS_ACCESS_KEY_ID_LENGTH = 20
+
+
+def _value_is_a_credential_literal(value: str) -> bool:
+    """Return whether a value is credential material on its own shape alone."""
+    if len(value) == AWS_ACCESS_KEY_ID_LENGTH and value.startswith(
+        AWS_ACCESS_KEY_ID_PREFIXES
+    ):
+        if all(
+            character.isdigit() or (character.isalpha() and character.isupper())
+            for character in value[len(AWS_ACCESS_KEY_ID_PREFIXES[0]) :]
+        ):
+            return True
+    return value.startswith("-----BEGIN") and "PRIVATE KEY" in value
+
+
+def _value_points_at_a_credential_store(value: str) -> bool:
+    """Return whether a value names where a credential lives, not the credential.
+
+    An ARN, a Parameter Store path, a URL and a Secrets Manager secret name are
+    all pointers. A decimal number or a boolean configures behaviour and is not a
+    credential, which is what keeps TOKEN_TTL=3600 out of the finding. A secret
+    name is a slash-separated path, so any value holding a slash reads as a
+    pointer: a base64 credential containing a slash is the scan's blind spot and
+    the passing finding says so.
+    """
+    lowered = value.lower()
+    if lowered.startswith(("arn:", "/", "http://", "https://")):
+        return True
+    if "/" in value:
+        return True
+    if lowered in ("true", "false"):
+        return True
+    return value.isdigit()
+
+
+def _runtime_credential_variables(
+    environment_variables: Dict[str, Any],
+) -> Tuple[List[str], List[str]]:
+    """Split environment-variable names into inline credentials and pointers."""
+    literals: List[str] = []
+    pointers: List[str] = []
+
+    for name, raw_value in sorted(environment_variables.items()):
+        value = (raw_value if isinstance(raw_value, str) else str(raw_value)).strip()
+        if _value_is_a_credential_literal(value):
+            literals.append(name)
+            continue
+        if not any(
+            fragment in name.lower() for fragment in CREDENTIAL_VARIABLE_NAME_FRAGMENTS
+        ):
+            continue
+        if not value or _value_points_at_a_credential_store(value):
+            pointers.append(name)
+        else:
+            literals.append(name)
+
+    return literals, pointers
+
+
+def check_agentcore_runtime_inline_credentials() -> List[Dict[str, Any]]:
+    """AC-34: Scan each runtime's environment variables for inline credentials.
+
+    AC-14 judges the token vault's own encryption. This is the other half of the
+    control: a credential pasted into the agent's definition never reaches the
+    vault, and every process in the microVM reads the variable. Only names are
+    reported, never values, because environmentVariables is modelled sensitive.
+    """
+    if agentcore_client is None:
+        return [
+            create_finding(
+                check_id="AC-34",
+                finding_name="AgentCore Runtime Inline Credentials",
+                finding_details="AgentCore client not available in this region.",
+                resolution="No action required unless AgentCore runs in this region.",
+                reference=AGENTCORE_RUNTIME_SECRET_REFERENCE_URL,
+                severity=SeverityEnum.INFORMATIONAL,
+                status=StatusEnum.NA,
+            )
+        ]
+
+    try:
+        runtimes = _agentcore_list_all("list_agent_runtimes", ["agentRuntimes"])
+    except Exception as error:
+        return [
+            _incomplete_check_finding(
+                check_id="AC-34",
+                finding_name="AgentCore Runtime Inline Credentials",
+                error=error,
+                reference=AGENTCORE_RUNTIME_SECRET_REFERENCE_URL,
+            )
+        ]
+
+    if not runtimes:
+        return [
+            create_finding(
+                check_id="AC-34",
+                finding_name="AgentCore Runtime Inline Credentials",
+                finding_details="No AgentCore runtimes found in this region.",
+                resolution="No action required.",
+                reference=AGENTCORE_RUNTIME_SECRET_REFERENCE_URL,
+                severity=SeverityEnum.INFORMATIONAL,
+                status=StatusEnum.NA,
+            )
+        ]
+
+    findings = []
+    for runtime in runtimes:
+        runtime_id = runtime.get("agentRuntimeId", "unknown")
+        runtime_name = runtime.get("agentRuntimeName", runtime_id)
+        label = f"Runtime '{runtime_name}' ({runtime_id})"
+
+        try:
+            details = agentcore_client.get_agent_runtime(agentRuntimeId=runtime_id)
+        except Exception as error:
+            findings.append(
+                create_finding(
+                    check_id="AC-34",
+                    finding_name="AgentCore Runtime Inline Credentials",
+                    finding_details=(
+                        f"{label} environment variables could not be read: "
+                        f"{_assessment_error_label(error)}."
+                    ),
+                    resolution=(
+                        "Grant bedrock-agentcore:GetAgentRuntime on this runtime "
+                        "and retry."
+                    ),
+                    reference=AGENTCORE_RUNTIME_SECRET_REFERENCE_URL,
+                    severity=SeverityEnum.INFORMATIONAL,
+                    status=StatusEnum.NA,
+                )
+            )
+            continue
+
+        environment_variables = details.get("environmentVariables") or {}
+        if not environment_variables:
+            findings.append(
+                create_finding(
+                    check_id="AC-34",
+                    finding_name="AgentCore Runtime Inline Credentials",
+                    finding_details=(
+                        f"{label} carries no environment variables, so its "
+                        "definition holds no inline credential."
+                    ),
+                    resolution="No action required.",
+                    reference=AGENTCORE_RUNTIME_SECRET_REFERENCE_URL,
+                    severity=SeverityEnum.HIGH,
+                    status=StatusEnum.PASSED,
+                )
+            )
+            continue
+
+        literals, pointers = _runtime_credential_variables(environment_variables)
+
+        if literals:
+            findings.append(
+                create_finding(
+                    check_id="AC-34",
+                    finding_name="AgentCore Runtime Inline Credential Found",
+                    finding_details=(
+                        f"{label} holds credential material inline in the "
+                        f"environment variable(s) {', '.join(literals)}, which "
+                        "every process in the microVM reads. The values are "
+                        "withheld from this report."
+                    ),
+                    resolution=(
+                        "Move each value into the AgentCore Identity token vault "
+                        "or AWS Secrets Manager, set the variable to the secret's "
+                        "ARN, and rotate the exposed credential."
+                    ),
+                    reference=AGENTCORE_RUNTIME_SECRET_REFERENCE_URL,
+                    severity=SeverityEnum.HIGH,
+                    status=StatusEnum.FAILED,
+                )
+            )
+            continue
+
+        scanned = (
+            f"{len(environment_variables)} environment variable(s), of which "
+            f"{', '.join(pointers)} name a credential and hold a reference to one"
+            if pointers
+            else f"{len(environment_variables)} environment variable(s)"
+        )
+        findings.append(
+            create_finding(
+                check_id="AC-34",
+                finding_name="AgentCore Runtime Inline Credentials",
+                finding_details=(
+                    f"{label} was scanned across {scanned}, and none holds "
+                    "credential material inline."
+                ),
+                resolution=(
+                    "No action required. This scan reads variable names and value "
+                    "shapes: a value containing a slash reads as a secret name, so "
+                    "confirm the remaining values are references and not literals."
+                ),
+                reference=AGENTCORE_RUNTIME_SECRET_REFERENCE_URL,
+                severity=SeverityEnum.HIGH,
+                status=StatusEnum.PASSED,
+            )
+        )
+
     return findings
 
 
@@ -7155,6 +8611,8 @@ def lambda_handler(event, context):
                     ("AC-03", "AgentCore Stale Access Check"),
                     ("AC-21", "AgentCore Log Unmask Restriction"),
                     ("AC-23", "AgentCore Memory Record Access Scope"),
+                    ("AC-32", "AgentCore Inbound JWT Issuer Conditions"),
+                    ("AC-33", "AgentCore Token Issuance Scope"),
                 ):
                     all_findings.append(
                         create_finding(
@@ -7182,12 +8640,17 @@ def lambda_handler(event, context):
                         "Service-Linked Role",
                         check_agentcore_service_linked_role,
                     ),
-                    # AC-28 reads service control policies, not the IAM cache, so a
-                    # missing cache does not stop it.
+                    # AC-28 and AC-29 read service control policies, not the IAM
+                    # cache, so a missing cache does not stop them.
                     (
                         ["AC-28"],
                         "Gateway Authorizer Guardrail",
                         check_agentcore_gateway_authorizer_scp,
+                    ),
+                    (
+                        ["AC-29"],
+                        "Runtime Authorizer Guardrail",
+                        check_agentcore_runtime_authorizer_scp,
                     ),
                 ]
             else:
@@ -7228,12 +8691,36 @@ def lambda_handler(event, context):
                         "Service-Linked Role",
                         check_agentcore_service_linked_role,
                     ),
-                    # AC-28 judges an organization-wide service control policy, which
-                    # is the same document whatever region a gateway is created in.
+                    # AC-32 reads the same global IAM cache: the token-exchange
+                    # grants that accept an end user's JWT are identical in every
+                    # scanned region, and AC-31 judges the gateway leg per region.
+                    (
+                        ["AC-32"],
+                        "Inbound JWT Issuer Conditions",
+                        lambda: check_agentcore_inbound_jwt_issuer_conditions(
+                            permission_cache
+                        ),
+                    ),
+                    # AC-33 reads the same global IAM cache: which workload
+                    # identity a role may mint a token against is written in the
+                    # policy's resource element, which carries its own region.
+                    (
+                        ["AC-33"],
+                        "Token Issuance Scope",
+                        lambda: check_agentcore_token_issuance_scope(permission_cache),
+                    ),
+                    # AC-28 and AC-29 judge organization-wide service control
+                    # policies, the same documents whatever region a gateway or a
+                    # runtime is created in.
                     (
                         ["AC-28"],
                         "Gateway Authorizer Guardrail",
                         check_agentcore_gateway_authorizer_scp,
+                    ),
+                    (
+                        ["AC-29"],
+                        "Runtime Authorizer Guardrail",
+                        check_agentcore_runtime_authorizer_scp,
                     ),
                 ]
             for check_ids, check_name, check_func in global_checks:
@@ -7491,6 +8978,21 @@ def lambda_handler(event, context):
                 ["AC-27"],
                 "Gateway Policy Conditions",
                 check_agentcore_gateway_policy_conditions,
+            ),
+            (
+                ["AC-30"],
+                "Runtime Inbound Authorization",
+                check_agentcore_runtime_inbound_authorization,
+            ),
+            (
+                ["AC-31"],
+                "Gateway Inbound Allow Lists",
+                check_agentcore_gateway_inbound_allow_lists,
+            ),
+            (
+                ["AC-34"],
+                "Runtime Inline Credentials",
+                check_agentcore_runtime_inline_credentials,
             ),
         ]
 

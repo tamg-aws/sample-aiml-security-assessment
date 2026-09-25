@@ -6,15 +6,15 @@
     "hosted": 67,
     "fnd_ai_subject": 11,
     "total": 78,
-    "covered": 20,
-    "tighten": 24,
-    "tighten_extend": 19,
+    "covered": 25,
+    "tighten": 22,
+    "tighten_extend": 17,
     "tighten_new_id": 5,
-    "new": 19,
+    "new": 16,
     "not_implementable": 4,
     "unassessed": 11,
-    "new_check_functions": 35,
-    "extensions": 19,
+    "new_check_functions": 32,
+    "extensions": 17,
     "extra_iam_actions": [
       "config:DescribeConfigRules",
       "config:DescribeConfigurationRecorders",
@@ -714,18 +714,18 @@
       "question": "Is agent code prevented from directly minting or retrieving its own access tokens, so a compromised agent cannot extract credentials for other users?",
       "assert": "Service-managed identity confirmation / token-issuance API restriction",
       "workload_agnostic": true,
-      "verdict": "tighten",
-      "disposition": "extend",
+      "verdict": "covered",
+      "disposition": null,
       "target_modules": [
         "agentcore_assessments"
       ],
       "incumbents": [
-        "AC-02"
+        "AC-33"
       ],
       "incumbent_names": [
-        "AgentCore IAM Full Access Check"
+        "AgentCore Token Issuance Scope"
       ],
-      "gap": "AC-02 detects full-access and wildcard grants only",
+      "gap": "AC-33 judges the resource element on the five token issuance actions per cached role and user: a resource ending in a wildcard mints a token for every workload identity in the account, while a resource naming one identity bounds the grant to that agent. A grant that names only the workload identity directory is reported separately at medium, because the service authorization reference marks both the directory and the identity required on these actions and never says whether the directory alone authorizes the call, so that grant either reaches every identity the directory holds or authorizes nothing",
       "extra_iam": [],
       "phase": 4,
       "source": "controls/ai-specific/agentcore-identity.yaml"
@@ -918,18 +918,20 @@
       "question": "Are credentials and tokens used by agents stored in a vault protected by keys the organization controls, rather than embedded in agent code or config?",
       "assert": "Vault encryption configuration + secret-scan result",
       "workload_agnostic": true,
-      "verdict": "tighten",
-      "disposition": "extend",
+      "verdict": "covered",
+      "disposition": null,
       "target_modules": [
         "agentcore_assessments"
       ],
       "incumbents": [
-        "AC-14"
+        "AC-14",
+        "AC-34"
       ],
       "incumbent_names": [
-        "AgentCore Identity Token Vault CMK Encryption"
+        "AgentCore Identity Token Vault CMK Encryption",
+        "AgentCore Runtime Inline Credentials"
       ],
-      "gap": "AC-14 has the CMK leg; the string 'secret' appears 0 times in the module, so the secret-scan leg is unwritten",
+      "gap": "AC-14 has the token vault CMK leg; AC-34 adds the secret-scan leg, reading GetAgentRuntime.environmentVariables and failing a runtime whose definition holds an access key id or a PEM private key inline. Only variable names reach the finding because the API models the map as sensitive, and the resolution states the blind spot: a value holding a slash reads as a secret name, so the remaining values are the reader's to confirm",
       "extra_iam": [],
       "phase": 4,
       "source": "controls/ai-specific/agentcore-identity.yaml"
@@ -1216,14 +1218,18 @@
       "question": "Is there an org-wide preventive control preventing an agent runtime from being deployed with an authentication mode that does not propagate a real user identity?",
       "assert": "Preventive guardrail configuration/policy",
       "workload_agnostic": true,
-      "verdict": "new",
+      "verdict": "covered",
       "disposition": null,
       "target_modules": [
         "agentcore_assessments"
       ],
-      "incumbents": [],
-      "incumbent_names": [],
-      "gap": "asserts an SCP; organizations:ListPolicies and organizations:DescribePolicy are now granted to this function for GW-02's AC-28, so ID-04 costs no further permission",
+      "incumbents": [
+        "AC-29"
+      ],
+      "incumbent_names": [
+        "AgentCore Runtime Authorizer Guardrail"
+      ],
+      "gap": "AC-29 requires a service control policy that denies both CreateAgentRuntime and UpdateAgentRuntime when bedrock-agentcore:RuntimeAuthorizerType is AWS_IAM, so a runtime cannot be created on, or moved back to, the SigV4 mode that authenticates the hosting application's shared role instead of the end user; a policy written the other way round, denying CUSTOM_JWT, is reported separately because it reads as configured to anyone counting policies. organizations:ListPolicies and organizations:DescribePolicy are granted to this function for GW-02's AC-28, so ID-04 costs no further permission. Attachment targets are outside the grant and every finding says so",
       "extra_iam": [],
       "phase": 4,
       "source": "controls/ai-specific/agentcore-identity.yaml"
@@ -1234,14 +1240,18 @@
       "question": "Is every request to invoke an agent authenticated and its identity claims validated before the agent's code runs?",
       "assert": "Inbound authorizer configuration (validated claims / signed-request enforcement)",
       "workload_agnostic": true,
-      "verdict": "new",
+      "verdict": "covered",
       "disposition": null,
       "target_modules": [
         "agentcore_assessments"
       ],
-      "incumbents": [],
-      "incumbent_names": [],
-      "gap": "GetAgentRuntime.authorizerConfiguration exists in botocore 1.43.85 and is never read anywhere; AG-24 is gateway-only, ID-08 is about the runtime",
+      "incumbents": [
+        "AC-30"
+      ],
+      "incumbent_names": [
+        "AgentCore Runtime Inbound Authorization"
+      ],
+      "gap": "AC-30 reads GetAgentRuntime.authorizerConfiguration per runtime: an absent configuration means every invoke is SigV4-signed, and a customJWTAuthorizer that pins neither allowedAudience nor allowedClients accepts every token its issuer minted for every application registered there, so the claims are validated but not against this agent. allowedScopes and customClaims are credited in the detail and cannot substitute, because a scope bounds what a token may ask for and not who it was minted for",
       "extra_iam": [],
       "phase": 4,
       "source": "controls/ai-specific/agentcore-identity.yaml"
@@ -1252,14 +1262,20 @@
       "question": "Is inbound access to agents restricted to only your approved identity provider(s) and client applications, so a validly-signed token from an unapproved issuer cannot invoke them?",
       "assert": "Inbound authorizer issuer/audience/client allow-lists + InboundJwtClaim condition keys pinning the IdP",
       "workload_agnostic": true,
-      "verdict": "new",
+      "verdict": "covered",
       "disposition": null,
       "target_modules": [
         "agentcore_assessments"
       ],
-      "incumbents": [],
-      "incumbent_names": [],
-      "gap": "the corpus reads authorizerType exactly once, at :3578, and never reads authorizerConfiguration; customJWTAuthorizer.{allowedAudience, allowedClients, allowedScopes, customClaims, discoveryUrl} are all present in the API and unread, so a gateway that trusts any issuer passes AG-24 today",
+      "incumbents": [
+        "AC-31",
+        "AC-32"
+      ],
+      "incumbent_names": [
+        "AgentCore Gateway Inbound Allow Lists",
+        "AgentCore Inbound JWT Issuer Conditions"
+      ],
+      "gap": "AG-24 passed every CUSTOM_JWT gateway on the authorizer type alone. AC-31 reads the authorizer's allow-lists and fails a gateway that pins neither allowedAudience nor allowedClients, because it then honours any token its issuer minted for any application registered there; allowedScopes and customClaims bound what a token may ask for and not who minted it for whom, so they are credited but do not substitute. AC-32 covers the second door, where the token-exchange APIs take an end user's JWT without passing a gateway authorizer at all, and fails a cached principal holding GetWorkloadAccessTokenForJWT or CompleteResourceTokenAuth with no InboundJwtClaim condition",
       "extra_iam": [],
       "phase": 4,
       "source": "controls/ai-specific/agentcore-identity.yaml"

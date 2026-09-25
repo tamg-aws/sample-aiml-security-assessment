@@ -337,11 +337,18 @@ ROWS = [
     ),
     (
         "AIR-ACR-ID-10",
-        TIGHTEN,
-        EXTEND,
+        COVERED,
+        None,
         "agentcore_assessments",
-        ["AC-02"],
-        "AC-02 detects full-access and wildcard grants only",
+        ["AC-33"],
+        "AC-33 judges the resource element on the five token issuance actions per cached role "
+        "and user: a resource ending in a wildcard mints a token for every workload identity "
+        "in the account, while a resource naming one identity bounds the grant to that agent. "
+        "A grant that names only the workload identity directory is reported separately at "
+        "medium, because the service authorization reference marks both the directory and the "
+        "identity required on these actions and never says whether the directory alone "
+        "authorizes the call, so that grant either reaches every identity the directory holds "
+        "or authorizes nothing",
         [],
         4,
     ),
@@ -441,12 +448,16 @@ ROWS = [
     ),
     (
         "AIR-ACR-ID-05",
-        TIGHTEN,
-        EXTEND,
+        COVERED,
+        None,
         "agentcore_assessments",
-        ["AC-14"],
-        "AC-14 has the CMK leg; the string 'secret' appears 0 times in the module, so the "
-        "secret-scan leg is unwritten",
+        ["AC-14", "AC-34"],
+        "AC-14 has the token vault CMK leg; AC-34 adds the secret-scan leg, reading "
+        "GetAgentRuntime.environmentVariables and failing a runtime whose definition holds an "
+        "access key id or a PEM private key inline. Only variable names reach the finding "
+        "because the API models the map as sensitive, and the resolution states the blind "
+        "spot: a value holding a slash reads as a secret name, so the remaining values are "
+        "the reader's to confirm",
         [],
         4,
     ),
@@ -590,36 +601,53 @@ ROWS = [
     ),
     (
         "AIR-ACR-ID-04",
-        NEW,
+        COVERED,
         None,
         "agentcore_assessments",
-        [],
-        "asserts an SCP; organizations:ListPolicies and organizations:DescribePolicy are now "
-        "granted to this function for GW-02's AC-28, so ID-04 costs no further permission",
+        ["AC-29"],
+        "AC-29 requires a service control policy that denies both CreateAgentRuntime and "
+        "UpdateAgentRuntime when bedrock-agentcore:RuntimeAuthorizerType is AWS_IAM, so a "
+        "runtime cannot be created on, or moved back to, the SigV4 mode that authenticates "
+        "the hosting application's shared role instead of the end user; a policy written the "
+        "other way round, denying CUSTOM_JWT, is reported separately because it reads as "
+        "configured to anyone counting policies. organizations:ListPolicies and "
+        "organizations:DescribePolicy are granted to this function for GW-02's AC-28, so "
+        "ID-04 costs no further permission. Attachment targets are outside the grant and "
+        "every finding says so",
         [],
         4,
     ),
     (
         "AIR-ACR-ID-08",
-        NEW,
+        COVERED,
         None,
         "agentcore_assessments",
-        [],
-        "GetAgentRuntime.authorizerConfiguration exists in botocore 1.43.85 and is never read "
-        "anywhere; AG-24 is gateway-only, ID-08 is about the runtime",
+        ["AC-30"],
+        "AC-30 reads GetAgentRuntime.authorizerConfiguration per runtime: an absent "
+        "configuration means every invoke is SigV4-signed, and a customJWTAuthorizer that "
+        "pins neither allowedAudience nor allowedClients accepts every token its issuer "
+        "minted for every application registered there, so the claims are validated but not "
+        "against this agent. allowedScopes and customClaims are credited in the detail and "
+        "cannot substitute, because a scope bounds what a token may ask for and not who it "
+        "was minted for",
         [],
         4,
     ),
     (
         "AIR-ACR-ID-11",
-        NEW,
+        COVERED,
         None,
         "agentcore_assessments",
-        [],
-        "the corpus reads authorizerType exactly once, at :3578, and never reads "
-        "authorizerConfiguration; customJWTAuthorizer.{allowedAudience, allowedClients, "
-        "allowedScopes, customClaims, discoveryUrl} are all present in the API and unread, so "
-        "a gateway that trusts any issuer passes AG-24 today",
+        ["AC-31", "AC-32"],
+        "AG-24 passed every CUSTOM_JWT gateway on the authorizer type alone. AC-31 reads the "
+        "authorizer's allow-lists and fails a gateway that pins neither allowedAudience nor "
+        "allowedClients, because it then honours any token its issuer minted for any "
+        "application registered there; allowedScopes and customClaims bound what a token may "
+        "ask for and not who minted it for whom, so they are credited but do not substitute. "
+        "AC-32 covers the second door, where the token-exchange APIs take an end user's JWT "
+        "without passing a gateway authorizer at all, and fails a cached principal holding "
+        "GetWorkloadAccessTokenForJWT or CompleteResourceTokenAuth with no InboundJwtClaim "
+        "condition",
         [],
         4,
     ),
@@ -829,6 +857,12 @@ INCUMBENT_NAMES = {
     "AC-26": "AgentCore Log Retention and Key Scope",
     "AC-27": "AgentCore Gateway Policy Conditions",
     "AC-28": "AgentCore Gateway Authorizer Guardrail",
+    "AC-29": "AgentCore Runtime Authorizer Guardrail",
+    "AC-30": "AgentCore Runtime Inbound Authorization",
+    "AC-31": "AgentCore Gateway Inbound Allow Lists",
+    "AC-32": "AgentCore Inbound JWT Issuer Conditions",
+    "AC-33": "AgentCore Token Issuance Scope",
+    "AC-34": "AgentCore Runtime Inline Credentials",
     "AG-24": "Agentic AI Gateway Inbound Authorization",
     "AG-25": "Agentic AI Gateway Tool Policy Enforcement",
     "AG-27": "Agentic AI Gateway WAF Protection",

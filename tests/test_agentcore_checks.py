@@ -5536,3 +5536,2038 @@ class TestAC28CheckRegistration:
             for region in ("us-east-1", "us-west-2", "eu-west-1")
         }
         assert len(endpoints) == 1
+
+
+_RUNTIME_WRITE = [
+    "bedrock-agentcore:CreateAgentRuntime",
+    "bedrock-agentcore:UpdateAgentRuntime",
+]
+_RUNTIME_KEY = "bedrock-agentcore:RuntimeAuthorizerType"
+
+
+class TestAC29RuntimeAuthorizerSCP:
+    """AC-29: an SCP has to deny runtime writes when the authorizer is AWS_IAM."""
+
+    def _wire(self, mock_orgs, documents):
+        """Serve one named SCP per entry in `documents`."""
+        mock_orgs.list_policies.return_value = {
+            "Policies": [
+                {"Id": f"p-{index}", "Name": name}
+                for index, name in enumerate(documents)
+            ]
+        }
+        by_id = {
+            f"p-{index}": statements
+            for index, statements in enumerate(documents.values())
+        }
+
+        def describe_policy(PolicyId):
+            return _scp(by_id[PolicyId])
+
+        mock_orgs.describe_policy.side_effect = describe_policy
+
+    @patch("agentcore_app.organizations_client")
+    def test_an_equals_deny_on_both_writes_passes(self, mock_orgs):
+        self._wire(
+            mock_orgs,
+            {
+                "DenySigV4Runtime": [
+                    {
+                        "Effect": "Deny",
+                        "Action": _RUNTIME_WRITE,
+                        "Resource": "*",
+                        "Condition": {"StringEquals": {_RUNTIME_KEY: "AWS_IAM"}},
+                    }
+                ]
+            },
+        )
+
+        findings = agentcore_app.check_agentcore_runtime_authorizer_scp()
+
+        assert len(findings) == 1
+        assert findings[0]["Check_ID"] == "AC-29"
+        assert findings[0]["Status"] == "Passed"
+        assert "DenySigV4Runtime" in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.organizations_client")
+    def test_a_not_equals_allow_list_that_omits_aws_iam_passes(self, mock_orgs):
+        # Deny unless the authorizer type is CUSTOM_JWT denies AWS_IAM, which is
+        # the same guardrail written from the approved side.
+        self._wire(
+            mock_orgs,
+            {
+                "OnlyJwtRuntimes": [
+                    {
+                        "Effect": "Deny",
+                        "Action": _RUNTIME_WRITE,
+                        "Resource": "*",
+                        "Condition": {"StringNotEquals": {_RUNTIME_KEY: "CUSTOM_JWT"}},
+                    }
+                ]
+            },
+        )
+
+        findings = agentcore_app.check_agentcore_runtime_authorizer_scp()
+
+        assert findings[0]["Status"] == "Passed"
+
+    @patch("agentcore_app.organizations_client")
+    def test_a_deny_on_create_alone_is_partial(self, mock_orgs):
+        self._wire(
+            mock_orgs,
+            {
+                "DenyCreateOnly": [
+                    {
+                        "Effect": "Deny",
+                        "Action": ["bedrock-agentcore:CreateAgentRuntime"],
+                        "Resource": "*",
+                        "Condition": {"StringEquals": {_RUNTIME_KEY: "AWS_IAM"}},
+                    }
+                ]
+            },
+        )
+
+        findings = agentcore_app.check_agentcore_runtime_authorizer_scp()
+
+        assert findings[0]["Status"] == "Failed"
+        assert findings[0]["Finding"].endswith("Partial")
+        assert "UpdateAgentRuntime" in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.organizations_client")
+    def test_a_deny_of_the_jwt_mode_is_reported_as_inverted(self, mock_orgs):
+        # The guardrail exists, conditions on the right key, and forbids the one
+        # mode that proves the end user's identity.
+        self._wire(
+            mock_orgs,
+            {
+                "NoJwtRuntimes": [
+                    {
+                        "Effect": "Deny",
+                        "Action": _RUNTIME_WRITE,
+                        "Resource": "*",
+                        "Condition": {"StringEquals": {_RUNTIME_KEY: "CUSTOM_JWT"}},
+                    }
+                ]
+            },
+        )
+
+        findings = agentcore_app.check_agentcore_runtime_authorizer_scp()
+
+        assert findings[0]["Status"] == "Failed"
+        assert findings[0]["Finding"].endswith("Inverted")
+        assert "NoJwtRuntimes" in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.organizations_client")
+    def test_a_not_equals_on_aws_iam_is_reported_as_inverted(self, mock_orgs):
+        # Deny unless the authorizer type is AWS_IAM admits only SigV4, the
+        # inverse of the intended guardrail written from the approved side.
+        self._wire(
+            mock_orgs,
+            {
+                "OnlySigV4Runtimes": [
+                    {
+                        "Effect": "Deny",
+                        "Action": _RUNTIME_WRITE,
+                        "Resource": "*",
+                        "Condition": {"StringNotEquals": {_RUNTIME_KEY: "AWS_IAM"}},
+                    }
+                ]
+            },
+        )
+
+        findings = agentcore_app.check_agentcore_runtime_authorizer_scp()
+
+        assert findings[0]["Status"] == "Failed"
+        assert findings[0]["Finding"].endswith("Inverted")
+
+    @patch("agentcore_app.organizations_client")
+    def test_a_policy_denying_both_modes_still_passes(self, mock_orgs):
+        # A blanket prohibition on runtimes does prevent the SigV4 deployment
+        # this control is about, so it earns the pass and the detail names the
+        # policy for a reader who wants to know the JWT mode is blocked too.
+        self._wire(
+            mock_orgs,
+            {
+                "NoRuntimesAtAll": [
+                    {
+                        "Effect": "Deny",
+                        "Action": _RUNTIME_WRITE,
+                        "Resource": "*",
+                        "Condition": {
+                            "StringEquals": {_RUNTIME_KEY: ["AWS_IAM", "CUSTOM_JWT"]}
+                        },
+                    }
+                ]
+            },
+        )
+
+        findings = agentcore_app.check_agentcore_runtime_authorizer_scp()
+
+        assert findings[0]["Status"] == "Passed"
+
+    @patch("agentcore_app.organizations_client")
+    def test_a_null_condition_is_reported_as_ineffective(self, mock_orgs):
+        self._wire(
+            mock_orgs,
+            {
+                "NullTest": [
+                    {
+                        "Effect": "Deny",
+                        "Action": _RUNTIME_WRITE,
+                        "Resource": "*",
+                        "Condition": {"Null": {_RUNTIME_KEY: "true"}},
+                    }
+                ]
+            },
+        )
+
+        findings = agentcore_app.check_agentcore_runtime_authorizer_scp()
+
+        assert findings[0]["Status"] == "Failed"
+        assert findings[0]["Finding"].endswith("Ineffective")
+
+    @patch("agentcore_app.organizations_client")
+    def test_an_allow_carrying_the_condition_is_not_coverage(self, mock_orgs):
+        self._wire(
+            mock_orgs,
+            {
+                "AllowShaped": [
+                    {
+                        "Effect": "Allow",
+                        "Action": _RUNTIME_WRITE,
+                        "Resource": "*",
+                        "Condition": {"StringEquals": {_RUNTIME_KEY: "AWS_IAM"}},
+                    }
+                ]
+            },
+        )
+
+        findings = agentcore_app.check_agentcore_runtime_authorizer_scp()
+
+        assert findings[0]["Status"] == "Failed"
+        assert findings[0]["Finding"].endswith("Missing")
+
+    @patch("agentcore_app.organizations_client")
+    def test_the_gateway_key_does_not_satisfy_the_runtime_control(self, mock_orgs):
+        # AC-28's guardrail is a different key on different actions. Without this
+        # a gateway SCP would close the runtime row for free.
+        self._wire(
+            mock_orgs,
+            {
+                "DenyOpenGateway": [
+                    {
+                        "Effect": "Deny",
+                        "Action": _GATEWAY_WRITE,
+                        "Resource": "*",
+                        "Condition": {
+                            "StringEquals": {
+                                "bedrock-agentcore:GatewayAuthorizerType": "NONE"
+                            }
+                        },
+                    }
+                ]
+            },
+        )
+
+        findings = agentcore_app.check_agentcore_runtime_authorizer_scp()
+
+        assert findings[0]["Status"] == "Failed"
+        assert findings[0]["Finding"].endswith("Missing")
+
+    @patch("agentcore_app.organizations_client")
+    def test_a_wildcard_action_covers_both_writes(self, mock_orgs):
+        self._wire(
+            mock_orgs,
+            {
+                "DenyAllAgentCore": [
+                    {
+                        "Effect": "Deny",
+                        "Action": "bedrock-agentcore:*",
+                        "Resource": "*",
+                        "Condition": {"StringEquals": {_RUNTIME_KEY: "AWS_IAM"}},
+                    }
+                ]
+            },
+        )
+
+        findings = agentcore_app.check_agentcore_runtime_authorizer_scp()
+
+        assert findings[0]["Status"] == "Passed"
+
+    @patch("agentcore_app.organizations_client")
+    def test_two_policies_can_cover_one_write_each(self, mock_orgs):
+        self._wire(
+            mock_orgs,
+            {
+                "DenyCreate": [
+                    {
+                        "Effect": "Deny",
+                        "Action": ["bedrock-agentcore:CreateAgentRuntime"],
+                        "Resource": "*",
+                        "Condition": {"StringEquals": {_RUNTIME_KEY: "AWS_IAM"}},
+                    }
+                ],
+                "DenyUpdate": [
+                    {
+                        "Effect": "Deny",
+                        "Action": ["bedrock-agentcore:UpdateAgentRuntime"],
+                        "Resource": "*",
+                        "Condition": {"StringEquals": {_RUNTIME_KEY: "AWS_IAM"}},
+                    }
+                ],
+            },
+        )
+
+        findings = agentcore_app.check_agentcore_runtime_authorizer_scp()
+
+        assert findings[0]["Status"] == "Passed"
+        assert "DenyCreate, DenyUpdate" in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.organizations_client")
+    def test_the_value_match_ignores_case_and_padding(self, mock_orgs):
+        self._wire(
+            mock_orgs,
+            {
+                "LowerCaseValue": [
+                    {
+                        "Effect": "Deny",
+                        "Action": _RUNTIME_WRITE,
+                        "Resource": "*",
+                        "Condition": {"StringEquals": {_RUNTIME_KEY: " aws_iam "}},
+                    }
+                ]
+            },
+        )
+
+        findings = agentcore_app.check_agentcore_runtime_authorizer_scp()
+
+        assert findings[0]["Status"] == "Passed"
+
+    @patch("agentcore_app.organizations_client")
+    def test_policies_are_read_from_every_page(self, mock_orgs):
+        # The guardrail sits on the second page, so an unpaginated read reports
+        # the organization as unguarded.
+        mock_orgs.list_policies.side_effect = [
+            {"Policies": [{"Id": "p-1", "Name": "Unrelated"}], "NextToken": "page-2"},
+            {"Policies": [{"Id": "p-2", "Name": "DenySigV4Runtime"}]},
+        ]
+
+        def describe_policy(PolicyId):
+            if PolicyId == "p-1":
+                return _scp([{"Effect": "Deny", "Action": "s3:*", "Resource": "*"}])
+            return _scp(
+                [
+                    {
+                        "Effect": "Deny",
+                        "Action": _RUNTIME_WRITE,
+                        "Resource": "*",
+                        "Condition": {"StringEquals": {_RUNTIME_KEY: "AWS_IAM"}},
+                    }
+                ]
+            )
+
+        mock_orgs.describe_policy.side_effect = describe_policy
+
+        findings = agentcore_app.check_agentcore_runtime_authorizer_scp()
+
+        assert mock_orgs.list_policies.call_count == 2
+        assert mock_orgs.list_policies.call_args_list[1].kwargs["NextToken"] == "page-2"
+        assert findings[0]["Status"] == "Passed"
+        assert "DenySigV4Runtime" in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.organizations_client")
+    def test_no_policies_at_all_fails_as_missing(self, mock_orgs):
+        mock_orgs.list_policies.return_value = {"Policies": []}
+
+        findings = agentcore_app.check_agentcore_runtime_authorizer_scp()
+
+        assert findings[0]["Status"] == "Failed"
+        assert findings[0]["Finding"].endswith("Missing")
+
+    @patch("agentcore_app.organizations_client", None)
+    def test_a_missing_client_is_not_applicable(self):
+        findings = agentcore_app.check_agentcore_runtime_authorizer_scp()
+
+        assert findings[0]["Check_ID"] == "AC-29"
+        assert findings[0]["Status"] == "N/A"
+
+    @patch("agentcore_app.organizations_client")
+    def test_a_member_account_denial_is_not_applicable(self, mock_orgs):
+        mock_orgs.list_policies.side_effect = ClientError(
+            {"Error": {"Code": "AccessDeniedException", "Message": "denied"}},
+            "ListPolicies",
+        )
+
+        findings = agentcore_app.check_agentcore_runtime_authorizer_scp()
+
+        assert findings[0]["Status"] == "N/A"
+        assert "member" in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.organizations_client")
+    def test_an_unreadable_single_policy_is_reported_and_the_rest_judged(
+        self, mock_orgs
+    ):
+        mock_orgs.list_policies.return_value = {
+            "Policies": [
+                {"Id": "p-broken", "Name": "Unreadable"},
+                {"Id": "p-good", "Name": "DenySigV4Runtime"},
+            ]
+        }
+
+        def describe_policy(PolicyId):
+            if PolicyId == "p-broken":
+                raise ClientError(
+                    {"Error": {"Code": "ServiceException", "Message": "boom"}},
+                    "DescribePolicy",
+                )
+            return _scp(
+                [
+                    {
+                        "Effect": "Deny",
+                        "Action": _RUNTIME_WRITE,
+                        "Resource": "*",
+                        "Condition": {"StringEquals": {_RUNTIME_KEY: "AWS_IAM"}},
+                    }
+                ]
+            )
+
+        mock_orgs.describe_policy.side_effect = describe_policy
+
+        findings = agentcore_app.check_agentcore_runtime_authorizer_scp()
+
+        assert [finding["Status"] for finding in findings] == ["N/A", "Passed"]
+        assert "Unreadable" in findings[0]["Finding_Details"]
+
+
+class TestAC29CheckRegistration:
+    """AC-29 is organization-wide, so it runs once and not per scanned region."""
+
+    def test_the_scp_check_is_not_in_the_regional_tuples(self):
+        assert "AC-29" not in agentcore_app.REGIONAL_AGENTCORE_CHECK_IDS
+        assert "AC-29" not in agentcore_app.AGENTCORE_RUNTIME_CHECK_IDS
+
+    def test_the_handler_registers_the_scp_check_on_both_cache_paths(self):
+        source = textwrap.dedent(inspect.getsource(agentcore_app.lambda_handler))
+        registrations = [
+            node
+            for node in ast.walk(ast.parse(source))
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name) and target.id == "global_checks"
+                for target in node.targets
+            )
+        ]
+        assert len(registrations) == 2
+        for registration in registrations:
+            assert "check_agentcore_runtime_authorizer_scp" in ast.unparse(
+                registration.value
+            )
+
+    def test_the_condition_key_is_wired_to_both_runtime_writes(self):
+        # The key carries no documented value set, so the two spellings the check
+        # matches are taken from the enums that do name these modes. If the
+        # service ever models a runtime authorizer type, this is where the
+        # vocabulary should come from instead.
+        credentials = {
+            "region_name": "us-east-1",
+            "aws_access_key_id": "testing",
+            "aws_secret_access_key": "testing",  # pragma: allowlist secret - synthetic test credential
+        }
+        model = agentcore_app.boto3.client(
+            "bedrock-agentcore-control", **credentials
+        ).meta.service_model
+        for operation in ("CreateAgentRuntime", "UpdateAgentRuntime"):
+            assert "authorizerConfiguration" in (
+                model.operation_model(operation).input_shape.members
+            )
+        enums = {
+            shape: set(model.shape_for(shape).enum)
+            for shape in (
+                "AuthorizerType",
+                "PaymentsAuthorizerType",
+                "RegistryAuthorizerType",
+            )
+        }
+        for values in enums.values():
+            assert agentcore_app.RUNTIME_AUTHORIZER_UNVERIFIED_USER_VALUE in values
+            assert agentcore_app.RUNTIME_AUTHORIZER_VERIFIED_USER_VALUE in values
+        # The runtime's own authorizer configuration models no type member, which
+        # is why the SCP key is the only surface that can answer this control.
+        authorizer = model.operation_model("GetAgentRuntime").output_shape.members[
+            "authorizerConfiguration"
+        ]
+        assert set(authorizer.members) == {"customJWTAuthorizer"}
+
+
+def _jwt_runtime(**authorizer):
+    return {"authorizerConfiguration": {"customJWTAuthorizer": authorizer}}
+
+
+class TestAC30RuntimeInboundAuthorization:
+    """AC-30: a runtime's inbound authorizer has to constrain the tokens it takes."""
+
+    _RUNTIMES = [
+        {"agentRuntimeId": "rt-sigv4", "agentRuntimeName": "Signed"},
+        {"agentRuntimeId": "rt-pinned", "agentRuntimeName": "Pinned"},
+        {"agentRuntimeId": "rt-open", "agentRuntimeName": "Open"},
+    ]
+
+    def _details(self, agentRuntimeId, **kwargs):
+        if agentRuntimeId == "rt-pinned":
+            return _jwt_runtime(
+                discoveryUrl="https://idp.example/.well-known/openid-configuration",
+                allowedAudience=["agent-api"],
+            )
+        if agentRuntimeId == "rt-open":
+            return _jwt_runtime(
+                discoveryUrl="https://idp.example/.well-known/openid-configuration"
+            )
+        return {"agentRuntimeId": agentRuntimeId}
+
+    @patch("agentcore_app.agentcore_client")
+    def test_each_runtime_gets_its_own_verdict(self, mock_ac):
+        mock_ac.list_agent_runtimes.return_value = {"agentRuntimes": self._RUNTIMES}
+        mock_ac.get_agent_runtime.side_effect = self._details
+
+        findings = agentcore_app.check_agentcore_runtime_inbound_authorization()
+
+        assert len(findings) == 3
+        by_runtime = {}
+        for finding in findings:
+            assert finding["Check_ID"] == "AC-30"
+            assert_finding_schema(finding)
+            for runtime in self._RUNTIMES:
+                if runtime["agentRuntimeId"] in finding["Finding_Details"]:
+                    by_runtime[runtime["agentRuntimeId"]] = finding
+        assert by_runtime["rt-sigv4"]["Status"] == "Passed"
+        assert by_runtime["rt-pinned"]["Status"] == "Passed"
+        assert by_runtime["rt-open"]["Status"] == "Failed"
+        assert by_runtime["rt-open"]["Finding"].endswith("Unbounded")
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_runtime_with_no_authorizer_enforces_sigv4(self, mock_ac):
+        mock_ac.list_agent_runtimes.return_value = {
+            "agentRuntimes": [self._RUNTIMES[0]]
+        }
+        mock_ac.get_agent_runtime.side_effect = self._details
+
+        findings = agentcore_app.check_agentcore_runtime_inbound_authorization()
+
+        assert findings[0]["Status"] == "Passed"
+        assert "SigV4-signed" in findings[0]["Finding_Details"]
+        assert "InvokeAgentRuntime" in findings[0]["Resolution"]
+
+    @pytest.mark.parametrize(
+        "member,label,status",
+        [
+            ("allowedAudience", "audience", "Passed"),
+            ("allowedClients", "client id", "Passed"),
+            ("allowedScopes", "scope", "Failed"),
+            ("customClaims", "custom claim", "Failed"),
+        ],
+    )
+    @patch("agentcore_app.agentcore_client")
+    def test_only_audience_or_client_binds_the_calling_application(
+        self, mock_ac, member, label, status
+    ):
+        # The inbound-authorizer guide requires at least one of the four, so a
+        # count of pinned claims cannot separate these cases: a scope-only
+        # authorizer validates a claim and still takes a token minted for
+        # another application at the same issuer.
+        mock_ac.list_agent_runtimes.return_value = {
+            "agentRuntimes": [self._RUNTIMES[1]]
+        }
+        mock_ac.get_agent_runtime.return_value = _jwt_runtime(
+            discoveryUrl="https://idp.example/.well-known/openid-configuration",
+            **{member: ["pinned"]},
+        )
+
+        findings = agentcore_app.check_agentcore_runtime_inbound_authorization()
+
+        assert findings[0]["Status"] == status
+        assert label in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_the_scope_only_detail_credits_the_claim_it_does_validate(self, mock_ac):
+        # This is the live shape of one runtime in the probe estate: a scope
+        # list, no audience and no client.
+        mock_ac.list_agent_runtimes.return_value = {
+            "agentRuntimes": [self._RUNTIMES[2]]
+        }
+        mock_ac.get_agent_runtime.return_value = _jwt_runtime(
+            discoveryUrl="https://idp.example/.well-known/openid-configuration",
+            allowedScopes=["agent/invoke"],
+        )
+
+        findings = agentcore_app.check_agentcore_runtime_inbound_authorization()
+
+        assert findings[0]["Status"] == "Failed"
+        assert (
+            "validates the scope claim(s) but neither the audience"
+            in (findings[0]["Finding_Details"])
+        )
+
+    @patch("agentcore_app.agentcore_client")
+    def test_the_passed_detail_names_every_validated_claim(self, mock_ac):
+        mock_ac.list_agent_runtimes.return_value = {
+            "agentRuntimes": [self._RUNTIMES[1]]
+        }
+        mock_ac.get_agent_runtime.return_value = _jwt_runtime(
+            discoveryUrl="https://idp.example/.well-known/openid-configuration",
+            allowedAudience=["agent-api"],
+            allowedScopes=["agent/invoke"],
+        )
+
+        findings = agentcore_app.check_agentcore_runtime_inbound_authorization()
+
+        assert findings[0]["Status"] == "Passed"
+        assert "audience, scope" in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_an_empty_allow_list_is_not_a_constraint(self, mock_ac):
+        # A present-but-empty list accepts every value of that claim, so a
+        # membership test on the key alone would score this as coverage.
+        mock_ac.list_agent_runtimes.return_value = {
+            "agentRuntimes": [self._RUNTIMES[2]]
+        }
+        mock_ac.get_agent_runtime.return_value = _jwt_runtime(
+            discoveryUrl="https://idp.example/.well-known/openid-configuration",
+            allowedAudience=[],
+            allowedClients=[],
+        )
+
+        findings = agentcore_app.check_agentcore_runtime_inbound_authorization()
+
+        assert findings[0]["Status"] == "Failed"
+        assert findings[0]["Finding"].endswith("Unbounded")
+
+    @patch("agentcore_app.agentcore_client")
+    def test_an_authorizer_that_pins_nothing_reads_as_unbounded(self, mock_ac):
+        # The guide says the service requires one of the four, so this state
+        # should not exist. It gets the same verdict as a scope-only authorizer
+        # instead of a branch of its own that nothing can reach.
+        mock_ac.list_agent_runtimes.return_value = {
+            "agentRuntimes": [self._RUNTIMES[2]]
+        }
+        mock_ac.get_agent_runtime.side_effect = self._details
+
+        findings = agentcore_app.check_agentcore_runtime_inbound_authorization()
+
+        assert findings[0]["Status"] == "Failed"
+        assert "validates neither the audience" in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_the_failed_detail_names_the_issuer_it_trusts(self, mock_ac):
+        mock_ac.list_agent_runtimes.return_value = {
+            "agentRuntimes": [self._RUNTIMES[2]]
+        }
+        mock_ac.get_agent_runtime.side_effect = self._details
+
+        findings = agentcore_app.check_agentcore_runtime_inbound_authorization()
+
+        assert (
+            "https://idp.example/.well-known/openid-configuration"
+            in (findings[0]["Finding_Details"])
+        )
+        assert "rt-open" in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_claim_constraint_is_not_read_from_the_wrong_level(self, mock_ac):
+        # The four constraints live inside customJWTAuthorizer. Reading them off
+        # authorizerConfiguration would score this runtime as pinned.
+        mock_ac.list_agent_runtimes.return_value = {
+            "agentRuntimes": [self._RUNTIMES[2]]
+        }
+        mock_ac.get_agent_runtime.return_value = {
+            "authorizerConfiguration": {
+                "allowedAudience": ["agent-api"],
+                "customJWTAuthorizer": {
+                    "discoveryUrl": "https://idp.example/.well-known/openid-configuration"
+                },
+            }
+        }
+
+        findings = agentcore_app.check_agentcore_runtime_inbound_authorization()
+
+        assert findings[0]["Status"] == "Failed"
+
+    @patch("agentcore_app.agentcore_client")
+    def test_an_authorizer_member_this_botocore_cannot_read_is_na(self, mock_ac):
+        mock_ac.list_agent_runtimes.return_value = {
+            "agentRuntimes": [self._RUNTIMES[1]]
+        }
+        mock_ac.get_agent_runtime.return_value = {
+            "authorizerConfiguration": {"mtlsAuthorizer": {"trustStoreArn": "arn:x"}}
+        }
+
+        findings = agentcore_app.check_agentcore_runtime_inbound_authorization()
+
+        assert findings[0]["Status"] == "N/A"
+        assert "mtlsAuthorizer" in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_one_unreadable_runtime_does_not_hide_the_others(self, mock_ac):
+        mock_ac.list_agent_runtimes.return_value = {"agentRuntimes": self._RUNTIMES[1:]}
+
+        def details(agentRuntimeId, **kwargs):
+            if agentRuntimeId == "rt-pinned":
+                raise ClientError(
+                    {"Error": {"Code": "AccessDeniedException", "Message": "no"}},
+                    "GetAgentRuntime",
+                )
+            return self._details(agentRuntimeId)
+
+        mock_ac.get_agent_runtime.side_effect = details
+
+        findings = agentcore_app.check_agentcore_runtime_inbound_authorization()
+
+        assert len(findings) == 2
+        assert [finding["Status"] for finding in findings] == ["N/A", "Failed"]
+        assert "GetAgentRuntime" in findings[0]["Resolution"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_runtimes_are_read_from_every_page(self, mock_ac):
+        mock_ac.list_agent_runtimes.side_effect = [
+            {"agentRuntimes": [self._RUNTIMES[0]], "nextToken": "rt-page-2"},
+            {"agentRuntimes": [self._RUNTIMES[2]]},
+        ]
+        mock_ac.get_agent_runtime.side_effect = self._details
+
+        findings = agentcore_app.check_agentcore_runtime_inbound_authorization()
+
+        assert mock_ac.list_agent_runtimes.call_count == 2
+        assert [finding["Status"] for finding in findings] == ["Passed", "Failed"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_list_failure_is_reported_as_incomplete(self, mock_ac):
+        mock_ac.list_agent_runtimes.side_effect = ClientError(
+            {"Error": {"Code": "AccessDeniedException", "Message": "no"}},
+            "ListAgentRuntimes",
+        )
+
+        findings = agentcore_app.check_agentcore_runtime_inbound_authorization()
+
+        assert len(findings) == 1
+        assert findings[0]["Status"] == "N/A"
+        assert findings[0]["Finding"].endswith("Incomplete")
+
+    @patch("agentcore_app.agentcore_client")
+    def test_no_runtimes_is_na(self, mock_ac):
+        mock_ac.list_agent_runtimes.return_value = {"agentRuntimes": []}
+        findings = agentcore_app.check_agentcore_runtime_inbound_authorization()
+        assert len(findings) == 1
+        assert findings[0]["Status"] == "N/A"
+
+    @patch("agentcore_app.agentcore_client", None)
+    def test_no_client_is_na(self):
+        findings = agentcore_app.check_agentcore_runtime_inbound_authorization()
+        assert findings[0]["Status"] == "N/A"
+        assert findings[0]["Check_ID"] == "AC-30"
+
+
+class TestAC30CheckRegistration:
+    """AC-30 reads a regional resource, so it runs in every scanned region."""
+
+    def test_the_runtime_check_is_in_both_regional_tuples(self):
+        assert "AC-30" in agentcore_app.REGIONAL_AGENTCORE_CHECK_IDS
+        assert "AC-30" in agentcore_app.AGENTCORE_RUNTIME_CHECK_IDS
+
+    def test_timeout_backfill_emits_the_runtime_check(self):
+        findings = agentcore_app.build_agentcore_timeout_findings("us-east-1", [])
+        assert "AC-30" in {finding["Check_ID"] for finding in findings}
+
+    def test_the_handler_registers_the_runtime_check_once(self):
+        source = textwrap.dedent(inspect.getsource(agentcore_app.lambda_handler))
+        assert source.count("check_agentcore_runtime_inbound_authorization") == 1
+
+    def test_the_claim_members_the_check_reads_are_modelled(self):
+        # A constraint the API does not model would never be found, and the
+        # check would report every JWT runtime as unbounded.
+        credentials = {
+            "region_name": "us-east-1",
+            "aws_access_key_id": "testing",
+            "aws_secret_access_key": "testing",  # pragma: allowlist secret - synthetic test credential
+        }
+        model = agentcore_app.boto3.client(
+            "bedrock-agentcore-control", **credentials
+        ).meta.service_model
+        authorizer = model.operation_model("GetAgentRuntime").output_shape.members[
+            "authorizerConfiguration"
+        ]
+        jwt = authorizer.members["customJWTAuthorizer"]
+        claims = set(agentcore_app.JWT_AUTHORIZER_CALLER_CLAIMS) | set(
+            agentcore_app.JWT_AUTHORIZER_OTHER_CLAIMS
+        )
+        assert claims <= set(jwt.members)
+        assert not set(agentcore_app.JWT_AUTHORIZER_CALLER_CLAIMS) & set(
+            agentcore_app.JWT_AUTHORIZER_OTHER_CLAIMS
+        )
+        # discoveryUrl alone is required in both machine-readable surfaces, the
+        # service model here and the AWS::BedrockAgentCore::Runtime resource
+        # schema, which is why the guide's "at least one of the four" cannot be
+        # read off either one.
+        assert jwt.required_members == ["discoveryUrl"]
+        # And the whole authorizer is optional on create, which is what makes
+        # an absent configuration mean SigV4 instead of no authentication.
+        create = model.operation_model("CreateAgentRuntime").input_shape
+        assert "authorizerConfiguration" not in create.required_members
+
+
+def _jwt_gateway(**authorizer):
+    return {
+        "authorizerType": "CUSTOM_JWT",
+        "authorizerConfiguration": {"customJWTAuthorizer": authorizer},
+    }
+
+
+_ISSUER = "https://idp.example/.well-known/openid-configuration"
+
+
+class TestAC31GatewayInboundAllowLists:
+    """AC-31: a gateway's JWT authorizer has to name the applications it serves."""
+
+    _GATEWAYS = [
+        {"gatewayId": "gw-iam", "name": "Signed"},
+        {"gatewayId": "gw-pinned", "name": "Pinned"},
+        {"gatewayId": "gw-open", "name": "Open"},
+        {"gatewayId": "gw-none", "name": "Unauthenticated"},
+    ]
+
+    def _details(self, gatewayIdentifier, **kwargs):
+        if gatewayIdentifier == "gw-pinned":
+            return _jwt_gateway(discoveryUrl=_ISSUER, allowedClients=["client-a"])
+        if gatewayIdentifier == "gw-open":
+            return _jwt_gateway(discoveryUrl=_ISSUER, allowedScopes=["tools/read"])
+        if gatewayIdentifier == "gw-none":
+            return {"authorizerType": "NONE"}
+        return {"authorizerType": "AWS_IAM"}
+
+    @patch("agentcore_app.agentcore_client")
+    def test_each_gateway_gets_its_own_verdict(self, mock_ac):
+        mock_ac.list_gateways.return_value = {"items": self._GATEWAYS}
+        mock_ac.get_gateway.side_effect = self._details
+
+        findings = agentcore_app.check_agentcore_gateway_inbound_allow_lists()
+
+        assert len(findings) == 4
+        by_gateway = {}
+        for finding in findings:
+            assert finding["Check_ID"] == "AC-31"
+            assert_finding_schema(finding)
+            for gateway in self._GATEWAYS:
+                if gateway["gatewayId"] in finding["Finding_Details"]:
+                    by_gateway[gateway["gatewayId"]] = finding
+        assert by_gateway["gw-iam"]["Status"] == "Passed"
+        assert by_gateway["gw-pinned"]["Status"] == "Passed"
+        assert by_gateway["gw-open"]["Status"] == "Failed"
+        assert by_gateway["gw-none"]["Status"] == "Failed"
+        assert by_gateway["gw-open"]["Finding"].endswith("Absent")
+
+    @pytest.mark.parametrize("authorizer_type", ["AWS_IAM", "AUTHENTICATE_ONLY"])
+    @patch("agentcore_app.agentcore_client")
+    def test_a_sigv4_gateway_has_no_issuer_to_allow_list(
+        self, mock_ac, authorizer_type
+    ):
+        # AG-24 fails AUTHENTICATE_ONLY without a policy engine in ENFORCE mode,
+        # which is the authorization question. This check asks who the caller is
+        # allowed to be, and a SigV4 caller carries no token to pin.
+        mock_ac.list_gateways.return_value = {"items": [self._GATEWAYS[0]]}
+        mock_ac.get_gateway.return_value = {"authorizerType": authorizer_type}
+
+        findings = agentcore_app.check_agentcore_gateway_inbound_allow_lists()
+
+        assert findings[0]["Status"] == "Passed"
+        assert authorizer_type in findings[0]["Finding_Details"]
+        assert "no bearer token" in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_no_inbound_authentication_has_no_allow_list_to_hold(self, mock_ac):
+        mock_ac.list_gateways.return_value = {"items": [self._GATEWAYS[3]]}
+        mock_ac.get_gateway.side_effect = self._details
+
+        findings = agentcore_app.check_agentcore_gateway_inbound_allow_lists()
+
+        assert findings[0]["Status"] == "Failed"
+        assert findings[0]["Finding"].endswith("Absent")
+        assert "passthrough" in findings[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "member,label,status",
+        [
+            ("allowedAudience", "audience", "Passed"),
+            ("allowedClients", "client id", "Passed"),
+            ("allowedScopes", "scope", "Failed"),
+            ("customClaims", "custom claim", "Failed"),
+        ],
+    )
+    @patch("agentcore_app.agentcore_client")
+    def test_only_audience_or_client_names_the_calling_application(
+        self, mock_ac, member, label, status
+    ):
+        mock_ac.list_gateways.return_value = {"items": [self._GATEWAYS[1]]}
+        mock_ac.get_gateway.return_value = _jwt_gateway(
+            discoveryUrl=_ISSUER, **{member: ["pinned"]}
+        )
+
+        findings = agentcore_app.check_agentcore_gateway_inbound_allow_lists()
+
+        assert findings[0]["Status"] == status
+        assert label in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_the_scope_only_detail_credits_the_claim_it_does_bound(self, mock_ac):
+        # One gateway in the live probe estate has exactly this shape: a scope
+        # list, no audience and no client.
+        mock_ac.list_gateways.return_value = {"items": [self._GATEWAYS[2]]}
+        mock_ac.get_gateway.side_effect = self._details
+
+        findings = agentcore_app.check_agentcore_gateway_inbound_allow_lists()
+
+        assert findings[0]["Status"] == "Failed"
+        assert (
+            "allow-lists the scope claim(s) but neither the audience"
+            in (findings[0]["Finding_Details"])
+        )
+        assert _ISSUER in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_the_passed_detail_names_every_allow_listed_claim(self, mock_ac):
+        mock_ac.list_gateways.return_value = {"items": [self._GATEWAYS[1]]}
+        mock_ac.get_gateway.return_value = _jwt_gateway(
+            discoveryUrl=_ISSUER,
+            allowedAudience=["gateway-api"],
+            allowedClients=["client-a"],
+            allowedScopes=["tools/read"],
+        )
+
+        findings = agentcore_app.check_agentcore_gateway_inbound_allow_lists()
+
+        assert findings[0]["Status"] == "Passed"
+        assert "audience, client id, scope" in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_an_empty_allow_list_is_not_a_constraint(self, mock_ac):
+        mock_ac.list_gateways.return_value = {"items": [self._GATEWAYS[2]]}
+        mock_ac.get_gateway.return_value = _jwt_gateway(
+            discoveryUrl=_ISSUER, allowedAudience=[], allowedClients=[]
+        )
+
+        findings = agentcore_app.check_agentcore_gateway_inbound_allow_lists()
+
+        assert findings[0]["Status"] == "Failed"
+        assert "allow-lists neither the audience" in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_an_allow_list_is_not_read_from_the_wrong_level(self, mock_ac):
+        mock_ac.list_gateways.return_value = {"items": [self._GATEWAYS[2]]}
+        mock_ac.get_gateway.return_value = {
+            "authorizerType": "CUSTOM_JWT",
+            "authorizerConfiguration": {
+                "allowedClients": ["client-a"],
+                "customJWTAuthorizer": {"discoveryUrl": _ISSUER},
+            },
+        }
+
+        findings = agentcore_app.check_agentcore_gateway_inbound_allow_lists()
+
+        assert findings[0]["Status"] == "Failed"
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_jwt_gateway_with_no_authorizer_configuration_is_na(self, mock_ac):
+        # Not a pass: CUSTOM_JWT with no readable authorizer means the
+        # allow-lists were not returned, not that they are empty.
+        mock_ac.list_gateways.return_value = {"items": [self._GATEWAYS[1]]}
+        mock_ac.get_gateway.return_value = {"authorizerType": "CUSTOM_JWT"}
+
+        findings = agentcore_app.check_agentcore_gateway_inbound_allow_lists()
+
+        assert findings[0]["Status"] == "N/A"
+        assert "customJWTAuthorizer" in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_an_authorizer_type_this_botocore_cannot_judge_is_na(self, mock_ac):
+        mock_ac.list_gateways.return_value = {"items": [self._GATEWAYS[1]]}
+        mock_ac.get_gateway.return_value = {"authorizerType": "CUSTOM_MTLS"}
+
+        findings = agentcore_app.check_agentcore_gateway_inbound_allow_lists()
+
+        assert findings[0]["Status"] == "N/A"
+        assert "CUSTOM_MTLS" in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_one_unreadable_gateway_does_not_hide_the_others(self, mock_ac):
+        mock_ac.list_gateways.return_value = {"items": self._GATEWAYS[1:3]}
+
+        def details(gatewayIdentifier, **kwargs):
+            if gatewayIdentifier == "gw-pinned":
+                raise ClientError(
+                    {"Error": {"Code": "AccessDeniedException", "Message": "no"}},
+                    "GetGateway",
+                )
+            return self._details(gatewayIdentifier)
+
+        mock_ac.get_gateway.side_effect = details
+
+        findings = agentcore_app.check_agentcore_gateway_inbound_allow_lists()
+
+        assert len(findings) == 2
+        assert [finding["Status"] for finding in findings] == ["N/A", "Failed"]
+        assert "GetGateway" in findings[0]["Resolution"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_gateways_are_read_from_every_page(self, mock_ac):
+        mock_ac.list_gateways.side_effect = [
+            {"items": [self._GATEWAYS[1]], "nextToken": "gw-page-2"},
+            {"items": [self._GATEWAYS[2]]},
+        ]
+        mock_ac.get_gateway.side_effect = self._details
+
+        findings = agentcore_app.check_agentcore_gateway_inbound_allow_lists()
+
+        assert mock_ac.list_gateways.call_count == 2
+        assert [finding["Status"] for finding in findings] == ["Passed", "Failed"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_list_failure_is_reported_as_incomplete(self, mock_ac):
+        mock_ac.list_gateways.side_effect = ClientError(
+            {"Error": {"Code": "AccessDeniedException", "Message": "no"}},
+            "ListGateways",
+        )
+
+        findings = agentcore_app.check_agentcore_gateway_inbound_allow_lists()
+
+        assert len(findings) == 1
+        assert findings[0]["Status"] == "N/A"
+        assert findings[0]["Finding"].endswith("Incomplete")
+
+    @patch("agentcore_app.agentcore_client")
+    def test_no_gateways_is_na(self, mock_ac):
+        mock_ac.list_gateways.return_value = {"items": []}
+        findings = agentcore_app.check_agentcore_gateway_inbound_allow_lists()
+        assert len(findings) == 1
+        assert findings[0]["Status"] == "N/A"
+
+    @patch("agentcore_app.agentcore_client", None)
+    def test_no_client_is_na(self):
+        findings = agentcore_app.check_agentcore_gateway_inbound_allow_lists()
+        assert findings[0]["Status"] == "N/A"
+        assert findings[0]["Check_ID"] == "AC-31"
+
+
+class TestAC31CheckRegistration:
+    """AC-31 reads a regional resource, so it runs in every scanned region."""
+
+    def test_the_gateway_check_is_in_both_regional_tuples(self):
+        assert "AC-31" in agentcore_app.REGIONAL_AGENTCORE_CHECK_IDS
+        assert "AC-31" in agentcore_app.AGENTCORE_RUNTIME_CHECK_IDS
+
+    def test_timeout_backfill_emits_the_gateway_check(self):
+        findings = agentcore_app.build_agentcore_timeout_findings("us-east-1", [])
+        assert "AC-31" in {finding["Check_ID"] for finding in findings}
+
+    def test_the_handler_registers_the_gateway_check_once(self):
+        source = textwrap.dedent(inspect.getsource(agentcore_app.lambda_handler))
+        assert source.count("check_agentcore_gateway_inbound_allow_lists") == 1
+
+    def test_the_check_judges_every_authorizer_type_the_api_models(self):
+        # A fifth value would fall through to the N/A branch, so the three
+        # groups have to account for all four the model carries today.
+        credentials = {
+            "region_name": "us-east-1",
+            "aws_access_key_id": "testing",
+            "aws_secret_access_key": "testing",  # pragma: allowlist secret - synthetic test credential
+        }
+        model = agentcore_app.boto3.client(
+            "bedrock-agentcore-control", **credentials
+        ).meta.service_model
+        output = model.operation_model("GetGateway").output_shape
+        modelled = set(output.members["authorizerType"].metadata["enum"])
+        judged = set(agentcore_app.GATEWAY_AUTHORIZER_SIGV4_VALUES) | {
+            agentcore_app.GATEWAY_AUTHORIZER_UNAUTHENTICATED_VALUE,
+            agentcore_app.GATEWAY_AUTHORIZER_JWT_VALUE,
+        }
+        assert judged == modelled
+        assert agentcore_app.GATEWAY_AUTHORIZER_JWT_VALUE not in (
+            agentcore_app.GATEWAY_AUTHORIZER_SIGV4_VALUES
+        )
+        # The type is required on the response, so "unspecified" can only come
+        # from a truncated read; the allow-lists are optional under it.
+        assert "authorizerType" in output.required_members
+        jwt = output.members["authorizerConfiguration"].members["customJWTAuthorizer"]
+        claims = set(agentcore_app.JWT_AUTHORIZER_CALLER_CLAIMS) | set(
+            agentcore_app.JWT_AUTHORIZER_OTHER_CLAIMS
+        )
+        assert claims <= set(jwt.members)
+        assert jwt.required_members == ["discoveryUrl"]
+
+
+class TestAC32InboundJwtIssuerConditions:
+    """AC-32: who can trade a JWT from any issuer for a workload access token."""
+
+    _WORKLOAD_ARN = (
+        "arn:aws:bedrock-agentcore:us-east-1:123456789012:workload-identity-directory/"
+        "default/workload-identity/agent-1"
+    )
+
+    @staticmethod
+    def _cache(
+        actions,
+        condition=None,
+        resource="*",
+        principal="agent-role",
+        effect="Allow",
+    ):
+        statement = {"Effect": effect, "Action": actions, "Resource": resource}
+        if condition:
+            statement["Condition"] = condition
+        return {
+            "role_permissions": {
+                principal: {
+                    "attached_policies": [
+                        {"name": "p", "document": {"Statement": [statement]}}
+                    ],
+                    "inline_policies": [],
+                }
+            },
+            "user_permissions": {},
+        }
+
+    def test_an_unpinned_exchange_fails(self):
+        findings = agentcore_app.check_agentcore_inbound_jwt_issuer_conditions(
+            self._cache(["bedrock-agentcore:GetWorkloadAccessTokenForJWT"])
+        )
+        assert [f["Status"] for f in findings] == ["Failed"]
+        assert findings[0]["Check_ID"] == "AC-32"
+        assert findings[0]["Severity"] == "High"
+        assert "role agent-role" in findings[0]["Finding_Details"]
+        for finding in findings:
+            assert_finding_schema(finding)
+
+    @pytest.mark.parametrize(
+        "condition_key",
+        [
+            "bedrock-agentcore:InboundJwtClaim/iss",
+            "bedrock-agentcore:InboundJwtClaim/aud",
+            "bedrock-agentcore:InboundJwtClaim/client_id",
+        ],
+    )
+    def test_an_issuer_or_application_condition_passes(self, condition_key):
+        findings = agentcore_app.check_agentcore_inbound_jwt_issuer_conditions(
+            self._cache(
+                ["bedrock-agentcore:GetWorkloadAccessTokenForJWT"],
+                condition={"StringEquals": {condition_key: "https://idp.example/"}},
+            )
+        )
+        assert [f["Status"] for f in findings] == ["Passed"]
+        assert "role agent-role" in findings[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "condition_key",
+        [
+            "bedrock-agentcore:InboundJwtClaim/scope",
+            "bedrock-agentcore:InboundJwtClaim/sub",
+        ],
+    )
+    def test_a_claim_that_is_not_the_issuer_or_the_application_fails(
+        self, condition_key
+    ):
+        # Both keys are real and both bound the exchange, so a check that counted
+        # any InboundJwtClaim condition would read these as coverage. Neither
+        # keeps a token from an unapproved issuer out.
+        findings = agentcore_app.check_agentcore_inbound_jwt_issuer_conditions(
+            self._cache(
+                ["bedrock-agentcore:CompleteResourceTokenAuth"],
+                condition={"StringEquals": {condition_key: "agent/invoke"}},
+            )
+        )
+        assert [f["Status"] for f in findings] == ["Failed"]
+
+    def test_the_second_exchange_action_is_assessed(self):
+        findings = agentcore_app.check_agentcore_inbound_jwt_issuer_conditions(
+            self._cache(["bedrock-agentcore:CompleteResourceTokenAuth"])
+        )
+        assert [f["Status"] for f in findings] == ["Failed"]
+
+    def test_the_agentcore_namespace_wildcard_is_detected(self):
+        findings = agentcore_app.check_agentcore_inbound_jwt_issuer_conditions(
+            self._cache(["bedrock-agentcore:*"])
+        )
+        assert [f["Status"] for f in findings] == ["Failed"]
+
+    def test_a_bare_wildcard_action_is_left_to_ac_02(self):
+        findings = agentcore_app.check_agentcore_inbound_jwt_issuer_conditions(
+            self._cache(["*"])
+        )
+        assert [f["Status"] for f in findings] == ["Passed"]
+        assert "No cached IAM role or user" in findings[0]["Finding_Details"]
+
+    def test_the_token_actions_that_take_no_inbound_jwt_are_not_assessed(self):
+        # IAM publishes no InboundJwtClaim key for these two, so a Failed verdict
+        # on them would demand a condition that can never match. ID-10 is where
+        # holding them at all is judged.
+        findings = agentcore_app.check_agentcore_inbound_jwt_issuer_conditions(
+            self._cache(
+                [
+                    "bedrock-agentcore:GetWorkloadAccessToken",
+                    "bedrock-agentcore:GetWorkloadAccessTokenForUserId",
+                ]
+            )
+        )
+        assert [f["Status"] for f in findings] == ["Passed"]
+        assert "No cached IAM role or user" in findings[0]["Finding_Details"]
+
+    def test_a_deny_statement_is_ignored(self):
+        findings = agentcore_app.check_agentcore_inbound_jwt_issuer_conditions(
+            self._cache(
+                ["bedrock-agentcore:GetWorkloadAccessTokenForJWT"], effect="Deny"
+            )
+        )
+        assert [f["Status"] for f in findings] == ["Passed"]
+        assert "No cached IAM role or user" in findings[0]["Finding_Details"]
+
+    def test_another_service_is_ignored(self):
+        findings = agentcore_app.check_agentcore_inbound_jwt_issuer_conditions(
+            self._cache(["sts:GetWorkloadAccessTokenForJWT"])
+        )
+        assert [f["Status"] for f in findings] == ["Passed"]
+
+    def test_a_workload_identity_arn_without_a_condition_still_fails(self):
+        # The workload identity is the only resource type these actions accept,
+        # so naming it narrows which agent exchanges tokens and not which issuer
+        # minted them.
+        findings = agentcore_app.check_agentcore_inbound_jwt_issuer_conditions(
+            self._cache(
+                ["bedrock-agentcore:GetWorkloadAccessTokenForJWT"],
+                resource=self._WORKLOAD_ARN,
+            )
+        )
+        assert [f["Status"] for f in findings] == ["Failed"]
+
+    def test_a_pinned_statement_does_not_excuse_an_unpinned_one(self):
+        cache = self._cache(
+            ["bedrock-agentcore:GetWorkloadAccessTokenForJWT"],
+            condition={
+                "StringEquals": {
+                    "bedrock-agentcore:InboundJwtClaim/iss": "https://idp.example/"
+                }
+            },
+        )
+        cache["role_permissions"]["agent-role"]["inline_policies"] = [
+            {
+                "name": "wide",
+                "document": {
+                    "Statement": [
+                        {
+                            "Effect": "Allow",
+                            "Action": "bedrock-agentcore:CompleteResourceTokenAuth",
+                            "Resource": "*",
+                        }
+                    ]
+                },
+            }
+        ]
+
+        findings = agentcore_app.check_agentcore_inbound_jwt_issuer_conditions(cache)
+
+        assert [f["Status"] for f in findings] == ["Failed"]
+
+    def test_the_unpinned_statement_still_decides_when_it_is_read_first(self):
+        # The mirror of the case above. A walker that records the last statement
+        # it saw instead of latching the unpinned one gets the right answer in one
+        # order and the wrong answer in the other.
+        cache = self._cache(["bedrock-agentcore:GetWorkloadAccessTokenForJWT"])
+        cache["role_permissions"]["agent-role"]["inline_policies"] = [
+            {
+                "name": "narrow",
+                "document": {
+                    "Statement": [
+                        {
+                            "Effect": "Allow",
+                            "Action": "bedrock-agentcore:CompleteResourceTokenAuth",
+                            "Resource": "*",
+                            "Condition": {
+                                "StringEquals": {
+                                    "bedrock-agentcore:InboundJwtClaim/iss": (
+                                        "https://idp.example/"
+                                    )
+                                }
+                            },
+                        }
+                    ]
+                },
+            }
+        ]
+
+        findings = agentcore_app.check_agentcore_inbound_jwt_issuer_conditions(cache)
+
+        assert [f["Status"] for f in findings] == ["Failed"]
+
+    def test_users_are_evaluated_alongside_roles(self):
+        cache = self._cache(["bedrock-agentcore:GetWorkloadAccessTokenForJWT"])
+        cache["user_permissions"] = cache["role_permissions"]
+        cache["role_permissions"] = {}
+
+        findings = agentcore_app.check_agentcore_inbound_jwt_issuer_conditions(cache)
+
+        assert [f["Status"] for f in findings] == ["Failed"]
+        assert "user agent-role" in findings[0]["Finding_Details"]
+
+    def test_pinned_and_unpinned_principals_are_reported_separately(self):
+        cache = self._cache(["bedrock-agentcore:GetWorkloadAccessTokenForJWT"])
+        cache["role_permissions"]["pinned-role"] = {
+            "attached_policies": [
+                {
+                    "name": "p",
+                    "document": {
+                        "Statement": [
+                            {
+                                "Effect": "Allow",
+                                "Action": (
+                                    "bedrock-agentcore:GetWorkloadAccessTokenForJWT"
+                                ),
+                                "Resource": "*",
+                                "Condition": {
+                                    "StringEquals": {
+                                        "bedrock-agentcore:InboundJwtClaim/iss": (
+                                            "https://idp.example/"
+                                        )
+                                    }
+                                },
+                            }
+                        ]
+                    },
+                }
+            ],
+            "inline_policies": [],
+        }
+
+        findings = agentcore_app.check_agentcore_inbound_jwt_issuer_conditions(cache)
+
+        assert {finding["Status"] for finding in findings} == {"Failed", "Passed"}
+
+    def test_findings_are_tagged_global(self):
+        findings = agentcore_app.check_agentcore_inbound_jwt_issuer_conditions(
+            self._cache(["bedrock-agentcore:GetWorkloadAccessTokenForJWT"])
+        )
+        assert all(
+            finding["Region"] == agentcore_app.GLOBAL_REGION_LABEL
+            for finding in findings
+        )
+
+    def test_an_empty_cache_is_na(self):
+        findings = agentcore_app.check_agentcore_inbound_jwt_issuer_conditions(
+            {"role_permissions": {}, "user_permissions": {}}
+        )
+        assert findings[0]["Status"] == "N/A"
+
+    def test_an_unparseable_policy_does_not_hide_a_sibling_grant(self):
+        cache = self._cache(["bedrock-agentcore:GetWorkloadAccessTokenForJWT"])
+        cache["role_permissions"]["agent-role"]["inline_policies"] = [
+            {"name": "broken", "document": "{not json"}
+        ]
+
+        findings = agentcore_app.check_agentcore_inbound_jwt_issuer_conditions(cache)
+
+        assert [f["Status"] for f in findings] == ["Failed"]
+
+    def test_an_unusable_cache_is_reported_incomplete(self):
+        findings = agentcore_app.check_agentcore_inbound_jwt_issuer_conditions(None)
+
+        assert [f["Status"] for f in findings] == ["N/A"]
+        assert findings[0]["Finding"].endswith("Incomplete")
+
+
+class TestAC32CheckRegistration:
+    """AC-32 reads the global IAM cache, so it runs once and not per region."""
+
+    def test_the_cache_check_is_not_in_the_regional_tuples(self):
+        assert "AC-32" not in agentcore_app.REGIONAL_AGENTCORE_CHECK_IDS
+        assert "AC-32" not in agentcore_app.AGENTCORE_RUNTIME_CHECK_IDS
+
+    def test_the_handler_registers_the_check_on_the_cached_path_only(self):
+        source = textwrap.dedent(inspect.getsource(agentcore_app.lambda_handler))
+        registrations = [
+            node
+            for node in ast.walk(ast.parse(source))
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name) and target.id == "global_checks"
+                for target in node.targets
+            )
+        ]
+        assert len(registrations) == 2
+        registered = [
+            "check_agentcore_inbound_jwt_issuer_conditions"
+            in ast.unparse(registration.value)
+            for registration in registrations
+        ]
+        # The first list is the path taken when the cache is missing, where this
+        # check has nothing to read; the second is the cached path.
+        assert registered == [False, True]
+
+    def test_a_missing_cache_reports_the_check_incomplete(self):
+        source = textwrap.dedent(inspect.getsource(agentcore_app.lambda_handler))
+        assert '("AC-32", "AgentCore Inbound JWT Issuer Conditions")' in source
+
+    def test_the_exchange_actions_name_real_api_operations(self):
+        # A typo here would narrow the check to nothing and report every account
+        # as having no token-exchange grant.
+        model = agentcore_app.boto3.client(
+            "bedrock-agentcore",
+            region_name="us-east-1",
+            aws_access_key_id="testing",
+            aws_secret_access_key="testing",  # pragma: allowlist secret - synthetic test credential
+        ).meta.service_model
+        operations = {name.lower() for name in model.operation_names}
+        assert set(agentcore_app.INBOUND_JWT_EXCHANGE_ACTIONS) <= operations
+        # The two token actions that accept no inbound JWT exist as well, so
+        # their absence from the tuple is a scoping decision and not a typo.
+        assert {
+            "getworkloadaccesstoken",
+            "getworkloadaccesstokenforuserid",
+        } <= operations
+        assert {
+            "getworkloadaccesstoken",
+            "getworkloadaccesstokenforuserid",
+        }.isdisjoint(agentcore_app.INBOUND_JWT_EXCHANGE_ACTIONS)
+
+    def test_the_condition_keys_are_matchable_and_exclude_the_weaker_claims(self):
+        # _statement_condition_keys lowercases, so an uppercased entry here would
+        # never match and every grant would read as unpinned.
+        keys = agentcore_app.INBOUND_JWT_ISSUER_CONDITION_KEYS
+        assert keys == tuple(key.lower() for key in keys)
+        assert "bedrock-agentcore:inboundjwtclaim/scope" not in keys
+        assert "bedrock-agentcore:inboundjwtclaim/sub" not in keys
+
+
+_DIRECTORY_ARN = (
+    "arn:aws:bedrock-agentcore:us-east-1:123456789012:"
+    "workload-identity-directory/default"
+)
+_IDENTITY_ARN = f"{_DIRECTORY_ARN}/workload-identity/agent-1"
+_VAULT_ARN = "arn:aws:bedrock-agentcore:us-east-1:123456789012:token-vault/default"
+_PROVIDER_ARN = f"{_VAULT_ARN}/oauth2-credential-provider/my-provider"
+
+
+class TestAC33TokenIssuanceScope:
+    """AC-33: which resources a principal may mint an agent token against."""
+
+    @staticmethod
+    def _cache(actions, resource="*", principal="agent-role", effect="Allow"):
+        return {
+            "role_permissions": {
+                principal: {
+                    "attached_policies": [
+                        {
+                            "name": "p",
+                            "document": {
+                                "Statement": [
+                                    {
+                                        "Effect": effect,
+                                        "Action": actions,
+                                        "Resource": resource,
+                                    }
+                                ]
+                            },
+                        }
+                    ],
+                    "inline_policies": [],
+                }
+            },
+            "user_permissions": {},
+        }
+
+    def test_a_wildcard_resource_fails(self):
+        findings = agentcore_app.check_agentcore_token_issuance_scope(
+            self._cache(["bedrock-agentcore:GetWorkloadAccessToken"])
+        )
+        assert [f["Status"] for f in findings] == ["Failed"]
+        assert findings[0]["Check_ID"] == "AC-33"
+        assert findings[0]["Severity"] == "High"
+        assert "role agent-role" in findings[0]["Finding_Details"]
+        for finding in findings:
+            assert_finding_schema(finding)
+
+    def test_the_published_scoped_policy_passes(self):
+        # The four ARNs AWS's own scoped example lists in one Resource array. A
+        # rule demanding that every element name a workload identity would fail
+        # the policy the service's own documentation tells a customer to write.
+        findings = agentcore_app.check_agentcore_token_issuance_scope(
+            self._cache(
+                [
+                    "bedrock-agentcore:GetWorkloadAccessToken",
+                    "bedrock-agentcore:GetResourceOauth2Token",
+                ],
+                resource=[_DIRECTORY_ARN, _IDENTITY_ARN, _VAULT_ARN, _PROVIDER_ARN],
+            )
+        )
+        assert [f["Status"] for f in findings] == ["Passed"]
+        assert "role agent-role" in findings[0]["Finding_Details"]
+
+    def test_a_grant_naming_no_workload_identity_is_undecidable_and_fails(self):
+        findings = agentcore_app.check_agentcore_token_issuance_scope(
+            self._cache(
+                ["bedrock-agentcore:GetWorkloadAccessToken"],
+                resource=[_DIRECTORY_ARN],
+            )
+        )
+        assert [f["Status"] for f in findings] == ["Failed"]
+        # Only one of the two readings of a two-required-resource action is a
+        # widening, so this leg is not scored alongside a wildcard grant.
+        assert findings[0]["Severity"] == "Medium"
+        assert "authorizes nothing" in findings[0]["Finding_Details"]
+
+    def test_a_trailing_wildcard_under_the_directory_is_the_wildcard_leg(self):
+        findings = agentcore_app.check_agentcore_token_issuance_scope(
+            self._cache(
+                ["bedrock-agentcore:GetWorkloadAccessToken"],
+                resource=[f"{_DIRECTORY_ARN}/workload-identity/*"],
+            )
+        )
+        assert [f["Status"] for f in findings] == ["Failed"]
+        assert findings[0]["Severity"] == "High"
+        assert "wildcard resource" in findings[0]["Finding_Details"]
+
+    def test_a_wildcard_inside_the_identity_name_is_not_a_named_identity(self):
+        # This ARN does not end in a wildcard, so it reaches the name test rather
+        # than the trailing-wildcard test, and prod-*-agent is not one identity.
+        findings = agentcore_app.check_agentcore_token_issuance_scope(
+            self._cache(
+                ["bedrock-agentcore:GetWorkloadAccessToken"],
+                resource=[f"{_DIRECTORY_ARN}/workload-identity/prod-*-agent"],
+            )
+        )
+        assert [f["Status"] for f in findings] == ["Failed"]
+
+    def test_a_region_wildcard_leaves_the_identity_named(self):
+        # A multi-region policy wildcards the region, which widens where the
+        # identity lives and not which identity it is.
+        findings = agentcore_app.check_agentcore_token_issuance_scope(
+            self._cache(
+                ["bedrock-agentcore:GetWorkloadAccessToken"],
+                resource=[_IDENTITY_ARN.replace("us-east-1", "*")],
+            )
+        )
+        assert [f["Status"] for f in findings] == ["Passed"]
+
+    def test_the_directory_arn_is_not_read_as_an_identity_arn(self):
+        # workload-identity-directory/ does not contain workload-identity/, which
+        # is the whole reason the substring parse is safe.
+        assert not agentcore_app._resource_names_one_workload_identity(_DIRECTORY_ARN)
+        assert agentcore_app._resource_names_one_workload_identity(_IDENTITY_ARN)
+
+    @pytest.mark.parametrize(
+        "action",
+        [
+            "CompleteResourceTokenAuth",
+            "GetResourceOauth2Token",
+            "GetWorkloadAccessToken",
+            "GetWorkloadAccessTokenForJWT",
+            "GetWorkloadAccessTokenForUserId",
+        ],
+    )
+    def test_every_token_issuance_action_is_assessed(self, action):
+        findings = agentcore_app.check_agentcore_token_issuance_scope(
+            self._cache([f"bedrock-agentcore:{action}"])
+        )
+        assert [f["Status"] for f in findings] == ["Failed"]
+
+    def test_the_payment_token_action_is_left_to_the_payments_control(self):
+        # GetResourcePaymentToken takes the same workload-identity resource, so
+        # its absence is a scoping decision: PAY-01 judges the payments roles.
+        findings = agentcore_app.check_agentcore_token_issuance_scope(
+            self._cache(["bedrock-agentcore:GetResourcePaymentToken"])
+        )
+        assert [f["Status"] for f in findings] == ["Passed"]
+        assert "No cached IAM role or user" in findings[0]["Finding_Details"]
+
+    def test_the_agentcore_namespace_wildcard_is_detected(self):
+        findings = agentcore_app.check_agentcore_token_issuance_scope(
+            self._cache(["bedrock-agentcore:Get*"])
+        )
+        assert [f["Status"] for f in findings] == ["Failed"]
+
+    def test_a_bare_wildcard_action_is_left_to_ac_02(self):
+        findings = agentcore_app.check_agentcore_token_issuance_scope(
+            self._cache(["*"])
+        )
+        assert [f["Status"] for f in findings] == ["Passed"]
+        assert "No cached IAM role or user" in findings[0]["Finding_Details"]
+
+    def test_a_deny_statement_is_ignored(self):
+        findings = agentcore_app.check_agentcore_token_issuance_scope(
+            self._cache(["bedrock-agentcore:GetWorkloadAccessToken"], effect="Deny")
+        )
+        assert [f["Status"] for f in findings] == ["Passed"]
+        assert "No cached IAM role or user" in findings[0]["Finding_Details"]
+
+    def test_another_service_is_ignored(self):
+        findings = agentcore_app.check_agentcore_token_issuance_scope(
+            self._cache(["sts:GetWorkloadAccessToken"])
+        )
+        assert [f["Status"] for f in findings] == ["Passed"]
+
+    def test_the_widest_statement_decides(self):
+        cache = self._cache(
+            ["bedrock-agentcore:GetWorkloadAccessToken"], resource=[_IDENTITY_ARN]
+        )
+        cache["role_permissions"]["agent-role"]["inline_policies"] = [
+            {
+                "name": "wide",
+                "document": {
+                    "Statement": [
+                        {
+                            "Effect": "Allow",
+                            "Action": "bedrock-agentcore:GetResourceOauth2Token",
+                            "Resource": "*",
+                        }
+                    ]
+                },
+            }
+        ]
+
+        findings = agentcore_app.check_agentcore_token_issuance_scope(cache)
+
+        assert [f["Status"] for f in findings] == ["Failed"]
+        assert findings[0]["Severity"] == "High"
+
+    def test_the_widest_statement_still_decides_when_it_is_read_first(self):
+        # The mirror of the case above, so a walker that records the last verdict
+        # it saw cannot pass by getting one statement order right.
+        cache = self._cache(["bedrock-agentcore:GetWorkloadAccessToken"])
+        cache["role_permissions"]["agent-role"]["inline_policies"] = [
+            {
+                "name": "narrow",
+                "document": {
+                    "Statement": [
+                        {
+                            "Effect": "Allow",
+                            "Action": "bedrock-agentcore:GetResourceOauth2Token",
+                            "Resource": [_IDENTITY_ARN],
+                        }
+                    ]
+                },
+            }
+        ]
+
+        findings = agentcore_app.check_agentcore_token_issuance_scope(cache)
+
+        assert [f["Status"] for f in findings] == ["Failed"]
+        assert findings[0]["Severity"] == "High"
+
+    def test_the_directory_arn_and_the_identity_arn_may_sit_in_two_statements(self):
+        # The same grant as the published example, split in two. Ranking the
+        # undecidable leg above the scoped one would fail this.
+        cache = self._cache(
+            ["bedrock-agentcore:GetWorkloadAccessToken"], resource=[_DIRECTORY_ARN]
+        )
+        cache["role_permissions"]["agent-role"]["inline_policies"] = [
+            {
+                "name": "identity",
+                "document": {
+                    "Statement": [
+                        {
+                            "Effect": "Allow",
+                            "Action": "bedrock-agentcore:GetWorkloadAccessToken",
+                            "Resource": [_IDENTITY_ARN],
+                        }
+                    ]
+                },
+            }
+        ]
+
+        findings = agentcore_app.check_agentcore_token_issuance_scope(cache)
+
+        assert [f["Status"] for f in findings] == ["Passed"]
+
+    def test_users_are_evaluated_alongside_roles(self):
+        cache = self._cache(["bedrock-agentcore:GetWorkloadAccessToken"])
+        cache["user_permissions"] = cache["role_permissions"]
+        cache["role_permissions"] = {}
+
+        findings = agentcore_app.check_agentcore_token_issuance_scope(cache)
+
+        assert [f["Status"] for f in findings] == ["Failed"]
+        assert "user agent-role" in findings[0]["Finding_Details"]
+
+    def test_all_three_groups_are_reported_separately(self):
+        cache = self._cache(["bedrock-agentcore:GetWorkloadAccessToken"])
+        for principal, resource in (
+            ("directory-role", [_DIRECTORY_ARN]),
+            ("scoped-role", [_DIRECTORY_ARN, _IDENTITY_ARN]),
+        ):
+            cache["role_permissions"][principal] = self._cache(
+                ["bedrock-agentcore:GetWorkloadAccessToken"], resource=resource
+            )["role_permissions"]["agent-role"]
+
+        findings = agentcore_app.check_agentcore_token_issuance_scope(cache)
+
+        assert [f["Status"] for f in findings] == ["Failed", "Failed", "Passed"]
+        assert [f["Severity"] for f in findings] == ["High", "Medium", "High"]
+
+    def test_findings_are_tagged_global(self):
+        findings = agentcore_app.check_agentcore_token_issuance_scope(
+            self._cache(["bedrock-agentcore:GetWorkloadAccessToken"])
+        )
+        assert all(
+            finding["Region"] == agentcore_app.GLOBAL_REGION_LABEL
+            for finding in findings
+        )
+
+    def test_an_empty_cache_is_na(self):
+        findings = agentcore_app.check_agentcore_token_issuance_scope(
+            {"role_permissions": {}, "user_permissions": {}}
+        )
+        assert findings[0]["Status"] == "N/A"
+
+    def test_an_unparseable_policy_does_not_hide_a_sibling_grant(self):
+        cache = self._cache(["bedrock-agentcore:GetWorkloadAccessToken"])
+        cache["role_permissions"]["agent-role"]["inline_policies"] = [
+            {"name": "broken", "document": "{not json"}
+        ]
+
+        findings = agentcore_app.check_agentcore_token_issuance_scope(cache)
+
+        assert [f["Status"] for f in findings] == ["Failed"]
+
+    def test_an_unusable_cache_is_reported_incomplete(self):
+        findings = agentcore_app.check_agentcore_token_issuance_scope(None)
+
+        assert [f["Status"] for f in findings] == ["N/A"]
+        assert findings[0]["Finding"].endswith("Incomplete")
+
+
+class TestAC33CheckRegistration:
+    """AC-33 reads the global IAM cache, so it runs once and not per region."""
+
+    def test_the_cache_check_is_not_in_the_regional_tuples(self):
+        assert "AC-33" not in agentcore_app.REGIONAL_AGENTCORE_CHECK_IDS
+        assert "AC-33" not in agentcore_app.AGENTCORE_RUNTIME_CHECK_IDS
+
+    def test_the_handler_registers_the_check_on_the_cached_path_only(self):
+        source = textwrap.dedent(inspect.getsource(agentcore_app.lambda_handler))
+        registrations = [
+            node
+            for node in ast.walk(ast.parse(source))
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name) and target.id == "global_checks"
+                for target in node.targets
+            )
+        ]
+        assert len(registrations) == 2
+        registered = [
+            "check_agentcore_token_issuance_scope" in ast.unparse(registration.value)
+            for registration in registrations
+        ]
+        # The first list is the path taken when the cache is missing, where this
+        # check has nothing to read; the second is the cached path.
+        assert registered == [False, True]
+
+    def test_a_missing_cache_reports_the_check_incomplete(self):
+        source = textwrap.dedent(inspect.getsource(agentcore_app.lambda_handler))
+        assert '("AC-33", "AgentCore Token Issuance Scope")' in source
+
+    def test_the_issuance_actions_name_real_api_operations(self):
+        # A typo here would narrow the check to nothing and report every account
+        # as having no token-issuance grant.
+        model = agentcore_app.boto3.client(
+            "bedrock-agentcore",
+            region_name="us-east-1",
+            aws_access_key_id="testing",
+            aws_secret_access_key="testing",  # pragma: allowlist secret - synthetic test credential
+        ).meta.service_model
+        operations = {name.lower() for name in model.operation_names}
+        assert set(agentcore_app.TOKEN_ISSUANCE_ACTIONS) <= operations
+        # The payment token action exists too, so its absence is deliberate.
+        assert "getresourcepaymenttoken" in operations
+        assert "getresourcepaymenttoken" not in agentcore_app.TOKEN_ISSUANCE_ACTIONS
+
+    def test_the_actions_are_matchable_against_a_lowercased_pattern(self):
+        actions = agentcore_app.TOKEN_ISSUANCE_ACTIONS
+        assert actions == tuple(action.lower() for action in actions)
+        # The devguide spells the last one GetWorkloadAccessTokenForJwt while the
+        # IAM action name is ...ForJWT; lowercasing absorbs the difference.
+        assert "getworkloadaccesstokenforjwt" in actions
+
+
+_SECRET_VALUE = "wJalrXUtnFEMI-K7MDENG-bPxRfiCY"  # pragma: allowlist secret - synthetic
+
+
+class TestAC34RuntimeInlineCredentials:
+    """AC-34: a credential pasted into a runtime's definition never reaches a vault."""
+
+    _RUNTIMES = [
+        {"agentRuntimeId": "rt-clean", "agentRuntimeName": "Clean"},
+        {"agentRuntimeId": "rt-inline", "agentRuntimeName": "Inline"},
+    ]
+
+    @staticmethod
+    def _details(agentRuntimeId, **kwargs):
+        if agentRuntimeId == "rt-inline":
+            return {"environmentVariables": {"API_KEY": _SECRET_VALUE}}
+        return {
+            "environmentVariables": {
+                "LOG_LEVEL": "INFO",
+                "TOKEN_SECRET_ARN": "arn:aws:secretsmanager:us-east-1:1:secret:t-AbC",
+            }
+        }
+
+    @patch("agentcore_app.agentcore_client")
+    def test_each_runtime_gets_its_own_verdict(self, mock_ac):
+        mock_ac.list_agent_runtimes.return_value = {"agentRuntimes": self._RUNTIMES}
+        mock_ac.get_agent_runtime.side_effect = self._details
+
+        findings = agentcore_app.check_agentcore_runtime_inline_credentials()
+
+        assert len(findings) == 2
+        assert [finding["Status"] for finding in findings] == ["Passed", "Failed"]
+        for finding in findings:
+            assert finding["Check_ID"] == "AC-34"
+            assert_finding_schema(finding)
+        assert findings[1]["Finding"].endswith("Found")
+        assert findings[1]["Severity"] == "High"
+        assert "rt-inline" in findings[1]["Finding_Details"]
+        assert "API_KEY" in findings[1]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_the_value_never_reaches_the_finding(self, mock_ac):
+        # environmentVariables is modelled sensitive, so the report may name the
+        # variable and must not carry what it holds.
+        mock_ac.list_agent_runtimes.return_value = {
+            "agentRuntimes": [self._RUNTIMES[1]]
+        }
+        mock_ac.get_agent_runtime.side_effect = self._details
+
+        findings = agentcore_app.check_agentcore_runtime_inline_credentials()
+
+        assert findings[0]["Status"] == "Failed"
+        for value in findings[0].values():
+            assert _SECRET_VALUE not in str(value)
+
+    @pytest.mark.parametrize(
+        "name,value,status",
+        [
+            # A credential-named variable holding a literal.
+            ("API_KEY", "abc123def456", "Failed"),
+            ("DB_PASSWORD", "hunter2hunter2", "Failed"),
+            ("CLIENT_SECRET", "s3cr3tvalue", "Failed"),
+            ("OAUTH_TOKEN", "eyJhbGciOiJIUzI1NiJ9.e30.abc", "Failed"),
+            ("SIGNING_PRIVATEKEY", "MIIEvQIBADANBg", "Failed"),
+            # The same variable pointing at where the credential lives.
+            (
+                "API_KEY_ARN",
+                "arn:aws:secretsmanager:us-east-1:1:secret:k-AbC",
+                "Passed",
+            ),
+            ("DB_PASSWORD_PARAM", "/prod/agent/db-password", "Passed"),
+            ("CLIENT_SECRET_NAME", "prod/agent/client-secret", "Passed"),
+            ("TOKEN_ENDPOINT", "https://idp.example/oauth2/token", "Passed"),
+            # A setting whose name contains a credential noun.
+            ("TOKEN_TTL", "3600", "Passed"),
+            ("CACHE_TOKENS", "true", "Passed"),
+            ("API_KEY_HEADER", "", "Passed"),
+            # A variable that names no credential and holds no credential shape.
+            ("LOG_LEVEL", "DEBUG", "Passed"),
+            ("MODEL_ID", "global.anthropic.claude-opus-5", "Passed"),
+        ],
+    )
+    @patch("agentcore_app.agentcore_client")
+    def test_a_credential_name_is_judged_on_its_value(
+        self, mock_ac, name, value, status
+    ):
+        mock_ac.list_agent_runtimes.return_value = {
+            "agentRuntimes": [self._RUNTIMES[0]]
+        }
+        mock_ac.get_agent_runtime.return_value = {"environmentVariables": {name: value}}
+
+        findings = agentcore_app.check_agentcore_runtime_inline_credentials()
+
+        assert [finding["Status"] for finding in findings] == [status]
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "AKIAIOSFODNN7EXAMPLE",  # pragma: allowlist secret - AWS's documented example id
+            "ASIAIOSFODNN7EXAMPLE",  # pragma: allowlist secret - the same id, STS prefix
+            "-----BEGIN RSA PRIVATE KEY-----\nMIIE\n-----END RSA PRIVATE KEY-----",  # pragma: allowlist secret - a 4-character body, not a key
+        ],
+    )
+    @patch("agentcore_app.agentcore_client")
+    def test_a_credential_shape_fails_under_an_innocent_name(self, mock_ac, value):
+        # The name leg cannot catch these: nothing in BUILD_USER or PEM_BLOB
+        # names a credential, and both values are credential material.
+        mock_ac.list_agent_runtimes.return_value = {
+            "agentRuntimes": [self._RUNTIMES[0]]
+        }
+        mock_ac.get_agent_runtime.return_value = {
+            "environmentVariables": {"BUILD_USER": value}
+        }
+
+        findings = agentcore_app.check_agentcore_runtime_inline_credentials()
+
+        assert [finding["Status"] for finding in findings] == ["Failed"]
+        assert "BUILD_USER" in findings[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "AKIAIOSFODNN7EXAMPL",
+            "AKIAIOSFODNN7EXAMPLE1",
+            "AKIAiosfodnn7example",
+            "AKIA-OSFODNN7EXAMPLE",
+            "BKIAIOSFODNN7EXAMPLE",
+            "-----BEGIN CERTIFICATE-----",
+        ],
+    )
+    @patch("agentcore_app.agentcore_client")
+    def test_a_near_miss_on_the_key_shape_is_not_a_credential(self, mock_ac, value):
+        # Wrong length, lowercase body, a punctuation character, the wrong
+        # prefix, and a PEM block that is a certificate and not a key.
+        mock_ac.list_agent_runtimes.return_value = {
+            "agentRuntimes": [self._RUNTIMES[0]]
+        }
+        mock_ac.get_agent_runtime.return_value = {
+            "environmentVariables": {"BUILD_USER": value}
+        }
+
+        findings = agentcore_app.check_agentcore_runtime_inline_credentials()
+
+        assert [finding["Status"] for finding in findings] == ["Passed"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_one_inline_credential_condemns_the_runtime(self, mock_ac):
+        mock_ac.list_agent_runtimes.return_value = {
+            "agentRuntimes": [self._RUNTIMES[0]]
+        }
+        mock_ac.get_agent_runtime.return_value = {
+            "environmentVariables": {
+                "LOG_LEVEL": "INFO",
+                "TOKEN_SECRET_ARN": "arn:aws:secretsmanager:us-east-1:1:secret:t-AbC",
+                "SLACK_API_KEY": "xoxb-not-a-real-token",  # pragma: allowlist secret - synthetic test credential
+            }
+        }
+
+        findings = agentcore_app.check_agentcore_runtime_inline_credentials()
+
+        assert [finding["Status"] for finding in findings] == ["Failed"]
+        assert "SLACK_API_KEY" in findings[0]["Finding_Details"]
+        assert "TOKEN_SECRET_ARN" not in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_the_passing_detail_credits_the_pointers_it_found(self, mock_ac):
+        mock_ac.list_agent_runtimes.return_value = {
+            "agentRuntimes": [self._RUNTIMES[0]]
+        }
+        mock_ac.get_agent_runtime.side_effect = self._details
+
+        findings = agentcore_app.check_agentcore_runtime_inline_credentials()
+
+        assert findings[0]["Status"] == "Passed"
+        assert "2 environment variable(s)" in findings[0]["Finding_Details"]
+        assert "TOKEN_SECRET_ARN" in findings[0]["Finding_Details"]
+        # The passing finding has to say what the scan cannot see.
+        assert "slash" in findings[0]["Resolution"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_runtime_with_no_environment_variables_passes(self, mock_ac):
+        mock_ac.list_agent_runtimes.return_value = {
+            "agentRuntimes": [self._RUNTIMES[0]]
+        }
+        mock_ac.get_agent_runtime.return_value = {"agentRuntimeId": "rt-clean"}
+
+        findings = agentcore_app.check_agentcore_runtime_inline_credentials()
+
+        assert [finding["Status"] for finding in findings] == ["Passed"]
+        assert "no environment variables" in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_one_unreadable_runtime_does_not_hide_the_others(self, mock_ac):
+        mock_ac.list_agent_runtimes.return_value = {"agentRuntimes": self._RUNTIMES}
+
+        def details(agentRuntimeId, **kwargs):
+            if agentRuntimeId == "rt-clean":
+                raise ClientError(
+                    {"Error": {"Code": "AccessDeniedException", "Message": "no"}},
+                    "GetAgentRuntime",
+                )
+            return self._details(agentRuntimeId)
+
+        mock_ac.get_agent_runtime.side_effect = details
+
+        findings = agentcore_app.check_agentcore_runtime_inline_credentials()
+
+        assert [finding["Status"] for finding in findings] == ["N/A", "Failed"]
+        assert "GetAgentRuntime" in findings[0]["Resolution"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_runtimes_are_read_from_every_page(self, mock_ac):
+        mock_ac.list_agent_runtimes.side_effect = [
+            {"agentRuntimes": [self._RUNTIMES[0]], "nextToken": "rt-page-2"},
+            {"agentRuntimes": [self._RUNTIMES[1]]},
+        ]
+        mock_ac.get_agent_runtime.side_effect = self._details
+
+        findings = agentcore_app.check_agentcore_runtime_inline_credentials()
+
+        assert mock_ac.list_agent_runtimes.call_count == 2
+        assert [finding["Status"] for finding in findings] == ["Passed", "Failed"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_list_failure_is_reported_as_incomplete(self, mock_ac):
+        mock_ac.list_agent_runtimes.side_effect = ClientError(
+            {"Error": {"Code": "AccessDeniedException", "Message": "no"}},
+            "ListAgentRuntimes",
+        )
+
+        findings = agentcore_app.check_agentcore_runtime_inline_credentials()
+
+        assert [finding["Status"] for finding in findings] == ["N/A"]
+        assert findings[0]["Finding"].endswith("Incomplete")
+
+    @patch("agentcore_app.agentcore_client")
+    def test_no_runtimes_is_na(self, mock_ac):
+        mock_ac.list_agent_runtimes.return_value = {"agentRuntimes": []}
+        findings = agentcore_app.check_agentcore_runtime_inline_credentials()
+        assert [finding["Status"] for finding in findings] == ["N/A"]
+
+    @patch("agentcore_app.agentcore_client", None)
+    def test_no_client_is_na(self):
+        findings = agentcore_app.check_agentcore_runtime_inline_credentials()
+        assert findings[0]["Status"] == "N/A"
+        assert findings[0]["Check_ID"] == "AC-34"
+
+
+class TestAC34CheckRegistration:
+    """AC-34 reads a regional resource, so it runs in every scanned region."""
+
+    def test_the_runtime_check_is_in_both_regional_tuples(self):
+        assert "AC-34" in agentcore_app.REGIONAL_AGENTCORE_CHECK_IDS
+        assert "AC-34" in agentcore_app.AGENTCORE_RUNTIME_CHECK_IDS
+
+    def test_timeout_backfill_emits_the_runtime_check(self):
+        findings = agentcore_app.build_agentcore_timeout_findings("us-east-1", [])
+        assert "AC-34" in {finding["Check_ID"] for finding in findings}
+
+    def test_the_handler_registers_the_runtime_check_once(self):
+        source = textwrap.dedent(inspect.getsource(agentcore_app.lambda_handler))
+        assert source.count("check_agentcore_runtime_inline_credentials") == 1
+
+    def test_the_scanned_field_is_modelled_and_marked_sensitive(self):
+        # A field the API does not return would make every runtime pass, and the
+        # sensitive marker is why the finding names variables and not values.
+        model = agentcore_app.boto3.client(
+            "bedrock-agentcore-control",
+            region_name="us-east-1",
+            aws_access_key_id="testing",
+            aws_secret_access_key="testing",  # pragma: allowlist secret - synthetic test credential
+        ).meta.service_model
+        environment = model.operation_model("GetAgentRuntime").output_shape.members[
+            "environmentVariables"
+        ]
+        assert environment.type_name == "map"
+        assert environment.metadata.get("sensitive") is True
+        # The variables are optional on create, so an absent map is a real state
+        # and not a truncated read.
+        create = model.operation_model("CreateAgentRuntime").input_shape
+        assert "environmentVariables" not in create.required_members

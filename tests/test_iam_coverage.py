@@ -655,6 +655,29 @@ _VERIFIED_REMEDIATION_IAM_ACTIONS |= {
     "organizations:DescribePolicy",
 }
 
+# Verified on 2026-09-25 with two more Access Analyzer validate-policy runs for
+# the identity controls AC-29 through AC-34: a SERVICE_CONTROL_POLICY run for
+# AC-29's SCP text and an IDENTITY_POLICY run for AC-32's condition advice. The
+# SCP run's negative controls were two invented actions
+# (bedrock-agentcore:CreateAgentRuntimeNotReal,
+# bedrock-agentcore:ModifyAgentRuntimeThatDoesNotExist) and one invented
+# condition key (bedrock-agentcore:RuntimeAuthorizerModeNotReal); the identity
+# run's were one invented action
+# (bedrock-agentcore:GetWorkloadAccessTokenForJWTNotReal) and two invented
+# condition keys (bedrock-agentcore:InboundJwtClaimNotReal/iss,
+# bedrock-agentcore:OutboundJwtClaim/iss). All six were reported and none of the
+# names below was.
+#
+# Unlike AC-28's GatewayAuthorizerType, the RuntimeAuthorizerType-to-runtime
+# wiring does not rest on a devguide sentence: the machine-readable service
+# reference wires that key to exactly CreateAgentRuntime and UpdateAgentRuntime,
+# and every InboundJwtClaim key to exactly CompleteResourceTokenAuth and
+# GetWorkloadAccessTokenForJWT.
+_VERIFIED_REMEDIATION_IAM_ACTIONS |= {
+    "bedrock-agentcore:CreateAgentRuntime",
+    "bedrock-agentcore:UpdateAgentRuntime",
+}
+
 _VERIFIED_REMEDIATION_CONDITION_KEYS = {
     "bedrock:GuardrailIdentifier",
     "iam:AWSServiceName",
@@ -668,6 +691,11 @@ _VERIFIED_REMEDIATION_CONDITION_KEYS = {
     "aws:SourceVpce",
     # Same SERVICE_CONTROL_POLICY run as the AC-28 action block above.
     "bedrock-agentcore:GatewayAuthorizerType",
+    # Same two runs as the AC-29 action block above. The reference publishes no
+    # bare InboundJwtClaim key: it is five keys, one per claim, and the token
+    # scan stops at the slash.
+    "bedrock-agentcore:RuntimeAuthorizerType",
+    "bedrock-agentcore:InboundJwtClaim",
 }
 
 _NON_IAM_REMEDIATION_TOKENS = {
