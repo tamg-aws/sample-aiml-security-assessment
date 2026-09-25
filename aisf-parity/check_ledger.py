@@ -149,6 +149,57 @@ def scope_figures(text):
     return out
 
 
+def tag_column_figures(text):
+    """The Compliance_Frameworks figures a piece of prose publishes.
+
+    Whitespace is collapsed to single spaces over the whole text first. Measured
+    against the paragraph as published: these same patterns without the flatten
+    resolve 7 of the 8 figures and return one None. The miss is `controls`, because
+    the prose reads `naming 36\\ndistinct controls` and the break falls inside that
+    marker. The break in `sagemaker 7,\\nagentcore 12` costs nothing, because it
+    falls between two pairs the per-module pattern matches separately.
+
+    So a wrap only costs a figure when it lands inside a marker, and where it lands
+    moves with the digit count of the figures themselves. Two consequences. An
+    unflattened implementation reads as working, since seven figures and one None
+    look like a doc that published seven figures. And a control that re-wraps the
+    paragraph at some other width can leave the break inside the same marker and
+    pass for the wrong reason, so pick the width by checking which marker it splits.
+    Flattening removes the dependence on the wrap position altogether.
+
+    A figure the patterns cannot find comes back None, and gate 14 reads None as a
+    failure. Same contract as scope_figures(): a reworded sentence that drops a
+    figure drops the gate with it instead of quietly stopping the assertion.
+
+    The qualifier census (bare/partial/joint) is deliberately absent. Gate 14
+    prints it, two tools compute it, and no document publishes it, so there is no
+    published claim to gate.
+    """
+    flat = re.sub(r"\s+", " ", text)
+    out = {}
+    for label, pattern in (
+        ("pairs", r"(\d+) check-control pairs over \d+ tagged checks"),
+        ("tagged", r"\d+ check-control pairs over (\d+) tagged checks"),
+        ("modules", r"tagged checks in (\d+) modules"),
+        ("controls", r"naming (\d+) distinct controls"),
+    ):
+        found = re.search(pattern, flat)
+        out[label] = int(found.group(1)) if found else None
+    # The per-module split is read as a mapping and not as four numbers, so the
+    # module *names* are asserted too: a renamed producer is the way this sentence
+    # goes stale without any count changing.
+    split = re.search(r"Tagged checks per module are ([^.]+)\.", flat)
+    out["per_module"] = (
+        {
+            m.group(1): int(m.group(2))
+            for m in re.finditer(r"(\w+) (\d+)", split.group(1))
+        }
+        if split
+        else None
+    )
+    return out
+
+
 def load_aisf_control(rel_path, control_id):
     """One control item as authored in the AISF repository, or None."""
     with open(os.path.join(AISF_REPO, rel_path)) as f:
@@ -731,14 +782,44 @@ def main():
     if extra:
         tag_problems.append(f"in a map, not taggable in the ledger: {sorted(extra)}")
     # Every figure docs/SECURITY_CHECKS_AISF.md publishes about the tag column is
-    # printed here, including the ones no assertion above turns on: the per-module
-    # split and the qualifier census. A figure a gate does not print gets re-derived
-    # by hand and copied into prose, which is how the counts in this project drifted
-    # before. The qualifier census doubles as a shape check a reader can apply --
-    # `bare` must equal the number of covered controls with a single incumbent.
-    per_module = " ".join(
-        f"{d.removesuffix('_assessments')}={len(m)}" for d, m in sorted(maps.items())
-    )
+    # computed here, and now asserted against the doc rather than only printed
+    # beside it. Printing was not enough: the eight figures in that paragraph are
+    # transcribed by hand, and adding one entry to any aisf_compliance_*.py moves
+    # four of them, so a stale paragraph shipped under a green gate that printed the
+    # right numbers two lines further down.
+    #
+    # Asserted in gate 14 and not in a gate of its own, because these are the same
+    # values the predicate above already computes. A separate gate would recompute
+    # them and could then disagree with the line printed here.
+    #
+    # The qualifier census stays printed and unasserted: no document publishes it,
+    # and it doubles as a shape check a reader can apply -- `bare` must equal the
+    # number of covered controls with a single incumbent.
+    computed = {
+        "pairs": len(found_pairs),
+        "tagged": sum(len(m) for m in maps.values()),
+        "modules": len(maps),
+        "controls": len({c for _, c in found_pairs}),
+        "per_module": {
+            d.removesuffix("_assessments"): len(m) for d, m in sorted(maps.items())
+        },
+    }
+    # Re-read rather than reusing gate 13's copy of the text: the gates above rebind
+    # names across blocks, and a figure gate that reads the wrong buffer fails open.
+    with open(AISF_DOC) as f:
+        published = tag_column_figures(f.read())
+    for label, want in published.items():
+        if want is None:
+            tag_problems.append(
+                f"SECURITY_CHECKS_AISF.md publishes no {label} figure these patterns "
+                f"can find; gate 14 computes {computed[label]}"
+            )
+        elif want != computed[label]:
+            tag_problems.append(
+                f"SECURITY_CHECKS_AISF.md publishes {label}={want}, gate 14 computes "
+                f"{computed[label]}"
+            )
+    per_module = " ".join(f"{k}={v}" for k, v in sorted(computed["per_module"].items()))
     census = collections.Counter()
     for module_dir, mapping in maps.items():
         for tag in mapping.values():
@@ -757,8 +838,11 @@ def main():
         f"{sum(len(m) for m in maps.values())} tagged checks in {len(maps)} modules, "
         f"naming {len({c for _, c in found_pairs})} distinct controls; "
         f"checks per module {per_module}; qualifiers bare={census['bare']} "
-        f"partial={census['partial']} joint={census['joint']}; "
-        "each checked for module ownership, ledger verdict and qualifier"
+        f"partial={census['partial']} joint={census['joint']} (printed, not gated: "
+        "no document publishes them); each checked for module ownership, ledger "
+        f"verdict and qualifier; {len(published) - 1} scalar figure(s) + "
+        f"{len(published['per_module'] or {})} per-module figure(s) asserted against "
+        f"SECURITY_CHECKS_AISF.md, doc={published} vs computed={computed}"
         + (f", bad={tag_problems}" if tag_problems else ""),
     )
 
