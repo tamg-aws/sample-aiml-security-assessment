@@ -7,13 +7,13 @@ Generated 2026-09-25 by `aisf-parity/build_ledger.py`. Do not hand-edit: change 
 | verdict | rows | meaning |
 |---|---|---|
 | covered | 28 | an incumbent already asserts this; nothing to write |
-| tighten / extend | 12 | incumbent name is honest, its assertion is narrower; extend it in place |
+| tighten / extend | 13 | incumbent name is honest, its assertion is narrower; extend it in place |
 | tighten / new_id | 5 | incumbent name claims more than it asserts; allocate a new id beside it |
 | new | 18 | no incumbent asserts any part of it |
-| not_implementable | 4 | flagged machine_checkable in the ledger but is not checkable from configuration |
+| not_implementable | 3 | flagged machine_checkable in the ledger but is not checkable from configuration |
 | unassessed | 11 | in scope, dedup pass not yet run |
 
-**34 new check functions and 12 extensions to existing checks.**
+**34 new check functions and 13 extensions to existing checks.**
 
 ## New IAM actions required
 
@@ -49,9 +49,9 @@ Generated 2026-09-25 by `aisf-parity/build_ledger.py`. Do not hand-edit: change 
 | `AIR-BDR-MDL-07` | covered | — | `bedrock_assessments` | `BR-06` | — |
 | `AIR-BDR-MDL-09` | covered | — | `bedrock_assessments` | `BR-45` | — |
 | `AIR-BDR-MDL-10` | covered | — | `bedrock_assessments` | `BR-37` | same GetAccountDataRetention call |
+| `AIR-BDR-MDL-08` | tighten | extend | `bedrock_assessments` | `BR-07` | BR-07 holds the catalog leg (ListPrompts non-empty is its Passed row, zero prompts is Not Applicable) and its second row only counts variants. The production-version leg is unwritten and cannot be written on the calls BR-07 already makes: bare ListPrompts returns each prompt's DRAFT, and BR-07's get_prompt omits promptVersion, which the API documents as returning the working draft, so a version != DRAFT test over either reports Failed for every prompt in every account and no configuration clears it. The falsifiable form is ListPrompts(promptIdentifier=...) for that prompt's version list, GetPrompt(promptVersion=N) for customerEncryptionKeyArn, which PromptSummary does not carry, and for flows the prompt node's resource.promptArn version suffix, with inline being the hardcoded prompt the control names |
 | `AIR-BDR-KB-05` | not_implementable | — | — | — | depends on customer Lambda code, not configuration |
 | `AIR-BDR-KB-08` | not_implementable | — | — | — | depends on customer Lambda code, not configuration |
-| `AIR-BDR-MDL-08` | not_implementable | — | — | — | needs a published-versus-DRAFT distinction GetPrompt does not return |
 
 ## SGM (11 controls)
 

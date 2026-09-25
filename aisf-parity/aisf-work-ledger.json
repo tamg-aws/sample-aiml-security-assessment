@@ -7,14 +7,14 @@
     "fnd_ai_subject": 11,
     "total": 78,
     "covered": 28,
-    "tighten": 17,
-    "tighten_extend": 12,
+    "tighten": 18,
+    "tighten_extend": 13,
     "tighten_new_id": 5,
     "new": 18,
-    "not_implementable": 4,
+    "not_implementable": 3,
     "unassessed": 11,
     "new_check_functions": 34,
-    "extensions": 12,
+    "extensions": 13,
     "extra_iam_actions": [
       "cloudtrail:GetEventSelectors",
       "cloudtrail:ListTrails",
@@ -410,14 +410,18 @@
       "question": "Are the production prompts that drive model behavior managed as controlled, versioned artifacts in a central catalog, rather than hardcoded ad hoc in application code?",
       "assert": "Prompt catalog + immutable production version reference + access/encryption configuration",
       "workload_agnostic": true,
-      "verdict": "not_implementable",
-      "disposition": null,
-      "target_modules": [],
-      "incumbents": [],
+      "verdict": "tighten",
+      "disposition": "extend",
+      "target_modules": [
+        "bedrock_assessments"
+      ],
+      "incumbents": [
+        "BR-07"
+      ],
       "incumbent_names": [],
-      "gap": "needs a published-versus-DRAFT distinction GetPrompt does not return",
+      "gap": "BR-07 holds the catalog leg (ListPrompts non-empty is its Passed row, zero prompts is Not Applicable) and its second row only counts variants. The production-version leg is unwritten and cannot be written on the calls BR-07 already makes: bare ListPrompts returns each prompt's DRAFT, and BR-07's get_prompt omits promptVersion, which the API documents as returning the working draft, so a version != DRAFT test over either reports Failed for every prompt in every account and no configuration clears it. The falsifiable form is ListPrompts(promptIdentifier=...) for that prompt's version list, GetPrompt(promptVersion=N) for customerEncryptionKeyArn, which PromptSummary does not carry, and for flows the prompt node's resource.promptArn version suffix, with inline being the hardcoded prompt the control names",
       "extra_iam": [],
-      "phase": null,
+      "phase": 4,
       "source": "controls/ai-specific/bedrock-model-access.yaml"
     },
     {

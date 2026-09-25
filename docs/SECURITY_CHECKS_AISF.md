@@ -228,8 +228,8 @@ contributes to, so a reader of `bedrock_security_report_*.csv` can trace a row
 back to the framework. The `Status` column still carries the verdict.
 
 Measured by `check_ledger.py` gate 14, which prints each of these figures on
-every run: 48 check-control pairs over 40 tagged checks in 4 modules, naming 45
-distinct controls. Tagged checks per module are bedrock 16, sagemaker 11,
+every run: 49 check-control pairs over 41 tagged checks in 4 modules, naming 46
+distinct controls. Tagged checks per module are bedrock 17, sagemaker 11,
 agentcore 12, agent_registry 1.
 
 ### The qualifier is what makes a `tighten` control safe to name
@@ -244,19 +244,21 @@ trusting the literal in the file:
 | ----- | ------- |
 | `AISF AIR-BDR-GRD-01` | this check alone asserts the whole control |
 | `AISF AIR-SGM-TRN-05 (1 of 3 checks)` | the control is covered, but jointly, so no single leg asserts it |
-| `AISF AIR-BDR-MDL-02 (partial)` | the check asserts less than the control requires, and the gap is open in the ledger |
+| `AISF AIR-BDR-MDL-08 (partial)` | the check asserts less than the control requires, and the gap is open in the ledger |
 
-Census at the current head, also printed by gate 14: 7 bare, 29 `(partial)`, 3
-`(1 of 3 checks)`. The 7 bare tags plus the single control that carries all 3
-joint legs account for the 8 `covered` controls; the remaining 28 are `tighten`.
-A bare tag on a `tighten` row, or a dropped `(1 of N)`, fails gate 14 with the
+Census at the current head, also printed by gate 14: 26 bare, 18 `(partial)`, 5
+joint. The 26 bare tags plus the two jointly covered controls, `AIR-BDR-MDL-02`
+over 2 checks and `AIR-SGM-TRN-05` over 3, account for the 28 `covered`
+controls; the 18 `(partial)` tags are the 18 `tighten` controls, one tag each. A
+bare tag on a `tighten` row, or a dropped `(1 of N)`, fails gate 14 with the
 row's verdict and incumbent count named.
 
 A check that contributes to several controls carries them pipe-joined, with the
 `AISF ` prefix repeated on each element so a consumer that splits on `|` gets a
-complete token. `AC-02` names four controls that way. `SM-03` is the case that
-exercises both qualifiers at once, holding a `(partial)` for one control and a
-`(1 of 3 checks)` for another.
+complete token. `AC-02` names four controls that way, all `(partial)`. `SM-03` is the case that
+mixes forms inside one value, a bare `AIR-SGM-TRN-02` beside
+`AIR-SGM-TRN-05 (1 of 3 checks)`; no check pairs a `(partial)` with a tag of
+another form.
 
 ### Generated, not hand-written
 

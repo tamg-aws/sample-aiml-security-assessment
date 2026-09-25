@@ -24,6 +24,7 @@ row's own Status column carries the verdict.
 AISF_COMPLIANCE_MAP = {
     "BR-04": "AISF AIR-BDR-MDL-02 (1 of 2 checks)",
     "BR-06": "AISF AIR-BDR-KB-06 | AISF AIR-BDR-MDL-07",
+    "BR-07": "AISF AIR-BDR-MDL-08 (partial)",
     "BR-10": "AISF AIR-BDR-GRD-01",
     "BR-12": "AISF AIR-BDR-MDL-02 (1 of 2 checks)",
     "BR-20": "AISF AIR-BDR-KB-03",

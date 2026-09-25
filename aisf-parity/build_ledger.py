@@ -85,13 +85,23 @@ ROWS = [
     ),
     (
         "AIR-BDR-MDL-08",
-        NOT_IMPL,
-        None,
-        None,
+        TIGHTEN,
+        EXTEND,
+        "bedrock_assessments",
+        ["BR-07"],
+        "BR-07 holds the catalog leg (ListPrompts non-empty is its Passed row, zero prompts "
+        "is Not Applicable) and its second row only counts variants. The "
+        "production-version leg is unwritten and cannot be written on the calls BR-07 "
+        "already makes: bare ListPrompts returns each prompt's DRAFT, and BR-07's "
+        "get_prompt omits promptVersion, which the API documents as returning the working "
+        "draft, so a version != DRAFT test over either reports Failed for every prompt in "
+        "every account and no configuration clears it. The falsifiable form is "
+        "ListPrompts(promptIdentifier=...) for that prompt's version list, "
+        "GetPrompt(promptVersion=N) for customerEncryptionKeyArn, which PromptSummary does "
+        "not carry, and for flows the prompt node's resource.promptArn version suffix, "
+        "with inline being the hardcoded prompt the control names",
         [],
-        "needs a published-versus-DRAFT distinction GetPrompt does not return",
-        [],
-        None,
+        4,
     ),
     # ---------------- SGM: 11 controls, sagemaker_assessments ----------------
     (

@@ -397,10 +397,19 @@ looks redundant:
 2. `AIR-FND-DET-09` is assertable: `deletionProtectionEnabled` *is* a `DescribeLogGroups` member, so
    `CONTRIBUTION-PROGRAM.md` section 8 is wrong to list it as mis-specified.
 
-Three AISF controls are flagged `machine_checkable` in the ledger but are not checkable from
-configuration: `AIR-BDR-KB-05` and `KB-08` depend on customer Lambda code, and `AIR-BDR-MDL-08`
-needs a published-versus-DRAFT distinction `GetPrompt` does not return. With `AIR-SGM-EP-03` that is
-4 of 105. The 105 figure is a ledger claim, not an implementability claim.
+Two AISF controls are flagged `machine_checkable` in the ledger but are not checkable from
+configuration: `AIR-BDR-KB-05` and `KB-08` depend on customer Lambda code. With `AIR-SGM-EP-03` that
+is 3 of 105. The 105 figure is a ledger claim, not an implementability claim.
+
+**Correction, `AIR-BDR-MDL-08` is implementable.** An earlier draft listed it above, on the grounds
+that it needs a published-versus-DRAFT distinction `GetPrompt` does not return. `version` is a
+required member of the `GetPrompt` response and of `PromptSummary` (botocore bedrock-agent
+2023-06-05), so the distinction is returned; what the request decides is *which* version gets
+described. `GetPrompt` with `promptVersion` omitted returns the working draft, and bare `ListPrompts`
+returns each prompt's DRAFT, so a `version != DRAFT` test over either reports `Failed` for every
+prompt in every account. That is an unfalsifiable check rather than an absent API: the falsifiable
+form is `ListPrompts(promptIdentifier=...)`, which lists that prompt's versions. The ledger now
+carries `MDL-08` as a tightening of `BR-07`, which already holds the catalog leg.
 
 ### 4.5 Published checks that cannot report a problem
 
@@ -458,9 +467,9 @@ model access is correctly scoped. The repo has the vocabulary for this already, 
 `Failed`. Summing the tiers into one "105 controls covered" claim is what would make the report
 misleading.
 
-Of the 83, four are not implementable as written, all four confirmed inside the 83:
-`AIR-BDR-KB-05`, `KB-08`, `MDL-08`, and `SGM-EP-03` (section 4.4). So **79** is the largest defensible
-unconditional figure. A further reduction to 70, on the grounds that 9 of the agnostic controls still
+Of the 83, three are not implementable as written, all three confirmed inside the 83:
+`AIR-BDR-KB-05`, `KB-08`, and `SGM-EP-03` (section 4.4, which also records why `MDL-08` left this
+list). So **80** is the largest defensible unconditional figure. A further reduction to 70, on the grounds that 9 of the agnostic controls still
 need an operator baseline, was reported but is not adopted here: it contradicts the ledger's own
 `workload_agnostic` flag for those 9, so either the flag is wrong or the two are counting different
 things. Resolve it against the ledger before quoting 70.
