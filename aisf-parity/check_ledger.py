@@ -314,6 +314,54 @@ def tag_column_figures(text):
     return out, found
 
 
+CENSUS_ANCHOR = "Census at the current head"
+# Cut from the RAW file text and never from flattened text. figure_occurrences()
+# collapses whitespace, which destroys both delimiters this needs: `^` and the
+# `\n\n` terminator. Measured at four refs -- this base, this branch, phase 3's
+# head and the merge dry-run -- the pattern returns ONE paragraph from the raw
+# file and ZERO from the same text flattened, so a slice taken after the flatten
+# would leave the exactly-one rule below failing gate 14 forever on a correct
+# document. The anchor text is shared with the message, so a reworded sentence
+# cannot leave the two disagreeing about what was looked for.
+CENSUS_PARAGRAPH = re.compile(
+    r"^" + re.escape(CENSUS_ANCHOR) + r".*?(?=\n\n|\Z)", re.S | re.M
+)
+
+
+def census_paragraph(text):
+    """The census paragraph, the number found, and a message unless there is one.
+
+    Narrowing the census read to its own paragraph is what stops the five
+    patterns answering from anywhere else in a 23 KB file. Measured at phase 3's
+    head: the covered pattern matches a coverage bullet elsewhere in the
+    document as well, so the whole-file read returns the two disagreeing copies
+    ['20', '28'] and reds gate 14 over a census sentence that is correct.
+
+    Exactly one paragraph, fail-closed both ways. Zero means the anchor sentence
+    was reworded or deleted; two means the figures would be read across two
+    paragraphs that need not agree. Both return an empty slice rather than the
+    whole file, so the five figures below also report as absent, and the message
+    names the count and the anchor so the repair is the sentence, not the gate.
+
+    Spelled with findall and not two str.index calls, which is shorter and
+    wrong: a missing anchor raises ValueError mid-gate and takes every later
+    gate's verdict with it, and a paragraph at end of file has no `\\n\\n` for
+    the second index to find.
+    """
+    found = CENSUS_PARAGRAPH.findall(text)
+    if len(found) == 1:
+        return found[0], 1, []
+    return (
+        "",
+        len(found),
+        [
+            f"SECURITY_CHECKS_AISF.md holds {len(found)} paragraph(s) beginning "
+            f"{CENSUS_ANCHOR!r}, not 1; the five census figures are read from "
+            "exactly one"
+        ],
+    )
+
+
 def census_figures(text):
     """The qualifier and verdict census a piece of prose publishes, and its copies.
 
@@ -324,14 +372,21 @@ def census_figures(text):
     claiming no document published them, which was false in the output of the gate
     the claim was meant to make trustworthy.
 
-    Three things the occurrence counts at this base forced, none of them guessable:
+    The text handed in is that paragraph alone, cut out of the raw file by
+    census_paragraph() before this flattens it.
 
-    The digits carry a `(?<![-\\w])` anchor because the example table immediately
-    above the paragraph reads `AISF AIR-BDR-MDL-02 (partial)` and
-    `AISF AIR-SGM-TRN-05 (1 of 3 checks)`. Unanchored, a check id's own suffix is
-    counted as a second copy of the figure -- partial resolves to ['02', '29'] and
-    joint to ['05', '3'] -- so the agreement rule would red on correct prose, and
-    the 05 would be the copy a first-match read returned.
+    Four things the occurrence counts forced, none of them guessable:
+
+    The digits carry a `(?<![-\\w])` anchor, which is inert on the slice and was
+    load-bearing while this read the whole file: unanchored over the whole
+    document, the example table sixteen lines above the paragraph
+    (`AISF AIR-BDR-MDL-02 (partial)`, `AISF AIR-SGM-TRN-05 (1 of 3 checks)`)
+    makes a check id's own suffix a second copy of the figure -- partial
+    resolves to ['02', '29'] and joint to ['05', '3'], and the 05 is the copy a
+    first-match read returns. Kept because the paragraph itself quotes suffixed
+    control ids: phase 3's head writes ``AIR-SGM-TRN-05`` over 3 inside it, one
+    rewording away from putting a suffix back in front of a figure pattern.
+    Measured on the slice at four refs, anchored and unanchored agree exactly.
 
     The flatten is load-bearing for two of the five, not one. Both joint spellings
     straddle a line break as published (`3\\n`(1 of 3 checks)`` and `all 3\\njoint
@@ -342,6 +397,16 @@ def census_figures(text):
     ``3 `(1 of 3 checks)``` and phase 3's head writes `5 joint`. The copies are
     pooled and have to agree; none at all under either spelling is a failure, never
     a skip. Backticks are optional throughout, being markdown and not the claim.
+
+    Tighten is pooled the same way, for the same reason and with the same rule.
+    `remaining (\\d+) are tighten` finds nothing at phase 3's head, where the
+    clause became ``the 18 `(partial)` tags are the 18 `tighten` controls``, so
+    the second spelling reads that one. Both spellings name the phrase they read
+    rather than the word alone: measured over the whole document, a bare
+    `(\\d+) tighten` matches three sentences at that head, one of them counting
+    tighten controls that carry no AISF- row. That is a different population
+    agreeing at 18 today, and a pattern that cannot tell the two apart publishes
+    the wrong one the day they diverge.
     """
     found = figure_occurrences(
         text,
@@ -351,10 +416,12 @@ def census_figures(text):
             ("joint_as_checks", r"(?<![-\w])(\d+) `?\(1 of \d+ checks\)`?"),
             ("joint_as_word", r"(?<![-\w])(\d+) joint"),
             ("covered", r"(?<![-\w])(\d+) `?covered`? controls"),
-            ("tighten", r"remaining (\d+) are `?tighten`?"),
+            ("tighten_as_remaining", r"remaining (\d+) are `?tighten`?"),
+            ("tighten_as_controls", r"(?<![-\w])(\d+) `?tighten`? controls"),
         ),
     )
     found["joint"] = found["joint_as_checks"] + found["joint_as_word"]
+    found["tighten"] = found["tighten_as_remaining"] + found["tighten_as_controls"]
     values = {
         label: agreed_figure(found[label])
         for label in ("bare", "partial", "joint", "covered", "tighten")
@@ -1018,7 +1085,15 @@ def main():
         "covered": verdict_census["covered"],
         "tighten": verdict_census["tighten"],
     }
-    census_published, census_hits = census_figures(published_text)
+    # Sliced here, on the raw text, because census_figures() flattens what it is
+    # given and the paragraph delimiters do not survive that. The count comes back
+    # for the verdict line: a census read from no paragraph, or from two, prints as
+    # such beside the figures instead of looking like five figures nobody published.
+    census_slice, census_paragraphs, census_slice_problems = census_paragraph(
+        published_text
+    )
+    tag_problems += census_slice_problems
+    census_published, census_hits = census_figures(census_slice)
     tag_problems += figure_drift(
         "SECURITY_CHECKS_AISF.md's census paragraph",
         census_published,
@@ -1036,7 +1111,8 @@ def main():
         f"{len(published['per_module'] or {})} per-module figure(s) + "
         f"{len(census_published)} census figure(s) asserted against "
         f"SECURITY_CHECKS_AISF.md, doc={published} vs computed={computed}, "
-        f"copies [{copies_note(published_hits)}]; census doc={census_published} vs "
+        f"copies [{copies_note(published_hits)}]; census from {census_paragraphs} "
+        f"paragraph(s) matching {CENSUS_ANCHOR!r}, doc={census_published} vs "
         f"computed={computed_census}, copies [{copies_note(census_hits)}]"
         + (f", bad={tag_problems}" if tag_problems else ""),
     )

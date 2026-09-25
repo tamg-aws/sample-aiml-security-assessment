@@ -56,6 +56,8 @@ BEDROCK = "aiml-security-assessment/functions/security/bedrock_assessments/app.p
 
 BUILD_LEDGER = "aisf-parity/build_ledger.py"
 
+AISF_DOC = "docs/SECURITY_CHECKS_AISF.md"
+
 # Phase 2's surfaces: the generated tag maps, the schema that looks a tag up, and
 # the CSV fieldnames list a tag has to reach.
 SECURITY = "aiml-security-assessment/functions/security"
@@ -210,6 +212,25 @@ MUTATIONS = [
         "sees the column appear and disappear rather than a failure",
         "find": '                "Region",\n                "Compliance_Frameworks",\n',
         "replace": '                "Region",\n',
+    },
+    # ----------------------------------------------------- the published census
+    # The first mutation of a document rather than of code. Gate 14 asserts five
+    # census figures against the paragraph under the tag-shape table, all five
+    # hand-transcribed, and until this entry not one of them had a mutation
+    # behind it -- the gate was as good as its own author's arithmetic. This
+    # find-string names the verdict figure, which gate 14 takes from
+    # build_ledger.ROWS, and it is the `remaining N are tighten` spelling, so it
+    # also proves the tighten pool reaches that half of the pair.
+    {
+        "name": "the published census drops a tighten control",
+        "file": AISF_DOC,
+        "defect": "the census sentence publishes one tighten control fewer than "
+        "the ledger carries, which is the drift that already shipped once: the "
+        "figures move whenever an entry is added to any aisf_compliance_*.py or "
+        "a verdict changes in build_ledger.ROWS, and nothing in the file changes "
+        "with them",
+        "find": "; the remaining 28 are `tighten`.\n",
+        "replace": "; the remaining 27 are `tighten`.\n",
     },
 ]
 
