@@ -432,6 +432,17 @@ def newest_execution(bucket: str, region: str | None):
         # and print one figure with nothing in the output to say whose rows it
         # covers. Grouped, an incomplete prefix stays incomplete and the refusal
         # below fires instead.
+        # An execution id can also be a constant, which this grouping cannot see.
+        # Two of the four producers default it to the literal "unknown" when the
+        # event carries no Execution block -- agentcore's handler, and
+        # agent_registry's `_execution_name` on both of its branches -- while
+        # bedrock and sagemaker index `event["Execution"]["Name"]` and raise
+        # instead. So `(prefix, "unknown", region)` is a reachable key, and two
+        # runs that both lose the block write the same object name: the loss is a
+        # PutObject overwrite upstream of this listing, so only one object ever
+        # reaches the loop and no count here can report the other. Both defaulting
+        # modules are in PRODUCERS, so the surviving object is inside the set
+        # `complete` is measured against.
         key = (found.group("prefix"), found.group("execution"), found.group("region"))
         runs[key][found.group("module")] = obj["Key"]
         stamps[key] = max(stamps.get(key, obj["LastModified"]), obj["LastModified"])
