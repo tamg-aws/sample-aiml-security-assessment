@@ -698,6 +698,85 @@ def test_agentcore_resource_reads_and_metric_writes_are_constrained(template):
 
 
 @pytest.mark.parametrize("template", _SAM_TEMPLATES, ids=os.path.basename)
+def test_agentcore_observability_and_governance_reads_are_scoped_where_iam_allows(
+    template,
+):
+    """The AgentCore telemetry and policy reads wildcard only the enumerations.
+
+    Each enumeration below has no resource type in the IAM service authorization
+    reference, so an ARN on it denies the call. The read that follows it does take
+    a resource, and is scoped. Splitting them keeps the wildcard on the statement
+    that cannot avoid it instead of on the statement that can.
+    """
+    wildcard_enumerations = {
+        "CloudTrailTrailInventory": ("cloudtrail:ListTrails",),
+        "LogsDeliveryInventory": (
+            "logs:DescribeDeliverySources",
+            "logs:DescribeDeliveries",
+        ),
+        "LogsAccountPolicyInventory": ("logs:DescribeAccountPolicies",),
+        "ObservabilitySinkInventory": ("oam:ListSinks",),
+        "OrganizationsInventoryPermissions": ("organizations:ListPolicies",),
+    }
+    for sid, actions in wildcard_enumerations.items():
+        statement = _statement_block(
+            template, "AgentCoreSecurityAssessmentFunction", sid
+        )
+        for action in actions:
+            assert action in statement
+        assert re.search(r"Resource:\s+['\"]\*['\"]", statement)
+
+    scoped_reads = {
+        "CloudTrailEventSelectorRead": (
+            "cloudtrail:GetEventSelectors",
+            "cloudtrail:*:${AWS::AccountId}:trail/*",
+        ),
+        "LogsDataProtectionPolicyRead": (
+            "logs:GetDataProtectionPolicy",
+            "logs:*:${AWS::AccountId}:log-group:*",
+        ),
+        "ObservabilitySinkPolicyRead": (
+            "oam:GetSinkPolicy",
+            "oam:*:${AWS::AccountId}:sink/*",
+        ),
+        "LogEncryptionKeyPolicyRead": (
+            "kms:GetKeyPolicy",
+            "kms:*:${AWS::AccountId}:key/*",
+        ),
+        "OrganizationsPolicyRead": (
+            "organizations:DescribePolicy",
+            "organizations::*:policy/*/*/*",
+        ),
+    }
+    for sid, (action, resource) in scoped_reads.items():
+        statement = _statement_block(
+            template, "AgentCoreSecurityAssessmentFunction", sid
+        )
+        assert action in statement
+        assert resource in statement
+        assert not re.search(r"Resource:\s+['\"]\*['\"]", statement)
+
+    # DescribeSecurityGroups has no resource-level authorization either, so it
+    # joins the existing EC2 enumeration statement instead of getting a wildcard
+    # statement of its own.
+    network = _statement_block(
+        template, "AgentCoreSecurityAssessmentFunction", "EC2Permissions"
+    )
+    assert "ec2:DescribeSecurityGroups" in network
+    assert re.search(r"Resource:\s+['\"]\*['\"]", network)
+
+    # The gateway execution role's name is chosen by whoever created the gateway,
+    # so the trust read covers role/* in this account and no other account.
+    gateway_role = _statement_block(
+        template, "AgentCoreSecurityAssessmentFunction", "AgentCoreGatewayRoleTrustRead"
+    )
+    assert "iam:GetRole" in gateway_role
+    assert "iam::${AWS::AccountId}:role/*" in gateway_role
+    assert "iam::*:role/" not in gateway_role
+    assert not re.search(r"Resource:\s+['\"]\*['\"]", gateway_role)
+
+
+@pytest.mark.parametrize("template", _SAM_TEMPLATES, ids=os.path.basename)
 def test_responsible_ai_bedrock_and_owasp_reads_are_arn_scoped(template):
     inventory = _statement_block(
         template,
