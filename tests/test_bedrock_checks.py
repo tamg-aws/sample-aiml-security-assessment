@@ -5276,11 +5276,28 @@ class TestBR20S3VectorsStore:
         return ClientError({"Error": {"Code": code, "Message": code}}, operation)
 
     @staticmethod
-    def _s3_vectors_kb_body(bucket_arn):
-        """A VECTOR knowledge base whose storage is an S3 Vectors bucket."""
+    def _index_arn(bucket_arn, index_name="kb-index"):
+        """The index ARN a knowledge base on `bucket_arn` reports."""
+        return f"{bucket_arn}/index/{index_name}"
+
+    @classmethod
+    def _s3_vectors_kb_body(cls, bucket_arn, index="arn"):
+        """A VECTOR knowledge base whose storage is an S3 Vectors bucket.
+
+        `index` chooses which index identifiers the knowledge base reports, the
+        three shapes s3VectorsConfiguration allows: "arn" for indexArn plus
+        indexName, "name" for indexName alone (GetIndex then needs the bucket
+        name), and None for neither, which is the shape that cannot be assessed.
+        """
         storage = {"type": "S3_VECTORS"}
         if bucket_arn is not None:
-            storage["s3VectorsConfiguration"] = {"vectorBucketArn": bucket_arn}
+            config = {"vectorBucketArn": bucket_arn}
+            if index == "arn":
+                config["indexArn"] = cls._index_arn(bucket_arn)
+                config["indexName"] = "kb-index"
+            elif index == "name":
+                config["indexName"] = "kb-index"
+            storage["s3VectorsConfiguration"] = config
         return {
             "knowledgeBaseConfiguration": {
                 "type": "VECTOR",
@@ -5305,7 +5322,13 @@ class TestBR20S3VectorsStore:
 
     @staticmethod
     def _vectors_client(
-        encryption=None, bucket_error=None, policy="", policy_error=None
+        encryption=None,
+        bucket_error=None,
+        policy="",
+        policy_error=None,
+        index_encryption=None,
+        index_error=None,
+        index_calls=None,
     ):
         vectors_client = MagicMock()
         if bucket_error is not None:
@@ -5320,6 +5343,26 @@ class TestBR20S3VectorsStore:
                     "encryptionConfiguration": encryption or {},
                 }
             }
+        if index_error is not None:
+            vectors_client.get_index.side_effect = index_error
+        else:
+            # Every index read live on 2026-09-25 echoed its bucket's
+            # encryption configuration, so that is the default here and a case
+            # has to ask for an override. `index_calls` records the lookup
+            # keywords, which is the only way to see WHICH index was read.
+            def get_index(**kwargs):
+                if index_calls is not None:
+                    index_calls.append(kwargs)
+                inherited = encryption or {}
+                return {
+                    "index": {
+                        "encryptionConfiguration": (
+                            inherited if index_encryption is None else index_encryption
+                        )
+                    }
+                }
+
+            vectors_client.get_index.side_effect = get_index
         if policy_error is not None:
             vectors_client.get_vector_bucket_policy.side_effect = policy_error
         else:
@@ -5348,7 +5391,13 @@ class TestBR20S3VectorsStore:
         return factory
 
     def _run_one(
-        self, mock_client, *, bucket_arn=_BUCKET_ARN, scan_region="us-east-1", **vectors
+        self,
+        mock_client,
+        *,
+        bucket_arn=_BUCKET_ARN,
+        scan_region="us-east-1",
+        index="arn",
+        **vectors,
     ):
         """Run BR-20 over a single S3 Vectors knowledge base.
 
@@ -5356,7 +5405,9 @@ class TestBR20S3VectorsStore:
         """
         clients_built = []
         mock_client.side_effect = self._by_service(
-            self._agent_client_for({"kb1": self._s3_vectors_kb_body(bucket_arn)}),
+            self._agent_client_for(
+                {"kb1": self._s3_vectors_kb_body(bucket_arn, index=index)}
+            ),
             self._vectors_client(**vectors),
             clients_built,
         )
@@ -5382,12 +5433,20 @@ class TestBR20S3VectorsStore:
                 raise answer
             return answer
 
+        index_encryption = {self._index_arn(arn): enc for _, arn, enc, _ in stores}
+
         vectors_client = MagicMock()
         vectors_client.get_vector_bucket.side_effect = lambda **kwargs: {
             "vectorBucket": {
                 "vectorBucketArn": kwargs["vectorBucketArn"],
                 "encryptionConfiguration": encryption[kwargs["vectorBucketArn"]],
             }
+        }
+        # Each index inherits its own bucket's configuration, so the index leg
+        # adds no verdict of its own to a population case. Keyed by index ARN,
+        # not bucket ARN, so a check that passed the wrong ARN would KeyError.
+        vectors_client.get_index.side_effect = lambda **kwargs: {
+            "index": {"encryptionConfiguration": index_encryption[kwargs["indexArn"]]}
         }
         vectors_client.get_vector_bucket_policy.side_effect = get_policy
         mock_client.side_effect = self._by_service(
@@ -5440,9 +5499,15 @@ class TestBR20S3VectorsStore:
         assert [f["Status"] for f in findings] == ["Passed"]
         assert findings[0]["Severity"] == "Medium"
         assert self._CMK["kmsKeyArn"] in findings[0]["Finding_Details"]
-        # The index carries its own encryptionConfiguration, which this check
-        # does not read. A Passed row that did not say so would overclaim.
-        assert "Index-level encryption overrides" in findings[0]["Finding_Details"]
+        # Both encryption legs are named in the Passed row: the bucket's and the
+        # index's. The row used to disclaim the index leg instead of reading it,
+        # so the old sentence must be gone rather than merely joined.
+        assert "vector bucket encryption is SSE-KMS" in findings[0]["Finding_Details"]
+        assert (
+            "vector index 'kb-index' encryption is SSE-KMS"
+            in findings[0]["Finding_Details"]
+        )
+        assert "are not read by this check" not in findings[0]["Finding_Details"]
 
     @patch("bedrock_app.boto3.client")
     def test_br20_s3_vectors_missing_policy_fails_and_is_never_na(self, mock_client):
@@ -5513,6 +5578,232 @@ class TestBR20S3VectorsStore:
             ),
         )
         assert [f["Status"] for f in findings] == ["Failed"]
+
+    @patch("bedrock_app.boto3.client")
+    def test_br20_s3_vectors_index_override_fails_a_cmk_bucket(self, mock_client):
+        # The gap the index leg closes. The bucket is SSE-KMS with a
+        # customer-managed key and carries a policy, so both of the other legs
+        # pass; the index the knowledge base names was created with its own
+        # AES256 encryptionConfiguration, which is what the embeddings are
+        # actually encrypted with. Without this leg the store reads as compliant.
+        findings, _ = self._run_one(
+            mock_client,
+            encryption=self._CMK,
+            policy='{"Statement": []}',
+            index_encryption={"sseType": "AES256"},
+        )
+        assert [f["Status"] for f in findings] == ["Failed"]
+        assert findings[0]["Check_ID"] == "BR-20"
+        assert findings[0]["Severity"] == "High"
+        assert "vector bucket encryption is SSE-KMS" in findings[0]["Finding_Details"]
+        assert (
+            "vector index 'kb-index' encryption is sseType=AES256"
+            in findings[0]["Finding_Details"]
+        )
+        assert (
+            "an index encryptionConfiguration overrides the bucket's"
+            in findings[0]["Finding_Details"]
+        )
+
+    @patch("bedrock_app.boto3.client")
+    def test_br20_s3_vectors_reads_the_index_each_knowledge_base_names(
+        self, mock_client
+    ):
+        # Two knowledge bases on ONE vector bucket, each naming its own index:
+        # kb1's is customer-managed, kb2's is AES256. Three implementations this
+        # separates, all of which the single-store cases above accept:
+        # a loop truncated to the first knowledge base (one row, Passed), a leg
+        # that reads one index per bucket instead of per knowledge base (two
+        # identical verdicts), and a leg that assessed every index in the bucket
+        # (two Failed rows, attributing kb2's index to kb1).
+        bucket = self._BUCKET_ARN
+        indexes = {
+            "kb1": self._index_arn(bucket, "kb1-index"),
+            "kb2": self._index_arn(bucket, "kb2-index"),
+        }
+        index_encryption = {
+            indexes["kb1"]: self._CMK,
+            indexes["kb2"]: {"sseType": "AES256"},
+        }
+
+        def body(index_arn):
+            return {
+                "knowledgeBaseConfiguration": {
+                    "type": "VECTOR",
+                    "vectorKnowledgeBaseConfiguration": {},
+                },
+                "storageConfiguration": {
+                    "type": "S3_VECTORS",
+                    "s3VectorsConfiguration": {
+                        "vectorBucketArn": bucket,
+                        "indexArn": index_arn,
+                    },
+                },
+            }
+
+        index_calls = []
+
+        def get_index(**kwargs):
+            index_calls.append(kwargs["indexArn"])
+            return {
+                "index": {
+                    "encryptionConfiguration": index_encryption[kwargs["indexArn"]]
+                }
+            }
+
+        vectors_client = MagicMock()
+        vectors_client.get_vector_bucket.side_effect = lambda **kwargs: {
+            "vectorBucket": {"encryptionConfiguration": self._CMK}
+        }
+        vectors_client.get_index.side_effect = get_index
+        vectors_client.get_vector_bucket_policy.return_value = {
+            "policy": '{"Statement": []}'
+        }
+        mock_client.side_effect = self._by_service(
+            self._agent_client_for({kb: body(arn) for kb, arn in indexes.items()}),
+            vectors_client,
+            [],
+        )
+
+        findings = extract_csv_data(
+            bedrock_app.check_bedrock_knowledge_base_kms_encryption(region="us-east-1")
+        )
+        assert [f["Status"] for f in findings] == ["Passed", "Failed"]
+        assert index_calls == [indexes["kb1"], indexes["kb2"]]
+        assert "kb1-index' encryption is SSE-KMS" in findings[0]["Finding_Details"]
+        assert (
+            "kb2-index' encryption is sseType=AES256" in findings[1]["Finding_Details"]
+        )
+        assert "kb2-index" not in findings[0]["Finding_Details"]
+
+    @patch("bedrock_app.boto3.client")
+    def test_br20_s3_vectors_index_inheriting_the_bucket_is_not_a_failure(
+        self, mock_client
+    ):
+        # An index created without an encryptionConfiguration inherits the
+        # bucket's, which the service model documents as the default. Requiring
+        # the field to be present would fail every index that never overrode it,
+        # which is the shape a compliant store has.
+        findings, _ = self._run_one(
+            mock_client,
+            encryption=self._CMK,
+            policy='{"Statement": []}',
+            index_encryption={},
+        )
+        assert [f["Status"] for f in findings] == ["Passed"]
+        assert (
+            "carries no encryptionConfiguration of its own and inherits the bucket's"
+            in findings[0]["Finding_Details"]
+        )
+
+    @patch("bedrock_app.boto3.client")
+    def test_br20_s3_vectors_index_access_denied_names_the_permission(
+        self, mock_client
+    ):
+        # Same convention as the GetVectorBucketPolicy leg: a permission gap is
+        # neither a pass nor a fail, and the row names the action to grant.
+        findings, _ = self._run_one(
+            mock_client,
+            encryption=self._CMK,
+            policy='{"Statement": []}',
+            index_error=self._client_error("AccessDeniedException", "GetIndex"),
+        )
+        assert [f["Status"] for f in findings] == ["N/A"]
+        assert findings[0]["Severity"] == "Informational"
+        assert "s3vectors:GetIndex" in findings[0]["Finding_Details"]
+        assert findings[0]["Finding"].endswith("Review")
+
+    @patch("bedrock_app.boto3.client")
+    def test_br20_s3_vectors_index_not_found_is_not_a_failure(self, mock_client):
+        # NotFoundException on GetIndex is a broken knowledge base, not evidence
+        # that its embeddings are unencrypted. The policy leg treats the same
+        # error code as an answer about the workload because a missing policy IS
+        # the finding there; a missing index is not.
+        findings, _ = self._run_one(
+            mock_client,
+            encryption=self._CMK,
+            policy='{"Statement": []}',
+            index_error=self._client_error("NotFoundException", "GetIndex"),
+        )
+        assert [f["Status"] for f in findings] == ["N/A"]
+        assert "could not be read" in findings[0]["Finding_Details"]
+
+    @patch("bedrock_app.boto3.client")
+    def test_br20_s3_vectors_failed_bucket_encryption_outranks_an_unreadable_index(
+        self, mock_client
+    ):
+        findings, _ = self._run_one(
+            mock_client,
+            encryption={"sseType": "AES256"},
+            policy='{"Statement": []}',
+            index_error=self._client_error("AccessDeniedException", "GetIndex"),
+        )
+        assert [f["Status"] for f in findings] == ["Failed"]
+
+    @patch("bedrock_app.boto3.client")
+    def test_br20_s3_vectors_index_failure_outranks_an_unreadable_policy(
+        self, mock_client
+    ):
+        findings, _ = self._run_one(
+            mock_client,
+            encryption=self._CMK,
+            index_encryption={"sseType": "AES256"},
+            policy_error=self._client_error(
+                "AccessDeniedException", "GetVectorBucketPolicy"
+            ),
+        )
+        assert [f["Status"] for f in findings] == ["Failed"]
+
+    @patch("bedrock_app.boto3.client")
+    def test_br20_s3_vectors_index_lookup_prefers_the_arn(self, mock_client):
+        index_calls = []
+        self._run_one(
+            mock_client,
+            encryption=self._CMK,
+            policy='{"Statement": []}',
+            index_calls=index_calls,
+        )
+        assert index_calls == [{"indexArn": self._index_arn(self._BUCKET_ARN)}]
+
+    @patch("bedrock_app.boto3.client")
+    def test_br20_s3_vectors_index_lookup_falls_back_to_the_bucket_and_index_name(
+        self, mock_client
+    ):
+        # GetIndex accepts the index ARN, or the bucket NAME with the index name.
+        # It does not accept the bucket ARN, so a knowledge base that reports
+        # only indexName needs the name parsed out of the bucket ARN. Abstaining
+        # on this shape would be a self-inflicted could-not-assess.
+        index_calls = []
+        findings, _ = self._run_one(
+            mock_client,
+            index="name",
+            encryption=self._CMK,
+            policy='{"Statement": []}',
+            index_calls=index_calls,
+        )
+        assert index_calls == [
+            {"vectorBucketName": "kb-vectors", "indexName": "kb-index"}
+        ]
+        assert [f["Status"] for f in findings] == ["Passed"]
+
+    @patch("bedrock_app.boto3.client")
+    def test_br20_s3_vectors_without_an_index_identifier_cannot_pass(self, mock_client):
+        # A knowledge base that reports a vector bucket but neither indexArn nor
+        # indexName: an index-level override cannot be ruled out, so the store
+        # does not pass on the bucket alone. Same treatment as the missing
+        # vectorBucketArn above, and no GetIndex call is made.
+        index_calls = []
+        findings, _ = self._run_one(
+            mock_client,
+            index=None,
+            encryption=self._CMK,
+            policy='{"Statement": []}',
+            index_calls=index_calls,
+        )
+        assert [f["Status"] for f in findings] == ["N/A"]
+        assert index_calls == []
+        assert "neither" in findings[0]["Finding_Details"]
+        assert "indexArn nor indexName" in findings[0]["Finding_Details"]
 
     @patch("bedrock_app.boto3.client")
     def test_br20_s3_vectors_client_is_built_for_the_bucket_region(self, mock_client):
@@ -5593,6 +5884,13 @@ class TestBR20S3VectorsStore:
         vectors_client.get_vector_bucket.side_effect = lambda **kwargs: {
             "vectorBucket": {
                 "encryptionConfiguration": encryption[kwargs["vectorBucketArn"]]
+            }
+        }
+        vectors_client.get_index.side_effect = lambda **kwargs: {
+            "index": {
+                "encryptionConfiguration": encryption[
+                    kwargs["indexArn"].rsplit("/index/", 1)[0]
+                ]
             }
         }
         vectors_client.get_vector_bucket_policy.side_effect = get_policy

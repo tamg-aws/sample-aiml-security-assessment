@@ -135,7 +135,8 @@ invocations.
 
 ## AISF-05: a CMK-encrypted vector store with a bucket policy
 
-BR-20's S3 Vectors branch has **two** legs and Passed needs both. A customer-managed
+BR-20's S3 Vectors branch has **three** legs (bucket encryption, index encryption,
+bucket policy) and Passed needs all three. A customer-managed
 key with no bucket policy is a Failed, because half of "encrypted and
 access-restricted" is not a pass. The CMK alone left the row at ONE_ONLY with all
 ten knowledge bases Failed; the bucket policy is what moves it to BOTH.
@@ -146,9 +147,12 @@ ten knowledge bases Failed; the bucket policy is what moves it to BOTH.
   `Decrypt`/`GenerateDataKey`/`DescribeKey` under an `aws:SourceAccount`
   condition. `CreateIndex` fails with `AccessDeniedException` without it.
 - Vector bucket `aisflive-vectors-cmk`, `sseType=aws:kms` with that key.
-- Index `aisflive-index`, float32, dimension 1024, cosine. It reports the same
-  `aws:kms` key, so the index-level override BR-20 cannot read is not masking a
-  weaker key here.
+- Index `aisflive-index`, float32, dimension 1024, cosine. `GetIndex` returns the
+  same `aws:kms` key, so the index leg agrees with the bucket leg on this fixture.
+  Every index read live on 2026-09-25 echoed its bucket's configuration instead of
+  omitting the field, so the fixture exercises the echoed shape and the unit suite
+  carries the two shapes it cannot: an index with no `encryptionConfiguration` of
+  its own, and an `AES256` index inside a CMK bucket.
 - A vector bucket policy, one `Allow` statement, principal `aisflive-kb-cmk-role`
   and nothing else, six `s3vectors` actions, resources limited to that bucket and
   its indexes. No wildcard principal, action or resource: a bucket policy opened to

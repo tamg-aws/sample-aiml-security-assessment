@@ -174,6 +174,7 @@ _EXPECTED_ACTIONS = {
         "s3:GetLifecycleConfiguration",
         "s3:GetObject",
         "s3:PutObject",
+        "s3vectors:GetIndex",
         "s3vectors:GetVectorBucket",
         "s3vectors:GetVectorBucketPolicy",
         "servicequotas:GetAWSDefaultServiceQuota",
@@ -519,9 +520,11 @@ def test_bedrock_resource_level_actions_are_arn_scoped(template):
         ),
         "BedrockFlowRead": "bedrock:*:${AWS::AccountId}:flow/*",
         "BedrockKnowledgeBaseRead": "bedrock:*:${AWS::AccountId}:knowledge-base/*",
-        # BR-20 reads the S3 Vectors bucket behind a knowledge base. The region is
-        # wildcarded (a knowledge base can point at a bucket in another region) but
-        # the account and the resource type are not.
+        # BR-20 reads the S3 Vectors bucket behind a knowledge base and the one
+        # index that knowledge base names. The region is wildcarded (a knowledge
+        # base can point at a bucket in another region) but the account and the
+        # resource type are not: an index ARN is bucket/<name>/index/<name>, so
+        # this bucket/* resource covers GetIndex without a second statement.
         "S3VectorsKnowledgeBaseStoreRead": "s3vectors:*:${AWS::AccountId}:bucket/*",
         "BedrockImportedModelRead": "bedrock:*:${AWS::AccountId}:imported-model/*",
         "BedrockInferenceProfileTagRead": (

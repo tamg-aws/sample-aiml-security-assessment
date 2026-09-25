@@ -5073,7 +5073,10 @@ S3_VECTORS_RESOLUTION = (
     "and CreateIndex with an encryptionConfiguration, and no Put*Encryption "
     "operation), so move the knowledge base to a vector bucket created with "
     "encryptionConfiguration.sseType=aws:kms and a customer-managed "
-    "kmsKeyArn, then re-ingest the data sources.\n"
+    "kmsKeyArn, and to an index created with the same configuration or with none "
+    "at all: an index created with its own encryptionConfiguration overrides the "
+    "bucket's default for every vector it holds. Then re-ingest the data "
+    "sources.\n"
     "2. Attach a vector bucket policy (s3vectors:PutVectorBucketPolicy) that grants "
     "the knowledge base service role only the vector operations it needs and denies "
     "everyone else."
@@ -5097,21 +5100,27 @@ def _vector_bucket_region(vector_bucket_arn: str) -> str:
 def _assess_s3_vectors_store(
     storage_config: Dict[str, Any], region: str
 ) -> Dict[str, str]:
-    """Assess the S3 Vectors bucket behind a knowledge base for BR-20.
+    """Assess the S3 Vectors store behind a knowledge base for BR-20.
 
-    Two legs, both read from the vector bucket itself:
-      - encryption: GetVectorBucket. sseType=aws:kms WITH a kmsKeyArn is the
-        customer-managed case and passes. AES256 is SSE-S3: encrypted, but not
-        with a customer-managed key, which is the bar every other BR-20 storage
-        type is held to, so it fails. The service model documents kmsKeyArn as
-        the "customer managed key" and allows it if and only if sseType is
-        aws:kms, so the pair is the whole test.
+    Three legs:
+      - bucket encryption: GetVectorBucket. sseType=aws:kms WITH a kmsKeyArn is
+        the customer-managed case and passes. AES256 is SSE-S3: encrypted, but
+        not with a customer-managed key, which is the bar every other BR-20
+        storage type is held to, so it fails. The service model documents
+        kmsKeyArn as the "customer managed key" and allows it if and only if
+        sseType is aws:kms, so the pair is the whole test.
+      - index encryption: GetIndex on the one index this knowledge base names.
+        The bucket's configuration is only the default for new indexes, so an
+        index created with its own encryptionConfiguration decides what the
+        embeddings are actually encrypted with, and an aws:kms bucket holding an
+        AES256 index reads as compliant without this leg. Same comparison as the
+        bucket, on identically named members.
       - access restriction: GetVectorBucketPolicy. NotFoundException means no
         policy is attached, which is a Failed for this leg and explicitly NOT an
         N/A. Abstaining here is what made this control read as unassessed while
         every knowledge base in the account used S3 Vectors.
 
-    An AccessDenied on either call is neither of those: it is an assessment
+    An AccessDenied on any of the three is none of those: it is an assessment
     prerequisite problem, reported as a could-not-assess that names the missing
     permission, so a permission gap stays visible instead of being restated as a
     verdict about the workload.
@@ -5121,6 +5130,7 @@ def _assess_s3_vectors_store(
     s3_vectors_config = storage_config.get("s3VectorsConfiguration") or {}
     vector_bucket_arn = s3_vectors_config.get("vectorBucketArn") or ""
     index_arn = s3_vectors_config.get("indexArn") or ""
+    index_name = s3_vectors_config.get("indexName") or ""
 
     if not vector_bucket_arn:
         return {
@@ -5195,6 +5205,88 @@ def _assess_s3_vectors_store(
             + ", not a customer-managed KMS key"
         )
 
+    # The one index this knowledge base names, not every index in the bucket. A
+    # vector bucket can hold indexes belonging to other workloads, and
+    # s3VectorsConfiguration carries a single indexArn/indexName, so a verdict
+    # read off a sibling index would be a verdict about someone else's data.
+    # GetIndex accepts the index ARN, or the bucket NAME with the index name --
+    # not the bucket ARN -- so the name path is built from the bucket ARN's own
+    # resource segment.
+    index_label = index_name or index_arn
+    if index_arn:
+        index_lookup = {"indexArn": index_arn}
+    elif index_name and "bucket/" in vector_bucket_arn:
+        index_lookup = {
+            "vectorBucketName": vector_bucket_arn.split("bucket/", 1)[1],
+            "indexName": index_name,
+        }
+    else:
+        index_lookup = {}
+
+    index_unreadable = ""
+    index_failed = False
+    if not index_lookup:
+        index_unreadable = "no index identifier"
+        index_detail = (
+            "the knowledge base reports neither "
+            "storageConfiguration.s3VectorsConfiguration.indexArn nor indexName, "
+            "so the index holding its embeddings could not be identified and an "
+            "index-level encryption override could not be ruled out"
+        )
+    else:
+        try:
+            index = s3_vectors_client.get_index(**index_lookup).get("index", {})
+        except ClientError as e:
+            error_code = e.response.get("Error", {}).get("Code", "")
+            if error_code in ACCESS_DENIED_ERROR_CODES:
+                index_unreadable = error_code
+                index_detail = (
+                    f"the encryption configuration of vector index '{index_label}' "
+                    f"could not be read: {error_code} on GetIndex. Grant "
+                    "s3vectors:GetIndex to assess index-level encryption, which "
+                    "overrides the bucket's"
+                )
+            else:
+                index_unreadable = get_assessment_error_label(e)
+                index_detail = (
+                    f"the encryption configuration of vector index '{index_label}' "
+                    f"could not be read: "
+                    f"{describe_api_error(e, 'GetIndex', bucket_region)}"
+                )
+        else:
+            index_encryption = index.get("encryptionConfiguration") or {}
+            index_sse = index_encryption.get("sseType")
+            index_kms_key_arn = index_encryption.get("kmsKeyArn") or ""
+            if not index_encryption:
+                # An index created without its own encryptionConfiguration
+                # inherits the bucket's, which the leg above already assessed.
+                # Every index read live on 2026-09-25 echoed its bucket's
+                # configuration rather than omitting the field, so this branch
+                # covers the other shape the service model allows, and it must
+                # not fail an index for the absence of an override.
+                index_detail = (
+                    f"vector index '{index_label}' carries no "
+                    "encryptionConfiguration of its own and inherits the bucket's"
+                )
+            elif index_sse == "aws:kms" and index_kms_key_arn:
+                index_detail = (
+                    f"vector index '{index_label}' encryption is SSE-KMS with "
+                    f"customer-managed key {index_kms_key_arn}"
+                )
+            else:
+                index_failed = True
+                index_detail = (
+                    f"vector index '{index_label}' encryption is sseType="
+                    f"{index_sse or 'AES256 (service default)'}"
+                    + (
+                        f" with kmsKeyArn={index_kms_key_arn}"
+                        if index_kms_key_arn
+                        else ""
+                    )
+                    + ", not a customer-managed KMS key, and an index "
+                    "encryptionConfiguration overrides the bucket's"
+                )
+
     policy_unreadable = ""
     policy_ok = False
     try:
@@ -5233,16 +5325,19 @@ def _assess_s3_vectors_store(
                 f"{describe_api_error(e, 'GetVectorBucketPolicy', bucket_region)}"
             )
 
-    detail = f"uses {located}. Assessed: {encryption_detail}; {policy_detail}."
-    if not encryption_ok:
-        # Positive evidence of a failing leg outranks an unreadable second leg.
+    detail = (
+        f"uses {located}. Assessed: {encryption_detail}; {index_detail}; "
+        f"{policy_detail}."
+    )
+    if not encryption_ok or index_failed:
+        # Positive evidence of a failing leg outranks an unreadable other leg.
         return {
             "status": "Failed",
             "severity": "High",
             "detail": detail,
             "resolution": S3_VECTORS_RESOLUTION,
         }
-    if policy_unreadable:
+    if index_unreadable or policy_unreadable:
         return {
             "status": "N/A",
             "severity": "Informational",
@@ -5259,13 +5354,11 @@ def _assess_s3_vectors_store(
     return {
         "status": "Passed",
         "severity": "Medium",
-        "detail": (
-            f"{detail} Index-level encryption overrides (CreateIndex accepts its own "
-            "encryptionConfiguration) are not read by this check."
-        ),
+        "detail": detail,
         "resolution": (
-            "No action required on the vector bucket. Confirm the vector index was "
-            "not created with an encryptionConfiguration that overrides the bucket."
+            "No action required on the vector bucket or on the index this knowledge "
+            "base names. Other indexes in the same bucket belong to other workloads "
+            "and are not read by this check."
         ),
     }
 

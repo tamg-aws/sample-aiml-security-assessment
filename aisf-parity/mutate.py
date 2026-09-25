@@ -129,6 +129,46 @@ MUTATIONS = [
         "            policy_unreadable = error_code\n",
     },
     {
+        "name": "S3 Vectors index encryption accepts any sseType",
+        "file": BEDROCK,
+        "defect": "an index created with its own AES256 encryptionConfiguration "
+        "passes BR-20's index leg, so the override that decides what the "
+        "embeddings are actually encrypted with reads as customer-managed. The "
+        "same fail-open shape as the bucket leg above, on the member that wins",
+        "find": '            elif index_sse == "aws:kms" and index_kms_key_arn:\n',
+        "replace": "            elif bool(index_sse):\n",
+    },
+    {
+        "name": "the index verdict dropped from the S3 Vectors combine",
+        "file": BEDROCK,
+        "defect": "the index leg is read, named in the finding detail, and then "
+        "not counted: an aws:kms bucket holding an AES256 index falls through to "
+        "Passed while the row says the index is AES256. A leg that reports but "
+        "does not decide is the shape a reader cannot tell from a working one",
+        "find": "    if not encryption_ok or index_failed:\n",
+        "replace": "    if not encryption_ok:\n",
+    },
+    {
+        "name": "an index inheriting the bucket's key is failed",
+        "file": BEDROCK,
+        "defect": "the opposite direction: an index created without an "
+        "encryptionConfiguration inherits the bucket's, which is what a "
+        "compliant store looks like, and this fails every one of them. A "
+        "false positive on the majority shape is as unshippable as a fail-open",
+        "find": "            if not index_encryption:\n",
+        "replace": "            if False:\n",
+    },
+    {
+        "name": "the knowledge base loop truncated to the first entry",
+        "file": BEDROCK,
+        "defect": "BR-20 assesses one knowledge base per region and reports its "
+        "verdict for all of them. Every single-store case in the suite still "
+        "passes, because one resource cannot tell a loop from a first-element "
+        "read",
+        "find": "            for kb_summary in knowledge_bases:\n",
+        "replace": "            for kb_summary in knowledge_bases[:1]:\n",
+    },
+    {
         "name": "source findings collapsed to one status per check id",
         "file": MAPPINGS,
         "defect": "a check's findings overwrite each other, so a Failed resource "
