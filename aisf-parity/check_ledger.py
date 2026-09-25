@@ -708,6 +708,51 @@ def main():
         ),
     )
 
+    # ---- gate 16: every generated map is wired into its own module's schema.py.
+    # A generated aisf_compliance_<module>.py that nothing imports stops tagging
+    # without failing: `Compliance_Frameworks` falls back to its Field(default="")
+    # while create_finding still fills it for the wired modules, so the column is
+    # present in every CSV and one producer's cells are empty. Deleting the import
+    # and keeping the call raises NameError, which is loud; the silent case is a
+    # new producer whose schema.py never wires the map at all.
+    #
+    # The list is globbed rather than taken from MODULE_TO_FUNCTION above, because
+    # a hardcoded module list is the thing this gate exists to close, and
+    # load_compliance_maps() `continue`s past a missing file, which is the same
+    # fail-open shape. A module that ships no map is simply not globbed: only
+    # four of the six producers carry one.
+    map_files = sorted(glob.glob(os.path.join(MODULES, "*", "aisf_compliance_*.py")))
+    unwired = []
+    for path in map_files:
+        module_dir = os.path.basename(os.path.dirname(path))
+        name = os.path.basename(path).removesuffix(".py")
+        schema_path = os.path.join(os.path.dirname(path), "schema.py")
+        if not os.path.exists(schema_path):
+            unwired.append(f"{module_dir} ships {name}.py but has no schema.py")
+            continue
+        with open(schema_path) as f:
+            schema_src = f.read()
+        pattern = rf"^\s*(?:from {re.escape(name)} import|import {re.escape(name)}\b)"
+        if not re.search(pattern, schema_src, re.M):
+            unwired.append(f"{module_dir}/schema.py does not import {name}")
+        elif "aisf_frameworks(" not in schema_src:
+            unwired.append(f"{module_dir}/schema.py imports {name} but never calls it")
+    gate(
+        "every generated AISF map is imported and called by its own schema.py",
+        # Fail closed on zero. An empty glob makes the loop above vacuously clean,
+        # and "0/0 wired" would print beside a PASS.
+        bool(map_files) and not unwired,
+        f"{len(map_files) - len(unwired)}/{len(map_files)} map(s) wired into the "
+        f"schema.py beside them"
+        + (
+            ""
+            if map_files
+            else "; no aisf_compliance_*.py exists at all, which is "
+            "not a pass -- an empty set satisfies every per-file check above"
+        )
+        + (f", unwired={unwired}" if unwired else ""),
+    )
+
     failed = [n for n, ok, _ in results if not ok]
     print()
     print(f"{len(results) - len(failed)}/{len(results)} gates passed")
