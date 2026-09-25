@@ -228,8 +228,8 @@ contributes to, so a reader of `bedrock_security_report_*.csv` can trace a row
 back to the framework. The `Status` column still carries the verdict.
 
 Measured by `check_ledger.py` gate 14, which prints each of these figures on
-every run: 39 check-control pairs over 31 tagged checks in 4 modules, naming 36
-distinct controls. Tagged checks per module are bedrock 11, sagemaker 7,
+every run: 48 check-control pairs over 40 tagged checks in 4 modules, naming 45
+distinct controls. Tagged checks per module are bedrock 16, sagemaker 11,
 agentcore 12, agent_registry 1.
 
 ### The qualifier is what makes a `tighten` control safe to name
