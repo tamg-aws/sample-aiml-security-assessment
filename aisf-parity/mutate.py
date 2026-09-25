@@ -231,10 +231,10 @@ MUTATIONS = [
     {
         "name": "the census anchor sentence is reworded",
         "file": AISF_DOC,
-        "defect": "gate 14 locates the census paragraph by this sentence and "
-        "reads its five published figures from that slice alone. A reworded "
+        "defect": "the ledger locates the census paragraph by this sentence and "
+        "reads its six published figures from that slice alone. A reworded "
         "anchor has to return zero paragraphs, report the count and the sentence "
-        "it looked for, and leave the five figures absent; the failure it must "
+        "it looked for, and leave the six figures absent; the failure it must "
         "not become is a widening back to the whole 23 KB document, where at "
         "phase 3's head a coverage bullet 239 lines above the anchor answers the "
         "covered pattern with a different population",

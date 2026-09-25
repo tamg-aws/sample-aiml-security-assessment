@@ -215,22 +215,30 @@ def figure_drift(source, values, found, computed):
     drift in shape from the tag-column ones. Gate 12 keeps figure_problems()
     instead: there the computed side is three separate legs printed below it, so
     those messages have no single computed value to name.
+
+    The computing side is named as "the ledger" and not by number. These three
+    strings are the only place a gate number reached the output, and once gate 14
+    printed under three names -- none of which is "gate 14" -- a failure line
+    titled `the SECURITY_CHECKS_AISF.md census paragraph is ...` carried a detail
+    pointing at a label no verdict in the run has. The numbers in this file's
+    comments stay: they are not printed, and the document cites them.
     """
     problems = []
     for label, want in values.items():
         if not found[label]:
             problems.append(
                 f"{source} publishes no {label} figure these patterns can find; "
-                f"gate 14 computes {computed[label]}"
+                f"the ledger computes {computed[label]}"
             )
         elif want is None:
             problems.append(
                 f"{source} publishes {len(found[label])} copies of {label} that "
-                f"disagree: {found[label]}; gate 14 computes {computed[label]}"
+                f"disagree: {found[label]}; the ledger computes {computed[label]}"
             )
         elif want != computed[label]:
             problems.append(
-                f"{source} publishes {label}={want}, gate 14 computes {computed[label]}"
+                f"{source} publishes {label}={want}, "
+                f"the ledger computes {computed[label]}"
             )
     return problems
 
@@ -537,6 +545,63 @@ def census_relations(values, found):
                 f"the census sentence claims one `(partial)` tag per `tighten` "
                 f"control, and publishes {values['partial']} tags over "
                 f"{values['tighten']} controls"
+            )
+    return problems
+
+
+def tagged_control_problems(tag_controls, verdict_controls):
+    """One message per control the tag maps and build_ledger.ROWS disagree about.
+
+    The census paragraph's two claims are set identities and not sums: the
+    controls a bare-or-joint tag names ARE the `covered` rows, and the controls a
+    `(partial)` tag names ARE the `tighten` rows. Equal counts satisfy neither.
+    Two sets of the same size over different members is the input that separates
+    a count from an identity, and it is what the test file for this uses.
+
+    Recorded here so the leg is not read as more independent than it is: inside
+    this battery it is entailed, and not by one leg alone. Gate 14a derives each
+    tag's expected qualifier from the ledger json verdict and reports both
+    directions of the check-control pair set, and gate 15 ties that json to ROWS
+    field by field while re-rendering the maps from ROWS itself. Measured: a
+    `covered` row flipped to `tighten` in ROWS reds this leg, 14c and gate 15
+    together, and a wrong qualifier reds 14a.
+
+    Two things are left over. The message is in the vocabulary of the claim --
+    which controls, which identity, which direction -- where 14a's is one line per
+    module:check:control with verdict, legs and qualifier fields. And this is the
+    only form of the claim CI can execute: every leg above runs inside main(),
+    which opens a path in a sibling AISF clone before it prints anything, and the
+    runner checks out this repository alone. So this function takes its two
+    populations as arguments and reads no file, and
+    tests/test_tagged_controls_match_the_verdict_rows.py runs it over the real
+    tree there.
+
+    Both directions of each identity are reported, because their repairs differ. A
+    control tagged and not `covered` is a map edit or a changed verdict; a
+    `covered` row no tag names is a map that was never regenerated.
+
+    The element count is deliberately NOT asserted against the set size. A
+    `tighten` control with two incumbents carries two `(partial)` tags, one per
+    incumbent: legal, passes 14a, and the state of this base at 29 elements over
+    28 controls with `AIR-BDR-MDL-02` carrying two. Asserting one tag per control
+    here would red a correct tree. Both numbers print beside the verdict, and the
+    document's own one-tag-each clause is asserted by census_relations() at the
+    refs that publish it.
+    """
+    problems = []
+    for kinds, verdict in ((("bare", "joint"), "covered"), (("partial",), "tighten")):
+        tagged = set().union(*(tag_controls[kind] for kind in kinds))
+        named = verdict_controls[verdict]
+        spelling = " or ".join(f"`{kind}`" for kind in kinds)
+        if tagged - named:
+            problems.append(
+                f"{sorted(tagged - named)} carry a {spelling} tag and are not "
+                f"`{verdict}` in build_ledger.ROWS"
+            )
+        if named - tagged:
+            problems.append(
+                f"{sorted(named - tagged)} are `{verdict}` in build_ledger.ROWS "
+                f"and no {spelling} tag names them"
             )
     return problems
 
@@ -1203,18 +1268,24 @@ def main():
     # ---- gate 14: the per-module AISF tag maps agree with the ledger, in both
     # directions, and no tag overstates what its check asserts.
     #
-    # This block emits three verdicts, 14a/14b/14c, over three separate problem
-    # lists. One boolean under one name used to cover all three, and four
+    # This block emits four verdicts, 14a/14b/14c/14d, over four separate problem
+    # lists. One boolean under one name used to cover the first three, and four
     # mutations with unrelated causes -- a dropped qualifier, a tag in the wrong
     # module, a reworded documentation sentence -- all printed the same gate name
     # as their first red, so the name told a reader nothing about which of the
-    # three broke.
+    # three broke. 14d is the two set identities the census paragraph states,
+    # compared code to code, where 14c compares the paragraph's numerals against
+    # the same computation. It had no verdict of its own before this; it was not
+    # unasserted, and tagged_control_problems() records what the gates that
+    # already run entail and what is left over.
     #
     # Lettered instead of renumbered: `docs/SECURITY_CHECKS_AISF.md` cites
-    # "gate 14" in seven places, the four generated aisf_compliance_*.py headers
-    # and gen_compliance_maps.py cite it in five more, and figure_drift's own
-    # messages name it. Renumbering would also move gates 15 and 16, so the
-    # letters keep every existing citation true while the printed names separate.
+    # "gate 14" in seven places, and the four generated aisf_compliance_*.py
+    # headers and gen_compliance_maps.py cite it in five more. Renumbering would
+    # also move gates 15 and 16, so the letters keep every existing citation true
+    # while the printed names separate. No printed verdict is called "gate 14" once
+    # the legs have their own names, which is why figure_drift's messages stopped
+    # naming one.
     #
     # Phase 2 tags rows the producers already emit, so unlike the derived map in
     # gate 11 it *may* reference a `tighten` control. What makes that sound is the
@@ -1303,6 +1374,12 @@ def main():
     # asserts the two sums the paragraph builds out of those figures, which is a
     # separate claim: every numeral in a sentence can be gated and right while the
     # sentence adds them up wrong.
+    #
+    # 14d asserts the same two claims with no document in them, as set identities
+    # over the tag maps and build_ledger.ROWS. Counts are what 14c can read out of
+    # prose; membership is what the claim is, and two sets of one size can have
+    # different members. What it adds over the chain of 14a and gate 15, which is
+    # narrow, is in tagged_control_problems()'s docstring.
     computed = {
         "pairs": len(found_pairs),
         "tagged": sum(len(m) for m in maps.values()),
@@ -1322,11 +1399,12 @@ def main():
     )
     per_module = " ".join(f"{k}={v}" for k, v in sorted(computed["per_module"].items()))
     census = collections.Counter()
-    # The joint tags' distinct controls, which is the sixth census figure and not
-    # the joint element count beside it: one control can carry several joint legs,
-    # and at this base 3 legs sit on 1 control. It is the middle term of the sum the
-    # paragraph states, so it is computed here and read out of the document too.
-    joint_controls = set()
+    # The controls each qualifier names, not just how many elements carry it. The
+    # joint set's size is the sixth census figure -- one control can carry several
+    # joint legs, and at this base 3 legs sit on 1 control -- and it is the middle
+    # term of the sum the paragraph states, so it is computed here and read out of
+    # the document too. The sets themselves are what gate 14d compares.
+    tag_controls = collections.defaultdict(set)
     for module_dir, mapping in maps.items():
         for tag in mapping.values():
             for element in tag.split(" | "):
@@ -1338,8 +1416,7 @@ def main():
                         else ("partial" if m.group(2) == "partial" else "joint")
                     )
                     census[kind] += 1
-                    if kind == "joint":
-                        joint_controls.add(m.group(1))
+                    tag_controls[kind].add(m.group(1))
     # The covered/tighten half of that sentence comes from build_ledger.ROWS, the
     # hand-authored verdict table, and not from the ledger json rendered out of it:
     # the json is a generated copy, and gate 15's --check leg is what keeps the two
@@ -1348,11 +1425,18 @@ def main():
     # sibling AISF repo and needs yaml, so a gate resting on it reds in any clone
     # that lacks that working copy.
     verdict_census = collections.Counter(r[1] for r in ROWS)
+    # The same table grouped rather than counted. A count cannot tell two sets of
+    # equal size apart, and what the paragraph claims about these two populations
+    # is membership: r[0] is the control, r[1] the verdict, measured against the
+    # tuples in build_ledger.ROWS rather than assumed from their order.
+    verdict_controls = collections.defaultdict(set)
+    for row in ROWS:
+        verdict_controls[row[1]].add(row[0])
     computed_census = {
         "bare": census["bare"],
         "partial": census["partial"],
         "joint": census["joint"],
-        "joint_controls": len(joint_controls),
+        "joint_controls": len(tag_controls["joint"]),
         "covered": verdict_census["covered"],
         "tighten": verdict_census["tighten"],
     }
@@ -1374,6 +1458,13 @@ def main():
         )
         + census_sum_problems
     )
+    tagged_problems = tagged_control_problems(tag_controls, verdict_controls)
+    # Printed whether or not it is zero. A union absorbs an overlap silently, and a
+    # control carrying both a bare and a joint tag is the one state where the set
+    # identity holds and the paragraph's sum does not: bare 2 + joint 2 over a
+    # 3-control union reconciles against 3 `covered` rows as a set and against 4 as
+    # a sum. It measured 0 here and 0 at the merge, so any other value is news.
+    overlap = tag_controls["bare"] & tag_controls["joint"]
     # 14a first, so a defect that violates more than one of the three claims names
     # the most specific one in mutate.py's first-red line. Deleting a map entry is
     # the case, measured: it loses a pair here, moves the `tagged` figure 14b
@@ -1409,6 +1500,20 @@ def main():
         f"covered {census_published['covered']}, "
         f"copies [{copies_note(census_hits)}]"
         + (f", bad={census_problems}" if census_problems else ""),
+    )
+    gate(
+        "the tagged controls are exactly the covered and tighten rows of "
+        "build_ledger.ROWS",
+        not tagged_problems,
+        f"{len(tag_controls['bare'] | tag_controls['joint'])} control(s) carry a "
+        f"bare or joint tag against {len(verdict_controls['covered'])} `covered` "
+        f"row(s), {len(tag_controls['partial'])} carry `(partial)` against "
+        f"{len(verdict_controls['tighten'])} `tighten` row(s); compared as sets, so "
+        f"two populations of one size over different members is a failure; "
+        f"bare/joint overlap {len(overlap)}{sorted(overlap) if overlap else ''}; "
+        f"partial {census['partial']} element(s) over "
+        f"{len(tag_controls['partial'])} control(s), which this leg counts and does "
+        f"not equate" + (f", bad={tagged_problems}" if tagged_problems else ""),
     )
 
     # ---- gate 15: the shipped maps are what the generator renders from the

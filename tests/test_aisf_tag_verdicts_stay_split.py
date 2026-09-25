@@ -9,6 +9,13 @@ verdict is a two-line edit that nothing else here would notice: the battery
 derives its sub-gate count from the output and cross-checks it against the
 summary, so both numbers move together and stay consistent.
 
+Three and not every leg gate 14 prints. A fourth, the set identities between the
+tag maps and build_ledger.ROWS, is a claim that was never pooled with these -- it
+had no verdict at all before it had its own -- so pinning it here would turn a
+record of one defect into a count of the legs, which is the figure this file
+exists to avoid asserting. tests/test_tagged_controls_match_the_verdict_rows.py
+pins that leg's wiring instead.
+
 Read from check_ledger.py alone, which is what makes this merge-safe. It asserts
 no gate number, no letter, no printed position and no denominator. All four move
 legitimately. The split gave its legs letters instead of new numbers, because the

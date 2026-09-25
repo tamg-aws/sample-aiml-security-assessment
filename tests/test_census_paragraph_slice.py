@@ -295,7 +295,7 @@ def test_the_numerals_only_update_fails_on_the_sum_five_figures_could_not_see():
 
     drift = check_ledger.figure_drift("fixture", values, hits, COMPUTED_AT_THE_MERGE)
     assert len(drift) == 1
-    assert "publishes joint_controls=2, gate 14 computes 16" in drift[0]
+    assert "publishes joint_controls=2, the ledger computes 16" in drift[0]
     assert len(sums) == 1
     assert "40 bare tags plus 2 jointly covered control(s)" in sums[0]
     assert "which sums to 42" in sums[0]
