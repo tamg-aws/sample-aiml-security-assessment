@@ -629,6 +629,17 @@ _VERIFIED_REMEDIATION_IAM_ACTIONS |= {
 
 _VERIFIED_REMEDIATION_CONDITION_KEYS |= {"aws:ResourceTag"}
 
+# Verified the same way on 2026-09-25 for BR-46's per-bucket Macie leg. The
+# knowledge-base data-source operations live on the bedrock-agent client but are
+# authorized under the bedrock: action prefix, so the three near-misses
+# bedrock:ListDataSource, macie2:DescribeBucket and macie2:GetAutomatedDiscovery
+# were submitted alongside them and all three came back INVALID_ACTION.
+_VERIFIED_REMEDIATION_IAM_ACTIONS |= {
+    "bedrock:GetDataSource",
+    "bedrock:ListDataSources",
+    "macie2:DescribeBuckets",
+}
+
 _NON_IAM_REMEDIATION_TOKENS = {
     "arn:PARTITION",
     "s3:ObjectCreated",

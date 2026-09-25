@@ -473,13 +473,24 @@ Resources:
                 - logs:DescribeMetricFilters # BR-32
               Resource: !Sub 'arn:${AWS::Partition}:logs:*:${AWS::AccountId}:log-group:*'
             - Sid: MaciePermissions
-              # macie2 GetMacieSession and GetAutomatedDiscoveryConfiguration are
-              # account-level reads with no resource-level authorization in IAM.
+              # macie2 GetMacieSession, GetAutomatedDiscoveryConfiguration and
+              # DescribeBuckets are account-level reads with no resource-level
+              # authorization in IAM: DescribeBuckets returns the whole bucket
+              # inventory and names no required resource type.
               Effect: Allow
               Action:
                 - macie2:GetMacieSession # BR-46
                 - macie2:GetAutomatedDiscoveryConfiguration # BR-46
+                - macie2:DescribeBuckets # BR-46
               Resource: '*'
+            - Sid: BedrockKnowledgeBaseDataSourceRead
+              # BR-46 resolves each knowledge base data source to the S3 bucket it
+              # ingests from. Both operations authorize on the knowledge base.
+              Effect: Allow
+              Action:
+                - bedrock:ListDataSources # BR-46
+                - bedrock:GetDataSource # BR-46
+              Resource: !Sub 'arn:${AWS::Partition}:bedrock:*:${AWS::AccountId}:knowledge-base/*'
             - Sid: S3BucketEncryptionPermissions
               Effect: Allow
               Action:

@@ -2414,7 +2414,46 @@ class TestBR41CentralGuardrailEnforcement:
             ],
         }
 
-    def _client_factory(self, bedrock_policies, scps, targets, contents, account):
+    # A configuration whose includedModels names ALL, with no exclusion and both
+    # content modes COMPREHENSIVE, is the only account-level shape that covers
+    # every invocation.
+    @staticmethod
+    def _account_config(
+        config_id,
+        included=("ALL",),
+        excluded=(),
+        system="COMPREHENSIVE",
+        messages="COMPREHENSIVE",
+        version="3",
+        guardrail_arn=None,
+        omit_model_enforcement=False,
+    ):
+        config = {
+            "configId": config_id,
+            "guardrailArn": guardrail_arn
+            or TestBR41CentralGuardrailEnforcement.GUARDRAIL_ARN,
+            "guardrailVersion": version,
+            "owner": "ACCOUNT",
+            "selectiveContentGuarding": {"system": system, "messages": messages},
+        }
+        if not omit_model_enforcement:
+            config["modelEnforcement"] = {
+                "includedModels": list(included),
+                "excludedModels": list(excluded),
+            }
+        return config
+
+    def _client_factory(
+        self,
+        bedrock_policies,
+        scps,
+        targets,
+        contents,
+        account,
+        account_configs,
+        account_pages,
+        account_error,
+    ):
         org_client = MagicMock()
         org_client.describe_organization.return_value = {
             "Organization": {"MasterAccountId": "123456789012"}
@@ -2436,27 +2475,56 @@ class TestBR41CentralGuardrailEnforcement:
         sts_client = MagicMock()
         sts_client.get_caller_identity.return_value = {"Account": account}
 
-        return org_client, lambda service, **kwargs: {
-            "organizations": org_client,
-            "sts": sts_client,
-        }[service]
+        bedrock_client = MagicMock()
+        if account_error is not None:
+            bedrock_client.get_paginator.side_effect = account_error
+        else:
+            bedrock_client.get_paginator.return_value.paginate.return_value = (
+                account_pages
+                if account_pages is not None
+                else [{"guardrailsConfig": list(account_configs)}]
+            )
 
-    def _run(
+        return (
+            org_client,
+            bedrock_client,
+            lambda service, **kwargs: {
+                "organizations": org_client,
+                "sts": sts_client,
+                "bedrock": bedrock_client,
+            }[service],
+        )
+
+    def _run_clients(
         self,
         bedrock_policies=(),
         scps=(),
         targets=None,
         contents=None,
         account="123456789012",
+        account_configs=(),
+        account_pages=None,
+        account_error=None,
     ):
-        org_client, factory = self._client_factory(
-            bedrock_policies, scps, targets or {}, contents or {}, account
+        org_client, bedrock_client, factory = self._client_factory(
+            bedrock_policies,
+            scps,
+            targets or {},
+            contents or {},
+            account,
+            account_configs,
+            account_pages,
+            account_error,
         )
         with patch("bedrock_app.boto3.client", side_effect=factory):
             result = bedrock_app.check_bedrock_central_guardrail_enforcement(
-                region="Global"
+                region="Global", api_region="us-east-1"
             )
-        return org_client, extract_csv_data(result)
+        return org_client, bedrock_client, extract_csv_data(result)
+
+    def _run(self, **kwargs):
+        org_client, _, findings = self._run_clients(**kwargs)
+        return org_client, findings
 
     def test_br41_draft_version_fails_while_published_version_passes(self):
         org_client, findings = self._run(
@@ -2602,12 +2670,17 @@ class TestBR41CentralGuardrailEnforcement:
         )
         sts_client = MagicMock()
         sts_client.get_caller_identity.return_value = {"Account": "123456789012"}
+        bedrock_client = MagicMock()
+        bedrock_client.get_paginator.return_value.paginate.return_value = [
+            {"guardrailsConfig": []}
+        ]
 
         with patch(
             "bedrock_app.boto3.client",
             side_effect=lambda service, **kwargs: {
                 "organizations": org_client,
                 "sts": sts_client,
+                "bedrock": bedrock_client,
             }[service],
         ):
             findings = extract_csv_data(
@@ -2646,12 +2719,17 @@ class TestBR41CentralGuardrailEnforcement:
         }
         sts_client = MagicMock()
         sts_client.get_caller_identity.return_value = {"Account": "123456789012"}
+        bedrock_client = MagicMock()
+        bedrock_client.get_paginator.return_value.paginate.return_value = [
+            {"guardrailsConfig": []}
+        ]
 
         with patch(
             "bedrock_app.boto3.client",
             side_effect=lambda service, **kwargs: {
                 "organizations": org_client,
                 "sts": sts_client,
+                "bedrock": bedrock_client,
             }[service],
         ):
             findings = extract_csv_data(
@@ -2673,20 +2751,196 @@ class TestBR41CentralGuardrailEnforcement:
         assert "222222222222" in findings[0]["Finding_Details"]
         assert "management account" in findings[0]["Finding_Details"]
 
-    def test_br41_organizations_not_in_use_returns_na(self):
+    def _run_without_organizations(self, account_configs):
+        """A standalone account: DescribeOrganization fails, so the account-enforced
+        configuration list is the only evidence there is."""
         org_client = MagicMock()
         org_client.describe_organization.side_effect = ClientError(
             {"Error": {"Code": "AWSOrganizationsNotInUseException"}},
             "DescribeOrganization",
         )
-        with patch("bedrock_app.boto3.client", return_value=org_client):
-            findings = extract_csv_data(
-                bedrock_app.check_bedrock_central_guardrail_enforcement(region="Global")
+        bedrock_client = MagicMock()
+        bedrock_client.get_paginator.return_value.paginate.return_value = [
+            {"guardrailsConfig": list(account_configs)}
+        ]
+        with patch(
+            "bedrock_app.boto3.client",
+            side_effect=lambda service, **kwargs: {
+                "organizations": org_client,
+                "sts": MagicMock(),
+                "bedrock": bedrock_client,
+            }[service],
+        ):
+            return extract_csv_data(
+                bedrock_app.check_bedrock_central_guardrail_enforcement(
+                    region="Global", api_region="us-east-1"
+                )
             )
 
+    def test_br41_no_organization_and_no_account_config_is_failed(self):
+        # Without an organization there is nothing to inherit from, so an empty
+        # account-enforced list is an absence of enforcement and not an
+        # unreadable surface.
+        findings = self._run_without_organizations([])
+
         assert len(findings) == 1
-        assert findings[0]["Status"] == "N/A"
-        assert "BR-15" in findings[0]["Finding_Details"]
+        assert findings[0]["Status"] == "Failed"
+        assert findings[0]["Severity"] == "High"
+        assert (
+            "No account-enforced guardrail configuration exists"
+            in findings[0]["Finding_Details"]
+        )
+        assert "AWS Organizations is not in use" in findings[0]["Finding_Details"]
+        assert "PutEnforcedGuardrailConfiguration" in findings[0]["Resolution"]
+
+    def test_br41_no_organization_but_account_config_is_passed(self):
+        findings = self._run_without_organizations(
+            [self._account_config("cfgstandalone")]
+        )
+
+        assert [f["Status"] for f in findings] == ["Passed"]
+        assert "cfgstandalone" in findings[0]["Finding_Details"]
+        assert "includedModels names ALL" in findings[0]["Finding_Details"]
+
+    def test_br41_all_models_config_passes_while_narrowed_sibling_is_covered(self):
+        # Two configurations, one covering every model and one covering two named
+        # models. The narrow one is not a gap because the broad one already
+        # applies, so the check must report exactly one mechanism and no failure.
+        _, bedrock_client, findings = self._run_clients(
+            account_configs=[
+                self._account_config("cfgcoversall1"),
+                self._account_config(
+                    "cfgtwomodels1",
+                    included=["anthropic.claude-3-sonnet", "amazon.titan-text-lite"],
+                    guardrail_arn=self.OTHER_GUARDRAIL_ARN,
+                ),
+            ]
+        )
+
+        bedrock_client.get_paginator.assert_called_once_with(
+            "list_enforced_guardrails_configuration"
+        )
+        assert [f["Status"] for f in findings] == ["Passed"]
+        detail = findings[0]["Finding_Details"]
+        assert "1 mechanism(s)" in detail
+        assert "cfgcoversall1" in detail
+        assert "all models, because includedModels names ALL" in detail
+        assert "system=COMPREHENSIVE, messages=COMPREHENSIVE" in detail
+        assert "cfgtwomodels1" not in detail
+
+    def test_br41_narrowed_configs_fail_with_their_own_reason(self):
+        # Each configuration is judged on its own fields: one is narrowed by the
+        # model list, the other by selective system guarding.
+        _, _, findings = self._run_clients(
+            account_configs=[
+                self._account_config(
+                    "cfgtwomodels1",
+                    included=["anthropic.claude-3-sonnet", "amazon.titan-text-lite"],
+                ),
+                self._account_config("cfgselective1", system="SELECTIVE"),
+            ]
+        )
+
+        failed = [f for f in findings if f["Status"] == "Failed"]
+        assert len(failed) == 2
+        assert not [f for f in findings if f["Status"] == "Passed"]
+
+        by_config = {
+            next(
+                config_id
+                for config_id in ("cfgtwomodels1", "cfgselective1")
+                if config_id in f["Finding_Details"]
+            ): f
+            for f in failed
+        }
+        assert set(by_config) == {"cfgtwomodels1", "cfgselective1"}
+
+        models_detail = by_config["cfgtwomodels1"]["Finding_Details"]
+        assert "includedModels does not name ALL" in models_detail
+        assert "amazon.titan-text-lite" in models_detail
+        assert "anthropic.claude-3-sonnet" in models_detail
+        assert "SELECTIVE" not in models_detail
+
+        guarding_detail = by_config["cfgselective1"]["Finding_Details"]
+        assert (
+            "system content is guarded SELECTIVE, so it is evaluated only when the "
+            "caller tags it" in guarding_detail
+        )
+        assert "includedModels does not name ALL" not in guarding_detail
+        assert "PutEnforcedGuardrailConfiguration" in failed[0]["Resolution"]
+
+    def test_br41_absent_model_enforcement_covers_every_model(self):
+        # PutEnforcedGuardrailConfiguration documents an absent modelEnforcement
+        # block as enforcement on all models.
+        _, _, findings = self._run_clients(
+            account_configs=[
+                self._account_config("cfgnoscope01", omit_model_enforcement=True)
+            ]
+        )
+
+        assert [f["Status"] for f in findings] == ["Passed"]
+        assert "carries no modelEnforcement block" in findings[0]["Finding_Details"]
+
+    def test_br41_excluded_model_is_a_gap_even_when_included_is_all(self):
+        _, _, findings = self._run_clients(
+            account_configs=[
+                self._account_config(
+                    "cfgexcluded1", excluded=["anthropic.claude-3-haiku"]
+                )
+            ]
+        )
+
+        failed = [f for f in findings if f["Status"] == "Failed"]
+        assert len(failed) == 1
+        assert (
+            "1 model(s) are excluded from enforcement" in failed[0]["Finding_Details"]
+        )
+        assert "anthropic.claude-3-haiku" in failed[0]["Finding_Details"]
+        assert not [f for f in findings if f["Status"] == "Passed"]
+
+    def test_br41_reads_enforced_configurations_from_every_page(self):
+        _, _, findings = self._run_clients(
+            account_pages=[
+                {
+                    "guardrailsConfig": [
+                        self._account_config("cfgpageone01", included=["amazon.titan"])
+                    ],
+                    "nextToken": "page-2",
+                },
+                {"guardrailsConfig": [self._account_config("cfgpagetwo01")]},
+            ]
+        )
+
+        assert [f["Status"] for f in findings] == ["Passed"]
+        assert "cfgpagetwo01" in findings[0]["Finding_Details"]
+
+    def test_br41_unreadable_enforced_configurations_are_not_absence(self):
+        _, _, findings = self._run_clients(
+            account_error=ClientError(
+                {"Error": {"Code": "AccessDeniedException"}},
+                "ListEnforcedGuardrailsConfiguration",
+            )
+        )
+
+        assert [f["Status"] for f in findings] == ["N/A"]
+        detail = findings[0]["Finding_Details"]
+        assert "AccessDeniedException" in detail
+        assert "bedrock:ListEnforcedGuardrailsConfiguration" in detail
+        assert "owner field reports ACCOUNT only" in detail
+        assert (
+            "bedrock:ListEnforcedGuardrailsConfiguration" in findings[0]["Resolution"]
+        )
+
+    def test_br41_account_config_is_read_from_a_member_account(self):
+        # The organization view is unreadable from a member account, but the
+        # account-enforced configuration list is not, so the check still decides.
+        _, _, findings = self._run_clients(
+            account="222222222222",
+            account_configs=[self._account_config("cfgmember0001")],
+        )
+
+        assert [f["Status"] for f in findings] == ["Passed"]
+        assert "cfgmember0001" in findings[0]["Finding_Details"]
 
     def test_br41_schema_valid(self):
         _, findings = self._run(
@@ -2707,6 +2961,26 @@ class TestBR41CentralGuardrailEnforcement:
         assert findings
         for finding in findings:
             assert_finding_schema(finding)
+
+    def test_br41_account_leg_schema_valid(self):
+        for kwargs in (
+            {"account_configs": [self._account_config("cfgcoversall1")]},
+            {
+                "account_configs": [
+                    self._account_config("cfgexcluded1", excluded=["x.y"])
+                ]
+            },
+            {
+                "account_error": ClientError(
+                    {"Error": {"Code": "AccessDeniedException"}},
+                    "ListEnforcedGuardrailsConfiguration",
+                )
+            },
+        ):
+            _, _, findings = self._run_clients(**kwargs)
+            assert findings
+            for finding in findings:
+                assert_finding_schema(finding)
 
 
 def _identity_cache(roles=None, users=None):
@@ -2919,23 +3193,77 @@ class TestBR43RegionInvocationControl:
             "list_error": None,
         }
 
-    def _run(self, inventory, account="123456789012"):
+    # A geographic profile enumerates its destination Regions; a global profile
+    # also lists the Region-agnostic ARN form, whose Region segment is empty.
+    BOUNDED_PROFILE = {
+        "inferenceProfileId": "us.anthropic.claude-3-sonnet-20240229-v1:0",
+        "inferenceProfileName": "US Claude 3 Sonnet",
+        "type": "SYSTEM_DEFINED",
+        "status": "ACTIVE",
+        "models": [
+            {
+                "modelArn": "arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-3-sonnet-20240229-v1:0"
+            },
+            {
+                "modelArn": "arn:aws:bedrock:us-west-2::foundation-model/anthropic.claude-3-sonnet-20240229-v1:0"
+            },
+        ],
+    }
+    UNBOUNDED_PROFILE = {
+        "inferenceProfileId": "global.cohere.embed-v4:0",
+        "inferenceProfileName": "Global Cohere Embed v4",
+        "type": "SYSTEM_DEFINED",
+        "status": "ACTIVE",
+        "models": [
+            {"modelArn": "arn:aws:bedrock:::foundation-model/cohere.embed-v4:0"},
+            {
+                "modelArn": "arn:aws:bedrock:us-east-1::foundation-model/cohere.embed-v4:0"
+            },
+        ],
+    }
+
+    def _run(
+        self,
+        inventory,
+        account="123456789012",
+        profiles=None,
+        profile_pages=None,
+        profile_error=None,
+    ):
         org_client = MagicMock()
         org_client.describe_organization.return_value = {
             "Organization": {"MasterAccountId": "123456789012"}
         }
         sts_client = MagicMock()
         sts_client.get_caller_identity.return_value = {"Account": account}
+        bedrock_client = MagicMock()
+        if profile_error is not None:
+            bedrock_client.get_paginator.side_effect = profile_error
+        else:
+            bedrock_client.get_paginator.return_value.paginate.return_value = (
+                profile_pages
+                if profile_pages is not None
+                else [
+                    {
+                        "inferenceProfileSummaries": list(
+                            profiles if profiles is not None else [self.BOUNDED_PROFILE]
+                        )
+                    }
+                ]
+            )
         with patch(
             "bedrock_app.boto3.client",
             side_effect=lambda service, **kwargs: {
                 "organizations": org_client,
                 "sts": sts_client,
+                "bedrock": bedrock_client,
             }[service],
         ):
             return extract_csv_data(
                 bedrock_app.check_bedrock_region_invocation_control(
-                    region="Global", scp_inventory=inventory
+                    region="Global",
+                    api_region="us-east-1",
+                    scp_inventory=inventory,
                 )
             )
 
@@ -3069,12 +3397,17 @@ class TestBR43RegionInvocationControl:
         }
         sts_client = MagicMock()
         sts_client.get_caller_identity.return_value = {"Account": "123456789012"}
+        bedrock_client = MagicMock()
+        bedrock_client.get_paginator.return_value.paginate.return_value = [
+            {"inferenceProfileSummaries": [self.BOUNDED_PROFILE]}
+        ]
 
         with patch(
             "bedrock_app.boto3.client",
             side_effect=lambda service, **kwargs: {
                 "organizations": org_client,
                 "sts": sts_client,
+                "bedrock": bedrock_client,
             }[service],
         ):
             findings = extract_csv_data(
@@ -3086,15 +3419,180 @@ class TestBR43RegionInvocationControl:
         )
         assert [f["Status"] for f in findings] == ["Passed"]
 
-    def test_br43_schema_valid(self):
+    def test_br43_global_profile_passes_the_region_allow_list_when_unspecified_is_allowed(
+        self,
+    ):
+        # Two profiles, one bounded to named Regions and one routing anywhere. The
+        # allow-list permits the literal 'unspecified', which is the value a global
+        # profile call presents, so the Region control does not bound it.
         findings = self._run(
             self._inventory(
-                [("ApprovedRegions", self._region_scp("StringEquals", ["cn-north-1"]))]
-            )
+                [
+                    (
+                        "ApprovedRegions",
+                        self._region_scp(
+                            "StringNotEquals", ["us-east-1", "unspecified"]
+                        ),
+                    )
+                ]
+            ),
+            profiles=[self.BOUNDED_PROFILE, self.UNBOUNDED_PROFILE],
         )
-        assert findings
-        for finding in findings:
-            assert_finding_schema(finding)
+
+        assert [f["Status"] for f in findings] == ["Failed"]
+        detail = findings[0]["Finding_Details"]
+        assert "1 of the 2 inference profile(s) available in us-east-1" in detail
+        assert "global.cohere.embed-v4:0" in detail
+        assert "us.anthropic.claude-3-sonnet-20240229-v1:0" not in detail
+        assert "name only us-east-1, us-west-2" in detail
+        assert "denies aws:RequestedRegion 'unspecified'" in detail
+        assert "accepted data-residency exception" in findings[0]["Resolution"]
+
+    def test_br43_allow_list_excluding_unspecified_bounds_a_global_profile(self):
+        findings = self._run(
+            self._inventory(
+                [
+                    (
+                        "ApprovedRegions",
+                        self._region_scp("StringNotEquals", ["us-east-1"]),
+                    )
+                ]
+            ),
+            profiles=[self.BOUNDED_PROFILE, self.UNBOUNDED_PROFILE],
+        )
+
+        assert [f["Status"] for f in findings] == ["Passed"]
+        detail = findings[0]["Finding_Details"]
+        assert "omits the literal 'unspecified'" in detail
+        assert "global.cohere.embed-v4:0" in detail
+
+    def test_br43_deny_list_does_not_bound_a_global_profile(self):
+        # A positive Region test is a deny-list: it never denies 'unspecified'
+        # unless that literal is one of the denied values.
+        findings = self._run(
+            self._inventory(
+                [("BlockedRegions", self._region_scp("StringEquals", ["eu-west-1"]))]
+            ),
+            profiles=[self.UNBOUNDED_PROFILE],
+        )
+
+        assert [f["Status"] for f in findings] == ["Failed"]
+        assert "BlockedRegions" in findings[0]["Finding_Details"]
+        assert "bounds direct invocation only" in findings[0]["Finding_Details"]
+
+    def test_br43_reads_inference_profiles_from_every_page(self):
+        findings = self._run(
+            self._inventory(
+                [
+                    (
+                        "ApprovedRegions",
+                        self._region_scp(
+                            "StringNotEquals", ["us-east-1", "unspecified"]
+                        ),
+                    )
+                ]
+            ),
+            profile_pages=[
+                {
+                    "inferenceProfileSummaries": [self.BOUNDED_PROFILE],
+                    "nextToken": "page-2",
+                },
+                {"inferenceProfileSummaries": [self.UNBOUNDED_PROFILE]},
+            ],
+        )
+
+        assert [f["Status"] for f in findings] == ["Failed"]
+        assert "1 of the 2 inference profile(s)" in findings[0]["Finding_Details"]
+        assert "global.cohere.embed-v4:0" in findings[0]["Finding_Details"]
+
+    def test_br43_unreadable_profile_list_keeps_the_policy_verdict(self):
+        findings = self._run(
+            self._inventory(
+                [
+                    (
+                        "ApprovedRegions",
+                        self._region_scp(
+                            "StringNotEquals", ["us-east-1", "unspecified"]
+                        ),
+                    )
+                ]
+            ),
+            profile_error=ClientError(
+                {"Error": {"Code": "AccessDeniedException"}}, "ListInferenceProfiles"
+            ),
+        )
+
+        assert [f["Status"] for f in findings] == ["Passed"]
+        assert (
+            "could not be listed (AccessDeniedException), so the default routing "
+            "behavior was not observed" in findings[0]["Finding_Details"]
+        )
+
+    def test_br43_no_region_condition_names_the_default_routing(self):
+        findings = self._run(
+            self._inventory([]),
+            profiles=[self.BOUNDED_PROFILE, self.UNBOUNDED_PROFILE],
+        )
+
+        assert [f["Status"] for f in findings] == ["Failed"]
+        detail = findings[0]["Finding_Details"]
+        assert "follows the default inference-profile behavior" in detail
+        assert "1 of the 2 inference profile(s) available in us-east-1" in detail
+
+    def test_br43_model_reference_that_is_not_an_arn_is_not_global(self):
+        # A value that is not an ARN has no Region segment to read, so it must not
+        # be counted as Region-agnostic routing.
+        findings = self._run(
+            self._inventory(
+                [
+                    (
+                        "ApprovedRegions",
+                        self._region_scp(
+                            "StringNotEquals", ["us-east-1", "unspecified"]
+                        ),
+                    )
+                ]
+            ),
+            profiles=[
+                {
+                    "inferenceProfileId": "us.custom.profile",
+                    "type": "APPLICATION",
+                    "status": "ACTIVE",
+                    "models": [{"modelArn": "cohere.embed-v4:0"}],
+                }
+            ],
+        )
+
+        assert [f["Status"] for f in findings] == ["Passed"]
+        detail = findings[0]["Finding_Details"]
+        assert "0 of the 1 inference profile(s)" in detail
+        assert "1 model reference(s) were not in ARN form" in detail
+
+    def test_br43_schema_valid(self):
+        for kwargs in (
+            {"profiles": [self.BOUNDED_PROFILE, self.UNBOUNDED_PROFILE]},
+            {"profiles": []},
+            {
+                "profile_error": ClientError(
+                    {"Error": {"Code": "AccessDeniedException"}},
+                    "ListInferenceProfiles",
+                )
+            },
+        ):
+            findings = self._run(
+                self._inventory(
+                    [
+                        (
+                            "ApprovedRegions",
+                            self._region_scp("StringEquals", ["cn-north-1"]),
+                        )
+                    ]
+                ),
+                **kwargs,
+            )
+            assert findings
+            for finding in findings:
+                assert_finding_schema(finding)
 
 
 # ===================================================================
@@ -3670,20 +4168,37 @@ class TestBR45ApiKeyGovernance:
 # BR-46: check_bedrock_knowledge_base_source_classification
 # ===================================================================
 class TestBR46KnowledgeBaseSourceClassification:
-    """BR-46: Macie must classify knowledge base sources before ingestion."""
+    """BR-46: every knowledge base source bucket must be monitored by Macie."""
 
     def _run(
         self,
         knowledge_bases=(),
+        data_sources=None,
+        data_source_detail=None,
+        macie_buckets=(),
         session_status="ENABLED",
         discovery_status="ENABLED",
         session_error=None,
         discovery_error=None,
+        describe_buckets_error=None,
+        data_source_error=None,
     ):
         agent_client = MagicMock()
         agent_client.list_knowledge_bases.return_value = {
             "knowledgeBaseSummaries": list(knowledge_bases)
         }
+        data_sources = data_sources or {}
+        agent_client.list_data_sources.side_effect = (
+            data_source_error
+            if data_source_error
+            else lambda **kwargs: {
+                "dataSourceSummaries": data_sources.get(kwargs["knowledgeBaseId"], [])
+            }
+        )
+        detail = data_source_detail or {}
+        agent_client.get_data_source.side_effect = lambda **kwargs: detail[
+            kwargs["dataSourceId"]
+        ]
 
         macie_client = MagicMock()
         if session_error:
@@ -3699,6 +4214,14 @@ class TestBR46KnowledgeBaseSourceClassification:
                 "status": discovery_status,
                 "classificationScopeId": "scope-1",
             }
+        if describe_buckets_error:
+            macie_client.get_paginator.return_value.paginate.side_effect = (
+                describe_buckets_error
+            )
+        else:
+            macie_client.get_paginator.return_value.paginate.return_value = [
+                {"buckets": list(macie_buckets)}
+            ]
 
         with patch(
             "bedrock_app.boto3.client",
@@ -3713,63 +4236,230 @@ class TestBR46KnowledgeBaseSourceClassification:
                 )
             )
 
-    def test_br46_macie_enabled_with_discovery_passes(self):
-        findings = self._run(knowledge_bases=[{"knowledgeBaseId": "kb-1"}])
+    @staticmethod
+    def _s3_source(data_source_id, name, bucket, owner=None):
+        configuration = {
+            "type": "S3",
+            "s3Configuration": {"bucketArn": f"arn:aws:s3:::{bucket}"},
+        }
+        if owner:
+            configuration["s3Configuration"]["bucketOwnerAccountId"] = owner
+        return {
+            "dataSource": {
+                "dataSourceId": data_source_id,
+                "name": name,
+                "dataSourceConfiguration": configuration,
+            }
+        }
 
-        assert [f["Status"] for f in findings] == ["Passed"]
-        assert findings[0]["Check_ID"] == "BR-46"
-        assert "1 knowledge base(s)" in findings[0]["Finding_Details"]
-        assert "the Macie session is ENABLED" in findings[0]["Finding_Details"]
-        assert "scope-1" in findings[0]["Finding_Details"]
-        assert "per-document metadata" in findings[0]["Finding_Details"]
+    def _two_bucket_estate(self, **overrides):
+        """Two knowledge bases, one bucket each: the fixture that discriminates."""
+        kwargs = {
+            "knowledge_bases": [
+                {"knowledgeBaseId": "kb-1", "name": "support-kb"},
+                {"knowledgeBaseId": "kb-2", "name": "hr-kb"},
+            ],
+            "data_sources": {
+                "kb-1": [{"dataSourceId": "ds-1", "name": "support-docs"}],
+                "kb-2": [{"dataSourceId": "ds-2", "name": "hr-docs"}],
+            },
+            "data_source_detail": {
+                "ds-1": self._s3_source("ds-1", "support-docs", "support-bucket"),
+                "ds-2": self._s3_source("ds-2", "hr-docs", "hr-bucket"),
+            },
+        }
+        kwargs.update(overrides)
+        return self._run(**kwargs)
 
-    def test_br46_discovery_disabled_fails_while_session_passes(self):
-        findings = self._run(
-            knowledge_bases=[{"knowledgeBaseId": "kb-1"}, {"knowledgeBaseId": "kb-2"}],
-            discovery_status="DISABLED",
+    def test_br46_monitored_and_unmonitored_buckets_discriminate(self):
+        findings = self._two_bucket_estate(
+            macie_buckets=[
+                {
+                    "bucketName": "support-bucket",
+                    "automatedDiscoveryMonitoringStatus": "MONITORED",
+                    "lastAutomatedDiscoveryTime": "2026-09-01T00:00:00Z",
+                    "sensitivityScore": 42,
+                },
+                {
+                    "bucketName": "hr-bucket",
+                    "automatedDiscoveryMonitoringStatus": "NOT_MONITORED",
+                },
+            ]
         )
 
         failed = [f for f in findings if f["Status"] == "Failed"]
         passed = [f for f in findings if f["Status"] == "Passed"]
         assert len(failed) == 1
-        assert "2 knowledge base(s)" in failed[0]["Finding_Details"]
+        assert failed[0]["Check_ID"] == "BR-46"
+        assert "hr-bucket is NOT_MONITORED" in failed[0]["Finding_Details"]
         assert (
-            "automated sensitive data discovery is DISABLED"
+            "data source 'hr-docs' in knowledge base 'hr-kb'"
             in (failed[0]["Finding_Details"])
         )
         assert len(passed) == 1
-        assert "the Macie session is ENABLED" in passed[0]["Finding_Details"]
+        assert "support-bucket is MONITORED" in passed[0]["Finding_Details"]
+        assert "sensitivity score 42" in passed[0]["Finding_Details"]
+        assert "1 of 2 knowledge base source bucket(s)" in passed[0]["Finding_Details"]
 
-    def test_br46_paused_session_fails(self):
-        findings = self._run(
-            knowledge_bases=[{"knowledgeBaseId": "kb-1"}],
-            session_status="PAUSED",
-            discovery_status="DISABLED",
+    def test_br46_macie_not_enabled_is_not_a_bucket_failure(self):
+        findings = self._two_bucket_estate(
+            session_error=_make_client_error(
+                "AccessDeniedException", "Macie is not enabled"
+            )
         )
 
-        assert [f["Status"] for f in findings] == ["Failed", "Failed"]
-        assert "the Macie session status is PAUSED" in findings[0]["Finding_Details"]
+        assert [f["Status"] for f in findings] == ["N/A"]
+        assert "Amazon Macie is not enabled" in findings[0]["Finding_Details"]
+        assert "FS-44" in findings[0]["Finding_Details"]
+        assert "support-bucket" in findings[0]["Finding_Details"]
+
+    def test_br46_missing_macie_grant_is_a_permissions_finding(self):
+        findings = self._two_bucket_estate(
+            session_error=_make_client_error(
+                "AccessDeniedException", "User is not authorized to perform this action"
+            )
+        )
+
+        assert [f["Status"] for f in findings] == ["N/A"]
+        assert "permissions or availability problem" in findings[0]["Finding_Details"]
+        assert "FS-44" not in findings[0]["Finding_Details"]
+        assert "macie2:GetMacieSession" in findings[0]["Resolution"]
+
+    def test_br46_discovery_disabled_is_not_a_bucket_failure(self):
+        findings = self._two_bucket_estate(discovery_status="DISABLED")
+
+        assert [f["Status"] for f in findings] == ["N/A"]
+        assert (
+            "automated sensitive data discovery is DISABLED"
+            in findings[0]["Finding_Details"]
+        )
+        assert "FS-44" in findings[0]["Finding_Details"]
+
+    def test_br46_bucket_error_code_is_indeterminate_not_failed(self):
+        findings = self._two_bucket_estate(
+            macie_buckets=[
+                {
+                    "bucketName": "support-bucket",
+                    "automatedDiscoveryMonitoringStatus": "MONITORED",
+                },
+                {
+                    "bucketName": "hr-bucket",
+                    "automatedDiscoveryMonitoringStatus": "NOT_MONITORED",
+                    "errorCode": "ACCESS_DENIED",
+                },
+            ]
+        )
+
+        assert not [f for f in findings if f["Status"] == "Failed"]
+        indeterminate = [f for f in findings if f["Status"] == "N/A"]
+        assert len(indeterminate) == 1
+        assert (
+            "hr-bucket reports Macie errorCode ACCESS_DENIED"
+            in (indeterminate[0]["Finding_Details"])
+        )
+
+    def test_br46_bucket_absent_from_inventory_is_not_compliant(self):
+        findings = self._run(
+            knowledge_bases=[{"knowledgeBaseId": "kb-1", "name": "support-kb"}],
+            data_sources={"kb-1": [{"dataSourceId": "ds-1", "name": "support-docs"}]},
+            data_source_detail={
+                "ds-1": self._s3_source(
+                    "ds-1", "support-docs", "other-account-bucket", owner="210987654321"
+                )
+            },
+            macie_buckets=[
+                {
+                    "bucketName": "unrelated-bucket",
+                    "automatedDiscoveryMonitoringStatus": "MONITORED",
+                }
+            ],
+        )
+
+        assert [f["Status"] for f in findings] == ["N/A"]
+        assert (
+            "other-account-bucket is absent from this Region's Macie bucket"
+            in (findings[0]["Finding_Details"])
+        )
+        assert "bucket owner account 210987654321" in findings[0]["Finding_Details"]
+
+    def test_br46_non_s3_data_source_is_out_of_macie_scope(self):
+        findings = self._run(
+            knowledge_bases=[{"knowledgeBaseId": "kb-1", "name": "web-kb"}],
+            data_sources={"kb-1": [{"dataSourceId": "ds-1", "name": "crawler"}]},
+            data_source_detail={
+                "ds-1": {
+                    "dataSource": {
+                        "dataSourceId": "ds-1",
+                        "name": "crawler",
+                        "dataSourceConfiguration": {"type": "WEB"},
+                    }
+                }
+            },
+        )
+
+        assert [f["Status"] for f in findings] == ["N/A", "N/A"]
+        assert "ingests from WEB" in findings[0]["Finding_Details"]
+        assert (
+            "none of them ingests from an S3 bucket" in findings[1]["Finding_Details"]
+        )
+
+    def test_br46_data_source_read_failure_is_reported_as_partial(self):
+        findings = self._two_bucket_estate(
+            data_source_error=_make_client_error("AccessDeniedException"),
+        )
+
+        assert [f["Status"] for f in findings] == ["N/A", "N/A"]
+        assert "data source read(s) failed" in findings[0]["Finding_Details"]
+        assert "bedrock:ListDataSources" in findings[0]["Resolution"]
+
+    def test_br46_describe_buckets_failure_is_not_absence(self):
+        findings = self._two_bucket_estate(
+            describe_buckets_error=_make_client_error("AccessDeniedException"),
+        )
+
+        assert [f["Status"] for f in findings] == ["N/A"]
+        assert (
+            "Macie bucket inventory could not be read"
+            in (findings[0]["Finding_Details"])
+        )
+        assert "macie2:DescribeBuckets" in findings[0]["Resolution"]
 
     def test_br46_no_knowledge_base_returns_na(self):
         findings = self._run()
 
         assert [f["Status"] for f in findings] == ["N/A"]
-        assert "no ingestion source to classify" in findings[0]["Finding_Details"]
+        assert "no source bucket to classify" in findings[0]["Finding_Details"]
 
-    def test_br46_macie_unreadable_is_not_absence(self):
-        findings = self._run(
-            knowledge_bases=[{"knowledgeBaseId": "kb-1"}],
-            session_error=_make_client_error("AccessDeniedException"),
+    def test_br46_unknown_monitoring_status_is_indeterminate(self):
+        findings = self._two_bucket_estate(
+            macie_buckets=[
+                {
+                    "bucketName": "support-bucket",
+                    "automatedDiscoveryMonitoringStatus": "MONITORED",
+                },
+                {"bucketName": "hr-bucket"},
+            ]
         )
 
-        assert [f["Status"] for f in findings] == ["N/A"]
-        assert "undetermined" in findings[0]["Finding_Details"]
-        assert "macie2:GetMacieSession" in findings[0]["Resolution"]
+        indeterminate = [f for f in findings if f["Status"] == "N/A"]
+        assert not [f for f in findings if f["Status"] == "Failed"]
+        assert (
+            "automatedDiscoveryMonitoringStatus 'unset'"
+            in (indeterminate[0]["Finding_Details"])
+        )
 
     def test_br46_schema_valid(self):
-        findings = self._run(
-            knowledge_bases=[{"knowledgeBaseId": "kb-1"}],
-            discovery_status="DISABLED",
+        findings = self._two_bucket_estate(
+            macie_buckets=[
+                {
+                    "bucketName": "support-bucket",
+                    "automatedDiscoveryMonitoringStatus": "MONITORED",
+                },
+                {
+                    "bucketName": "hr-bucket",
+                    "automatedDiscoveryMonitoringStatus": "NOT_MONITORED",
+                },
+            ]
         )
         assert findings
         for finding in findings:
