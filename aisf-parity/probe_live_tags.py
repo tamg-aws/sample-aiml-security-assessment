@@ -133,10 +133,20 @@ LEGACY_COLUMNS = [
 ]
 EXPECTED_COLUMNS = LEGACY_COLUMNS + ["Compliance_Frameworks"]
 
-# <module>_security_report_<execution id>_<region>.csv
+# [<prefix>/]<module>_security_report_<execution id>_<region>.csv
+#
+# The prefix is optional because two stacks write the same CSVs under two layouts:
+# one at the bucket root, one under an account id. `^` alone put `[a-z_]+` against
+# that account id, so every prefixed key missed the pattern and the probe refused
+# with "no report CSVs at all" -- closed, but on a cause that was not true.
+#
+# Only the prefix is loose. It has to end in `/`, so it cannot eat part of a
+# filename, and a key that is not a report CSV still misses on `_security_report_`,
+# on the 36-character execution id, or on `\.csv$`. It is captured rather than
+# skipped because newest_execution() groups on it.
 REPORT_RE = re.compile(
-    r"^(?P<module>[a-z_]+)_security_report_(?P<execution>[0-9a-f-]{36})_"
-    r"(?P<region>[a-z0-9-]+)\.csv$"
+    r"^(?P<prefix>(?:.*/)?)(?P<module>[a-z_]+)_security_report_"
+    r"(?P<execution>[0-9a-f-]{36})_(?P<region>[a-z0-9-]+)\.csv$"
 )
 
 ELEMENT_RE = re.compile(
@@ -335,6 +345,9 @@ def newest_execution(bucket: str, region: str | None):
 
     A partial set is refused rather than measured: validating three producers and
     reporting a pass would be a pass for the fourth as well.
+
+    A run is identified by key prefix as well as execution id and region, so a set
+    whose four CSVs live under two prefixes is partial for each prefix and refused.
     """
     import boto3
 
@@ -359,22 +372,40 @@ def newest_execution(bucket: str, region: str | None):
             continue
         if region and found.group("region") != region:
             continue
-        key = (found.group("execution"), found.group("region"))
+        # The prefix is part of a run's identity, not decoration. Once any prefix
+        # matches, one bucket can hold reports for more than one account -- in the
+        # prefixed layout the prefix IS an account id -- and `runs[key][module]` is
+        # last-write-wins, so pooling would let one CSV from each of two accounts
+        # assemble a "complete" set that no account ever completed, then measure it
+        # and print one figure with nothing in the output to say whose rows it
+        # covers. Grouped, an incomplete prefix stays incomplete and the refusal
+        # below fires instead.
+        key = (found.group("prefix"), found.group("execution"), found.group("region"))
         runs[key][found.group("module")] = obj["Key"]
         stamps[key] = max(stamps.get(key, obj["LastModified"]), obj["LastModified"])
 
     complete = [k for k, v in runs.items() if all(p in v for p in PRODUCERS)]
     if not complete:
         partial = {k: sorted(v) for k, v in runs.items()}
+        # An empty bucket and a listing whose keys no longer match the pattern used
+        # to print the same sentence, which is how the anchor bug above read as an
+        # empty estate. The object count and a sample key separate the two.
+        detail = f"listed {len(objects)} object(s)"
+        if not partial:
+            detail += f"; first: {[obj['Key'] for obj in objects[:3]]}"
         die(
             f"no execution in s3://{bucket} has a CSV for all of {PRODUCERS}.\n"
-            f"found: {partial or 'no report CSVs at all'}\n"
+            f"found: {partial or 'no key matched a report CSV name'}\n"
+            f"{detail}\n"
             "Refusing to measure a partial set: it would report a pass for the "
-            "producers it never read."
+            "producers it never read. A set spread across two key prefixes is "
+            "partial for each of them: one prefix has to carry all of it."
         )
     chosen = max(complete, key=lambda k: stamps[k])
+    prefix, execution, scanned = chosen
     print(f"bucket    s3://{bucket}")
-    print(f"execution {chosen[0]}  region {chosen[1]}  written {stamps[chosen]}")
+    print(f"prefix    {prefix or '(bucket root)'}  one prefix carries the whole set")
+    print(f"execution {execution}  region {scanned}  written {stamps[chosen]}")
     print("          the timestamp is printed so a stale run is visible, not assumed")
     out = {}
     for module in PRODUCERS:
