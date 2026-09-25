@@ -4199,6 +4199,8 @@ class TestBR46KnowledgeBaseSourceClassification:
         agent_client.get_data_source.side_effect = lambda **kwargs: detail[
             kwargs["dataSourceId"]
         ]
+        # Exposed so the describe cap can be asserted on the call count.
+        self.last_agent_client = agent_client
 
         macie_client = MagicMock()
         if session_error:
@@ -4505,6 +4507,64 @@ class TestBR46KnowledgeBaseSourceClassification:
             "automatedDiscoveryMonitoringStatus 'unset'"
             in (indeterminate[0]["Finding_Details"])
         )
+
+    def test_br46_describe_cap_bounds_the_fan_out_and_still_reports(self):
+        """55 data sources across two knowledge bases, one GetDataSource each."""
+        cap = bedrock_app.MAX_KNOWLEDGE_BASE_DATA_SOURCE_DESCRIBES
+        first_kb, second_kb = 30, 25
+        assert first_kb + second_kb > cap
+
+        summaries = {"kb-1": [], "kb-2": []}
+        detail = {}
+        for index in range(first_kb + second_kb):
+            data_source_id = f"ds-{index:03d}"
+            kb_id = "kb-1" if index < first_kb else "kb-2"
+            summaries[kb_id].append(
+                {"dataSourceId": data_source_id, "name": f"docs-{index:03d}"}
+            )
+            detail[data_source_id] = self._s3_source(
+                data_source_id, f"docs-{index:03d}", f"bucket-{index:03d}"
+            )
+
+        findings = self._run(
+            knowledge_bases=[
+                {"knowledgeBaseId": "kb-1", "name": "first-kb"},
+                {"knowledgeBaseId": "kb-2", "name": "second-kb"},
+            ],
+            data_sources=summaries,
+            data_source_detail=detail,
+            macie_buckets=[
+                {
+                    "bucketName": f"bucket-{index:03d}",
+                    "automatedDiscoveryMonitoringStatus": (
+                        "NOT_MONITORED" if index == 0 else "MONITORED"
+                    ),
+                }
+                for index in range(first_kb + second_kb)
+            ],
+        )
+
+        assert self.last_agent_client.get_data_source.call_count == cap
+
+        failed = [f for f in findings if f["Status"] == "Failed"]
+        passed = [f for f in findings if f["Status"] == "Passed"]
+        truncation = [
+            f
+            for f in findings
+            if f"stopped after {cap} data sources" in (f["Finding_Details"])
+        ]
+        # The cap bounds the walk without dropping the verdict for what was walked.
+        assert len(failed) == 1
+        assert "bucket-000 is NOT_MONITORED" in failed[0]["Finding_Details"]
+        assert len(passed) == 1
+        assert (
+            f"{cap - 1} of {cap} knowledge base source bucket(s)"
+            in (passed[0]["Finding_Details"])
+        )
+        assert len(truncation) == 1
+        assert truncation[0]["Status"] == "N/A"
+        # A source past the cap was never resolved, so it appears nowhere.
+        assert not any("bucket-054" in f["Finding_Details"] for f in findings)
 
     def test_br46_schema_valid(self):
         findings = self._two_bucket_estate(
