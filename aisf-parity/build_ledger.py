@@ -358,11 +358,18 @@ ROWS = [
     ),
     (
         "AIR-ACR-PAY-01",
-        TIGHTEN,
-        EXTEND,
+        COVERED,
+        None,
         "agentcore_assessments",
         ["AC-02"],
-        "AC-02 detects full-access and wildcard grants only",
+        "AC-02 now fails any role or user whose Allow statements reach both an AgentCore "
+        "payment session or instrument write and ProcessPayment with no account-wide Deny on "
+        "the latter. A payment session carries its own limits.maxSpendAmount, so that one "
+        "principal sets the budget it then spends against, which is the single failure behind "
+        "both legs the devguide draws: its ManagementRole denies ProcessPayment and its "
+        "ProcessPaymentRole holds no session write. A Deny scoped to one payment manager or "
+        "carrying a condition is read as no account-wide Deny, so a narrower Deny never "
+        "excuses the collision",
         [],
         4,
     ),

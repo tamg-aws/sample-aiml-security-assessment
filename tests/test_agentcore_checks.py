@@ -769,6 +769,358 @@ class TestAC02FullAccessRoles:
             for action in agentcore_app.EVALUATION_ADMINISTRATION_ACTIONS
         } <= agentcore_app.AGENT_PLATFORM_IAM_NAMESPACES
 
+    # --- PAY-01: one principal holding both payment authorities ---
+
+    _PAYMENT_MANAGER_ARN = (
+        "arn:aws:bedrock-agentcore:us-east-1:123456789012:payment-manager/pm-1"
+    )
+    _PAYMENTS_FINDING = "AgentCore Payments Duty Separation"
+
+    @classmethod
+    def _payments_cache(
+        cls,
+        statements,
+        principal_kind="role_permissions",
+        principal_name="PaymentsRole",
+    ):
+        return {
+            principal_kind: {
+                principal_name: {
+                    "attached_policies": [],
+                    "inline_policies": [
+                        {
+                            "name": "PaymentsPolicy",
+                            "document": {"Statement": statements},
+                        }
+                    ],
+                }
+            }
+        }
+
+    @classmethod
+    def _allow(cls, action, resource=None):
+        return {
+            "Effect": "Allow",
+            "Action": action,
+            "Resource": resource or cls._PAYMENT_MANAGER_ARN,
+        }
+
+    def _payments_finding(self, findings):
+        return next(
+            finding
+            for finding in findings
+            if finding["Finding"] == self._PAYMENTS_FINDING
+        )
+
+    @pytest.mark.parametrize(
+        "write",
+        [
+            "bedrock-agentcore:CreatePaymentSession",
+            "bedrock-agentcore:DeletePaymentSession",
+            "bedrock-agentcore:CreatePaymentInstrument",
+            "bedrock-agentcore:DeletePaymentInstrument",
+        ],
+        ids=[
+            "create-session",
+            "delete-session",
+            "create-instrument",
+            "delete-instrument",
+        ],
+    )
+    def test_a_principal_holding_a_payment_write_and_process_payment_fails(self, write):
+        permission_cache = self._payments_cache(
+            [self._allow(write), self._allow("bedrock-agentcore:ProcessPayment")]
+        )
+
+        findings = agentcore_app.check_agentcore_full_access_roles(permission_cache)
+
+        payments_finding = self._payments_finding(findings)
+        assert payments_finding["Status"] == "Failed"
+        assert payments_finding["Severity"] == "High"
+        assert payments_finding["Check_ID"] == "AC-02"
+        assert "role PaymentsRole" in payments_finding["Finding_Details"]
+        assert write in payments_finding["Finding_Details"]
+        assert "maxSpendAmount" in payments_finding["Finding_Details"]
+        assert 'Deny on bedrock-agentcore:ProcessPayment for Resource "*"' in " ".join(
+            payments_finding["Resolution"].split()
+        )
+        assert "payments-iam-roles.html" in payments_finding["Reference"]
+        assert_finding_schema(payments_finding)
+
+    def test_a_wildcard_reaching_both_authorities_fails(self):
+        permission_cache = self._payments_cache(
+            self._allow("bedrock-agentcore:*Payment*")
+        )
+
+        findings = agentcore_app.check_agentcore_full_access_roles(permission_cache)
+
+        payments_finding = self._payments_finding(findings)
+        assert payments_finding["Status"] == "Failed"
+        # All four writes are reached by the one pattern, so all four are named.
+        for write in agentcore_app.PAYMENT_BUDGET_WRITE_ACTIONS:
+            assert write in payments_finding["Finding_Details"]
+
+    def test_the_management_role_from_the_devguide_passes(self):
+        permission_cache = self._payments_cache(
+            [
+                self._allow(list(agentcore_app.PAYMENT_BUDGET_WRITE_ACTIONS)),
+                {
+                    "Effect": "Deny",
+                    "Action": "bedrock-agentcore:ProcessPayment",
+                    "Resource": "*",
+                },
+            ]
+        )
+
+        findings = agentcore_app.check_agentcore_full_access_roles(permission_cache)
+
+        assert [finding["Finding"] for finding in findings] == [
+            "AgentCore IAM Full Access Check"
+        ]
+        assert findings[0]["Status"] == "Passed"
+
+    def test_the_process_payment_role_from_the_devguide_passes(self):
+        permission_cache = self._payments_cache(
+            [
+                self._allow("bedrock-agentcore:ProcessPayment"),
+                self._allow(
+                    [
+                        "bedrock-agentcore:GetPaymentInstrument",
+                        "bedrock-agentcore:GetPaymentInstrumentBalance",
+                        "bedrock-agentcore:GetPaymentSession",
+                    ]
+                ),
+            ]
+        )
+
+        findings = agentcore_app.check_agentcore_full_access_roles(permission_cache)
+
+        assert len(findings) == 1
+        assert findings[0]["Status"] == "Passed"
+
+    @pytest.mark.parametrize(
+        "deny",
+        [
+            {
+                "Effect": "Deny",
+                "Action": "bedrock-agentcore:ProcessPayment",
+                "Resource": _PAYMENT_MANAGER_ARN,
+            },
+            {
+                "Effect": "Deny",
+                "Action": "bedrock-agentcore:ProcessPayment",
+                "Resource": "*",
+                "Condition": {"StringEquals": {"aws:RequestedRegion": "us-east-1"}},
+            },
+        ],
+        ids=["scoped-to-one-manager", "conditioned"],
+    )
+    def test_a_deny_narrower_than_account_wide_does_not_excuse_the_collision(
+        self, deny
+    ):
+        permission_cache = self._payments_cache(
+            [
+                self._allow("bedrock-agentcore:CreatePaymentSession"),
+                self._allow("bedrock-agentcore:ProcessPayment"),
+                deny,
+            ]
+        )
+
+        findings = agentcore_app.check_agentcore_full_access_roles(permission_cache)
+
+        assert self._payments_finding(findings)["Status"] == "Failed"
+
+    def test_a_deny_on_the_platform_namespace_excuses_the_collision(self):
+        # A Deny is read with the full action grammar, so a namespace wildcard
+        # that reaches ProcessPayment removes it as an exact Deny would.
+        permission_cache = self._payments_cache(
+            [
+                self._allow("bedrock-agentcore:CreatePaymentSession"),
+                self._allow("bedrock-agentcore:ProcessPayment"),
+                {
+                    "Effect": "Deny",
+                    "Action": "bedrock-agentcore:*",
+                    "Resource": "*",
+                },
+            ]
+        )
+
+        findings = agentcore_app.check_agentcore_full_access_roles(permission_cache)
+
+        assert self._PAYMENTS_FINDING not in [
+            finding["Finding"] for finding in findings
+        ]
+
+    @pytest.mark.parametrize(
+        "action",
+        [
+            "bedrock-agentcore:CreatePaymentSession",
+            "bedrock-agentcore:ProcessPayment",
+        ],
+        ids=["writes-only", "executes-only"],
+    )
+    def test_one_authority_alone_passes(self, action):
+        permission_cache = self._payments_cache(self._allow(action))
+
+        findings = agentcore_app.check_agentcore_full_access_roles(permission_cache)
+
+        assert len(findings) == 1
+        assert findings[0]["Status"] == "Passed"
+
+    def test_an_iam_user_holding_both_authorities_is_reported(self):
+        permission_cache = self._payments_cache(
+            [
+                self._allow("bedrock-agentcore:CreatePaymentSession"),
+                self._allow("bedrock-agentcore:ProcessPayment"),
+            ],
+            principal_kind="user_permissions",
+            principal_name="PaymentsUser",
+        )
+
+        findings = agentcore_app.check_agentcore_full_access_roles(permission_cache)
+
+        assert (
+            "user PaymentsUser" in self._payments_finding(findings)["Finding_Details"]
+        )
+
+    def test_the_two_authorities_collide_across_attached_and_inline_documents(self):
+        permission_cache = {
+            "role_permissions": {
+                "PaymentsRole": {
+                    "attached_policies": [
+                        {
+                            "name": "AttachedPolicy",
+                            "document": {
+                                "Statement": self._allow(
+                                    "bedrock-agentcore:CreatePaymentSession"
+                                )
+                            },
+                        }
+                    ],
+                    "inline_policies": [
+                        {
+                            "name": "InlinePolicy",
+                            "document": {
+                                "Statement": self._allow(
+                                    "bedrock-agentcore:ProcessPayment"
+                                )
+                            },
+                        }
+                    ],
+                }
+            }
+        }
+
+        findings = agentcore_app.check_agentcore_full_access_roles(permission_cache)
+
+        assert self._payments_finding(findings)["Status"] == "Failed"
+
+    def test_the_payments_leg_judges_every_principal_not_only_the_first(self):
+        permission_cache = {
+            "role_permissions": {
+                "FirstRole": {"attached_policies": [], "inline_policies": []},
+                "SecondRole": self._payments_cache(
+                    [
+                        self._allow("bedrock-agentcore:CreatePaymentSession"),
+                        self._allow("bedrock-agentcore:ProcessPayment"),
+                    ]
+                )["role_permissions"]["PaymentsRole"],
+            }
+        }
+
+        findings = agentcore_app.check_agentcore_full_access_roles(permission_cache)
+
+        details = self._payments_finding(findings)["Finding_Details"]
+        assert "role SecondRole" in details
+        assert "FirstRole" not in details
+
+    def test_a_deny_in_one_document_excuses_an_allow_in_another(self):
+        permission_cache = {
+            "role_permissions": {
+                "PaymentsRole": {
+                    "attached_policies": [
+                        {
+                            "name": "AttachedPolicy",
+                            "document": {
+                                "Statement": [
+                                    self._allow(
+                                        "bedrock-agentcore:CreatePaymentSession"
+                                    ),
+                                    self._allow("bedrock-agentcore:ProcessPayment"),
+                                ]
+                            },
+                        }
+                    ],
+                    "inline_policies": [
+                        {
+                            "name": "GuardrailPolicy",
+                            "document": {
+                                "Statement": {
+                                    "Effect": "Deny",
+                                    "Action": "bedrock-agentcore:ProcessPayment",
+                                    "Resource": "*",
+                                }
+                            },
+                        }
+                    ],
+                }
+            }
+        }
+
+        findings = agentcore_app.check_agentcore_full_access_roles(permission_cache)
+
+        assert len(findings) == 1
+        assert findings[0]["Status"] == "Passed"
+
+    def test_a_user_entry_that_is_not_a_mapping_is_skipped(self):
+        # The wildcard leg above reads role_permissions only, so a non-mapping
+        # user entry reaches the payments leg rather than ending the check.
+        permission_cache = {
+            "role_permissions": {},
+            "user_permissions": {"PaymentsUser": "not-a-mapping"},
+        }
+
+        findings = agentcore_app.check_agentcore_full_access_roles(permission_cache)
+
+        assert len(findings) == 1
+        assert findings[0]["Status"] == "Passed"
+
+    def test_the_payment_actions_are_the_modelled_operations(self):
+        model = agentcore_app.boto3.client(
+            "bedrock-agentcore",
+            region_name="us-east-1",
+            aws_access_key_id="testing",
+            aws_secret_access_key="testing",  # pragma: allowlist secret - synthetic test credential
+        ).meta.service_model
+        modelled = {
+            operation
+            for operation in model.operation_names
+            if operation.startswith(("Create", "Delete"))
+            and ("PaymentSession" in operation or "PaymentInstrument" in operation)
+        }
+        assert {
+            action.split(":", 1)[1]
+            for action in agentcore_app.PAYMENT_BUDGET_WRITE_ACTIONS
+        } == modelled
+        assert agentcore_app.PAYMENT_EXECUTION_ACTION.split(":", 1)[1] in (
+            model.operation_names
+        )
+        # CreatePaymentSession is where the budget is set, which is what makes
+        # holding it beside ProcessPayment a separation-of-duties failure.
+        assert (
+            "maxSpendAmount"
+            in model.operation_model("CreatePaymentSession")
+            .input_shape.members["limits"]
+            .members
+        )
+        assert {
+            action.split(":", 1)[0]
+            for action in (
+                *agentcore_app.PAYMENT_BUDGET_WRITE_ACTIONS,
+                agentcore_app.PAYMENT_EXECUTION_ACTION,
+            )
+        } <= agentcore_app.AGENT_PLATFORM_IAM_NAMESPACES
+
 
 # ===================================================================
 # AC-03: check_stale_agentcore_access

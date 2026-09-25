@@ -23,7 +23,7 @@ row's own Status column carries the verdict.
 
 AISF_COMPLIANCE_MAP = {
     "AC-01": "AISF AIR-ACR-RT-08",
-    "AC-02": "AISF AIR-ACR-EVAL-01 | AISF AIR-ACR-PAY-01 (partial) | AISF AIR-ACR-RT-03 (1 of 2 checks)",
+    "AC-02": "AISF AIR-ACR-EVAL-01 | AISF AIR-ACR-PAY-01 | AISF AIR-ACR-RT-03 (1 of 2 checks)",
     "AC-06": "AISF AIR-ACR-RT-09",
     "AC-07": "AISF AIR-ACR-MEM-01 (1 of 2 checks)",
     "AC-08": "AISF AIR-ACR-GW-04 (1 of 2 checks) | AISF AIR-ACR-RT-13 (1 of 3 checks)",

@@ -222,6 +222,10 @@ AGENTCORE_ALLOWED_WORKLOAD_REFERENCE_URL = (
     "https://docs.aws.amazon.com/bedrock-agentcore-control/latest/APIReference/"
     "API_AllowedWorkloadConfiguration.html"
 )
+AGENTCORE_PAYMENTS_IAM_REFERENCE_URL = (
+    "https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/"
+    "payments-iam-roles.html"
+)
 
 
 def _assessment_error_label(error: Exception) -> str:
@@ -1982,6 +1986,106 @@ def _evaluation_admin_wildcard_principals(
     return sorted(labels)
 
 
+# The four payment writes the devguide keeps on the management side of the
+# payments role model, and the one action it keeps off that side. A payment
+# session carries its own limits.maxSpendAmount and a payment instrument is what
+# funds it, so a principal holding a session or instrument write beside
+# ProcessPayment raises the ceiling it is about to spend under. The devguide's
+# ManagementRole holds all four writes under an explicit Deny on ProcessPayment;
+# its ProcessPaymentRole holds ProcessPayment beside reads only.
+PAYMENT_BUDGET_WRITE_ACTIONS = (
+    "bedrock-agentcore:CreatePaymentSession",
+    "bedrock-agentcore:DeletePaymentSession",
+    "bedrock-agentcore:CreatePaymentInstrument",
+    "bedrock-agentcore:DeletePaymentInstrument",
+)
+PAYMENT_EXECUTION_ACTION = "bedrock-agentcore:ProcessPayment"
+
+
+def _statement_grants_payment_action(statement: Dict[str, Any], action: str) -> bool:
+    """Return whether one Allow statement names a payment action by service.
+
+    A pattern with no service segment stays out of scope for the same reason it
+    does in the evaluation leg above: `Action: "*"` and a `NotAction`
+    administrator grant are service-agnostic, and AC-02 reports an account
+    administrator through neither the wildcard leg nor this one, so that one
+    identity is not reported again under every AgentCore question separately.
+    """
+    return any(
+        ":" in pattern and fnmatchcase(action, pattern)
+        for pattern in _statement_actions(statement)
+    )
+
+
+def _payment_execution_denied(statement: Dict[str, Any]) -> bool:
+    """Return whether one Deny statement removes ProcessPayment account-wide.
+
+    The devguide's ManagementRole denies ProcessPayment on `Resource: "*"` with
+    no condition, which is the only Deny shape that holds whatever the Allow
+    beside it names: a Deny scoped to one payment manager leaves the action on
+    every other one, and a conditioned Deny leaves it wherever the condition is
+    unmet. Either narrower shape is read here as no account-wide Deny, which
+    reports the principal instead of excusing it.
+
+    A Deny is read with the full action grammar rather than the service-segment
+    rule the Allow side uses, because a service-agnostic Deny does remove the
+    action and reading it is the direction that adds no false positive.
+    """
+    if not _statement_matches_action(statement, PAYMENT_EXECUTION_ACTION.lower()):
+        return False
+    if _statement_condition_keys(statement):
+        return False
+    return "*" in _statement_resources(statement)
+
+
+def _payment_duty_collisions(
+    permissions_by_name: Dict[str, Any],
+    principal_kind: str,
+) -> List[str]:
+    """Return each principal holding both payment authorities at once."""
+    labels: List[str] = []
+    for principal_name, permissions in permissions_by_name.items():
+        if not isinstance(permissions, dict):
+            continue
+        budget_writes: List[str] = []
+        executes = False
+        denied = False
+        for policy in [
+            *(permissions.get("attached_policies") or []),
+            *(permissions.get("inline_policies") or []),
+        ]:
+            try:
+                document = _policy_document(policy)
+            except Exception as error:
+                # Counted and reported by the wildcard leg above, which reads the
+                # same documents. Counting it again would report one unreadable
+                # document twice.
+                logger.warning(
+                    f"Error parsing policy for {principal_kind} "
+                    f"{principal_name}: {error}"
+                )
+                continue
+            for statement in _document_statements(document, effect="Allow"):
+                budget_writes.extend(
+                    action
+                    for action in PAYMENT_BUDGET_WRITE_ACTIONS
+                    if _statement_grants_payment_action(statement, action.lower())
+                )
+                if _statement_grants_payment_action(
+                    statement, PAYMENT_EXECUTION_ACTION.lower()
+                ):
+                    executes = True
+            for statement in _document_statements(document, effect="Deny"):
+                if _payment_execution_denied(statement):
+                    denied = True
+        if budget_writes and executes and not denied:
+            labels.append(
+                f"{principal_kind} {principal_name} "
+                f"({', '.join(sorted(set(budget_writes)))})"
+            )
+    return sorted(labels)
+
+
 def check_agentcore_full_access_roles(
     permission_cache: Dict[str, Any],
 ) -> List[Dict[str, Any]]:
@@ -1992,6 +2096,7 @@ def check_agentcore_full_access_roles(
     - Roles with BedrockAgentCoreFullAccess
     - Roles with wildcard or allow-except AgentCore permissions
     - Roles and users reaching an evaluation write through a wildcard action
+    - Roles and users holding both AgentCore payment authorities at once
 
     Args:
         permission_cache: Cached IAM permissions data
@@ -2110,6 +2215,45 @@ def check_agentcore_full_access_roles(
                         "evaluator and configuration ARNs it maintains."
                     ),
                     reference="https://docs.aws.amazon.com/bedrock/latest/userguide/security-iam-awsmanpol.html",
+                    severity=SeverityEnum.HIGH,
+                    status=StatusEnum.FAILED,
+                )
+            )
+
+        # Who can both set a payment budget and spend against it. The two legs
+        # the devguide draws, a management identity denied ProcessPayment and an
+        # executing identity that cannot write a session, are the same invariant
+        # read from either side: no one principal holds both authorities.
+        payment_collisions = [
+            *_payment_duty_collisions(role_permissions, "role"),
+            *_payment_duty_collisions(user_permissions, "user"),
+        ]
+        if payment_collisions:
+            findings.append(
+                create_finding(
+                    check_id="AC-02",
+                    finding_name="AgentCore Payments Duty Separation",
+                    finding_details=(
+                        "The following principals can write an AgentCore payment "
+                        "session or instrument and call "
+                        f"{PAYMENT_EXECUTION_ACTION}, with no account-wide Deny on "
+                        f"the latter: {', '.join(payment_collisions)}. A payment "
+                        "session carries its own maxSpendAmount, so one identity "
+                        "holding both authorities can create a session with the "
+                        "budget it wants and spend against it in the same call "
+                        "path, and the audit trail no longer separates who set the "
+                        "limit from who spent it."
+                    ),
+                    resolution=(
+                        "Split the two authorities across separate roles: keep "
+                        f"{', '.join(PAYMENT_BUDGET_WRITE_ACTIONS)} on the "
+                        "management identity and add an explicit Deny on "
+                        f'{PAYMENT_EXECUTION_ACTION} for Resource "*" there, and '
+                        "grant the executing identity "
+                        f"{PAYMENT_EXECUTION_ACTION} beside the payment reads it "
+                        "needs and no session or instrument write."
+                    ),
+                    reference=AGENTCORE_PAYMENTS_IAM_REFERENCE_URL,
                     severity=SeverityEnum.HIGH,
                     status=StatusEnum.FAILED,
                 )

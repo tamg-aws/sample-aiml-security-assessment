@@ -6,15 +6,15 @@
     "hosted": 67,
     "fnd_ai_subject": 11,
     "total": 78,
-    "covered": 40,
-    "tighten": 13,
-    "tighten_extend": 11,
+    "covered": 41,
+    "tighten": 12,
+    "tighten_extend": 10,
     "tighten_new_id": 2,
     "new": 10,
     "not_implementable": 4,
     "unassessed": 11,
     "new_check_functions": 23,
-    "extensions": 11,
+    "extensions": 10,
     "extra_iam_actions": [
       "config:DescribeConfigRules",
       "config:DescribeConfigurationRecorders",
@@ -736,8 +736,8 @@
       "question": "For agents that make payments, is a separation-of-duties model enforced so no single role can both set spending limits and execute payments?",
       "assert": "Payments four-role IAM model: ManagementRole denies ProcessPayment; ProcessPaymentRole cannot create sessions",
       "workload_agnostic": true,
-      "verdict": "tighten",
-      "disposition": "extend",
+      "verdict": "covered",
+      "disposition": null,
       "target_modules": [
         "agentcore_assessments"
       ],
@@ -747,7 +747,7 @@
       "incumbent_names": [
         "AgentCore IAM Full Access Check"
       ],
-      "gap": "AC-02 detects full-access and wildcard grants only",
+      "gap": "AC-02 now fails any role or user whose Allow statements reach both an AgentCore payment session or instrument write and ProcessPayment with no account-wide Deny on the latter. A payment session carries its own limits.maxSpendAmount, so that one principal sets the budget it then spends against, which is the single failure behind both legs the devguide draws: its ManagementRole denies ProcessPayment and its ProcessPaymentRole holds no session write. A Deny scoped to one payment manager or carrying a condition is read as no account-wide Deny, so a narrower Deny never excuses the collision",
       "extra_iam": [],
       "phase": 4,
       "source": "controls/ai-specific/agentcore-registry-optimization-payments.yaml"

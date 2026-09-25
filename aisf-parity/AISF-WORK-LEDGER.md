@@ -6,14 +6,14 @@ Generated 2026-09-25 by `aisf-parity/build_ledger.py`. Do not hand-edit: change 
 
 | verdict | rows | meaning |
 |---|---|---|
-| covered | 40 | an incumbent already asserts this; nothing to write |
-| tighten / extend | 11 | incumbent name is honest, its assertion is narrower; extend it in place |
+| covered | 41 | an incumbent already asserts this; nothing to write |
+| tighten / extend | 10 | incumbent name is honest, its assertion is narrower; extend it in place |
 | tighten / new_id | 2 | incumbent name claims more than it asserts; allocate a new id beside it |
 | new | 10 | no incumbent asserts any part of it |
 | not_implementable | 4 | flagged machine_checkable in the ledger but is not checkable from configuration |
 | unassessed | 11 | in scope, dedup pass not yet run |
 
-**23 new check functions and 11 extensions to existing checks.**
+**23 new check functions and 10 extensions to existing checks.**
 
 ## New IAM actions required
 
@@ -95,6 +95,7 @@ Generated 2026-09-25 by `aisf-parity/build_ledger.py`. Do not hand-edit: change 
 | `AIR-ACR-OBS-03` | covered | — | `agentcore_assessments` | `AC-19` | AC-04 is X-Ray tracingConfig.enabled over list_agent_runtimes only, so it cannot cover Gateway, Memory, Policy or Identity, which is OBS-03's whole subject. AC-19 asserts an APPLICATION_LOGS delivery source wired to a destination per gateway and per memory; runtime logging is service-managed, WorkloadIdentity delivery is configured on the associated runtime or gateway resource, and policy engines have no log-destination surface, so those three legs need no separate assertion |
 | `AIR-ACR-OBS-04` | covered | — | `agentcore_assessments` | `AC-20`, `AC-21` | AC-20 asserts a Deidentify data-protection policy and a customer managed key on the AgentCore log groups, AC-21 asserts that no cached role or user holds logs:Unmask on every resource |
 | `AIR-ACR-OBS-06` | covered | — | `agentcore_assessments` | `AC-22` | AC-22 asserts that every Allow statement on an OAM sink policy either names its principals or carries an organization condition key |
+| `AIR-ACR-PAY-01` | covered | — | `agentcore_assessments` | `AC-02` | AC-02 now fails any role or user whose Allow statements reach both an AgentCore payment session or instrument write and ProcessPayment with no account-wide Deny on the latter. A payment session carries its own limits.maxSpendAmount, so that one principal sets the budget it then spends against, which is the single failure behind both legs the devguide draws: its ManagementRole denies ProcessPayment and its ProcessPaymentRole holds no session write. A Deny scoped to one payment manager or carrying a condition is read as no account-wide Deny, so a narrower Deny never excuses the collision |
 | `AIR-ACR-POL-01` | covered | — | `agentcore_assessments` | `AG-25`, `AC-19`, `AC-35` | AG-25 asserts mode ENFORCE plus status/enforcementMode ACTIVE, AC-19 asserts the gateway delivers APPLICATION_LOGS, which is where a policy decision record lands, and AC-35 asserts no enforcing permit leaves the action position unconstrained; default-deny and forbid-wins are engine behaviour and not a setting to read, so a permit over every tool is the only way to restore allow-all |
 | `AIR-ACR-POL-04` | covered | — | `agentcore_assessments` | `AC-11`, `AC-36` | AC-11 asserts the engine names a customer managed key, AC-36 asserts the key policy names who may decrypt with it and who may disable it or schedule it for deletion; the key cannot be added to or changed on an existing engine, so the key policy is the whole guard. The disable/delete alarm and the break-glass runbook are not readable from the key, and AC-36's passing resolution says so |
 | `AIR-ACR-POL-06` *(workload-specific)* | covered | — | `agentcore_assessments` | `AC-37` | AC-37 asserts the workload-independent half: a policy carrying a guardrails condition needs bedrock:InvokeGuardrailChecks on the gateway execution role, because the Policy data plane calls Bedrock Guardrails with that role's forward access session. Whether this workload's content belongs at the authorization boundary at all, and which safeguard categories and thresholds apply, is the workload owner's decision, which AC-37 reports and does not judge |
@@ -104,7 +105,6 @@ Generated 2026-09-25 by `aisf-parity/build_ledger.py`. Do not hand-edit: change 
 | `AIR-ACR-RT-08` | covered | — | `agentcore_assessments` | `AC-01` | AC-01 now reads the outbound rules of every security group attached to a VPC runtime, code interpreter or browser and fails a group permitting 0.0.0.0/0 or ::/0 egress. A tool in PUBLIC network mode fails without a describe call, because the service grants it open internet egress by configuration; SANDBOX passes at Medium, because the sandbox reaches no network the workload can name. A group the describe did not return and a denied ec2:DescribeSecurityGroups are both reported N/A on their own line, so an unread group is never counted as closed |
 | `AIR-ACR-RT-09` | covered | — | `agentcore_assessments` | `AC-06` | recording.enabled is True plus an S3 bucket |
 | `AIR-ACR-RT-13` | covered | — | `agentcore_assessments` | `AC-08`, `AC-10`, `AC-47` | AC-47 fails a runtime whose resource policy restricts neither the network path nor the caller: the network leg reads aws:SourceVpc, aws:SourceVpce, aws:VpcSourceIp and aws:SourceIp on any statement, the caller leg reads a named principal or an allowedWorkloadConfiguration on the JWT authorizer. AC-08 fails an AgentCore interface endpoint with private DNS off, which is the leg that keeps the runtime's own callers off the public endpoint name. AC-10 reports only that a policy exists |
-| `AIR-ACR-PAY-01` | tighten | extend | `agentcore_assessments` | `AC-02` | AC-02 detects full-access and wildcard grants only |
 | `AIR-ACR-REG-02` | tighten | new_id | `agent_registry_assessments` | `AR-03` | AR-03 is named "Publication Approval Governance" but covers auto-approval only, behind the REQUIRE_AGENT_REGISTRY_MANUAL_APPROVAL env gate; no curator/publisher separation and no EventBridge rule |
 | `AIR-ACR-MEM-07` *(workload-specific)* | new | — | `agentcore_assessments` | — | — |
 
