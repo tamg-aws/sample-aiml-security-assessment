@@ -10,11 +10,19 @@ ships in a public fork; the profile in the commands below resolves it. Every res
 is named with the `aisflive` prefix and tagged
 `purpose=aisf-live-verifiability-fixture` and `temporary=true`.
 
-Do not use a tag query as the teardown inventory. Measured against the standing
-fixtures, `resourcegroupstaggingapi get-resources --tag-filters
-Key=purpose,Values=aisf-live-verifiability-fixture` returns two of them, the KMS key
-and the knowledge base, and none of the vector bucket, the vector index, the gateway,
-or the IAM roles. The lists below are the inventory.
+Do not use a tag query as the teardown inventory: it is wrong in both directions.
+Measured on 2026-09-25, `resourcegroupstaggingapi get-resources --tag-filters
+Key=purpose,Values=aisf-live-verifiability-fixture` returns two of the fixtures, the
+KMS key and the knowledge base, and none of the vector bucket, the vector index, the
+gateway, or the IAM roles. It also returns four resources that are **not**
+fixtures, and `Key=temporary,Values=true` returns the identical six: the CodeBuild
+project `AIMLSecurityCodeBuild`, its start-build Lambda, the assessment bucket
+`aiml-security-aisf-parity-assessmentbucket-7za0aaaa3dfo`, and the
+`aiml-security-aisf-parity` stack that owns all three, which are the pipeline
+recorded under **Also standing** below and carry these tags because the deploy passed
+them as stack tags. A teardown driven by either tag deletes the project the
+post-merge validation build runs on and the versioned bucket holding its reports, so
+neither tag selects a safe set. The lists below are the inventory.
 
 The gate is not part of `gate_all.sh`. It needs AWS credentials, and it measures
 an account rather than this tree, so a green battery says nothing about it. Run it
@@ -201,8 +209,14 @@ The gate above measures the account. Reading the derived `AISF-` rows in a
 generated HTML report needs the assessment itself deployed, and that deploy is not
 a fixture: it leaves three stacks, three versioned buckets and a fixed-name IAM
 role behind. It is recorded here because this file is the teardown inventory, and a
-tag query cannot see any of it. `deployment/aiml-security-single-account.yaml` sets
-no tags at all, so the fixture tag filter returns none of these.
+tag query reports it wrongly in both directions.
+`deployment/aiml-security-single-account.yaml` sets no tags of its own, but the
+`cloudformation deploy` that created the parent stack passed the two fixture tags on
+the command line and CloudFormation propagated them, so the fixture filter answers
+with the CodeBuild project, the start-build Lambda, the assessment bucket and the
+stack itself. Both IAM roles in that same stack carry the identical tags and the
+query returns neither, and no resource the inner `sam deploy` created answers either
+tag.
 
 Deployed twice, into the same three stacks:
 
