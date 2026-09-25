@@ -31,6 +31,7 @@ framework. The tests here hold three properties that a silent drift would break.
 """
 
 import csv
+import glob
 import importlib.util
 import json
 import os
@@ -51,12 +52,36 @@ GENERATOR = os.path.join(REPO_ROOT, "aisf-parity", "gen_compliance_maps.py")
 # _generator asserts they have not drifted apart.
 TAGGABLE = ("covered", "tighten")
 
-PRODUCERS = (
-    "bedrock_assessments",
-    "sagemaker_assessments",
-    "agentcore_assessments",
-    "agent_registry_assessments",
-)
+
+def _producers_from_shipped_maps():
+    """The producer directories that ship a generated AISF map.
+
+    Hand-listed before, as four directory names, while aisf-parity/
+    probe_live_tags.py hand-listed the same four producers in its own spelling
+    ("bedrock", not "bedrock_assessments"). A new producer could be left out of
+    either list with nothing to notice. Both are derived now, and derived
+    separately: the two consumers need different strings, and a shared helper
+    normalising one spelling into the other is where the next silent mismatch
+    would live.
+
+    Empty raises. `pytest.mark.parametrize` over an empty sequence collects zero
+    cases and reports a warning, not a failure, so an empty derivation would turn
+    every parametrized test in this module into a no-op that reads as green.
+    """
+    found = sorted(
+        os.path.basename(os.path.dirname(path))
+        for path in glob.glob(os.path.join(MODULES, "*", "aisf_compliance_*.py"))
+    )
+    if not found:
+        raise RuntimeError(
+            f"no aisf_compliance_*.py under {MODULES}: the derivation found no "
+            "producer at all, which would make every test in this module vacuous "
+            "instead of red"
+        )
+    return tuple(found)
+
+
+PRODUCERS = _producers_from_shipped_maps()
 
 # The 8 columns every producer CSV carried before this change, in order.
 LEGACY_COLUMNS = [
@@ -299,6 +324,33 @@ def _all_maps():
         ).AISF_COMPLIANCE_MAP
         assert os.path.exists(path)
     return out
+
+
+def test_the_producer_set_is_derived_and_not_empty():
+    """The derived producer set, measured against a second reading of it.
+
+    PRODUCERS is derived from which directories hold an `aisf_compliance_*.py`.
+    This reads which `schema.py` imports one, which is a different file and a
+    different mechanism, so a module that ships a map nothing imports, or imports
+    a map it does not ship, appears in one reading and not the other. It also
+    catches PRODUCERS being turned back into a hand-written literal, which is how
+    this list and aisf-parity/probe_live_tags.py's drifted apart in the first
+    place. Both counts are in the message, because a comparison of two empty sets
+    holds.
+    """
+    wired = []
+    for path in sorted(glob.glob(os.path.join(MODULES, "*", "schema.py"))):
+        with open(path) as handle:
+            source = handle.read()
+        if re.search(
+            r"^\s*from aisf_compliance_\w+ import aisf_frameworks", source, re.M
+        ):
+            wired.append(os.path.basename(os.path.dirname(path)))
+    assert PRODUCERS, "the derived producer set is empty; every test here is vacuous"
+    assert set(PRODUCERS) == set(wired), (
+        f"{len(PRODUCERS)} producer(s) ship a map {sorted(PRODUCERS)}; "
+        f"{len(wired)} wire one into schema.py {wired}"
+    )
 
 
 def test_taggable_verdicts_agree_with_the_generator():

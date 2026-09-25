@@ -69,10 +69,45 @@ USAGE = 2
 REPO_ROOT = Path(__file__).resolve().parent.parent
 MODULES = REPO_ROOT / "aiml-security-assessment" / "functions" / "security"
 
-# The four producers the tag column reaches. owasp_assessments is excluded because
-# the ledger names no OW- incumbent, and responsible_ai_grc_assessments populates
-# the field from its own COMPLIANCE_MAP; neither is part of this measurement.
-PRODUCERS = ("bedrock", "sagemaker", "agentcore", "agent_registry")
+
+def producers_from_shipped_maps() -> tuple[str, ...]:
+    """The producer names that ship a generated AISF map, in this file's spelling.
+
+    The set used to be hand-listed as ("bedrock", "sagemaker", "agentcore",
+    "agent_registry"), and the offline suite hand-listed the same four producers
+    as directory names, so a new producer could be left out of either list with
+    nothing to notice. Derived here from the map filenames, which carry exactly
+    this spelling: `aisf_compliance_<name>.py` beside `<name>_assessments/app.py`.
+
+    Derived again, separately, in tests/test_aisf_compliance_column.py. The two
+    consumers genuinely need different strings, and one shared helper normalising
+    one spelling into the other is where the next silent mismatch would live.
+
+    owasp_assessments and responsible_ai_grc_assessments fall out of the
+    derivation rather than being excluded by name: the ledger names no OW-
+    incumbent, and the GRC module fills the column from its own COMPLIANCE_MAP.
+    Neither ships an aisf_compliance_*.py, so neither is part of this
+    measurement, and a module that starts shipping one joins it without an edit.
+
+    Empty is fatal, and fatal here at derivation time rather than after the
+    aggregation in newest_execution(): `all([])` is True, so an empty tuple marks
+    every execution in the bucket complete and the `if not complete` guard below
+    never fires.
+    """
+    found = sorted(
+        path.name.removeprefix("aisf_compliance_").removesuffix(".py")
+        for path in MODULES.glob("*/aisf_compliance_*.py")
+    )
+    if not found:
+        raise SystemExit(
+            f"no aisf_compliance_*.py under {MODULES}: there is no producer to "
+            "measure. Not an empty measurement: an empty producer set marks every "
+            "run in the bucket complete, because all([]) is True."
+        )
+    return tuple(found)
+
+
+PRODUCERS = producers_from_shipped_maps()
 
 LEGACY_COLUMNS = [
     "Check_ID",
@@ -455,6 +490,14 @@ def main() -> int:
     parser.add_argument("--csv-dir", type=Path, help="already-downloaded CSV set")
     parser.add_argument("--selftest", action="store_true")
     args = parser.parse_args()
+
+    # The denominator behind every section below, printed before any of them and on
+    # the --selftest path too: a producer this derivation misses is a producer
+    # nothing here measures, and the sections would report a clean run without it.
+    print(
+        f"producers {len(PRODUCERS)} derived from */aisf_compliance_*.py under "
+        f"{MODULES.relative_to(REPO_ROOT)}: {', '.join(PRODUCERS)}"
+    )
 
     if args.selftest:
         return selftest()
