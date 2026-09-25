@@ -14,7 +14,7 @@ import time
 from fnmatch import fnmatchcase
 from io import StringIO
 from datetime import datetime, timezone
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Set, Tuple
 from botocore.config import Config
 from botocore.exceptions import ClientError, EndpointConnectionError
 
@@ -36,6 +36,8 @@ ec2_client = None
 ecr_client = None
 logs_client = None
 cloudwatch_client = None
+cloudtrail_client = None
+oam_client = None
 agentcore_client = None
 
 # Environment variables
@@ -108,6 +110,22 @@ AGENTCORE_BROWSER_RECORDING_FINDING_NAME = "AgentCore Browser Session Recording"
 AGENTCORE_ONLINE_EVALUATION_REFERENCE_URL = (
     "https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/"
     "get-online-evaluations.html"
+)
+CLOUDTRAIL_DATA_EVENTS_REFERENCE_URL = (
+    "https://docs.aws.amazon.com/awscloudtrail/latest/userguide/"
+    "logging-data-events-with-cloudtrail.html"
+)
+AGENTCORE_OBSERVABILITY_CONFIGURE_REFERENCE_URL = (
+    "https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/"
+    "observability-configure.html"
+)
+LOGS_DATA_PROTECTION_REFERENCE_URL = (
+    "https://docs.aws.amazon.com/AmazonCloudWatch/latest/logs/"
+    "mask-sensitive-log-data.html"
+)
+OAM_CROSS_ACCOUNT_REFERENCE_URL = (
+    "https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/"
+    "CloudWatch-Unified-Cross-Account.html"
 )
 
 
@@ -278,6 +296,10 @@ REGIONAL_AGENTCORE_CHECK_IDS = (
     "AC-15",
     "AC-16",
     "AC-17",
+    "AC-18",
+    "AC-19",
+    "AC-20",
+    "AC-22",
 )
 
 AGENTCORE_RUNTIME_CHECK_IDS = (
@@ -295,6 +317,10 @@ AGENTCORE_RUNTIME_CHECK_IDS = (
     "AC-15",
     "AC-16",
     "AC-17",
+    "AC-18",
+    "AC-19",
+    "AC-20",
+    "AC-22",
 )
 
 NATIVE_AGENTIC_AGENTCORE_CHECK_NAMES = {
@@ -302,6 +328,67 @@ NATIVE_AGENTIC_AGENTCORE_CHECK_NAMES = {
     "AG-25": "Agentic AI Gateway Policy Enforcement",
     "AG-26": "Agentic AI Gateway Exception Handling",
     "AG-27": "Agentic AI Gateway WAF Protection",
+}
+
+# CloudTrail data-event resource types per AgentCore service family, as listed in
+# the CloudTrail data-events table. AC-18 decides presence from this module's own
+# inventory so a family with no resources in the region reads N/A instead of a
+# Failed nobody can act on.
+AGENTCORE_DATA_EVENT_FAMILIES = (
+    {
+        "key": "runtime",
+        "label": "Runtime",
+        "resource_types": (
+            "AWS::BedrockAgentCore::Runtime",
+            "AWS::BedrockAgentCore::RuntimeEndpoint",
+        ),
+        "inventory": (("list_agent_runtimes", ("agentRuntimes",), {}),),
+    },
+    {
+        "key": "memory",
+        "label": "Memory",
+        "resource_types": ("AWS::BedrockAgentCore::Memory",),
+        "inventory": (("list_memories", ("memories",), {}),),
+    },
+    {
+        "key": "tools",
+        "label": "Tool",
+        "resource_types": (
+            "AWS::BedrockAgentCore::CodeInterpreter",
+            "AWS::BedrockAgentCore::CodeInterpreterCustom",
+            "AWS::BedrockAgentCore::Browser",
+            "AWS::BedrockAgentCore::BrowserCustom",
+        ),
+        "inventory": (
+            (
+                "list_code_interpreters",
+                ("codeInterpreterSummaries",),
+                {"type": "CUSTOM"},
+            ),
+            ("list_browsers", ("browserSummaries",), {"type": "CUSTOM"}),
+        ),
+    },
+)
+
+# Log groups AgentCore writes to: the service-managed prefix and the vended-log
+# prefix used by memory and gateway log delivery.
+AGENTCORE_LOG_GROUP_PREFIXES = (
+    "/aws/bedrock-agentcore/",
+    "/aws/vendedlogs/bedrock-agentcore/",
+)
+
+# AgentCore does not configure log destinations automatically. Memory and gateway
+# application logs reach CloudWatch only through a vended-log delivery source
+# with this service and log type, plus a delivery to a destination.
+AGENTCORE_VENDED_LOG_SERVICE = "bedrock-agentcore"
+AGENTCORE_VENDED_LOG_TYPE = "APPLICATION_LOGS"
+
+# Condition keys that bind a cross-account observability sink policy to a known
+# set of principals. Operators may be prefixed (ForAnyValue:StringLike), so the
+# key names are compared, not the operators.
+SINK_PRINCIPAL_SCOPE_CONDITION_KEYS = {
+    "aws:principalorgid",
+    "aws:principalorgpaths",
 }
 
 # Error codes that establish the target region is not enabled for the account.
@@ -436,6 +523,58 @@ def _agentcore_list_all(
         if next_token is not None and not isinstance(next_token, str):
             logger.warning(
                 f"{list_method_name} returned non-string nextToken: "
+                f"{type(next_token).__name__}"
+            )
+            break
+        if not next_token or next_token in seen_tokens:
+            break
+        seen_tokens.add(next_token)
+
+    return items
+
+
+def _paginate_aws_list(
+    client: Any,
+    operation_name: str,
+    result_key: str,
+    token_request_key: str = "nextToken",
+    token_response_key: str = "nextToken",
+    **list_kwargs,
+) -> List[Dict[str, Any]]:
+    """Collect all items from a non-AgentCore list API, following its token.
+
+    The continuation member is capitalized differently per service, so both the
+    request and the response member names are supplied by the caller.
+    """
+    if client is None:
+        return []
+
+    items: List[Dict[str, Any]] = []
+    next_token = None
+    seen_tokens = set()
+    list_method = getattr(client, operation_name)
+
+    while True:
+        kwargs = dict(list_kwargs)
+        if next_token:
+            kwargs[token_request_key] = next_token
+
+        response = list_method(**kwargs)
+        if not isinstance(response, dict):
+            logger.warning(
+                f"{operation_name} returned unexpected response type: "
+                f"{type(response).__name__}"
+            )
+            break
+
+        page_items = response.get(result_key)
+        if isinstance(page_items, list):
+            items.extend(page_items)
+
+        next_token = response.get(token_response_key)
+        if next_token is not None and not isinstance(next_token, str):
+            logger.warning(
+                f"{operation_name} returned non-string {token_response_key}: "
                 f"{type(next_token).__name__}"
             )
             break
@@ -3474,6 +3613,1150 @@ def check_agentcore_gateway_configuration() -> List[Dict[str, Any]]:
     return findings
 
 
+def _advanced_selector_data_resource_types(selector: Dict[str, Any]) -> Set[str]:
+    """Read resources.type values from a Data-category advanced event selector.
+
+    Management-category selectors carry no resources.type, and a selector that
+    omits eventCategory Data does not log data events, so its resource types are
+    not evidence of data-event coverage.
+    """
+    field_selectors = selector.get("FieldSelectors")
+    if not isinstance(field_selectors, list):
+        return set()
+
+    logs_data_events = False
+    resource_types: Set[str] = set()
+
+    for field_selector in field_selectors:
+        if not isinstance(field_selector, dict):
+            continue
+        equals = field_selector.get("Equals")
+        if not isinstance(equals, list):
+            continue
+        field = field_selector.get("Field")
+        if field == "eventCategory" and "Data" in equals:
+            logs_data_events = True
+        elif field == "resources.type":
+            resource_types.update(value for value in equals if isinstance(value, str))
+
+    return resource_types if logs_data_events else set()
+
+
+def _cloudtrail_data_event_resource_types() -> Tuple[Set[str], List[str]]:
+    """Collect every resources.type any trail selects for data events.
+
+    Returns the selected types and the trails whose selectors could not be read,
+    so a family with no matching type can be reported as unknown instead of
+    uncovered when the evidence is incomplete.
+    """
+    selected_types: Set[str] = set()
+    unreadable_trails: List[str] = []
+
+    trails = _paginate_aws_list(
+        cloudtrail_client,
+        "list_trails",
+        "Trails",
+        token_request_key="NextToken",
+        token_response_key="NextToken",
+    )
+
+    for trail in trails:
+        # The ARN, not the name: a name resolves only in the trail's home region,
+        # while organization and multi-region trails must resolve from any region.
+        trail_identifier = trail.get("TrailARN") or trail.get("Name")
+        if not trail_identifier:
+            continue
+
+        try:
+            selectors = cloudtrail_client.get_event_selectors(
+                TrailName=trail_identifier
+            )
+        except Exception as error:
+            logger.warning(
+                f"Could not read event selectors for {trail_identifier}: "
+                f"{type(error).__name__}"
+            )
+            unreadable_trails.append(trail_identifier)
+            continue
+
+        advanced_selectors = selectors.get("AdvancedEventSelectors")
+        if not isinstance(advanced_selectors, list):
+            continue
+
+        for selector in advanced_selectors:
+            if isinstance(selector, dict):
+                selected_types.update(_advanced_selector_data_resource_types(selector))
+
+    return selected_types, unreadable_trails
+
+
+def _agentcore_family_resource_count(family: Dict[str, Any]) -> int:
+    """Count this region's resources for one AgentCore data-event family."""
+    count = 0
+    for operation_name, result_keys, list_kwargs in family["inventory"]:
+        count += len(
+            _agentcore_list_all(operation_name, list(result_keys), **list_kwargs)
+        )
+    return count
+
+
+def check_agentcore_cloudtrail_data_events() -> List[Dict[str, Any]]:
+    """AC-18: Report CloudTrail data-event coverage per AgentCore service family.
+
+    Management events record that a runtime or memory was created. Only a
+    Data-category advanced event selector on the family's resources.type records
+    the invocations and the memory record reads and writes that follow.
+    """
+    if cloudtrail_client is None:
+        return [
+            create_finding(
+                check_id="AC-18",
+                finding_name="AgentCore CloudTrail Data Event Coverage",
+                finding_details="CloudTrail client not available in this region.",
+                resolution="No action required unless AgentCore runs in this region.",
+                reference=CLOUDTRAIL_DATA_EVENTS_REFERENCE_URL,
+                severity=SeverityEnum.INFORMATIONAL,
+                status=StatusEnum.NA,
+            )
+        ]
+
+    try:
+        selected_types, unreadable_trails = _cloudtrail_data_event_resource_types()
+    except Exception as error:
+        return [
+            create_finding(
+                check_id="AC-18",
+                finding_name="AgentCore CloudTrail Data Event Coverage",
+                finding_details=(
+                    f"Could not list CloudTrail trails: {type(error).__name__}."
+                ),
+                resolution="Grant cloudtrail:ListTrails and retry.",
+                reference=CLOUDTRAIL_DATA_EVENTS_REFERENCE_URL,
+                severity=SeverityEnum.INFORMATIONAL,
+                status=StatusEnum.NA,
+            )
+        ]
+
+    findings = []
+    for family in AGENTCORE_DATA_EVENT_FAMILIES:
+        label = family["label"]
+        resource_types = family["resource_types"]
+        type_list = ", ".join(resource_types)
+
+        try:
+            resource_count = _agentcore_family_resource_count(family)
+        except Exception as error:
+            findings.append(
+                create_finding(
+                    check_id="AC-18",
+                    finding_name="AgentCore CloudTrail Data Event Coverage",
+                    finding_details=(
+                        f"{label} resources could not be inventoried, so "
+                        f"data-event coverage for {type_list} is unknown: "
+                        f"{type(error).__name__}."
+                    ),
+                    resolution=(
+                        "Grant the AgentCore list permissions for this resource "
+                        "family and retry."
+                    ),
+                    reference=CLOUDTRAIL_DATA_EVENTS_REFERENCE_URL,
+                    severity=SeverityEnum.INFORMATIONAL,
+                    status=StatusEnum.NA,
+                )
+            )
+            continue
+
+        covered_types = sorted(set(resource_types) & selected_types)
+
+        if resource_count == 0:
+            findings.append(
+                create_finding(
+                    check_id="AC-18",
+                    finding_name="AgentCore CloudTrail Data Event Coverage",
+                    finding_details=(
+                        f"No AgentCore {label} resources found in this region, so "
+                        f"data-event coverage for {type_list} is not assessed."
+                    ),
+                    resolution="No action required.",
+                    reference=CLOUDTRAIL_DATA_EVENTS_REFERENCE_URL,
+                    severity=SeverityEnum.INFORMATIONAL,
+                    status=StatusEnum.NA,
+                )
+            )
+            continue
+
+        if covered_types:
+            findings.append(
+                create_finding(
+                    check_id="AC-18",
+                    finding_name="AgentCore CloudTrail Data Event Coverage",
+                    finding_details=(
+                        f"{resource_count} AgentCore {label} resource(s) are "
+                        f"covered by a CloudTrail data-event selector on "
+                        f"{', '.join(covered_types)}."
+                    ),
+                    resolution=(
+                        "No action required. Confirm the trail's selector matches "
+                        "the resources in scope and that the trail is logging."
+                    ),
+                    reference=CLOUDTRAIL_DATA_EVENTS_REFERENCE_URL,
+                    severity=SeverityEnum.MEDIUM,
+                    status=StatusEnum.PASSED,
+                )
+            )
+            continue
+
+        if unreadable_trails:
+            findings.append(
+                create_finding(
+                    check_id="AC-18",
+                    finding_name="AgentCore CloudTrail Data Event Coverage",
+                    finding_details=(
+                        f"{resource_count} AgentCore {label} resource(s) found, and "
+                        f"no readable trail selects {type_list} for data events, but "
+                        f"{len(unreadable_trails)} trail(s) could not be read."
+                    ),
+                    resolution=(
+                        "Grant cloudtrail:GetEventSelectors on every trail and "
+                        "retry so the coverage verdict is decided on all trails."
+                    ),
+                    reference=CLOUDTRAIL_DATA_EVENTS_REFERENCE_URL,
+                    severity=SeverityEnum.INFORMATIONAL,
+                    status=StatusEnum.NA,
+                )
+            )
+            continue
+
+        findings.append(
+            create_finding(
+                check_id="AC-18",
+                finding_name="AgentCore CloudTrail Data Event Coverage",
+                finding_details=(
+                    f"{resource_count} AgentCore {label} resource(s) found, and no "
+                    f"trail selects {type_list} for data events, so "
+                    f"{label.lower()} invocations are not in the audit trail."
+                ),
+                resolution=(
+                    "Add a CloudTrail advanced event selector with eventCategory "
+                    f"Data and resources.type set to {type_list}."
+                ),
+                reference=CLOUDTRAIL_DATA_EVENTS_REFERENCE_URL,
+                severity=SeverityEnum.MEDIUM,
+                status=StatusEnum.FAILED,
+            )
+        )
+
+    return findings
+
+
+def _agentcore_delivery_configuration() -> Tuple[Dict[str, List[str]], Set[str]]:
+    """Map AgentCore resource ARNs to their application-log delivery sources.
+
+    A delivery source names the resource whose logs it collects; a delivery
+    connects that source to a destination. A source with no delivery produces no
+    logs, so both halves are needed to answer whether logging is configured.
+    """
+    sources = _paginate_aws_list(
+        logs_client, "describe_delivery_sources", "deliverySources"
+    )
+
+    arn_sources: Dict[str, List[str]] = {}
+    for source in sources:
+        if source.get("service") != AGENTCORE_VENDED_LOG_SERVICE:
+            continue
+        if source.get("logType") != AGENTCORE_VENDED_LOG_TYPE:
+            continue
+        source_name = source.get("name")
+        resource_arns = source.get("resourceArns")
+        if not source_name or not isinstance(resource_arns, list):
+            continue
+        for resource_arn in resource_arns:
+            if isinstance(resource_arn, str):
+                arn_sources.setdefault(resource_arn, []).append(source_name)
+
+    deliveries = _paginate_aws_list(logs_client, "describe_deliveries", "deliveries")
+    delivered_source_names = {
+        delivery.get("deliverySourceName")
+        for delivery in deliveries
+        if delivery.get("deliverySourceName")
+    }
+
+    return arn_sources, delivered_source_names
+
+
+def _delivery_source_names_for(
+    arn_match: str, arn_sources: Dict[str, List[str]]
+) -> List[str]:
+    """Find the delivery sources naming one resource.
+
+    GatewaySummary carries no ARN, so a gateway is matched on the ARN tail built
+    from its id; a memory is matched on the exact ARN the list API returns.
+    """
+    names: List[str] = []
+    for resource_arn, source_names in arn_sources.items():
+        if resource_arn == arn_match or resource_arn.endswith(arn_match):
+            names.extend(source_names)
+    return names
+
+
+def _log_delivery_finding(
+    resource_label: str,
+    arn_match: str,
+    arn_sources: Dict[str, List[str]],
+    delivered_source_names: Set[str],
+) -> Dict[str, Any]:
+    """Build one AC-19 finding for a gateway or memory resource."""
+    source_names = _delivery_source_names_for(arn_match, arn_sources)
+    delivered = sorted(name for name in source_names if name in delivered_source_names)
+
+    if delivered:
+        return create_finding(
+            check_id="AC-19",
+            finding_name="AgentCore Log Delivery Configuration",
+            finding_details=(
+                f"{resource_label} delivers application logs through delivery "
+                f"source {', '.join(delivered)}."
+            ),
+            resolution=(
+                "No action required. Confirm the delivery destination retention "
+                "and encryption meet the workload's requirements."
+            ),
+            reference=AGENTCORE_OBSERVABILITY_CONFIGURE_REFERENCE_URL,
+            severity=SeverityEnum.MEDIUM,
+            status=StatusEnum.PASSED,
+        )
+
+    if source_names:
+        return create_finding(
+            check_id="AC-19",
+            finding_name="AgentCore Log Delivery Configuration",
+            finding_details=(
+                f"{resource_label} has delivery source "
+                f"{', '.join(sorted(source_names))} but no delivery to a "
+                "destination, so its application logs are not stored anywhere."
+            ),
+            resolution=(
+                "Create a CloudWatch Logs delivery joining this delivery source "
+                "to a log group, S3 bucket, or Firehose destination."
+            ),
+            reference=AGENTCORE_OBSERVABILITY_CONFIGURE_REFERENCE_URL,
+            severity=SeverityEnum.MEDIUM,
+            status=StatusEnum.FAILED,
+        )
+
+    return create_finding(
+        check_id="AC-19",
+        finding_name="AgentCore Log Delivery Configuration",
+        finding_details=(
+            f"{resource_label} has no bedrock-agentcore "
+            f"{AGENTCORE_VENDED_LOG_TYPE} delivery source, so its application "
+            "logs are not collected."
+        ),
+        resolution=(
+            "Enable observability for this resource and configure a delivery "
+            "source and delivery for its application logs."
+        ),
+        reference=AGENTCORE_OBSERVABILITY_CONFIGURE_REFERENCE_URL,
+        severity=SeverityEnum.MEDIUM,
+        status=StatusEnum.FAILED,
+    )
+
+
+def check_agentcore_log_delivery_configuration() -> List[Dict[str, Any]]:
+    """AC-19: Report application-log delivery per gateway and memory resource.
+
+    Runtime logging is service-managed and needs no delivery configuration, so
+    runtimes are out of scope here; AC-04 covers runtime tracing.
+    """
+    if logs_client is None:
+        return [
+            create_finding(
+                check_id="AC-19",
+                finding_name="AgentCore Log Delivery Configuration",
+                finding_details="CloudWatch Logs client not available in this region.",
+                resolution="No action required unless AgentCore runs in this region.",
+                reference=AGENTCORE_OBSERVABILITY_CONFIGURE_REFERENCE_URL,
+                severity=SeverityEnum.INFORMATIONAL,
+                status=StatusEnum.NA,
+            )
+        ]
+
+    try:
+        arn_sources, delivered_source_names = _agentcore_delivery_configuration()
+    except Exception as error:
+        return [
+            create_finding(
+                check_id="AC-19",
+                finding_name="AgentCore Log Delivery Configuration",
+                finding_details=(
+                    "Could not read CloudWatch Logs delivery configuration: "
+                    f"{type(error).__name__}."
+                ),
+                resolution=(
+                    "Grant logs:DescribeDeliverySources and logs:DescribeDeliveries "
+                    "and retry."
+                ),
+                reference=AGENTCORE_OBSERVABILITY_CONFIGURE_REFERENCE_URL,
+                severity=SeverityEnum.INFORMATIONAL,
+                status=StatusEnum.NA,
+            )
+        ]
+
+    findings = []
+
+    try:
+        gateways = _agentcore_list_all("list_gateways", ["items", "gateways"])
+    except Exception as error:
+        gateways = []
+        findings.append(
+            create_finding(
+                check_id="AC-19",
+                finding_name="AgentCore Log Delivery Configuration",
+                finding_details=(
+                    f"Gateways could not be listed: {type(error).__name__}."
+                ),
+                resolution="Grant bedrock-agentcore:ListGateways and retry.",
+                reference=AGENTCORE_OBSERVABILITY_CONFIGURE_REFERENCE_URL,
+                severity=SeverityEnum.INFORMATIONAL,
+                status=StatusEnum.NA,
+            )
+        )
+
+    for gateway in gateways:
+        gateway_id = gateway.get("gatewayId")
+        if not gateway_id:
+            continue
+        gateway_name = gateway.get("name", gateway_id)
+        findings.append(
+            _log_delivery_finding(
+                f"Gateway '{gateway_name}' ({gateway_id})",
+                f":gateway/{gateway_id}",
+                arn_sources,
+                delivered_source_names,
+            )
+        )
+
+    try:
+        memories = _agentcore_list_all("list_memories", ["memories"])
+    except Exception as error:
+        memories = []
+        findings.append(
+            create_finding(
+                check_id="AC-19",
+                finding_name="AgentCore Log Delivery Configuration",
+                finding_details=(
+                    f"Memory resources could not be listed: {type(error).__name__}."
+                ),
+                resolution="Grant bedrock-agentcore:ListMemories and retry.",
+                reference=AGENTCORE_OBSERVABILITY_CONFIGURE_REFERENCE_URL,
+                severity=SeverityEnum.INFORMATIONAL,
+                status=StatusEnum.NA,
+            )
+        )
+
+    for memory in memories:
+        memory_arn = memory.get("arn")
+        if not memory_arn:
+            continue
+        memory_id = memory.get("id", memory_arn)
+        findings.append(
+            _log_delivery_finding(
+                f"Memory '{memory_id}'",
+                memory_arn,
+                arn_sources,
+                delivered_source_names,
+            )
+        )
+
+    if not findings:
+        findings.append(
+            create_finding(
+                check_id="AC-19",
+                finding_name="AgentCore Log Delivery Configuration",
+                finding_details=(
+                    "No AgentCore gateway or memory resources found in this region."
+                ),
+                resolution="No action required.",
+                reference=AGENTCORE_OBSERVABILITY_CONFIGURE_REFERENCE_URL,
+                severity=SeverityEnum.INFORMATIONAL,
+                status=StatusEnum.NA,
+            )
+        )
+
+    # AWS documents a configurable log destination for memory, gateway and
+    # built-in tool resources only. Runtime logging is service-managed,
+    # WorkloadIdentity log delivery is configured on the associated runtime or
+    # gateway resource, and policy engines have no log-destination surface. A
+    # built-in tool emits no service logs at all, so whether a missing delivery
+    # loses anything depends on the workload writing its own logs.
+    findings.append(
+        create_finding(
+            check_id="AC-19",
+            finding_name="AgentCore Log Delivery Configuration",
+            finding_details=(
+                "Built-in tool log delivery is not assessed: AgentCore provides "
+                "no tool logs by default, so a missing delivery only loses data "
+                "when the workload writes its own logs. Identity log delivery is "
+                "configured on the associated runtime or gateway resource, and "
+                "policy engines have no log-destination configuration."
+            ),
+            resolution=(
+                "Where a built-in tool writes its own logs, add a CloudWatch "
+                "Logs, Amazon S3 or Firehose destination for that tool in the "
+                "AgentCore console."
+            ),
+            reference=AGENTCORE_OBSERVABILITY_CONFIGURE_REFERENCE_URL,
+            severity=SeverityEnum.INFORMATIONAL,
+            status=StatusEnum.NA,
+        )
+    )
+
+    return findings
+
+
+def _masking_data_identifiers(policy_document: Any) -> List[str]:
+    """Collect data identifiers a Logs policy actually de-identifies.
+
+    An Audit-only statement records that sensitive data was found and masks
+    nothing, so only Deidentify statements answer whether the data is masked.
+    """
+    if isinstance(policy_document, str):
+        try:
+            policy_document = json.loads(policy_document)
+        except (TypeError, ValueError):
+            return []
+    if not isinstance(policy_document, dict):
+        return []
+
+    statements = policy_document.get("Statement")
+    if isinstance(statements, dict):
+        statements = [statements]
+    if not isinstance(statements, list):
+        return []
+
+    identifiers: List[str] = []
+    for statement in statements:
+        if not isinstance(statement, dict):
+            continue
+        operation = statement.get("Operation")
+        if not isinstance(operation, dict) or "Deidentify" not in operation:
+            continue
+        entries = statement.get("DataIdentifier")
+        if isinstance(entries, str):
+            entries = [entries]
+        if isinstance(entries, list):
+            identifiers.extend(entry for entry in entries if isinstance(entry, str))
+
+    return identifiers
+
+
+def _account_masking_data_identifiers() -> List[str]:
+    """Data identifiers masked by an account-wide data-protection policy."""
+    policies = _paginate_aws_list(
+        logs_client,
+        "describe_account_policies",
+        "accountPolicies",
+        policyType="DATA_PROTECTION_POLICY",
+    )
+
+    identifiers: List[str] = []
+    for policy in policies:
+        identifiers.extend(_masking_data_identifiers(policy.get("policyDocument")))
+    return identifiers
+
+
+def _agentcore_log_groups() -> List[Dict[str, Any]]:
+    """List the log groups AgentCore writes to, across both name prefixes."""
+    log_groups: List[Dict[str, Any]] = []
+    for prefix in AGENTCORE_LOG_GROUP_PREFIXES:
+        log_groups.extend(
+            _paginate_aws_list(
+                logs_client,
+                "describe_log_groups",
+                "logGroups",
+                logGroupNamePrefix=prefix,
+            )
+        )
+    return log_groups
+
+
+def check_agentcore_log_group_data_protection() -> List[Dict[str, Any]]:
+    """AC-20: Report masking and CMK encryption on AgentCore log groups.
+
+    Agent prompts, tool arguments and memory records reach these log groups
+    verbatim, so a guardrail at the model boundary does not cover them.
+    """
+    if logs_client is None:
+        return [
+            create_finding(
+                check_id="AC-20",
+                finding_name="AgentCore Log Data Protection",
+                finding_details="CloudWatch Logs client not available in this region.",
+                resolution="No action required unless AgentCore runs in this region.",
+                reference=LOGS_DATA_PROTECTION_REFERENCE_URL,
+                severity=SeverityEnum.INFORMATIONAL,
+                status=StatusEnum.NA,
+            )
+        ]
+
+    try:
+        account_identifiers = _account_masking_data_identifiers()
+    except Exception as error:
+        return [
+            create_finding(
+                check_id="AC-20",
+                finding_name="AgentCore Log Data Protection",
+                finding_details=(
+                    "Could not read account data-protection policies: "
+                    f"{type(error).__name__}."
+                ),
+                resolution="Grant logs:DescribeAccountPolicies and retry.",
+                reference=LOGS_DATA_PROTECTION_REFERENCE_URL,
+                severity=SeverityEnum.INFORMATIONAL,
+                status=StatusEnum.NA,
+            )
+        ]
+
+    try:
+        log_groups = _agentcore_log_groups()
+    except Exception as error:
+        return [
+            create_finding(
+                check_id="AC-20",
+                finding_name="AgentCore Log Data Protection",
+                finding_details=(
+                    f"Could not list AgentCore log groups: {type(error).__name__}."
+                ),
+                resolution="Grant logs:DescribeLogGroups and retry.",
+                reference=LOGS_DATA_PROTECTION_REFERENCE_URL,
+                severity=SeverityEnum.INFORMATIONAL,
+                status=StatusEnum.NA,
+            )
+        ]
+
+    if not log_groups:
+        return [
+            create_finding(
+                check_id="AC-20",
+                finding_name="AgentCore Log Data Protection",
+                finding_details="No AgentCore log groups found in this region.",
+                resolution="No action required.",
+                reference=LOGS_DATA_PROTECTION_REFERENCE_URL,
+                severity=SeverityEnum.INFORMATIONAL,
+                status=StatusEnum.NA,
+            )
+        ]
+
+    findings = []
+    for log_group in log_groups:
+        log_group_name = log_group.get("logGroupName")
+        if not log_group_name:
+            continue
+
+        has_cmk = bool(log_group.get("kmsKeyId"))
+        identifiers = list(account_identifiers)
+        masking_scope = "account-wide"
+
+        if not identifiers and log_group.get("dataProtectionStatus") == "ACTIVATED":
+            # describe_log_groups reports that a policy is attached but not what
+            # it masks, so the document is read only for groups that have one.
+            try:
+                document = logs_client.get_data_protection_policy(
+                    logGroupIdentifier=log_group_name
+                ).get("policyDocument")
+                identifiers = _masking_data_identifiers(document)
+                masking_scope = "log-group"
+            except Exception as error:
+                findings.append(
+                    create_finding(
+                        check_id="AC-20",
+                        finding_name="AgentCore Log Data Protection",
+                        finding_details=(
+                            f"Log group '{log_group_name}' has a data-protection "
+                            "policy whose document could not be read: "
+                            f"{type(error).__name__}."
+                        ),
+                        resolution="Grant logs:GetDataProtectionPolicy and retry.",
+                        reference=LOGS_DATA_PROTECTION_REFERENCE_URL,
+                        severity=SeverityEnum.INFORMATIONAL,
+                        status=StatusEnum.NA,
+                    )
+                )
+                continue
+
+        if identifiers and has_cmk:
+            findings.append(
+                create_finding(
+                    check_id="AC-20",
+                    finding_name="AgentCore Log Data Protection",
+                    finding_details=(
+                        f"Log group '{log_group_name}' masks "
+                        f"{len(set(identifiers))} data identifier(s) through a "
+                        f"{masking_scope} data-protection policy and is encrypted "
+                        "with a customer managed key."
+                    ),
+                    resolution=(
+                        "No action required. Confirm the data identifiers cover "
+                        "the sensitive data this workload logs."
+                    ),
+                    reference=LOGS_DATA_PROTECTION_REFERENCE_URL,
+                    severity=SeverityEnum.MEDIUM,
+                    status=StatusEnum.PASSED,
+                )
+            )
+            continue
+
+        missing = []
+        if not identifiers:
+            missing.append("no data-protection policy that de-identifies log events")
+        if not has_cmk:
+            missing.append("no customer managed encryption key")
+
+        findings.append(
+            create_finding(
+                check_id="AC-20",
+                finding_name="AgentCore Log Data Protection",
+                finding_details=(
+                    f"Log group '{log_group_name}' has {' and '.join(missing)}."
+                ),
+                resolution=(
+                    "Attach a data-protection policy with a Deidentify operation "
+                    "covering the sensitive data identifiers this workload logs, "
+                    "and set a customer managed KMS key on the log group."
+                ),
+                reference=LOGS_DATA_PROTECTION_REFERENCE_URL,
+                severity=SeverityEnum.MEDIUM,
+                status=StatusEnum.FAILED,
+            )
+        )
+
+    return findings
+
+
+def _principals_granting_logs_unmask(
+    permissions_by_name: Dict[str, Any],
+    principal_kind: str,
+) -> Tuple[List[str], List[str]]:
+    """Split principals holding logs:Unmask into unscoped and scoped grants.
+
+    Only an action in the ``logs`` namespace counts. A bare ``Action: "*"`` is a
+    service-agnostic administrator grant, so counting it here would fail every
+    account that has an administrator role; AC-21 reports the grants that name
+    the logs namespace and leaves administrator scope to the IAM checks.
+    """
+    unscoped: List[str] = []
+    scoped: List[str] = []
+
+    for principal_name, permissions in permissions_by_name.items():
+        if not isinstance(permissions, dict):
+            continue
+        label = f"{principal_kind} {principal_name}"
+        attached_policies = permissions.get("attached_policies", [])
+        inline_policies = permissions.get("inline_policies", [])
+        if not isinstance(attached_policies, list):
+            attached_policies = []
+        if not isinstance(inline_policies, list):
+            inline_policies = []
+
+        holds_unmask = False
+        holds_unscoped_unmask = False
+
+        for policy in [*attached_policies, *inline_policies]:
+            try:
+                for statement in _allow_statements(policy):
+                    grants_unmask = False
+                    for action in _statement_actions(statement):
+                        action_parts = action.split(":", 1)
+                        if len(action_parts) != 2:
+                            continue
+                        service_namespace, action_pattern = action_parts
+                        if service_namespace == "logs" and fnmatchcase(
+                            "unmask", action_pattern
+                        ):
+                            grants_unmask = True
+                            break
+                    if not grants_unmask:
+                        continue
+                    holds_unmask = True
+                    if "*" in _statement_resources(statement):
+                        holds_unscoped_unmask = True
+            except Exception as error:
+                logger.warning(f"Error parsing policy for {label}: {error}")
+
+        if holds_unscoped_unmask:
+            unscoped.append(label)
+        elif holds_unmask:
+            scoped.append(label)
+
+    return unscoped, scoped
+
+
+def check_agentcore_log_unmask_restriction(
+    permission_cache: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    """AC-21: Report who can read masked values back out of AgentCore logs.
+
+    Masking a log group is reversible by any principal holding logs:Unmask, so
+    the masking control is only as strong as the scope of that grant.
+    """
+    findings = []
+
+    try:
+        role_permissions = permission_cache.get("role_permissions", {})
+        user_permissions = permission_cache.get("user_permissions", {})
+
+        if not role_permissions and not user_permissions:
+            return [
+                create_finding(
+                    check_id="AC-21",
+                    finding_name="AgentCore Log Unmask Restriction",
+                    finding_details="No IAM permissions found in cache.",
+                    resolution="No action required.",
+                    reference=LOGS_DATA_PROTECTION_REFERENCE_URL,
+                    severity=SeverityEnum.INFORMATIONAL,
+                    status=StatusEnum.NA,
+                    region=GLOBAL_REGION_LABEL,
+                )
+            ]
+
+        unscoped_roles, scoped_roles = _principals_granting_logs_unmask(
+            role_permissions, "role"
+        )
+        unscoped_users, scoped_users = _principals_granting_logs_unmask(
+            user_permissions, "user"
+        )
+        unscoped = sorted(unscoped_roles + unscoped_users)
+        scoped = sorted(scoped_roles + scoped_users)
+
+        if unscoped:
+            findings.append(
+                create_finding(
+                    check_id="AC-21",
+                    finding_name="AgentCore Log Unmask Restriction",
+                    finding_details=(
+                        "The following principals can unmask any log group's "
+                        f"masked values: {', '.join(unscoped)}."
+                    ),
+                    resolution=(
+                        "Scope logs:Unmask to the log groups whose masked values "
+                        "the principal is authorized to read, and remove it from "
+                        "principals that do not investigate log content."
+                    ),
+                    reference=LOGS_DATA_PROTECTION_REFERENCE_URL,
+                    severity=SeverityEnum.MEDIUM,
+                    status=StatusEnum.FAILED,
+                    region=GLOBAL_REGION_LABEL,
+                )
+            )
+
+        if scoped:
+            findings.append(
+                create_finding(
+                    check_id="AC-21",
+                    finding_name="AgentCore Log Unmask Restriction",
+                    finding_details=(
+                        "The following principals hold logs:Unmask only on named "
+                        f"log group resources: {', '.join(scoped)}."
+                    ),
+                    resolution=(
+                        "No action required. Confirm the named log groups are the "
+                        "ones this principal is authorized to unmask."
+                    ),
+                    reference=LOGS_DATA_PROTECTION_REFERENCE_URL,
+                    severity=SeverityEnum.MEDIUM,
+                    status=StatusEnum.PASSED,
+                    region=GLOBAL_REGION_LABEL,
+                )
+            )
+
+        if not unscoped and not scoped:
+            findings.append(
+                create_finding(
+                    check_id="AC-21",
+                    finding_name="AgentCore Log Unmask Restriction",
+                    finding_details=(
+                        "No cached IAM role or user grants logs:Unmask, so masked "
+                        "log values cannot be read back through IAM policy."
+                    ),
+                    resolution="No action required.",
+                    reference=LOGS_DATA_PROTECTION_REFERENCE_URL,
+                    severity=SeverityEnum.MEDIUM,
+                    status=StatusEnum.PASSED,
+                    region=GLOBAL_REGION_LABEL,
+                )
+            )
+
+    except Exception as error:
+        logger.error(f"Error in log unmask restriction check: {error}")
+        findings.append(
+            _incomplete_check_finding(
+                check_id="AC-21",
+                finding_name="AgentCore Log Unmask Restriction",
+                error=error,
+                reference=LOGS_DATA_PROTECTION_REFERENCE_URL,
+                region=GLOBAL_REGION_LABEL,
+            )
+        )
+
+    return findings
+
+
+def _sink_statement_principals(statement: Dict[str, Any]) -> List[str]:
+    """Return the principal values of one resource-policy statement."""
+    principals = statement.get("Principal")
+    if isinstance(principals, str):
+        return [principals]
+    if isinstance(principals, list):
+        return [value for value in principals if isinstance(value, str)]
+    if isinstance(principals, dict):
+        values: List[str] = []
+        for entry in principals.values():
+            if isinstance(entry, str):
+                values.append(entry)
+            elif isinstance(entry, list):
+                values.extend(value for value in entry if isinstance(value, str))
+        return values
+    return []
+
+
+def _sink_statement_is_scoped(statement: Dict[str, Any]) -> bool:
+    """Return whether one sink-policy statement binds the sink to known callers."""
+    principals = _sink_statement_principals(statement)
+    if principals and "*" not in principals:
+        return True
+
+    conditions = statement.get("Condition")
+    if not isinstance(conditions, dict):
+        return False
+
+    for condition_values in conditions.values():
+        if not isinstance(condition_values, dict):
+            continue
+        for condition_key in condition_values:
+            if str(condition_key).lower() in SINK_PRINCIPAL_SCOPE_CONDITION_KEYS:
+                return True
+
+    return False
+
+
+def check_agentcore_telemetry_sink_scope() -> List[Dict[str, Any]]:
+    """AC-22: Report whether each observability sink is scoped to known callers.
+
+    A sink accepting a link from any account turns centralized agent telemetry
+    into a cross-account write path an unrelated account can join.
+    """
+    if oam_client is None:
+        return [
+            create_finding(
+                check_id="AC-22",
+                finding_name="AgentCore Telemetry Sink Scope",
+                finding_details=(
+                    "CloudWatch Observability Access Manager client not available "
+                    "in this region."
+                ),
+                resolution="No action required unless telemetry is aggregated here.",
+                reference=OAM_CROSS_ACCOUNT_REFERENCE_URL,
+                severity=SeverityEnum.INFORMATIONAL,
+                status=StatusEnum.NA,
+            )
+        ]
+
+    try:
+        sinks = _paginate_aws_list(
+            oam_client,
+            "list_sinks",
+            "Items",
+            token_request_key="NextToken",
+            token_response_key="NextToken",
+        )
+    except Exception as error:
+        return [
+            create_finding(
+                check_id="AC-22",
+                finding_name="AgentCore Telemetry Sink Scope",
+                finding_details=(
+                    f"Could not list observability sinks: {type(error).__name__}."
+                ),
+                resolution="Grant oam:ListSinks and retry.",
+                reference=OAM_CROSS_ACCOUNT_REFERENCE_URL,
+                severity=SeverityEnum.INFORMATIONAL,
+                status=StatusEnum.NA,
+            )
+        ]
+
+    if not sinks:
+        return [
+            create_finding(
+                check_id="AC-22",
+                finding_name="AgentCore Telemetry Sink Scope",
+                finding_details=(
+                    "No observability sink found in this region, so no telemetry "
+                    "is aggregated into this account."
+                ),
+                resolution=(
+                    "No action required for a single-account deployment. Create a "
+                    "sink in the monitoring account for a multi-account one."
+                ),
+                reference=OAM_CROSS_ACCOUNT_REFERENCE_URL,
+                severity=SeverityEnum.INFORMATIONAL,
+                status=StatusEnum.NA,
+            )
+        ]
+
+    findings = []
+    for sink in sinks:
+        sink_arn = sink.get("Arn")
+        if not sink_arn:
+            continue
+        sink_name = sink.get("Name", sink_arn)
+
+        try:
+            policy_text = oam_client.get_sink_policy(SinkIdentifier=sink_arn).get(
+                "Policy"
+            )
+        except ClientError as error:
+            if error.response.get("Error", {}).get("Code") in {
+                "ResourceNotFoundException",
+                "MissingRequiredParameterException",
+            }:
+                policy_text = None
+            else:
+                findings.append(
+                    create_finding(
+                        check_id="AC-22",
+                        finding_name="AgentCore Telemetry Sink Scope",
+                        finding_details=(
+                            f"Sink '{sink_name}' policy could not be read: "
+                            f"{type(error).__name__}."
+                        ),
+                        resolution="Grant oam:GetSinkPolicy and retry.",
+                        reference=OAM_CROSS_ACCOUNT_REFERENCE_URL,
+                        severity=SeverityEnum.INFORMATIONAL,
+                        status=StatusEnum.NA,
+                    )
+                )
+                continue
+        except Exception as error:
+            findings.append(
+                create_finding(
+                    check_id="AC-22",
+                    finding_name="AgentCore Telemetry Sink Scope",
+                    finding_details=(
+                        f"Sink '{sink_name}' policy could not be read: "
+                        f"{type(error).__name__}."
+                    ),
+                    resolution="Grant oam:GetSinkPolicy and retry.",
+                    reference=OAM_CROSS_ACCOUNT_REFERENCE_URL,
+                    severity=SeverityEnum.INFORMATIONAL,
+                    status=StatusEnum.NA,
+                )
+            )
+            continue
+
+        if not policy_text:
+            # With no policy attached the sink accepts no link at all, so nothing
+            # is shared into it and an unscoped-sharing verdict would be wrong.
+            findings.append(
+                create_finding(
+                    check_id="AC-22",
+                    finding_name="AgentCore Telemetry Sink Scope",
+                    finding_details=(
+                        f"Sink '{sink_name}' has no policy attached, so no source "
+                        "account can link to it."
+                    ),
+                    resolution=(
+                        "No action required unless source accounts are expected to "
+                        "share telemetry into this sink."
+                    ),
+                    reference=OAM_CROSS_ACCOUNT_REFERENCE_URL,
+                    severity=SeverityEnum.INFORMATIONAL,
+                    status=StatusEnum.NA,
+                )
+            )
+            continue
+
+        try:
+            policy_document = json.loads(policy_text)
+        except (TypeError, ValueError) as error:
+            findings.append(
+                create_finding(
+                    check_id="AC-22",
+                    finding_name="AgentCore Telemetry Sink Scope",
+                    finding_details=(
+                        f"Sink '{sink_name}' policy is not valid JSON: "
+                        f"{type(error).__name__}."
+                    ),
+                    resolution="Review the sink policy document.",
+                    reference=OAM_CROSS_ACCOUNT_REFERENCE_URL,
+                    severity=SeverityEnum.INFORMATIONAL,
+                    status=StatusEnum.NA,
+                )
+            )
+            continue
+
+        statements = policy_document.get("Statement")
+        if isinstance(statements, dict):
+            statements = [statements]
+        if not isinstance(statements, list):
+            statements = []
+
+        allow_statements = [
+            statement
+            for statement in statements
+            if isinstance(statement, dict) and statement.get("Effect") == "Allow"
+        ]
+        unscoped_count = sum(
+            1
+            for statement in allow_statements
+            if not _sink_statement_is_scoped(statement)
+        )
+
+        if allow_statements and not unscoped_count:
+            findings.append(
+                create_finding(
+                    check_id="AC-22",
+                    finding_name="AgentCore Telemetry Sink Scope",
+                    finding_details=(
+                        f"Sink '{sink_name}' restricts every Allow statement to "
+                        "named principals or to an organization condition key."
+                    ),
+                    resolution=(
+                        "No action required. Confirm the organization or account "
+                        "list matches the accounts that run agents."
+                    ),
+                    reference=OAM_CROSS_ACCOUNT_REFERENCE_URL,
+                    severity=SeverityEnum.MEDIUM,
+                    status=StatusEnum.PASSED,
+                )
+            )
+            continue
+
+        findings.append(
+            create_finding(
+                check_id="AC-22",
+                finding_name="AgentCore Telemetry Sink Scope",
+                finding_details=(
+                    f"Sink '{sink_name}' has {unscoped_count} Allow statement(s) "
+                    "that name no principal and carry no organization condition, "
+                    "so any account can link telemetry into it."
+                    if unscoped_count
+                    else f"Sink '{sink_name}' policy contains no Allow statement "
+                    "binding it to a known set of principals."
+                ),
+                resolution=(
+                    "Add an aws:PrincipalOrgID or aws:PrincipalOrgPaths condition "
+                    "to each Allow statement, or name the source accounts "
+                    "explicitly in the Principal element."
+                ),
+                reference=OAM_CROSS_ACCOUNT_REFERENCE_URL,
+                severity=SeverityEnum.MEDIUM,
+                status=StatusEnum.FAILED,
+            )
+        )
+
+    return findings
+
+
 def check_agentcore_gateway_agentic_security() -> List[Dict[str, Any]]:
     """
     Check API-provable AgentCore Gateway controls for agentic tool execution.
@@ -3805,7 +5088,7 @@ def lambda_handler(event, context):
         Response with status and S3 URL
     """
     global start_time, iam_client, ec2_client, ecr_client, logs_client
-    global cloudwatch_client, agentcore_client
+    global cloudwatch_client, cloudtrail_client, oam_client, agentcore_client
     start_time = time.time()
 
     try:
@@ -3825,6 +5108,10 @@ def lambda_handler(event, context):
         cloudwatch_client = boto3.client(
             "cloudwatch", config=boto3_config, region_name=region
         )
+        cloudtrail_client = boto3.client(
+            "cloudtrail", config=boto3_config, region_name=region
+        )
+        oam_client = boto3.client("oam", config=boto3_config, region_name=region)
 
         # Collect all findings
         all_findings = []
@@ -3850,6 +5137,7 @@ def lambda_handler(event, context):
                 for check_id, finding_name in (
                     ("AC-02", "AgentCore IAM Full Access Check"),
                     ("AC-03", "AgentCore Stale Access Check"),
+                    ("AC-21", "AgentCore Log Unmask Restriction"),
                 ):
                     all_findings.append(
                         create_finding(
@@ -3889,6 +5177,15 @@ def lambda_handler(event, context):
                         ["AC-03"],
                         "Stale Access",
                         lambda: check_stale_agentcore_access(permission_cache),
+                    ),
+                    # AC-21 reads the same global IAM cache: who can unmask a
+                    # masked log value is identical in every scanned region.
+                    (
+                        ["AC-21"],
+                        "Log Unmask Restriction",
+                        lambda: check_agentcore_log_unmask_restriction(
+                            permission_cache
+                        ),
                     ),
                     # AC-09 inspects a global IAM service-linked role, so it is also
                     # run once on the primary region rather than per scanned region.
@@ -4108,6 +5405,26 @@ def lambda_handler(event, context):
                 ["AC-17"],
                 "Online Evaluation Coverage",
                 check_agentcore_online_evaluation_coverage,
+            ),
+            (
+                ["AC-18"],
+                "CloudTrail Data Event Coverage",
+                check_agentcore_cloudtrail_data_events,
+            ),
+            (
+                ["AC-19"],
+                "Log Delivery Configuration",
+                check_agentcore_log_delivery_configuration,
+            ),
+            (
+                ["AC-20"],
+                "Log Data Protection",
+                check_agentcore_log_group_data_protection,
+            ),
+            (
+                ["AC-22"],
+                "Telemetry Sink Scope",
+                check_agentcore_telemetry_sink_scope,
             ),
             (
                 ["AG-24", "AG-25", "AG-26", "AG-27"],

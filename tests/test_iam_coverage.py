@@ -580,10 +580,34 @@ _VERIFIED_REMEDIATION_IAM_ACTIONS = {
 # AWS Knowledge like the block above.
 _VERIFIED_REMEDIATION_IAM_ACTIONS |= {"s3vectors:PutVectorBucketPolicy"}
 
+# Verified on 2026-09-25 with IAM Access Analyzer validate-policy, which is an
+# oracle for both halves: it reports INVALID_ACTION for an action the service
+# does not define and INVALID_GLOBAL_CONDITION_KEY for an unknown condition key.
+# The probe policy carried three invented actions
+# (logs:DescribeNotARealThing, oam:GetSinkPolicyDocument,
+# cloudtrail:ListTrailsAndStuff) and one invented condition key
+# (aws:PrincipalOrgIdentifier) as negative controls; all four were reported and
+# every name below was not, so the run discriminates rather than passing
+# everything.
+_VERIFIED_REMEDIATION_IAM_ACTIONS |= {
+    "bedrock-agentcore:ListMemories",
+    "cloudtrail:GetEventSelectors",
+    "cloudtrail:ListTrails",
+    "logs:DescribeDeliveries",
+    "logs:DescribeDeliverySources",
+    "logs:DescribeLogGroups",
+    "logs:Unmask",
+    "oam:GetSinkPolicy",
+    "oam:ListSinks",
+}
+
 _VERIFIED_REMEDIATION_CONDITION_KEYS = {
     "bedrock:GuardrailIdentifier",
     "iam:AWSServiceName",
     "kms:ViaService",
+    # Same Access Analyzer run as the action block above.
+    "aws:PrincipalOrgID",
+    "aws:PrincipalOrgPaths",
 }
 
 _NON_IAM_REMEDIATION_TOKENS = {

@@ -1,32 +1,26 @@
 {
-  "generated": "2026-09-24",
+  "generated": "2026-09-25",
   "generator": "aisf-parity/build_ledger.py",
   "aisf_repo": "/Users/tamg/WorkDocs/Builder/aws-ai-security-framework-assessment",
   "summary": {
     "hosted": 67,
     "fnd_ai_subject": 11,
     "total": 78,
-    "covered": 8,
+    "covered": 13,
     "tighten": 28,
     "tighten_extend": 22,
     "tighten_new_id": 6,
-    "new": 27,
+    "new": 22,
     "not_implementable": 4,
     "unassessed": 11,
-    "new_check_functions": 44,
+    "new_check_functions": 39,
     "extensions": 22,
     "extra_iam_actions": [
-      "cloudtrail:GetEventSelectors",
-      "cloudtrail:ListTrails",
       "config:DescribeConfigRules",
       "config:DescribeConfigurationRecorders",
       "ec2:DescribeSecurityGroups",
-      "logs:DescribeAccountPolicies",
-      "logs:GetDataProtectionPolicy",
       "macie2:GetAutomatedDiscoveryConfiguration",
       "macie2:GetMacieSession",
-      "oam:GetSinkPolicy",
-      "oam:ListSinks",
       "organizations:DescribeEffectivePolicy",
       "organizations:DescribePolicy",
       "organizations:ListPolicies",
@@ -1279,18 +1273,19 @@
       "question": "Are session-level memory operations (record reads/writes, extraction jobs) captured in an audit trail, not just management events?",
       "assert": "CloudTrail data-event selector covering Memory Events + Records",
       "workload_agnostic": true,
-      "verdict": "new",
+      "verdict": "covered",
       "disposition": null,
       "target_modules": [
         "agentcore_assessments"
       ],
-      "incumbents": [],
-      "incumbent_names": [],
-      "gap": "CloudTrail event selectors; reads no AgentCore API",
-      "extra_iam": [
-        "cloudtrail:GetEventSelectors",
-        "cloudtrail:ListTrails"
+      "incumbents": [
+        "AC-18"
       ],
+      "incumbent_names": [
+        "AgentCore CloudTrail Data Event Coverage"
+      ],
+      "gap": "AC-18 asserts that a CloudTrail advanced event selector logs data events for AWS::BedrockAgentCore::Memory whenever the region holds a memory resource",
+      "extra_iam": [],
       "phase": 4,
       "source": "controls/ai-specific/agentcore-memory.yaml"
     },
@@ -1300,18 +1295,19 @@
       "question": "Are CloudTrail data events enabled for AgentCore Runtime, Memory, and tool invocations, not just management events?",
       "assert": "CloudTrail advanced event selector covering AgentCore Runtime/Memory/Tools data events",
       "workload_agnostic": true,
-      "verdict": "new",
+      "verdict": "covered",
       "disposition": null,
       "target_modules": [
         "agentcore_assessments"
       ],
-      "incumbents": [],
-      "incumbent_names": [],
-      "gap": "CloudTrail event selectors; reads no AgentCore API",
-      "extra_iam": [
-        "cloudtrail:GetEventSelectors",
-        "cloudtrail:ListTrails"
+      "incumbents": [
+        "AC-18"
       ],
+      "incumbent_names": [
+        "AgentCore CloudTrail Data Event Coverage"
+      ],
+      "gap": "AC-18 asserts data-event coverage per resource family, so a trail that logs only the runtime types still fails for memory and for the built-in tools",
+      "extra_iam": [],
       "phase": 4,
       "source": "controls/ai-specific/agentcore-observability.yaml"
     },
@@ -1321,14 +1317,18 @@
       "question": "Is observability explicitly enabled and its log destination configured for each AgentCore service in use, not just Runtime?",
       "assert": "Per-service observability + log-destination configuration (Gateway/Memory/Policy/Identity)",
       "workload_agnostic": true,
-      "verdict": "new",
+      "verdict": "covered",
       "disposition": null,
       "target_modules": [
         "agentcore_assessments"
       ],
-      "incumbents": [],
-      "incumbent_names": [],
-      "gap": "AC-04 is X-Ray tracingConfig.enabled over list_agent_runtimes only, so it cannot cover Gateway, Memory, Policy or Identity, which is OBS-03's whole subject; this row was a tightening in an earlier draft and the resource-scope check moved it",
+      "incumbents": [
+        "AC-19"
+      ],
+      "incumbent_names": [
+        "AgentCore Log Delivery Configuration"
+      ],
+      "gap": "AC-04 is X-Ray tracingConfig.enabled over list_agent_runtimes only, so it cannot cover Gateway, Memory, Policy or Identity, which is OBS-03's whole subject. AC-19 asserts an APPLICATION_LOGS delivery source wired to a destination per gateway and per memory; runtime logging is service-managed, WorkloadIdentity delivery is configured on the associated runtime or gateway resource, and policy engines have no log-destination surface, so those three legs need no separate assertion",
       "extra_iam": [],
       "phase": 4,
       "source": "controls/ai-specific/agentcore-observability.yaml"
@@ -1339,18 +1339,21 @@
       "question": "Is sensitive data (PII/PHI) that agents write to their own logs masked, and are those log groups encrypted and access-restricted, not just filtered at the model boundary?",
       "assert": "CloudWatch Logs data-protection policy + CMK log encryption + logs:Unmask restriction",
       "workload_agnostic": true,
-      "verdict": "new",
+      "verdict": "covered",
       "disposition": null,
       "target_modules": [
         "agentcore_assessments"
       ],
-      "incumbents": [],
-      "incumbent_names": [],
-      "gap": "CloudWatch Logs data-protection policy",
-      "extra_iam": [
-        "logs:GetDataProtectionPolicy",
-        "logs:DescribeAccountPolicies"
+      "incumbents": [
+        "AC-20",
+        "AC-21"
       ],
+      "incumbent_names": [
+        "AgentCore Log Data Protection",
+        "AgentCore Log Unmask Restriction"
+      ],
+      "gap": "AC-20 asserts a Deidentify data-protection policy and a customer managed key on the AgentCore log groups, AC-21 asserts that no cached role or user holds logs:Unmask on every resource",
+      "extra_iam": [],
       "phase": 4,
       "source": "controls/ai-specific/agentcore-observability.yaml"
     },
@@ -1360,18 +1363,19 @@
       "question": "For multi-account agent deployments, is telemetry aggregated into a central monitoring account with the cross-account sharing link scoped to your organization?",
       "assert": "OAM sink policy scoped by aws:PrincipalOrgID + least-privilege cross-account view",
       "workload_agnostic": true,
-      "verdict": "new",
+      "verdict": "covered",
       "disposition": null,
       "target_modules": [
         "agentcore_assessments"
       ],
-      "incumbents": [],
-      "incumbent_names": [],
-      "gap": "OAM sink policy",
-      "extra_iam": [
-        "oam:ListSinks",
-        "oam:GetSinkPolicy"
+      "incumbents": [
+        "AC-22"
       ],
+      "incumbent_names": [
+        "AgentCore Telemetry Sink Scope"
+      ],
+      "gap": "AC-22 asserts that every Allow statement on an OAM sink policy either names its principals or carries an organization condition key",
+      "extra_iam": [],
       "phase": 4,
       "source": "controls/ai-specific/agentcore-observability.yaml"
     },

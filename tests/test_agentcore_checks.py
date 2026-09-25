@@ -2383,3 +2383,1061 @@ class TestProposedAgentCoreChecks:
 
 
 # ===================================================================
+# AC-18: check_agentcore_cloudtrail_data_events
+# ===================================================================
+def _data_event_selector(*resource_types):
+    """An advanced event selector that logs data events for resource types."""
+    return {
+        "Name": "agentcore",
+        "FieldSelectors": [
+            {"Field": "eventCategory", "Equals": ["Data"]},
+            {"Field": "resources.type", "Equals": list(resource_types)},
+        ],
+    }
+
+
+def _management_selector(*resource_types):
+    """A selector naming resource types without opting into data events."""
+    return {
+        "Name": "management",
+        "FieldSelectors": [
+            {"Field": "eventCategory", "Equals": ["Management"]},
+            {"Field": "resources.type", "Equals": list(resource_types)},
+        ],
+    }
+
+
+def _empty_agentcore_inventory(mock_ac):
+    """Stub every AgentCore list API AC-18 and AC-19 read as returning nothing.
+
+    A MagicMock attribute returns a MagicMock whose .get() is also a MagicMock,
+    which the paginator rejects and reports as an empty page, so an unstubbed
+    list API would silently read as "no resources" instead of failing the test.
+    """
+    mock_ac.list_agent_runtimes.return_value = {"agentRuntimes": []}
+    mock_ac.list_memories.return_value = {"memories": []}
+    mock_ac.list_code_interpreters.return_value = {"codeInterpreterSummaries": []}
+    mock_ac.list_browsers.return_value = {"browserSummaries": []}
+    mock_ac.list_gateways.return_value = {"items": []}
+
+
+def _family_finding(findings, label):
+    """Return the one AC-18 finding for a resource family."""
+    matches = [
+        f for f in findings if f"AgentCore {label} resource" in f["Finding_Details"]
+    ]
+    assert len(matches) == 1, findings
+    return matches[0]
+
+
+class TestAC18CloudTrailDataEvents:
+    """AC-18: CloudTrail data-event coverage per AgentCore resource family."""
+
+    _TRAIL = {
+        "Name": "org-trail",
+        "TrailARN": "arn:aws:cloudtrail:us-east-1:123456789012:trail/org-trail",
+    }
+
+    @patch("agentcore_app.agentcore_client")
+    @patch("agentcore_app.cloudtrail_client")
+    def test_memory_data_events_selected_passes(self, mock_ct, mock_ac):
+        mock_ct.list_trails.return_value = {"Trails": [self._TRAIL]}
+        mock_ct.get_event_selectors.return_value = {
+            "AdvancedEventSelectors": [
+                _data_event_selector("AWS::BedrockAgentCore::Memory")
+            ]
+        }
+        _empty_agentcore_inventory(mock_ac)
+        mock_ac.list_memories.return_value = {"memories": [{"id": "mem-1"}]}
+
+        findings = agentcore_app.check_agentcore_cloudtrail_data_events()
+
+        memory = _family_finding(findings, "Memory")
+        assert memory["Check_ID"] == "AC-18"
+        assert memory["Status"] == "Passed"
+        for finding in findings:
+            assert_finding_schema(finding)
+
+    @patch("agentcore_app.agentcore_client")
+    @patch("agentcore_app.cloudtrail_client")
+    def test_memory_data_events_absent_fails(self, mock_ct, mock_ac):
+        mock_ct.list_trails.return_value = {"Trails": [self._TRAIL]}
+        mock_ct.get_event_selectors.return_value = {
+            "AdvancedEventSelectors": [_data_event_selector("AWS::S3::Object")]
+        }
+        _empty_agentcore_inventory(mock_ac)
+        mock_ac.list_memories.return_value = {"memories": [{"id": "mem-1"}]}
+
+        findings = agentcore_app.check_agentcore_cloudtrail_data_events()
+
+        assert _family_finding(findings, "Memory")["Status"] == "Failed"
+
+    @patch("agentcore_app.agentcore_client")
+    @patch("agentcore_app.cloudtrail_client")
+    def test_management_category_selector_does_not_count(self, mock_ct, mock_ac):
+        mock_ct.list_trails.return_value = {"Trails": [self._TRAIL]}
+        mock_ct.get_event_selectors.return_value = {
+            "AdvancedEventSelectors": [
+                _management_selector("AWS::BedrockAgentCore::Memory")
+            ]
+        }
+        _empty_agentcore_inventory(mock_ac)
+        mock_ac.list_memories.return_value = {"memories": [{"id": "mem-1"}]}
+
+        findings = agentcore_app.check_agentcore_cloudtrail_data_events()
+
+        assert _family_finding(findings, "Memory")["Status"] == "Failed"
+
+    @patch("agentcore_app.agentcore_client")
+    @patch("agentcore_app.cloudtrail_client")
+    def test_each_family_gets_its_own_verdict(self, mock_ct, mock_ac):
+        mock_ct.list_trails.return_value = {"Trails": [self._TRAIL]}
+        mock_ct.get_event_selectors.return_value = {
+            "AdvancedEventSelectors": [
+                _data_event_selector("AWS::BedrockAgentCore::Runtime")
+            ]
+        }
+        _empty_agentcore_inventory(mock_ac)
+        mock_ac.list_agent_runtimes.return_value = {"agentRuntimes": [{"id": "rt-1"}]}
+        mock_ac.list_code_interpreters.return_value = {
+            "codeInterpreterSummaries": [{"codeInterpreterId": "ci-1"}]
+        }
+
+        findings = agentcore_app.check_agentcore_cloudtrail_data_events()
+
+        assert _family_finding(findings, "Runtime")["Status"] == "Passed"
+        assert _family_finding(findings, "Tool")["Status"] == "Failed"
+        assert _family_finding(findings, "Memory")["Status"] == "N/A"
+
+    @patch("agentcore_app.agentcore_client")
+    @patch("agentcore_app.cloudtrail_client")
+    def test_a_tool_inventory_spans_both_list_apis(self, mock_ct, mock_ac):
+        mock_ct.list_trails.return_value = {"Trails": [self._TRAIL]}
+        mock_ct.get_event_selectors.return_value = {
+            "AdvancedEventSelectors": [
+                _data_event_selector("AWS::BedrockAgentCore::BrowserCustom")
+            ]
+        }
+        _empty_agentcore_inventory(mock_ac)
+        mock_ac.list_browsers.return_value = {
+            "browserSummaries": [{"browserId": "b-1"}]
+        }
+
+        findings = agentcore_app.check_agentcore_cloudtrail_data_events()
+
+        assert _family_finding(findings, "Tool")["Status"] == "Passed"
+
+    @patch("agentcore_app.agentcore_client")
+    @patch("agentcore_app.cloudtrail_client")
+    def test_unreadable_trail_reads_unknown_not_uncovered(self, mock_ct, mock_ac):
+        mock_ct.list_trails.return_value = {"Trails": [self._TRAIL]}
+        mock_ct.get_event_selectors.side_effect = _make_client_error(
+            "AccessDeniedException", "denied"
+        )
+        _empty_agentcore_inventory(mock_ac)
+        mock_ac.list_memories.return_value = {"memories": [{"id": "mem-1"}]}
+
+        findings = agentcore_app.check_agentcore_cloudtrail_data_events()
+
+        memory = _family_finding(findings, "Memory")
+        assert memory["Status"] == "N/A"
+        assert "could not be read" in memory["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    @patch("agentcore_app.cloudtrail_client")
+    def test_event_selectors_are_read_by_trail_arn(self, mock_ct, mock_ac):
+        trail_arn = "arn:aws:cloudtrail:us-west-2:999988887777:trail/shadow"
+        mock_ct.list_trails.return_value = {
+            "Trails": [{"Name": "shadow", "TrailARN": trail_arn}]
+        }
+        mock_ct.get_event_selectors.return_value = {"AdvancedEventSelectors": []}
+        _empty_agentcore_inventory(mock_ac)
+
+        agentcore_app.check_agentcore_cloudtrail_data_events()
+
+        mock_ct.get_event_selectors.assert_called_once_with(TrailName=trail_arn)
+
+    @patch("agentcore_app.agentcore_client")
+    @patch("agentcore_app.cloudtrail_client")
+    def test_every_trail_page_is_read(self, mock_ct, mock_ac):
+        mock_ct.list_trails.side_effect = [
+            {
+                "Trails": [
+                    {"TrailARN": "arn:aws:cloudtrail:us-east-1:123456789012:trail/t1"}
+                ],
+                "NextToken": "page-2",
+            },
+            {
+                "Trails": [
+                    {"TrailARN": "arn:aws:cloudtrail:us-east-1:123456789012:trail/t2"}
+                ]
+            },
+        ]
+        mock_ct.get_event_selectors.side_effect = [
+            {"AdvancedEventSelectors": [_data_event_selector("AWS::S3::Object")]},
+            {
+                "AdvancedEventSelectors": [
+                    _data_event_selector("AWS::BedrockAgentCore::Memory")
+                ]
+            },
+        ]
+        _empty_agentcore_inventory(mock_ac)
+        mock_ac.list_memories.return_value = {"memories": [{"id": "mem-1"}]}
+
+        findings = agentcore_app.check_agentcore_cloudtrail_data_events()
+
+        assert mock_ct.get_event_selectors.call_count == 2
+        # CloudTrail capitalizes the continuation member; a lowercase nextToken
+        # is a ParamValidationError against the real API.
+        assert mock_ct.list_trails.call_args_list[1].kwargs == {"NextToken": "page-2"}
+        assert _family_finding(findings, "Memory")["Status"] == "Passed"
+
+    def test_no_cloudtrail_client_is_na(self):
+        with patch("agentcore_app.cloudtrail_client", None):
+            findings = agentcore_app.check_agentcore_cloudtrail_data_events()
+        assert len(findings) == 1
+        assert findings[0]["Status"] == "N/A"
+
+    @patch("agentcore_app.cloudtrail_client")
+    def test_list_trails_failure_is_na(self, mock_ct):
+        mock_ct.list_trails.side_effect = _make_client_error(
+            "AccessDeniedException", "denied"
+        )
+        findings = agentcore_app.check_agentcore_cloudtrail_data_events()
+        assert findings[0]["Status"] == "N/A"
+        assert "cloudtrail:ListTrails" in findings[0]["Resolution"]
+
+    @patch("agentcore_app.agentcore_client")
+    @patch("agentcore_app.cloudtrail_client")
+    def test_uninventoriable_family_is_na_not_failed(self, mock_ct, mock_ac):
+        mock_ct.list_trails.return_value = {"Trails": [self._TRAIL]}
+        mock_ct.get_event_selectors.return_value = {"AdvancedEventSelectors": []}
+        _empty_agentcore_inventory(mock_ac)
+        mock_ac.list_memories.side_effect = _make_client_error(
+            "AccessDeniedException", "denied"
+        )
+
+        findings = agentcore_app.check_agentcore_cloudtrail_data_events()
+
+        memory = [
+            f for f in findings if "could not be inventoried" in f["Finding_Details"]
+        ]
+        assert memory[0]["Status"] == "N/A"
+
+
+# ===================================================================
+# AC-19: check_agentcore_log_delivery_configuration
+# ===================================================================
+class TestAC19LogDeliveryConfiguration:
+    """AC-19: Application-log delivery per gateway and memory resource."""
+
+    @staticmethod
+    def _sources(*entries):
+        return {"deliverySources": list(entries)}
+
+    @staticmethod
+    def _gateway_source(
+        name="gw-logs-source", log_type="APPLICATION_LOGS", service="bedrock-agentcore"
+    ):
+        return {
+            "name": name,
+            "service": service,
+            "logType": log_type,
+            "resourceArns": [
+                "arn:aws:bedrock-agentcore:us-east-1:123456789012:gateway/gw-1"
+            ],
+        }
+
+    @patch("agentcore_app.agentcore_client")
+    @patch("agentcore_app.logs_client")
+    def test_gateway_with_source_and_delivery_passes(self, mock_logs, mock_ac):
+        mock_logs.describe_delivery_sources.return_value = self._sources(
+            self._gateway_source()
+        )
+        mock_logs.describe_deliveries.return_value = {
+            "deliveries": [{"deliverySourceName": "gw-logs-source"}]
+        }
+        _empty_agentcore_inventory(mock_ac)
+        mock_ac.list_gateways.return_value = {
+            "items": [{"gatewayId": "gw-1", "name": "gateway-1"}]
+        }
+
+        findings = agentcore_app.check_agentcore_log_delivery_configuration()
+
+        gateway = [f for f in findings if "gateway-1" in f["Finding_Details"]]
+        assert gateway[0]["Check_ID"] == "AC-19"
+        assert gateway[0]["Status"] == "Passed"
+        for finding in findings:
+            assert_finding_schema(finding)
+
+    @patch("agentcore_app.agentcore_client")
+    @patch("agentcore_app.logs_client")
+    def test_source_without_delivery_fails_distinctly(self, mock_logs, mock_ac):
+        mock_logs.describe_delivery_sources.return_value = self._sources(
+            self._gateway_source()
+        )
+        mock_logs.describe_deliveries.return_value = {"deliveries": []}
+        _empty_agentcore_inventory(mock_ac)
+        mock_ac.list_gateways.return_value = {
+            "items": [{"gatewayId": "gw-1", "name": "gateway-1"}]
+        }
+
+        findings = agentcore_app.check_agentcore_log_delivery_configuration()
+
+        gateway = [f for f in findings if "gateway-1" in f["Finding_Details"]]
+        assert gateway[0]["Status"] == "Failed"
+        assert "no delivery to a" in gateway[0]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    @patch("agentcore_app.logs_client")
+    def test_no_source_fails_with_its_own_detail(self, mock_logs, mock_ac):
+        mock_logs.describe_delivery_sources.return_value = self._sources()
+        mock_logs.describe_deliveries.return_value = {"deliveries": []}
+        _empty_agentcore_inventory(mock_ac)
+        mock_ac.list_gateways.return_value = {
+            "items": [{"gatewayId": "gw-1", "name": "gateway-1"}]
+        }
+
+        findings = agentcore_app.check_agentcore_log_delivery_configuration()
+
+        gateway = [f for f in findings if "gateway-1" in f["Finding_Details"]]
+        assert gateway[0]["Status"] == "Failed"
+        assert "no bedrock-agentcore" in gateway[0]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    @patch("agentcore_app.logs_client")
+    def test_memory_is_matched_on_its_exact_arn(self, mock_logs, mock_ac):
+        memory_arn = "arn:aws:bedrock-agentcore:us-east-1:123456789012:memory/mem-1"
+        mock_logs.describe_delivery_sources.return_value = self._sources(
+            {
+                "name": "mem-logs-source",
+                "service": "bedrock-agentcore",
+                "logType": "APPLICATION_LOGS",
+                "resourceArns": [memory_arn],
+            }
+        )
+        mock_logs.describe_deliveries.return_value = {
+            "deliveries": [{"deliverySourceName": "mem-logs-source"}]
+        }
+        _empty_agentcore_inventory(mock_ac)
+        mock_ac.list_memories.return_value = {
+            "memories": [{"id": "mem-1", "arn": memory_arn}]
+        }
+
+        findings = agentcore_app.check_agentcore_log_delivery_configuration()
+
+        memory = [f for f in findings if "mem-1" in f["Finding_Details"]]
+        assert memory[0]["Status"] == "Passed"
+
+    @patch("agentcore_app.agentcore_client")
+    @patch("agentcore_app.logs_client")
+    def test_traces_only_source_does_not_satisfy_application_logs(
+        self, mock_logs, mock_ac
+    ):
+        mock_logs.describe_delivery_sources.return_value = self._sources(
+            self._gateway_source(name="gw-traces-source", log_type="TRACES")
+        )
+        mock_logs.describe_deliveries.return_value = {
+            "deliveries": [{"deliverySourceName": "gw-traces-source"}]
+        }
+        _empty_agentcore_inventory(mock_ac)
+        mock_ac.list_gateways.return_value = {
+            "items": [{"gatewayId": "gw-1", "name": "gateway-1"}]
+        }
+
+        findings = agentcore_app.check_agentcore_log_delivery_configuration()
+
+        gateway = [f for f in findings if "gateway-1" in f["Finding_Details"]]
+        assert gateway[0]["Status"] == "Failed"
+
+    @patch("agentcore_app.agentcore_client")
+    @patch("agentcore_app.logs_client")
+    def test_another_service_source_on_the_same_arn_does_not_count(
+        self, mock_logs, mock_ac
+    ):
+        mock_logs.describe_delivery_sources.return_value = self._sources(
+            self._gateway_source(name="other-source", service="bedrock")
+        )
+        mock_logs.describe_deliveries.return_value = {
+            "deliveries": [{"deliverySourceName": "other-source"}]
+        }
+        _empty_agentcore_inventory(mock_ac)
+        mock_ac.list_gateways.return_value = {
+            "items": [{"gatewayId": "gw-1", "name": "gateway-1"}]
+        }
+
+        findings = agentcore_app.check_agentcore_log_delivery_configuration()
+
+        gateway = [f for f in findings if "gateway-1" in f["Finding_Details"]]
+        assert gateway[0]["Status"] == "Failed"
+
+    @patch("agentcore_app.agentcore_client")
+    @patch("agentcore_app.logs_client")
+    def test_services_without_a_readable_delivery_are_reported_unassessed(
+        self, mock_logs, mock_ac
+    ):
+        mock_logs.describe_delivery_sources.return_value = self._sources()
+        mock_logs.describe_deliveries.return_value = {"deliveries": []}
+        _empty_agentcore_inventory(mock_ac)
+
+        findings = agentcore_app.check_agentcore_log_delivery_configuration()
+
+        residual = [f for f in findings if "not assessed" in f["Finding_Details"]]
+        assert len(residual) == 1, findings
+        assert residual[0]["Status"] == "N/A"
+        # The residual has to name why each service is out of scope, because
+        # "configured in the console" was wrong for all three: identity
+        # delivery is configured on the runtime or gateway resource, policy
+        # engines have no log destination, and only built-in tools are both
+        # configurable and unassessable from the inventory.
+        details = residual[0]["Finding_Details"]
+        assert "Built-in tool log delivery is not assessed" in details
+        assert "configured on the associated runtime or gateway resource" in details
+        assert "policy engines have no log-destination configuration" in details
+
+    def test_no_logs_client_is_na(self):
+        with patch("agentcore_app.logs_client", None):
+            findings = agentcore_app.check_agentcore_log_delivery_configuration()
+        assert len(findings) == 1
+        assert findings[0]["Status"] == "N/A"
+
+    @patch("agentcore_app.logs_client")
+    def test_delivery_read_failure_is_na(self, mock_logs):
+        mock_logs.describe_delivery_sources.side_effect = _make_client_error(
+            "AccessDeniedException", "denied"
+        )
+        findings = agentcore_app.check_agentcore_log_delivery_configuration()
+        assert findings[0]["Status"] == "N/A"
+        assert "logs:DescribeDeliverySources" in findings[0]["Resolution"]
+
+    @patch("agentcore_app.agentcore_client")
+    @patch("agentcore_app.logs_client")
+    def test_every_delivery_source_page_is_read(self, mock_logs, mock_ac):
+        mock_logs.describe_delivery_sources.side_effect = [
+            {
+                "deliverySources": [self._gateway_source(name="page-1-source")],
+                "nextToken": "page-2",
+            },
+            {"deliverySources": [self._gateway_source()]},
+        ]
+        mock_logs.describe_deliveries.return_value = {
+            "deliveries": [{"deliverySourceName": "gw-logs-source"}]
+        }
+        _empty_agentcore_inventory(mock_ac)
+        mock_ac.list_gateways.return_value = {
+            "items": [{"gatewayId": "gw-1", "name": "gateway-1"}]
+        }
+
+        findings = agentcore_app.check_agentcore_log_delivery_configuration()
+
+        assert mock_logs.describe_delivery_sources.call_count == 2
+        assert mock_logs.describe_delivery_sources.call_args_list[1].kwargs == {
+            "nextToken": "page-2"
+        }
+        gateway = [f for f in findings if "gateway-1" in f["Finding_Details"]]
+        assert gateway[0]["Status"] == "Passed"
+
+
+# ===================================================================
+# AC-20: check_agentcore_log_group_data_protection
+# ===================================================================
+def _log_group_side_effect(groups_by_prefix):
+    """describe_log_groups stub that answers per logGroupNamePrefix.
+
+    One return_value would hand the same groups back for both AgentCore
+    prefixes and double every finding, so a test could not tell one prefix's
+    results from the other's.
+    """
+
+    def describe(**kwargs):
+        prefix = kwargs.get("logGroupNamePrefix")
+        return {"logGroups": groups_by_prefix.get(prefix, [])}
+
+    return describe
+
+
+class TestAC20LogDataProtection:
+    """AC-20: Masking and CMK encryption on AgentCore log groups."""
+
+    _MASKING_POLICY = (
+        '{"Name": "p", "Statement": [{"Sid": "mask", '
+        '"DataIdentifier": ["arn:aws:dataprotection::aws:data-identifier/EmailAddress"], '
+        '"Operation": {"Deidentify": {"MaskConfig": {}}}}]}'
+    )
+    _AUDIT_ONLY_POLICY = (
+        '{"Name": "p", "Statement": [{"Sid": "audit", '
+        '"DataIdentifier": ["arn:aws:dataprotection::aws:data-identifier/EmailAddress"], '
+        '"Operation": {"Audit": {"FindingsDestination": {}}}}]}'
+    )
+    _KMS_KEY = "arn:aws:kms:us-east-1:123456789012:key/k1"
+
+    @patch("agentcore_app.logs_client")
+    def test_masked_and_cmk_log_group_passes(self, mock_logs):
+        mock_logs.describe_account_policies.return_value = {"accountPolicies": []}
+        mock_logs.describe_log_groups.side_effect = _log_group_side_effect(
+            {
+                "/aws/bedrock-agentcore/": [
+                    {
+                        "logGroupName": "/aws/bedrock-agentcore/runtimes/rt-1",
+                        "kmsKeyId": self._KMS_KEY,
+                        "dataProtectionStatus": "ACTIVATED",
+                    }
+                ]
+            }
+        )
+        mock_logs.get_data_protection_policy.return_value = {
+            "policyDocument": self._MASKING_POLICY
+        }
+
+        findings = agentcore_app.check_agentcore_log_group_data_protection()
+
+        assert len(findings) == 1
+        assert findings[0]["Check_ID"] == "AC-20"
+        assert findings[0]["Status"] == "Passed"
+        assert_finding_schema(findings[0])
+
+    @patch("agentcore_app.logs_client")
+    def test_missing_cmk_fails_and_names_only_that_leg(self, mock_logs):
+        mock_logs.describe_account_policies.return_value = {"accountPolicies": []}
+        mock_logs.describe_log_groups.side_effect = _log_group_side_effect(
+            {
+                "/aws/bedrock-agentcore/": [
+                    {
+                        "logGroupName": "/aws/bedrock-agentcore/runtimes/rt-1",
+                        "dataProtectionStatus": "ACTIVATED",
+                    }
+                ]
+            }
+        )
+        mock_logs.get_data_protection_policy.return_value = {
+            "policyDocument": self._MASKING_POLICY
+        }
+
+        findings = agentcore_app.check_agentcore_log_group_data_protection()
+
+        assert findings[0]["Status"] == "Failed"
+        assert "no customer managed encryption key" in findings[0]["Finding_Details"]
+        assert "data-protection policy" not in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.logs_client")
+    def test_both_legs_missing_are_named_together(self, mock_logs):
+        mock_logs.describe_account_policies.return_value = {"accountPolicies": []}
+        mock_logs.describe_log_groups.side_effect = _log_group_side_effect(
+            {
+                "/aws/bedrock-agentcore/": [
+                    {"logGroupName": "/aws/bedrock-agentcore/runtimes/rt-1"}
+                ]
+            }
+        )
+
+        findings = agentcore_app.check_agentcore_log_group_data_protection()
+
+        assert findings[0]["Status"] == "Failed"
+        assert " and " in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.logs_client")
+    def test_audit_only_policy_is_not_masking(self, mock_logs):
+        mock_logs.describe_account_policies.return_value = {"accountPolicies": []}
+        mock_logs.describe_log_groups.side_effect = _log_group_side_effect(
+            {
+                "/aws/bedrock-agentcore/": [
+                    {
+                        "logGroupName": "/aws/bedrock-agentcore/runtimes/rt-1",
+                        "kmsKeyId": self._KMS_KEY,
+                        "dataProtectionStatus": "ACTIVATED",
+                    }
+                ]
+            }
+        )
+        mock_logs.get_data_protection_policy.return_value = {
+            "policyDocument": self._AUDIT_ONLY_POLICY
+        }
+
+        findings = agentcore_app.check_agentcore_log_group_data_protection()
+
+        assert findings[0]["Status"] == "Failed"
+        assert "de-identifies" in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.logs_client")
+    def test_account_policy_covers_a_group_with_no_policy_of_its_own(self, mock_logs):
+        mock_logs.describe_account_policies.return_value = {
+            "accountPolicies": [
+                {
+                    "policyName": "account-wide",
+                    "policyType": "DATA_PROTECTION_POLICY",
+                    "policyDocument": self._MASKING_POLICY,
+                }
+            ]
+        }
+        mock_logs.describe_log_groups.side_effect = _log_group_side_effect(
+            {
+                "/aws/vendedlogs/bedrock-agentcore/": [
+                    {
+                        "logGroupName": "/aws/vendedlogs/bedrock-agentcore/gw-1",
+                        "kmsKeyId": self._KMS_KEY,
+                    }
+                ]
+            }
+        )
+
+        findings = agentcore_app.check_agentcore_log_group_data_protection()
+
+        assert findings[0]["Status"] == "Passed"
+        assert "account-wide data-protection policy" in findings[0]["Finding_Details"]
+        mock_logs.get_data_protection_policy.assert_not_called()
+
+    @patch("agentcore_app.logs_client")
+    def test_group_policy_is_read_only_when_one_is_attached(self, mock_logs):
+        mock_logs.describe_account_policies.return_value = {"accountPolicies": []}
+        mock_logs.describe_log_groups.side_effect = _log_group_side_effect(
+            {
+                "/aws/bedrock-agentcore/": [
+                    {
+                        "logGroupName": "/aws/bedrock-agentcore/runtimes/rt-1",
+                        "kmsKeyId": self._KMS_KEY,
+                    }
+                ]
+            }
+        )
+
+        findings = agentcore_app.check_agentcore_log_group_data_protection()
+
+        mock_logs.get_data_protection_policy.assert_not_called()
+        assert findings[0]["Status"] == "Failed"
+
+    @patch("agentcore_app.logs_client")
+    def test_unreadable_group_policy_is_na(self, mock_logs):
+        mock_logs.describe_account_policies.return_value = {"accountPolicies": []}
+        mock_logs.describe_log_groups.side_effect = _log_group_side_effect(
+            {
+                "/aws/bedrock-agentcore/": [
+                    {
+                        "logGroupName": "/aws/bedrock-agentcore/runtimes/rt-1",
+                        "kmsKeyId": self._KMS_KEY,
+                        "dataProtectionStatus": "ACTIVATED",
+                    }
+                ]
+            }
+        )
+        mock_logs.get_data_protection_policy.side_effect = _make_client_error(
+            "AccessDeniedException", "denied"
+        )
+
+        findings = agentcore_app.check_agentcore_log_group_data_protection()
+
+        assert findings[0]["Status"] == "N/A"
+        assert "logs:GetDataProtectionPolicy" in findings[0]["Resolution"]
+
+    @patch("agentcore_app.logs_client")
+    def test_both_prefixes_are_inventoried(self, mock_logs):
+        mock_logs.describe_account_policies.return_value = {"accountPolicies": []}
+        mock_logs.describe_log_groups.side_effect = _log_group_side_effect(
+            {
+                "/aws/bedrock-agentcore/": [
+                    {"logGroupName": "/aws/bedrock-agentcore/runtimes/rt-1"}
+                ],
+                "/aws/vendedlogs/bedrock-agentcore/": [
+                    {"logGroupName": "/aws/vendedlogs/bedrock-agentcore/gw-1"}
+                ],
+            }
+        )
+
+        findings = agentcore_app.check_agentcore_log_group_data_protection()
+
+        assert len({finding["Finding_Details"] for finding in findings}) == 2
+
+    @patch("agentcore_app.logs_client")
+    def test_no_agentcore_log_groups_is_na(self, mock_logs):
+        mock_logs.describe_account_policies.return_value = {"accountPolicies": []}
+        mock_logs.describe_log_groups.side_effect = _log_group_side_effect({})
+
+        findings = agentcore_app.check_agentcore_log_group_data_protection()
+
+        assert len(findings) == 1
+        assert findings[0]["Status"] == "N/A"
+
+    def test_no_logs_client_is_na(self):
+        with patch("agentcore_app.logs_client", None):
+            findings = agentcore_app.check_agentcore_log_group_data_protection()
+        assert findings[0]["Status"] == "N/A"
+
+    @patch("agentcore_app.logs_client")
+    def test_account_policy_read_failure_is_na(self, mock_logs):
+        mock_logs.describe_account_policies.side_effect = _make_client_error(
+            "AccessDeniedException", "denied"
+        )
+        findings = agentcore_app.check_agentcore_log_group_data_protection()
+        assert findings[0]["Status"] == "N/A"
+        assert "logs:DescribeAccountPolicies" in findings[0]["Resolution"]
+
+
+# ===================================================================
+# AC-21: check_agentcore_log_unmask_restriction
+# ===================================================================
+class TestAC21LogUnmaskRestriction:
+    """AC-21: Who can read masked values back out of AgentCore logs."""
+
+    @staticmethod
+    def _cache(actions, resource="*", principal="analyst-role"):
+        return {
+            "role_permissions": {
+                principal: {
+                    "attached_policies": [
+                        {
+                            "name": "p",
+                            "document": {
+                                "Statement": [
+                                    {
+                                        "Effect": "Allow",
+                                        "Action": actions,
+                                        "Resource": resource,
+                                    }
+                                ]
+                            },
+                        }
+                    ],
+                    "inline_policies": [],
+                }
+            },
+            "user_permissions": {},
+        }
+
+    def test_unscoped_unmask_fails(self):
+        findings = agentcore_app.check_agentcore_log_unmask_restriction(
+            self._cache(["logs:Unmask"])
+        )
+        assert [f["Status"] for f in findings] == ["Failed"]
+        assert findings[0]["Check_ID"] == "AC-21"
+        assert "role analyst-role" in findings[0]["Finding_Details"]
+        for finding in findings:
+            assert_finding_schema(finding)
+
+    def test_scoped_unmask_passes(self):
+        findings = agentcore_app.check_agentcore_log_unmask_restriction(
+            self._cache(
+                ["logs:Unmask"],
+                resource=(
+                    "arn:aws:logs:us-east-1:123456789012:"
+                    "log-group:/aws/bedrock-agentcore/*"
+                ),
+            )
+        )
+        assert [f["Status"] for f in findings] == ["Passed"]
+        assert "role analyst-role" in findings[0]["Finding_Details"]
+
+    def test_no_unmask_grant_passes(self):
+        findings = agentcore_app.check_agentcore_log_unmask_restriction(
+            self._cache(["logs:DescribeLogGroups"])
+        )
+        assert [f["Status"] for f in findings] == ["Passed"]
+        assert "No cached IAM role or user" in findings[0]["Finding_Details"]
+
+    def test_bare_wildcard_action_is_ignored(self):
+        findings = agentcore_app.check_agentcore_log_unmask_restriction(
+            self._cache(["*"])
+        )
+        assert [f["Status"] for f in findings] == ["Passed"]
+        assert "No cached IAM role or user" in findings[0]["Finding_Details"]
+
+    def test_logs_namespace_wildcard_is_detected(self):
+        findings = agentcore_app.check_agentcore_log_unmask_restriction(
+            self._cache(["logs:*"])
+        )
+        assert [f["Status"] for f in findings] == ["Failed"]
+
+    def test_a_different_namespace_unmask_is_ignored(self):
+        findings = agentcore_app.check_agentcore_log_unmask_restriction(
+            self._cache(["macie2:Unmask"])
+        )
+        assert [f["Status"] for f in findings] == ["Passed"]
+        assert "No cached IAM role or user" in findings[0]["Finding_Details"]
+
+    def test_users_are_evaluated_alongside_roles(self):
+        cache = self._cache(["logs:Unmask"])
+        cache["user_permissions"] = cache["role_permissions"]
+        cache["role_permissions"] = {}
+
+        findings = agentcore_app.check_agentcore_log_unmask_restriction(cache)
+
+        assert [f["Status"] for f in findings] == ["Failed"]
+        assert "user analyst-role" in findings[0]["Finding_Details"]
+
+    def test_scoped_and_unscoped_principals_are_reported_separately(self):
+        cache = self._cache(["logs:Unmask"])
+        cache["role_permissions"]["scoped-role"] = {
+            "attached_policies": [
+                {
+                    "name": "p",
+                    "document": {
+                        "Statement": [
+                            {
+                                "Effect": "Allow",
+                                "Action": "logs:Unmask",
+                                "Resource": (
+                                    "arn:aws:logs:us-east-1:123456789012:log-group:/x"
+                                ),
+                            }
+                        ]
+                    },
+                }
+            ],
+            "inline_policies": [],
+        }
+
+        findings = agentcore_app.check_agentcore_log_unmask_restriction(cache)
+
+        assert {finding["Status"] for finding in findings} == {"Failed", "Passed"}
+
+    def test_findings_are_tagged_global(self):
+        findings = agentcore_app.check_agentcore_log_unmask_restriction(
+            self._cache(["logs:Unmask"])
+        )
+        assert all(
+            finding["Region"] == agentcore_app.GLOBAL_REGION_LABEL
+            for finding in findings
+        )
+
+    def test_empty_cache_is_na(self):
+        findings = agentcore_app.check_agentcore_log_unmask_restriction(
+            {"role_permissions": {}, "user_permissions": {}}
+        )
+        assert findings[0]["Status"] == "N/A"
+
+    def test_unparseable_policy_does_not_hide_a_sibling_grant(self):
+        cache = self._cache(["logs:Unmask"])
+        cache["role_permissions"]["analyst-role"]["inline_policies"] = [
+            {"name": "broken", "document": "{not json"}
+        ]
+
+        findings = agentcore_app.check_agentcore_log_unmask_restriction(cache)
+
+        assert [f["Status"] for f in findings] == ["Failed"]
+
+
+# ===================================================================
+# AC-22: check_agentcore_telemetry_sink_scope
+# ===================================================================
+class TestAC22TelemetrySinkScope:
+    """AC-22: Whether each observability sink is scoped to known callers."""
+
+    _SINK = {
+        "Arn": "arn:aws:oam:us-east-1:123456789012:sink/s-1",
+        "Id": "s-1",
+        "Name": "central-sink",
+    }
+
+    @patch("agentcore_app.oam_client")
+    def test_org_id_condition_passes(self, mock_oam):
+        mock_oam.list_sinks.return_value = {"Items": [self._SINK]}
+        mock_oam.get_sink_policy.return_value = {
+            "Policy": (
+                '{"Statement": [{"Effect": "Allow", "Principal": "*", '
+                '"Action": "oam:CreateLink", "Resource": "*", '
+                '"Condition": {"StringEquals": {"aws:PrincipalOrgID": "o-1"}}}]}'
+            )
+        }
+
+        findings = agentcore_app.check_agentcore_telemetry_sink_scope()
+
+        assert findings[0]["Check_ID"] == "AC-22"
+        assert findings[0]["Status"] == "Passed"
+        assert_finding_schema(findings[0])
+
+    @patch("agentcore_app.oam_client")
+    def test_prefixed_condition_operator_passes(self, mock_oam):
+        mock_oam.list_sinks.return_value = {"Items": [self._SINK]}
+        mock_oam.get_sink_policy.return_value = {
+            "Policy": (
+                '{"Statement": [{"Effect": "Allow", "Principal": {"AWS": "*"}, '
+                '"Action": "oam:CreateLink", "Resource": "*", '
+                '"Condition": {"ForAnyValue:StringLike": '
+                '{"aws:PrincipalOrgPaths": "o-1/r-1/ou-1/"}}}]}'
+            )
+        }
+
+        findings = agentcore_app.check_agentcore_telemetry_sink_scope()
+
+        assert findings[0]["Status"] == "Passed"
+
+    @patch("agentcore_app.oam_client")
+    def test_named_account_principal_passes(self, mock_oam):
+        mock_oam.list_sinks.return_value = {"Items": [self._SINK]}
+        mock_oam.get_sink_policy.return_value = {
+            "Policy": (
+                '{"Statement": [{"Effect": "Allow", '
+                '"Principal": {"AWS": ["arn:aws:iam::111122223333:root"]}, '
+                '"Action": "oam:CreateLink", "Resource": "*"}]}'
+            )
+        }
+
+        findings = agentcore_app.check_agentcore_telemetry_sink_scope()
+
+        assert findings[0]["Status"] == "Passed"
+
+    @patch("agentcore_app.oam_client")
+    def test_open_principal_without_condition_fails(self, mock_oam):
+        mock_oam.list_sinks.return_value = {"Items": [self._SINK]}
+        mock_oam.get_sink_policy.return_value = {
+            "Policy": (
+                '{"Statement": [{"Effect": "Allow", "Principal": "*", '
+                '"Action": "oam:CreateLink", "Resource": "*"}]}'
+            )
+        }
+
+        findings = agentcore_app.check_agentcore_telemetry_sink_scope()
+
+        assert findings[0]["Status"] == "Failed"
+        assert "central-sink" in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.oam_client")
+    def test_an_unrelated_condition_key_does_not_scope_the_sink(self, mock_oam):
+        mock_oam.list_sinks.return_value = {"Items": [self._SINK]}
+        mock_oam.get_sink_policy.return_value = {
+            "Policy": (
+                '{"Statement": [{"Effect": "Allow", "Principal": "*", '
+                '"Action": "oam:CreateLink", "Resource": "*", '
+                '"Condition": {"ForAllValues:StringEquals": '
+                '{"oam:ResourceTypes": "AWS::Logs::LogGroup"}}}]}'
+            )
+        }
+
+        findings = agentcore_app.check_agentcore_telemetry_sink_scope()
+
+        assert findings[0]["Status"] == "Failed"
+
+    @patch("agentcore_app.oam_client")
+    def test_one_open_statement_among_scoped_ones_fails(self, mock_oam):
+        mock_oam.list_sinks.return_value = {"Items": [self._SINK]}
+        mock_oam.get_sink_policy.return_value = {
+            "Policy": (
+                '{"Statement": ['
+                '{"Effect": "Allow", "Principal": "*", "Action": "oam:CreateLink", '
+                '"Resource": "*", '
+                '"Condition": {"StringEquals": {"aws:PrincipalOrgID": "o-1"}}}, '
+                '{"Effect": "Allow", "Principal": "*", "Action": "oam:UpdateLink", '
+                '"Resource": "*"}]}'
+            )
+        }
+
+        findings = agentcore_app.check_agentcore_telemetry_sink_scope()
+
+        assert findings[0]["Status"] == "Failed"
+        assert "1 Allow statement" in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.oam_client")
+    def test_no_sinks_is_na(self, mock_oam):
+        mock_oam.list_sinks.return_value = {"Items": []}
+        findings = agentcore_app.check_agentcore_telemetry_sink_scope()
+        assert len(findings) == 1
+        assert findings[0]["Status"] == "N/A"
+
+    @patch("agentcore_app.oam_client")
+    def test_sink_without_a_policy_is_na(self, mock_oam):
+        mock_oam.list_sinks.return_value = {"Items": [self._SINK]}
+        mock_oam.get_sink_policy.side_effect = _make_client_error(
+            "ResourceNotFoundException", "no policy"
+        )
+        findings = agentcore_app.check_agentcore_telemetry_sink_scope()
+        assert findings[0]["Status"] == "N/A"
+        assert "no policy attached" in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.oam_client")
+    def test_sink_policy_access_denied_is_na(self, mock_oam):
+        mock_oam.list_sinks.return_value = {"Items": [self._SINK]}
+        mock_oam.get_sink_policy.side_effect = _make_client_error(
+            "AccessDeniedException", "denied"
+        )
+        findings = agentcore_app.check_agentcore_telemetry_sink_scope()
+        assert findings[0]["Status"] == "N/A"
+        assert "oam:GetSinkPolicy" in findings[0]["Resolution"]
+
+    def test_no_oam_client_is_na(self):
+        with patch("agentcore_app.oam_client", None):
+            findings = agentcore_app.check_agentcore_telemetry_sink_scope()
+        assert findings[0]["Status"] == "N/A"
+
+    @patch("agentcore_app.oam_client")
+    def test_list_sinks_failure_is_na(self, mock_oam):
+        mock_oam.list_sinks.side_effect = _make_client_error(
+            "AccessDeniedException", "denied"
+        )
+        findings = agentcore_app.check_agentcore_telemetry_sink_scope()
+        assert findings[0]["Status"] == "N/A"
+        assert "oam:ListSinks" in findings[0]["Resolution"]
+
+    @patch("agentcore_app.oam_client")
+    def test_every_sink_page_is_read(self, mock_oam):
+        second = dict(self._SINK, Arn="arn:aws:oam:us-east-1:123456789012:sink/s-2")
+        mock_oam.list_sinks.side_effect = [
+            {"Items": [self._SINK], "NextToken": "page-2"},
+            {"Items": [second]},
+        ]
+        mock_oam.get_sink_policy.return_value = {
+            "Policy": (
+                '{"Statement": [{"Effect": "Allow", "Principal": "*", '
+                '"Action": "oam:CreateLink", "Resource": "*"}]}'
+            )
+        }
+
+        findings = agentcore_app.check_agentcore_telemetry_sink_scope()
+
+        assert len(findings) == 2
+        assert mock_oam.list_sinks.call_args_list[1].kwargs == {"NextToken": "page-2"}
+
+
+# ===================================================================
+# AC-18..AC-22 registration and API contracts
+# ===================================================================
+class TestObservabilityCheckRegistration:
+    """The new ids must reach the backfill paths and the API must answer them."""
+
+    def test_regional_ids_are_registered_for_timeout_backfill(self):
+        for check_id in ("AC-18", "AC-19", "AC-20", "AC-22"):
+            assert check_id in agentcore_app.REGIONAL_AGENTCORE_CHECK_IDS
+            assert check_id in agentcore_app.AGENTCORE_RUNTIME_CHECK_IDS
+
+    def test_the_global_unmask_check_is_not_in_the_regional_tuples(self):
+        assert "AC-21" not in agentcore_app.REGIONAL_AGENTCORE_CHECK_IDS
+        assert "AC-21" not in agentcore_app.AGENTCORE_RUNTIME_CHECK_IDS
+
+    def test_timeout_backfill_emits_the_new_regional_ids(self):
+        findings = agentcore_app.build_agentcore_timeout_findings("us-east-1", [])
+        emitted = {finding["Check_ID"] for finding in findings}
+        assert {"AC-18", "AC-19", "AC-20", "AC-22"}.issubset(emitted)
+
+    def test_data_event_families_cover_runtime_memory_and_tools(self):
+        keys = {family["key"] for family in agentcore_app.AGENTCORE_DATA_EVENT_FAMILIES}
+        assert keys == {"runtime", "memory", "tools"}
+        memory = next(
+            family
+            for family in agentcore_app.AGENTCORE_DATA_EVENT_FAMILIES
+            if family["key"] == "memory"
+        )
+        assert memory["resource_types"] == ("AWS::BedrockAgentCore::Memory",)
+
+    def test_observability_operation_contracts_exist(self):
+        credentials = {
+            "region_name": "us-east-1",
+            "aws_access_key_id": "testing",
+            "aws_secret_access_key": "testing",  # pragma: allowlist secret - synthetic test credential
+        }
+        expected = {
+            "cloudtrail": ["ListTrails", "GetEventSelectors"],
+            "logs": [
+                "DescribeLogGroups",
+                "DescribeAccountPolicies",
+                "GetDataProtectionPolicy",
+                "DescribeDeliverySources",
+                "DescribeDeliveries",
+            ],
+            "oam": ["ListSinks", "GetSinkPolicy"],
+        }
+        for service, operations in expected.items():
+            model = agentcore_app.boto3.client(
+                service, **credentials
+            ).meta.service_model
+            for operation in operations:
+                assert model.operation_model(operation)
+
+
+# ===================================================================

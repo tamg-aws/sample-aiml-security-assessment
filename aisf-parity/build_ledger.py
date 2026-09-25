@@ -586,54 +586,62 @@ ROWS = [
     ("AIR-ACR-MEM-07", NEW, None, "agentcore_assessments", [], "", [], 4),
     (
         "AIR-ACR-MEM-12",
-        NEW,
+        COVERED,
         None,
         "agentcore_assessments",
+        ["AC-18"],
+        "AC-18 asserts that a CloudTrail advanced event selector logs data events for "
+        "AWS::BedrockAgentCore::Memory whenever the region holds a memory resource",
         [],
-        "CloudTrail event selectors; reads no AgentCore API",
-        ["cloudtrail:GetEventSelectors", "cloudtrail:ListTrails"],
         4,
     ),
     (
         "AIR-ACR-OBS-02",
-        NEW,
+        COVERED,
         None,
         "agentcore_assessments",
+        ["AC-18"],
+        "AC-18 asserts data-event coverage per resource family, so a trail that logs only "
+        "the runtime types still fails for memory and for the built-in tools",
         [],
-        "CloudTrail event selectors; reads no AgentCore API",
-        ["cloudtrail:GetEventSelectors", "cloudtrail:ListTrails"],
         4,
     ),
     (
         "AIR-ACR-OBS-03",
-        NEW,
+        COVERED,
         None,
         "agentcore_assessments",
-        [],
+        ["AC-19"],
         "AC-04 is X-Ray tracingConfig.enabled over list_agent_runtimes only, so it cannot "
-        "cover Gateway, Memory, Policy or Identity, which is OBS-03's whole subject; this row "
-        "was a tightening in an earlier draft and the resource-scope check moved it",
+        "cover Gateway, Memory, Policy or Identity, which is OBS-03's whole subject. AC-19 "
+        "asserts an APPLICATION_LOGS delivery source wired to a destination per gateway and "
+        "per memory; runtime logging is service-managed, WorkloadIdentity delivery is "
+        "configured on the associated runtime or gateway resource, and policy engines have "
+        "no log-destination surface, so those three legs need no separate assertion",
         [],
         4,
     ),
     (
         "AIR-ACR-OBS-04",
-        NEW,
+        COVERED,
         None,
         "agentcore_assessments",
+        ["AC-20", "AC-21"],
+        "AC-20 asserts a Deidentify data-protection policy and a customer managed key on "
+        "the AgentCore log groups, AC-21 asserts that no cached role or user holds "
+        "logs:Unmask on every resource",
         [],
-        "CloudWatch Logs data-protection policy",
-        ["logs:GetDataProtectionPolicy", "logs:DescribeAccountPolicies"],
         4,
     ),
     (
         "AIR-ACR-OBS-06",
-        NEW,
+        COVERED,
         None,
         "agentcore_assessments",
+        ["AC-22"],
+        "AC-22 asserts that every Allow statement on an OAM sink policy either names its "
+        "principals or carries an organization condition key",
         [],
-        "OAM sink policy",
-        ["oam:ListSinks", "oam:GetSinkPolicy"],
         4,
     ),
     ("AIR-ACR-POL-06", NEW, None, "agentcore_assessments", [], "", [], 4),
@@ -769,6 +777,11 @@ INCUMBENT_NAMES = {
     "AC-11": "AgentCore Policy Engine Encryption Check",
     "AC-14": "AgentCore Identity Token Vault CMK Encryption",
     "AC-17": "AgentCore Online Evaluation Coverage",
+    "AC-18": "AgentCore CloudTrail Data Event Coverage",
+    "AC-19": "AgentCore Log Delivery Configuration",
+    "AC-20": "AgentCore Log Data Protection",
+    "AC-21": "AgentCore Log Unmask Restriction",
+    "AC-22": "AgentCore Telemetry Sink Scope",
     "AG-24": "Agentic AI Gateway Inbound Authorization",
     "AG-25": "Agentic AI Gateway Tool Policy Enforcement",
     "AG-27": "Agentic AI Gateway WAF Protection",

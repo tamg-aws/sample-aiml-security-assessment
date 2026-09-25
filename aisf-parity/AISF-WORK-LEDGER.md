@@ -1,33 +1,27 @@
 # AISF parity work ledger
 
-Generated 2026-09-24 by `aisf-parity/build_ledger.py`. Do not hand-edit: change `ROWS` in the generator and re-run.
+Generated 2026-09-25 by `aisf-parity/build_ledger.py`. Do not hand-edit: change `ROWS` in the generator and re-run.
 
 78 controls in scope: 67 hosted (BDR, SGM, ACR) plus 11 FND controls whose assertion subject is an AI resource.
 
 | verdict | rows | meaning |
 |---|---|---|
-| covered | 8 | an incumbent already asserts this; nothing to write |
+| covered | 13 | an incumbent already asserts this; nothing to write |
 | tighten / extend | 22 | incumbent name is honest, its assertion is narrower; extend it in place |
 | tighten / new_id | 6 | incumbent name claims more than it asserts; allocate a new id beside it |
-| new | 27 | no incumbent asserts any part of it |
+| new | 22 | no incumbent asserts any part of it |
 | not_implementable | 4 | flagged machine_checkable in the ledger but is not checkable from configuration |
 | unassessed | 11 | in scope, dedup pass not yet run |
 
-**44 new check functions and 22 extensions to existing checks.**
+**39 new check functions and 22 extensions to existing checks.**
 
 ## New IAM actions required
 
-- `cloudtrail:GetEventSelectors` — AIR-ACR-MEM-12, AIR-ACR-OBS-02
-- `cloudtrail:ListTrails` — AIR-ACR-MEM-12, AIR-ACR-OBS-02
 - `config:DescribeConfigRules` — AIR-SGM-GOV-10
 - `config:DescribeConfigurationRecorders` — AIR-SGM-GOV-10
 - `ec2:DescribeSecurityGroups` — AIR-ACR-RT-08, AIR-FND-NET-06
-- `logs:DescribeAccountPolicies` — AIR-ACR-OBS-04
-- `logs:GetDataProtectionPolicy` — AIR-ACR-OBS-04
 - `macie2:GetAutomatedDiscoveryConfiguration` — AIR-BDR-KB-01
 - `macie2:GetMacieSession` — AIR-BDR-KB-01
-- `oam:GetSinkPolicy` — AIR-ACR-OBS-06
-- `oam:ListSinks` — AIR-ACR-OBS-06
 - `organizations:DescribeEffectivePolicy` — AIR-FND-DAT-09
 - `organizations:DescribePolicy` — AIR-SGM-TRN-08, AIR-ACR-GW-02, AIR-ACR-ID-04
 - `organizations:ListPolicies` — AIR-SGM-TRN-08, AIR-ACR-GW-02, AIR-ACR-ID-04
@@ -78,6 +72,11 @@ Generated 2026-09-24 by `aisf-parity/build_ledger.py`. Do not hand-edit: change 
 | control | verdict | do | module | incumbent | gap |
 |---|---|---|---|---|---|
 | `AIR-ACR-GW-01` | covered | — | `agentcore_assessments` | `AG-24` | AG-24 accepts authorizerType in {AWS_IAM, CUSTOM_JWT}, or AUTHENTICATE_ONLY with a policy engine in ENFORCE, which is GW-01's assertion exactly |
+| `AIR-ACR-MEM-12` | covered | — | `agentcore_assessments` | `AC-18` | AC-18 asserts that a CloudTrail advanced event selector logs data events for AWS::BedrockAgentCore::Memory whenever the region holds a memory resource |
+| `AIR-ACR-OBS-02` | covered | — | `agentcore_assessments` | `AC-18` | AC-18 asserts data-event coverage per resource family, so a trail that logs only the runtime types still fails for memory and for the built-in tools |
+| `AIR-ACR-OBS-03` | covered | — | `agentcore_assessments` | `AC-19` | AC-04 is X-Ray tracingConfig.enabled over list_agent_runtimes only, so it cannot cover Gateway, Memory, Policy or Identity, which is OBS-03's whole subject. AC-19 asserts an APPLICATION_LOGS delivery source wired to a destination per gateway and per memory; runtime logging is service-managed, WorkloadIdentity delivery is configured on the associated runtime or gateway resource, and policy engines have no log-destination surface, so those three legs need no separate assertion |
+| `AIR-ACR-OBS-04` | covered | — | `agentcore_assessments` | `AC-20`, `AC-21` | AC-20 asserts a Deidentify data-protection policy and a customer managed key on the AgentCore log groups, AC-21 asserts that no cached role or user holds logs:Unmask on every resource |
+| `AIR-ACR-OBS-06` | covered | — | `agentcore_assessments` | `AC-22` | AC-22 asserts that every Allow statement on an OAM sink policy either names its principals or carries an organization condition key |
 | `AIR-ACR-RT-09` | covered | — | `agentcore_assessments` | `AC-06` | recording.enabled is True plus an S3 bucket |
 | `AIR-ACR-EVAL-01` | tighten | extend | `agentcore_assessments` | `AC-02` | AC-02 detects AgentCore full-access and wildcard grants only, so a role holding a single over-broad named action passes it |
 | `AIR-ACR-EVAL-05` | tighten | new_id | `agentcore_assessments` | `AC-17` | AC-17 is named "Online Evaluation Coverage" but tests only status == ACTIVE, executionStatus == ENABLED and bool(evaluators); it never reads a sampling rate and never asks which evaluators, so coverage is the one thing it does not measure |
@@ -107,11 +106,6 @@ Generated 2026-09-24 by `aisf-parity/build_ledger.py`. Do not hand-edit: change 
 | `AIR-ACR-ID-08` | new | — | `agentcore_assessments` | — | GetAgentRuntime.authorizerConfiguration exists in botocore 1.43.85 and is never read anywhere; AG-24 is gateway-only, ID-08 is about the runtime |
 | `AIR-ACR-ID-11` | new | — | `agentcore_assessments` | — | the corpus reads authorizerType exactly once, at :3578, and never reads authorizerConfiguration; customJWTAuthorizer.{allowedAudience, allowedClients, allowedScopes, customClaims, discoveryUrl} are all present in the API and unread, so a gateway that trusts any issuer passes AG-24 today |
 | `AIR-ACR-MEM-07` *(workload-specific)* | new | — | `agentcore_assessments` | — | — |
-| `AIR-ACR-MEM-12` | new | — | `agentcore_assessments` | — | CloudTrail event selectors; reads no AgentCore API |
-| `AIR-ACR-OBS-02` | new | — | `agentcore_assessments` | — | CloudTrail event selectors; reads no AgentCore API |
-| `AIR-ACR-OBS-03` | new | — | `agentcore_assessments` | — | AC-04 is X-Ray tracingConfig.enabled over list_agent_runtimes only, so it cannot cover Gateway, Memory, Policy or Identity, which is OBS-03's whole subject; this row was a tightening in an earlier draft and the resource-scope check moved it |
-| `AIR-ACR-OBS-04` | new | — | `agentcore_assessments` | — | CloudWatch Logs data-protection policy |
-| `AIR-ACR-OBS-06` | new | — | `agentcore_assessments` | — | OAM sink policy |
 | `AIR-ACR-POL-06` *(workload-specific)* | new | — | `agentcore_assessments` | — | — |
 | `AIR-ACR-RT-04` *(workload-specific)* | new | — | `agentcore_assessments` | — | — |
 

@@ -709,6 +709,49 @@ Resources:
               Action:
                 - logs:DescribeLogGroups
               Resource: '*'
+            # AC-18 reads which trails select AgentCore resource types for data
+            # events. ListTrails takes no resource; GetEventSelectors is scoped to
+            # the trail resource type.
+            - Sid: CloudTrailTrailInventory
+              Effect: Allow
+              Action:
+                - cloudtrail:ListTrails
+              Resource: '*'
+            - Sid: CloudTrailEventSelectorRead
+              Effect: Allow
+              Action:
+                - cloudtrail:GetEventSelectors
+              Resource: !Sub 'arn:${AWS::Partition}:cloudtrail:*:${AWS::AccountId}:trail/*'
+            # AC-19 pairs each AgentCore delivery source with its delivery.
+            - Sid: LogsDeliveryInventory
+              Effect: Allow
+              Action:
+                - logs:DescribeDeliverySources
+                - logs:DescribeDeliveries
+              Resource: '*'
+            # AC-20 reads masking configuration at both scopes: an account-wide
+            # data-protection policy and a per-log-group one.
+            - Sid: LogsAccountPolicyInventory
+              Effect: Allow
+              Action:
+                - logs:DescribeAccountPolicies
+              Resource: '*'
+            - Sid: LogsDataProtectionPolicyRead
+              Effect: Allow
+              Action:
+                - logs:GetDataProtectionPolicy
+              Resource: !Sub 'arn:${AWS::Partition}:logs:*:${AWS::AccountId}:log-group:*'
+            # AC-22 reads the cross-account observability sink policy.
+            - Sid: ObservabilitySinkInventory
+              Effect: Allow
+              Action:
+                - oam:ListSinks
+              Resource: '*'
+            - Sid: ObservabilitySinkPolicyRead
+              Effect: Allow
+              Action:
+                - oam:GetSinkPolicy
+              Resource: !Sub 'arn:${AWS::Partition}:oam:*:${AWS::AccountId}:sink/*'
             - Sid: CloudWatchPermissions
               Effect: Allow
               Action:
