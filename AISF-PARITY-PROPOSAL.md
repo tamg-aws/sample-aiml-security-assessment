@@ -730,21 +730,28 @@ verdict, disposition, target modules, incumbents and their published names, the 
 extra IAM actions, and the phase. `aisf-parity/AISF-WORK-LEDGER.md` is a generated view of the same
 data. Neither is hand-edited: change `ROWS` in `build_ledger.py` and re-run.
 
-`aisf-parity/check_ledger.py` gates it with 10 checks, each printing its denominator. The two that
+`aisf-parity/check_ledger.py` gates it with 15 checks, each printing its denominator. The two that
 matter most are the ones a scan over the ledger's own rows cannot perform: a **backward** check that
 every machine-checkable hosted control in the AISF classification ledger has a row (catching a
 control silently dropped), and a check that each named incumbent both exists and lives in the row's
-target module (which is what caught the `OBS-03` and `RT-08` errors above). All 10 gates were
-mutation-tested with 6 deliberate corruptions: a dropped row, an invented incumbent, an IAM action
-already granted, a workload-specific control smuggled into the FND tier, inflated arithmetic, and a
-tightening with no disposition. All 6 were caught by the intended gate; none survived.
+target module (which is what caught the `OBS-03` and `RT-08` errors above). `aisf-parity/mutate.py`
+carries the counter-evidence a green gate cannot give: 17 deliberate defects, 5 in the derived
+mapping, 6 in `BR-20`'s S3 Vectors legs, 5 in the tag column (three tag-map entries, the bedrock
+finding schema's sentinel, and agentcore's empty-report header) and 1 in the ledger's markdown
+renderer. Each find-string must occur exactly once in its file or the run aborts, and the harness
+prints the gate or test that caught each defect instead of the one assumed while the defect was
+written.
 
-**15 new IAM actions** fall out of the ledger across 22 action-claims, each verified as not already
-granted to the function that would need it: `cloudtrail:GetEventSelectors`, `cloudtrail:ListTrails`,
-`config:DescribeConfigRules`, `config:DescribeConfigurationRecorders`, `ec2:DescribeSecurityGroups`,
-`logs:DescribeAccountPolicies`, `logs:GetDataProtectionPolicy`,
-`macie2:GetAutomatedDiscoveryConfiguration`, `macie2:GetMacieSession`, `oam:GetSinkPolicy`,
-`oam:ListSinks`, `organizations:DescribeEffectivePolicy`, `organizations:DescribePolicy`,
-`organizations:ListPolicies`, `s3:GetBucketPolicy`. Each needs adding to **both** SAM templates and
-to the matching `_EXPECTED_ACTIONS` entry, which is a set equality at
-`tests/test_sam_role_least_privilege.py:325-331`.
+**14 new IAM actions** fall out of the ledger across 19 action-claims on 12 rows, each verified by
+gate 6 as not already granted to the function that would need it: `cloudtrail:GetEventSelectors`,
+`cloudtrail:ListTrails`, `ec2:DescribeSecurityGroups`, `logs:DescribeAccountPolicies`,
+`logs:GetDataProtectionPolicy`, `macie2:DescribeClassificationJob`,
+`macie2:ListClassificationJobs`, `oam:GetSinkPolicy`, `oam:ListSinks`,
+`organizations:DescribeEffectivePolicy`, `organizations:DescribePolicy`,
+`organizations:ListPolicies`, `s3:GetBucketPolicy`, `wafv2:GetWebACL`. Granted to some other
+function does not count: `wafv2:GetWebACL` is already on `ResponsibleAIGRCAssessmentFunction`, and
+`AIR-FND-NET-04` still claims it because that row is hosted in the AgentCore module, where its
+incumbent `AG-27` lives. Gate 6 parses the granted actions out of `template.yaml` only; each action
+needs adding to **both** SAM templates and to the matching `_EXPECTED_ACTIONS` entry at
+`tests/test_sam_role_least_privilege.py:92`, which
+`test_sam_resource_actions_match_reviewed_inventory` asserts as a set equality per function.

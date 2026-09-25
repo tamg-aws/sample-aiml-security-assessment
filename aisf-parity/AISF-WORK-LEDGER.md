@@ -22,12 +22,15 @@ Generated 2026-09-25 by `aisf-parity/build_ledger.py`. Do not hand-edit: change 
 - `ec2:DescribeSecurityGroups` — AIR-ACR-RT-08, AIR-FND-NET-06
 - `logs:DescribeAccountPolicies` — AIR-ACR-OBS-04
 - `logs:GetDataProtectionPolicy` — AIR-ACR-OBS-04
+- `macie2:DescribeClassificationJob` — AIR-FND-DAT-03
+- `macie2:ListClassificationJobs` — AIR-FND-DAT-03
 - `oam:GetSinkPolicy` — AIR-ACR-OBS-06
 - `oam:ListSinks` — AIR-ACR-OBS-06
 - `organizations:DescribeEffectivePolicy` — AIR-FND-DAT-09
 - `organizations:DescribePolicy` — AIR-ACR-GW-02, AIR-ACR-ID-04
 - `organizations:ListPolicies` — AIR-ACR-GW-02, AIR-ACR-ID-04
 - `s3:GetBucketPolicy` — AIR-FND-DAT-02
+- `wafv2:GetWebACL` — AIR-FND-NET-04
 
 ## BDR (19 controls)
 
@@ -115,14 +118,14 @@ Generated 2026-09-25 by `aisf-parity/build_ledger.py`. Do not hand-edit: change 
 
 | control | verdict | do | module | incumbent | gap |
 |---|---|---|---|---|---|
-| `AIR-FND-DAT-01` | unassessed | — | `bedrock_assessments`, `responsible_ai_grc_assessments` | `BR-20`, `FS-65` | candidate incumbents only; dedup not run. Spans two modules: BR-20 covers knowledge base CMK, FS-65 covers the data-source buckets |
+| `AIR-FND-DAT-01` | unassessed | — | `bedrock_assessments` | `BR-20` | candidate incumbent only; dedup not run. BR-20 covers the knowledge base's vector store keys. FS-65 was listed beside it and is not an incumbent for encryption at rest: its finding is "KB Data Source Buckets Missing S3 Event Notifications", which asserts notification wiring and says nothing about keys, and it runs only when the execution input carries enableResponsibleAIGRC. The data-source bucket leg stays open and is writable here, since this function already holds s3:GetEncryptionConfiguration |
 | `AIR-FND-DAT-02` | unassessed | — | `bedrock_assessments` | — | needs s3:GetBucketPolicy, which no function is granted |
-| `AIR-FND-DAT-03` | unassessed | — | `responsible_ai_grc_assessments` | — | macie2 already granted to this function |
+| `AIR-FND-DAT-03` | unassessed | — | `bedrock_assessments` | `BR-46` | re-hosted off responsible_ai_grc_assessments, which the state machine invokes only when the execution input carries enableResponsibleAIGRC, so a row hosted there ships conditionally, and the candidate incumbent is here rather than there: BR-46 reads automatedDiscoveryMonitoringStatus per knowledge base source bucket, which is the automated-discovery leg of this control. The move costs no IAM, since that check already holds macie2:GetMacieSession, GetAutomatedDiscoveryConfiguration and DescribeBuckets. The unwritten leg is the one the control keeps separate: automated discovery samples objects, so per-object assurance over what is about to be ingested needs a targeted discovery job over the actual source prefixes, which would take macie2:ListClassificationJobs and DescribeClassificationJob, granted to no function today. The subject is also wider than knowledge bases, and the pre-ingest Comprehend detection the control recommends is a call the application makes, not a configuration this scanner can read |
 | `AIR-FND-DAT-09` | unassessed | — | `bedrock_assessments` | — | AISERVICES_OPT_OUT_POLICY via DescribeEffectivePolicy, which no function is granted; the AI-services opt-out is the most AI-specific control in the FND area |
 | `AIR-FND-DET-01` | unassessed | — | `bedrock_assessments` | `BR-04`, `BR-12` | candidate incumbents only; dedup not run |
 | `AIR-FND-DET-04` | unassessed | — | `bedrock_assessments` | `BR-34` | candidate incumbent only; dedup not run |
 | `AIR-FND-IAM-05` | unassessed | — | `agentcore_assessments` | `AC-02` | candidate incumbent only; dedup not run |
 | `AIR-FND-NET-01` | unassessed | — | `agentcore_assessments`, `sagemaker_assessments` | `AC-01`, `SM-11` | spans two modules; candidate incumbents only. 'AI workloads run privately' has no single host, which is why the FND area has no module of its own |
 | `AIR-FND-NET-02` | unassessed | — | `agentcore_assessments` | `AC-08` | candidate incumbent only; dedup not run |
-| `AIR-FND-NET-04` | unassessed | — | `responsible_ai_grc_assessments`, `agentcore_assessments` | `AG-27` | wafv2 is already granted to the GRC function, but the AG-27 incumbent lives in the AgentCore module; pick one before writing it |
+| `AIR-FND-NET-04` | unassessed | — | `agentcore_assessments` | `AG-27` | hosted where the incumbent lives. AG-27 reads webAclArn off the gateway and needs no wafv2 permission, so the association leg costs nothing; the inspection leg the control asks for is the web ACL's rule content, which needs wafv2:GetWebACL. That action is granted only to the GRC function, and that module runs only when the execution input carries enableResponsibleAIGRC, so hosting the row there would make it conditional. The subject narrows to AgentCore gateways |
 | `AIR-FND-NET-06` | unassessed | — | `agentcore_assessments` | `AC-01` | overlaps RT-08; resolve the two together |
