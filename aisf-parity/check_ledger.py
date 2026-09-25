@@ -8,11 +8,13 @@ Run:  python3 aisf-parity/check_ledger.py
 Exit 0 = all gates pass. Exit 1 = at least one gate failed.
 """
 
+import collections
 import glob
 import importlib.util
 import json
 import os
 import re
+import subprocess
 import sys
 
 import yaml
@@ -149,6 +151,34 @@ def load_aisf_control(rel_path, control_id):
         if item.get("id") == control_id:
             return item
     return None
+
+
+def load_compliance_maps():
+    """module dir -> the AISF_COMPLIANCE_MAP that module ships.
+
+    Loaded from source under the module's own unique name. The map modules are
+    deliberately not all called `aisf_compliance`: several producers get loaded
+    into one interpreter by the test suite, and a shared bare name resolves to
+    whichever directory reached sys.path last, which returns "" for every other
+    producer's check ids without raising. Any cached bytecode is dropped first,
+    for the reason given at the top of this file.
+    """
+    out = {}
+    for module_dir in sorted(MODULE_TO_FUNCTION):
+        suffix = module_dir.removesuffix("_assessments")
+        name = f"aisf_compliance_{suffix}"
+        path = os.path.join(MODULES, module_dir, name + ".py")
+        if not os.path.exists(path):
+            continue
+        cached = importlib.util.cache_from_source(path)
+        if os.path.exists(cached):
+            os.remove(cached)
+        spec = importlib.util.spec_from_file_location(name, path)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = module
+        spec.loader.exec_module(module)
+        out[module_dir] = module.AISF_COMPLIANCE_MAP
+    return out
 
 
 def emitted_check_ids():
@@ -551,6 +581,131 @@ def main():
         f"{len(all_ids)} ids ({len(AISF_DERIVED_MAP)} mapped + the coverage marker) "
         f"x 3 legs (^AISF-\\d{{2}}$, registered prefix {registered_prefix!r}, "
         "documented) checked" + (f", bad={shape}" if shape else ""),
+    )
+
+    # ---- gate 14: the per-module AISF tag maps agree with the ledger, in both
+    # directions, and no tag overstates what its check asserts.
+    #
+    # Phase 2 tags rows the producers already emit, so unlike the derived map in
+    # gate 11 it *may* reference a `tighten` control. What makes that sound is the
+    # qualifier: `(partial)` says the check asserts less than the control needs,
+    # and `(1 of N checks)` says the control is covered but not by this leg alone.
+    # Drop the qualifier and the row reads as a full pass against a control the
+    # assessment only partly checks, which is the same overclaim gate 11 exists to
+    # prevent. So the qualifier is derived from the ledger here rather than
+    # trusted, and the N is compared against the row's own incumbent count.
+    #
+    # Both directions, because a scan over the maps cannot see a control that was
+    # never written into one, and that is the direction a newly-added ledger row
+    # drifts.
+    taggable = ("covered", "tighten")
+    maps = load_compliance_maps()
+    # Called again rather than reusing `emitted` from the top of main(): gate 12
+    # rebinds that name to a list of derived findings, so by here it is no longer
+    # the check_id -> modules map.
+    emitting_modules = emitted_check_ids()
+    expected_pairs = set()
+    for r in rows:
+        if r["verdict"] in taggable:
+            for inc in r["incumbents"] or []:
+                expected_pairs.add((inc, r["control"]))
+    found_pairs = set()
+    tag_problems = []
+    element_re = re.compile(
+        r"AISF (AIR-[A-Z]+-[A-Z]+-\d+)(?: \((partial|1 of (\d+) checks)\))?$"
+    )
+    for module_dir, mapping in sorted(maps.items()):
+        for cid, tag in sorted(mapping.items()):
+            if module_dir not in emitting_modules.get(cid, set()):
+                tag_problems.append(f"{module_dir} maps {cid}, which it does not emit")
+            for element in tag.split(" | "):
+                m = element_re.fullmatch(element)
+                if not m:
+                    tag_problems.append(
+                        f"{module_dir}:{cid} unparseable tag {element!r}"
+                    )
+                    continue
+                control, qualifier, denominator = m.groups()
+                row = by_control.get(control)
+                if row is None or row["verdict"] not in taggable:
+                    verdict = None if row is None else row["verdict"]
+                    tag_problems.append(
+                        f"{module_dir}:{cid}:{control} verdict={verdict}"
+                    )
+                    continue
+                found_pairs.add((cid, control))
+                legs = len(row["incumbents"] or [])
+                want = (
+                    "partial"
+                    if row["verdict"] == "tighten"
+                    else (None if legs == 1 else f"1 of {legs} checks")
+                )
+                if qualifier != want:
+                    tag_problems.append(
+                        f"{module_dir}:{cid}:{control} verdict={row['verdict']} "
+                        f"legs={legs} qualifier={qualifier!r} want={want!r}"
+                    )
+                elif denominator is not None and int(denominator) != legs:
+                    tag_problems.append(
+                        f"{module_dir}:{cid}:{control} denominator={denominator} legs={legs}"
+                    )
+    missing = expected_pairs - found_pairs
+    extra = found_pairs - expected_pairs
+    if missing:
+        tag_problems.append(f"in the ledger, absent from every map: {sorted(missing)}")
+    if extra:
+        tag_problems.append(f"in a map, not taggable in the ledger: {sorted(extra)}")
+    # Every figure docs/SECURITY_CHECKS_AISF.md publishes about the tag column is
+    # printed here, including the ones no assertion above turns on: the per-module
+    # split and the qualifier census. A figure a gate does not print gets re-derived
+    # by hand and copied into prose, which is how the counts in this project drifted
+    # before. The qualifier census doubles as a shape check a reader can apply --
+    # `bare` must equal the number of covered controls with a single incumbent.
+    per_module = " ".join(
+        f"{d.removesuffix('_assessments')}={len(m)}" for d, m in sorted(maps.items())
+    )
+    census = collections.Counter()
+    for module_dir, mapping in maps.items():
+        for tag in mapping.values():
+            for element in tag.split(" | "):
+                m = element_re.fullmatch(element)
+                if m:
+                    census[
+                        "bare"
+                        if m.group(2) is None
+                        else ("partial" if m.group(2) == "partial" else "joint")
+                    ] += 1
+    gate(
+        "per-module AISF tag maps agree with the ledger both ways",
+        not tag_problems,
+        f"{len(found_pairs)}/{len(expected_pairs)} check-control pairs over "
+        f"{sum(len(m) for m in maps.values())} tagged checks in {len(maps)} modules, "
+        f"naming {len({c for _, c in found_pairs})} distinct controls; "
+        f"checks per module {per_module}; qualifiers bare={census['bare']} "
+        f"partial={census['partial']} joint={census['joint']}; "
+        "each checked for module ownership, ledger verdict and qualifier"
+        + (f", bad={tag_problems}" if tag_problems else ""),
+    )
+
+    # ---- gate 15: the shipped maps are what the generator renders from the
+    # ledger. Gate 14 asserts the semantics independently of the generator; this
+    # one catches a hand-edit that happens to stay semantically legal, such as a
+    # reordered or duplicated entry.
+    gen = subprocess.run(
+        [sys.executable, os.path.join(HERE, "gen_compliance_maps.py"), "--check"],
+        capture_output=True,
+        text=True,
+        cwd=REPO,
+    )
+    gate(
+        "shipped AISF tag maps match a fresh render of the ledger",
+        gen.returncode == 0 and "maps match the ledger" in gen.stdout,
+        f"generator --check exit {gen.returncode} over {len(maps)} modules"
+        + (
+            ""
+            if gen.returncode == 0
+            else f", output={(gen.stdout + gen.stderr).strip().splitlines()[-1:]}"
+        ),
     )
 
     failed = [n for n, ok, _ in results if not ok]

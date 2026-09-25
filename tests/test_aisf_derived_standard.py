@@ -106,17 +106,27 @@ single_account = _load_module(
 # over SEVERITY_REGISTER, which the derived map is invisible to, so the derived
 # rows need their own assertion. Reading the enum means a `Critical` added
 # upstream fails here instead of being silently permitted by a copied literal.
-severity_schema = _load_module(
-    "aisf_severity_schema",
-    os.path.join(
-        REPO_ROOT,
-        "aiml-security-assessment",
-        "functions",
-        "security",
-        "bedrock_assessments",
-        "schema.py",
-    ),
+#
+# The schema imports its AISF tag map as a flat module, the way the Lambda does:
+# at runtime the function root is on sys.path, so `from aisf_compliance_bedrock
+# import ...` resolves. Put that one directory on sys.path for the load and take
+# it off again. Leaving a producer directory on the path for the rest of the
+# session would shadow `app` and `schema` for any test that loads a different
+# producer afterwards, and those names are shared by all six producers.
+_BEDROCK_DIR = os.path.join(
+    REPO_ROOT,
+    "aiml-security-assessment",
+    "functions",
+    "security",
+    "bedrock_assessments",
 )
+sys.path.insert(0, _BEDROCK_DIR)
+try:
+    severity_schema = _load_module(
+        "aisf_severity_schema", os.path.join(_BEDROCK_DIR, "schema.py")
+    )
+finally:
+    sys.path.remove(_BEDROCK_DIR)
 ALLOWED_SEVERITIES = {band.value for band in severity_schema.SeverityEnum}
 
 METHODOLOGY_DOC = os.path.join(

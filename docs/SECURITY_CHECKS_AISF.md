@@ -15,6 +15,11 @@ and the shipped BR/SM/AC/AG check every row is derived from.
   checks that already ship; the remaining 70 are not yet assessed. The parity
   analysis behind those figures is in
   [`aisf-parity/AISF-WORK-LEDGER.md`](../aisf-parity/AISF-WORK-LEDGER.md).
+- **Traceability:** a further 28 controls are partly covered, too partly to earn
+  an `AISF-` row. Those, and the 8 above, are named on the producer rows
+  themselves by the `Compliance_Frameworks` CSV column described under
+  [Traceability column on producer rows](#traceability-column-on-producer-rows).
+  A tag carries no verdict.
 
 ## Disclaimer
 
@@ -214,6 +219,86 @@ leg.
 
 Reference: <https://docs.aws.amazon.com/whitepapers/latest/sagemaker-studio-admin-best-practices/permissions-management.html>
 
+## Traceability column on producer rows
+
+The `AISF-` rows above are derived verdicts. The `Compliance_Frameworks` column
+is the second half of the parity work and publishes no verdict at all: it tags
+rows the BR/SM/AC/AG/AR checks already emit with the AISF control each check
+contributes to, so a reader of `bedrock_security_report_*.csv` can trace a row
+back to the framework. The `Status` column still carries the verdict.
+
+Measured by `check_ledger.py` gate 14, which prints each of these figures on
+every run: 39 check-control pairs over 31 tagged checks in 4 modules, naming 36
+distinct controls. Tagged checks per module are bedrock 11, sagemaker 7,
+agentcore 12, agent_registry 1.
+
+### The qualifier is what makes a `tighten` control safe to name
+
+Gate 11 keeps a `tighten` control out of `AISF_DERIVED_MAP`, because an `AISF-`
+row restates the incumbent's `Passed` under the control id. A tag restates
+nothing, so it may name a partly-covered control as long as it says so. Three
+forms, and gate 14 derives which one is correct from the ledger row instead of
+trusting the literal in the file:
+
+| Tag | Means |
+| ----- | ------- |
+| `AISF AIR-BDR-GRD-01` | this check alone asserts the whole control |
+| `AISF AIR-SGM-TRN-05 (1 of 3 checks)` | the control is covered, but jointly, so no single leg asserts it |
+| `AISF AIR-BDR-MDL-02 (partial)` | the check asserts less than the control requires, and the gap is open in the ledger |
+
+Census at the current head, also printed by gate 14: 7 bare, 29 `(partial)`, 3
+`(1 of 3 checks)`. The 7 bare tags plus the single control that carries all 3
+joint legs account for the 8 `covered` controls; the remaining 28 are `tighten`.
+A bare tag on a `tighten` row, or a dropped `(1 of N)`, fails gate 14 with the
+row's verdict and incumbent count named.
+
+A check that contributes to several controls carries them pipe-joined, with the
+`AISF ` prefix repeated on each element so a consumer that splits on `|` gets a
+complete token. `AC-02` names four controls that way. `SM-03` is the case that
+exercises both qualifiers at once, holding a `(partial)` for one control and a
+`(1 of 3 checks)` for another.
+
+### Generated, not hand-written
+
+`aisf-parity/gen_compliance_maps.py` renders one map module per producer from
+the ledger, resolving each incumbent to the module that emits it. `--check`
+re-renders and diffs without writing, which is gate 15. Gate 14 asserts the same
+maps semantically with its own logic, so a wrong derivation cannot pass by
+agreeing with itself: a semantically legal hand-edit, such as reordering two
+entries, passes gate 14 and fails gate 15.
+
+The map files are named per producer (`aisf_compliance_bedrock.py` and so on)
+for a measured reason. All six producers name their files `schema.py` and
+`app.py`, and `app.py` reaches its schema with `from schema import
+create_finding`, resolved through `sys.modules` under that bare name. With four
+files all called `aisf_compliance.py`, loading two producers into one
+interpreter gave the second one the first one's map, and
+`aisf_frameworks("BR-10")` returned `""` inside the bedrock module. The symptom
+is an empty tag and no `ImportError`, so nothing raises.
+
+### Scope, and what it does not cover
+
+- **CSV and the schema contract only.** The column reaches all four producer
+  CSVs. `generate_table_rows` renders 6 columns and never reads the field, so
+  the HTML report does not show it; a 7th column would touch the OWASP and
+  FinServ sections plus the `colspan="6"` assertions.
+- **4 producer modules, not 5.** `owasp_assessments` is excluded because the
+  ledger names no `OW-` incumbent for any control, so the field would ship
+  unpopulated on every OWASP row.
+- **`responsible_ai_grc_assessments` is untouched.** It already declared the
+  field and populates it from its own 64-entry `COMPLIANCE_MAP`, none of whose
+  26 tokens is AISF. Its frozen inventory baseline, whose tuples carry the
+  compliance string as their 5th element, is unchanged.
+- **The lookup cannot be bypassed.** Every finding in the four producers is
+  built by `create_finding`, and
+  `test_no_producer_builds_a_finding_outside_create_finding` fails if any is
+  assembled as a literal dict. Such a row would ship an empty tag silently,
+  because `csv.DictWriter` raises on a key the fieldnames lack and never on a
+  key a row is missing. That same `extrasaction="raise"` default couples the
+  schema field to the fieldnames list, so landing one without the other raises
+  `ValueError` on the first row. `agentcore_assessments` builds its header
+  twice, once for the no-findings case, and both lists are asserted.
+
 ## Live verification
 
 The local battery proves the mapping is internally consistent. It cannot prove a
@@ -257,8 +342,14 @@ head: BOTH=4, ONE_ONLY=4, NONE=0, VACUOUS=0.
    and the coverage sentence in this file. Gate 12 compares both against
    `AISF_DERIVED_MAP` and the ledger, so a stale figure fails the gate.
 4. Add the row to the check catalogue above with its own per-control section.
-5. Run the whole local battery, recording its exit code into the same file
-   because step 7 reads it:
+5. Regenerate the tag maps with `.venv/bin/python
+   aisf-parity/gen_compliance_maps.py`, and commit the four files it writes. A
+   control that became `covered` is also newly taggable, and a control that was
+   already tagged `(partial)` changes qualifier when its verdict moves, so the
+   maps go stale on the same edit. Gate 15 fails if the shipped maps are not what
+   the ledger renders, and gate 14 fails if a qualifier disagrees with the row.
+6. Run the whole local battery, recording its exit code into the same file
+   because step 8 reads it:
 
    ```bash
    bash aisf-parity/gate_all.sh --out /tmp/battery.txt
@@ -271,17 +362,17 @@ head: BOTH=4, ONE_ONLY=4, NONE=0, VACUOUS=0.
    bare `pytest responsible_ai_grc_tests/` collects nothing and exits 4 while
    looking like a pass, so gate 3 runs that path as a positive control and fails
    if it ever succeeds.
-6. Run `.venv/bin/python aisf-parity/mutate.py`. It breaks the mapping four
+7. Run `.venv/bin/python aisf-parity/mutate.py`. It breaks the mapping four
    ways and requires a ledger gate or a test to go red for each one, naming the
    catcher it observed. A mutation nothing catches means the new control's
    assertions are missing; the answer is an assertion, not a gentler mutation.
-7. Before any push, run `.venv/bin/python aisf-parity/push_safety.py
+8. Before any push, run `.venv/bin/python aisf-parity/push_safety.py
    --battery-output /tmp/battery.txt -- git push origin <branch>`. It pushes
    nothing: it asserts the remote is the fork and not `aws-samples`, that no
    commit in the range carries a secret or an attribution line, that the push is
    neither a force nor aimed at `main`, and it re-reads the recorded battery run
    to confirm every gate that file claims actually reported at this commit.
-8. Run `probe_live.py` against an account that has a resource on each side of the
+9. Run `probe_live.py` against an account that has a resource on each side of the
    new control. If the new row comes back ONE_ONLY with a `REACHABLE`
    classification, the missing verdict is a missing fixture, not a waiver: add it
    to `aisf-parity/LIVE-FIXTURES.md` with its cost and its teardown.

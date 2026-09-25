@@ -2,7 +2,7 @@
 # Run every local gate for the AISF parity work: the ledger gates, the three test
 # sessions CI runs, and ruff. One command, one verdict, a denominator beside each.
 #
-# Why this exists. The 13 ledger gates, the four pytest invocations and the two ruff
+# Why this exists. The ledger gates, the four pytest invocations and the two ruff
 # commands have been run by hand, in different orders, with the numbers copied into
 # prose afterwards. A hand-assembled run omits a step silently: the invocation that
 # collects nothing (gate 3 below) exits 4 and prints "no tests ran", which scrolls

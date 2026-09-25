@@ -66,6 +66,10 @@ reach none of the 144 Bedrock, SageMaker, AgentCore, Agent Registry, or OWASP ch
 exactly the ones AISF overlaps. A framework tag that lands only on the FinServ subset is
 misleading, because a reader would read absence of the tag as absence of AISF relevance.
 
+> **Superseded by phase 2.** The column now exists in 5 of the 6 schemas. `owasp_assessments` is the
+> exception, for the reason given at the end of section 3.3. The counts above are the starting
+> position this work was scoped against and are kept as that.
+
 ### 3.3 Two candidate meanings, and which one to pick
 
 **Option A, tag on existing rows.** Add `Compliance_Frameworks` to the five schemas that lack it,
@@ -88,6 +92,25 @@ monkeypatched proof that a second standard renders already exists at `:274-311`.
 **Recommendation: B for the report surface, A scoped to the hosted checks only.** B is the
 mechanism the repo was built for and has a passing proof. A is worth doing only for the checks that
 actually map to AISF controls, which section 4 quantifies as 67.
+
+**As shipped, A departs from this analysis in two ways, both measured after the fact.**
+
+*Four schemas, not five.* `owasp_assessments` was left out. The ledger names no `OW-` incumbent for
+any of the 105 controls, so the field would have shipped declared and permanently empty on every
+OWASP row, which reads to a consumer as "no AISF control applies" instead of "not analysed". The
+four that carry it are `bedrock`, `sagemaker`, `agentcore` and `agent_registry`.
+
+*The frozen baseline was not rewritten.* The cost predicted above assumed the change would reach
+`responsible_ai_grc_tests/test_inventory_equivalence.py:604-696`. It does not: that baseline covers
+the GRC module, which is the one module that already declared `Compliance_Frameworks`, and which
+this phase does not touch. Its 875-test in-module suite passes unchanged.
+
+Two facts about the mechanism that section 3.3 did not anticipate. Tagging a `tighten` control is
+sound where restating its verdict is not, because a tag publishes no verdict, so the shipped
+vocabulary carries a `(partial)` and a `(1 of N checks)` qualifier and gate 14 derives the correct
+one from the ledger row. And the tag reaches the CSV only: `generate_table_rows` renders 6 columns
+and never reads the field. Both are documented in
+[`docs/SECURITY_CHECKS_AISF.md`](docs/SECURITY_CHECKS_AISF.md#traceability-column-on-producer-rows).
 
 ### 3.4 Correction to a comment in the codebase
 
@@ -543,6 +566,7 @@ Each phase is independently shippable and leaves the suite green.
 | 0 | `chore/aisf-parity-proposal` | this document, the crosswalk data, no code | none |
 | 1 | `feature/aisf-report-section` | register `AISF-` in `COMPLIANCE_STANDARDS`, wire `per_region_categories`, artifact prefixes, report IAM | report layer only |
 | 2 | `feature/aisf-compliance-column` | add `Compliance_Frameworks` to the 5 schemas that lack it, plus per-module AISF maps for the 67 hosted controls | 5 schemas, rewrites the frozen baseline |
+| 2 as shipped | `feature/aisf-compliance-column` | the column in **4** schemas, generated maps tagging 36 controls across 39 check-control pairs | 4 schemas, the frozen baseline untouched |
 | 3 | `feature/aisf-checks-bedrock` | BDR 19 into `bedrock_assessments` | one module |
 | 4 | `feature/aisf-checks-agentcore` | ACR 37 into `agentcore_assessments` / `agent_registry_assessments` | two modules |
 | 5 | `feature/aisf-checks-sagemaker` | SGM 11 into `sagemaker_assessments` | one module |
