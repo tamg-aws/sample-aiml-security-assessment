@@ -350,10 +350,14 @@ AWS_PROFILE=<profile> .venv/bin/python aisf-parity/probe_live_tags.py \
 aisf-parity/probe_live_tags.py --selftest   # 12 classifier cases, no credentials
 ```
 
-Measured at the current head against execution `2654a727`, written by a deploy of
-this branch: 13/13 assertions, 31/31 map keys confirmed against an id the module
-really emitted, 0 unproven, 0 misplaced, 115 of 356 rows tagged as the run wrote
-them, 0 producers disagreeing. Because a 100% result is also what a probe measuring
+Measured against execution `2654a727`, written by a CodeBuild run that resolved to
+commit `6ac8dca`: 13/13 assertions, 31/31 map keys confirmed against an id the
+module really emitted, 0 unproven, 0 misplaced, 115 of 356 rows tagged as the run
+wrote them, 0 producers disagreeing. The head has moved past `6ac8dca` since, and
+the probe still passes because the commits since then touch no map, `schema.py` or
+`app.py`: the deployed maps and this tree's maps are the same bytes. Check that
+before reusing an older run's CSVs, because the as-written section compares them
+against whatever the tree says now. Because a 100% result is also what a probe measuring
 nothing prints, every live assertion was driven red once against real CSVs; the four
 injections and their observed failures are tabulated in
 `aisf-parity/LIVE-FIXTURES.md`.

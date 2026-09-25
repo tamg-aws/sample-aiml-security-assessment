@@ -48,8 +48,8 @@ AWS_PROFILE=delegated-admin .venv/bin/python aisf-parity/probe_live_tags.py \
 .venv/bin/python aisf-parity/probe_live_tags.py --selftest   # 12 cases, no credentials
 ```
 
-Measured against execution `2654a727` in us-east-1, written 2026-09-25 12:51 UTC
-by a deploy of this branch: **13/13 assertions, 31/31 map keys confirmed against an
+Measured against execution `2654a727` in us-east-1, written 2026-09-25 12:51 UTC by
+a CodeBuild run that resolved to commit `6ac8dca`: **13/13 assertions, 31/31 map keys confirmed against an
 id the module really emitted, 0 unproven, 0 misplaced, 115 of 356 rows tagged as
 the run wrote them, 0 producers disagreeing.** Qualifier forms on real rows: 33
 bare, 101 `(partial)`, 11 joint, 28 pipe-joined multi-control, 0 unparseable. A key
@@ -220,6 +220,18 @@ is built, so the override needs no CloudFormation change and reverts by simply n
 passing it again. The build reported `resolvedSourceVersion
 6ac8dca1498efe559b04712be961cac3017e9dde`, which is what ties the CSVs above to a
 commit instead of to a branch name that moves.
+
+That distinction is load-bearing for the as-written assertion, which compares the
+shipped column against whatever the tree says **now**. A run is reusable only while
+the commits since it touch no map, `schema.py` or `app.py`:
+
+```bash
+git diff --name-only <resolvedSourceVersion> HEAD \
+  | grep -E 'aisf_compliance_|/schema\.py|/app\.py'   # silence means reusable
+```
+
+A hit there means a redeploy, not a rerun of the probe: the failure would be real,
+and it would name the deployed artifact rather than the map.
 
 | Stack | Created by | Holds |
 |---|---|---|
