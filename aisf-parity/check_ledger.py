@@ -128,29 +128,115 @@ def load_granted_actions():
     return out
 
 
+def figure_occurrences(text, patterns):
+    """label -> every value its pattern finds, over whitespace-flattened text.
+
+    Flattened for two independent reasons. A marker that hard-wraps is invisible
+    to a literal-space pattern: measured against the tag-column paragraph as
+    published, the patterns resolve 7 of 8 figures on the raw file and miss
+    `naming 36\\ndistinct controls`. And the agreement rule below has to count
+    copies on the same flattened text, or a hard-wrapped second copy carrying a
+    different number is not seen as a copy at all, which leaves exactly the hole
+    a first-match read left open.
+    """
+    flat = re.sub(r"\s+", " ", text)
+    return {label: re.findall(pattern, flat) for label, pattern in patterns}
+
+
+def agreed_figure(found):
+    """The integer every occurrence agrees on, or None for none or a disagreement.
+
+    A figure appearing more than once is not an error by itself: these figures
+    live in nine files and move together, and one file can restate a paragraph.
+    Two copies that *disagree* is the error, and taking the earliest match is how
+    it stayed invisible -- a correct copy earlier in the file returned the right
+    number while the published paragraph below it was wrong, and gate 12, gate 14
+    and the whole battery passed. So every copy has to agree and there has to be
+    at least one; zero is still a failure, exactly as it was.
+
+    Compared as integers and not as the strings matched, so a zero-padded copy is
+    not read as a second, different figure.
+    """
+    values = {int(v) for v in found}
+    if len(values) != 1:
+        return None
+    return values.pop()
+
+
+def agreed_mapping(found):
+    """The same rule for the per-module split, compared as a parsed mapping.
+
+    Parsed before comparing, so two copies listing the same modules in a
+    different order agree. The names are part of the published claim: a renamed
+    producer is how that sentence goes stale with no count moving.
+    """
+    parsed = [
+        {m.group(1): int(m.group(2)) for m in re.finditer(r"(\w+) (\d+)", sentence)}
+        for sentence in found
+    ]
+    if not parsed or any(p != parsed[0] for p in parsed):
+        return None
+    return parsed[0]
+
+
+def figure_problems(source, values, found):
+    """One message per figure `source` fails to publish once and consistently.
+
+    Absence and disagreement both arrive as a None value and are reported apart,
+    because they are different defects with different repairs: no match at all is
+    a reworded or deleted sentence, while two matches that differ is a stale
+    published paragraph masked by a correct copy elsewhere in the same file. The
+    occurrence list is the only thing that tells them apart, so it is what this
+    reads, and every value found is printed with the name of the figure.
+    """
+    problems = []
+    for label, value in sorted(values.items()):
+        if not found[label]:
+            problems.append(
+                f"{source} publishes no {label} figure these patterns can find"
+            )
+        elif value is None:
+            problems.append(
+                f"{source} publishes {len(found[label])} copies of {label} that "
+                f"disagree: {found[label]}"
+            )
+    return problems
+
+
+def copies_note(found):
+    """`label xN` for every figure, for printing beside the values.
+
+    The count belongs in the verdict line and is not a debug aid: it is what says
+    how much the agreement rule had to compare. One copy asserts the agreement of
+    one, which is the whole of what the old first-match read ever checked.
+    """
+    return " ".join(f"{label} x{len(hits)}" for label, hits in sorted(found.items()))
+
+
 def scope_figures(text):
-    """The AISF coverage figures a piece of prose publishes.
+    """The AISF coverage figures a piece of prose publishes, and all their copies.
 
     The same three coverage figures are published twice, in the report section's
     scope_text and in docs/SECURITY_CHECKS_AISF.md, so both are read with one
-    set of patterns and compared. A figure the patterns cannot find comes back
-    as None, which gate 12 treats as a failure: a reworded sentence that drops a
-    figure also drops it from the gate.
+    set of patterns and compared. Returns the figures beside every occurrence
+    found for each. A figure is the value all of its copies agree on; gate 12
+    reads None as a failure whether that is no copy or two that disagree, so a
+    reworded sentence that drops a figure also drops it from the gate.
     """
-    out = {}
-    for label, pattern in (
-        ("derivable", r"(\d+) of the \d+ in-scope AISF controls"),
-        ("in_scope", r"\d+ of the (\d+) in-scope AISF controls"),
-        ("remaining", r"remaining (\d+) are not yet"),
-        ("catalog", r"framework's (\d+)-check total"),
-    ):
-        found = re.search(pattern, text)
-        out[label] = int(found.group(1)) if found else None
-    return out
+    found = figure_occurrences(
+        text,
+        (
+            ("derivable", r"(\d+) of the \d+ in-scope AISF controls"),
+            ("in_scope", r"\d+ of the (\d+) in-scope AISF controls"),
+            ("remaining", r"remaining (\d+) are not yet"),
+            ("catalog", r"framework's (\d+)-check total"),
+        ),
+    )
+    return {label: agreed_figure(hits) for label, hits in found.items()}, found
 
 
 def tag_column_figures(text):
-    """The Compliance_Frameworks figures a piece of prose publishes.
+    """The Compliance_Frameworks figures a piece of prose publishes, and their copies.
 
     Whitespace is collapsed to single spaces over the whole text first. Measured
     against the paragraph as published: these same patterns without the flatten
@@ -167,37 +253,35 @@ def tag_column_figures(text):
     pass for the wrong reason, so pick the width by checking which marker it splits.
     Flattening removes the dependence on the wrap position altogether.
 
-    A figure the patterns cannot find comes back None, and gate 14 reads None as a
-    failure. Same contract as scope_figures(): a reworded sentence that drops a
-    figure drops the gate with it instead of quietly stopping the assertion.
+    Same fail-closed contract as scope_figures(): the value is what every copy of
+    the figure agrees on, and gate 14 fails on None whether that is no copy at all
+    or two copies that disagree. A reworded sentence that drops a figure drops the
+    gate with it instead of quietly stopping the assertion.
 
     The qualifier census (bare/partial/joint) is deliberately absent. Gate 14
     prints it, two tools compute it, and no document publishes it, so there is no
     published claim to gate.
     """
-    flat = re.sub(r"\s+", " ", text)
-    out = {}
-    for label, pattern in (
-        ("pairs", r"(\d+) check-control pairs over \d+ tagged checks"),
-        ("tagged", r"\d+ check-control pairs over (\d+) tagged checks"),
-        ("modules", r"tagged checks in (\d+) modules"),
-        ("controls", r"naming (\d+) distinct controls"),
-    ):
-        found = re.search(pattern, flat)
-        out[label] = int(found.group(1)) if found else None
-    # The per-module split is read as a mapping and not as four numbers, so the
-    # module *names* are asserted too: a renamed producer is the way this sentence
-    # goes stale without any count changing.
-    split = re.search(r"Tagged checks per module are ([^.]+)\.", flat)
-    out["per_module"] = (
-        {
-            m.group(1): int(m.group(2))
-            for m in re.finditer(r"(\w+) (\d+)", split.group(1))
-        }
-        if split
-        else None
+    found = figure_occurrences(
+        text,
+        (
+            ("pairs", r"(\d+) check-control pairs over \d+ tagged checks"),
+            ("tagged", r"\d+ check-control pairs over (\d+) tagged checks"),
+            ("modules", r"tagged checks in (\d+) modules"),
+            ("controls", r"naming (\d+) distinct controls"),
+            # The per-module split is read as a mapping and not as four numbers, so
+            # the module *names* are asserted too: a renamed producer is the way
+            # this sentence goes stale without any count changing.
+            ("per_module", r"Tagged checks per module are ([^.]+)\."),
+        ),
     )
-    return out
+    out = {
+        label: agreed_figure(hits)
+        for label, hits in found.items()
+        if label != "per_module"
+    }
+    out["per_module"] = agreed_mapping(found["per_module"])
+    return out, found
 
 
 def load_aisf_control(rel_path, control_id):
@@ -566,17 +650,30 @@ def main():
                 )
 
     aisf_entry = next((s for s in COMPLIANCE_STANDARDS if s["slug"] == "aisf"), None)
-    figures = scope_figures((aisf_entry or {}).get("scope_text", ""))
+    figures, figure_hits = scope_figures((aisf_entry or {}).get("scope_text", ""))
     with open(AISF_DOC) as f:
-        doc_figures = scope_figures(f.read())
+        doc_figures, doc_hits = scope_figures(f.read())
     # AISF-00 is the coverage marker row, never a control, so it is not in the map
     # and must not be counted among the derivable controls.
     allocated = [m["check_id"] for m in AISF_DERIVED_MAP]
     if AISF_COVERAGE_CHECK_ID in allocated:
         drift.append(f"{AISF_COVERAGE_CHECK_ID} is reserved but allocated to a control")
     with open(SECURITY_CHECKS_DOC) as f:
-        doc_total = re.search(r"reference for all (\d+) security checks", f.read())
-    catalog_total = int(doc_total.group(1)) if doc_total else None
+        sc_hits = figure_occurrences(
+            f.read(), (("sc_total", r"reference for all (\d+) security checks"),)
+        )
+    catalog_total = agreed_figure(sc_hits["sc_total"])
+    # Each figure above is the value all of its copies agree on, and a figure whose
+    # copies disagree is a failure of its own, named here with every value found.
+    # These three reads used to take the earliest match over the whole file, so a
+    # correct copy above the published paragraph -- another section, a quoted
+    # example, a deliberately dated appendix -- answered for the paragraph below
+    # it. Reproduced: a duplicate sentence at the top of SECURITY_CHECKS_AISF.md
+    # carrying the right figures left gate 14 green and the battery at 16/16 with
+    # exit 0 while the paragraph it publishes read one control too many.
+    drift += figure_problems("the report section's scope_text", figures, figure_hits)
+    drift += figure_problems("SECURITY_CHECKS_AISF.md", doc_figures, doc_hits)
+    drift += figure_problems("SECURITY_CHECKS.md", {"sc_total": catalog_total}, sc_hits)
     if figures["derivable"] != len(AISF_DERIVED_MAP):
         drift.append(
             f"scope_text claims {figures['derivable']} derivable, map has "
@@ -639,7 +736,10 @@ def main():
         f"{len(collapsed)} collapsed-band disclosures x 2 status paths + "
         f"{len(figures)} figures in the report section + "
         f"{len(doc_figures)} in SECURITY_CHECKS_AISF.md checked, "
-        f"figures={figures}, catalog 3 sides: emitted {len(emitted_catalog_ids)} "
+        f"figures={figures}, copies scope_text [{copies_note(figure_hits)}] "
+        f"SECURITY_CHECKS_AISF.md [{copies_note(doc_hits)}] "
+        f"SECURITY_CHECKS.md [{copies_note(sc_hits)}], "
+        f"catalog 3 sides: emitted {len(emitted_catalog_ids)} "
         f"({len(catalog_owners)} distinct ids minus {len(marker_ids)} "
         f"{marker_ids} markers) vs scope_text {figures['catalog']} vs "
         f"SECURITY_CHECKS.md {catalog_total}" + (f", drift={drift}" if drift else ""),
@@ -807,12 +907,23 @@ def main():
     # Re-read rather than reusing gate 13's copy of the text: the gates above rebind
     # names across blocks, and a figure gate that reads the wrong buffer fails open.
     with open(AISF_DOC) as f:
-        published = tag_column_figures(f.read())
+        published, published_hits = tag_column_figures(f.read())
+    # Three outcomes, not two: no copy of the figure, copies that disagree with each
+    # other, and a copy that disagrees with the gate. The middle one is new and was
+    # the fail-open case -- an earlier copy carrying the right number answered for
+    # the published paragraph. These messages name the computed value too, which is
+    # why gate 14 does not reuse figure_problems() from gate 12.
     for label, want in published.items():
-        if want is None:
+        if not published_hits[label]:
             tag_problems.append(
                 f"SECURITY_CHECKS_AISF.md publishes no {label} figure these patterns "
                 f"can find; gate 14 computes {computed[label]}"
+            )
+        elif want is None:
+            tag_problems.append(
+                f"SECURITY_CHECKS_AISF.md publishes {len(published_hits[label])} "
+                f"copies of {label} that disagree: {published_hits[label]}; gate 14 "
+                f"computes {computed[label]}"
             )
         elif want != computed[label]:
             tag_problems.append(
@@ -842,7 +953,8 @@ def main():
         "no document publishes them); each checked for module ownership, ledger "
         f"verdict and qualifier; {len(published) - 1} scalar figure(s) + "
         f"{len(published['per_module'] or {})} per-module figure(s) asserted against "
-        f"SECURITY_CHECKS_AISF.md, doc={published} vs computed={computed}"
+        f"SECURITY_CHECKS_AISF.md, doc={published} vs computed={computed}, "
+        f"copies [{copies_note(published_hits)}]"
         + (f", bad={tag_problems}" if tag_problems else ""),
     )
 
