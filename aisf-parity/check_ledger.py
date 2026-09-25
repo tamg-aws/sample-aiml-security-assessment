@@ -29,6 +29,8 @@ TEMPLATE = os.path.join(REPO, "aiml-security-assessment", "template.yaml")
 REPORT_APP_DIR = os.path.join(MODULES, "generate_consolidated_report")
 SECURITY_CHECKS_DOC = os.path.join(REPO, "docs", "SECURITY_CHECKS.md")
 AISF_DOC = os.path.join(REPO, "docs", "SECURITY_CHECKS_AISF.md")
+OWASP_DOC = os.path.join(REPO, "docs", "SECURITY_CHECKS_OWASP.md")
+GRC_DOC = os.path.join(REPO, "docs", "SECURITY_CHECKS_RESPONSIBLE_AI_GRC.md")
 
 # Gates 11 and 12 read the shipped derived-standard map directly, not a copy of
 # it, so a drift between the map and the ledger cannot hide behind a transcription.
@@ -44,12 +46,15 @@ AISF_DOC = os.path.join(REPO, "docs", "SECURITY_CHECKS_AISF.md")
 #
 # build_ledger is in the same list for the same reason: gate 10 renders the
 # markdown through it, so a stale copy of the renderer would compare the json
-# against yesterday's layout and pass.
+# against yesterday's layout and pass. gen_compliance_maps likewise: gate 12
+# derives the catalog total through its check_owners(), and a stale copy would
+# count the ids the producers emitted the last time it was imported.
 sys.dont_write_bytecode = True
 for _dir, _name in (
     (REPORT_APP_DIR, "report_template"),
     (REPORT_APP_DIR, "aisf_mappings"),
     (HERE, "build_ledger"),
+    (HERE, "gen_compliance_maps"),
 ):
     _cached = importlib.util.cache_from_source(os.path.join(_dir, _name + ".py"))
     if os.path.exists(_cached):
@@ -66,6 +71,7 @@ from aisf_mappings import (  # noqa: E402
     derive_aisf_findings,
 )
 from build_ledger import render_markdown  # noqa: E402
+from gen_compliance_maps import check_owners  # noqa: E402
 from report_template import COMPLIANCE_STANDARDS  # noqa: E402
 
 # target_module directory -> the SAM function logical id that runs it
@@ -534,10 +540,41 @@ def main():
         figures["derivable"] + figures["remaining"] != figures["in_scope"]
     ):
         drift.append(f"scope_text figures do not partition: {figures}")
-    if figures["catalog"] != catalog_total:
+    # The catalog total gets a third side, derived from the code that emits the
+    # ids. The other two are both prose -- report_template's scope_text and
+    # SECURITY_CHECKS.md line 3 -- so comparing only those two catches one copy
+    # drifting and never both copies being equally stale. That is the failure that
+    # already happened: the two read 208 to each other's satisfaction while the
+    # producers emitted 218, and ten check ids shipped undocumented.
+    #
+    # Derived through gen_compliance_maps.check_owners() and not a regex written
+    # here. It runs both call spellings, and agent_registry_assessments passes
+    # check_id positionally, so a `check_id=` keyword scan resolves 0 of that
+    # module's 9 ids while a scan loose enough to catch them also matches every
+    # quoted id in a comment or docstring (BR alone measured 62 against a true 47).
+    #
+    # The `XX-00` rows are excluded by name: they are the "no resource of this type
+    # in the account" markers, never a check, and the published total counts checks.
+    # The excluded count is printed so the exclusion is visible and arguable.
+    catalog_owners = check_owners()
+    marker_ids = sorted(c for c in catalog_owners if c.endswith("-00"))
+    emitted_catalog_ids = sorted(c for c in catalog_owners if not c.endswith("-00"))
+    catalog_sides = {
+        "emitted": len(emitted_catalog_ids),
+        "scope_text": figures["catalog"],
+        "SECURITY_CHECKS.md": catalog_total,
+    }
+    if not emitted_catalog_ids:
+        # Zero is not agreement with a prose figure of zero either: it means the
+        # derivation resolved nothing, which would make the comparison below and
+        # gate 13's doc leg both vacuous.
         drift.append(
-            f"scope_text claims a {figures['catalog']}-check catalog, "
-            f"SECURITY_CHECKS.md publishes {catalog_total}"
+            f"check_owners() resolved no non-marker check id under {MODULES}, so "
+            "the derived side of the catalog total measures nothing"
+        )
+    elif len(set(catalog_sides.values())) != 1:
+        drift.append(
+            f"the catalog total disagrees across its three sides: {catalog_sides}"
         )
     if doc_figures != figures:
         drift.append(
@@ -551,7 +588,10 @@ def main():
         f"{len(collapsed)} collapsed-band disclosures x 2 status paths + "
         f"{len(figures)} figures in the report section + "
         f"{len(doc_figures)} in SECURITY_CHECKS_AISF.md checked, "
-        f"figures={figures}" + (f", drift={drift}" if drift else ""),
+        f"figures={figures}, catalog 3 sides: emitted {len(emitted_catalog_ids)} "
+        f"({len(catalog_owners)} distinct ids minus {len(marker_ids)} "
+        f"{marker_ids} markers) vs scope_text {figures['catalog']} vs "
+        f"SECURITY_CHECKS.md {catalog_total}" + (f", drift={drift}" if drift else ""),
     )
 
     # ---- gate 13: the published id shape. Every id carries the registered prefix
@@ -575,12 +615,47 @@ def main():
             shape.append(f"{cid} does not carry the registered prefix")
         if cid not in aisf_doc_text:
             shape.append(f"{cid} is not documented in SECURITY_CHECKS_AISF.md")
+
+    # The same evidence gap, over the whole emitted catalog rather than the nine
+    # derived ids. Read against SECURITY_CHECKS.md plus the two per-framework
+    # catalogues, because the OW- and NR- ids are documented in their own files and
+    # not in the main one. Not against SECURITY_CHECKS_AISF.md: that file
+    # catalogues AISF-01..08 and has no per-service section, so `BR-01` has 0 hits
+    # in it while `AISF-01` has 3, and reading it here would flag all 208 ids.
+    #
+    # docs/DEVELOPER_GUIDE.md is excluded, and not because it is wrong. Its line
+    # 739 reads "Your new `Check_ID` (for example BR-41, SM-31, AR-09, AG-33,
+    # OW-13, or NR-01)": it names the *next* id a contributor would add, so five of
+    # those six do not exist here and the sentence is accurate as written. Counting
+    # it as a documentation source would mark an id documented the day it ships,
+    # from prose written before it existed, which is the drift this leg exists to
+    # catch. Of the six only AG-33 exists at this base, and SECURITY_CHECKS.md
+    # documents it properly, so the exclusion changes nothing here yet.
+    doc_sources = (SECURITY_CHECKS_DOC, OWASP_DOC, GRC_DOC)
+    catalogued = ""
+    for path in doc_sources:
+        with open(path) as f:
+            catalogued += f.read()
+    if not emitted_catalog_ids or not catalogued.strip():
+        shape.append(
+            f"{len(emitted_catalog_ids)} emitted id(s) against "
+            f"{len(catalogued)} character(s) of catalogue: one side is empty, so "
+            "the per-id loop below asserts nothing"
+        )
+    for cid in emitted_catalog_ids:
+        if cid not in catalogued:
+            shape.append(f"{cid} is emitted but documented in no catalogue")
     gate(
-        "every derived id has the published AISF- shape",
+        "every derived id has the published AISF- shape, and every emitted id is "
+        "documented",
         not shape,
         f"{len(all_ids)} ids ({len(AISF_DERIVED_MAP)} mapped + the coverage marker) "
         f"x 3 legs (^AISF-\\d{{2}}$, registered prefix {registered_prefix!r}, "
-        "documented) checked" + (f", bad={shape}" if shape else ""),
+        f"documented) checked; {len(emitted_catalog_ids)} emitted non-marker id(s) "
+        f"against {len(doc_sources)} catalogue(s) "
+        f"({', '.join(os.path.basename(p) for p in doc_sources)}), "
+        "DEVELOPER_GUIDE.md excluded as forward-looking"
+        + (f", bad={shape}" if shape else ""),
     )
 
     # ---- gate 14: the per-module AISF tag maps agree with the ledger, in both
