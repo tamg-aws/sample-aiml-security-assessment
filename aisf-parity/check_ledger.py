@@ -885,9 +885,10 @@ def main():
     # These three reads used to take the earliest match over the whole file, so a
     # correct copy above the published paragraph -- another section, a quoted
     # example, a deliberately dated appendix -- answered for the paragraph below
-    # it. Reproduced: a duplicate sentence at the top of SECURITY_CHECKS_AISF.md
-    # carrying the right figures left gate 14 green and the battery at 16/16 with
-    # exit 0 while the paragraph it publishes read one control too many.
+    # it. Reproduced: a duplicate tag-column sentence at the top of
+    # SECURITY_CHECKS_AISF.md carrying the right figures left the tag-column figure
+    # leg green and the whole battery green with exit 0 while the paragraph it
+    # publishes read one control too many.
     drift += figure_problems("the report section's scope_text", figures, figure_hits)
     drift += figure_problems("SECURITY_CHECKS_AISF.md", doc_figures, doc_hits)
     drift += figure_problems("SECURITY_CHECKS.md", {"sc_total": catalog_total}, sc_hits)
