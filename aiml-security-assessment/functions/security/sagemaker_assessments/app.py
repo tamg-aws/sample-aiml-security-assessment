@@ -5611,14 +5611,20 @@ def check_sagemaker_config_compliance_evaluation(region: str = "") -> Dict[str, 
                     finding_details=(
                         "DescribeConfigurationRecorders returned no "
                         f"customer-managed AWS Config recorder in {region or 'this region'}, "
-                        "so no SageMaker configuration item is recorded here. A "
-                        "recorder owned by another service principal is not "
-                        "returned by this call and would not be visible."
+                        "so whether SageMaker configuration items are recorded here "
+                        "could not be determined. A service-linked recorder is "
+                        "returned only when the call names its ServicePrincipal, "
+                        "which this check does not guess at, so an empty result is "
+                        "not evidence that recording is off."
                     ),
-                    resolution=CONFIG_RECORDING_RESOLUTION,
+                    resolution=(
+                        "Confirm whether a service-linked configuration recorder "
+                        "covers this account, then create a customer-managed "
+                        "recorder if SageMaker resource types are not recorded."
+                    ),
                     reference=CONFIG_REFERENCE,
-                    severity="Medium",
-                    status="Failed",
+                    severity="Informational",
+                    status="N/A",
                     region=region,
                 )
             )

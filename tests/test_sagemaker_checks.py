@@ -3307,7 +3307,7 @@ class TestSM32ConfigComplianceEvaluation:
             assert f["Check_ID"] == "SM-32"
             assert_finding_schema(f)
 
-    def test_no_recorder_and_no_rule_fail_independently(self):
+    def test_no_recorder_is_indeterminate_and_no_rule_still_fails(self):
         with patch("sagemaker_app.boto3.client") as mock_client:
             self._config(mock_client, [], [], [])
             findings = extract_csv_data(
@@ -3315,9 +3315,16 @@ class TestSM32ConfigComplianceEvaluation:
                     region="us-east-1"
                 )
             )
-        assert [f["Status"] for f in findings] == ["Failed", "Failed"]
+        # An empty no-arg DescribeConfigurationRecorders hides a service-linked
+        # recorder, so it cannot carry a Failed on its own. The rule leg is
+        # independent and still fails.
+        assert [f["Status"] for f in findings] == ["N/A", "Failed"]
         assert (
             "no customer-managed AWS Config recorder" in findings[0]["Finding_Details"]
+        )
+        assert (
+            "returned only when the call names its ServicePrincipal"
+            in findings[0]["Finding_Details"]
         )
         assert "No ACTIVE AWS Config rule" in findings[1]["Finding_Details"]
 
