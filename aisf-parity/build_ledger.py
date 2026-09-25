@@ -390,12 +390,14 @@ ROWS = [
     ),
     (
         "AIR-ACR-GW-03",
-        TIGHTEN,
-        NEW_ID,
+        COVERED,
+        None,
         "agentcore_assessments",
-        ["AC-10"],
-        'AC-10 is named "Resource-Based Policies Check" but reports only that a policy is '
-        "present and never evaluates its conditions, so the confused-deputy leg is unasserted",
+        ["AC-10", "AC-27"],
+        "AC-10 reports that a gateway resource policy is present; AC-27 judges whether its "
+        "Allow statements and the gateway execution role's trust policy carry "
+        "aws:SourceAccount or aws:SourceArn, and fails an unconditioned statement even when a "
+        "guarded sibling sits beside it in the same document",
         [],
         4,
     ),
@@ -413,23 +415,27 @@ ROWS = [
     ),
     (
         "AIR-ACR-GW-04",
-        TIGHTEN,
-        EXTEND,
+        COVERED,
+        None,
         "agentcore_assessments",
-        ["AC-08"],
-        "AC-08 tests endpoint existence and available state, not endpoint policy or "
-        "security-group scope; it does hold one leg GW-04 lacks, endpoint health",
+        ["AC-08", "AC-27"],
+        "AC-08 now judges each AgentCore endpoint's policy against the default "
+        "allow-everything document and reads its security groups for 0.0.0.0/0 and ::/0 "
+        "inbound rules, alongside the existence and health legs it already held; AC-27 adds "
+        "the gateway resource policy's aws:SourceVpc / aws:SourceVpce / aws:VpcSourceIp / "
+        "aws:SourceIp leg",
         [],
         4,
     ),
     (
         "AIR-ACR-GW-05",
-        TIGHTEN,
-        EXTEND,
+        COVERED,
+        None,
         "agentcore_assessments",
-        ["AG-27"],
-        "AG-27 has the WAF leg; the rate-limit leg needs ListGatewayRateLimits, "
-        "so botocore >= 1.43.66",
+        ["AG-27", "AC-24"],
+        "AG-27 holds the WAF leg; AC-24 requires an ACTIVE gateway rate limit carrying a "
+        "requests, tokens or connections ceiling, because dimensions is the only required "
+        "member of a limit entry and a limit can therefore name a dimension and bound nothing",
         [],
         4,
     ),
@@ -507,9 +513,9 @@ ROWS = [
         "agentcore_assessments",
         ["AC-01"],
         "AC-01 requires VPC placement and flags public subnets but never reads what the "
-        "security-group rules permit; describe_security_groups is 0 hits in the module, so "
-        "VPC placement is proven and egress filtering is not",
-        ["ec2:DescribeSecurityGroups"],
+        "security-group rules permit; ec2:DescribeSecurityGroups is now granted to this "
+        "function for AC-08's endpoint scope leg, so RT-08 costs no further permission",
+        [],
         4,
     ),
     (
@@ -542,13 +548,42 @@ ROWS = [
         None,
         "agentcore_assessments",
         [],
-        "asserts an SCP; the corpus already enumerates SCPs in two modules, so the cost is "
-        "the Organizations read",
+        "blocked, not merely unbuilt: bedrock-agentcore:GatewayAuthorizerType is declared as "
+        "a condition key of the service but is wired to zero actions, on both the "
+        "machine-readable service reference and the service authorization reference page, "
+        "while the sibling RuntimeAuthorizerType is wired to CreateAgentRuntime and "
+        "UpdateAgentRuntime. A Deny on CreateGateway or UpdateGateway conditioned on it can "
+        "never match, so the only expressible SCP is a blanket prohibition on gateways, which "
+        "is a different control. Recheck the per-action key list before implementing",
         ["organizations:ListPolicies", "organizations:DescribePolicy"],
         4,
     ),
-    ("AIR-ACR-GW-08", NEW, None, "agentcore_assessments", [], "", [], 4),
-    ("AIR-ACR-GW-10", NEW, None, "agentcore_assessments", [], "", [], 4),
+    (
+        "AIR-ACR-GW-08",
+        COVERED,
+        None,
+        "agentcore_assessments",
+        ["AC-25"],
+        "AC-25 reads credentialProviderConfigurations per target through GetGatewayTarget, "
+        "which is the only surface that carries it: the ListGatewayTargets summary omits the "
+        "field. The control's second leg, a Lambda target scoped to one function ARN, is not "
+        "expressible because the target ARN members reject a wildcard",
+        [],
+        4,
+    ),
+    (
+        "AIR-ACR-GW-10",
+        COVERED,
+        None,
+        "agentcore_assessments",
+        ["AC-19", "AC-20", "AC-26"],
+        "AC-19 pairs each AgentCore delivery source with its delivery and AC-20 asserts "
+        "masking plus a customer managed key; AC-26 adds the two legs neither held, an "
+        "explicitly configured retentionInDays and a key policy that does not let every "
+        "principal decrypt without a condition",
+        [],
+        4,
+    ),
     (
         "AIR-ACR-ID-04",
         NEW,
@@ -757,8 +792,9 @@ ROWS = [
         None,
         "agentcore_assessments",
         ["AC-01"],
-        "overlaps RT-08; resolve the two together",
-        ["ec2:DescribeSecurityGroups"],
+        "overlaps RT-08; resolve the two together. Both now cost no further permission: "
+        "ec2:DescribeSecurityGroups is granted to this function for AC-08's endpoint scope leg",
+        [],
         5,
     ),
 ]
@@ -783,6 +819,10 @@ INCUMBENT_NAMES = {
     "AC-21": "AgentCore Log Unmask Restriction",
     "AC-22": "AgentCore Telemetry Sink Scope",
     "AC-23": "AgentCore Memory Record Access Scope",
+    "AC-24": "AgentCore Gateway Rate Limiting",
+    "AC-25": "AgentCore Gateway Target Authorization",
+    "AC-26": "AgentCore Log Retention and Key Scope",
+    "AC-27": "AgentCore Gateway Policy Conditions",
     "AG-24": "Agentic AI Gateway Inbound Authorization",
     "AG-25": "Agentic AI Gateway Tool Policy Enforcement",
     "AG-27": "Agentic AI Gateway WAF Protection",

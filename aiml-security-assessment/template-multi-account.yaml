@@ -666,6 +666,12 @@ Resources:
                 - bedrock-agentcore:GetBrowser
                 - bedrock-agentcore:GetOnlineEvaluationConfig
                 - bedrock-agentcore:ListPolicies
+                # AC-24 and AC-25 read a gateway's rate limits and targets. The
+                # service authorization reference lists the gateway resource type
+                # for all three, so they stay inside this ARN-scoped statement.
+                - bedrock-agentcore:ListGatewayRateLimits
+                - bedrock-agentcore:ListGatewayTargets
+                - bedrock-agentcore:GetGatewayTarget
               Resource:
                 - !Sub 'arn:${AWS::Partition}:bedrock-agentcore:*:${AWS::AccountId}:runtime/*'
                 - !Sub 'arn:${AWS::Partition}:bedrock-agentcore:*:${AWS::AccountId}:runtime/*/runtime-endpoint/*'
@@ -693,6 +699,14 @@ Resources:
                 - !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/AWSServiceRoleForBedrockAgentCoreNetwork'
                 # Once present, the AgentCore SLR has this service-linked path.
                 - !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/aws-service-role/network.bedrock-agentcore.amazonaws.com/AWSServiceRoleForBedrockAgentCoreNetwork'
+            # AC-27 reads the trust policy of each gateway's execution role. The
+            # role name is chosen by whoever created the gateway, so it cannot be
+            # enumerated in the template the way the service-linked role above is.
+            - Sid: AgentCoreGatewayRoleTrustRead
+              Effect: Allow
+              Action:
+                - iam:GetRole
+              Resource: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/*'
             - Sid: EC2Permissions
               Effect: Allow
               Action:
@@ -700,6 +714,10 @@ Resources:
                 - ec2:DescribeRouteTables
                 - ec2:DescribeVpcEndpoints
                 - ec2:DescribeVpcs
+                # AC-08 reads the inbound rules of each AgentCore endpoint's
+                # security groups. DescribeSecurityGroups has no resource-level
+                # authorization.
+                - ec2:DescribeSecurityGroups
               Resource: '*'
             - Sid: ECRPermissions
               Effect: Allow
@@ -754,6 +772,13 @@ Resources:
               Action:
                 - oam:GetSinkPolicy
               Resource: !Sub 'arn:${AWS::Partition}:oam:*:${AWS::AccountId}:sink/*'
+            # AC-26 reads the key policy behind a log group's customer managed
+            # key to see who the key lets decrypt the log data.
+            - Sid: LogEncryptionKeyPolicyRead
+              Effect: Allow
+              Action:
+                - kms:GetKeyPolicy
+              Resource: !Sub 'arn:${AWS::Partition}:kms:*:${AWS::AccountId}:key/*'
             - Sid: CloudWatchPermissions
               Effect: Allow
               Action:

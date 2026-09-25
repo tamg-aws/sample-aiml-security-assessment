@@ -153,6 +153,9 @@ REQUIRED_AGENTCORE_ACTIONS = {
     "bedrock-agentcore:ListPolicyEngines",
     "bedrock-agentcore:GetPolicyEngine",
     "bedrock-agentcore:GetResourcePolicy",
+    "bedrock-agentcore:ListGatewayRateLimits",
+    "bedrock-agentcore:ListGatewayTargets",
+    "bedrock-agentcore:GetGatewayTarget",
 }
 
 REQUIRED_AGENT_REGISTRY_ACTIONS = {
@@ -611,6 +614,26 @@ _VERIFIED_REMEDIATION_IAM_ACTIONS |= {
 # keys it accepts as scoping.
 _VERIFIED_REMEDIATION_IAM_ACTIONS |= {"bedrock-agentcore:GetMemory"}
 
+# Verified on 2026-09-25 with a third Access Analyzer validate-policy run for the
+# gateway controls AC-24 through AC-27. Its negative controls were four invented
+# actions (ec2:DescribeVpcEndpointsThatDoNotExist,
+# kms:GetKeyPolicyDocumentNotReal, organizations:DescribePolicyDetailNotReal,
+# bedrock-agentcore:ListGatewayRateLimitEntriesNotReal) and two invented
+# condition keys (aws:SourceArnPrefixNotReal,
+# bedrock-agentcore:GatewayAuthorizerKindNotReal). All six were reported,
+# INVALID_ACTION for the actions and INVALID_GLOBAL_CONDITION_KEY plus
+# INVALID_SERVICE_CONDITION_KEY for the keys, and none of the names below was, so
+# the run discriminates in both directions.
+_VERIFIED_REMEDIATION_IAM_ACTIONS |= {
+    "bedrock-agentcore:GetGatewayTarget",
+    "bedrock-agentcore:ListGatewayRateLimits",
+    "bedrock-agentcore:ListGatewayTargets",
+    "ec2:DescribeSecurityGroups",
+    "ec2:DescribeVpcEndpoints",
+    "iam:GetRole",
+    "kms:GetKeyPolicy",
+}
+
 _VERIFIED_REMEDIATION_CONDITION_KEYS = {
     "bedrock:GuardrailIdentifier",
     "iam:AWSServiceName",
@@ -618,6 +641,10 @@ _VERIFIED_REMEDIATION_CONDITION_KEYS = {
     # Same Access Analyzer run as the action block above.
     "aws:PrincipalOrgID",
     "aws:PrincipalOrgPaths",
+    # Same Access Analyzer run as the gateway action block above.
+    "aws:SourceAccount",
+    "aws:SourceArn",
+    "aws:SourceVpce",
 }
 
 _NON_IAM_REMEDIATION_TOKENS = {

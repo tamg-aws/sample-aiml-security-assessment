@@ -15,6 +15,7 @@ Each check is tested for:
 """
 
 import sys
+import json
 import os
 import importlib.util
 from unittest.mock import patch, MagicMock
@@ -3944,3 +3945,968 @@ class TestObservabilityCheckRegistration:
 
 
 # ===================================================================
+# AC-08 endpoint scope plus AC-24..AC-27
+# ===================================================================
+_GUARDED_TRUST = {
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Effect": "Allow",
+            "Principal": {"Service": "bedrock-agentcore.amazonaws.com"},
+            "Action": "sts:AssumeRole",
+            "Condition": {"StringEquals": {"aws:SourceAccount": "123456789012"}},
+        }
+    ],
+}
+_UNGUARDED_TRUST = {
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Effect": "Allow",
+            "Principal": {"Service": "bedrock-agentcore.amazonaws.com"},
+            "Action": "sts:AssumeRole",
+        },
+        {
+            "Effect": "Allow",
+            "Principal": {"Service": "bedrock-agentcore.amazonaws.com"},
+            "Action": "sts:AssumeRole",
+            "Condition": {"StringEquals": {"aws:SourceAccount": "123456789012"}},
+        },
+    ],
+}
+
+
+class TestAC08EndpointScope:
+    """AC-08 now judges each AgentCore endpoint's policy and inbound scope."""
+
+    _DEFAULT_POLICY = json.dumps(
+        {
+            "Statement": [
+                {
+                    "Effect": "Allow",
+                    "Principal": "*",
+                    "Action": "*",
+                    "Resource": "*",
+                }
+            ]
+        }
+    )
+    _SCOPED_POLICY = json.dumps(
+        {
+            "Statement": [
+                {
+                    "Effect": "Allow",
+                    "Principal": {"AWS": "arn:aws:iam::123456789012:role/app"},
+                    "Action": "bedrock-agentcore:InvokeAgentRuntime",
+                    "Resource": "*",
+                }
+            ]
+        }
+    )
+
+    def _endpoints(self):
+        return [
+            {
+                "VpcEndpointId": "vpce-default",
+                "VpcId": "vpc-1",
+                "State": "available",
+                "ServiceName": "com.amazonaws.us-east-1.bedrock-agentcore",
+                "PolicyDocument": self._DEFAULT_POLICY,
+                "Groups": [{"GroupId": "sg-open"}],
+            },
+            {
+                "VpcEndpointId": "vpce-scoped",
+                "VpcId": "vpc-1",
+                "State": "available",
+                "ServiceName": "com.amazonaws.us-east-1.bedrock-agentcore-control",
+                "PolicyDocument": self._SCOPED_POLICY,
+                "Groups": [{"GroupId": "sg-closed"}],
+            },
+        ]
+
+    def _wire(self, mock_ec2):
+        mock_ec2.describe_vpcs.return_value = {"Vpcs": [{"VpcId": "vpc-1"}]}
+        mock_ec2.describe_vpc_endpoints.return_value = {
+            "VpcEndpoints": self._endpoints()
+        }
+        mock_ec2.describe_security_groups.return_value = {
+            "SecurityGroups": [
+                {
+                    "GroupId": "sg-open",
+                    "IpPermissions": [
+                        {"IpRanges": [{"CidrIp": "0.0.0.0/0"}]},
+                        {"Ipv6Ranges": [{"CidrIpv6": "::/0"}]},
+                    ],
+                },
+                {
+                    "GroupId": "sg-closed",
+                    "IpPermissions": [{"IpRanges": [{"CidrIp": "10.0.0.0/16"}]}],
+                },
+            ]
+        }
+
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_both_verdicts_are_reached_within_one_account(self, mock_ac, mock_ec2):
+        mock_ac.list_agent_runtimes.return_value = {
+            "agentRuntimes": [{"agentRuntimeId": "rt-1"}]
+        }
+        self._wire(mock_ec2)
+
+        findings = agentcore_app.check_agentcore_vpc_endpoints()
+        by_name = {}
+        for finding in findings:
+            by_name.setdefault(finding["Finding"], []).append(finding)
+            assert finding["Check_ID"] == "AC-08"
+            assert_finding_schema(finding)
+
+        assert len(by_name["AgentCore VPC Endpoint Policy Unrestricted"]) == 1
+        assert len(by_name["AgentCore VPC Endpoint Policy"]) == 1
+        assert by_name["AgentCore VPC Endpoint Policy"][0]["Status"] == "Passed"
+        assert len(by_name["AgentCore VPC Endpoint Network Scope Unrestricted"]) == 1
+        assert by_name["AgentCore VPC Endpoint Network Scope"][0]["Status"] == "Passed"
+        # The default-policy endpoint is named, not just counted, so a reader can
+        # act on the right one of the two.
+        assert (
+            "vpce-default"
+            in by_name["AgentCore VPC Endpoint Policy Unrestricted"][0][
+                "Finding_Details"
+            ]
+        )
+        assert (
+            "vpce-scoped"
+            in by_name["AgentCore VPC Endpoint Policy"][0]["Finding_Details"]
+        )
+
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_both_open_ranges_are_reported(self, mock_ac, mock_ec2):
+        mock_ac.list_agent_runtimes.return_value = {
+            "agentRuntimes": [{"agentRuntimeId": "rt-1"}]
+        }
+        self._wire(mock_ec2)
+
+        findings = agentcore_app.check_agentcore_vpc_endpoints()
+        open_finding = next(
+            finding
+            for finding in findings
+            if finding["Finding"].endswith("Network Scope Unrestricted")
+        )
+        assert "0.0.0.0/0" in open_finding["Finding_Details"]
+        assert "::/0" in open_finding["Finding_Details"]
+
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_security_group_read_failure_is_na_not_passed(self, mock_ac, mock_ec2):
+        mock_ac.list_agent_runtimes.return_value = {
+            "agentRuntimes": [{"agentRuntimeId": "rt-1"}]
+        }
+        self._wire(mock_ec2)
+        mock_ec2.describe_security_groups.side_effect = Exception("denied")
+
+        findings = agentcore_app.check_agentcore_vpc_endpoints()
+        network = [
+            finding for finding in findings if "Network Scope" in finding["Finding"]
+        ]
+        assert len(network) == 2
+        assert {finding["Status"] for finding in network} == {"N/A"}
+
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_endpoints_are_read_from_every_page(self, mock_ac, mock_ec2):
+        mock_ac.list_agent_runtimes.return_value = {
+            "agentRuntimes": [{"agentRuntimeId": "rt-1"}]
+        }
+        mock_ec2.describe_vpcs.return_value = {"Vpcs": [{"VpcId": "vpc-1"}]}
+        first, second = self._endpoints()
+        mock_ec2.describe_vpc_endpoints.side_effect = [
+            {"VpcEndpoints": [first], "NextToken": "page-2"},
+            {"VpcEndpoints": [second]},
+        ]
+        mock_ec2.describe_security_groups.return_value = {"SecurityGroups": []}
+
+        findings = agentcore_app.check_agentcore_vpc_endpoints()
+
+        assert mock_ec2.describe_vpc_endpoints.call_count == 2
+        mock_ec2.describe_vpc_endpoints.assert_any_call(NextToken="page-2")
+        details = " ".join(finding["Finding_Details"] for finding in findings)
+        assert "vpce-default" in details and "vpce-scoped" in details
+
+    def test_the_default_endpoint_document_is_the_only_full_access_shape(self):
+        assert agentcore_app._vpc_endpoint_policy_is_full_access(self._DEFAULT_POLICY)
+        assert not agentcore_app._vpc_endpoint_policy_is_full_access(
+            self._SCOPED_POLICY
+        )
+        # A conditioned allow-everything statement is a scoping decision.
+        assert not agentcore_app._vpc_endpoint_policy_is_full_access(
+            json.dumps(
+                {
+                    "Statement": [
+                        {
+                            "Effect": "Allow",
+                            "Principal": "*",
+                            "Action": "*",
+                            "Resource": "*",
+                            "Condition": {
+                                "StringEquals": {"aws:PrincipalOrgID": "o-1"}
+                            },
+                        }
+                    ]
+                }
+            )
+        )
+        assert not agentcore_app._vpc_endpoint_policy_is_full_access("not json")
+        assert not agentcore_app._vpc_endpoint_policy_is_full_access(None)
+
+
+class TestAC24GatewayRateLimiting:
+    """AC-24: an active rate limit that bounds a throughput value."""
+
+    _GATEWAYS = [
+        {"gatewayId": "gw-bounded", "name": "Bounded"},
+        {"gatewayId": "gw-none", "name": "Unbounded"},
+        {"gatewayId": "gw-creating", "name": "Creating"},
+    ]
+
+    def _rate_limits(self, gatewayIdentifier, **kwargs):
+        if gatewayIdentifier == "gw-bounded":
+            return {
+                "rateLimits": [
+                    {
+                        "rateLimitId": "rl-1",
+                        "status": "ACTIVE",
+                        "dimensionKeys": ["$.context.iam.principal"],
+                        "entries": [{"requests": [{"rate": 100, "period": "MINUTE"}]}],
+                    }
+                ]
+            }
+        if gatewayIdentifier == "gw-creating":
+            return {
+                "rateLimits": [
+                    {
+                        "rateLimitId": "rl-2",
+                        "status": "CREATING",
+                        "dimensionKeys": ["$.context.iam.principal"],
+                        "entries": [{"requests": [{"rate": 100, "period": "MINUTE"}]}],
+                    }
+                ]
+            }
+        return {"rateLimits": []}
+
+    @patch("agentcore_app.agentcore_client")
+    def test_each_gateway_gets_its_own_verdict(self, mock_ac):
+        mock_ac.list_gateways.return_value = {"items": self._GATEWAYS}
+        mock_ac.list_gateway_rate_limits.side_effect = self._rate_limits
+
+        findings = agentcore_app.check_agentcore_gateway_rate_limiting()
+
+        assert len(findings) == 3
+        by_gateway = {}
+        for finding in findings:
+            assert finding["Check_ID"] == "AC-24"
+            assert_finding_schema(finding)
+            for gateway in self._GATEWAYS:
+                if gateway["gatewayId"] in finding["Finding_Details"]:
+                    by_gateway[gateway["gatewayId"]] = finding
+        assert by_gateway["gw-bounded"]["Status"] == "Passed"
+        assert by_gateway["gw-none"]["Status"] == "Failed"
+        assert by_gateway["gw-none"]["Finding"].endswith("Missing")
+        assert by_gateway["gw-creating"]["Status"] == "Failed"
+        assert by_gateway["gw-creating"]["Finding"].endswith("Ineffective")
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_limit_with_no_bounded_value_is_not_a_limit(self, mock_ac):
+        mock_ac.list_gateways.return_value = {"items": [self._GATEWAYS[0]]}
+        mock_ac.list_gateway_rate_limits.return_value = {
+            "rateLimits": [
+                {
+                    "rateLimitId": "rl-3",
+                    "status": "ACTIVE",
+                    "dimensionKeys": ["$.context.iam.principal"],
+                    "entries": [{}],
+                }
+            ]
+        }
+
+        findings = agentcore_app.check_agentcore_gateway_rate_limiting()
+
+        assert findings[0]["Status"] == "Failed"
+        assert findings[0]["Finding"].endswith("Ineffective")
+
+    @patch("agentcore_app.agentcore_client")
+    def test_the_passed_detail_names_the_rate_and_the_dimension(self, mock_ac):
+        mock_ac.list_gateways.return_value = {"items": [self._GATEWAYS[0]]}
+        mock_ac.list_gateway_rate_limits.side_effect = self._rate_limits
+
+        findings = agentcore_app.check_agentcore_gateway_rate_limiting()
+
+        assert "100 requests per MINUTE" in findings[0]["Finding_Details"]
+        assert "$.context.iam.principal" in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_rate_limits_are_read_from_every_page(self, mock_ac):
+        mock_ac.list_gateways.return_value = {"items": [self._GATEWAYS[0]]}
+        mock_ac.list_gateway_rate_limits.side_effect = [
+            {"rateLimits": [], "nextToken": "rl-page-2"},
+            {
+                "rateLimits": [
+                    {
+                        "rateLimitId": "rl-4",
+                        "status": "ACTIVE",
+                        "entries": [{"tokens": [{"rate": 5, "period": "HOUR"}]}],
+                    }
+                ]
+            },
+        ]
+
+        findings = agentcore_app.check_agentcore_gateway_rate_limiting()
+
+        assert findings[0]["Status"] == "Passed"
+        assert mock_ac.list_gateway_rate_limits.call_count == 2
+
+    @patch("agentcore_app.agentcore_client")
+    def test_one_unreadable_gateway_does_not_hide_the_others(self, mock_ac):
+        mock_ac.list_gateways.return_value = {"items": self._GATEWAYS[:2]}
+
+        def rate_limits(gatewayIdentifier, **kwargs):
+            if gatewayIdentifier == "gw-bounded":
+                raise ClientError(
+                    {"Error": {"Code": "AccessDeniedException", "Message": "no"}},
+                    "ListGatewayRateLimits",
+                )
+            return {"rateLimits": []}
+
+        mock_ac.list_gateway_rate_limits.side_effect = rate_limits
+
+        findings = agentcore_app.check_agentcore_gateway_rate_limiting()
+
+        assert {finding["Status"] for finding in findings} == {"N/A", "Failed"}
+        assert len(findings) == 2
+
+    @patch("agentcore_app.agentcore_client")
+    def test_no_gateways_is_na(self, mock_ac):
+        mock_ac.list_gateways.return_value = {"items": []}
+        findings = agentcore_app.check_agentcore_gateway_rate_limiting()
+        assert len(findings) == 1
+        assert findings[0]["Status"] == "N/A"
+
+    @patch("agentcore_app.agentcore_client", None)
+    def test_no_client_is_na(self):
+        findings = agentcore_app.check_agentcore_gateway_rate_limiting()
+        assert findings[0]["Status"] == "N/A"
+        assert findings[0]["Check_ID"] == "AC-24"
+
+
+class TestAC25GatewayTargetAuthorization:
+    """AC-25: every gateway target declares an outbound credential provider."""
+
+    @patch("agentcore_app.agentcore_client")
+    def test_each_target_gets_its_own_verdict(self, mock_ac):
+        mock_ac.list_gateways.return_value = {
+            "items": [{"gatewayId": "gw-1", "name": "One"}]
+        }
+        mock_ac.list_gateway_targets.return_value = {
+            "items": [
+                {"targetId": "t-auth", "name": "Authenticated"},
+                {"targetId": "t-open", "name": "Open"},
+            ]
+        }
+
+        def detail(gatewayIdentifier, targetId):
+            if targetId == "t-auth":
+                return {
+                    "credentialProviderConfigurations": [
+                        {"credentialProviderType": "GATEWAY_IAM_ROLE"}
+                    ]
+                }
+            return {}
+
+        mock_ac.get_gateway_target.side_effect = detail
+
+        findings = agentcore_app.check_agentcore_gateway_target_authorization()
+
+        assert len(findings) == 2
+        by_status = {finding["Status"]: finding for finding in findings}
+        assert by_status["Passed"]["Finding_Details"].count("GATEWAY_IAM_ROLE") == 1
+        assert "t-open" in by_status["Failed"]["Finding_Details"]
+        assert by_status["Failed"]["Severity"] == "High"
+        for finding in findings:
+            assert finding["Check_ID"] == "AC-25"
+            assert_finding_schema(finding)
+
+    @patch("agentcore_app.agentcore_client")
+    def test_targets_are_read_from_every_page(self, mock_ac):
+        mock_ac.list_gateways.return_value = {
+            "items": [{"gatewayId": "gw-1", "name": "One"}]
+        }
+        mock_ac.list_gateway_targets.side_effect = [
+            {"items": [], "nextToken": "t-page-2"},
+            {"items": [{"targetId": "t-2", "name": "Second"}]},
+        ]
+        mock_ac.get_gateway_target.return_value = {}
+
+        findings = agentcore_app.check_agentcore_gateway_target_authorization()
+
+        assert len(findings) == 1
+        assert mock_ac.list_gateway_targets.call_count == 2
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_gateway_with_no_target_does_not_read_as_compliant(self, mock_ac):
+        mock_ac.list_gateways.return_value = {
+            "items": [{"gatewayId": "gw-1", "name": "One"}]
+        }
+        mock_ac.list_gateway_targets.return_value = {"items": []}
+
+        findings = agentcore_app.check_agentcore_gateway_target_authorization()
+
+        assert len(findings) == 1
+        assert findings[0]["Status"] == "N/A"
+
+    @patch("agentcore_app.agentcore_client")
+    def test_an_unreadable_target_is_na_not_failed(self, mock_ac):
+        mock_ac.list_gateways.return_value = {
+            "items": [{"gatewayId": "gw-1", "name": "One"}]
+        }
+        mock_ac.list_gateway_targets.return_value = {
+            "items": [{"targetId": "t-1", "name": "One"}]
+        }
+        mock_ac.get_gateway_target.side_effect = ClientError(
+            {"Error": {"Code": "AccessDeniedException", "Message": "no"}},
+            "GetGatewayTarget",
+        )
+
+        findings = agentcore_app.check_agentcore_gateway_target_authorization()
+
+        assert findings[0]["Status"] == "N/A"
+        assert "GetGatewayTarget" in findings[0]["Resolution"]
+
+    @patch("agentcore_app.agentcore_client", None)
+    def test_no_client_is_na(self):
+        findings = agentcore_app.check_agentcore_gateway_target_authorization()
+        assert findings[0]["Check_ID"] == "AC-25"
+        assert findings[0]["Status"] == "N/A"
+
+
+class TestAC26LogRetentionAndKeyScope:
+    """AC-26: retention on every AgentCore log group, scoped key policy on its CMK."""
+
+    _KEY = "arn:aws:kms:us-east-1:123456789012:key/k1"
+    _SCOPED_KEY_POLICY = json.dumps(
+        {
+            "Statement": [
+                {
+                    "Effect": "Allow",
+                    "Principal": {"Service": "logs.us-east-1.amazonaws.com"},
+                    "Action": ["kms:Decrypt", "kms:GenerateDataKey"],
+                    "Resource": "*",
+                }
+            ]
+        }
+    )
+    _OPEN_KEY_POLICY = json.dumps(
+        {
+            "Statement": [
+                {
+                    "Effect": "Allow",
+                    "Principal": "*",
+                    "Action": "kms:Decrypt",
+                    "Resource": "*",
+                }
+            ]
+        }
+    )
+
+    @patch("agentcore_app.kms_client")
+    @patch("agentcore_app.logs_client")
+    def test_retention_verdicts_are_per_log_group(self, mock_logs, mock_kms):
+        mock_logs.describe_log_groups.side_effect = _log_group_side_effect(
+            {
+                "/aws/bedrock-agentcore/": [
+                    {
+                        "logGroupName": "/aws/bedrock-agentcore/runtimes/rt-1",
+                        "retentionInDays": 90,
+                    },
+                    {"logGroupName": "/aws/bedrock-agentcore/runtimes/rt-2"},
+                ]
+            }
+        )
+
+        findings = agentcore_app.check_agentcore_log_retention_and_key_scope()
+
+        assert len(findings) == 2
+        statuses = {
+            finding["Finding_Details"].split("'")[1]: finding["Status"]
+            for finding in findings
+        }
+        assert statuses["/aws/bedrock-agentcore/runtimes/rt-1"] == "Passed"
+        assert statuses["/aws/bedrock-agentcore/runtimes/rt-2"] == "Failed"
+        for finding in findings:
+            assert finding["Check_ID"] == "AC-26"
+            assert_finding_schema(finding)
+
+    @patch("agentcore_app.kms_client")
+    @patch("agentcore_app.logs_client")
+    def test_an_open_key_policy_fails_a_retained_log_group(self, mock_logs, mock_kms):
+        mock_logs.describe_log_groups.side_effect = _log_group_side_effect(
+            {
+                "/aws/bedrock-agentcore/": [
+                    {
+                        "logGroupName": "/aws/bedrock-agentcore/runtimes/rt-1",
+                        "retentionInDays": 90,
+                        "kmsKeyId": self._KEY,
+                    }
+                ]
+            }
+        )
+        mock_kms.get_key_policy.return_value = {"Policy": self._OPEN_KEY_POLICY}
+
+        findings = agentcore_app.check_agentcore_log_retention_and_key_scope()
+
+        assert findings[0]["Status"] == "Failed"
+        assert "every principal to decrypt" in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.kms_client")
+    @patch("agentcore_app.logs_client")
+    def test_a_scoped_key_policy_passes_and_is_read_once_per_key(
+        self, mock_logs, mock_kms
+    ):
+        mock_logs.describe_log_groups.side_effect = _log_group_side_effect(
+            {
+                "/aws/bedrock-agentcore/": [
+                    {
+                        "logGroupName": "/aws/bedrock-agentcore/runtimes/rt-1",
+                        "retentionInDays": 30,
+                        "kmsKeyId": self._KEY,
+                    },
+                    {
+                        "logGroupName": "/aws/bedrock-agentcore/runtimes/rt-2",
+                        "retentionInDays": 30,
+                        "kmsKeyId": self._KEY,
+                    },
+                ]
+            }
+        )
+        mock_kms.get_key_policy.return_value = {"Policy": self._SCOPED_KEY_POLICY}
+
+        findings = agentcore_app.check_agentcore_log_retention_and_key_scope()
+
+        assert [finding["Status"] for finding in findings] == ["Passed", "Passed"]
+        assert mock_kms.get_key_policy.call_count == 1
+
+    @patch("agentcore_app.kms_client")
+    @patch("agentcore_app.logs_client")
+    def test_an_unreadable_key_policy_is_na_beside_the_retention_verdict(
+        self, mock_logs, mock_kms
+    ):
+        mock_logs.describe_log_groups.side_effect = _log_group_side_effect(
+            {
+                "/aws/bedrock-agentcore/": [
+                    {
+                        "logGroupName": "/aws/bedrock-agentcore/runtimes/rt-1",
+                        "retentionInDays": 30,
+                        "kmsKeyId": self._KEY,
+                    }
+                ]
+            }
+        )
+        mock_kms.get_key_policy.side_effect = ClientError(
+            {"Error": {"Code": "AccessDeniedException", "Message": "no"}},
+            "GetKeyPolicy",
+        )
+
+        findings = agentcore_app.check_agentcore_log_retention_and_key_scope()
+
+        statuses = sorted(finding["Status"] for finding in findings)
+        assert statuses == ["N/A", "Passed"]
+        na = next(finding for finding in findings if finding["Status"] == "N/A")
+        assert "kms:GetKeyPolicy" in na["Resolution"]
+
+    def test_the_open_decrypt_predicate_discriminates(self):
+        assert agentcore_app._kms_key_policy_allows_open_decrypt(self._OPEN_KEY_POLICY)
+        assert not agentcore_app._kms_key_policy_allows_open_decrypt(
+            self._SCOPED_KEY_POLICY
+        )
+        # A wildcard action reaches Decrypt, and a wildcard within the namespace
+        # does too.
+        for actions in ("*", "kms:*", "kms:Decry*"):
+            assert agentcore_app._kms_key_policy_allows_open_decrypt(
+                json.dumps(
+                    {
+                        "Statement": [
+                            {
+                                "Effect": "Allow",
+                                "Principal": {"AWS": "*"},
+                                "Action": actions,
+                                "Resource": "*",
+                            }
+                        ]
+                    }
+                )
+            )
+        # A non-decrypt action to everybody is a different control's problem.
+        assert not agentcore_app._kms_key_policy_allows_open_decrypt(
+            json.dumps(
+                {
+                    "Statement": [
+                        {
+                            "Effect": "Allow",
+                            "Principal": "*",
+                            "Action": "kms:DescribeKey",
+                            "Resource": "*",
+                        }
+                    ]
+                }
+            )
+        )
+        # A condition on the wildcard principal is the scoping this asks for.
+        assert not agentcore_app._kms_key_policy_allows_open_decrypt(
+            json.dumps(
+                {
+                    "Statement": [
+                        {
+                            "Effect": "Allow",
+                            "Principal": "*",
+                            "Action": "kms:Decrypt",
+                            "Resource": "*",
+                            "Condition": {
+                                "StringEquals": {
+                                    "kms:ViaService": "logs.us-east-1.amazonaws.com"
+                                }
+                            },
+                        }
+                    ]
+                }
+            )
+        )
+        assert not agentcore_app._kms_key_policy_allows_open_decrypt("")
+
+    @patch("agentcore_app.logs_client", None)
+    def test_no_client_is_na(self):
+        findings = agentcore_app.check_agentcore_log_retention_and_key_scope()
+        assert findings[0]["Check_ID"] == "AC-26"
+        assert findings[0]["Status"] == "N/A"
+
+    @patch("agentcore_app.kms_client")
+    @patch("agentcore_app.logs_client")
+    def test_no_log_groups_is_na(self, mock_logs, mock_kms):
+        mock_logs.describe_log_groups.side_effect = _log_group_side_effect({})
+        findings = agentcore_app.check_agentcore_log_retention_and_key_scope()
+        assert len(findings) == 1
+        assert findings[0]["Status"] == "N/A"
+
+
+class TestAC27GatewayPolicyConditions:
+    """AC-27: confused-deputy and network-path conditions on gateway policies."""
+
+    _GUARDED_RESOURCE_POLICY = json.dumps(
+        {
+            "Statement": [
+                {
+                    "Effect": "Allow",
+                    "Principal": {"Service": "bedrock-agentcore.amazonaws.com"},
+                    "Action": "bedrock-agentcore:InvokeGateway",
+                    "Resource": "*",
+                    "Condition": {
+                        "StringEquals": {
+                            "aws:SourceAccount": "123456789012",
+                            "aws:SourceVpce": "vpce-1",
+                        }
+                    },
+                }
+            ]
+        }
+    )
+    _UNGUARDED_RESOURCE_POLICY = json.dumps(
+        {
+            "Statement": [
+                {
+                    "Effect": "Allow",
+                    "Principal": {"Service": "bedrock-agentcore.amazonaws.com"},
+                    "Action": "bedrock-agentcore:InvokeGateway",
+                    "Resource": "*",
+                }
+            ]
+        }
+    )
+
+    def _wire(self, mock_ac, mock_iam):
+        mock_ac.list_gateways.return_value = {
+            "items": [
+                {"gatewayId": "gw-guarded", "name": "Guarded"},
+                {"gatewayId": "gw-open", "name": "Open"},
+            ]
+        }
+
+        def get_gateway(gatewayIdentifier):
+            return {
+                "gatewayArn": f"arn:aws:bedrock-agentcore:us-east-1:123456789012:gateway/{gatewayIdentifier}",
+                "roleArn": (
+                    "arn:aws:iam::123456789012:role/GuardedRole"
+                    if gatewayIdentifier == "gw-guarded"
+                    else "arn:aws:iam::123456789012:role/OpenRole"
+                ),
+            }
+
+        mock_ac.get_gateway.side_effect = get_gateway
+
+        def get_resource_policy(resourceArn):
+            if resourceArn.endswith("gw-guarded"):
+                return {"policy": self._GUARDED_RESOURCE_POLICY}
+            return {"policy": self._UNGUARDED_RESOURCE_POLICY}
+
+        mock_ac.get_resource_policy.side_effect = get_resource_policy
+
+        def get_role(RoleName):
+            document = _GUARDED_TRUST if RoleName == "GuardedRole" else _UNGUARDED_TRUST
+            return {"Role": {"AssumeRolePolicyDocument": document}}
+
+        mock_iam.get_role.side_effect = get_role
+
+    @patch("agentcore_app.iam_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_both_verdicts_are_reached_on_all_three_legs(self, mock_ac, mock_iam):
+        self._wire(mock_ac, mock_iam)
+
+        findings = agentcore_app.check_agentcore_gateway_policy_conditions()
+
+        # Three legs per gateway, two gateways.
+        assert len(findings) == 6
+        for finding in findings:
+            assert finding["Check_ID"] == "AC-27"
+            assert_finding_schema(finding)
+
+        guarded = [f for f in findings if "gw-guarded" in f["Finding_Details"]]
+        opened = [f for f in findings if "gw-open" in f["Finding_Details"]]
+        assert {f["Status"] for f in guarded} == {"Passed"}
+        assert {f["Status"] for f in opened} == {"Failed"}
+
+    @patch("agentcore_app.iam_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_guarded_statement_does_not_excuse_an_unguarded_sibling(
+        self, mock_ac, mock_iam
+    ):
+        self._wire(mock_ac, mock_iam)
+
+        findings = agentcore_app.check_agentcore_gateway_policy_conditions()
+        trust = next(
+            finding
+            for finding in findings
+            if "Role Trust" in finding["Finding"]
+            and "OpenRole" in finding["Finding_Details"]
+        )
+        assert trust["Status"] == "Failed"
+        assert "1 of 2 Allow statement(s)" in trust["Finding_Details"]
+
+    @patch("agentcore_app.iam_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_one_role_is_read_once_for_two_gateways(self, mock_ac, mock_iam):
+        mock_ac.list_gateways.return_value = {
+            "items": [
+                {"gatewayId": "gw-1", "name": "One"},
+                {"gatewayId": "gw-2", "name": "Two"},
+            ]
+        }
+        mock_ac.get_gateway.return_value = {
+            "gatewayArn": "arn:aws:bedrock-agentcore:us-east-1:123456789012:gateway/gw",
+            "roleArn": "arn:aws:iam::123456789012:role/Shared",
+        }
+        mock_ac.get_resource_policy.return_value = {
+            "policy": self._GUARDED_RESOURCE_POLICY
+        }
+        mock_iam.get_role.return_value = {
+            "Role": {"AssumeRolePolicyDocument": _GUARDED_TRUST}
+        }
+
+        findings = agentcore_app.check_agentcore_gateway_policy_conditions()
+
+        assert len(findings) == 6
+        assert mock_iam.get_role.call_count == 1
+
+    @patch("agentcore_app.iam_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_gateway_without_a_resource_policy_is_na_on_that_leg_only(
+        self, mock_ac, mock_iam
+    ):
+        mock_ac.list_gateways.return_value = {
+            "items": [{"gatewayId": "gw-1", "name": "One"}]
+        }
+        mock_ac.get_gateway.return_value = {
+            "gatewayArn": "arn:aws:bedrock-agentcore:us-east-1:123456789012:gateway/gw-1",
+            "roleArn": "arn:aws:iam::123456789012:role/GuardedRole",
+        }
+        mock_ac.get_resource_policy.side_effect = ClientError(
+            {"Error": {"Code": "ResourceNotFoundException", "Message": "none"}},
+            "GetResourcePolicy",
+        )
+        mock_iam.get_role.return_value = {
+            "Role": {"AssumeRolePolicyDocument": _GUARDED_TRUST}
+        }
+
+        findings = agentcore_app.check_agentcore_gateway_policy_conditions()
+
+        statuses = {finding["Finding"]: finding["Status"] for finding in findings}
+        assert (
+            statuses["AgentCore Gateway Resource Policy Confused Deputy Guard"] == "N/A"
+        )
+        # No resource policy still means no network restriction.
+        assert statuses["AgentCore Gateway Network Path Unrestricted"] == "Failed"
+        assert (
+            statuses["AgentCore Gateway Role Trust Confused Deputy Guard"] == "Passed"
+        )
+
+    @patch("agentcore_app.iam_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_an_unreadable_trust_policy_is_na_not_passed(self, mock_ac, mock_iam):
+        mock_ac.list_gateways.return_value = {
+            "items": [{"gatewayId": "gw-1", "name": "One"}]
+        }
+        mock_ac.get_gateway.return_value = {
+            "gatewayArn": "arn:aws:bedrock-agentcore:us-east-1:123456789012:gateway/gw-1",
+            "roleArn": "arn:aws:iam::123456789012:role/Hidden",
+        }
+        mock_ac.get_resource_policy.return_value = {
+            "policy": self._GUARDED_RESOURCE_POLICY
+        }
+        mock_iam.get_role.side_effect = ClientError(
+            {"Error": {"Code": "AccessDenied", "Message": "no"}}, "GetRole"
+        )
+
+        findings = agentcore_app.check_agentcore_gateway_policy_conditions()
+        trust = next(
+            finding for finding in findings if "Role Trust" in finding["Finding"]
+        )
+        assert trust["Status"] == "N/A"
+        assert "iam:GetRole" in trust["Resolution"]
+
+    @patch("agentcore_app.iam_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_gateways_are_read_from_every_page(self, mock_ac, mock_iam):
+        mock_ac.list_gateways.side_effect = [
+            {"items": [], "nextToken": "gw-page-2"},
+            {"items": [{"gatewayId": "gw-2", "name": "Two"}]},
+        ]
+        mock_ac.get_gateway.return_value = {
+            "gatewayArn": "arn:aws:bedrock-agentcore:us-east-1:123456789012:gateway/gw-2",
+            "roleArn": "arn:aws:iam::123456789012:role/GuardedRole",
+        }
+        mock_ac.get_resource_policy.return_value = {
+            "policy": self._GUARDED_RESOURCE_POLICY
+        }
+        mock_iam.get_role.return_value = {
+            "Role": {"AssumeRolePolicyDocument": _GUARDED_TRUST}
+        }
+
+        findings = agentcore_app.check_agentcore_gateway_policy_conditions()
+
+        assert len(findings) == 3
+        assert mock_ac.list_gateways.call_count == 2
+
+    def test_the_confused_deputy_predicate_only_fires_on_borrowed_principals(self):
+        exposed = agentcore_app._statement_is_confused_deputy_exposed
+        assert exposed(
+            {
+                "Principal": {"Service": "bedrock-agentcore.amazonaws.com"},
+                "Action": "sts:AssumeRole",
+            }
+        )
+        assert exposed({"Principal": "*", "Action": "sts:AssumeRole"})
+        assert exposed({"Principal": {"AWS": "*"}, "Action": "sts:AssumeRole"})
+        # aws:SourceArn alone is enough; the two keys are alternatives.
+        assert not exposed(
+            {
+                "Principal": {"Service": "bedrock-agentcore.amazonaws.com"},
+                "Action": "sts:AssumeRole",
+                "Condition": {"ArnLike": {"aws:SourceArn": "arn:aws:*"}},
+            }
+        )
+        # A named account principal is a trust the account owner wrote down.
+        assert not exposed(
+            {
+                "Principal": {"AWS": "arn:aws:iam::999988887777:root"},
+                "Action": "sts:AssumeRole",
+            }
+        )
+        assert not exposed({"Action": "sts:AssumeRole"})
+
+    @patch("agentcore_app.agentcore_client")
+    def test_no_gateways_is_na(self, mock_ac):
+        mock_ac.list_gateways.return_value = {"items": []}
+        findings = agentcore_app.check_agentcore_gateway_policy_conditions()
+        assert len(findings) == 1
+        assert findings[0]["Status"] == "N/A"
+
+    @patch("agentcore_app.agentcore_client", None)
+    def test_no_client_is_na(self):
+        findings = agentcore_app.check_agentcore_gateway_policy_conditions()
+        assert findings[0]["Check_ID"] == "AC-27"
+        assert findings[0]["Status"] == "N/A"
+
+
+class TestGatewayCheckRegistration:
+    """AC-24..AC-27 must reach the backfill paths, and the API must answer them."""
+
+    def test_regional_ids_are_registered_for_timeout_backfill(self):
+        for check_id in ("AC-24", "AC-25", "AC-26", "AC-27"):
+            assert check_id in agentcore_app.REGIONAL_AGENTCORE_CHECK_IDS
+            assert check_id in agentcore_app.AGENTCORE_RUNTIME_CHECK_IDS
+
+    def test_timeout_backfill_emits_the_new_regional_ids(self):
+        findings = agentcore_app.build_agentcore_timeout_findings("us-east-1", [])
+        emitted = {finding["Check_ID"] for finding in findings}
+        assert {"AC-24", "AC-25", "AC-26", "AC-27"}.issubset(emitted)
+
+    def test_gateway_operation_contracts_exist(self):
+        credentials = {
+            "region_name": "us-east-1",
+            "aws_access_key_id": "testing",
+            "aws_secret_access_key": "testing",  # pragma: allowlist secret - synthetic test credential
+        }
+        expected = {
+            "bedrock-agentcore-control": [
+                "ListGatewayRateLimits",
+                "ListGatewayTargets",
+                "GetGatewayTarget",
+                "GetGateway",
+            ],
+            "ec2": ["DescribeSecurityGroups", "DescribeVpcEndpoints"],
+            "kms": ["GetKeyPolicy"],
+            "iam": ["GetRole"],
+        }
+        for service, operations in expected.items():
+            model = agentcore_app.boto3.client(
+                service, **credentials
+            ).meta.service_model
+            for operation in operations:
+                assert model.operation_model(operation)
+
+    def test_the_rate_limit_value_keys_are_the_ones_the_api_models(self):
+        credentials = {
+            "region_name": "us-east-1",
+            "aws_access_key_id": "testing",
+            "aws_secret_access_key": "testing",  # pragma: allowlist secret - synthetic test credential
+        }
+        model = agentcore_app.boto3.client(
+            "bedrock-agentcore-control", **credentials
+        ).meta.service_model
+        output = model.operation_model("ListGatewayRateLimits").output_shape
+        entry = output.members["rateLimits"].member.members["entries"].member
+        assert set(agentcore_app.GATEWAY_RATE_LIMIT_VALUE_KEYS) <= set(entry.members)
+        # dimensions is the only required member, which is why presence of an
+        # entry cannot stand in for a bounded value.
+        assert entry.required_members == ["dimensions"]
+
+    def test_the_credential_provider_types_are_the_modelled_enum(self):
+        credentials = {
+            "region_name": "us-east-1",
+            "aws_access_key_id": "testing",
+            "aws_secret_access_key": "testing",  # pragma: allowlist secret - synthetic test credential
+        }
+        model = agentcore_app.boto3.client(
+            "bedrock-agentcore-control", **credentials
+        ).meta.service_model
+        output = model.operation_model("GetGatewayTarget").output_shape
+        configuration = output.members["credentialProviderConfigurations"].member
+        provider_type = configuration.members["credentialProviderType"]
+        assert set(agentcore_app.GATEWAY_TARGET_CREDENTIAL_PROVIDER_TYPES) == set(
+            provider_type.enum
+        )

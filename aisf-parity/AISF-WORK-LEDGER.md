@@ -6,20 +6,19 @@ Generated 2026-09-25 by `aisf-parity/build_ledger.py`. Do not hand-edit: change 
 
 | verdict | rows | meaning |
 |---|---|---|
-| covered | 14 | an incumbent already asserts this; nothing to write |
-| tighten / extend | 21 | incumbent name is honest, its assertion is narrower; extend it in place |
-| tighten / new_id | 6 | incumbent name claims more than it asserts; allocate a new id beside it |
-| new | 22 | no incumbent asserts any part of it |
+| covered | 19 | an incumbent already asserts this; nothing to write |
+| tighten / extend | 19 | incumbent name is honest, its assertion is narrower; extend it in place |
+| tighten / new_id | 5 | incumbent name claims more than it asserts; allocate a new id beside it |
+| new | 20 | no incumbent asserts any part of it |
 | not_implementable | 4 | flagged machine_checkable in the ledger but is not checkable from configuration |
 | unassessed | 11 | in scope, dedup pass not yet run |
 
-**39 new check functions and 21 extensions to existing checks.**
+**36 new check functions and 19 extensions to existing checks.**
 
 ## New IAM actions required
 
 - `config:DescribeConfigRules` — AIR-SGM-GOV-10
 - `config:DescribeConfigurationRecorders` — AIR-SGM-GOV-10
-- `ec2:DescribeSecurityGroups` — AIR-ACR-RT-08, AIR-FND-NET-06
 - `macie2:GetAutomatedDiscoveryConfiguration` — AIR-BDR-KB-01
 - `macie2:GetMacieSession` — AIR-BDR-KB-01
 - `organizations:DescribeEffectivePolicy` — AIR-FND-DAT-09
@@ -72,6 +71,11 @@ Generated 2026-09-25 by `aisf-parity/build_ledger.py`. Do not hand-edit: change 
 | control | verdict | do | module | incumbent | gap |
 |---|---|---|---|---|---|
 | `AIR-ACR-GW-01` | covered | — | `agentcore_assessments` | `AG-24` | AG-24 accepts authorizerType in {AWS_IAM, CUSTOM_JWT}, or AUTHENTICATE_ONLY with a policy engine in ENFORCE, which is GW-01's assertion exactly |
+| `AIR-ACR-GW-03` | covered | — | `agentcore_assessments` | `AC-10`, `AC-27` | AC-10 reports that a gateway resource policy is present; AC-27 judges whether its Allow statements and the gateway execution role's trust policy carry aws:SourceAccount or aws:SourceArn, and fails an unconditioned statement even when a guarded sibling sits beside it in the same document |
+| `AIR-ACR-GW-04` *(workload-specific)* | covered | — | `agentcore_assessments` | `AC-08`, `AC-27` | AC-08 now judges each AgentCore endpoint's policy against the default allow-everything document and reads its security groups for 0.0.0.0/0 and ::/0 inbound rules, alongside the existence and health legs it already held; AC-27 adds the gateway resource policy's aws:SourceVpc / aws:SourceVpce / aws:VpcSourceIp / aws:SourceIp leg |
+| `AIR-ACR-GW-05` | covered | — | `agentcore_assessments` | `AG-27`, `AC-24` | AG-27 holds the WAF leg; AC-24 requires an ACTIVE gateway rate limit carrying a requests, tokens or connections ceiling, because dimensions is the only required member of a limit entry and a limit can therefore name a dimension and bound nothing |
+| `AIR-ACR-GW-08` | covered | — | `agentcore_assessments` | `AC-25` | AC-25 reads credentialProviderConfigurations per target through GetGatewayTarget, which is the only surface that carries it: the ListGatewayTargets summary omits the field. The control's second leg, a Lambda target scoped to one function ARN, is not expressible because the target ARN members reject a wildcard |
+| `AIR-ACR-GW-10` | covered | — | `agentcore_assessments` | `AC-19`, `AC-20`, `AC-26` | AC-19 pairs each AgentCore delivery source with its delivery and AC-20 asserts masking plus a customer managed key; AC-26 adds the two legs neither held, an explicitly configured retentionInDays and a key policy that does not let every principal decrypt without a condition |
 | `AIR-ACR-MEM-01` | covered | — | `agentcore_assessments` | `AC-07`, `AC-23` | AC-07 asserts a customer managed key and an {actorId} namespace per memory, AC-23 asserts that no cached role or user reads memory records without a namespace, strategy, actor or session condition |
 | `AIR-ACR-MEM-12` | covered | — | `agentcore_assessments` | `AC-18` | AC-18 asserts that a CloudTrail advanced event selector logs data events for AWS::BedrockAgentCore::Memory whenever the region holds a memory resource |
 | `AIR-ACR-OBS-02` | covered | — | `agentcore_assessments` | `AC-18` | AC-18 asserts data-event coverage per resource family, so a trail that logs only the runtime types still fails for memory and for the built-in tools |
@@ -82,9 +86,6 @@ Generated 2026-09-25 by `aisf-parity/build_ledger.py`. Do not hand-edit: change 
 | `AIR-ACR-EVAL-01` | tighten | extend | `agentcore_assessments` | `AC-02` | AC-02 detects AgentCore full-access and wildcard grants only, so a role holding a single over-broad named action passes it |
 | `AIR-ACR-EVAL-05` | tighten | new_id | `agentcore_assessments` | `AC-17` | AC-17 is named "Online Evaluation Coverage" but tests only status == ACTIVE, executionStatus == ENABLED and bool(evaluators); it never reads a sampling rate and never asks which evaluators, so coverage is the one thing it does not measure |
 | `AIR-ACR-EVAL-06` | tighten | new_id | `agentcore_assessments` | `AC-17` | AC-17 is named "Online Evaluation Coverage" and never asks which evaluators are attached, so it cannot distinguish a safety evaluator from a latency one |
-| `AIR-ACR-GW-03` | tighten | new_id | `agentcore_assessments` | `AC-10` | AC-10 is named "Resource-Based Policies Check" but reports only that a policy is present and never evaluates its conditions, so the confused-deputy leg is unasserted |
-| `AIR-ACR-GW-04` *(workload-specific)* | tighten | extend | `agentcore_assessments` | `AC-08` | AC-08 tests endpoint existence and available state, not endpoint policy or security-group scope; it does hold one leg GW-04 lacks, endpoint health |
-| `AIR-ACR-GW-05` | tighten | extend | `agentcore_assessments` | `AG-27` | AG-27 has the WAF leg; the rate-limit leg needs ListGatewayRateLimits, so botocore >= 1.43.66 |
 | `AIR-ACR-ID-05` | tighten | extend | `agentcore_assessments` | `AC-14` | AC-14 has the CMK leg; the string 'secret' appears 0 times in the module, so the secret-scan leg is unwritten |
 | `AIR-ACR-ID-10` | tighten | extend | `agentcore_assessments` | `AC-02` | AC-02 detects full-access and wildcard grants only |
 | `AIR-ACR-PAY-01` | tighten | extend | `agentcore_assessments` | `AC-02` | AC-02 detects full-access and wildcard grants only |
@@ -93,15 +94,13 @@ Generated 2026-09-25 by `aisf-parity/build_ledger.py`. Do not hand-edit: change 
 | `AIR-ACR-POL-07` | tighten | extend | `agentcore_assessments` | `AG-25` | AG-25 has no session-aware leg |
 | `AIR-ACR-REG-02` | tighten | new_id | `agent_registry_assessments` | `AR-03` | AR-03 is named "Publication Approval Governance" but covers auto-approval only, behind the REQUIRE_AGENT_REGISTRY_MANUAL_APPROVAL env gate; no curator/publisher separation and no EventBridge rule |
 | `AIR-ACR-RT-03` | tighten | extend | `agentcore_assessments` | `AC-02` | AC-02 detects full-access and wildcard grants only |
-| `AIR-ACR-RT-08` | tighten | extend | `agentcore_assessments` | `AC-01` | AC-01 requires VPC placement and flags public subnets but never reads what the security-group rules permit; describe_security_groups is 0 hits in the module, so VPC placement is proven and egress filtering is not |
+| `AIR-ACR-RT-08` | tighten | extend | `agentcore_assessments` | `AC-01` | AC-01 requires VPC placement and flags public subnets but never reads what the security-group rules permit; ec2:DescribeSecurityGroups is now granted to this function for AC-08's endpoint scope leg, so RT-08 costs no further permission |
 | `AIR-ACR-RT-13` | tighten | new_id | `agentcore_assessments` | `AC-10` | AC-10 is named "Resource-Based Policies Check" but never evaluates policy conditions, so the aws:SourceVpc / aws:SourceVpce leg is unasserted; both keys are 0 hits corpus-wide |
 | `AIR-ACR-EVAL-02` | new | — | `agentcore_assessments` | — | PassRole returns 0 across all six modules; AssumeRolePolicyDocument is read once at :2725 but only to match principal.Service for role discovery, never a condition |
 | `AIR-ACR-EVAL-03` | new | — | `agentcore_assessments` | — | confused-deputy conditions absent: SourceAccount/SourceArn are 1 hit corpus-wide, in sagemaker_assessments, none in AgentCore |
 | `AIR-ACR-EVAL-04` *(workload-specific)* | new | — | `agentcore_assessments` | — | — |
 | `AIR-ACR-EVAL-07` | new | — | `agentcore_assessments` | — | — |
-| `AIR-ACR-GW-02` | new | — | `agentcore_assessments` | — | asserts an SCP; the corpus already enumerates SCPs in two modules, so the cost is the Organizations read |
-| `AIR-ACR-GW-08` | new | — | `agentcore_assessments` | — | — |
-| `AIR-ACR-GW-10` | new | — | `agentcore_assessments` | — | — |
+| `AIR-ACR-GW-02` | new | — | `agentcore_assessments` | — | blocked, not merely unbuilt: bedrock-agentcore:GatewayAuthorizerType is declared as a condition key of the service but is wired to zero actions, on both the machine-readable service reference and the service authorization reference page, while the sibling RuntimeAuthorizerType is wired to CreateAgentRuntime and UpdateAgentRuntime. A Deny on CreateGateway or UpdateGateway conditioned on it can never match, so the only expressible SCP is a blanket prohibition on gateways, which is a different control. Recheck the per-action key list before implementing |
 | `AIR-ACR-ID-04` | new | — | `agentcore_assessments` | — | asserts an SCP; same Organizations read as GW-02 |
 | `AIR-ACR-ID-08` | new | — | `agentcore_assessments` | — | GetAgentRuntime.authorizerConfiguration exists in botocore 1.43.85 and is never read anywhere; AG-24 is gateway-only, ID-08 is about the runtime |
 | `AIR-ACR-ID-11` | new | — | `agentcore_assessments` | — | the corpus reads authorizerType exactly once, at :3578, and never reads authorizerConfiguration; customJWTAuthorizer.{allowedAudience, allowedClients, allowedScopes, customClaims, discoveryUrl} are all present in the API and unread, so a gateway that trusts any issuer passes AG-24 today |
@@ -123,4 +122,4 @@ Generated 2026-09-25 by `aisf-parity/build_ledger.py`. Do not hand-edit: change 
 | `AIR-FND-NET-01` | unassessed | — | `agentcore_assessments`, `sagemaker_assessments` | `AC-01`, `SM-11` | spans two modules; candidate incumbents only. 'AI workloads run privately' has no single host, which is why the FND area has no module of its own |
 | `AIR-FND-NET-02` | unassessed | — | `agentcore_assessments` | `AC-08` | candidate incumbent only; dedup not run |
 | `AIR-FND-NET-04` | unassessed | — | `responsible_ai_grc_assessments`, `agentcore_assessments` | `AG-27` | wafv2 is already granted to the GRC function, but the AG-27 incumbent lives in the AgentCore module; pick one before writing it |
-| `AIR-FND-NET-06` | unassessed | — | `agentcore_assessments` | `AC-01` | overlaps RT-08; resolve the two together |
+| `AIR-FND-NET-06` | unassessed | — | `agentcore_assessments` | `AC-01` | overlaps RT-08; resolve the two together. Both now cost no further permission: ec2:DescribeSecurityGroups is granted to this function for AC-08's endpoint scope leg |

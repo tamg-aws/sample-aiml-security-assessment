@@ -39,6 +39,7 @@ cloudwatch_client = None
 cloudtrail_client = None
 oam_client = None
 agentcore_client = None
+kms_client = None
 
 # Environment variables
 BUCKET_NAME = os.environ.get("AIML_ASSESSMENT_BUCKET_NAME")
@@ -130,6 +131,27 @@ LOGS_DATA_PROTECTION_REFERENCE_URL = (
 OAM_CROSS_ACCOUNT_REFERENCE_URL = (
     "https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/"
     "CloudWatch-Unified-Cross-Account.html"
+)
+AGENTCORE_GATEWAY_RATE_LIMIT_REFERENCE_URL = (
+    "https://docs.aws.amazon.com/bedrock-agentcore-control/latest/APIReference/"
+    "API_ListGatewayRateLimits.html"
+)
+AGENTCORE_GATEWAY_TARGET_REFERENCE_URL = (
+    "https://docs.aws.amazon.com/bedrock-agentcore-control/latest/APIReference/"
+    "API_CredentialProviderConfiguration.html"
+)
+LOGS_RETENTION_REFERENCE_URL = (
+    "https://docs.aws.amazon.com/AmazonCloudWatch/latest/logs/"
+    "Working-with-log-groups-and-streams.html"
+)
+KMS_KEY_POLICY_REFERENCE_URL = (
+    "https://docs.aws.amazon.com/kms/latest/developerguide/key-policies.html"
+)
+CONFUSED_DEPUTY_REFERENCE_URL = (
+    "https://docs.aws.amazon.com/IAM/latest/UserGuide/confused-deputy.html"
+)
+VPC_ENDPOINT_POLICY_REFERENCE_URL = (
+    "https://docs.aws.amazon.com/vpc/latest/privatelink/vpc-endpoints-access.html"
 )
 
 
@@ -304,6 +326,10 @@ REGIONAL_AGENTCORE_CHECK_IDS = (
     "AC-19",
     "AC-20",
     "AC-22",
+    "AC-24",
+    "AC-25",
+    "AC-26",
+    "AC-27",
 )
 
 AGENTCORE_RUNTIME_CHECK_IDS = (
@@ -325,6 +351,10 @@ AGENTCORE_RUNTIME_CHECK_IDS = (
     "AC-19",
     "AC-20",
     "AC-22",
+    "AC-24",
+    "AC-25",
+    "AC-26",
+    "AC-27",
 )
 
 NATIVE_AGENTIC_AGENTCORE_CHECK_NAMES = {
@@ -431,6 +461,44 @@ MEMORY_SCOPE_CONDITION_KEYS = {
     "bedrock-agentcore:sessionid",
 }
 MEMORY_SCOPE_CONDITION_KEY_PREFIXES = ("bedrock-agentcore:namespacevariable/",)
+
+# A gateway rate limit carries one or more entries, and each entry may bound
+# requests, tokens or connections. `dimensions` is the only required member of an
+# entry, so a limit can exist with dimensions and no ceiling at all; the presence
+# of one of these members is what makes the limit bound anything.
+GATEWAY_RATE_LIMIT_VALUE_KEYS = ("requests", "tokens", "connections")
+
+# Outbound credential provider types a gateway target can declare. The member is
+# optional on CreateGatewayTarget and the console offers "No authorization (not
+# recommended)", so a target can reach its backend with no gateway-supplied
+# credential; the assessment reports the type it finds rather than ranking the
+# types, because which one suits a backend is a workload decision.
+GATEWAY_TARGET_CREDENTIAL_PROVIDER_TYPES = (
+    "GATEWAY_IAM_ROLE",
+    "OAUTH",
+    "API_KEY",
+    "CALLER_IAM_CREDENTIALS",
+    "JWT_PASSTHROUGH",
+)
+
+# Condition keys that bind a resource policy or a role trust policy to the
+# account or the resource the calling service acts for. Either one stops another
+# customer's gateway from borrowing this account's permissions through the
+# service principal.
+CONFUSED_DEPUTY_CONDITION_KEYS = {"aws:sourceaccount", "aws:sourcearn"}
+
+# Condition keys that bind a gateway resource policy to a private network path.
+NETWORK_PATH_CONDITION_KEYS = {
+    "aws:sourcevpc",
+    "aws:sourcevpce",
+    "aws:vpcsourceip",
+    "aws:sourceip",
+}
+
+# KMS actions that read log data under a customer managed key. A key policy that
+# allows one of these to every principal with no condition hands the plaintext to
+# anyone the account trusts, which defeats the point of the CMK.
+KMS_DECRYPT_ACTIONS = ("decrypt", "generatedatakey", "reencryptfrom")
 
 # Error codes that establish the target region is not enabled for the account.
 # AWS returns these credential-shaped codes when a request is signed for a
@@ -1233,6 +1301,58 @@ def _statement_resources(statement: Dict[str, Any]) -> List[str]:
     if isinstance(resources, str):
         resources = [resources]
     return [str(resource) for resource in resources]
+
+
+def _document_statements(document: Any, effect: str = "") -> List[Dict[str, Any]]:
+    """Return the statements of a policy document that is not a cached policy.
+
+    Resource policies, role trust policies and service control policies arrive as
+    a JSON string straight from their own API rather than through the permission
+    cache, so `_allow_statements` cannot read them. A single-statement document is
+    a mapping and not a list, which the IAM grammar allows and which would
+    otherwise iterate the statement's keys.
+    """
+    if isinstance(document, (str, bytes)):
+        try:
+            document = json.loads(document)
+        except (TypeError, ValueError):
+            return []
+    if not isinstance(document, dict):
+        return []
+    statements = document.get("Statement", [])
+    if isinstance(statements, dict):
+        statements = [statements]
+    if not isinstance(statements, list):
+        return []
+    return [
+        statement
+        for statement in statements
+        if isinstance(statement, dict)
+        and (not effect or statement.get("Effect") == effect)
+    ]
+
+
+def _statement_principals(statement: Dict[str, Any]) -> List[str]:
+    """Return normalized principal values from one resource or trust statement.
+
+    A bare `"Principal": "*"` and `{"AWS": "*"}` mean the same thing and are both
+    flattened to `*` here, so a caller can test one shape.
+    """
+    principal = statement.get("Principal")
+    if principal is None:
+        return []
+    if isinstance(principal, str):
+        return [principal.strip()]
+    if not isinstance(principal, dict):
+        return []
+
+    values: List[str] = []
+    for entry in principal.values():
+        if isinstance(entry, str):
+            values.append(entry.strip())
+        elif isinstance(entry, list):
+            values.extend(str(item).strip() for item in entry)
+    return values
 
 
 def _is_agent_platform_action(action: str) -> bool:
@@ -2872,6 +2992,247 @@ def check_agentcore_memory_configuration() -> List[Dict[str, Any]]:
     return findings
 
 
+def _vpc_endpoint_policy_is_full_access(policy_document: Any) -> bool:
+    """Return whether an endpoint policy allows every principal every action.
+
+    AWS attaches exactly this document when no policy is supplied, so an endpoint
+    carrying it contributes a private network path and no authorization. One
+    unconditioned statement of that shape has the effect no matter what else the
+    document holds, which is why the statements are not scored together.
+    """
+    for statement in _document_statements(policy_document, effect="Allow"):
+        if statement.get("Condition"):
+            continue
+        if (
+            "*" in _statement_actions(statement)
+            and "*" in _statement_resources(statement)
+            and "*" in _statement_principals(statement)
+        ):
+            return True
+    return False
+
+
+def _security_group_open_ingress(security_group: Dict[str, Any]) -> List[str]:
+    """Return the internet-open inbound CIDR ranges of one security group."""
+    open_ranges: List[str] = []
+    for permission in security_group.get("IpPermissions") or []:
+        if not isinstance(permission, dict):
+            continue
+        for ip_range in permission.get("IpRanges") or []:
+            if isinstance(ip_range, dict) and ip_range.get("CidrIp") == "0.0.0.0/0":
+                open_ranges.append("0.0.0.0/0")
+        for ip_range in permission.get("Ipv6Ranges") or []:
+            if isinstance(ip_range, dict) and ip_range.get("CidrIpv6") == "::/0":
+                open_ranges.append("::/0")
+    return sorted(set(open_ranges))
+
+
+def _agentcore_endpoint_scope_findings(
+    endpoints: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Judge each AgentCore VPC endpoint's policy and inbound network scope.
+
+    An endpoint that exists and reports `available` still authorizes every call
+    from every principal unless its policy narrows them, and still accepts
+    traffic from any address unless its security groups narrow the source. Both
+    legs are reported per endpoint, so an account holding one hardened endpoint
+    and one default endpoint does not read as uniformly compliant.
+
+    Which principals and which ports a given workload needs is a workload
+    decision, so the assertions here are the workload-independent ones: the
+    policy is not the default allow-everything document, and the inbound rules
+    do not name the whole internet.
+    """
+    findings: List[Dict[str, Any]] = []
+    if not endpoints:
+        return findings
+
+    group_ids = sorted(
+        {
+            group["GroupId"]
+            for entry in endpoints
+            for group in entry["endpoint"].get("Groups") or []
+            if isinstance(group, dict) and group.get("GroupId")
+        }
+    )
+    security_groups: Dict[str, Dict[str, Any]] = {}
+    security_group_error = None
+    if group_ids:
+        try:
+            for security_group in _paginate_aws_list(
+                ec2_client,
+                "describe_security_groups",
+                "SecurityGroups",
+                token_request_key="NextToken",
+                token_response_key="NextToken",
+                GroupIds=group_ids,
+            ):
+                security_groups[security_group.get("GroupId")] = security_group
+        except Exception as error:
+            logger.warning(f"Could not describe endpoint security groups: {error}")
+            security_group_error = error
+
+    for entry in endpoints:
+        endpoint = entry["endpoint"]
+        endpoint_id = endpoint.get("VpcEndpointId", "unknown")
+        label = f"endpoint {endpoint_id} for {entry['service']}"
+        policy_document = endpoint.get("PolicyDocument")
+
+        if not policy_document:
+            findings.append(
+                create_finding(
+                    check_id="AC-08",
+                    finding_name="AgentCore VPC Endpoint Policy",
+                    finding_details=(
+                        f"AgentCore VPC {label} returned no policy document, so "
+                        "the calls it authorizes could not be assessed."
+                    ),
+                    resolution=(
+                        "Grant ec2:DescribeVpcEndpoints on this endpoint and rerun "
+                        "the assessment."
+                    ),
+                    reference=VPC_ENDPOINT_POLICY_REFERENCE_URL,
+                    severity=SeverityEnum.INFORMATIONAL,
+                    status=StatusEnum.NA,
+                )
+            )
+        elif _vpc_endpoint_policy_is_full_access(policy_document):
+            findings.append(
+                create_finding(
+                    check_id="AC-08",
+                    finding_name="AgentCore VPC Endpoint Policy Unrestricted",
+                    finding_details=(
+                        f"AgentCore VPC {label} carries the default endpoint "
+                        "policy, which allows every principal every action on "
+                        "every resource. The endpoint keeps the traffic off the "
+                        "public internet and authorizes nothing."
+                    ),
+                    resolution=(
+                        "Replace the default endpoint policy with one that names "
+                        "the principals allowed to reach AgentCore through this "
+                        "endpoint and the AgentCore resources they may call."
+                    ),
+                    reference=VPC_ENDPOINT_POLICY_REFERENCE_URL,
+                    severity=SeverityEnum.MEDIUM,
+                    status=StatusEnum.FAILED,
+                )
+            )
+        else:
+            findings.append(
+                create_finding(
+                    check_id="AC-08",
+                    finding_name="AgentCore VPC Endpoint Policy",
+                    finding_details=(
+                        f"AgentCore VPC {label} carries an endpoint policy that "
+                        "is narrower than the default allow-everything document."
+                    ),
+                    resolution=(
+                        "No action required. Confirm the policy names the "
+                        "principals and AgentCore resources this workload needs."
+                    ),
+                    reference=VPC_ENDPOINT_POLICY_REFERENCE_URL,
+                    severity=SeverityEnum.MEDIUM,
+                    status=StatusEnum.PASSED,
+                )
+            )
+
+        groups = [
+            group
+            for group in endpoint.get("Groups") or []
+            if isinstance(group, dict) and group.get("GroupId")
+        ]
+        if not groups:
+            # Gateway-type endpoints have no security group, so there is no
+            # inbound rule to judge.
+            continue
+
+        if security_group_error is not None:
+            findings.append(
+                create_finding(
+                    check_id="AC-08",
+                    finding_name="AgentCore VPC Endpoint Network Scope",
+                    finding_details=(
+                        f"AgentCore VPC {label} has "
+                        f"{len(groups)} security group(s) whose inbound rules "
+                        "could not be read: "
+                        f"{_assessment_error_label(security_group_error)}."
+                    ),
+                    resolution="Grant ec2:DescribeSecurityGroups and retry.",
+                    reference=VPC_ENDPOINT_POLICY_REFERENCE_URL,
+                    severity=SeverityEnum.INFORMATIONAL,
+                    status=StatusEnum.NA,
+                )
+            )
+            continue
+
+        open_ranges: List[str] = []
+        unreadable: List[str] = []
+        for group in groups:
+            security_group = security_groups.get(group["GroupId"])
+            if security_group is None:
+                unreadable.append(group["GroupId"])
+                continue
+            open_ranges.extend(_security_group_open_ingress(security_group))
+
+        if open_ranges:
+            findings.append(
+                create_finding(
+                    check_id="AC-08",
+                    finding_name="AgentCore VPC Endpoint Network Scope Unrestricted",
+                    finding_details=(
+                        f"AgentCore VPC {label} accepts inbound traffic from "
+                        f"{', '.join(sorted(set(open_ranges)))}, so any host that "
+                        "can route to the VPC reaches the AgentCore endpoint."
+                    ),
+                    resolution=(
+                        "Restrict the endpoint security group's inbound rules to "
+                        "the VPC CIDR ranges or the security groups of the "
+                        "workloads that call AgentCore."
+                    ),
+                    reference=VPC_ENDPOINT_POLICY_REFERENCE_URL,
+                    severity=SeverityEnum.MEDIUM,
+                    status=StatusEnum.FAILED,
+                )
+            )
+        elif unreadable:
+            findings.append(
+                create_finding(
+                    check_id="AC-08",
+                    finding_name="AgentCore VPC Endpoint Network Scope",
+                    finding_details=(
+                        f"AgentCore VPC {label} references security group(s) "
+                        f"{', '.join(unreadable)} that were not returned, so the "
+                        "inbound scope is unknown."
+                    ),
+                    resolution="Grant ec2:DescribeSecurityGroups and retry.",
+                    reference=VPC_ENDPOINT_POLICY_REFERENCE_URL,
+                    severity=SeverityEnum.INFORMATIONAL,
+                    status=StatusEnum.NA,
+                )
+            )
+        else:
+            findings.append(
+                create_finding(
+                    check_id="AC-08",
+                    finding_name="AgentCore VPC Endpoint Network Scope",
+                    finding_details=(
+                        f"AgentCore VPC {label} accepts no inbound traffic from "
+                        "0.0.0.0/0 or ::/0 on any of its "
+                        f"{len(groups)} security group(s)."
+                    ),
+                    resolution=(
+                        "No action required. Confirm the inbound rules name only "
+                        "the workloads that call AgentCore."
+                    ),
+                    reference=VPC_ENDPOINT_POLICY_REFERENCE_URL,
+                    severity=SeverityEnum.MEDIUM,
+                    status=StatusEnum.PASSED,
+                )
+            )
+
+    return findings
+
+
 def check_agentcore_vpc_endpoints() -> List[Dict[str, Any]]:
     """
     Check for AWS PrivateLink VPC endpoints for AgentCore.
@@ -2879,6 +3240,8 @@ def check_agentcore_vpc_endpoints() -> List[Dict[str, Any]]:
     Validates:
     - VPC endpoints exist for bedrock-agentcore services
     - Private connectivity is configured
+    - Each endpoint's policy authorizes something narrower than every call
+    - Each endpoint's security group admits a narrower source than the internet
 
     Returns:
         List of findings
@@ -2939,8 +3302,13 @@ def check_agentcore_vpc_endpoints() -> List[Dict[str, Any]]:
         vpc_ids = [vpc["VpcId"] for vpc in vpcs]
 
         # Get all VPC endpoints
-        endpoints_response = ec2_client.describe_vpc_endpoints()
-        all_endpoints = endpoints_response.get("VpcEndpoints", [])
+        all_endpoints = _paginate_aws_list(
+            ec2_client,
+            "describe_vpc_endpoints",
+            "VpcEndpoints",
+            token_request_key="NextToken",
+            token_response_key="NextToken",
+        )
 
         # Check for AgentCore endpoints
         found_agentcore_endpoints = []
@@ -2955,6 +3323,7 @@ def check_agentcore_vpc_endpoints() -> List[Dict[str, Any]]:
                         "vpc_id": endpoint.get("VpcId"),
                         "service": service_name,
                         "state": endpoint.get("State"),
+                        "endpoint": endpoint,
                     }
                 )
 
@@ -3010,6 +3379,8 @@ def check_agentcore_vpc_endpoints() -> List[Dict[str, Any]]:
                         status=StatusEnum.PASSED,
                     )
                 )
+
+        findings.extend(_agentcore_endpoint_scope_findings(found_agentcore_endpoints))
 
     except Exception as e:
         logger.error(f"Error in VPC endpoints check: {e}")
@@ -5145,6 +5516,923 @@ def check_agentcore_memory_record_access_scope(
     return findings
 
 
+def _gateway_rate_limit_is_bounded(rate_limit: Dict[str, Any]) -> bool:
+    """Return whether an active rate limit bounds a throughput value.
+
+    `dimensions` is the only required member of a limit entry, so a limit can be
+    ACTIVE, name a dimension, and bound nothing. Only `requests`, `tokens` or
+    `connections` carries a rate, and a limit still CREATING or DELETING is not
+    in force.
+    """
+    if rate_limit.get("status") != "ACTIVE":
+        return False
+    for entry in rate_limit.get("entries") or []:
+        if not isinstance(entry, dict):
+            continue
+        if any(entry.get(key) for key in GATEWAY_RATE_LIMIT_VALUE_KEYS):
+            return True
+    return False
+
+
+def _gateway_rate_limit_summary(rate_limit: Dict[str, Any]) -> str:
+    """Describe one rate limit's dimensions and bounded values for a finding."""
+    dimensions = [str(key) for key in rate_limit.get("dimensionKeys") or []]
+    bounded: List[str] = []
+    for entry in rate_limit.get("entries") or []:
+        if not isinstance(entry, dict):
+            continue
+        for key in GATEWAY_RATE_LIMIT_VALUE_KEYS:
+            values = entry.get(key) or []
+            for value in values:
+                if isinstance(value, dict) and value.get("period"):
+                    bounded.append(f"{value.get('rate')} {key} per {value['period']}")
+    label = rate_limit.get("rateLimitId", "unknown")
+    parts = [f"'{label}'"]
+    if dimensions:
+        parts.append("on " + ", ".join(dimensions))
+    if bounded:
+        parts.append("limited to " + "; ".join(sorted(set(bounded))))
+    return " ".join(parts)
+
+
+def check_agentcore_gateway_rate_limiting() -> List[Dict[str, Any]]:
+    """AC-24: Report whether each gateway carries an active, bounded rate limit.
+
+    A gateway is a network-reachable entry point that fans one caller request out
+    into tool calls and model invocations, so an unbounded gateway converts one
+    abusive caller into a bill and a denial of service for every other caller.
+    The WAF association AG-27 reports filters request content; it sets no
+    throughput ceiling.
+    """
+    if agentcore_client is None:
+        return [
+            create_finding(
+                check_id="AC-24",
+                finding_name="AgentCore Gateway Rate Limiting",
+                finding_details="AgentCore client not available in this region.",
+                resolution="No action required unless AgentCore runs in this region.",
+                reference=AGENTCORE_GATEWAY_RATE_LIMIT_REFERENCE_URL,
+                severity=SeverityEnum.INFORMATIONAL,
+                status=StatusEnum.NA,
+            )
+        ]
+
+    try:
+        gateways = _agentcore_list_all("list_gateways", ["items", "gateways"])
+    except Exception as error:
+        return [
+            _incomplete_check_finding(
+                check_id="AC-24",
+                finding_name="AgentCore Gateway Rate Limiting",
+                error=error,
+                reference=AGENTCORE_GATEWAY_RATE_LIMIT_REFERENCE_URL,
+            )
+        ]
+
+    if not gateways:
+        return [
+            create_finding(
+                check_id="AC-24",
+                finding_name="AgentCore Gateway Rate Limiting",
+                finding_details="No AgentCore gateways found in this region.",
+                resolution="No action required.",
+                reference=AGENTCORE_GATEWAY_RATE_LIMIT_REFERENCE_URL,
+                severity=SeverityEnum.INFORMATIONAL,
+                status=StatusEnum.NA,
+            )
+        ]
+
+    findings = []
+    for gateway in gateways:
+        gateway_id = gateway.get("gatewayId", "unknown")
+        gateway_name = gateway.get("name", gateway_id)
+        label = f"Gateway '{gateway_name}' ({gateway_id})"
+
+        try:
+            rate_limits = _agentcore_list_all(
+                "list_gateway_rate_limits",
+                ["rateLimits"],
+                gatewayIdentifier=gateway_id,
+            )
+        except Exception as error:
+            findings.append(
+                create_finding(
+                    check_id="AC-24",
+                    finding_name="AgentCore Gateway Rate Limiting",
+                    finding_details=(
+                        f"{label} rate limits could not be read: "
+                        f"{_assessment_error_label(error)}."
+                    ),
+                    resolution=(
+                        "Grant bedrock-agentcore:ListGatewayRateLimits and retry. "
+                        "The operation needs botocore 1.43.66 or later."
+                    ),
+                    reference=AGENTCORE_GATEWAY_RATE_LIMIT_REFERENCE_URL,
+                    severity=SeverityEnum.INFORMATIONAL,
+                    status=StatusEnum.NA,
+                )
+            )
+            continue
+
+        bounded = [
+            rate_limit
+            for rate_limit in rate_limits
+            if _gateway_rate_limit_is_bounded(rate_limit)
+        ]
+        if bounded:
+            findings.append(
+                create_finding(
+                    check_id="AC-24",
+                    finding_name="AgentCore Gateway Rate Limiting",
+                    finding_details=(
+                        f"{label} has {len(bounded)} active rate limit(s) that bound "
+                        "throughput: "
+                        + "; ".join(
+                            _gateway_rate_limit_summary(rate_limit)
+                            for rate_limit in bounded
+                        )
+                        + "."
+                    ),
+                    resolution=(
+                        "No action required. Confirm the rate and the dimension "
+                        "match this workload's expected caller volume, because the "
+                        "right ceiling is a workload decision."
+                    ),
+                    reference=AGENTCORE_GATEWAY_RATE_LIMIT_REFERENCE_URL,
+                    severity=SeverityEnum.MEDIUM,
+                    status=StatusEnum.PASSED,
+                )
+            )
+        elif rate_limits:
+            findings.append(
+                create_finding(
+                    check_id="AC-24",
+                    finding_name="AgentCore Gateway Rate Limiting Ineffective",
+                    finding_details=(
+                        f"{label} has {len(rate_limits)} rate limit(s), none of "
+                        "which is ACTIVE with a requests, tokens or connections "
+                        "ceiling, so no limit is in force."
+                    ),
+                    resolution=(
+                        "Add a requests, tokens or connections rate to the limit's "
+                        "entries and wait for its status to reach ACTIVE."
+                    ),
+                    reference=AGENTCORE_GATEWAY_RATE_LIMIT_REFERENCE_URL,
+                    severity=SeverityEnum.MEDIUM,
+                    status=StatusEnum.FAILED,
+                )
+            )
+        else:
+            findings.append(
+                create_finding(
+                    check_id="AC-24",
+                    finding_name="AgentCore Gateway Rate Limiting Missing",
+                    finding_details=(
+                        f"{label} has no rate limit, so one caller can consume the "
+                        "gateway's whole tool and model capacity."
+                    ),
+                    resolution=(
+                        "Create a gateway rate limit with a requests, tokens or "
+                        "connections ceiling on a caller dimension such as "
+                        "$.context.iam.principal or a JWT claim."
+                    ),
+                    reference=AGENTCORE_GATEWAY_RATE_LIMIT_REFERENCE_URL,
+                    severity=SeverityEnum.MEDIUM,
+                    status=StatusEnum.FAILED,
+                )
+            )
+
+    return findings
+
+
+def check_agentcore_gateway_target_authorization() -> List[Dict[str, Any]]:
+    """AC-25: Report the outbound credential each gateway target reaches out with.
+
+    `credentialProviderConfigurations` is optional on CreateGatewayTarget and the
+    console offers "No authorization", so a target can call its backend with no
+    gateway-supplied credential at all. Which of the five provider types suits a
+    given backend is a workload decision; that a credential exists is not.
+    """
+    if agentcore_client is None:
+        return [
+            create_finding(
+                check_id="AC-25",
+                finding_name="AgentCore Gateway Target Authorization",
+                finding_details="AgentCore client not available in this region.",
+                resolution="No action required unless AgentCore runs in this region.",
+                reference=AGENTCORE_GATEWAY_TARGET_REFERENCE_URL,
+                severity=SeverityEnum.INFORMATIONAL,
+                status=StatusEnum.NA,
+            )
+        ]
+
+    try:
+        gateways = _agentcore_list_all("list_gateways", ["items", "gateways"])
+    except Exception as error:
+        return [
+            _incomplete_check_finding(
+                check_id="AC-25",
+                finding_name="AgentCore Gateway Target Authorization",
+                error=error,
+                reference=AGENTCORE_GATEWAY_TARGET_REFERENCE_URL,
+            )
+        ]
+
+    findings = []
+    targets_seen = 0
+    for gateway in gateways:
+        gateway_id = gateway.get("gatewayId", "unknown")
+        gateway_name = gateway.get("name", gateway_id)
+
+        try:
+            targets = _agentcore_list_all(
+                "list_gateway_targets",
+                ["items", "targets"],
+                gatewayIdentifier=gateway_id,
+            )
+        except Exception as error:
+            findings.append(
+                create_finding(
+                    check_id="AC-25",
+                    finding_name="AgentCore Gateway Target Authorization",
+                    finding_details=(
+                        f"Gateway '{gateway_name}' ({gateway_id}) targets could not "
+                        f"be listed: {_assessment_error_label(error)}."
+                    ),
+                    resolution="Grant bedrock-agentcore:ListGatewayTargets and retry.",
+                    reference=AGENTCORE_GATEWAY_TARGET_REFERENCE_URL,
+                    severity=SeverityEnum.INFORMATIONAL,
+                    status=StatusEnum.NA,
+                )
+            )
+            continue
+
+        for target in targets:
+            target_id = target.get("targetId")
+            if not target_id:
+                continue
+            targets_seen += 1
+            target_name = target.get("name", target_id)
+            label = (
+                f"Target '{target_name}' ({target_id}) on gateway "
+                f"'{gateway_name}' ({gateway_id})"
+            )
+
+            try:
+                # The list summary carries targetType and status but no
+                # credential provider, so the detail call is the only surface
+                # that answers this control.
+                detail = agentcore_client.get_gateway_target(
+                    gatewayIdentifier=gateway_id, targetId=target_id
+                )
+            except Exception as error:
+                findings.append(
+                    create_finding(
+                        check_id="AC-25",
+                        finding_name="AgentCore Gateway Target Authorization",
+                        finding_details=(
+                            f"{label} could not be read: "
+                            f"{_assessment_error_label(error)}."
+                        ),
+                        resolution=(
+                            "Grant bedrock-agentcore:GetGatewayTarget and retry."
+                        ),
+                        reference=AGENTCORE_GATEWAY_TARGET_REFERENCE_URL,
+                        severity=SeverityEnum.INFORMATIONAL,
+                        status=StatusEnum.NA,
+                    )
+                )
+                continue
+
+            provider_types = [
+                str(configuration.get("credentialProviderType"))
+                for configuration in detail.get("credentialProviderConfigurations")
+                or []
+                if isinstance(configuration, dict)
+                and configuration.get("credentialProviderType")
+            ]
+
+            if provider_types:
+                findings.append(
+                    create_finding(
+                        check_id="AC-25",
+                        finding_name="AgentCore Gateway Target Authorization",
+                        finding_details=(
+                            f"{label} authenticates outbound calls with "
+                            f"{', '.join(provider_types)}."
+                        ),
+                        resolution=(
+                            "No action required. Confirm the credential the "
+                            "provider issues is scoped to the operations this "
+                            "target needs on its backend, which the gateway API "
+                            "does not express."
+                        ),
+                        reference=AGENTCORE_GATEWAY_TARGET_REFERENCE_URL,
+                        severity=SeverityEnum.HIGH,
+                        status=StatusEnum.PASSED,
+                    )
+                )
+            else:
+                findings.append(
+                    create_finding(
+                        check_id="AC-25",
+                        finding_name="AgentCore Gateway Target Unauthenticated",
+                        finding_details=(
+                            f"{label} declares no credential provider, so the "
+                            "gateway reaches its backend with no credential of "
+                            "its own and the backend cannot tell one caller from "
+                            "another."
+                        ),
+                        resolution=(
+                            "Set credentialProviderConfigurations on the target to "
+                            "GATEWAY_IAM_ROLE, OAUTH, API_KEY, "
+                            "CALLER_IAM_CREDENTIALS or JWT_PASSTHROUGH, whichever "
+                            "the backend authenticates."
+                        ),
+                        reference=AGENTCORE_GATEWAY_TARGET_REFERENCE_URL,
+                        severity=SeverityEnum.HIGH,
+                        status=StatusEnum.FAILED,
+                    )
+                )
+
+    if not targets_seen and not findings:
+        return [
+            create_finding(
+                check_id="AC-25",
+                finding_name="AgentCore Gateway Target Authorization",
+                finding_details=(
+                    f"No AgentCore gateway target found across {len(gateways)} "
+                    "gateway(s) in this region."
+                ),
+                resolution="No action required.",
+                reference=AGENTCORE_GATEWAY_TARGET_REFERENCE_URL,
+                severity=SeverityEnum.INFORMATIONAL,
+                status=StatusEnum.NA,
+            )
+        ]
+
+    return findings
+
+
+def _kms_key_policy_allows_open_decrypt(policy_document: Any) -> bool:
+    """Return whether a key policy lets every principal decrypt with no condition.
+
+    A customer managed key on a log group only keeps the log data under the
+    account's control while the key policy narrows who may use it. An Allow to
+    `Principal: "*"` with no condition puts the plaintext within reach of every
+    principal the account trusts, which is the posture the CMK was meant to
+    replace.
+    """
+    for statement in _document_statements(policy_document, effect="Allow"):
+        if statement.get("Condition"):
+            continue
+        if "*" not in _statement_principals(statement):
+            continue
+        for pattern in _statement_actions(statement):
+            if pattern == "*":
+                return True
+            namespace, _, action_pattern = pattern.partition(":")
+            if namespace != "kms":
+                continue
+            if any(
+                fnmatchcase(action, action_pattern) for action in KMS_DECRYPT_ACTIONS
+            ):
+                return True
+    return False
+
+
+def check_agentcore_log_retention_and_key_scope() -> List[Dict[str, Any]]:
+    """AC-26: Report log retention and CMK key scope on AgentCore log groups.
+
+    A log group with no retention keeps agent prompts, tool arguments and memory
+    records forever, which turns an investigation aid into a growing store of the
+    data the workload was careful about elsewhere. AC-20 asserts that a customer
+    managed key is set; this check asserts that the key policy behind it narrows
+    who can read through it.
+    """
+    if logs_client is None:
+        return [
+            create_finding(
+                check_id="AC-26",
+                finding_name="AgentCore Log Retention and Key Scope",
+                finding_details="CloudWatch Logs client not available in this region.",
+                resolution="No action required unless AgentCore runs in this region.",
+                reference=LOGS_RETENTION_REFERENCE_URL,
+                severity=SeverityEnum.INFORMATIONAL,
+                status=StatusEnum.NA,
+            )
+        ]
+
+    try:
+        log_groups = _agentcore_log_groups()
+    except Exception as error:
+        return [
+            _incomplete_check_finding(
+                check_id="AC-26",
+                finding_name="AgentCore Log Retention and Key Scope",
+                error=error,
+                reference=LOGS_RETENTION_REFERENCE_URL,
+            )
+        ]
+
+    if not log_groups:
+        return [
+            create_finding(
+                check_id="AC-26",
+                finding_name="AgentCore Log Retention and Key Scope",
+                finding_details="No AgentCore log groups found in this region.",
+                resolution="No action required.",
+                reference=LOGS_RETENTION_REFERENCE_URL,
+                severity=SeverityEnum.INFORMATIONAL,
+                status=StatusEnum.NA,
+            )
+        ]
+
+    key_policy_cache: Dict[str, Any] = {}
+    findings = []
+    for log_group in log_groups:
+        log_group_name = log_group.get("logGroupName")
+        if not log_group_name:
+            continue
+
+        retention = log_group.get("retentionInDays")
+        key_id = log_group.get("kmsKeyId")
+        problems: List[str] = []
+        confirmations: List[str] = []
+
+        if retention:
+            confirmations.append(f"expires log events after {retention} day(s)")
+        else:
+            problems.append(
+                "has no retention period, so every logged prompt, tool argument "
+                "and memory record is kept indefinitely"
+            )
+
+        if key_id:
+            if key_id not in key_policy_cache:
+                try:
+                    key_policy_cache[key_id] = kms_client.get_key_policy(KeyId=key_id)[
+                        "Policy"
+                    ]
+                except Exception as error:
+                    logger.warning(f"Could not read key policy for {key_id}: {error}")
+                    key_policy_cache[key_id] = error
+            key_policy = key_policy_cache[key_id]
+            if isinstance(key_policy, Exception):
+                findings.append(
+                    create_finding(
+                        check_id="AC-26",
+                        finding_name="AgentCore Log Key Scope",
+                        finding_details=(
+                            f"Log group '{log_group_name}' is encrypted with "
+                            f"{key_id}, whose key policy could not be read: "
+                            f"{_assessment_error_label(key_policy)}."
+                        ),
+                        resolution="Grant kms:GetKeyPolicy on the key and retry.",
+                        reference=KMS_KEY_POLICY_REFERENCE_URL,
+                        severity=SeverityEnum.INFORMATIONAL,
+                        status=StatusEnum.NA,
+                    )
+                )
+            elif _kms_key_policy_allows_open_decrypt(key_policy):
+                problems.append(
+                    f"is encrypted with {key_id}, whose key policy allows every "
+                    "principal to decrypt with no condition"
+                )
+            else:
+                confirmations.append(
+                    f"is encrypted with {key_id}, whose key policy names the "
+                    "principals allowed to decrypt"
+                )
+
+        if problems:
+            findings.append(
+                create_finding(
+                    check_id="AC-26",
+                    finding_name="AgentCore Log Retention and Key Scope",
+                    finding_details=(
+                        f"Log group '{log_group_name}' {' and '.join(problems)}."
+                    ),
+                    resolution=(
+                        "Set a retention period on the log group that matches the "
+                        "investigation window this workload commits to, and remove "
+                        "any unconditioned wildcard-principal decrypt grant from "
+                        "the encryption key's policy."
+                    ),
+                    reference=LOGS_RETENTION_REFERENCE_URL,
+                    severity=SeverityEnum.MEDIUM,
+                    status=StatusEnum.FAILED,
+                )
+            )
+        else:
+            findings.append(
+                create_finding(
+                    check_id="AC-26",
+                    finding_name="AgentCore Log Retention and Key Scope",
+                    finding_details=(
+                        f"Log group '{log_group_name}' {' and '.join(confirmations)}."
+                    ),
+                    resolution=(
+                        "No action required. Confirm the retention period covers "
+                        "the investigation window this workload commits to."
+                    ),
+                    reference=LOGS_RETENTION_REFERENCE_URL,
+                    severity=SeverityEnum.MEDIUM,
+                    status=StatusEnum.PASSED,
+                )
+            )
+
+    return findings
+
+
+def _statement_is_confused_deputy_exposed(statement: Dict[str, Any]) -> bool:
+    """Return whether an Allow statement trusts a service or anyone without a guard.
+
+    The confused-deputy problem is about a principal the account did not choose:
+    an AWS service principal acting for somebody else's resource, or `*`. A named
+    cross-account ARN is a trust the account owner wrote down, so it is left to
+    the resource-policy checks that judge who is named.
+    """
+    principals = _statement_principals(statement)
+    exposed = any(
+        principal == "*" or principal.endswith(".amazonaws.com")
+        for principal in principals
+    )
+    if not exposed:
+        return False
+    condition_keys = set(_statement_condition_keys(statement))
+    return not (condition_keys & CONFUSED_DEPUTY_CONDITION_KEYS)
+
+
+def check_agentcore_gateway_policy_conditions() -> List[Dict[str, Any]]:
+    """AC-27: Judge the conditions on each gateway's resource and trust policies.
+
+    AC-10 reports that a resource policy is present. Presence is not the control:
+    a policy that allows the AgentCore service principal to invoke the gateway
+    with no aws:SourceAccount or aws:SourceArn condition lets another customer's
+    gateway borrow this account's permissions, and the same hole exists on the
+    gateway execution role's trust policy. The network leg is separate: a gateway
+    reachable over any path is restricted to an approved private path only by a
+    condition on the request's source VPC, VPC endpoint or address.
+    """
+    if agentcore_client is None:
+        return [
+            create_finding(
+                check_id="AC-27",
+                finding_name="AgentCore Gateway Policy Conditions",
+                finding_details="AgentCore client not available in this region.",
+                resolution="No action required unless AgentCore runs in this region.",
+                reference=CONFUSED_DEPUTY_REFERENCE_URL,
+                severity=SeverityEnum.INFORMATIONAL,
+                status=StatusEnum.NA,
+            )
+        ]
+
+    try:
+        gateways = _agentcore_list_all("list_gateways", ["items", "gateways"])
+    except Exception as error:
+        return [
+            _incomplete_check_finding(
+                check_id="AC-27",
+                finding_name="AgentCore Gateway Policy Conditions",
+                error=error,
+                reference=CONFUSED_DEPUTY_REFERENCE_URL,
+            )
+        ]
+
+    if not gateways:
+        return [
+            create_finding(
+                check_id="AC-27",
+                finding_name="AgentCore Gateway Policy Conditions",
+                finding_details="No AgentCore gateways found in this region.",
+                resolution="No action required.",
+                reference=CONFUSED_DEPUTY_REFERENCE_URL,
+                severity=SeverityEnum.INFORMATIONAL,
+                status=StatusEnum.NA,
+            )
+        ]
+
+    findings = []
+    trust_cache: Dict[str, Any] = {}
+    for gateway in gateways:
+        gateway_id = gateway.get("gatewayId", "unknown")
+        gateway_name = gateway.get("name", gateway_id)
+        label = f"Gateway '{gateway_name}' ({gateway_id})"
+
+        try:
+            detail = agentcore_client.get_gateway(gatewayIdentifier=gateway_id)
+        except Exception as error:
+            findings.append(
+                create_finding(
+                    check_id="AC-27",
+                    finding_name="AgentCore Gateway Policy Conditions",
+                    finding_details=(
+                        f"{label} could not be read: {_assessment_error_label(error)}."
+                    ),
+                    resolution="Grant bedrock-agentcore:GetGateway and retry.",
+                    reference=CONFUSED_DEPUTY_REFERENCE_URL,
+                    severity=SeverityEnum.INFORMATIONAL,
+                    status=StatusEnum.NA,
+                )
+            )
+            continue
+
+        findings.extend(
+            _gateway_resource_policy_findings(label, detail.get("gatewayArn"))
+        )
+        findings.extend(
+            _gateway_role_trust_findings(label, detail.get("roleArn"), trust_cache)
+        )
+
+    return findings
+
+
+def _gateway_resource_policy_findings(
+    label: str, gateway_arn: Any
+) -> List[Dict[str, Any]]:
+    """Judge one gateway resource policy's confused-deputy and network conditions."""
+    if not gateway_arn:
+        return [
+            create_finding(
+                check_id="AC-27",
+                finding_name="AgentCore Gateway Policy Conditions",
+                finding_details=(
+                    f"{label} reported no gateway ARN, so its resource policy "
+                    "could not be read."
+                ),
+                resolution="Grant bedrock-agentcore:GetGateway and retry.",
+                reference=CONFUSED_DEPUTY_REFERENCE_URL,
+                severity=SeverityEnum.INFORMATIONAL,
+                status=StatusEnum.NA,
+            )
+        ]
+
+    try:
+        policy = _get_agentcore_resource_policy(gateway_arn)
+    except ClientError as error:
+        if error.response.get("Error", {}).get("Code") == "ResourceNotFoundException":
+            policy = ""
+        else:
+            return [
+                create_finding(
+                    check_id="AC-27",
+                    finding_name="AgentCore Gateway Policy Conditions",
+                    finding_details=(
+                        f"{label} resource policy could not be read: "
+                        f"{_assessment_error_label(error)}."
+                    ),
+                    resolution=("Grant bedrock-agentcore:GetResourcePolicy and retry."),
+                    reference=CONFUSED_DEPUTY_REFERENCE_URL,
+                    severity=SeverityEnum.INFORMATIONAL,
+                    status=StatusEnum.NA,
+                )
+            ]
+    except Exception as error:
+        return [
+            create_finding(
+                check_id="AC-27",
+                finding_name="AgentCore Gateway Policy Conditions",
+                finding_details=(
+                    f"{label} resource policy could not be read: "
+                    f"{_assessment_error_label(error)}."
+                ),
+                resolution="Grant bedrock-agentcore:GetResourcePolicy and retry.",
+                reference=CONFUSED_DEPUTY_REFERENCE_URL,
+                severity=SeverityEnum.INFORMATIONAL,
+                status=StatusEnum.NA,
+            )
+        ]
+
+    statements = _document_statements(policy, effect="Allow")
+    findings = []
+
+    if not statements:
+        findings.append(
+            create_finding(
+                check_id="AC-27",
+                finding_name="AgentCore Gateway Resource Policy Confused Deputy Guard",
+                finding_details=(
+                    f"{label} has no resource policy that allows another account "
+                    "or an AWS service to invoke it, so there is no service "
+                    "principal to guard."
+                ),
+                resolution="No action required.",
+                reference=CONFUSED_DEPUTY_REFERENCE_URL,
+                severity=SeverityEnum.INFORMATIONAL,
+                status=StatusEnum.NA,
+            )
+        )
+    else:
+        exposed = [
+            statement
+            for statement in statements
+            if _statement_is_confused_deputy_exposed(statement)
+        ]
+        if exposed:
+            findings.append(
+                create_finding(
+                    check_id="AC-27",
+                    finding_name=(
+                        "AgentCore Gateway Resource Policy Confused Deputy Guard "
+                        "Missing"
+                    ),
+                    finding_details=(
+                        f"{label} has {len(exposed)} of {len(statements)} Allow "
+                        "statement(s) that trust an AWS service principal or every "
+                        "principal without an aws:SourceAccount or aws:SourceArn "
+                        "condition, so another account's resource can make the "
+                        "service call this gateway on its behalf."
+                    ),
+                    resolution=(
+                        "Add aws:SourceAccount for this account and aws:SourceArn "
+                        "for this gateway's ARN to every statement whose principal "
+                        "is an AWS service or a wildcard."
+                    ),
+                    reference=CONFUSED_DEPUTY_REFERENCE_URL,
+                    severity=SeverityEnum.HIGH,
+                    status=StatusEnum.FAILED,
+                )
+            )
+        else:
+            findings.append(
+                create_finding(
+                    check_id="AC-27",
+                    finding_name="AgentCore Gateway Resource Policy Confused Deputy Guard",
+                    finding_details=(
+                        f"{label} guards all {len(statements)} Allow statement(s) "
+                        "in its resource policy with aws:SourceAccount or "
+                        "aws:SourceArn, or names no service or wildcard principal."
+                    ),
+                    resolution=(
+                        "No action required. Confirm the aws:SourceArn pattern "
+                        "names this gateway rather than every resource in the "
+                        "account."
+                    ),
+                    reference=CONFUSED_DEPUTY_REFERENCE_URL,
+                    severity=SeverityEnum.HIGH,
+                    status=StatusEnum.PASSED,
+                )
+            )
+
+    network_keys = sorted(
+        {
+            key
+            for statement in statements
+            for key in _statement_condition_keys(statement)
+            if key in NETWORK_PATH_CONDITION_KEYS
+        }
+    )
+    if network_keys:
+        findings.append(
+            create_finding(
+                check_id="AC-27",
+                finding_name="AgentCore Gateway Network Path Scope",
+                finding_details=(
+                    f"{label} binds its resource policy to a network path with "
+                    f"{', '.join(network_keys)}."
+                ),
+                resolution=(
+                    "No action required. Confirm the VPC, VPC endpoint or address "
+                    "range named in the condition is the approved private path for "
+                    "this workload."
+                ),
+                reference=VPC_ENDPOINT_POLICY_REFERENCE_URL,
+                severity=SeverityEnum.MEDIUM,
+                status=StatusEnum.PASSED,
+            )
+        )
+    else:
+        findings.append(
+            create_finding(
+                check_id="AC-27",
+                finding_name="AgentCore Gateway Network Path Unrestricted",
+                finding_details=(
+                    f"{label} carries no aws:SourceVpc, aws:SourceVpce, "
+                    "aws:VpcSourceIp or aws:SourceIp condition, so any caller "
+                    "holding a valid authorizer token reaches it over any network "
+                    "path, including the public internet."
+                ),
+                resolution=(
+                    "Attach a gateway resource policy that denies calls whose "
+                    "aws:SourceVpce is not the approved interface endpoint, or "
+                    "express the same restriction in a service control policy."
+                ),
+                reference=VPC_ENDPOINT_POLICY_REFERENCE_URL,
+                severity=SeverityEnum.MEDIUM,
+                status=StatusEnum.FAILED,
+            )
+        )
+
+    return findings
+
+
+def _gateway_role_trust_findings(
+    label: str, role_arn: Any, trust_cache: Dict[str, Any]
+) -> List[Dict[str, Any]]:
+    """Judge one gateway execution role's trust policy for a confused-deputy guard.
+
+    The permission cache stores attached and inline policies only, so the trust
+    policy is read from IAM here. Roles are cached per invocation because several
+    gateways in one account share one execution role.
+    """
+    if not role_arn:
+        return [
+            create_finding(
+                check_id="AC-27",
+                finding_name="AgentCore Gateway Role Trust Confused Deputy Guard",
+                finding_details=(
+                    f"{label} has no execution role, so there is no trust policy "
+                    "to guard."
+                ),
+                resolution="No action required.",
+                reference=CONFUSED_DEPUTY_REFERENCE_URL,
+                severity=SeverityEnum.INFORMATIONAL,
+                status=StatusEnum.NA,
+            )
+        ]
+
+    role_name = str(role_arn).rsplit("/", 1)[-1]
+    if role_name not in trust_cache:
+        try:
+            trust_cache[role_name] = iam_client.get_role(RoleName=role_name)["Role"][
+                "AssumeRolePolicyDocument"
+            ]
+        except Exception as error:
+            logger.warning(f"Could not read trust policy for {role_name}: {error}")
+            trust_cache[role_name] = error
+
+    document = trust_cache[role_name]
+    if isinstance(document, Exception):
+        return [
+            create_finding(
+                check_id="AC-27",
+                finding_name="AgentCore Gateway Role Trust Confused Deputy Guard",
+                finding_details=(
+                    f"{label} uses execution role {role_name}, whose trust policy "
+                    f"could not be read: {_assessment_error_label(document)}."
+                ),
+                resolution="Grant iam:GetRole on the role and retry.",
+                reference=CONFUSED_DEPUTY_REFERENCE_URL,
+                severity=SeverityEnum.INFORMATIONAL,
+                status=StatusEnum.NA,
+            )
+        ]
+
+    statements = _document_statements(document, effect="Allow")
+    exposed = [
+        statement
+        for statement in statements
+        if _statement_is_confused_deputy_exposed(statement)
+    ]
+
+    if exposed:
+        return [
+            create_finding(
+                check_id="AC-27",
+                finding_name=(
+                    "AgentCore Gateway Role Trust Confused Deputy Guard Missing"
+                ),
+                finding_details=(
+                    f"{label} uses execution role {role_name}, which has "
+                    f"{len(exposed)} of {len(statements)} Allow statement(s) "
+                    "trusting an AWS service principal or every principal with no "
+                    "aws:SourceAccount or aws:SourceArn condition. A guarded "
+                    "statement elsewhere in the same policy does not narrow an "
+                    "unguarded one."
+                ),
+                resolution=(
+                    "Add aws:SourceAccount for this account and aws:SourceArn for "
+                    "this gateway's ARN to every statement of the trust policy, or "
+                    "delete the unguarded statement."
+                ),
+                reference=CONFUSED_DEPUTY_REFERENCE_URL,
+                severity=SeverityEnum.HIGH,
+                status=StatusEnum.FAILED,
+            )
+        ]
+
+    return [
+        create_finding(
+            check_id="AC-27",
+            finding_name="AgentCore Gateway Role Trust Confused Deputy Guard",
+            finding_details=(
+                f"{label} uses execution role {role_name}, whose "
+                f"{len(statements)} Allow statement(s) each carry an "
+                "aws:SourceAccount or aws:SourceArn condition, or name no service "
+                "or wildcard principal."
+            ),
+            resolution=(
+                "No action required. Confirm the aws:SourceArn pattern names this "
+                "gateway rather than every AgentCore resource in the account."
+            ),
+            reference=CONFUSED_DEPUTY_REFERENCE_URL,
+            severity=SeverityEnum.HIGH,
+            status=StatusEnum.PASSED,
+        )
+    ]
+
+
 def check_agentcore_gateway_agentic_security() -> List[Dict[str, Any]]:
     """
     Check API-provable AgentCore Gateway controls for agentic tool execution.
@@ -5477,6 +6765,7 @@ def lambda_handler(event, context):
     """
     global start_time, iam_client, ec2_client, ecr_client, logs_client
     global cloudwatch_client, cloudtrail_client, oam_client, agentcore_client
+    global kms_client
     start_time = time.time()
 
     try:
@@ -5500,6 +6789,8 @@ def lambda_handler(event, context):
             "cloudtrail", config=boto3_config, region_name=region
         )
         oam_client = boto3.client("oam", config=boto3_config, region_name=region)
+        # A log group's encryption key lives in the log group's own region.
+        kms_client = boto3.client("kms", config=boto3_config, region_name=region)
 
         # Collect all findings
         all_findings = []
@@ -5829,6 +7120,26 @@ def lambda_handler(event, context):
                 ["AG-24", "AG-25", "AG-26", "AG-27"],
                 "Agentic Gateway Security",
                 check_agentcore_gateway_agentic_security,
+            ),
+            (
+                ["AC-24"],
+                "Gateway Rate Limiting",
+                check_agentcore_gateway_rate_limiting,
+            ),
+            (
+                ["AC-25"],
+                "Gateway Target Authorization",
+                check_agentcore_gateway_target_authorization,
+            ),
+            (
+                ["AC-26"],
+                "Log Retention and Key Scope",
+                check_agentcore_log_retention_and_key_scope,
+            ),
+            (
+                ["AC-27"],
+                "Gateway Policy Conditions",
+                check_agentcore_gateway_policy_conditions,
             ),
         ]
 

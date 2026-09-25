@@ -6,19 +6,18 @@
     "hosted": 67,
     "fnd_ai_subject": 11,
     "total": 78,
-    "covered": 14,
-    "tighten": 27,
-    "tighten_extend": 21,
-    "tighten_new_id": 6,
-    "new": 22,
+    "covered": 19,
+    "tighten": 24,
+    "tighten_extend": 19,
+    "tighten_new_id": 5,
+    "new": 20,
     "not_implementable": 4,
     "unassessed": 11,
-    "new_check_functions": 39,
-    "extensions": 21,
+    "new_check_functions": 36,
+    "extensions": 19,
     "extra_iam_actions": [
       "config:DescribeConfigRules",
       "config:DescribeConfigurationRecorders",
-      "ec2:DescribeSecurityGroups",
       "macie2:GetAutomatedDiscoveryConfiguration",
       "macie2:GetMacieSession",
       "organizations:DescribeEffectivePolicy",
@@ -825,18 +824,20 @@
       "question": "Do the gateway's resource-based policy and target execution-role trust prevent a confused-deputy attack when an AWS service or another account is allowed to invoke it?",
       "assert": "Gateway resource policy + execution-role trust with SourceAccount/SourceArn conditions",
       "workload_agnostic": true,
-      "verdict": "tighten",
-      "disposition": "new_id",
+      "verdict": "covered",
+      "disposition": null,
       "target_modules": [
         "agentcore_assessments"
       ],
       "incumbents": [
-        "AC-10"
+        "AC-10",
+        "AC-27"
       ],
       "incumbent_names": [
-        "AgentCore Resource-Based Policies Check"
+        "AgentCore Resource-Based Policies Check",
+        "AgentCore Gateway Policy Conditions"
       ],
-      "gap": "AC-10 is named \"Resource-Based Policies Check\" but reports only that a policy is present and never evaluates its conditions, so the confused-deputy leg is unasserted",
+      "gap": "AC-10 reports that a gateway resource policy is present; AC-27 judges whether its Allow statements and the gateway execution role's trust policy carry aws:SourceAccount or aws:SourceArn, and fails an unconditioned statement even when a guarded sibling sits beside it in the same document",
       "extra_iam": [],
       "phase": 4,
       "source": "controls/ai-specific/agentcore-gateway.yaml"
@@ -869,18 +870,20 @@
       "question": "Is the network path to the gateway restricted to approved private endpoints, rather than reachable over any network path?",
       "assert": "Gateway VPCE + endpoint policy + SG scope + resource-policy network conditions",
       "workload_agnostic": false,
-      "verdict": "tighten",
-      "disposition": "extend",
+      "verdict": "covered",
+      "disposition": null,
       "target_modules": [
         "agentcore_assessments"
       ],
       "incumbents": [
-        "AC-08"
+        "AC-08",
+        "AC-27"
       ],
       "incumbent_names": [
-        "AgentCore VPC Endpoints Check"
+        "AgentCore VPC Endpoints Check",
+        "AgentCore Gateway Policy Conditions"
       ],
-      "gap": "AC-08 tests endpoint existence and available state, not endpoint policy or security-group scope; it does hold one leg GW-04 lacks, endpoint health",
+      "gap": "AC-08 now judges each AgentCore endpoint's policy against the default allow-everything document and reads its security groups for 0.0.0.0/0 and ::/0 inbound rules, alongside the existence and health legs it already held; AC-27 adds the gateway resource policy's aws:SourceVpc / aws:SourceVpce / aws:VpcSourceIp / aws:SourceIp leg",
       "extra_iam": [],
       "phase": 4,
       "source": "controls/ai-specific/agentcore-gateway.yaml"
@@ -891,18 +894,20 @@
       "question": "Is the gateway protected against volumetric abuse and malicious requests with rate limiting and a web-application firewall, given it is a public-facing agent entry point?",
       "assert": "ListGatewayRateLimits showing an ACTIVE limit on a bounded dimension + WAF web ACL associated to the gateway",
       "workload_agnostic": true,
-      "verdict": "tighten",
-      "disposition": "extend",
+      "verdict": "covered",
+      "disposition": null,
       "target_modules": [
         "agentcore_assessments"
       ],
       "incumbents": [
-        "AG-27"
+        "AG-27",
+        "AC-24"
       ],
       "incumbent_names": [
-        "Agentic AI Gateway WAF Protection"
+        "Agentic AI Gateway WAF Protection",
+        "AgentCore Gateway Rate Limiting"
       ],
-      "gap": "AG-27 has the WAF leg; the rate-limit leg needs ListGatewayRateLimits, so botocore >= 1.43.66",
+      "gap": "AG-27 holds the WAF leg; AC-24 requires an ACTIVE gateway rate limit carrying a requests, tokens or connections ceiling, because dimensions is the only required member of a limit entry and a limit can therefore name a dimension and bound nothing",
       "extra_iam": [],
       "phase": 4,
       "source": "controls/ai-specific/agentcore-gateway.yaml"
@@ -1058,10 +1063,8 @@
       "incumbent_names": [
         "AgentCore Runtime VPC Configuration"
       ],
-      "gap": "AC-01 requires VPC placement and flags public subnets but never reads what the security-group rules permit; describe_security_groups is 0 hits in the module, so VPC placement is proven and egress filtering is not",
-      "extra_iam": [
-        "ec2:DescribeSecurityGroups"
-      ],
+      "gap": "AC-01 requires VPC placement and flags public subnets but never reads what the security-group rules permit; ec2:DescribeSecurityGroups is now granted to this function for AC-08's endpoint scope leg, so RT-08 costs no further permission",
+      "extra_iam": [],
       "phase": 4,
       "source": "controls/ai-specific/agentcore-runtime.yaml"
     },
@@ -1150,7 +1153,7 @@
       ],
       "incumbents": [],
       "incumbent_names": [],
-      "gap": "asserts an SCP; the corpus already enumerates SCPs in two modules, so the cost is the Organizations read",
+      "gap": "blocked, not merely unbuilt: bedrock-agentcore:GatewayAuthorizerType is declared as a condition key of the service but is wired to zero actions, on both the machine-readable service reference and the service authorization reference page, while the sibling RuntimeAuthorizerType is wired to CreateAgentRuntime and UpdateAgentRuntime. A Deny on CreateGateway or UpdateGateway conditioned on it can never match, so the only expressible SCP is a blanket prohibition on gateways, which is a different control. Recheck the per-action key list before implementing",
       "extra_iam": [
         "organizations:ListPolicies",
         "organizations:DescribePolicy"
@@ -1164,14 +1167,18 @@
       "question": "Does each gateway target use an appropriate, least-privilege outbound authentication method, with no unauthenticated targets in production and no wildcard target permissions?",
       "assert": "Per-target outbound-auth enumeration + Lambda target scoped to specific function ARN",
       "workload_agnostic": true,
-      "verdict": "new",
+      "verdict": "covered",
       "disposition": null,
       "target_modules": [
         "agentcore_assessments"
       ],
-      "incumbents": [],
-      "incumbent_names": [],
-      "gap": "",
+      "incumbents": [
+        "AC-25"
+      ],
+      "incumbent_names": [
+        "AgentCore Gateway Target Authorization"
+      ],
+      "gap": "AC-25 reads credentialProviderConfigurations per target through GetGatewayTarget, which is the only surface that carries it: the ListGatewayTargets summary omits the field. The control's second leg, a Lambda target scoped to one function ARN, is not expressible because the target ARN members reject a wildcard",
       "extra_iam": [],
       "phase": 4,
       "source": "controls/ai-specific/agentcore-gateway.yaml"
@@ -1182,14 +1189,22 @@
       "question": "Is every call made through the gateway logged with enough detail (caller, target, parameters, result) to support a security investigation, with the encryption of that data under organization control?",
       "assert": "Gateway application-log config + retention + CMK key-policy scoping",
       "workload_agnostic": true,
-      "verdict": "new",
+      "verdict": "covered",
       "disposition": null,
       "target_modules": [
         "agentcore_assessments"
       ],
-      "incumbents": [],
-      "incumbent_names": [],
-      "gap": "",
+      "incumbents": [
+        "AC-19",
+        "AC-20",
+        "AC-26"
+      ],
+      "incumbent_names": [
+        "AgentCore Log Delivery Configuration",
+        "AgentCore Log Data Protection",
+        "AgentCore Log Retention and Key Scope"
+      ],
+      "gap": "AC-19 pairs each AgentCore delivery source with its delivery and AC-20 asserts masking plus a customer managed key; AC-26 adds the two legs neither held, an explicitly configured retentionInDays and a key policy that does not let every principal decrypt without a condition",
       "extra_iam": [],
       "phase": 4,
       "source": "controls/ai-specific/agentcore-gateway.yaml"
@@ -1655,10 +1670,8 @@
       "incumbent_names": [
         "AgentCore Runtime VPC Configuration"
       ],
-      "gap": "overlaps RT-08; resolve the two together",
-      "extra_iam": [
-        "ec2:DescribeSecurityGroups"
-      ],
+      "gap": "overlaps RT-08; resolve the two together. Both now cost no further permission: ec2:DescribeSecurityGroups is granted to this function for AC-08's endpoint scope leg",
+      "extra_iam": [],
       "phase": 5,
       "source": "controls/baseline/network-isolation.yaml"
     }
