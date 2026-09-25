@@ -398,8 +398,16 @@ looks redundant:
    `CONTRIBUTION-PROGRAM.md` section 8 is wrong to list it as mis-specified.
 
 Two AISF controls are flagged `machine_checkable` in the ledger but are not checkable from
-configuration: `AIR-BDR-KB-05` and `KB-08` depend on customer Lambda code. With `AIR-SGM-EP-03` that
-is 3 of 105. The 105 figure is a ledger claim, not an implementability claim.
+configuration: `AIR-BDR-KB-05` and `KB-08` ask what an ingestion or retrieval step does to content,
+and each surface that would answer is readable without being evidence. `GetDataSource` returns the
+custom transformation Lambda's ARN under
+`vectorIngestionConfiguration.customTransformationConfiguration` with `stepToApply POST_CHUNKING`,
+which shows that a customer Lambda rewrites every chunk and not whether it screens for injected
+instructions or strips PII. `GetGuardrail` returns the `PROMPT_ATTACK` content filter and the
+`sensitiveInformationPolicy`, but `KnowledgeBase` has no `guardrailConfiguration` member: only
+`Agent` and `KnowledgeBaseFlowNodeConfiguration` record one, and a direct `RetrieveAndGenerate`
+caller passes `guardrailId` per request, so no read binds a filter to a knowledge base. With
+`AIR-SGM-EP-03` that is 3 of 105. The 105 figure is a ledger claim, not an implementability claim.
 
 **Correction, `AIR-BDR-MDL-08` is implementable.** An earlier draft listed it above, on the grounds
 that it needs a published-versus-DRAFT distinction `GetPrompt` does not return. `version` is a

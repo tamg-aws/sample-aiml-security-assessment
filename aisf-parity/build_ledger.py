@@ -69,7 +69,16 @@ ROWS = [
         None,
         None,
         [],
-        "depends on customer Lambda code, not configuration",
+        "the screening step is readable configuration and reading it proves nothing: "
+        "GetDataSource returns vectorIngestionConfiguration.customTransformationConfiguration"
+        ".transformations[].transformationFunction.transformationLambdaConfiguration.lambdaArn "
+        "with stepToApply POST_CHUNKING, so a check can see that a customer Lambda rewrites "
+        "each chunk, and no API says whether it looks for instruction-like patterns. The "
+        "guardrail leg is readable and unattributable: GetGuardrail exposes the PROMPT_ATTACK "
+        "content filter, but KnowledgeBase has no guardrailConfiguration member, only Agent "
+        "and KnowledgeBaseFlowNodeConfiguration do, and a direct RetrieveAndGenerate caller "
+        "supplies guardrailId per request, so a read cannot bind the filter to this knowledge "
+        "base",
         [],
         None,
     ),
@@ -79,7 +88,15 @@ ROWS = [
         None,
         None,
         [],
-        "depends on customer Lambda code, not configuration",
+        "every nearby surface is readable and none of them is evidence of redaction: a "
+        "pre-ingestion Comprehend or Glue job is not an attribute of the knowledge base, "
+        "macie2 GetAutomatedDiscoveryConfiguration reports that discovery is enabled and "
+        "where sensitive data was found, never that it was removed, and a guardrail "
+        "sensitiveInformationPolicy with piiEntities action ANONYMIZE or BLOCK is readable on "
+        "GetGuardrail but recorded on an Agent or a flow node and not on the knowledge base, "
+        "with a direct RetrieveAndGenerate caller supplying guardrailId per request. The "
+        "strongest assertable statement is that some guardrail in the account masks PII, "
+        "which is not evidence that this knowledge base's content reaches a model redacted",
         [],
         None,
     ),
