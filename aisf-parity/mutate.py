@@ -59,7 +59,6 @@ BUILD_LEDGER = "aisf-parity/build_ledger.py"
 # Phase 2's surfaces: the generated tag maps, the schema that looks a tag up, and
 # the CSV fieldnames list a tag has to reach.
 SECURITY = "aiml-security-assessment/functions/security"
-MAP_BEDROCK = f"{SECURITY}/bedrock_assessments/aisf_compliance_bedrock.py"
 MAP_SAGEMAKER = f"{SECURITY}/sagemaker_assessments/aisf_compliance_sagemaker.py"
 MAP_AGENTCORE = f"{SECURITY}/agentcore_assessments/aisf_compliance_agentcore.py"
 SCHEMA_BEDROCK = f"{SECURITY}/bedrock_assessments/schema.py"
@@ -195,22 +194,34 @@ MUTATIONS = [
         'asserts this; nothing to write |"\n',
     },
     # ---------------------------------------------------------------- phase 2
-    # The tag column. Mutations 9 and 10 are the two halves of the qualifier
+    # The tag column. The next two entries are the two halves of the qualifier
     # vocabulary and are both here because they fail different branches of the
     # same gate: a `tighten` row wants `(partial)`, a multi-leg `covered` row
-    # wants `(1 of N checks)`, and an earlier hand-run of 9 hit the `(partial)`
-    # in this file's own module docstring instead of a map entry, which left gate
-    # 14 green and looked like a weak gate. The find-strings below name the
-    # check id, so they cannot drift onto prose.
+    # wants `(1 of N checks)`, and an earlier hand-run of the first hit the
+    # `(partial)` in a map's own module docstring instead of a map entry, which
+    # left gate 14 green and looked like a weak gate. The find-strings below name
+    # the check id, so they cannot drift onto prose. They are referred to by name
+    # and not by position: inserting a mutation renumbers every one after it.
     {
+        # This entry named BR-04's `(partial)` until 8faf24f retired the whole
+        # (partial) vocabulary from the bedrock map, and it was not refreshed with
+        # it, so every run since aborted at this entry and the ones after it never
+        # ran (measured 2026-09-25: twelve printed CAUGHT, then the abort, and
+        # five entries carried no verdict). agentcore's map is the surface that
+        # still carries the qualifier, so the entry moves there instead of being
+        # re-pointed at a `(N of M checks)` tag, which is the next entry's branch.
+        # Gate 14 runs the same comparison for all three maps, so the branch is
+        # covered wherever the qualifier lives; bedrock's map now has no entry of
+        # its own, and duplicating one there would buy a second run of the same
+        # code path.
         "name": "a (partial) qualifier dropped from a tighten row's tag",
-        "file": MAP_BEDROCK,
-        "defect": "BR-04's tag reads as a full assertion of AIR-BDR-MDL-02, a "
-        "control the ledger says it only partly covers, so a Passed BR-20 row "
+        "file": MAP_AGENTCORE,
+        "defect": "AC-07's tag reads as a full assertion of AIR-ACR-MEM-01, a "
+        "control the ledger says it only partly covers, so a Passed AC-07 row "
         "publishes a pass against the whole control -- the same overclaim gate "
         "11 refuses for the derived AISF- rows, arriving by the other surface",
-        "find": '    "BR-04": "AISF AIR-BDR-MDL-02 (partial)",\n',
-        "replace": '    "BR-04": "AISF AIR-BDR-MDL-02",\n',
+        "find": '    "AC-07": "AISF AIR-ACR-MEM-01 (partial)",\n',
+        "replace": '    "AC-07": "AISF AIR-ACR-MEM-01",\n',
     },
     {
         "name": "a (1 of N checks) qualifier dropped from a joint leg",
