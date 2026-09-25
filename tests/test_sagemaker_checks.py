@@ -12,6 +12,7 @@ Each check is tested for:
 import sys
 import os
 import importlib.util
+import json
 from unittest.mock import call, patch, MagicMock
 
 from botocore.exceptions import EndpointConnectionError, ClientError
@@ -2641,3 +2642,1200 @@ class TestSageMakerHandlerMultiRegion:
         # Reachable => no SM-00, and many regional checks ran.
         assert "SM-00" not in check_ids
         assert len(check_ids) > 3
+
+
+# ===================================================================
+# Phase 3 AISF parity: SageMaker rows
+# ===================================================================
+def _sm_client_factory(**clients):
+    """Dispatch boto3.client by service name for a multi-service check."""
+
+    def factory(service_name, *args, **kwargs):
+        if service_name not in clients:
+            raise AssertionError(f"unexpected boto3 client: {service_name}")
+        return clients[service_name]
+
+    return factory
+
+
+def _identity_policy(actions, resources, condition=None):
+    statement = {"Effect": "Allow", "Action": actions, "Resource": resources}
+    if condition:
+        statement["Condition"] = condition
+    return {"Version": "2012-10-17", "Statement": [statement]}
+
+
+def _role_cache(roles):
+    """Build a permission cache from {role_name: [(policy_name, document)]}."""
+    return {
+        "role_permissions": {
+            name: {
+                "attached_policies": [
+                    {
+                        "name": policy_name,
+                        "arn": f"arn:aws:iam::123456789012:policy/{policy_name}",
+                        "document": document,
+                    }
+                    for policy_name, document in policies
+                ],
+                "inline_policies": [],
+            }
+            for name, policies in roles.items()
+        },
+        "user_permissions": {},
+    }
+
+
+class TestSM11ModelVpcAttachment:
+    """AIR-SGM-EP-01: SM-11 reports the VpcConfig leg per model."""
+
+    @staticmethod
+    def _models(mock_client, details):
+        mock_sm = MagicMock()
+        mock_client.return_value = mock_sm
+        paginator = MagicMock()
+        mock_sm.get_paginator.return_value = paginator
+        paginator.paginate.return_value = [
+            {"Models": [{"ModelName": name} for name in details]}
+        ]
+        mock_sm.describe_model.side_effect = lambda ModelName: details[ModelName]
+        return mock_sm
+
+    @patch("sagemaker_app.boto3.client")
+    def test_model_without_vpc_config_is_failed_and_one_with_is_passed(
+        self, mock_client
+    ):
+        self._models(
+            mock_client,
+            {
+                "private-model": {
+                    "EnableNetworkIsolation": True,
+                    "VpcConfig": {
+                        "Subnets": ["subnet-aaa", "subnet-bbb"],
+                        "SecurityGroupIds": ["sg-1"],
+                    },
+                },
+                "open-model": {"EnableNetworkIsolation": True},
+            },
+        )
+        findings = extract_csv_data(
+            sagemaker_app.check_sagemaker_model_network_isolation(region="us-east-1")
+        )
+        vpc_rows = [
+            f
+            for f in findings
+            if f["Finding"] == sagemaker_app.MODEL_VPC_ATTACHMENT_FINDING
+        ]
+        failed = [f for f in vpc_rows if f["Status"] == "Failed"]
+        passed = [f for f in vpc_rows if f["Status"] == "Passed"]
+        assert len(failed) == 1
+        assert "open-model" in failed[0]["Finding_Details"]
+        assert "no VpcConfig" in failed[0]["Finding_Details"]
+        assert len(passed) == 1
+        assert "private-model" in passed[0]["Finding_Details"]
+        assert "subnet-aaa" in passed[0]["Finding_Details"]
+        assert "interface VPC" in passed[0]["Finding_Details"]
+        for f in vpc_rows:
+            assert_finding_schema(f)
+
+    @patch("sagemaker_app.boto3.client")
+    def test_vpc_leg_is_independent_of_network_isolation(self, mock_client):
+        # A model can be isolated and still have no VpcConfig: the isolation leg
+        # passing must not suppress the VPC leg failing.
+        self._models(
+            mock_client,
+            {
+                "isolated-no-vpc": {"EnableNetworkIsolation": True},
+                "isolated-no-vpc-2": {"EnableNetworkIsolation": True},
+            },
+        )
+        findings = extract_csv_data(
+            sagemaker_app.check_sagemaker_model_network_isolation(region="us-east-1")
+        )
+        isolation_passed = [
+            f
+            for f in findings
+            if f["Status"] == "Passed"
+            and f["Finding"] != sagemaker_app.MODEL_VPC_ATTACHMENT_FINDING
+        ]
+        vpc_failed = [
+            f
+            for f in findings
+            if f["Finding"] == sagemaker_app.MODEL_VPC_ATTACHMENT_FINDING
+            and f["Status"] == "Failed"
+        ]
+        assert isolation_passed
+        assert len(vpc_failed) == 2
+
+    @patch("sagemaker_app.boto3.client")
+    def test_more_than_twenty_models_without_vpc_are_summarised(self, mock_client):
+        details = {
+            f"model-{index}": {"EnableNetworkIsolation": True} for index in range(25)
+        }
+        self._models(mock_client, details)
+        findings = extract_csv_data(
+            sagemaker_app.check_sagemaker_model_network_isolation(region="us-east-1")
+        )
+        vpc_failed = [
+            f
+            for f in findings
+            if f["Finding"] == sagemaker_app.MODEL_VPC_ATTACHMENT_FINDING
+            and f["Status"] == "Failed"
+        ]
+        assert len(vpc_failed) == 21
+        assert "25 models have no VpcConfig" in vpc_failed[-1]["Finding_Details"]
+
+
+class TestSM02EndpointInvocationScoping:
+    """AIR-SGM-EP-02: SM-02 reports wildcard sagemaker:InvokeEndpoint grants."""
+
+    @staticmethod
+    def _scoping_rows(cache):
+        with patch("sagemaker_app.boto3.client") as mock_client:
+            mock_client.return_value = MagicMock()
+            findings = extract_csv_data(
+                sagemaker_app.check_sagemaker_iam_permissions(cache, region="Global")
+            )
+        return [
+            f
+            for f in findings
+            if f["Finding"] == sagemaker_app.ENDPOINT_INVOCATION_SCOPING_FINDING
+        ]
+
+    def test_wildcard_grant_is_failed_and_named_endpoint_is_passed(self):
+        cache = _role_cache(
+            {
+                "WildcardInvokeRole": [
+                    (
+                        "InvokeAnything",
+                        _identity_policy("sagemaker:InvokeEndpoint", "*"),
+                    )
+                ],
+                "ScopedInvokeRole": [
+                    (
+                        "InvokeOne",
+                        _identity_policy(
+                            "sagemaker:InvokeEndpoint",
+                            "arn:aws:sagemaker:us-east-1:123456789012:endpoint/fraud",
+                        ),
+                    )
+                ],
+            }
+        )
+        rows = self._scoping_rows(cache)
+        failed = [f for f in rows if f["Status"] == "Failed"]
+        passed = [f for f in rows if f["Status"] == "Passed"]
+        assert len(failed) == 1
+        assert "WildcardInvokeRole" in failed[0]["Finding_Details"]
+        assert "InvokeAnything" in failed[0]["Finding_Details"]
+        assert "no endpoint ARN" in failed[0]["Finding_Details"]
+        assert len(passed) == 1
+        assert "ScopedInvokeRole" in passed[0]["Finding_Details"]
+        assert "workload decision" in passed[0]["Finding_Details"]
+        for f in rows:
+            assert_finding_schema(f)
+
+    def test_endpoint_arn_with_trailing_wildcard_is_failed(self):
+        cache = _role_cache(
+            {
+                "PrefixRole": [
+                    (
+                        "InvokePrefix",
+                        _identity_policy(
+                            "sagemaker:InvokeEndpoint",
+                            "arn:aws:sagemaker:us-east-1:123456789012:endpoint/*",
+                        ),
+                    )
+                ]
+            }
+        )
+        rows = self._scoping_rows(cache)
+        assert [f["Status"] for f in rows] == ["Failed"]
+        assert "endpoint/*" in rows[0]["Finding_Details"]
+
+    def test_resource_tag_condition_counts_as_scoping(self):
+        cache = _role_cache(
+            {
+                "TaggedRole": [
+                    (
+                        "InvokeTagged",
+                        _identity_policy(
+                            "sagemaker:InvokeEndpoint",
+                            "*",
+                            {"StringEquals": {"aws:ResourceTag/project": "alpha"}},
+                        ),
+                    )
+                ]
+            }
+        )
+        rows = self._scoping_rows(cache)
+        assert [f["Status"] for f in rows] == ["Passed"]
+
+    def test_identity_without_invoke_permission_produces_no_row(self):
+        cache = _role_cache(
+            {
+                "ReadOnlyRole": [
+                    (
+                        "DescribeOnly",
+                        _identity_policy("sagemaker:DescribeEndpoint", "*"),
+                    )
+                ]
+            }
+        )
+        assert self._scoping_rows(cache) == []
+
+    def test_service_wildcard_action_reaches_the_invoke_grant(self):
+        cache = _role_cache(
+            {"AdminRole": [("Everything", _identity_policy("sagemaker:*", "*"))]}
+        )
+        rows = self._scoping_rows(cache)
+        assert [f["Status"] for f in rows] == ["Failed"]
+
+
+class TestSM03TrainingVolumeEncryption:
+    """AIR-SGM-TRN-02: SM-03 reports ResourceConfig.VolumeKmsKeyId per job."""
+
+    @staticmethod
+    def _jobs(mock_client, jobs):
+        mock_sm = MagicMock()
+        mock_client.return_value = mock_sm
+        empty = MagicMock()
+        empty.paginate.return_value = [{}]
+        training = MagicMock()
+        training.paginate.return_value = [
+            {"TrainingJobSummaries": [{"TrainingJobName": name} for name in jobs]}
+        ]
+        mock_sm.get_paginator.side_effect = lambda name: (
+            training if name == "list_training_jobs" else empty
+        )
+        mock_sm.describe_training_job.side_effect = lambda TrainingJobName: jobs[
+            TrainingJobName
+        ]
+        return mock_sm
+
+    @patch("sagemaker_app.boto3.client")
+    def test_job_without_volume_key_is_failed_and_one_with_is_passed(self, mock_client):
+        self._jobs(
+            mock_client,
+            {
+                "encrypted-job": {
+                    "OutputDataConfig": {"KmsKeyId": "arn:aws:kms:::key/out"},
+                    "EnableInterContainerTrafficEncryption": True,
+                    "ResourceConfig": {
+                        "VolumeKmsKeyId": "arn:aws:kms:::key/vol",
+                        "InstanceType": "ml.m5.large",
+                    },
+                },
+                "plain-job": {
+                    "OutputDataConfig": {"KmsKeyId": "arn:aws:kms:::key/out"},
+                    "EnableInterContainerTrafficEncryption": True,
+                    "ResourceConfig": {"InstanceType": "ml.m5.large"},
+                },
+            },
+        )
+        findings = extract_csv_data(
+            sagemaker_app.check_sagemaker_data_protection(region="us-east-1")
+        )
+        volume_rows = [
+            f
+            for f in findings
+            if f["Finding"] == sagemaker_app.TRAINING_VOLUME_ENCRYPTION_FINDING
+        ]
+        failed = [f for f in volume_rows if f["Status"] == "Failed"]
+        passed = [f for f in volume_rows if f["Status"] == "Passed"]
+        assert len(failed) == 1
+        assert "plain-job" in failed[0]["Finding_Details"]
+        assert "ResourceConfig.VolumeKmsKeyId" in failed[0]["Finding_Details"]
+        assert len(passed) == 1
+        assert "encrypted-job" in passed[0]["Finding_Details"]
+        assert "arn:aws:kms:::key/vol" in passed[0]["Finding_Details"]
+        for f in volume_rows:
+            assert_finding_schema(f)
+
+    @patch("sagemaker_app.boto3.client")
+    def test_aggregate_passed_row_is_withheld_when_a_volume_key_is_missing(
+        self, mock_client
+    ):
+        # The incumbent aggregate row claims every resource is encrypted, so it
+        # must not be emitted alongside a volume-key failure.
+        self._jobs(
+            mock_client,
+            {
+                "plain-job": {
+                    "OutputDataConfig": {"KmsKeyId": "arn:aws:kms:::key/out"},
+                    "EnableInterContainerTrafficEncryption": True,
+                    "ResourceConfig": {"InstanceType": "ml.m5.large"},
+                }
+            },
+        )
+        findings = extract_csv_data(
+            sagemaker_app.check_sagemaker_data_protection(region="us-east-1")
+        )
+        assert not [
+            f
+            for f in findings
+            if "All resources use appropriate encryption" in f["Finding_Details"]
+        ]
+
+
+class TestSM22ApproverAttribution:
+    """AIR-SGM-GOV-01: SM-22 reports who approved each model version."""
+
+    @staticmethod
+    def _registry(mock_client, packages):
+        mock_sm = MagicMock()
+        mock_client.return_value = mock_sm
+        groups = MagicMock()
+        groups.paginate.return_value = [
+            {"ModelPackageGroupSummaryList": [{"ModelPackageGroupName": "fraud"}]}
+        ]
+        versions = MagicMock()
+        versions.paginate.return_value = [
+            {
+                "ModelPackageSummaryList": [
+                    {
+                        "ModelPackageArn": arn,
+                        "ModelApprovalStatus": "Approved",
+                    }
+                    for arn in packages
+                ]
+            }
+        ]
+        mock_sm.get_paginator.side_effect = lambda name: (
+            groups if name == "list_model_package_groups" else versions
+        )
+        mock_sm.describe_model_package.side_effect = lambda ModelPackageName: packages[
+            ModelPackageName
+        ]
+        return mock_sm
+
+    @patch("sagemaker_app.boto3.client")
+    def test_unattributed_approval_is_failed_and_attributed_one_is_passed(
+        self, mock_client
+    ):
+        self._registry(
+            mock_client,
+            {
+                "arn:aws:sagemaker:::model-package/fraud/1": {
+                    "ModelPackageName": "fraud/1",
+                    "LastModifiedBy": {"UserProfileName": "risk-reviewer"},
+                    "ApprovalDescription": "",
+                },
+                "arn:aws:sagemaker:::model-package/fraud/2": {
+                    "ModelPackageName": "fraud/2",
+                    "LastModifiedBy": {},
+                    "CreatedBy": {},
+                    "ApprovalDescription": "   ",
+                },
+            },
+        )
+        findings = extract_csv_data(
+            sagemaker_app.check_model_approval_workflow(region="us-east-1")
+        )
+        rows = [
+            f
+            for f in findings
+            if f["Finding"] == sagemaker_app.APPROVER_ATTRIBUTION_FINDING
+        ]
+        failed = [f for f in rows if f["Status"] == "Failed"]
+        passed = [f for f in rows if f["Status"] == "Passed"]
+        assert len(failed) == 1
+        assert "fraud/2" in failed[0]["Finding_Details"]
+        assert "records no approver" in failed[0]["Finding_Details"]
+        assert len(passed) == 1
+        assert "fraud/1" in passed[0]["Finding_Details"]
+        assert "risk-reviewer" in passed[0]["Finding_Details"]
+        for f in rows:
+            assert_finding_schema(f)
+
+    @patch("sagemaker_app.boto3.client")
+    def test_approval_description_alone_counts_as_attribution(self, mock_client):
+        self._registry(
+            mock_client,
+            {
+                "arn:aws:sagemaker:::model-package/fraud/3": {
+                    "ModelPackageName": "fraud/3",
+                    "LastModifiedBy": {},
+                    "ApprovalDescription": "approved at CAB-4412 by the risk board",
+                }
+            },
+        )
+        findings = extract_csv_data(
+            sagemaker_app.check_model_approval_workflow(region="us-east-1")
+        )
+        rows = [
+            f
+            for f in findings
+            if f["Finding"] == sagemaker_app.APPROVER_ATTRIBUTION_FINDING
+        ]
+        assert [f["Status"] for f in rows] == ["Passed"]
+        assert "CAB-4412" in rows[0]["Finding_Details"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_iam_role_arn_counts_as_attribution(self, mock_client):
+        self._registry(
+            mock_client,
+            {
+                "arn:aws:sagemaker:::model-package/fraud/4": {
+                    "ModelPackageName": "fraud/4",
+                    "LastModifiedBy": {
+                        "IamIdentity": {
+                            "Arn": "arn:aws:sts::123456789012:assumed-role/Approver/j"
+                        }
+                    },
+                }
+            },
+        )
+        rows = [
+            f
+            for f in extract_csv_data(
+                sagemaker_app.check_model_approval_workflow(region="us-east-1")
+            )
+            if f["Finding"] == sagemaker_app.APPROVER_ATTRIBUTION_FINDING
+        ]
+        assert [f["Status"] for f in rows] == ["Passed"]
+        assert "assumed-role/Approver" in rows[0]["Finding_Details"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_describe_count_is_capped(self, mock_client):
+        packages = {
+            f"arn:aws:sagemaker:::model-package/fraud/{index}": {
+                "ModelPackageName": f"fraud/{index}",
+                "LastModifiedBy": {},
+                "ApprovalDescription": "",
+            }
+            for index in range(40)
+        }
+        mock_sm = self._registry(mock_client, packages)
+        extract_csv_data(
+            sagemaker_app.check_model_approval_workflow(region="us-east-1")
+        )
+        assert (
+            mock_sm.describe_model_package.call_count
+            == sagemaker_app.MAX_APPROVAL_ATTRIBUTION_DESCRIBES
+        )
+
+
+class TestSM31EndpointDataCapture:
+    """AIR-SGM-EP-06: SM-31 asserts inference data capture per endpoint."""
+
+    @staticmethod
+    def _endpoints(mock_client, endpoints):
+        mock_sm = MagicMock()
+        mock_client.return_value = mock_sm
+        paginator = MagicMock()
+        mock_sm.get_paginator.return_value = paginator
+        paginator.paginate.return_value = [
+            {"Endpoints": [{"EndpointName": name} for name in endpoints]}
+        ]
+        mock_sm.describe_endpoint.side_effect = lambda EndpointName: endpoints[
+            EndpointName
+        ]
+        return mock_sm
+
+    @patch("sagemaker_app.boto3.client")
+    def test_capturing_endpoint_passes_and_disabled_and_stopped_ones_fail(
+        self, mock_client
+    ):
+        self._endpoints(
+            mock_client,
+            {
+                "capturing": {
+                    "DataCaptureConfig": {
+                        "EnableCapture": True,
+                        "CaptureStatus": "Started",
+                        "DestinationS3Uri": "s3://audit/capture",
+                        "CurrentSamplingPercentage": 100,
+                    }
+                },
+                "disabled": {
+                    "DataCaptureConfig": {
+                        "EnableCapture": False,
+                        "CaptureStatus": "Stopped",
+                    }
+                },
+                "stopped": {
+                    "DataCaptureConfig": {
+                        "EnableCapture": True,
+                        "CaptureStatus": "Stopped",
+                    }
+                },
+                "unconfigured": {},
+            },
+        )
+        findings = extract_csv_data(
+            sagemaker_app.check_sagemaker_endpoint_data_capture(region="us-east-1")
+        )
+        failed = [f for f in findings if f["Status"] == "Failed"]
+        passed = [f for f in findings if f["Status"] == "Passed"]
+        details = " | ".join(f["Finding_Details"] for f in failed)
+        assert len(failed) == 3
+        assert "EnableCapture is false" in details
+        assert "CaptureStatus is Stopped" in details
+        assert "no DataCaptureConfig is attached" in details
+        assert len(passed) == 1
+        assert "s3://audit/capture" in passed[0]["Finding_Details"]
+        assert "1 of 4 endpoint(s)" in passed[0]["Finding_Details"]
+        for f in findings:
+            assert f["Check_ID"] == "SM-31"
+            assert_finding_schema(f)
+
+    @patch("sagemaker_app.boto3.client")
+    def test_no_endpoints_returns_na(self, mock_client):
+        self._endpoints(mock_client, {})
+        findings = extract_csv_data(
+            sagemaker_app.check_sagemaker_endpoint_data_capture(region="us-east-1")
+        )
+        assert [f["Status"] for f in findings] == ["N/A"]
+        assert "No SageMaker endpoints found" in findings[0]["Finding_Details"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_describe_failure_is_reported_as_na_not_as_compliant(self, mock_client):
+        mock_sm = self._endpoints(
+            mock_client,
+            {
+                "capturing": {
+                    "DataCaptureConfig": {
+                        "EnableCapture": True,
+                        "CaptureStatus": "Started",
+                        "DestinationS3Uri": "s3://audit/capture",
+                    }
+                },
+                "denied": {},
+            },
+        )
+        mock_sm.describe_endpoint.side_effect = lambda EndpointName: (
+            {
+                "DataCaptureConfig": {
+                    "EnableCapture": True,
+                    "CaptureStatus": "Started",
+                    "DestinationS3Uri": "s3://audit/capture",
+                }
+            }
+            if EndpointName == "capturing"
+            else _raise(_make_client_error("AccessDeniedException"))
+        )
+        findings = extract_csv_data(
+            sagemaker_app.check_sagemaker_endpoint_data_capture(region="us-east-1")
+        )
+        na_rows = [f for f in findings if f["Status"] == "N/A"]
+        assert len(na_rows) == 1
+        assert "denied" in na_rows[0]["Finding_Details"]
+        assert "AccessDeniedException" in na_rows[0]["Finding_Details"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_exception_returns_could_not_assess(self, mock_client):
+        mock_client.side_effect = Exception("boom")
+        findings = extract_csv_data(
+            sagemaker_app.check_sagemaker_endpoint_data_capture(region="us-east-1")
+        )
+        assert len(findings) == 1
+        assert_could_not_assess_finding(findings[0])
+
+
+def _raise(error):
+    raise error
+
+
+class TestSM32ConfigComplianceEvaluation:
+    """AIR-SGM-GOV-10: SM-32 asserts Config recording and rule evaluation."""
+
+    @staticmethod
+    def _config(mock_client, recorders, rules, compliance):
+        config_client = MagicMock()
+        config_client.describe_configuration_recorders.return_value = {
+            "ConfigurationRecorders": recorders
+        }
+        rule_paginator = MagicMock()
+        rule_paginator.paginate.return_value = [{"ConfigRules": rules}]
+        compliance_paginator = MagicMock()
+        compliance_paginator.paginate.return_value = [
+            {"ComplianceByConfigRules": compliance}
+        ]
+        config_client.get_paginator.side_effect = lambda name: (
+            rule_paginator if name == "describe_config_rules" else compliance_paginator
+        )
+        mock_client.return_value = config_client
+        return config_client
+
+    def test_recorder_and_compliant_rule_pass(self):
+        with patch("sagemaker_app.boto3.client") as mock_client:
+            self._config(
+                mock_client,
+                [
+                    {
+                        "name": "default",
+                        "recordingGroup": {
+                            "recordingStrategy": {
+                                "useOnly": "ALL_SUPPORTED_RESOURCE_TYPES"
+                            }
+                        },
+                    }
+                ],
+                [
+                    {
+                        "ConfigRuleName": "sagemaker-notebook-no-direct-internet",
+                        "ConfigRuleState": "ACTIVE",
+                        "Source": {
+                            "Owner": "AWS",
+                            "SourceIdentifier": (
+                                "SAGEMAKER_NOTEBOOK_NO_DIRECT_INTERNET_ACCESS"
+                            ),
+                        },
+                    }
+                ],
+                [
+                    {
+                        "ConfigRuleName": "sagemaker-notebook-no-direct-internet",
+                        "Compliance": {"ComplianceType": "COMPLIANT"},
+                    }
+                ],
+            )
+            findings = extract_csv_data(
+                sagemaker_app.check_sagemaker_config_compliance_evaluation(
+                    region="us-east-1"
+                )
+            )
+        assert {f["Status"] for f in findings} == {"Passed"}
+        recording = [
+            f
+            for f in findings
+            if f["Finding"] == sagemaker_app.CONFIG_RECORDING_FINDING
+        ]
+        assert "all supported resource types" in recording[0]["Finding_Details"]
+        for f in findings:
+            assert f["Check_ID"] == "SM-32"
+            assert_finding_schema(f)
+
+    def test_no_recorder_and_no_rule_fail_independently(self):
+        with patch("sagemaker_app.boto3.client") as mock_client:
+            self._config(mock_client, [], [], [])
+            findings = extract_csv_data(
+                sagemaker_app.check_sagemaker_config_compliance_evaluation(
+                    region="us-east-1"
+                )
+            )
+        assert [f["Status"] for f in findings] == ["Failed", "Failed"]
+        assert (
+            "no customer-managed AWS Config recorder" in findings[0]["Finding_Details"]
+        )
+        assert "No ACTIVE AWS Config rule" in findings[1]["Finding_Details"]
+
+    def test_recorder_recording_other_services_only_is_failed(self):
+        with patch("sagemaker_app.boto3.client") as mock_client:
+            self._config(
+                mock_client,
+                [
+                    {
+                        "name": "partial",
+                        "recordingGroup": {
+                            "allSupported": False,
+                            "resourceTypes": ["AWS::S3::Bucket", "AWS::IAM::Role"],
+                            "recordingStrategy": {
+                                "useOnly": "INCLUSION_BY_RESOURCE_TYPES"
+                            },
+                        },
+                    }
+                ],
+                [],
+                [],
+            )
+            findings = extract_csv_data(
+                sagemaker_app.check_sagemaker_config_compliance_evaluation(
+                    region="us-east-1"
+                )
+            )
+        recording = [
+            f
+            for f in findings
+            if f["Finding"] == sagemaker_app.CONFIG_RECORDING_FINDING
+        ]
+        assert [f["Status"] for f in recording] == ["Failed"]
+        assert "none of them AWS::SageMaker::*" in recording[0]["Finding_Details"]
+
+    def test_recorder_including_a_sagemaker_type_is_passed(self):
+        with patch("sagemaker_app.boto3.client") as mock_client:
+            self._config(
+                mock_client,
+                [
+                    {
+                        "name": "scoped",
+                        "recordingGroup": {
+                            "allSupported": False,
+                            "resourceTypes": [
+                                "AWS::S3::Bucket",
+                                "AWS::SageMaker::Domain",
+                            ],
+                            "recordingStrategy": {
+                                "useOnly": "INCLUSION_BY_RESOURCE_TYPES"
+                            },
+                        },
+                    }
+                ],
+                [],
+                [],
+            )
+            findings = extract_csv_data(
+                sagemaker_app.check_sagemaker_config_compliance_evaluation(
+                    region="us-east-1"
+                )
+            )
+        recording = [
+            f
+            for f in findings
+            if f["Finding"] == sagemaker_app.CONFIG_RECORDING_FINDING
+        ]
+        assert [f["Status"] for f in recording] == ["Passed"]
+        assert "AWS::SageMaker::Domain" in recording[0]["Finding_Details"]
+
+    def test_excluding_a_sagemaker_type_is_failed(self):
+        with patch("sagemaker_app.boto3.client") as mock_client:
+            self._config(
+                mock_client,
+                [
+                    {
+                        "name": "excluding",
+                        "recordingGroup": {
+                            "recordingStrategy": {
+                                "useOnly": "EXCLUSION_BY_RESOURCE_TYPES"
+                            },
+                            "exclusionByResourceTypes": {
+                                "resourceTypes": ["AWS::SageMaker::Model"]
+                            },
+                        },
+                    }
+                ],
+                [],
+                [],
+            )
+            findings = extract_csv_data(
+                sagemaker_app.check_sagemaker_config_compliance_evaluation(
+                    region="us-east-1"
+                )
+            )
+        recording = [
+            f
+            for f in findings
+            if f["Finding"] == sagemaker_app.CONFIG_RECORDING_FINDING
+        ]
+        assert [f["Status"] for f in recording] == ["Failed"]
+        assert "AWS::SageMaker::Model" in recording[0]["Finding_Details"]
+
+    def test_non_compliant_rule_reports_the_resource_count(self):
+        with patch("sagemaker_app.boto3.client") as mock_client:
+            self._config(
+                mock_client,
+                [
+                    {
+                        "name": "default",
+                        "recordingGroup": {"allSupported": True},
+                    }
+                ],
+                [
+                    {
+                        "ConfigRuleName": "sagemaker-endpoint-kms",
+                        "ConfigRuleState": "ACTIVE",
+                        "Scope": {"ComplianceResourceTypes": ["AWS::SageMaker::Model"]},
+                        "Source": {"Owner": "AWS", "SourceIdentifier": "OTHER"},
+                    }
+                ],
+                [
+                    {
+                        "ConfigRuleName": "sagemaker-endpoint-kms",
+                        "Compliance": {
+                            "ComplianceType": "NON_COMPLIANT",
+                            "ComplianceContributorCount": {"CappedCount": 4},
+                        },
+                    }
+                ],
+            )
+            findings = extract_csv_data(
+                sagemaker_app.check_sagemaker_config_compliance_evaluation(
+                    region="us-east-1"
+                )
+            )
+        rule_rows = [
+            f
+            for f in findings
+            if f["Finding"] == sagemaker_app.CONFIG_RULE_COMPLIANCE_FINDING
+        ]
+        assert [f["Status"] for f in rule_rows] == ["Failed"]
+        assert "4 non-compliant resource(s)" in rule_rows[0]["Finding_Details"]
+        assert "sagemaker-endpoint-kms" in rule_rows[0]["Finding_Details"]
+
+    def test_rule_in_deleting_state_does_not_count_as_active(self):
+        with patch("sagemaker_app.boto3.client") as mock_client:
+            self._config(
+                mock_client,
+                [{"name": "default", "recordingGroup": {"allSupported": True}}],
+                [
+                    {
+                        "ConfigRuleName": "sagemaker-endpoint-kms",
+                        "ConfigRuleState": "DELETING",
+                        "Source": {"SourceIdentifier": "SAGEMAKER_SOMETHING"},
+                    }
+                ],
+                [],
+            )
+            findings = extract_csv_data(
+                sagemaker_app.check_sagemaker_config_compliance_evaluation(
+                    region="us-east-1"
+                )
+            )
+        rule_rows = [
+            f
+            for f in findings
+            if f["Finding"] == sagemaker_app.CONFIG_RULE_COMPLIANCE_FINDING
+        ]
+        assert [f["Status"] for f in rule_rows] == ["Failed"]
+        assert "1 SageMaker-related rule(s)" in rule_rows[0]["Finding_Details"]
+
+    def test_non_sagemaker_rules_are_not_counted(self):
+        with patch("sagemaker_app.boto3.client") as mock_client:
+            self._config(
+                mock_client,
+                [{"name": "default", "recordingGroup": {"allSupported": True}}],
+                [
+                    {
+                        "ConfigRuleName": "s3-bucket-ssl-requests-only",
+                        "ConfigRuleState": "ACTIVE",
+                        "Scope": {"ComplianceResourceTypes": ["AWS::S3::Bucket"]},
+                        "Source": {"SourceIdentifier": "S3_BUCKET_SSL_REQUESTS_ONLY"},
+                    }
+                ],
+                [],
+            )
+            findings = extract_csv_data(
+                sagemaker_app.check_sagemaker_config_compliance_evaluation(
+                    region="us-east-1"
+                )
+            )
+        rule_rows = [
+            f
+            for f in findings
+            if f["Finding"] == sagemaker_app.CONFIG_RULE_COMPLIANCE_FINDING
+        ]
+        assert [f["Status"] for f in rule_rows] == ["Failed"]
+        assert "0 SageMaker-related rule(s)" in rule_rows[0]["Finding_Details"]
+
+    def test_exception_returns_could_not_assess(self):
+        with patch("sagemaker_app.boto3.client") as mock_client:
+            mock_client.side_effect = Exception("boom")
+            findings = extract_csv_data(
+                sagemaker_app.check_sagemaker_config_compliance_evaluation(
+                    region="us-east-1"
+                )
+            )
+        assert len(findings) == 1
+        assert_could_not_assess_finding(findings[0])
+
+
+class TestSM33TrainingJobNetworkBoundary:
+    """AIR-SGM-TRN-01: SM-33 asserts training jobs run in a customer VPC."""
+
+    @staticmethod
+    def _jobs(mock_client, jobs):
+        mock_sm = MagicMock()
+        mock_client.return_value = mock_sm
+        paginator = MagicMock()
+        mock_sm.get_paginator.return_value = paginator
+        paginator.paginate.return_value = [
+            {"TrainingJobSummaries": [{"TrainingJobName": name} for name in jobs]}
+        ]
+        mock_sm.describe_training_job.side_effect = lambda TrainingJobName: jobs[
+            TrainingJobName
+        ]
+        return mock_sm, paginator
+
+    @patch("sagemaker_app.boto3.client")
+    def test_job_without_vpc_is_failed_and_one_in_a_vpc_is_passed(self, mock_client):
+        self._jobs(
+            mock_client,
+            {
+                "vpc-job": {
+                    "VpcConfig": {
+                        "Subnets": ["subnet-a", "subnet-b"],
+                        "SecurityGroupIds": ["sg-1"],
+                    },
+                    "EnableNetworkIsolation": True,
+                },
+                "open-job": {"EnableNetworkIsolation": False},
+            },
+        )
+        findings = extract_csv_data(
+            sagemaker_app.check_sagemaker_training_job_network_boundary(
+                region="us-east-1"
+            )
+        )
+        failed = [f for f in findings if f["Status"] == "Failed"]
+        passed = [f for f in findings if f["Status"] == "Passed"]
+        assert len(failed) == 1
+        assert "open-job" in failed[0]["Finding_Details"]
+        assert "no VpcConfig" in failed[0]["Finding_Details"]
+        assert "Network isolation is off as well" in failed[0]["Finding_Details"]
+        assert len(passed) == 1
+        assert "subnet-a" in passed[0]["Finding_Details"]
+        assert "2 most recent" in passed[0]["Finding_Details"]
+        for f in findings:
+            assert f["Check_ID"] == "SM-33"
+            assert_finding_schema(f)
+
+    @patch("sagemaker_app.boto3.client")
+    def test_isolated_job_without_vpc_still_fails_and_says_so(self, mock_client):
+        self._jobs(
+            mock_client,
+            {"isolated-job": {"EnableNetworkIsolation": True}},
+        )
+        findings = extract_csv_data(
+            sagemaker_app.check_sagemaker_training_job_network_boundary(
+                region="us-east-1"
+            )
+        )
+        assert [f["Status"] for f in findings] == ["Failed"]
+        assert "Network isolation is on" in findings[0]["Finding_Details"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_sample_is_bounded_to_the_most_recent_jobs(self, mock_client):
+        _, paginator = self._jobs(mock_client, {})
+        sagemaker_app.check_sagemaker_training_job_network_boundary(region="us-east-1")
+        paginator.paginate.assert_called_once_with(
+            SortBy="CreationTime",
+            SortOrder="Descending",
+            PaginationConfig={"MaxItems": sagemaker_app.MAX_TRAINING_JOBS_SAMPLED},
+        )
+
+    @patch("sagemaker_app.boto3.client")
+    def test_no_training_jobs_returns_na(self, mock_client):
+        self._jobs(mock_client, {})
+        findings = extract_csv_data(
+            sagemaker_app.check_sagemaker_training_job_network_boundary(
+                region="us-east-1"
+            )
+        )
+        assert [f["Status"] for f in findings] == ["N/A"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_exception_returns_could_not_assess(self, mock_client):
+        mock_client.side_effect = Exception("boom")
+        findings = extract_csv_data(
+            sagemaker_app.check_sagemaker_training_job_network_boundary(
+                region="us-east-1"
+            )
+        )
+        assert len(findings) == 1
+        assert_could_not_assess_finding(findings[0])
+
+
+class TestSM34CreationGuardrails:
+    """AIR-SGM-TRN-08: SM-34 asserts an SCP blocks non-compliant creation."""
+
+    @staticmethod
+    def _management_account_clients():
+        orgs = MagicMock()
+        orgs.describe_organization.return_value = {
+            "Organization": {"MasterAccountId": "123456789012"}
+        }
+        sts = MagicMock()
+        sts.get_caller_identity.return_value = {"Account": "123456789012"}
+        return _sm_client_factory(organizations=orgs, sts=sts)
+
+    def _run(self, inventory):
+        with patch(
+            "sagemaker_app.boto3.client",
+            side_effect=self._management_account_clients(),
+        ):
+            return extract_csv_data(
+                sagemaker_app.check_sagemaker_creation_guardrails(
+                    region="Global", scp_inventory=inventory
+                )
+            )
+
+    @staticmethod
+    def _inventory(*documents):
+        return {
+            "items": [
+                {"name": name, "id": f"p-{index}", "content": json.dumps(document)}
+                for index, (name, document) in enumerate(documents)
+            ],
+            "errors": [],
+            "list_error": None,
+        }
+
+    def test_encryption_guard_passes_while_network_and_internet_fail(self):
+        findings = self._run(
+            self._inventory(
+                (
+                    "RequireTrainingVolumeKey",
+                    {
+                        "Version": "2012-10-17",
+                        "Statement": [
+                            {
+                                "Effect": "Deny",
+                                "Action": "sagemaker:CreateTrainingJob",
+                                "Resource": "*",
+                                "Condition": {
+                                    "Null": {"sagemaker:VolumeKmsKey": "true"}
+                                },
+                            }
+                        ],
+                    },
+                )
+            )
+        )
+        by_status = {}
+        for f in findings:
+            by_status.setdefault(f["Status"], []).append(f["Finding_Details"])
+        assert len(by_status["Passed"]) == 1
+        assert "encryption" in by_status["Passed"][0]
+        assert "RequireTrainingVolumeKey" in by_status["Passed"][0]
+        assert len(by_status["Failed"]) == 2
+        failed = " | ".join(by_status["Failed"])
+        assert "approved network" in failed
+        assert "no direct internet access" in failed
+        for f in findings:
+            assert f["Check_ID"] == "SM-34"
+            assert_finding_schema(f)
+
+    def test_all_three_guardrails_can_pass(self):
+        findings = self._run(
+            self._inventory(
+                (
+                    "SageMakerCreationGuardrails",
+                    {
+                        "Version": "2012-10-17",
+                        "Statement": [
+                            {
+                                "Effect": "Deny",
+                                "Action": "sagemaker:Create*",
+                                "Resource": "*",
+                                "Condition": {
+                                    "Null": {
+                                        "sagemaker:VolumeKmsKey": "true",
+                                        "sagemaker:VpcSubnets": "true",
+                                    },
+                                    "StringNotEquals": {
+                                        "sagemaker:DirectInternetAccess": "Disabled"
+                                    },
+                                },
+                            }
+                        ],
+                    },
+                )
+            )
+        )
+        assert [f["Status"] for f in findings] == ["Passed", "Passed", "Passed"]
+
+    def test_positive_value_deny_is_reported_as_indeterminate(self):
+        findings = self._run(
+            self._inventory(
+                (
+                    "DenyOneKey",
+                    {
+                        "Version": "2012-10-17",
+                        "Statement": [
+                            {
+                                "Effect": "Deny",
+                                "Action": "sagemaker:CreateTrainingJob",
+                                "Resource": "*",
+                                "Condition": {
+                                    "StringEquals": {
+                                        "sagemaker:VolumeKmsKey": (
+                                            "arn:aws:kms:::key/legacy"
+                                        )
+                                    }
+                                },
+                            }
+                        ],
+                    },
+                )
+            )
+        )
+        indeterminate = [f for f in findings if f["Status"] == "N/A"]
+        assert len(indeterminate) == 1
+        assert "depends on that value" in indeterminate[0]["Finding_Details"]
+        assert "DenyOneKey" in indeterminate[0]["Finding_Details"]
+
+    def test_allow_statement_does_not_count_as_a_guardrail(self):
+        findings = self._run(
+            self._inventory(
+                (
+                    "AllowWithCondition",
+                    {
+                        "Version": "2012-10-17",
+                        "Statement": [
+                            {
+                                "Effect": "Allow",
+                                "Action": "sagemaker:CreateTrainingJob",
+                                "Resource": "*",
+                                "Condition": {
+                                    "Null": {"sagemaker:VolumeKmsKey": "true"}
+                                },
+                            }
+                        ],
+                    },
+                )
+            )
+        )
+        assert [f["Status"] for f in findings] == ["Failed", "Failed", "Failed"]
+
+    def test_deny_on_an_unrelated_service_does_not_count(self):
+        findings = self._run(
+            self._inventory(
+                (
+                    "DenyBedrock",
+                    {
+                        "Version": "2012-10-17",
+                        "Statement": [
+                            {
+                                "Effect": "Deny",
+                                "Action": "bedrock:InvokeModel",
+                                "Resource": "*",
+                                "Condition": {
+                                    "Null": {"sagemaker:VolumeKmsKey": "true"}
+                                },
+                            }
+                        ],
+                    },
+                )
+            )
+        )
+        assert [f["Status"] for f in findings] == ["Failed", "Failed", "Failed"]
+
+    def test_member_account_run_reports_unassessed(self):
+        orgs = MagicMock()
+        orgs.describe_organization.return_value = {
+            "Organization": {"MasterAccountId": "999999999999"}
+        }
+        sts = MagicMock()
+        sts.get_caller_identity.return_value = {"Account": "123456789012"}
+        with patch(
+            "sagemaker_app.boto3.client",
+            side_effect=_sm_client_factory(organizations=orgs, sts=sts),
+        ):
+            findings = extract_csv_data(
+                sagemaker_app.check_sagemaker_creation_guardrails(region="Global")
+            )
+        assert [f["Status"] for f in findings] == ["N/A"]
+        assert "management account" in findings[0]["Finding_Details"]
+
+    def test_organizations_not_in_use_reports_unassessed(self):
+        orgs = MagicMock()
+        orgs.describe_organization.side_effect = _make_client_error(
+            "AWSOrganizationsNotInUseException"
+        )
+        with patch(
+            "sagemaker_app.boto3.client",
+            side_effect=_sm_client_factory(organizations=orgs),
+        ):
+            findings = extract_csv_data(
+                sagemaker_app.check_sagemaker_creation_guardrails(region="Global")
+            )
+        assert [f["Status"] for f in findings] == ["N/A"]
+        assert "Organizations is not in use" in findings[0]["Finding_Details"]
+
+    def test_list_failure_reports_unassessed(self):
+        findings = self._run(
+            {"items": [], "errors": [], "list_error": "AccessDeniedException"}
+        )
+        assert [f["Status"] for f in findings] == ["N/A"]
+        assert "could not be listed" in findings[0]["Finding_Details"]

@@ -6,20 +6,18 @@
     "hosted": 67,
     "fnd_ai_subject": 11,
     "total": 78,
-    "covered": 20,
-    "tighten": 21,
-    "tighten_extend": 16,
+    "covered": 28,
+    "tighten": 17,
+    "tighten_extend": 12,
     "tighten_new_id": 5,
-    "new": 22,
+    "new": 18,
     "not_implementable": 4,
     "unassessed": 11,
-    "new_check_functions": 38,
-    "extensions": 16,
+    "new_check_functions": 34,
+    "extensions": 12,
     "extra_iam_actions": [
       "cloudtrail:GetEventSelectors",
       "cloudtrail:ListTrails",
-      "config:DescribeConfigRules",
-      "config:DescribeConfigurationRecorders",
       "ec2:DescribeSecurityGroups",
       "logs:DescribeAccountPolicies",
       "logs:GetDataProtectionPolicy",
@@ -476,8 +474,8 @@
       "question": "Are inference endpoints reachable only through a private network path, without requiring a public internet-facing endpoint?",
       "assert": "Endpoint network configuration review",
       "workload_agnostic": true,
-      "verdict": "tighten",
-      "disposition": "extend",
+      "verdict": "covered",
+      "disposition": null,
       "target_modules": [
         "sagemaker_assessments"
       ],
@@ -487,7 +485,7 @@
       "incumbent_names": [
         "SageMaker Model Network Isolation Check"
       ],
-      "gap": "SM-11 has the EnableNetworkIsolation leg, not the VpcConfig leg",
+      "gap": "",
       "extra_iam": [],
       "phase": 3,
       "source": "controls/ai-specific/sagemaker-endpoints.yaml"
@@ -498,8 +496,8 @@
       "question": "Is access to invoke an inference endpoint restricted to specific, authorized callers rather than any identity in the account?",
       "assert": "Endpoint invocation policy scoping",
       "workload_agnostic": false,
-      "verdict": "tighten",
-      "disposition": "extend",
+      "verdict": "covered",
+      "disposition": null,
       "target_modules": [
         "sagemaker_assessments"
       ],
@@ -509,7 +507,7 @@
       "incumbent_names": [
         "SageMaker IAM Permissions"
       ],
-      "gap": "SM-02 scans IAM permissions but never tests resource-scoped sagemaker:InvokeEndpoint against a named endpoint ARN; SageMaker endpoints carry no resource-based policy, so the identity policy is the whole surface",
+      "gap": "",
       "extra_iam": [],
       "phase": 3,
       "source": "controls/ai-specific/sagemaker-endpoints.yaml"
@@ -520,8 +518,8 @@
       "question": "Is there a central registry recording every model version, its approval status, and who approved it for production use?",
       "assert": "Model registry entries with approver/status",
       "workload_agnostic": true,
-      "verdict": "tighten",
-      "disposition": "extend",
+      "verdict": "covered",
+      "disposition": null,
       "target_modules": [
         "sagemaker_assessments"
       ],
@@ -531,7 +529,7 @@
       "incumbent_names": [
         "Model Approval Workflow Check"
       ],
-      "gap": "SM-22 has approval status, not approver metadata",
+      "gap": "",
       "extra_iam": [],
       "phase": 3,
       "source": "controls/ai-specific/sagemaker-governance.yaml"
@@ -542,8 +540,8 @@
       "question": "Is training data encrypted at rest and in transit throughout the pipeline, from source storage through to the training job?",
       "assert": "Encryption configuration across pipeline stages",
       "workload_agnostic": true,
-      "verdict": "tighten",
-      "disposition": "extend",
+      "verdict": "covered",
+      "disposition": null,
       "target_modules": [
         "sagemaker_assessments"
       ],
@@ -553,7 +551,7 @@
       "incumbent_names": [
         "SageMaker Data Protection Check"
       ],
-      "gap": "SM-03 has the KMS legs, not inter-container traffic encryption",
+      "gap": "",
       "extra_iam": [],
       "phase": 3,
       "source": "controls/ai-specific/sagemaker-training.yaml"
@@ -564,14 +562,16 @@
       "question": "Is model performance and output monitored for drift or anomalous behavior that could indicate tampering, degradation, or adversarial input?",
       "assert": "Drift/anomaly monitoring configuration + recent report",
       "workload_agnostic": true,
-      "verdict": "new",
+      "verdict": "covered",
       "disposition": null,
       "target_modules": [
         "sagemaker_assessments"
       ],
-      "incumbents": [],
+      "incumbents": [
+        "SM-31"
+      ],
       "incumbent_names": [],
-      "gap": "DataCaptureConfig; SM-23 reads monitoring schedules, not data capture",
+      "gap": "",
       "extra_iam": [],
       "phase": 3,
       "source": "controls/ai-specific/sagemaker-endpoints.yaml"
@@ -582,18 +582,17 @@
       "question": "Is the configuration state of SageMaker resources continuously assessed against required controls, with non-compliant resources flagged?",
       "assert": "Continuous config-compliance evaluation + non-compliant-resource report",
       "workload_agnostic": true,
-      "verdict": "new",
+      "verdict": "covered",
       "disposition": null,
       "target_modules": [
         "sagemaker_assessments"
       ],
-      "incumbents": [],
-      "incumbent_names": [],
-      "gap": "Config recorder state; no incumbent in this module reads config",
-      "extra_iam": [
-        "config:DescribeConfigurationRecorders",
-        "config:DescribeConfigRules"
+      "incumbents": [
+        "SM-32"
       ],
+      "incumbent_names": [],
+      "gap": "",
+      "extra_iam": [],
       "phase": 3,
       "source": "controls/ai-specific/sagemaker-governance.yaml"
     },
@@ -603,14 +602,16 @@
       "question": "Do training jobs run inside a private network boundary with no direct internet access unless explicitly required and approved?",
       "assert": "Training job network configuration review",
       "workload_agnostic": true,
-      "verdict": "new",
+      "verdict": "covered",
       "disposition": null,
       "target_modules": [
         "sagemaker_assessments"
       ],
-      "incumbents": [],
+      "incumbents": [
+        "SM-33"
+      ],
       "incumbent_names": [],
-      "gap": "training-job network isolation; SM-21 does this for AutoML jobs only",
+      "gap": "",
       "extra_iam": [],
       "phase": 3,
       "source": "controls/ai-specific/sagemaker-training.yaml"
@@ -621,18 +622,17 @@
       "question": "Is the creation of non-compliant SageMaker resources (no encryption key, internet-enabled, or outside the approved network) prevented at creation time, rather than only detected after the fact?",
       "assert": "Preventive policy enforcing encryption / no-internet / VPC at resource creation",
       "workload_agnostic": true,
-      "verdict": "new",
+      "verdict": "covered",
       "disposition": null,
       "target_modules": [
         "sagemaker_assessments"
       ],
-      "incumbents": [],
-      "incumbent_names": [],
-      "gap": "SCP asserting encryption/no-internet/VPC at creation; the corpus already enumerates SCPs in two modules, so the cost is the Organizations read, not a new mechanism",
-      "extra_iam": [
-        "organizations:ListPolicies",
-        "organizations:DescribePolicy"
+      "incumbents": [
+        "SM-34"
       ],
+      "incumbent_names": [],
+      "gap": "",
+      "extra_iam": [],
       "phase": 3,
       "source": "controls/ai-specific/sagemaker-training.yaml"
     },

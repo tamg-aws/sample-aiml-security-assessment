@@ -593,6 +593,7 @@ Resources:
                 - sagemaker:DescribeDomain
                 - sagemaker:DescribeTrainingJob
                 - sagemaker:ListModelPackages
+                - sagemaker:DescribeModelPackage # SM-22
                 - sagemaker:DescribeFeatureGroup
                 - sagemaker:DescribeProcessingJob
                 - sagemaker:DescribeMonitoringSchedule
@@ -634,6 +635,31 @@ Resources:
               Action:
                 - guardduty:GetDetector
               Resource: !Sub 'arn:${AWS::Partition}:guardduty:*:${AWS::AccountId}:detector/*'
+            - Sid: ConfigEvaluationRead
+              # SM-32 reads the recorder scope, the rule inventory and each
+              # rule's compliance summary. None of these three Config reads
+              # supports resource-level authorization in IAM.
+              Effect: Allow
+              Action:
+                - config:DescribeConfigurationRecorders # SM-32
+                - config:DescribeConfigRules # SM-32
+                - config:DescribeComplianceByConfigRule # SM-32
+              Resource: '*'
+            - Sid: OrganizationsInventoryPermissions
+              Effect: Allow
+              Action:
+                - organizations:DescribeOrganization # SM-34
+                - organizations:ListPolicies # SM-34
+              Resource: '*'
+            - Sid: OrganizationsPolicyDocumentRead
+              # SM-34 reads the policy document itself, which only
+              # DescribePolicy returns.
+              Effect: Allow
+              Action:
+                - organizations:DescribePolicy # SM-34
+              Resource:
+                - !Sub 'arn:${AWS::Partition}:organizations::*:policy/*/*/*'
+                - !Sub 'arn:${AWS::Partition}:organizations::aws:policy/*/*'
 
   AgentCoreSecurityAssessmentFunction:
     Type: AWS::Serverless::Function

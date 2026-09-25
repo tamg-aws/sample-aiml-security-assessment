@@ -616,6 +616,19 @@ _VERIFIED_REMEDIATION_CONDITION_KEYS |= {
     "iam:ServiceSpecificCredentialServiceName",
 }
 
+# Verified the same way on 2026-09-25 for the SageMaker phase-3 checks. The
+# condition key was submitted in its qualified aws:ResourceTag/<key> form, which
+# is the only form IAM accepts; a bogus aws:...Tag/<key> key came back as
+# INVALID_GLOBAL_CONDITION_KEY, so the clean result is discriminating.
+_VERIFIED_REMEDIATION_IAM_ACTIONS |= {
+    "config:DescribeComplianceByConfigRule",
+    "sagemaker:DescribeEndpoint",
+    "sagemaker:DescribeTrainingJob",
+    "sagemaker:InvokeEndpoint",
+}
+
+_VERIFIED_REMEDIATION_CONDITION_KEYS |= {"aws:ResourceTag"}
+
 _NON_IAM_REMEDIATION_TOKENS = {
     "arn:PARTITION",
     "s3:ObjectCreated",

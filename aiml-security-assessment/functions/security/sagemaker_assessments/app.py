@@ -596,6 +596,220 @@ def check_guardduty_ai_protection(
     return findings
 
 
+ENDPOINT_INVOCATION_SCOPING_FINDING = "Endpoint Invocation Policy Scoping"
+ENDPOINT_INVOCATION_SCOPING_REFERENCE = (
+    "https://docs.aws.amazon.com/sagemaker/latest/dg/api-permissions-reference.html"
+)
+ENDPOINT_INVOCATION_SCOPING_RESOLUTION = (
+    "Replace the wildcard resource on sagemaker:InvokeEndpoint with the ARNs of "
+    "the endpoints that identity is authorized to call "
+    "(arn:aws:sagemaker:<region>:<account>:endpoint/<name>), or add an "
+    "aws:ResourceTag condition that selects them. A SageMaker endpoint accepts "
+    "no resource-based policy, so the identity policy is the only place this can "
+    "be scoped."
+)
+
+ENDPOINT_INVOKE_ACTIONS = (
+    "sagemaker:invokeendpoint",
+    "sagemaker:invokeendpointasync",
+    "sagemaker:invokeendpointwithresponsestream",
+)
+
+
+def _sm_policy_statements(document: Any) -> List[Dict[str, Any]]:
+    """Return the statement list of a policy document given as JSON or text."""
+    if isinstance(document, str):
+        try:
+            document = json.loads(document)
+        except ValueError:
+            return []
+    if not isinstance(document, dict):
+        return []
+    statements = document.get("Statement", [])
+    if isinstance(statements, dict):
+        statements = [statements]
+    return [statement for statement in statements if isinstance(statement, dict)]
+
+
+def _statement_grants_endpoint_invocation(statement: Dict[str, Any]) -> bool:
+    """Return whether an Allow statement reaches sagemaker:InvokeEndpoint."""
+    if str(statement.get("Effect", "")).upper() != "ALLOW":
+        return False
+    for action in _policy_values(statement.get("Action")):
+        normalized = action.lower()
+        if normalized in ENDPOINT_INVOKE_ACTIONS:
+            return True
+        if normalized in ("*", "sagemaker:*"):
+            return True
+        if normalized.startswith("sagemaker:invokeendpoint") and normalized.endswith(
+            "*"
+        ):
+            return True
+    return False
+
+
+def _resource_scopes_endpoint(resource: str) -> bool:
+    """
+    Return whether one Resource element stops short of every endpoint.
+
+    An element that is not a SageMaker endpoint ARN authorizes no invocation, so
+    it is not a wildcard grant either.
+    """
+    if resource == "*":
+        return False
+    match = re.fullmatch(
+        r"arn:[^:]*:sagemaker:[^:]*:[^:]*:endpoint/(.+)", resource, re.IGNORECASE
+    )
+    if not match:
+        return True
+    endpoint_name = match.group(1)
+    return "*" not in endpoint_name and "?" not in endpoint_name
+
+
+def _statement_has_resource_tag_condition(statement: Dict[str, Any]) -> bool:
+    """Return whether a statement narrows its resources by tag."""
+    condition = statement.get("Condition", {})
+    if not isinstance(condition, dict):
+        return False
+    for operator, condition_keys in condition.items():
+        if not isinstance(condition_keys, dict):
+            continue
+        if str(operator).lower().endswith("null"):
+            continue
+        for key in condition_keys:
+            if str(key).lower().startswith("aws:resourcetag/"):
+                return True
+    return False
+
+
+def _unscoped_endpoint_invocation_statement(
+    statement: Dict[str, Any],
+) -> Optional[str]:
+    """
+    Return the wildcard resource element that makes an invoke grant account-wide.
+
+    AIR-SGM-EP-02 is workload-specific: which endpoints an identity should reach
+    is a workload decision. The workload-independent invariant is that the grant
+    names its endpoints at all, so only the wildcard is reported.
+    """
+    if not _statement_grants_endpoint_invocation(statement):
+        return None
+    if _statement_has_resource_tag_condition(statement):
+        return None
+    for resource in _policy_values(statement.get("Resource")):
+        if not _resource_scopes_endpoint(resource):
+            return resource
+    return None
+
+
+def _endpoint_invocation_scoping_findings(
+    permission_cache: Dict[str, Any], region: str
+) -> List[Dict[str, Any]]:
+    """Report the AIR-SGM-EP-02 leg of SM-02, per identity."""
+    unscoped = []
+    scoped = []
+
+    identities = []
+    for identity_type, cache_key in (
+        ("Role", "role_permissions"),
+        ("User", "user_permissions"),
+    ):
+        for name, permissions in (permission_cache.get(cache_key) or {}).items():
+            identities.append((identity_type, name, permissions))
+
+    for identity_type, name, permissions in identities:
+        policies = (permissions.get("attached_policies") or []) + (
+            permissions.get("inline_policies") or []
+        )
+        grants_invocation = False
+        wildcard = None
+        wildcard_policy = None
+        for policy in policies:
+            for statement in _sm_policy_statements(policy.get("document")):
+                if not _statement_grants_endpoint_invocation(statement):
+                    continue
+                grants_invocation = True
+                resource = _unscoped_endpoint_invocation_statement(statement)
+                if resource and wildcard is None:
+                    wildcard = resource
+                    wildcard_policy = policy.get("name") or "inline policy"
+        if not grants_invocation:
+            continue
+        if wildcard is None:
+            scoped.append(f"{identity_type} '{name}'")
+        else:
+            unscoped.append(
+                {
+                    "label": f"{identity_type} '{name}'",
+                    "policy": wildcard_policy,
+                    "resource": wildcard,
+                }
+            )
+
+    emitted = []
+    for entry in unscoped[:20]:
+        emitted.append(
+            create_finding(
+                check_id="SM-02",
+                finding_name=ENDPOINT_INVOCATION_SCOPING_FINDING,
+                finding_details=(
+                    f"{entry['label']} can invoke any SageMaker endpoint in the "
+                    f"account: policy '{entry['policy']}' allows endpoint "
+                    f"invocation on resource '{entry['resource']}' with no "
+                    "endpoint ARN and no aws:ResourceTag condition."
+                ),
+                resolution=ENDPOINT_INVOCATION_SCOPING_RESOLUTION,
+                reference=ENDPOINT_INVOCATION_SCOPING_REFERENCE,
+                severity="High",
+                status="Failed",
+                region=region,
+            )
+        )
+
+    if len(unscoped) > 20:
+        emitted.append(
+            create_finding(
+                check_id="SM-02",
+                finding_name=ENDPOINT_INVOCATION_SCOPING_FINDING,
+                finding_details=(
+                    f"{len(unscoped)} identities can invoke any SageMaker endpoint "
+                    "in the account (the first 20 are reported individually above)."
+                ),
+                resolution=ENDPOINT_INVOCATION_SCOPING_RESOLUTION,
+                reference=ENDPOINT_INVOCATION_SCOPING_REFERENCE,
+                severity="High",
+                status="Failed",
+                region=region,
+            )
+        )
+
+    if scoped:
+        emitted.append(
+            create_finding(
+                check_id="SM-02",
+                finding_name=ENDPOINT_INVOCATION_SCOPING_FINDING,
+                finding_details=(
+                    f"{len(scoped)} identity/identities that can invoke a SageMaker "
+                    "endpoint name the endpoints or select them by tag: "
+                    f"{', '.join(sorted(scoped)[:5])}. Whether those are the "
+                    "endpoints each caller should reach is a workload decision the "
+                    "owner still has to confirm."
+                ),
+                resolution=(
+                    "No action required on the wildcard. Confirm with the workload "
+                    "owner that each named endpoint belongs in that identity's "
+                    "scope."
+                ),
+                reference=ENDPOINT_INVOCATION_SCOPING_REFERENCE,
+                severity="High",
+                status="Passed",
+                region=region,
+            )
+        )
+
+    return emitted
+
+
 def check_sagemaker_iam_permissions(
     permission_cache, region: str = ""
 ) -> Dict[str, Any]:
@@ -722,6 +936,13 @@ def check_sagemaker_iam_permissions(
                     region=region,
                 )
             )
+
+        # AIR-SGM-EP-02 is independent of the full-access and stale-access legs
+        # above: an identity can hold neither and still be able to invoke every
+        # endpoint in the account.
+        findings["csv_data"].extend(
+            _endpoint_invocation_scoping_findings(permission_cache, region)
+        )
 
         return findings
 
@@ -869,6 +1090,95 @@ def has_sagemaker_permissions(policy_doc: Dict) -> bool:
         return False
 
 
+TRAINING_VOLUME_ENCRYPTION_FINDING = "Training Job Volume Encryption"
+TRAINING_VOLUME_ENCRYPTION_REFERENCE = (
+    "https://docs.aws.amazon.com/sagemaker/latest/dg/train-encrypt.html"
+)
+TRAINING_VOLUME_ENCRYPTION_RESOLUTION = (
+    "Set ResourceConfig.VolumeKmsKeyId to a customer managed key when creating "
+    "the training job. Without it the ML storage volume that holds the "
+    "downloaded training data and the checkpoints is encrypted with the "
+    "Amazon EBS default key, which the workload cannot audit or revoke. "
+    "Instance types with only local NVMe storage ignore the key, so confirm the "
+    "instance family before treating this as remediated."
+)
+
+
+def _training_volume_encryption_findings(
+    jobs_with_volume_key: List[Dict[str, Any]],
+    jobs_without_volume_key: List[str],
+    region: str,
+) -> List[Dict[str, Any]]:
+    """
+    Report the training-volume leg of AIR-SGM-TRN-02.
+
+    The incumbent legs cover OutputDataConfig.KmsKeyId (the model artifact) and
+    EnableInterContainerTrafficEncryption (the wire between nodes). The storage
+    volume that the training data is downloaded onto is a third stage with its
+    own key, and none of the other legs can tell you about it.
+    """
+    emitted = []
+
+    for job_name in jobs_without_volume_key[:20]:
+        emitted.append(
+            create_finding(
+                check_id="SM-03",
+                finding_name=TRAINING_VOLUME_ENCRYPTION_FINDING,
+                finding_details=(
+                    f"Training job '{job_name}' has no "
+                    "ResourceConfig.VolumeKmsKeyId, so the ML storage volume "
+                    "holding its training data used the EBS default key."
+                ),
+                resolution=TRAINING_VOLUME_ENCRYPTION_RESOLUTION,
+                reference=TRAINING_VOLUME_ENCRYPTION_REFERENCE,
+                severity="Medium",
+                status="Failed",
+                region=region,
+            )
+        )
+
+    if len(jobs_without_volume_key) > 20:
+        emitted.append(
+            create_finding(
+                check_id="SM-03",
+                finding_name=TRAINING_VOLUME_ENCRYPTION_FINDING,
+                finding_details=(
+                    f"{len(jobs_without_volume_key)} training jobs have no "
+                    "ResourceConfig.VolumeKmsKeyId (the first 20 are reported "
+                    "individually above)."
+                ),
+                resolution=TRAINING_VOLUME_ENCRYPTION_RESOLUTION,
+                reference=TRAINING_VOLUME_ENCRYPTION_REFERENCE,
+                severity="Medium",
+                status="Failed",
+                region=region,
+            )
+        )
+
+    if jobs_with_volume_key:
+        described = ", ".join(
+            "{} ({})".format(job["name"], job["key_id"])
+            for job in jobs_with_volume_key[:3]
+        )
+        emitted.append(
+            create_finding(
+                check_id="SM-03",
+                finding_name=TRAINING_VOLUME_ENCRYPTION_FINDING,
+                finding_details=(
+                    f"{len(jobs_with_volume_key)} training job(s) encrypt the ML "
+                    f"storage volume with a named KMS key: {described}."
+                ),
+                resolution="No action required.",
+                reference=TRAINING_VOLUME_ENCRYPTION_REFERENCE,
+                severity="Medium",
+                status="Passed",
+                region=region,
+            )
+        )
+
+    return emitted
+
+
 def check_sagemaker_data_protection(region: str = "") -> Dict[str, Any]:
     """
     Check SageMaker data protection configurations including encryption at rest and in transit
@@ -885,6 +1195,8 @@ def check_sagemaker_data_protection(region: str = "") -> Dict[str, Any]:
         resources_with_aws_managed_keys = []
         resources_without_encryption = []
         resources_without_vpc_encryption = []
+        training_jobs_with_volume_key = []
+        training_jobs_without_volume_key = []
         total_resources_checked = 0
 
         # Check Notebook Instances
@@ -1010,14 +1322,33 @@ def check_sagemaker_data_protection(region: str = "") -> Dict[str, Any]:
                                     "issue": "Inter-container traffic encryption not enabled",
                                 }
                             )
+
+                        # AIR-SGM-TRN-02 also covers the storage volume the
+                        # training data is downloaded onto, which carries its own
+                        # key separate from the output artifact key above.
+                        resource_config = job_details.get("ResourceConfig") or {}
+                        volume_key_id = (
+                            resource_config.get("VolumeKmsKeyId")
+                            if isinstance(resource_config, dict)
+                            else None
+                        )
+                        if volume_key_id:
+                            training_jobs_with_volume_key.append(
+                                {"name": job_name, "key_id": volume_key_id}
+                            )
+                        else:
+                            training_jobs_without_volume_key.append(job_name)
         except Exception as e:
             logger.error(f"Error checking training jobs encryption: {str(e)}")
 
-        # Generate findings
+        # Generate findings. The volume-key list is part of this guard so the
+        # aggregate "all resources use appropriate encryption" row cannot be
+        # emitted alongside a volume-key failure below.
         if (
             resources_without_encryption
             or resources_with_aws_managed_keys
             or resources_without_vpc_encryption
+            or training_jobs_without_volume_key
         ):
             # Resources without encryption
             for resource in resources_without_encryption:
@@ -1091,6 +1422,14 @@ def check_sagemaker_data_protection(region: str = "") -> Dict[str, Any]:
                         region=region,
                     )
                 )
+
+        findings["csv_data"].extend(
+            _training_volume_encryption_findings(
+                training_jobs_with_volume_key,
+                training_jobs_without_volume_key,
+                region,
+            )
+        )
 
         return findings
 
@@ -1776,6 +2115,96 @@ def check_sagemaker_notebook_vpc_deployment(region: str = "") -> Dict[str, Any]:
         }
 
 
+MODEL_VPC_ATTACHMENT_FINDING = "SageMaker Model VPC Attachment"
+MODEL_VPC_ATTACHMENT_REFERENCE = (
+    "https://docs.aws.amazon.com/sagemaker/latest/dg/host-vpc.html"
+)
+MODEL_VPC_ATTACHMENT_RESOLUTION = (
+    "Recreate the model with VpcConfig naming private subnets and security "
+    "groups, and reach it through a com.amazonaws.<region>.sagemaker.runtime "
+    "interface VPC endpoint with an endpoint policy. VpcConfig alone places the "
+    "model containers in the VPC; the caller still resolves the public runtime "
+    "endpoint unless an interface endpoint is in place."
+)
+
+
+def _model_vpc_attachment_findings(
+    models_in_vpc: List[Dict[str, Any]], models_without_vpc: List[str], region: str
+) -> List[Dict[str, Any]]:
+    """
+    Report the VpcConfig leg of AIR-SGM-EP-01, per model and independently of
+    the EnableNetworkIsolation legs above.
+
+    Network isolation and VPC attachment are separate settings: a model can be
+    isolated and still have no VpcConfig, so neither verdict can be inferred
+    from the other.
+    """
+    emitted = []
+
+    for model_name in models_without_vpc[:20]:
+        emitted.append(
+            create_finding(
+                check_id="SM-11",
+                finding_name=MODEL_VPC_ATTACHMENT_FINDING,
+                finding_details=(
+                    f"Model '{model_name}' has no VpcConfig, so its containers run "
+                    "in the SageMaker-managed network with no customer subnet or "
+                    "security group controlling their traffic."
+                ),
+                resolution=MODEL_VPC_ATTACHMENT_RESOLUTION,
+                reference=MODEL_VPC_ATTACHMENT_REFERENCE,
+                severity="Medium",
+                status="Failed",
+                region=region,
+            )
+        )
+
+    if len(models_without_vpc) > 20:
+        emitted.append(
+            create_finding(
+                check_id="SM-11",
+                finding_name=MODEL_VPC_ATTACHMENT_FINDING,
+                finding_details=(
+                    f"{len(models_without_vpc)} models have no VpcConfig "
+                    "(the first 20 are reported individually above)."
+                ),
+                resolution=MODEL_VPC_ATTACHMENT_RESOLUTION,
+                reference=MODEL_VPC_ATTACHMENT_REFERENCE,
+                severity="Medium",
+                status="Failed",
+                region=region,
+            )
+        )
+
+    if models_in_vpc:
+        described = "; ".join(
+            "{} in {}".format(model["name"], ", ".join(model["subnets"][:3]))
+            for model in models_in_vpc[:5]
+        )
+        emitted.append(
+            create_finding(
+                check_id="SM-11",
+                finding_name=MODEL_VPC_ATTACHMENT_FINDING,
+                finding_details=(
+                    f"{len(models_in_vpc)} model(s) are attached to customer "
+                    f"subnets: {described}. Confirm those subnets are private and "
+                    "that callers reach the endpoint through an interface VPC "
+                    "endpoint, which the model configuration does not record."
+                ),
+                resolution=(
+                    "No action required on the model. Confirm the subnets have no "
+                    "route to an internet gateway."
+                ),
+                reference=MODEL_VPC_ATTACHMENT_REFERENCE,
+                severity="Medium",
+                status="Passed",
+                region=region,
+            )
+        )
+
+    return emitted
+
+
 def check_sagemaker_model_network_isolation(region: str = "") -> Dict[str, Any]:
     """
     Check if SageMaker hosted models have network isolation enabled.
@@ -1792,6 +2221,8 @@ def check_sagemaker_model_network_isolation(region: str = "") -> Dict[str, Any]:
 
         models_without_isolation = []
         models_with_isolation = []
+        models_in_vpc = []
+        models_without_vpc = []
 
         try:
             paginator = sagemaker_client.get_paginator("list_models")
@@ -1807,6 +2238,21 @@ def check_sagemaker_model_network_isolation(region: str = "") -> Dict[str, Any]:
                             enable_network_isolation = model_details.get(
                                 "EnableNetworkIsolation", False
                             )
+
+                            # AIR-SGM-EP-01 asks about the private network path,
+                            # which is VpcConfig rather than network isolation.
+                            vpc_config = model_details.get("VpcConfig")
+                            subnets = (
+                                vpc_config.get("Subnets")
+                                if isinstance(vpc_config, dict)
+                                else None
+                            )
+                            if subnets:
+                                models_in_vpc.append(
+                                    {"name": model_name, "subnets": list(subnets)}
+                                )
+                            else:
+                                models_without_vpc.append(model_name)
 
                             if not enable_network_isolation:
                                 models_without_isolation.append(
@@ -1886,6 +2332,10 @@ def check_sagemaker_model_network_isolation(region: str = "") -> Dict[str, Any]:
                         region=region,
                     )
                 )
+
+        findings["csv_data"].extend(
+            _model_vpc_attachment_findings(models_in_vpc, models_without_vpc, region)
+        )
 
         return findings
 
@@ -3233,6 +3683,123 @@ def check_sagemaker_automl_network_isolation(region: str = "") -> Dict[str, Any]
 # ============================================================================
 
 
+APPROVER_ATTRIBUTION_FINDING = "Model Approval Workflow - Approver Attribution"
+APPROVER_ATTRIBUTION_REFERENCE = (
+    "https://docs.aws.amazon.com/sagemaker/latest/dg/model-registry-approve.html"
+)
+APPROVER_ATTRIBUTION_RESOLUTION = (
+    "Approve model packages with UpdateModelPackage called by a named identity "
+    "and pass ApprovalDescription recording who approved the version and on what "
+    "evidence. SageMaker stores the calling identity in LastModifiedBy, so an "
+    "approval made by a shared automation role with no description leaves no "
+    "auditable approver."
+)
+
+# Reading approver metadata costs one DescribeModelPackage per approved version.
+# The registry has no bulk read for it, so the sample is bounded and the finding
+# says how many versions it covered.
+MAX_APPROVAL_ATTRIBUTION_DESCRIBES = 25
+
+
+def _approver_attribution(model_package_detail: Dict[str, Any]) -> Optional[str]:
+    """Return the recorded approver of a model package version, if there is one."""
+    context = model_package_detail.get("LastModifiedBy") or model_package_detail.get(
+        "CreatedBy"
+    )
+    if isinstance(context, dict):
+        user_profile = context.get("UserProfileName")
+        if user_profile:
+            return f"user profile {user_profile}"
+        iam_identity = context.get("IamIdentity")
+        if isinstance(iam_identity, dict):
+            source_identity = iam_identity.get("SourceIdentity")
+            if source_identity:
+                return f"source identity {source_identity}"
+            arn = iam_identity.get("Arn")
+            if arn:
+                return arn
+    return None
+
+
+def _approval_attribution_findings(
+    approvals_with_approver: List[Dict[str, Any]],
+    approvals_without_approver: List[Dict[str, Any]],
+    versions_examined: int,
+    region: str,
+) -> List[Dict[str, Any]]:
+    """
+    Report the approver-metadata leg of AIR-SGM-GOV-01.
+
+    The incumbent legs read ModelApprovalStatus, which says a version is
+    approved but not by whom, so neither verdict can be derived from them.
+    """
+    if not versions_examined:
+        return []
+
+    emitted = []
+
+    for entry in approvals_without_approver[:20]:
+        emitted.append(
+            create_finding(
+                check_id="SM-22",
+                finding_name=APPROVER_ATTRIBUTION_FINDING,
+                finding_details=(
+                    f"Approved model package '{entry['name']}' in group "
+                    f"'{entry['group']}' records no approver: LastModifiedBy and "
+                    "CreatedBy carry no user profile, source identity or IAM ARN, "
+                    "and ApprovalDescription is empty."
+                ),
+                resolution=APPROVER_ATTRIBUTION_RESOLUTION,
+                reference=APPROVER_ATTRIBUTION_REFERENCE,
+                severity="Medium",
+                status="Failed",
+                region=region,
+            )
+        )
+
+    if len(approvals_without_approver) > 20:
+        emitted.append(
+            create_finding(
+                check_id="SM-22",
+                finding_name=APPROVER_ATTRIBUTION_FINDING,
+                finding_details=(
+                    f"{len(approvals_without_approver)} approved model package "
+                    "versions record no approver (the first 20 are reported "
+                    "individually above)."
+                ),
+                resolution=APPROVER_ATTRIBUTION_RESOLUTION,
+                reference=APPROVER_ATTRIBUTION_REFERENCE,
+                severity="Medium",
+                status="Failed",
+                region=region,
+            )
+        )
+
+    if approvals_with_approver:
+        described = "; ".join(
+            "{} approved by {}".format(entry["name"], entry["approver"])
+            for entry in approvals_with_approver[:3]
+        )
+        emitted.append(
+            create_finding(
+                check_id="SM-22",
+                finding_name=APPROVER_ATTRIBUTION_FINDING,
+                finding_details=(
+                    f"{len(approvals_with_approver)} of {versions_examined} "
+                    "approved model package versions examined record an approver "
+                    f"identity: {described}."
+                ),
+                resolution="No action required.",
+                reference=APPROVER_ATTRIBUTION_REFERENCE,
+                severity="Medium",
+                status="Passed",
+                region=region,
+            )
+        )
+
+    return emitted
+
+
 def check_model_approval_workflow(region: str = "") -> Dict[str, Any]:
     """
     Check if Model Registry has proper approval workflows configured.
@@ -3253,6 +3820,9 @@ def check_model_approval_workflow(region: str = "") -> Dict[str, Any]:
 
         issues_found = []
         groups_checked = 0
+        approvals_with_approver = []
+        approvals_without_approver = []
+        approval_versions_examined = 0
 
         try:
             paginator = sagemaker_client.get_paginator("list_model_package_groups")
@@ -3300,6 +3870,63 @@ def check_model_approval_workflow(region: str = "") -> Dict[str, Any]:
                                     }
                                 )
 
+                            # AIR-SGM-GOV-01 asks who approved each version,
+                            # which only DescribeModelPackage answers.
+                            for model in model_packages:
+                                if (
+                                    approval_versions_examined
+                                    >= MAX_APPROVAL_ATTRIBUTION_DESCRIBES
+                                ):
+                                    break
+                                if model.get("ModelApprovalStatus") != "Approved":
+                                    continue
+                                package_id = model.get("ModelPackageArn") or model.get(
+                                    "ModelPackageName"
+                                )
+                                if not package_id:
+                                    continue
+                                try:
+                                    detail = sagemaker_client.describe_model_package(
+                                        ModelPackageName=package_id
+                                    )
+                                except Exception as error:
+                                    logger.warning(
+                                        "Error describing model package "
+                                        f"{package_id}: {str(error)}"
+                                    )
+                                    continue
+                                approval_versions_examined += 1
+                                version_label = (
+                                    detail.get("ModelPackageName")
+                                    or detail.get("ModelPackageArn")
+                                    or package_id
+                                )
+                                approver = _approver_attribution(detail)
+                                description = detail.get("ApprovalDescription") or ""
+                                if approver:
+                                    approvals_with_approver.append(
+                                        {
+                                            "name": version_label,
+                                            "group": group_name,
+                                            "approver": approver,
+                                        }
+                                    )
+                                elif description.strip():
+                                    approvals_with_approver.append(
+                                        {
+                                            "name": version_label,
+                                            "group": group_name,
+                                            "approver": (
+                                                "ApprovalDescription "
+                                                f"'{description.strip()[:60]}'"
+                                            ),
+                                        }
+                                    )
+                                else:
+                                    approvals_without_approver.append(
+                                        {"name": version_label, "group": group_name}
+                                    )
+
                             # Check for models stuck in pending
                             if pending_count > 5:
                                 issues_found.append(
@@ -3332,7 +3959,10 @@ def check_model_approval_workflow(region: str = "") -> Dict[str, Any]:
                     region=region,
                 )
             )
-        elif issues_found:
+        elif issues_found or approvals_without_approver:
+            # The unattributed-approval list is part of this guard so the
+            # aggregate "approval workflows appear properly configured" row
+            # cannot be emitted alongside an attribution failure below.
             for issue in issues_found:
                 findings["csv_data"].append(
                     create_finding(
@@ -3359,6 +3989,15 @@ def check_model_approval_workflow(region: str = "") -> Dict[str, Any]:
                     region=region,
                 )
             )
+
+        findings["csv_data"].extend(
+            _approval_attribution_findings(
+                approvals_with_approver,
+                approvals_without_approver,
+                approval_versions_examined,
+                region,
+            )
+        )
 
         return findings
 
@@ -4622,6 +5261,1140 @@ def check_model_package_group_policy_exposure(
     return findings
 
 
+ENDPOINT_DATA_CAPTURE_FINDING = "Endpoint Inference Data Capture"
+ENDPOINT_DATA_CAPTURE_REFERENCE = (
+    "https://docs.aws.amazon.com/sagemaker/latest/dg/model-monitor-data-capture.html"
+)
+ENDPOINT_DATA_CAPTURE_RESOLUTION = (
+    "Set DataCaptureConfig on the endpoint configuration with EnableCapture "
+    "true, CaptureOptions covering Input and Output, a DestinationS3Uri and a "
+    "KmsKeyId, then update the endpoint. Without captured inference records a "
+    "Model Monitor schedule has no data to compare against its baseline, so "
+    "drift and adversarial input cannot be detected after the fact."
+)
+
+
+def check_sagemaker_endpoint_data_capture(region: str = "") -> Dict[str, Any]:
+    """
+    SM-31: Verify each SageMaker endpoint captures inference requests and
+    responses (AIR-SGM-EP-06).
+
+    DescribeEndpoint reports the live capture state (EnableCapture plus
+    CaptureStatus, which is Started or Stopped), so an endpoint whose
+    configuration enables capture but whose capture has stopped is reported as a
+    failure and not as compliant.
+    """
+    logger.debug("Starting check for SageMaker endpoint data capture")
+    findings = {"csv_data": []}
+    try:
+        sagemaker_client = boto3.client(
+            "sagemaker", config=boto3_config, region_name=region
+        )
+
+        capturing = []
+        not_capturing = []
+        endpoints_seen = 0
+        describe_errors = []
+
+        paginator = sagemaker_client.get_paginator("list_endpoints")
+        for page in paginator.paginate():
+            for endpoint in page.get("Endpoints", []):
+                endpoint_name = endpoint.get("EndpointName")
+                if not endpoint_name:
+                    continue
+                endpoints_seen += 1
+                try:
+                    detail = sagemaker_client.describe_endpoint(
+                        EndpointName=endpoint_name
+                    )
+                except Exception as error:
+                    describe_errors.append(
+                        {
+                            "name": endpoint_name,
+                            "label": get_assessment_error_label(error),
+                        }
+                    )
+                    continue
+
+                capture_config = detail.get("DataCaptureConfig") or {}
+                if not isinstance(capture_config, dict):
+                    capture_config = {}
+                enabled = capture_config.get("EnableCapture") is True
+                capture_status = capture_config.get("CaptureStatus")
+                if enabled and capture_status == "Started":
+                    capturing.append(
+                        {
+                            "name": endpoint_name,
+                            "destination": capture_config.get("DestinationS3Uri") or "",
+                            "sampling": capture_config.get("CurrentSamplingPercentage"),
+                        }
+                    )
+                elif not capture_config:
+                    not_capturing.append(
+                        {
+                            "name": endpoint_name,
+                            "reason": "no DataCaptureConfig is attached",
+                        }
+                    )
+                elif not enabled:
+                    not_capturing.append(
+                        {
+                            "name": endpoint_name,
+                            "reason": "DataCaptureConfig.EnableCapture is false",
+                        }
+                    )
+                else:
+                    not_capturing.append(
+                        {
+                            "name": endpoint_name,
+                            "reason": (
+                                "DataCaptureConfig is enabled but CaptureStatus is "
+                                f"{capture_status or 'not reported'}"
+                            ),
+                        }
+                    )
+
+        if endpoints_seen == 0:
+            findings["csv_data"].append(
+                create_finding(
+                    check_id="SM-31",
+                    finding_name=ENDPOINT_DATA_CAPTURE_FINDING,
+                    finding_details=(
+                        f"No SageMaker endpoints found in {region or 'this region'}, "
+                        "so there is no inference traffic to capture."
+                    ),
+                    resolution="No action required",
+                    reference=ENDPOINT_DATA_CAPTURE_REFERENCE,
+                    severity="Informational",
+                    status="N/A",
+                    region=region,
+                )
+            )
+            return findings
+
+        for entry in not_capturing[:20]:
+            findings["csv_data"].append(
+                create_finding(
+                    check_id="SM-31",
+                    finding_name=ENDPOINT_DATA_CAPTURE_FINDING,
+                    finding_details=(
+                        f"Endpoint '{entry['name']}' is not capturing inference "
+                        f"records: {entry['reason']}."
+                    ),
+                    resolution=ENDPOINT_DATA_CAPTURE_RESOLUTION,
+                    reference=ENDPOINT_DATA_CAPTURE_REFERENCE,
+                    severity="Medium",
+                    status="Failed",
+                    region=region,
+                )
+            )
+
+        if len(not_capturing) > 20:
+            findings["csv_data"].append(
+                create_finding(
+                    check_id="SM-31",
+                    finding_name=ENDPOINT_DATA_CAPTURE_FINDING,
+                    finding_details=(
+                        f"{len(not_capturing)} endpoints are not capturing inference "
+                        "records (the first 20 are reported individually above)."
+                    ),
+                    resolution=ENDPOINT_DATA_CAPTURE_RESOLUTION,
+                    reference=ENDPOINT_DATA_CAPTURE_REFERENCE,
+                    severity="Medium",
+                    status="Failed",
+                    region=region,
+                )
+            )
+
+        if capturing:
+            described = "; ".join(
+                "{} to {}".format(entry["name"], entry["destination"] or "S3")
+                for entry in capturing[:3]
+            )
+            findings["csv_data"].append(
+                create_finding(
+                    check_id="SM-31",
+                    finding_name=ENDPOINT_DATA_CAPTURE_FINDING,
+                    finding_details=(
+                        f"{len(capturing)} of {endpoints_seen} endpoint(s) report "
+                        f"CaptureStatus Started: {described}. Whether the captured "
+                        "records are reviewed, and at what sampling percentage, is "
+                        "not readable from the endpoint."
+                    ),
+                    resolution=(
+                        "No action required on capture. Confirm a Model Monitor "
+                        "schedule consumes the captured records."
+                    ),
+                    reference=ENDPOINT_DATA_CAPTURE_REFERENCE,
+                    severity="Medium",
+                    status="Passed",
+                    region=region,
+                )
+            )
+
+        for entry in describe_errors[:5]:
+            findings["csv_data"].append(
+                create_finding(
+                    check_id="SM-31",
+                    finding_name=ENDPOINT_DATA_CAPTURE_FINDING,
+                    finding_details=(
+                        f"Endpoint '{entry['name']}' could not be assessed for data "
+                        f"capture. Assessment error: {entry['label']}."
+                    ),
+                    resolution="Grant sagemaker:DescribeEndpoint and retry.",
+                    reference=ENDPOINT_DATA_CAPTURE_REFERENCE,
+                    severity="Informational",
+                    status="N/A",
+                    region=region,
+                )
+            )
+
+        return findings
+
+    except Exception as error:
+        logger.error(
+            f"Error in check_sagemaker_endpoint_data_capture: {str(error)}",
+            exc_info=True,
+        )
+        return {
+            "csv_data": [
+                create_finding(
+                    check_id="SM-31",
+                    finding_name=ENDPOINT_DATA_CAPTURE_FINDING,
+                    finding_details=build_could_not_assess_detail(error, region),
+                    resolution=COULD_NOT_ASSESS_RESOLUTION,
+                    reference=ENDPOINT_DATA_CAPTURE_REFERENCE,
+                    severity="Informational",
+                    status="N/A",
+                    region=region,
+                )
+            ]
+        }
+
+
+CONFIG_RECORDING_FINDING = "SageMaker Configuration Recording"
+CONFIG_RULE_COMPLIANCE_FINDING = "SageMaker Config Rule Compliance"
+CONFIG_REFERENCE = (
+    "https://docs.aws.amazon.com/config/latest/developerguide/evaluate-config.html"
+)
+CONFIG_RECORDING_RESOLUTION = (
+    "Turn on an AWS Config recorder in this region and include the "
+    "AWS::SageMaker::* resource types (or record all supported types). Without "
+    "recorded configuration items, a change to a domain, model or feature group "
+    "leaves no evaluated history to compare against the required controls."
+)
+CONFIG_RULE_RESOLUTION = (
+    "Deploy AWS Config rules covering the SageMaker controls this workload "
+    "requires, for example through the Security Hub CSPM SageMaker controls or a "
+    "conformance pack, and keep them in the ACTIVE state. A recorder on its own "
+    "stores configuration items without evaluating them, so nothing flags a "
+    "non-compliant resource."
+)
+SAGEMAKER_CONFIG_RESOURCE_PREFIX = "AWS::SageMaker::"
+
+
+def _sagemaker_recording_coverage(recorder: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Decide whether one Config recorder records SageMaker resource types.
+
+    recordingStrategy is the current field and allSupported/resourceTypes are the
+    older ones, so both are read: a recorder created before recordingStrategy
+    existed reports only the latter.
+    """
+    recording_group = recorder.get("recordingGroup") or {}
+    strategy = (recording_group.get("recordingStrategy") or {}).get("useOnly")
+    resource_types = [
+        str(item) for item in (recording_group.get("resourceTypes") or [])
+    ]
+    excluded = [
+        str(item)
+        for item in (
+            (recording_group.get("exclusionByResourceTypes") or {}).get("resourceTypes")
+            or []
+        )
+    ]
+    sagemaker_included = [
+        item
+        for item in resource_types
+        if item.startswith(SAGEMAKER_CONFIG_RESOURCE_PREFIX)
+    ]
+    sagemaker_excluded = [
+        item for item in excluded if item.startswith(SAGEMAKER_CONFIG_RESOURCE_PREFIX)
+    ]
+
+    if strategy == "EXCLUSION_BY_RESOURCE_TYPES":
+        return {
+            "covered": not sagemaker_excluded,
+            "detail": (
+                "records all supported resource types except "
+                f"{', '.join(sorted(sagemaker_excluded))}"
+                if sagemaker_excluded
+                else "records all supported resource types by exclusion strategy"
+            ),
+        }
+
+    if strategy == "ALL_SUPPORTED_RESOURCE_TYPES" or recording_group.get(
+        "allSupported"
+    ):
+        return {
+            "covered": True,
+            "detail": "records all supported resource types",
+        }
+
+    if sagemaker_included:
+        return {
+            "covered": True,
+            "detail": (
+                "records the SageMaker resource types "
+                f"{', '.join(sorted(sagemaker_included))}"
+            ),
+        }
+
+    return {
+        "covered": False,
+        "detail": (
+            f"records {len(resource_types)} resource type(s), none of them "
+            "AWS::SageMaker::*"
+        ),
+    }
+
+
+def _rule_targets_sagemaker(rule: Dict[str, Any]) -> bool:
+    """
+    Return whether a Config rule evaluates SageMaker.
+
+    Scope is empty on a periodic rule, and the SageMaker managed rules that
+    evaluate notebook instances and endpoint configurations are periodic because
+    AWS Config records no configuration item for those resource types. Matching
+    the rule identifier and name as well as the scope keeps those rules in.
+    """
+    scope = rule.get("Scope") or {}
+    for resource_type in scope.get("ComplianceResourceTypes") or []:
+        if str(resource_type).startswith(SAGEMAKER_CONFIG_RESOURCE_PREFIX):
+            return True
+    source_identifier = str((rule.get("Source") or {}).get("SourceIdentifier") or "")
+    if "SAGEMAKER" in source_identifier.upper():
+        return True
+    return "sagemaker" in str(rule.get("ConfigRuleName") or "").lower()
+
+
+def check_sagemaker_config_compliance_evaluation(region: str = "") -> Dict[str, Any]:
+    """
+    SM-32: Verify SageMaker configuration state is continuously evaluated and
+    non-compliant resources are reported (AIR-SGM-GOV-10).
+
+    Two independent legs: an AWS Config recorder covering SageMaker resource
+    types, and at least one active Config rule evaluating SageMaker with its
+    current compliance result. A recorder without rules evaluates nothing, and a
+    rule without a recorder cannot see configuration changes, so neither verdict
+    implies the other.
+    """
+    logger.debug("Starting check for SageMaker AWS Config coverage")
+    findings = {"csv_data": []}
+    try:
+        config_client = boto3.client("config", config=boto3_config, region_name=region)
+
+        # DescribeConfigurationRecorders has no continuation field in the
+        # botocore model, so there is no paginator to use. Called without
+        # arguments it returns only the customer-managed recorder; a recorder
+        # created for another service is reachable only by naming that service
+        # principal, which this check does not guess at.
+        recorders = config_client.describe_configuration_recorders().get(
+            "ConfigurationRecorders", []
+        )
+
+        if not recorders:
+            findings["csv_data"].append(
+                create_finding(
+                    check_id="SM-32",
+                    finding_name=CONFIG_RECORDING_FINDING,
+                    finding_details=(
+                        "DescribeConfigurationRecorders returned no "
+                        f"customer-managed AWS Config recorder in {region or 'this region'}, "
+                        "so no SageMaker configuration item is recorded here. A "
+                        "recorder owned by another service principal is not "
+                        "returned by this call and would not be visible."
+                    ),
+                    resolution=CONFIG_RECORDING_RESOLUTION,
+                    reference=CONFIG_REFERENCE,
+                    severity="Medium",
+                    status="Failed",
+                    region=region,
+                )
+            )
+        else:
+            for recorder in recorders:
+                recorder_name = recorder.get("name") or "default"
+                coverage = _sagemaker_recording_coverage(recorder)
+                findings["csv_data"].append(
+                    create_finding(
+                        check_id="SM-32",
+                        finding_name=CONFIG_RECORDING_FINDING,
+                        finding_details=(
+                            f"AWS Config recorder '{recorder_name}' "
+                            f"{coverage['detail']}."
+                        ),
+                        resolution=(
+                            "No action required"
+                            if coverage["covered"]
+                            else CONFIG_RECORDING_RESOLUTION
+                        ),
+                        reference=CONFIG_REFERENCE,
+                        severity="Medium",
+                        status="Passed" if coverage["covered"] else "Failed",
+                        region=region,
+                    )
+                )
+
+        sagemaker_rules = []
+        rule_paginator = config_client.get_paginator("describe_config_rules")
+        for page in rule_paginator.paginate():
+            for rule in page.get("ConfigRules", []):
+                if _rule_targets_sagemaker(rule):
+                    sagemaker_rules.append(rule)
+
+        active_rules = [
+            rule for rule in sagemaker_rules if rule.get("ConfigRuleState") == "ACTIVE"
+        ]
+
+        if not active_rules:
+            findings["csv_data"].append(
+                create_finding(
+                    check_id="SM-32",
+                    finding_name=CONFIG_RULE_COMPLIANCE_FINDING,
+                    finding_details=(
+                        f"No ACTIVE AWS Config rule in {region or 'this region'} "
+                        "evaluates SageMaker: none of the "
+                        f"{len(sagemaker_rules)} SageMaker-related rule(s) found is "
+                        "in the ACTIVE state, so no SageMaker resource is reported "
+                        "as compliant or non-compliant."
+                    ),
+                    resolution=CONFIG_RULE_RESOLUTION,
+                    reference=CONFIG_REFERENCE,
+                    severity="Medium",
+                    status="Failed",
+                    region=region,
+                )
+            )
+            return findings
+
+        rule_names = [
+            rule.get("ConfigRuleName")
+            for rule in active_rules
+            if rule.get("ConfigRuleName")
+        ]
+        compliance_by_rule = {}
+        compliance_error = None
+        try:
+            compliance_paginator = config_client.get_paginator(
+                "describe_compliance_by_config_rule"
+            )
+            # DescribeComplianceByConfigRule accepts at most 25 rule names.
+            for index in range(0, len(rule_names), 25):
+                batch = rule_names[index : index + 25]
+                for page in compliance_paginator.paginate(ConfigRuleNames=batch):
+                    for entry in page.get("ComplianceByConfigRules", []):
+                        name = entry.get("ConfigRuleName")
+                        compliance = entry.get("Compliance") or {}
+                        if name:
+                            compliance_by_rule[name] = compliance
+        except Exception as error:
+            compliance_error = get_assessment_error_label(error)
+
+        non_compliant = {
+            name: compliance
+            for name, compliance in compliance_by_rule.items()
+            if compliance.get("ComplianceType") == "NON_COMPLIANT"
+        }
+
+        if non_compliant:
+            for name, compliance in sorted(non_compliant.items())[:20]:
+                capped = (compliance.get("ComplianceContributorCount") or {}).get(
+                    "CappedCount"
+                )
+                counted = (
+                    f"{capped} non-compliant resource(s)"
+                    if capped is not None
+                    else "a non-compliant resource"
+                )
+                findings["csv_data"].append(
+                    create_finding(
+                        check_id="SM-32",
+                        finding_name=CONFIG_RULE_COMPLIANCE_FINDING,
+                        finding_details=(
+                            f"AWS Config rule '{name}' reports {counted} for "
+                            "SageMaker. The rule is evaluating, and the resources "
+                            "it flagged are outstanding."
+                        ),
+                        resolution=(
+                            "Remediate the resources the rule flagged, then "
+                            "re-evaluate the rule."
+                        ),
+                        reference=CONFIG_REFERENCE,
+                        severity="Medium",
+                        status="Failed",
+                        region=region,
+                    )
+                )
+
+        compliant_names = sorted(
+            name
+            for name, compliance in compliance_by_rule.items()
+            if compliance.get("ComplianceType") == "COMPLIANT"
+        )
+        if compliant_names or (not non_compliant and not compliance_error):
+            described = ", ".join((compliant_names or rule_names)[:5])
+            findings["csv_data"].append(
+                create_finding(
+                    check_id="SM-32",
+                    finding_name=CONFIG_RULE_COMPLIANCE_FINDING,
+                    finding_details=(
+                        f"{len(active_rules)} ACTIVE AWS Config rule(s) evaluate "
+                        f"SageMaker in {region or 'this region'} and report no "
+                        f"non-compliant resource: {described}. AWS Config records "
+                        "configuration items for the AWS::SageMaker::* types only, "
+                        "so endpoints and training jobs are covered by periodic "
+                        "rules rather than by configuration history."
+                    ),
+                    resolution="No action required",
+                    reference=CONFIG_REFERENCE,
+                    severity="Medium",
+                    status="Passed",
+                    region=region,
+                )
+            )
+
+        if compliance_error:
+            findings["csv_data"].append(
+                create_finding(
+                    check_id="SM-32",
+                    finding_name=CONFIG_RULE_COMPLIANCE_FINDING,
+                    finding_details=(
+                        f"{len(active_rules)} ACTIVE SageMaker Config rule(s) were "
+                        "found, but their compliance results could not be read. "
+                        f"Assessment error: {compliance_error}."
+                    ),
+                    resolution=(
+                        "Grant config:DescribeComplianceByConfigRule and retry."
+                    ),
+                    reference=CONFIG_REFERENCE,
+                    severity="Informational",
+                    status="N/A",
+                    region=region,
+                )
+            )
+
+        return findings
+
+    except Exception as error:
+        logger.error(
+            f"Error in check_sagemaker_config_compliance_evaluation: {str(error)}",
+            exc_info=True,
+        )
+        return {
+            "csv_data": [
+                create_finding(
+                    check_id="SM-32",
+                    finding_name=CONFIG_RECORDING_FINDING,
+                    finding_details=build_could_not_assess_detail(error, region),
+                    resolution=COULD_NOT_ASSESS_RESOLUTION,
+                    reference=CONFIG_REFERENCE,
+                    severity="Informational",
+                    status="N/A",
+                    region=region,
+                )
+            ]
+        }
+
+
+TRAINING_NETWORK_BOUNDARY_FINDING = "Training Job Network Boundary"
+TRAINING_NETWORK_BOUNDARY_REFERENCE = (
+    "https://docs.aws.amazon.com/sagemaker/latest/dg/train-vpc.html"
+)
+TRAINING_NETWORK_BOUNDARY_RESOLUTION = (
+    "Create training jobs with VpcConfig naming private subnets and security "
+    "groups, and set EnableNetworkIsolation true unless the job has to reach an "
+    "approved external source. Without VpcConfig the training container runs in "
+    "a SageMaker-managed network with outbound internet access, so nothing stops "
+    "a compromised training script from exfiltrating the training data."
+)
+
+# Training jobs are never deleted, so an account accumulates them indefinitely.
+# The check samples the most recent jobs and the finding says how many it read.
+MAX_TRAINING_JOBS_SAMPLED = 50
+
+
+def check_sagemaker_training_job_network_boundary(region: str = "") -> Dict[str, Any]:
+    """
+    SM-33: Verify training jobs run inside a customer VPC (AIR-SGM-TRN-01).
+
+    SM-21 asserts this for AutoML jobs only. Network isolation and VpcConfig are
+    reported separately because a job can be isolated with no VPC attachment, and
+    an isolated job still has no private path to S3 or ECR without one.
+    """
+    logger.debug("Starting check for SageMaker training job network boundary")
+    findings = {"csv_data": []}
+    try:
+        sagemaker_client = boto3.client(
+            "sagemaker", config=boto3_config, region_name=region
+        )
+
+        jobs_in_vpc = []
+        jobs_without_vpc = []
+        jobs_sampled = 0
+        describe_errors = []
+
+        paginator = sagemaker_client.get_paginator("list_training_jobs")
+        for page in paginator.paginate(
+            SortBy="CreationTime",
+            SortOrder="Descending",
+            PaginationConfig={"MaxItems": MAX_TRAINING_JOBS_SAMPLED},
+        ):
+            for summary in page.get("TrainingJobSummaries", []):
+                job_name = summary.get("TrainingJobName")
+                if not job_name:
+                    continue
+                jobs_sampled += 1
+                try:
+                    detail = sagemaker_client.describe_training_job(
+                        TrainingJobName=job_name
+                    )
+                except Exception as error:
+                    describe_errors.append(
+                        {
+                            "name": job_name,
+                            "label": get_assessment_error_label(error),
+                        }
+                    )
+                    continue
+
+                vpc_config = detail.get("VpcConfig")
+                subnets = (
+                    vpc_config.get("Subnets") if isinstance(vpc_config, dict) else None
+                )
+                isolated = detail.get("EnableNetworkIsolation") is True
+                if subnets:
+                    jobs_in_vpc.append(
+                        {
+                            "name": job_name,
+                            "subnets": list(subnets),
+                            "isolated": isolated,
+                        }
+                    )
+                else:
+                    jobs_without_vpc.append({"name": job_name, "isolated": isolated})
+
+        if jobs_sampled == 0:
+            findings["csv_data"].append(
+                create_finding(
+                    check_id="SM-33",
+                    finding_name=TRAINING_NETWORK_BOUNDARY_FINDING,
+                    finding_details=(
+                        "No SageMaker training jobs found in "
+                        f"{region or 'this region'}."
+                    ),
+                    resolution="No action required",
+                    reference=TRAINING_NETWORK_BOUNDARY_REFERENCE,
+                    severity="Informational",
+                    status="N/A",
+                    region=region,
+                )
+            )
+            return findings
+
+        for entry in jobs_without_vpc[:20]:
+            isolation_note = (
+                " Network isolation is on, which blocks the container's own "
+                "egress but leaves it outside the customer VPC."
+                if entry["isolated"]
+                else " Network isolation is off as well."
+            )
+            findings["csv_data"].append(
+                create_finding(
+                    check_id="SM-33",
+                    finding_name=TRAINING_NETWORK_BOUNDARY_FINDING,
+                    finding_details=(
+                        f"Training job '{entry['name']}' ran with no VpcConfig, so "
+                        "it ran in the SageMaker-managed network."
+                        f"{isolation_note}"
+                    ),
+                    resolution=TRAINING_NETWORK_BOUNDARY_RESOLUTION,
+                    reference=TRAINING_NETWORK_BOUNDARY_REFERENCE,
+                    severity="Medium",
+                    status="Failed",
+                    region=region,
+                )
+            )
+
+        if len(jobs_without_vpc) > 20:
+            findings["csv_data"].append(
+                create_finding(
+                    check_id="SM-33",
+                    finding_name=TRAINING_NETWORK_BOUNDARY_FINDING,
+                    finding_details=(
+                        f"{len(jobs_without_vpc)} of the {jobs_sampled} most recent "
+                        "training jobs ran with no VpcConfig (the first 20 are "
+                        "reported individually above)."
+                    ),
+                    resolution=TRAINING_NETWORK_BOUNDARY_RESOLUTION,
+                    reference=TRAINING_NETWORK_BOUNDARY_REFERENCE,
+                    severity="Medium",
+                    status="Failed",
+                    region=region,
+                )
+            )
+
+        if jobs_in_vpc:
+            described = "; ".join(
+                "{} in {}".format(entry["name"], ", ".join(entry["subnets"][:3]))
+                for entry in jobs_in_vpc[:3]
+            )
+            findings["csv_data"].append(
+                create_finding(
+                    check_id="SM-33",
+                    finding_name=TRAINING_NETWORK_BOUNDARY_FINDING,
+                    finding_details=(
+                        f"{len(jobs_in_vpc)} of the {jobs_sampled} most recent "
+                        f"training jobs ran in customer subnets: {described}. "
+                        "Whether those subnets are private, and whether the job "
+                        "needed outbound access at all, is a workload decision the "
+                        "owner still has to confirm."
+                    ),
+                    resolution=(
+                        "No action required on the VPC attachment. Confirm the "
+                        "subnets have no route to an internet gateway."
+                    ),
+                    reference=TRAINING_NETWORK_BOUNDARY_REFERENCE,
+                    severity="Medium",
+                    status="Passed",
+                    region=region,
+                )
+            )
+
+        for entry in describe_errors[:5]:
+            findings["csv_data"].append(
+                create_finding(
+                    check_id="SM-33",
+                    finding_name=TRAINING_NETWORK_BOUNDARY_FINDING,
+                    finding_details=(
+                        f"Training job '{entry['name']}' could not be assessed for "
+                        f"network configuration. Assessment error: {entry['label']}."
+                    ),
+                    resolution="Grant sagemaker:DescribeTrainingJob and retry.",
+                    reference=TRAINING_NETWORK_BOUNDARY_REFERENCE,
+                    severity="Informational",
+                    status="N/A",
+                    region=region,
+                )
+            )
+
+        return findings
+
+    except Exception as error:
+        logger.error(
+            f"Error in check_sagemaker_training_job_network_boundary: {str(error)}",
+            exc_info=True,
+        )
+        return {
+            "csv_data": [
+                create_finding(
+                    check_id="SM-33",
+                    finding_name=TRAINING_NETWORK_BOUNDARY_FINDING,
+                    finding_details=build_could_not_assess_detail(error, region),
+                    resolution=COULD_NOT_ASSESS_RESOLUTION,
+                    reference=TRAINING_NETWORK_BOUNDARY_REFERENCE,
+                    severity="Informational",
+                    status="N/A",
+                    region=region,
+                )
+            ]
+        }
+
+
+CREATION_GUARDRAIL_FINDING = "SageMaker Creation Guardrail"
+CREATION_GUARDRAIL_REFERENCE = (
+    "https://docs.aws.amazon.com/sagemaker/latest/dg/security_iam_service-with-iam.html"
+)
+
+SAGEMAKER_CREATION_ACTIONS = (
+    "sagemaker:createtrainingjob",
+    "sagemaker:createmodel",
+    "sagemaker:createendpoint",
+    "sagemaker:createendpointconfig",
+    "sagemaker:createnotebookinstance",
+    "sagemaker:createprocessingjob",
+    "sagemaker:createtransformjob",
+    "sagemaker:createhyperparametertuningjob",
+    "sagemaker:createautomljob",
+    "sagemaker:createautomljobv2",
+)
+
+# Each guardrail category and the SageMaker condition keys that enforce it at
+# creation time. Every key was confirmed to exist in the sagemaker service
+# authorization vocabulary before being listed here.
+SAGEMAKER_CREATION_GUARDRAILS = (
+    (
+        "encryption",
+        (
+            "sagemaker:volumekmskey",
+            "sagemaker:outputkmskey",
+            "sagemaker:intercontainertrafficencryption",
+        ),
+        "sagemaker:VolumeKmsKey, sagemaker:OutputKmsKey or "
+        "sagemaker:InterContainerTrafficEncryption",
+    ),
+    (
+        "approved network",
+        (
+            "sagemaker:vpcsubnets",
+            "sagemaker:vpcsecuritygroupids",
+            "sagemaker:networkisolation",
+        ),
+        "sagemaker:VpcSubnets, sagemaker:VpcSecurityGroupIds or "
+        "sagemaker:NetworkIsolation",
+    ),
+    (
+        "no direct internet access",
+        ("sagemaker:directinternetaccess",),
+        "sagemaker:DirectInternetAccess",
+    ),
+)
+
+
+def _sm_organization_policy_context() -> Dict[str, Any]:
+    """
+    Resolve whether organization policy documents can be read from this account.
+
+    ListPolicies and DescribePolicy answer only in the management account or a
+    delegated administrator, so a member-account run has to report the control as
+    unassessed instead of reporting the policy as absent.
+    """
+    context = {"readable": False, "detail": "", "resolution": "", "account": ""}
+
+    orgs_client = boto3.client("organizations", config=boto3_config)
+    try:
+        org_info = orgs_client.describe_organization()
+        master_account_id = org_info["Organization"]["MasterAccountId"]
+        context["account"] = boto3.client(
+            "sts", config=boto3_config
+        ).get_caller_identity()["Account"]
+    except ClientError as error:
+        error_code = error.response.get("Error", {}).get("Code", "")
+        if error_code == "AWSOrganizationsNotInUseException":
+            context["detail"] = (
+                "AWS Organizations is not in use for this account, so no service "
+                "control policy can exist to enforce this control"
+            )
+            context["resolution"] = (
+                "Enable AWS Organizations if an organization-wide preventive "
+                "control is required."
+            )
+            return context
+        if error_code in ACCESS_DENIED_ERROR_CODES:
+            context["detail"] = (
+                "the organization could not be read "
+                f"({get_assessment_error_label(error)}), so service control "
+                "policies were not enumerated"
+            )
+            context["resolution"] = (
+                "Grant organizations:DescribeOrganization, "
+                "organizations:ListPolicies and organizations:DescribePolicy to "
+                "the assessment role."
+            )
+            return context
+        raise
+
+    if context["account"] != master_account_id:
+        context["detail"] = (
+            "service control policy documents are readable only from the "
+            "organization management account or a delegated administrator, and "
+            f"this assessment ran in account {context['account']}"
+        )
+        context["resolution"] = (
+            "Run the assessment from the organization management account to "
+            "assess this preventive control."
+        )
+        return context
+
+    context["readable"] = True
+    return context
+
+
+def get_sagemaker_scp_inventory() -> Dict[str, Any]:
+    """Read every service control policy document once."""
+    inventory = {"items": [], "errors": [], "list_error": None}
+    orgs_client = boto3.client("organizations", config=boto3_config)
+
+    try:
+        policies = []
+        paginator = orgs_client.get_paginator("list_policies")
+        for page in paginator.paginate(Filter="SERVICE_CONTROL_POLICY"):
+            policies.extend(page.get("Policies", []))
+    except Exception as error:
+        inventory["list_error"] = str(error)
+        return inventory
+
+    for policy in policies:
+        policy_id = policy.get("Id")
+        if not policy_id:
+            continue
+        policy_name = policy.get("Name") or policy_id
+        try:
+            policy_detail = orgs_client.describe_policy(PolicyId=policy_id)
+            content = (
+                policy_detail.get("Policy", {}).get("Content")
+                if isinstance(policy_detail, dict)
+                else None
+            )
+        except Exception as error:
+            inventory["errors"].append(f"policy '{policy_name}': {str(error)}")
+            continue
+        inventory["items"].append(
+            {"name": policy_name, "id": policy_id, "content": content}
+        )
+
+    return inventory
+
+
+def _statement_denies_sagemaker_creation(statement: Dict[str, Any]) -> bool:
+    """Return whether a Deny statement reaches a SageMaker creation action."""
+    if str(statement.get("Effect", "")).upper() != "DENY":
+        return False
+    for action in _policy_values(statement.get("Action")) + _policy_values(
+        statement.get("NotAction")
+    ):
+        normalized = action.lower()
+        if normalized in SAGEMAKER_CREATION_ACTIONS:
+            return True
+        if normalized in ("*", "sagemaker:*", "sagemaker:create*"):
+            return True
+    return False
+
+
+def _creation_guard_strength(statement: Dict[str, Any], keys: tuple) -> Optional[str]:
+    """
+    Classify how one Deny statement constrains a creation parameter.
+
+    Returns "enforced" for a Deny that fires when the parameter is absent or
+    holds a value other than the approved one, "ambiguous" for a Deny that names
+    one specific value (whether that value is the non-compliant one depends on
+    the value, which this check does not interpret), and None when the statement
+    does not mention the parameter at all.
+    """
+    condition = statement.get("Condition", {})
+    if not isinstance(condition, dict):
+        return None
+    strength = None
+    for operator, condition_keys in condition.items():
+        if not isinstance(condition_keys, dict):
+            continue
+        operator_name = str(operator).lower()
+        for key, value in condition_keys.items():
+            if str(key).lower() not in keys:
+                continue
+            values = [str(item).lower() for item in _policy_values(value)]
+            if operator_name.endswith("null") and "true" in values:
+                return "enforced"
+            if "not" in operator_name:
+                return "enforced"
+            if operator_name.endswith("bool") and "false" in values:
+                return "enforced"
+            strength = "ambiguous"
+    return strength
+
+
+def check_sagemaker_creation_guardrails(
+    region: str = "", scp_inventory: Dict[str, Any] = None
+) -> Dict[str, Any]:
+    """
+    SM-34: Verify a service control policy blocks creation of unencrypted,
+    internet-exposed or non-VPC SageMaker resources (AIR-SGM-TRN-08).
+
+    One verdict per guardrail category, because an organization commonly enforces
+    encryption at creation and leaves the network parameters unguarded.
+    """
+    logger.debug("Starting check for SageMaker creation guardrails")
+    findings = {"csv_data": []}
+    try:
+        context = _sm_organization_policy_context()
+        if not context["readable"]:
+            findings["csv_data"].append(
+                create_finding(
+                    check_id="SM-34",
+                    finding_name=CREATION_GUARDRAIL_FINDING,
+                    finding_details=(
+                        "Creation guardrails for SageMaker were not assessed: "
+                        f"{context['detail']}."
+                    ),
+                    resolution=context["resolution"] or COULD_NOT_ASSESS_RESOLUTION,
+                    reference=CREATION_GUARDRAIL_REFERENCE,
+                    severity="Informational",
+                    status="N/A",
+                    region=region,
+                )
+            )
+            return findings
+
+        inventory = (
+            scp_inventory
+            if scp_inventory is not None
+            else get_sagemaker_scp_inventory()
+        )
+        if inventory.get("list_error"):
+            findings["csv_data"].append(
+                create_finding(
+                    check_id="SM-34",
+                    finding_name=CREATION_GUARDRAIL_FINDING,
+                    finding_details=(
+                        "Service control policies could not be listed, so SageMaker "
+                        "creation guardrails were not assessed."
+                    ),
+                    resolution=(
+                        "Grant organizations:ListPolicies and "
+                        "organizations:DescribePolicy to the assessment role."
+                    ),
+                    reference=CREATION_GUARDRAIL_REFERENCE,
+                    severity="Informational",
+                    status="N/A",
+                    region=region,
+                )
+            )
+            return findings
+
+        # Collect, per category, which policies enforce it and which only name a
+        # specific value for it.
+        enforcing = {name: [] for name, _, _ in SAGEMAKER_CREATION_GUARDRAILS}
+        ambiguous = {name: [] for name, _, _ in SAGEMAKER_CREATION_GUARDRAILS}
+
+        for item in inventory.get("items", []):
+            statements = _sm_policy_statements(item.get("content"))
+            for statement in statements:
+                if not _statement_denies_sagemaker_creation(statement):
+                    continue
+                for category, keys, _ in SAGEMAKER_CREATION_GUARDRAILS:
+                    strength = _creation_guard_strength(statement, keys)
+                    if strength == "enforced":
+                        if item["name"] not in enforcing[category]:
+                            enforcing[category].append(item["name"])
+                    elif strength == "ambiguous":
+                        if item["name"] not in ambiguous[category]:
+                            ambiguous[category].append(item["name"])
+
+        for category, _, key_names in SAGEMAKER_CREATION_GUARDRAILS:
+            if enforcing[category]:
+                findings["csv_data"].append(
+                    create_finding(
+                        check_id="SM-34",
+                        finding_name=CREATION_GUARDRAIL_FINDING,
+                        finding_details=(
+                            f"Service control policy {', '.join(sorted(enforcing[category])[:3])} "
+                            f"denies SageMaker resource creation unless the "
+                            f"{category} parameter is set, using {key_names}. "
+                            "Which organizational units that policy is attached to "
+                            "is not read by this check."
+                        ),
+                        resolution=(
+                            "No action required on the policy. Confirm it is "
+                            "attached to every organizational unit that runs "
+                            "SageMaker workloads."
+                        ),
+                        reference=CREATION_GUARDRAIL_REFERENCE,
+                        severity="Medium",
+                        status="Passed",
+                        region=region,
+                    )
+                )
+            elif ambiguous[category]:
+                findings["csv_data"].append(
+                    create_finding(
+                        check_id="SM-34",
+                        finding_name=CREATION_GUARDRAIL_FINDING,
+                        finding_details=(
+                            f"Service control policy {', '.join(sorted(ambiguous[category])[:3])} "
+                            f"denies SageMaker resource creation for one named "
+                            f"value of {key_names}, so whether the {category} "
+                            "guardrail holds depends on that value. This check "
+                            "recognises the deny-when-absent form (Null true), a "
+                            "negated operator, or Bool false."
+                        ),
+                        resolution=(
+                            "Restate the deny so it fires when the parameter is "
+                            "absent, using Null with value true or a negated "
+                            "operator naming the approved values."
+                        ),
+                        reference=CREATION_GUARDRAIL_REFERENCE,
+                        severity="Informational",
+                        status="N/A",
+                        region=region,
+                    )
+                )
+            else:
+                findings["csv_data"].append(
+                    create_finding(
+                        check_id="SM-34",
+                        finding_name=CREATION_GUARDRAIL_FINDING,
+                        finding_details=(
+                            f"None of the {len(inventory.get('items', []))} service "
+                            "control policies read denies SageMaker resource "
+                            f"creation on the {category} parameter: no Deny "
+                            f"statement on a SageMaker create action carries "
+                            f"{key_names}. A non-compliant resource can be created "
+                            "and is only detected afterwards."
+                        ),
+                        resolution=(
+                            "Add a service control policy that denies the SageMaker "
+                            f"create actions when {key_names} is absent, using Null "
+                            "with value true, and attach it to the organizational "
+                            "units that run SageMaker workloads."
+                        ),
+                        reference=CREATION_GUARDRAIL_REFERENCE,
+                        severity="Medium",
+                        status="Failed",
+                        region=region,
+                    )
+                )
+
+        for error_detail in inventory.get("errors", [])[:5]:
+            findings["csv_data"].append(
+                create_finding(
+                    check_id="SM-34",
+                    finding_name=CREATION_GUARDRAIL_FINDING,
+                    finding_details=(
+                        f"A service control policy document could not be read, so "
+                        f"it was not searched for SageMaker creation guardrails: "
+                        f"{error_detail.split(':')[0]}."
+                    ),
+                    resolution="Grant organizations:DescribePolicy and retry.",
+                    reference=CREATION_GUARDRAIL_REFERENCE,
+                    severity="Informational",
+                    status="N/A",
+                    region=region,
+                )
+            )
+
+        return findings
+
+    except Exception as error:
+        logger.error(
+            f"Error in check_sagemaker_creation_guardrails: {str(error)}",
+            exc_info=True,
+        )
+        return {
+            "csv_data": [
+                create_finding(
+                    check_id="SM-34",
+                    finding_name=CREATION_GUARDRAIL_FINDING,
+                    finding_details=build_could_not_assess_detail(error, region),
+                    resolution=COULD_NOT_ASSESS_RESOLUTION,
+                    reference=CREATION_GUARDRAIL_REFERENCE,
+                    severity="Informational",
+                    status="N/A",
+                    region=region,
+                )
+            ]
+        }
+
+
 def handle_aws_throttling(func, *args, **kwargs):
     """
     Handle AWS API throttling with exponential backoff
@@ -4744,6 +6517,13 @@ def lambda_handler(event, context):
                 )
             )
             all_findings.append(sagemaker_iam_findings)
+
+            # Service control policies are organization-wide, so this preventive
+            # control is assessed once and not once per scanned region.
+            logger.info("Running SageMaker creation guardrail check (SM-34)")
+            all_findings.append(
+                check_sagemaker_creation_guardrails(region=GLOBAL_REGION_LABEL)
+            )
 
         # Verify SageMaker is available in this region
         try:
@@ -5008,6 +6788,17 @@ def lambda_handler(event, context):
             check_model_package_group_policy_exposure(
                 region=region, model_package_groups=model_package_groups
             )
+        )
+
+        logger.info("Running SageMaker endpoint data capture check (SM-31)")
+        all_findings.append(check_sagemaker_endpoint_data_capture(region=region))
+
+        logger.info("Running SageMaker AWS Config coverage check (SM-32)")
+        all_findings.append(check_sagemaker_config_compliance_evaluation(region=region))
+
+        logger.info("Running SageMaker training job network boundary check (SM-33)")
+        all_findings.append(
+            check_sagemaker_training_job_network_boundary(region=region)
         )
 
         # Generate and upload report

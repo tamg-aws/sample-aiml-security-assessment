@@ -6,29 +6,27 @@ Generated 2026-09-25 by `aisf-parity/build_ledger.py`. Do not hand-edit: change 
 
 | verdict | rows | meaning |
 |---|---|---|
-| covered | 20 | an incumbent already asserts this; nothing to write |
-| tighten / extend | 16 | incumbent name is honest, its assertion is narrower; extend it in place |
+| covered | 28 | an incumbent already asserts this; nothing to write |
+| tighten / extend | 12 | incumbent name is honest, its assertion is narrower; extend it in place |
 | tighten / new_id | 5 | incumbent name claims more than it asserts; allocate a new id beside it |
-| new | 22 | no incumbent asserts any part of it |
+| new | 18 | no incumbent asserts any part of it |
 | not_implementable | 4 | flagged machine_checkable in the ledger but is not checkable from configuration |
 | unassessed | 11 | in scope, dedup pass not yet run |
 
-**38 new check functions and 16 extensions to existing checks.**
+**34 new check functions and 12 extensions to existing checks.**
 
 ## New IAM actions required
 
 - `cloudtrail:GetEventSelectors` — AIR-ACR-MEM-12, AIR-ACR-OBS-02
 - `cloudtrail:ListTrails` — AIR-ACR-MEM-12, AIR-ACR-OBS-02
-- `config:DescribeConfigRules` — AIR-SGM-GOV-10
-- `config:DescribeConfigurationRecorders` — AIR-SGM-GOV-10
 - `ec2:DescribeSecurityGroups` — AIR-ACR-RT-08, AIR-FND-NET-06
 - `logs:DescribeAccountPolicies` — AIR-ACR-OBS-04
 - `logs:GetDataProtectionPolicy` — AIR-ACR-OBS-04
 - `oam:GetSinkPolicy` — AIR-ACR-OBS-06
 - `oam:ListSinks` — AIR-ACR-OBS-06
 - `organizations:DescribeEffectivePolicy` — AIR-FND-DAT-09
-- `organizations:DescribePolicy` — AIR-SGM-TRN-08, AIR-ACR-GW-02, AIR-ACR-ID-04
-- `organizations:ListPolicies` — AIR-SGM-TRN-08, AIR-ACR-GW-02, AIR-ACR-ID-04
+- `organizations:DescribePolicy` — AIR-ACR-GW-02, AIR-ACR-ID-04
+- `organizations:ListPolicies` — AIR-ACR-GW-02, AIR-ACR-ID-04
 - `s3:GetBucketPolicy` — AIR-FND-DAT-02
 
 ## BDR (19 controls)
@@ -59,16 +57,16 @@ Generated 2026-09-25 by `aisf-parity/build_ledger.py`. Do not hand-edit: change 
 
 | control | verdict | do | module | incumbent | gap |
 |---|---|---|---|---|---|
+| `AIR-SGM-EP-01` | covered | — | `sagemaker_assessments` | `SM-11` | — |
+| `AIR-SGM-EP-02` *(workload-specific)* | covered | — | `sagemaker_assessments` | `SM-02` | — |
+| `AIR-SGM-EP-06` | covered | — | `sagemaker_assessments` | `SM-31` | — |
 | `AIR-SGM-EP-08` | covered | — | `sagemaker_assessments` | `SM-18` | — |
+| `AIR-SGM-GOV-01` | covered | — | `sagemaker_assessments` | `SM-22` | — |
+| `AIR-SGM-GOV-10` | covered | — | `sagemaker_assessments` | `SM-32` | — |
+| `AIR-SGM-TRN-01` | covered | — | `sagemaker_assessments` | `SM-33` | — |
+| `AIR-SGM-TRN-02` | covered | — | `sagemaker_assessments` | `SM-03` | — |
 | `AIR-SGM-TRN-05` | covered | — | `sagemaker_assessments` | `SM-09`, `SM-01`, `SM-03` | all three legs present |
-| `AIR-SGM-EP-01` | tighten | extend | `sagemaker_assessments` | `SM-11` | SM-11 has the EnableNetworkIsolation leg, not the VpcConfig leg |
-| `AIR-SGM-EP-02` *(workload-specific)* | tighten | extend | `sagemaker_assessments` | `SM-02` | SM-02 scans IAM permissions but never tests resource-scoped sagemaker:InvokeEndpoint against a named endpoint ARN; SageMaker endpoints carry no resource-based policy, so the identity policy is the whole surface |
-| `AIR-SGM-GOV-01` | tighten | extend | `sagemaker_assessments` | `SM-22` | SM-22 has approval status, not approver metadata |
-| `AIR-SGM-TRN-02` | tighten | extend | `sagemaker_assessments` | `SM-03` | SM-03 has the KMS legs, not inter-container traffic encryption |
-| `AIR-SGM-EP-06` | new | — | `sagemaker_assessments` | — | DataCaptureConfig; SM-23 reads monitoring schedules, not data capture |
-| `AIR-SGM-GOV-10` | new | — | `sagemaker_assessments` | — | Config recorder state; no incumbent in this module reads config |
-| `AIR-SGM-TRN-01` | new | — | `sagemaker_assessments` | — | training-job network isolation; SM-21 does this for AutoML jobs only |
-| `AIR-SGM-TRN-08` | new | — | `sagemaker_assessments` | — | SCP asserting encryption/no-internet/VPC at creation; the corpus already enumerates SCPs in two modules, so the cost is the Organizations read, not a new mechanism |
+| `AIR-SGM-TRN-08` | covered | — | `sagemaker_assessments` | `SM-34` | — |
 | `AIR-SGM-EP-03` | not_implementable | — | — | — | slug names sagemaker_endpoint_intercontainer_encryption_enabled but EnableInterContainerTrafficEncryption is absent from DescribeEndpointConfig and present only on DescribeTrainingJob; do not port as written, fix in the AISF repo first |
 
 ## ACR (37 controls)

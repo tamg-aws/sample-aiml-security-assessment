@@ -23,12 +23,16 @@ row's own Status column carries the verdict.
 
 AISF_COMPLIANCE_MAP = {
     "SM-01": "AISF AIR-SGM-TRN-05 (1 of 3 checks)",
-    "SM-02": "AISF AIR-SGM-EP-02 (partial)",
-    "SM-03": "AISF AIR-SGM-TRN-02 (partial) | AISF AIR-SGM-TRN-05 (1 of 3 checks)",
+    "SM-02": "AISF AIR-SGM-EP-02",
+    "SM-03": "AISF AIR-SGM-TRN-02 | AISF AIR-SGM-TRN-05 (1 of 3 checks)",
     "SM-09": "AISF AIR-SGM-TRN-05 (1 of 3 checks)",
-    "SM-11": "AISF AIR-SGM-EP-01 (partial)",
+    "SM-11": "AISF AIR-SGM-EP-01",
     "SM-18": "AISF AIR-SGM-EP-08",
-    "SM-22": "AISF AIR-SGM-GOV-01 (partial)",
+    "SM-22": "AISF AIR-SGM-GOV-01",
+    "SM-31": "AISF AIR-SGM-EP-06",
+    "SM-32": "AISF AIR-SGM-GOV-10",
+    "SM-33": "AISF AIR-SGM-TRN-01",
+    "SM-34": "AISF AIR-SGM-TRN-08",
 }
 
 
