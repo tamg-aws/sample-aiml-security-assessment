@@ -4301,6 +4301,64 @@ class TestBR46KnowledgeBaseSourceClassification:
         assert "sensitivity score 42" in passed[0]["Finding_Details"]
         assert "1 of 2 knowledge base source bucket(s)" in passed[0]["Finding_Details"]
 
+    def test_br46_monitored_account_bucket_no_knowledge_base_uses_is_not_counted(self):
+        """The Macie inventory is wider than the source set on any real account."""
+        findings = self._two_bucket_estate(
+            macie_buckets=[
+                {
+                    "bucketName": "support-bucket",
+                    "automatedDiscoveryMonitoringStatus": "MONITORED",
+                },
+                {
+                    "bucketName": "hr-bucket",
+                    "automatedDiscoveryMonitoringStatus": "NOT_MONITORED",
+                },
+                {
+                    "bucketName": "unrelated-bucket",
+                    "automatedDiscoveryMonitoringStatus": "MONITORED",
+                },
+            ]
+        )
+
+        failed = [f for f in findings if f["Status"] == "Failed"]
+        passed = [f for f in findings if f["Status"] == "Passed"]
+        assert len(failed) == 1
+        assert "hr-bucket is NOT_MONITORED" in failed[0]["Finding_Details"]
+        assert len(passed) == 1
+        # The denominator counts knowledge base source buckets, not the account's
+        # buckets, so a third monitored bucket cannot inflate it.
+        assert "1 of 2 knowledge base source bucket(s)" in passed[0]["Finding_Details"]
+        assert not any("unrelated-bucket" in f["Finding_Details"] for f in findings)
+
+    def test_br46_unmonitored_source_fails_while_another_bucket_is_monitored(self):
+        findings = self._run(
+            knowledge_bases=[{"knowledgeBaseId": "kb-2", "name": "hr-kb"}],
+            data_sources={"kb-2": [{"dataSourceId": "ds-2", "name": "hr-docs"}]},
+            data_source_detail={
+                "ds-2": self._s3_source("ds-2", "hr-docs", "hr-bucket")
+            },
+            macie_buckets=[
+                {
+                    "bucketName": "unrelated-bucket",
+                    "automatedDiscoveryMonitoringStatus": "MONITORED",
+                },
+                {
+                    "bucketName": "hr-bucket",
+                    "automatedDiscoveryMonitoringStatus": "NOT_MONITORED",
+                },
+            ],
+        )
+
+        # Discovery being on and some bucket being monitored is not coverage of the
+        # one bucket a knowledge base ingests from, so there is no Passed here.
+        assert [f["Status"] for f in findings] == ["Failed"]
+        assert "hr-bucket is NOT_MONITORED" in findings[0]["Finding_Details"]
+        assert (
+            "data source 'hr-docs' in knowledge base 'hr-kb'"
+            in (findings[0]["Finding_Details"])
+        )
+        assert "unrelated-bucket" not in findings[0]["Finding_Details"]
+
     def test_br46_macie_not_enabled_is_not_a_bucket_failure(self):
         findings = self._two_bucket_estate(
             session_error=_make_client_error(
