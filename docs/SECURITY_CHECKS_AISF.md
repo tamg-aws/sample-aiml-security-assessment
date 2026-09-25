@@ -11,13 +11,20 @@ and the shipped BR/SM/AC/AG check every row is derived from.
   needs no deployment parameter and adds no scan time.
 - **Report location:** the "By Compliance Standard" sidebar section, alongside
   OWASP Top 10 for LLM.
-- **Coverage:** 8 of the 78 in-scope AISF controls are currently derivable from
-  checks that already ship; the remaining 70 are not yet assessed. The parity
+- **Coverage:** 8 of the 78 in-scope AISF controls carry a derived `AISF-` row;
+  the remaining 70 are not yet rendered as a row. A row is a narrower claim than
+  coverage, so read this figure with the ledger census below it: 28 of the 78 are
+  `covered`, all 8 rows sit on `covered` controls, and the other 20 `covered`
+  controls are named by the `Compliance_Frameworks` tag column until each is
+  walked through [Adding a control](#adding-a-control), which allocates an id and
+  writes a per-control section. The 70 without a row are 20 `covered`, 18
+  `tighten`, 18 `new`, 11 `unassessed` and 3 `not_implementable`. The parity
   analysis behind those figures is in
   [`aisf-parity/AISF-WORK-LEDGER.md`](../aisf-parity/AISF-WORK-LEDGER.md).
-- **Traceability:** a further 28 controls are partly covered, too partly to earn
-  an `AISF-` row. Those, and the 8 above, are named on the producer rows
-  themselves by the `Compliance_Frameworks` CSV column described under
+- **Traceability:** 18 controls are `tighten`, covered too partly to earn an
+  `AISF-` row at all. The `Compliance_Frameworks` CSV column names all 46
+  taggable controls on the producer rows themselves, the 28 `covered` and the 18
+  `tighten`, and is described under
   [Traceability column on producer rows](#traceability-column-on-producer-rows).
   A tag carries no verdict.
 

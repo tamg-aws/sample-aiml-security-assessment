@@ -208,10 +208,13 @@ COMPLIANCE_STANDARDS: List[Dict[str, Any]] = [
         "reference_url": GENAI_LENS_URL,
         "section_title": "AWS AI Security Framework Findings",
         "scope_text": (
-            "Scope: 8 of the 78 in-scope AISF controls are currently derivable "
-            "from checks that already ship; the remaining 70 are not yet "
-            "assessed, and their absence from this section is not evidence of "
-            "compliance. These rows restate existing check verdicts under AISF "
+            "Scope: 8 of the 78 in-scope AISF controls carry a derived AISF- "
+            "row; the remaining 70 are not yet rendered as rows, and their "
+            "absence from this section is not evidence of compliance. A row is a "
+            "narrower claim than coverage: 28 of the 78 are covered by checks "
+            "that already ship, and the 20 covered controls without a row are "
+            "named by the Compliance_Frameworks column on the producer rows "
+            "instead. These rows restate existing check verdicts under AISF "
             "control ids, so they are <strong>not</strong> counted in the "
             "framework's 218-check total. AISF-00 marks an account and region "
             "where AISF-relevant checks ran but a mapped source check was "
