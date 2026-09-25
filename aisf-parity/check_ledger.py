@@ -70,7 +70,7 @@ from aisf_mappings import (  # noqa: E402
     SEVERITY_COLLAPSE_NOTE,
     derive_aisf_findings,
 )
-from build_ledger import render_markdown  # noqa: E402
+from build_ledger import ROWS, render_markdown  # noqa: E402
 from gen_compliance_maps import check_owners  # noqa: E402
 from report_template import COMPLIANCE_STANDARDS  # noqa: E402
 
@@ -203,6 +203,37 @@ def figure_problems(source, values, found):
     return problems
 
 
+def figure_drift(source, values, found, computed):
+    """Absence, copies that disagree with each other, and a copy the gate refutes.
+
+    Three outcomes and not two. The middle one is the fail-open case: an earlier
+    copy carrying the right number answered for a wrong published paragraph while
+    the whole battery passed.
+
+    Used for both figure families gate 14 asserts, so the census messages cannot
+    drift in shape from the tag-column ones. Gate 12 keeps figure_problems()
+    instead: there the computed side is three separate legs printed below it, so
+    those messages have no single computed value to name.
+    """
+    problems = []
+    for label, want in values.items():
+        if not found[label]:
+            problems.append(
+                f"{source} publishes no {label} figure these patterns can find; "
+                f"gate 14 computes {computed[label]}"
+            )
+        elif want is None:
+            problems.append(
+                f"{source} publishes {len(found[label])} copies of {label} that "
+                f"disagree: {found[label]}; gate 14 computes {computed[label]}"
+            )
+        elif want != computed[label]:
+            problems.append(
+                f"{source} publishes {label}={want}, gate 14 computes {computed[label]}"
+            )
+    return problems
+
+
 def copies_note(found):
     """`label xN` for every figure, for printing beside the values.
 
@@ -258,9 +289,8 @@ def tag_column_figures(text):
     or two copies that disagree. A reworded sentence that drops a figure drops the
     gate with it instead of quietly stopping the assertion.
 
-    The qualifier census (bare/partial/joint) is deliberately absent. Gate 14
-    prints it, two tools compute it, and no document publishes it, so there is no
-    published claim to gate.
+    The qualifier census is absent from here because it has its own extractor,
+    census_figures(), and its own sentence sixteen lines further down the file.
     """
     found = figure_occurrences(
         text,
@@ -282,6 +312,54 @@ def tag_column_figures(text):
     }
     out["per_module"] = agreed_mapping(found["per_module"])
     return out, found
+
+
+def census_figures(text):
+    """The qualifier and verdict census a piece of prose publishes, and its copies.
+
+    Five figures in one paragraph of docs/SECURITY_CHECKS_AISF.md, directly under
+    the tag-shape table: the bare/partial/joint qualifier counts, and the
+    covered/tighten verdict counts the sentence reconciles them against. Gate 14
+    computed the first three already and printed them beside a parenthetical
+    claiming no document published them, which was false in the output of the gate
+    the claim was meant to make trustworthy.
+
+    Three things the occurrence counts at this base forced, none of them guessable:
+
+    The digits carry a `(?<![-\\w])` anchor because the example table immediately
+    above the paragraph reads `AISF AIR-BDR-MDL-02 (partial)` and
+    `AISF AIR-SGM-TRN-05 (1 of 3 checks)`. Unanchored, a check id's own suffix is
+    counted as a second copy of the figure -- partial resolves to ['02', '29'] and
+    joint to ['05', '3'] -- so the agreement rule would red on correct prose, and
+    the 05 would be the copy a first-match read returned.
+
+    The flatten is load-bearing for two of the five, not one. Both joint spellings
+    straddle a line break as published (`3\\n`(1 of 3 checks)`` and `all 3\\njoint
+    legs`), so raw extraction finds the joint figure zero times.
+
+    The joint figure is accepted under either spelling and the two are counted
+    separately, so the verdict line prints which one matched: this base writes
+    ``3 `(1 of 3 checks)``` and phase 3's head writes `5 joint`. The copies are
+    pooled and have to agree; none at all under either spelling is a failure, never
+    a skip. Backticks are optional throughout, being markdown and not the claim.
+    """
+    found = figure_occurrences(
+        text,
+        (
+            ("bare", r"(?<![-\w])(\d+) bare"),
+            ("partial", r"(?<![-\w])(\d+) `?\(partial\)`?"),
+            ("joint_as_checks", r"(?<![-\w])(\d+) `?\(1 of \d+ checks\)`?"),
+            ("joint_as_word", r"(?<![-\w])(\d+) joint"),
+            ("covered", r"(?<![-\w])(\d+) `?covered`? controls"),
+            ("tighten", r"remaining (\d+) are `?tighten`?"),
+        ),
+    )
+    found["joint"] = found["joint_as_checks"] + found["joint_as_word"]
+    values = {
+        label: agreed_figure(found[label])
+        for label in ("bare", "partial", "joint", "covered", "tighten")
+    }
+    return values, found
 
 
 def load_aisf_control(rel_path, control_id):
@@ -892,9 +970,10 @@ def main():
     # values the predicate above already computes. A separate gate would recompute
     # them and could then disagree with the line printed here.
     #
-    # The qualifier census stays printed and unasserted: no document publishes it,
-    # and it doubles as a shape check a reader can apply -- `bare` must equal the
-    # number of covered controls with a single incumbent.
+    # The qualifier census is asserted here too, against the paragraph sixteen lines
+    # below the one above. It was printed unasserted under a parenthetical saying no
+    # document published it; the paragraph publishes five figures, and the two
+    # verdict counts among them have already drifted on phase 3's branch.
     computed = {
         "pairs": len(found_pairs),
         "tagged": sum(len(m) for m in maps.values()),
@@ -907,29 +986,11 @@ def main():
     # Re-read rather than reusing gate 13's copy of the text: the gates above rebind
     # names across blocks, and a figure gate that reads the wrong buffer fails open.
     with open(AISF_DOC) as f:
-        published, published_hits = tag_column_figures(f.read())
-    # Three outcomes, not two: no copy of the figure, copies that disagree with each
-    # other, and a copy that disagrees with the gate. The middle one is new and was
-    # the fail-open case -- an earlier copy carrying the right number answered for
-    # the published paragraph. These messages name the computed value too, which is
-    # why gate 14 does not reuse figure_problems() from gate 12.
-    for label, want in published.items():
-        if not published_hits[label]:
-            tag_problems.append(
-                f"SECURITY_CHECKS_AISF.md publishes no {label} figure these patterns "
-                f"can find; gate 14 computes {computed[label]}"
-            )
-        elif want is None:
-            tag_problems.append(
-                f"SECURITY_CHECKS_AISF.md publishes {len(published_hits[label])} "
-                f"copies of {label} that disagree: {published_hits[label]}; gate 14 "
-                f"computes {computed[label]}"
-            )
-        elif want != computed[label]:
-            tag_problems.append(
-                f"SECURITY_CHECKS_AISF.md publishes {label}={want}, gate 14 computes "
-                f"{computed[label]}"
-            )
+        published_text = f.read()
+    published, published_hits = tag_column_figures(published_text)
+    tag_problems += figure_drift(
+        "SECURITY_CHECKS_AISF.md", published, published_hits, computed
+    )
     per_module = " ".join(f"{k}={v}" for k, v in sorted(computed["per_module"].items()))
     census = collections.Counter()
     for module_dir, mapping in maps.items():
@@ -942,19 +1003,41 @@ def main():
                         if m.group(2) is None
                         else ("partial" if m.group(2) == "partial" else "joint")
                     ] += 1
+    # The covered/tighten half of that sentence comes from build_ledger.ROWS, the
+    # hand-authored verdict table, and not from the ledger json rendered out of it:
+    # the json is a generated copy, and gate 15's --check leg is what keeps the two
+    # agreeing. Measured at this base, they do agree -- 78 rows, covered 8,
+    # tighten 28, from either side. ROWS is imported, never built: build() reads the
+    # sibling AISF repo and needs yaml, so a gate resting on it reds in any clone
+    # that lacks that working copy.
+    verdict_census = collections.Counter(r[1] for r in ROWS)
+    computed_census = {
+        "bare": census["bare"],
+        "partial": census["partial"],
+        "joint": census["joint"],
+        "covered": verdict_census["covered"],
+        "tighten": verdict_census["tighten"],
+    }
+    census_published, census_hits = census_figures(published_text)
+    tag_problems += figure_drift(
+        "SECURITY_CHECKS_AISF.md's census paragraph",
+        census_published,
+        census_hits,
+        computed_census,
+    )
     gate(
         "per-module AISF tag maps agree with the ledger both ways",
         not tag_problems,
         f"{len(found_pairs)}/{len(expected_pairs)} check-control pairs over "
         f"{sum(len(m) for m in maps.values())} tagged checks in {len(maps)} modules, "
         f"naming {len({c for _, c in found_pairs})} distinct controls; "
-        f"checks per module {per_module}; qualifiers bare={census['bare']} "
-        f"partial={census['partial']} joint={census['joint']} (printed, not gated: "
-        "no document publishes them); each checked for module ownership, ledger "
+        f"checks per module {per_module}; each checked for module ownership, ledger "
         f"verdict and qualifier; {len(published) - 1} scalar figure(s) + "
-        f"{len(published['per_module'] or {})} per-module figure(s) asserted against "
+        f"{len(published['per_module'] or {})} per-module figure(s) + "
+        f"{len(census_published)} census figure(s) asserted against "
         f"SECURITY_CHECKS_AISF.md, doc={published} vs computed={computed}, "
-        f"copies [{copies_note(published_hits)}]"
+        f"copies [{copies_note(published_hits)}]; census doc={census_published} vs "
+        f"computed={computed_census}, copies [{copies_note(census_hits)}]"
         + (f", bad={tag_problems}" if tag_problems else ""),
     )
 
