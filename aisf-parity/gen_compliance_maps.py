@@ -87,9 +87,12 @@ def generated_name(module):
 # Only these two verdicts name an incumbent that already ships a verdict.
 #   new              - no incumbent exists to tag.
 #   not_implementable - nothing to tag, and nothing will be built.
-#   unassessed       - the 11 FND rows have not had their dedup pass, so their
-#                      "incumbents" are candidates and not yet findings. Tagging
-#                      them would publish a mapping the ledger has not settled.
+#   unassessed       - a row that has not had its dedup pass carries "incumbents"
+#                      that are candidates and not yet findings, so tagging one
+#                      would publish a mapping the ledger has not settled. No row
+#                      holds this verdict today; the FND block, which was the whole
+#                      population of it, is assessed. The verdict stays in the
+#                      vocabulary because the next control batch enters through it.
 TAGGABLE = ("covered", "tighten")
 
 

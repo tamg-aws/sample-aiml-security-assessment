@@ -235,9 +235,9 @@ contributes to, so a reader of `bedrock_security_report_*.csv` can trace a row
 back to the framework. The `Status` column still carries the verdict.
 
 Measured by `check_ledger.py` gate 14, which prints each of these figures on
-every run: 87 check-control pairs over 72 tagged checks in 4 modules, naming 63
-distinct controls. Tagged checks per module are bedrock 17, sagemaker 11,
-agentcore 42, agent_registry 2.
+every run: 109 check-control pairs over 79 tagged checks in 4 modules, naming 72
+distinct controls. Tagged checks per module are bedrock 21, sagemaker 13,
+agentcore 43, agent_registry 2.
 
 ### The qualifier is what makes a `tighten` control safe to name
 
@@ -253,18 +253,27 @@ trusting the literal in the file:
 | `AISF AIR-SGM-TRN-05 (1 of 3 checks)` | the control is covered, but jointly, so no single leg asserts it |
 | `AISF AIR-BDR-MDL-08 (partial)` | the check asserts less than the control requires, and the gap is open in the ledger |
 
-Census at the current head, also printed by gate 14: 43 bare, 3 `(partial)`, 41
+Census at the current head, also printed by gate 14: 43 bare, 25 `(partial)`, 41
 joint. The 43 bare tags plus the 18 jointly covered controls account for the 61
-`covered` controls; the 3 `(partial)` tags fall on the 2 `tighten` controls, one
-of which carries two. A bare tag on a `tighten` row, or a dropped `(1 of N)`,
-fails gate 14 with the row's verdict and incumbent count named.
+`covered` controls; the 25 `(partial)` tags fall on the 11 `tighten` controls,
+unevenly, four of those controls carrying one tag and `AIR-FND-NET-01` carrying
+six. A bare tag on a `tighten` row, or a dropped `(1 of N)`, fails gate 14 with
+the row's verdict and incumbent count named.
 
 A check that contributes to several controls carries them pipe-joined, with the
 `AISF ` prefix repeated on each element so a consumer that splits on `|` gets a
-complete token. `AC-02` names four controls that way, all `(partial)`. `SM-03` is the case that
-mixes forms inside one value, a bare `AIR-SGM-TRN-02` beside
-`AIR-SGM-TRN-05 (1 of 3 checks)`; no check pairs a `(partial)` with a tag of
-another form.
+complete token. 23 checks name more than one control. `AC-02` names four, and
+between them they use every form the vocabulary has: bare on `AIR-ACR-EVAL-01`
+and on `AIR-ACR-PAY-01`, joint on `AIR-ACR-RT-03 (1 of 2 checks)`, and
+`AIR-FND-IAM-05 (partial)`.
+
+Mixing a `(partial)` with a tag of another form inside one value is now the
+common case, 15 of those 23, and it is a direct consequence of the FND block:
+a foundational control such as `AIR-FND-NET-01` is asserted in part by checks
+whose own service control they fully assert, so the same check carries a bare
+tag and a `(partial)` one. Nothing in the vocabulary forbids the mix, and gate
+14 derives each element's form from that element's own ledger row, so a value
+is judged per tag and never as a whole.
 
 ### Generated, not hand-written
 

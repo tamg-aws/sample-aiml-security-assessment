@@ -703,37 +703,52 @@ ROWS = [
         [],
         4,
     ),
-    # ------- FND, AI-resource subject: 11 controls, dedup pass not yet run -------
+    # ------- FND, AI-resource subject: 11 controls -------
     (
         "AIR-FND-DAT-01",
-        UNASSESSED,
-        None,
-        "bedrock_assessments",
-        ["BR-20"],
-        "candidate incumbent only; dedup not run. BR-20 covers the knowledge base's vector "
-        "store keys. FS-65 was listed beside it and is not an incumbent for encryption at "
-        'rest: its finding is "KB Data Source Buckets Missing S3 Event Notifications", which '
-        "asserts notification wiring and says nothing about keys, and it runs only when the "
-        "execution input carries enableResponsibleAIGRC. The data-source bucket leg stays "
-        "open and is writable here, since this function already holds "
+        TIGHTEN,
+        EXTEND,
+        ["bedrock_assessments", "sagemaker_assessments"],
+        ["BR-20", "BR-11", "BR-17", "SM-03"],
+        "four checks cover the stores this control names: BR-20 the knowledge "
+        "base's vector store keys, BR-11 and BR-17 the custom model artefacts, "
+        "SM-03 the training output and volume keys. The unread store is the one "
+        "the ingested objects sit in before any of those exist -- the knowledge "
+        "base's own data source bucket. FS-65 was listed beside BR-20 and is not "
+        'an incumbent for encryption at rest: its finding is "KB Data Source '
+        'Buckets Missing S3 Event Notifications", which asserts notification '
+        "wiring and says nothing about keys, and it runs only when the execution "
+        "input carries enableResponsibleAIGRC. EXTEND and not new_id because the "
+        "bucket is a second resource inside the subject BR-20's name already "
+        "claims, the knowledge base, so that name stays accurate once the leg "
+        "lands. It costs no IAM either: the bedrock function already holds "
         "s3:GetEncryptionConfiguration",
         [],
         5,
     ),
     (
         "AIR-FND-DAT-02",
-        UNASSESSED,
+        NEW,
         None,
         "bedrock_assessments",
         [],
-        "needs s3:GetBucketPolicy, which no function is granted",
+        "no check in any producer reads a bucket policy. s3:GetBucketPolicy is "
+        "granted to no function, and neither aws:SecureTransport nor s3:TlsVersion "
+        "appears anywhere in the corpus, so no incumbent asserts any part of this "
+        "control. On S3 the assertion is a bucket-policy Deny for requests that "
+        "are not TLS, over the buckets the AI data path reads and writes. The "
+        "check reports which principals that Deny reaches rather than passing on "
+        "its presence: a Deny written without regard for the path a service takes "
+        "when it reads under a customer-supplied execution role can strand a "
+        "knowledge base sync, and an operator who cannot see the principal scope "
+        "cannot tell a correct policy from one about to break ingestion",
         ["s3:GetBucketPolicy"],
         5,
     ),
     (
         "AIR-FND-DAT-03",
-        UNASSESSED,
-        None,
+        TIGHTEN,
+        EXTEND,
         "bedrock_assessments",
         ["BR-46"],
         "re-hosted off responsible_ai_grc_assessments, which the state machine invokes only "
@@ -744,101 +759,222 @@ ROWS = [
         "already holds macie2:GetMacieSession, GetAutomatedDiscoveryConfiguration and "
         "DescribeBuckets. The unwritten leg is the one the control keeps separate: automated "
         "discovery samples objects, so per-object assurance over what is about to be ingested "
-        "needs a targeted discovery job over the actual source prefixes, which would take "
-        "macie2:ListClassificationJobs and DescribeClassificationJob, granted to no function "
-        "today. The subject is also wider than knowledge bases, and the pre-ingest Comprehend "
-        "detection the control recommends is a call the application makes, not a "
-        "configuration this scanner can read",
-        ["macie2:ListClassificationJobs", "macie2:DescribeClassificationJob"],
+        "needs a targeted discovery job over the actual source prefixes, which takes "
+        "macie2:ListClassificationJobs, granted to no function today. One action and "
+        "not two: DescribeClassificationJob was claimed here as well and is not "
+        "needed, because a ListClassificationJobs item already carries "
+        "bucketDefinitions[].buckets[], bucketCriteria.includes/excludes, jobType "
+        "and jobStatus, which is every field deciding whether a job covers the "
+        "source prefixes and is still running. The subject is also wider than "
+        "knowledge bases, and the pre-ingest Comprehend detection the control "
+        "recommends is a call the application makes, not a configuration this "
+        "scanner can read",
+        ["macie2:ListClassificationJobs"],
         5,
     ),
     (
         "AIR-FND-DAT-09",
-        UNASSESSED,
+        NEW,
         None,
         "bedrock_assessments",
         [],
-        "AISERVICES_OPT_OUT_POLICY via DescribeEffectivePolicy, which no function is granted; "
-        "the AI-services opt-out is the most AI-specific control in the FND area",
+        "the AI-services opt-out is the most AI-specific control in the FND area "
+        "and nothing reads it: neither AISERVICES nor any opt-out string appears in "
+        "the corpus. Two surfaces, not one. DescribeEffectivePolicy on "
+        "AISERVICES_OPT_OUT_POLICY proves what resolves for the account, which is "
+        "the verdict an operator wants, but it returns the merged document with the "
+        "inheritance operators stripped, so @@assign and "
+        "@@operators_allowed_for_child_policies are invisible in it and it cannot "
+        "answer whether a child OU may re-enable a service the root opted out of. "
+        "The source document answers that, and the bedrock function already holds "
+        "organizations:DescribePolicy, ListPolicies and ListTargetsForPolicy, so "
+        "the effective read is the only new grant",
         ["organizations:DescribeEffectivePolicy"],
         5,
     ),
     (
         "AIR-FND-DET-01",
-        UNASSESSED,
-        None,
+        TIGHTEN,
+        EXTEND,
         "bedrock_assessments",
         ["BR-04", "BR-12"],
-        "candidate incumbents only; dedup not run",
+        "between them BR-04 and BR-12 assert that invocation logging is on and "
+        "that its destination is encrypted: BR-04 reads loggingConfig.s3Config and "
+        "cloudWatchConfig.logGroupName for presence and checks the log group's "
+        "retention, BR-12 the key. Two fields decide whether anything useful is "
+        "actually written, and neither is read. The five modality flags on "
+        "LoggingConfig -- textDataDeliveryEnabled, imageDataDeliveryEnabled, "
+        "embeddingDataDeliveryEnabled, videoDataDeliveryEnabled and "
+        "audioDataDeliveryEnabled -- gate what reaches the destination, so a "
+        "configuration with every one of them false passes today while logging no "
+        "prompt or completion at all. And cloudWatchConfig.largeDataDeliveryS3Config "
+        "is where CloudWatch puts payloads too large to inline, so a CloudWatch "
+        "destination without it drops exactly the largest prompts. The tightening "
+        "must not fail an S3-only configuration on the second field: "
+        "largeDataDeliveryS3Config sits on CloudWatchConfig and does not apply "
+        "there. No new IAM: both fields come back on the same "
+        "GetModelInvocationLoggingConfiguration call BR-04 already makes",
         [],
         5,
     ),
     (
         "AIR-FND-DET-04",
-        UNASSESSED,
-        None,
+        TIGHTEN,
+        NEW_ID,
         "bedrock_assessments",
         ["BR-34"],
-        "candidate incumbent only; dedup not run",
+        'BR-34 publishes "Guardrail Prompt Attack Filter" and asserts that some '
+        "guardrail carries a PROMPT_ATTACK filter with inputEnabled true, an "
+        "inputAction of BLOCK and an inputStrength of HIGH, reporting the content "
+        "policy tier alongside. Every field it reads belongs to a guardrail's own "
+        "configuration, and a guardrail no request references filters nothing, so "
+        "the name promises that prompt attacks are being filtered while the "
+        "assertion reaches only that a filter exists somewhere in the account. That "
+        "is the overclaim, and it is why the missing leg gets an id of its own "
+        "rather than widening a check named for a filter. The falsifiable leg is "
+        "enforcement: bedrock:ListEnforcedGuardrailsConfiguration returns each "
+        "AccountEnforcedGuardrailOutputConfiguration with guardrailArn, "
+        "guardrailVersion, modelEnforcement and selectiveContentGuarding, so it can "
+        "tell an account that applies a guardrail to every model from one that names "
+        "a single model and leaves the rest unguarded, or that guards part of the "
+        "content. Where no account-level configuration exists the fallback leg is a "
+        "paired Allow and Deny on bedrock:GuardrailIdentifier over InvokeModel, "
+        "InvokeModelWithResponseStream, Converse and ConverseStream, which is an "
+        "identity-policy read this function can already do. No new IAM: this leg was "
+        "recorded as needing bedrock:ListEnforcedGuardrailsConfiguration, and the "
+        "Bedrock function has held that action since the grant block was written "
+        "(template.yaml:338). The claim was wrong in the direction that costs "
+        "nothing to make and would have widened a policy for no reason, which is why "
+        "the grant ledger is gated against the template and not against a reading of "
+        "the API reference",
         [],
         5,
     ),
     (
         "AIR-FND-IAM-05",
-        UNASSESSED,
-        None,
+        TIGHTEN,
+        NEW_ID,
         "agentcore_assessments",
-        ["AC-02"],
-        "candidate incumbent only; dedup not run",
+        ["AC-43", "AC-45", "AC-02"],
+        "the permission side of this control is well covered and the trust side is "
+        "covered once. AC-45 scopes what a tool execution role may do and AC-02 "
+        'flags wildcard grants across every cached role. "AgentCore Evaluation Role '
+        'Trust" is the only check that reads a trust policy at all: AC-43 calls '
+        "iam:GetRole and asserts the confused-deputy guard, an aws:SourceAccount or "
+        "aws:SourceArn condition, on evaluation execution roles. Four other role "
+        "families -- runtime, gateway, browser and code interpreter -- have no trust "
+        "policy read by anything, and no check asserts the control's other half, "
+        "that two workloads do not share one execution role. NEW_ID rather than "
+        "extend, and the deciding fact is the name: AC-43's name is accurate for "
+        "what it reads today, and would stop being accurate the moment its subject "
+        "grew to roles that have nothing to do with evaluation. iam:GetRole is "
+        "already granted, so the widened assertion needs no new IAM, only a new id",
         [],
         5,
     ),
     (
         "AIR-FND-NET-01",
-        UNASSESSED,
-        None,
-        ["agentcore_assessments", "sagemaker_assessments"],
-        ["AC-01", "SM-11"],
-        "spans two modules; candidate incumbents only. 'AI workloads run privately' has no "
-        "single host, which is why the FND area has no module of its own",
-        [],
+        TIGHTEN,
+        EXTEND,
+        [
+            "agentcore_assessments",
+            "sagemaker_assessments",
+            "bedrock_assessments",
+        ],
+        ["AC-01", "SM-10", "SM-11", "SM-28", "SM-33", "BR-39"],
+        "spans three modules, because 'AI workloads run privately' has no single "
+        "host, which is why the FND area has no module of its own. Six checks assert "
+        "that a resource names subnets and security groups: AC-01 for the runtime, "
+        "SM-10 for notebooks, SM-11 for models, SM-28 for HyperPod clusters, SM-33 "
+        "for training jobs together with EnableNetworkIsolation, and BR-39 for "
+        "marketplace model endpoints. Exactly one of them goes on to prove those "
+        "subnets are private: AC-01 reads their route tables and fails an internet "
+        "gateway route. SM-11 says as much itself -- its Passed text asks the reader "
+        "to confirm the subnets are private and that callers arrive over an "
+        "interface VPC endpoint, because the model configuration does not record "
+        "it. A subnet id is not a privacy claim, so the tightening is to do for the "
+        "other five what AC-01 already does. That needs ec2:DescribeSubnets and "
+        "ec2:DescribeRouteTables on the SageMaker and Bedrock functions: SageMaker "
+        "holds no ec2 action at all, Bedrock holds DescribeVpcEndpoints and "
+        "DescribeVpcs but neither of these, and the AgentCore function already has "
+        "both. EXTEND because every one of the six keeps its name and its subject "
+        "and gains a leg one of them already carries",
+        ["ec2:DescribeSubnets", "ec2:DescribeRouteTables"],
         5,
     ),
     (
         "AIR-FND-NET-02",
-        UNASSESSED,
-        None,
-        "agentcore_assessments",
-        ["AC-08"],
-        "candidate incumbent only; dedup not run",
+        TIGHTEN,
+        EXTEND,
+        ["agentcore_assessments", "bedrock_assessments"],
+        ["AC-08", "BR-02"],
+        "AC-08 already asserts the three things this control asks of an endpoint -- "
+        "private DNS enabled, a policy attached, and the network scope that policy "
+        'grants -- but only for endpoints whose service name contains "agentcore". '
+        "The S3 and DynamoDB gateway endpoints an agent's data path traverses, and "
+        "the sagemaker.api and sagemaker.runtime interface endpoints, fall outside "
+        "that match and are therefore unasserted. BR-02 covers Bedrock with the "
+        "narrower claim: it reports that an endpoint exists, reading neither private "
+        "DNS nor the endpoint policy. Widening the service-name match and adding the "
+        "two field reads to BR-02 costs no IAM, since both functions already hold "
+        "ec2:DescribeVpcEndpoints. EXTEND on both counts: AC-08's name says VPC "
+        "endpoints without qualifying which, and BR-02's says connectivity",
         [],
         5,
     ),
     (
         "AIR-FND-NET-04",
-        UNASSESSED,
-        None,
+        TIGHTEN,
+        NEW_ID,
         "agentcore_assessments",
         ["AG-27"],
-        "hosted where the incumbent lives. AG-27 reads webAclArn off the gateway and needs no "
-        "wafv2 permission, so the association leg costs nothing; the inspection leg the "
-        "control asks for is the web ACL's rule content, which needs wafv2:GetWebACL. That "
-        "action is granted only to the GRC function, and that module runs only when the "
-        "execution input carries enableResponsibleAIGRC, so hosting the row there would make "
-        "it conditional. The subject narrows to AgentCore gateways",
+        'AG-27 publishes "Agentic AI Gateway WAF Protection" and passes on webAclArn '
+        "being present, with a detail line saying the gateway is associated with that "
+        "web ACL. It makes no wafv2 call, so a web ACL holding no rules at all, or "
+        "holding every rule in COUNT mode, satisfies it -- the name says protection "
+        "and the assertion reaches association. That is the overclaim, and it is why "
+        "the inspection leg takes a new id. What that leg needs is the web ACL's rule "
+        "content: at least one rule in BLOCK, coverage for SQL injection and "
+        "cross-site scripting, a rate-based rule, and the association's body "
+        "inspection limit. All of it comes from wafv2:GetWebACL, which is granted "
+        "only to the GRC function, and that module runs only when the execution "
+        "input carries enableResponsibleAIGRC, so the row is hosted here, where the "
+        "incumbent lives, and claims the grant for the AgentCore function instead of "
+        "shipping conditionally. The association leg itself stays free, since AG-27 "
+        "reads webAclArn off the gateway with no wafv2 permission at all. The subject "
+        "narrows to AgentCore gateways",
         ["wafv2:GetWebACL"],
         5,
     ),
     (
         "AIR-FND-NET-06",
-        UNASSESSED,
-        None,
+        TIGHTEN,
+        NEW_ID,
         "agentcore_assessments",
-        ["AC-01"],
-        "overlaps RT-08; resolve the two together. AC-01 already reads security-group egress "
-        "under the ec2:DescribeSecurityGroups grant the template carries for RT-08, so this row "
-        "claims no further IAM of its own",
-        [],
+        ["AC-01", "AC-15"],
+        "overlaps RT-08; resolve the two together. AC-01 reads the runtime's network "
+        "mode and its security-group egress under the ec2:DescribeSecurityGroups "
+        'grant the template carries for RT-08, and AC-15 publishes "AgentCore Code '
+        "Interpreter Network Isolation\" off a sandbox's network mode. So egress is "
+        "asserted by port and by CIDR, and not once by destination name, which is "
+        "the allow-list this control asks for. A check named for network isolation "
+        "passing a workload whose security group permits 0.0.0.0/0 on 443 is the "
+        "overclaim here, and it is why the leg takes a new id. Route 53 Resolver DNS "
+        "Firewall is the readable mechanism: "
+        "route53resolver:ListFirewallRuleGroupAssociations names the rule groups "
+        "bound to the VPC the workload runs in, and route53resolver:ListFirewallRules "
+        "shows whether a group ends in a BLOCK over a catch-all domain list, which is "
+        "what makes the configuration an allow-list of permitted destinations rather "
+        "than a deny-list of known-bad ones. Recorded because it looks like a cheaper "
+        "answer and is not: an IAM Deny on bedrock-agentcore:subnets or "
+        ":securityGroups does not close this gap, because the devguide lists those "
+        "condition keys while the machine-readable IAM reference lists none for "
+        "CreateGatewayTarget or UpdateGatewayTarget, so a Deny written against them "
+        "can fail open on the very calls that would change the network path",
+        [
+            "route53resolver:ListFirewallRuleGroupAssociations",
+            "route53resolver:ListFirewallRules",
+        ],
         5,
     ),
 ]
@@ -856,6 +992,7 @@ INCUMBENT_NAMES = {
     "AC-10": "AgentCore Resource-Based Policies Check",
     "AC-11": "AgentCore Policy Engine Encryption Check",
     "AC-14": "AgentCore Identity Token Vault CMK Encryption",
+    "AC-15": "AgentCore Code Interpreter Network Isolation",
     "AC-17": "AgentCore Online Evaluation Coverage",
     "AC-18": "AgentCore CloudTrail Data Event Coverage",
     "AC-19": "AgentCore Log Delivery Configuration",
@@ -892,21 +1029,47 @@ INCUMBENT_NAMES = {
     "AG-27": "Agentic AI Gateway WAF Protection",
     "AR-03": "AWS Agent Registry Publication Approval Governance",
     "AR-09": "AWS Agent Registry Approval Authority Separation",
-    "BR-04": "Bedrock Model Invocation Logging Check",
+    # Four names for one check, one per status branch: the Passed row, the Failed
+    # row and each of the two N/A rows carry a different name. The subject is one
+    # thing -- whether a Bedrock VPC endpoint is in use -- so no single CSV filter
+    # returns this check's verdicts, and filtering on the Passed name reports a
+    # clean estate for an account whose only row said "not used".
+    "BR-02": (
+        "Amazon Bedrock private connectivity",
+        "Amazon Bedrock private connectivity check",
+        "Amazon Bedrock private connectivity not used",
+        "Bedrock VPC Endpoint Check",
+    ),
+    # The second name is published by the outer `except` alone, where every other
+    # path publishes the first. An operator filtering the report on the name the
+    # passing rows carry therefore sees no row at all for the runs that failed
+    # with an exception, which is the direction that hides a broken check.
+    "BR-04": (
+        "Bedrock Model Invocation Logging Check",
+        "Bedrock Logging Configuration Check",
+    ),
     "BR-06": "Bedrock CloudTrail Logging Check",
     # BR-07 publishes its Failed line under a different name than its Passed and
     # N/A lines, so both are recorded. Filtering the report CSV on either name
     # alone hides half of this check's verdicts.
     "BR-07": ("Bedrock Prompt Management Check", "Bedrock Prompt Variants Check"),
     "BR-10": "Bedrock Guardrail IAM Enforcement Check",
+    # Same split as BR-07: the second name carries this check's Failed rows, one
+    # per custom model found without a CMK, and the first carries everything else.
+    "BR-11": (
+        "Bedrock Custom Model Encryption Check",
+        "Bedrock Custom Model Encryption Review",
+    ),
     "BR-12": "Bedrock Invocation Log Encryption",
     "BR-15": "Cross-Account Guardrails Enforcement Check",
+    "BR-17": "Custom Model Customer-Managed KMS Encryption Check",
     "BR-20": "Knowledge Base Customer-Managed KMS Encryption Check",
     "BR-26": "Guardrail Sensitive Information Filter Check",
     "BR-27": "Guardrail Contextual Grounding Check",
     "BR-32": "Bedrock CloudWatch Alarm Check",
     "BR-34": "Guardrail Prompt Attack Filter",
     "BR-37": "Bedrock Account Data Retention",
+    "BR-39": "Marketplace Model Endpoint VPC Configuration",
     "BR-41": "Central Guardrail Enforcement Policy Check",
     "BR-42": "Foundation Model Invocation Allow-List",
     "BR-43": "Bedrock Region Invocation Control",
@@ -922,9 +1085,15 @@ INCUMBENT_NAMES = {
     "SM-02": "SageMaker IAM Permissions Check",
     "SM-03": "SageMaker Data Protection Check",
     "SM-09": "SageMaker Notebook Root Access Check",
+    # Failed under the first name, Passed and both N/A rows under the second.
+    "SM-10": (
+        "SageMaker Notebook Not in VPC",
+        "SageMaker Notebook VPC Deployment Check",
+    ),
     "SM-11": "SageMaker Model Network Isolation Check",
     "SM-18": "SageMaker Transform Job Encryption Check",
     "SM-22": "Model Approval Workflow Check",
+    "SM-28": "HyperPod VPC Configuration",
     "SM-31": "Endpoint Inference Data Capture",
     # Recording is the precondition, rule compliance is the assertion.
     "SM-32": ("SageMaker Configuration Recording", "SageMaker Config Rule Compliance"),
@@ -936,10 +1105,14 @@ INCUMBENT_NAMES = {
 def published_names(check_id):
     """Every finding name one incumbent publishes, as a list.
 
-    A value may be one string or a tuple of them: three check ids publish two
-    named findings each. Raises on an unmapped id rather than returning nothing,
-    so adding a check without recording its name stops the build here instead of
-    shipping a row whose incumbent has no name.
+    A value may be one string or a tuple of them, because several check ids
+    publish more than one name -- usually the Failed rows under one name and
+    everything else under another, and BR-02 a different name per status branch.
+    No count is stated here on purpose: the last one drifted from three to seven
+    the first time this map was extended, and nothing gates a number in a
+    docstring. Raises on an unmapped id rather than returning nothing, so adding a
+    check without recording its name stops the build here instead of shipping a
+    row whose incumbent has no name.
     """
     try:
         entry = INCUMBENT_NAMES[check_id]

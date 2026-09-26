@@ -938,9 +938,9 @@ def main():
     unnamed = sorted(
         {i for r in rows for i in r["incumbents"] if not r["incumbent_names"]}
     )
-    # Element type first, and as a gate rather than an exception. Three ids map to
-    # a tuple of two names because they publish two, and a lookup that forgets to
-    # flatten puts the tuple itself in the list. `name.startswith` then raises
+    # Element type first, and as a gate rather than an exception. Several ids map
+    # to a tuple because they publish more than one name, and a lookup that forgets
+    # to flatten puts the tuple itself in the list. `name.startswith` then raises
     # AttributeError mid-gate, exit 1 with zero [FAIL] lines printed and every
     # later gate's verdict lost -- a failure that reads like a crash in the
     # harness rather than a defect in the ledger.

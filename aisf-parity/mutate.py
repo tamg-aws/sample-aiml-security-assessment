@@ -241,11 +241,15 @@ MUTATIONS = [
         # second copy of the same mapping. The fix was to give both sides one
         # table_fields(), not to drop the entry: a mutation no catcher can observe
         # is a statement about the gates, not about the mutation.
-        "defect": "the lookup stops flattening the three ids that publish two "
-        "finding names each (BR-07, BR-45, SM-32), so a row carries a nested list "
-        "where the schema says strings. Observed: gate 15 names those three rows' "
-        "incumbent_names as differing between the shipped json and a fresh render "
-        "of the verdict table. This is half of the shipped defect, restored",
+        "defect": "the lookup stops flattening the ids that publish more than one "
+        "finding name, so a row carries a nested tuple where the schema says "
+        "strings. Observed: gate 15 names every row whose incumbents include one of "
+        "those ids as differing between the shipped json and a fresh render of the "
+        "verdict table. No count and no id list here on purpose -- the previous "
+        "text said three ids and named them, and went stale the hour the FND block "
+        "was assessed, because assessing it added four more. Nothing gates prose in "
+        "a mutation entry, so the only safe figure is none. This is half of the "
+        "shipped defect, restored",
         "find": '        "incumbent_names": [name for i in incumbents for name in '
         "published_names(i)],\n",
         "replace": '        "incumbent_names": [\n'

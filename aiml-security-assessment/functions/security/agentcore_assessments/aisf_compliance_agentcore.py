@@ -22,14 +22,15 @@ row's own Status column carries the verdict.
 """
 
 AISF_COMPLIANCE_MAP = {
-    "AC-01": "AISF AIR-ACR-RT-08",
-    "AC-02": "AISF AIR-ACR-EVAL-01 | AISF AIR-ACR-PAY-01 | AISF AIR-ACR-RT-03 (1 of 2 checks)",
+    "AC-01": "AISF AIR-ACR-RT-08 | AISF AIR-FND-NET-01 (partial) | AISF AIR-FND-NET-06 (partial)",
+    "AC-02": "AISF AIR-ACR-EVAL-01 | AISF AIR-ACR-PAY-01 | AISF AIR-ACR-RT-03 (1 of 2 checks) | AISF AIR-FND-IAM-05 (partial)",
     "AC-06": "AISF AIR-ACR-RT-09",
     "AC-07": "AISF AIR-ACR-MEM-01 (1 of 2 checks)",
-    "AC-08": "AISF AIR-ACR-GW-04 (1 of 2 checks) | AISF AIR-ACR-RT-13 (1 of 3 checks)",
+    "AC-08": "AISF AIR-ACR-GW-04 (1 of 2 checks) | AISF AIR-ACR-RT-13 (1 of 3 checks) | AISF AIR-FND-NET-02 (partial)",
     "AC-10": "AISF AIR-ACR-GW-03 (1 of 2 checks) | AISF AIR-ACR-RT-13 (1 of 3 checks)",
     "AC-11": "AISF AIR-ACR-POL-04 (1 of 2 checks)",
     "AC-14": "AISF AIR-ACR-ID-05 (1 of 2 checks)",
+    "AC-15": "AISF AIR-FND-NET-06 (partial)",
     "AC-17": "AISF AIR-ACR-EVAL-05 (1 of 2 checks) | AISF AIR-ACR-EVAL-06 (1 of 2 checks)",
     "AC-18": "AISF AIR-ACR-MEM-12 | AISF AIR-ACR-OBS-02",
     "AC-19": "AISF AIR-ACR-GW-10 (1 of 3 checks) | AISF AIR-ACR-OBS-03 | AISF AIR-ACR-POL-01 (1 of 3 checks)",
@@ -56,14 +57,14 @@ AISF_COMPLIANCE_MAP = {
     "AC-40": "AISF AIR-ACR-EVAL-06 (1 of 2 checks)",
     "AC-41": "AISF AIR-ACR-EVAL-07 (1 of 3 checks)",
     "AC-42": "AISF AIR-ACR-EVAL-02",
-    "AC-43": "AISF AIR-ACR-EVAL-03",
+    "AC-43": "AISF AIR-ACR-EVAL-03 | AISF AIR-FND-IAM-05 (partial)",
     "AC-44": "AISF AIR-ACR-EVAL-04",
-    "AC-45": "AISF AIR-ACR-RT-03 (1 of 2 checks)",
+    "AC-45": "AISF AIR-ACR-RT-03 (1 of 2 checks) | AISF AIR-FND-IAM-05 (partial)",
     "AC-46": "AISF AIR-ACR-RT-04",
     "AC-47": "AISF AIR-ACR-RT-13 (1 of 3 checks)",
     "AG-24": "AISF AIR-ACR-GW-01",
     "AG-25": "AISF AIR-ACR-POL-01 (1 of 3 checks) | AISF AIR-ACR-POL-07 (1 of 2 checks)",
-    "AG-27": "AISF AIR-ACR-GW-05 (1 of 2 checks)",
+    "AG-27": "AISF AIR-ACR-GW-05 (1 of 2 checks) | AISF AIR-FND-NET-04 (partial)",
 }
 
 
