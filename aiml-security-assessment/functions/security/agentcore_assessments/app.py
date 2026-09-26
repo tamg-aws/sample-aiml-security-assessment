@@ -41,6 +41,8 @@ oam_client = None
 agentcore_client = None
 kms_client = None
 organizations_client = None
+wafv2_client = None
+route53resolver_client = None
 
 # Environment variables
 BUCKET_NAME = os.environ.get("AIML_ASSESSMENT_BUCKET_NAME")
@@ -225,6 +227,25 @@ AGENTCORE_ALLOWED_WORKLOAD_REFERENCE_URL = (
 AGENTCORE_PAYMENTS_IAM_REFERENCE_URL = (
     "https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/"
     "payments-iam-roles.html"
+)
+IAM_PRINCIPAL_ELEMENT_REFERENCE_URL = (
+    "https://docs.aws.amazon.com/IAM/latest/UserGuide/"
+    "reference_policies_elements_principal.html"
+)
+AGENTCORE_RUNTIME_PERMISSIONS_REFERENCE_URL = (
+    "https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/"
+    "runtime-permissions.html"
+)
+DNS_FIREWALL_RULE_ACTION_REFERENCE_URL = (
+    "https://docs.aws.amazon.com/Route53/latest/DeveloperGuide/"
+    "resolver-dns-firewall-rule-actions.html"
+)
+WAF_RULE_ACTION_REFERENCE_URL = (
+    "https://docs.aws.amazon.com/waf/latest/developerguide/waf-rule-action.html"
+)
+WAF_BODY_INSPECTION_LIMIT_REFERENCE_URL = (
+    "https://docs.aws.amazon.com/waf/latest/developerguide/"
+    "web-acl-setting-body-inspection-limit.html"
 )
 
 
@@ -419,6 +440,8 @@ REGIONAL_AGENTCORE_CHECK_IDS = (
     "AC-45",
     "AC-46",
     "AC-47",
+    "AC-48",
+    "AC-49",
 )
 
 AGENTCORE_RUNTIME_CHECK_IDS = (
@@ -460,6 +483,8 @@ AGENTCORE_RUNTIME_CHECK_IDS = (
     "AC-45",
     "AC-46",
     "AC-47",
+    "AC-48",
+    "AC-49",
 )
 
 NATIVE_AGENTIC_AGENTCORE_CHECK_NAMES = {
@@ -467,6 +492,7 @@ NATIVE_AGENTIC_AGENTCORE_CHECK_NAMES = {
     "AG-25": "Agentic AI Gateway Policy Enforcement",
     "AG-26": "Agentic AI Gateway Exception Handling",
     "AG-27": "Agentic AI Gateway WAF Protection",
+    "AG-39": "Agentic AI Gateway WAF Rule Coverage",
 }
 
 # CloudTrail data-event resource types per AgentCore service family, as listed in
@@ -3762,6 +3788,39 @@ def _security_group_open_egress(security_group: Dict[str, Any]) -> List[str]:
     return sorted(set(open_ranges))
 
 
+# The AgentCore service endpoints. The runtime, control-plane and gateway
+# endpoint service names all carry "agentcore", which is what AC-08 matched on
+# before the data-path endpoints below were added.
+AGENTCORE_SERVICE_ENDPOINT_TOKEN = "agentcore"
+
+# The other endpoints an AgentCore workload's data path uses: an agent reads its
+# inputs and writes its outputs through S3 and DynamoDB, and reaches a model it
+# hosts itself through the two SageMaker endpoints. A name match on "agentcore"
+# left all four out of the policy and inbound-scope legs, so a default
+# allow-everything policy on the bucket path was never reported. The match is on
+# the trailing service segment, so com.amazonaws.<region>.s3express, which is a
+# different service, does not answer for s3.
+AGENTCORE_DATA_PATH_ENDPOINT_SUFFIXES = (
+    ".s3",
+    ".dynamodb",
+    ".sagemaker.api",
+    ".sagemaker.runtime",
+)
+
+
+def _is_agentcore_service_endpoint(service_name: str) -> bool:
+    """Return whether one VPC endpoint service name is an AgentCore endpoint."""
+    return AGENTCORE_SERVICE_ENDPOINT_TOKEN in (service_name or "").lower()
+
+
+def _is_agentcore_data_path_endpoint(service_name: str) -> bool:
+    """Return whether one VPC endpoint carries an AgentCore workload's data."""
+    lowered = (service_name or "").lower()
+    return any(
+        lowered.endswith(suffix) for suffix in AGENTCORE_DATA_PATH_ENDPOINT_SUFFIXES
+    )
+
+
 def _agentcore_endpoint_scope_findings(
     endpoints: List[Dict[str, Any]],
 ) -> List[Dict[str, Any]]:
@@ -3777,6 +3836,10 @@ def _agentcore_endpoint_scope_findings(
     decision, so the assertions here are the workload-independent ones: the
     policy is not the default allow-everything document, and the inbound rules
     do not name the whole internet.
+
+    The endpoints judged here are the AgentCore service endpoints and the
+    data-path endpoints in the same VPCs, so the wording names the endpoint's own
+    service rather than claiming every endpoint carries AgentCore API calls.
     """
     findings: List[Dict[str, Any]] = []
     if not endpoints:
@@ -3810,7 +3873,10 @@ def _agentcore_endpoint_scope_findings(
     for entry in endpoints:
         endpoint = entry["endpoint"]
         endpoint_id = endpoint.get("VpcEndpointId", "unknown")
-        label = f"endpoint {endpoint_id} for {entry['service']}"
+        label = (
+            f"{entry['vpc_id'] or 'unknown VPC'} endpoint {endpoint_id} for "
+            f"{entry['service']}"
+        )
         policy_document = endpoint.get("PolicyDocument")
 
         if not policy_document:
@@ -3844,8 +3910,8 @@ def _agentcore_endpoint_scope_findings(
                     ),
                     resolution=(
                         "Replace the default endpoint policy with one that names "
-                        "the principals allowed to reach AgentCore through this "
-                        "endpoint and the AgentCore resources they may call."
+                        "the principals allowed to reach this endpoint's service "
+                        "through it and the resources they may call."
                     ),
                     reference=VPC_ENDPOINT_POLICY_REFERENCE_URL,
                     severity=SeverityEnum.MEDIUM,
@@ -3863,7 +3929,7 @@ def _agentcore_endpoint_scope_findings(
                     ),
                     resolution=(
                         "No action required. Confirm the policy names the "
-                        "principals and AgentCore resources this workload needs."
+                        "principals and resources this workload needs."
                     ),
                     reference=VPC_ENDPOINT_POLICY_REFERENCE_URL,
                     severity=SeverityEnum.MEDIUM,
@@ -3887,8 +3953,8 @@ def _agentcore_endpoint_scope_findings(
                         finding_name="AgentCore VPC Endpoint Private DNS",
                         finding_details=(
                             f"AgentCore VPC {label} reported no private DNS "
-                            "setting, so whether callers reach AgentCore through "
-                            "it by default could not be assessed."
+                            "setting, so whether callers reach that service "
+                            "through it by default could not be assessed."
                         ),
                         resolution=(
                             "Grant ec2:DescribeVpcEndpoints on this endpoint and "
@@ -3907,7 +3973,7 @@ def _agentcore_endpoint_scope_findings(
                         finding_details=(
                             f"AgentCore VPC {label} has private DNS enabled, so "
                             "callers using the default Regional DNS name reach "
-                            "AgentCore through this endpoint."
+                            "that service through this endpoint."
                         ),
                         resolution=(
                             "No action required. Confirm the VPC also has DNS "
@@ -3927,7 +3993,7 @@ def _agentcore_endpoint_scope_findings(
                             f"AgentCore VPC {label} has private DNS disabled, so "
                             "the default Regional DNS name still resolves to the "
                             "public endpoint and any caller that was not given "
-                            "the endpoint-specific DNS name reaches AgentCore "
+                            "the endpoint-specific DNS name reaches that service "
                             "over the internet instead."
                         ),
                         resolution=(
@@ -3987,12 +4053,12 @@ def _agentcore_endpoint_scope_findings(
                     finding_details=(
                         f"AgentCore VPC {label} accepts inbound traffic from "
                         f"{', '.join(sorted(set(open_ranges)))}, so any host that "
-                        "can route to the VPC reaches the AgentCore endpoint."
+                        "can route to the VPC reaches this endpoint."
                     ),
                     resolution=(
                         "Restrict the endpoint security group's inbound rules to "
                         "the VPC CIDR ranges or the security groups of the "
-                        "workloads that call AgentCore."
+                        "workloads that use this endpoint."
                     ),
                     reference=VPC_ENDPOINT_POLICY_REFERENCE_URL,
                     severity=SeverityEnum.MEDIUM,
@@ -4027,7 +4093,7 @@ def _agentcore_endpoint_scope_findings(
                     ),
                     resolution=(
                         "No action required. Confirm the inbound rules name only "
-                        "the workloads that call AgentCore."
+                        "the workloads that use this endpoint."
                     ),
                     reference=VPC_ENDPOINT_POLICY_REFERENCE_URL,
                     severity=SeverityEnum.MEDIUM,
@@ -4047,6 +4113,8 @@ def check_agentcore_vpc_endpoints() -> List[Dict[str, Any]]:
     - Private connectivity is configured
     - Each endpoint's policy authorizes something narrower than every call
     - Each endpoint's security group admits a narrower source than the internet
+    - The S3, DynamoDB and SageMaker endpoints in the same VPCs are judged on the
+      same two legs, because they carry the workload's data and its model calls
 
     Returns:
         List of findings
@@ -4115,22 +4183,25 @@ def check_agentcore_vpc_endpoints() -> List[Dict[str, Any]]:
             token_response_key="NextToken",
         )
 
-        # Check for AgentCore endpoints
+        # Check for AgentCore endpoints. The presence and health legs below stay
+        # scoped to the AgentCore service endpoints: whether a workload uses S3,
+        # DynamoDB or SageMaker is a workload decision, so a missing data-path
+        # endpoint is not a finding, while the policy and inbound-scope legs of a
+        # data-path endpoint that does exist are.
         found_agentcore_endpoints = []
+        data_path_candidates = []
         for endpoint in all_endpoints:
             service_name = endpoint.get("ServiceName", "")
-            if (
-                "agentcore" in service_name.lower()
-                or "bedrock-agentcore" in service_name.lower()
-            ):
-                found_agentcore_endpoints.append(
-                    {
-                        "vpc_id": endpoint.get("VpcId"),
-                        "service": service_name,
-                        "state": endpoint.get("State"),
-                        "endpoint": endpoint,
-                    }
-                )
+            entry = {
+                "vpc_id": endpoint.get("VpcId"),
+                "service": service_name,
+                "state": endpoint.get("State"),
+                "endpoint": endpoint,
+            }
+            if _is_agentcore_service_endpoint(service_name):
+                found_agentcore_endpoints.append(entry)
+            elif _is_agentcore_data_path_endpoint(service_name):
+                data_path_candidates.append(entry)
 
         if not found_agentcore_endpoints:
             findings.append(
@@ -4141,7 +4212,7 @@ def check_agentcore_vpc_endpoints() -> List[Dict[str, Any]]:
                     resolution="Create VPC interface endpoints for AgentCore services:\n"
                     + "1. com.amazonaws.region.bedrock-agentcore\n"
                     + "2. com.amazonaws.region.bedrock-agentcore-control\n"
-                    + "3. com.amazonaws.region.bedrock-agentcore-runtime\n"
+                    + "3. com.amazonaws.region.bedrock-agentcore.gateway\n"
                     + "This enables private connectivity via AWS PrivateLink",
                     reference="https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/vpc.html",
                     severity=SeverityEnum.HIGH,
@@ -4185,7 +4256,24 @@ def check_agentcore_vpc_endpoints() -> List[Dict[str, Any]]:
                     )
                 )
 
-        findings.extend(_agentcore_endpoint_scope_findings(found_agentcore_endpoints))
+        # A data-path endpoint is judged only in a VPC that also holds an
+        # AgentCore endpoint. An S3 or DynamoDB endpoint in an unrelated VPC
+        # carries no agent traffic, and reporting its policy under AC-08 would
+        # name an endpoint this workload never calls.
+        agentcore_vpc_ids = {
+            entry["vpc_id"] for entry in found_agentcore_endpoints if entry["vpc_id"]
+        }
+        data_path_endpoints = [
+            entry
+            for entry in data_path_candidates
+            if entry["vpc_id"] in agentcore_vpc_ids
+        ]
+
+        findings.extend(
+            _agentcore_endpoint_scope_findings(
+                found_agentcore_endpoints + data_path_endpoints
+            )
+        )
 
     except Exception as e:
         logger.error(f"Error in VPC endpoints check: {e}")
@@ -12142,6 +12230,1002 @@ def check_agentcore_runtime_invocation_path() -> List[Dict[str, Any]]:
     return findings
 
 
+def _statement_trusts_whole_account(statement: Dict[str, Any]) -> bool:
+    """Return whether one Allow statement lets a whole account assume a role.
+
+    `arn:<partition>:iam::<account>:root` and a bare 12-digit account id both
+    delegate to every principal in that account, so any principal there reaches
+    the role as soon as its own identity policy allows sts:AssumeRole. A
+    statement carrying a Condition was narrowed by the account owner and which
+    condition suits a workload is not this check's decision, the same way
+    _vpc_endpoint_policy_is_full_access leaves conditioned statements alone.
+    """
+    if statement.get("Condition"):
+        return False
+    for principal in _statement_principals(statement):
+        if principal.endswith(":root"):
+            return True
+        if len(principal) == 12 and principal.isdigit():
+            return True
+    return False
+
+
+def _agentcore_tool_family(label: str) -> str:
+    """Return the resource family behind one built-in tool label.
+
+    _agentcore_tool_details merges two families into one list, so the family is
+    recovered from the label prefix it builds there.
+    """
+    if label.startswith("Browser "):
+        return "browser"
+    if label.startswith("Code Interpreter "):
+        return "code interpreter"
+    return "tool"
+
+
+def _agentcore_execution_role_references(
+    browser_inventory: Dict[str, Any] = None,
+) -> Tuple[List[Tuple[str, str, str]], List[Tuple[str, Exception, str]]]:
+    """Return (family, resource label, role ARN) per AgentCore resource.
+
+    Four families name an execution role. Runtime and gateway spell it roleArn
+    and CreateAgentRuntime and CreateGateway both require it, so a missing value
+    there means the detail call did not report one. Browser and code interpreter
+    spell it executionRoleArn and may omit it.
+
+    A family whose list or detail call fails is returned as an error rather than
+    raised, so the families that did read are still judged.
+    """
+    references: List[Tuple[str, str, str]] = []
+    errors: List[Tuple[str, Exception, str]] = []
+
+    try:
+        runtimes = _agentcore_list_all("list_agent_runtimes", ["agentRuntimes"])
+    except Exception as error:
+        runtimes = []
+        logger.warning(f"Could not list AgentCore runtimes: {error}")
+        errors.append(
+            (
+                "The list of AgentCore runtimes",
+                error,
+                "bedrock-agentcore:ListAgentRuntimes",
+            )
+        )
+
+    for runtime in runtimes:
+        runtime_id = runtime.get("agentRuntimeId") or "unknown"
+        name = runtime.get("agentRuntimeName") or runtime_id
+        label = f"Runtime '{name}' ({runtime_id})"
+        try:
+            detail = agentcore_client.get_agent_runtime(agentRuntimeId=runtime_id)
+        except Exception as error:
+            logger.warning(f"Could not read runtime {runtime_id}: {error}")
+            errors.append((label, error, "bedrock-agentcore:GetAgentRuntime"))
+            continue
+        references.append(("runtime", label, detail.get("roleArn") or ""))
+
+    try:
+        gateways = _agentcore_list_all("list_gateways", ["items", "gateways"])
+    except Exception as error:
+        gateways = []
+        logger.warning(f"Could not list AgentCore gateways: {error}")
+        errors.append(
+            (
+                "The list of AgentCore gateways",
+                error,
+                "bedrock-agentcore:ListGateways",
+            )
+        )
+
+    for gateway in gateways:
+        gateway_id = gateway.get("gatewayId") or "unknown"
+        name = gateway.get("name") or gateway_id
+        label = f"Gateway '{name}' ({gateway_id})"
+        try:
+            detail = agentcore_client.get_gateway(gatewayIdentifier=gateway_id)
+        except Exception as error:
+            logger.warning(f"Could not read gateway {gateway_id}: {error}")
+            errors.append((label, error, "bedrock-agentcore:GetGateway"))
+            continue
+        references.append(("gateway", label, detail.get("roleArn") or ""))
+
+    try:
+        tool_details, tool_errors = _agentcore_tool_details(browser_inventory)
+    except Exception as error:
+        tool_details = []
+        tool_errors = [
+            (
+                "The list of AgentCore built-in tools",
+                error,
+                "bedrock-agentcore:ListCodeInterpreters",
+            )
+        ]
+    errors.extend(tool_errors)
+
+    for label, detail in tool_details:
+        references.append(
+            (
+                _agentcore_tool_family(label),
+                label,
+                detail.get("executionRoleArn") or "",
+            )
+        )
+
+    return references, errors
+
+
+def check_agentcore_execution_role_trust_and_sharing(
+    browser_inventory: Dict[str, Any] = None,
+) -> List[Dict[str, Any]]:
+    """AC-48: Judge who may assume each AgentCore execution role, and its reuse.
+
+    Two facts decide what an execution role is worth to an attacker. The trust
+    policy says who may assume it: an AWS service principal with no
+    aws:SourceAccount or aws:SourceArn condition lets the service assume the role
+    while acting for another customer's configuration, and an account-root or
+    bare account-id principal lets every principal in the account assume it. The
+    second fact is reuse: a role named by more than one AgentCore resource
+    carries the union of what each resource needs, so whoever reaches one
+    resource reaches everything the others may read.
+
+    AC-27 already judges the deputy guard on the roles that gateways name. The
+    runtime, browser and code interpreter families had no trust policy read by
+    anything, and no check read the account-wide principal or the sharing.
+    """
+    reference = CONFUSED_DEPUTY_REFERENCE_URL
+    if agentcore_client is None:
+        return [
+            create_finding(
+                check_id="AC-48",
+                finding_name="AgentCore Execution Role Trust",
+                finding_details="AgentCore client not available in this region.",
+                resolution="No action required unless AgentCore runs in this region.",
+                reference=reference,
+                severity=SeverityEnum.INFORMATIONAL,
+                status=StatusEnum.NA,
+            )
+        ]
+
+    try:
+        references, errors = _agentcore_execution_role_references(browser_inventory)
+    except Exception as error:
+        return [
+            _incomplete_check_finding(
+                check_id="AC-48",
+                finding_name="AgentCore Execution Role Trust",
+                error=error,
+                reference=reference,
+            )
+        ]
+
+    if not references and not errors:
+        return [
+            create_finding(
+                check_id="AC-48",
+                finding_name="AgentCore Execution Role Trust",
+                finding_details=(
+                    "No AgentCore runtime, gateway, browser or code interpreter "
+                    "was found in this region, so no execution role is assumed "
+                    "on their behalf."
+                ),
+                resolution="No action required for this check.",
+                reference=reference,
+                severity=SeverityEnum.INFORMATIONAL,
+                status=StatusEnum.NA,
+            )
+        ]
+
+    findings = _agentcore_tool_read_findings(
+        "AC-48", "AgentCore Execution Role Trust", errors, reference
+    )
+
+    roles: Dict[str, List[Tuple[str, str]]] = {}
+    for family, label, role_arn in references:
+        if not role_arn:
+            findings.append(
+                create_finding(
+                    check_id="AC-48",
+                    finding_name="AgentCore Execution Role Trust",
+                    finding_details=(
+                        f"{label} [{family} family] names no execution role, so "
+                        "there is no trust policy to judge."
+                    ),
+                    resolution="No action required for this check.",
+                    reference=reference,
+                    severity=SeverityEnum.INFORMATIONAL,
+                    status=StatusEnum.NA,
+                )
+            )
+            continue
+        roles.setdefault(role_arn, []).append((family, label))
+
+    for role_arn, users in roles.items():
+        role_name = str(role_arn).rsplit("/", 1)[-1]
+        used_by = ", ".join(f"{label} [{family} family]" for family, label in users)
+
+        try:
+            document = iam_client.get_role(RoleName=role_name)["Role"][
+                "AssumeRolePolicyDocument"
+            ]
+        except Exception as error:
+            logger.warning(f"Could not read trust policy for {role_name}: {error}")
+            findings.append(
+                create_finding(
+                    check_id="AC-48",
+                    finding_name="AgentCore Execution Role Trust",
+                    finding_details=(
+                        f"{used_by} runs as {role_name}, whose trust policy could "
+                        f"not be read: {_assessment_error_label(error)}."
+                    ),
+                    resolution="Grant iam:GetRole on the role and retry.",
+                    reference=reference,
+                    severity=SeverityEnum.INFORMATIONAL,
+                    status=StatusEnum.NA,
+                )
+            )
+            continue
+
+        statements = _document_statements(document, effect="Allow")
+        exposed = [
+            statement
+            for statement in statements
+            if _statement_is_confused_deputy_exposed(statement)
+        ]
+        account_wide = [
+            statement
+            for statement in statements
+            if _statement_trusts_whole_account(statement)
+        ]
+
+        if exposed:
+            findings.append(
+                create_finding(
+                    check_id="AC-48",
+                    finding_name="AgentCore Execution Role Trust Guard Missing",
+                    finding_details=(
+                        f"{used_by} runs as {role_name}, which has {len(exposed)} "
+                        f"of {len(statements)} Allow statement(s) trusting an AWS "
+                        "service principal or every principal with no "
+                        "aws:SourceAccount or aws:SourceArn condition. The "
+                        "service can assume the role while acting for another "
+                        "customer's configuration."
+                    ),
+                    resolution=(
+                        "Add aws:SourceAccount for this account and aws:SourceArn "
+                        "for this resource's ARN to every statement of the trust "
+                        "policy, or delete the unguarded statement."
+                    ),
+                    reference=reference,
+                    severity=SeverityEnum.HIGH,
+                    status=StatusEnum.FAILED,
+                )
+            )
+        if account_wide:
+            findings.append(
+                create_finding(
+                    check_id="AC-48",
+                    finding_name="AgentCore Execution Role Account Wide Trust",
+                    finding_details=(
+                        f"{used_by} runs as {role_name}, which has "
+                        f"{len(account_wide)} of {len(statements)} Allow "
+                        "statement(s) trusting an account root or a bare account "
+                        "id with no condition. Every principal in that account "
+                        "can assume the role and act as this AgentCore resource."
+                    ),
+                    resolution=(
+                        "Name the specific role or service principal that must "
+                        "assume this execution role instead of the account root, "
+                        "or add a condition that narrows the caller."
+                    ),
+                    reference=IAM_PRINCIPAL_ELEMENT_REFERENCE_URL,
+                    severity=SeverityEnum.HIGH,
+                    status=StatusEnum.FAILED,
+                )
+            )
+        if not exposed and not account_wide:
+            findings.append(
+                create_finding(
+                    check_id="AC-48",
+                    finding_name="AgentCore Execution Role Trust",
+                    finding_details=(
+                        f"{used_by} runs as {role_name}, whose {len(statements)} "
+                        "Allow statement(s) name no account root and no "
+                        "unconditioned service or wildcard principal."
+                    ),
+                    resolution=(
+                        "No action required. Confirm the aws:SourceArn pattern "
+                        "names this resource rather than every AgentCore resource "
+                        "in the account."
+                    ),
+                    reference=reference,
+                    severity=SeverityEnum.HIGH,
+                    status=StatusEnum.PASSED,
+                )
+            )
+
+    shared = {role_arn: users for role_arn, users in roles.items() if len(users) > 1}
+    for role_arn, users in shared.items():
+        role_name = str(role_arn).rsplit("/", 1)[-1]
+        used_by = ", ".join(f"{label} [{family} family]" for family, label in users)
+        findings.append(
+            create_finding(
+                check_id="AC-48",
+                finding_name="AgentCore Execution Role Shared Across Workloads",
+                finding_details=(
+                    f"Role {role_name} is the execution role of {len(users)} "
+                    f"AgentCore resources: {used_by}. The role carries the union "
+                    "of what each resource needs, so whoever reaches one of them "
+                    "acts with the permissions of all of them."
+                ),
+                resolution=(
+                    "Give each AgentCore resource its own execution role scoped "
+                    "to the data and services that resource needs."
+                ),
+                reference=AGENTCORE_RUNTIME_PERMISSIONS_REFERENCE_URL,
+                severity=SeverityEnum.MEDIUM,
+                status=StatusEnum.FAILED,
+            )
+        )
+
+    if roles and not shared:
+        findings.append(
+            create_finding(
+                check_id="AC-48",
+                finding_name="AgentCore Execution Role Sharing",
+                finding_details=(
+                    f"The {len(references)} AgentCore resource(s) that name an "
+                    f"execution role name {len(roles)} distinct role ARN(s), so "
+                    "no role is assumed on behalf of more than one resource."
+                ),
+                resolution="No action required.",
+                reference=AGENTCORE_RUNTIME_PERMISSIONS_REFERENCE_URL,
+                severity=SeverityEnum.MEDIUM,
+                status=StatusEnum.PASSED,
+            )
+        )
+
+    return findings
+
+
+def _agentcore_hosting_subnets(
+    browser_inventory: Dict[str, Any] = None,
+) -> Tuple[List[Tuple[str, str]], List[Tuple[str, Exception, str]]]:
+    """Return (resource label, subnet id) per VPC-mode AgentCore resource.
+
+    Two spellings reach a subnet list: AgentCore Runtime reports subnets under
+    networkConfiguration.networkModeConfig.subnets, and the built-in tools report
+    theirs under networkConfiguration.vpcConfig.subnets. Bedrock's own VpcConfig
+    spelling, subnetIds, belongs to neither API and is not read here.
+    """
+    subnets: List[Tuple[str, str]] = []
+    errors: List[Tuple[str, Exception, str]] = []
+
+    try:
+        runtimes = _agentcore_list_all("list_agent_runtimes", ["agentRuntimes"])
+    except Exception as error:
+        runtimes = []
+        logger.warning(f"Could not list AgentCore runtimes: {error}")
+        errors.append(
+            (
+                "The list of AgentCore runtimes",
+                error,
+                "bedrock-agentcore:ListAgentRuntimes",
+            )
+        )
+
+    for runtime in runtimes:
+        runtime_id = runtime.get("agentRuntimeId") or "unknown"
+        name = runtime.get("agentRuntimeName") or runtime_id
+        label = f"Runtime '{name}' ({runtime_id})"
+        try:
+            detail = agentcore_client.get_agent_runtime(agentRuntimeId=runtime_id)
+        except Exception as error:
+            logger.warning(f"Could not read runtime {runtime_id}: {error}")
+            errors.append((label, error, "bedrock-agentcore:GetAgentRuntime"))
+            continue
+        network = detail.get("networkConfiguration") or {}
+        for subnet_id in (network.get("networkModeConfig") or {}).get("subnets") or []:
+            subnets.append((label, subnet_id))
+
+    try:
+        tool_details, tool_errors = _agentcore_tool_details(browser_inventory)
+    except Exception as error:
+        tool_details = []
+        tool_errors = [
+            (
+                "The list of AgentCore built-in tools",
+                error,
+                "bedrock-agentcore:ListCodeInterpreters",
+            )
+        ]
+    errors.extend(tool_errors)
+
+    for label, detail in tool_details:
+        network = detail.get("networkConfiguration") or {}
+        for subnet_id in (network.get("vpcConfig") or {}).get("subnets") or []:
+            subnets.append((label, subnet_id))
+
+    return subnets, errors
+
+
+def _dns_firewall_rule_subject(rule: Dict[str, Any]) -> str:
+    """Return what one DNS Firewall rule matches, as the API reports it."""
+    domain_list_id = rule.get("FirewallDomainListId")
+    if domain_list_id:
+        return f"domain list {domain_list_id}"
+    threat = rule.get("DnsThreatProtection")
+    if threat:
+        threshold = rule.get("ConfidenceThreshold") or "unspecified"
+        return f"DNS threat protection {threat} at confidence {threshold}"
+    if rule.get("FirewallRuleType"):
+        return "an advanced rule type that names no domain list"
+    return "no domain list"
+
+
+def _dns_firewall_enforcing_rules(
+    rules: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Return the rules that are in force.
+
+    A rule reports Status only while it is being created, updated or deleted, so
+    an absent Status is a rule that finished and is enforcing.
+    """
+    return [rule for rule in rules if (rule.get("Status") or "COMPLETE") == "COMPLETE"]
+
+
+def check_agentcore_dns_egress_control(
+    browser_inventory: Dict[str, Any] = None,
+) -> List[Dict[str, Any]]:
+    """AC-49: Judge DNS egress control for the VPCs that host AgentCore.
+
+    Security groups decide which addresses an agent may open a connection to,
+    and AC-01 and AC-15 judge those. Neither sees the name resolution that
+    precedes the connection, which is the channel that carries data out of a
+    private subnet without any outbound connection at all. Route 53 Resolver DNS
+    Firewall is the control for it.
+
+    A rule group is only worth its association if it ends in a block. Rules
+    process from the lowest Priority up and Priority is unique inside a group, so
+    the rule with the largest Priority decides every query the earlier rules did
+    not match: if that rule allows, the group is an allow-list with an open
+    default. The same ordering applies to the groups associated with one VPC, so
+    the association with the largest Priority holds the terminal rule.
+    """
+    reference = DNS_FIREWALL_RULE_ACTION_REFERENCE_URL
+    if agentcore_client is None:
+        return [
+            create_finding(
+                check_id="AC-49",
+                finding_name="AgentCore DNS Egress Control",
+                finding_details="AgentCore client not available in this region.",
+                resolution="No action required unless AgentCore runs in this region.",
+                reference=reference,
+                severity=SeverityEnum.INFORMATIONAL,
+                status=StatusEnum.NA,
+            )
+        ]
+
+    if route53resolver_client is None or ec2_client is None:
+        return [
+            create_finding(
+                check_id="AC-49",
+                finding_name="AgentCore DNS Egress Control",
+                finding_details=(
+                    "The Route 53 Resolver or EC2 client is not available in "
+                    "this region, so the DNS Firewall rule groups associated "
+                    "with the hosting VPCs were not read."
+                ),
+                resolution="No action required unless AgentCore runs in this region.",
+                reference=reference,
+                severity=SeverityEnum.INFORMATIONAL,
+                status=StatusEnum.NA,
+            )
+        ]
+
+    try:
+        subnet_references, errors = _agentcore_hosting_subnets(browser_inventory)
+    except Exception as error:
+        return [
+            _incomplete_check_finding(
+                check_id="AC-49",
+                finding_name="AgentCore DNS Egress Control",
+                error=error,
+                reference=reference,
+            )
+        ]
+
+    if not subnet_references and not errors:
+        return [
+            create_finding(
+                check_id="AC-49",
+                finding_name="AgentCore DNS Egress Control",
+                finding_details=(
+                    "No AgentCore runtime, browser or code interpreter in this "
+                    "region runs in a VPC, so there is no hosting VPC whose DNS "
+                    "egress could be controlled."
+                ),
+                resolution="No action required for this check.",
+                reference=reference,
+                severity=SeverityEnum.INFORMATIONAL,
+                status=StatusEnum.NA,
+            )
+        ]
+
+    findings = _agentcore_tool_read_findings(
+        "AC-49", "AgentCore DNS Egress Control", errors, reference
+    )
+
+    if not subnet_references:
+        return findings
+
+    subnet_ids = sorted({subnet_id for _, subnet_id in subnet_references})
+    try:
+        described = _paginate_aws_list(
+            ec2_client,
+            "describe_subnets",
+            "Subnets",
+            token_request_key="NextToken",
+            token_response_key="NextToken",
+            SubnetIds=subnet_ids,
+        )
+    except Exception as error:
+        logger.warning(f"Could not describe AgentCore subnets: {error}")
+        findings.append(
+            create_finding(
+                check_id="AC-49",
+                finding_name="AgentCore DNS Egress Control",
+                finding_details=(
+                    f"The {len(subnet_ids)} subnet(s) that host AgentCore "
+                    "resources could not be described, so their VPCs are "
+                    f"unknown: {_assessment_error_label(error)}."
+                ),
+                resolution="Grant ec2:DescribeSubnets and retry.",
+                reference=reference,
+                severity=SeverityEnum.INFORMATIONAL,
+                status=StatusEnum.NA,
+            )
+        )
+        return findings
+
+    subnet_vpcs = {
+        subnet.get("SubnetId"): subnet.get("VpcId")
+        for subnet in described
+        if subnet.get("SubnetId") and subnet.get("VpcId")
+    }
+    vpc_users: Dict[str, Set[str]] = {}
+    for label, subnet_id in subnet_references:
+        vpc_id = subnet_vpcs.get(subnet_id)
+        if vpc_id:
+            vpc_users.setdefault(vpc_id, set()).add(label)
+
+    if not vpc_users:
+        findings.append(
+            create_finding(
+                check_id="AC-49",
+                finding_name="AgentCore DNS Egress Control",
+                finding_details=(
+                    f"None of the {len(subnet_ids)} subnet(s) that host AgentCore "
+                    "resources reported a VPC id, so no hosting VPC was judged."
+                ),
+                resolution="Grant ec2:DescribeSubnets and retry.",
+                reference=reference,
+                severity=SeverityEnum.INFORMATIONAL,
+                status=StatusEnum.NA,
+            )
+        )
+        return findings
+
+    for vpc_id in sorted(vpc_users):
+        hosted = ", ".join(sorted(vpc_users[vpc_id]))
+        try:
+            associations = _paginate_aws_list(
+                route53resolver_client,
+                "list_firewall_rule_group_associations",
+                "FirewallRuleGroupAssociations",
+                token_request_key="NextToken",
+                token_response_key="NextToken",
+                VpcId=vpc_id,
+            )
+        except Exception as error:
+            logger.warning(f"Could not list DNS Firewall groups for {vpc_id}: {error}")
+            findings.append(
+                create_finding(
+                    check_id="AC-49",
+                    finding_name="AgentCore DNS Egress Control",
+                    finding_details=(
+                        f"The DNS Firewall rule groups associated with {vpc_id}, "
+                        f"which hosts {hosted}, could not be listed: "
+                        f"{_assessment_error_label(error)}."
+                    ),
+                    resolution=(
+                        "Grant route53resolver:ListFirewallRuleGroupAssociations "
+                        "and retry."
+                    ),
+                    reference=reference,
+                    severity=SeverityEnum.INFORMATIONAL,
+                    status=StatusEnum.NA,
+                )
+            )
+            continue
+
+        live = [
+            association
+            for association in associations
+            if (association.get("Status") or "COMPLETE") != "DELETING"
+        ]
+        if not live:
+            findings.append(
+                create_finding(
+                    check_id="AC-49",
+                    finding_name="AgentCore DNS Egress Control Missing",
+                    finding_details=(
+                        f"VPC {vpc_id}, which hosts {hosted}, has no Route 53 "
+                        "Resolver DNS Firewall rule group associated, so every "
+                        "domain an agent resolves is answered, including a "
+                        "domain that carries data out in the query itself."
+                    ),
+                    resolution=(
+                        "Associate a DNS Firewall rule group with this VPC and "
+                        "end it in a rule whose action is BLOCK."
+                    ),
+                    reference=reference,
+                    severity=SeverityEnum.MEDIUM,
+                    status=StatusEnum.FAILED,
+                )
+            )
+            continue
+
+        terminal_association = max(live, key=lambda item: item.get("Priority") or 0)
+        group_id = terminal_association.get("FirewallRuleGroupId") or "unknown"
+        group_name = terminal_association.get("Name") or group_id
+
+        try:
+            rules = _paginate_aws_list(
+                route53resolver_client,
+                "list_firewall_rules",
+                "FirewallRules",
+                token_request_key="NextToken",
+                token_response_key="NextToken",
+                FirewallRuleGroupId=group_id,
+            )
+        except Exception as error:
+            logger.warning(f"Could not list DNS Firewall rules in {group_id}: {error}")
+            findings.append(
+                create_finding(
+                    check_id="AC-49",
+                    finding_name="AgentCore DNS Egress Control",
+                    finding_details=(
+                        f"The rules of DNS Firewall rule group {group_name} "
+                        f"({group_id}), the last group associated with {vpc_id}, "
+                        f"could not be listed: {_assessment_error_label(error)}."
+                    ),
+                    resolution="Grant route53resolver:ListFirewallRules and retry.",
+                    reference=reference,
+                    severity=SeverityEnum.INFORMATIONAL,
+                    status=StatusEnum.NA,
+                )
+            )
+            continue
+
+        enforcing = _dns_firewall_enforcing_rules(rules)
+        if not enforcing:
+            findings.append(
+                create_finding(
+                    check_id="AC-49",
+                    finding_name="AgentCore DNS Egress Control Missing",
+                    finding_details=(
+                        f"VPC {vpc_id}, which hosts {hosted}, is associated with "
+                        f"DNS Firewall rule group {group_name} ({group_id}), "
+                        f"which has no rule in force out of {len(rules)} "
+                        "returned, so no domain an agent resolves is blocked."
+                    ),
+                    resolution=(
+                        "Add a rule to this rule group whose action is BLOCK and "
+                        "whose Priority is the highest in the group."
+                    ),
+                    reference=reference,
+                    severity=SeverityEnum.MEDIUM,
+                    status=StatusEnum.FAILED,
+                )
+            )
+            continue
+
+        terminal_rule = max(enforcing, key=lambda item: item.get("Priority") or 0)
+        rule_name = terminal_rule.get("Name") or "unnamed"
+        priority = terminal_rule.get("Priority")
+        action = terminal_rule.get("Action") or "unspecified"
+        subject = _dns_firewall_rule_subject(terminal_rule)
+
+        if action == "BLOCK":
+            findings.append(
+                create_finding(
+                    check_id="AC-49",
+                    finding_name="AgentCore DNS Egress Control",
+                    finding_details=(
+                        f"VPC {vpc_id}, which hosts {hosted}, is associated with "
+                        f"DNS Firewall rule group {group_name} ({group_id}), "
+                        f"whose last rule '{rule_name}' at Priority {priority} "
+                        f"blocks {subject}."
+                    ),
+                    resolution=(
+                        "No action required. Confirm the blocked domain list is "
+                        "wide enough that the earlier allow rules are the only "
+                        "names an agent can resolve."
+                    ),
+                    reference=reference,
+                    severity=SeverityEnum.MEDIUM,
+                    status=StatusEnum.PASSED,
+                )
+            )
+        else:
+            findings.append(
+                create_finding(
+                    check_id="AC-49",
+                    finding_name="AgentCore DNS Egress Control Not Terminal",
+                    finding_details=(
+                        f"VPC {vpc_id}, which hosts {hosted}, is associated with "
+                        f"DNS Firewall rule group {group_name} ({group_id}), "
+                        f"whose last rule '{rule_name}' at Priority {priority} "
+                        f"has action {action} on {subject}. Every query the "
+                        "earlier rules did not match is answered."
+                    ),
+                    resolution=(
+                        "Add a rule whose action is BLOCK at the highest "
+                        "Priority in this rule group, so a name no earlier rule "
+                        "allowed is not resolved."
+                    ),
+                    reference=reference,
+                    severity=SeverityEnum.MEDIUM,
+                    status=StatusEnum.FAILED,
+                )
+            )
+
+    return findings
+
+
+# The web ACL setting that decides how much of an agent's tool payload AWS WAF
+# inspects. AGENTCORE_GATEWAY is the AssociatedResourceType key a gateway
+# association uses, and the API documents KB_16 as the limit that applies when
+# the association names no other value.
+WAF_AGENTCORE_RESOURCE_TYPE = "AGENTCORE_GATEWAY"
+WAF_DEFAULT_BODY_INSPECTION_LIMIT = "KB_16"
+
+# The two AWS Managed Rules groups that carry the request-content rules this
+# check looks for. The SQL database rule group is published as VendorName AWS,
+# Name AWSManagedRulesSQLiRuleSet, and the core rule set carries the
+# CrossSiteScripting_BODY, _COOKIE, _PATH and _QUERYARGUMENTS rules, each with
+# rule action Block.
+WAF_SQL_INJECTION_GROUP_TOKEN = "sqli"
+WAF_CROSS_SITE_SCRIPTING_GROUP_TOKEN = "commonruleset"
+
+
+def _waf_statement_nodes(statement: Any) -> List[Dict[str, Any]]:
+    """Return one node per statement in a rule's statement tree.
+
+    AndStatement and OrStatement nest a list of statements, and a rate-based or
+    managed-rule-group statement nests the scope-down statement that decides
+    which requests it applies to, so a match statement inside any of them is
+    still inspecting requests. NotStatement is not descended into: it matches
+    everything its child does not, so a SQL injection match inside one is not
+    SQL injection coverage.
+    """
+    if not isinstance(statement, dict):
+        return []
+
+    nodes = [statement]
+    for key in ("AndStatement", "OrStatement"):
+        nested = statement.get(key)
+        if isinstance(nested, dict):
+            for child in nested.get("Statements") or []:
+                nodes.extend(_waf_statement_nodes(child))
+    for key in ("RateBasedStatement", "ManagedRuleGroupStatement"):
+        nested = statement.get(key)
+        if isinstance(nested, dict):
+            nodes.extend(_waf_statement_nodes(nested.get("ScopeDownStatement")))
+    return nodes
+
+
+def _waf_rule_coverage(web_acl: Dict[str, Any]) -> Dict[str, Any]:
+    """Return which request filters one web ACL applies, and what it hides.
+
+    A rule whose action or override is Count observes requests without changing
+    the response, so it contributes no coverage. A referenced customer rule group
+    and a managed rule group from a vendor other than AWS both keep their rules
+    in another resource this check does not read, so they are reported as opaque
+    and leave the verdict indeterminate rather than absent. RuleActionOverrides
+    inside an AWS managed rule group are not read, so a group whose every rule is
+    individually overridden to Count still counts as blocking.
+    """
+    coverage: Dict[str, Any] = {
+        "block": False,
+        "sqli": False,
+        "xss": False,
+        "rate": False,
+        "opaque": [],
+        "evidence": {},
+    }
+
+    if "Block" in (web_acl.get("DefaultAction") or {}):
+        coverage["block"] = True
+        coverage["evidence"]["block"] = "the web ACL default action"
+
+    for rule in web_acl.get("Rules") or []:
+        rule_name = rule.get("Name") or "unnamed"
+        if "Count" in (rule.get("Action") or {}) or "Count" in (
+            rule.get("OverrideAction") or {}
+        ):
+            continue
+
+        if "Block" in (rule.get("Action") or {}) and not coverage["block"]:
+            coverage["block"] = True
+            coverage["evidence"]["block"] = f"rule '{rule_name}'"
+
+        for node in _waf_statement_nodes(rule.get("Statement")):
+            if "SqliMatchStatement" in node and not coverage["sqli"]:
+                coverage["sqli"] = True
+                coverage["evidence"]["sqli"] = f"rule '{rule_name}'"
+            if "XssMatchStatement" in node and not coverage["xss"]:
+                coverage["xss"] = True
+                coverage["evidence"]["xss"] = f"rule '{rule_name}'"
+            if "RateBasedStatement" in node and not coverage["rate"]:
+                coverage["rate"] = True
+                coverage["evidence"]["rate"] = f"rule '{rule_name}'"
+
+            referenced = node.get("RuleGroupReferenceStatement")
+            if isinstance(referenced, dict):
+                coverage["opaque"].append(
+                    f"rule '{rule_name}' references rule group "
+                    f"{referenced.get('ARN') or 'unknown'}"
+                )
+                continue
+
+            group = node.get("ManagedRuleGroupStatement")
+            if not isinstance(group, dict):
+                continue
+            vendor = group.get("VendorName") or "unnamed"
+            name = group.get("Name") or "unnamed"
+            if vendor != "AWS":
+                coverage["opaque"].append(
+                    f"rule '{rule_name}' uses the {vendor} managed rule group {name}"
+                )
+                continue
+
+            if not coverage["block"]:
+                coverage["block"] = True
+                coverage["evidence"]["block"] = (
+                    f"the blocking rules of {name} in rule '{rule_name}'"
+                )
+            lowered = name.lower()
+            if WAF_SQL_INJECTION_GROUP_TOKEN in lowered and not coverage["sqli"]:
+                coverage["sqli"] = True
+                coverage["evidence"]["sqli"] = f"{name} in rule '{rule_name}'"
+            if WAF_CROSS_SITE_SCRIPTING_GROUP_TOKEN in lowered and not coverage["xss"]:
+                coverage["xss"] = True
+                coverage["evidence"]["xss"] = f"{name} in rule '{rule_name}'"
+
+    return coverage
+
+
+def _waf_body_inspection_limit(web_acl: Dict[str, Any]) -> str:
+    """Return the body inspection limit the ACL sets for a gateway association."""
+    request_body = (web_acl.get("AssociationConfig") or {}).get("RequestBody") or {}
+    resource_config = request_body.get(WAF_AGENTCORE_RESOURCE_TYPE) or {}
+    return resource_config.get("DefaultSizeInspectionLimit") or ""
+
+
+def _gateway_waf_rule_findings(
+    label: str, web_acl_arn: str, web_acl: Dict[str, Any]
+) -> List[Dict[str, Any]]:
+    """AG-39: judge whether one gateway's web ACL filters the request.
+
+    AG-27 reports that a web ACL is associated. An associated ACL filters nothing
+    unless its rules act: five settings decide whether it does, and an ACL that
+    is missing any of them lets the matching request through to the agent's
+    tools. The body inspection limit is one of them because a tool call carries
+    its arguments in the body, and AWS WAF inspects only the first 16 KB of it
+    unless the association raises the limit.
+    """
+    coverage = _waf_rule_coverage(web_acl)
+    body_limit = _waf_body_inspection_limit(web_acl)
+    body_filters = bool(body_limit) and body_limit != WAF_DEFAULT_BODY_INSPECTION_LIMIT
+    acl_name = web_acl.get("Name") or web_acl_arn
+
+    conditions = [
+        ("a rule that blocks", coverage["block"], coverage["evidence"].get("block")),
+        (
+            "SQL injection inspection",
+            coverage["sqli"],
+            coverage["evidence"].get("sqli"),
+        ),
+        (
+            "cross-site scripting inspection",
+            coverage["xss"],
+            coverage["evidence"].get("xss"),
+        ),
+        ("a rate-based rule", coverage["rate"], coverage["evidence"].get("rate")),
+        (
+            "a request body inspection limit above the 16 KB default",
+            body_filters,
+            f"DefaultSizeInspectionLimit {body_limit}" if body_filters else "",
+        ),
+    ]
+    missing = [name for name, present, _ in conditions if not present]
+    applied = "; ".join(
+        f"{name} from {why or 'the web ACL'}"
+        for name, present, why in conditions
+        if present
+    )
+
+    if not missing:
+        return [
+            create_finding(
+                check_id="AG-39",
+                finding_name="Agentic AI Gateway WAF Rule Coverage",
+                finding_details=(
+                    f"{label} is filtered by web ACL {acl_name}, which applies "
+                    f"all five request filters this check reads: {applied}."
+                ),
+                resolution="No action required",
+                reference=WAF_RULE_ACTION_REFERENCE_URL,
+                severity=SeverityEnum.MEDIUM,
+                status=StatusEnum.PASSED,
+            )
+        ]
+
+    if coverage["opaque"]:
+        return [
+            create_finding(
+                check_id="AG-39",
+                finding_name="Agentic AI Gateway WAF Rule Coverage",
+                finding_details=(
+                    f"{label} is associated with web ACL {acl_name}, which does "
+                    f"not apply {', '.join(missing)} in the rules this check "
+                    f"reads, and which delegates to {len(coverage['opaque'])} "
+                    "rule group(s) whose rules live in another resource: "
+                    f"{'; '.join(coverage['opaque'])}. Those groups may carry "
+                    "the missing filters, so the ACL was not judged."
+                ),
+                resolution=(
+                    "Read the named rule groups and confirm they apply the "
+                    "missing filters, or move the filters into rules on the web "
+                    "ACL itself."
+                ),
+                reference=WAF_RULE_ACTION_REFERENCE_URL,
+                severity=SeverityEnum.INFORMATIONAL,
+                status=StatusEnum.NA,
+            )
+        ]
+
+    reference = (
+        WAF_BODY_INSPECTION_LIMIT_REFERENCE_URL
+        if not body_filters and len(missing) == 1
+        else WAF_RULE_ACTION_REFERENCE_URL
+    )
+    return [
+        create_finding(
+            check_id="AG-39",
+            finding_name="Agentic AI Gateway WAF Rule Coverage Gaps",
+            finding_details=(
+                f"{label} is associated with web ACL {acl_name}, which is "
+                f"missing {len(missing)} of the five request filters this check "
+                f"reads: {', '.join(missing)}. It applies "
+                f"{applied or 'none of the five'}."
+            ),
+            resolution=(
+                "Add the missing filters to the web ACL: a rule or default "
+                "action that blocks, the AWSManagedRulesSQLiRuleSet and "
+                "AWSManagedRulesCommonRuleSet managed rule groups without a "
+                "Count override, a rate-based rule, and a "
+                "DefaultSizeInspectionLimit above KB_16 for the "
+                "AGENTCORE_GATEWAY association, which costs additional WCUs."
+            ),
+            reference=reference,
+            severity=SeverityEnum.MEDIUM,
+            status=StatusEnum.FAILED,
+        )
+    ]
+
+
 def check_agentcore_gateway_agentic_security() -> List[Dict[str, Any]]:
     """
     Check API-provable AgentCore Gateway controls for agentic tool execution.
@@ -12151,6 +13235,7 @@ def check_agentcore_gateway_agentic_security() -> List[Dict[str, Any]]:
     - Policy engine is attached in ENFORCE mode
     - Debug exception detail is not exposed
     - AWS WAF web ACL is associated
+    - The associated web ACL applies rules that filter the request
     """
     findings = []
 
@@ -12160,6 +13245,7 @@ def check_agentcore_gateway_agentic_security() -> List[Dict[str, Any]]:
             ("AG-25", "Agentic AI Gateway Tool Policy Enforcement"),
             ("AG-26", "Agentic AI Gateway Error Detail Exposure"),
             ("AG-27", "Agentic AI Gateway WAF Protection"),
+            ("AG-39", "Agentic AI Gateway WAF Rule Coverage"),
         ]:
             findings.append(
                 create_finding(
@@ -12174,7 +13260,7 @@ def check_agentcore_gateway_agentic_security() -> List[Dict[str, Any]]:
             )
         return findings
 
-    gateway_check_ids = ["AG-24", "AG-25", "AG-26", "AG-27"]
+    gateway_check_ids = ["AG-24", "AG-25", "AG-26", "AG-27", "AG-39"]
 
     try:
         gateways = _agentcore_list_all("list_gateways", ["items", "gateways"])
@@ -12222,6 +13308,15 @@ def check_agentcore_gateway_agentic_security() -> List[Dict[str, Any]]:
                 finding_details="No AgentCore Gateways found",
                 resolution="No action required",
                 reference=AGENTCORE_GATEWAY_API_REFERENCE_URL,
+                severity=SeverityEnum.INFORMATIONAL,
+                status=StatusEnum.NA,
+            ),
+            create_finding(
+                check_id="AG-39",
+                finding_name="Agentic AI Gateway WAF Rule Coverage",
+                finding_details="No AgentCore Gateways found",
+                resolution="No action required",
+                reference=WAF_RULE_ACTION_REFERENCE_URL,
                 severity=SeverityEnum.INFORMATIONAL,
                 status=StatusEnum.NA,
             ),
@@ -12458,6 +13553,66 @@ def check_agentcore_gateway_agentic_security() -> List[Dict[str, Any]]:
                 )
             )
 
+        gateway_label = f"Gateway '{gateway_name}' ({gateway_id})"
+        if not web_acl_arn:
+            findings.append(
+                create_finding(
+                    check_id="AG-39",
+                    finding_name="Agentic AI Gateway WAF Rule Coverage",
+                    finding_details=(
+                        f"{gateway_label} has no web ACL associated, so there are "
+                        "no WAF rules to judge. AG-27 reports the missing "
+                        "association."
+                    ),
+                    resolution="No action required for this check.",
+                    reference=WAF_RULE_ACTION_REFERENCE_URL,
+                    severity=SeverityEnum.INFORMATIONAL,
+                    status=StatusEnum.NA,
+                )
+            )
+        elif wafv2_client is None:
+            findings.append(
+                create_finding(
+                    check_id="AG-39",
+                    finding_name="Agentic AI Gateway WAF Rule Coverage",
+                    finding_details=(
+                        f"{gateway_label} is associated with web ACL "
+                        f"{web_acl_arn}, but the AWS WAF client is not available "
+                        "in this region, so its rules were not read."
+                    ),
+                    resolution="No action required unless AWS WAF runs in this region.",
+                    reference=WAF_RULE_ACTION_REFERENCE_URL,
+                    severity=SeverityEnum.INFORMATIONAL,
+                    status=StatusEnum.NA,
+                )
+            )
+        else:
+            try:
+                web_acl = (wafv2_client.get_web_acl(ARN=web_acl_arn) or {}).get(
+                    "WebACL"
+                ) or {}
+            except Exception as error:
+                logger.warning(f"Could not read web ACL {web_acl_arn}: {error}")
+                findings.append(
+                    create_finding(
+                        check_id="AG-39",
+                        finding_name="Agentic AI Gateway WAF Rule Coverage",
+                        finding_details=(
+                            f"{gateway_label} is associated with web ACL "
+                            f"{web_acl_arn}, whose rules could not be read: "
+                            f"{_assessment_error_label(error)}."
+                        ),
+                        resolution="Grant wafv2:GetWebACL on the web ACL and retry.",
+                        reference=WAF_RULE_ACTION_REFERENCE_URL,
+                        severity=SeverityEnum.INFORMATIONAL,
+                        status=StatusEnum.NA,
+                    )
+                )
+            else:
+                findings.extend(
+                    _gateway_waf_rule_findings(gateway_label, web_acl_arn, web_acl)
+                )
+
     return findings
 
 
@@ -12475,6 +13630,7 @@ def lambda_handler(event, context):
     global start_time, iam_client, ec2_client, ecr_client, logs_client
     global cloudwatch_client, cloudtrail_client, oam_client, agentcore_client
     global kms_client, organizations_client
+    global wafv2_client, route53resolver_client
     start_time = time.time()
 
     try:
@@ -12502,6 +13658,13 @@ def lambda_handler(event, context):
         kms_client = boto3.client("kms", config=boto3_config, region_name=region)
         # Organizations resolves to one global endpoint whatever region is passed.
         organizations_client = boto3.client("organizations", config=boto3_config)
+        # A gateway is a regional resource, so its web ACL is a REGIONAL scope ACL
+        # in the gateway's own region, and the DNS Firewall rule groups associated
+        # with a VPC live in the VPC's region.
+        wafv2_client = boto3.client("wafv2", config=boto3_config, region_name=region)
+        route53resolver_client = boto3.client(
+            "route53resolver", config=boto3_config, region_name=region
+        )
 
         # Collect all findings
         all_findings = []
@@ -12982,6 +14145,18 @@ def lambda_handler(event, context):
                 ["AC-47"],
                 "Runtime Invocation Path",
                 check_agentcore_runtime_invocation_path,
+            ),
+            (
+                ["AC-48"],
+                "Execution Role Trust And Sharing",
+                lambda: check_agentcore_execution_role_trust_and_sharing(
+                    browser_inventory
+                ),
+            ),
+            (
+                ["AC-49"],
+                "DNS Egress Control",
+                lambda: check_agentcore_dns_egress_control(browser_inventory),
             ),
         ]
 

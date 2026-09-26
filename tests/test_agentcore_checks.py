@@ -2876,6 +2876,7 @@ class TestAgenticGatewaySecurity:
             "AG-25",
             "AG-26",
             "AG-27",
+            "AG-39",
         }
         assert all(finding["Status"] == "N/A" for finding in findings)
         assert all(finding["Severity"] == "Informational" for finding in findings)
@@ -2895,6 +2896,7 @@ class TestAgenticGatewaySecurity:
             "AG-25",
             "AG-26",
             "AG-27",
+            "AG-39",
         }
         assert all(finding["Status"] == "N/A" for finding in findings)
         assert all(finding["Severity"] == "Informational" for finding in findings)
@@ -12840,3 +12842,1613 @@ class TestRuntimeIsolationCheckRegistration:
         source = textwrap.dedent(inspect.getsource(agentcore_app.lambda_handler))
         assert source.count("get_custom_browser_inventory()") == 1
         assert source.count("browser_inventory") >= 3
+
+
+# ===================================================================
+# AC-48 execution role trust and sharing
+# ===================================================================
+_ACCOUNT_ROOT_TRUST = {
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Effect": "Allow",
+            "Principal": {"AWS": "arn:aws:iam::123456789012:root"},
+            "Action": "sts:AssumeRole",
+        }
+    ],
+}
+_BARE_ACCOUNT_TRUST = {
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Effect": "Allow",
+            "Principal": {"AWS": "123456789012"},
+            "Action": "sts:AssumeRole",
+        }
+    ],
+}
+_CONDITIONED_ROOT_TRUST = {
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Effect": "Allow",
+            "Principal": {"AWS": "arn:aws:iam::123456789012:root"},
+            "Action": "sts:AssumeRole",
+            "Condition": {"StringEquals": {"aws:PrincipalTag/team": "agents"}},
+        }
+    ],
+}
+
+
+class TestAC48ExecutionRoleTrustAndSharing:
+    """AC-48: who may assume each AgentCore execution role, and its reuse."""
+
+    def _arn(self, role_name):
+        return f"arn:aws:iam::123456789012:role/{role_name}"
+
+    def _wire(
+        self,
+        mock_ac,
+        mock_iam,
+        runtimes=(),
+        gateways=(),
+        interpreters=(),
+        browsers=(),
+        trust=None,
+    ):
+        """Stub one resource per role name in each of the four families.
+
+        A None entry is a resource that names no execution role. The browser
+        inventory is returned rather than stubbed on the client, because the
+        handler reads it once and passes it down.
+        """
+        runtime_summaries = [
+            {"agentRuntimeId": f"rt-{index}", "agentRuntimeName": f"rt-{index}"}
+            for index in range(len(runtimes))
+        ]
+        mock_ac.list_agent_runtimes.return_value = {"agentRuntimes": runtime_summaries}
+        runtime_details = {
+            summary["agentRuntimeId"]: ({"roleArn": self._arn(role)} if role else {})
+            for summary, role in zip(runtime_summaries, runtimes)
+        }
+        mock_ac.get_agent_runtime.side_effect = lambda agentRuntimeId: runtime_details[
+            agentRuntimeId
+        ]
+
+        gateway_summaries = [
+            {"gatewayId": f"gw-{index}", "name": f"gw-{index}"}
+            for index in range(len(gateways))
+        ]
+        mock_ac.list_gateways.return_value = {"items": gateway_summaries}
+        gateway_details = {
+            summary["gatewayId"]: ({"roleArn": self._arn(role)} if role else {})
+            for summary, role in zip(gateway_summaries, gateways)
+        }
+        mock_ac.get_gateway.side_effect = lambda gatewayIdentifier: gateway_details[
+            gatewayIdentifier
+        ]
+
+        interpreter_summaries = [
+            {"codeInterpreterId": f"ci-{index}", "name": f"ci-{index}"}
+            for index in range(len(interpreters))
+        ]
+        mock_ac.list_code_interpreters.return_value = {
+            "codeInterpreterSummaries": interpreter_summaries
+        }
+        interpreter_details = {
+            summary["codeInterpreterId"]: (
+                {"executionRoleArn": self._arn(role)} if role else {}
+            )
+            for summary, role in zip(interpreter_summaries, interpreters)
+        }
+        mock_ac.get_code_interpreter.side_effect = lambda codeInterpreterId: (
+            interpreter_details[codeInterpreterId]
+        )
+
+        inventory = {
+            "items": [
+                {
+                    "summary": {"browserId": f"br-{index}", "name": f"br-{index}"},
+                    "detail": ({"executionRoleArn": self._arn(role)} if role else {}),
+                }
+                for index, role in enumerate(browsers)
+            ],
+            "errors": [],
+            "list_error": None,
+        }
+
+        documents = dict(trust or {})
+        for role in (
+            list(runtimes) + list(gateways) + list(interpreters) + list(browsers)
+        ):
+            if role:
+                documents.setdefault(role, _GUARDED_TRUST)
+        mock_iam.get_role.side_effect = lambda RoleName: {
+            "Role": {"AssumeRolePolicyDocument": documents[RoleName]}
+        }
+        return inventory
+
+    def _named(self, findings, name):
+        return [finding for finding in findings if finding["Finding"] == name]
+
+    @patch("agentcore_app.agentcore_client", None)
+    def test_no_client_is_na(self):
+        findings = agentcore_app.check_agentcore_execution_role_trust_and_sharing()
+
+        assert len(findings) == 1
+        assert findings[0]["Check_ID"] == "AC-48"
+        assert findings[0]["Status"] == "N/A"
+        assert findings[0]["Severity"] == "Informational"
+        assert_finding_schema(findings[0])
+
+    @patch("agentcore_app.iam_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_no_resource_in_any_family_is_na(self, mock_ac, mock_iam):
+        inventory = self._wire(mock_ac, mock_iam)
+
+        findings = agentcore_app.check_agentcore_execution_role_trust_and_sharing(
+            inventory
+        )
+
+        assert len(findings) == 1
+        assert findings[0]["Status"] == "N/A"
+        assert mock_iam.get_role.call_count == 0
+
+    @patch("agentcore_app.iam_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_one_guarded_role_per_family_passes_both_legs(self, mock_ac, mock_iam):
+        """A single-workload account with four guarded roles reaches Passed.
+
+        Four trust rows and the sharing row are all that can be emitted here, so
+        this is the case that proves Passed is reachable on both legs at once.
+        """
+        inventory = self._wire(
+            mock_ac,
+            mock_iam,
+            runtimes=["RuntimeRole"],
+            gateways=["GatewayRole"],
+            interpreters=["InterpreterRole"],
+            browsers=["BrowserRole"],
+        )
+
+        findings = agentcore_app.check_agentcore_execution_role_trust_and_sharing(
+            inventory
+        )
+        details = " ".join(finding["Finding_Details"] for finding in findings)
+
+        assert len(findings) == 5
+        assert {finding["Status"] for finding in findings} == {"Passed"}
+        assert {finding["Check_ID"] for finding in findings} == {"AC-48"}
+        for family in ("runtime", "gateway", "browser", "code interpreter"):
+            assert f"[{family} family]" in details
+        assert len(self._named(findings, "AgentCore Execution Role Sharing")) == 1
+        for finding in findings:
+            assert_finding_schema(finding)
+
+    @pytest.mark.parametrize(
+        ("family", "wiring"),
+        [
+            ("runtime family", {"runtimes": ["OpenRole"]}),
+            ("gateway family", {"gateways": ["OpenRole"]}),
+            ("browser family", {"browsers": ["OpenRole"]}),
+            ("code interpreter family", {"interpreters": ["OpenRole"]}),
+        ],
+        ids=["runtime", "gateway", "browser", "code-interpreter"],
+    )
+    @patch("agentcore_app.iam_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_an_unguarded_service_principal_fails_in_every_family(
+        self, mock_ac, mock_iam, family, wiring
+    ):
+        inventory = self._wire(
+            mock_ac, mock_iam, trust={"OpenRole": _UNGUARDED_TRUST}, **wiring
+        )
+
+        findings = agentcore_app.check_agentcore_execution_role_trust_and_sharing(
+            inventory
+        )
+        failed = self._named(findings, "AgentCore Execution Role Trust Guard Missing")
+
+        assert len(failed) == 1
+        assert failed[0]["Status"] == "Failed"
+        assert failed[0]["Severity"] == "High"
+        assert f"[{family}]" in failed[0]["Finding_Details"]
+        assert "OpenRole" in failed[0]["Finding_Details"]
+        assert "1 of 2 Allow statement(s)" in failed[0]["Finding_Details"]
+        assert_finding_schema(failed[0])
+
+    @pytest.mark.parametrize(
+        ("label", "document"),
+        [
+            ("account-root", _ACCOUNT_ROOT_TRUST),
+            ("bare-account-id", _BARE_ACCOUNT_TRUST),
+        ],
+    )
+    @patch("agentcore_app.iam_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_whole_account_principal_fails(self, mock_ac, mock_iam, label, document):
+        inventory = self._wire(
+            mock_ac, mock_iam, runtimes=["WideRole"], trust={"WideRole": document}
+        )
+
+        findings = agentcore_app.check_agentcore_execution_role_trust_and_sharing(
+            inventory
+        )
+        failed = self._named(findings, "AgentCore Execution Role Account Wide Trust")
+
+        assert len(failed) == 1
+        assert failed[0]["Status"] == "Failed"
+        assert failed[0]["Severity"] == "High"
+        assert "WideRole" in failed[0]["Finding_Details"]
+        assert "[runtime family]" in failed[0]["Finding_Details"]
+        assert not self._named(findings, "AgentCore Execution Role Trust Guard Missing")
+
+    @patch("agentcore_app.iam_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_conditioned_account_root_is_a_scoping_decision(self, mock_ac, mock_iam):
+        # The account owner narrowed the trust. Which condition suits a workload
+        # is not this check's call, so a conditioned root is not reported.
+        inventory = self._wire(
+            mock_ac,
+            mock_iam,
+            runtimes=["NarrowedRole"],
+            trust={"NarrowedRole": _CONDITIONED_ROOT_TRUST},
+        )
+
+        findings = agentcore_app.check_agentcore_execution_role_trust_and_sharing(
+            inventory
+        )
+
+        assert not self._named(findings, "AgentCore Execution Role Account Wide Trust")
+        assert (
+            self._named(findings, "AgentCore Execution Role Trust")[0]["Status"]
+            == "Passed"
+        )
+
+    @patch("agentcore_app.iam_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_role_named_by_two_families_fails_the_sharing_leg(
+        self, mock_ac, mock_iam
+    ):
+        inventory = self._wire(
+            mock_ac,
+            mock_iam,
+            runtimes=["SharedRole"],
+            browsers=["SharedRole"],
+            gateways=["OwnRole"],
+        )
+
+        findings = agentcore_app.check_agentcore_execution_role_trust_and_sharing(
+            inventory
+        )
+        shared = self._named(
+            findings, "AgentCore Execution Role Shared Across Workloads"
+        )
+
+        assert len(shared) == 1
+        assert shared[0]["Status"] == "Failed"
+        assert shared[0]["Severity"] == "Medium"
+        assert "SharedRole" in shared[0]["Finding_Details"]
+        assert "[runtime family]" in shared[0]["Finding_Details"]
+        assert "[browser family]" in shared[0]["Finding_Details"]
+        assert not self._named(findings, "AgentCore Execution Role Sharing")
+        # Two distinct role ARNs, so the trust policy is read twice and the
+        # shared role is judged once rather than once per resource naming it.
+        assert mock_iam.get_role.call_count == 2
+        assert len(self._named(findings, "AgentCore Execution Role Trust")) == 2
+
+    @patch("agentcore_app.iam_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_runtime_list_failure_is_na(self, mock_ac, mock_iam):
+        self._wire(mock_ac, mock_iam)
+        mock_ac.list_agent_runtimes.side_effect = _make_client_error(
+            "AccessDeniedException", "denied"
+        )
+
+        findings = agentcore_app.check_agentcore_execution_role_trust_and_sharing(
+            {"items": [], "errors": [], "list_error": None}
+        )
+
+        assert len(findings) == 1
+        assert findings[0]["Status"] == "N/A"
+        assert findings[0]["Severity"] == "Informational"
+        assert "bedrock-agentcore:ListAgentRuntimes" in findings[0]["Resolution"]
+
+    @patch("agentcore_app.iam_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_one_unreadable_runtime_does_not_hide_the_other(self, mock_ac, mock_iam):
+        inventory = self._wire(mock_ac, mock_iam, runtimes=["RuntimeRole", "Other"])
+        readable = mock_ac.get_agent_runtime.side_effect
+
+        def detail(agentRuntimeId):
+            if agentRuntimeId == "rt-1":
+                raise _make_client_error("AccessDeniedException", "denied")
+            return readable(agentRuntimeId)
+
+        mock_ac.get_agent_runtime.side_effect = detail
+
+        findings = agentcore_app.check_agentcore_execution_role_trust_and_sharing(
+            inventory
+        )
+        statuses = [finding["Status"] for finding in findings]
+
+        assert "N/A" in statuses
+        assert "Passed" in statuses
+        unreadable = next(
+            finding
+            for finding in findings
+            if "could not be read" in finding["Finding_Details"]
+        )
+        assert "rt-1" in unreadable["Finding_Details"]
+        assert "bedrock-agentcore:GetAgentRuntime" in unreadable["Resolution"]
+
+    @patch("agentcore_app.iam_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_an_unreadable_trust_policy_is_na(self, mock_ac, mock_iam):
+        inventory = self._wire(mock_ac, mock_iam, runtimes=["RuntimeRole"])
+        mock_iam.get_role.side_effect = _make_client_error(
+            "AccessDenied", "not authorized"
+        )
+
+        findings = agentcore_app.check_agentcore_execution_role_trust_and_sharing(
+            inventory
+        )
+        unreadable = self._named(findings, "AgentCore Execution Role Trust")
+
+        assert len(unreadable) == 1
+        assert unreadable[0]["Status"] == "N/A"
+        assert "iam:GetRole" in unreadable[0]["Resolution"]
+        assert "RuntimeRole" in unreadable[0]["Finding_Details"]
+
+    @patch("agentcore_app.iam_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_resource_naming_no_role_is_na_without_an_iam_call(
+        self, mock_ac, mock_iam
+    ):
+        inventory = self._wire(mock_ac, mock_iam, browsers=[None])
+
+        findings = agentcore_app.check_agentcore_execution_role_trust_and_sharing(
+            inventory
+        )
+
+        assert len(findings) == 1
+        assert findings[0]["Status"] == "N/A"
+        assert "names no execution role" in findings[0]["Finding_Details"]
+        assert "[browser family]" in findings[0]["Finding_Details"]
+        assert mock_iam.get_role.call_count == 0
+
+    def test_the_family_words_come_from_the_tool_label_prefixes(self):
+        # _agentcore_tool_details merges browsers and code interpreters into one
+        # list, so the family a failing role belongs to is recovered from the
+        # label prefix that helper builds.
+        assert agentcore_app._agentcore_tool_family("Browser 'b' (br-1)") == "browser"
+        assert (
+            agentcore_app._agentcore_tool_family("Code Interpreter 'c' (ci-1)")
+            == "code interpreter"
+        )
+        assert agentcore_app._agentcore_tool_family("Something 'x' (id)") == "tool"
+
+
+# ===================================================================
+# AC-49 DNS egress control
+# ===================================================================
+class TestAC49DnsEgressControl:
+    """AC-49: the DNS Firewall rule group that ends the hosting VPC's egress."""
+
+    def _rule(self, name, priority, action="BLOCK", **extra):
+        rule = {
+            "Name": name,
+            "Priority": priority,
+            "Action": action,
+            "FirewallDomainListId": f"rslvr-fdl-{name}",
+        }
+        rule.update(extra)
+        return rule
+
+    def _association(self, group_id, priority=100, **extra):
+        association = {
+            "Id": f"rslvr-frgassoc-{group_id}",
+            "FirewallRuleGroupId": group_id,
+            "Name": f"assoc-{group_id}",
+            "Priority": priority,
+        }
+        association.update(extra)
+        return association
+
+    def _wire(
+        self,
+        mock_ac,
+        mock_ec2,
+        mock_r53,
+        runtime_subnets=("subnet-a",),
+        tool_subnets=(),
+        subnet_vpcs=None,
+        associations=None,
+        rules=None,
+    ):
+        """Stub one VPC-mode runtime, optional tools, and the DNS Firewall reads."""
+        mock_ac.list_agent_runtimes.return_value = {
+            "agentRuntimes": [{"agentRuntimeId": "rt-1", "agentRuntimeName": "rt-1"}]
+        }
+        mock_ac.get_agent_runtime.return_value = {
+            "networkConfiguration": {
+                "networkMode": "VPC",
+                "networkModeConfig": {"subnets": list(runtime_subnets)},
+            }
+        }
+        mock_ac.list_code_interpreters.return_value = {
+            "codeInterpreterSummaries": (
+                [{"codeInterpreterId": "ci-1", "name": "ci-1"}] if tool_subnets else []
+            )
+        }
+        mock_ac.get_code_interpreter.return_value = {
+            "networkConfiguration": {
+                "networkMode": "VPC",
+                "vpcConfig": {"subnets": list(tool_subnets)},
+            }
+        }
+        subnet_vpcs = {"subnet-a": "vpc-a"} if subnet_vpcs is None else subnet_vpcs
+        mock_ec2.describe_subnets.return_value = {
+            "Subnets": [
+                {"SubnetId": subnet_id, "VpcId": vpc_id}
+                for subnet_id, vpc_id in subnet_vpcs.items()
+            ]
+        }
+        associations = associations or {}
+        mock_r53.list_firewall_rule_group_associations.side_effect = lambda VpcId: {
+            "FirewallRuleGroupAssociations": associations.get(VpcId, [])
+        }
+        rules = rules or {}
+        mock_r53.list_firewall_rules.side_effect = lambda FirewallRuleGroupId: {
+            "FirewallRules": rules.get(FirewallRuleGroupId, [])
+        }
+        return {"items": [], "errors": [], "list_error": None}
+
+    @patch("agentcore_app.agentcore_client", None)
+    def test_no_agentcore_client_is_na(self):
+        findings = agentcore_app.check_agentcore_dns_egress_control()
+
+        assert len(findings) == 1
+        assert findings[0]["Check_ID"] == "AC-49"
+        assert findings[0]["Status"] == "N/A"
+        assert_finding_schema(findings[0])
+
+    @patch("agentcore_app.route53resolver_client", None)
+    @patch("agentcore_app.agentcore_client")
+    def test_no_route53_resolver_client_is_na(self, mock_ac):
+        findings = agentcore_app.check_agentcore_dns_egress_control()
+
+        assert len(findings) == 1
+        assert findings[0]["Status"] == "N/A"
+        assert findings[0]["Severity"] == "Informational"
+        assert mock_ac.list_agent_runtimes.call_count == 0
+
+    @patch("agentcore_app.route53resolver_client")
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_no_vpc_mode_resource_is_na(self, mock_ac, mock_ec2, mock_r53):
+        inventory = self._wire(mock_ac, mock_ec2, mock_r53, runtime_subnets=())
+
+        findings = agentcore_app.check_agentcore_dns_egress_control(inventory)
+
+        assert len(findings) == 1
+        assert findings[0]["Status"] == "N/A"
+        assert mock_ec2.describe_subnets.call_count == 0
+
+    @patch("agentcore_app.route53resolver_client")
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_terminal_block_rule_passes_and_names_its_domain_list(
+        self, mock_ac, mock_ec2, mock_r53
+    ):
+        inventory = self._wire(
+            mock_ac,
+            mock_ec2,
+            mock_r53,
+            associations={"vpc-a": [self._association("group-1")]},
+            rules={
+                "group-1": [
+                    self._rule("allowed", 10, action="ALLOW"),
+                    self._rule("catchall", 100),
+                ]
+            },
+        )
+
+        findings = agentcore_app.check_agentcore_dns_egress_control(inventory)
+
+        assert len(findings) == 1
+        assert findings[0]["Status"] == "Passed"
+        assert findings[0]["Severity"] == "Medium"
+        assert "vpc-a" in findings[0]["Finding_Details"]
+        assert "rslvr-fdl-catchall" in findings[0]["Finding_Details"]
+        assert "Priority 100" in findings[0]["Finding_Details"]
+        assert_finding_schema(findings[0])
+        # The domain list's own contents are a separate API and a separate
+        # grant, so the check never reads them.
+        assert mock_r53.list_firewall_domains.call_count == 0
+
+    @patch("agentcore_app.route53resolver_client")
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_terminal_allow_rule_fails(self, mock_ac, mock_ec2, mock_r53):
+        inventory = self._wire(
+            mock_ac,
+            mock_ec2,
+            mock_r53,
+            associations={"vpc-a": [self._association("group-1")]},
+            rules={
+                "group-1": [
+                    self._rule("blocked", 10),
+                    self._rule("everything-else", 100, action="ALLOW"),
+                ]
+            },
+        )
+
+        findings = agentcore_app.check_agentcore_dns_egress_control(inventory)
+
+        assert len(findings) == 1
+        assert findings[0]["Finding"] == "AgentCore DNS Egress Control Not Terminal"
+        assert findings[0]["Status"] == "Failed"
+        assert "everything-else" in findings[0]["Finding_Details"]
+        assert "ALLOW" in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.route53resolver_client")
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_no_association_fails(self, mock_ac, mock_ec2, mock_r53):
+        inventory = self._wire(mock_ac, mock_ec2, mock_r53, associations={})
+
+        findings = agentcore_app.check_agentcore_dns_egress_control(inventory)
+
+        assert len(findings) == 1
+        assert findings[0]["Finding"] == "AgentCore DNS Egress Control Missing"
+        assert findings[0]["Status"] == "Failed"
+        assert "vpc-a" in findings[0]["Finding_Details"]
+        assert "Runtime 'rt-1' (rt-1)" in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.route53resolver_client")
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_an_association_being_deleted_is_not_an_association(
+        self, mock_ac, mock_ec2, mock_r53
+    ):
+        inventory = self._wire(
+            mock_ac,
+            mock_ec2,
+            mock_r53,
+            associations={"vpc-a": [self._association("group-1", Status="DELETING")]},
+            rules={"group-1": [self._rule("catchall", 100)]},
+        )
+
+        findings = agentcore_app.check_agentcore_dns_egress_control(inventory)
+
+        assert len(findings) == 1
+        assert findings[0]["Finding"] == "AgentCore DNS Egress Control Missing"
+        assert mock_r53.list_firewall_rules.call_count == 0
+
+    @patch("agentcore_app.route53resolver_client")
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_rule_still_updating_is_not_the_terminal_rule(
+        self, mock_ac, mock_ec2, mock_r53
+    ):
+        """A BLOCK rule that has not finished updating does not end the group.
+
+        Without the Status filter the UPDATING rule at the highest Priority
+        reads as the terminal block and the VPC passes.
+        """
+        inventory = self._wire(
+            mock_ac,
+            mock_ec2,
+            mock_r53,
+            associations={"vpc-a": [self._association("group-1")]},
+            rules={
+                "group-1": [
+                    self._rule("allowed", 10, action="ALLOW", Status="COMPLETE"),
+                    self._rule("catchall", 100, Status="UPDATING"),
+                ]
+            },
+        )
+
+        findings = agentcore_app.check_agentcore_dns_egress_control(inventory)
+
+        assert len(findings) == 1
+        assert findings[0]["Status"] == "Failed"
+        assert "allowed" in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.route53resolver_client")
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_rule_reporting_no_status_is_enforcing(self, mock_ac, mock_ec2, mock_r53):
+        # A rule carries Status only while it is being created, updated or
+        # deleted, so treating an absent Status as not-in-force would fail every
+        # settled rule group.
+        inventory = self._wire(
+            mock_ac,
+            mock_ec2,
+            mock_r53,
+            associations={"vpc-a": [self._association("group-1")]},
+            rules={
+                "group-1": [
+                    self._rule("allowed", 10, action="ALLOW"),
+                    self._rule("catchall", 100),
+                ]
+            },
+        )
+
+        findings = agentcore_app.check_agentcore_dns_egress_control(inventory)
+
+        assert findings[0]["Status"] == "Passed"
+
+    @patch("agentcore_app.route53resolver_client")
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_group_with_no_rule_in_force_fails(self, mock_ac, mock_ec2, mock_r53):
+        inventory = self._wire(
+            mock_ac,
+            mock_ec2,
+            mock_r53,
+            associations={"vpc-a": [self._association("group-1")]},
+            rules={"group-1": [self._rule("catchall", 100, Status="DELETING")]},
+        )
+
+        findings = agentcore_app.check_agentcore_dns_egress_control(inventory)
+
+        assert len(findings) == 1
+        assert findings[0]["Finding"] == "AgentCore DNS Egress Control Missing"
+        assert "no rule in force out of 1" in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.route53resolver_client")
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_the_last_associated_group_decides(self, mock_ac, mock_ec2, mock_r53):
+        # Groups process in Priority order too, so the group with the largest
+        # Priority holds the rule that answers a query no earlier group matched.
+        inventory = self._wire(
+            mock_ac,
+            mock_ec2,
+            mock_r53,
+            associations={
+                "vpc-a": [
+                    self._association("group-early", priority=100),
+                    self._association("group-late", priority=101),
+                ]
+            },
+            rules={
+                "group-early": [self._rule("catchall", 100)],
+                "group-late": [self._rule("open", 100, action="ALLOW")],
+            },
+        )
+
+        findings = agentcore_app.check_agentcore_dns_egress_control(inventory)
+
+        assert len(findings) == 1
+        assert findings[0]["Status"] == "Failed"
+        mock_r53.list_firewall_rules.assert_called_once_with(
+            FirewallRuleGroupId="group-late"
+        )
+
+    @patch("agentcore_app.route53resolver_client")
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_both_verdicts_are_reached_across_two_hosting_vpcs(
+        self, mock_ac, mock_ec2, mock_r53
+    ):
+        """Two VPCs, one controlled and one not, are reported separately.
+
+        The code interpreter's subnet is read from vpcConfig.subnets, which is
+        the tool APIs' spelling; networkModeConfig belongs to the runtime.
+        """
+        inventory = self._wire(
+            mock_ac,
+            mock_ec2,
+            mock_r53,
+            runtime_subnets=("subnet-a",),
+            tool_subnets=("subnet-b",),
+            subnet_vpcs={"subnet-a": "vpc-a", "subnet-b": "vpc-b"},
+            associations={"vpc-a": [self._association("group-1")]},
+            rules={"group-1": [self._rule("catchall", 100)]},
+        )
+
+        findings = agentcore_app.check_agentcore_dns_egress_control(inventory)
+        by_vpc = {
+            "vpc-a" if "vpc-a" in finding["Finding_Details"] else "vpc-b": finding
+            for finding in findings
+        }
+
+        assert len(findings) == 2
+        assert by_vpc["vpc-a"]["Status"] == "Passed"
+        assert by_vpc["vpc-b"]["Status"] == "Failed"
+        assert "Code Interpreter 'ci-1' (ci-1)" in by_vpc["vpc-b"]["Finding_Details"]
+        for finding in findings:
+            assert_finding_schema(finding)
+
+    @patch("agentcore_app.route53resolver_client")
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_terminal_threat_protection_rule_names_what_it_matches(
+        self, mock_ac, mock_ec2, mock_r53
+    ):
+        rule = {
+            "Name": "dga",
+            "Priority": 100,
+            "Action": "BLOCK",
+            "DnsThreatProtection": "DGA",
+            "ConfidenceThreshold": "HIGH",
+            "FirewallRuleType": "FIREWALL_DOMAIN_REDIRECTION",
+        }
+        inventory = self._wire(
+            mock_ac,
+            mock_ec2,
+            mock_r53,
+            associations={"vpc-a": [self._association("group-1")]},
+            rules={"group-1": [rule]},
+        )
+
+        findings = agentcore_app.check_agentcore_dns_egress_control(inventory)
+
+        assert findings[0]["Status"] == "Passed"
+        assert "DNS threat protection DGA" in findings[0]["Finding_Details"]
+        assert "confidence HIGH" in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.route53resolver_client")
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_subnet_describe_failure_is_na(self, mock_ac, mock_ec2, mock_r53):
+        inventory = self._wire(mock_ac, mock_ec2, mock_r53)
+        mock_ec2.describe_subnets.side_effect = _make_client_error(
+            "UnauthorizedOperation", "denied"
+        )
+
+        findings = agentcore_app.check_agentcore_dns_egress_control(inventory)
+
+        assert len(findings) == 1
+        assert findings[0]["Status"] == "N/A"
+        assert "ec2:DescribeSubnets" in findings[0]["Resolution"]
+
+    @patch("agentcore_app.route53resolver_client")
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_subnet_that_reports_no_vpc_is_na(self, mock_ac, mock_ec2, mock_r53):
+        inventory = self._wire(mock_ac, mock_ec2, mock_r53, subnet_vpcs={})
+
+        findings = agentcore_app.check_agentcore_dns_egress_control(inventory)
+
+        assert len(findings) == 1
+        assert findings[0]["Status"] == "N/A"
+        assert "no hosting VPC was judged" in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.route53resolver_client")
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_an_association_list_failure_is_na(self, mock_ac, mock_ec2, mock_r53):
+        inventory = self._wire(mock_ac, mock_ec2, mock_r53)
+        mock_r53.list_firewall_rule_group_associations.side_effect = _make_client_error(
+            "AccessDeniedException", "denied"
+        )
+
+        findings = agentcore_app.check_agentcore_dns_egress_control(inventory)
+
+        assert len(findings) == 1
+        assert findings[0]["Status"] == "N/A"
+        assert (
+            "route53resolver:ListFirewallRuleGroupAssociations"
+            in findings[0]["Resolution"]
+        )
+
+    @patch("agentcore_app.route53resolver_client")
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_rule_list_failure_is_na(self, mock_ac, mock_ec2, mock_r53):
+        inventory = self._wire(
+            mock_ac,
+            mock_ec2,
+            mock_r53,
+            associations={"vpc-a": [self._association("group-1")]},
+        )
+        mock_r53.list_firewall_rules.side_effect = _make_client_error(
+            "AccessDeniedException", "denied"
+        )
+
+        findings = agentcore_app.check_agentcore_dns_egress_control(inventory)
+
+        assert len(findings) == 1
+        assert findings[0]["Status"] == "N/A"
+        assert "route53resolver:ListFirewallRules" in findings[0]["Resolution"]
+
+    @patch("agentcore_app.route53resolver_client")
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_runtime_list_failure_is_na(self, mock_ac, mock_ec2, mock_r53):
+        self._wire(mock_ac, mock_ec2, mock_r53)
+        mock_ac.list_agent_runtimes.side_effect = _make_client_error(
+            "AccessDeniedException", "denied"
+        )
+
+        findings = agentcore_app.check_agentcore_dns_egress_control(
+            {"items": [], "errors": [], "list_error": None}
+        )
+
+        assert len(findings) == 1
+        assert findings[0]["Status"] == "N/A"
+        assert "bedrock-agentcore:ListAgentRuntimes" in findings[0]["Resolution"]
+
+    @patch("agentcore_app.route53resolver_client")
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_one_unreadable_runtime_does_not_hide_the_hosting_vpc(
+        self, mock_ac, mock_ec2, mock_r53
+    ):
+        inventory = self._wire(
+            mock_ac,
+            mock_ec2,
+            mock_r53,
+            associations={"vpc-a": [self._association("group-1")]},
+            rules={"group-1": [self._rule("catchall", 100)]},
+        )
+        mock_ac.list_agent_runtimes.return_value = {
+            "agentRuntimes": [
+                {"agentRuntimeId": "rt-1", "agentRuntimeName": "rt-1"},
+                {"agentRuntimeId": "rt-2", "agentRuntimeName": "rt-2"},
+            ]
+        }
+
+        def detail(agentRuntimeId):
+            if agentRuntimeId == "rt-2":
+                raise _make_client_error("AccessDeniedException", "denied")
+            return {
+                "networkConfiguration": {
+                    "networkMode": "VPC",
+                    "networkModeConfig": {"subnets": ["subnet-a"]},
+                }
+            }
+
+        mock_ac.get_agent_runtime.side_effect = detail
+
+        findings = agentcore_app.check_agentcore_dns_egress_control(inventory)
+        statuses = [finding["Status"] for finding in findings]
+
+        assert len(findings) == 2
+        assert statuses.count("N/A") == 1
+        assert statuses.count("Passed") == 1
+        assert "rt-2" in findings[0]["Finding_Details"]
+
+
+# ===================================================================
+# AG-39 gateway WAF rule coverage
+# ===================================================================
+_WEB_ACL_ARN = "arn:aws:wafv2:us-east-1:123456789012:regional/webacl/gw-acl/abc"
+
+
+def _managed_rule(name, group_name, vendor="AWS", **overrides):
+    rule = {
+        "Name": name,
+        "OverrideAction": {"None": {}},
+        "Statement": {
+            "ManagedRuleGroupStatement": {"VendorName": vendor, "Name": group_name}
+        },
+    }
+    rule.update(overrides)
+    return rule
+
+
+def _rate_rule(name="rate", **overrides):
+    rule = {
+        "Name": name,
+        "Action": {"Block": {}},
+        "Statement": {"RateBasedStatement": {"Limit": 2000, "AggregateKeyType": "IP"}},
+    }
+    rule.update(overrides)
+    return rule
+
+
+def _match_rule(name, statement_key, **overrides):
+    rule = {
+        "Name": name,
+        "Action": {"Allow": {}},
+        "Statement": {
+            statement_key: {
+                "FieldToMatch": {"Body": {}},
+                "TextTransformations": [{"Priority": 0, "Type": "NONE"}],
+            }
+        },
+    }
+    rule.update(overrides)
+    return rule
+
+
+class TestAG39GatewayWafRuleCoverage:
+    """AG-39: the five filters that decide whether a gateway's web ACL acts."""
+
+    def _acl(self, rules=None, default_action=None, body_limit="KB_64", **overrides):
+        acl = {
+            "Name": "gw-acl",
+            "ARN": _WEB_ACL_ARN,
+            "DefaultAction": default_action or {"Block": {}},
+            "Rules": [
+                _managed_rule("sqli", "AWSManagedRulesSQLiRuleSet"),
+                _managed_rule("common", "AWSManagedRulesCommonRuleSet"),
+                _rate_rule(),
+            ]
+            if rules is None
+            else rules,
+        }
+        if body_limit:
+            acl["AssociationConfig"] = {
+                "RequestBody": {
+                    "AGENTCORE_GATEWAY": {"DefaultSizeInspectionLimit": body_limit}
+                }
+            }
+        acl.update(overrides)
+        return acl
+
+    def _ag39(self, mock_ac, mock_waf, web_acl, web_acl_arn=_WEB_ACL_ARN):
+        mock_ac.list_gateways.return_value = {
+            "items": [{"gatewayId": "gw-1", "name": "TestGateway"}]
+        }
+        detail = {
+            "gatewayId": "gw-1",
+            "name": "TestGateway",
+            "authorizerType": "AWS_IAM",
+        }
+        if web_acl_arn:
+            detail["webAclArn"] = web_acl_arn
+        mock_ac.get_gateway.return_value = detail
+        if mock_waf is not None:
+            mock_waf.get_web_acl.return_value = {"WebACL": web_acl}
+
+        findings = agentcore_app.check_agentcore_gateway_agentic_security()
+        return [finding for finding in findings if finding["Check_ID"] == "AG-39"]
+
+    @patch("agentcore_app.wafv2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_all_five_filters_pass(self, mock_ac, mock_waf):
+        findings = self._ag39(mock_ac, mock_waf, self._acl())
+
+        assert len(findings) == 1
+        assert findings[0]["Finding"] == "Agentic AI Gateway WAF Rule Coverage"
+        assert findings[0]["Status"] == "Passed"
+        assert findings[0]["Severity"] == "Medium"
+        assert "gw-acl" in findings[0]["Finding_Details"]
+        assert_finding_schema(findings[0])
+        # The ACL is resolved from the gateway's own association, so no
+        # account-wide web ACL inventory is listed.
+        mock_waf.get_web_acl.assert_called_once_with(ARN=_WEB_ACL_ARN)
+        assert mock_waf.list_web_acls.call_count == 0
+
+    @pytest.mark.parametrize(
+        ("missing", "acl_kwargs"),
+        [
+            (
+                "a rule that blocks",
+                {
+                    "default_action": {"Allow": {}},
+                    "rules": [
+                        _match_rule("sqli", "SqliMatchStatement"),
+                        _match_rule("xss", "XssMatchStatement"),
+                        _rate_rule(Action={"Allow": {}}),
+                    ],
+                },
+            ),
+            (
+                "SQL injection inspection",
+                {
+                    "rules": [
+                        _managed_rule("common", "AWSManagedRulesCommonRuleSet"),
+                        _rate_rule(),
+                    ]
+                },
+            ),
+            (
+                "cross-site scripting inspection",
+                {
+                    "rules": [
+                        _managed_rule("sqli", "AWSManagedRulesSQLiRuleSet"),
+                        _rate_rule(),
+                    ]
+                },
+            ),
+            (
+                "a rate-based rule",
+                {
+                    "rules": [
+                        _managed_rule("sqli", "AWSManagedRulesSQLiRuleSet"),
+                        _managed_rule("common", "AWSManagedRulesCommonRuleSet"),
+                    ]
+                },
+            ),
+            (
+                "a request body inspection limit above the 16 KB default",
+                {"body_limit": ""},
+            ),
+        ],
+        ids=["block", "sqli", "xss", "rate", "body-limit"],
+    )
+    @patch("agentcore_app.wafv2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_each_missing_filter_is_named(self, mock_ac, mock_waf, missing, acl_kwargs):
+        findings = self._ag39(mock_ac, mock_waf, self._acl(**acl_kwargs))
+
+        assert len(findings) == 1
+        assert findings[0]["Finding"] == "Agentic AI Gateway WAF Rule Coverage Gaps"
+        assert findings[0]["Status"] == "Failed"
+        assert findings[0]["Severity"] == "Medium"
+        assert "missing 1 of the five" in findings[0]["Finding_Details"]
+        assert missing in findings[0]["Finding_Details"]
+        assert_finding_schema(findings[0])
+
+    @patch("agentcore_app.wafv2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_the_default_16_kb_limit_is_not_a_raised_limit(self, mock_ac, mock_waf):
+        findings = self._ag39(mock_ac, mock_waf, self._acl(body_limit="KB_16"))
+
+        assert findings[0]["Status"] == "Failed"
+        assert (
+            "a request body inspection limit above the 16 KB default"
+            in findings[0]["Finding_Details"]
+        )
+
+    @pytest.mark.parametrize(
+        ("missing", "rules"),
+        [
+            (
+                "SQL injection inspection",
+                [
+                    _managed_rule(
+                        "sqli",
+                        "AWSManagedRulesSQLiRuleSet",
+                        OverrideAction={"Count": {}},
+                    ),
+                    _managed_rule("common", "AWSManagedRulesCommonRuleSet"),
+                    _rate_rule(),
+                ],
+            ),
+            (
+                "a rate-based rule",
+                [
+                    _managed_rule("sqli", "AWSManagedRulesSQLiRuleSet"),
+                    _managed_rule("common", "AWSManagedRulesCommonRuleSet"),
+                    _rate_rule(Action={"Count": {}}),
+                ],
+            ),
+        ],
+        ids=["count-override", "count-action"],
+    )
+    @patch("agentcore_app.wafv2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_counting_rule_is_not_coverage(self, mock_ac, mock_waf, missing, rules):
+        # A rule set to Count observes the request and leaves the response
+        # unchanged, so it filters nothing.
+        findings = self._ag39(mock_ac, mock_waf, self._acl(rules=rules))
+
+        assert findings[0]["Status"] == "Failed"
+        assert missing in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.wafv2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_sqli_match_inside_an_and_statement_is_coverage(self, mock_ac, mock_waf):
+        nested = {
+            "Name": "nested",
+            "Action": {"Block": {}},
+            "Statement": {
+                "AndStatement": {
+                    "Statements": [
+                        {"ByteMatchStatement": {"SearchString": "x"}},
+                        {
+                            "OrStatement": {
+                                "Statements": [
+                                    {"SqliMatchStatement": {}},
+                                    {"XssMatchStatement": {}},
+                                ]
+                            }
+                        },
+                    ]
+                }
+            },
+        }
+        findings = self._ag39(
+            mock_ac, mock_waf, self._acl(rules=[nested, _rate_rule()])
+        )
+
+        assert findings[0]["Status"] == "Passed"
+
+    @patch("agentcore_app.wafv2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_sqli_match_inside_a_not_statement_is_not_coverage(
+        self, mock_ac, mock_waf
+    ):
+        # NotStatement matches everything its child does not, so the rule fires
+        # on requests that are not SQL injection.
+        negated = {
+            "Name": "negated",
+            "Action": {"Block": {}},
+            "Statement": {"NotStatement": {"Statement": {"SqliMatchStatement": {}}}},
+        }
+        findings = self._ag39(
+            mock_ac,
+            mock_waf,
+            self._acl(
+                rules=[
+                    negated,
+                    _managed_rule("common", "AWSManagedRulesCommonRuleSet"),
+                    _rate_rule(),
+                ]
+            ),
+        )
+
+        assert findings[0]["Status"] == "Failed"
+        assert "SQL injection inspection" in findings[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "opaque_rule",
+        [
+            {
+                "Name": "customer-group",
+                "OverrideAction": {"None": {}},
+                "Statement": {
+                    "RuleGroupReferenceStatement": {
+                        "ARN": "arn:aws:wafv2:us-east-1:123456789012:regional/rulegroup/own/1"
+                    }
+                },
+            },
+            _managed_rule("marketplace", "ThirdPartyRules", vendor="ExampleVendor"),
+        ],
+        ids=["customer-rule-group", "non-aws-vendor"],
+    )
+    @patch("agentcore_app.wafv2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_rule_group_this_check_cannot_read_leaves_the_verdict_na(
+        self, mock_ac, mock_waf, opaque_rule
+    ):
+        findings = self._ag39(
+            mock_ac,
+            mock_waf,
+            self._acl(
+                rules=[
+                    opaque_rule,
+                    _managed_rule("common", "AWSManagedRulesCommonRuleSet"),
+                    _rate_rule(),
+                ]
+            ),
+        )
+
+        assert len(findings) == 1
+        assert findings[0]["Status"] == "N/A"
+        assert findings[0]["Severity"] == "Informational"
+        assert "SQL injection inspection" in findings[0]["Finding_Details"]
+        assert "was not judged" in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.wafv2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_an_unreadable_rule_group_does_not_block_a_pass(self, mock_ac, mock_waf):
+        # Opaque only matters when something is missing: an ACL that applies all
+        # five filters passes whatever else it delegates.
+        opaque = {
+            "Name": "customer-group",
+            "OverrideAction": {"None": {}},
+            "Statement": {
+                "RuleGroupReferenceStatement": {
+                    "ARN": "arn:aws:wafv2:us-east-1:123456789012:regional/rulegroup/own/1"
+                }
+            },
+        }
+        findings = self._ag39(
+            mock_ac,
+            mock_waf,
+            self._acl(
+                rules=[
+                    opaque,
+                    _managed_rule("sqli", "AWSManagedRulesSQLiRuleSet"),
+                    _managed_rule("common", "AWSManagedRulesCommonRuleSet"),
+                    _rate_rule(),
+                ]
+            ),
+        )
+
+        assert findings[0]["Status"] == "Passed"
+
+    @patch("agentcore_app.wafv2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_gateway_with_no_web_acl_is_na(self, mock_ac, mock_waf):
+        findings = self._ag39(mock_ac, mock_waf, self._acl(), web_acl_arn=None)
+
+        assert len(findings) == 1
+        assert findings[0]["Status"] == "N/A"
+        assert "AG-27" in findings[0]["Finding_Details"]
+        assert mock_waf.get_web_acl.call_count == 0
+
+    @patch("agentcore_app.wafv2_client", None)
+    @patch("agentcore_app.agentcore_client")
+    def test_no_waf_client_is_na(self, mock_ac):
+        findings = self._ag39(mock_ac, None, None)
+
+        assert len(findings) == 1
+        assert findings[0]["Status"] == "N/A"
+        assert _WEB_ACL_ARN in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.wafv2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_an_unreadable_web_acl_is_na(self, mock_ac, mock_waf):
+        mock_waf.get_web_acl.side_effect = _make_client_error(
+            "WAFNonexistentItemException", "no such ACL"
+        )
+
+        findings = self._ag39(mock_ac, mock_waf, None)
+
+        assert len(findings) == 1
+        assert findings[0]["Status"] == "N/A"
+        assert "wafv2:GetWebACL" in findings[0]["Resolution"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_no_gateways_is_na(self, mock_ac):
+        mock_ac.list_gateways.return_value = {"items": []}
+
+        findings = agentcore_app.check_agentcore_gateway_agentic_security()
+        ag39 = [finding for finding in findings if finding["Check_ID"] == "AG-39"]
+
+        assert len(ag39) == 1
+        assert ag39[0]["Status"] == "N/A"
+
+    @patch("agentcore_app.wafv2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_two_gateways_reach_both_verdicts(self, mock_ac, mock_waf):
+        second_arn = _WEB_ACL_ARN.replace("gw-acl", "gw-acl-2")
+        mock_ac.list_gateways.return_value = {
+            "items": [
+                {"gatewayId": "gw-filtered", "name": "Filtered"},
+                {"gatewayId": "gw-open", "name": "Open"},
+            ]
+        }
+        details = {
+            "gw-filtered": {
+                "gatewayId": "gw-filtered",
+                "name": "Filtered",
+                "authorizerType": "AWS_IAM",
+                "webAclArn": _WEB_ACL_ARN,
+            },
+            "gw-open": {
+                "gatewayId": "gw-open",
+                "name": "Open",
+                "authorizerType": "AWS_IAM",
+                "webAclArn": second_arn,
+            },
+        }
+        mock_ac.get_gateway.side_effect = lambda gatewayIdentifier: details[
+            gatewayIdentifier
+        ]
+        acls = {
+            _WEB_ACL_ARN: self._acl(),
+            second_arn: self._acl(
+                Name="gw-acl-2",
+                rules=[_managed_rule("sqli", "AWSManagedRulesSQLiRuleSet")],
+            ),
+        }
+        mock_waf.get_web_acl.side_effect = lambda ARN: {"WebACL": acls[ARN]}
+
+        findings = [
+            finding
+            for finding in agentcore_app.check_agentcore_gateway_agentic_security()
+            if finding["Check_ID"] == "AG-39"
+        ]
+        statuses = {finding["Status"] for finding in findings}
+
+        assert len(findings) == 2
+        assert statuses == {"Passed", "Failed"}
+        failed = next(finding for finding in findings if finding["Status"] == "Failed")
+        assert "Gateway 'Open' (gw-open)" in failed["Finding_Details"]
+        assert "missing 2 of the five" in failed["Finding_Details"]
+        assert "cross-site scripting inspection" in failed["Finding_Details"]
+        assert "a rate-based rule" in failed["Finding_Details"]
+
+    def test_the_body_inspection_setting_is_the_one_the_api_models(self):
+        credentials = {
+            "region_name": "us-east-1",
+            "aws_access_key_id": "testing",
+            "aws_secret_access_key": "testing",  # pragma: allowlist secret - synthetic test credential
+        }
+        model = agentcore_app.boto3.client("wafv2", **credentials).meta.service_model
+        web_acl = model.operation_model("GetWebACL").output_shape.members["WebACL"]
+        request_body = web_acl.members["AssociationConfig"].members["RequestBody"]
+        limit = request_body.value.members["DefaultSizeInspectionLimit"]
+
+        assert agentcore_app.WAF_AGENTCORE_RESOURCE_TYPE in request_body.key.enum
+        assert agentcore_app.WAF_DEFAULT_BODY_INSPECTION_LIMIT in limit.enum
+
+
+# ===================================================================
+# AC-08 data-path endpoints
+# ===================================================================
+class TestAC08DataPathEndpointScope:
+    """AC-08 also judges the S3, DynamoDB and SageMaker endpoints."""
+
+    _DEFAULT_POLICY = json.dumps(
+        {
+            "Statement": [
+                {
+                    "Effect": "Allow",
+                    "Principal": "*",
+                    "Action": "*",
+                    "Resource": "*",
+                }
+            ]
+        }
+    )
+    _SCOPED_POLICY = json.dumps(
+        {
+            "Statement": [
+                {
+                    "Effect": "Allow",
+                    "Principal": {"AWS": "arn:aws:iam::123456789012:role/app"},
+                    "Action": "bedrock-agentcore:InvokeAgentRuntime",
+                    "Resource": "*",
+                }
+            ]
+        }
+    )
+
+    def _agentcore_endpoint(self):
+        return {
+            "VpcEndpointId": "vpce-agentcore",
+            "VpcId": "vpc-1",
+            "State": "available",
+            "VpcEndpointType": "Interface",
+            "ServiceName": "com.amazonaws.us-east-1.bedrock-agentcore",
+            "PolicyDocument": self._SCOPED_POLICY,
+            "PrivateDnsEnabled": True,
+            "Groups": [{"GroupId": "sg-closed"}],
+        }
+
+    def _gateway_endpoint(self, endpoint_id="vpce-s3", vpc_id="vpc-1", service="s3"):
+        return {
+            "VpcEndpointId": endpoint_id,
+            "VpcId": vpc_id,
+            "State": "available",
+            "VpcEndpointType": "Gateway",
+            "ServiceName": f"com.amazonaws.us-east-1.{service}",
+            "PolicyDocument": self._DEFAULT_POLICY,
+        }
+
+    def _wire(self, mock_ac, mock_ec2, endpoints):
+        mock_ac.list_agent_runtimes.return_value = {
+            "agentRuntimes": [{"agentRuntimeId": "rt-1"}]
+        }
+        mock_ec2.describe_vpcs.return_value = {
+            "Vpcs": [{"VpcId": "vpc-1"}, {"VpcId": "vpc-2"}]
+        }
+        mock_ec2.describe_vpc_endpoints.return_value = {"VpcEndpoints": endpoints}
+        mock_ec2.describe_security_groups.return_value = {
+            "SecurityGroups": [
+                {
+                    "GroupId": "sg-closed",
+                    "IpPermissions": [{"IpRanges": [{"CidrIp": "10.0.0.0/16"}]}],
+                }
+            ]
+        }
+
+    def _naming(self, findings, token):
+        return [finding for finding in findings if token in finding["Finding_Details"]]
+
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_an_s3_gateway_endpoint_in_an_agentcore_vpc_is_judged(
+        self, mock_ac, mock_ec2
+    ):
+        """The default S3 endpoint policy in an AgentCore VPC is reported.
+
+        AC-08 matched only endpoint service names containing "agentcore", so the
+        bucket path an agent reads its inputs and writes its outputs through was
+        never judged: without the widened match this finding does not exist.
+        """
+        self._wire(
+            mock_ac, mock_ec2, [self._agentcore_endpoint(), self._gateway_endpoint()]
+        )
+
+        findings = agentcore_app.check_agentcore_vpc_endpoints()
+        unrestricted = [
+            finding
+            for finding in findings
+            if finding["Finding"] == "AgentCore VPC Endpoint Policy Unrestricted"
+        ]
+
+        assert len(unrestricted) == 1
+        assert unrestricted[0]["Status"] == "Failed"
+        assert unrestricted[0]["Severity"] == "Medium"
+        assert "vpce-s3" in unrestricted[0]["Finding_Details"]
+        assert "com.amazonaws.us-east-1.s3" in unrestricted[0]["Finding_Details"]
+        assert "vpc-1" in unrestricted[0]["Finding_Details"]
+        for finding in findings:
+            assert finding["Check_ID"] == "AC-08"
+            assert_finding_schema(finding)
+
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_gateway_endpoint_is_not_failed_for_private_dns(self, mock_ac, mock_ec2):
+        # A gateway endpoint has no private DNS setting, so the absent value is
+        # not a disabled one.
+        self._wire(
+            mock_ac, mock_ec2, [self._agentcore_endpoint(), self._gateway_endpoint()]
+        )
+
+        findings = agentcore_app.check_agentcore_vpc_endpoints()
+        private_dns = [
+            finding for finding in findings if "Private DNS" in finding["Finding"]
+        ]
+
+        assert [finding["Status"] for finding in private_dns] == ["Passed"]
+        assert "vpce-agentcore" in private_dns[0]["Finding_Details"]
+        assert not self._naming(private_dns, "vpce-s3")
+        # No security group means no inbound rule to judge either.
+        network = [
+            finding for finding in findings if "Network Scope" in finding["Finding"]
+        ]
+        assert not self._naming(network, "vpce-s3")
+
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_data_path_endpoint_outside_an_agentcore_vpc_is_not_judged(
+        self, mock_ac, mock_ec2
+    ):
+        # An S3 endpoint in a VPC that hosts no AgentCore endpoint belongs to
+        # some other workload, and AC-08 is not the check that judges it.
+        self._wire(
+            mock_ac,
+            mock_ec2,
+            [
+                self._agentcore_endpoint(),
+                self._gateway_endpoint(endpoint_id="vpce-s3-other", vpc_id="vpc-2"),
+            ],
+        )
+
+        findings = agentcore_app.check_agentcore_vpc_endpoints()
+
+        assert not self._naming(findings, "vpce-s3-other")
+        assert not self._naming(findings, "vpc-2")
+
+    @pytest.mark.parametrize(
+        "service", ["dynamodb", "sagemaker.api", "sagemaker.runtime"]
+    )
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_the_other_data_path_services_are_judged(self, mock_ac, mock_ec2, service):
+        self._wire(
+            mock_ac,
+            mock_ec2,
+            [
+                self._agentcore_endpoint(),
+                self._gateway_endpoint(endpoint_id="vpce-data", service=service),
+            ],
+        )
+
+        findings = agentcore_app.check_agentcore_vpc_endpoints()
+        judged = self._naming(findings, "vpce-data")
+
+        assert len(judged) == 1
+        assert judged[0]["Status"] == "Failed"
+        assert f"com.amazonaws.us-east-1.{service}" in judged[0]["Finding_Details"]
+
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_s3express_is_a_different_service(self, mock_ac, mock_ec2):
+        # The match is on the trailing service segment, so s3express does not
+        # answer for s3.
+        self._wire(
+            mock_ac,
+            mock_ec2,
+            [
+                self._agentcore_endpoint(),
+                self._gateway_endpoint(
+                    endpoint_id="vpce-s3express", service="s3express"
+                ),
+            ],
+        )
+
+        findings = agentcore_app.check_agentcore_vpc_endpoints()
+
+        assert not self._naming(findings, "vpce-s3express")
+
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_data_path_endpoints_alone_still_fail_the_presence_leg(
+        self, mock_ac, mock_ec2
+    ):
+        # Widening the policy and inbound legs must not let an account with an
+        # S3 endpoint and no AgentCore endpoint read as privately connected.
+        self._wire(mock_ac, mock_ec2, [self._gateway_endpoint()])
+
+        findings = agentcore_app.check_agentcore_vpc_endpoints()
+
+        assert len(findings) == 1
+        assert findings[0]["Finding"] == "AgentCore VPC Endpoints Missing"
+        assert findings[0]["Status"] == "Failed"
+
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_the_resolution_names_endpoint_services_that_exist(self, mock_ac, mock_ec2):
+        # describe-vpc-endpoint-services publishes bedrock-agentcore,
+        # bedrock-agentcore-control and bedrock-agentcore.gateway. There is no
+        # bedrock-agentcore-runtime endpoint service to create.
+        self._wire(mock_ac, mock_ec2, [])
+
+        findings = agentcore_app.check_agentcore_vpc_endpoints()
+        resolution = findings[0]["Resolution"]
+
+        assert "com.amazonaws.region.bedrock-agentcore.gateway" in resolution
+        assert "bedrock-agentcore-runtime" not in resolution
+
+    @pytest.mark.parametrize(
+        ("service_name", "expected"),
+        [
+            ("com.amazonaws.us-east-1.s3", True),
+            ("com.amazonaws.us-east-1.dynamodb", True),
+            ("com.amazonaws.us-east-1.sagemaker.api", True),
+            ("com.amazonaws.us-east-1.sagemaker.runtime", True),
+            ("com.amazonaws.us-east-1.s3express", False),
+            ("com.amazonaws.us-east-1.sagemaker.featurestore-runtime", False),
+            ("com.amazonaws.us-east-1.bedrock-agentcore", False),
+            ("", False),
+            (None, False),
+        ],
+    )
+    def test_the_data_path_match_covers_the_family(self, service_name, expected):
+        assert agentcore_app._is_agentcore_data_path_endpoint(service_name) is expected
+
+    @pytest.mark.parametrize(
+        "service_name",
+        [
+            "com.amazonaws.us-east-1.bedrock-agentcore",
+            "com.amazonaws.us-east-1.bedrock-agentcore-control",
+            "com.amazonaws.us-east-1.bedrock-agentcore.gateway",
+        ],
+    )
+    def test_every_agentcore_endpoint_service_still_matches(self, service_name):
+        assert agentcore_app._is_agentcore_service_endpoint(service_name)
+
+
+class TestExecutionRoleAndDnsCheckRegistration:
+    """AC-48, AC-49 and AG-39 are registered like the checks they sit beside."""
+
+    _CHECKS = {
+        "AC-48": "check_agentcore_execution_role_trust_and_sharing",
+        "AC-49": "check_agentcore_dns_egress_control",
+    }
+
+    @pytest.mark.parametrize("check_id", sorted(_CHECKS))
+    def test_the_checks_are_in_both_regional_tuples(self, check_id):
+        assert check_id in agentcore_app.REGIONAL_AGENTCORE_CHECK_IDS
+        assert check_id in agentcore_app.AGENTCORE_RUNTIME_CHECK_IDS
+
+    @pytest.mark.parametrize("check_id", sorted(_CHECKS) + ["AG-39"])
+    def test_timeout_backfill_emits_the_checks(self, check_id):
+        findings = agentcore_app.build_agentcore_timeout_findings("us-east-1", [])
+        assert check_id in {finding["Check_ID"] for finding in findings}
+
+    @pytest.mark.parametrize("check_id", sorted(_CHECKS) + ["AG-39"])
+    def test_the_runtime_probe_backfill_emits_the_checks(self, check_id):
+        findings = []
+        agentcore_app.prepare_agentcore_runtime_incomplete_report_findings(
+            findings, "us-east-1", "ExpiredToken"
+        )
+        assert check_id in {finding["Check_ID"] for finding in findings}
+
+    @pytest.mark.parametrize("function_name", sorted(_CHECKS.values()))
+    def test_the_handler_registers_each_check_once(self, function_name):
+        source = textwrap.dedent(inspect.getsource(agentcore_app.lambda_handler))
+        assert source.count(function_name) == 1
+
+    def test_ag39_is_a_native_gateway_control(self):
+        assert (
+            agentcore_app.NATIVE_AGENTIC_AGENTCORE_CHECK_NAMES["AG-39"]
+            == "Agentic AI Gateway WAF Rule Coverage"
+        )
+
+    @pytest.mark.parametrize("client_name", ["wafv2_client", "route53resolver_client"])
+    def test_the_handler_creates_the_new_clients_for_the_target_region(
+        self, client_name
+    ):
+        # A gateway's web ACL is a REGIONAL ACL in the gateway's own region and a
+        # DNS Firewall association lives in the VPC's region, so neither client
+        # may be built without region_name.
+        source = textwrap.dedent(inspect.getsource(agentcore_app.lambda_handler))
+        assignment = source.split(f"{client_name} = ", 1)[1].split(")", 1)[0]
+        assert "region_name=region" in assignment
+        assert "global wafv2_client, route53resolver_client" in source
