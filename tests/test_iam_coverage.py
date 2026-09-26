@@ -793,6 +793,32 @@ _VERIFIED_REMEDIATION_IAM_ACTIONS |= {
     "macie2:DescribeBuckets",
 }
 
+# Verified on 2026-09-26 with one IDENTITY_POLICY validate-policy run, one
+# statement per action so a finding's path index names the action it belongs to,
+# for the phase-5 network and eventing legs. Eight negative controls were
+# submitted alongside: ec2:DescribeVpcSubnets, ec2:DescribeVpcRouteTables,
+# route53resolver:GetFirewallRuleGroupAssociations,
+# route53resolver:GetFirewallRules, wafv2:DescribeWebACL, events:DescribeRules,
+# events:ListRuleTargets and route53resolver:NotARealFirewallAction. All eight
+# came back INVALID_ACTION, the run reported exactly eight findings, and none of
+# the seven names below was reported.
+#
+# The first attempt built its controls by singularising the real name
+# (ec2:DescribeRouteTable, route53resolver:ListFirewallRule), which makes the
+# control a substring of the action it is meant to discriminate, so a substring
+# read of the findings would accuse the valid plural. Each control below is a
+# near-miss in some other position, and no name in the run is a substring of any
+# other in either direction.
+_VERIFIED_REMEDIATION_IAM_ACTIONS |= {
+    "ec2:DescribeSubnets",
+    "ec2:DescribeRouteTables",
+    "route53resolver:ListFirewallRuleGroupAssociations",
+    "route53resolver:ListFirewallRules",
+    "wafv2:GetWebACL",
+    "events:ListRules",
+    "events:ListTargetsByRule",
+}
+
 _NON_IAM_REMEDIATION_TOKENS = {
     "arn:PARTITION",
     "s3:ObjectCreated",
