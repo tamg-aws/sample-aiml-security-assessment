@@ -19,6 +19,7 @@ Generated 2026-09-25 by `aisf-parity/build_ledger.py`. Do not hand-edit: change 
 
 - `config:DescribeConfigRules` — AIR-SGM-GOV-10
 - `config:DescribeConfigurationRecorders` — AIR-SGM-GOV-10
+- `ec2:DescribeSecurityGroups` — AIR-FND-NET-06
 - `events:ListRules` — AIR-ACR-REG-02
 - `events:ListTargetsByRule` — AIR-ACR-REG-02
 - `macie2:GetAutomatedDiscoveryConfiguration` — AIR-BDR-KB-01
@@ -124,4 +125,4 @@ Generated 2026-09-25 by `aisf-parity/build_ledger.py`. Do not hand-edit: change 
 | `AIR-FND-NET-01` | unassessed | — | `agentcore_assessments`, `sagemaker_assessments` | `AC-01`, `SM-11` | spans two modules; candidate incumbents only. 'AI workloads run privately' has no single host, which is why the FND area has no module of its own |
 | `AIR-FND-NET-02` | unassessed | — | `agentcore_assessments` | `AC-08` | candidate incumbent only; dedup not run |
 | `AIR-FND-NET-04` | unassessed | — | `responsible_ai_grc_assessments`, `agentcore_assessments` | `AG-27` | wafv2 is already granted to the GRC function, but the AG-27 incumbent lives in the AgentCore module; pick one before writing it |
-| `AIR-FND-NET-06` | unassessed | — | `agentcore_assessments` | `AC-01` | overlaps RT-08; resolve the two together. Both now cost no further permission: ec2:DescribeSecurityGroups is granted to this function for AC-08's endpoint scope leg |
+| `AIR-FND-NET-06` | unassessed | — | `agentcore_assessments` | `AC-01` | overlaps RT-08; resolve the two together |

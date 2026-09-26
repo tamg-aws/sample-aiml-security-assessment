@@ -18,6 +18,7 @@
     "extra_iam_actions": [
       "config:DescribeConfigRules",
       "config:DescribeConfigurationRecorders",
+      "ec2:DescribeSecurityGroups",
       "events:ListRules",
       "events:ListTargetsByRule",
       "macie2:GetAutomatedDiscoveryConfiguration",
@@ -1737,8 +1738,10 @@
       "incumbent_names": [
         "AgentCore Runtime VPC Configuration"
       ],
-      "gap": "overlaps RT-08; resolve the two together. Both now cost no further permission: ec2:DescribeSecurityGroups is granted to this function for AC-08's endpoint scope leg",
-      "extra_iam": [],
+      "gap": "overlaps RT-08; resolve the two together",
+      "extra_iam": [
+        "ec2:DescribeSecurityGroups"
+      ],
       "phase": 5,
       "source": "controls/baseline/network-isolation.yaml"
     }

@@ -955,9 +955,8 @@ ROWS = [
         None,
         "agentcore_assessments",
         ["AC-01"],
-        "overlaps RT-08; resolve the two together. Both now cost no further permission: "
-        "ec2:DescribeSecurityGroups is granted to this function for AC-08's endpoint scope leg",
-        [],
+        "overlaps RT-08; resolve the two together",
+        ["ec2:DescribeSecurityGroups"],
         5,
     ),
 ]
