@@ -652,8 +652,12 @@ Resources:
                 - bedrock-agentcore:ListBrowsers
                 - bedrock-agentcore:ListOnlineEvaluationConfigs
                 # AC-40 classifies the evaluators an online evaluation attaches
-                # against the account's catalogue, which is an account-wide list
-                # with no resource to scope it to.
+                # against the account's catalogue. ListEvaluators has no
+                # resource-level authorization: its "Resource types" cell is
+                # empty in
+                # https://docs.aws.amazon.com/service-authorization/latest/reference/list_bedrock-agentcore.html
+                # while GetEvaluator in the same table carries evaluator*, so an
+                # ARN on this action denies the call.
                 - bedrock-agentcore:ListEvaluators
               Resource: '*'
             - Sid: AgentCoreResourceReadPermissions
