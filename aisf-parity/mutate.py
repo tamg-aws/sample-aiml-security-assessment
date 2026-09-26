@@ -62,6 +62,8 @@ BEDROCK = "aiml-security-assessment/functions/security/bedrock_assessments/app.p
 
 BUILD_LEDGER = "aisf-parity/build_ledger.py"
 
+AISF_DOC = "docs/SECURITY_CHECKS_AISF.md"
+
 # Phase 2's surfaces: the generated tag maps, the schema that looks a tag up, and
 # the CSV fieldnames list a tag has to reach.
 SECURITY = "aiml-security-assessment/functions/security"
@@ -274,6 +276,34 @@ MUTATIONS = [
         "sees the column appear and disappear rather than a failure",
         "find": '                "Region",\n                "Compliance_Frameworks",\n',
         "replace": '                "Region",\n',
+    },
+    # ------------------------------------------------------ the census paragraph
+    # The first mutation of a document rather than of code, and it breaks the
+    # anchor instead of a figure. The ledger reads its six census figures out of one
+    # paragraph, located by this sentence, and returns an empty slice when the
+    # sentence is not found exactly once. Nothing proved that fail-closed path
+    # fired.
+    #
+    # The anchor is the find-string because it is the only candidate unique at
+    # every ref this battery runs at. Counted as raw bytes, no flattening:
+    # "Census at the current head" is 1 at this base, on this branch, at phase 3's
+    # head and in the merge tree, while a figure phrase moves with the branch --
+    # "; the remaining 28 are `tighten`.\n" is 1/1/0/0 because phase 3 rewords the
+    # clause, and "the 28 `covered` controls" is 0 everywhere because the document
+    # wraps inside the phrase, which a flattened extractor finds and a find-string
+    # never will.
+    {
+        "name": "the census anchor sentence is reworded",
+        "file": AISF_DOC,
+        "defect": "the ledger locates the census paragraph by this sentence and "
+        "reads its six published figures from that slice alone. A reworded "
+        "anchor has to return zero paragraphs, report the count and the sentence "
+        "it looked for, and leave the six figures absent; the failure it must "
+        "not become is a widening back to the whole 23 KB document, where at "
+        "phase 3's head a coverage bullet 239 lines above the anchor answers the "
+        "covered pattern with a different population",
+        "find": "Census at the current head",
+        "replace": "Census at the present head",
     },
 ]
 
