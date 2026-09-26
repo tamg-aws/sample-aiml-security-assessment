@@ -592,6 +592,156 @@ inventory is never treated as evidence of compliance.
 - **Severity:** Informational by default; Medium when required
 - **Description:** Reports whether online evaluation configurations are active/enabled and include non-zero sampling, evaluators, CloudWatch input data, and output logging. Set the `RequireAgentCoreOnlineEvaluation` deployment parameter to `true` (`REQUIRE_AGENTCORE_ONLINE_EVALUATION` in the Lambda) to make incomplete coverage fail.
 
+### AC-18: CloudTrail Data Event Coverage
+
+- **Severity:** Medium
+- **Description:** Requires a CloudTrail advanced event selector of category `Data` on each AgentCore family that has resources in the region: `AWS::BedrockAgentCore::Runtime` and `::RuntimeEndpoint` for runtimes, `::Memory` for memory, and `::CodeInterpreter`, `::CodeInterpreterCustom`, `::Browser`, `::BrowserCustom` for custom tools. Management events do not satisfy it, because they record that a runtime or memory was created and not the invocations and memory record reads that follow. Presence of resources is decided from this module's own inventory, so a family with no resources in the region reports informational `N/A` instead of a failure nobody can act on. An unavailable CloudTrail client, a failed `ListTrails` call, an uninventoriable family, and the case where no readable trail selects the type while other trails could not be read are also informational `N/A`.
+
+### AC-19: Log Delivery Configuration
+
+- **Severity:** Medium
+- **Description:** Reports one finding per gateway and per memory resource, and requires both a `bedrock-agentcore` `APPLICATION_LOGS` delivery source for that resource and a delivery carrying the source to a destination. A resource with a delivery source and no delivery fails, because nothing stores the logs it collects. Runtimes are out of scope: runtime logging is service-managed, and AC-04 covers runtime tracing. Built-in tools, Identity, and policy engines are covered by one informational `N/A` row that names why none of the three has a delivery configuration to assert. An unavailable CloudWatch Logs client, an unreadable delivery configuration, and a failed gateway or memory listing are informational `N/A`.
+
+### AC-20: Log Data Protection
+
+- **Severity:** Medium
+- **Description:** For every log group under `/aws/bedrock-agentcore/` or `/aws/vendedlogs/bedrock-agentcore/`, requires a data-protection policy that masks at least one data identifier and a customer managed KMS key, and names which of the two is missing. Masking set on the log group and masking inherited from an account-level policy both count. Agent prompts, tool arguments, and memory records reach these log groups verbatim, so a guardrail at the model boundary does not cover them. A region with no AgentCore log groups, an unreadable account policy list, and a log group whose policy document cannot be read are informational `N/A`.
+
+### AC-21: Log Unmask Restriction
+
+- **Severity:** Medium
+- **Description:** Fails any cached IAM role or user granted `logs:Unmask` on a resource pattern that names no log group, because masking is reversible by whoever holds that action. A principal holding it only on named log group resources passes, and so does an account where no cached principal holds it at all. An empty or unreadable permission cache is informational `N/A`. Reported once under the `Global` region, because the grant does not vary by scanned region.
+
+### AC-22: Telemetry Sink Scope
+
+- **Severity:** Medium
+- **Description:** Requires every `Allow` statement in an observability sink policy to name its principals or to carry an organization condition key, so an unrelated account cannot link its telemetry into the account that aggregates agent traces. Condition operators are matched with their set-operator prefixes stripped, so a key under `ForAllValues:StringEquals` is read. A sink with no policy attached is informational `N/A` because no source account can link to it, as are an unavailable client, a failed `ListSinks` call, an unreadable policy, and a policy that is not valid JSON.
+
+### AC-23: Memory Record Access Scope
+
+- **Severity:** High
+- **Description:** Fails any cached IAM role or user that can read memory records or events with no namespace, strategy, actor, or session condition, because one such call returns every actor's stored records out of the same memory. AC-07 judges each memory's own namespace partitioning; partitioning separates records only when retrieval is bound to one actor too. A principal whose read is conditioned passes, as does an account where no cached principal holds a memory read action. An empty or unreadable permission cache is informational `N/A`. Reported once under the `Global` region.
+
+### AC-24: Gateway Rate Limiting
+
+- **Severity:** Medium
+- **Description:** Requires each gateway to carry at least one `ACTIVE` rate limit with a requests, tokens, or connections ceiling. A gateway with rate limits none of which is active with a ceiling fails separately from a gateway with no rate limit at all, because a limit that bounds nothing reads as configured. The WAF association AG-27 reports filters request content and sets no throughput ceiling. An unavailable client, a region with no gateways, and unreadable rate limits are informational `N/A`.
+
+### AC-25: Gateway Target Authorization
+
+- **Severity:** High
+- **Description:** Requires each gateway target to declare a credential provider, because `credentialProviderConfigurations` is optional on `CreateGatewayTarget` and the console offers "No authorization", so a target can reach its backend with no gateway-supplied credential and the backend cannot tell one caller from another. The provider types found are reported; which of the five suits a given backend is a workload decision. A region with no targets, an unlistable gateway, and an unreadable target are informational `N/A`.
+
+### AC-26: Log Retention and Key Scope
+
+- **Severity:** Medium
+- **Description:** Requires a retention period on every AgentCore log group, and requires the key policy behind its customer managed key to name the principals allowed to decrypt and the administrators allowed to disable the key or schedule it for deletion. A group with no retention keeps agent prompts, tool arguments, and memory records for as long as the account exists. AC-20 asserts that a customer managed key is set; this check judges the policy behind it. A log group whose key policy cannot be read is reported as informational `N/A` on its own row, so the retention verdict still stands.
+
+### AC-27: Gateway Policy Conditions
+
+- **Severity:** High for the confused-deputy legs; Medium for the network-path leg
+- **Description:** Judges the conditions on each gateway's resource policy and on its execution role's trust policy. An `Allow` statement that trusts an AWS service principal or every principal with no `aws:SourceAccount` or `aws:SourceArn` condition fails, because another account's resource can then make the service call this gateway on its behalf, and a guarded statement elsewhere in the same policy does not narrow an unguarded one. The network leg is separate: a resource policy carrying no `aws:SourceVpc`, `aws:SourceVpce`, `aws:VpcSourceIp`, or `aws:SourceIp` condition admits any caller holding a valid authorizer token over any path, including the public internet. AC-10 reports that a resource policy is present. Trust policies are read from IAM, because the permission cache stores attached and inline policies only, and roles are cached per invocation because several gateways can share one execution role. A gateway with no cross-account or service-principal policy, a gateway with no execution role, and an unreadable policy are informational `N/A`.
+
+### AC-28: Gateway Authorizer Guardrail
+
+- **Severity:** High
+- **Description:** Requires a service control policy that denies both `CreateGateway` and `UpdateGateway` when `bedrock-agentcore:GatewayAuthorizerType` is `NONE`. A deny on create alone fails separately, because it leaves an authenticated gateway one `UpdateGateway` call away from accepting unauthenticated requests. A policy that conditions on the key in a shape which cannot deny the value `NONE`, such as a `Null` test on a member the create request always carries, fails as ineffective. AG-24 reads the authorizer type of the gateways that exist now, which says nothing about the next one created. The check reads policy content only, so every finding says that attachment is still the reader's to confirm, and a member account that cannot list the organization's policies is reported as informational `N/A` and never as a failure. Reported once under the `Global` region.
+
+### AC-29: Runtime Authorizer Guardrail
+
+- **Severity:** High
+- **Description:** Requires a service control policy that denies both `CreateAgentRuntime` and `UpdateAgentRuntime` when `bedrock-agentcore:RuntimeAuthorizerType` is `AWS_IAM`, because a runtime on SigV4-only inbound auth authenticates the calling AWS principal, which for a hosting application is one shared role for every end user, and the end user then arrives in an unverified header. A deny on create alone fails separately. A policy written the other way round, denying `CUSTOM_JWT` and leaving SigV4 as the only way to deploy, is reported as inverted, and a condition shape that denies neither value is reported as ineffective. As with AC-28, policy content is read but attachment is not, and a member account that cannot list policies is informational `N/A`. Reported once under the `Global` region.
+
+### AC-30: Runtime Inbound Authorization
+
+- **Severity:** High
+- **Description:** Reports how each runtime authenticates its caller. A runtime with no inbound authorizer passes, because every invoke must then be SigV4-signed and IAM decides which principal reaches the agent. A JWT authorizer that pins neither `allowedAudience` nor `allowedClients` fails, because it accepts every token its issuer minted for every application registered with that issuer. AG-24 asks this of a gateway, and a runtime callers invoke directly never passes through one. An authorizer shape the pinned botocore model does not define is informational `N/A` and names the members it found.
+
+### AC-31: Gateway Inbound Allow Lists
+
+- **Severity:** High
+- **Description:** Judges which issuers and applications each gateway accepts tokens from. A `CUSTOM_JWT` gateway that allow-lists neither the audience nor the client id fails, because any application registered with that issuer reaches its tools; AG-24 passes the same gateway on the authorizer type alone. A scope or custom-claim constraint bounds what a token may ask for and not who minted it for whom, so it does not satisfy the check. `authorizerType` `NONE` fails as performing no inbound authentication at all. A SigV4 gateway passes, having no bearer token to allow-list, and an unrecognized authorizer type or a missing `customJWTAuthorizer` is informational `N/A`.
+
+### AC-32: Inbound JWT Issuer Conditions
+
+- **Severity:** High
+- **Description:** Fails any cached IAM role or user that can call `GetWorkloadAccessTokenForJWT` or `CompleteResourceTokenAuth` with no condition on the inbound token's issuer, audience, or client id, because the token-exchange APIs accept an end user's JWT directly and never pass through a gateway authorizer. AC-31 pins the issuer at the gateway's front door; this is the second path to the same workload token. An `Action` element of `"*"` is a service-agnostic administrator grant and is left to AC-02. An empty or unreadable permission cache is informational `N/A`. Reported once under the `Global` region.
+
+### AC-33: Token Issuance Scope
+
+- **Severity:** High for a wildcard resource; Medium for a grant naming only a workload-identity directory
+- **Description:** Judges which resources each cached principal may mint agent tokens against. The control is not enforced by removing the actions: the reference execution role grants all three `GetWorkloadAccessToken*` actions and an agent breaks without them, so what a policy can still do is bound which workload identity, token vault, and credential provider they reach. A wildcard resource fails, and AWS's own consent-portal execution role allows three of these actions on `Resource: "*"`, so the widest grant on the page is one a customer may have copied forward. A grant naming only a workload-identity directory is reported at Medium, because the service authorization reference marks both the identity and the directory as required and does not say whether the directory alone authorizes the call. Reported once under the `Global` region.
+
+### AC-34: Runtime Inline Credentials
+
+- **Severity:** High
+- **Description:** Scans each runtime's environment variables for inline credential material and fails a runtime that holds any, because a credential pasted into the agent's definition never reaches the token vault and every process in the microVM reads the variable. Only variable names are reported, never values, because `environmentVariables` is modelled as sensitive. AC-14 judges the token vault's own encryption. A runtime with no environment variables passes; an unreadable runtime is informational `N/A`.
+
+### AC-35: Policy Tool Scope
+
+- **Severity:** High for an unconditional permit; Medium for a permit that names no action under a condition
+- **Description:** Reads the active enforcing policies of the policy engine each gateway enforces and fails a permit that names no action. With no condition on it, such a permit authorizes every tool the gateway exposes for every caller the scope admits and the engine's default-deny decides nothing; under a condition, the one condition gates every tool the gateway exposes today and every tool added later. Default-deny and forbid-wins are enforced by the engine and are not settings to read. AG-25 counts enforcing policies without reading one, so a single permit over every tool passes it. A gateway enforcing no engine, an engine with no active enforcing policy, and a policy still being generated that carries no text are informational `N/A`.
+
+### AC-36: Policy Engine Key Scope
+
+- **Severity:** High
+- **Description:** Requires the key policy behind a policy engine's customer managed key to name the principals allowed to decrypt with it and the administrators allowed to disable it or schedule it for deletion. The key cannot be added to or changed on an existing engine, so the key policy is the whole guard: a principal who can schedule the key for deletion makes every stored Cedar policy unreadable with no way to repoint the engine. AC-11 asserts that a key is named, which is presence only. An engine with no customer managed key is informational `N/A` and AC-11 reports it; an unreadable key policy is informational `N/A`.
+
+### AC-37: Policy Guardrail Wiring
+
+- **Severity:** High
+- **Description:** For each gateway enforcing a policy with a `when guardrails` condition, requires the gateway's execution role to grant `bedrock:InvokeGuardrailChecks`, because the Policy data plane calls the Bedrock Guardrails API with forward access session credentials derived from that role. Without the grant the call is denied and the content safety the policy claims is either absent or the tool is unreachable, which the devguide does not resolve either way. The action is resourceless, so the grant is read by action and no guardrail ARN is required of it. Whether content-safety decisions belong at the authorization boundary at all is the workload owner's call, and a gateway enforcing no guardrail policy is reported as informational `N/A` that says so. An execution role outside the permission cache, and a role with unparsable policy documents, are informational `N/A`.
+
+### AC-38: Policy Session Binding
+
+- **Severity:** High when a temporal policy runs on a gateway that authenticates no caller; Medium when no enforcing policy is session-aware
+- **Description:** Judges whether a rule that only reads across a sequence of actions, such as an unverified payee or a cumulative overspend, is evaluated against a policy session, and whether that session binds to a caller. The Gateway binds a session to the caller's authenticated identity on `CUSTOM_JWT` and `AWS_IAM` gateways, so on a gateway that authenticates no caller two callers presenting the same session id share one accumulated history and a per-session limit is reset or consumed by someone else. An engine whose active enforcing policies carry no temporal condition is reported at Medium, because every request is then judged on its own and any sequence rule is enforced by agent or tool code. AG-25 counts enforcing policies without reading whether any is session-aware.
+
+### AC-39: Online Evaluation Operation
+
+- **Severity:** Medium
+- **Description:** Requires each online evaluation configuration to be `ACTIVE` and `ENABLED`, to sample a non-zero share of traffic, to read from at least one input source, and to write its scores to a log group, and names which of those stopped it running. AC-17 reads the same settings but reports `N/A` unless `REQUIRE_AGENTCORE_ONLINE_EVALUATION` is set, so the one verdict it cannot return by default is Failed. This check judges a configuration that exists whatever that parameter is set to. A region with no configurations is informational `N/A`, and AC-17 reports whether one is expected.
+
+### AC-40: Evaluation Safety Coverage
+
+- **Severity:** Medium
+- **Description:** Requires each online evaluation configuration to attach both a safety evaluator and a tool-call evaluator, classified from the evaluator catalogue: a service-authored description carrying `safety metric` for the first, and an evaluation level of `TOOL_CALL` for the second. AC-17 and AC-39 count evaluators without asking what any of them scores, so ten answer-quality judges read the same as a harmful-content judge. If either category is empty in the catalogue the check judges no configuration and reports informational `N/A` with both counts, because the catalogue cannot then say which attached evaluator scores safety. An unreadable catalogue is informational `N/A`.
+
+### AC-41: Evaluation Result Protection
+
+- **Severity:** Medium
+- **Description:** Judges the log group each online evaluation writes its results to, anchored on the configuration's `outputConfig` and not on a log group name. An evaluation result carries the agent output that was scored and the judge's reasoning about it, and AC-20 and AC-26 judge only log groups under an AgentCore prefix, so a results group named anywhere else is judged by neither. A results group that does not exist in the region fails, because CloudWatch Logs creates it on first write with no encryption key and no retention period. A configuration naming no results group is informational `N/A` and AC-39 reports the missing output configuration.
+
+### AC-42: Evaluation Pass Role Scope
+
+- **Severity:** High
+- **Description:** Fails any cached principal that can pass an evaluation execution role through an `iam:PassRole` grant wider than the one role, or without an `iam:PassedToService` condition naming the service the role was written for. Creating or updating a configuration means passing the role named in `evaluationExecutionRoleArn`, so a wide grant turns evaluation administration into a way to run a role the caller could not assume. A region whose configurations name no execution role, and an empty permission cache, are informational `N/A`; unparsable cached policy documents are reported on their own informational `N/A` row so the judged grants still stand.
+
+### AC-43: Evaluation Role Trust
+
+- **Severity:** High
+- **Description:** Requires every `Allow` statement in an evaluation execution role's trust policy to carry `aws:SourceAccount` or `aws:SourceArn`, or to name no service or wildcard principal. The role lets the service read the scored traces and invoke the judge model on the account's behalf, so without a guard the same service principal assumes it while acting for another customer's configuration. AC-27 judges this on gateway execution roles and reaches no evaluation role, because it reads the roles that gateways name. A configuration naming no role, and an unreadable trust policy, are informational `N/A`.
+
+### AC-44: Evaluation Judge Model Scope
+
+- **Severity:** Medium
+- **Description:** Fails an evaluation execution role that can invoke a model through a `Resource` pattern naming no model, because an LLM-as-a-judge prompt carries the agent output being scored, so every model such a grant reaches is a model attacker-influenced text can be sent to at that model's price. Which models a workload's judges may use is the workload owner's decision, so the check asserts only that the grant names models at all and reports the patterns it found for the owner to confirm. A role with no model-invocation grant passes. A role outside the permission cache is informational `N/A`, and unparsable documents are reported on a separate informational `N/A` row.
+
+### AC-45: Tool Execution Role Scope
+
+- **Severity:** High
+- **Description:** Judges the execution role a custom Code Interpreter or custom Browser Tool can use, and fails a role whose `Allow` statements grant every resource or every action of a service. Code the model writes runs in the sandbox with that role, and a browser session follows the pages it is pointed at with the same role, so the role has to be read as available to whatever the sandbox ends up running. `executionRoleArn` is optional on both create calls, so a tool that names no role passes, holding no credentials to misuse. A role outside the permission cache is informational `N/A`.
+
+### AC-46: Runtime Session Limits
+
+- **Severity:** Medium
+- **Description:** Fails a runtime whose `idleRuntimeSessionTimeout` or `maxLifetime` is set to the service ceiling of 1,209,600 seconds (14 days), because a limit at the ceiling bounds nothing one session could do: each `runtimeSessionId` gets its own microVM, and a runaway task holds its session, its filesystem, and its accumulated context until one of the two timers fires. How long this workload's sessions should live is the workload owner's decision, so the assertion is the one that holds regardless. The control plane carries no per-session memory or cost limit, so those two halves of the control are named in the finding for the owner to confirm elsewhere. A runtime reporting neither setting is informational `N/A`.
+
+### AC-47: Runtime Invocation Path
+
+- **Severity:** High for the caller leg; Medium for the network-path leg
+- **Description:** Judges who may invoke each runtime and over what path. A runtime carrying neither an `allowedWorkloadConfiguration` on its JWT authorizer nor a resource policy naming the principals allowed to invoke it fails, because a caller that satisfies its inbound authentication then reaches the agent directly and the tool policy, rate limits, and audit trail of the gateway in front of it do not apply. The network leg fails a resource policy with no `aws:SourceVpc`, `aws:SourceVpce`, `aws:VpcSourceIp`, or `aws:SourceIp` condition. AC-10 reports that a resource policy exists; the conditions inside it are what restrict anything. An unreadable runtime or resource policy is informational `N/A`.
+
 ---
 
 ## AWS Agent Registry Security Checks (8)
@@ -654,6 +804,11 @@ error-specific remediation rather than to a failure.
 
 - **Severity:** Medium
 - **Description:** Verifies that manually created records retain a 12-digit creator-account attribution and that auto-detected records carry a `DETECTED_FROM` provenance summary whose `sourceId` is a `bedrock-agentcore` ARN matching its declared `sourceType`: a `runtime/...` resource for `AWS::BedrockAgentCore::Runtime` or a `gateway/...` resource for `AWS::BedrockAgentCore::Gateway`. A record whose declared lineage does not match fails, and it continues to fail even when another provenance entry omits its own source type. Optional origin-mode, creator-attribution, provenance, and source-type metadata are reported as informational `N/A` rather than as operator-remediable failures.
+
+### AR-09: Registry Approval Authority Separation
+
+- **Severity:** High
+- **Description:** Fails any cached IAM role or user that can both write a registry record (`CreateRegistryRecord`, `UpdateRegistryRecord`, or `SubmitRegistryRecordForApproval`) and approve one with `UpdateRegistryRecordStatus`, the only operation in the registry control plane that can set a record's status to `APPROVED`. Such a principal is the publisher and the curator of the same entry, so the review the approval workflow exists to impose never happens. AR-03 reads the auto-approval setting and only when `REQUIRE_AGENT_REGISTRY_MANUAL_APPROVAL` is set, so it asserts nothing about who holds the two authorities. Both IAM namespace spellings are read, because a policy written during the public preview grants the same authorities under `bedrock-agentcore` until 30 October 2026, and a single-namespace read would answer "no collision" for it. A `Deny` scoped to one registry or carrying a condition is not treated as an account-wide `Deny`, so a narrower `Deny` reports the principal instead of excusing it. Service-agnostic administrator grants stay with AR-01. An empty permission cache is an informational `N/A` tooling condition. Reported once under the `Global` region.
 
 ---
 
