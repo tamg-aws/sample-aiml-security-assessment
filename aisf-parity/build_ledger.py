@@ -997,24 +997,66 @@ def load_aisf():
     return out
 
 
+def table_fields(row):
+    """The nine ledger fields the verdict table above decides, for one ROWS entry.
+
+    Shared with gen_compliance_maps.rows_from_source(), which renders these same
+    fields so that `--check` can compare the shipped json against this table.
+    That comparison used to carry its own copy of this mapping, and a defect in
+    build()'s copy was therefore invisible to it: neither copy was the other's
+    oracle, so both could be read as agreeing while only one was right.
+
+    Measured, which is why this function exists: the mutation battery's entry
+    "the incumbent-name lookup reverts to its fail-open form" edits the
+    incumbent_names comprehension below, and with two copies NO catcher went red
+    -- check_ledger.py never re-runs build_ledger.py, so the shipped json it
+    reads was still the good one, and gen_compliance_maps rendered its side from
+    the unmutated copy. 21 of 22 caught. One function read by both makes the
+    defect observable as a gate-15 drift.
+
+    The other five fields a ledger row carries (`area`, `question`, `assert`,
+    `workload_agnostic`, `source`) are not here: four are read from the sibling
+    AISF repository and one is derived from the control id, so no verdict-table
+    edit can change them.
+    """
+    control, verdict, disposition, module, incumbents, gap, extra_iam, phase = row
+    return {
+        "control": control,
+        "verdict": verdict,
+        "disposition": disposition,
+        # a list: some controls have no single host module
+        "target_modules": (
+            []
+            if module is None
+            else [module]
+            if isinstance(module, str)
+            else list(module)
+        ),
+        "incumbents": incumbents,
+        # Strict on purpose. The `if i in INCUMBENT_NAMES` guard this replaces
+        # dropped any unmapped id silently, so 12 of 78 rows shipped an incumbent
+        # id beside an empty name list -- every check phase 3 added, because the
+        # map was never extended with them. A blank name list is also what gate 8
+        # reads to decide whether a new_id row quotes its incumbent, so the
+        # omission could only ever make that gate easier to pass.
+        "incumbent_names": [name for i in incumbents for name in published_names(i)],
+        "gap": gap,
+        "extra_iam": extra_iam,
+        "phase": phase,
+    }
+
+
 def build():
     aisf = load_aisf()
     rows = []
-    for (
-        control,
-        verdict,
-        disposition,
-        module,
-        incumbents,
-        gap,
-        extra_iam,
-        phase,
-    ) in ROWS:
+    for row in ROWS:
+        control = row[0]
         meta = aisf.get(control)
         if meta is None:
             raise SystemExit(f"{control} is not a control in the AISF repo")
         if not meta["machine_checkable"]:
             raise SystemExit(f"{control} is not machine_checkable in the ledger")
+        fields = table_fields(row)
         rows.append(
             {
                 "control": control,
@@ -1022,30 +1064,10 @@ def build():
                 "question": meta["q"],
                 "assert": meta["ev"],
                 "workload_agnostic": meta["workload_agnostic"],
-                "verdict": verdict,
-                "disposition": disposition,
-                # a list: some controls have no single host module
-                "target_modules": (
-                    []
-                    if module is None
-                    else [module]
-                    if isinstance(module, str)
-                    else list(module)
-                ),
-                "incumbents": incumbents,
-                # Strict on purpose. The `if i in INCUMBENT_NAMES` guard this
-                # replaces dropped any unmapped id silently, so 12 of 78 rows
-                # shipped an incumbent id beside an empty name list -- every
-                # check phase 3 added, because the map was never extended with
-                # them. A blank name list is also what gate 8 reads to decide
-                # whether a new_id row quotes its incumbent, so the omission
-                # could only ever make that gate easier to pass.
-                "incumbent_names": [
-                    name for i in incumbents for name in published_names(i)
-                ],
-                "gap": gap,
-                "extra_iam": extra_iam,
-                "phase": phase,
+                # Key order is preserved as it was when these nine were spelled
+                # out here, so that regenerating produces the same json bytes and
+                # a reader diffing the file sees only the rows that changed.
+                **{k: v for k, v in fields.items() if k != "control"},
                 "source": meta["source"],
             }
         )

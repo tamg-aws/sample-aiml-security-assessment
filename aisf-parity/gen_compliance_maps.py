@@ -119,40 +119,17 @@ def rows_from_source():
         os.remove(cached)
     if HERE not in sys.path:
         sys.path.insert(0, HERE)
-    # published_names is imported rather than re-derived here. This function
-    # carried its own `INCUMBENT_NAMES[i] for i in incumbents if i in
-    # INCUMBENT_NAMES` copy of the lookup, so the drift check compared one
-    # fail-open against the other and agreed. Two implementations of one rule
-    # agree on the wrong answer as readily as on the right one.
-    from build_ledger import ROWS, published_names
+    # The row mapping is imported, not re-derived here. This function carried its
+    # own copy of all eight fields -- its own `INCUMBENT_NAMES[i] for i in
+    # incumbents if i in INCUMBENT_NAMES` lookup, its own target_modules
+    # normalisation -- so the drift check compared one copy against the other and
+    # agreed. Two implementations of one rule agree on the wrong answer as
+    # readily as on the right one, and a defect confined to build()'s copy was
+    # measurably invisible: the mutation battery's fail-open entry went uncaught,
+    # 21 of 22, because nothing here read the line it edited.
+    from build_ledger import ROWS, table_fields
 
-    rows = []
-    for row in ROWS:
-        control, verdict, disposition, module, incumbents, gap, extra_iam, phase = row
-        rows.append(
-            {
-                "control": control,
-                "verdict": verdict,
-                "disposition": disposition,
-                # Normalised as build() normalises it: a row may name no host
-                # module, one, or several, and the json always carries a list.
-                "target_modules": (
-                    []
-                    if module is None
-                    else [module]
-                    if isinstance(module, str)
-                    else list(module)
-                ),
-                "incumbents": incumbents,
-                "incumbent_names": [
-                    name for i in incumbents for name in published_names(i)
-                ],
-                "gap": gap,
-                "extra_iam": extra_iam,
-                "phase": phase,
-            }
-        )
-    return rows
+    return [table_fields(row) for row in ROWS]
 
 
 def ledger_json_drift(source_rows):

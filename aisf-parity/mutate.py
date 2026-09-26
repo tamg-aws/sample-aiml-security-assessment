@@ -232,15 +232,25 @@ MUTATIONS = [
         # unmapped-id leg is a separate discriminating input and has its own
         # entry below; claiming this one covers it would be claiming a catch the
         # run does not produce.
+        #
+        # This entry went UNCAUGHT at 6455a80, 21 of 22, and the reason is worth
+        # keeping: the line it edits lived inside build_ledger.build(), and
+        # NEITHER catcher runs build_ledger.py. check_ledger.py reads the shipped
+        # json, which a mutation to the generator cannot touch until the generator
+        # is re-run, and gen_compliance_maps rendered its comparison side from a
+        # second copy of the same mapping. The fix was to give both sides one
+        # table_fields(), not to drop the entry: a mutation no catcher can observe
+        # is a statement about the gates, not about the mutation.
         "defect": "the lookup stops flattening the three ids that publish two "
-        "finding names each, so a row carries a nested list where the schema says "
-        "strings. Observed: gate 4's element-type leg names all three rows and "
-        "gate 15 reports the same field differing between the json and a fresh "
-        "render. This is half of the shipped defect, restored",
-        "find": "                    name for i in incumbents for name in "
-        "published_names(i)\n",
-        "replace": "                    INCUMBENT_NAMES[i] for i in incumbents "
-        "if i in INCUMBENT_NAMES\n",
+        "finding names each (BR-07, BR-45, SM-32), so a row carries a nested list "
+        "where the schema says strings. Observed: gate 15 names those three rows' "
+        "incumbent_names as differing between the shipped json and a fresh render "
+        "of the verdict table. This is half of the shipped defect, restored",
+        "find": '        "incumbent_names": [name for i in incumbents for name in '
+        "published_names(i)],\n",
+        "replace": '        "incumbent_names": [\n'
+        "            INCUMBENT_NAMES[i] for i in incumbents if i in INCUMBENT_NAMES\n"
+        "        ],\n",
     },
     {
         "name": "an incumbent is cited with no INCUMBENT_NAMES entry at all",
