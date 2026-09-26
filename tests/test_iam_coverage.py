@@ -819,6 +819,35 @@ _VERIFIED_REMEDIATION_IAM_ACTIONS |= {
     "events:ListTargetsByRule",
 }
 
+# Verified on 2026-09-26 with one IDENTITY_POLICY validate-policy run for the
+# phase-5 Bedrock legs, one statement per name so a finding's path index names
+# the entry it belongs to. Nine negative controls were submitted alongside:
+# bedrock:DescribePrompts, bedrock:ReadPrompt, bedrock:StreamConverse,
+# macie2:ListClassifyJobs, s3:ReadBucketPolicy and
+# organizations:GetEffectivePolicy came back INVALID_ACTION, and
+# aws:ArnOfPrincipal, aws:VpcSource and aws:PrivateTransport came back
+# INVALID_GLOBAL_CONDITION_KEY. None of the names below was reported.
+#
+# The same run reported bedrock:Converse and bedrock:ConverseStream as
+# INVALID_ACTION. The guardrail enforcement page lists Converse and
+# ConverseStream among the inference APIs bedrock:GuardrailIdentifier applies
+# to, but they are authorized by bedrock:InvokeModel and
+# bedrock:InvokeModelWithResponseStream and have no IAM action of their own, so
+# BR-49 asserts the Deny over those two and names no Converse action.
+_VERIFIED_REMEDIATION_IAM_ACTIONS |= {
+    "bedrock:ListPrompts",
+    "bedrock:GetPrompt",
+    "macie2:ListClassificationJobs",
+    "s3:GetBucketPolicy",
+    "organizations:DescribeEffectivePolicy",
+}
+
+_VERIFIED_REMEDIATION_CONDITION_KEYS |= {
+    "aws:PrincipalArn",
+    "aws:SourceVpc",
+    "aws:SecureTransport",
+}
+
 _NON_IAM_REMEDIATION_TOKENS = {
     "arn:PARTITION",
     "s3:ObjectCreated",
