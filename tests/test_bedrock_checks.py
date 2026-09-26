@@ -14,7 +14,7 @@ import json
 import sys
 import os
 import importlib.util
-from unittest.mock import patch, MagicMock
+from unittest.mock import call, patch, MagicMock
 from botocore.exceptions import (
     EndpointConnectionError,
     ClientError,
@@ -220,6 +220,523 @@ class TestBR02VPCEndpoints:
         result = check(permission_cache_compliant)
         for f in extract_csv_data(result):
             assert_finding_schema(f)
+
+
+class TestBR02VPCEndpointHardening:
+    """
+    BR-02 hardening legs: an endpoint existing is not private connectivity.
+
+    Private DNS decides whether an unmodified client uses the endpoint at all,
+    and the endpoint policy decides which principals may use it once traffic
+    reaches it. Every case fixes one endpoint and varies one of the two.
+    """
+
+    _ORG_POLICY = json.dumps(
+        {
+            "Statement": [
+                {
+                    "Sid": "OrgOnly",
+                    "Effect": "Allow",
+                    "Principal": "*",
+                    "Action": "bedrock:InvokeModel",
+                    "Resource": "*",
+                    "Condition": {"StringEquals": {"aws:PrincipalOrgID": "o-abc123"}},
+                }
+            ]
+        }
+    )
+
+    _OPEN_POLICY = json.dumps(
+        {
+            "Statement": [
+                {
+                    "Sid": "default",
+                    "Effect": "Allow",
+                    "Principal": "*",
+                    "Action": "*",
+                    "Resource": "*",
+                }
+            ]
+        }
+    )
+
+    @classmethod
+    def _endpoint(
+        cls,
+        endpoint_id="vpce-1",
+        service="com.amazonaws.us-east-1.bedrock-runtime",
+        vpc_id="vpc-1",
+        private_dns=True,
+        policy=None,
+    ):
+        return {
+            "vpc_id": vpc_id,
+            "service": service,
+            "endpoint_id": endpoint_id,
+            "private_dns": private_dns,
+            "policy": cls._ORG_POLICY if policy is None else policy,
+        }
+
+    def _run(self, endpoints, permission_cache):
+        with (
+            patch("bedrock_app.detect_bedrock_regional_footprint", return_value=True),
+            patch(
+                "bedrock_app.check_bedrock_vpc_endpoints",
+                return_value={
+                    "has_endpoints": True,
+                    "found_endpoints": list(endpoints),
+                    "all_vpcs": ["vpc-1"],
+                },
+            ),
+        ):
+            self.result = bedrock_app.check_bedrock_access_and_vpc_endpoints(
+                permission_cache, region="us-east-1"
+            )
+        return extract_csv_data(self.result)
+
+    @staticmethod
+    def _dns_rows(findings):
+        return [
+            finding
+            for finding in findings
+            if finding["Finding"] == bedrock_app.VPC_ENDPOINT_PRIVATE_DNS_FINDING
+        ]
+
+    @staticmethod
+    def _policy_rows(findings):
+        return [
+            finding
+            for finding in findings
+            if finding["Finding"] == bedrock_app.VPC_ENDPOINT_POLICY_FINDING
+        ]
+
+    def test_br02_private_dns_disabled_fails_and_names_the_endpoint(
+        self, permission_cache_compliant
+    ):
+        findings = self._run(
+            [self._endpoint(private_dns=False)], permission_cache_compliant
+        )
+
+        dns_rows = self._dns_rows(findings)
+        assert len(dns_rows) == 1
+        assert dns_rows[0]["Status"] == "Failed"
+        assert dns_rows[0]["Check_ID"] == "BR-02"
+        assert "1 of 1" in dns_rows[0]["Finding_Details"]
+        assert (
+            "vpce-1 (com.amazonaws.us-east-1.bedrock-runtime in vpc-1)"
+            in (dns_rows[0]["Finding_Details"])
+        )
+        assert "still resolves the public endpoint" in dns_rows[0]["Finding_Details"]
+        assert self.result["status"] == "WARN"
+
+    def test_br02_private_dns_enabled_passes(self, permission_cache_compliant):
+        findings = self._run([self._endpoint()], permission_cache_compliant)
+
+        dns_rows = self._dns_rows(findings)
+        assert len(dns_rows) == 1
+        assert dns_rows[0]["Status"] == "Passed"
+        assert "1 of 1" in dns_rows[0]["Finding_Details"]
+        assert self.result["status"] == "PASS"
+
+    def test_br02_unreported_private_dns_is_na_not_disabled(
+        self, permission_cache_compliant
+    ):
+        findings = self._run(
+            [self._endpoint(private_dns=None)], permission_cache_compliant
+        )
+
+        dns_rows = self._dns_rows(findings)
+        assert len(dns_rows) == 1
+        assert dns_rows[0]["Status"] == "N/A"
+        assert dns_rows[0]["Severity"] == "Informational"
+        assert "did not report PrivateDnsEnabled" in dns_rows[0]["Finding_Details"]
+
+    def test_br02_two_endpoints_reach_both_dns_verdicts(
+        self, permission_cache_compliant
+    ):
+        findings = self._run(
+            [
+                self._endpoint(endpoint_id="vpce-on", private_dns=True),
+                self._endpoint(endpoint_id="vpce-off", private_dns=False),
+            ],
+            permission_cache_compliant,
+        )
+
+        dns_rows = self._dns_rows(findings)
+        failed = [row for row in dns_rows if row["Status"] == "Failed"]
+        passed = [row for row in dns_rows if row["Status"] == "Passed"]
+        assert len(failed) == 1
+        assert len(passed) == 1
+        assert "1 of 2" in failed[0]["Finding_Details"]
+        assert "vpce-off" in failed[0]["Finding_Details"]
+        # One endpoint's setting cannot speak for the other.
+        assert "vpce-on" not in failed[0]["Finding_Details"]
+        assert "vpce-off" not in passed[0]["Finding_Details"]
+
+    def test_br02_default_endpoint_policy_fails_with_the_scope_it_grants(
+        self, permission_cache_compliant
+    ):
+        findings = self._run(
+            [self._endpoint(policy=self._OPEN_POLICY)], permission_cache_compliant
+        )
+
+        policy_rows = self._policy_rows(findings)
+        assert len(policy_rows) == 1
+        assert policy_rows[0]["Status"] == "Failed"
+        assert (
+            "statement 'default' allows any principal to call * on *"
+            in (policy_rows[0]["Finding_Details"])
+        )
+        assert "a peered VPC" in policy_rows[0]["Finding_Details"]
+        assert self.result["status"] == "WARN"
+
+    def test_br02_org_condition_scopes_the_endpoint_policy(
+        self, permission_cache_compliant
+    ):
+        findings = self._run([self._endpoint()], permission_cache_compliant)
+
+        policy_rows = self._policy_rows(findings)
+        assert len(policy_rows) == 1
+        assert policy_rows[0]["Status"] == "Passed"
+        assert (
+            "statement 'OrgOnly' requires aws:principalorgid"
+            in (policy_rows[0]["Finding_Details"])
+        )
+
+    def test_br02_source_vpce_condition_scopes_the_endpoint_policy(
+        self, permission_cache_compliant
+    ):
+        """aws:SourceVpce and aws:SourceVpc are one family, so both must count."""
+        policy = json.dumps(
+            {
+                "Statement": [
+                    {
+                        "Sid": "FromThisVpce",
+                        "Effect": "Allow",
+                        "Principal": "*",
+                        "Action": "bedrock:InvokeModel",
+                        "Resource": "*",
+                        "Condition": {"StringEquals": {"aws:SourceVpce": "vpce-1"}},
+                    }
+                ]
+            }
+        )
+        findings = self._run(
+            [self._endpoint(policy=policy)], permission_cache_compliant
+        )
+
+        policy_rows = self._policy_rows(findings)
+        assert policy_rows[0]["Status"] == "Passed"
+        assert "requires aws:sourcevpce" in policy_rows[0]["Finding_Details"]
+
+    def test_br02_named_principal_scopes_the_endpoint_policy(
+        self, permission_cache_compliant
+    ):
+        policy = json.dumps(
+            {
+                "Statement": [
+                    {
+                        "Sid": "AppOnly",
+                        "Effect": "Allow",
+                        "Principal": {
+                            "AWS": [
+                                "arn:aws:iam::123456789012:role/app",
+                                "arn:aws:iam::123456789012:role/batch",
+                            ]
+                        },
+                        "Action": "bedrock:InvokeModel",
+                        "Resource": "*",
+                    }
+                ]
+            }
+        )
+        findings = self._run(
+            [self._endpoint(policy=policy)], permission_cache_compliant
+        )
+
+        policy_rows = self._policy_rows(findings)
+        assert policy_rows[0]["Status"] == "Passed"
+        assert (
+            "statement 'AppOnly' names 2 principal(s)"
+            in (policy_rows[0]["Finding_Details"])
+        )
+
+    def test_br02_wildcard_inside_a_principal_block_is_not_a_bound(
+        self, permission_cache_compliant
+    ):
+        """Principal {"AWS": "*"} is the default policy written the long way."""
+        policy = json.dumps(
+            {
+                "Statement": [
+                    {
+                        "Sid": "LooksNamed",
+                        "Effect": "Allow",
+                        "Principal": {"AWS": "*"},
+                        "Action": "bedrock:*",
+                        "Resource": "*",
+                    }
+                ]
+            }
+        )
+        findings = self._run(
+            [self._endpoint(policy=policy)], permission_cache_compliant
+        )
+
+        policy_rows = self._policy_rows(findings)
+        assert policy_rows[0]["Status"] == "Failed"
+        assert (
+            "statement 'LooksNamed' allows any principal to call bedrock:* on *"
+            in (policy_rows[0]["Finding_Details"])
+        )
+
+    def test_br02_action_narrowing_alone_does_not_scope_the_endpoint(
+        self, permission_cache_compliant
+    ):
+        """Naming the actions bounds what, not who, so the endpoint is still open."""
+        policy = json.dumps(
+            {
+                "Statement": [
+                    {
+                        "Sid": "InvokeOnly",
+                        "Effect": "Allow",
+                        "Principal": "*",
+                        "Action": ["bedrock:InvokeModel"],
+                        "Resource": "*",
+                    }
+                ]
+            }
+        )
+        findings = self._run(
+            [self._endpoint(policy=policy)], permission_cache_compliant
+        )
+
+        policy_rows = self._policy_rows(findings)
+        assert policy_rows[0]["Status"] == "Failed"
+        assert (
+            "statement 'InvokeOnly' allows any principal to call "
+            "bedrock:InvokeModel on *" in (policy_rows[0]["Finding_Details"])
+        )
+
+    def test_br02_deny_outside_the_org_scopes_a_wide_allow(
+        self, permission_cache_compliant
+    ):
+        policy = json.dumps(
+            {
+                "Statement": [
+                    {
+                        "Sid": "default",
+                        "Effect": "Allow",
+                        "Principal": "*",
+                        "Action": "*",
+                        "Resource": "*",
+                    },
+                    {
+                        "Sid": "OrgBoundary",
+                        "Effect": "Deny",
+                        "Principal": "*",
+                        "Action": "*",
+                        "Resource": "*",
+                        "Condition": {
+                            "StringNotEquals": {"aws:PrincipalOrgID": "o-abc123"}
+                        },
+                    },
+                ]
+            }
+        )
+        findings = self._run(
+            [self._endpoint(policy=policy)], permission_cache_compliant
+        )
+
+        policy_rows = self._policy_rows(findings)
+        assert policy_rows[0]["Status"] == "Passed"
+        assert (
+            "a Deny statement rejects every request outside aws:principalorgid"
+            in (policy_rows[0]["Finding_Details"])
+        )
+
+    def test_br02_string_equals_deny_does_not_scope_the_endpoint(
+        self, permission_cache_compliant
+    ):
+        """A Deny testing the key as equal denies the org and allows everyone else."""
+        policy = json.dumps(
+            {
+                "Statement": [
+                    {
+                        "Sid": "default",
+                        "Effect": "Allow",
+                        "Principal": "*",
+                        "Action": "*",
+                        "Resource": "*",
+                    },
+                    {
+                        "Sid": "Inverted",
+                        "Effect": "Deny",
+                        "Principal": "*",
+                        "Action": "*",
+                        "Resource": "*",
+                        "Condition": {
+                            "StringEquals": {"aws:PrincipalOrgID": "o-abc123"}
+                        },
+                    },
+                ]
+            }
+        )
+        findings = self._run(
+            [self._endpoint(policy=policy)], permission_cache_compliant
+        )
+
+        policy_rows = self._policy_rows(findings)
+        assert policy_rows[0]["Status"] == "Failed"
+        assert "statement 'default'" in policy_rows[0]["Finding_Details"]
+
+    def test_br02_not_principal_allow_is_unbounded(self, permission_cache_compliant):
+        policy = json.dumps(
+            {
+                "Statement": [
+                    {
+                        "Sid": "AllButOne",
+                        "Effect": "Allow",
+                        "NotPrincipal": {
+                            "AWS": "arn:aws:iam::123456789012:role/blocked"
+                        },
+                        "Action": "*",
+                        "Resource": "*",
+                    }
+                ]
+            }
+        )
+        findings = self._run(
+            [self._endpoint(policy=policy)], permission_cache_compliant
+        )
+
+        policy_rows = self._policy_rows(findings)
+        assert policy_rows[0]["Status"] == "Failed"
+        assert (
+            "statement 'AllButOne' allows every principal except the ones it names"
+            in (policy_rows[0]["Finding_Details"])
+        )
+
+    def test_br02_policy_with_no_allow_statement_is_reported_as_unusable(
+        self, permission_cache_compliant
+    ):
+        findings = self._run(
+            [self._endpoint(policy=json.dumps({"Statement": []}))],
+            permission_cache_compliant,
+        )
+
+        policy_rows = self._policy_rows(findings)
+        assert policy_rows[0]["Status"] == "Passed"
+        assert (
+            "carries no Allow statement, so no principal can reach Bedrock through it"
+            in (policy_rows[0]["Finding_Details"])
+        )
+
+    def test_br02_unparsable_policy_is_na_not_a_failure(
+        self, permission_cache_compliant
+    ):
+        findings = self._run(
+            [self._endpoint(policy="{not json")], permission_cache_compliant
+        )
+
+        policy_rows = self._policy_rows(findings)
+        assert len(policy_rows) == 1
+        assert policy_rows[0]["Status"] == "N/A"
+        assert (
+            "its endpoint policy could not be parsed"
+            in (policy_rows[0]["Finding_Details"])
+        )
+        assert self.result["status"] == "PASS"
+
+    def test_br02_absent_policy_is_na_not_scoped(self, permission_cache_compliant):
+        findings = self._run([self._endpoint(policy="")], permission_cache_compliant)
+
+        policy_rows = self._policy_rows(findings)
+        assert len(policy_rows) == 1
+        assert policy_rows[0]["Status"] == "N/A"
+        assert (
+            "no endpoint policy document was returned for it"
+            in (policy_rows[0]["Finding_Details"])
+        )
+
+    def test_br02_two_endpoints_reach_both_policy_verdicts(
+        self, permission_cache_compliant
+    ):
+        findings = self._run(
+            [
+                self._endpoint(endpoint_id="vpce-scoped"),
+                self._endpoint(endpoint_id="vpce-open", policy=self._OPEN_POLICY),
+            ],
+            permission_cache_compliant,
+        )
+
+        policy_rows = self._policy_rows(findings)
+        failed = [row for row in policy_rows if row["Status"] == "Failed"]
+        passed = [row for row in policy_rows if row["Status"] == "Passed"]
+        assert len(failed) == 1
+        assert len(passed) == 1
+        assert "1 of 2" in failed[0]["Finding_Details"]
+        assert "vpce-open" in failed[0]["Finding_Details"]
+        assert "vpce-scoped" not in failed[0]["Finding_Details"]
+        assert "vpce-scoped" in passed[0]["Finding_Details"]
+
+    def test_br02_hardening_rows_pass_the_finding_schema(
+        self, permission_cache_compliant
+    ):
+        findings = self._run(
+            [
+                self._endpoint(endpoint_id="vpce-open", policy=self._OPEN_POLICY),
+                self._endpoint(endpoint_id="vpce-off", private_dns=False),
+                self._endpoint(endpoint_id="vpce-unknown", private_dns=None, policy=""),
+            ],
+            permission_cache_compliant,
+        )
+
+        rows = self._dns_rows(findings) + self._policy_rows(findings)
+        # Three endpoints in three states: both legs report all three verdicts.
+        assert sorted(row["Status"] for row in rows) == [
+            "Failed",
+            "Failed",
+            "N/A",
+            "N/A",
+            "Passed",
+            "Passed",
+        ]
+        for finding in rows:
+            assert_finding_schema(finding)
+
+    def test_br02_collector_captures_private_dns_and_the_policy_document(self):
+        """The two fields the legs judge must survive the endpoint walk."""
+        ec2_client = MagicMock()
+        ec2_client.describe_vpcs.return_value = {"Vpcs": [{"VpcId": "vpc-1"}]}
+        ec2_client.get_paginator.return_value.paginate.return_value = [
+            {
+                "VpcEndpoints": [
+                    {
+                        "VpcEndpointId": "vpce-1",
+                        "VpcId": "vpc-1",
+                        "ServiceName": "com.amazonaws.us-east-1.bedrock-runtime",
+                        "PrivateDnsEnabled": False,
+                        "PolicyDocument": self._OPEN_POLICY,
+                    },
+                    {
+                        "VpcEndpointId": "vpce-2",
+                        "VpcId": "vpc-1",
+                        "ServiceName": "com.amazonaws.us-east-1.s3",
+                        "PrivateDnsEnabled": True,
+                    },
+                ]
+            }
+        ]
+
+        with patch("bedrock_app.boto3.client", return_value=ec2_client):
+            result = bedrock_app.check_bedrock_vpc_endpoints(region="us-east-1")
+
+        assert result["has_endpoints"] is True
+        assert len(result["found_endpoints"]) == 1
+        endpoint = result["found_endpoints"][0]
+        assert endpoint["endpoint_id"] == "vpce-1"
+        assert endpoint["private_dns"] is False
+        assert endpoint["policy"] == self._OPEN_POLICY
 
 
 # ===================================================================
@@ -1003,8 +1520,10 @@ class TestBR07PromptManagement:
         paginator = MagicMock()
         mock_client.return_value = mock_agent
         mock_agent.get_paginator.return_value = paginator
+        # ListPrompts without an identifier reports the DRAFT of each prompt, and
+        # version is a required member of PromptSummary.
         paginator.paginate.return_value = [
-            {"promptSummaries": [{"name": "prompt1", "id": "p1"}]}
+            {"promptSummaries": [{"name": "prompt1", "id": "p1", "version": "DRAFT"}]}
         ]
         mock_agent.get_prompt.return_value = {"variants": ["v1", "v2"]}
         result = check()
@@ -1022,7 +1541,11 @@ class TestBR07PromptManagement:
         mock_client.return_value = mock_agent
         mock_agent.get_paginator.return_value = paginator
         paginator.paginate.return_value = [
-            {"promptSummaries": [{"name": "prompt1", "promptId": "p1"}]}
+            {
+                "promptSummaries": [
+                    {"name": "prompt1", "promptId": "p1", "version": "DRAFT"}
+                ]
+            }
         ]
         mock_agent.get_prompt.return_value = {"variants": ["v1", "v2"]}
 
@@ -1080,6 +1603,563 @@ class TestBR07PromptManagement:
         result = check()
         for f in extract_csv_data(result):
             assert_finding_schema(f)
+
+
+class TestBR07PromptProductionVersion:
+    """BR-07 / AIR-BDR-MDL-08: production must run a pinned, encrypted prompt."""
+
+    _CMK_ARN = "arn:aws:kms:us-east-1:123456789012:key/prompt-key"
+    _PROMPT_ARN = "arn:aws:bedrock:us-east-1:123456789012:prompt/ABCDEFGHIJ"
+
+    @staticmethod
+    def _summary(prompt_id, version, name=None):
+        return {
+            "id": prompt_id,
+            "name": name or prompt_id,
+            "arn": f"arn:aws:bedrock:us-east-1:123456789012:prompt/{prompt_id}",
+            "version": version,
+        }
+
+    @classmethod
+    def _client(
+        cls,
+        prompts=(),
+        versions=None,
+        version_details=None,
+        flows=(),
+        flow_definitions=None,
+        flows_error=None,
+    ):
+        """
+        A bedrock-agent client whose ListPrompts answers per promptIdentifier.
+
+        Without an identifier the API returns the DRAFT summary of every prompt;
+        with one it returns that prompt's versions, so a single shared page would
+        let a DRAFT-only estate read as versioned.
+        """
+        versions = versions or {}
+        version_details = version_details or {}
+        flow_definitions = flow_definitions or {}
+
+        def list_prompts_pages(**kwargs):
+            identifier = kwargs.get("promptIdentifier")
+            if identifier is None:
+                return [{"promptSummaries": list(prompts)}]
+            entry = versions.get(identifier, [])
+            if isinstance(entry, Exception):
+                raise entry
+            return [{"promptSummaries": list(entry)}]
+
+        prompts_paginator = MagicMock()
+        prompts_paginator.paginate.side_effect = list_prompts_pages
+
+        flows_paginator = MagicMock()
+        if flows_error is not None:
+            flows_paginator.paginate.side_effect = flows_error
+        else:
+            flows_paginator.paginate.return_value = [{"flowSummaries": list(flows)}]
+
+        client = MagicMock()
+        client.get_paginator.side_effect = lambda operation: {
+            "list_prompts": prompts_paginator,
+            "list_flows": flows_paginator,
+        }[operation]
+
+        def get_prompt(**kwargs):
+            version = kwargs.get("promptVersion")
+            if version is None:
+                # The variants leg reads the DRAFT of each prompt.
+                return {"variants": ["v1", "v2"]}
+            entry = version_details.get((kwargs["promptIdentifier"], version))
+            if isinstance(entry, Exception):
+                raise entry
+            return entry or {}
+
+        client.get_prompt.side_effect = get_prompt
+
+        def get_flow(flowIdentifier):
+            entry = flow_definitions.get(flowIdentifier)
+            if isinstance(entry, Exception):
+                raise entry
+            return entry or {}
+
+        client.get_flow.side_effect = get_flow
+        return client
+
+    def _run(self, client):
+        with patch("boto3.client", return_value=client):
+            self.result = bedrock_app.check_bedrock_prompt_management("us-east-1")
+        return extract_csv_data(self.result)
+
+    @staticmethod
+    def _rows(findings, finding_name):
+        return [finding for finding in findings if finding["Finding"] == finding_name]
+
+    @classmethod
+    def _version_rows(cls, findings):
+        return cls._rows(findings, bedrock_app.PROMPT_VERSION_FINDING)
+
+    @classmethod
+    def _encryption_rows(cls, findings):
+        return cls._rows(findings, bedrock_app.PROMPT_VERSION_ENCRYPTION_FINDING)
+
+    @classmethod
+    def _flow_rows(cls, findings):
+        return cls._rows(findings, bedrock_app.FLOW_PROMPT_VERSION_FINDING)
+
+    @staticmethod
+    def _flow(nodes):
+        return {"definition": {"nodes": list(nodes)}}
+
+    @classmethod
+    def _prompt_node(cls, name, prompt_arn):
+        return {
+            "name": name,
+            "type": "Prompt",
+            "configuration": {
+                "prompt": {
+                    "sourceConfiguration": {"resource": {"promptArn": prompt_arn}}
+                }
+            },
+        }
+
+    # ------------------------------------------------------------------
+    # Leg A: does a numbered version exist at all
+    # ------------------------------------------------------------------
+    def test_br07_numbered_version_passes_the_pinning_leg(self):
+        rows = self._version_rows(
+            self._run(
+                self._client(
+                    prompts=[self._summary("p1", "DRAFT")],
+                    versions={
+                        "p1": [self._summary("p1", "DRAFT"), self._summary("p1", "1")]
+                    },
+                )
+            )
+        )
+
+        assert [row["Status"] for row in rows] == ["Passed"]
+        assert "1 of 1 prompt(s)" in rows[0]["Finding_Details"]
+        assert "latest version 1" in rows[0]["Finding_Details"]
+
+    def test_br07_draft_only_prompt_fails_the_pinning_leg(self):
+        rows = self._version_rows(
+            self._run(
+                self._client(
+                    prompts=[self._summary("p1", "DRAFT", name="greeting")],
+                    versions={"p1": [self._summary("p1", "DRAFT")]},
+                )
+            )
+        )
+
+        assert [row["Status"] for row in rows] == ["Failed"]
+        assert rows[0]["Severity"] == "Medium"
+        assert "greeting" in rows[0]["Finding_Details"]
+        assert self.result["status"] == "WARN"
+
+    def test_br07_two_prompts_reach_both_pinning_verdicts(self):
+        rows = self._version_rows(
+            self._run(
+                self._client(
+                    prompts=[
+                        self._summary("p1", "DRAFT", name="pinned"),
+                        self._summary("p2", "DRAFT", name="draft-only"),
+                    ],
+                    versions={
+                        "p1": [self._summary("p1", "1")],
+                        "p2": [self._summary("p2", "DRAFT")],
+                    },
+                    version_details={("p1", "1"): {}},
+                )
+            )
+        )
+
+        assert [row["Status"] for row in rows] == ["Failed", "Passed"]
+        assert "1 of 2 prompt(s)" in rows[0]["Finding_Details"]
+        assert "draft-only" in rows[0]["Finding_Details"]
+        assert "1 of 2 prompt(s)" in rows[1]["Finding_Details"]
+        assert "pinned" in rows[1]["Finding_Details"]
+
+    def test_br07_version_list_error_is_na_not_draft_only(self):
+        findings = self._run(
+            self._client(
+                prompts=[self._summary("p1", "DRAFT")],
+                versions={
+                    "p1": _client_error("AccessDeniedException", "no", "ListPrompts")
+                },
+            )
+        )
+
+        rows = self._version_rows(findings)
+        assert [row["Status"] for row in rows] == ["N/A"]
+        assert "AccessDeniedException" in rows[0]["Finding_Details"]
+        assert "bedrock:ListPrompts" in rows[0]["Resolution"]
+        assert self._encryption_rows(findings) == []
+
+    def test_br07_latest_version_is_the_highest_number_not_the_last_listed(self):
+        rows = self._version_rows(
+            self._run(
+                self._client(
+                    prompts=[self._summary("p1", "DRAFT")],
+                    versions={
+                        "p1": [
+                            self._summary("p1", "DRAFT"),
+                            self._summary("p1", "10"),
+                            self._summary("p1", "9"),
+                        ]
+                    },
+                    version_details={("p1", "10"): {}},
+                )
+            )
+        )
+
+        assert "latest version 10" in rows[0]["Finding_Details"]
+
+    # ------------------------------------------------------------------
+    # Leg B: the encryption key of the version production would pin
+    # ------------------------------------------------------------------
+    def test_br07_cmk_on_the_latest_version_passes_the_encryption_leg(self):
+        rows = self._encryption_rows(
+            self._run(
+                self._client(
+                    prompts=[self._summary("p1", "DRAFT")],
+                    versions={"p1": [self._summary("p1", "1")]},
+                    version_details={
+                        ("p1", "1"): {"customerEncryptionKeyArn": self._CMK_ARN}
+                    },
+                )
+            )
+        )
+
+        assert [row["Status"] for row in rows] == ["Passed"]
+        assert "1 of 1 versioned prompt(s)" in rows[0]["Finding_Details"]
+
+    def test_br07_version_without_a_cmk_fails_the_encryption_leg(self):
+        rows = self._encryption_rows(
+            self._run(
+                self._client(
+                    prompts=[self._summary("p1", "DRAFT", name="greeting")],
+                    versions={"p1": [self._summary("p1", "4")]},
+                    version_details={("p1", "4"): {}},
+                )
+            )
+        )
+
+        assert [row["Status"] for row in rows] == ["Failed"]
+        assert rows[0]["Severity"] == "Medium"
+        assert "greeting (version 4)" in rows[0]["Finding_Details"]
+        assert self.result["status"] == "WARN"
+
+    def test_br07_encryption_leg_reads_the_latest_version_only(self):
+        client = self._client(
+            prompts=[self._summary("p1", "DRAFT")],
+            versions={"p1": [self._summary("p1", "1"), self._summary("p1", "2")]},
+            version_details={
+                ("p1", "1"): {},
+                ("p1", "2"): {"customerEncryptionKeyArn": self._CMK_ARN},
+            },
+        )
+        rows = self._encryption_rows(self._run(client))
+
+        assert [row["Status"] for row in rows] == ["Passed"]
+        assert client.get_prompt.call_args_list == [
+            call(promptIdentifier="p1"),
+            call(promptIdentifier="p1", promptVersion="2"),
+        ]
+
+    def test_br07_get_prompt_error_on_the_version_is_na_not_unencrypted(self):
+        rows = self._encryption_rows(
+            self._run(
+                self._client(
+                    prompts=[self._summary("p1", "DRAFT")],
+                    versions={"p1": [self._summary("p1", "1")]},
+                    version_details={
+                        ("p1", "1"): _client_error(
+                            "AccessDeniedException", "no", "GetPrompt"
+                        )
+                    },
+                )
+            )
+        )
+
+        assert [row["Status"] for row in rows] == ["N/A"]
+        assert "bedrock:GetPrompt" in rows[0]["Resolution"]
+        assert "AccessDeniedException" in rows[0]["Finding_Details"]
+
+    def test_br07_draft_only_prompt_stays_out_of_the_encryption_denominator(self):
+        rows = self._encryption_rows(
+            self._run(
+                self._client(
+                    prompts=[
+                        self._summary("p1", "DRAFT"),
+                        self._summary("p2", "DRAFT"),
+                    ],
+                    versions={
+                        "p1": [self._summary("p1", "DRAFT")],
+                        "p2": [self._summary("p2", "1")],
+                    },
+                    version_details={
+                        ("p2", "1"): {"customerEncryptionKeyArn": self._CMK_ARN}
+                    },
+                )
+            )
+        )
+
+        assert [row["Status"] for row in rows] == ["Passed"]
+        assert "1 of 1 versioned prompt(s)" in rows[0]["Finding_Details"]
+
+    # ------------------------------------------------------------------
+    # Leg C: what the flows of the Region actually reference
+    # ------------------------------------------------------------------
+    def _flow_client(self, flows, flow_definitions, **kwargs):
+        return self._client(
+            prompts=[self._summary("p1", "DRAFT")],
+            versions={"p1": [self._summary("p1", "1")]},
+            version_details={("p1", "1"): {"customerEncryptionKeyArn": self._CMK_ARN}},
+            flows=flows,
+            flow_definitions=flow_definitions,
+            **kwargs,
+        )
+
+    def test_br07_flow_node_pinning_a_version_passes(self):
+        rows = self._flow_rows(
+            self._run(
+                self._flow_client(
+                    [{"id": "f1", "name": "support"}],
+                    {
+                        "f1": self._flow(
+                            [self._prompt_node("classify", f"{self._PROMPT_ARN}:3")]
+                        )
+                    },
+                )
+            )
+        )
+
+        assert [row["Status"] for row in rows] == ["Passed"]
+        assert "1 of 1 prompt reference(s)" in rows[0]["Finding_Details"]
+        assert (
+            "flow 'support' node 'classify' pins version 3"
+            in (rows[0]["Finding_Details"])
+        )
+
+    def test_br07_flow_node_without_a_version_suffix_fails(self):
+        rows = self._flow_rows(
+            self._run(
+                self._flow_client(
+                    [{"id": "f1", "name": "support"}],
+                    {
+                        "f1": self._flow(
+                            [self._prompt_node("classify", self._PROMPT_ARN)]
+                        )
+                    },
+                )
+            )
+        )
+
+        assert [row["Status"] for row in rows] == ["Failed"]
+        assert rows[0]["Severity"] == "Medium"
+        details = rows[0]["Finding_Details"]
+        assert "flow 'support' node 'classify'" in details
+        assert self._PROMPT_ARN in details
+        assert self.result["status"] == "WARN"
+
+    def test_br07_prompt_node_inside_a_loop_is_walked(self):
+        """A DoWhile loop carries its own definition, and a prompt node is legal there."""
+        loop_node = {
+            "name": "retry",
+            "type": "Loop",
+            "configuration": {
+                "loop": {
+                    "definition": {
+                        "nodes": [self._prompt_node("looped", self._PROMPT_ARN)]
+                    }
+                }
+            },
+        }
+        rows = self._flow_rows(
+            self._run(
+                self._flow_client(
+                    [{"id": "f1", "name": "support"}], {"f1": self._flow([loop_node])}
+                )
+            )
+        )
+
+        assert [row["Status"] for row in rows] == ["Failed"]
+        assert "node 'looped'" in rows[0]["Finding_Details"]
+
+    def test_br07_inline_prompt_node_is_not_a_managed_reference(self):
+        inline_node = {
+            "name": "inline",
+            "type": "Prompt",
+            "configuration": {
+                "prompt": {
+                    "sourceConfiguration": {
+                        "inline": {
+                            "templateType": "TEXT",
+                            "modelId": "anthropic.claude-v2",
+                            "templateConfiguration": {"text": {"text": "hello"}},
+                        }
+                    }
+                }
+            },
+        }
+        findings = self._run(
+            self._flow_client(
+                [{"id": "f1", "name": "support"}], {"f1": self._flow([inline_node])}
+            )
+        )
+
+        assert self._flow_rows(findings) == []
+
+    def test_br07_five_digit_version_suffix_is_pinned(self):
+        rows = self._flow_rows(
+            self._run(
+                self._flow_client(
+                    [{"id": "f1", "name": "support"}],
+                    {
+                        "f1": self._flow(
+                            [self._prompt_node("classify", f"{self._PROMPT_ARN}:12345")]
+                        )
+                    },
+                )
+            )
+        )
+
+        assert [row["Status"] for row in rows] == ["Passed"]
+        assert "pins version 12345" in rows[0]["Finding_Details"]
+
+    def test_br07_flow_list_error_is_na_not_pinned(self):
+        rows = self._flow_rows(
+            self._run(
+                self._flow_client(
+                    [],
+                    {},
+                    flows_error=_client_error(
+                        "AccessDeniedException", "no", "ListFlows"
+                    ),
+                )
+            )
+        )
+
+        assert [row["Status"] for row in rows] == ["N/A"]
+        assert "bedrock:ListFlows" in rows[0]["Resolution"]
+        assert "AccessDeniedException" in rows[0]["Finding_Details"]
+
+    def test_br07_flow_detail_error_keeps_the_other_flow_and_is_na(self):
+        rows = self._flow_rows(
+            self._run(
+                self._flow_client(
+                    [{"id": "f1", "name": "support"}, {"id": "f2", "name": "closed"}],
+                    {
+                        "f1": self._flow(
+                            [self._prompt_node("classify", f"{self._PROMPT_ARN}:3")]
+                        ),
+                        "f2": _client_error("AccessDeniedException", "no", "GetFlow"),
+                    },
+                )
+            )
+        )
+
+        assert [row["Status"] for row in rows] == ["Passed", "N/A"]
+        assert "closed" in rows[1]["Finding_Details"]
+        assert "bedrock:GetFlow" in rows[1]["Resolution"]
+
+    def test_br07_two_flow_nodes_reach_both_reference_verdicts(self):
+        rows = self._flow_rows(
+            self._run(
+                self._flow_client(
+                    [{"id": "f1", "name": "support"}],
+                    {
+                        "f1": self._flow(
+                            [
+                                self._prompt_node("pinned", f"{self._PROMPT_ARN}:3"),
+                                self._prompt_node("unpinned", self._PROMPT_ARN),
+                            ]
+                        )
+                    },
+                )
+            )
+        )
+
+        assert [row["Status"] for row in rows] == ["Failed", "Passed"]
+        assert "1 of 2 prompt reference(s)" in rows[0]["Finding_Details"]
+        assert "1 of 2 prompt reference(s)" in rows[1]["Finding_Details"]
+
+    def test_br07_flow_without_a_prompt_node_emits_no_flow_row(self):
+        lambda_node = {
+            "name": "enrich",
+            "type": "LambdaFunction",
+            "configuration": {
+                "lambdaFunction": {
+                    "lambdaArn": "arn:aws:lambda:us-east-1:123456789012:function:f"
+                }
+            },
+        }
+        findings = self._run(
+            self._flow_client(
+                [{"id": "f1", "name": "support"}], {"f1": self._flow([lambda_node])}
+            )
+        )
+
+        assert self._flow_rows(findings) == []
+
+    def test_br07_a_pinned_encrypted_estate_keeps_the_check_passing(self):
+        findings = self._run(
+            self._flow_client(
+                [{"id": "f1", "name": "support"}],
+                {
+                    "f1": self._flow(
+                        [self._prompt_node("classify", f"{self._PROMPT_ARN}:1")]
+                    )
+                },
+            )
+        )
+
+        assert self.result["status"] == "PASS"
+        assert [finding["Status"] for finding in findings] == [
+            "Passed",
+            "Passed",
+            "Passed",
+            "Passed",
+        ]
+
+    def test_br07_version_rows_pass_the_finding_schema(self):
+        findings = self._run(
+            self._client(
+                prompts=[
+                    self._summary("p1", "DRAFT", name="pinned"),
+                    self._summary("p2", "DRAFT", name="draft-only"),
+                    self._summary("p3", "DRAFT", name="closed"),
+                ],
+                versions={
+                    "p1": [self._summary("p1", "1")],
+                    "p2": [self._summary("p2", "DRAFT")],
+                    "p3": _client_error("AccessDeniedException", "no", "ListPrompts"),
+                },
+                version_details={("p1", "1"): {}},
+                flows=[{"id": "f1", "name": "support"}],
+                flow_definitions={
+                    "f1": self._flow([self._prompt_node("classify", self._PROMPT_ARN)])
+                },
+            )
+        )
+
+        rows = (
+            self._version_rows(findings)
+            + self._encryption_rows(findings)
+            + self._flow_rows(findings)
+        )
+        assert sorted(row["Status"] for row in rows) == [
+            "Failed",
+            "Failed",
+            "Failed",
+            "N/A",
+            "Passed",
+        ]
+        for finding in rows:
+            assert_finding_schema(finding)
+            assert finding["Check_ID"] == "BR-07"
+            assert finding["Region"] == "us-east-1"
 
 
 # ===================================================================
@@ -4198,6 +5278,8 @@ class TestBR46KnowledgeBaseSourceClassification:
         discovery_error=None,
         describe_buckets_error=None,
         data_source_error=None,
+        classification_jobs=(),
+        classification_jobs_error=None,
     ):
         agent_client = MagicMock()
         agent_client.list_knowledge_bases.return_value = {
@@ -4232,14 +5314,27 @@ class TestBR46KnowledgeBaseSourceClassification:
                 "status": discovery_status,
                 "classificationScopeId": "scope-1",
             }
+        # Two paginators are read, so each one answers under its own operation
+        # name: a single shared mock would let the bucket inventory answer the
+        # classification job list with buckets and vice versa.
+        buckets_paginator = MagicMock()
         if describe_buckets_error:
-            macie_client.get_paginator.return_value.paginate.side_effect = (
-                describe_buckets_error
-            )
+            buckets_paginator.paginate.side_effect = describe_buckets_error
         else:
-            macie_client.get_paginator.return_value.paginate.return_value = [
-                {"buckets": list(macie_buckets)}
+            buckets_paginator.paginate.return_value = [{"buckets": list(macie_buckets)}]
+        jobs_paginator = MagicMock()
+        if classification_jobs_error:
+            jobs_paginator.paginate.side_effect = classification_jobs_error
+        else:
+            jobs_paginator.paginate.return_value = [
+                {"items": list(classification_jobs)}
             ]
+        macie_client.get_paginator.side_effect = lambda operation: {
+            "describe_buckets": buckets_paginator,
+            "list_classification_jobs": jobs_paginator,
+        }[operation]
+        # Exposed so a case can assert which macie2 operations were reached.
+        self.macie_client = macie_client
 
         with patch(
             "bedrock_app.boto3.client",
@@ -4597,6 +5692,322 @@ class TestBR46KnowledgeBaseSourceClassification:
         )
         assert findings
         for finding in findings:
+            assert_finding_schema(finding)
+
+
+class TestBR46ClassificationJobCoverage:
+    """
+    BR-46 job leg: a targeted Macie classification job is the other mechanism.
+
+    Automated sensitive data discovery reporting NOT_MONITORED is not the whole
+    answer, because a classification job can inspect the same bucket. Only a
+    scheduled job that will run again counts, so every case below fixes the
+    bucket inventory and varies the job.
+    """
+
+    _BUCKETS = [
+        {
+            "bucketName": "support-bucket",
+            "automatedDiscoveryMonitoringStatus": "MONITORED",
+        },
+        {
+            "bucketName": "hr-bucket",
+            "automatedDiscoveryMonitoringStatus": "NOT_MONITORED",
+        },
+    ]
+
+    _BOTH_UNMONITORED = [
+        {
+            "bucketName": "support-bucket",
+            "automatedDiscoveryMonitoringStatus": "NOT_MONITORED",
+        },
+        {
+            "bucketName": "hr-bucket",
+            "automatedDiscoveryMonitoringStatus": "NOT_MONITORED",
+        },
+    ]
+
+    def _run(self, **kwargs):
+        """Reuse the two-bucket estate so only the job list varies."""
+        estate = TestBR46KnowledgeBaseSourceClassification()
+        kwargs.setdefault("macie_buckets", self._BUCKETS)
+        findings = estate._two_bucket_estate(**kwargs)
+        self.macie_client = estate.macie_client
+        return findings
+
+    @staticmethod
+    def _job(
+        name,
+        buckets=(),
+        job_type="SCHEDULED",
+        status="IDLE",
+        last_run_error=None,
+        criteria=None,
+    ):
+        job = {
+            "jobId": f"job-{name}",
+            "name": name,
+            "jobType": job_type,
+            "jobStatus": status,
+        }
+        if buckets:
+            job["bucketDefinitions"] = [
+                {"accountId": "123456789012", "buckets": list(buckets)}
+            ]
+        if criteria:
+            job["bucketCriteria"] = criteria
+        if last_run_error:
+            job["lastRunErrorStatus"] = {"code": last_run_error}
+        return job
+
+    @staticmethod
+    def _job_rows(findings):
+        return [
+            finding
+            for finding in findings
+            if finding["Finding"] == bedrock_app.CLASSIFICATION_JOB_FINDING
+        ]
+
+    def test_br46_scheduled_job_clears_an_unmonitored_bucket(self):
+        findings = self._run(
+            classification_jobs=[self._job("nightly-hr", ["hr-bucket"])]
+        )
+
+        assert not [f for f in findings if f["Status"] == "Failed"]
+        job_rows = self._job_rows(findings)
+        assert len(job_rows) == 1
+        assert job_rows[0]["Status"] == "Passed"
+        assert job_rows[0]["Check_ID"] == "BR-46"
+        assert (
+            "hr-bucket is classified by scheduled Macie job 'nightly-hr' (IDLE)"
+            in (job_rows[0]["Finding_Details"])
+        )
+        assert (
+            "1 of 2 knowledge base source bucket(s)" in job_rows[0]["Finding_Details"]
+        )
+
+    def test_br46_running_scheduled_job_also_clears_the_bucket(self):
+        """RUNNING and IDLE both mean the schedule is live, so both count."""
+        findings = self._run(
+            classification_jobs=[
+                self._job("nightly-hr", ["hr-bucket"], status="RUNNING")
+            ]
+        )
+
+        assert not [f for f in findings if f["Status"] == "Failed"]
+        assert "(RUNNING)" in self._job_rows(findings)[0]["Finding_Details"]
+
+    def test_br46_one_time_job_does_not_clear_an_unmonitored_bucket(self):
+        findings = self._run(
+            classification_jobs=[
+                self._job(
+                    "one-shot", ["hr-bucket"], job_type="ONE_TIME", status="COMPLETE"
+                )
+            ]
+        )
+
+        failed = [f for f in findings if f["Status"] == "Failed"]
+        assert len(failed) == 1
+        assert "hr-bucket is NOT_MONITORED" in failed[0]["Finding_Details"]
+        assert (
+            "Macie job 'one-shot' is ONE_TIME and COMPLETE"
+            in (failed[0]["Finding_Details"])
+        )
+        assert (
+            "nothing ingested since that run is classified"
+            in (failed[0]["Finding_Details"])
+        )
+        assert not self._job_rows(findings)
+
+    def test_br46_paused_scheduled_job_does_not_clear_the_bucket(self):
+        findings = self._run(
+            classification_jobs=[
+                self._job("nightly-hr", ["hr-bucket"], status="USER_PAUSED")
+            ]
+        )
+
+        failed = [f for f in findings if f["Status"] == "Failed"]
+        assert len(failed) == 1
+        assert (
+            "the scheduled Macie job naming it, 'nightly-hr', is USER_PAUSED"
+            in (failed[0]["Finding_Details"])
+        )
+        assert not self._job_rows(findings)
+
+    def test_br46_scheduled_job_whose_last_run_errored_does_not_clear_the_bucket(self):
+        """A live schedule whose run failed classified nothing on that run."""
+        findings = self._run(
+            classification_jobs=[
+                self._job(
+                    "nightly-hr",
+                    ["hr-bucket"],
+                    status="RUNNING",
+                    last_run_error="ERROR",
+                )
+            ]
+        )
+
+        failed = [f for f in findings if f["Status"] == "Failed"]
+        assert len(failed) == 1
+        assert "lastRunErrorStatus ERROR" in failed[0]["Finding_Details"]
+        assert not self._job_rows(findings)
+
+    def test_br46_last_run_error_code_none_still_clears_the_bucket(self):
+        """lastRunErrorStatus is present on a healthy job with code NONE."""
+        findings = self._run(
+            classification_jobs=[
+                self._job("nightly-hr", ["hr-bucket"], last_run_error="NONE")
+            ]
+        )
+
+        assert not [f for f in findings if f["Status"] == "Failed"]
+        assert self._job_rows(findings)[0]["Status"] == "Passed"
+
+    def test_br46_job_naming_another_bucket_does_not_clear_this_one(self):
+        findings = self._run(
+            classification_jobs=[self._job("nightly-other", ["unrelated-bucket"])]
+        )
+
+        failed = [f for f in findings if f["Status"] == "Failed"]
+        assert len(failed) == 1
+        assert (
+            "No Macie classification job in this Region names hr-bucket either."
+            in (failed[0]["Finding_Details"])
+        )
+        assert "nightly-other" not in failed[0]["Finding_Details"]
+        assert not self._job_rows(findings)
+
+    def test_br46_two_unmonitored_buckets_reach_both_verdicts(self):
+        findings = self._run(
+            macie_buckets=self._BOTH_UNMONITORED,
+            classification_jobs=[self._job("nightly-support", ["support-bucket"])],
+        )
+
+        failed = [f for f in findings if f["Status"] == "Failed"]
+        job_rows = self._job_rows(findings)
+        assert len(failed) == 1
+        assert "hr-bucket is NOT_MONITORED" in failed[0]["Finding_Details"]
+        assert len(job_rows) == 1
+        assert job_rows[0]["Status"] == "Passed"
+        assert "support-bucket" in job_rows[0]["Finding_Details"]
+        # One bucket's job cannot speak for the other.
+        assert "hr-bucket" not in job_rows[0]["Finding_Details"]
+
+    def test_br46_a_live_job_after_a_cancelled_one_still_clears_the_bucket(self):
+        findings = self._run(
+            classification_jobs=[
+                self._job("old-hr", ["hr-bucket"], status="CANCELLED"),
+                self._job("nightly-hr", ["hr-bucket"]),
+            ]
+        )
+
+        assert not [f for f in findings if f["Status"] == "Failed"]
+        assert "'nightly-hr'" in self._job_rows(findings)[0]["Finding_Details"]
+
+    def test_br46_bucket_criteria_job_is_indeterminate_not_coverage(self):
+        findings = self._run(
+            classification_jobs=[
+                self._job(
+                    "by-tag",
+                    criteria={
+                        "includes": {
+                            "and": [
+                                {
+                                    "tagCriterion": {
+                                        "comparator": "EQ",
+                                        "tagValues": [{"key": "pii", "value": "yes"}],
+                                    }
+                                }
+                            ]
+                        }
+                    },
+                )
+            ]
+        )
+
+        failed = [f for f in findings if f["Status"] == "Failed"]
+        job_rows = self._job_rows(findings)
+        assert len(failed) == 1
+        assert len(job_rows) == 1
+        assert job_rows[0]["Status"] == "N/A"
+        assert job_rows[0]["Severity"] == "Informational"
+        assert (
+            "select their buckets with bucketCriteria instead of naming them"
+            in (job_rows[0]["Finding_Details"])
+        )
+        assert "by-tag" in job_rows[0]["Finding_Details"]
+        assert "hr-bucket" in job_rows[0]["Finding_Details"]
+
+    def test_br46_job_list_failure_is_na_not_coverage_and_not_absence(self):
+        findings = self._run(
+            classification_jobs_error=_make_client_error("AccessDeniedException"),
+        )
+
+        failed = [f for f in findings if f["Status"] == "Failed"]
+        job_rows = self._job_rows(findings)
+        assert len(failed) == 1
+        # The monitoring verdict stands, but the check must not claim no job
+        # names the bucket when it could not read the job list.
+        assert "No Macie classification job" not in failed[0]["Finding_Details"]
+        assert len(job_rows) == 1
+        assert job_rows[0]["Status"] == "N/A"
+        assert (
+            "The Macie classification job list could not be read"
+            in (job_rows[0]["Finding_Details"])
+        )
+        assert "hr-bucket" in job_rows[0]["Finding_Details"]
+        assert "macie2:ListClassificationJobs" in job_rows[0]["Resolution"]
+
+    def test_br46_job_list_is_not_read_when_every_bucket_is_monitored(self):
+        """Nothing is failing, so the second Macie call buys nothing."""
+        findings = self._run(
+            macie_buckets=[
+                {
+                    "bucketName": "support-bucket",
+                    "automatedDiscoveryMonitoringStatus": "MONITORED",
+                },
+                {
+                    "bucketName": "hr-bucket",
+                    "automatedDiscoveryMonitoringStatus": "MONITORED",
+                },
+            ],
+            classification_jobs=[self._job("nightly-hr", ["hr-bucket"])],
+        )
+
+        assert [f["Status"] for f in findings] == ["Passed"]
+        assert not self._job_rows(findings)
+        self.macie_client.get_paginator.assert_called_once_with("describe_buckets")
+
+    def test_br46_job_coverage_reads_the_job_list_only(self):
+        """One macie2 job action: DescribeClassificationJob is never called."""
+        self._run(classification_jobs=[self._job("nightly-hr", ["hr-bucket"])])
+
+        assert [
+            call.args[0] for call in self.macie_client.get_paginator.call_args_list
+        ] == ["describe_buckets", "list_classification_jobs"]
+        assert self.macie_client.describe_classification_job.call_count == 0
+        assert self.macie_client.list_classification_jobs.call_count == 0
+
+    def test_br46_job_rows_pass_the_finding_schema(self):
+        covered = self._run(
+            classification_jobs=[self._job("nightly-hr", ["hr-bucket"])]
+        )
+        criteria = self._run(
+            classification_jobs=[
+                self._job("by-tag", criteria={"includes": {"and": []}})
+            ]
+        )
+        unreadable = self._run(
+            classification_jobs_error=_make_client_error("AccessDeniedException")
+        )
+
+        rows = (
+            self._job_rows(covered)
+            + self._job_rows(criteria)
+            + self._job_rows(unreadable)
+        )
+        assert len(rows) == 3
+        for finding in rows:
             assert_finding_schema(finding)
 
 
@@ -5134,6 +6545,7 @@ class TestBR20KnowledgeBaseKMS:
         agent_client.list_knowledge_bases.return_value = {
             "knowledgeBaseSummaries": [{"knowledgeBaseId": "kb1", "name": "ManagedKB"}]
         }
+        agent_client.list_data_sources.return_value = {"dataSourceSummaries": []}
         agent_client.get_knowledge_base.return_value = {
             "knowledgeBase": {
                 "knowledgeBaseConfiguration": {
@@ -5161,6 +6573,7 @@ class TestBR20KnowledgeBaseKMS:
         agent_client.list_knowledge_bases.return_value = {
             "knowledgeBaseSummaries": [{"knowledgeBaseId": "kb1", "name": "ManagedKB"}]
         }
+        agent_client.list_data_sources.return_value = {"dataSourceSummaries": []}
         agent_client.get_knowledge_base.return_value = {
             "knowledgeBase": {
                 "knowledgeBaseConfiguration": {
@@ -5187,6 +6600,7 @@ class TestBR20KnowledgeBaseKMS:
         agent_client.list_knowledge_bases.return_value = {
             "knowledgeBaseSummaries": [{"knowledgeBaseId": "kb1", "name": "ManagedKB"}]
         }
+        agent_client.list_data_sources.return_value = {"dataSourceSummaries": []}
         agent_client.get_knowledge_base.return_value = {
             "knowledgeBase": {"knowledgeBaseConfiguration": {"type": "MANAGED"}}
         }
@@ -5210,6 +6624,7 @@ class TestBR20KnowledgeBaseKMS:
         agent_client.list_knowledge_bases.return_value = {
             "knowledgeBaseSummaries": [{"knowledgeBaseId": "kb1", "name": "VectorKB"}]
         }
+        agent_client.list_data_sources.return_value = {"dataSourceSummaries": []}
         agent_client.get_knowledge_base.return_value = {
             "knowledgeBase": {
                 "knowledgeBaseConfiguration": {
@@ -5324,13 +6739,18 @@ class TestBR20S3VectorsStore:
 
     @staticmethod
     def _agent_client_for(bodies):
-        """bodies: {kb_id: knowledgeBase body}, answered per knowledgeBaseId."""
+        """bodies: {kb_id: knowledgeBase body}, answered per knowledgeBaseId.
+
+        These knowledge bases hold no data source, which is what keeps the
+        data-source-bucket encryption leg out of the rows a case below asserts.
+        """
         agent_client = MagicMock()
         agent_client.list_knowledge_bases.return_value = {
             "knowledgeBaseSummaries": [
                 {"knowledgeBaseId": kb_id, "name": f"KB-{kb_id}"} for kb_id in bodies
             ]
         }
+        agent_client.list_data_sources.return_value = {"dataSourceSummaries": []}
         agent_client.get_knowledge_base.side_effect = lambda **kwargs: {
             "knowledgeBase": bodies[kwargs["knowledgeBaseId"]]
         }
@@ -7995,9 +9415,24 @@ class TestProposedBedrockChecks:
             "errors": [],
             "list_error": None,
         }
-        br39 = extract_csv_data(
-            bedrock_app.check_bedrock_marketplace_endpoint_vpc("us-east-1", inventory)
-        )[0]
+        # BR-39 resolves each registered subnet to its route table, so the ec2
+        # client is supplied here for the same reason kms_client is.
+        privacy_helper = TestBR39MarketplaceSubnetPrivacy
+        ec2_client = privacy_helper._ec2(
+            [{"SubnetId": "subnet-1", "VpcId": "vpc-1"}],
+            [
+                privacy_helper._table(
+                    "rtb-1", privacy_helper._PRIVATE_TABLE["Routes"], main=True
+                )
+            ],
+        )
+        br39_rows = extract_csv_data(
+            bedrock_app.check_bedrock_marketplace_endpoint_vpc(
+                "us-east-1", inventory, ec2_client
+            )
+        )
+        br39 = br39_rows[0]
+        assert [row["Status"] for row in br39_rows] == ["Passed", "Passed"]
         br40 = extract_csv_data(
             bedrock_app.check_bedrock_marketplace_endpoint_cmk(
                 "us-east-1", inventory, kms_client
@@ -8333,3 +9768,2026 @@ class TestProposedBedrockChecks:
         assert findings[0]["Region"] == "us-east-1"
         assert "Source check BR-28" in findings[0]["Finding_Details"]
         assert_finding_schema(findings[0])
+
+
+# ===================================================================
+# BR-47: check_bedrock_data_path_bucket_tls
+# ===================================================================
+def _client_error(code, message="denied", operation="GetBucketPolicy"):
+    return ClientError({"Error": {"Code": code, "Message": message}}, operation)
+
+
+def _tls_deny_statement(
+    buckets,
+    sid="DenyInsecureTransport",
+    principal="*",
+    actions="s3:*",
+    operator="Bool",
+    value="false",
+    resources=None,
+):
+    """The documented TLS-only statement, with one element parameterised per test."""
+    if resources is None:
+        resources = []
+        for bucket in buckets:
+            resources.extend([f"arn:aws:s3:::{bucket}", f"arn:aws:s3:::{bucket}/*"])
+    statement = {
+        "Sid": sid,
+        "Effect": "Deny",
+        "Action": actions,
+        "Resource": resources,
+        "Condition": {operator: {"aws:SecureTransport": value}},
+    }
+    if principal is not None:
+        statement["Principal"] = principal
+    return statement
+
+
+def _bucket_policy(*statements):
+    return {
+        "Policy": json.dumps({"Version": "2012-10-17", "Statement": list(statements)})
+    }
+
+
+class TestBR47DataPathBucketTLS:
+    """BR-47: every Bedrock data path bucket must deny plaintext requests."""
+
+    def _run(
+        self,
+        knowledge_bases=(),
+        data_sources=None,
+        data_source_detail=None,
+        logging_config=None,
+        logging_error=None,
+        bucket_policies=None,
+        list_knowledge_bases_error=None,
+        get_data_source_error=None,
+    ):
+        agent_client = MagicMock()
+        if list_knowledge_bases_error:
+            agent_client.list_knowledge_bases.side_effect = list_knowledge_bases_error
+        else:
+            agent_client.list_knowledge_bases.return_value = {
+                "knowledgeBaseSummaries": list(knowledge_bases)
+            }
+        data_sources = data_sources or {}
+        agent_client.list_data_sources.side_effect = lambda **kwargs: {
+            "dataSourceSummaries": data_sources.get(kwargs["knowledgeBaseId"], [])
+        }
+        detail = data_source_detail or {}
+
+        def get_data_source(**kwargs):
+            if (
+                get_data_source_error
+                and kwargs["dataSourceId"] in get_data_source_error
+            ):
+                raise get_data_source_error[kwargs["dataSourceId"]]
+            return detail[kwargs["dataSourceId"]]
+
+        agent_client.get_data_source.side_effect = get_data_source
+
+        bedrock_client = MagicMock()
+        if logging_error:
+            bedrock_client.get_model_invocation_logging_configuration.side_effect = (
+                logging_error
+            )
+        else:
+            bedrock_client.get_model_invocation_logging_configuration.return_value = (
+                logging_config or {}
+            )
+
+        s3_client = MagicMock()
+        policies = bucket_policies or {}
+
+        def get_bucket_policy(Bucket):
+            entry = policies.get(Bucket, _client_error("NoSuchBucketPolicy"))
+            if isinstance(entry, Exception):
+                raise entry
+            return entry
+
+        s3_client.get_bucket_policy.side_effect = get_bucket_policy
+        self.last_s3_client = s3_client
+
+        with patch(
+            "bedrock_app.boto3.client",
+            side_effect=lambda service, **kwargs: {
+                "bedrock-agent": agent_client,
+                "bedrock": bedrock_client,
+                "s3": s3_client,
+            }[service],
+        ):
+            return extract_csv_data(
+                bedrock_app.check_bedrock_data_path_bucket_tls(region="us-east-1")
+            )
+
+    @staticmethod
+    def _s3_source(data_source_id, name, bucket):
+        return {
+            "dataSource": {
+                "dataSourceId": data_source_id,
+                "name": name,
+                "dataSourceConfiguration": {
+                    "type": "S3",
+                    "s3Configuration": {"bucketArn": f"arn:aws:s3:::{bucket}"},
+                },
+            }
+        }
+
+    def _two_bucket_estate(self, **overrides):
+        """Two knowledge bases, one bucket each: the fixture that discriminates."""
+        kwargs = {
+            "knowledge_bases": [
+                {"knowledgeBaseId": "kb-1", "name": "support-kb"},
+                {"knowledgeBaseId": "kb-2", "name": "hr-kb"},
+            ],
+            "data_sources": {
+                "kb-1": [{"dataSourceId": "ds-1", "name": "support-docs"}],
+                "kb-2": [{"dataSourceId": "ds-2", "name": "hr-docs"}],
+            },
+            "data_source_detail": {
+                "ds-1": self._s3_source("ds-1", "support-docs", "support-bucket"),
+                "ds-2": self._s3_source("ds-2", "hr-docs", "hr-bucket"),
+            },
+        }
+        kwargs.update(overrides)
+        return self._run(**kwargs)
+
+    def test_br47_enforced_and_plaintext_buckets_discriminate(self):
+        findings = self._two_bucket_estate(
+            bucket_policies={
+                "support-bucket": _bucket_policy(
+                    _tls_deny_statement(["support-bucket"])
+                ),
+                "hr-bucket": _bucket_policy(
+                    {
+                        "Sid": "AllowRead",
+                        "Effect": "Allow",
+                        "Principal": {"AWS": "arn:aws:iam::123456789012:role/ingest"},
+                        "Action": "s3:GetObject",
+                        "Resource": "arn:aws:s3:::hr-bucket/*",
+                    }
+                ),
+            }
+        )
+
+        failed = [f for f in findings if f["Status"] == "Failed"]
+        passed = [f for f in findings if f["Status"] == "Passed"]
+        assert len(failed) == 1
+        assert failed[0]["Check_ID"] == "BR-47"
+        assert failed[0]["Severity"] == "High"
+        assert "Bucket hr-bucket" in failed[0]["Finding_Details"]
+        assert (
+            "data source 'hr-docs' in knowledge base 'hr-kb'"
+            in failed[0]["Finding_Details"]
+        )
+        assert (
+            "no Deny statement conditioned on aws:SecureTransport being false"
+            in failed[0]["Finding_Details"]
+        )
+        assert len(passed) == 1
+        assert "1 of 2 Bedrock data path bucket(s)" in passed[0]["Finding_Details"]
+        assert "support-bucket" in passed[0]["Finding_Details"]
+        for finding in findings:
+            assert_finding_schema(finding)
+
+    def test_br47_missing_bucket_policy_is_failed_not_unassessed(self):
+        findings = self._two_bucket_estate(
+            bucket_policies={
+                "support-bucket": _client_error("NoSuchBucketPolicy"),
+                "hr-bucket": _bucket_policy(_tls_deny_statement(["hr-bucket"])),
+            }
+        )
+
+        failed = [f for f in findings if f["Status"] == "Failed"]
+        assert len(failed) == 1
+        assert "no bucket policy at all" in failed[0]["Finding_Details"]
+        assert [f["Status"] for f in findings] == ["Failed", "Passed"]
+
+    def test_br47_access_denied_is_na_and_not_a_failure(self):
+        findings = self._two_bucket_estate(
+            bucket_policies={
+                "support-bucket": _client_error("AccessDenied"),
+                "hr-bucket": _client_error("AccessDenied"),
+            }
+        )
+
+        assert [f["Status"] for f in findings] == ["N/A"]
+        assert findings[0]["Severity"] == "Informational"
+        assert (
+            "neither proven to enforce TLS nor proven to accept plaintext"
+            in findings[0]["Finding_Details"]
+        )
+        assert "support-bucket" in findings[0]["Finding_Details"]
+
+    def test_br47_no_data_path_bucket_returns_na(self):
+        findings = self._run()
+
+        assert [f["Status"] for f in findings] == ["N/A"]
+        assert findings[0]["Check_ID"] == "BR-47"
+        assert (
+            "no data path bucket whose transport can be assessed"
+            in findings[0]["Finding_Details"]
+        )
+
+    def test_br47_knowledge_base_list_error_still_assesses_the_log_bucket(self):
+        findings = self._run(
+            list_knowledge_bases_error=_client_error(
+                "AccessDeniedException", operation="ListKnowledgeBases"
+            ),
+            logging_config={
+                "loggingConfig": {"s3Config": {"bucketName": "log-bucket"}}
+            },
+            bucket_policies={
+                "log-bucket": _bucket_policy(_tls_deny_statement(["log-bucket"]))
+            },
+        )
+
+        statuses = [f["Status"] for f in findings]
+        assert statuses == ["N/A", "Passed"]
+        assert "data path read(s) failed" in findings[0]["Finding_Details"]
+        assert "knowledge base data sources" in findings[0]["Finding_Details"]
+        assert "log-bucket" in findings[1]["Finding_Details"]
+        assert "the model invocation log destination" in findings[1]["Finding_Details"]
+
+    def test_br47_per_data_source_error_still_assesses_the_other_bucket(self):
+        findings = self._two_bucket_estate(
+            get_data_source_error={
+                "ds-2": _client_error(
+                    "AccessDeniedException", operation="GetDataSource"
+                )
+            },
+            bucket_policies={
+                "support-bucket": _bucket_policy(
+                    _tls_deny_statement(["support-bucket"])
+                )
+            },
+        )
+
+        assert [f["Status"] for f in findings] == ["N/A", "Passed"]
+        assert "1 data path read(s) failed" in findings[0]["Finding_Details"]
+        assert (
+            "data source 'hr-docs' in knowledge base 'hr-kb'"
+            in findings[0]["Finding_Details"]
+        )
+        assert "support-bucket" in findings[1]["Finding_Details"]
+
+    def test_br47_deny_over_the_bucket_only_leaves_objects_plaintext(self):
+        """AIR-FND-DAT-02: a Deny without the /* ARN leaves GetObject over HTTP."""
+        findings = self._two_bucket_estate(
+            bucket_policies={
+                "support-bucket": _bucket_policy(
+                    _tls_deny_statement(
+                        ["support-bucket"], resources=["arn:aws:s3:::support-bucket"]
+                    )
+                ),
+                "hr-bucket": _bucket_policy(_tls_deny_statement(["hr-bucket"])),
+            }
+        )
+
+        failed = [f for f in findings if f["Status"] == "Failed"]
+        assert len(failed) == 1
+        assert "Bucket support-bucket" in failed[0]["Finding_Details"]
+        assert (
+            "its Resource entries do not cover the objects"
+            in failed[0]["Finding_Details"]
+        )
+        assert [f["Status"] for f in findings] == ["Failed", "Passed"]
+
+    def test_br47_deny_naming_principals_reports_which_ones_it_reaches(self):
+        findings = self._two_bucket_estate(
+            bucket_policies={
+                "support-bucket": _bucket_policy(
+                    _tls_deny_statement(
+                        ["support-bucket"],
+                        principal={"AWS": "arn:aws:iam::123456789012:role/ingest"},
+                    )
+                ),
+                "hr-bucket": _bucket_policy(_tls_deny_statement(["hr-bucket"])),
+            }
+        )
+
+        failed = [f for f in findings if f["Status"] == "Failed"]
+        assert len(failed) == 1
+        assert (
+            "it reaches only arn:aws:iam::123456789012:role/ingest"
+            in failed[0]["Finding_Details"]
+        )
+
+    def test_br47_notprincipal_deny_names_the_principal_it_misses(self):
+        findings = self._two_bucket_estate(
+            bucket_policies={
+                "support-bucket": _bucket_policy(
+                    {
+                        "Sid": "DenyInsecureExceptIngest",
+                        "Effect": "Deny",
+                        "NotPrincipal": {
+                            "AWS": "arn:aws:iam::123456789012:role/ingest"
+                        },
+                        "Action": "s3:*",
+                        "Resource": [
+                            "arn:aws:s3:::support-bucket",
+                            "arn:aws:s3:::support-bucket/*",
+                        ],
+                        "Condition": {"Bool": {"aws:SecureTransport": "false"}},
+                    }
+                ),
+                "hr-bucket": _bucket_policy(_tls_deny_statement(["hr-bucket"])),
+            }
+        )
+
+        failed = [f for f in findings if f["Status"] == "Failed"]
+        assert len(failed) == 1
+        assert (
+            "it reaches every principal except arn:aws:iam::123456789012:role/ingest"
+        ) in failed[0]["Finding_Details"]
+
+    def test_br47_deny_on_securetransport_true_is_not_credited(self):
+        """A Deny on aws:SecureTransport true blocks HTTPS, not HTTP."""
+        findings = self._two_bucket_estate(
+            bucket_policies={
+                "support-bucket": _bucket_policy(
+                    _tls_deny_statement(["support-bucket"], value="true")
+                ),
+                "hr-bucket": _bucket_policy(_tls_deny_statement(["hr-bucket"])),
+            }
+        )
+
+        failed = [f for f in findings if f["Status"] == "Failed"]
+        assert len(failed) == 1
+        assert "Bucket support-bucket" in failed[0]["Finding_Details"]
+        assert (
+            "no Deny statement conditioned on aws:SecureTransport being false"
+            in failed[0]["Finding_Details"]
+        )
+
+    def test_br47_set_operator_prefix_on_the_condition_is_stripped(self):
+        """ForAnyValue:Bool is a Bool test; matching the raw operator reds a pass."""
+        findings = self._two_bucket_estate(
+            bucket_policies={
+                "support-bucket": _bucket_policy(
+                    _tls_deny_statement(["support-bucket"], operator="ForAnyValue:Bool")
+                ),
+                "hr-bucket": _bucket_policy(_tls_deny_statement(["hr-bucket"])),
+            }
+        )
+
+        assert [f["Status"] for f in findings] == ["Passed"]
+        assert "2 of 2 Bedrock data path bucket(s)" in findings[0]["Finding_Details"]
+
+    def test_br47_deny_on_one_action_does_not_cover_the_s3_family(self):
+        findings = self._two_bucket_estate(
+            bucket_policies={
+                "support-bucket": _bucket_policy(
+                    _tls_deny_statement(["support-bucket"], actions="s3:GetObject")
+                ),
+                "hr-bucket": _bucket_policy(_tls_deny_statement(["hr-bucket"])),
+            }
+        )
+
+        failed = [f for f in findings if f["Status"] == "Failed"]
+        assert len(failed) == 1
+        assert (
+            "its Action entries do not cover the whole s3 family"
+            in failed[0]["Finding_Details"]
+        )
+        assert (
+            "'DenyInsecureTransport' does not enforce" in failed[0]["Finding_Details"]
+        )
+
+    def test_br47_wildcard_resource_deny_covers_every_bucket(self):
+        findings = self._two_bucket_estate(
+            bucket_policies={
+                bucket: _bucket_policy(_tls_deny_statement([bucket], resources=["*"]))
+                for bucket in ("support-bucket", "hr-bucket")
+            }
+        )
+
+        assert [f["Status"] for f in findings] == ["Passed"]
+
+    def test_br47_one_bucket_serving_two_knowledge_bases_is_read_once(self):
+        findings = self._run(
+            knowledge_bases=[
+                {"knowledgeBaseId": "kb-1", "name": "support-kb"},
+                {"knowledgeBaseId": "kb-2", "name": "hr-kb"},
+            ],
+            data_sources={
+                "kb-1": [{"dataSourceId": "ds-1", "name": "support-docs"}],
+                "kb-2": [{"dataSourceId": "ds-2", "name": "hr-docs"}],
+            },
+            data_source_detail={
+                "ds-1": self._s3_source("ds-1", "support-docs", "shared-bucket"),
+                "ds-2": self._s3_source("ds-2", "hr-docs", "shared-bucket"),
+            },
+            bucket_policies={
+                "shared-bucket": _bucket_policy(_tls_deny_statement(["shared-bucket"]))
+            },
+        )
+
+        assert self.last_s3_client.get_bucket_policy.call_count == 1
+        assert [f["Status"] for f in findings] == ["Passed"]
+        assert "1 of 1 Bedrock data path bucket(s)" in findings[0]["Finding_Details"]
+
+    def test_br47_unparseable_bucket_policy_is_na(self):
+        findings = self._two_bucket_estate(
+            bucket_policies={
+                "support-bucket": {"Policy": "{not json"},
+                "hr-bucket": _bucket_policy(_tls_deny_statement(["hr-bucket"])),
+            }
+        )
+
+        statuses = [f["Status"] for f in findings]
+        assert statuses == ["Passed", "N/A"]
+        assert "not readable JSON" in findings[1]["Finding_Details"]
+
+    def test_br47_exception_returns_could_not_assess(self):
+        """The bucket walk swallows its own errors, so the S3 client is the path."""
+        agent_client = MagicMock()
+        agent_client.list_knowledge_bases.return_value = {
+            "knowledgeBaseSummaries": [{"knowledgeBaseId": "kb-1", "name": "kb"}]
+        }
+        agent_client.list_data_sources.return_value = {
+            "dataSourceSummaries": [{"dataSourceId": "ds-1", "name": "docs"}]
+        }
+        agent_client.get_data_source.return_value = self._s3_source(
+            "ds-1", "docs", "support-bucket"
+        )
+        bedrock_client = MagicMock()
+        bedrock_client.get_model_invocation_logging_configuration.return_value = {}
+
+        def build(service, **kwargs):
+            if service == "s3":
+                raise RuntimeError("boom")
+            return {"bedrock-agent": agent_client, "bedrock": bedrock_client}[service]
+
+        with patch("bedrock_app.boto3.client", side_effect=build):
+            findings = extract_csv_data(
+                bedrock_app.check_bedrock_data_path_bucket_tls(region="us-east-1")
+            )
+
+        assert len(findings) == 1
+        assert findings[0]["Check_ID"] == "BR-47"
+        assert_could_not_assess_finding(findings[0])
+
+
+# ===================================================================
+# BR-48: check_bedrock_ai_services_opt_out
+# ===================================================================
+class TestBR48AIServicesOptOut:
+    """BR-48: an AI services opt-out policy must resolve for the account."""
+
+    ACCOUNT = "123456789012"
+
+    def _run(
+        self,
+        effective_content=None,
+        effective_error=None,
+        target_id="o-a1b2c3d4e5",
+        caller_account=None,
+        source_policies=None,
+        source_documents=None,
+        list_policies_error=None,
+        describe_policy_error=None,
+        describe_organization_error=None,
+    ):
+        orgs_client = MagicMock()
+        if effective_error:
+            orgs_client.describe_effective_policy.side_effect = effective_error
+        else:
+            orgs_client.describe_effective_policy.return_value = {
+                "EffectivePolicy": {
+                    "PolicyContent": effective_content
+                    if isinstance(effective_content, str)
+                    else json.dumps(effective_content),
+                    "TargetId": target_id,
+                    "PolicyType": "AISERVICES_OPT_OUT_POLICY",
+                }
+            }
+
+        if describe_organization_error:
+            orgs_client.describe_organization.side_effect = describe_organization_error
+        else:
+            orgs_client.describe_organization.return_value = {
+                "Organization": {"MasterAccountId": self.ACCOUNT}
+            }
+
+        if list_policies_error:
+            orgs_client.list_policies.side_effect = list_policies_error
+        else:
+            orgs_client.list_policies.return_value = {
+                "Policies": list(source_policies or [])
+            }
+
+        documents = source_documents or {}
+
+        def describe_policy(PolicyId):
+            if describe_policy_error and PolicyId in describe_policy_error:
+                raise describe_policy_error[PolicyId]
+            content = documents[PolicyId]
+            return {
+                "Policy": {
+                    "Content": content
+                    if isinstance(content, str)
+                    else json.dumps(content)
+                }
+            }
+
+        orgs_client.describe_policy.side_effect = describe_policy
+
+        sts_client = MagicMock()
+        sts_client.get_caller_identity.return_value = {
+            "Account": caller_account or self.ACCOUNT
+        }
+
+        with patch(
+            "bedrock_app.boto3.client",
+            side_effect=lambda service, **kwargs: {
+                "organizations": orgs_client,
+                "sts": sts_client,
+            }[service],
+        ):
+            return extract_csv_data(
+                bedrock_app.check_bedrock_ai_services_opt_out(region="Global")
+            )
+
+    def test_br48_default_optout_passes(self):
+        findings = self._run(
+            effective_content={"services": {"default": {"opt_out_policy": "optOut"}}}
+        )
+
+        assert [f["Status"] for f in findings] == ["Passed"]
+        assert findings[0]["Check_ID"] == "BR-48"
+        assert findings[0]["Region"] == "Global"
+        assert (
+            "sets services.default.opt_out_policy to optOut and no service section "
+            "opts back in" in findings[0]["Finding_Details"]
+        )
+        assert "o-a1b2c3d4e5" in findings[0]["Finding_Details"]
+        assert (
+            "No source policy delegates the value to a child policy"
+            in findings[0]["Finding_Details"]
+        )
+        assert_finding_schema(findings[0])
+
+    def test_br48_service_section_opting_back_in_fails_and_names_it(self):
+        """AIR-FND-DAT-09: an optIn section re-enables content use for that service."""
+        findings = self._run(
+            effective_content={
+                "services": {
+                    "default": {"opt_out_policy": "optOut"},
+                    "bedrock": {"opt_out_policy": "optIn"},
+                    "rekognition": {"opt_out_policy": "optIn"},
+                }
+            }
+        )
+
+        assert [f["Status"] for f in findings] == ["Failed"]
+        assert findings[0]["Severity"] == "High"
+        assert (
+            "2 service section(s) opt back in: bedrock, rekognition"
+            in findings[0]["Finding_Details"]
+        )
+
+    def test_br48_absent_default_fails_and_reports_partial_coverage(self):
+        findings = self._run(
+            effective_content={"services": {"bedrock": {"opt_out_policy": "optOut"}}}
+        )
+
+        assert [f["Status"] for f in findings] == ["Failed"]
+        assert (
+            "services.default.opt_out_policy is absent"
+            in findings[0]["Finding_Details"]
+        )
+        assert (
+            "1 service section(s) opt out individually: bedrock"
+            in findings[0]["Finding_Details"]
+        )
+
+    def test_br48_no_effective_policy_is_failed_not_unassessed(self):
+        findings = self._run(
+            effective_error=_client_error(
+                "EffectivePolicyNotFoundException",
+                operation="DescribeEffectivePolicy",
+            )
+        )
+
+        assert [f["Status"] for f in findings] == ["Failed"]
+        assert findings[0]["Severity"] == "High"
+        assert (
+            "No AI services opt-out policy resolves for this account"
+            in findings[0]["Finding_Details"]
+        )
+        assert "opted-in default" in findings[0]["Finding_Details"]
+
+    def test_br48_outside_an_organization_is_na(self):
+        findings = self._run(
+            effective_error=_client_error(
+                "AWSOrganizationsNotInUseException",
+                operation="DescribeEffectivePolicy",
+            )
+        )
+
+        assert [f["Status"] for f in findings] == ["N/A"]
+        assert findings[0]["Severity"] == "Informational"
+        assert "was not established" in findings[0]["Finding_Details"]
+
+    def test_br48_access_denied_is_na(self):
+        findings = self._run(
+            effective_error=_client_error(
+                "AccessDeniedException", operation="DescribeEffectivePolicy"
+            )
+        )
+
+        assert [f["Status"] for f in findings] == ["N/A"]
+        assert findings[0]["Severity"] == "Informational"
+        assert "organizations:DescribeEffectivePolicy" in findings[0]["Resolution"]
+
+    def test_br48_child_operator_delegation_is_reported_on_the_verdict_row(self):
+        """The effective document has no operators left, so the source answers this."""
+        findings = self._run(
+            effective_content={"services": {"default": {"opt_out_policy": "optOut"}}},
+            source_policies=[{"Id": "p-1", "Name": "ai-opt-out"}],
+            source_documents={
+                "p-1": {
+                    "services": {
+                        "@@operators_allowed_for_child_policies": ["@@assign"],
+                        "default": {"opt_out_policy": {"@@assign": "optOut"}},
+                    }
+                }
+            },
+        )
+
+        assert [f["Status"] for f in findings] == ["Passed"]
+        assert (
+            "'ai-opt-out' delegates @@assign to child policies"
+            in findings[0]["Finding_Details"]
+        )
+
+    def test_br48_member_account_says_the_child_leg_was_not_assessed(self):
+        findings = self._run(
+            effective_content={"services": {"default": {"opt_out_policy": "optOut"}}},
+            caller_account="111122223333",
+        )
+
+        assert [f["Status"] for f in findings] == ["Passed"]
+        assert (
+            "Whether a child policy may change the value was not assessed"
+            in findings[0]["Finding_Details"]
+        )
+
+    def test_br48_source_policy_read_error_keeps_the_effective_verdict(self):
+        findings = self._run(
+            effective_content={"services": {"default": {"opt_out_policy": "optOut"}}},
+            source_policies=[{"Id": "p-1", "Name": "ai-opt-out"}],
+            describe_policy_error={
+                "p-1": _client_error(
+                    "AccessDeniedException", operation="DescribePolicy"
+                )
+            },
+        )
+
+        assert [f["Status"] for f in findings] == ["Passed", "N/A"]
+        assert "policy 'ai-opt-out'" in findings[1]["Finding_Details"]
+        assert "organizations:DescribePolicy" in findings[1]["Resolution"]
+
+    def test_br48_unreadable_service_value_adds_an_na_row(self):
+        findings = self._run(
+            effective_content={
+                "services": {
+                    "default": {"opt_out_policy": "optOut"},
+                    "comprehend": {"opt_out_policy": 42},
+                }
+            }
+        )
+
+        assert [f["Status"] for f in findings] == ["Passed", "N/A"]
+        assert (
+            "comprehend carries opt_out_policy 'nothing readable'"
+            in findings[1]["Finding_Details"]
+        )
+
+    def test_br48_missing_services_section_is_na(self):
+        findings = self._run(effective_content={"something_else": {}})
+
+        assert [f["Status"] for f in findings] == ["N/A"]
+        assert "carries no services section" in findings[0]["Finding_Details"]
+
+    def test_br48_unparseable_effective_policy_is_na(self):
+        findings = self._run(effective_content="{not json")
+
+        assert [f["Status"] for f in findings] == ["N/A"]
+        assert "is not readable JSON" in findings[0]["Finding_Details"]
+
+    def test_br48_exception_returns_could_not_assess(self):
+        with patch("bedrock_app.boto3.client", side_effect=RuntimeError("boom")):
+            findings = extract_csv_data(
+                bedrock_app.check_bedrock_ai_services_opt_out(region="Global")
+            )
+
+        assert len(findings) == 1
+        assert findings[0]["Check_ID"] == "BR-48"
+        assert_could_not_assess_finding(findings[0])
+
+    @pytest.mark.parametrize(
+        ("node", "expected"),
+        [
+            ("optOut", {"value": "optout", "wrapped": False}),
+            ({"@@assign": "optOut"}, {"value": "optout", "wrapped": True}),
+            ({"@@append": "optIn"}, {"value": "optin", "wrapped": True}),
+            (None, {"value": "", "wrapped": False}),
+            ({}, {"value": "", "wrapped": False}),
+        ],
+    )
+    def test_ai_services_opt_out_value_reads_both_document_shapes(self, node, expected):
+        """DescribeEffectivePolicy resolves the operator; DescribePolicy keeps it."""
+        assert bedrock_app._ai_services_opt_out_value(node) == expected
+
+    def test_br48_effective_policy_type_is_a_modelled_enum_value(self):
+        client = bedrock_app.boto3.client(
+            "organizations",
+            region_name="us-east-1",
+            aws_access_key_id="testing",
+            aws_secret_access_key="testing",  # pragma: allowlist secret - synthetic test credential
+        )
+        model = client.meta.service_model
+        assert (
+            bedrock_app.AI_SERVICES_OPT_OUT_POLICY_TYPE
+            in model.shape_for("EffectivePolicyType").enum
+        )
+        assert model.operation_model("DescribeEffectivePolicy")
+
+
+# ===================================================================
+# BR-49: check_bedrock_guardrail_invocation_deny
+# ===================================================================
+def _guardrail_deny_statement(
+    actions=None,
+    operator="Null",
+    value="true",
+    resources="*",
+):
+    return {
+        "Effect": "Deny",
+        "Action": actions
+        or [
+            "bedrock:InvokeModel",
+            "bedrock:InvokeModelWithResponseStream",
+        ],
+        "Resource": resources,
+        "Condition": {operator: {"bedrock:GuardrailIdentifier": value}},
+    }
+
+
+def _invoke_cache(*statements, role="AppRole", policy_name="BedrockInvoke", users=None):
+    return {
+        "role_permissions": {
+            role: {
+                "attached_policies": [
+                    {
+                        "name": policy_name,
+                        "arn": f"arn:aws:iam::123456789012:policy/{policy_name}",
+                        "document": {
+                            "Version": "2012-10-17",
+                            "Statement": list(statements),
+                        },
+                    }
+                ],
+                "inline_policies": [],
+                "permission_boundary": None,
+            }
+        },
+        "user_permissions": users or {},
+    }
+
+
+_ALLOW_ALL_BEDROCK = {
+    "Effect": "Allow",
+    "Action": "bedrock:*",
+    "Resource": "*",
+}
+
+
+class TestBR49GuardrailInvocationDeny:
+    """BR-49: every invoke permission must be paired with a conditioned Deny."""
+
+    def _run(self, cache):
+        return extract_csv_data(
+            bedrock_app.check_bedrock_guardrail_invocation_deny(cache, region="Global")
+        )
+
+    def test_br49_deny_over_both_invoke_actions_passes(self):
+        findings = self._run(
+            _invoke_cache(_ALLOW_ALL_BEDROCK, _guardrail_deny_statement())
+        )
+
+        assert [f["Status"] for f in findings] == ["Passed"]
+        assert findings[0]["Check_ID"] == "BR-49"
+        assert findings[0]["Region"] == "Global"
+        assert "1 of 1 identity/identities" in findings[0]["Finding_Details"]
+        assert "role 'AppRole'" in findings[0]["Finding_Details"]
+        assert (
+            "bedrock:InvokeModel, bedrock:InvokeModelWithResponseStream"
+            in findings[0]["Finding_Details"]
+        )
+        assert_finding_schema(findings[0])
+
+    def test_br49_deny_on_invoke_wildcard_passes(self):
+        """
+        Regression: Converse and ConverseStream are authorized by the two Invoke
+        actions and have no IAM action of their own, so a Deny over bedrock:Invoke*
+        guards all four APIs and must not be reported as leaving Converse open.
+        """
+        findings = self._run(
+            _invoke_cache(
+                _ALLOW_ALL_BEDROCK,
+                _guardrail_deny_statement(actions="bedrock:Invoke*"),
+            )
+        )
+
+        assert [f["Status"] for f in findings] == ["Passed"]
+        assert "Converse" not in findings[0]["Finding_Details"]
+
+    def test_br49_deny_on_invoke_model_alone_leaves_streaming_unguarded(self):
+        """A Deny that omits InvokeModelWithResponseStream leaves ConverseStream open."""
+        findings = self._run(
+            _invoke_cache(
+                _ALLOW_ALL_BEDROCK,
+                _guardrail_deny_statement(actions=["bedrock:InvokeModel"]),
+            )
+        )
+
+        assert [f["Status"] for f in findings] == ["Failed"]
+        assert findings[0]["Severity"] == "High"
+        assert (
+            "role 'AppRole' may call bedrock:InvokeModel, "
+            "bedrock:InvokeModelWithResponseStream" in findings[0]["Finding_Details"]
+        )
+        assert (
+            "no policy on it denies bedrock:InvokeModelWithResponseStream unless"
+            in findings[0]["Finding_Details"]
+        )
+        assert "bedrock:Converse and" not in findings[0]["Resolution"]
+        assert "bedrock:InvokeModelWithResponseStream" in findings[0]["Resolution"]
+
+    def test_br49_allow_on_converse_name_grants_nothing_to_assess(self):
+        """bedrock:Converse is not an IAM action, so allowing it grants no invocation."""
+        findings = self._run(
+            _invoke_cache(
+                {
+                    "Effect": "Allow",
+                    "Action": ["bedrock:Converse", "bedrock:ConverseStream"],
+                    "Resource": "*",
+                }
+            )
+        )
+
+        assert [f["Status"] for f in findings] == ["N/A"]
+
+    def test_br49_allow_side_guardrail_condition_alone_fails(
+        self, permission_cache_with_guardrail_condition
+    ):
+        """BR-10 passes this cache: an Allow condition is not a Deny."""
+        bedrock_client = MagicMock()
+        bedrock_client.list_guardrails.return_value = {
+            "guardrails": [{"id": "gr-1", "name": "TestGuardrail"}]
+        }
+        with patch("bedrock_app.boto3.client", return_value=bedrock_client):
+            br10 = extract_csv_data(
+                bedrock_app.check_bedrock_guardrail_iam_enforcement(
+                    permission_cache_with_guardrail_condition, region="us-east-1"
+                )
+            )
+        findings = self._run(permission_cache_with_guardrail_condition)
+
+        assert [f["Status"] for f in br10] == ["Passed"]
+        assert [f["Status"] for f in findings] == ["Failed"]
+        assert "role 'GuardrailEnforcedRole'" in findings[0]["Finding_Details"]
+        assert (
+            "bedrock:InvokeModel, bedrock:InvokeModelWithResponseStream"
+            in findings[0]["Finding_Details"]
+        )
+
+    def test_br49_no_invoke_permission_returns_na(self):
+        findings = self._run(
+            _invoke_cache(
+                {
+                    "Effect": "Allow",
+                    "Action": ["bedrock:ListFoundationModels", "s3:GetObject"],
+                    "Resource": "*",
+                }
+            )
+        )
+
+        assert [f["Status"] for f in findings] == ["N/A"]
+        assert findings[0]["Severity"] == "Informational"
+        assert (
+            "no identity whose guardrail enforcement can be assessed"
+            in findings[0]["Finding_Details"]
+        )
+
+    def test_br49_empty_cache_returns_na(self, empty_permission_cache):
+        findings = self._run(empty_permission_cache)
+
+        assert [f["Status"] for f in findings] == ["N/A"]
+        assert findings[0]["Check_ID"] == "BR-49"
+
+    def test_br49_missing_cache_is_reported_as_incomplete(self):
+        findings = extract_csv_data(
+            bedrock_app._permission_cache_unavailable_result(
+                "BR-49", "Guardrail Invocation Deny Enforcement", "Global"
+            )
+        )
+
+        assert [f["Status"] for f in findings] == ["N/A"]
+        assert findings[0]["Check_ID"] == "BR-49"
+        assert findings[0]["Severity"] == "Informational"
+
+    def test_br49_two_identities_reach_both_verdicts(self):
+        """One identity cannot tell a per-identity verdict from an aggregate one."""
+        cache = _invoke_cache(_ALLOW_ALL_BEDROCK, _guardrail_deny_statement())
+        cache["role_permissions"]["UnguardedRole"] = {
+            "attached_policies": [
+                {
+                    "name": "BedrockOpen",
+                    "document": {
+                        "Version": "2012-10-17",
+                        "Statement": [_ALLOW_ALL_BEDROCK],
+                    },
+                }
+            ],
+            "inline_policies": [],
+            "permission_boundary": None,
+        }
+
+        findings = self._run(cache)
+
+        assert [f["Status"] for f in findings] == ["Failed", "Passed"]
+        assert "role 'UnguardedRole'" in findings[0]["Finding_Details"]
+        assert "1 of 2 identity/identities" in findings[1]["Finding_Details"]
+        assert "role 'AppRole'" in findings[1]["Finding_Details"]
+
+    def test_br49_user_policies_are_assessed_too(self):
+        cache = _invoke_cache(
+            {
+                "Effect": "Allow",
+                "Action": "bedrock:ListFoundationModels",
+                "Resource": "*",
+            },
+            users={
+                "BatchUser": {
+                    "attached_policies": [
+                        {
+                            "name": "BedrockOpen",
+                            "document": {
+                                "Version": "2012-10-17",
+                                "Statement": [_ALLOW_ALL_BEDROCK],
+                            },
+                        }
+                    ],
+                    "inline_policies": [],
+                }
+            },
+        )
+
+        findings = self._run(cache)
+
+        assert [f["Status"] for f in findings] == ["Failed"]
+        assert "user 'BatchUser'" in findings[0]["Finding_Details"]
+
+    def test_br49_stringequals_deny_is_not_credited(self):
+        """StringEquals on a Deny rejects the approved guardrail, not the absent one."""
+        findings = self._run(
+            _invoke_cache(
+                _ALLOW_ALL_BEDROCK,
+                _guardrail_deny_statement(
+                    operator="StringEquals",
+                    value="arn:aws:bedrock:us-east-1:123456789012:guardrail/abc123",
+                ),
+            )
+        )
+
+        assert [f["Status"] for f in findings] == ["Failed"]
+
+    def test_br49_null_false_deny_is_not_credited(self):
+        """Null false denies exactly the calls that do name a guardrail."""
+        findings = self._run(
+            _invoke_cache(_ALLOW_ALL_BEDROCK, _guardrail_deny_statement(value="false"))
+        )
+
+        assert [f["Status"] for f in findings] == ["Failed"]
+
+    def test_br49_stringnotequals_deny_passes(self):
+        findings = self._run(
+            _invoke_cache(
+                _ALLOW_ALL_BEDROCK,
+                _guardrail_deny_statement(
+                    operator="StringNotEquals",
+                    value=["arn:aws:bedrock:us-east-1:123456789012:guardrail/abc123"],
+                ),
+            )
+        )
+
+        assert [f["Status"] for f in findings] == ["Passed"]
+
+    def test_br49_set_operator_prefix_on_the_condition_is_stripped(self):
+        """ForAllValues:StringNotEquals is a StringNotEquals test."""
+        findings = self._run(
+            _invoke_cache(
+                _ALLOW_ALL_BEDROCK,
+                _guardrail_deny_statement(
+                    operator="ForAllValues:StringNotEquals",
+                    value=["arn:aws:bedrock:us-east-1:123456789012:guardrail/abc123"],
+                ),
+            )
+        )
+
+        assert [f["Status"] for f in findings] == ["Passed"]
+
+    def test_br49_deny_scoped_to_one_model_reports_the_scoping(self):
+        findings = self._run(
+            _invoke_cache(
+                _ALLOW_ALL_BEDROCK,
+                _guardrail_deny_statement(
+                    resources=[
+                        "arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-v2"
+                    ]
+                ),
+            )
+        )
+
+        assert [f["Status"] for f in findings] == ["Failed"]
+        assert (
+            "is scoped to arn:aws:bedrock:us-east-1::foundation-model/"
+            "anthropic.claude-v2" in findings[0]["Finding_Details"]
+        )
+        assert (
+            "leaves every other model invocable without a guardrail"
+            in findings[0]["Finding_Details"]
+        )
+
+    def test_br49_deny_on_a_model_prefix_is_credited(self):
+        findings = self._run(
+            _invoke_cache(
+                _ALLOW_ALL_BEDROCK,
+                _guardrail_deny_statement(
+                    resources=["arn:aws:bedrock:us-east-1::foundation-model/*"]
+                ),
+            )
+        )
+
+        assert [f["Status"] for f in findings] == ["Passed"]
+
+    def test_br49_unparseable_policy_document_adds_an_na_row(self):
+        cache = _invoke_cache(_ALLOW_ALL_BEDROCK, _guardrail_deny_statement())
+        cache["role_permissions"]["AppRole"]["inline_policies"] = [
+            {"name": "Broken", "document": "{not json"}
+        ]
+
+        findings = self._run(cache)
+
+        assert [f["Status"] for f in findings] == ["Passed", "N/A"]
+        assert "role 'AppRole': policy 'Broken'" in findings[1]["Finding_Details"]
+        assert (
+            "may deny unguarded invocation in a statement this check did not read"
+            in findings[1]["Finding_Details"]
+        )
+
+    def test_br49_exception_returns_could_not_assess(self):
+        findings = self._run({"role_permissions": "not-a-dict"})
+
+        assert len(findings) == 1
+        assert findings[0]["Check_ID"] == "BR-49"
+        assert_could_not_assess_finding(findings[0])
+
+    def test_br49_reported_identities_are_capped(self):
+        cache = {"role_permissions": {}, "user_permissions": {}}
+        for index in range(bedrock_app.MAX_REPORTED_UNGUARDED_IDENTITIES + 3):
+            cache["role_permissions"][f"OpenRole{index:02d}"] = {
+                "attached_policies": [
+                    {
+                        "name": "BedrockOpen",
+                        "document": {
+                            "Version": "2012-10-17",
+                            "Statement": [_ALLOW_ALL_BEDROCK],
+                        },
+                    }
+                ],
+                "inline_policies": [],
+            }
+
+        findings = self._run(cache)
+
+        assert len(findings) == bedrock_app.MAX_REPORTED_UNGUARDED_IDENTITIES + 1
+        assert findings[-1]["Status"] == "Failed"
+        assert "3 further identity/identities" in findings[-1]["Finding_Details"]
+        assert "OpenRole10" in findings[-1]["Finding_Details"]
+
+
+# ===================================================================
+# BR-04 extension: _invocation_log_coverage_findings (AIR-FND-DET-01)
+# ===================================================================
+class TestBR04InvocationLogDataCoverage:
+    """BR-04: what an enabled invocation log actually records."""
+
+    COVERAGE_FINDING = "Bedrock Invocation Log Data Coverage"
+
+    ALL_MODALITIES = {
+        "textDataDeliveryEnabled": True,
+        "imageDataDeliveryEnabled": True,
+        "embeddingDataDeliveryEnabled": True,
+        "videoDataDeliveryEnabled": True,
+        "audioDataDeliveryEnabled": True,
+    }
+
+    def _run(self, logging_config):
+        """Run BR-04 over one logging configuration and keep the coverage rows."""
+        bedrock_client = MagicMock()
+        bedrock_client.get_model_invocation_logging_configuration.return_value = {
+            "loggingConfig": logging_config
+        }
+
+        logs_client = MagicMock()
+        logs_client.describe_log_groups.return_value = {"logGroups": []}
+
+        s3_client = MagicMock()
+        s3_client.get_bucket_lifecycle_configuration.side_effect = _client_error(
+            "NoSuchLifecycleConfiguration",
+            "no lifecycle",
+            "GetBucketLifecycleConfiguration",
+        )
+
+        clients = {"bedrock": bedrock_client, "logs": logs_client, "s3": s3_client}
+        with (
+            patch("bedrock_app.detect_bedrock_regional_footprint", return_value=True),
+            patch(
+                "bedrock_app.boto3.client",
+                side_effect=lambda service, **kwargs: clients[service],
+            ),
+        ):
+            self.result = bedrock_app.check_bedrock_logging_configuration(
+                region="us-east-1"
+            )
+            self.all_findings = extract_csv_data(self.result)
+        return [f for f in self.all_findings if f["Finding"] == self.COVERAGE_FINDING]
+
+    def test_br04_all_five_data_types_delivered_passes(self):
+        # PASS reachability: a real S3-only configuration with every delivery
+        # flag set produces exactly one coverage row and it is Passed.
+        coverage = self._run(
+            {"s3Config": {"bucketName": "log-bucket"}, **self.ALL_MODALITIES}
+        )
+
+        assert [f["Status"] for f in coverage] == ["Passed"]
+        assert "all 5 data types" in coverage[0]["Finding_Details"]
+        assert "text, image, embedding, video, audio" in coverage[0]["Finding_Details"]
+        assert "log-bucket" in coverage[0]["Finding_Details"]
+
+    def test_br04_disabled_data_types_fail_and_are_named(self):
+        # Three flags true and two false: a check that read any() of the flags,
+        # or that judged only the first one, would call this configuration
+        # covered. The row has to name the two that are off.
+        config = dict(self.ALL_MODALITIES)
+        config["imageDataDeliveryEnabled"] = False
+        config["videoDataDeliveryEnabled"] = False
+
+        coverage = self._run({"s3Config": {"bucketName": "log-bucket"}, **config})
+
+        assert [f["Status"] for f in coverage] == ["Failed"]
+        details = coverage[0]["Finding_Details"]
+        assert "2 of 5 data types are excluded" in details
+        assert "image, video" in details
+        assert "log-bucket" in details
+        assert (
+            coverage[0]["Resolution"]
+            == "Set imageDataDeliveryEnabled, videoDataDeliveryEnabled to true in "
+            "PutModelInvocationLoggingConfiguration so the log carries the "
+            "content of every data type this account invokes."
+        )
+
+    def test_br04_s3_only_delivery_is_not_failed_for_large_data_delivery(self):
+        # largeDataDeliveryS3Config is a member of cloudWatchConfig. An S3-only
+        # configuration delivers the whole payload, so the absent field is not a
+        # gap and must not cost this account a Failed row.
+        coverage = self._run(
+            {"s3Config": {"bucketName": "log-bucket"}, **self.ALL_MODALITIES}
+        )
+
+        assert [f["Status"] for f in coverage] == ["Passed"]
+        assert all(
+            "largeDataDeliveryS3Config" not in f["Finding_Details"] for f in coverage
+        )
+
+    def test_br04_cloudwatch_delivery_without_large_data_bucket_fails(self):
+        coverage = self._run(
+            {
+                "s3Config": {},
+                "cloudWatchConfig": {"logGroupName": "/aws/bedrock/invocations"},
+                **self.ALL_MODALITIES,
+            }
+        )
+
+        assert [f["Status"] for f in coverage] == ["Failed"]
+        details = coverage[0]["Finding_Details"]
+        assert "'/aws/bedrock/invocations'" in details
+        assert "no cloudWatchConfig.largeDataDeliveryS3Config" in details
+        assert "over 100 KB" in details
+
+    def test_br04_cloudwatch_large_data_bucket_passes_and_is_named(self):
+        coverage = self._run(
+            {
+                "s3Config": {},
+                "cloudWatchConfig": {
+                    "logGroupName": "/aws/bedrock/invocations",
+                    "largeDataDeliveryS3Config": {"bucketName": "overflow-bucket"},
+                },
+                **self.ALL_MODALITIES,
+            }
+        )
+
+        assert [f["Status"] for f in coverage] == ["Passed"]
+        assert "overflow-bucket" in coverage[0]["Finding_Details"]
+        assert "over 100 KB" in coverage[0]["Finding_Details"]
+
+    def test_br04_legacy_bucket_key_in_large_data_config_is_credited(self):
+        coverage = self._run(
+            {
+                "s3Config": {},
+                "cloudWatchConfig": {
+                    "logGroupName": "/aws/bedrock/invocations",
+                    "largeDataDeliveryS3Config": {"s3BucketName": "legacy-overflow"},
+                },
+                **self.ALL_MODALITIES,
+            }
+        )
+
+        assert [f["Status"] for f in coverage] == ["Passed"]
+        assert "legacy-overflow" in coverage[0]["Finding_Details"]
+
+    def test_br04_unreported_flags_are_na_not_a_disabled_data_type(self):
+        # A flag the API did not return is indeterminate. Reading it as false
+        # would fail every configuration the API reports without the flags.
+        coverage = self._run(
+            {"s3Config": {"bucketName": "log-bucket"}, "cloudWatchConfig": {}}
+        )
+
+        assert [f["Status"] for f in coverage] == ["N/A"]
+        assert coverage[0]["Severity"] == "Informational"
+        details = coverage[0]["Finding_Details"]
+        assert "did not report textDataDeliveryEnabled" in details
+        assert "audioDataDeliveryEnabled" in details
+        assert "could not be assessed" in details
+
+    def test_br04_partially_reported_flags_report_both_sides(self):
+        coverage = self._run(
+            {
+                "s3Config": {"bucketName": "log-bucket"},
+                "textDataDeliveryEnabled": True,
+                "imageDataDeliveryEnabled": True,
+                "embeddingDataDeliveryEnabled": True,
+            }
+        )
+
+        assert [f["Status"] for f in coverage] == ["N/A"]
+        details = coverage[0]["Finding_Details"]
+        assert "Delivery is enabled for text, image, embedding." in details
+        assert "videoDataDeliveryEnabled, audioDataDeliveryEnabled" in details
+
+    def test_br04_both_gap_kinds_are_reported_separately(self):
+        config = dict(self.ALL_MODALITIES)
+        config["audioDataDeliveryEnabled"] = False
+
+        coverage = self._run(
+            {
+                "s3Config": {"bucketName": "log-bucket"},
+                "cloudWatchConfig": {"logGroupName": "/aws/bedrock/invocations"},
+                **config,
+            }
+        )
+
+        assert [f["Status"] for f in coverage] == ["Failed", "Failed"]
+        assert "1 of 5 data types are excluded" in coverage[0]["Finding_Details"]
+        assert "audio" in coverage[0]["Finding_Details"]
+        assert "largeDataDeliveryS3Config" in coverage[1]["Finding_Details"]
+
+    def test_br04_disabled_logging_emits_no_coverage_row(self):
+        # The logging switch row already carries a disabled configuration. A
+        # coverage row on top of it would double-count the same gap.
+        coverage = self._run({"s3Config": {}, "cloudWatchConfig": {}})
+
+        assert coverage == []
+        assert [f["Status"] for f in self.all_findings] == ["Failed"]
+
+    def test_br04_a_coverage_gap_moves_the_check_roll_up_to_warn(self):
+        # The logging switch is on, so the legacy rows are all Passed and the
+        # roll-up would stay PASS while the CSV carries a Failed row.
+        config = dict(self.ALL_MODALITIES)
+        config["audioDataDeliveryEnabled"] = False
+
+        coverage = self._run({"s3Config": {"bucketName": "log-bucket"}, **config})
+
+        assert [f["Status"] for f in coverage] == ["Failed"]
+        assert self.result["status"] == "WARN"
+
+    def test_br04_full_coverage_leaves_the_check_roll_up_at_pass(self):
+        # Negative control for the row above: a leg that set WARN
+        # unconditionally, or on any row rather than on a Failed one, would
+        # fail this.
+        coverage = self._run(
+            {"s3Config": {"bucketName": "log-bucket"}, **self.ALL_MODALITIES}
+        )
+
+        assert [f["Status"] for f in coverage] == ["Passed"]
+        assert self.result["status"] == "PASS"
+
+    def test_br04_indeterminate_coverage_leaves_the_check_roll_up_at_pass(self):
+        # An N/A row is not a gap, so it must not move the roll-up either.
+        coverage = self._run({"s3Config": {"bucketName": "log-bucket"}})
+
+        assert [f["Status"] for f in coverage] == ["N/A"]
+        assert self.result["status"] == "PASS"
+
+    def test_br04_disabled_logging_keeps_the_fail_roll_up(self):
+        # With no destination the coverage leg returns nothing, so the switch
+        # verdict stands. A leg that overwrote the roll-up would downgrade this
+        # FAIL to WARN.
+        coverage = self._run({"s3Config": {}, "cloudWatchConfig": {}})
+
+        assert coverage == []
+        assert self.result["status"] == "FAIL"
+
+    def test_br04_coverage_rows_pass_the_finding_schema(self):
+        config = dict(self.ALL_MODALITIES)
+        config["videoDataDeliveryEnabled"] = False
+        coverage = self._run(
+            {
+                "s3Config": {"bucketName": "log-bucket"},
+                "cloudWatchConfig": {"logGroupName": "/aws/bedrock/invocations"},
+                **config,
+            }
+        )
+
+        assert coverage
+        for finding in self.all_findings:
+            assert_finding_schema(finding)
+            assert finding["Check_ID"] == "BR-04"
+
+
+# ===================================================================
+# BR-20 extension: the S3 bucket a knowledge base ingests from carries
+# its own encryption configuration (AIR-FND-DAT-01)
+# ===================================================================
+class TestBR20KnowledgeBaseDataSourceEncryption:
+    """BR-20: encryption at rest on knowledge base data source buckets."""
+
+    SOURCE_FINDING = "Knowledge Base Data Source Bucket Encryption"
+    _CMK_ARN = "arn:aws:kms:us-east-1:123456789012:key/abc"
+
+    @staticmethod
+    def _sse(algorithm, key=None):
+        """A GetBucketEncryption response with one default-encryption rule."""
+        rule = {"SSEAlgorithm": algorithm}
+        if key is not None:
+            rule["KMSMasterKeyID"] = key
+        return {
+            "ServerSideEncryptionConfiguration": {
+                "Rules": [{"ApplyServerSideEncryptionByDefault": rule}]
+            }
+        }
+
+    def _run(self, sources, encryption=None, list_error=None):
+        """Run BR-20 over one MANAGED knowledge base with the given data sources.
+
+        The knowledge base itself holds a customer-managed key, so the vector
+        store leg contributes one Passed row and every row this returns comes
+        from the data source leg.
+        """
+        agent_client = MagicMock()
+        agent_client.list_knowledge_bases.return_value = {
+            "knowledgeBaseSummaries": [{"knowledgeBaseId": "kb1", "name": "CorpusKB"}]
+        }
+        agent_client.get_knowledge_base.return_value = {
+            "knowledgeBase": {
+                "knowledgeBaseConfiguration": {
+                    "type": "MANAGED",
+                    "managedKnowledgeBaseConfiguration": {
+                        "serverSideEncryptionConfiguration": {
+                            "kmsKeyArn": self._CMK_ARN
+                        }
+                    },
+                }
+            }
+        }
+
+        if list_error is not None:
+            agent_client.list_data_sources.side_effect = list_error
+        else:
+            agent_client.list_data_sources.return_value = {
+                "dataSourceSummaries": [
+                    {"dataSourceId": source["id"], "name": source["name"]}
+                    for source in sources
+                ]
+            }
+
+        details = {source["id"]: source for source in sources}
+
+        def get_data_source(**kwargs):
+            source = details[kwargs["dataSourceId"]]
+            configuration = {"type": source.get("type", "S3")}
+            if source.get("bucket"):
+                s3_configuration = {"bucketArn": f"arn:aws:s3:::{source['bucket']}"}
+                if source.get("owner"):
+                    s3_configuration["bucketOwnerAccountId"] = source["owner"]
+                configuration["s3Configuration"] = s3_configuration
+            return {
+                "dataSource": {
+                    "name": source["name"],
+                    "dataSourceConfiguration": configuration,
+                }
+            }
+
+        agent_client.get_data_source.side_effect = get_data_source
+
+        s3_client = MagicMock()
+        answers = encryption or {}
+
+        def get_bucket_encryption(Bucket):
+            answer = answers[Bucket]
+            if isinstance(answer, Exception):
+                raise answer
+            return answer
+
+        s3_client.get_bucket_encryption.side_effect = get_bucket_encryption
+        self.s3_client = s3_client
+
+        clients = {"bedrock-agent": agent_client, "s3": s3_client}
+        with patch(
+            "bedrock_app.boto3.client",
+            side_effect=lambda service, **kwargs: clients[service],
+        ):
+            self.all_findings = extract_csv_data(
+                bedrock_app.check_bedrock_knowledge_base_kms_encryption(
+                    region="us-east-1"
+                )
+            )
+        return [f for f in self.all_findings if f["Finding"] == self.SOURCE_FINDING]
+
+    def test_br20_source_bucket_with_a_customer_key_passes(self):
+        # PASS reachability: a real data source bucket on SSE-KMS with the
+        # account's own key produces one Passed row and nothing else.
+        source = self._run(
+            [{"id": "ds1", "name": "docs", "bucket": "corpus-bucket"}],
+            {"corpus-bucket": self._sse("aws:kms", self._CMK_ARN)},
+        )
+
+        assert [f["Status"] for f in source] == ["Passed"]
+        assert "1 of 1" in source[0]["Finding_Details"]
+        assert "corpus-bucket" in source[0]["Finding_Details"]
+        assert self._CMK_ARN in source[0]["Finding_Details"]
+
+    def test_br20_sse_s3_source_bucket_fails_and_names_the_data_source(self):
+        source = self._run(
+            [{"id": "ds1", "name": "docs", "bucket": "corpus-bucket"}],
+            {"corpus-bucket": self._sse("AES256")},
+        )
+
+        assert [f["Status"] for f in source] == ["Failed"]
+        assert source[0]["Severity"] == "High"
+        details = source[0]["Finding_Details"]
+        assert "'corpus-bucket' uses AES256 instead of SSE-KMS" in details
+        assert "data source 'docs' in knowledge base 'CorpusKB'" in details
+
+    def test_br20_aws_managed_key_is_not_a_customer_managed_key(self):
+        source = self._run(
+            [{"id": "ds1", "name": "docs", "bucket": "corpus-bucket"}],
+            {"corpus-bucket": self._sse("aws:kms", "alias/aws/s3")},
+        )
+
+        assert [f["Status"] for f in source] == ["Failed"]
+        assert "AWS-managed key alias/aws/s3" in source[0]["Finding_Details"]
+
+    def test_br20_aws_managed_key_in_arn_form_is_not_credited(self):
+        # KMSMasterKeyID arrives as a key id, a key ARN, an alias name or an
+        # alias ARN. A match on the bare alias alone credits this ARN as a
+        # customer-managed key and passes an AWS-managed bucket.
+        source = self._run(
+            [{"id": "ds1", "name": "docs", "bucket": "corpus-bucket"}],
+            {
+                "corpus-bucket": self._sse(
+                    "aws:kms", "arn:aws:kms:us-east-1:123456789012:alias/aws/s3"
+                )
+            },
+        )
+
+        assert [f["Status"] for f in source] == ["Failed"]
+        assert "alias/aws/s3" in source[0]["Finding_Details"]
+
+    def test_br20_dual_layer_kms_with_a_customer_key_passes(self):
+        source = self._run(
+            [{"id": "ds1", "name": "docs", "bucket": "corpus-bucket"}],
+            {"corpus-bucket": self._sse("aws:kms:dsse", self._CMK_ARN)},
+        )
+
+        assert [f["Status"] for f in source] == ["Passed"]
+        assert "aws:kms:dsse" in source[0]["Finding_Details"]
+
+    def test_br20_two_source_buckets_reach_both_verdicts(self):
+        # Two buckets with different configurations: an aggregate row for the
+        # region would have to pick one verdict and lose the other.
+        source = self._run(
+            [
+                {"id": "ds1", "name": "docs", "bucket": "plain-bucket"},
+                {"id": "ds2", "name": "hr", "bucket": "cmk-bucket"},
+            ],
+            {
+                "plain-bucket": self._sse("AES256"),
+                "cmk-bucket": self._sse("aws:kms", self._CMK_ARN),
+            },
+        )
+
+        assert [f["Status"] for f in source] == ["Failed", "Passed"]
+        assert "plain-bucket" in source[0]["Finding_Details"]
+        assert "1 of 2" in source[1]["Finding_Details"]
+        assert "cmk-bucket" in source[1]["Finding_Details"]
+        assert "plain-bucket" not in source[1]["Finding_Details"]
+
+    def test_br20_one_bucket_serving_two_data_sources_is_read_once(self):
+        source = self._run(
+            [
+                {"id": "ds1", "name": "docs", "bucket": "shared-bucket"},
+                {"id": "ds2", "name": "hr", "bucket": "shared-bucket"},
+            ],
+            {"shared-bucket": self._sse("AES256")},
+        )
+
+        assert [f["Status"] for f in source] == ["Failed"]
+        assert self.s3_client.get_bucket_encryption.call_count == 1
+        details = source[0]["Finding_Details"]
+        assert "data source 'docs' in knowledge base 'CorpusKB'" in details
+        assert "data source 'hr' in knowledge base 'CorpusKB'" in details
+
+    def test_br20_source_bucket_access_denied_is_na_not_a_failure(self):
+        source = self._run(
+            [{"id": "ds1", "name": "docs", "bucket": "corpus-bucket"}],
+            {
+                "corpus-bucket": _client_error(
+                    "AccessDenied", "denied", "GetBucketEncryption"
+                )
+            },
+        )
+
+        assert [f["Status"] for f in source] == ["N/A"]
+        assert source[0]["Severity"] == "Informational"
+        assert "corpus-bucket" in source[0]["Finding_Details"]
+        assert "s3:GetEncryptionConfiguration" in source[0]["Resolution"]
+
+    def test_br20_bucket_without_default_encryption_is_failed(self):
+        source = self._run(
+            [{"id": "ds1", "name": "docs", "bucket": "corpus-bucket"}],
+            {
+                "corpus-bucket": _client_error(
+                    "ServerSideEncryptionConfigurationNotFoundError",
+                    "not found",
+                    "GetBucketEncryption",
+                )
+            },
+        )
+
+        assert [f["Status"] for f in source] == ["Failed"]
+        assert (
+            "has no default encryption configuration at all"
+            in source[0]["Finding_Details"]
+        )
+
+    def test_br20_cross_account_source_bucket_names_its_owner(self):
+        source = self._run(
+            [
+                {
+                    "id": "ds1",
+                    "name": "docs",
+                    "bucket": "partner-bucket",
+                    "owner": "210987654321",
+                }
+            ],
+            {"partner-bucket": self._sse("AES256")},
+        )
+
+        assert [f["Status"] for f in source] == ["Failed"]
+        assert "owned by account 210987654321" in source[0]["Finding_Details"]
+
+    def test_br20_non_s3_data_source_emits_no_encryption_row(self):
+        # A knowledge base on a WEB connector has no bucket to judge, so the leg
+        # has to stay silent instead of reporting a gap it cannot name.
+        source = self._run([{"id": "ds1", "name": "site", "type": "WEB"}])
+
+        assert source == []
+        assert [f["Status"] for f in self.all_findings] == ["Passed"]
+        self.s3_client.get_bucket_encryption.assert_not_called()
+
+    def test_br20_data_source_walk_error_keeps_the_vector_store_verdict(self):
+        source = self._run(
+            [{"id": "ds1", "name": "docs", "bucket": "corpus-bucket"}],
+            list_error=_client_error(
+                "AccessDeniedException", "denied", "ListDataSources"
+            ),
+        )
+
+        assert [f["Status"] for f in source] == ["N/A"]
+        assert "knowledge base 'CorpusKB' data sources" in source[0]["Finding_Details"]
+        # The managed knowledge base was still assessed on its own key.
+        assert [f["Status"] for f in self.all_findings] == ["Passed", "N/A"]
+
+    def test_br20_source_encryption_rows_pass_the_finding_schema(self):
+        source = self._run(
+            [
+                {"id": "ds1", "name": "docs", "bucket": "plain-bucket"},
+                {"id": "ds2", "name": "hr", "bucket": "cmk-bucket"},
+                {"id": "ds3", "name": "denied", "bucket": "closed-bucket"},
+            ],
+            {
+                "plain-bucket": self._sse("AES256"),
+                "cmk-bucket": self._sse("aws:kms", self._CMK_ARN),
+                "closed-bucket": _client_error(
+                    "AccessDenied", "denied", "GetBucketEncryption"
+                ),
+            },
+        )
+
+        assert [f["Status"] for f in source] == ["Failed", "Passed", "N/A"]
+        for finding in self.all_findings:
+            assert_finding_schema(finding)
+            assert finding["Check_ID"] == "BR-20"
+
+
+class TestBR39MarketplaceSubnetPrivacy:
+    """BR-39 / AIR-FND-NET-01: the registered subnets must not route to an IGW."""
+
+    _PRIVATE_TABLE = {
+        "RouteTableId": "rtb-private",
+        "VpcId": "vpc-1",
+        "Associations": [{"Main": False, "SubnetId": "subnet-private"}],
+        "Routes": [
+            {"DestinationCidrBlock": "10.0.0.0/16", "GatewayId": "local"},
+            {"DestinationCidrBlock": "0.0.0.0/0", "NatGatewayId": "nat-1"},
+        ],
+    }
+    _PUBLIC_TABLE = {
+        "RouteTableId": "rtb-public",
+        "VpcId": "vpc-1",
+        "Associations": [{"Main": False, "SubnetId": "subnet-public"}],
+        "Routes": [{"DestinationCidrBlock": "0.0.0.0/0", "GatewayId": "igw-1"}],
+    }
+
+    @staticmethod
+    def _subnet(subnet_id, vpc_id="vpc-1"):
+        return {"SubnetId": subnet_id, "VpcId": vpc_id}
+
+    @staticmethod
+    def _table(
+        table_id,
+        routes,
+        subnet_id=None,
+        main=False,
+        vpc_id="vpc-1",
+    ):
+        associations = [{"Main": True}] if main else []
+        if subnet_id:
+            associations.append({"Main": False, "SubnetId": subnet_id})
+        return {
+            "RouteTableId": table_id,
+            "VpcId": vpc_id,
+            "Associations": associations,
+            "Routes": list(routes),
+        }
+
+    @staticmethod
+    def _ec2(subnets=(), tables=(), subnets_error=None, tables_error=None):
+        """An ec2 client whose two paginators answer under their own names."""
+        subnets_paginator = MagicMock()
+        if subnets_error is not None:
+            subnets_paginator.paginate.side_effect = subnets_error
+        else:
+            subnets_paginator.paginate.return_value = [{"Subnets": list(subnets)}]
+
+        tables_paginator = MagicMock()
+        if tables_error is not None:
+            tables_paginator.paginate.side_effect = tables_error
+        else:
+            tables_paginator.paginate.return_value = [{"RouteTables": list(tables)}]
+
+        ec2_client = MagicMock()
+        ec2_client.get_paginator.side_effect = lambda operation: {
+            "describe_subnets": subnets_paginator,
+            "describe_route_tables": tables_paginator,
+        }[operation]
+        ec2_client.subnets_paginator = subnets_paginator
+        ec2_client.tables_paginator = tables_paginator
+        return ec2_client
+
+    @staticmethod
+    def _endpoint(arn, subnet_ids=(), security_group_ids=("sg-1",)):
+        return {
+            "summary": {"endpointArn": arn},
+            "detail": {
+                "endpointConfig": {
+                    "sageMaker": {
+                        "vpc": {
+                            "subnetIds": list(subnet_ids),
+                            "securityGroupIds": list(security_group_ids),
+                        }
+                    }
+                }
+            },
+        }
+
+    @classmethod
+    def _inventory(cls, *endpoints):
+        return {"items": list(endpoints), "errors": [], "list_error": None}
+
+    def _run(self, inventory, ec2_client):
+        return extract_csv_data(
+            bedrock_app.check_bedrock_marketplace_endpoint_vpc(
+                "us-east-1", inventory, ec2_client
+            )
+        )
+
+    @staticmethod
+    def _privacy_rows(findings):
+        return [
+            finding
+            for finding in findings
+            if finding["Finding"] == bedrock_app.MARKETPLACE_SUBNET_PRIVACY_FINDING
+        ]
+
+    def test_br39_private_subnet_passes(self):
+        rows = self._privacy_rows(
+            self._run(
+                self._inventory(self._endpoint("arn:endpoint-1", ["subnet-private"])),
+                self._ec2([self._subnet("subnet-private")], [self._PRIVATE_TABLE]),
+            )
+        )
+
+        assert len(rows) == 1
+        assert rows[0]["Status"] == "Passed"
+        assert rows[0]["Severity"] == "High"
+        assert "subnet-private" in rows[0]["Finding_Details"]
+        assert "arn:endpoint-1" in rows[0]["Finding_Details"]
+
+    def test_br39_public_subnet_fails_and_names_the_route(self):
+        rows = self._privacy_rows(
+            self._run(
+                self._inventory(self._endpoint("arn:endpoint-1", ["subnet-public"])),
+                self._ec2([self._subnet("subnet-public")], [self._PUBLIC_TABLE]),
+            )
+        )
+
+        assert len(rows) == 1
+        assert rows[0]["Status"] == "Failed"
+        assert rows[0]["Severity"] == "High"
+        details = rows[0]["Finding_Details"]
+        assert "subnet-public" in details
+        assert "rtb-public" in details
+        assert "0.0.0.0/0" in details
+        assert "igw-1" in details
+
+    def test_br39_main_route_table_is_used_when_no_explicit_association(self):
+        """A subnet with no explicit association inherits the VPC main table."""
+        main_public = self._table(
+            "rtb-main",
+            [{"DestinationCidrBlock": "0.0.0.0/0", "GatewayId": "igw-main"}],
+            main=True,
+        )
+        rows = self._privacy_rows(
+            self._run(
+                self._inventory(self._endpoint("arn:endpoint-1", ["subnet-orphan"])),
+                self._ec2([self._subnet("subnet-orphan")], [main_public]),
+            )
+        )
+
+        assert [row["Status"] for row in rows] == ["Failed"]
+        assert "rtb-main" in rows[0]["Finding_Details"]
+        assert "igw-main" in rows[0]["Finding_Details"]
+
+    def test_br39_explicit_association_wins_over_a_public_main_table(self):
+        main_public = self._table(
+            "rtb-main",
+            [{"DestinationCidrBlock": "0.0.0.0/0", "GatewayId": "igw-main"}],
+            main=True,
+        )
+        rows = self._privacy_rows(
+            self._run(
+                self._inventory(self._endpoint("arn:endpoint-1", ["subnet-private"])),
+                self._ec2(
+                    [self._subnet("subnet-private")],
+                    [main_public, self._PRIVATE_TABLE],
+                ),
+            )
+        )
+
+        assert [row["Status"] for row in rows] == ["Passed"]
+
+    def test_br39_egress_only_internet_gateway_stays_private(self):
+        egress_only = self._table(
+            "rtb-eigw",
+            [
+                {"DestinationCidrBlock": "10.0.0.0/16", "GatewayId": "local"},
+                {
+                    "DestinationIpv6CidrBlock": "::/0",
+                    "EgressOnlyInternetGatewayId": "eigw-1",
+                },
+            ],
+            subnet_id="subnet-v6",
+        )
+        rows = self._privacy_rows(
+            self._run(
+                self._inventory(self._endpoint("arn:endpoint-1", ["subnet-v6"])),
+                self._ec2([self._subnet("subnet-v6")], [egress_only]),
+            )
+        )
+
+        assert [row["Status"] for row in rows] == ["Passed"]
+
+    def test_br39_two_endpoints_reach_both_verdicts(self):
+        findings = self._run(
+            self._inventory(
+                self._endpoint("arn:endpoint-private", ["subnet-private"]),
+                self._endpoint("arn:endpoint-public", ["subnet-public"]),
+            ),
+            self._ec2(
+                [self._subnet("subnet-private"), self._subnet("subnet-public")],
+                [self._PRIVATE_TABLE, self._PUBLIC_TABLE],
+            ),
+        )
+
+        rows = self._privacy_rows(findings)
+        assert [row["Status"] for row in rows] == ["Passed", "Failed"]
+        assert "arn:endpoint-private" in rows[0]["Finding_Details"]
+        assert "arn:endpoint-public" in rows[1]["Finding_Details"]
+
+    def test_br39_one_public_subnet_fails_an_otherwise_private_endpoint(self):
+        """The endpoint verdict is any-public, not all-public."""
+        rows = self._privacy_rows(
+            self._run(
+                self._inventory(
+                    self._endpoint(
+                        "arn:endpoint-1", ["subnet-private", "subnet-public"]
+                    )
+                ),
+                self._ec2(
+                    [self._subnet("subnet-private"), self._subnet("subnet-public")],
+                    [self._PRIVATE_TABLE, self._PUBLIC_TABLE],
+                ),
+            )
+        )
+
+        assert [row["Status"] for row in rows] == ["Failed"]
+        assert "1 of 2 subnet(s)" in rows[0]["Finding_Details"]
+
+    def test_br39_missing_subnet_is_indeterminate_not_private(self):
+        rows = self._privacy_rows(
+            self._run(
+                self._inventory(self._endpoint("arn:endpoint-1", ["subnet-gone"])),
+                self._ec2([], []),
+            )
+        )
+
+        assert [row["Status"] for row in rows] == ["N/A"]
+        assert rows[0]["Severity"] == "Informational"
+        assert "not present in this Region" in rows[0]["Finding_Details"]
+
+    def test_br39_subnet_without_any_route_table_is_indeterminate(self):
+        rows = self._privacy_rows(
+            self._run(
+                self._inventory(self._endpoint("arn:endpoint-1", ["subnet-lonely"])),
+                self._ec2([self._subnet("subnet-lonely", vpc_id="vpc-9")], []),
+            )
+        )
+
+        assert [row["Status"] for row in rows] == ["N/A"]
+        assert "vpc-9" in rows[0]["Finding_Details"]
+
+    def test_br39_a_public_subnet_outranks_an_unresolved_one(self):
+        rows = self._privacy_rows(
+            self._run(
+                self._inventory(
+                    self._endpoint("arn:endpoint-1", ["subnet-public", "subnet-gone"])
+                ),
+                self._ec2([self._subnet("subnet-public")], [self._PUBLIC_TABLE]),
+            )
+        )
+
+        assert [row["Status"] for row in rows] == ["Failed"]
+
+    def test_br39_describe_subnets_denied_is_na_not_private(self):
+        rows = self._privacy_rows(
+            self._run(
+                self._inventory(self._endpoint("arn:endpoint-1", ["subnet-private"])),
+                self._ec2(
+                    subnets_error=_client_error(
+                        "AccessDenied", "denied", "DescribeSubnets"
+                    )
+                ),
+            )
+        )
+
+        assert [row["Status"] for row in rows] == ["N/A"]
+        assert "AccessDenied" in rows[0]["Finding_Details"]
+        assert "ec2:DescribeSubnets" in rows[0]["Resolution"]
+        assert "ec2:DescribeRouteTables" in rows[0]["Resolution"]
+
+    def test_br39_describe_route_tables_denied_is_na_not_private(self):
+        ec2_client = self._ec2(
+            [self._subnet("subnet-private")],
+            tables_error=_client_error(
+                "UnauthorizedOperation", "denied", "DescribeRouteTables"
+            ),
+        )
+        rows = self._privacy_rows(
+            self._run(
+                self._inventory(self._endpoint("arn:endpoint-1", ["subnet-private"])),
+                ec2_client,
+            )
+        )
+
+        assert [row["Status"] for row in rows] == ["N/A"]
+        assert "UnauthorizedOperation" in rows[0]["Finding_Details"]
+
+    def test_br39_endpoint_without_subnets_reaches_no_ec2_call(self):
+        ec2_client = self._ec2()
+        findings = self._run(
+            {
+                "items": [
+                    {
+                        "summary": {"endpointArn": "arn:endpoint-1"},
+                        "detail": {"endpointConfig": {"sageMaker": {}}},
+                    }
+                ],
+                "errors": [],
+                "list_error": None,
+            },
+            ec2_client,
+        )
+
+        assert self._privacy_rows(findings) == []
+        assert [finding["Status"] for finding in findings] == ["Failed"]
+        ec2_client.get_paginator.assert_not_called()
+
+    def test_br39_subnets_of_every_endpoint_are_resolved_in_one_pass(self):
+        ec2_client = self._ec2(
+            [self._subnet("subnet-private"), self._subnet("subnet-public")],
+            [self._PRIVATE_TABLE, self._PUBLIC_TABLE],
+        )
+        self._run(
+            self._inventory(
+                self._endpoint("arn:endpoint-1", ["subnet-public", "subnet-private"]),
+                self._endpoint("arn:endpoint-2", ["subnet-private"]),
+            ),
+            ec2_client,
+        )
+
+        ec2_client.subnets_paginator.paginate.assert_called_once_with(
+            SubnetIds=["subnet-private", "subnet-public"]
+        )
+        ec2_client.tables_paginator.paginate.assert_called_once_with(
+            Filters=[{"Name": "vpc-id", "Values": ["vpc-1"]}]
+        )
+
+    def test_br39_subnet_walk_is_capped_and_reports_the_remainder(self):
+        subnet_ids = [f"subnet-{index:03d}" for index in range(60)]
+        cap = bedrock_app.MAX_MARKETPLACE_SUBNETS_CHECKED
+        ec2_client = self._ec2(
+            [self._subnet(subnet_id) for subnet_id in subnet_ids[:cap]],
+            [self._table("rtb-shared", self._PRIVATE_TABLE["Routes"], main=True)],
+        )
+        rows = self._privacy_rows(
+            self._run(
+                self._inventory(self._endpoint("arn:endpoint-1", subnet_ids)),
+                ec2_client,
+            )
+        )
+
+        assert [row["Status"] for row in rows] == ["N/A"]
+        assert f"{cap} of 60 subnet(s)" in rows[0]["Finding_Details"]
+        assert f"stopped after {cap} subnets" in rows[0]["Finding_Details"]
+        assert (
+            len(ec2_client.subnets_paginator.paginate.call_args.kwargs["SubnetIds"])
+            == cap
+        )
+
+    def test_br39_privacy_rows_pass_the_finding_schema(self):
+        findings = self._run(
+            self._inventory(
+                self._endpoint("arn:endpoint-private", ["subnet-private"]),
+                self._endpoint("arn:endpoint-public", ["subnet-public"]),
+                self._endpoint("arn:endpoint-unknown", ["subnet-gone"]),
+            ),
+            self._ec2(
+                [self._subnet("subnet-private"), self._subnet("subnet-public")],
+                [self._PRIVATE_TABLE, self._PUBLIC_TABLE],
+            ),
+        )
+
+        rows = self._privacy_rows(findings)
+        assert [row["Status"] for row in rows] == ["Passed", "Failed", "N/A"]
+        for finding in rows:
+            assert_finding_schema(finding)
+            assert finding["Check_ID"] == "BR-39"
+            assert finding["Region"] == "us-east-1"

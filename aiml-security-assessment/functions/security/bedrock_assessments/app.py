@@ -1017,7 +1017,16 @@ def check_bedrock_vpc_endpoints(region: str = "") -> Dict[str, bool]:
                             f"Found matching Bedrock endpoint: {service_name} in VPC: {vpc_id}"
                         )
                         found_endpoints.append(
-                            {"vpc_id": vpc_id, "service": service_name}
+                            {
+                                "vpc_id": vpc_id,
+                                "service": service_name,
+                                "endpoint_id": endpoint.get("VpcEndpointId"),
+                                # Absent rather than False when the API did not
+                                # report it, so a missing field is never read as
+                                # a disabled setting or an absent policy.
+                                "private_dns": endpoint.get("PrivateDnsEnabled"),
+                                "policy": endpoint.get("PolicyDocument"),
+                            }
                         )
 
         return {
@@ -1133,6 +1142,359 @@ def handle_aws_throttling(func, *args, **kwargs):
                 raise
 
 
+VPC_ENDPOINT_REFERENCE = (
+    "https://docs.aws.amazon.com/bedrock/latest/userguide/vpc-interface-endpoints.html"
+)
+
+VPC_ENDPOINT_PRIVATE_DNS_FINDING = "Bedrock VPC Endpoint Private DNS"
+
+VPC_ENDPOINT_POLICY_FINDING = "Bedrock VPC Endpoint Policy Scope"
+
+# Condition keys that bound which principals or which networks may use the
+# endpoint. Prefixes, not exact keys, so the whole family is covered:
+# aws:PrincipalOrgID and aws:PrincipalOrgPaths, aws:SourceVpc and aws:SourceVpce,
+# and every aws:PrincipalTag/<key>.
+ENDPOINT_POLICY_SCOPE_CONDITION_PREFIXES = (
+    "aws:principalorg",
+    "aws:principalaccount",
+    "aws:principalarn",
+    "aws:principaltag/",
+    "aws:sourcevpc",
+)
+
+
+def _is_endpoint_scope_condition_key(key: str) -> bool:
+    """True when a condition key bounds who or which network may use an endpoint."""
+    return any(
+        key.startswith(prefix) for prefix in ENDPOINT_POLICY_SCOPE_CONDITION_PREFIXES
+    )
+
+
+def _principal_is_bounded(principal: Any) -> bool:
+    """
+    True when a Principal element names specific principals.
+
+    An absent, empty or wildcard Principal names nobody in particular, so all
+    three read as unbounded: a resource policy statement is only a boundary when
+    it says who it is for.
+    """
+    values: List[str] = []
+    if isinstance(principal, dict):
+        for entry in principal.values():
+            values.extend(str(item).strip() for item in _as_list(entry))
+    else:
+        values = [str(item).strip() for item in _as_list(principal)]
+
+    values = [value for value in values if value]
+    return bool(values) and all(value != "*" for value in values)
+
+
+def _vpc_endpoint_policy_scope(document: Any) -> Dict[str, Any]:
+    """
+    Describe the network scope a Bedrock interface endpoint policy grants.
+
+    The default endpoint policy allows Principal "*" every action on every
+    resource, so any principal whose traffic reaches the endpoint inherits full
+    Bedrock API access: a peered VPC, a shared subnet, a Transit Gateway
+    attachment or an on-premises range over Direct Connect all qualify. The
+    policy is only a boundary when it names the principals or carries a condition
+    on the principal or the source network, and a Deny that rejects everything
+    outside such a key is a boundary even when the Allow is wide.
+    """
+    if document is None or (isinstance(document, str) and not document.strip()):
+        return {
+            "readable": False,
+            "scoped": False,
+            "detail": "no endpoint policy document was returned for it",
+        }
+
+    try:
+        statements = _policy_statements(document)
+    except (ValueError, TypeError) as error:
+        return {
+            "readable": False,
+            "scoped": False,
+            "detail": f"its endpoint policy could not be parsed ({error})",
+        }
+
+    for statement in statements:
+        if str(statement.get("Effect", "")).upper() != "DENY":
+            continue
+        for operator, key, _values in _condition_keys_by_operator(statement):
+            # Only a negated or Null test denies the principals outside the
+            # scope; StringEquals on a Deny would reject the scoped principal
+            # and leave everyone else allowed.
+            if _is_endpoint_scope_condition_key(key) and (
+                "not" in operator or operator == "null"
+            ):
+                return {
+                    "readable": True,
+                    "scoped": True,
+                    "detail": f"a Deny statement rejects every request outside {key}",
+                }
+
+    unbounded: List[str] = []
+    bounded: List[str] = []
+
+    for index, statement in enumerate(statements):
+        if str(statement.get("Effect", "")).upper() != "ALLOW":
+            continue
+
+        label = statement.get("Sid") or f"#{index + 1}"
+        scope_keys = sorted(
+            {
+                key
+                for _operator, key, _values in _condition_keys_by_operator(statement)
+                if _is_endpoint_scope_condition_key(key)
+            }
+        )
+
+        if "NotPrincipal" in statement:
+            unbounded.append(
+                f"statement '{label}' allows every principal except the ones it names"
+            )
+        elif scope_keys:
+            bounded.append(f"statement '{label}' requires {', '.join(scope_keys)}")
+        elif _principal_is_bounded(statement.get("Principal")):
+            bounded.append(
+                "statement '{}' names {} principal(s)".format(
+                    label,
+                    len(
+                        [
+                            value
+                            for entry in _as_list(statement.get("Principal"))
+                            for value in (
+                                [
+                                    item
+                                    for values in entry.values()
+                                    for item in _as_list(values)
+                                ]
+                                if isinstance(entry, dict)
+                                else [entry]
+                            )
+                        ]
+                    ),
+                )
+            )
+        else:
+            actions = sorted({str(item) for item in _as_list(statement.get("Action"))})
+            resources = sorted(
+                {str(item) for item in _as_list(statement.get("Resource"))}
+            )
+            unbounded.append(
+                "statement '{}' allows any principal to call {} on {}".format(
+                    label,
+                    ", ".join(actions[:3]) or "every action",
+                    ", ".join(resources[:3]) or "every resource",
+                )
+            )
+
+    if unbounded:
+        return {
+            "readable": True,
+            "scoped": False,
+            "detail": "; ".join(unbounded[:3]),
+        }
+
+    if bounded:
+        return {"readable": True, "scoped": True, "detail": "; ".join(bounded[:3])}
+
+    return {
+        "readable": True,
+        "scoped": True,
+        "detail": (
+            "its endpoint policy carries no Allow statement, so no principal can "
+            "reach Bedrock through it"
+        ),
+    }
+
+
+def _endpoint_label(endpoint: Dict[str, Any]) -> str:
+    """Name an endpoint by id, service and VPC, as the console lists it."""
+    return "{} ({} in {})".format(
+        endpoint.get("endpoint_id") or "an unnamed endpoint",
+        endpoint.get("service", "unknown service"),
+        endpoint.get("vpc_id", "unknown VPC"),
+    )
+
+
+def _vpc_endpoint_hardening_findings(
+    found_endpoints: List[Dict[str, Any]], region: str
+) -> List[Dict[str, Any]]:
+    """
+    Judge the two settings that decide whether a Bedrock endpoint isolates
+    traffic: AIR-FND-NET-02 asks for private connectivity, and an endpoint whose
+    private DNS is off or whose policy is the default grants none of it.
+
+    Private DNS off means the SDK's default hostname still resolves publicly, so
+    the endpoint exists while the traffic does not use it. The policy decides
+    which principals may use the endpoint once traffic does reach it.
+    """
+    rows: List[Dict[str, Any]] = []
+    total = len(found_endpoints)
+
+    dns_disabled = [
+        endpoint for endpoint in found_endpoints if endpoint.get("private_dns") is False
+    ]
+    dns_enabled = [
+        endpoint for endpoint in found_endpoints if endpoint.get("private_dns") is True
+    ]
+    dns_unreported = [
+        endpoint for endpoint in found_endpoints if endpoint.get("private_dns") is None
+    ]
+
+    if dns_disabled:
+        rows.append(
+            create_finding(
+                check_id="BR-02",
+                finding_name=VPC_ENDPOINT_PRIVATE_DNS_FINDING,
+                finding_details=(
+                    "{} of {} Bedrock interface endpoint(s) report "
+                    "PrivateDnsEnabled false: {}. A client calling the default "
+                    "service hostname in {} still resolves the public endpoint, so "
+                    "its traffic leaves the VPC unless every SDK client is "
+                    "reconfigured to the endpoint-specific DNS name.".format(
+                        len(dns_disabled),
+                        total,
+                        "; ".join(
+                            _endpoint_label(endpoint) for endpoint in dns_disabled[:5]
+                        ),
+                        region or "this region",
+                    )
+                ),
+                resolution="Enable private DNS on each Bedrock interface endpoint so the default service hostname resolves to the endpoint inside the VPC.",
+                reference=VPC_ENDPOINT_REFERENCE,
+                severity="Medium",
+                status="Failed",
+                region=region,
+            )
+        )
+
+    if dns_enabled:
+        rows.append(
+            create_finding(
+                check_id="BR-02",
+                finding_name=VPC_ENDPOINT_PRIVATE_DNS_FINDING,
+                finding_details=(
+                    "{} of {} Bedrock interface endpoint(s) have private DNS "
+                    "enabled, so an unmodified SDK client reaches Bedrock through "
+                    "the endpoint: {}.".format(
+                        len(dns_enabled),
+                        total,
+                        "; ".join(
+                            _endpoint_label(endpoint) for endpoint in dns_enabled[:5]
+                        ),
+                    )
+                ),
+                resolution="No action required for private DNS. Re-check it whenever an endpoint is recreated, because the setting is per endpoint.",
+                reference=VPC_ENDPOINT_REFERENCE,
+                severity="Medium",
+                status="Passed",
+                region=region,
+            )
+        )
+
+    if dns_unreported:
+        rows.append(
+            create_finding(
+                check_id="BR-02",
+                finding_name=VPC_ENDPOINT_PRIVATE_DNS_FINDING,
+                finding_details=(
+                    "{} of {} Bedrock interface endpoint(s) did not report "
+                    "PrivateDnsEnabled, so whether the default service hostname "
+                    "resolves inside the VPC could not be read: {}.".format(
+                        len(dns_unreported),
+                        total,
+                        "; ".join(
+                            _endpoint_label(endpoint) for endpoint in dns_unreported[:5]
+                        ),
+                    )
+                ),
+                resolution="Grant ec2:DescribeVpcEndpoints and re-read PrivateDnsEnabled for each Bedrock endpoint before concluding it is set.",
+                reference=VPC_ENDPOINT_REFERENCE,
+                severity="Informational",
+                status="N/A",
+                region=region,
+            )
+        )
+
+    unscoped = []
+    scoped = []
+    unreadable = []
+    for endpoint in found_endpoints:
+        verdict = _vpc_endpoint_policy_scope(endpoint.get("policy"))
+        entry = f"{_endpoint_label(endpoint)}: {verdict['detail']}"
+        if not verdict["readable"]:
+            unreadable.append(entry)
+        elif verdict["scoped"]:
+            scoped.append(entry)
+        else:
+            unscoped.append(entry)
+
+    if unscoped:
+        rows.append(
+            create_finding(
+                check_id="BR-02",
+                finding_name=VPC_ENDPOINT_POLICY_FINDING,
+                finding_details=(
+                    "{} of {} Bedrock interface endpoint(s) carry an endpoint policy "
+                    "that bounds neither the principals nor the source network, so "
+                    "any principal whose traffic reaches the endpoint (a peered VPC, "
+                    "a shared subnet, a Transit Gateway attachment or an on-premises "
+                    "range) can call Bedrock through it: {}.".format(
+                        len(unscoped), total, "; ".join(unscoped[:5])
+                    )
+                ),
+                resolution="Attach an endpoint policy that names the principals allowed to use the endpoint, or add a condition on aws:PrincipalOrgID, aws:PrincipalArn or aws:SourceVpc, so a peered or shared network cannot reach Bedrock through it.",
+                reference=VPC_ENDPOINT_REFERENCE,
+                severity="Medium",
+                status="Failed",
+                region=region,
+            )
+        )
+
+    if scoped:
+        rows.append(
+            create_finding(
+                check_id="BR-02",
+                finding_name=VPC_ENDPOINT_POLICY_FINDING,
+                finding_details=(
+                    "{} of {} Bedrock interface endpoint(s) carry an endpoint policy "
+                    "that bounds who may use the endpoint: {}.".format(
+                        len(scoped), total, "; ".join(scoped[:5])
+                    )
+                ),
+                resolution="No action required for the endpoint policy. Re-read it whenever the VPC gains a peering, Transit Gateway or shared-subnet attachment.",
+                reference=VPC_ENDPOINT_REFERENCE,
+                severity="Medium",
+                status="Passed",
+                region=region,
+            )
+        )
+
+    if unreadable:
+        rows.append(
+            create_finding(
+                check_id="BR-02",
+                finding_name=VPC_ENDPOINT_POLICY_FINDING,
+                finding_details=(
+                    "{} of {} Bedrock interface endpoint(s) have no readable endpoint "
+                    "policy, so the principals that may use them are neither bounded "
+                    "nor proven unbounded: {}.".format(
+                        len(unreadable), total, "; ".join(unreadable[:5])
+                    )
+                ),
+                resolution="Grant ec2:DescribeVpcEndpoints, then read PolicyDocument for each Bedrock endpoint and confirm it names the principals allowed to use it.",
+                reference=VPC_ENDPOINT_REFERENCE,
+                severity="Informational",
+                status="N/A",
+                region=region,
+            )
+        )
+
+    return rows
+
+
 def check_bedrock_access_and_vpc_endpoints(
     permission_cache, region: str = ""
 ) -> Dict[str, Any]:
@@ -1229,6 +1591,15 @@ def check_bedrock_access_and_vpc_endpoints(
                         region=region,
                     )
                 )
+                # An endpoint existing is not private connectivity being used,
+                # which is what AIR-FND-NET-02 asks for, so the two settings that
+                # decide it are judged per endpoint.
+                hardening = _vpc_endpoint_hardening_findings(
+                    vpc_endpoint_check["found_endpoints"], region
+                )
+                if any(row["Status"] == "Failed" for row in hardening):
+                    findings["status"] = "WARN"
+                findings["csv_data"].extend(hardening)
         else:
             findings["details"] = "No Bedrock access found in roles or users"
 
@@ -1569,6 +1940,180 @@ def _invocation_log_retention_findings(
     return retention_findings
 
 
+INVOCATION_LOG_COVERAGE_FINDING = "Bedrock Invocation Log Data Coverage"
+
+INVOCATION_LOG_COVERAGE_REFERENCE = (
+    "https://docs.aws.amazon.com/bedrock/latest/userguide/model-invocation-logging.html"
+)
+
+# Each data type has its own delivery flag in LoggingConfig, and a flag left at
+# false drops that modality's prompt and response content from the log while the
+# logging switch still reads as enabled.
+INVOCATION_LOG_MODALITY_FLAGS = (
+    ("textDataDeliveryEnabled", "text"),
+    ("imageDataDeliveryEnabled", "image"),
+    ("embeddingDataDeliveryEnabled", "embedding"),
+    ("videoDataDeliveryEnabled", "video"),
+    ("audioDataDeliveryEnabled", "audio"),
+)
+
+
+def _invocation_log_coverage_findings(
+    logging_config: Dict[str, Any],
+    s3_bucket_name: Optional[str],
+    log_group_name: Optional[str],
+    region: str,
+) -> List[Dict[str, Any]]:
+    """Assess what an enabled invocation log actually records.
+
+    AIR-FND-DET-01 asks for the prompt and response content, which the logging
+    switch alone does not establish: each data type has its own delivery flag,
+    and CloudWatch Logs delivery drops any payload over 100 KB unless
+    ``cloudWatchConfig.largeDataDeliveryS3Config`` names a bucket to hold it.
+
+    The large-data field is a member of ``cloudWatchConfig``, so it is read only
+    when CloudWatch Logs is a destination. An S3-only configuration delivers the
+    whole payload to the bucket and is never judged on it.
+
+    A flag the API did not return is indeterminate, not disabled: it is reported
+    as N/A instead of as a missing modality.
+    """
+    if not s3_bucket_name and not log_group_name:
+        return []
+
+    destinations = []
+    if s3_bucket_name:
+        destinations.append(f"S3 bucket '{s3_bucket_name}'")
+    if log_group_name:
+        destinations.append(f"CloudWatch Logs group '{log_group_name}'")
+    destination_text = " and ".join(destinations)
+
+    disabled: List[str] = []
+    delivered: List[str] = []
+    unreported: List[str] = []
+    for flag, label in INVOCATION_LOG_MODALITY_FLAGS:
+        if flag not in logging_config:
+            unreported.append(label)
+        elif logging_config.get(flag):
+            delivered.append(label)
+        else:
+            disabled.append(label)
+
+    large_data_bucket = None
+    if log_group_name:
+        cloudwatch_config = logging_config.get("cloudWatchConfig") or {}
+        large_data_bucket = _extract_s3_bucket_name(
+            cloudwatch_config.get("largeDataDeliveryS3Config")
+        )
+
+    coverage_findings: List[Dict[str, Any]] = []
+
+    if disabled:
+        disabled_flags = ", ".join(
+            flag for flag, label in INVOCATION_LOG_MODALITY_FLAGS if label in disabled
+        )
+        coverage_findings.append(
+            create_finding(
+                check_id="BR-04",
+                finding_name=INVOCATION_LOG_COVERAGE_FINDING,
+                finding_details=(
+                    f"Invocation logging delivers to {destination_text} but "
+                    f"{len(disabled)} of {len(INVOCATION_LOG_MODALITY_FLAGS)} data "
+                    f"types are excluded from delivery: {', '.join(disabled)}. "
+                    "Invocations carrying those data types are logged without "
+                    "their prompt and response content."
+                ),
+                resolution=(
+                    f"Set {disabled_flags} to true in "
+                    "PutModelInvocationLoggingConfiguration so the log carries the "
+                    "content of every data type this account invokes."
+                ),
+                reference=INVOCATION_LOG_COVERAGE_REFERENCE,
+                severity="Medium",
+                status="Failed",
+                region=region,
+            )
+        )
+
+    if log_group_name and not large_data_bucket:
+        coverage_findings.append(
+            create_finding(
+                check_id="BR-04",
+                finding_name=INVOCATION_LOG_COVERAGE_FINDING,
+                finding_details=(
+                    f"CloudWatch Logs group '{log_group_name}' receives invocation "
+                    "logs with no cloudWatchConfig.largeDataDeliveryS3Config, so "
+                    "any prompt, response or image payload over 100 KB is recorded "
+                    "as a truncation marker instead of as content."
+                ),
+                resolution=(
+                    "Set cloudWatchConfig.largeDataDeliveryS3Config to an encrypted "
+                    "S3 bucket in PutModelInvocationLoggingConfiguration so "
+                    "payloads too large for CloudWatch Logs are still delivered."
+                ),
+                reference=INVOCATION_LOG_COVERAGE_REFERENCE,
+                severity="Medium",
+                status="Failed",
+                region=region,
+            )
+        )
+
+    if not disabled and not unreported and (large_data_bucket or not log_group_name):
+        large_data_text = (
+            f" Payloads over 100 KB are delivered to S3 bucket '{large_data_bucket}'."
+            if large_data_bucket
+            else ""
+        )
+        coverage_findings.append(
+            create_finding(
+                check_id="BR-04",
+                finding_name=INVOCATION_LOG_COVERAGE_FINDING,
+                finding_details=(
+                    f"Invocation logging delivers all "
+                    f"{len(INVOCATION_LOG_MODALITY_FLAGS)} data types "
+                    f"({', '.join(delivered)}) to {destination_text}."
+                    f"{large_data_text}"
+                ),
+                resolution="No action required",
+                reference=INVOCATION_LOG_COVERAGE_REFERENCE,
+                severity="Medium",
+                status="Passed",
+                region=region,
+            )
+        )
+
+    if unreported:
+        delivered_text = (
+            f"Delivery is enabled for {', '.join(delivered)}. " if delivered else ""
+        )
+        unreported_flags = ", ".join(
+            flag for flag, label in INVOCATION_LOG_MODALITY_FLAGS if label in unreported
+        )
+        coverage_findings.append(
+            create_finding(
+                check_id="BR-04",
+                finding_name=INVOCATION_LOG_COVERAGE_FINDING,
+                finding_details=(
+                    f"{delivered_text}GetModelInvocationLoggingConfiguration did "
+                    f"not report {unreported_flags} for {destination_text}, so "
+                    f"delivery of {', '.join(unreported)} data could not be "
+                    "assessed."
+                ),
+                resolution=(
+                    "Set every data-delivery flag explicitly with "
+                    "PutModelInvocationLoggingConfiguration so the configuration "
+                    "states which data types the invocation log carries."
+                ),
+                reference=INVOCATION_LOG_COVERAGE_REFERENCE,
+                severity="Informational",
+                status="N/A",
+                region=region,
+            )
+        )
+
+    return coverage_findings
+
+
 def check_bedrock_logging_configuration(region: str = "") -> Dict[str, Any]:
     """
     Check if model invocation logging is enabled for Amazon Bedrock
@@ -1675,6 +2220,22 @@ def check_bedrock_logging_configuration(region: str = "") -> Dict[str, Any]:
                     s3_bucket_name, log_group_name, region
                 )
             )
+
+            # AIR-FND-DET-01 asks for the prompt and response content itself,
+            # which the per-modality delivery flags and the CloudWatch Logs
+            # large-payload destination decide once logging is switched on.
+            coverage_rows = _invocation_log_coverage_findings(
+                response.get("loggingConfig") or {},
+                s3_bucket_name,
+                log_group_name,
+                region,
+            )
+            # These rows are empty unless a destination is configured, which is
+            # the same condition that keeps the roll-up at PASS above, so a
+            # coverage gap can only ever escalate PASS.
+            if any(row["Status"] == "Failed" for row in coverage_rows):
+                findings["status"] = "WARN"
+            findings["csv_data"].extend(coverage_rows)
 
         except bedrock_client.exceptions.ValidationException:
             findings["status"] = "FAIL"
@@ -2060,9 +2621,437 @@ def check_bedrock_cloudtrail_logging(region: str = "") -> Dict[str, Any]:
         }
 
 
+PROMPT_MANAGEMENT_REFERENCE = (
+    "https://docs.aws.amazon.com/bedrock/latest/userguide/prompt-management.html"
+)
+PROMPT_FLOWS_REFERENCE = (
+    "https://docs.aws.amazon.com/bedrock/latest/userguide/flows.html"
+)
+
+PROMPT_VERSION_FINDING = "Bedrock Prompt Production Version"
+PROMPT_VERSION_ENCRYPTION_FINDING = "Bedrock Prompt Version Encryption"
+FLOW_PROMPT_VERSION_FINDING = "Bedrock Flow Prompt Version Reference"
+
+MAX_REPORTED_PROMPTS = 5
+
+
+def _prompt_numbered_versions(bedrock_client: Any, prompt_id: str) -> Dict[str, Any]:
+    """
+    List the numbered versions of one prompt.
+
+    ListPrompts answers with the DRAFT of every prompt when no identifier is
+    passed, and with the versions of a single prompt when promptIdentifier is.
+    The API models a version as either DRAFT or a number, and DRAFT is mutable,
+    so only a numbered version is a pinned artifact.
+    """
+    versions = []
+    try:
+        paginator = bedrock_client.get_paginator("list_prompts")
+        for page in paginator.paginate(promptIdentifier=prompt_id):
+            for summary in page.get("promptSummaries", []):
+                version = str(summary.get("version") or "")
+                if version.isdigit():
+                    versions.append(version)
+    except ClientError as error:
+        return {
+            "readable": False,
+            "error": get_assessment_error_label(error),
+            "versions": [],
+        }
+    return {"readable": True, "error": "", "versions": sorted(versions, key=int)}
+
+
+def _prompt_version_encryption_key(
+    bedrock_client: Any, prompt_id: str, version: str
+) -> Dict[str, Any]:
+    """Read customerEncryptionKeyArn from one numbered prompt version."""
+    try:
+        detail = bedrock_client.get_prompt(
+            promptIdentifier=prompt_id, promptVersion=version
+        )
+    except ClientError as error:
+        return {
+            "readable": False,
+            "error": get_assessment_error_label(error),
+            "key_arn": "",
+        }
+    prompt = detail.get("prompt", detail)
+    return {
+        "readable": True,
+        "error": "",
+        "key_arn": str(prompt.get("customerEncryptionKeyArn") or ""),
+    }
+
+
+def _flow_prompt_arn_version(prompt_arn: str) -> str:
+    """Return the version a flow node's promptArn pins, or '' when it pins DRAFT."""
+    trailing = str(prompt_arn or "").rsplit(":", 1)[-1]
+    return trailing if trailing.isdigit() else ""
+
+
+def _flow_prompt_node_references(definition: Dict[str, Any]) -> List[Dict[str, str]]:
+    """
+    Collect every Prompt management reference in a flow definition.
+
+    A DoWhile loop node carries its own FlowDefinition and AWS documents a prompt
+    node as a supported loop body node, so a walk over the top-level nodes alone
+    misses the prompts a looping flow runs.
+    """
+    references = []
+    pending = [definition or {}]
+    while pending:
+        current = pending.pop()
+        for node in current.get("nodes") or []:
+            configuration = node.get("configuration") or {}
+            nested = (configuration.get("loop") or {}).get("definition")
+            if nested:
+                pending.append(nested)
+            source = (configuration.get("prompt") or {}).get(
+                "sourceConfiguration"
+            ) or {}
+            prompt_arn = (source.get("resource") or {}).get("promptArn")
+            if prompt_arn:
+                references.append(
+                    {"node": node.get("name") or "unnamed", "arn": str(prompt_arn)}
+                )
+    return references
+
+
+def _flow_prompt_version_references(bedrock_client: Any) -> Dict[str, Any]:
+    """Group the prompt references of every flow's current definition."""
+    result: Dict[str, Any] = {
+        "readable": True,
+        "error": "",
+        "pinned": [],
+        "unpinned": [],
+        "unreadable_flows": [],
+    }
+
+    try:
+        flows = []
+        paginator = bedrock_client.get_paginator("list_flows")
+        for page in paginator.paginate():
+            flows.extend(page.get("flowSummaries", []))
+    except ClientError as error:
+        result["readable"] = False
+        result["error"] = get_assessment_error_label(error)
+        return result
+
+    for flow in flows:
+        flow_id = flow.get("id")
+        if not flow_id:
+            continue
+        flow_name = flow.get("name") or flow_id
+
+        try:
+            detail = bedrock_client.get_flow(flowIdentifier=flow_id)
+        except ClientError as error:
+            result["unreadable_flows"].append(
+                {"flow": flow_name, "error": get_assessment_error_label(error)}
+            )
+            continue
+
+        flow_info = detail.get("flow", detail)
+        for reference in _flow_prompt_node_references(
+            flow_info.get("definition") or {}
+        ):
+            entry = {"flow": flow_name, **reference}
+            version = _flow_prompt_arn_version(reference["arn"])
+            if version:
+                result["pinned"].append({**entry, "version": version})
+            else:
+                result["unpinned"].append(entry)
+
+    return result
+
+
+def _prompt_version_findings(
+    states: List[Dict[str, Any]], region: str
+) -> List[Dict[str, Any]]:
+    """Report which prompts carry a pinned version and how that version is encrypted."""
+    rows = []
+    total = len(states)
+    draft_only = [
+        state for state in states if state["readable"] and not state["latest"]
+    ]
+    versioned = [state for state in states if state["readable"] and state["latest"]]
+    unlistable = [state for state in states if not state["readable"]]
+
+    if draft_only:
+        rows.append(
+            create_finding(
+                check_id="BR-07",
+                finding_name=PROMPT_VERSION_FINDING,
+                finding_details=(
+                    "{} of {} prompt(s) exist only as DRAFT: {}. A flow or "
+                    "application that references a prompt without a version suffix "
+                    "runs the DRAFT, which changes in place with no review.".format(
+                        len(draft_only),
+                        total,
+                        ", ".join(
+                            state["name"] for state in draft_only[:MAX_REPORTED_PROMPTS]
+                        ),
+                    )
+                ),
+                resolution="Create a numbered version of each named prompt with CreatePromptVersion, then reference that version from every flow and application.",
+                reference=PROMPT_MANAGEMENT_REFERENCE,
+                severity="Medium",
+                status="Failed",
+                region=region,
+            )
+        )
+
+    if versioned:
+        rows.append(
+            create_finding(
+                check_id="BR-07",
+                finding_name=PROMPT_VERSION_FINDING,
+                finding_details=(
+                    "{} of {} prompt(s) have a numbered version that a flow or "
+                    "application can pin to: {}.".format(
+                        len(versioned),
+                        total,
+                        ", ".join(
+                            "{} (latest version {})".format(
+                                state["name"], state["latest"]
+                            )
+                            for state in versioned[:MAX_REPORTED_PROMPTS]
+                        ),
+                    )
+                ),
+                resolution="No action required for version pinning. Create a new version whenever the prompt changes so the pinned reference stays current.",
+                reference=PROMPT_MANAGEMENT_REFERENCE,
+                severity="Medium",
+                status="Passed",
+                region=region,
+            )
+        )
+
+    if unlistable:
+        rows.append(
+            create_finding(
+                check_id="BR-07",
+                finding_name=PROMPT_VERSION_FINDING,
+                finding_details=(
+                    "The versions of {} of {} prompt(s) could not be listed, so "
+                    "whether each one is pinned is unknown: {}.".format(
+                        len(unlistable),
+                        total,
+                        "; ".join(
+                            "{} ({})".format(state["name"], state["error"])
+                            for state in unlistable[:MAX_REPORTED_PROMPTS]
+                        ),
+                    )
+                ),
+                resolution="Grant bedrock:ListPrompts on each prompt and re-run the assessment.",
+                reference=PROMPT_MANAGEMENT_REFERENCE,
+                severity="Informational",
+                status="N/A",
+                region=region,
+            )
+        )
+
+    encrypted = [
+        state for state in versioned if state["key_readable"] and state["key_arn"]
+    ]
+    aws_owned = [
+        state for state in versioned if state["key_readable"] and not state["key_arn"]
+    ]
+    unreadable_key = [state for state in versioned if not state["key_readable"]]
+
+    if aws_owned:
+        rows.append(
+            create_finding(
+                check_id="BR-07",
+                finding_name=PROMPT_VERSION_ENCRYPTION_FINDING,
+                finding_details=(
+                    "{} of {} versioned prompt(s) report no customerEncryptionKeyArn "
+                    "on their latest version, so the prompt text is held under an AWS "
+                    "owned key that no key policy of yours can restrict: {}.".format(
+                        len(aws_owned),
+                        len(versioned),
+                        ", ".join(
+                            "{} (version {})".format(state["name"], state["latest"])
+                            for state in aws_owned[:MAX_REPORTED_PROMPTS]
+                        ),
+                    )
+                ),
+                resolution="Recreate each named prompt with a customer-managed KMS key in customerEncryptionKeyArn, then create the version to be referenced.",
+                reference=PROMPT_MANAGEMENT_REFERENCE,
+                severity="Medium",
+                status="Failed",
+                region=region,
+            )
+        )
+
+    if encrypted:
+        rows.append(
+            create_finding(
+                check_id="BR-07",
+                finding_name=PROMPT_VERSION_ENCRYPTION_FINDING,
+                finding_details=(
+                    "{} of {} versioned prompt(s) encrypt their latest version with a "
+                    "customer-managed KMS key: {}.".format(
+                        len(encrypted),
+                        len(versioned),
+                        ", ".join(
+                            "{} (version {})".format(state["name"], state["latest"])
+                            for state in encrypted[:MAX_REPORTED_PROMPTS]
+                        ),
+                    )
+                ),
+                resolution="No action required for prompt version encryption. Keep the key policy scoped to the roles that run the prompt.",
+                reference=PROMPT_MANAGEMENT_REFERENCE,
+                severity="Medium",
+                status="Passed",
+                region=region,
+            )
+        )
+
+    if unreadable_key:
+        rows.append(
+            create_finding(
+                check_id="BR-07",
+                finding_name=PROMPT_VERSION_ENCRYPTION_FINDING,
+                finding_details=(
+                    "The latest version of {} of {} versioned prompt(s) could not be "
+                    "read, so its encryption key is unknown: {}.".format(
+                        len(unreadable_key),
+                        len(versioned),
+                        "; ".join(
+                            "{} version {} ({})".format(
+                                state["name"], state["latest"], state["key_error"]
+                            )
+                            for state in unreadable_key[:MAX_REPORTED_PROMPTS]
+                        ),
+                    )
+                ),
+                resolution="Grant bedrock:GetPrompt on each prompt version and re-run the assessment.",
+                reference=PROMPT_MANAGEMENT_REFERENCE,
+                severity="Informational",
+                status="N/A",
+                region=region,
+            )
+        )
+
+    return rows
+
+
+def _flow_prompt_version_findings(
+    references: Dict[str, Any], region: str
+) -> List[Dict[str, Any]]:
+    """Report whether each flow pins the prompt version it runs."""
+    if not references["readable"]:
+        return [
+            create_finding(
+                check_id="BR-07",
+                finding_name=FLOW_PROMPT_VERSION_FINDING,
+                finding_details=(
+                    "The flows of this Region could not be listed ({}), so whether "
+                    "any flow runs an unpinned prompt is unknown.".format(
+                        references["error"]
+                    )
+                ),
+                resolution="Grant bedrock:ListFlows and bedrock:GetFlow, then re-run the assessment.",
+                reference=PROMPT_FLOWS_REFERENCE,
+                severity="Informational",
+                status="N/A",
+                region=region,
+            )
+        ]
+
+    rows = []
+    total = len(references["pinned"]) + len(references["unpinned"])
+
+    if references["unpinned"]:
+        rows.append(
+            create_finding(
+                check_id="BR-07",
+                finding_name=FLOW_PROMPT_VERSION_FINDING,
+                finding_details=(
+                    "{} of {} prompt reference(s) in the current flow definitions "
+                    "carry no version suffix, so the flow runs whatever the DRAFT "
+                    "holds at invocation time: {}.".format(
+                        len(references["unpinned"]),
+                        total,
+                        "; ".join(
+                            "flow '{}' node '{}' references {}".format(
+                                entry["flow"], entry["node"], entry["arn"]
+                            )
+                            for entry in references["unpinned"][:MAX_REPORTED_PROMPTS]
+                        ),
+                    )
+                ),
+                resolution="Point each named node at a numbered prompt version by appending the version to the promptArn, then prepare the flow again.",
+                reference=PROMPT_FLOWS_REFERENCE,
+                severity="Medium",
+                status="Failed",
+                region=region,
+            )
+        )
+
+    if references["pinned"]:
+        rows.append(
+            create_finding(
+                check_id="BR-07",
+                finding_name=FLOW_PROMPT_VERSION_FINDING,
+                finding_details=(
+                    "{} of {} prompt reference(s) in the current flow definitions pin "
+                    "a numbered prompt version: {}.".format(
+                        len(references["pinned"]),
+                        total,
+                        "; ".join(
+                            "flow '{}' node '{}' pins version {}".format(
+                                entry["flow"], entry["node"], entry["version"]
+                            )
+                            for entry in references["pinned"][:MAX_REPORTED_PROMPTS]
+                        ),
+                    )
+                ),
+                resolution="No action required for these nodes. Move the pin forward whenever a new prompt version is published.",
+                reference=PROMPT_FLOWS_REFERENCE,
+                severity="Medium",
+                status="Passed",
+                region=region,
+            )
+        )
+
+    if references["unreadable_flows"]:
+        rows.append(
+            create_finding(
+                check_id="BR-07",
+                finding_name=FLOW_PROMPT_VERSION_FINDING,
+                finding_details=(
+                    "The definition of {} flow(s) could not be read, so the prompt "
+                    "versions they run are unknown: {}.".format(
+                        len(references["unreadable_flows"]),
+                        "; ".join(
+                            "{} ({})".format(entry["flow"], entry["error"])
+                            for entry in references["unreadable_flows"][
+                                :MAX_REPORTED_PROMPTS
+                            ]
+                        ),
+                    )
+                ),
+                resolution="Grant bedrock:GetFlow on each named flow and re-run the assessment.",
+                reference=PROMPT_FLOWS_REFERENCE,
+                severity="Informational",
+                status="N/A",
+                region=region,
+            )
+        )
+
+    return rows
+
+
 def check_bedrock_prompt_management(region: str = "") -> Dict[str, Any]:
     """
     Check if Amazon Bedrock Prompt Management feature is being used
+
+    AIR-BDR-MDL-08 asks for the prompt that production runs to be a pinned,
+    encrypted artifact, so three further legs judge the prompts that exist: each
+    prompt's numbered versions, the encryption key of the latest of them, and
+    whether the flows of the Region reference a version or the mutable DRAFT.
     """
     logger.debug("Starting check for Bedrock Prompt Management usage")
     try:
@@ -2136,6 +3125,44 @@ def check_bedrock_prompt_management(region: str = "") -> Dict[str, Any]:
                             region=region,
                         )
                     )
+
+                version_states = []
+                for prompt in prompts:
+                    prompt_id = prompt.get("id") or prompt.get("promptId")
+                    if not prompt_id:
+                        continue
+
+                    listing = _prompt_numbered_versions(bedrock_client, prompt_id)
+                    latest = listing["versions"][-1] if listing["versions"] else ""
+                    key = (
+                        _prompt_version_encryption_key(
+                            bedrock_client, prompt_id, latest
+                        )
+                        if latest
+                        else {"readable": True, "error": "", "key_arn": ""}
+                    )
+                    version_states.append(
+                        {
+                            "name": prompt.get("name") or prompt_id,
+                            "id": prompt_id,
+                            "readable": listing["readable"],
+                            "error": listing["error"],
+                            "latest": latest,
+                            "key_readable": key["readable"],
+                            "key_error": key["error"],
+                            "key_arn": key["key_arn"],
+                        }
+                    )
+
+                version_rows = _prompt_version_findings(version_states, region)
+                version_rows.extend(
+                    _flow_prompt_version_findings(
+                        _flow_prompt_version_references(bedrock_client), region
+                    )
+                )
+                if any(row["Status"] == "Failed" for row in version_rows):
+                    findings["status"] = "WARN"
+                findings["csv_data"].extend(version_rows)
             else:
                 findings["status"] = "WARN"
                 findings["details"] = "Prompt Management feature is not being used"
@@ -5367,6 +6394,259 @@ def _assess_s3_vectors_store(
     }
 
 
+KB_DATA_SOURCE_ENCRYPTION_FINDING = "Knowledge Base Data Source Bucket Encryption"
+
+KB_DATA_SOURCE_ENCRYPTION_RESOLUTION = (
+    "Set default encryption on the data source bucket to SSE-KMS with a "
+    "customer-managed key (PutBucketEncryption with SSEAlgorithm aws:kms and "
+    "KMSMasterKeyID set to your own key), and grant the Bedrock knowledge base "
+    "service role kms:Decrypt on that key so ingestion keeps working."
+)
+
+# S3 accepts aws:kms for SSE-KMS and aws:kms:dsse for dual-layer SSE-KMS. Both
+# are key-backed, so both can satisfy the customer-managed bar; AES256 (SSE-S3)
+# cannot.
+KMS_SSE_ALGORITHMS = ("aws:kms", "aws:kms:dsse")
+
+
+def _is_aws_managed_kms_key(key_identifier: str) -> bool:
+    """Report whether a KMSMasterKeyID names an AWS-managed key.
+
+    The identifier arrives as a key id, a key ARN, an alias name or an alias
+    ARN, so the AWS-managed alias has to be matched in both the bare
+    ``alias/aws/s3`` form and the ``arn:aws:kms:...:alias/aws/s3`` form. Matching
+    only the bare form would credit the ARN form as a customer-managed key.
+    """
+    identifier = key_identifier.strip().lower()
+    return identifier.startswith("alias/aws/") or ":alias/aws/" in identifier
+
+
+def _bucket_default_encryption(bucket: str, region: str) -> Dict[str, Any]:
+    """Read the default encryption S3 applies to new objects in ``bucket``."""
+    s3_client = boto3.client("s3", config=boto3_config, region_name=region)
+    response = s3_client.get_bucket_encryption(Bucket=bucket)
+    rules = (response.get("ServerSideEncryptionConfiguration") or {}).get("Rules") or []
+    for rule in rules:
+        default = rule.get("ApplyServerSideEncryptionByDefault") or {}
+        algorithm = str(default.get("SSEAlgorithm") or "")
+        if not algorithm:
+            continue
+        key_identifier = str(default.get("KMSMasterKeyID") or "")
+        customer_managed = (
+            algorithm in KMS_SSE_ALGORITHMS
+            and bool(key_identifier)
+            and not _is_aws_managed_kms_key(key_identifier)
+        )
+        return {
+            "algorithm": algorithm,
+            "key": key_identifier,
+            "customer_managed": customer_managed,
+        }
+    return {"algorithm": "", "key": "", "customer_managed": False}
+
+
+def _knowledge_base_source_encryption_findings(region: str) -> List[Dict[str, Any]]:
+    """Assess encryption at rest on every S3 bucket a knowledge base ingests from.
+
+    AIR-FND-DAT-01 covers the corpus itself, which the vector store leg does not
+    reach: the data source bucket holds the same documents and is encrypted
+    independently of the knowledge base. One bucket can serve several data
+    sources, so each bucket is read once and every data source that names it is
+    listed on the row.
+
+    Returns no rows at all when the account has no S3 data source, so a
+    knowledge base on a non-S3 connector is not judged on a bucket it has not
+    got.
+    """
+    try:
+        inventory = _knowledge_base_s3_sources(region)
+    except Exception as error:
+        # The data source walk is secondary to the vector-store verdicts this
+        # check already returned, so its failure costs one N/A row instead of
+        # reaching the outer handler, which would replace every row for the
+        # region with a single could-not-assess.
+        logger.warning(
+            f"Unable to resolve knowledge base data sources in {region}: "
+            f"{get_assessment_error_label(error)}"
+        )
+        return [
+            create_finding(
+                check_id="BR-20",
+                finding_name=KB_DATA_SOURCE_ENCRYPTION_FINDING,
+                finding_details=(
+                    "Encryption at rest on the knowledge base data source buckets "
+                    "could not be assessed: "
+                    f"{describe_api_error(error, 'bedrock:ListDataSources', region)}"
+                ),
+                resolution=COULD_NOT_ASSESS_RESOLUTION,
+                reference=KB_ENCRYPTION_REFERENCE,
+                severity="Informational",
+                status="N/A",
+                region=region,
+            )
+        ]
+
+    buckets: Dict[str, List[str]] = {}
+    owners: Dict[str, str] = {}
+    for source in inventory["s3_sources"]:
+        buckets.setdefault(source["bucket"], []).append(source["label"])
+        if source["owner_account"]:
+            owners[source["bucket"]] = source["owner_account"]
+
+    encrypted: List[str] = []
+    plaintext: List[Dict[str, str]] = []
+    unreadable: List[str] = []
+
+    for bucket, labels in buckets.items():
+        served = "; ".join(labels)
+        try:
+            encryption = _bucket_default_encryption(bucket, region)
+        except ClientError as error:
+            code = error.response.get("Error", {}).get("Code", "")
+            if code == "ServerSideEncryptionConfigurationNotFoundError":
+                plaintext.append(
+                    {
+                        "bucket": bucket,
+                        "served": served,
+                        "reason": "has no default encryption configuration at all",
+                    }
+                )
+                continue
+            unreadable.append(
+                f"S3 bucket '{bucket}' ({served}): "
+                f"{describe_api_error(error, 's3:GetEncryptionConfiguration', region)}"
+            )
+            continue
+        except Exception as error:
+            unreadable.append(
+                f"S3 bucket '{bucket}' ({served}): "
+                f"{describe_api_error(error, 's3:GetEncryptionConfiguration', region)}"
+            )
+            continue
+
+        if encryption["customer_managed"]:
+            encrypted.append(
+                f"S3 bucket '{bucket}' uses {encryption['algorithm']} with "
+                f"{encryption['key']}"
+            )
+        elif encryption["algorithm"] in KMS_SSE_ALGORITHMS:
+            plaintext.append(
+                {
+                    "bucket": bucket,
+                    "served": served,
+                    "reason": (
+                        f"uses {encryption['algorithm']} with the AWS-managed key "
+                        f"{encryption['key'] or 'aws/s3'} instead of a "
+                        "customer-managed key"
+                    ),
+                }
+            )
+        elif encryption["algorithm"]:
+            plaintext.append(
+                {
+                    "bucket": bucket,
+                    "served": served,
+                    "reason": (
+                        f"uses {encryption['algorithm']} instead of SSE-KMS with a "
+                        "customer-managed key"
+                    ),
+                }
+            )
+        else:
+            unreadable.append(
+                f"S3 bucket '{bucket}' ({served}): GetBucketEncryption returned no "
+                "default encryption rule"
+            )
+
+    source_findings: List[Dict[str, Any]] = []
+
+    for gap in plaintext:
+        owner = owners.get(gap["bucket"])
+        owner_text = f" The bucket is owned by account {owner}." if owner else ""
+        source_findings.append(
+            create_finding(
+                check_id="BR-20",
+                finding_name=KB_DATA_SOURCE_ENCRYPTION_FINDING,
+                finding_details=(
+                    f"S3 bucket '{gap['bucket']}' {gap['reason']}, and it is "
+                    f"ingested by {gap['served']}. The documents a knowledge base "
+                    "indexes are as sensitive as the vectors derived from them."
+                    f"{owner_text}"
+                ),
+                resolution=KB_DATA_SOURCE_ENCRYPTION_RESOLUTION,
+                reference=KB_ENCRYPTION_REFERENCE,
+                severity="High",
+                status="Failed",
+                region=region,
+            )
+        )
+
+    if encrypted:
+        source_findings.append(
+            create_finding(
+                check_id="BR-20",
+                finding_name=KB_DATA_SOURCE_ENCRYPTION_FINDING,
+                finding_details=(
+                    f"{len(encrypted)} of {len(buckets)} knowledge base data source "
+                    "bucket(s) encrypt objects with a customer-managed KMS key: "
+                    f"{'; '.join(encrypted)}."
+                ),
+                resolution="No action required",
+                reference=KB_ENCRYPTION_REFERENCE,
+                severity="Medium",
+                status="Passed",
+                region=region,
+            )
+        )
+
+    for gap in unreadable + inventory["errors"]:
+        source_findings.append(
+            create_finding(
+                check_id="BR-20",
+                finding_name=KB_DATA_SOURCE_ENCRYPTION_FINDING,
+                finding_details=(
+                    "Encryption at rest on a knowledge base data source bucket "
+                    f"could not be assessed: {gap}"
+                ),
+                resolution=(
+                    "Grant the assessment role s3:GetEncryptionConfiguration on the "
+                    "knowledge base data source buckets, including a bucket policy "
+                    "grant for a bucket in another account, then re-run the "
+                    "assessment."
+                ),
+                reference=KB_ENCRYPTION_REFERENCE,
+                severity="Informational",
+                status="N/A",
+                region=region,
+            )
+        )
+
+    if inventory["truncated"]:
+        source_findings.append(
+            create_finding(
+                check_id="BR-20",
+                finding_name=KB_DATA_SOURCE_ENCRYPTION_FINDING,
+                finding_details=(
+                    "Encryption at rest was assessed for the first "
+                    f"{MAX_KNOWLEDGE_BASE_DATA_SOURCE_DESCRIBES} knowledge base data "
+                    "sources in this region only; the remaining data sources were "
+                    "not read."
+                ),
+                resolution=(
+                    "Assess the remaining knowledge base data source buckets "
+                    "directly, or split the knowledge bases across regions or "
+                    "accounts so the whole estate is covered."
+                ),
+                reference=KB_ENCRYPTION_REFERENCE,
+                severity="Informational",
+                status="N/A",
+                region=region,
+            )
+        )
+
+    return source_findings
+
+
 def check_bedrock_knowledge_base_kms_encryption(region: str = "") -> Dict[str, Any]:
     """
     BR-20: Verify Knowledge Base vector stores use customer-managed KMS keys (extends BR-09)
@@ -5626,6 +6906,14 @@ def check_bedrock_knowledge_base_kms_encryption(region: str = "") -> Dict[str, A
                         region=region,
                     )
                 )
+
+            # AIR-FND-DAT-01 covers the corpus a knowledge base ingests as well
+            # as the vector store it writes, and the data source bucket carries
+            # its own encryption configuration.
+            source_encryption = _knowledge_base_source_encryption_findings(region)
+            if any(row["Status"] == "Failed" for row in source_encryption):
+                findings["status"] = "WARN"
+            findings["csv_data"].extend(source_encryption)
 
         except ClientError as e:
             error_code = e.response.get("Error", {}).get("Code", "")
@@ -9091,10 +10379,258 @@ def get_marketplace_endpoint_inventory(region: str = "") -> Dict[str, Any]:
     return inventory
 
 
-def check_bedrock_marketplace_endpoint_vpc(
-    region: str = "", endpoint_inventory: Dict[str, Any] = None
+MARKETPLACE_SUBNET_PRIVACY_FINDING = "Marketplace Model Endpoint Subnet Privacy"
+
+# One DescribeSubnets and one DescribeRouteTables call cover every endpoint, so
+# the cap only bounds the request size for an estate with many subnets.
+MAX_MARKETPLACE_SUBNETS_CHECKED = 50
+
+
+def _marketplace_endpoint_subnet_ids(item: Dict[str, Any]) -> List[str]:
+    """Return the subnet ids one Marketplace endpoint is registered with."""
+    endpoint_config = (item.get("detail") or {}).get("endpointConfig") or {}
+    sagemaker_config = endpoint_config.get("sageMaker")
+    if not isinstance(sagemaker_config, dict):
+        return []
+    vpc = sagemaker_config.get("vpc") or {}
+    return [
+        subnet_id
+        for subnet_id in _as_list(vpc.get("subnetIds"))
+        if isinstance(subnet_id, str) and subnet_id
+    ]
+
+
+def _subnet_route_privacy(
+    region: str, subnet_ids: List[str], ec2_client: Any = None
 ) -> Dict[str, Any]:
-    """BR-39: Require VPC subnets and security groups on Marketplace endpoints."""
+    """
+    Decide for each subnet whether its effective route table reaches an internet
+    gateway.
+
+    A subnet with no explicit route table association uses its VPC's main route
+    table, so a filter on association.subnet-id alone resolves no table for such
+    a subnet and an internet-routed subnet reads as private. Both associations
+    are resolved here: the explicit one first, then the VPC main table.
+
+    An egress-only internet gateway is not counted as public. It carries outbound
+    IPv6 only and cannot accept an inbound connection, which is the posture a NAT
+    gateway gives IPv4.
+    """
+    result: Dict[str, Any] = {
+        "public": {},
+        "private": [],
+        "unresolved": {},
+        "error": "",
+    }
+
+    checked = subnet_ids[:MAX_MARKETPLACE_SUBNETS_CHECKED]
+    for subnet_id in subnet_ids[MAX_MARKETPLACE_SUBNETS_CHECKED:]:
+        result["unresolved"][subnet_id] = (
+            f"the subnet walk stopped after {MAX_MARKETPLACE_SUBNETS_CHECKED} subnets"
+        )
+    if not checked:
+        return result
+
+    client = ec2_client or boto3.client("ec2", config=boto3_config, region_name=region)
+
+    try:
+        vpc_by_subnet = {}
+        paginator = client.get_paginator("describe_subnets")
+        for page in paginator.paginate(SubnetIds=checked):
+            for subnet in page.get("Subnets", []):
+                if subnet.get("SubnetId"):
+                    vpc_by_subnet[subnet["SubnetId"]] = subnet.get("VpcId") or ""
+    except ClientError as error:
+        result["error"] = get_assessment_error_label(error)
+        return result
+
+    for subnet_id in checked:
+        if subnet_id not in vpc_by_subnet:
+            result["unresolved"][subnet_id] = (
+                "the subnet is not present in this Region, so no route table could "
+                "be resolved for it"
+            )
+
+    vpc_ids = sorted({vpc_id for vpc_id in vpc_by_subnet.values() if vpc_id})
+    if not vpc_ids:
+        return result
+
+    try:
+        explicit = {}
+        main_by_vpc = {}
+        paginator = client.get_paginator("describe_route_tables")
+        for page in paginator.paginate(Filters=[{"Name": "vpc-id", "Values": vpc_ids}]):
+            for table in page.get("RouteTables", []):
+                for association in table.get("Associations", []):
+                    if association.get("Main"):
+                        main_by_vpc[table.get("VpcId") or ""] = table
+                    elif association.get("SubnetId"):
+                        explicit[association["SubnetId"]] = table
+    except ClientError as error:
+        result["error"] = get_assessment_error_label(error)
+        return result
+
+    for subnet_id, vpc_id in sorted(vpc_by_subnet.items()):
+        table = explicit.get(subnet_id) or main_by_vpc.get(vpc_id)
+        if table is None:
+            result["unresolved"][subnet_id] = (
+                "neither an explicit route table association nor a main route "
+                f"table was found in {vpc_id or 'its VPC'}"
+            )
+            continue
+
+        internet_routes = [
+            route
+            for route in table.get("Routes", [])
+            if str(route.get("GatewayId") or "").startswith("igw-")
+        ]
+        if internet_routes:
+            route = internet_routes[0]
+            destination = (
+                route.get("DestinationCidrBlock")
+                or route.get("DestinationIpv6CidrBlock")
+                or route.get("DestinationPrefixListId")
+                or "an unreported destination"
+            )
+            result["public"][subnet_id] = (
+                "route table {} sends {} to internet gateway {}".format(
+                    table.get("RouteTableId") or "unknown",
+                    destination,
+                    route.get("GatewayId"),
+                )
+            )
+        else:
+            result["private"].append(subnet_id)
+
+    return result
+
+
+def _marketplace_subnet_privacy_finding(
+    endpoint_arn: str,
+    subnet_ids: List[str],
+    privacy: Dict[str, Any],
+    reference: str,
+    region: str,
+) -> List[Dict[str, Any]]:
+    """Report one verdict per endpoint on the privacy of the subnets it uses."""
+    if privacy["error"]:
+        return [
+            create_finding(
+                check_id="BR-39",
+                finding_name=MARKETPLACE_SUBNET_PRIVACY_FINDING,
+                finding_details=(
+                    "The {} subnet(s) of Marketplace endpoint '{}' could not be "
+                    "resolved to a route table ({}), so whether the endpoint's "
+                    "network egress reaches the internet is unknown.".format(
+                        len(subnet_ids), endpoint_arn, privacy["error"]
+                    )
+                ),
+                resolution="Grant ec2:DescribeSubnets and ec2:DescribeRouteTables, then re-check that every endpoint subnet is private.",
+                reference=reference,
+                severity="Informational",
+                status="N/A",
+                region=region,
+            )
+        ]
+
+    public = [
+        (subnet_id, privacy["public"][subnet_id])
+        for subnet_id in subnet_ids
+        if subnet_id in privacy["public"]
+    ]
+    private = [subnet_id for subnet_id in subnet_ids if subnet_id in privacy["private"]]
+    unresolved = [
+        (subnet_id, privacy["unresolved"][subnet_id])
+        for subnet_id in subnet_ids
+        if subnet_id in privacy["unresolved"]
+    ]
+
+    if public:
+        return [
+            create_finding(
+                check_id="BR-39",
+                finding_name=MARKETPLACE_SUBNET_PRIVACY_FINDING,
+                finding_details=(
+                    "{} of {} subnet(s) of Marketplace endpoint '{}' route to an "
+                    "internet gateway, so the endpoint's inference container has a "
+                    "path off the VPC: {}.".format(
+                        len(public),
+                        len(subnet_ids),
+                        endpoint_arn,
+                        "; ".join(
+                            f"{subnet_id} ({reason})"
+                            for subnet_id, reason in public[:5]
+                        ),
+                    )
+                ),
+                resolution="Re-register the endpoint on subnets whose route tables carry no internet gateway route, and reach AWS services from them through VPC endpoints or a NAT gateway.",
+                reference=reference,
+                severity="High",
+                status="Failed",
+                region=region,
+            )
+        ]
+
+    if unresolved:
+        return [
+            create_finding(
+                check_id="BR-39",
+                finding_name=MARKETPLACE_SUBNET_PRIVACY_FINDING,
+                finding_details=(
+                    "{} of {} subnet(s) of Marketplace endpoint '{}' are private, and "
+                    "{} could not be resolved, so the endpoint is neither proven "
+                    "private nor proven public: {}.".format(
+                        len(private),
+                        len(subnet_ids),
+                        endpoint_arn,
+                        len(unresolved),
+                        "; ".join(
+                            f"{subnet_id} ({reason})"
+                            for subnet_id, reason in unresolved[:5]
+                        ),
+                    )
+                ),
+                resolution="Resolve each named subnet to its route table, either explicitly associated or the VPC main table, then re-check that it carries no internet gateway route.",
+                reference=reference,
+                severity="Informational",
+                status="N/A",
+                region=region,
+            )
+        ]
+
+    return [
+        create_finding(
+            check_id="BR-39",
+            finding_name=MARKETPLACE_SUBNET_PRIVACY_FINDING,
+            finding_details=(
+                "All {} subnet(s) of Marketplace endpoint '{}' are private: their "
+                "route tables carry no internet gateway route ({}).".format(
+                    len(private), endpoint_arn, ", ".join(private[:5])
+                )
+            ),
+            resolution="No action required for subnet privacy. Re-check it whenever the endpoint is re-registered or a route table changes.",
+            reference=reference,
+            severity="High",
+            status="Passed",
+            region=region,
+        )
+    ]
+
+
+def check_bedrock_marketplace_endpoint_vpc(
+    region: str = "",
+    endpoint_inventory: Dict[str, Any] = None,
+    ec2_client: Any = None,
+) -> Dict[str, Any]:
+    """
+    BR-39: Require VPC subnets and security groups on Marketplace endpoints.
+
+    AIR-FND-NET-01 asks for the inference network to be isolated, and a subnet id
+    on its own does not isolate anything: a subnet whose route table sends
+    0.0.0.0/0 to an internet gateway gives the endpoint's container the same
+    egress it would have with no VPC at all. Each registered subnet is therefore
+    resolved to its effective route table.
+    """
     findings = {"csv_data": []}
     reference = (
         "https://docs.aws.amazon.com/bedrock/latest/APIReference/"
@@ -9123,6 +10659,21 @@ def check_bedrock_marketplace_endpoint_vpc(
             )
         )
         return findings
+
+    # Every endpoint's subnets are resolved together so the route table walk
+    # costs two EC2 calls for the Region instead of two per endpoint.
+    all_subnet_ids = sorted(
+        {
+            subnet_id
+            for item in inventory.get("items", [])
+            for subnet_id in _marketplace_endpoint_subnet_ids(item)
+        }
+    )
+    subnet_privacy = (
+        _subnet_route_privacy(region, all_subnet_ids, ec2_client)
+        if all_subnet_ids
+        else {"public": {}, "private": [], "unresolved": {}, "error": ""}
+    )
 
     for item in inventory.get("items", []):
         endpoint_arn = item["summary"].get("endpointArn", "unknown")
@@ -9164,6 +10715,14 @@ def check_bedrock_marketplace_endpoint_vpc(
                 region=region,
             )
         )
+
+        endpoint_subnets = _marketplace_endpoint_subnet_ids(item)
+        if endpoint_subnets:
+            findings["csv_data"].extend(
+                _marketplace_subnet_privacy_finding(
+                    endpoint_arn, endpoint_subnets, subnet_privacy, reference, region
+                )
+            )
     for item in inventory.get("errors", []):
         findings["csv_data"].append(
             create_finding(
@@ -10695,6 +12254,13 @@ MAX_KNOWLEDGE_BASE_DATA_SOURCE_DESCRIBES = 50
 
 MAX_REPORTED_UNMONITORED_BUCKETS = 20
 
+CLASSIFICATION_JOB_FINDING = "Knowledge Base Source Classification Job Coverage"
+
+# JobStatus values that mean a scheduled job will run again. PAUSED, USER_PAUSED
+# and CANCELLED all leave the bucket uninspected from now on, and COMPLETE is the
+# terminal state of a one-time job.
+CLASSIFICATION_JOB_RECURRING_STATUSES = ("RUNNING", "IDLE")
+
 
 def _s3_bucket_name_from_arn(bucket_arn: Any) -> str:
     """
@@ -10890,6 +12456,145 @@ def _macie_discovery_precondition(macie_client) -> Dict[str, Any]:
     }
 
 
+def _classification_jobs_for_buckets(
+    macie_client, buckets: List[str]
+) -> Dict[str, Any]:
+    """
+    Index the Macie classification jobs that name any of ``buckets``.
+
+    ListClassificationJobs is the only job action read. DescribeClassificationJob
+    would be one call per job and carries nothing this leg needs, because
+    JobSummary already holds jobType, jobStatus, lastRunErrorStatus and the
+    bucketDefinitions that decide which bucket a job inspects.
+
+    A job that selects its buckets through ``bucketCriteria`` instead of naming
+    them in ``bucketDefinitions`` is counted separately: Macie evaluates those
+    criteria against the account's buckets when the job runs, so calling such a
+    job either coverage or not-coverage of a named bucket would be a guess.
+    """
+    wanted = set(buckets)
+    jobs_by_bucket: Dict[str, List[Dict[str, Any]]] = {}
+    criteria_jobs: List[str] = []
+
+    try:
+        paginator = macie_client.get_paginator("list_classification_jobs")
+        for page in paginator.paginate():
+            for job in page.get("items") or []:
+                named = {
+                    name
+                    for definition in job.get("bucketDefinitions") or []
+                    for name in definition.get("buckets") or []
+                }
+                summary = {
+                    "name": job.get("name") or job.get("jobId") or "an unnamed job",
+                    "type": str(job.get("jobType") or "").upper(),
+                    "status": str(job.get("jobStatus") or "").upper(),
+                    "last_run_error": str(
+                        (job.get("lastRunErrorStatus") or {}).get("code") or ""
+                    ).upper()
+                    == "ERROR",
+                }
+                if not named:
+                    if job.get("bucketCriteria"):
+                        criteria_jobs.append(summary["name"])
+                    continue
+                for name in sorted(named & wanted):
+                    jobs_by_bucket.setdefault(name, []).append(summary)
+    except ClientError as error:
+        return {
+            "readable": False,
+            "error": get_assessment_error_label(error),
+            "jobs_by_bucket": {},
+            "criteria_jobs": [],
+        }
+
+    return {
+        "readable": True,
+        "error": "",
+        "jobs_by_bucket": jobs_by_bucket,
+        "criteria_jobs": criteria_jobs,
+    }
+
+
+def _classification_job_coverage(
+    bucket: str, jobs: List[Dict[str, Any]]
+) -> Dict[str, Any]:
+    """
+    Decide whether the classification jobs naming one bucket keep classifying it.
+
+    Only a SCHEDULED job that is RUNNING or IDLE and whose last run did not error
+    inspects the objects a knowledge base ingests after the job was created. A
+    ONE_TIME job classified a point-in-time snapshot, so every later upload to an
+    ingestion bucket is unclassified, and that is reported as the reason the
+    bucket still fails rather than as coverage.
+    """
+    for job in jobs:
+        if (
+            job["type"] == "SCHEDULED"
+            and job["status"] in CLASSIFICATION_JOB_RECURRING_STATUSES
+            and not job["last_run_error"]
+        ):
+            return {
+                "covered": True,
+                "job": job,
+                "reason": "{} is classified by scheduled Macie job '{}' ({})".format(
+                    bucket, job["name"], job["status"]
+                ),
+            }
+
+    if not jobs:
+        return {
+            "covered": False,
+            "job": None,
+            "reason": (
+                f"No Macie classification job in this Region names {bucket} either."
+            ),
+        }
+
+    errored = [
+        job for job in jobs if job["type"] == "SCHEDULED" and job["last_run_error"]
+    ]
+    paused = [job for job in jobs if job["type"] == "SCHEDULED"]
+    one_time = [job for job in jobs if job["type"] == "ONE_TIME"]
+
+    if errored:
+        job = errored[0]
+        detail = (
+            "scheduled Macie job '{}' names it but reports lastRunErrorStatus "
+            "ERROR, so its last run classified nothing".format(job["name"])
+        )
+    elif paused:
+        job = paused[0]
+        detail = (
+            "the scheduled Macie job naming it, '{}', is {}, so it will not run "
+            "again".format(job["name"], job["status"] or "in an unreported state")
+        )
+    elif one_time:
+        job = one_time[0]
+        detail = (
+            "Macie job '{}' is ONE_TIME and {}, so it inspected a point-in-time "
+            "snapshot and nothing ingested since that run is classified".format(
+                job["name"], job["status"] or "in an unreported state"
+            )
+        )
+    else:
+        job = jobs[0]
+        detail = (
+            "Macie job '{}' reports jobType '{}' and jobStatus '{}', which is not a "
+            "scheduled job that will run again".format(
+                job["name"],
+                job["type"] or "unset",
+                job["status"] or "unset",
+            )
+        )
+
+    return {
+        "covered": False,
+        "job": job,
+        "reason": f"{len(jobs)} Macie classification job(s) name {bucket}, but {detail}.",
+    }
+
+
 def check_bedrock_knowledge_base_source_classification(
     region: str = "",
 ) -> Dict[str, Any]:
@@ -10907,6 +12612,12 @@ def check_bedrock_knowledge_base_source_classification(
     GetClassificationScope is deliberately not used: its s3 member is
     ``excludes.bucketNames``, an exclusion list, so a check built on it would
     pass precisely when the knowledge base buckets are excluded from discovery.
+
+    A bucket that automated discovery reports as NOT_MONITORED can still be
+    classified by a targeted classification job, so ListClassificationJobs is
+    read before any such bucket is failed. The job leg runs only where the
+    precondition above holds, because a Region with Macie switched off returns
+    early on the account-level state that FS-44 owns.
     """
     logger.debug("Starting check for knowledge base source data classification")
     check_name = "Knowledge Base Source Data Classification"
@@ -11113,6 +12824,40 @@ def check_bedrock_knowledge_base_source_classification(
                     "NOT_MONITORED"
                 )
 
+        # Automated discovery is one classification mechanism and a targeted job
+        # is the other, so the jobs are read before any NOT_MONITORED bucket is
+        # failed: failing a bucket that a scheduled job classifies on every run
+        # would be a false positive against AIR-FND-DAT-03. The job list is only
+        # read when a bucket is failing, because that is the only verdict it can
+        # change, and an account where discovery covers every source bucket
+        # should not pay a second Macie call for it.
+        job_index = (
+            _classification_jobs_for_buckets(macie_client, source_buckets)
+            if unmonitored
+            else {
+                "readable": True,
+                "error": "",
+                "jobs_by_bucket": {},
+                "criteria_jobs": [],
+            }
+        )
+        job_covered = []
+        still_unmonitored = []
+        for source in unmonitored:
+            verdict = (
+                _classification_job_coverage(
+                    source["bucket"],
+                    job_index["jobs_by_bucket"].get(source["bucket"]) or [],
+                )
+                if job_index["readable"]
+                else {"covered": False, "reason": ""}
+            )
+            if verdict["covered"]:
+                job_covered.append({**source, "reason": verdict["reason"]})
+            else:
+                still_unmonitored.append({**source, "job_note": verdict["reason"]})
+        unmonitored = still_unmonitored
+
         for source in unmonitored[:MAX_REPORTED_UNMONITORED_BUCKETS]:
             findings["status"] = "WARN"
             findings["csv_data"].append(
@@ -11123,8 +12868,10 @@ def check_bedrock_knowledge_base_source_classification(
                         "Automated sensitive data discovery is enabled in this "
                         "Region, but bucket {} is NOT_MONITORED and it is the "
                         "ingestion source for {}, so sensitive data in it is not "
-                        "classified before a retrieval can surface it.".format(
-                            source["bucket"], source["label"]
+                        "classified before a retrieval can surface it.{}".format(
+                            source["bucket"],
+                            source["label"],
+                            f" {source['job_note']}" if source["job_note"] else "",
                         )
                     ),
                     resolution="Remove the bucket from the Macie classification scope exclusions so automated sensitive data discovery monitors it, and carry the classification result into per-document metadata so retrieval can filter on it.",
@@ -11207,6 +12954,81 @@ def check_bedrock_knowledge_base_source_classification(
                 )
             )
 
+        if job_covered:
+            findings["csv_data"].append(
+                create_finding(
+                    check_id="BR-46",
+                    finding_name=CLASSIFICATION_JOB_FINDING,
+                    finding_details=(
+                        "{} of {} knowledge base source bucket(s) are NOT_MONITORED by "
+                        "automated sensitive data discovery, but a recurring Macie "
+                        "classification job inspects each of them: {}. A job run is "
+                        "not a triaged finding, so confirm the sensitive data the job "
+                        "reports is reviewed and carried into per-document "
+                        "metadata.".format(
+                            len(job_covered),
+                            len(inventory["s3_sources"]),
+                            "; ".join(item["reason"] for item in job_covered[:5]),
+                        )
+                    ),
+                    resolution="No action required for classification coverage. Confirm the scheduled job keeps running and that the sensitive data it reports is triaged.",
+                    reference=KNOWLEDGE_BASE_CLASSIFICATION_REFERENCE,
+                    severity="Medium",
+                    status="Passed",
+                    region=region,
+                )
+            )
+
+        # Both rows below are emitted only while a bucket is still failing,
+        # because that is the only verdict a job list could have changed.
+        if unmonitored and not job_index["readable"]:
+            findings["csv_data"].append(
+                create_finding(
+                    check_id="BR-46",
+                    finding_name=CLASSIFICATION_JOB_FINDING,
+                    finding_details=(
+                        "The Macie classification job list could not be read ({}), so "
+                        "whether a targeted job classifies the {} NOT_MONITORED "
+                        "knowledge base source bucket(s) ({}) is unknown and the "
+                        "monitoring verdict above stands on automated discovery "
+                        "alone.".format(
+                            job_index["error"],
+                            len(unmonitored),
+                            ", ".join(item["bucket"] for item in unmonitored[:5]),
+                        )
+                    ),
+                    resolution="Grant macie2:ListClassificationJobs and retry before acting on the NOT_MONITORED buckets above.",
+                    reference=KNOWLEDGE_BASE_CLASSIFICATION_REFERENCE,
+                    severity="Informational",
+                    status="N/A",
+                    region=region,
+                )
+            )
+
+        if unmonitored and job_index["criteria_jobs"]:
+            findings["csv_data"].append(
+                create_finding(
+                    check_id="BR-46",
+                    finding_name=CLASSIFICATION_JOB_FINDING,
+                    finding_details=(
+                        "{} Macie classification job(s) ({}) select their buckets with "
+                        "bucketCriteria instead of naming them, so whether they cover "
+                        "the {} NOT_MONITORED knowledge base source bucket(s) ({}) "
+                        "cannot be read from the job list.".format(
+                            len(job_index["criteria_jobs"]),
+                            ", ".join(job_index["criteria_jobs"][:5]),
+                            len(unmonitored),
+                            ", ".join(item["bucket"] for item in unmonitored[:5]),
+                        )
+                    ),
+                    resolution="Name each knowledge base source bucket in the job's bucketDefinitions, or confirm in the Macie console that the job's bucket criteria select it.",
+                    reference=KNOWLEDGE_BASE_CLASSIFICATION_REFERENCE,
+                    severity="Informational",
+                    status="N/A",
+                    region=region,
+                )
+            )
+
         if inventory["truncated"]:
             findings["csv_data"].append(
                 create_finding(
@@ -11243,6 +13065,1339 @@ def check_bedrock_knowledge_base_source_classification(
                     finding_details=build_could_not_assess_detail(e, region),
                     resolution=COULD_NOT_ASSESS_RESOLUTION,
                     reference=KNOWLEDGE_BASE_CLASSIFICATION_REFERENCE,
+                    severity="Informational",
+                    status="N/A",
+                    region=region,
+                )
+            ],
+        }
+
+
+AI_DATA_PATH_TLS_REFERENCE = (
+    "https://docs.aws.amazon.com/AmazonS3/latest/userguide/security-best-practices.html"
+)
+
+# aws:SecureTransport is false on a plaintext request, so only a Deny that tests
+# the key as false blocks HTTP. A Deny testing it as true blocks the encrypted
+# traffic instead, which is why the value is matched and not only the key.
+SECURE_TRANSPORT_CONDITION_KEY = "aws:securetransport"
+
+SECURE_TRANSPORT_OPERATORS = ("bool", "boolifexists")
+
+# The documented TLS-only bucket policy denies s3:* so that a future object or
+# bucket action is covered without editing the policy. A Deny naming individual
+# actions leaves every unnamed action reachable over HTTP, so the action entry
+# has to cover the whole s3 family rather than one member of it.
+S3_ALL_ACTIONS = "s3:*"
+
+MAX_REPORTED_PLAINTEXT_BUCKETS = 20
+
+
+def _strip_condition_set_operator(operator: Any) -> str:
+    """
+    Drop a ForAllValues:/ForAnyValue: set-operator prefix from a condition operator.
+
+    IAM carries the set operator on the operator name and not on the condition
+    key, so "ForAllValues:Bool" is a Bool test. Matching the operator without
+    stripping the prefix reads an enforcing statement as absent.
+    """
+    text = str(operator).strip().lower()
+    if ":" in text:
+        text = text.split(":", 1)[1]
+    return text
+
+
+def _statement_denies_plaintext_transport(statement: Dict[str, Any]) -> bool:
+    """Return True when a Deny statement is conditioned on aws:SecureTransport false."""
+    if str(statement.get("Effect", "")).upper() != "DENY":
+        return False
+
+    for operator, key, values in _condition_keys_by_operator(statement):
+        if _strip_condition_set_operator(operator) not in SECURE_TRANSPORT_OPERATORS:
+            continue
+        if key != SECURE_TRANSPORT_CONDITION_KEY:
+            continue
+        if values and all(str(value).strip().lower() == "false" for value in values):
+            return True
+    return False
+
+
+def _deny_principal_reach(statement: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Describe which principals a bucket-policy Deny statement reaches.
+
+    A Deny that names principals reaches only those, so every other identity
+    keeps plaintext access. NotPrincipal inverts the set: the named identities
+    are the ones the Deny does not reach.
+    """
+    if "NotPrincipal" in statement:
+        excluded = sorted(
+            str(value)
+            for values in (
+                statement["NotPrincipal"].values()
+                if isinstance(statement["NotPrincipal"], dict)
+                else [statement["NotPrincipal"]]
+            )
+            for value in _as_list(values)
+        )
+        return {
+            "all_principals": False,
+            "described": "every principal except {}".format(
+                ", ".join(excluded[:5]) or "an unreadable NotPrincipal entry"
+            ),
+        }
+
+    principal = statement.get("Principal")
+    entries = [
+        str(value)
+        for values in (
+            principal.values() if isinstance(principal, dict) else [principal]
+        )
+        for value in _as_list(values)
+    ]
+    if not entries:
+        return {
+            "all_principals": False,
+            "described": "no principal, so the statement reaches nothing",
+        }
+    if any(entry.strip() == "*" for entry in entries):
+        return {"all_principals": True, "described": "every principal"}
+    return {
+        "all_principals": False,
+        "described": "only {}".format(", ".join(sorted(entries)[:5])),
+    }
+
+
+def _deny_resource_reach(statement: Dict[str, Any], bucket: str) -> Dict[str, bool]:
+    """
+    Report whether a Deny statement's Resource entries reach the bucket and its
+    objects.
+
+    Both are needed: a Deny over arn:aws:s3:::bucket alone leaves GetObject
+    reachable over HTTP, and a Deny over arn:aws:s3:::bucket/* alone leaves the
+    bucket-level actions reachable. A key pattern narrower than "*" covers only
+    part of the object namespace, so it is not credited.
+    """
+    reach = {"bucket": False, "objects": False}
+    for resource in _as_list(statement.get("Resource")):
+        if not isinstance(resource, str):
+            continue
+        value = resource.strip()
+        if value == "*":
+            return {"bucket": True, "objects": True}
+        if ":::" not in value:
+            continue
+        name, separator, key = value.split(":::", 1)[1].partition("/")
+        if name not in (bucket, "*"):
+            continue
+        if not separator:
+            reach["bucket"] = True
+        elif key == "*":
+            reach["objects"] = True
+    return reach
+
+
+def _bucket_tls_enforcement(bucket: str, policy_document: Any) -> Dict[str, Any]:
+    """
+    Decide whether a bucket policy denies every plaintext request to the bucket.
+
+    ``reasons`` names what each candidate Deny statement failed to reach so the
+    finding can say which principals, resources or actions stay reachable over
+    HTTP instead of reporting only that the bucket is non-compliant.
+    """
+    candidates = 0
+    reasons = []
+
+    for statement in _policy_statements(policy_document):
+        if not _statement_denies_plaintext_transport(statement):
+            continue
+        candidates += 1
+        statement_id = str(statement.get("Sid") or f"statement {candidates}")
+
+        gaps = []
+        principals = _deny_principal_reach(statement)
+        if not principals["all_principals"]:
+            gaps.append(f"it reaches {principals['described']}")
+
+        resource_reach = _deny_resource_reach(statement, bucket)
+        missing = [
+            scope for scope in ("bucket", "objects") if not resource_reach[scope]
+        ]
+        if missing:
+            gaps.append(
+                "its Resource entries do not cover the {}".format(
+                    " or the ".join(missing)
+                )
+            )
+
+        if "NotAction" in statement:
+            gaps.append(
+                "it uses NotAction, so which actions it denies cannot be established"
+            )
+        elif not any(
+            _action_pattern_covers(action, S3_ALL_ACTIONS)
+            for action in _as_list(statement.get("Action"))
+        ):
+            gaps.append(
+                "its Action entries do not cover the whole s3 family, so any "
+                "unnamed action stays reachable over HTTP"
+            )
+
+        if not gaps:
+            return {
+                "enforced": True,
+                "detail": (
+                    f"'{statement_id}' denies s3:* to every principal over both "
+                    f"arn:aws:s3:::{bucket} and its objects when "
+                    "aws:SecureTransport is false"
+                ),
+            }
+        reasons.append(f"'{statement_id}' does not enforce because {'; '.join(gaps)}")
+
+    if not candidates:
+        return {
+            "enforced": False,
+            "detail": (
+                "the bucket policy has no Deny statement conditioned on "
+                "aws:SecureTransport being false, so any request to it may use "
+                "plaintext HTTP"
+            ),
+        }
+
+    return {
+        "enforced": False,
+        "detail": "{} Deny statement(s) test aws:SecureTransport but none of them "
+        "closes the bucket: {}".format(candidates, "; ".join(reasons[:5])),
+    }
+
+
+def _ai_data_path_buckets(region: str = "") -> Dict[str, Any]:
+    """
+    Resolve the S3 buckets that Bedrock reads training data from and writes
+    inference records to.
+
+    Knowledge base data sources carry the retrieval corpus and the model
+    invocation log destination carries prompts and completions, so both sit on
+    the AI data path. Each bucket is resolved once and the labels are collected,
+    because one bucket often serves several knowledge bases.
+    """
+    buckets: Dict[str, List[str]] = {}
+    errors = []
+
+    try:
+        inventory = _knowledge_base_s3_sources(region)
+    except Exception as error:
+        errors.append(
+            f"knowledge base data sources: {get_assessment_error_label(error)}"
+        )
+    else:
+        errors.extend(inventory["errors"])
+        for source in inventory["s3_sources"]:
+            buckets.setdefault(source["bucket"], []).append(source["label"])
+
+    try:
+        bedrock_client = boto3.client(
+            "bedrock", config=boto3_config, region_name=region
+        )
+        response = bedrock_client.get_model_invocation_logging_configuration()
+        logging_bucket = _extract_s3_bucket_name(
+            (response.get("loggingConfig") or {}).get("s3Config")
+        )
+    except Exception as error:
+        logging_bucket = None
+        errors.append(
+            f"model invocation logging configuration: {get_assessment_error_label(error)}"
+        )
+
+    if logging_bucket:
+        buckets.setdefault(logging_bucket, []).append(
+            "the model invocation log destination"
+        )
+
+    return {"buckets": buckets, "errors": errors}
+
+
+def check_bedrock_data_path_bucket_tls(region: str = "") -> Dict[str, Any]:
+    """
+    BR-47: Verify every S3 bucket on the Bedrock data path denies plaintext
+    requests, so training corpora and inference records cannot be read or written
+    over HTTP.
+
+    S3 accepts both HTTP and HTTPS on the same endpoint and the only per-bucket
+    control over that is a bucket policy Deny conditioned on aws:SecureTransport,
+    so the check reads the policy rather than any bucket setting. A missing bucket
+    policy is a failure and not an unassessed state: with no policy, plaintext
+    requests are accepted.
+    """
+    logger.debug("Starting check for Bedrock data path bucket TLS enforcement")
+    check_name = "Bedrock Data Path Bucket TLS Enforcement"
+    try:
+        findings = {
+            "check_name": check_name,
+            "status": "PASS",
+            "details": "",
+            "csv_data": [],
+        }
+
+        inventory = _ai_data_path_buckets(region)
+
+        if inventory["errors"]:
+            findings["csv_data"].append(
+                create_finding(
+                    check_id="BR-47",
+                    finding_name=check_name,
+                    finding_details=(
+                        "{} data path read(s) failed, so the bucket list is "
+                        "incomplete and a bucket missing from it is not evidence "
+                        "that it enforces TLS: {}.".format(
+                            len(inventory["errors"]),
+                            "; ".join(inventory["errors"][:5]),
+                        )
+                    ),
+                    resolution=(
+                        "Grant bedrock:ListKnowledgeBases, bedrock:ListDataSources, "
+                        "bedrock:GetDataSource and "
+                        "bedrock:GetModelInvocationLoggingConfiguration, then retry."
+                    ),
+                    reference=AI_DATA_PATH_TLS_REFERENCE,
+                    severity="Informational",
+                    status="N/A",
+                    region=region,
+                )
+            )
+
+        if not inventory["buckets"]:
+            findings["csv_data"].append(
+                create_finding(
+                    check_id="BR-47",
+                    finding_name=check_name,
+                    finding_details=(
+                        "No knowledge base ingests from an S3 bucket in {} and no "
+                        "model invocation log destination is configured, so there is "
+                        "no data path bucket whose transport can be "
+                        "assessed.".format(region or "this region")
+                    ),
+                    resolution="No action required",
+                    reference=AI_DATA_PATH_TLS_REFERENCE,
+                    severity="Informational",
+                    status="N/A",
+                    region=region,
+                )
+            )
+            return findings
+
+        s3_client = boto3.client("s3", config=boto3_config, region_name=region)
+        enforced = []
+        plaintext = []
+        indeterminate = []
+
+        for bucket in sorted(inventory["buckets"]):
+            labels = "; ".join(sorted(inventory["buckets"][bucket])[:3])
+            try:
+                policy = s3_client.get_bucket_policy(Bucket=bucket)
+            except ClientError as error:
+                code = error.response.get("Error", {}).get("Code", "")
+                if code == "NoSuchBucketPolicy":
+                    plaintext.append(
+                        {
+                            "bucket": bucket,
+                            "labels": labels,
+                            "detail": (
+                                "it has no bucket policy at all, so every request to "
+                                "it is accepted over plaintext HTTP"
+                            ),
+                        }
+                    )
+                    continue
+                indeterminate.append(
+                    f"{bucket} ({labels}): its bucket policy could not be read "
+                    f"({get_assessment_error_label(error)}), which is a permissions "
+                    "or location problem and not evidence that TLS is unenforced"
+                )
+                continue
+            except Exception as error:
+                indeterminate.append(
+                    f"{bucket} ({labels}): its bucket policy could not be read "
+                    f"({get_assessment_error_label(error)})"
+                )
+                continue
+
+            try:
+                assessment = _bucket_tls_enforcement(bucket, policy.get("Policy"))
+            except (ValueError, TypeError) as error:
+                indeterminate.append(
+                    f"{bucket} ({labels}): its bucket policy is not readable JSON "
+                    f"({get_assessment_error_label(error)})"
+                )
+                continue
+
+            if assessment["enforced"]:
+                enforced.append(f"{bucket} ({labels}): {assessment['detail']}")
+            else:
+                plaintext.append(
+                    {
+                        "bucket": bucket,
+                        "labels": labels,
+                        "detail": assessment["detail"],
+                    }
+                )
+
+        for entry in plaintext[:MAX_REPORTED_PLAINTEXT_BUCKETS]:
+            findings["status"] = "WARN"
+            findings["csv_data"].append(
+                create_finding(
+                    check_id="BR-47",
+                    finding_name=check_name,
+                    finding_details=(
+                        "Bucket {} is on the Bedrock data path as {} and {}.".format(
+                            entry["bucket"], entry["labels"], entry["detail"]
+                        )
+                    ),
+                    resolution=(
+                        'Add a bucket policy statement with "Effect": "Deny", '
+                        '"Principal": "*", "Action": "s3:*", both '
+                        "arn:aws:s3:::<bucket> and arn:aws:s3:::<bucket>/* in "
+                        'Resource, and "Condition": {"Bool": '
+                        '{"aws:SecureTransport": "false"}}.'
+                    ),
+                    reference=AI_DATA_PATH_TLS_REFERENCE,
+                    severity="High",
+                    status="Failed",
+                    region=region,
+                )
+            )
+
+        if len(plaintext) > MAX_REPORTED_PLAINTEXT_BUCKETS:
+            findings["csv_data"].append(
+                create_finding(
+                    check_id="BR-47",
+                    finding_name=check_name,
+                    finding_details=(
+                        "{} further data path bucket(s) accept plaintext requests "
+                        "beyond the {} reported individually: {}.".format(
+                            len(plaintext) - MAX_REPORTED_PLAINTEXT_BUCKETS,
+                            MAX_REPORTED_PLAINTEXT_BUCKETS,
+                            ", ".join(
+                                entry["bucket"]
+                                for entry in plaintext[MAX_REPORTED_PLAINTEXT_BUCKETS:][
+                                    :20
+                                ]
+                            ),
+                        )
+                    ),
+                    resolution=(
+                        "Apply the same aws:SecureTransport Deny statement to each "
+                        "of these buckets."
+                    ),
+                    reference=AI_DATA_PATH_TLS_REFERENCE,
+                    severity="High",
+                    status="Failed",
+                    region=region,
+                )
+            )
+
+        if enforced:
+            findings["csv_data"].append(
+                create_finding(
+                    check_id="BR-47",
+                    finding_name=check_name,
+                    finding_details=(
+                        "{} of {} Bedrock data path bucket(s) deny every plaintext "
+                        "request: {}.".format(
+                            len(enforced),
+                            len(inventory["buckets"]),
+                            "; ".join(enforced[:5]),
+                        )
+                    ),
+                    resolution=(
+                        "No action required. Re-check whenever a knowledge base data "
+                        "source or a log destination adds a bucket."
+                    ),
+                    reference=AI_DATA_PATH_TLS_REFERENCE,
+                    severity="Medium",
+                    status="Passed",
+                    region=region,
+                )
+            )
+
+        if indeterminate:
+            findings["csv_data"].append(
+                create_finding(
+                    check_id="BR-47",
+                    finding_name=check_name,
+                    finding_details=(
+                        "{} Bedrock data path bucket(s) have no readable bucket "
+                        "policy, so they are neither proven to enforce TLS nor proven "
+                        "to accept plaintext: {}.".format(
+                            len(indeterminate), "; ".join(indeterminate[:5])
+                        )
+                    ),
+                    resolution=(
+                        "Grant s3:GetBucketPolicy on these buckets, or run the "
+                        "assessment from the account and Region that owns them, then "
+                        "re-check the transport condition."
+                    ),
+                    reference=AI_DATA_PATH_TLS_REFERENCE,
+                    severity="Informational",
+                    status="N/A",
+                    region=region,
+                )
+            )
+
+        return findings
+
+    except Exception as e:
+        logger.error(
+            f"Error in check_bedrock_data_path_bucket_tls: {str(e)}", exc_info=True
+        )
+        return {
+            "check_name": check_name,
+            "status": "ERROR",
+            "details": f"Error during check: {str(e)}",
+            "csv_data": [
+                create_finding(
+                    check_id="BR-47",
+                    finding_name=check_name,
+                    finding_details=build_could_not_assess_detail(e, region),
+                    resolution=COULD_NOT_ASSESS_RESOLUTION,
+                    reference=AI_DATA_PATH_TLS_REFERENCE,
+                    severity="Informational",
+                    status="N/A",
+                    region=region,
+                )
+            ],
+        }
+
+
+AI_SERVICES_OPT_OUT_REFERENCE = "https://docs.aws.amazon.com/organizations/latest/userguide/orgs_manage_policies_ai-opt-out.html"
+
+AI_SERVICES_OPT_OUT_POLICY_TYPE = "AISERVICES_OPT_OUT_POLICY"
+
+# The policy document keys every service section by its lowercase service name
+# and uses "default" for the section that applies to every AI service.
+AI_OPT_OUT_DEFAULT_SERVICE = "default"
+
+AI_OPT_OUT_VALUE = "optout"
+
+AI_OPT_IN_VALUE = "optin"
+
+# The child-override operator list sits beside the value in the source document.
+# Any of these being delegated lets a child OU or account re-enable a service the
+# organization opted out of, which the effective policy cannot show because it is
+# the already-merged result.
+AI_OPT_OUT_CHILD_OPERATORS_KEY = "@@operators_allowed_for_child_policies"
+
+# DescribeEffectivePolicy answers per target and is not paginated, so a member
+# account reads its own resolved policy with one call.
+AI_OPT_OUT_UNREACHABLE_CODES = {
+    "AWSOrganizationsNotInUseException",
+    "UnsupportedAPIEndpointException",
+}
+
+AI_OPT_OUT_ABSENT_CODES = {
+    "EffectivePolicyNotFoundException",
+    "PolicyTypeNotEnabledException",
+}
+
+
+def _ai_services_opt_out_value(node: Any) -> Dict[str, Any]:
+    """
+    Read one service section's opt_out_policy value.
+
+    DescribeEffectivePolicy returns the merged document with the inheritance
+    operators resolved, so the value is the string itself. DescribePolicy keeps
+    the operator, so the same field is {"@@assign": "optOut"} in the source
+    document; ``wrapped`` records that the value arrived from an operator so a
+    caller cannot mistake a source document for an effective one.
+    """
+    if isinstance(node, str):
+        return {"value": node.strip().lower(), "wrapped": False}
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if str(key).startswith("@@") and isinstance(value, str):
+                return {"value": value.strip().lower(), "wrapped": True}
+    return {"value": "", "wrapped": False}
+
+
+def _ai_services_opt_out_scope(policy_content: Any) -> Dict[str, Any]:
+    """
+    Describe which AI services an effective opt-out policy opts the account out of.
+
+    ``default`` governs every service that has no section of its own, so a
+    service section set to optIn re-enables content use for that service even
+    when the default opts out.
+    """
+    document = (
+        json.loads(policy_content)
+        if isinstance(policy_content, str)
+        else (policy_content)
+    )
+    services = (document or {}).get("services")
+    if not isinstance(services, dict):
+        return {
+            "parsed": False,
+            "default": "",
+            "opted_out": [],
+            "opted_in": [],
+            "unresolved": [],
+            "wrapped": False,
+        }
+
+    scope = {
+        "parsed": True,
+        "default": "",
+        "opted_out": [],
+        "opted_in": [],
+        "unresolved": [],
+        "wrapped": False,
+    }
+    for name, section in services.items():
+        service = str(name).strip().lower()
+        read = _ai_services_opt_out_value(
+            section.get("opt_out_policy") if isinstance(section, dict) else None
+        )
+        scope["wrapped"] = scope["wrapped"] or read["wrapped"]
+        if service == AI_OPT_OUT_DEFAULT_SERVICE:
+            scope["default"] = read["value"]
+
+        if read["value"] == AI_OPT_OUT_VALUE:
+            if service != AI_OPT_OUT_DEFAULT_SERVICE:
+                scope["opted_out"].append(service)
+        elif read["value"] == AI_OPT_IN_VALUE:
+            if service != AI_OPT_OUT_DEFAULT_SERVICE:
+                scope["opted_in"].append(service)
+        else:
+            scope["unresolved"].append(
+                f"{service} carries opt_out_policy "
+                f"'{read['value'] or 'nothing readable'}'"
+            )
+
+    scope["opted_out"].sort()
+    scope["opted_in"].sort()
+    return scope
+
+
+def _ai_services_opt_out_child_overrides() -> Dict[str, Any]:
+    """
+    Report which source opt-out policies let a child policy change the value.
+
+    The source document is read only for @@operators_allowed_for_child_policies:
+    the effective document is the merged result and has no operators left in it,
+    so it cannot answer whether an OU below the attachment point may opt a
+    service back in. ListPolicies and DescribePolicy answer only in the
+    management account, so a member-account run reports the leg as unassessed
+    instead of reporting no delegation.
+    """
+    result = {"readable": False, "delegating": [], "errors": []}
+    context = _organization_policy_context()
+    if not context["readable"]:
+        result["detail"] = context["detail"]
+        return result
+
+    orgs_client = boto3.client("organizations", config=boto3_config)
+    try:
+        policies = _list_all_items(
+            orgs_client,
+            "list_policies",
+            "Policies",
+            max_results_param="MaxResults",
+            token_param="NextToken",
+            token_response_keys=("NextToken",),
+            max_results=20,
+            Filter=AI_SERVICES_OPT_OUT_POLICY_TYPE,
+        )
+    except Exception as error:
+        result["errors"].append(
+            f"the opt-out policy list could not be read: "
+            f"{get_assessment_error_label(error)}"
+        )
+        return result
+
+    result["readable"] = True
+    for policy in policies:
+        policy_id = policy.get("Id")
+        if not policy_id:
+            continue
+        policy_name = policy.get("Name") or policy_id
+        try:
+            detail = orgs_client.describe_policy(PolicyId=policy_id)
+        except Exception as error:
+            result["errors"].append(
+                f"policy '{policy_name}': {get_assessment_error_label(error)}"
+            )
+            continue
+
+        content = (detail or {}).get("Policy", {}).get("Content")
+        try:
+            document = json.loads(content) if isinstance(content, str) else content
+        except ValueError as error:
+            result["errors"].append(
+                f"policy '{policy_name}': its document is not readable JSON "
+                f"({get_assessment_error_label(error)})"
+            )
+            continue
+
+        delegated = sorted(_collect_child_operator_delegations(document))
+        if delegated:
+            result["delegating"].append(
+                f"'{policy_name}' delegates {', '.join(delegated)} to child policies"
+            )
+
+    return result
+
+
+def _collect_child_operator_delegations(node: Any) -> set:
+    """Collect every operator an opt-out policy document delegates to children."""
+    delegated = set()
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if str(key) == AI_OPT_OUT_CHILD_OPERATORS_KEY:
+                delegated.update(
+                    str(operator) for operator in _as_list(value) if operator
+                )
+                continue
+            delegated.update(_collect_child_operator_delegations(value))
+    elif isinstance(node, list):
+        for child in node:
+            delegated.update(_collect_child_operator_delegations(child))
+    return delegated
+
+
+def check_bedrock_ai_services_opt_out(region: str = "") -> Dict[str, Any]:
+    """
+    BR-48: Verify an AWS Organizations AI services opt-out policy resolves for
+    this account, so prompts and completions are not retained or used to improve
+    the service.
+
+    The verdict comes from DescribeEffectivePolicy because that is what actually
+    applies to the account: it is the merged result of every policy from the root
+    down. Without such a policy the account is opted in, which is why an absent
+    effective policy is a failure and not an unassessed state.
+    """
+    logger.debug("Starting check for AI services opt-out policy")
+    check_name = "AI Services Opt-Out Policy Enforcement"
+    try:
+        findings = {
+            "check_name": check_name,
+            "status": "PASS",
+            "details": "",
+            "csv_data": [],
+        }
+
+        orgs_client = boto3.client("organizations", config=boto3_config)
+        try:
+            response = orgs_client.describe_effective_policy(
+                PolicyType=AI_SERVICES_OPT_OUT_POLICY_TYPE
+            )
+        except ClientError as error:
+            code = error.response.get("Error", {}).get("Code", "")
+            if code in AI_OPT_OUT_ABSENT_CODES:
+                findings["status"] = "WARN"
+                findings["csv_data"].append(
+                    create_finding(
+                        check_id="BR-48",
+                        finding_name=check_name,
+                        finding_details=(
+                            "No AI services opt-out policy resolves for this account "
+                            f"({code}), so every AI service including Amazon Bedrock "
+                            "runs under the opted-in default and content may be "
+                            "stored and used for service improvement."
+                        ),
+                        resolution=(
+                            "Enable the AISERVICES_OPT_OUT_POLICY type on the "
+                            "organization root, then attach a policy setting "
+                            'services.default.opt_out_policy to "optOut".'
+                        ),
+                        reference=AI_SERVICES_OPT_OUT_REFERENCE,
+                        severity="High",
+                        status="Failed",
+                        region=region,
+                    )
+                )
+                return findings
+
+            if code in AI_OPT_OUT_UNREACHABLE_CODES | ACCESS_DENIED_ERROR_CODES:
+                findings["csv_data"].append(
+                    create_finding(
+                        check_id="BR-48",
+                        finding_name=check_name,
+                        finding_details=(
+                            "The effective AI services opt-out policy could not be "
+                            f"read ({get_assessment_error_label(error)}), so whether "
+                            "this account is opted out was not established. An "
+                            "account outside an organization has no opt-out policy to "
+                            "read and has to set the preference per service instead."
+                        ),
+                        resolution=(
+                            "Grant organizations:DescribeEffectivePolicy to the "
+                            "assessment role, or record the per-service opt-out "
+                            "preference for an account that is not in an "
+                            "organization, then retry."
+                        ),
+                        reference=AI_SERVICES_OPT_OUT_REFERENCE,
+                        severity="Informational",
+                        status="N/A",
+                        region=region,
+                    )
+                )
+                return findings
+            raise
+
+        policy = (response or {}).get("EffectivePolicy") or {}
+        try:
+            scope = _ai_services_opt_out_scope(policy.get("PolicyContent"))
+        except ValueError as error:
+            findings["csv_data"].append(
+                create_finding(
+                    check_id="BR-48",
+                    finding_name=check_name,
+                    finding_details=(
+                        "The effective AI services opt-out policy was returned but "
+                        "its document is not readable JSON "
+                        f"({get_assessment_error_label(error)}), so whether this "
+                        "account is opted out was not established."
+                    ),
+                    resolution=COULD_NOT_ASSESS_RESOLUTION,
+                    reference=AI_SERVICES_OPT_OUT_REFERENCE,
+                    severity="Informational",
+                    status="N/A",
+                    region=region,
+                )
+            )
+            return findings
+
+        if not scope["parsed"]:
+            findings["csv_data"].append(
+                create_finding(
+                    check_id="BR-48",
+                    finding_name=check_name,
+                    finding_details=(
+                        "The effective AI services opt-out policy for target "
+                        f"{policy.get('TargetId') or 'unknown'} carries no services "
+                        "section, so which services it opts out of was not "
+                        "established."
+                    ),
+                    resolution=(
+                        "Review the attached AI services opt-out policies and "
+                        "confirm each one sets services.default.opt_out_policy."
+                    ),
+                    reference=AI_SERVICES_OPT_OUT_REFERENCE,
+                    severity="Informational",
+                    status="N/A",
+                    region=region,
+                )
+            )
+            return findings
+
+        # The child-override leg is secondary: an error reading the source
+        # documents must not discard the effective-policy verdict, which is the
+        # answer an operator acts on.
+        try:
+            overrides = _ai_services_opt_out_child_overrides()
+        except Exception as error:
+            overrides = {
+                "readable": False,
+                "delegating": [],
+                "errors": [
+                    "the source opt-out policy documents could not be read: "
+                    f"{get_assessment_error_label(error)}"
+                ],
+            }
+
+        child_clause = (
+            " Child policies may change it: {}.".format(
+                "; ".join(overrides["delegating"][:3])
+            )
+            if overrides["delegating"]
+            else " No source policy delegates the value to a child policy."
+            if overrides["readable"] and not overrides["errors"]
+            else " Whether a child policy may change the value was not assessed "
+            "because the source policy documents were not readable from this "
+            "account."
+        )
+
+        default_opts_out = scope["default"] == AI_OPT_OUT_VALUE
+
+        if default_opts_out and not scope["opted_in"]:
+            findings["csv_data"].append(
+                create_finding(
+                    check_id="BR-48",
+                    finding_name=check_name,
+                    finding_details=(
+                        "The effective AI services opt-out policy for target {} sets "
+                        "services.default.opt_out_policy to optOut and no service "
+                        "section opts back in, so Amazon Bedrock content is not "
+                        "stored or used for service improvement.{}".format(
+                            policy.get("TargetId") or "this account", child_clause
+                        )
+                    ),
+                    resolution=(
+                        "No action required. Re-check whenever a service section is "
+                        "added to the policy."
+                    ),
+                    reference=AI_SERVICES_OPT_OUT_REFERENCE,
+                    severity="Medium",
+                    status="Passed",
+                    region=region,
+                )
+            )
+        elif default_opts_out:
+            findings["status"] = "WARN"
+            findings["csv_data"].append(
+                create_finding(
+                    check_id="BR-48",
+                    finding_name=check_name,
+                    finding_details=(
+                        "The effective AI services opt-out policy for target {} opts "
+                        "out by default, but {} service section(s) opt back in: {}. "
+                        "Content handled by those services may be stored and used "
+                        "for service improvement.{}".format(
+                            policy.get("TargetId") or "this account",
+                            len(scope["opted_in"]),
+                            ", ".join(scope["opted_in"]),
+                            child_clause,
+                        )
+                    ),
+                    resolution=(
+                        "Set opt_out_policy to optOut for each service section that "
+                        "currently reads optIn, or delete the section so the default "
+                        "applies to it."
+                    ),
+                    reference=AI_SERVICES_OPT_OUT_REFERENCE,
+                    severity="High",
+                    status="Failed",
+                    region=region,
+                )
+            )
+        else:
+            findings["status"] = "WARN"
+            findings["csv_data"].append(
+                create_finding(
+                    check_id="BR-48",
+                    finding_name=check_name,
+                    finding_details=(
+                        "The effective AI services opt-out policy for target {} does "
+                        "not opt out by default (services.default.opt_out_policy is "
+                        "{}), so every AI service without its own optOut section runs "
+                        "under the opted-in default. {} service section(s) opt out "
+                        "individually: {}.{}".format(
+                            policy.get("TargetId") or "this account",
+                            scope["default"] or "absent",
+                            len(scope["opted_out"]),
+                            ", ".join(scope["opted_out"]) or "none",
+                            child_clause,
+                        )
+                    ),
+                    resolution=(
+                        'Set services.default.opt_out_policy to "optOut" in the '
+                        "policy attached highest in the organization, so a service "
+                        "added later is opted out without another policy change."
+                    ),
+                    reference=AI_SERVICES_OPT_OUT_REFERENCE,
+                    severity="High",
+                    status="Failed",
+                    region=region,
+                )
+            )
+
+        if scope["unresolved"]:
+            findings["csv_data"].append(
+                create_finding(
+                    check_id="BR-48",
+                    finding_name=check_name,
+                    finding_details=(
+                        "{} service section(s) in the effective AI services opt-out "
+                        "policy carry no readable opt_out_policy value, so they are "
+                        "neither opted in nor opted out for reporting: {}.".format(
+                            len(scope["unresolved"]), "; ".join(scope["unresolved"][:5])
+                        )
+                    ),
+                    resolution=(
+                        "Correct these service sections so each one sets "
+                        'opt_out_policy to "optOut" or "optIn".'
+                    ),
+                    reference=AI_SERVICES_OPT_OUT_REFERENCE,
+                    severity="Informational",
+                    status="N/A",
+                    region=region,
+                )
+            )
+
+        if overrides["errors"]:
+            findings["csv_data"].append(
+                create_finding(
+                    check_id="BR-48",
+                    finding_name=check_name,
+                    finding_details=(
+                        "{} source opt-out policy read(s) failed, so whether a child "
+                        "policy may re-enable a service was not established: "
+                        "{}.".format(
+                            len(overrides["errors"]),
+                            "; ".join(overrides["errors"][:5]),
+                        )
+                    ),
+                    resolution=(
+                        "Grant organizations:ListPolicies and "
+                        "organizations:DescribePolicy, then retry before concluding "
+                        "that no child policy may change the opt-out value."
+                    ),
+                    reference=AI_SERVICES_OPT_OUT_REFERENCE,
+                    severity="Informational",
+                    status="N/A",
+                    region=region,
+                )
+            )
+
+        return findings
+
+    except Exception as e:
+        logger.error(
+            f"Error in check_bedrock_ai_services_opt_out: {str(e)}", exc_info=True
+        )
+        return {
+            "check_name": check_name,
+            "status": "ERROR",
+            "details": f"Error during check: {str(e)}",
+            "csv_data": [
+                create_finding(
+                    check_id="BR-48",
+                    finding_name=check_name,
+                    finding_details=build_could_not_assess_detail(e, region),
+                    resolution=COULD_NOT_ASSESS_RESOLUTION,
+                    reference=AI_SERVICES_OPT_OUT_REFERENCE,
+                    severity="Informational",
+                    status="N/A",
+                    region=region,
+                )
+            ],
+        }
+
+
+GUARDRAIL_DENY_REFERENCE = "https://docs.aws.amazon.com/bedrock/latest/userguide/guardrails-permissions-id.html"
+
+# The IAM actions that accept bedrock:GuardrailIdentifier. The enforcement page
+# lists four inference APIs, but Converse and ConverseStream have no IAM action
+# of their own: they are authorized by bedrock:InvokeModel and
+# bedrock:InvokeModelWithResponseStream, so a Deny over these two already
+# reaches all four, and bedrock:Converse is rejected as INVALID_ACTION.
+GUARDRAIL_ENFORCED_INVOKE_ACTIONS = (
+    "bedrock:InvokeModel",
+    "bedrock:InvokeModelWithResponseStream",
+)
+
+MAX_REPORTED_UNGUARDED_IDENTITIES = 10
+
+
+def _statement_requires_guardrail_identifier(statement: Dict[str, Any]) -> bool:
+    """
+    Return True when a Deny statement's condition blocks a call that carries no
+    approved guardrail.
+
+    Only a negated or Null test enforces. StringEquals on a Deny rejects the
+    approved guardrail and permits every other value, and a negated operator
+    matches when the key is absent, which is what blocks an unguarded call.
+    ``Null`` has to be true for the same reason: Null false denies exactly the
+    requests that do name a guardrail.
+    """
+    for operator, key, values in _condition_keys_by_operator(statement):
+        operator = _strip_condition_set_operator(operator)
+        if GUARDRAIL_CONDITION_KEY not in key:
+            continue
+        if operator == "null":
+            if values and all(str(value).strip().lower() == "true" for value in values):
+                return True
+            continue
+        if "not" in operator:
+            return True
+    return False
+
+
+def _statement_invoke_actions(statement: Dict[str, Any]) -> List[str]:
+    """Return the guardrail-capable invoke actions one statement's Action covers."""
+    actions = _as_list(statement.get("Action"))
+    return [
+        invoke_action
+        for invoke_action in GUARDRAIL_ENFORCED_INVOKE_ACTIONS
+        if any(
+            _action_pattern_covers(action, invoke_action.lower()) for action in actions
+        )
+    ]
+
+
+def _identity_guardrail_deny_coverage(policies: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Describe how far an identity's policies deny unguarded model invocation.
+
+    ``allowed`` is what the identity may invoke and ``denied`` is what a
+    conditioned Deny takes back, so the gap between them is the set of actions
+    the identity can still call with no guardrail attached.
+    """
+    allowed = set()
+    denied = set()
+    uncredited = []
+    unreadable = []
+
+    for policy in policies:
+        document = policy.get("document")
+        try:
+            statements = _policy_statements(document)
+        except (ValueError, TypeError) as error:
+            unreadable.append(
+                "policy '{}': {}".format(
+                    policy.get("policy_name") or policy.get("name") or "unnamed",
+                    get_assessment_error_label(error),
+                )
+            )
+            continue
+
+        for statement in statements:
+            covered = _statement_invoke_actions(statement)
+            if not covered:
+                continue
+
+            effect = str(statement.get("Effect", "")).upper()
+            if effect == "ALLOW":
+                allowed.update(covered)
+                continue
+            if effect != "DENY":
+                continue
+            if not _statement_requires_guardrail_identifier(statement):
+                continue
+
+            resources = _as_list(statement.get("Resource"))
+            if not any(_resource_is_unscoped(resource) for resource in resources):
+                uncredited.append(
+                    "a Deny on {} is scoped to {}, so it leaves every other model "
+                    "invocable without a guardrail".format(
+                        ", ".join(covered),
+                        ", ".join(str(resource) for resource in resources[:3])
+                        or "no Resource at all",
+                    )
+                )
+                continue
+            denied.update(covered)
+
+    return {
+        "allowed": sorted(allowed),
+        "denied": sorted(denied),
+        "uncovered": sorted(allowed - denied),
+        "uncredited": uncredited,
+        "unreadable": unreadable,
+    }
+
+
+def check_bedrock_guardrail_invocation_deny(
+    permission_cache, region: str = ""
+) -> Dict[str, Any]:
+    """
+    BR-49: Verify each identity that can invoke a Bedrock model is also denied
+    invocation without an approved guardrail, on both invoke actions, which
+    also authorize Converse and ConverseStream.
+
+    BR-10 reads the Allow side and only for InvokeModel and
+    InvokeModelWithResponseStream: an Allow carrying a
+    bedrock:GuardrailIdentifier condition restricts which guardrail may be named
+    but does not stop a second Allow statement, or another policy, from
+    permitting the same call with no guardrail at all. Only a Deny does that, so
+    this check asserts the Deny and names the actions it misses. BR-41 asserts
+    the account and organization enforcement surfaces
+    (ListEnforcedGuardrailsConfiguration and the Organizations Bedrock policy),
+    which are a different mechanism from an identity policy.
+    """
+    logger.debug("Starting check for guardrail invocation Deny enforcement")
+    check_name = "Guardrail Invocation Deny Enforcement"
+    try:
+        findings = {
+            "check_name": check_name,
+            "status": "PASS",
+            "details": "",
+            "csv_data": [],
+        }
+
+        identities = []
+        for collection, kind in (
+            ("role_permissions", "role"),
+            ("user_permissions", "user"),
+        ):
+            for name, permissions in (permission_cache.get(collection) or {}).items():
+                identities.append(
+                    (
+                        f"{kind} '{name}'",
+                        (permissions.get("attached_policies") or [])
+                        + (permissions.get("inline_policies") or []),
+                    )
+                )
+
+        unguarded = []
+        guarded = []
+        notes = []
+
+        for label, policies in identities:
+            coverage = _identity_guardrail_deny_coverage(policies)
+            notes.extend(f"{label}: {note}" for note in coverage["unreadable"])
+            if not coverage["allowed"]:
+                continue
+            if coverage["uncovered"]:
+                unguarded.append(
+                    {
+                        "label": label,
+                        "coverage": coverage,
+                    }
+                )
+            else:
+                guarded.append(
+                    "{} is denied all of {} without an approved guardrail".format(
+                        label, ", ".join(coverage["denied"])
+                    )
+                )
+
+        if not unguarded and not guarded:
+            findings["csv_data"].append(
+                create_finding(
+                    check_id="BR-49",
+                    finding_name=check_name,
+                    finding_details=(
+                        "No cached role or user policy allows any of {}, so there is "
+                        "no identity whose guardrail enforcement can be "
+                        "assessed.".format(", ".join(GUARDRAIL_ENFORCED_INVOKE_ACTIONS))
+                    ),
+                    resolution="No action required",
+                    reference=GUARDRAIL_DENY_REFERENCE,
+                    severity="Informational",
+                    status="N/A",
+                    region=region,
+                )
+            )
+            return findings
+
+        for entry in unguarded[:MAX_REPORTED_UNGUARDED_IDENTITIES]:
+            coverage = entry["coverage"]
+            findings["status"] = "WARN"
+            findings["csv_data"].append(
+                create_finding(
+                    check_id="BR-49",
+                    finding_name=check_name,
+                    finding_details=(
+                        "{} may call {} with no guardrail attached, because no policy "
+                        "on it denies {} unless the request carries an approved "
+                        "bedrock:GuardrailIdentifier{}.".format(
+                            entry["label"],
+                            ", ".join(coverage["allowed"]),
+                            ", ".join(coverage["uncovered"]),
+                            "; " + "; ".join(coverage["uncredited"][:2])
+                            if coverage["uncredited"]
+                            else "",
+                        )
+                    ),
+                    resolution=(
+                        "Add a Deny statement covering bedrock:InvokeModel and "
+                        "bedrock:InvokeModelWithResponseStream, which also authorize "
+                        'Converse and ConverseStream, on Resource "*" with '
+                        '"Condition": {"Null": {"bedrock:GuardrailIdentifier": '
+                        '"true"}}, or StringNotEquals against the approved guardrail '
+                        "ARNs."
+                    ),
+                    reference=GUARDRAIL_DENY_REFERENCE,
+                    severity="High",
+                    status="Failed",
+                    region=region,
+                )
+            )
+
+        if len(unguarded) > MAX_REPORTED_UNGUARDED_IDENTITIES:
+            findings["csv_data"].append(
+                create_finding(
+                    check_id="BR-49",
+                    finding_name=check_name,
+                    finding_details=(
+                        "{} further identity/identities can invoke a model without a "
+                        "guardrail beyond the {} reported individually: {}.".format(
+                            len(unguarded) - MAX_REPORTED_UNGUARDED_IDENTITIES,
+                            MAX_REPORTED_UNGUARDED_IDENTITIES,
+                            ", ".join(
+                                entry["label"]
+                                for entry in unguarded[
+                                    MAX_REPORTED_UNGUARDED_IDENTITIES:
+                                ][:20]
+                            ),
+                        )
+                    ),
+                    resolution=(
+                        "Apply the same conditioned Deny to each of these identities, "
+                        "or attach it once as a permissions boundary."
+                    ),
+                    reference=GUARDRAIL_DENY_REFERENCE,
+                    severity="High",
+                    status="Failed",
+                    region=region,
+                )
+            )
+
+        if guarded:
+            findings["csv_data"].append(
+                create_finding(
+                    check_id="BR-49",
+                    finding_name=check_name,
+                    finding_details=(
+                        "{} of {} identity/identities that can invoke a Bedrock model "
+                        "are denied every guardrail-capable action they hold unless "
+                        "the request names an approved guardrail: {}.".format(
+                            len(guarded),
+                            len(guarded) + len(unguarded),
+                            "; ".join(guarded[:5]),
+                        )
+                    ),
+                    resolution=(
+                        "No action required. Re-check whenever an invoke permission "
+                        "is added, because the Deny has to name the new action."
+                    ),
+                    reference=GUARDRAIL_DENY_REFERENCE,
+                    severity="Medium",
+                    status="Passed",
+                    region=region,
+                )
+            )
+
+        if notes:
+            findings["csv_data"].append(
+                create_finding(
+                    check_id="BR-49",
+                    finding_name=check_name,
+                    finding_details=(
+                        "{} cached policy document(s) could not be parsed, so the "
+                        "identities holding them may deny unguarded invocation in a "
+                        "statement this check did not read: {}.".format(
+                            len(notes), "; ".join(notes[:5])
+                        )
+                    ),
+                    resolution=(
+                        "Review the IAM Permission Caching task output for these "
+                        "policies, then rerun the assessment."
+                    ),
+                    reference=GUARDRAIL_DENY_REFERENCE,
+                    severity="Informational",
+                    status="N/A",
+                    region=region,
+                )
+            )
+
+        return findings
+
+    except Exception as e:
+        logger.error(
+            f"Error in check_bedrock_guardrail_invocation_deny: {str(e)}", exc_info=True
+        )
+        return {
+            "check_name": check_name,
+            "status": "ERROR",
+            "details": f"Error during check: {str(e)}",
+            "csv_data": [
+                create_finding(
+                    check_id="BR-49",
+                    finding_name=check_name,
+                    finding_details=build_could_not_assess_detail(e, region),
+                    resolution=COULD_NOT_ASSESS_RESOLUTION,
+                    reference=GUARDRAIL_DENY_REFERENCE,
                     severity="Informational",
                     status="N/A",
                     region=region,
@@ -11614,6 +14769,24 @@ def lambda_handler(event, context):
                 )
             )
 
+            logger.info("Running AI services opt-out policy check (BR-48)")
+            all_findings.append(
+                check_bedrock_ai_services_opt_out(region=GLOBAL_REGION_LABEL)
+            )
+
+            logger.info("Running guardrail invocation Deny check (BR-49)")
+            all_findings.append(
+                _permission_cache_unavailable_result(
+                    "BR-49",
+                    "Guardrail Invocation Deny Enforcement",
+                    GLOBAL_REGION_LABEL,
+                )
+                if permission_cache is None
+                else check_bedrock_guardrail_invocation_deny(
+                    permission_cache, region=GLOBAL_REGION_LABEL
+                )
+            )
+
         # Regional checks (BR-16 through BR-25)
         logger.info("Running guardrail tier validation check (BR-16)")
         guardrail_tier_findings = check_bedrock_guardrail_tier(region=region)
@@ -11758,6 +14931,9 @@ def lambda_handler(event, context):
         all_findings.append(
             check_bedrock_knowledge_base_source_classification(region=region)
         )
+
+        logger.info("Running data path bucket TLS check (BR-47)")
+        all_findings.append(check_bedrock_data_path_bucket_tls(region=region))
 
         logger.info("Building Agentic AI Security findings from Bedrock results")
         all_findings.append(build_agentic_bedrock_security_findings(all_findings))
