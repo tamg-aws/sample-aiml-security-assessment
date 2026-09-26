@@ -221,7 +221,21 @@ class TestRegistryEntry(unittest.TestCase):
         self.assertEqual(derivable + remaining, in_scope)
         self.assertIn("not evidence of compliance", scope)
         self.assertIn("<strong>not</strong> counted", scope)
-        self.assertIn("218-check total", scope)
+        # check_ledger.py gate 12 asserts the catalog total four ways, one of them
+        # derived from the check registry itself, so pin the sentence's shape here
+        # and leave the figure to that gate. A literal here is a stale fifth copy.
+        self.assertRegex(scope, r"framework's \d+-check total")
+        covered, covered_denominator, covered_no_row = (
+            int(n)
+            for n in re.search(
+                r"(\d+) of the (\d+) are covered by checks.*?"
+                r"the (\d+) covered controls without a row",
+                scope,
+                re.S,
+            ).groups()
+        )
+        self.assertEqual(covered_denominator, in_scope)
+        self.assertEqual(derivable + covered_no_row, covered)
 
     def test_ids_are_unique_and_the_coverage_id_is_not_allocated(self):
         ids = [m["check_id"] for m in aisf_mappings.AISF_DERIVED_MAP]

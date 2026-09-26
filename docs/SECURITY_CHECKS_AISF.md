@@ -57,7 +57,7 @@ map, gate 12 fails if the control text baked into the map drifts from the
 AISF control definition, and gate 13 fails if an id does not carry the
 registered `AISF-` prefix or is missing from this catalogue.
 
-**`AISF-` rows are not counted in the framework's 218-check total.** They carry
+**`AISF-` rows are not counted in the framework's 249-check total.** They carry
 no new assertion, so counting them would double-count the incumbent check. They
 are excluded from the report's pass-rate denominator and from Open Action Items
 for the same reason, which is how OWASP-mapped rows already behave.
@@ -235,9 +235,9 @@ contributes to, so a reader of `bedrock_security_report_*.csv` can trace a row
 back to the framework. The `Status` column still carries the verdict.
 
 Measured by `check_ledger.py` gate 14, which prints each of these figures on
-every run: 49 check-control pairs over 41 tagged checks in 4 modules, naming 46
+every run: 87 check-control pairs over 72 tagged checks in 4 modules, naming 63
 distinct controls. Tagged checks per module are bedrock 17, sagemaker 11,
-agentcore 12, agent_registry 1.
+agentcore 42, agent_registry 2.
 
 ### The qualifier is what makes a `tighten` control safe to name
 
@@ -253,12 +253,11 @@ trusting the literal in the file:
 | `AISF AIR-SGM-TRN-05 (1 of 3 checks)` | the control is covered, but jointly, so no single leg asserts it |
 | `AISF AIR-BDR-MDL-08 (partial)` | the check asserts less than the control requires, and the gap is open in the ledger |
 
-Census at the current head, also printed by gate 14: 26 bare, 18 `(partial)`, 5
-joint. The 26 bare tags plus the two jointly covered controls, `AIR-BDR-MDL-02`
-over 2 checks and `AIR-SGM-TRN-05` over 3, account for the 28 `covered`
-controls; the 18 `(partial)` tags are the 18 `tighten` controls, one tag each. A
-bare tag on a `tighten` row, or a dropped `(1 of N)`, fails gate 14 with the
-row's verdict and incumbent count named.
+Census at the current head, also printed by gate 14: 43 bare, 3 `(partial)`, 41
+joint. The 43 bare tags plus the 18 jointly covered controls account for the 61
+`covered` controls; the 3 `(partial)` tags fall on the 2 `tighten` controls, one
+of which carries two. A bare tag on a `tighten` row, or a dropped `(1 of N)`,
+fails gate 14 with the row's verdict and incumbent count named.
 
 A check that contributes to several controls carries them pipe-joined, with the
 `AISF ` prefix repeated on each element so a consumer that splits on `|` gets a

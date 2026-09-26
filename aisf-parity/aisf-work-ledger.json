@@ -16,7 +16,6 @@
     "new_check_functions": 13,
     "extensions": 1,
     "extra_iam_actions": [
-      "ec2:DescribeSecurityGroups",
       "events:ListRules",
       "events:ListTargetsByRule",
       "macie2:DescribeClassificationJob",
@@ -1749,10 +1748,8 @@
       "incumbent_names": [
         "AgentCore Runtime VPC Configuration"
       ],
-      "gap": "overlaps RT-08; resolve the two together",
-      "extra_iam": [
-        "ec2:DescribeSecurityGroups"
-      ],
+      "gap": "overlaps RT-08; resolve the two together. AC-01 already reads security-group egress under the ec2:DescribeSecurityGroups grant the template carries for RT-08, so this row claims no further IAM of its own",
+      "extra_iam": [],
       "phase": 5,
       "source": "controls/baseline/network-isolation.yaml"
     }

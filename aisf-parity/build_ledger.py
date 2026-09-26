@@ -835,8 +835,10 @@ ROWS = [
         None,
         "agentcore_assessments",
         ["AC-01"],
-        "overlaps RT-08; resolve the two together",
-        ["ec2:DescribeSecurityGroups"],
+        "overlaps RT-08; resolve the two together. AC-01 already reads security-group egress "
+        "under the ec2:DescribeSecurityGroups grant the template carries for RT-08, so this row "
+        "claims no further IAM of its own",
+        [],
         5,
     ),
 ]

@@ -1,6 +1,6 @@
 # Security Checks Reference
 
-This document provides a comprehensive reference for all 218 security checks performed by the AI/ML Security Assessment framework (104 core checks across Amazon Bedrock, Amazon SageMaker AI, Amazon Bedrock AgentCore, and AWS Agent Registry, 38 Agentic AI Security checks, 64 Responsible AI GRC checks, and 12 OWASP Top 10 for LLM checks).
+This document provides a comprehensive reference for all 249 security checks performed by the AI/ML Security Assessment framework (135 core checks across Amazon Bedrock, Amazon SageMaker AI, Amazon Bedrock AgentCore, and AWS Agent Registry, 38 Agentic AI Security checks, 64 Responsible AI GRC checks, and 12 OWASP Top 10 for LLM checks).
 
 Sources differ by bucket and are not interchangeable: the core Bedrock, SageMaker, AgentCore, and AWS Agent Registry checks derive from the AWS Well-Architected **Generative AI Lens** security best practices (`gensec*`) and service security documentation; the Agentic AI Security checks from the AWS Well-Architected **Agentic AI Lens**; the `FS-*` **Responsible AI GRC** checks from the AWS GRC User Guide; and the `OW-*` checks from the OWASP Top 10 for LLM. The AWS Well-Architected **Responsible AI Lens** is not a source for any of them — see [Responsible AI GRC — scope, sources, and compatibility](RESPONSIBLE_AI_GRC_SCOPE.md).
 
@@ -15,8 +15,8 @@ The 64 Responsible AI GRC checks occupy 69 `FS-*` numbers: 64 ship as standalone
 - [Status Values](#status-values)
 - [Amazon SageMaker AI Security Checks (33)](#amazon-sagemaker-ai-security-checks-33)
 - [Amazon Bedrock Security Checks (46)](#amazon-bedrock-security-checks-46)
-- [Amazon Bedrock AgentCore Security Checks (17)](#amazon-bedrock-agentcore-security-checks-17)
-- [AWS Agent Registry Security Checks (8)](#aws-agent-registry-security-checks-8)
+- [Amazon Bedrock AgentCore Security Checks (47)](#amazon-bedrock-agentcore-security-checks-47)
+- [AWS Agent Registry Security Checks (9)](#aws-agent-registry-security-checks-9)
 - [Agentic AI Security Checks (38)](#agentic-ai-security-checks-38)
 - [Responsible AI GRC Checks (64)](#responsible-ai-grc-checks-64-additional-5-upstream-extensions)
 - [OWASP Top 10 for LLM Checks (12)](#owasp-top-10-for-llm-checks-12)
@@ -555,7 +555,7 @@ inventory is never treated as evidence of compliance.
 
 ---
 
-## Amazon Bedrock AgentCore Security Checks (17)
+## Amazon Bedrock AgentCore Security Checks (47)
 
 ### AC-01: Runtime Amazon VPC Configuration
 
@@ -794,7 +794,7 @@ inventory is never treated as evidence of compliance.
 
 ---
 
-## AWS Agent Registry Security Checks (8)
+## AWS Agent Registry Security Checks (9)
 
 AWS Agent Registry checks use the `AR-XX` namespace and run in a dedicated
 regional Lambda that writes its own CSV artifact and HTML report area. They are

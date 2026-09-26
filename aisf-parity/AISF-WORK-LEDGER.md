@@ -17,7 +17,6 @@ Generated 2026-09-25 by `aisf-parity/build_ledger.py`. Do not hand-edit: change 
 
 ## New IAM actions required
 
-- `ec2:DescribeSecurityGroups` — AIR-FND-NET-06
 - `events:ListRules` — AIR-ACR-REG-02
 - `events:ListTargetsByRule` — AIR-ACR-REG-02
 - `macie2:DescribeClassificationJob` — AIR-FND-DAT-03
@@ -122,4 +121,4 @@ Generated 2026-09-25 by `aisf-parity/build_ledger.py`. Do not hand-edit: change 
 | `AIR-FND-NET-01` | unassessed | — | `agentcore_assessments`, `sagemaker_assessments` | `AC-01`, `SM-11` | spans two modules; candidate incumbents only. 'AI workloads run privately' has no single host, which is why the FND area has no module of its own |
 | `AIR-FND-NET-02` | unassessed | — | `agentcore_assessments` | `AC-08` | candidate incumbent only; dedup not run |
 | `AIR-FND-NET-04` | unassessed | — | `agentcore_assessments` | `AG-27` | hosted where the incumbent lives. AG-27 reads webAclArn off the gateway and needs no wafv2 permission, so the association leg costs nothing; the inspection leg the control asks for is the web ACL's rule content, which needs wafv2:GetWebACL. That action is granted only to the GRC function, and that module runs only when the execution input carries enableResponsibleAIGRC, so hosting the row there would make it conditional. The subject narrows to AgentCore gateways |
-| `AIR-FND-NET-06` | unassessed | — | `agentcore_assessments` | `AC-01` | overlaps RT-08; resolve the two together |
+| `AIR-FND-NET-06` | unassessed | — | `agentcore_assessments` | `AC-01` | overlaps RT-08; resolve the two together. AC-01 already reads security-group egress under the ec2:DescribeSecurityGroups grant the template carries for RT-08, so this row claims no further IAM of its own |
