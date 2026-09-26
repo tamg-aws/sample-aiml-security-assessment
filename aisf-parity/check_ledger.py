@@ -8,11 +8,13 @@ Run:  python3 aisf-parity/check_ledger.py
 Exit 0 = all gates pass. Exit 1 = at least one gate failed.
 """
 
+import ast
 import collections
 import glob
 import importlib.util
 import json
 import os
+import pathlib
 import re
 import subprocess
 import sys
@@ -773,6 +775,100 @@ def emitted_check_ids():
     return out
 
 
+CHECK_ID_SHAPE = re.compile(r"^[A-Z]{2,3}-\d{2}$")
+
+
+def emitted_finding_names():
+    """check_id -> set of finding names its findings publish.
+
+    Parsed, not grepped, because `finding_name=` is a bare literal at some call
+    sites and a variable at others -- a module-level constant in some modules and
+    a function-local in others. A regex over the literal form alone sees roughly
+    half the corpus and reads the rest as publishing nothing, which is the
+    direction that makes a name assertion pass for want of evidence.
+
+    `create_finding(check_id, finding_name, ...)` is called with keywords in some
+    modules and positionally in others, and agent_registry routes most of its
+    findings through wrappers (`_na`, `_inventory_start`, `_registry_errors`) that
+    forward the same two values at a different index -- `_inventory_start` takes
+    the inventory first, so the id is its second argument. Keying on a roster of
+    emitter function names would therefore have to be extended for every new
+    wrapper, and would read a module it does not know about as publishing nothing.
+    So this keys on the argument's VALUE shape instead: the first check-id-shaped
+    string constant in the call is the id, and the argument after it is the name.
+    A new wrapper is picked up without being listed.
+
+    An unresolvable name is recorded as an `UNRESOLVED<...>` sentinel rather than
+    dropped, so a call site this cannot read can never be mistaken for agreement.
+    """
+    out = {}
+    for path in glob.glob(os.path.join(MODULES, "*", "app.py")):
+        with open(path) as f:
+            src = f.read()
+        try:
+            tree = ast.parse(src)
+        except SyntaxError:
+            continue
+
+        def string_consts(body):
+            found = {}
+            for node in body:
+                if isinstance(node, ast.Assign) and isinstance(
+                    node.value, ast.Constant
+                ):
+                    if isinstance(node.value.value, str):
+                        for t in node.targets:
+                            if isinstance(t, ast.Name):
+                                found[t.id] = node.value.value
+            return found
+
+        module_consts = string_consts(tree.body)
+        for fn in [
+            n
+            for n in ast.walk(tree)
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+        ]:
+            scope = dict(module_consts)
+            scope.update(string_consts(list(ast.walk(fn))))
+
+            def resolve(node):
+                if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                    return node.value
+                if isinstance(node, ast.Name):
+                    return scope.get(node.id, f"UNRESOLVED<name {node.id}>")
+                return f"UNRESOLVED<{type(node).__name__}>"
+
+            for call in [n for n in ast.walk(fn) if isinstance(n, ast.Call)]:
+                kw = {k.arg: k.value for k in call.keywords}
+                cid_node, name_node = kw.get("check_id"), kw.get("finding_name")
+                if cid_node is None:
+                    for i, arg in enumerate(call.args):
+                        if (
+                            isinstance(arg, ast.Constant)
+                            and isinstance(arg.value, str)
+                            and CHECK_ID_SHAPE.match(arg.value)
+                        ):
+                            cid_node = arg
+                            if name_node is None and i + 1 < len(call.args):
+                                name_node = call.args[i + 1]
+                            break
+                if not (
+                    isinstance(cid_node, ast.Constant)
+                    and isinstance(cid_node.value, str)
+                    and CHECK_ID_SHAPE.match(cid_node.value)
+                ):
+                    continue
+                if name_node is None:
+                    value = "UNRESOLVED<finding_name absent>"
+                else:
+                    value = resolve(name_node)
+                    # A second id in the same call is a list of ids, not a name.
+                    if CHECK_ID_SHAPE.match(value):
+                        continue
+                out.setdefault(cid_node.value, set()).add(value)
+    return out
+
+
 def main():
     doc = load_ledger()
     rows = doc["rows"]
@@ -826,14 +922,52 @@ def main():
         + (f", workload-specific={wrong}" if wrong else ""),
     )
 
-    # ---- gate 4: every incumbent named actually exists in the codebase.
+    # ---- gate 4: every incumbent named actually exists in the codebase, and the
+    # name the ledger prints for it is one that check really publishes.
+    #
+    # The second leg exists because the first one passed while 12 of 78 rows
+    # printed an incumbent id beside an empty name list. build_ledger looked the
+    # name up under `if i in INCUMBENT_NAMES`, so every check phase 3 added --
+    # BR-41..BR-46, SM-31..SM-34, plus BR-07 -- resolved to nothing and was
+    # dropped without a word. Existence and naming are asserted together here so
+    # that adding a check id to a row cannot outrun recording what it publishes.
     named = sorted({i for r in rows for i in r["incumbents"]})
     absent = [i for i in named if i not in emitted]
+
+    published = emitted_finding_names()
+    unnamed = sorted(
+        {i for r in rows for i in r["incumbents"] if not r["incumbent_names"]}
+    )
+    # Element type first, and as a gate rather than an exception. Three ids map to
+    # a tuple of two names because they publish two, and a lookup that forgets to
+    # flatten puts the tuple itself in the list. `name.startswith` then raises
+    # AttributeError mid-gate, exit 1 with zero [FAIL] lines printed and every
+    # later gate's verdict lost -- a failure that reads like a crash in the
+    # harness rather than a defect in the ledger.
+    mistyped = [
+        f"{r['control']}: {name!r} is {type(name).__name__}, not str"
+        for r in rows
+        for name in r["incumbent_names"]
+        if not isinstance(name, str)
+    ]
+    wrong_name = []
+    for r in rows:
+        for name in r["incumbent_names"]:
+            if not isinstance(name, str) or name.startswith("UNRESOLVED<"):
+                continue
+            if not any(name in published.get(i, set()) for i in r["incumbents"]):
+                wrong_name.append(
+                    f"{r['control']}: {name!r} published by none of {r['incumbents']}"
+                )
     gate(
-        "every incumbent check_id exists in a module",
-        not absent,
-        f"{len(named) - len(absent)}/{len(named)} found"
-        + (f", absent={absent}" if absent else ""),
+        "every incumbent exists and is named as it publishes",
+        not absent and not unnamed and not mistyped and not wrong_name,
+        f"{len(named) - len(absent)}/{len(named)} found, "
+        f"{len(named) - len(unnamed)}/{len(named)} named"
+        + (f", absent={absent}" if absent else "")
+        + (f", unnamed={unnamed}" if unnamed else "")
+        + (f", mistyped={mistyped}" if mistyped else "")
+        + (f", wrong_name={wrong_name}" if wrong_name else ""),
     )
 
     # ---- gate 5: an incumbent must live in the row's target module.
@@ -915,24 +1049,35 @@ def main():
     )
 
     # ---- gate 9: the partition sums, and the published totals match the rows.
+    # The partition covers EVERY row, not just the hosted ones. The earlier form
+    # summed four verdicts over all 78 rows and compared the total to the 67
+    # hosted rows, which reconciled only because all 11 FND rows happened to be
+    # `unassessed` and `unassessed` was not one of the four terms. Finishing the
+    # dedup pass would have turned a correct ledger red, and -- worse in the
+    # other direction -- an FND row left `covered` by mistake would have pushed
+    # the sum to 68 and been read as a partition error rather than as the
+    # verdict it is. The two population sizes are asserted on their own.
     hosted = [r for r in rows if r["area"] in hosted_areas]
+    fnd = [r for r in rows if r["area"] == "FND"]
     part = (
         summary["covered"]
         + summary["tighten"]
         + summary["new"]
         + summary["not_implementable"]
+        + summary["unassessed"]
     )
     ok = (
-        part == len(hosted) == 67
+        part == summary["total"] == len(rows)
+        and len(hosted) == 67
+        and len(fnd) == 11
         and summary["tighten_extend"] + summary["tighten_new_id"] == summary["tighten"]
-        and summary["total"] == len(rows)
         and summary["new_check_functions"]
         == summary["new"] + summary["tighten_new_id"] + summary["unassessed"]
     )
     gate(
         "published totals reconcile against the rows",
         ok,
-        f"hosted partition {part}/{len(hosted)}, "
+        f"partition {part}/{len(rows)} (hosted {len(hosted)}, FND {len(fnd)}), "
         f"tighten {summary['tighten_extend']}+{summary['tighten_new_id']}"
         f"={summary['tighten']}, "
         f"new functions {summary['new_check_functions']}",
@@ -1580,6 +1725,127 @@ def main():
             "not a pass -- an empty set satisfies every per-file check above"
         )
         + (f", unwired={unwired}" if unwired else ""),
+    )
+
+    # ---- gate 20: the mutation-battery figures SECURITY_CHECKS_AISF.md publishes
+    # match mutate.py's own entry list. Step 7 of that procedure quotes the entry
+    # count twice and then splits it by group, and nothing read the two together:
+    # the sentence said 17 while the battery had grown to 21, so a reader following
+    # the procedure would have accepted a run four entries short as complete. The
+    # precedent is worse than drift -- AISF-PARITY-PROPOSAL.md at 7be56d4 published
+    # "all 10 gates were mutation-tested with 6 deliberate corruptions, all 6
+    # caught" in a commit made four hours before mutate.py's first commit existed.
+    #
+    # Scoped to step 7 alone, by slicing on its anchor before any matching. Two
+    # reasons. The proposal doc holds a dated stale copy of these figures on
+    # purpose and must not be gated, and within this doc a bare `21` or a `5` is
+    # ordinary prose -- the census gate above already reds on a correct paragraph
+    # once for exactly that reason. The slice is taken on the raw text and the
+    # whitespace flattened afterwards, because every one of these figures wraps
+    # across a line break in the rendered markdown.
+    #
+    # The leg that catches something the per-figure comparison cannot: each group
+    # phrase must appear EXACTLY once in the slice. A new group added to mutate.py
+    # and left out of the sentence matches zero times, which the equality check
+    # would never see, because a figure that is absent cannot disagree.
+    mut_bad = []
+    mut_detail = "not read"
+    battery, want_groups = [], {}
+    # SystemExit is caught alongside Exception on purpose. mutate.py's own
+    # population check calls die(), which raises SystemExit, and SystemExit is a
+    # BaseException: a bare `except Exception` would let it terminate this harness
+    # at exit 2 with no [FAIL] line and every later gate's verdict lost. A
+    # traceback is not a gate catching a defect.
+    try:
+        mut_path = os.path.join(HERE, "mutate.py")
+        cached = importlib.util.cache_from_source(mut_path)
+        if os.path.exists(cached):
+            os.remove(cached)
+        spec = importlib.util.spec_from_file_location("mutate", mut_path)
+        mutate_mod = importlib.util.module_from_spec(spec)
+        sys.modules["mutate"] = mutate_mod
+        spec.loader.exec_module(mutate_mod)
+        battery = mutate_mod.resolve_mutations(pathlib.Path(REPO))
+        want_groups = mutate_mod.group_counts(pathlib.Path(REPO))
+    except (Exception, SystemExit) as exc:  # noqa: BLE001 - reported, never raised
+        mut_bad.append(f"mutate.py could not be read for its entry list: {exc!r}")
+        battery, want_groups = [], {}
+    if not mut_bad:
+        with open(AISF_DOC) as f:
+            mut_text = f.read()
+        anchor = "Run `.venv/bin/python aisf-parity/mutate.py`"
+        starts = [m.start() for m in re.finditer(re.escape(anchor), mut_text)]
+        if len(starts) != 1:
+            mut_bad.append(
+                f"the step-7 anchor {anchor!r} occurs {len(starts)} time(s) in "
+                "SECURITY_CHECKS_AISF.md; the slice this gate reads is undecidable, "
+                "which is a failure and not a skip"
+            )
+        else:
+            end = mut_text.find("\n8. ", starts[0])
+            if end == -1:
+                mut_bad.append(
+                    "no '8. ' step follows the mutate.py step, so step 7 has no end "
+                    "and the slice would run to the end of the document"
+                )
+        if not mut_bad:
+            step = " ".join(mut_text[starts[0] : end].split())
+            total = len(battery)
+            validated = re.findall(r"entries (\d+)/(\d+) find-strings validated", step)
+            if len(validated) != 1:
+                mut_bad.append(
+                    f"the 'entries N/N find-strings validated' line occurs "
+                    f"{len(validated)} time(s) in step 7"
+                )
+            elif [int(n) for n in validated[0]] != [total, total]:
+                mut_bad.append(
+                    f"step 7 quotes 'entries {validated[0][0]}/{validated[0][1]} "
+                    f"find-strings validated'; mutate.py defines {total}"
+                )
+            ways = re.findall(r"breaks the code (\d+) ways", step)
+            if len(ways) != 1:
+                mut_bad.append(
+                    f"the 'breaks the code N ways' phrase occurs {len(ways)} "
+                    "time(s) in step 7"
+                )
+            elif int(ways[0]) != total:
+                mut_bad.append(
+                    f"step 7 says it breaks the code {ways[0]} ways; mutate.py "
+                    f"defines {total} entries"
+                )
+            for phrase, count in want_groups.items():
+                hits = re.findall(r"(\d+) " + re.escape(phrase), step)
+                if len(hits) != 1:
+                    mut_bad.append(
+                        f"the group {phrase!r} is counted {count} time(s) by "
+                        f"mutate.py but its figure occurs {len(hits)} time(s) in "
+                        "step 7"
+                    )
+                elif int(hits[0]) != count:
+                    mut_bad.append(
+                        f"step 7 says {hits[0]} {phrase}; mutate.py counts {count}"
+                    )
+            mut_detail = (
+                f"{total} entry(ies) in mutate.py over {len(want_groups)} group(s), "
+                f"2 total-count figure(s) + {len(want_groups)} group figure(s) "
+                f"asserted against step 7 of SECURITY_CHECKS_AISF.md, "
+                f"computed={want_groups}"
+            )
+    gate(
+        "the mutation-battery figures SECURITY_CHECKS_AISF.md publishes match "
+        "mutate.py's entries",
+        # Fail closed on an empty battery: zero entries over zero groups makes
+        # every comparison above vacuously true, and "0 entries asserted" would
+        # print beside a PASS.
+        bool(battery) and bool(want_groups) and not mut_bad,
+        mut_detail
+        + (
+            ""
+            if battery and want_groups
+            else f"; {len(battery)} entry(ies) and {len(want_groups)} group(s) is "
+            "not a pass -- an empty battery satisfies every figure check above"
+        )
+        + (f", bad={mut_bad}" if mut_bad else ""),
     )
 
     failed = [n for n, ok, _ in results if not ok]

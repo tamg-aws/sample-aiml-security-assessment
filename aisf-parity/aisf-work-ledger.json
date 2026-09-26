@@ -1,5 +1,5 @@
 {
-  "generated": "2026-09-25",
+  "generated": "2026-09-26",
   "generator": "aisf-parity/build_ledger.py",
   "aisf_repo": "/Users/tamg/WorkDocs/Builder/aws-ai-security-framework-assessment",
   "summary": {
@@ -194,7 +194,9 @@
       "incumbents": [
         "BR-41"
       ],
-      "incumbent_names": [],
+      "incumbent_names": [
+        "Central Guardrail Enforcement Policy Check"
+      ],
       "gap": "",
       "extra_iam": [],
       "phase": 3,
@@ -282,7 +284,9 @@
       "incumbents": [
         "BR-46"
       ],
-      "incumbent_names": [],
+      "incumbent_names": [
+        "Knowledge Base Source Data Classification"
+      ],
       "gap": "",
       "extra_iam": [],
       "phase": 3,
@@ -302,7 +306,9 @@
       "incumbents": [
         "BR-42"
       ],
-      "incumbent_names": [],
+      "incumbent_names": [
+        "Foundation Model Invocation Allow-List"
+      ],
       "gap": "",
       "extra_iam": [],
       "phase": 3,
@@ -322,7 +328,9 @@
       "incumbents": [
         "BR-43"
       ],
-      "incumbent_names": [],
+      "incumbent_names": [
+        "Bedrock Region Invocation Control"
+      ],
       "gap": "",
       "extra_iam": [],
       "phase": 3,
@@ -342,7 +350,9 @@
       "incumbents": [
         "BR-44"
       ],
-      "incumbent_names": [],
+      "incumbent_names": [
+        "Marketplace Model Subscription Control"
+      ],
       "gap": "",
       "extra_iam": [],
       "phase": 3,
@@ -362,7 +372,10 @@
       "incumbents": [
         "BR-45"
       ],
-      "incumbent_names": [],
+      "incumbent_names": [
+        "Bedrock API Key Inventory",
+        "Bedrock API Key Age And Token Type Control"
+      ],
       "gap": "",
       "extra_iam": [],
       "phase": 3,
@@ -414,7 +427,10 @@
       "incumbents": [
         "BR-07"
       ],
-      "incumbent_names": [],
+      "incumbent_names": [
+        "Bedrock Prompt Management Check",
+        "Bedrock Prompt Variants Check"
+      ],
       "gap": "BR-07 holds the catalog leg (ListPrompts non-empty is its Passed row, zero prompts is Not Applicable) and its second row only counts variants. The production-version leg is unwritten and cannot be written on the calls BR-07 already makes: bare ListPrompts returns each prompt's DRAFT, and BR-07's get_prompt omits promptVersion, which the API documents as returning the working draft, so a version != DRAFT test over either reports Failed for every prompt in every account and no configuration clears it. The falsifiable form is ListPrompts(promptIdentifier=...) for that prompt's version list, GetPrompt(promptVersion=N) for customerEncryptionKeyArn, which PromptSummary does not carry, and for flows the prompt node's resource.promptArn version suffix, with inline being the hardcoded prompt the control names",
       "extra_iam": [],
       "phase": 4,
@@ -505,7 +521,7 @@
         "SM-02"
       ],
       "incumbent_names": [
-        "SageMaker IAM Permissions"
+        "SageMaker IAM Permissions Check"
       ],
       "gap": "",
       "extra_iam": [],
@@ -570,7 +586,9 @@
       "incumbents": [
         "SM-31"
       ],
-      "incumbent_names": [],
+      "incumbent_names": [
+        "Endpoint Inference Data Capture"
+      ],
       "gap": "",
       "extra_iam": [],
       "phase": 3,
@@ -590,7 +608,10 @@
       "incumbents": [
         "SM-32"
       ],
-      "incumbent_names": [],
+      "incumbent_names": [
+        "SageMaker Configuration Recording",
+        "SageMaker Config Rule Compliance"
+      ],
       "gap": "",
       "extra_iam": [],
       "phase": 3,
@@ -610,7 +631,9 @@
       "incumbents": [
         "SM-33"
       ],
-      "incumbent_names": [],
+      "incumbent_names": [
+        "Training Job Network Boundary"
+      ],
       "gap": "",
       "extra_iam": [],
       "phase": 3,
@@ -630,7 +653,9 @@
       "incumbents": [
         "SM-34"
       ],
-      "incumbent_names": [],
+      "incumbent_names": [
+        "SageMaker Creation Guardrail"
+      ],
       "gap": "",
       "extra_iam": [],
       "phase": 3,
@@ -1563,7 +1588,9 @@
       "incumbents": [
         "BR-46"
       ],
-      "incumbent_names": [],
+      "incumbent_names": [
+        "Knowledge Base Source Data Classification"
+      ],
       "gap": "re-hosted off responsible_ai_grc_assessments, which the state machine invokes only when the execution input carries enableResponsibleAIGRC, so a row hosted there ships conditionally, and the candidate incumbent is here rather than there: BR-46 reads automatedDiscoveryMonitoringStatus per knowledge base source bucket, which is the automated-discovery leg of this control. The move costs no IAM, since that check already holds macie2:GetMacieSession, GetAutomatedDiscoveryConfiguration and DescribeBuckets. The unwritten leg is the one the control keeps separate: automated discovery samples objects, so per-object assurance over what is about to be ingested needs a targeted discovery job over the actual source prefixes, which would take macie2:ListClassificationJobs and DescribeClassificationJob, granted to no function today. The subject is also wider than knowledge bases, and the pre-ingest Comprehend detection the control recommends is a call the application makes, not a configuration this scanner can read",
       "extra_iam": [
         "macie2:ListClassificationJobs",

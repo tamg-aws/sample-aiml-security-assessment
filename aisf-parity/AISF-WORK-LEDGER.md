@@ -1,6 +1,6 @@
 # AISF parity work ledger
 
-Generated 2026-09-25 by `aisf-parity/build_ledger.py`. Do not hand-edit: change `ROWS` in the generator and re-run.
+Generated 2026-09-26 by `aisf-parity/build_ledger.py`. Do not hand-edit: change `ROWS` in the generator and re-run.
 
 78 controls in scope: 67 hosted (BDR, SGM, ACR) plus 11 FND controls whose assertion subject is an AI resource.
 

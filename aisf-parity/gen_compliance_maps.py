@@ -119,7 +119,12 @@ def rows_from_source():
         os.remove(cached)
     if HERE not in sys.path:
         sys.path.insert(0, HERE)
-    from build_ledger import INCUMBENT_NAMES, ROWS
+    # published_names is imported rather than re-derived here. This function
+    # carried its own `INCUMBENT_NAMES[i] for i in incumbents if i in
+    # INCUMBENT_NAMES` copy of the lookup, so the drift check compared one
+    # fail-open against the other and agreed. Two implementations of one rule
+    # agree on the wrong answer as readily as on the right one.
+    from build_ledger import ROWS, published_names
 
     rows = []
     for row in ROWS:
@@ -140,7 +145,7 @@ def rows_from_source():
                 ),
                 "incumbents": incumbents,
                 "incumbent_names": [
-                    INCUMBENT_NAMES[i] for i in incumbents if i in INCUMBENT_NAMES
+                    name for i in incumbents for name in published_names(i)
                 ],
                 "gap": gap,
                 "extra_iam": extra_iam,

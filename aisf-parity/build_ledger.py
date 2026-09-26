@@ -894,6 +894,10 @@ INCUMBENT_NAMES = {
     "AR-09": "AWS Agent Registry Approval Authority Separation",
     "BR-04": "Bedrock Model Invocation Logging Check",
     "BR-06": "Bedrock CloudTrail Logging Check",
+    # BR-07 publishes its Failed line under a different name than its Passed and
+    # N/A lines, so both are recorded. Filtering the report CSV on either name
+    # alone hides half of this check's verdicts.
+    "BR-07": ("Bedrock Prompt Management Check", "Bedrock Prompt Variants Check"),
     "BR-10": "Bedrock Guardrail IAM Enforcement Check",
     "BR-12": "Bedrock Invocation Log Encryption",
     "BR-15": "Cross-Account Guardrails Enforcement Check",
@@ -903,15 +907,50 @@ INCUMBENT_NAMES = {
     "BR-32": "Bedrock CloudWatch Alarm Check",
     "BR-34": "Guardrail Prompt Attack Filter",
     "BR-37": "Bedrock Account Data Retention",
+    "BR-41": "Central Guardrail Enforcement Policy Check",
+    "BR-42": "Foundation Model Invocation Allow-List",
+    "BR-43": "Bedrock Region Invocation Control",
+    "BR-44": "Marketplace Model Subscription Control",
+    # An inventory line and a prevention line, by design.
+    "BR-45": (
+        "Bedrock API Key Inventory",
+        "Bedrock API Key Age And Token Type Control",
+    ),
+    "BR-46": "Knowledge Base Source Data Classification",
     "FS-65": "KB Data Source Buckets Missing S3 Event Notifications",
     "SM-01": "SageMaker Internet Access Check",
-    "SM-02": "SageMaker IAM Permissions",
+    "SM-02": "SageMaker IAM Permissions Check",
     "SM-03": "SageMaker Data Protection Check",
     "SM-09": "SageMaker Notebook Root Access Check",
     "SM-11": "SageMaker Model Network Isolation Check",
     "SM-18": "SageMaker Transform Job Encryption Check",
     "SM-22": "Model Approval Workflow Check",
+    "SM-31": "Endpoint Inference Data Capture",
+    # Recording is the precondition, rule compliance is the assertion.
+    "SM-32": ("SageMaker Configuration Recording", "SageMaker Config Rule Compliance"),
+    "SM-33": "Training Job Network Boundary",
+    "SM-34": "SageMaker Creation Guardrail",
 }
+
+
+def published_names(check_id):
+    """Every finding name one incumbent publishes, as a list.
+
+    A value may be one string or a tuple of them: three check ids publish two
+    named findings each. Raises on an unmapped id rather than returning nothing,
+    so adding a check without recording its name stops the build here instead of
+    shipping a row whose incumbent has no name.
+    """
+    try:
+        entry = INCUMBENT_NAMES[check_id]
+    except KeyError:
+        raise KeyError(
+            f"{check_id} is cited as an incumbent but has no INCUMBENT_NAMES "
+            "entry. Add the finding name(s) the check actually publishes, as "
+            "read from its create_finding calls."
+        ) from None
+    return [entry] if isinstance(entry, str) else list(entry)
+
 
 AISF_REPO = os.path.expanduser(
     "~/WorkDocs/Builder/aws-ai-security-framework-assessment"
@@ -994,8 +1033,15 @@ def build():
                     else list(module)
                 ),
                 "incumbents": incumbents,
+                # Strict on purpose. The `if i in INCUMBENT_NAMES` guard this
+                # replaces dropped any unmapped id silently, so 12 of 78 rows
+                # shipped an incumbent id beside an empty name list -- every
+                # check phase 3 added, because the map was never extended with
+                # them. A blank name list is also what gate 8 reads to decide
+                # whether a new_id row quotes its incumbent, so the omission
+                # could only ever make that gate easier to pass.
                 "incumbent_names": [
-                    INCUMBENT_NAMES[i] for i in incumbents if i in INCUMBENT_NAMES
+                    name for i in incumbents for name in published_names(i)
                 ],
                 "gap": gap,
                 "extra_iam": extra_iam,

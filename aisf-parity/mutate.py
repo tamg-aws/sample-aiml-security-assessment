@@ -220,6 +220,63 @@ MUTATIONS = [
         "replace": "        f\"| covered | {s['total']} | an incumbent already "
         'asserts this; nothing to write |"\n',
     },
+    {
+        "name": "the incumbent-name lookup reverts to its fail-open form",
+        "file": BUILD_LEDGER,
+        # WHAT THIS ENTRY ACTUALLY EXERCISES. The shipped form does two things:
+        # it raises on an id the map does not hold, and it flattens the three
+        # tuple-valued entries. This mutation removes both, but only the second
+        # is observable HERE, because the map is now complete and so no id is
+        # unmapped -- the `if i in INCUMBENT_NAMES` filter drops nothing today.
+        # What goes red is the tuple leaking into the row unflattened. The
+        # unmapped-id leg is a separate discriminating input and has its own
+        # entry below; claiming this one covers it would be claiming a catch the
+        # run does not produce.
+        "defect": "the lookup stops flattening the three ids that publish two "
+        "finding names each, so a row carries a nested list where the schema says "
+        "strings. Observed: gate 4's element-type leg names all three rows and "
+        "gate 15 reports the same field differing between the json and a fresh "
+        "render. This is half of the shipped defect, restored",
+        "find": "                    name for i in incumbents for name in "
+        "published_names(i)\n",
+        "replace": "                    INCUMBENT_NAMES[i] for i in incumbents "
+        "if i in INCUMBENT_NAMES\n",
+    },
+    {
+        "name": "an incumbent is cited with no INCUMBENT_NAMES entry at all",
+        "file": BUILD_LEDGER,
+        # The other half, and the one that actually shipped: 12 of 78 rows
+        # published an incumbent check_id beside an empty name list -- every
+        # check phase 3 added, because the map was never extended with them. It
+        # failed open in the only direction that matters: gate 8 decides whether
+        # a new_id row quotes its incumbent by reading that same list, so a
+        # missing name could only ever make that gate easier to pass.
+        #
+        # The catcher differs from every other entry here and that is the point.
+        # published_names raises, so build_ledger REFUSES to regenerate rather
+        # than writing a row it cannot name. check_ledger then reads the last
+        # good json and its first fourteen gates pass on it; what goes red is
+        # gate 15, which runs the generator as a subprocess and surfaces the
+        # exit code. Measured: build_ledger exit 1 with the KeyError's own
+        # remedy text, check_ledger 18/19 with gate 15 the one red.
+        "defect": "a check is cited as an incumbent without recording the finding "
+        "name it publishes, so the ledger has no name to print for it. Under the "
+        "fail-open form this shipped as a blank name; under the strict form the "
+        "build stops here instead",
+        "find": '    "BR-46": "Knowledge Base Source Data Classification",\n',
+        "replace": "",
+    },
+    {
+        "name": "an incumbent is named something it does not publish",
+        "file": BUILD_LEDGER,
+        "defect": "the ledger prints a finding name no create_finding call emits, "
+        "so a reader filtering the report CSV for the name the ledger gave them "
+        "matches nothing. This is the error the map already carried for SM-02, "
+        "which named 'SageMaker IAM Permissions' while the check publishes "
+        "'SageMaker IAM Permissions Check'",
+        "find": '    "BR-46": "Knowledge Base Source Data Classification",\n',
+        "replace": '    "BR-46": "Knowledge Base Source Classification",\n',
+    },
     # ---------------------------------------------------------------- phase 2
     # The tag column. The next two entries are the two halves of the qualifier
     # vocabulary and are both here because they fail different branches of the
@@ -305,6 +362,23 @@ MUTATIONS = [
         "find": "Census at the current head",
         "replace": "Census at the present head",
     },
+    {
+        "name": "a mutation group disappears from the published battery figures",
+        "file": AISF_DOC,
+        # Respells one group phrase rather than changing one of its digits. A
+        # wrong digit is the easy half and the equality check finds it; the half
+        # that needs a mutation is a group the sentence stops naming at all,
+        # because a figure that is absent cannot disagree with a computed count.
+        # The find-string is a phrase and not a number on purpose: a number here
+        # would go stale every time the battery grows, and the entry would then be
+        # lost to the pre-flight rather than exercising anything.
+        "defect": "step 7 of the parity doc splits the battery by group, and this "
+        "leaves the doc naming five of the six groups. Gate 20 has to report that "
+        "group's figure as occurring zero times in the slice, not reconcile the "
+        "five it can still find",
+        "find": "1 in the census anchor",
+        "replace": "1 in the census marker",
+    },
 ]
 
 # Directories whose contents are generated by the suites and hidden from git by
@@ -362,14 +436,105 @@ def partial_qualifier_mutation(repo: Path) -> dict[str, str]:
     raise AssertionError("unreachable: die() raises")
 
 
+# Which published figure each mutation counts toward, keyed by name because the
+# target file does not separate them: the tag-column group spans five files, and
+# build_ledger.py carries two unrelated groups. The value is the phrase the doc
+# uses, so `docs/SECURITY_CHECKS_AISF.md` can be gated against a count derived
+# from this list instead of a number someone typed. Ordered as the doc reads.
+#
+# Keyed by name, so GROUPS and MUTATIONS are asserted to describe the same
+# population in BOTH directions below. A roster keyed by name that has drifted
+# out of the population guards nothing: an entry whose name was reworded would
+# silently leave the census, and the doc figure would still reconcile against
+# the smaller list. That is the failure this pairing exists to prevent, which is
+# why a missing key is an error and not a default group.
+GROUPS: dict[str, str] = {
+    "collapse-note append removed": "defects in the derived mapping",
+    "N/A clause removed from the collapse note": "defects in the derived mapping",
+    "critical maps to a lowercase severity (length-identical)": (
+        "defects in the derived mapping"
+    ),
+    "AISF-05 reverted to the pre-rename AI-05": "defects in the derived mapping",
+    "source findings collapsed to one status per check id": (
+        "defects in the derived mapping"
+    ),
+    "S3 Vectors CMK test accepts any sseType": "in `BR-20`'s S3 Vectors legs",
+    "S3 Vectors missing bucket policy reverted to N/A": (
+        "in `BR-20`'s S3 Vectors legs"
+    ),
+    "S3 Vectors index encryption accepts any sseType": ("in `BR-20`'s S3 Vectors legs"),
+    "the index verdict dropped from the S3 Vectors combine": (
+        "in `BR-20`'s S3 Vectors legs"
+    ),
+    "an index inheriting the bucket's key is failed": "in `BR-20`'s S3 Vectors legs",
+    "the knowledge base loop truncated to the first entry": (
+        "in `BR-20`'s S3 Vectors legs"
+    ),
+    "a (partial) qualifier dropped from AR-03's tag": "in the tag column",
+    "a (1 of N checks) qualifier dropped from a joint leg": "in the tag column",
+    "a tag placed in a module that does not emit the check": "in the tag column",
+    "the tag sentinel defaults to empty instead of None (length-identical)": (
+        "in the tag column"
+    ),
+    "agentcore's empty-report header loses the column": "in the tag column",
+    "the incumbent-name lookup reverts to its fail-open form": (
+        "in the incumbent-name map"
+    ),
+    "an incumbent is cited with no INCUMBENT_NAMES entry at all": (
+        "in the incumbent-name map"
+    ),
+    "an incumbent is named something it does not publish": (
+        "in the incumbent-name map"
+    ),
+    "ledger markdown renders a figure from the wrong summary key": (
+        "in the ledger's markdown renderer"
+    ),
+    "the census anchor sentence is reworded": "in the census anchor",
+    "a mutation group disappears from the published battery figures": (
+        "in the published battery figures"
+    ),
+}
+
+
 def resolve_mutations(repo: Path) -> list[dict[str, str]]:
-    """MUTATIONS with every derived entry built against this tree."""
-    return [
+    """MUTATIONS with every derived entry built against this tree, plus its group.
+
+    The group is attached here rather than written into each literal so that the
+    derived entry, whose name is built at run time, cannot skip it.
+    """
+    resolved = [
         partial_qualifier_mutation(repo)
         if entry == DERIVED_PARTIAL_QUALIFIER
         else entry
         for entry in MUTATIONS
     ]
+    names = {entry["name"] for entry in resolved}
+    ungrouped = sorted(names - set(GROUPS))
+    orphaned = sorted(set(GROUPS) - names)
+    if ungrouped or orphaned:
+        die(
+            "GROUPS and MUTATIONS do not describe the same population, so the "
+            "figures the parity doc publishes cannot be derived:\n"
+            + (f"  no group for: {ungrouped}\n" if ungrouped else "")
+            + (f"  group for a mutation that is gone: {orphaned}\n" if orphaned else "")
+            + "  Add or rename the GROUPS key. Do not default an unlisted "
+            "mutation into a group: it would leave the published split "
+            "reconciling against a population one entry short."
+        )
+    return [{**entry, "group": GROUPS[entry["name"]]} for entry in resolved]
+
+
+def group_counts(repo: Path) -> dict[str, int]:
+    """doc phrase -> how many mutations count toward it, in the doc's order.
+
+    Imported by check_ledger.py's doc-figure gate. Kept here because this list is
+    the only authority for the split, and a second copy of the grouping would
+    agree with the first as readily on a wrong answer as on a right one.
+    """
+    counts = dict.fromkeys(GROUPS.values(), 0)
+    for entry in resolve_mutations(repo):
+        counts[entry["group"]] += 1
+    return counts
 
 
 def child_env() -> dict[str, str]:
