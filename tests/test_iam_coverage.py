@@ -153,6 +153,9 @@ REQUIRED_AGENTCORE_ACTIONS = {
     "bedrock-agentcore:ListPolicyEngines",
     "bedrock-agentcore:GetPolicyEngine",
     "bedrock-agentcore:GetResourcePolicy",
+    "bedrock-agentcore:ListGatewayRateLimits",
+    "bedrock-agentcore:ListGatewayTargets",
+    "bedrock-agentcore:GetGatewayTarget",
 }
 
 REQUIRED_AGENT_REGISTRY_ACTIONS = {
@@ -597,10 +600,160 @@ _VERIFIED_REMEDIATION_IAM_ACTIONS |= {
     "s3:GetLifecycleConfiguration",
 }
 
+# Verified on 2026-09-25 with IAM Access Analyzer validate-policy, which is an
+# oracle for both halves: it reports INVALID_ACTION for an action the service
+# does not define and INVALID_GLOBAL_CONDITION_KEY for an unknown condition key.
+# The probe policy carried three invented actions
+# (logs:DescribeNotARealThing, oam:GetSinkPolicyDocument,
+# cloudtrail:ListTrailsAndStuff) and one invented condition key
+# (aws:PrincipalOrgIdentifier) as negative controls; all four were reported and
+# every name below was not, so the run discriminates rather than passing
+# everything.
+_VERIFIED_REMEDIATION_IAM_ACTIONS |= {
+    "bedrock-agentcore:ListMemories",
+    "cloudtrail:GetEventSelectors",
+    "cloudtrail:ListTrails",
+    "logs:DescribeDeliveries",
+    "logs:DescribeDeliverySources",
+    "logs:DescribeLogGroups",
+    "logs:Unmask",
+    "oam:GetSinkPolicy",
+    "oam:ListSinks",
+}
+
+# Verified on 2026-09-25 with a second Access Analyzer validate-policy run whose
+# negative controls were two invented actions
+# (bedrock-agentcore:GetMemoryThatDoesNotExist,
+# bedrock-agentcore:NotARealMemoryAction) and one invented condition key
+# (bedrock-agentcore:memoryNamespaceThatDoesNotExist). All three were reported
+# and GetMemory was not, alongside the memory read actions AC-23 assesses and
+# the bedrock-agentcore namespace, strategyId, actorId and sessionId condition
+# keys it accepts as scoping.
+_VERIFIED_REMEDIATION_IAM_ACTIONS |= {"bedrock-agentcore:GetMemory"}
+
+# Verified on 2026-09-25 with a third Access Analyzer validate-policy run for the
+# gateway controls AC-24 through AC-27. Its negative controls were four invented
+# actions (ec2:DescribeVpcEndpointsThatDoNotExist,
+# kms:GetKeyPolicyDocumentNotReal, organizations:DescribePolicyDetailNotReal,
+# bedrock-agentcore:ListGatewayRateLimitEntriesNotReal) and two invented
+# condition keys (aws:SourceArnPrefixNotReal,
+# bedrock-agentcore:GatewayAuthorizerKindNotReal). All six were reported,
+# INVALID_ACTION for the actions and INVALID_GLOBAL_CONDITION_KEY plus
+# INVALID_SERVICE_CONDITION_KEY for the keys, and none of the names below was, so
+# the run discriminates in both directions.
+_VERIFIED_REMEDIATION_IAM_ACTIONS |= {
+    "bedrock-agentcore:GetGatewayTarget",
+    "bedrock-agentcore:ListGatewayRateLimits",
+    "bedrock-agentcore:ListGatewayTargets",
+    "ec2:DescribeSecurityGroups",
+    "ec2:DescribeVpcEndpoints",
+    "iam:GetRole",
+    "kms:GetKeyPolicy",
+}
+
+# Verified on 2026-09-25 with a fourth Access Analyzer validate-policy run, this
+# one against policyType SERVICE_CONTROL_POLICY because AC-28's remediation text
+# describes an SCP. Its negative controls were three invented actions
+# (bedrock-agentcore:CreateGatewayNotReal,
+# bedrock-agentcore:UpdateGatewayThatDoesNotExist,
+# organizations:DescribePolicyDocumentNotReal) and one invented condition key
+# (bedrock-agentcore:GatewayAuthorizerModeNotReal). All four were reported and
+# none of the names below was.
+#
+# The run is an oracle for name existence only, not for which actions a condition
+# key applies to: a control statement pairing bedrock-agentcore:CreateGateway
+# with bedrock-agentcore:RuntimeAuthorizerType, a pairing no reference declares,
+# drew no finding either. The GatewayAuthorizerType-to-CreateGateway wiring rests
+# on the AgentCore devguide, which the AISF work ledger's GW-02 row records as
+# disagreeing with the two IAM reference surfaces.
+_VERIFIED_REMEDIATION_IAM_ACTIONS |= {
+    "bedrock-agentcore:CreateGateway",
+    "bedrock-agentcore:UpdateGateway",
+    "organizations:DescribePolicy",
+}
+
+# Verified on 2026-09-25 with two more Access Analyzer validate-policy runs for
+# the identity controls AC-29 through AC-34: a SERVICE_CONTROL_POLICY run for
+# AC-29's SCP text and an IDENTITY_POLICY run for AC-32's condition advice. The
+# SCP run's negative controls were two invented actions
+# (bedrock-agentcore:CreateAgentRuntimeNotReal,
+# bedrock-agentcore:ModifyAgentRuntimeThatDoesNotExist) and one invented
+# condition key (bedrock-agentcore:RuntimeAuthorizerModeNotReal); the identity
+# run's were one invented action
+# (bedrock-agentcore:GetWorkloadAccessTokenForJWTNotReal) and two invented
+# condition keys (bedrock-agentcore:InboundJwtClaimNotReal/iss,
+# bedrock-agentcore:OutboundJwtClaim/iss). All six were reported and none of the
+# names below was.
+#
+# Unlike AC-28's GatewayAuthorizerType, the RuntimeAuthorizerType-to-runtime
+# wiring does not rest on a devguide sentence: the machine-readable service
+# reference wires that key to exactly CreateAgentRuntime and UpdateAgentRuntime,
+# and every InboundJwtClaim key to exactly CompleteResourceTokenAuth and
+# GetWorkloadAccessTokenForJWT.
+_VERIFIED_REMEDIATION_IAM_ACTIONS |= {
+    "bedrock-agentcore:CreateAgentRuntime",
+    "bedrock-agentcore:UpdateAgentRuntime",
+}
+
+# Verified on 2026-09-25 with one more IDENTITY_POLICY Access Analyzer
+# validate-policy run for the policy controls AC-36 and AC-37. Its negative
+# controls were bedrock-agentcore:GetPolicyEngineNotReal,
+# bedrock:InvokeGuardrailChecksNotReal and the singular
+# bedrock:InvokeGuardrailCheck, which settles the plural spelling; all three were
+# reported and neither name below was.
+#
+# InvokeGuardrailChecks reaches AC-37's resolution text through the
+# GUARDRAIL_CHECK_ACTION constant, so the token scan below does not see it. It is
+# classified here anyway, because the scan reading a Name instead of a string is
+# a property of the scan and not a statement about the action.
+_VERIFIED_REMEDIATION_IAM_ACTIONS |= {
+    "bedrock-agentcore:GetPolicyEngine",
+    "bedrock:InvokeGuardrailChecks",
+}
+
+# Verified on 2026-09-25 with two IDENTITY_POLICY Access Analyzer validate-policy
+# runs for the evaluation controls AC-39 through AC-44. The first run covered the
+# nine evaluation actions with two negative controls,
+# bedrock-agentcore:NotARealEvaluationAction and the plausible
+# bedrock-agentcore:UpdateEvaluatorConfig; the second covered iam:PassRole with
+# iam:PassedToService against three negative controls, iam:PassRoleNotReal,
+# iam:PassedToServiceNotReal and the plausible iam:PassedToRole. All five were
+# reported and none of the names below was.
+#
+# The six writes in EVALUATION_ADMINISTRATION_ACTIONS reach AC-02's resolution
+# text through that constant, so the token scan below does not see them. They are
+# classified here for the same reason InvokeGuardrailChecks is.
+_VERIFIED_REMEDIATION_IAM_ACTIONS |= {
+    "bedrock-agentcore:ListEvaluators",
+    "bedrock-agentcore:CreateEvaluator",
+    "bedrock-agentcore:UpdateEvaluator",
+    "bedrock-agentcore:DeleteEvaluator",
+    "bedrock-agentcore:CreateOnlineEvaluationConfig",
+    "bedrock-agentcore:UpdateOnlineEvaluationConfig",
+    "bedrock-agentcore:DeleteOnlineEvaluationConfig",
+    "iam:PassRole",
+}
+
 _VERIFIED_REMEDIATION_CONDITION_KEYS = {
     "bedrock:GuardrailIdentifier",
     "iam:AWSServiceName",
     "kms:ViaService",
+    # Same Access Analyzer run as the action block above.
+    "aws:PrincipalOrgID",
+    "aws:PrincipalOrgPaths",
+    # Same Access Analyzer run as the gateway action block above.
+    "aws:SourceAccount",
+    "aws:SourceArn",
+    "aws:SourceVpce",
+    # Same SERVICE_CONTROL_POLICY run as the AC-28 action block above.
+    "bedrock-agentcore:GatewayAuthorizerType",
+    # Same two runs as the AC-29 action block above. The reference publishes no
+    # bare InboundJwtClaim key: it is five keys, one per claim, and the token
+    # scan stops at the slash.
+    "bedrock-agentcore:RuntimeAuthorizerType",
+    "bedrock-agentcore:InboundJwtClaim",
+    # Same second run as the AC-42 action block above.
+    "iam:PassedToService",
 }
 
 # Verified the same way and on the same date: ValidatePolicy reports an

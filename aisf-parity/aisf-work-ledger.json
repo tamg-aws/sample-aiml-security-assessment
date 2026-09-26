@@ -6,28 +6,22 @@
     "hosted": 67,
     "fnd_ai_subject": 11,
     "total": 78,
-    "covered": 28,
-    "tighten": 18,
-    "tighten_extend": 13,
-    "tighten_new_id": 5,
-    "new": 18,
+    "covered": 61,
+    "tighten": 2,
+    "tighten_extend": 1,
+    "tighten_new_id": 1,
+    "new": 1,
     "not_implementable": 3,
     "unassessed": 11,
-    "new_check_functions": 34,
-    "extensions": 13,
+    "new_check_functions": 13,
+    "extensions": 1,
     "extra_iam_actions": [
-      "cloudtrail:GetEventSelectors",
-      "cloudtrail:ListTrails",
       "ec2:DescribeSecurityGroups",
-      "logs:DescribeAccountPolicies",
-      "logs:GetDataProtectionPolicy",
+      "events:ListRules",
+      "events:ListTargetsByRule",
       "macie2:DescribeClassificationJob",
       "macie2:ListClassificationJobs",
-      "oam:GetSinkPolicy",
-      "oam:ListSinks",
       "organizations:DescribeEffectivePolicy",
-      "organizations:DescribePolicy",
-      "organizations:ListPolicies",
       "s3:GetBucketPolicy",
       "wafv2:GetWebACL"
     ]
@@ -709,8 +703,8 @@
       "question": "Do the people and roles that administer agent evaluations use permissions scoped to just the evaluation actions, rather than a broad agent-platform admin grant?",
       "assert": "Evaluation-admin IAM policy showing action-scoped (non-wildcard) grants",
       "workload_agnostic": true,
-      "verdict": "tighten",
-      "disposition": "extend",
+      "verdict": "covered",
+      "disposition": null,
       "target_modules": [
         "agentcore_assessments"
       ],
@@ -720,7 +714,7 @@
       "incumbent_names": [
         "AgentCore IAM Full Access Check"
       ],
-      "gap": "AC-02 detects AgentCore full-access and wildcard grants only, so a role holding a single over-broad named action passes it",
+      "gap": "AC-02 now reads wildcard action patterns at any resource scope, on cached roles and users alike, so bedrock-agentcore:* narrowed to one evaluation ARN is reported where the full-access legs saw nothing. A pattern reaching any one of the six evaluator and online-evaluation-config writes grants all six, and a principal that can delete an evaluation can stop the measurement of the agent it watches. A bare Action \"*\" stays with the existing legs as a service-agnostic administrator grant",
       "extra_iam": [],
       "phase": 4,
       "source": "controls/ai-specific/agentcore-evaluations.yaml"
@@ -731,18 +725,18 @@
       "question": "Is agent code prevented from directly minting or retrieving its own access tokens, so a compromised agent cannot extract credentials for other users?",
       "assert": "Service-managed identity confirmation / token-issuance API restriction",
       "workload_agnostic": true,
-      "verdict": "tighten",
-      "disposition": "extend",
+      "verdict": "covered",
+      "disposition": null,
       "target_modules": [
         "agentcore_assessments"
       ],
       "incumbents": [
-        "AC-02"
+        "AC-33"
       ],
       "incumbent_names": [
-        "AgentCore IAM Full Access Check"
+        "AgentCore Token Issuance Scope"
       ],
-      "gap": "AC-02 detects full-access and wildcard grants only",
+      "gap": "AC-33 judges the resource element on the five token issuance actions per cached role and user: a resource ending in a wildcard mints a token for every workload identity in the account, while a resource naming one identity bounds the grant to that agent. A grant that names only the workload identity directory is reported separately at medium, because the service authorization reference marks both the directory and the identity required on these actions and never says whether the directory alone authorizes the call, so that grant either reaches every identity the directory holds or authorizes nothing",
       "extra_iam": [],
       "phase": 4,
       "source": "controls/ai-specific/agentcore-identity.yaml"
@@ -753,8 +747,8 @@
       "question": "For agents that make payments, is a separation-of-duties model enforced so no single role can both set spending limits and execute payments?",
       "assert": "Payments four-role IAM model: ManagementRole denies ProcessPayment; ProcessPaymentRole cannot create sessions",
       "workload_agnostic": true,
-      "verdict": "tighten",
-      "disposition": "extend",
+      "verdict": "covered",
+      "disposition": null,
       "target_modules": [
         "agentcore_assessments"
       ],
@@ -764,7 +758,7 @@
       "incumbent_names": [
         "AgentCore IAM Full Access Check"
       ],
-      "gap": "AC-02 detects full-access and wildcard grants only",
+      "gap": "AC-02 now fails any role or user whose Allow statements reach both an AgentCore payment session or instrument write and ProcessPayment with no account-wide Deny on the latter. A payment session carries its own limits.maxSpendAmount, so that one principal sets the budget it then spends against, which is the single failure behind both legs the devguide draws: its ManagementRole denies ProcessPayment and its ProcessPaymentRole holds no session write. A Deny scoped to one payment manager or carrying a condition is read as no account-wide Deny, so a narrower Deny never excuses the collision",
       "extra_iam": [],
       "phase": 4,
       "source": "controls/ai-specific/agentcore-registry-optimization-payments.yaml"
@@ -775,18 +769,20 @@
       "question": "Is the execution role available to code-execution and browser tools scoped to least privilege, on the assumption that any code in the sandbox can assume it?",
       "assert": "Tool execution-role policy showing resource-scoped, least-privilege grants",
       "workload_agnostic": true,
-      "verdict": "tighten",
-      "disposition": "extend",
+      "verdict": "covered",
+      "disposition": null,
       "target_modules": [
         "agentcore_assessments"
       ],
       "incumbents": [
-        "AC-02"
+        "AC-02",
+        "AC-45"
       ],
       "incumbent_names": [
-        "AgentCore IAM Full Access Check"
+        "AgentCore IAM Full Access Check",
+        "AgentCore Tool Execution Role Scope"
       ],
-      "gap": "AC-02 detects full-access and wildcard grants only",
+      "gap": "AC-45 reads the execution role of every code interpreter and browser in the account and fails a role whose Allow statements reach every resource, name a NotResource, or carry a service-wide or bare action wildcard. AC-02 judges the same wildcards but only over the bedrock-agentcore namespace and only on the assessment's own roles, so a tool role granting s3:* on every bucket is a verdict it cannot reach",
       "extra_iam": [],
       "phase": 4,
       "source": "controls/ai-specific/agentcore-runtime.yaml"
@@ -797,18 +793,20 @@
       "question": "Is a continuous evaluation running against production agent traffic at a defined sampling rate, so quality and safety regressions are caught in production rather than only before deployment?",
       "assert": "Online evaluation configuration with a defined sampling rate on production traffic",
       "workload_agnostic": true,
-      "verdict": "tighten",
-      "disposition": "new_id",
+      "verdict": "covered",
+      "disposition": null,
       "target_modules": [
         "agentcore_assessments"
       ],
       "incumbents": [
-        "AC-17"
+        "AC-17",
+        "AC-39"
       ],
       "incumbent_names": [
-        "AgentCore Online Evaluation Coverage"
+        "AgentCore Online Evaluation Coverage",
+        "AgentCore Online Evaluation Operation"
       ],
-      "gap": "AC-17 is named \"Online Evaluation Coverage\" but tests only status == ACTIVE, executionStatus == ENABLED and bool(evaluators); it never reads a sampling rate and never asks which evaluators, so coverage is the one thing it does not measure",
+      "gap": "AC-39 judges every online evaluation configuration that exists whatever REQUIRE_AGENTCORE_ONLINE_EVALUATION is set to, and names the setting that stops it running: a status other than ACTIVE, an executionStatus other than ENABLED, no sampling percentage above zero, no input log group or service, no output log group, or no evaluator attached. AC-17 reads the same settings and returns N/A with that variable unset, so Failed is the verdict it cannot reach by default",
       "extra_iam": [],
       "phase": 4,
       "source": "controls/ai-specific/agentcore-evaluations.yaml"
@@ -819,18 +817,20 @@
       "question": "Are safety- and security-relevant evaluators (harmful output, unauthorized tool selection) enabled and alerted on, not just quality-of-answer scores?",
       "assert": "Harmfulness/Stereotyping/Tool-Selection evaluators enabled + score-drop alarm",
       "workload_agnostic": true,
-      "verdict": "tighten",
-      "disposition": "new_id",
+      "verdict": "covered",
+      "disposition": null,
       "target_modules": [
         "agentcore_assessments"
       ],
       "incumbents": [
-        "AC-17"
+        "AC-17",
+        "AC-40"
       ],
       "incumbent_names": [
-        "AgentCore Online Evaluation Coverage"
+        "AgentCore Online Evaluation Coverage",
+        "AgentCore Evaluation Safety Coverage"
       ],
-      "gap": "AC-17 is named \"Online Evaluation Coverage\" and never asks which evaluators are attached, so it cannot distinguish a safety evaluator from a latency one",
+      "gap": "AC-40 classifies the evaluators each configuration attaches against the account's own catalogue, which marks a service-authored evaluator's category in its description and reports the level it scores at, and fails a configuration attaching no safety evaluator or none at TOOL_CALL level. Evaluators written in this account are named for the owner to classify, because their descriptions are prose no check can verify. AgentCore publishes no evaluation score metric, so an alarm on a falling score is a metric filter over the results log group whose pattern and threshold belong to the workload, and every AC-40 verdict says so",
       "extra_iam": [],
       "phase": 4,
       "source": "controls/ai-specific/agentcore-evaluations.yaml"
@@ -841,18 +841,20 @@
       "question": "Do the gateway's resource-based policy and target execution-role trust prevent a confused-deputy attack when an AWS service or another account is allowed to invoke it?",
       "assert": "Gateway resource policy + execution-role trust with SourceAccount/SourceArn conditions",
       "workload_agnostic": true,
-      "verdict": "tighten",
-      "disposition": "new_id",
+      "verdict": "covered",
+      "disposition": null,
       "target_modules": [
         "agentcore_assessments"
       ],
       "incumbents": [
-        "AC-10"
+        "AC-10",
+        "AC-27"
       ],
       "incumbent_names": [
-        "AgentCore Resource-Based Policies Check"
+        "AgentCore Resource-Based Policies Check",
+        "AgentCore Gateway Policy Conditions"
       ],
-      "gap": "AC-10 is named \"Resource-Based Policies Check\" but reports only that a policy is present and never evaluates its conditions, so the confused-deputy leg is unasserted",
+      "gap": "AC-10 reports that a gateway resource policy is present; AC-27 judges whether its Allow statements and the gateway execution role's trust policy carry aws:SourceAccount or aws:SourceArn, and fails an unconditioned statement even when a guarded sibling sits beside it in the same document",
       "extra_iam": [],
       "phase": 4,
       "source": "controls/ai-specific/agentcore-gateway.yaml"
@@ -863,18 +865,22 @@
       "question": "Is invocation of the agent runtime restricted to an approved network path AND an approved caller, so neither the internet nor a direct call that bypasses the gateway can reach the agent?",
       "assert": "Runtime VPCE + Private DNS + SG scope + resource-policy aws:SourceVpc/SourceVpce deny; plus gateway-source restriction (SigV4 resource policy scoped to the gateway role, or allowedWorkloadConfiguration on customJWTAuthorizer)",
       "workload_agnostic": true,
-      "verdict": "tighten",
-      "disposition": "new_id",
+      "verdict": "covered",
+      "disposition": null,
       "target_modules": [
         "agentcore_assessments"
       ],
       "incumbents": [
-        "AC-10"
+        "AC-08",
+        "AC-10",
+        "AC-47"
       ],
       "incumbent_names": [
-        "AgentCore Resource-Based Policies Check"
+        "AgentCore VPC Endpoints Check",
+        "AgentCore Resource-Based Policies Check",
+        "AgentCore Runtime Invocation Path"
       ],
-      "gap": "AC-10 is named \"Resource-Based Policies Check\" but never evaluates policy conditions, so the aws:SourceVpc / aws:SourceVpce leg is unasserted; both keys are 0 hits corpus-wide",
+      "gap": "AC-47 fails a runtime whose resource policy restricts neither the network path nor the caller: the network leg reads aws:SourceVpc, aws:SourceVpce, aws:VpcSourceIp and aws:SourceIp on any statement, the caller leg reads a named principal or an allowedWorkloadConfiguration on the JWT authorizer. AC-08 fails an AgentCore interface endpoint with private DNS off, which is the leg that keeps the runtime's own callers off the public endpoint name. AC-10 reports only that a policy exists",
       "extra_iam": [],
       "phase": 4,
       "source": "controls/ai-specific/agentcore-runtime.yaml"
@@ -885,18 +891,20 @@
       "question": "Is the network path to the gateway restricted to approved private endpoints, rather than reachable over any network path?",
       "assert": "Gateway VPCE + endpoint policy + SG scope + resource-policy network conditions",
       "workload_agnostic": false,
-      "verdict": "tighten",
-      "disposition": "extend",
+      "verdict": "covered",
+      "disposition": null,
       "target_modules": [
         "agentcore_assessments"
       ],
       "incumbents": [
-        "AC-08"
+        "AC-08",
+        "AC-27"
       ],
       "incumbent_names": [
-        "AgentCore VPC Endpoints Check"
+        "AgentCore VPC Endpoints Check",
+        "AgentCore Gateway Policy Conditions"
       ],
-      "gap": "AC-08 tests endpoint existence and available state, not endpoint policy or security-group scope; it does hold one leg GW-04 lacks, endpoint health",
+      "gap": "AC-08 now judges each AgentCore endpoint's policy against the default allow-everything document and reads its security groups for 0.0.0.0/0 and ::/0 inbound rules, alongside the existence and health legs it already held; AC-27 adds the gateway resource policy's aws:SourceVpc / aws:SourceVpce / aws:VpcSourceIp / aws:SourceIp leg",
       "extra_iam": [],
       "phase": 4,
       "source": "controls/ai-specific/agentcore-gateway.yaml"
@@ -907,18 +915,20 @@
       "question": "Is the gateway protected against volumetric abuse and malicious requests with rate limiting and a web-application firewall, given it is a public-facing agent entry point?",
       "assert": "ListGatewayRateLimits showing an ACTIVE limit on a bounded dimension + WAF web ACL associated to the gateway",
       "workload_agnostic": true,
-      "verdict": "tighten",
-      "disposition": "extend",
+      "verdict": "covered",
+      "disposition": null,
       "target_modules": [
         "agentcore_assessments"
       ],
       "incumbents": [
-        "AG-27"
+        "AG-27",
+        "AC-24"
       ],
       "incumbent_names": [
-        "Agentic AI Gateway WAF Protection"
+        "Agentic AI Gateway WAF Protection",
+        "AgentCore Gateway Rate Limiting"
       ],
-      "gap": "AG-27 has the WAF leg; the rate-limit leg needs ListGatewayRateLimits, so botocore >= 1.43.66",
+      "gap": "AG-27 holds the WAF leg; AC-24 requires an ACTIVE gateway rate limit carrying a requests, tokens or connections ceiling, because dimensions is the only required member of a limit entry and a limit can therefore name a dimension and bound nothing",
       "extra_iam": [],
       "phase": 4,
       "source": "controls/ai-specific/agentcore-gateway.yaml"
@@ -929,18 +939,20 @@
       "question": "Are credentials and tokens used by agents stored in a vault protected by keys the organization controls, rather than embedded in agent code or config?",
       "assert": "Vault encryption configuration + secret-scan result",
       "workload_agnostic": true,
-      "verdict": "tighten",
-      "disposition": "extend",
+      "verdict": "covered",
+      "disposition": null,
       "target_modules": [
         "agentcore_assessments"
       ],
       "incumbents": [
-        "AC-14"
+        "AC-14",
+        "AC-34"
       ],
       "incumbent_names": [
-        "AgentCore Identity Token Vault CMK Encryption"
+        "AgentCore Identity Token Vault CMK Encryption",
+        "AgentCore Runtime Inline Credentials"
       ],
-      "gap": "AC-14 has the CMK leg; the string 'secret' appears 0 times in the module, so the secret-scan leg is unwritten",
+      "gap": "AC-14 has the token vault CMK leg; AC-34 adds the secret-scan leg, reading GetAgentRuntime.environmentVariables and failing a runtime whose definition holds an access key id or a PEM private key inline. Only variable names reach the finding because the API models the map as sensitive, and the resolution states the blind spot: a value holding a slash reads as a secret name, so the remaining values are the reader's to confirm",
       "extra_iam": [],
       "phase": 4,
       "source": "controls/ai-specific/agentcore-identity.yaml"
@@ -951,18 +963,20 @@
       "question": "Is an agent's persisted memory (conversation history, learned facts) encrypted with organization-controlled keys and partitioned so one agent or user cannot read another's records?",
       "assert": "Memory CMK encryption + per-actor/namespace access-scope configuration",
       "workload_agnostic": true,
-      "verdict": "tighten",
-      "disposition": "extend",
+      "verdict": "covered",
+      "disposition": null,
       "target_modules": [
         "agentcore_assessments"
       ],
       "incumbents": [
-        "AC-07"
+        "AC-07",
+        "AC-23"
       ],
       "incumbent_names": [
-        "AgentCore Memory Encryption"
+        "AgentCore Memory Encryption",
+        "AgentCore Memory Record Access Scope"
       ],
-      "gap": "AC-07's presence-only CMK test is sound (encryptionKeyArn is an optional customer-supplied CreateMemory input); MEM-01 adds per-actor and namespace access scoping",
+      "gap": "AC-07 asserts a customer managed key and an {actorId} namespace per memory, AC-23 asserts that no cached role or user reads memory records without a namespace, strategy, actor or session condition",
       "extra_iam": [],
       "phase": 4,
       "source": "controls/ai-specific/agentcore-memory.yaml"
@@ -973,18 +987,20 @@
       "question": "Is the Policy Engine encrypted with an organization-controlled key, and are the operational failure modes of that key understood and guarded?",
       "assert": "Policy Engine CMK config + key-policy scoping + disable/delete alarm + break-glass runbook",
       "workload_agnostic": true,
-      "verdict": "tighten",
-      "disposition": "extend",
+      "verdict": "covered",
+      "disposition": null,
       "target_modules": [
         "agentcore_assessments"
       ],
       "incumbents": [
-        "AC-11"
+        "AC-11",
+        "AC-36"
       ],
       "incumbent_names": [
-        "AgentCore Policy Engine Encryption Check"
+        "AgentCore Policy Engine Encryption Check",
+        "AgentCore Policy Engine Key Scope"
       ],
-      "gap": "AC-11's presence-only CMK test is sound; POL-04 adds key-policy scoping plus a disable/delete alarm",
+      "gap": "AC-11 asserts the engine names a customer managed key, AC-36 asserts the key policy names who may decrypt with it and who may disable it or schedule it for deletion; the key cannot be added to or changed on an existing engine, so the key policy is the whole guard. The disable/delete alarm and the break-glass runbook are not readable from the key, and AC-36's passing resolution says so",
       "extra_iam": [],
       "phase": 4,
       "source": "controls/ai-specific/agentcore-policy.yaml"
@@ -995,18 +1011,22 @@
       "question": "Are agent-to-tool authorization decisions made by a deterministic, default-deny policy engine outside the agent's own reasoning, rather than trusting the model to only request permitted actions?",
       "assert": "Cedar policies in ENFORCE mode with default-deny + a sample decision log",
       "workload_agnostic": true,
-      "verdict": "tighten",
-      "disposition": "extend",
+      "verdict": "covered",
+      "disposition": null,
       "target_modules": [
         "agentcore_assessments"
       ],
       "incumbents": [
-        "AG-25"
+        "AG-25",
+        "AC-19",
+        "AC-35"
       ],
       "incumbent_names": [
-        "Agentic AI Gateway Tool Policy Enforcement"
+        "Agentic AI Gateway Tool Policy Enforcement",
+        "AgentCore Log Delivery Configuration",
+        "AgentCore Policy Tool Scope"
       ],
-      "gap": "AG-25 tests mode ENFORCE plus status/enforcementMode ACTIVE, with no default-deny leg, no decision log, and nothing session-aware",
+      "gap": "AG-25 asserts mode ENFORCE plus status/enforcementMode ACTIVE, AC-19 asserts the gateway delivers APPLICATION_LOGS, which is where a policy decision record lands, and AC-35 asserts no enforcing permit leaves the action position unconstrained; default-deny and forbid-wins are engine behaviour and not a setting to read, so a permit over every tool is the only way to restore allow-all",
       "extra_iam": [],
       "phase": 4,
       "source": "controls/ai-specific/agentcore-policy.yaml"
@@ -1017,18 +1037,20 @@
       "question": "For risks that are only visible across a sequence of actions \u2014 an unverified payee, a skipped prerequisite, a reused approval, a cumulative overspend \u2014 are those rules enforced as session-aware policy at the gateway, rather than as state tracking inside the agent or tool code?",
       "assert": "ListPolicies showing a temporal policy in ACTIVE enforcementMode + the session-id propagation path",
       "workload_agnostic": true,
-      "verdict": "tighten",
-      "disposition": "extend",
+      "verdict": "covered",
+      "disposition": null,
       "target_modules": [
         "agentcore_assessments"
       ],
       "incumbents": [
-        "AG-25"
+        "AG-25",
+        "AC-38"
       ],
       "incumbent_names": [
-        "Agentic AI Gateway Tool Policy Enforcement"
+        "Agentic AI Gateway Tool Policy Enforcement",
+        "AgentCore Policy Session Binding"
       ],
-      "gap": "AG-25 has no session-aware leg",
+      "gap": "AG-25 counts enforcing policies, AC-38 asserts a temporal policy exists and that the gateway carrying it authenticates callers with CUSTOM_JWT or AWS_IAM, the two authorizer types the devguide names as binding a session to the caller's identity; the session-id propagation path is fail-closed by the service, since a request to an engine holding a temporal policy fails validation without the header",
       "extra_iam": [],
       "phase": 4,
       "source": "controls/ai-specific/agentcore-policy.yaml"
@@ -1045,13 +1067,18 @@
         "agent_registry_assessments"
       ],
       "incumbents": [
-        "AR-03"
+        "AR-03",
+        "AR-09"
       ],
       "incumbent_names": [
-        "AWS Agent Registry Publication Approval Governance"
+        "AWS Agent Registry Publication Approval Governance",
+        "AWS Agent Registry Approval Authority Separation"
       ],
-      "gap": "AR-03 is named \"Publication Approval Governance\" but covers auto-approval only, behind the REQUIRE_AGENT_REGISTRY_MANUAL_APPROVAL env gate; no curator/publisher separation and no EventBridge rule",
-      "extra_iam": [],
+      "gap": "AR-03 is named \"Publication Approval Governance\" but covers auto-approval only, behind the REQUIRE_AGENT_REGISTRY_MANUAL_APPROVAL env gate, so a default deployment skips it. AR-09 now asserts the separation leg: it fails any role or user whose effective policy reaches both a record write (CreateRegistryRecord, UpdateRegistryRecord, SubmitRegistryRecordForApproval) and UpdateRegistryRecordStatus, the one operation that can set a record to APPROVED, in either the agent-registry namespace or the public-preview bedrock-agentcore spelling of it. The EventBridge leg stays unasserted: no check reads whether an enabled rule matches the aws.agent-registry approval state-change events and carries a target, which needs events:ListRules and events:ListTargetsByRule on AgentRegistrySecurityAssessmentFunction",
+      "extra_iam": [
+        "events:ListRules",
+        "events:ListTargetsByRule"
+      ],
       "phase": 4,
       "source": "controls/ai-specific/agentcore-registry-optimization-payments.yaml"
     },
@@ -1061,8 +1088,8 @@
       "question": "Is outbound network access from code-execution and browser tools restricted to only what the workload needs, rather than open internet egress?",
       "assert": "Tool network-mode / egress-filtering configuration",
       "workload_agnostic": true,
-      "verdict": "tighten",
-      "disposition": "extend",
+      "verdict": "covered",
+      "disposition": null,
       "target_modules": [
         "agentcore_assessments"
       ],
@@ -1072,10 +1099,8 @@
       "incumbent_names": [
         "AgentCore Runtime VPC Configuration"
       ],
-      "gap": "AC-01 requires VPC placement and flags public subnets but never reads what the security-group rules permit; describe_security_groups is 0 hits in the module, so VPC placement is proven and egress filtering is not",
-      "extra_iam": [
-        "ec2:DescribeSecurityGroups"
-      ],
+      "gap": "AC-01 now reads the outbound rules of every security group attached to a VPC runtime, code interpreter or browser and fails a group permitting 0.0.0.0/0 or ::/0 egress. A tool in PUBLIC network mode fails without a describe call, because the service grants it open internet egress by configuration; SANDBOX passes at Medium, because the sandbox reaches no network the workload can name. A group the describe did not return and a denied ec2:DescribeSecurityGroups are both reported N/A on their own line, so an unread group is never counted as closed",
+      "extra_iam": [],
       "phase": 4,
       "source": "controls/ai-specific/agentcore-runtime.yaml"
     },
@@ -1085,14 +1110,18 @@
       "question": "Is the ability to hand the evaluation service an IAM role (PassRole) restricted to the specific evaluation execution role, rather than any role?",
       "assert": "iam:PassRole policy with resource + PassedToService condition",
       "workload_agnostic": true,
-      "verdict": "new",
+      "verdict": "covered",
       "disposition": null,
       "target_modules": [
         "agentcore_assessments"
       ],
-      "incumbents": [],
-      "incumbent_names": [],
-      "gap": "PassRole returns 0 across all six modules; AssumeRolePolicyDocument is read once at :2725 but only to match principal.Service for role discovery, never a condition",
+      "incumbents": [
+        "AC-42"
+      ],
+      "incumbent_names": [
+        "AgentCore Evaluation Pass Role Scope"
+      ],
+      "gap": "AC-42 reads iam:PassRole on every cached role and user against the execution roles the region's online evaluation configurations name, and judges the widest statement that reaches one of them: a Resource pattern wider than the role itself, or a grant carrying no iam:PassedToService condition, lets the holder run a role it could not assume by writing a configuration that names it",
       "extra_iam": [],
       "phase": 4,
       "source": "controls/ai-specific/agentcore-evaluations.yaml"
@@ -1103,14 +1132,18 @@
       "question": "Does the evaluation execution role's trust policy prevent a confused-deputy attack from another account?",
       "assert": "Evaluation execution-role trust policy with SourceAccount/SourceArn conditions",
       "workload_agnostic": true,
-      "verdict": "new",
+      "verdict": "covered",
       "disposition": null,
       "target_modules": [
         "agentcore_assessments"
       ],
-      "incumbents": [],
-      "incumbent_names": [],
-      "gap": "confused-deputy conditions absent: SourceAccount/SourceArn are 1 hit corpus-wide, in sagemaker_assessments, none in AgentCore",
+      "incumbents": [
+        "AC-43"
+      ],
+      "incumbent_names": [
+        "AgentCore Evaluation Role Trust"
+      ],
+      "gap": "AC-43 reads each evaluation execution role's own trust policy and reports every Allow statement trusting an AWS service principal, or every principal, with no aws:SourceAccount and no aws:SourceArn condition. The role can read the scored traces and invoke the judge model, so a service acting for another customer's configuration reaches both. AC-27 makes the same assertion on gateway execution roles and reaches no evaluation role, because it reads the roles gateways name",
       "extra_iam": [],
       "phase": 4,
       "source": "controls/ai-specific/agentcore-evaluations.yaml"
@@ -1121,14 +1154,18 @@
       "question": "For custom LLM-as-a-judge evaluators, is the model-invocation permission scoped to only the specific models the evaluators use?",
       "assert": "Evaluator role bedrock:InvokeModel scoped to specific model ARNs",
       "workload_agnostic": false,
-      "verdict": "new",
+      "verdict": "covered",
       "disposition": null,
       "target_modules": [
         "agentcore_assessments"
       ],
-      "incumbents": [],
-      "incumbent_names": [],
-      "gap": "",
+      "incumbents": [
+        "AC-44"
+      ],
+      "incumbent_names": [
+        "AgentCore Evaluation Judge Model Scope"
+      ],
+      "gap": "AC-44 reports whether each evaluation execution role's model-invocation grant names models at all: a Resource pattern ending in a bare wildcard reaches every model the account can invoke, and the judge prompt carries the agent output being scored, so every model it reaches is one attacker-influenced text can be sent to. Which models a workload's judges may use is the workload owner's decision, so the check names the patterns it found and asserts only that they are bounded",
       "extra_iam": [],
       "phase": 4,
       "source": "controls/ai-specific/agentcore-evaluations.yaml"
@@ -1139,14 +1176,22 @@
       "question": "Are evaluation results treated as sensitive data \u2014 encrypted with organization-controlled keys, retained to a compliance schedule, and free of PII in tags or free-form fields?",
       "assert": "Evaluation-results CMK config (evaluation-scoped encryption context) + retention + no-PII-in-tags check",
       "workload_agnostic": true,
-      "verdict": "new",
+      "verdict": "covered",
       "disposition": null,
       "target_modules": [
         "agentcore_assessments"
       ],
-      "incumbents": [],
-      "incumbent_names": [],
-      "gap": "",
+      "incumbents": [
+        "AC-20",
+        "AC-26",
+        "AC-41"
+      ],
+      "incumbent_names": [
+        "AgentCore Log Data Protection",
+        "AgentCore Log Retention and Key Scope",
+        "AgentCore Evaluation Result Protection"
+      ],
+      "gap": "AC-41 anchors on the log group each configuration's outputConfig names and asserts a retention period, a customer managed key, and membership of the AgentCore log group prefixes, so a results group whose creator chose a name outside them is reported rather than skipped. AC-20 and AC-26 judge masking and key policy on the groups under those prefixes and neither reaches a group outside them. Tag values and the configuration's own description are free-form text AC-41 discloses instead of judging",
       "extra_iam": [],
       "phase": 4,
       "source": "controls/ai-specific/agentcore-evaluations.yaml"
@@ -1157,18 +1202,19 @@
       "question": "Is there an org-wide preventive control that blocks creating or updating a gateway with no inbound authorizer?",
       "assert": "SCP denying CreateGateway/UpdateGateway when GatewayAuthorizerType is NONE",
       "workload_agnostic": true,
-      "verdict": "new",
+      "verdict": "covered",
       "disposition": null,
       "target_modules": [
         "agentcore_assessments"
       ],
-      "incumbents": [],
-      "incumbent_names": [],
-      "gap": "asserts an SCP; the corpus already enumerates SCPs in two modules, so the cost is the Organizations read",
-      "extra_iam": [
-        "organizations:ListPolicies",
-        "organizations:DescribePolicy"
+      "incumbents": [
+        "AC-28"
       ],
+      "incumbent_names": [
+        "AgentCore Gateway Authorizer Guardrail"
+      ],
+      "gap": "AC-28 requires a service control policy that denies both CreateGateway and UpdateGateway when bedrock-agentcore:GatewayAuthorizerType is NONE, either by naming NONE in an equals-family condition or by omitting it from a not-equals-family one, so no approved-authorizer list has to be invented; attachment targets are outside the grant and the finding says so. The condition key carries a documentation drift: the AgentCore devguide wires GatewayAuthorizerType to CreateGateway and UpdateGateway and shows sibling gateway keys used this way in SCPs, while the machine-readable service reference and the service authorization reference page wire it to zero actions. The devguide wins for feature availability. Access Analyzer validate-policy accepts the key name but is no oracle for the wiring: it also accepts RuntimeAuthorizerType on CreateGateway, a pairing neither surface declares",
+      "extra_iam": [],
       "phase": 4,
       "source": "controls/ai-specific/agentcore-gateway.yaml"
     },
@@ -1178,14 +1224,18 @@
       "question": "Does each gateway target use an appropriate, least-privilege outbound authentication method, with no unauthenticated targets in production and no wildcard target permissions?",
       "assert": "Per-target outbound-auth enumeration + Lambda target scoped to specific function ARN",
       "workload_agnostic": true,
-      "verdict": "new",
+      "verdict": "covered",
       "disposition": null,
       "target_modules": [
         "agentcore_assessments"
       ],
-      "incumbents": [],
-      "incumbent_names": [],
-      "gap": "",
+      "incumbents": [
+        "AC-25"
+      ],
+      "incumbent_names": [
+        "AgentCore Gateway Target Authorization"
+      ],
+      "gap": "AC-25 reads credentialProviderConfigurations per target through GetGatewayTarget, which is the only surface that carries it: the ListGatewayTargets summary omits the field. The control's second leg, a Lambda target scoped to one function ARN, is not expressible because the target ARN members reject a wildcard",
       "extra_iam": [],
       "phase": 4,
       "source": "controls/ai-specific/agentcore-gateway.yaml"
@@ -1196,14 +1246,22 @@
       "question": "Is every call made through the gateway logged with enough detail (caller, target, parameters, result) to support a security investigation, with the encryption of that data under organization control?",
       "assert": "Gateway application-log config + retention + CMK key-policy scoping",
       "workload_agnostic": true,
-      "verdict": "new",
+      "verdict": "covered",
       "disposition": null,
       "target_modules": [
         "agentcore_assessments"
       ],
-      "incumbents": [],
-      "incumbent_names": [],
-      "gap": "",
+      "incumbents": [
+        "AC-19",
+        "AC-20",
+        "AC-26"
+      ],
+      "incumbent_names": [
+        "AgentCore Log Delivery Configuration",
+        "AgentCore Log Data Protection",
+        "AgentCore Log Retention and Key Scope"
+      ],
+      "gap": "AC-19 pairs each AgentCore delivery source with its delivery and AC-20 asserts masking plus a customer managed key; AC-26 adds the two legs neither held, an explicitly configured retentionInDays and a key policy that does not let every principal decrypt without a condition",
       "extra_iam": [],
       "phase": 4,
       "source": "controls/ai-specific/agentcore-gateway.yaml"
@@ -1214,18 +1272,19 @@
       "question": "Is there an org-wide preventive control preventing an agent runtime from being deployed with an authentication mode that does not propagate a real user identity?",
       "assert": "Preventive guardrail configuration/policy",
       "workload_agnostic": true,
-      "verdict": "new",
+      "verdict": "covered",
       "disposition": null,
       "target_modules": [
         "agentcore_assessments"
       ],
-      "incumbents": [],
-      "incumbent_names": [],
-      "gap": "asserts an SCP; same Organizations read as GW-02",
-      "extra_iam": [
-        "organizations:ListPolicies",
-        "organizations:DescribePolicy"
+      "incumbents": [
+        "AC-29"
       ],
+      "incumbent_names": [
+        "AgentCore Runtime Authorizer Guardrail"
+      ],
+      "gap": "AC-29 requires a service control policy that denies both CreateAgentRuntime and UpdateAgentRuntime when bedrock-agentcore:RuntimeAuthorizerType is AWS_IAM, so a runtime cannot be created on, or moved back to, the SigV4 mode that authenticates the hosting application's shared role instead of the end user; a policy written the other way round, denying CUSTOM_JWT, is reported separately because it reads as configured to anyone counting policies. organizations:ListPolicies and organizations:DescribePolicy are granted to this function for GW-02's AC-28, so ID-04 costs no further permission. Attachment targets are outside the grant and every finding says so",
+      "extra_iam": [],
       "phase": 4,
       "source": "controls/ai-specific/agentcore-identity.yaml"
     },
@@ -1235,14 +1294,18 @@
       "question": "Is every request to invoke an agent authenticated and its identity claims validated before the agent's code runs?",
       "assert": "Inbound authorizer configuration (validated claims / signed-request enforcement)",
       "workload_agnostic": true,
-      "verdict": "new",
+      "verdict": "covered",
       "disposition": null,
       "target_modules": [
         "agentcore_assessments"
       ],
-      "incumbents": [],
-      "incumbent_names": [],
-      "gap": "GetAgentRuntime.authorizerConfiguration exists in botocore 1.43.85 and is never read anywhere; AG-24 is gateway-only, ID-08 is about the runtime",
+      "incumbents": [
+        "AC-30"
+      ],
+      "incumbent_names": [
+        "AgentCore Runtime Inbound Authorization"
+      ],
+      "gap": "AC-30 reads GetAgentRuntime.authorizerConfiguration per runtime: an absent configuration means every invoke is SigV4-signed, and a customJWTAuthorizer that pins neither allowedAudience nor allowedClients accepts every token its issuer minted for every application registered there, so the claims are validated but not against this agent. allowedScopes and customClaims are credited in the detail and cannot substitute, because a scope bounds what a token may ask for and not who it was minted for",
       "extra_iam": [],
       "phase": 4,
       "source": "controls/ai-specific/agentcore-identity.yaml"
@@ -1253,14 +1316,20 @@
       "question": "Is inbound access to agents restricted to only your approved identity provider(s) and client applications, so a validly-signed token from an unapproved issuer cannot invoke them?",
       "assert": "Inbound authorizer issuer/audience/client allow-lists + InboundJwtClaim condition keys pinning the IdP",
       "workload_agnostic": true,
-      "verdict": "new",
+      "verdict": "covered",
       "disposition": null,
       "target_modules": [
         "agentcore_assessments"
       ],
-      "incumbents": [],
-      "incumbent_names": [],
-      "gap": "the corpus reads authorizerType exactly once, at :3578, and never reads authorizerConfiguration; customJWTAuthorizer.{allowedAudience, allowedClients, allowedScopes, customClaims, discoveryUrl} are all present in the API and unread, so a gateway that trusts any issuer passes AG-24 today",
+      "incumbents": [
+        "AC-31",
+        "AC-32"
+      ],
+      "incumbent_names": [
+        "AgentCore Gateway Inbound Allow Lists",
+        "AgentCore Inbound JWT Issuer Conditions"
+      ],
+      "gap": "AG-24 passed every CUSTOM_JWT gateway on the authorizer type alone. AC-31 reads the authorizer's allow-lists and fails a gateway that pins neither allowedAudience nor allowedClients, because it then honours any token its issuer minted for any application registered there; allowedScopes and customClaims bound what a token may ask for and not who minted it for whom, so they are credited but do not substitute. AC-32 covers the second door, where the token-exchange APIs take an end user's JWT without passing a gateway authorizer at all, and fails a cached principal holding GetWorkloadAccessTokenForJWT or CompleteResourceTokenAuth with no InboundJwtClaim condition",
       "extra_iam": [],
       "phase": 4,
       "source": "controls/ai-specific/agentcore-identity.yaml"
@@ -1278,7 +1347,7 @@
       ],
       "incumbents": [],
       "incumbent_names": [],
-      "gap": "",
+      "gap": "Left open in phase 4: no workload-independent invariant here reaches Failed per memory. eventExpiryDuration is required at CreateMemory, 3 to 365 days in the pinned 2023-06-05 model, and required again on the Memory shape GetMemory returns, so every memory carries a retention bound and a presence check passes unconditionally. Which value is short enough is the workload owner's judgment, and this row will not invent a ceiling. The namespace-scope half of the control is asserted under AIR-ACR-MEM-01 by AC-07 and AC-23, and its log-retention clause asks for a compliance schedule only the workload owner can name",
       "extra_iam": [],
       "phase": 4,
       "source": "controls/ai-specific/agentcore-memory.yaml"
@@ -1289,18 +1358,19 @@
       "question": "Are session-level memory operations (record reads/writes, extraction jobs) captured in an audit trail, not just management events?",
       "assert": "CloudTrail data-event selector covering Memory Events + Records",
       "workload_agnostic": true,
-      "verdict": "new",
+      "verdict": "covered",
       "disposition": null,
       "target_modules": [
         "agentcore_assessments"
       ],
-      "incumbents": [],
-      "incumbent_names": [],
-      "gap": "CloudTrail event selectors; reads no AgentCore API",
-      "extra_iam": [
-        "cloudtrail:GetEventSelectors",
-        "cloudtrail:ListTrails"
+      "incumbents": [
+        "AC-18"
       ],
+      "incumbent_names": [
+        "AgentCore CloudTrail Data Event Coverage"
+      ],
+      "gap": "AC-18 asserts that a CloudTrail advanced event selector logs data events for AWS::BedrockAgentCore::Memory whenever the region holds a memory resource",
+      "extra_iam": [],
       "phase": 4,
       "source": "controls/ai-specific/agentcore-memory.yaml"
     },
@@ -1310,18 +1380,19 @@
       "question": "Are CloudTrail data events enabled for AgentCore Runtime, Memory, and tool invocations, not just management events?",
       "assert": "CloudTrail advanced event selector covering AgentCore Runtime/Memory/Tools data events",
       "workload_agnostic": true,
-      "verdict": "new",
+      "verdict": "covered",
       "disposition": null,
       "target_modules": [
         "agentcore_assessments"
       ],
-      "incumbents": [],
-      "incumbent_names": [],
-      "gap": "CloudTrail event selectors; reads no AgentCore API",
-      "extra_iam": [
-        "cloudtrail:GetEventSelectors",
-        "cloudtrail:ListTrails"
+      "incumbents": [
+        "AC-18"
       ],
+      "incumbent_names": [
+        "AgentCore CloudTrail Data Event Coverage"
+      ],
+      "gap": "AC-18 asserts data-event coverage per resource family, so a trail that logs only the runtime types still fails for memory and for the built-in tools",
+      "extra_iam": [],
       "phase": 4,
       "source": "controls/ai-specific/agentcore-observability.yaml"
     },
@@ -1331,14 +1402,18 @@
       "question": "Is observability explicitly enabled and its log destination configured for each AgentCore service in use, not just Runtime?",
       "assert": "Per-service observability + log-destination configuration (Gateway/Memory/Policy/Identity)",
       "workload_agnostic": true,
-      "verdict": "new",
+      "verdict": "covered",
       "disposition": null,
       "target_modules": [
         "agentcore_assessments"
       ],
-      "incumbents": [],
-      "incumbent_names": [],
-      "gap": "AC-04 is X-Ray tracingConfig.enabled over list_agent_runtimes only, so it cannot cover Gateway, Memory, Policy or Identity, which is OBS-03's whole subject; this row was a tightening in an earlier draft and the resource-scope check moved it",
+      "incumbents": [
+        "AC-19"
+      ],
+      "incumbent_names": [
+        "AgentCore Log Delivery Configuration"
+      ],
+      "gap": "AC-04 is X-Ray tracingConfig.enabled over list_agent_runtimes only, so it cannot cover Gateway, Memory, Policy or Identity, which is OBS-03's whole subject. AC-19 asserts an APPLICATION_LOGS delivery source wired to a destination per gateway and per memory; runtime logging is service-managed, WorkloadIdentity delivery is configured on the associated runtime or gateway resource, and policy engines have no log-destination surface, so those three legs need no separate assertion",
       "extra_iam": [],
       "phase": 4,
       "source": "controls/ai-specific/agentcore-observability.yaml"
@@ -1349,18 +1424,21 @@
       "question": "Is sensitive data (PII/PHI) that agents write to their own logs masked, and are those log groups encrypted and access-restricted, not just filtered at the model boundary?",
       "assert": "CloudWatch Logs data-protection policy + CMK log encryption + logs:Unmask restriction",
       "workload_agnostic": true,
-      "verdict": "new",
+      "verdict": "covered",
       "disposition": null,
       "target_modules": [
         "agentcore_assessments"
       ],
-      "incumbents": [],
-      "incumbent_names": [],
-      "gap": "CloudWatch Logs data-protection policy",
-      "extra_iam": [
-        "logs:GetDataProtectionPolicy",
-        "logs:DescribeAccountPolicies"
+      "incumbents": [
+        "AC-20",
+        "AC-21"
       ],
+      "incumbent_names": [
+        "AgentCore Log Data Protection",
+        "AgentCore Log Unmask Restriction"
+      ],
+      "gap": "AC-20 asserts a Deidentify data-protection policy and a customer managed key on the AgentCore log groups, AC-21 asserts that no cached role or user holds logs:Unmask on every resource",
+      "extra_iam": [],
       "phase": 4,
       "source": "controls/ai-specific/agentcore-observability.yaml"
     },
@@ -1370,18 +1448,19 @@
       "question": "For multi-account agent deployments, is telemetry aggregated into a central monitoring account with the cross-account sharing link scoped to your organization?",
       "assert": "OAM sink policy scoped by aws:PrincipalOrgID + least-privilege cross-account view",
       "workload_agnostic": true,
-      "verdict": "new",
+      "verdict": "covered",
       "disposition": null,
       "target_modules": [
         "agentcore_assessments"
       ],
-      "incumbents": [],
-      "incumbent_names": [],
-      "gap": "OAM sink policy",
-      "extra_iam": [
-        "oam:ListSinks",
-        "oam:GetSinkPolicy"
+      "incumbents": [
+        "AC-22"
       ],
+      "incumbent_names": [
+        "AgentCore Telemetry Sink Scope"
+      ],
+      "gap": "AC-22 asserts that every Allow statement on an OAM sink policy either names its principals or carries an organization condition key",
+      "extra_iam": [],
       "phase": 4,
       "source": "controls/ai-specific/agentcore-observability.yaml"
     },
@@ -1391,14 +1470,18 @@
       "question": "For content-safety decisions on agent actions, are Bedrock Guardrails composed into the policy engine so harmful content, prompt injection, or PII is scored and enforced at the same authorization boundary?",
       "assert": "Cedar guardrails-block config + gateway role bedrock:InvokeGuardrailChecks grant",
       "workload_agnostic": false,
-      "verdict": "new",
+      "verdict": "covered",
       "disposition": null,
       "target_modules": [
         "agentcore_assessments"
       ],
-      "incumbents": [],
-      "incumbent_names": [],
-      "gap": "",
+      "incumbents": [
+        "AC-37"
+      ],
+      "incumbent_names": [
+        "AgentCore Policy Guardrail Wiring"
+      ],
+      "gap": "AC-37 asserts the workload-independent half: a policy carrying a guardrails condition needs bedrock:InvokeGuardrailChecks on the gateway execution role, because the Policy data plane calls Bedrock Guardrails with that role's forward access session. Whether this workload's content belongs at the authorization boundary at all, and which safeguard categories and thresholds apply, is the workload owner's decision, which AC-37 reports and does not judge",
       "extra_iam": [],
       "phase": 4,
       "source": "controls/ai-specific/agentcore-policy.yaml"
@@ -1409,14 +1492,18 @@
       "question": "Are resource limits (time, memory, cost) enforced per agent session to prevent a single runaway task from consuming disproportionate resources?",
       "assert": "Per-session resource limit configuration",
       "workload_agnostic": false,
-      "verdict": "new",
+      "verdict": "covered",
       "disposition": null,
       "target_modules": [
         "agentcore_assessments"
       ],
-      "incumbents": [],
-      "incumbent_names": [],
-      "gap": "",
+      "incumbents": [
+        "AC-46"
+      ],
+      "incumbent_names": [
+        "AgentCore Runtime Session Limits"
+      ],
+      "gap": "AC-46 fails a runtime that configures neither idleRuntimeSessionTimeout nor maxLifetime, or that sets either at the service ceiling of 1209600 seconds, which is the setting that lets one runaway session hold its resources for 14 days. AgentCore exposes no per-session memory or cost limit to read, so the time bound is the only limit the API can answer for, and every verdict says which values it found so the workload owner can judge whether the bound suits the task",
       "extra_iam": [],
       "phase": 4,
       "source": "controls/ai-specific/agentcore-runtime.yaml"

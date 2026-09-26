@@ -23,6 +23,7 @@ row's own Status column carries the verdict.
 
 AISF_COMPLIANCE_MAP = {
     "AR-03": "AISF AIR-ACR-REG-02 (partial)",
+    "AR-09": "AISF AIR-ACR-REG-02 (partial)",
 }
 
 

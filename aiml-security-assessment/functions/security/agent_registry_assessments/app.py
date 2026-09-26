@@ -31,6 +31,17 @@ GLOBAL_REGION_LABEL = "Global"
 REGISTRY_PAGE_SIZE = 100
 RECORD_INVENTORY_LIMIT = 1000
 REGISTRY_IAM_NAMESPACE = "agent-registry"
+# Both namespaces grant the Registry actions. Support for the public-preview
+# `bedrock-agentcore` spelling ends on 30 October 2026, so until then a question
+# about who holds a Registry authority has to read the policy in both namespaces
+# or a preview-era grant answers it as absent.
+REGISTRY_IAM_NAMESPACES = (REGISTRY_IAM_NAMESPACE, "bedrock-agentcore")
+REGISTRY_PUBLISH_ACTIONS = (
+    "CreateRegistryRecord",
+    "UpdateRegistryRecord",
+    "SubmitRegistryRecordForApproval",
+)
+REGISTRY_APPROVAL_ACTION = "UpdateRegistryRecordStatus"
 REGION_UNAVAILABLE_ERROR_CODES = {
     "AuthFailure",
     "InvalidClientTokenId",
@@ -54,6 +65,10 @@ IAM_LAST_ACCESSED_REFERENCE_URL = "https://docs.aws.amazon.com/IAM/latest/UserGu
 APPROVAL_REFERENCE_URL = (
     "https://docs.aws.amazon.com/agent-registry-control/latest/APIReference/"
     "API_ApprovalConfiguration.html"
+)
+APPROVAL_SEPARATION_REFERENCE_URL = (
+    "https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/"
+    "registry-concepts.html#registry-concept-personas"
 )
 AUTHORIZATION_REFERENCE_URL = (
     "https://docs.aws.amazon.com/agent-registry-control/latest/APIReference/"
@@ -526,6 +541,148 @@ def check_agent_registry_stale_access(
             "No action required",
             IAM_LAST_ACCESSED_REFERENCE_URL,
             SeverityEnum.LOW,
+            StatusEnum.PASSED,
+        )
+    ]
+
+
+def _qualified_registry_actions(local_name: str) -> tuple[str, ...]:
+    """Both namespace spellings of one Registry action, as IAM publishes them."""
+    return tuple(f"{namespace}:{local_name}" for namespace in REGISTRY_IAM_NAMESPACES)
+
+
+def _pattern_names_a_service(pattern: str) -> bool:
+    """Whether one IAM action pattern names a service rather than all of them."""
+    service, separator, _ = pattern.partition(":")
+    return bool(separator) and service != "*"
+
+
+def _statement_allows_registry_action(statement: Dict[str, Any], action: str) -> bool:
+    """Whether one Allow statement names a Registry action by service.
+
+    A service-agnostic pattern is out of scope, as it is in AR-01's wildcard leg:
+    an account administrator is reported once, under the full-access question, and
+    not again under every narrower Registry question. Both spellings of that grant
+    are read alike, a bare `*` and a `*:*`.
+    """
+    return any(
+        _pattern_names_a_service(pattern) and fnmatchcase(action.lower(), pattern)
+        for pattern in _as_list(statement.get("Action", []))
+    )
+
+
+def _statement_denies_registry_action(statement: Dict[str, Any], action: str) -> bool:
+    """Whether one Deny statement removes a Registry action account-wide.
+
+    Read with the full action grammar, including NotAction, because a
+    service-agnostic Deny does remove the action. A Deny scoped to one registry,
+    or carrying a condition, is not an account-wide Deny and does not excuse the
+    principal.
+    """
+    if statement.get("Condition"):
+        return False
+    if "*" not in _as_list(statement.get("Resource", [])):
+        return False
+    patterns = _as_list(statement.get("Action", []))
+    if patterns:
+        return any(fnmatchcase(action.lower(), pattern) for pattern in patterns)
+    excluded = _as_list(statement.get("NotAction", []))
+    return bool(excluded) and not any(
+        fnmatchcase(action.lower(), pattern) for pattern in excluded
+    )
+
+
+def _registry_authority_actions(permissions: Dict[str, Any]) -> tuple[set, set]:
+    """Return the Registry authority actions one principal is allowed and denied."""
+    watched = _qualified_registry_actions(REGISTRY_APPROVAL_ACTION) + tuple(
+        action
+        for local_name in REGISTRY_PUBLISH_ACTIONS
+        for action in _qualified_registry_actions(local_name)
+    )
+    allowed: set = set()
+    denied: set = set()
+    for policy in [
+        *permissions.get("attached_policies", []),
+        *permissions.get("inline_policies", []),
+    ]:
+        for statement in _policy_statements(policy):
+            effect = statement.get("Effect")
+            for action in watched:
+                if effect == "Allow" and _statement_allows_registry_action(
+                    statement, action
+                ):
+                    allowed.add(action)
+                elif effect == "Deny" and _statement_denies_registry_action(
+                    statement, action
+                ):
+                    denied.add(action)
+    return allowed, denied
+
+
+def _registry_approval_collisions(
+    permissions_by_name: Dict[str, Any], principal_kind: str
+) -> List[str]:
+    """Return each principal that can publish a record and approve it as well."""
+    approval_actions = set(_qualified_registry_actions(REGISTRY_APPROVAL_ACTION))
+    labels = []
+    for principal_name, permissions in permissions_by_name.items():
+        allowed, denied = _registry_authority_actions(permissions)
+        effective = allowed - denied
+        publishes = sorted(effective - approval_actions)
+        if publishes and effective & approval_actions:
+            labels.append(
+                f"{principal_kind} '{principal_name}' ({', '.join(publishes)})"
+            )
+    return sorted(labels)
+
+
+def check_agent_registry_approval_separation(
+    permission_cache: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    """AR-09: find principals that can approve the records they publish.
+
+    A record becomes discoverable only once UpdateRegistryRecordStatus sets it to
+    APPROVED, so a principal holding that action beside a record write is the
+    publisher and the curator of the same entry, and the review the registry's
+    approval workflow exists to impose never happens.
+    """
+    finding = "AWS Agent Registry Approval Authority Separation"
+    roles = permission_cache.get("role_permissions", {})
+    users = permission_cache.get("user_permissions", {})
+    if not roles and not users:
+        return [
+            _na(
+                "AR-09",
+                finding,
+                "No IAM permissions found in cache.",
+                APPROVAL_SEPARATION_REFERENCE_URL,
+            )
+        ]
+    collisions = [
+        *_registry_approval_collisions(roles, "role"),
+        *_registry_approval_collisions(users, "user"),
+    ]
+    if collisions:
+        return [
+            create_finding(
+                "AR-09",
+                finding,
+                "The following principals can both publish an AWS Agent Registry record and approve it: "
+                + ", ".join(collisions),
+                f"Split the publisher and curator personas: leave {REGISTRY_IAM_NAMESPACE}:{REGISTRY_APPROVAL_ACTION} to the curator and remove it from principals that create, update, or submit records.",
+                APPROVAL_SEPARATION_REFERENCE_URL,
+                SeverityEnum.HIGH,
+                StatusEnum.FAILED,
+            )
+        ]
+    return [
+        create_finding(
+            "AR-09",
+            finding,
+            f"None of the {len(roles) + len(users)} cached IAM identities hold both AWS Agent Registry record-publication and record-approval permissions.",
+            "No action required",
+            APPROVAL_SEPARATION_REFERENCE_URL,
+            SeverityEnum.HIGH,
             StatusEnum.PASSED,
         )
     ]
@@ -1369,21 +1526,36 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                             "AWS Agent Registry Stale Access Check",
                             IAM_LAST_ACCESSED_REFERENCE_URL,
                         ),
+                        (
+                            "AR-09",
+                            "AWS Agent Registry Approval Authority Separation",
+                            APPROVAL_SEPARATION_REFERENCE_URL,
+                        ),
                     )
                 ]
             else:
-                cache_findings = _run_check_safely(
-                    "AR-01",
-                    "AWS Agent Registry IAM Full Access Check",
-                    IAM_FULL_ACCESS_REFERENCE_URL,
-                    check_agent_registry_full_access,
-                    cache,
-                ) + _run_check_safely(
-                    "AR-02",
-                    "AWS Agent Registry Stale Access Check",
-                    IAM_LAST_ACCESSED_REFERENCE_URL,
-                    check_agent_registry_stale_access,
-                    cache,
+                cache_findings = (
+                    _run_check_safely(
+                        "AR-01",
+                        "AWS Agent Registry IAM Full Access Check",
+                        IAM_FULL_ACCESS_REFERENCE_URL,
+                        check_agent_registry_full_access,
+                        cache,
+                    )
+                    + _run_check_safely(
+                        "AR-02",
+                        "AWS Agent Registry Stale Access Check",
+                        IAM_LAST_ACCESSED_REFERENCE_URL,
+                        check_agent_registry_stale_access,
+                        cache,
+                    )
+                    + _run_check_safely(
+                        "AR-09",
+                        "AWS Agent Registry Approval Authority Separation",
+                        APPROVAL_SEPARATION_REFERENCE_URL,
+                        check_agent_registry_approval_separation,
+                        cache,
+                    )
                 )
             for finding in cache_findings:
                 finding["Region"] = GLOBAL_REGION_LABEL

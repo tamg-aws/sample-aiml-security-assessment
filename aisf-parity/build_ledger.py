@@ -185,165 +185,221 @@ ROWS = [
     ),
     (
         "AIR-ACR-EVAL-01",
-        TIGHTEN,
-        EXTEND,
+        COVERED,
+        None,
         "agentcore_assessments",
         ["AC-02"],
-        "AC-02 detects AgentCore full-access and wildcard grants only, so a role holding a "
-        "single over-broad named action passes it",
+        "AC-02 now reads wildcard action patterns at any resource scope, on cached roles and "
+        "users alike, so bedrock-agentcore:* narrowed to one evaluation ARN is reported where "
+        "the full-access legs saw nothing. A pattern reaching any one of the six evaluator and "
+        "online-evaluation-config writes grants all six, and a principal that can delete an "
+        'evaluation can stop the measurement of the agent it watches. A bare Action "*" stays '
+        "with the existing legs as a service-agnostic administrator grant",
         [],
         4,
     ),
     (
         "AIR-ACR-ID-10",
-        TIGHTEN,
-        EXTEND,
+        COVERED,
+        None,
         "agentcore_assessments",
-        ["AC-02"],
-        "AC-02 detects full-access and wildcard grants only",
+        ["AC-33"],
+        "AC-33 judges the resource element on the five token issuance actions per cached role "
+        "and user: a resource ending in a wildcard mints a token for every workload identity "
+        "in the account, while a resource naming one identity bounds the grant to that agent. "
+        "A grant that names only the workload identity directory is reported separately at "
+        "medium, because the service authorization reference marks both the directory and the "
+        "identity required on these actions and never says whether the directory alone "
+        "authorizes the call, so that grant either reaches every identity the directory holds "
+        "or authorizes nothing",
         [],
         4,
     ),
     (
         "AIR-ACR-PAY-01",
-        TIGHTEN,
-        EXTEND,
+        COVERED,
+        None,
         "agentcore_assessments",
         ["AC-02"],
-        "AC-02 detects full-access and wildcard grants only",
+        "AC-02 now fails any role or user whose Allow statements reach both an AgentCore "
+        "payment session or instrument write and ProcessPayment with no account-wide Deny on "
+        "the latter. A payment session carries its own limits.maxSpendAmount, so that one "
+        "principal sets the budget it then spends against, which is the single failure behind "
+        "both legs the devguide draws: its ManagementRole denies ProcessPayment and its "
+        "ProcessPaymentRole holds no session write. A Deny scoped to one payment manager or "
+        "carrying a condition is read as no account-wide Deny, so a narrower Deny never "
+        "excuses the collision",
         [],
         4,
     ),
     (
         "AIR-ACR-RT-03",
-        TIGHTEN,
-        EXTEND,
+        COVERED,
+        None,
         "agentcore_assessments",
-        ["AC-02"],
-        "AC-02 detects full-access and wildcard grants only",
+        ["AC-02", "AC-45"],
+        "AC-45 reads the execution role of every code interpreter and browser in the account "
+        "and fails a role whose Allow statements reach every resource, name a NotResource, or "
+        "carry a service-wide or bare action wildcard. AC-02 judges the same wildcards but "
+        "only over the bedrock-agentcore namespace and only on the assessment's own roles, so "
+        "a tool role granting s3:* on every bucket is a verdict it cannot reach",
         [],
         4,
     ),
     (
         "AIR-ACR-EVAL-05",
-        TIGHTEN,
-        NEW_ID,
+        COVERED,
+        None,
         "agentcore_assessments",
-        ["AC-17"],
-        'AC-17 is named "Online Evaluation Coverage" but tests only status == ACTIVE, '
-        "executionStatus == ENABLED and bool(evaluators); it never reads a sampling rate and "
-        "never asks which evaluators, so coverage is the one thing it does not measure",
+        ["AC-17", "AC-39"],
+        "AC-39 judges every online evaluation configuration that exists whatever "
+        "REQUIRE_AGENTCORE_ONLINE_EVALUATION is set to, and names the setting that stops it "
+        "running: a status other than ACTIVE, an executionStatus other than ENABLED, no "
+        "sampling percentage above zero, no input log group or service, no output log group, "
+        "or no evaluator attached. AC-17 reads the same settings and returns N/A with that "
+        "variable unset, so Failed is the verdict it cannot reach by default",
         [],
         4,
     ),
     (
         "AIR-ACR-EVAL-06",
-        TIGHTEN,
-        NEW_ID,
+        COVERED,
+        None,
         "agentcore_assessments",
-        ["AC-17"],
-        'AC-17 is named "Online Evaluation Coverage" and never asks which evaluators are '
-        "attached, so it cannot distinguish a safety evaluator from a latency one",
+        ["AC-17", "AC-40"],
+        "AC-40 classifies the evaluators each configuration attaches against the account's own "
+        "catalogue, which marks a service-authored evaluator's category in its description and "
+        "reports the level it scores at, and fails a configuration attaching no safety "
+        "evaluator or none at TOOL_CALL level. Evaluators written in this account are named for "
+        "the owner to classify, because their descriptions are prose no check can verify. "
+        "AgentCore publishes no evaluation score metric, so an alarm on a falling score is a "
+        "metric filter over the results log group whose pattern and threshold belong to the "
+        "workload, and every AC-40 verdict says so",
         [],
         4,
     ),
     (
         "AIR-ACR-GW-03",
-        TIGHTEN,
-        NEW_ID,
+        COVERED,
+        None,
         "agentcore_assessments",
-        ["AC-10"],
-        'AC-10 is named "Resource-Based Policies Check" but reports only that a policy is '
-        "present and never evaluates its conditions, so the confused-deputy leg is unasserted",
+        ["AC-10", "AC-27"],
+        "AC-10 reports that a gateway resource policy is present; AC-27 judges whether its "
+        "Allow statements and the gateway execution role's trust policy carry "
+        "aws:SourceAccount or aws:SourceArn, and fails an unconditioned statement even when a "
+        "guarded sibling sits beside it in the same document",
         [],
         4,
     ),
     (
         "AIR-ACR-RT-13",
-        TIGHTEN,
-        NEW_ID,
+        COVERED,
+        None,
         "agentcore_assessments",
-        ["AC-10"],
-        'AC-10 is named "Resource-Based Policies Check" but never evaluates policy conditions, '
-        "so the aws:SourceVpc / aws:SourceVpce leg is unasserted; both keys are 0 hits "
-        "corpus-wide",
+        ["AC-08", "AC-10", "AC-47"],
+        "AC-47 fails a runtime whose resource policy restricts neither the network path nor "
+        "the caller: the network leg reads aws:SourceVpc, aws:SourceVpce, aws:VpcSourceIp and "
+        "aws:SourceIp on any statement, the caller leg reads a named principal or an "
+        "allowedWorkloadConfiguration on the JWT authorizer. AC-08 fails an AgentCore "
+        "interface endpoint with private DNS off, which is the leg that keeps the runtime's "
+        "own callers off the public endpoint name. AC-10 reports only that a policy exists",
         [],
         4,
     ),
     (
         "AIR-ACR-GW-04",
-        TIGHTEN,
-        EXTEND,
+        COVERED,
+        None,
         "agentcore_assessments",
-        ["AC-08"],
-        "AC-08 tests endpoint existence and available state, not endpoint policy or "
-        "security-group scope; it does hold one leg GW-04 lacks, endpoint health",
+        ["AC-08", "AC-27"],
+        "AC-08 now judges each AgentCore endpoint's policy against the default "
+        "allow-everything document and reads its security groups for 0.0.0.0/0 and ::/0 "
+        "inbound rules, alongside the existence and health legs it already held; AC-27 adds "
+        "the gateway resource policy's aws:SourceVpc / aws:SourceVpce / aws:VpcSourceIp / "
+        "aws:SourceIp leg",
         [],
         4,
     ),
     (
         "AIR-ACR-GW-05",
-        TIGHTEN,
-        EXTEND,
+        COVERED,
+        None,
         "agentcore_assessments",
-        ["AG-27"],
-        "AG-27 has the WAF leg; the rate-limit leg needs ListGatewayRateLimits, "
-        "so botocore >= 1.43.66",
+        ["AG-27", "AC-24"],
+        "AG-27 holds the WAF leg; AC-24 requires an ACTIVE gateway rate limit carrying a "
+        "requests, tokens or connections ceiling, because dimensions is the only required "
+        "member of a limit entry and a limit can therefore name a dimension and bound nothing",
         [],
         4,
     ),
     (
         "AIR-ACR-ID-05",
-        TIGHTEN,
-        EXTEND,
+        COVERED,
+        None,
         "agentcore_assessments",
-        ["AC-14"],
-        "AC-14 has the CMK leg; the string 'secret' appears 0 times in the module, so the "
-        "secret-scan leg is unwritten",
+        ["AC-14", "AC-34"],
+        "AC-14 has the token vault CMK leg; AC-34 adds the secret-scan leg, reading "
+        "GetAgentRuntime.environmentVariables and failing a runtime whose definition holds an "
+        "access key id or a PEM private key inline. Only variable names reach the finding "
+        "because the API models the map as sensitive, and the resolution states the blind "
+        "spot: a value holding a slash reads as a secret name, so the remaining values are "
+        "the reader's to confirm",
         [],
         4,
     ),
     (
         "AIR-ACR-MEM-01",
-        TIGHTEN,
-        EXTEND,
+        COVERED,
+        None,
         "agentcore_assessments",
-        ["AC-07"],
-        "AC-07's presence-only CMK test is sound (encryptionKeyArn is an optional "
-        "customer-supplied CreateMemory input); MEM-01 adds per-actor and namespace "
-        "access scoping",
+        ["AC-07", "AC-23"],
+        "AC-07 asserts a customer managed key and an {actorId} namespace per memory, "
+        "AC-23 asserts that no cached role or user reads memory records without a "
+        "namespace, strategy, actor or session condition",
         [],
         4,
     ),
     (
         "AIR-ACR-POL-04",
-        TIGHTEN,
-        EXTEND,
+        COVERED,
+        None,
         "agentcore_assessments",
-        ["AC-11"],
-        "AC-11's presence-only CMK test is sound; POL-04 adds key-policy scoping plus a "
-        "disable/delete alarm",
+        ["AC-11", "AC-36"],
+        "AC-11 asserts the engine names a customer managed key, AC-36 asserts the key "
+        "policy names who may decrypt with it and who may disable it or schedule it for "
+        "deletion; the key cannot be added to or changed on an existing engine, so the "
+        "key policy is the whole guard. The disable/delete alarm and the break-glass "
+        "runbook are not readable from the key, and AC-36's passing resolution says so",
         [],
         4,
     ),
     (
         "AIR-ACR-POL-01",
-        TIGHTEN,
-        EXTEND,
+        COVERED,
+        None,
         "agentcore_assessments",
-        ["AG-25"],
-        "AG-25 tests mode ENFORCE plus status/enforcementMode ACTIVE, with no default-deny "
-        "leg, no decision log, and nothing session-aware",
+        ["AG-25", "AC-19", "AC-35"],
+        "AG-25 asserts mode ENFORCE plus status/enforcementMode ACTIVE, AC-19 asserts the "
+        "gateway delivers APPLICATION_LOGS, which is where a policy decision record "
+        "lands, and AC-35 asserts no enforcing permit leaves the action position "
+        "unconstrained; default-deny and forbid-wins are engine behaviour and not a "
+        "setting to read, so a permit over every tool is the only way to restore "
+        "allow-all",
         [],
         4,
     ),
     (
         "AIR-ACR-POL-07",
-        TIGHTEN,
-        EXTEND,
+        COVERED,
+        None,
         "agentcore_assessments",
-        ["AG-25"],
-        "AG-25 has no session-aware leg",
+        ["AG-25", "AC-38"],
+        "AG-25 counts enforcing policies, AC-38 asserts a temporal policy exists and that "
+        "the gateway carrying it authenticates callers with CUSTOM_JWT or AWS_IAM, the "
+        "two authorizer types the devguide names as binding a session to the caller's "
+        "identity; the session-id propagation path is fail-closed by the service, since a "
+        "request to an engine holding a temporal policy fails validation without the "
+        "header",
         [],
         4,
     ),
@@ -352,151 +408,301 @@ ROWS = [
         TIGHTEN,
         NEW_ID,
         "agent_registry_assessments",
-        ["AR-03"],
+        ["AR-03", "AR-09"],
         'AR-03 is named "Publication Approval Governance" but covers auto-approval only, '
-        "behind the REQUIRE_AGENT_REGISTRY_MANUAL_APPROVAL env gate; no curator/publisher "
-        "separation and no EventBridge rule",
-        [],
+        "behind the REQUIRE_AGENT_REGISTRY_MANUAL_APPROVAL env gate, so a default "
+        "deployment skips it. AR-09 now asserts the separation leg: it fails any role or "
+        "user whose effective policy reaches both a record write (CreateRegistryRecord, "
+        "UpdateRegistryRecord, SubmitRegistryRecordForApproval) and "
+        "UpdateRegistryRecordStatus, the one operation that can set a record to APPROVED, "
+        "in either the agent-registry namespace or the public-preview bedrock-agentcore "
+        "spelling of it. The EventBridge leg stays unasserted: no check reads whether an "
+        "enabled rule matches the aws.agent-registry approval state-change events and "
+        "carries a target, which needs events:ListRules and events:ListTargetsByRule on "
+        "AgentRegistrySecurityAssessmentFunction",
+        ["events:ListRules", "events:ListTargetsByRule"],
         4,
     ),
     (
         "AIR-ACR-RT-08",
-        TIGHTEN,
-        EXTEND,
+        COVERED,
+        None,
         "agentcore_assessments",
         ["AC-01"],
-        "AC-01 requires VPC placement and flags public subnets but never reads what the "
-        "security-group rules permit; describe_security_groups is 0 hits in the module, so "
-        "VPC placement is proven and egress filtering is not",
-        ["ec2:DescribeSecurityGroups"],
+        "AC-01 now reads the outbound rules of every security group attached to a VPC runtime, "
+        "code interpreter or browser and fails a group permitting 0.0.0.0/0 or ::/0 egress. A "
+        "tool in PUBLIC network mode fails without a describe call, because the service grants "
+        "it open internet egress by configuration; SANDBOX passes at Medium, because the "
+        "sandbox reaches no network the workload can name. A group the describe did not return "
+        "and a denied ec2:DescribeSecurityGroups are both reported N/A on their own line, so "
+        "an unread group is never counted as closed",
+        [],
         4,
     ),
     (
         "AIR-ACR-EVAL-02",
-        NEW,
+        COVERED,
         None,
         "agentcore_assessments",
-        [],
-        "PassRole returns 0 across all six modules; AssumeRolePolicyDocument is read once at "
-        ":2725 but only to match principal.Service for role discovery, never a condition",
+        ["AC-42"],
+        "AC-42 reads iam:PassRole on every cached role and user against the execution roles the "
+        "region's online evaluation configurations name, and judges the widest statement that "
+        "reaches one of them: a Resource pattern wider than the role itself, or a grant "
+        "carrying no iam:PassedToService condition, lets the holder run a role it could not "
+        "assume by writing a configuration that names it",
         [],
         4,
     ),
     (
         "AIR-ACR-EVAL-03",
-        NEW,
+        COVERED,
         None,
         "agentcore_assessments",
-        [],
-        "confused-deputy conditions absent: SourceAccount/SourceArn are 1 hit corpus-wide, "
-        "in sagemaker_assessments, none in AgentCore",
+        ["AC-43"],
+        "AC-43 reads each evaluation execution role's own trust policy and reports every Allow "
+        "statement trusting an AWS service principal, or every principal, with no "
+        "aws:SourceAccount and no aws:SourceArn condition. The role can read the scored traces "
+        "and invoke the judge model, so a service acting for another customer's configuration "
+        "reaches both. AC-27 makes the same assertion on gateway execution roles and reaches no "
+        "evaluation role, because it reads the roles gateways name",
         [],
         4,
     ),
-    ("AIR-ACR-EVAL-04", NEW, None, "agentcore_assessments", [], "", [], 4),
-    ("AIR-ACR-EVAL-07", NEW, None, "agentcore_assessments", [], "", [], 4),
+    (
+        "AIR-ACR-EVAL-04",
+        COVERED,
+        None,
+        "agentcore_assessments",
+        ["AC-44"],
+        "AC-44 reports whether each evaluation execution role's model-invocation grant names "
+        "models at all: a Resource pattern ending in a bare wildcard reaches every model the "
+        "account can invoke, and the judge prompt carries the agent output being scored, so "
+        "every model it reaches is one attacker-influenced text can be sent to. Which models a "
+        "workload's judges may use is the workload owner's decision, so the check names the "
+        "patterns it found and asserts only that they are bounded",
+        [],
+        4,
+    ),
+    (
+        "AIR-ACR-EVAL-07",
+        COVERED,
+        None,
+        "agentcore_assessments",
+        ["AC-20", "AC-26", "AC-41"],
+        "AC-41 anchors on the log group each configuration's outputConfig names and asserts a "
+        "retention period, a customer managed key, and membership of the AgentCore log group "
+        "prefixes, so a results group whose creator chose a name outside them is reported "
+        "rather than skipped. AC-20 and AC-26 judge masking and key policy on the groups under "
+        "those prefixes and neither reaches a group outside them. Tag values and the "
+        "configuration's own description are free-form text AC-41 discloses instead of judging",
+        [],
+        4,
+    ),
     (
         "AIR-ACR-GW-02",
-        NEW,
+        COVERED,
         None,
         "agentcore_assessments",
+        ["AC-28"],
+        "AC-28 requires a service control policy that denies both CreateGateway and "
+        "UpdateGateway when bedrock-agentcore:GatewayAuthorizerType is NONE, either by naming "
+        "NONE in an equals-family condition or by omitting it from a not-equals-family one, "
+        "so no approved-authorizer list has to be invented; attachment targets are outside "
+        "the grant and the finding says so. The condition key carries a documentation drift: "
+        "the AgentCore devguide wires GatewayAuthorizerType to CreateGateway and UpdateGateway "
+        "and shows sibling gateway keys used this way in SCPs, while the machine-readable "
+        "service reference and the service authorization reference page wire it to zero "
+        "actions. The devguide wins for feature availability. Access Analyzer validate-policy "
+        "accepts the key name but is no oracle for the wiring: it also accepts "
+        "RuntimeAuthorizerType on CreateGateway, a pairing neither surface declares",
         [],
-        "asserts an SCP; the corpus already enumerates SCPs in two modules, so the cost is "
-        "the Organizations read",
-        ["organizations:ListPolicies", "organizations:DescribePolicy"],
         4,
     ),
-    ("AIR-ACR-GW-08", NEW, None, "agentcore_assessments", [], "", [], 4),
-    ("AIR-ACR-GW-10", NEW, None, "agentcore_assessments", [], "", [], 4),
     (
-        "AIR-ACR-ID-04",
-        NEW,
+        "AIR-ACR-GW-08",
+        COVERED,
         None,
         "agentcore_assessments",
+        ["AC-25"],
+        "AC-25 reads credentialProviderConfigurations per target through GetGatewayTarget, "
+        "which is the only surface that carries it: the ListGatewayTargets summary omits the "
+        "field. The control's second leg, a Lambda target scoped to one function ARN, is not "
+        "expressible because the target ARN members reject a wildcard",
         [],
-        "asserts an SCP; same Organizations read as GW-02",
-        ["organizations:ListPolicies", "organizations:DescribePolicy"],
+        4,
+    ),
+    (
+        "AIR-ACR-GW-10",
+        COVERED,
+        None,
+        "agentcore_assessments",
+        ["AC-19", "AC-20", "AC-26"],
+        "AC-19 pairs each AgentCore delivery source with its delivery and AC-20 asserts "
+        "masking plus a customer managed key; AC-26 adds the two legs neither held, an "
+        "explicitly configured retentionInDays and a key policy that does not let every "
+        "principal decrypt without a condition",
+        [],
+        4,
+    ),
+    (
+        "AIR-ACR-ID-04",
+        COVERED,
+        None,
+        "agentcore_assessments",
+        ["AC-29"],
+        "AC-29 requires a service control policy that denies both CreateAgentRuntime and "
+        "UpdateAgentRuntime when bedrock-agentcore:RuntimeAuthorizerType is AWS_IAM, so a "
+        "runtime cannot be created on, or moved back to, the SigV4 mode that authenticates "
+        "the hosting application's shared role instead of the end user; a policy written the "
+        "other way round, denying CUSTOM_JWT, is reported separately because it reads as "
+        "configured to anyone counting policies. organizations:ListPolicies and "
+        "organizations:DescribePolicy are granted to this function for GW-02's AC-28, so "
+        "ID-04 costs no further permission. Attachment targets are outside the grant and "
+        "every finding says so",
+        [],
         4,
     ),
     (
         "AIR-ACR-ID-08",
-        NEW,
+        COVERED,
         None,
         "agentcore_assessments",
-        [],
-        "GetAgentRuntime.authorizerConfiguration exists in botocore 1.43.85 and is never read "
-        "anywhere; AG-24 is gateway-only, ID-08 is about the runtime",
+        ["AC-30"],
+        "AC-30 reads GetAgentRuntime.authorizerConfiguration per runtime: an absent "
+        "configuration means every invoke is SigV4-signed, and a customJWTAuthorizer that "
+        "pins neither allowedAudience nor allowedClients accepts every token its issuer "
+        "minted for every application registered there, so the claims are validated but not "
+        "against this agent. allowedScopes and customClaims are credited in the detail and "
+        "cannot substitute, because a scope bounds what a token may ask for and not who it "
+        "was minted for",
         [],
         4,
     ),
     (
         "AIR-ACR-ID-11",
-        NEW,
+        COVERED,
         None,
         "agentcore_assessments",
-        [],
-        "the corpus reads authorizerType exactly once, at :3578, and never reads "
-        "authorizerConfiguration; customJWTAuthorizer.{allowedAudience, allowedClients, "
-        "allowedScopes, customClaims, discoveryUrl} are all present in the API and unread, so "
-        "a gateway that trusts any issuer passes AG-24 today",
+        ["AC-31", "AC-32"],
+        "AG-24 passed every CUSTOM_JWT gateway on the authorizer type alone. AC-31 reads the "
+        "authorizer's allow-lists and fails a gateway that pins neither allowedAudience nor "
+        "allowedClients, because it then honours any token its issuer minted for any "
+        "application registered there; allowedScopes and customClaims bound what a token may "
+        "ask for and not who minted it for whom, so they are credited but do not substitute. "
+        "AC-32 covers the second door, where the token-exchange APIs take an end user's JWT "
+        "without passing a gateway authorizer at all, and fails a cached principal holding "
+        "GetWorkloadAccessTokenForJWT or CompleteResourceTokenAuth with no InboundJwtClaim "
+        "condition",
         [],
         4,
     ),
-    ("AIR-ACR-MEM-07", NEW, None, "agentcore_assessments", [], "", [], 4),
     (
-        "AIR-ACR-MEM-12",
+        "AIR-ACR-MEM-07",
         NEW,
         None,
         "agentcore_assessments",
         [],
-        "CloudTrail event selectors; reads no AgentCore API",
-        ["cloudtrail:GetEventSelectors", "cloudtrail:ListTrails"],
+        "Left open in phase 4: no workload-independent invariant here reaches Failed per "
+        "memory. eventExpiryDuration is required at CreateMemory, 3 to 365 days in the "
+        "pinned 2023-06-05 model, and required again on the Memory shape GetMemory "
+        "returns, so every memory carries a retention bound and a presence check passes "
+        "unconditionally. Which value is short enough is the workload owner's judgment, "
+        "and this row will not invent a ceiling. The namespace-scope half of the control "
+        "is asserted under AIR-ACR-MEM-01 by AC-07 and AC-23, and its log-retention "
+        "clause asks for a compliance schedule only the workload owner can name",
+        [],
+        4,
+    ),
+    (
+        "AIR-ACR-MEM-12",
+        COVERED,
+        None,
+        "agentcore_assessments",
+        ["AC-18"],
+        "AC-18 asserts that a CloudTrail advanced event selector logs data events for "
+        "AWS::BedrockAgentCore::Memory whenever the region holds a memory resource",
+        [],
         4,
     ),
     (
         "AIR-ACR-OBS-02",
-        NEW,
+        COVERED,
         None,
         "agentcore_assessments",
+        ["AC-18"],
+        "AC-18 asserts data-event coverage per resource family, so a trail that logs only "
+        "the runtime types still fails for memory and for the built-in tools",
         [],
-        "CloudTrail event selectors; reads no AgentCore API",
-        ["cloudtrail:GetEventSelectors", "cloudtrail:ListTrails"],
         4,
     ),
     (
         "AIR-ACR-OBS-03",
-        NEW,
+        COVERED,
         None,
         "agentcore_assessments",
-        [],
+        ["AC-19"],
         "AC-04 is X-Ray tracingConfig.enabled over list_agent_runtimes only, so it cannot "
-        "cover Gateway, Memory, Policy or Identity, which is OBS-03's whole subject; this row "
-        "was a tightening in an earlier draft and the resource-scope check moved it",
+        "cover Gateway, Memory, Policy or Identity, which is OBS-03's whole subject. AC-19 "
+        "asserts an APPLICATION_LOGS delivery source wired to a destination per gateway and "
+        "per memory; runtime logging is service-managed, WorkloadIdentity delivery is "
+        "configured on the associated runtime or gateway resource, and policy engines have "
+        "no log-destination surface, so those three legs need no separate assertion",
         [],
         4,
     ),
     (
         "AIR-ACR-OBS-04",
-        NEW,
+        COVERED,
         None,
         "agentcore_assessments",
+        ["AC-20", "AC-21"],
+        "AC-20 asserts a Deidentify data-protection policy and a customer managed key on "
+        "the AgentCore log groups, AC-21 asserts that no cached role or user holds "
+        "logs:Unmask on every resource",
         [],
-        "CloudWatch Logs data-protection policy",
-        ["logs:GetDataProtectionPolicy", "logs:DescribeAccountPolicies"],
         4,
     ),
     (
         "AIR-ACR-OBS-06",
-        NEW,
+        COVERED,
         None,
         "agentcore_assessments",
+        ["AC-22"],
+        "AC-22 asserts that every Allow statement on an OAM sink policy either names its "
+        "principals or carries an organization condition key",
         [],
-        "OAM sink policy",
-        ["oam:ListSinks", "oam:GetSinkPolicy"],
         4,
     ),
-    ("AIR-ACR-POL-06", NEW, None, "agentcore_assessments", [], "", [], 4),
-    ("AIR-ACR-RT-04", NEW, None, "agentcore_assessments", [], "", [], 4),
+    (
+        "AIR-ACR-POL-06",
+        COVERED,
+        None,
+        "agentcore_assessments",
+        ["AC-37"],
+        "AC-37 asserts the workload-independent half: a policy carrying a guardrails "
+        "condition needs bedrock:InvokeGuardrailChecks on the gateway execution role, "
+        "because the Policy data plane calls Bedrock Guardrails with that role's forward "
+        "access session. Whether this workload's content belongs at the authorization "
+        "boundary at all, and which safeguard categories and thresholds apply, is the "
+        "workload owner's decision, which AC-37 reports and does not judge",
+        [],
+        4,
+    ),
+    (
+        "AIR-ACR-RT-04",
+        COVERED,
+        None,
+        "agentcore_assessments",
+        ["AC-46"],
+        "AC-46 fails a runtime that configures neither idleRuntimeSessionTimeout nor "
+        "maxLifetime, or that sets either at the service ceiling of 1209600 seconds, which is "
+        "the setting that lets one runaway session hold its resources for 14 days. AgentCore "
+        "exposes no per-session memory or cost limit to read, so the time bound is the only "
+        "limit the API can answer for, and every verdict says which values it found so the "
+        "workload owner can judge whether the bound suits the task",
+        [],
+        4,
+    ),
     # ------- FND, AI-resource subject: 11 controls, dedup pass not yet run -------
     (
         "AIR-FND-DAT-01",
@@ -649,10 +855,41 @@ INCUMBENT_NAMES = {
     "AC-11": "AgentCore Policy Engine Encryption Check",
     "AC-14": "AgentCore Identity Token Vault CMK Encryption",
     "AC-17": "AgentCore Online Evaluation Coverage",
+    "AC-18": "AgentCore CloudTrail Data Event Coverage",
+    "AC-19": "AgentCore Log Delivery Configuration",
+    "AC-20": "AgentCore Log Data Protection",
+    "AC-21": "AgentCore Log Unmask Restriction",
+    "AC-22": "AgentCore Telemetry Sink Scope",
+    "AC-23": "AgentCore Memory Record Access Scope",
+    "AC-24": "AgentCore Gateway Rate Limiting",
+    "AC-25": "AgentCore Gateway Target Authorization",
+    "AC-26": "AgentCore Log Retention and Key Scope",
+    "AC-27": "AgentCore Gateway Policy Conditions",
+    "AC-28": "AgentCore Gateway Authorizer Guardrail",
+    "AC-29": "AgentCore Runtime Authorizer Guardrail",
+    "AC-30": "AgentCore Runtime Inbound Authorization",
+    "AC-31": "AgentCore Gateway Inbound Allow Lists",
+    "AC-32": "AgentCore Inbound JWT Issuer Conditions",
+    "AC-33": "AgentCore Token Issuance Scope",
+    "AC-34": "AgentCore Runtime Inline Credentials",
+    "AC-35": "AgentCore Policy Tool Scope",
+    "AC-36": "AgentCore Policy Engine Key Scope",
+    "AC-37": "AgentCore Policy Guardrail Wiring",
+    "AC-38": "AgentCore Policy Session Binding",
+    "AC-39": "AgentCore Online Evaluation Operation",
+    "AC-40": "AgentCore Evaluation Safety Coverage",
+    "AC-41": "AgentCore Evaluation Result Protection",
+    "AC-42": "AgentCore Evaluation Pass Role Scope",
+    "AC-43": "AgentCore Evaluation Role Trust",
+    "AC-44": "AgentCore Evaluation Judge Model Scope",
+    "AC-45": "AgentCore Tool Execution Role Scope",
+    "AC-46": "AgentCore Runtime Session Limits",
+    "AC-47": "AgentCore Runtime Invocation Path",
     "AG-24": "Agentic AI Gateway Inbound Authorization",
     "AG-25": "Agentic AI Gateway Tool Policy Enforcement",
     "AG-27": "Agentic AI Gateway WAF Protection",
     "AR-03": "AWS Agent Registry Publication Approval Governance",
+    "AR-09": "AWS Agent Registry Approval Authority Separation",
     "BR-04": "Bedrock Model Invocation Logging Check",
     "BR-06": "Bedrock CloudTrail Logging Check",
     "BR-10": "Bedrock Guardrail IAM Enforcement Check",
