@@ -1273,6 +1273,27 @@ def main():
     # other direction -- an FND row left `covered` by mistake would have pushed
     # the sum to 68 and been read as a partition error rather than as the
     # verdict it is. The two population sizes are asserted on their own.
+    #
+    # Why mutate.py holds no entry for this gate, measured 2026-09-26. Every
+    # field it reads comes out of the shipped json, so the only way to break it
+    # is to break that artifact, and each route is already covered from another
+    # side: a hand edit to one summary field diverges from the markdown, which
+    # gate 10 renders out of the json and compares to the file on disk (driven
+    # on `extensions`, which no other gate reads: gate 10 alone, 20/21); a hand
+    # edit consistent across both leaves the rows contradicting the counts, and
+    # the partition leg below is what reads that (`covered` 61 -> 62 in the json
+    # and the markdown together: partition 79/78, and gate 21 behind it); a
+    # per-control verdict changed in the json alone reds gate 10 on the row it
+    # renders and gate 18's drift check inside the generator, in that order.
+    # What no
+    # gate reads at edit time is build_ledger's own summary arithmetic -- point
+    # new_check_functions at not_implementable, leave the artifacts alone, and
+    # all 21 gates pass while the next regeneration would publish 11 for 7. The
+    # relation below is its reader and fires at that regeneration, which is
+    # before the wrong figure can ship, and mutate.py regenerates nothing by
+    # design, since a battery that rewrites the artifact it gates cannot fail
+    # (the same reason stated at gate 10). So the entry would have to mutate a
+    # digit in a generated file, which the battery's find-strings exclude.
     hosted = [r for r in rows if r["area"] in hosted_areas]
     fnd = [r for r in rows if r["area"] == "FND"]
     part = (
