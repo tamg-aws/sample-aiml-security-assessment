@@ -348,6 +348,49 @@ MUTATIONS = [
         "find": '                "Region",\n                "Compliance_Frameworks",\n',
         "replace": '                "Region",\n',
     },
+    # -------------------------------------- the field names the APIs return
+    # Both of these revert a field name to the spelling that shipped, and both
+    # spellings are real: each belongs to a different AWS API. That is the class
+    # of defect no assertion inside the check can catch, because the leg reading
+    # the absent key does not run, and a leg that does not run publishes nothing
+    # to disagree with. Each one's unit fixture set the same absent key the code
+    # read, so the test agreed with the code it covered and with nothing else --
+    # 2839 green tests over both defects. The catcher for each entry below is the
+    # test whose fixture carries the documented shape, which is the only kind of
+    # test that can tell the two spellings apart.
+    {
+        "name": "AC-01 reads Bedrock's spelling of the subnet field",
+        "file": AGENTCORE,
+        "defect": "GetAgentRuntime reports a VPC runtime's subnets under "
+        "networkModeConfig, spelled `subnets`, in the same object the egress leg "
+        "twelve lines above reads for securityGroups. `subnetIds` is Bedrock's "
+        "VpcConfig spelling and networkConfiguration has no such key, so "
+        "reverting leaves the subnet list empty for every runtime, the "
+        "route-table block below it unreachable, and no public subnet ever "
+        "reported. This half fails OPEN",
+        "find": (
+            "                            subnet_ids = (\n"
+            '                                network_config.get("networkModeConfig")'
+            " or {}\n"
+            '                            ).get("subnets") or []'
+        ),
+        "replace": (
+            "                            subnet_ids = "
+            'network_config.get("subnetIds", [])'
+        ),
+    },
+    {
+        "name": "BR-11 reads the output key off the wrong object",
+        "file": BEDROCK,
+        "defect": "GetModelCustomizationJob returns an outputDataConfig holding "
+        "s3Uri alone and reports the output key as a top-level "
+        "outputModelKmsKeyArn. Reverting to outputDataConfig.kmsKeyId makes "
+        "has_cmk always False, so the passing branch is unreachable and every "
+        "custom model is reported as needing review. This half fails CLOSED, "
+        "which is the one a reader mistakes for a check finding real problems",
+        "find": 'if job_details.get("outputModelKmsKeyArn"):',
+        "replace": 'if job_details.get("outputDataConfig", {}).get("kmsKeyId"):',
+    },
     # ------------------------------------------------------ the census paragraph
     # The first mutation of a document rather than of code, and it breaks the
     # anchor instead of a figure. The ledger reads its six census figures out of one
@@ -386,10 +429,13 @@ MUTATIONS = [
         # The find-string is a phrase and not a number on purpose: a number here
         # would go stale every time the battery grows, and the entry would then be
         # lost to the pre-flight rather than exercising anything.
+        # The defect text below counts no groups for the same reason: it said
+        # "five of the six" while the battery had grown to seven groups, which is
+        # the drift this entry exists to catch, in the entry itself.
         "defect": "step 7 of the parity doc splits the battery by group, and this "
-        "leaves the doc naming five of the six groups. Gate 20 has to report that "
-        "group's figure as occurring zero times in the slice, not reconcile the "
-        "five it can still find",
+        "leaves one of those groups unnamed in the sentence. Gate 20 has to "
+        "report that group's figure as occurring zero times in the slice, not "
+        "reconcile the ones it can still find",
         "find": "1 in the census anchor",
         "replace": "1 in the census marker",
     },
@@ -491,6 +537,12 @@ GROUPS: dict[str, str] = {
         "in the tag column"
     ),
     "agentcore's empty-report header loses the column": "in the tag column",
+    "AC-01 reads Bedrock's spelling of the subnet field": (
+        "in the API field names the checks read"
+    ),
+    "BR-11 reads the output key off the wrong object": (
+        "in the API field names the checks read"
+    ),
     "the incumbent-name lookup reverts to its fail-open form": (
         "in the incumbent-name map"
     ),
