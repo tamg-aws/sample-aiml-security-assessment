@@ -2666,8 +2666,12 @@ def check_bedrock_custom_model_encryption(region: str = "") -> Dict[str, Any]:
                             job_details = bedrock_client.get_model_customization_job(
                                 jobIdentifier=job_arn
                             )
-                            job_output_config = job_details.get("outputDataConfig", {})
-                            if job_output_config.get("kmsKeyId"):
+                            # GetModelCustomizationJob reports the output key as a
+                            # top-level outputModelKmsKeyArn. Its outputDataConfig
+                            # carries s3Uri and nothing else, so the kmsKeyId read
+                            # this replaces could never be true and no model could
+                            # reach the passing branch below.
+                            if job_details.get("outputModelKmsKeyArn"):
                                 has_cmk = True
                         except Exception as job_err:
                             logger.warning(

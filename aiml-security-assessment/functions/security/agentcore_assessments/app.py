@@ -1617,8 +1617,14 @@ def check_agentcore_vpc_configuration(
                                 )
                             )
 
-                            # Validate VPC configuration
-                            subnet_ids = network_config.get("subnetIds", [])
+                            # Validate VPC configuration. The runtime's subnets live
+                            # in the same networkModeConfig the security groups above
+                            # come from, spelled "subnets". Bedrock's VpcConfig spells
+                            # the field "subnetIds", and reading that spelling against
+                            # an AgentCore response made this leg unreachable.
+                            subnet_ids = (
+                                network_config.get("networkModeConfig") or {}
+                            ).get("subnets") or []
 
                             if subnet_ids:
                                 # Check if subnets are private

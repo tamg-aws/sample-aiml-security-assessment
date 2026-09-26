@@ -1394,6 +1394,17 @@ class TestBR11CustomModelEncryption:
 
     @patch("boto3.client")
     def test_br11_model_with_cmk_returns_passed(self, mock_client):
+        """A job that names an output key passes.
+
+        This branch was covered before, by a fixture that set
+        outputDataConfig.kmsKeyId, the same key the predicate read. Neither
+        exists: GetModelCustomizationJob returns an outputDataConfig holding
+        s3Uri alone and reports the key as a top-level outputModelKmsKeyArn. The
+        test and the code agreed with each other and with nothing else, so the
+        coverage was real and the assertion was vacuous -- against a live job
+        the check could only ever report every custom model as needing review.
+        The fixture below is the shape the API documents.
+        """
         check = bedrock_app.check_bedrock_custom_model_encryption
         mock_bedrock = MagicMock()
         mock_client.return_value = mock_bedrock
@@ -1407,12 +1418,17 @@ class TestBR11CustomModelEncryption:
             "baseModelArn": "arn:base:1",
         }
         mock_bedrock.get_model_customization_job.return_value = {
-            "outputDataConfig": {"kmsKeyId": "arn:aws:kms:us-east-1:123:key/abc"}
+            "outputDataConfig": {"s3Uri": "s3://out/"},
+            "outputModelKmsKeyArn": (
+                "arn:aws:kms:us-east-1:123456789012:key/"
+                "11111111-2222-3333-4444-555555555555"
+            ),
         }
         result = check()
         findings = extract_csv_data(result)
         assert len(findings) >= 1
         assert findings[0]["Status"] == "Passed"
+        assert findings[0]["Check_ID"] == "BR-11"
 
     @patch("boto3.client")
     def test_br11_exception_returns_error_finding(self, mock_client):

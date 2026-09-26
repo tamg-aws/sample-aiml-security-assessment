@@ -712,7 +712,18 @@ ROWS = [
         ["BR-20", "BR-11", "BR-17", "SM-03"],
         "four checks cover the stores this control names: BR-20 the knowledge "
         "base's vector store keys, BR-11 and BR-17 the custom model artefacts, "
-        "SM-03 the training output and volume keys. The unread store is the one "
+        "SM-03 the training output and volume keys. BR-11's half of that was not "
+        "being read: it hops from the model to its customization job to look for "
+        "outputDataConfig.kmsKeyId, and GetModelCustomizationJob returns an "
+        "outputDataConfig holding s3Uri alone, reporting the key as a top-level "
+        "outputModelKmsKeyArn. Its unit test set the same absent key, so the test "
+        "and the code agreed with each other and with nothing else, the passing "
+        "branch was unreachable against a live job, and every custom model was "
+        "reported as needing review. BR-17 was the live reader of the two, on the "
+        "model's own modelKmsKeyArn. Reading the documented field is a precondition "
+        "of this row rather than part of it, and is done: BR-11 now answers for the "
+        "customization output and BR-17 for the model, which is the split their "
+        "names already claim. The unread store is the one "
         "the ingested objects sit in before any of those exist -- the knowledge "
         "base's own data source bucket. FS-65 was listed beside BR-20 and is not "
         'an incumbent for encryption at rest: its finding is "KB Data Source '
@@ -889,16 +900,23 @@ ROWS = [
         "for training jobs together with EnableNetworkIsolation, and BR-39 for "
         "marketplace model endpoints. Exactly one of them goes on to prove those "
         "subnets are private: AC-01 reads their route tables and fails an internet "
-        "gateway route. SM-11 says as much itself -- its Passed text asks the reader "
+        "gateway route. That leg was written against Bedrock's spelling of the "
+        "field, subnetIds, which GetAgentRuntime does not return -- a runtime "
+        "reports its subnets under networkModeConfig, as subnets -- so while the "
+        "two spellings disagreed the leg could not run and nothing in the corpus "
+        "proved a subnet private at all. Reading the documented field is a "
+        "precondition of this row rather than part of it, and is done. SM-11 says "
+        "as much itself -- its Passed text asks the reader "
         "to confirm the subnets are private and that callers arrive over an "
         "interface VPC endpoint, because the model configuration does not record "
         "it. A subnet id is not a privacy claim, so the tightening is to do for the "
-        "other five what AC-01 already does. That needs ec2:DescribeSubnets and "
+        "other five what AC-01 now does. That needs ec2:DescribeSubnets and "
         "ec2:DescribeRouteTables on the SageMaker and Bedrock functions: SageMaker "
         "holds no ec2 action at all, Bedrock holds DescribeVpcEndpoints and "
         "DescribeVpcs but neither of these, and the AgentCore function already has "
-        "both. EXTEND because every one of the six keeps its name and its subject "
-        "and gains a leg one of them already carries",
+        "both, which is what a grant looks like when it outlives the code path that "
+        "earned it. EXTEND because every one of the six keeps its name and its "
+        "subject and gains a leg one of them already carries",
         ["ec2:DescribeSubnets", "ec2:DescribeRouteTables"],
         5,
     ),

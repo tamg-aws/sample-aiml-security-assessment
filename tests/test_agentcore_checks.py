@@ -150,7 +150,7 @@ class TestAC01VPCConfiguration:
         mock_ac.get_agent_runtime.return_value = {
             "networkConfiguration": {
                 "networkMode": "VPC",
-                "subnetIds": ["subnet-123"],
+                "networkModeConfig": {"subnets": ["subnet-123"]},
             }
         }
         mock_ec2.describe_subnets.return_value = {
@@ -163,6 +163,42 @@ class TestAC01VPCConfiguration:
         findings = extract_csv_data(result)
         assert len(findings) >= 1
         assert findings[0]["Status"] == "Passed"
+
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_ac01_runtime_public_subnet_returns_failed(self, mock_ac, mock_ec2):
+        """A VPC-mode runtime whose subnet routes to an internet gateway fails.
+
+        The route-table leg reads networkModeConfig.subnets. It spent its whole
+        life reading Bedrock's subnetIds spelling instead, which GetAgentRuntime
+        never returns, so this is the case that distinguishes the two: with the
+        wrong key the subnet list is empty and the runtime passes.
+        """
+        mock_ac.list_agent_runtimes.return_value = {
+            "agentRuntimes": [{"agentRuntimeId": "rt-1", "agentRuntimeName": "TestRT"}]
+        }
+        mock_ac.get_agent_runtime.return_value = {
+            "networkConfiguration": {
+                "networkMode": "VPC",
+                "networkModeConfig": {"subnets": ["subnet-public"]},
+            }
+        }
+        mock_ec2.describe_subnets.return_value = {
+            "Subnets": [{"SubnetId": "subnet-public"}]
+        }
+        mock_ec2.describe_route_tables.return_value = {
+            "RouteTables": [{"Routes": [{"GatewayId": "igw-0abc"}]}]
+        }
+        result = agentcore_app.check_agentcore_vpc_configuration()
+        findings = extract_csv_data(result)
+        public = [
+            f for f in findings if f["Finding"] == "AgentCore Runtime Public Subnet"
+        ]
+        assert len(public) == 1
+        assert public[0]["Status"] == "Failed"
+        assert public[0]["Severity"] == "Medium"
+        assert "subnet-public" in public[0]["Finding_Details"]
+        mock_ec2.describe_subnets.assert_called_once_with(SubnetIds=["subnet-public"])
 
     @patch("agentcore_app.agentcore_client")
     def test_ac01_exception_returns_incomplete_na(self, mock_ac):
@@ -11434,9 +11470,12 @@ def _runtime_arn(runtime_id):
 def _vpc_runtime(runtime_id="rt-1", security_groups=("sg-runtime",), **detail):
     """Return one VPC-mode runtime as a (summary, detail) pair.
 
-    networkModeConfig is where the API reports a runtime's security groups.
-    subnetIds is left out: it drives the incumbent public-subnet leg, and a
-    fixture that sets both would make one assertion answer for two legs.
+    networkModeConfig is where the API reports a runtime's security groups and
+    its subnets alike, so these fixtures drive the public-subnet leg too. They
+    did not when this helper was written, because that leg read subnetIds, a
+    key GetAgentRuntime does not return. The ec2 stub these tests pass yields no
+    subnets, so the leg adds no finding and each assertion here still answers
+    for the egress leg alone.
     """
     network = {"networkMode": "VPC"}
     if security_groups is not None:
