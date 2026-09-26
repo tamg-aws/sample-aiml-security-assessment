@@ -371,6 +371,24 @@ def tag_column_figures(text):
 
     The qualifier census is absent from here because it has its own extractor,
     census_figures(), and its own sentence sixteen lines further down the file.
+
+    The pipe-joined paragraph's two figures are read here rather than sliced like
+    the census, and the difference is measured and not stylistic: both of its
+    phrases occur exactly once in the whole document, while the census spellings
+    collide with the coverage bullet's -- `(\\d+) `?covered`? controls` matches the
+    bullet's `the other 53 covered controls` as well as the census's 61, which is
+    the disagreement the census slice exists to separate. Nothing unique needs a
+    slice, and a slice around a unique phrase only adds an anchor that can rot.
+
+    The multi-control count is published twice, once as a statement and once as the
+    back-reference the next paragraph rests on (`14 of those 23`), and the two are
+    read as two required figures against one computed value instead of being pooled
+    into one. Pooling was the first shape and it failed a mutation: deleting the
+    statement sentence outright left the back-reference as the pool's only member,
+    which agreed with the maps, so the gate passed over a document publishing a
+    dangling `of those 23` with no antecedent. A pool asserts that the copies it
+    finds agree; it cannot assert that a copy exists in each sentence. So both
+    labels carry the same computed key, and either sentence going missing reds.
     """
     found = figure_occurrences(
         text,
@@ -379,6 +397,9 @@ def tag_column_figures(text):
             ("tagged", r"\d+ check-control pairs over (\d+) tagged checks"),
             ("modules", r"tagged checks in (\d+) modules"),
             ("controls", r"naming (\d+) distinct controls"),
+            ("multi", r"(\d+) checks name more than one control"),
+            ("multi_restated", r"common case, \d+ of those (\d+),"),
+            ("mixing", r"common case, (\d+) of those \d+,"),
             # The per-module split is read as a mapping and not as four numbers, so
             # the module *names* are asserted too: a renamed producer is the way
             # this sentence goes stale without any count changing.
@@ -721,6 +742,201 @@ def census_figures(text):
             f"{unreadable}, which is neither a digit nor a number word this reads"
         )
     return values, found, problems
+
+
+BULLET_ANCHOR = "- **Coverage:**"
+# Same two-step as the census: cut from raw text, match on flattened. Cut raw
+# because the `\n\n` terminator does not survive the flatten. Matched flattened
+# because the hard wrap lands inside the markers: at this head's wrapping 5 of the
+# 10 digit patterns below, plus the `unassessed` phrase, return zero copies on the
+# raw bullet and one copy flattened -- `covered`, `covered_without_row`,
+# `tighten_in_the_split`, `taggable` and `taggable_tighten` -- so a raw-matched
+# implementation reads as five working figures and five absent ones. Which five
+# they are moves with the wrapping, so the suite asserts that at least one pattern
+# splits that way and not the count.
+#
+# One slice covers both bullets: they sit in one blank-line-delimited block with
+# no blank line between them, measured at this head, and the Report location
+# bullet above the anchor is excluded. Terminating on `\n\n` rather than on the
+# next `\n- ` is deliberate -- a third bullet added to this block should be read,
+# not silently excluded.
+COVERAGE_BULLETS = re.compile(
+    r"^" + re.escape(BULLET_ANCHOR) + r".*?(?=\n\n|\Z)", re.S | re.M
+)
+
+
+def coverage_bullets(text):
+    """The Coverage and Traceability bullets, the count, and a message unless one.
+
+    Exactly one slice, fail-closed both ways, and an empty slice on failure so
+    every figure below reports as absent rather than being read from the rest of
+    the file. Identical contract to census_paragraph(), for the same reason.
+
+    Pinned by tests/test_coverage_bullet_slice.py, which carries the bd0ecb8 block
+    verbatim and asserts the call site as well as the contract. Twelve mutations of
+    the code below, twelve caught. Edit either side and run that suite.
+    """
+    found = COVERAGE_BULLETS.findall(text)
+    if len(found) == 1:
+        return found[0], 1, []
+    return (
+        "",
+        len(found),
+        [
+            f"SECURITY_CHECKS_AISF.md holds {len(found)} block(s) beginning "
+            f"{BULLET_ANCHOR!r}, not 1; the coverage figures are read from "
+            "exactly one"
+        ],
+    )
+
+
+def coverage_bullet_figures(text):
+    """The verdict figures the coverage and traceability bullets publish.
+
+    This extractor exists because these two bullets published eleven figure
+    instances over seven distinct values with no gate reading any of them, and ten
+    of those eleven instances were wrong for a whole phase under 20/20 green. Ten
+    of the eleven and not all eleven: `3 not_implementable` agreed with the ledger
+    at bd0ecb8 and went wrong only when AIR-ACR-MEM-07 was reclassified. The
+    mechanism is worth naming, because it is not a missing gate: 5ad07b5 narrowed
+    census_figures() to its own paragraph so that the scope label it prints would
+    be true, and before that slice the census `covered` pattern had been matching
+    this bullet as well. The disagreement it reported, ['20', '28'], was the
+    failure that motivated the slice. So the slice made one label honest and
+    removed the only reader the bullet ever had, and the commit message says as
+    much -- "a different population agreeing at 18 today". Narrowing a gate's
+    scope silently un-gates whatever the old scope was reaching by accident.
+
+    Ten labels over six computed values, not six patterns. Two reasons, both
+    measured. The word `covered` publishes two different populations eleven words
+    apart in the Coverage bullet -- 61 controls that are `covered` and the 53 of
+    them without a row -- so one `covered` pattern cannot be written that reads
+    either honestly; each label is tight to the phrase around it. And a figure
+    restated in a second sentence needs its own label rather than a pool with the
+    first: pooling was tried on the multi-control count in tag_column_figures()
+    and a mutation deleting one of the two sentences outright left the pool with a
+    single agreeing member and passed.
+
+    `unassessed` is not in the pattern list, because at this head it is published
+    as the words `with no control left `unassessed`` and not as a digit. A zero
+    stated in prose still has to be gated, so it is handled as a relation in the
+    gate: the phrase is required while the ledger computes zero, a digit is
+    required once it does not, and either form appearing when the other is the
+    true one is a failure. A pattern alone would have read the digit-free
+    sentence as an absent figure forever.
+    """
+    found = figure_occurrences(
+        text,
+        (
+            ("covered", r"(?<![-\w])(\d+) of the \d+ are `covered`"),
+            ("covered_without_row", r"the other (\d+) `covered` controls"),
+            ("covered_without_row_restated", r"without a row are (\d+) `covered`"),
+            ("tighten", r"(?<![-\w])(\d+) controls are `tighten`"),
+            ("tighten_in_the_split", r"are \d+ `covered`, (\d+) `tighten`"),
+            ("new", r"`tighten`, (\d+) `new`"),
+            ("not_implementable", r"(?<![-\w])(\d+) `not_implementable`"),
+            ("taggable", r"all (\d+) taggable controls"),
+            ("taggable_covered", r"themselves, the (\d+) `covered`"),
+            ("taggable_tighten", r"the \d+ `covered` and the (\d+) `tighten`"),
+            ("unassessed_as_words", r"with no control left (`unassessed`)"),
+            # Position-independent, unlike a leading `and`. The one ref that did
+            # publish this as a digit wrote it mid-list, `18 `new`, 11
+            # `unassessed` and 3 `not_implementable``, where an `and (\d+)`
+            # pattern reads zero. Zero still fails the relation below, so the
+            # narrow form failed closed, but it failed naming the figure as
+            # absent when the document was publishing it -- a different repair
+            # from the one the message asked for.
+            ("unassessed_as_figure", r"(?<![-\w])(\d+) `unassessed`"),
+        ),
+    )
+    values = {
+        label: agreed_figure(found[label])
+        for label in found
+        if not label.startswith("unassessed")
+    }
+    return values, found
+
+
+def coverage_bullet_relations(values, computed, found):
+    """The arithmetic between the bullets' figures, and the prose zero.
+
+    Every figure in these bullets can be gated and right while the sentence adds
+    them up wrong, so the two sums the bullets state are asserted as sums.
+
+    Both look entailed by the figure legs above, and while the document is the only
+    thing moving they are: given doc taggable == computed taggable and doc
+    covered/tighten == computed covered/tighten, doc taggable == doc covered + doc
+    tighten follows. Measured, every one-file mutation reds on a figure leg first
+    and neither sum ever fires alone.
+
+    What each leg uniquely reads is a second computed expression that no figure leg
+    touches. `computed["taggable"]` is written here as covered + tighten and
+    `computed["without_row_total"]` as total - mapped controls; the figure legs
+    compare the document against whatever those two expressions say, so redefining
+    one and updating the document to match leaves all ten figure legs green.
+    Measured both ways: move the computing side to covered + tighten + 1 and the
+    document to 73, and only the traceability sum fires; move without_row_total to
+    71 and touch no prose, and only the partition sum fires. The partition leg
+    reaches further of the two, because the 70 it checks is a population gate 12
+    independently binds through `derivable + remaining == in_scope`, and because the
+    identity holding today needs summary["total"] to stay equal to the five verdict
+    populations -- add a sixth verdict and the document's split silently stops
+    covering the whole 70 with every figure still agreeing.
+    """
+    problems = []
+    parts = (
+        "covered_without_row",
+        "tighten",
+        "new",
+        "not_implementable",
+    )
+    if all(values[p] is not None for p in parts):
+        total = sum(values[p] for p in parts) + computed["unassessed"]
+        if total != computed["without_row_total"]:
+            problems.append(
+                "the coverage bullet's own split sums to "
+                f"{total} ({' + '.join(f'{p}={values[p]}' for p in parts)} "
+                f"+ unassessed={computed['unassessed']}), and the ledger leaves "
+                f"{computed['without_row_total']} controls without a row"
+            )
+    if values["taggable"] is not None and None not in (
+        values["covered"],
+        values["tighten"],
+    ):
+        if values["taggable"] != values["covered"] + values["tighten"]:
+            problems.append(
+                f"the traceability bullet's own sum {values['covered']} + "
+                f"{values['tighten']} does not reach the {values['taggable']} "
+                "taggable controls it claims"
+            )
+    # The prose zero. Each form is required exactly when it is the true one, so
+    # neither a stale digit nor a phrase left behind after the count moves off zero
+    # can stand, and the message names which form was expected.
+    words, figure = found["unassessed_as_words"], found["unassessed_as_figure"]
+    if computed["unassessed"] == 0:
+        if not words:
+            problems.append(
+                "the ledger leaves no control `unassessed` and the coverage "
+                "bullet does not say so; expected the words `with no control "
+                "left `unassessed``"
+            )
+        if figure:
+            problems.append(
+                f"the coverage bullet publishes {figure} `unassessed` while the "
+                "ledger computes 0"
+            )
+    else:
+        if words:
+            problems.append(
+                f"the ledger computes {computed['unassessed']} `unassessed` "
+                "control(s) and the coverage bullet says there are none"
+            )
+        if agreed_figure(figure) != computed["unassessed"]:
+            problems.append(
+                f"the coverage bullet publishes {figure} `unassessed`, the "
+                f"ledger computes {computed['unassessed']}"
+            )
+    return problems
 
 
 def load_aisf_control(rel_path, control_id):
@@ -1525,11 +1741,46 @@ def main():
     # prose; membership is what the claim is, and two sets of one size can have
     # different members. What it adds over the chain of 14a and gate 15, which is
     # narrow, is in tagged_control_problems()'s docstring.
+    # The pipe-joined paragraph's two populations, computed in their own loop and
+    # not inside 14a's above. 14a `continue`s past an element whose row verdict is
+    # wrong, so recording forms there would make a verdict mutation move this
+    # figure too and leave a red here pointing at an unrelated cause. No
+    # unparseable-element guard: 14a already fails on one at :1469, and a second
+    # copy of that check here would be dead code.
+    #
+    # The predicate is the one the prose states -- at least one `(partial)` element
+    # and at least one element of another form -- and not the broader "two or more
+    # distinct forms". They agree at 14 today and are not the same population:
+    # `AC-19` carries bare plus joint and no partial at all, so the broad reading
+    # counts it while the sentence's own explanation ("a direct consequence of the
+    # FND block") does not describe it, AC-19 naming no FND control. A value whose
+    # every element is `(partial)` separates them the other way.
+    multi_tags = [v for m in maps.values() for v in m.values() if "|" in v]
+    mixing = 0
+    for tag in multi_tags:
+        forms = set()
+        for element in tag.split(" | "):
+            m = element_re.fullmatch(element)
+            if m:
+                forms.add(
+                    "bare"
+                    if m.group(2) is None
+                    else ("partial" if m.group(2) == "partial" else "joint")
+                )
+        if "partial" in forms and len(forms) > 1:
+            mixing += 1
     computed = {
         "pairs": len(found_pairs),
         "tagged": sum(len(m) for m in maps.values()),
         "modules": len(maps),
         "controls": len({c for _, c in found_pairs}),
+        # Two keys, one number, deliberately: the paragraph states this count and
+        # the next one restates it as `of those 23`, and each sentence is required
+        # to publish it. See tag_column_figures() for the mutation that forced the
+        # two-figure shape over a pool.
+        "multi": len(multi_tags),
+        "multi_restated": len(multi_tags),
+        "mixing": mixing,
         "per_module": {
             d.removesuffix("_assessments"): len(m) for d, m in sorted(maps.items())
         },
@@ -1846,6 +2097,64 @@ def main():
             "not a pass -- an empty battery satisfies every figure check above"
         )
         + (f", bad={mut_bad}" if mut_bad else ""),
+    )
+
+    # ---- gate 21: the coverage and traceability bullets. Ten digit figures over
+    # six ledger populations asserted here plus `unassessed` as prose, none of which
+    # any gate read until this one. The block published eleven figure instances at
+    # bd0ecb8, the eleventh being an `unassessed` digit, and ten of the eleven were
+    # wrong for a whole phase while every other gate passed.
+    # coverage_bullet_figures() records how that happened.
+    #
+    # Appended rather than placed beside the other two document-figure gates, which
+    # would read better: the gates above are numbered in comments and cited by
+    # number in the document's own prose, so inserting one renumbers the citations.
+    with open(AISF_DOC) as f:
+        bullet_text = f.read()
+    bullet_slice, bullet_blocks, bullet_bad = coverage_bullets(bullet_text)
+    bullet_published, bullet_hits = coverage_bullet_figures(bullet_slice)
+    # Counted as distinct controls and not as mappings. The bullet's claim is about
+    # controls -- "the other 53 `covered` controls" -- and the two are 8 either way
+    # here, but nothing asserts they must be: gate 11 checks each mapping's control
+    # against a row and gate 13 checks the ids are well-formed, and neither would
+    # fail if one control were mapped twice. On the day that happens this leg reds
+    # on the split sum while gate 12's partition stays green, and the repair is the
+    # duplicate mapping rather than either figure.
+    mapped_controls = {m["control"] for m in AISF_DERIVED_MAP}
+    bullet_computed = {
+        "covered": summary["covered"],
+        "covered_without_row": summary["covered"] - len(mapped_controls),
+        "covered_without_row_restated": summary["covered"] - len(mapped_controls),
+        "tighten": summary["tighten"],
+        "tighten_in_the_split": summary["tighten"],
+        "new": summary["new"],
+        "not_implementable": summary["not_implementable"],
+        "taggable": summary["covered"] + summary["tighten"],
+        "taggable_covered": summary["covered"],
+        "taggable_tighten": summary["tighten"],
+        "unassessed": summary["unassessed"],
+        "without_row_total": summary["total"] - len(mapped_controls),
+    }
+    bullet_bad += figure_drift(
+        "SECURITY_CHECKS_AISF.md's coverage bullets",
+        bullet_published,
+        bullet_hits,
+        bullet_computed,
+    )
+    bullet_bad += coverage_bullet_relations(
+        bullet_published, bullet_computed, bullet_hits
+    )
+    gate(
+        "the SECURITY_CHECKS_AISF.md coverage and traceability bullets match the "
+        "ledger, and their own two sums add up",
+        not bullet_bad,
+        f"bullets from {bullet_blocks} block(s) matching {BULLET_ANCHOR!r}, "
+        f"{len(bullet_published)} figure(s) asserted plus `unassessed` as prose, "
+        f"doc={bullet_published} vs computed={bullet_computed}, "
+        f"the split {bullet_computed['without_row_total']} without a row and "
+        f"taggable {bullet_computed['covered']}+{bullet_computed['tighten']}, "
+        f"copies [{copies_note(bullet_hits)}]"
+        + (f", bad={bullet_bad}" if bullet_bad else ""),
     )
 
     failed = [n for n, ok, _ in results if not ok]

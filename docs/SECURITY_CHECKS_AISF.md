@@ -13,17 +13,17 @@ and the shipped BR/SM/AC/AG check every row is derived from.
   OWASP Top 10 for LLM.
 - **Coverage:** 8 of the 78 in-scope AISF controls carry a derived `AISF-` row;
   the remaining 70 are not yet rendered as a row. A row is a narrower claim than
-  coverage, so read this figure with the ledger census below it: 28 of the 78 are
-  `covered`, all 8 rows sit on `covered` controls, and the other 20 `covered`
+  coverage, so read this figure with the ledger census below it: 61 of the 78 are
+  `covered`, all 8 rows sit on `covered` controls, and the other 53 `covered`
   controls are named by the `Compliance_Frameworks` tag column until each is
   walked through [Adding a control](#adding-a-control), which allocates an id and
-  writes a per-control section. The 70 without a row are 20 `covered`, 18
-  `tighten`, 18 `new`, 11 `unassessed` and 3 `not_implementable`. The parity
-  analysis behind those figures is in
+  writes a per-control section. The 70 without a row are 53 `covered`, 11
+  `tighten`, 2 `new` and 4 `not_implementable`, with no control left
+  `unassessed`. The parity analysis behind those figures is in
   [`aisf-parity/AISF-WORK-LEDGER.md`](../aisf-parity/AISF-WORK-LEDGER.md).
-- **Traceability:** 18 controls are `tighten`, covered too partly to earn an
-  `AISF-` row at all. The `Compliance_Frameworks` CSV column names all 46
-  taggable controls on the producer rows themselves, the 28 `covered` and the 18
+- **Traceability:** 11 controls are `tighten`, covered too partly to earn an
+  `AISF-` row at all. The `Compliance_Frameworks` CSV column names all 72
+  taggable controls on the producer rows themselves, the 61 `covered` and the 11
   `tighten`, and is described under
   [Traceability column on producer rows](#traceability-column-on-producer-rows).
   A tag carries no verdict.
@@ -268,7 +268,7 @@ and on `AIR-ACR-PAY-01`, joint on `AIR-ACR-RT-03 (1 of 2 checks)`, and
 `AIR-FND-IAM-05 (partial)`.
 
 Mixing a `(partial)` with a tag of another form inside one value is now the
-common case, 15 of those 23, and it is a direct consequence of the FND block:
+common case, 14 of those 23, and it is a direct consequence of the FND block:
 a foundational control such as `AIR-FND-NET-01` is asserted in part by checks
 whose own service control they fully assert, so the same check carries a bare
 tag and a `(partial)` one. Nothing in the vocabulary forbids the mix, and gate
@@ -423,14 +423,15 @@ timestamp and `--csv-dir` says it cannot.
    if it ever succeeds.
 7. Run `.venv/bin/python aisf-parity/mutate.py`. Before it mutates anything it
    validates every entry's find-string against its file and prints
-   `entries 24/24 find-strings validated`, aborting and naming each entry whose
+   `entries 27/27 find-strings validated`, aborting and naming each entry whose
    string no longer occurs exactly once, so a battery that lost entries to a
    refactor cannot report a clean run on the entries it still reached. It then
-   breaks the code 24 ways and requires a ledger gate or a test to go red for
+   breaks the code 27 ways and requires a ledger gate or a test to go red for
    each one, naming the catcher it observed: 5 defects in the derived mapping, 6
    in `BR-20`'s S3 Vectors legs, 5 in the tag column, 2 in the API field names
    the checks read, 3 in the incumbent-name map, 1 in the ledger's markdown
-   renderer, 1 in the census anchor and 1 in the published battery figures. Gate
+   renderer, 1 in the census anchor, 1 in the published battery figures, 2 in the
+   coverage bullets and 1 in the multi-control figures. Gate
    20 derives every figure in this step from `mutate.py`'s own entry list and
    fails if this paragraph disagrees with it, because the earlier copy of this
    sentence went stale at 17 while the battery grew to 22 and nothing read the

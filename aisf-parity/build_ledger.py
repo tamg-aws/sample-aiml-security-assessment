@@ -598,20 +598,29 @@ ROWS = [
     ),
     (
         "AIR-ACR-MEM-07",
-        NEW,
+        NOT_IMPL,
         None,
-        "agentcore_assessments",
+        None,
         [],
-        "Left open in phase 4: no workload-independent invariant here reaches Failed per "
-        "memory. eventExpiryDuration is required at CreateMemory, 3 to 365 days in the "
-        "pinned 2023-06-05 model, and required again on the Memory shape GetMemory "
-        "returns, so every memory carries a retention bound and a presence check passes "
-        "unconditionally. Which value is short enough is the workload owner's judgment, "
-        "and this row will not invent a ceiling. The namespace-scope half of the control "
-        "is asserted under AIR-ACR-MEM-01 by AC-07 and AC-23, and its log-retention "
+        "the only retention field AgentCore Memory exposes is required, and it bounds a "
+        "different thing from the one this control asks about. eventExpiryDuration is "
+        "Required: Yes on CreateMemory, 3 to 365 days, and comes back on the Memory shape "
+        "GetMemory returns, so a presence check over it passes for every memory that "
+        "exists, which is worse than no check. It also bounds the wrong subject: the "
+        "create page calls it event retention for raw events in short-term memory and "
+        "applies it per event at write time, so updating it moves only later events, "
+        "while what this control asks to bound is the long-term cross-session records "
+        "extracted from those events, and neither CreateMemory nor Memory carries any "
+        "retention field for those. Which value is short enough is the workload owner's "
+        "judgment in any case, and this row will not invent a ceiling. What is readable "
+        "is the namespace partitioning, already asserted under AIR-ACR-MEM-01 by AC-07 "
+        "and AC-23 on {actorId}; session partitioning cannot join it, because AWS "
+        "documents /summaries/{actorId}/{sessionId}/ for a summary strategy and "
+        "/users/{actorId}/preferences/ for a user-preference strategy, so failing the "
+        "absence of {sessionId} would fail a documented configuration. The log-retention "
         "clause asks for a compliance schedule only the workload owner can name",
         [],
-        4,
+        None,
     ),
     (
         "AIR-ACR-MEM-12",
@@ -843,12 +852,19 @@ ROWS = [
         "assertion reaches only that a filter exists somewhere in the account. That "
         "is the overclaim, and it is why the missing leg gets an id of its own "
         "rather than widening a check named for a filter. The falsifiable leg is "
-        "enforcement: bedrock:ListEnforcedGuardrailsConfiguration returns each "
-        "AccountEnforcedGuardrailOutputConfiguration with guardrailArn, "
-        "guardrailVersion, modelEnforcement and selectiveContentGuarding, so it can "
-        "tell an account that applies a guardrail to every model from one that names "
-        "a single model and leaves the rest unguarded, or that guards part of the "
-        "content. Where no account-level configuration exists the fallback leg is a "
+        "enforcement: bedrock:ListEnforcedGuardrailsConfiguration returns "
+        "guardrailsConfig, an array of at most one item carrying guardrailArn, "
+        "guardrailVersion, modelEnforcement and selectiveContentGuarding. Reading "
+        "those two objects rather than their presence is the whole leg, because "
+        "modelEnforcement is not a scalar: it is excludedModels and includedModels, "
+        "both required, and the includedModels pattern permits the literal ALL. So "
+        "ALL with an empty excludedModels is every model enforced, a named list "
+        "leaves every other model unguarded, and a non-empty excludedModels carves "
+        "holes even under ALL, which the finding has to name. "
+        "selectiveContentGuarding is messages and system, each SELECTIVE or "
+        "COMPREHENSIVE, so a configuration can guard the prompt and not the system "
+        "instructions. inputTags is deprecated and carries no verdict. Where no "
+        "account-level configuration exists the fallback leg is a "
         "paired Allow and Deny on bedrock:GuardrailIdentifier over InvokeModel, "
         "InvokeModelWithResponseStream, Converse and ConverseStream, which is an "
         "identity-policy read this function can already do. No new IAM: this leg was "
@@ -981,9 +997,19 @@ ROWS = [
         "Firewall is the readable mechanism: "
         "route53resolver:ListFirewallRuleGroupAssociations names the rule groups "
         "bound to the VPC the workload runs in, and route53resolver:ListFirewallRules "
-        "shows whether a group ends in a BLOCK over a catch-all domain list, which is "
-        "what makes the configuration an allow-list of permitted destinations rather "
-        "than a deny-list of known-bad ones. Recorded because it looks like a cheaper "
+        "shows whether the group's terminal rule blocks. Terminal means the largest "
+        "Priority, since rules are processed lowest first and Priority is unique "
+        "within a group, and enforcing means a Status of COMPLETE or absent, because "
+        "a rule needing no async provisioning reports none and reading absent as "
+        "not-enforcing would fail a correct configuration. What this leg does not "
+        "assert is that the blocked domain list is a catch-all, which is what would "
+        "make the configuration an allow-list of permitted destinations rather than a "
+        "deny-list of known-bad ones: proving catch-all membership needs "
+        "route53resolver:ListFirewallDomains, a third action this row does not claim, "
+        "so the finding reports the terminal rule's FirewallDomainListId and leaves "
+        "that confirmation to the operator. Note also that a DNS Firewall Advanced "
+        "rule is a tagged union and may carry no FirewallDomainListId at all. "
+        "Recorded because it looks like a cheaper "
         "answer and is not: an IAM Deny on bedrock-agentcore:subnets or "
         ":securityGroups does not close this gap, because the devguide lists those "
         "condition keys while the machine-readable IAM reference lists none for "
