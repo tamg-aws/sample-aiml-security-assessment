@@ -716,10 +716,12 @@ Resources:
                 - config:DescribeComplianceByConfigRule # SM-32
               Resource: '*'
             - Sid: OrganizationsInventoryPermissions
+              # None of these three Organizations actions has a resource type in IAM.
               Effect: Allow
               Action:
-                - organizations:DescribeOrganization # SM-34
+                - organizations:DescribeOrganization # SM-34, SM-35
                 - organizations:ListPolicies # SM-34
+                - organizations:ListDelegatedAdministrators # SM-35
               Resource: '*'
             - Sid: EC2SubnetExposureInventory
               # SM-10, SM-11, SM-28 and SM-33 resolve whether a subnet routes to an
@@ -738,6 +740,36 @@ Resources:
               Resource:
                 - !Sub 'arn:${AWS::Partition}:organizations::*:policy/*/*/*'
                 - !Sub 'arn:${AWS::Partition}:organizations::aws:policy/*/*'
+            - Sid: SecurityHubStandardsRead
+              Effect: Allow
+              Action:
+                - securityhub:GetEnabledStandards # SM-36
+              Resource: !Sub 'arn:${AWS::Partition}:securityhub:*:${AWS::AccountId}:hub/default'
+            - Sid: AccountInventoryWithoutResourceType
+              # SM-39, SM-40 and SM-41 enumerate clusters, secrets and IoT policies.
+              # None of these three list actions has a resource type in IAM.
+              # SM-40 reads rotation metadata only, never a secret value.
+              Effect: Allow
+              Action:
+                - eks:ListClusters # SM-39
+                - secretsmanager:ListSecrets # SM-40
+                - iot:ListPolicies # SM-41
+              Resource: '*'
+            - Sid: EKSAddonRead
+              Effect: Allow
+              Action:
+                - eks:DescribeCluster # SM-39
+                - eks:ListAddons # SM-39
+                - eks:DescribeAddon # SM-39
+              Resource:
+                - !Sub 'arn:${AWS::Partition}:eks:*:${AWS::AccountId}:cluster/*'
+                - !Sub 'arn:${AWS::Partition}:eks:*:${AWS::AccountId}:addon/*/*/*'
+            - Sid: IoTPolicyRead
+              Effect: Allow
+              Action:
+                - iot:GetPolicy # SM-41
+                - iot:ListTargetsForPolicy # SM-41
+              Resource: !Sub 'arn:${AWS::Partition}:iot:*:${AWS::AccountId}:policy/*'
 
   AgentCoreSecurityAssessmentFunction:
     Type: AWS::Serverless::Function

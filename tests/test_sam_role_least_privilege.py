@@ -209,12 +209,20 @@ _EXPECTED_ACTIONS = {
         "config:DescribeConfigurationRecorders",
         "ec2:DescribeRouteTables",
         "ec2:DescribeSubnets",
+        "eks:DescribeAddon",
+        "eks:DescribeCluster",
+        "eks:ListAddons",
+        "eks:ListClusters",
         "guardduty:GetDetector",
         "guardduty:ListDetectors",
         "iam:GenerateServiceLastAccessedDetails",
         "iam:GetServiceLastAccessedDetails",
+        "iot:GetPolicy",
+        "iot:ListPolicies",
+        "iot:ListTargetsForPolicy",
         "organizations:DescribeOrganization",
         "organizations:DescribePolicy",
+        "organizations:ListDelegatedAdministrators",
         "organizations:ListPolicies",
         "s3:GetObject",
         "s3:PutObject",
@@ -256,6 +264,8 @@ _EXPECTED_ACTIONS = {
         "sagemaker:ListTrainingJobs",
         "sagemaker:ListTransformJobs",
         "sagemaker:ListTrials",
+        "secretsmanager:ListSecrets",
+        "securityhub:GetEnabledStandards",
     },
     "AgentCoreSecurityAssessmentFunction": {
         "bedrock-agentcore:GetAgentRuntime",
@@ -721,6 +731,69 @@ def test_sagemaker_and_guardduty_resource_reads_are_arn_scoped(template):
     assert "guardduty:GetDetector" in detector
     assert "guardduty:*:${AWS::AccountId}:detector/*" in detector
     assert not re.search(r"Resource:\s+['\"]\*['\"]", detector)
+
+
+@pytest.mark.parametrize("template", _SAM_TEMPLATES, ids=os.path.basename)
+def test_sagemaker_scope27_reads_wildcard_only_where_iam_has_no_resource_type(
+    template,
+):
+    """SM-35..SM-41 take '*' only on list actions with no IAM resource type.
+
+    The servicereference.us-east-1.amazonaws.com action lists give no resource
+    type for organizations:ListDelegatedAdministrators, eks:ListClusters,
+    secretsmanager:ListSecrets or iot:ListPolicies, and give hub, cluster,
+    addon and policy for the four scoped reads below.
+    """
+    for sid, actions in (
+        (
+            "OrganizationsInventoryPermissions",
+            ("organizations:ListDelegatedAdministrators",),
+        ),
+        (
+            "AccountInventoryWithoutResourceType",
+            ("eks:ListClusters", "secretsmanager:ListSecrets", "iot:ListPolicies"),
+        ),
+    ):
+        statement = _statement_block(
+            template, "SagemakerSecurityAssessmentFunction", sid
+        )
+        for action in actions:
+            assert action in statement
+        assert re.search(r"Resource:\s+['\"]\*['\"]", statement)
+
+    for sid, actions, resources in (
+        (
+            "SecurityHubStandardsRead",
+            ("securityhub:GetEnabledStandards",),
+            ("securityhub:*:${AWS::AccountId}:hub/default",),
+        ),
+        (
+            "EKSAddonRead",
+            ("eks:DescribeCluster", "eks:ListAddons", "eks:DescribeAddon"),
+            (
+                "eks:*:${AWS::AccountId}:cluster/*",
+                "eks:*:${AWS::AccountId}:addon/*/*/*",
+            ),
+        ),
+        (
+            "IoTPolicyRead",
+            ("iot:GetPolicy", "iot:ListTargetsForPolicy"),
+            ("iot:*:${AWS::AccountId}:policy/*",),
+        ),
+    ):
+        statement = _statement_block(
+            template, "SagemakerSecurityAssessmentFunction", sid
+        )
+        for action in actions:
+            assert action in statement
+        for resource in resources:
+            assert resource in statement
+        assert not re.search(r"Resource:\s+['\"]\*['\"]", statement)
+
+    # SM-40 reads rotation metadata only; a secret value read would widen the
+    # role from inventory to data access.
+    block = _resource_block(template, "SagemakerSecurityAssessmentFunction")
+    assert "secretsmanager:GetSecretValue" not in block
 
 
 @pytest.mark.parametrize("template", _SAM_TEMPLATES, ids=os.path.basename)

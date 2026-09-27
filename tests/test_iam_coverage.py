@@ -141,6 +141,17 @@ REQUIRED_SAGEMAKER_ACTIONS = {
     "sagemaker:ListExperiments",
     "sagemaker:ListTrials",
     "sagemaker:ListAssociations",
+    # SM-35..SM-41 (AISF scope-27 foundation controls).
+    "organizations:ListDelegatedAdministrators",
+    "securityhub:GetEnabledStandards",
+    "eks:ListClusters",
+    "eks:DescribeCluster",
+    "eks:ListAddons",
+    "eks:DescribeAddon",
+    "secretsmanager:ListSecrets",
+    "iot:ListPolicies",
+    "iot:GetPolicy",
+    "iot:ListTargetsForPolicy",
 }
 
 REQUIRED_AGENTCORE_ACTIONS = {
@@ -881,6 +892,12 @@ _VERIFIED_REMEDIATION_CONDITION_KEYS |= {
 }
 
 _NON_IAM_REMEDIATION_TOKENS = {
+    # SM-41 names the AWS IoT Core policy variables
+    # ${iot:Connection.Thing.ThingName} and iot:Connection.Thing.IsAttached, and
+    # the token scan stops at the first dot. Both are IoT Core policy
+    # variables, not IAM keys, and are listed on the IoT developer guide's
+    # thing-policy-variables page.
+    "iot:Connection",
     "arn:PARTITION",
     "s3:ObjectCreated",
     "s3:ObjectModified",

@@ -4699,3 +4699,1172 @@ class TestSubnetExposurePerCheck:
         )
         assert exposure["Status"] == "Passed"
         assert "Training job 'private-job'" in exposure["Finding_Details"]
+
+
+# ===================================================================
+# AISF scope-27: SM-02 service-wide grant leg and SM-35..SM-41
+# ===================================================================
+def _pager(pages_by_operation):
+    """Build a get_paginator side effect from {operation: pages or callable}.
+
+    A callable receives the paginate kwargs and returns the pages, so a
+    per-resource paginator can return different pages per resource. A raised
+    exception inside the callable surfaces from paginate().
+    """
+
+    def get_paginator(operation):
+        source = pages_by_operation[operation]
+        paginator = MagicMock()
+
+        def paginate(**kwargs):
+            pages = source(**kwargs) if callable(source) else source
+            return iter(pages)
+
+        paginator.paginate.side_effect = paginate
+        return paginator
+
+    return get_paginator
+
+
+def _rows(result):
+    rows = extract_csv_data(result)
+    for row in rows:
+        assert_finding_schema(row)
+    return rows
+
+
+class TestSM02ServiceWideGrant:
+    """AIR-FND-IAM-09: SM-02 reports sagemaker:* and NotAction Allow grants."""
+
+    @staticmethod
+    def _grant_rows(cache):
+        with patch("sagemaker_app.boto3.client") as mock_client:
+            mock_client.return_value = MagicMock()
+            # The stale-user leg polls this job once a second until COMPLETED.
+            mock_client.return_value.get_service_last_accessed_details.return_value = {
+                "JobStatus": "COMPLETED",
+                "ServicesLastAccessed": [],
+            }
+            findings = _rows(
+                sagemaker_app.check_sagemaker_iam_permissions(cache, region="Global")
+            )
+        return [
+            f
+            for f in findings
+            if f["Finding"] == sagemaker_app.SERVICE_WIDE_GRANT_FINDING
+        ]
+
+    def test_scoped_role_first_and_service_wide_role_second_fails_only_second(self):
+        cache = _role_cache(
+            {
+                "ReadOnlyRole": [
+                    ("DescribeOnly", _identity_policy("sagemaker:Describe*", "*"))
+                ],
+                "EverythingRole": [
+                    ("AllSageMaker", _identity_policy("sagemaker:*", "*"))
+                ],
+            }
+        )
+        rows = self._grant_rows(cache)
+        assert [f["Status"] for f in rows] == ["Failed"]
+        assert "Role 'EverythingRole'" in rows[0]["Finding_Details"]
+        assert "AllSageMaker" in rows[0]["Finding_Details"]
+        assert "Action 'sagemaker:*'" in rows[0]["Finding_Details"]
+        assert rows[0]["Severity"] == "High"
+        assert rows[0]["Region"] == "Global"
+
+    def test_only_scoped_grants_is_passed_with_policy_count(self):
+        cache = _role_cache(
+            {
+                "RoleA": [("A", _identity_policy("sagemaker:DescribeEndpoint", "*"))],
+                "RoleB": [("B", _identity_policy("s3:GetObject", "*"))],
+            }
+        )
+        rows = self._grant_rows(cache)
+        assert [f["Status"] for f in rows] == ["Passed"]
+        assert "None of the 2 customer-managed or inline" in rows[0]["Finding_Details"]
+
+    def test_notaction_allow_reaches_sagemaker_and_fails(self):
+        document = {
+            "Version": "2012-10-17",
+            "Statement": [{"Effect": "Allow", "NotAction": ["iam:*"], "Resource": "*"}],
+        }
+        rows = self._grant_rows(_role_cache({"NotActionRole": [("NA", document)]}))
+        assert [f["Status"] for f in rows] == ["Failed"]
+        assert "NotAction ['iam:*']" in rows[0]["Finding_Details"]
+
+    def test_notaction_excluding_sagemaker_is_not_a_grant(self):
+        document = {
+            "Version": "2012-10-17",
+            "Statement": [
+                {"Effect": "Allow", "NotAction": "sagemaker:*", "Resource": "*"}
+            ],
+        }
+        rows = self._grant_rows(_role_cache({"ExcludesRole": [("EX", document)]}))
+        assert [f["Status"] for f in rows] == ["Passed"]
+
+    def test_bare_star_is_left_to_the_administrator_checks(self):
+        rows = self._grant_rows(
+            _role_cache({"AdminRole": [("Admin", _identity_policy("*", "*"))]})
+        )
+        assert [f["Status"] for f in rows] == ["Passed"]
+
+    def test_aws_managed_policy_is_excluded(self):
+        cache = {
+            "role_permissions": {
+                "ManagedRole": {
+                    "attached_policies": [
+                        {
+                            "name": "AmazonSageMakerFullAccess",
+                            "arn": "arn:aws:iam::aws:policy/AmazonSageMakerFullAccess",
+                            "document": _identity_policy("sagemaker:*", "*"),
+                        }
+                    ],
+                    "inline_policies": [],
+                }
+            },
+            "user_permissions": {},
+        }
+        rows = self._grant_rows(cache)
+        assert [f["Status"] for f in rows] == ["Passed"]
+        assert "None of the 0 customer-managed" in rows[0]["Finding_Details"]
+
+    def test_inline_user_policy_with_mixed_case_and_prefix_wildcard_fails(self):
+        cache = {
+            "role_permissions": {},
+            "user_permissions": {
+                "alice": {
+                    "attached_policies": [],
+                    "inline_policies": [
+                        {
+                            "name": "scoped",
+                            "document": _identity_policy("sagemaker:List*", "*"),
+                        },
+                        {
+                            "name": "prefix",
+                            "document": _identity_policy("SageMaker*", "*"),
+                        },
+                    ],
+                }
+            },
+        }
+        rows = self._grant_rows(cache)
+        assert [f["Status"] for f in rows] == ["Failed"]
+        assert "User 'alice'" in rows[0]["Finding_Details"]
+        assert "'prefix'" in rows[0]["Finding_Details"]
+
+    def test_deny_sagemaker_star_is_not_a_grant(self):
+        document = {
+            "Version": "2012-10-17",
+            "Statement": [{"Effect": "Deny", "Action": "sagemaker:*", "Resource": "*"}],
+        }
+        rows = self._grant_rows(_role_cache({"DenyRole": [("D", document)]}))
+        assert [f["Status"] for f in rows] == ["Passed"]
+
+    def test_more_than_twenty_violations_adds_an_overflow_row(self):
+        cache = _role_cache(
+            {
+                f"Role{index:02d}": [("All", _identity_policy("sagemaker:*", "*"))]
+                for index in range(21)
+            }
+        )
+        rows = self._grant_rows(cache)
+        assert len(rows) == 21
+        assert all(f["Status"] == "Failed" for f in rows)
+        assert rows[-1]["Finding_Details"].startswith("21 customer-managed")
+
+
+class TestSM35SecurityServiceDelegatedAdmin:
+    """AIR-FND-ACC-09: one row per security service, from a fixed list."""
+
+    MANAGEMENT = "111122223333"
+    SECURITY = "444455556666"
+
+    def _client(self, pages_by_principal):
+        client = MagicMock()
+        client.describe_organization.return_value = {
+            "Organization": {"MasterAccountId": self.MANAGEMENT}
+        }
+
+        def pages(ServicePrincipal):
+            value = pages_by_principal[ServicePrincipal]
+            if isinstance(value, Exception):
+                raise value
+            return value
+
+        client.get_paginator.side_effect = _pager(
+            {"list_delegated_administrators": pages}
+        )
+        return client
+
+    @patch("sagemaker_app.boto3.client")
+    def test_one_row_per_service_across_every_outcome(self, mock_client):
+        active = {"Id": self.SECURITY, "Status": "ACTIVE"}
+        mock_client.return_value = self._client(
+            {
+                "guardduty.amazonaws.com": [{"DelegatedAdministrators": [active]}],
+                "securityhub.amazonaws.com": [{"DelegatedAdministrators": []}],
+                "inspector2.amazonaws.com": _make_client_error("AccessDeniedException"),
+                "macie.amazonaws.com": [
+                    {
+                        "DelegatedAdministrators": [
+                            {"Id": self.MANAGEMENT, "Status": "ACTIVE"}
+                        ]
+                    }
+                ],
+                "config.amazonaws.com": [
+                    {
+                        "DelegatedAdministrators": [
+                            {"Id": self.SECURITY, "Status": "PENDING_ACTIVATION"}
+                        ]
+                    }
+                ],
+                # The active admin arrives on the second page.
+                "access-analyzer.amazonaws.com": [
+                    {"DelegatedAdministrators": []},
+                    {"DelegatedAdministrators": [active]},
+                ],
+            }
+        )
+        rows = _rows(
+            sagemaker_app.check_security_service_delegated_admin(region="Global")
+        )
+        assert [r["Status"] for r in rows] == [
+            "Passed",
+            "Failed",
+            "N/A",
+            "Failed",
+            "Failed",
+            "Passed",
+        ]
+        assert all(r["Check_ID"] == "SM-35" for r in rows)
+        assert all(
+            "Services checked (fixed list): Amazon GuardDuty" in r["Finding_Details"]
+            for r in rows
+        )
+        assert self.SECURITY in rows[0]["Finding_Details"]
+        assert "No active delegated administrator" in rows[1]["Finding_Details"]
+        assert "readable only from the management account" in rows[2]["Finding_Details"]
+        assert rows[2]["Severity"] == "Informational"
+        assert "is the organization management account" in rows[3]["Finding_Details"]
+        assert "No active delegated administrator" in rows[4]["Finding_Details"]
+        assert rows[1]["Severity"] == "High"
+
+    @patch("sagemaker_app.boto3.client")
+    def test_dedicated_admin_beside_management_account_passes(self, mock_client):
+        both = [
+            {"Id": self.MANAGEMENT, "Status": "ACTIVE"},
+            {"Id": self.SECURITY, "Status": "ACTIVE"},
+        ]
+        mock_client.return_value = self._client(
+            {
+                principal: [{"DelegatedAdministrators": both}]
+                for _, principal in sagemaker_app.SECURITY_SERVICE_PRINCIPALS
+            }
+        )
+        rows = _rows(sagemaker_app.check_security_service_delegated_admin())
+        assert [r["Status"] for r in rows] == ["Passed"] * 6
+        assert self.MANAGEMENT not in rows[0]["Finding_Details"].split(".")[0]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_non_access_error_is_could_not_assess_without_access_reason(
+        self, mock_client
+    ):
+        pages = {
+            principal: [{"DelegatedAdministrators": []}]
+            for _, principal in sagemaker_app.SECURITY_SERVICE_PRINCIPALS
+        }
+        pages["guardduty.amazonaws.com"] = _make_client_error("TooManyRequests")
+        mock_client.return_value = self._client(pages)
+        rows = _rows(sagemaker_app.check_security_service_delegated_admin())
+        assert len(rows) == 6
+        assert_could_not_assess_finding(rows[0])
+        assert "readable only from" not in rows[0]["Finding_Details"]
+        assert rows[1]["Status"] == "Failed"
+
+    @patch("sagemaker_app.boto3.client")
+    def test_organizations_not_in_use_is_one_na_row(self, mock_client):
+        client = MagicMock()
+        client.describe_organization.side_effect = _make_client_error(
+            "AWSOrganizationsNotInUseException"
+        )
+        mock_client.return_value = client
+        rows = _rows(sagemaker_app.check_security_service_delegated_admin())
+        assert len(rows) == 1
+        assert rows[0]["Status"] == "N/A"
+        assert "not in use" in rows[0]["Finding_Details"]
+        client.get_paginator.assert_not_called()
+
+    @patch("sagemaker_app.boto3.client")
+    def test_describe_organization_access_denied_is_could_not_assess(self, mock_client):
+        client = MagicMock()
+        client.describe_organization.side_effect = _make_client_error(
+            "AccessDeniedException"
+        )
+        mock_client.return_value = client
+        rows = _rows(sagemaker_app.check_security_service_delegated_admin())
+        assert len(rows) == 1
+        assert_could_not_assess_finding(rows[0])
+
+
+class TestSM36SecurityHubAIStandard:
+    """AIR-FND-DET-02: the AI Security Best Practices v1.0.0 standard."""
+
+    AI_ARN = (
+        "arn:aws:securityhub:us-east-1::standards/ai-security-best-practices/v/1.0.0"
+    )
+    FSBP_ARN = (
+        "arn:aws:securityhub:us-east-1::standards/"
+        "aws-foundational-security-best-practices/v/1.0.0"
+    )
+
+    def _run(self, mock_client, pages=None, error=None):
+        client = MagicMock()
+        if error is not None:
+            client.get_paginator.side_effect = error
+        else:
+            client.get_paginator.side_effect = _pager({"get_enabled_standards": pages})
+        mock_client.return_value = client
+        return _rows(sagemaker_app.check_security_hub_ai_standard(region="us-east-1"))
+
+    @patch("sagemaker_app.boto3.client")
+    def test_ai_standard_on_second_page_after_another_standard_passes(
+        self, mock_client
+    ):
+        rows = self._run(
+            mock_client,
+            [
+                {
+                    "StandardsSubscriptions": [
+                        {"StandardsArn": self.FSBP_ARN, "StandardsStatus": "READY"}
+                    ]
+                },
+                {
+                    "StandardsSubscriptions": [
+                        {"StandardsArn": self.AI_ARN, "StandardsStatus": "READY"}
+                    ]
+                },
+            ],
+        )
+        assert [r["Status"] for r in rows] == ["Passed"]
+        assert rows[0]["Check_ID"] == "SM-36"
+        assert "status READY" in rows[0]["Finding_Details"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_incomplete_passes_with_a_status_reason_note(self, mock_client):
+        rows = self._run(
+            mock_client,
+            [
+                {
+                    "StandardsSubscriptions": [
+                        {"StandardsArn": self.AI_ARN, "StandardsStatus": "INCOMPLETE"}
+                    ]
+                }
+            ],
+        )
+        assert rows[0]["Status"] == "Passed"
+        assert "StatusReason" in rows[0]["Finding_Details"]
+
+    @pytest.mark.parametrize("status", ["PENDING", "DELETING", "FAILED"])
+    @patch("sagemaker_app.boto3.client")
+    def test_subscription_not_ready_fails(self, mock_client, status):
+        rows = self._run(
+            mock_client,
+            [
+                {
+                    "StandardsSubscriptions": [
+                        {"StandardsArn": self.AI_ARN, "StandardsStatus": status}
+                    ]
+                }
+            ],
+        )
+        assert rows[0]["Status"] == "Failed"
+        assert f"status {status}" in rows[0]["Finding_Details"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_other_standards_only_fails_with_count(self, mock_client):
+        rows = self._run(
+            mock_client,
+            [
+                {
+                    "StandardsSubscriptions": [
+                        {"StandardsArn": self.FSBP_ARN, "StandardsStatus": "READY"}
+                    ]
+                }
+            ],
+        )
+        assert rows[0]["Status"] == "Failed"
+        assert rows[0]["Severity"] == "High"
+        assert "with 1 standard(s)" in rows[0]["Finding_Details"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_security_hub_not_enabled_is_failed(self, mock_client):
+        rows = self._run(
+            mock_client, error=_make_client_error("InvalidAccessException")
+        )
+        assert rows[0]["Status"] == "Failed"
+        assert "not enabled in this region" in rows[0]["Finding_Details"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_access_denied_is_could_not_assess(self, mock_client):
+        rows = self._run(mock_client, error=_make_client_error("AccessDeniedException"))
+        assert len(rows) == 1
+        assert_could_not_assess_finding(rows[0])
+
+
+def _detector(status="ENABLED", features=None):
+    return {
+        "detector_id": "12abc34d567e8fa901bc2d34e56789f0",
+        "detail": {"Status": status, "Features": features or []},
+        "error": None,
+    }
+
+
+class TestSM37GuardDutyLambdaNetworkLogs:
+    """AIR-FND-NET-07: GuardDuty Lambda Protection."""
+
+    check = staticmethod(sagemaker_app.check_guardduty_lambda_network_logs)
+
+    def test_enabled_feature_listed_after_another_passes(self):
+        rows = _rows(
+            self.check(
+                region="us-east-1",
+                detector_inventory=_detector(
+                    features=[
+                        {"Name": "S3_DATA_EVENTS", "Status": "DISABLED"},
+                        {"Name": "LAMBDA_NETWORK_LOGS", "Status": "ENABLED"},
+                    ]
+                ),
+            )
+        )
+        assert [r["Status"] for r in rows] == ["Passed"]
+        assert rows[0]["Check_ID"] == "SM-37"
+        assert rows[0]["Severity"] == "Medium"
+
+    def test_disabled_feature_after_an_enabled_one_fails(self):
+        rows = _rows(
+            self.check(
+                detector_inventory=_detector(
+                    features=[
+                        {"Name": "S3_DATA_EVENTS", "Status": "ENABLED"},
+                        {"Name": "LAMBDA_NETWORK_LOGS", "Status": "DISABLED"},
+                    ]
+                )
+            )
+        )
+        assert rows[0]["Status"] == "Failed"
+        assert "feature is DISABLED" in rows[0]["Finding_Details"]
+
+    def test_absent_feature_fails(self):
+        rows = _rows(
+            self.check(
+                detector_inventory=_detector(
+                    features=[{"Name": "S3_DATA_EVENTS", "Status": "ENABLED"}]
+                )
+            )
+        )
+        assert rows[0]["Status"] == "Failed"
+        assert "feature is absent" in rows[0]["Finding_Details"]
+
+    def test_disabled_detector_fails_even_with_feature_enabled(self):
+        rows = _rows(
+            self.check(
+                detector_inventory=_detector(
+                    status="DISABLED",
+                    features=[{"Name": "LAMBDA_NETWORK_LOGS", "Status": "ENABLED"}],
+                )
+            )
+        )
+        assert rows[0]["Status"] == "Failed"
+        assert "detector is not enabled" in rows[0]["Finding_Details"]
+
+    def test_no_detector_is_na(self):
+        rows = _rows(
+            self.check(
+                detector_inventory={"detector_id": None, "detail": None, "error": None}
+            )
+        )
+        assert rows[0]["Status"] == "N/A"
+        assert rows[0]["Severity"] == "Informational"
+
+    def test_inventory_error_is_could_not_assess(self):
+        rows = _rows(
+            self.check(
+                detector_inventory={
+                    "detector_id": None,
+                    "detail": None,
+                    "error": _make_client_error("AccessDeniedException"),
+                }
+            )
+        )
+        assert_could_not_assess_finding(rows[0])
+
+
+class TestSM38GuardDutyRuntimeMonitoring:
+    """AIR-SLF-RT-04: RUNTIME_MONITORING, not the EKS-only legacy feature."""
+
+    check = staticmethod(sagemaker_app.check_guardduty_runtime_monitoring)
+
+    def test_runtime_monitoring_enabled_passes_and_lists_agent_management(self):
+        # The live detector reports both features; the legacy one DISABLED.
+        rows = _rows(
+            self.check(
+                detector_inventory=_detector(
+                    features=[
+                        {"Name": "EKS_RUNTIME_MONITORING", "Status": "DISABLED"},
+                        {
+                            "Name": "RUNTIME_MONITORING",
+                            "Status": "ENABLED",
+                            "AdditionalConfiguration": [
+                                {"Name": "EKS_ADDON_MANAGEMENT", "Status": "ENABLED"},
+                                {
+                                    "Name": "ECS_FARGATE_AGENT_MANAGEMENT",
+                                    "Status": "DISABLED",
+                                },
+                            ],
+                        },
+                    ]
+                )
+            )
+        )
+        assert [r["Status"] for r in rows] == ["Passed"]
+        details = rows[0]["Finding_Details"]
+        assert "EKS_ADDON_MANAGEMENT ENABLED" in details
+        assert "ECS_FARGATE_AGENT_MANAGEMENT DISABLED" in details
+        assert "EC2_AGENT_MANAGEMENT not reported" in details
+
+    def test_legacy_eks_only_feature_fails(self):
+        rows = _rows(
+            self.check(
+                detector_inventory=_detector(
+                    features=[
+                        {"Name": "EKS_RUNTIME_MONITORING", "Status": "ENABLED"},
+                        {"Name": "RUNTIME_MONITORING", "Status": "DISABLED"},
+                    ]
+                )
+            )
+        )
+        assert rows[0]["Status"] == "Failed"
+        assert rows[0]["Severity"] == "High"
+        assert "covers EKS only" in rows[0]["Finding_Details"]
+
+    def test_both_features_absent_fails(self):
+        rows = _rows(self.check(detector_inventory=_detector(features=[])))
+        assert rows[0]["Status"] == "Failed"
+        assert "feature is absent" in rows[0]["Finding_Details"]
+
+    def test_disabled_detector_fails(self):
+        rows = _rows(
+            self.check(
+                detector_inventory=_detector(
+                    status="DISABLED",
+                    features=[{"Name": "RUNTIME_MONITORING", "Status": "ENABLED"}],
+                )
+            )
+        )
+        assert rows[0]["Status"] == "Failed"
+
+    def test_no_detector_is_na(self):
+        rows = _rows(
+            self.check(
+                detector_inventory={"detector_id": None, "detail": None, "error": None}
+            )
+        )
+        assert rows[0]["Status"] == "N/A"
+
+    def test_inventory_error_is_could_not_assess(self):
+        rows = _rows(
+            self.check(
+                detector_inventory={
+                    "detector_id": None,
+                    "detail": None,
+                    "error": RuntimeError("boom"),
+                }
+            )
+        )
+        assert_could_not_assess_finding(rows[0])
+
+
+class TestSM39EksVpcCniNetworkPolicy:
+    """AIR-SLF-RT-05: enableNetworkPolicy in the managed vpc-cni add-on."""
+
+    @pytest.mark.parametrize(
+        ("configuration_values", "expected"),
+        [
+            ('{"enableNetworkPolicy":"true"}', True),  # live shape, a string
+            ('{"enableNetworkPolicy": true}', True),
+            ('{"enableNetworkPolicy":"false"}', False),
+            ("{}", False),
+            ('["enableNetworkPolicy"]', False),
+            ('enableNetworkPolicy: "true"\n', True),
+            ("env:\n  X: 1\nenableNetworkPolicy: true\n", True),
+            ("nodeAgent:\n  enableNetworkPolicy: true\n", False),
+            ("enableNetworkPolicy: false\n", False),
+            ("", False),
+            (None, False),
+        ],
+    )
+    def test_configuration_values_parser(self, configuration_values, expected):
+        assert (
+            sagemaker_app._vpc_cni_network_policy_enabled(configuration_values)
+            is expected
+        )
+
+    @patch("sagemaker_app.boto3.client")
+    def test_clusters_across_pages_each_reported_and_error_isolated(self, mock_client):
+        addons_by_cluster = {
+            # vpc-cni arrives on the second list_addons page.
+            "agents-good": [{"addons": ["coredns"]}, {"addons": ["vpc-cni"]}],
+            "agents-open": [{"addons": ["vpc-cni", "kube-proxy"]}],
+            "agents-calico": [{"addons": ["coredns"]}],
+        }
+
+        def list_addons(clusterName):
+            if clusterName == "agents-broken":
+                raise _make_client_error("AccessDeniedException")
+            return addons_by_cluster[clusterName]
+
+        client = MagicMock()
+        client.get_paginator.side_effect = _pager(
+            {
+                "list_clusters": [
+                    {"clusters": ["agents-good"]},
+                    {"clusters": ["agents-open", "agents-calico", "agents-broken"]},
+                ],
+                "list_addons": list_addons,
+            }
+        )
+        client.describe_addon.side_effect = lambda clusterName, addonName: {
+            "addon": {
+                "configurationValues": (
+                    '{"enableNetworkPolicy":"true"}'
+                    if clusterName == "agents-good"
+                    else ""
+                )
+            }
+        }
+        mock_client.return_value = client
+        rows = _rows(sagemaker_app.check_eks_vpc_cni_network_policy("us-east-1"))
+        by_status = {}
+        for row in rows:
+            by_status.setdefault(row["Status"], []).append(row["Finding_Details"])
+        assert len(by_status["Failed"]) == 1
+        assert "'agents-open'" in by_status["Failed"][0]
+        assert len(by_status["Passed"]) == 1
+        assert "agents-good" in by_status["Passed"][0]
+        assert len(by_status["N/A"]) == 2
+        assert any(
+            "agents-calico" in d and "self-managed CNI" in d for d in by_status["N/A"]
+        )
+        assert any(
+            "'agents-broken'" in d and "Could not assess" in d for d in by_status["N/A"]
+        )
+        assert all(r["Check_ID"] == "SM-39" for r in rows)
+        client.describe_addon.assert_any_call(
+            clusterName="agents-good", addonName="vpc-cni"
+        )
+
+    @staticmethod
+    def _cluster_client(clusters, config_by_cluster, compute_by_cluster=None):
+        """Every cluster runs the managed vpc-cni add-on with the given value."""
+        compute_by_cluster = compute_by_cluster or {}
+        client = MagicMock()
+        client.get_paginator.side_effect = _pager(
+            {
+                "list_clusters": [{"clusters": clusters}],
+                "list_addons": lambda clusterName: [{"addons": ["vpc-cni"]}],
+            }
+        )
+        client.describe_cluster.side_effect = lambda name: {
+            "cluster": {"name": name, **compute_by_cluster.get(name, {})}
+        }
+
+        def describe_addon(clusterName, addonName):
+            addon = {"addonName": addonName}
+            if config_by_cluster.get(clusterName) is not None:
+                addon["configurationValues"] = config_by_cluster[clusterName]
+            return {"addon": addon}
+
+        client.describe_addon.side_effect = describe_addon
+        return client
+
+    @patch("sagemaker_app.boto3.client")
+    def test_true_then_missing_configuration_values_is_passed_then_failed(
+        self, mock_client
+    ):
+        mock_client.return_value = self._cluster_client(
+            ["agents-a", "agents-b"],
+            {"agents-a": '{"enableNetworkPolicy":"true"}', "agents-b": None},
+        )
+        rows = _rows(sagemaker_app.check_eks_vpc_cni_network_policy("us-east-1"))
+        assert sorted(r["Status"] for r in rows) == ["Failed", "Passed"]
+        failed = next(r for r in rows if r["Status"] == "Failed")
+        passed = next(r for r in rows if r["Status"] == "Passed")
+        assert "'agents-b'" in failed["Finding_Details"]
+        assert "agents-a" in passed["Finding_Details"]
+        assert "agents-b" not in passed["Finding_Details"]
+        assert (
+            "Network-policy enforcement is enabled on the VPC CNI add-on; whether "
+            "NetworkPolicy objects restrict pod traffic is a Kubernetes-API fact "
+            "this scan cannot read." in passed["Finding_Details"]
+        )
+
+    @patch("sagemaker_app.boto3.client")
+    def test_boolean_true_configuration_value_passes(self, mock_client):
+        mock_client.return_value = self._cluster_client(
+            ["agents-bool"], {"agents-bool": '{"enableNetworkPolicy": true}'}
+        )
+        rows = _rows(sagemaker_app.check_eks_vpc_cni_network_policy("us-east-1"))
+        assert [r["Status"] for r in rows] == ["Passed"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_auto_mode_cluster_is_na_with_the_nodeclass_reason(self, mock_client):
+        client = self._cluster_client(
+            ["agents-standard", "agents-auto", "agents-auto-off"],
+            {
+                "agents-standard": '{"enableNetworkPolicy":"true"}',
+                "agents-auto-off": '{"enableNetworkPolicy":"true"}',
+            },
+            {
+                "agents-auto": {"computeConfig": {"enabled": True}},
+                # computeConfig present but disabled is a standard cluster.
+                "agents-auto-off": {"computeConfig": {"enabled": False}},
+            },
+        )
+        mock_client.return_value = client
+        rows = _rows(sagemaker_app.check_eks_vpc_cni_network_policy("us-east-1"))
+        assert sorted(r["Status"] for r in rows) == ["N/A", "Passed"]
+        na = next(r for r in rows if r["Status"] == "N/A")
+        passed = next(r for r in rows if r["Status"] == "Passed")
+        assert "agents-auto" in na["Finding_Details"]
+        assert "agents-auto-off" not in na["Finding_Details"]
+        assert (
+            "EKS Auto Mode sets network policy on the NodeClass, a Kubernetes "
+            "object no AWS API returns" in na["Finding_Details"]
+        )
+        assert "self-managed CNI" not in na["Finding_Details"]
+        assert na["Severity"] == "Informational"
+        assert "2 EKS cluster(s)" in passed["Finding_Details"]
+        assert "agents-auto-off" in passed["Finding_Details"]
+        client.describe_cluster.assert_any_call(name="agents-auto")
+        assert all(
+            c.kwargs["clusterName"] != "agents-auto"
+            for c in client.describe_addon.call_args_list
+        )
+
+    @patch("sagemaker_app.boto3.client")
+    def test_no_clusters_is_na(self, mock_client):
+        client = MagicMock()
+        client.get_paginator.side_effect = _pager({"list_clusters": [{"clusters": []}]})
+        mock_client.return_value = client
+        rows = _rows(sagemaker_app.check_eks_vpc_cni_network_policy("us-east-1"))
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert "No EKS clusters" in rows[0]["Finding_Details"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_list_clusters_error_is_could_not_assess(self, mock_client):
+        client = MagicMock()
+        client.get_paginator.side_effect = _make_client_error("AccessDeniedException")
+        mock_client.return_value = client
+        rows = _rows(sagemaker_app.check_eks_vpc_cni_network_policy("us-east-1"))
+        assert len(rows) == 1
+        assert_could_not_assess_finding(rows[0])
+
+
+class TestSM40SecretsManagerRotation:
+    """AIR-SLF-RT-06: automatic rotation that actually happened on schedule."""
+
+    @pytest.mark.parametrize(
+        ("rules", "expected"),
+        [
+            ({"ScheduleExpression": "rate(30 days)"}, 30.0),
+            ({"ScheduleExpression": "rate(1 day)"}, 1.0),
+            ({"ScheduleExpression": "rate(4 hours)"}, 4 / 24),
+            ({"ScheduleExpression": "cron(0 16 1,15 * ? *)"}, 17.0),
+            ({"ScheduleExpression": "cron(0 8 ? * SAT *)"}, 7.0),
+            ({"ScheduleExpression": "cron(0 8 1 * ? *)"}, 31.0),
+            ({"ScheduleExpression": "cron(0 8 L * ? *)"}, 31.0),
+            ({"ScheduleExpression": "cron(0 8 ? * MON-FRI *)"}, 3.0),
+            ({"ScheduleExpression": "cron(0 8 ? * SUN#1 *)"}, 35.0),
+            ({"ScheduleExpression": "cron(0 8 ? * SUNL *)"}, 35.0),
+            ({"ScheduleExpression": "cron(0 8 ? 1/3 SUN#1 *)"}, 91.0),
+            ({"ScheduleExpression": "cron(0 4/12 * * ? *)"}, 1.0),
+            ({"ScheduleExpression": "cron(0 8 15W * ? *)"}, None),
+            ({"ScheduleExpression": "cron(0 8 ? * FOO#1 *)"}, None),
+            ({"ScheduleExpression": "cron(0 8 1 * ? 2025)"}, None),
+            ({"ScheduleExpression": "rate(2 weeks)"}, None),
+            ({"AutomaticallyAfterDays": 45}, 45.0),
+            ({}, None),
+        ],
+    )
+    def test_rotation_interval_parser(self, rules, expected):
+        assert sagemaker_app._rotation_interval_days(rules) == expected
+
+    def _run(self, mock_client, pages):
+        client = MagicMock()
+        paginator = MagicMock()
+        paginator.paginate.return_value = iter(pages)
+        client.get_paginator.return_value = paginator
+        mock_client.return_value = client
+        rows = _rows(sagemaker_app.check_secrets_manager_rotation("us-east-1"))
+        client.get_paginator.assert_called_once_with("list_secrets")
+        paginator.paginate.assert_called_once_with()
+        return rows
+
+    @staticmethod
+    def _ago(days):
+        from datetime import datetime, timedelta, timezone
+
+        return datetime.now(timezone.utc) - timedelta(days=days)
+
+    @patch("sagemaker_app.boto3.client")
+    def test_every_outcome_across_two_pages(self, mock_client):
+        rate30 = {"ScheduleExpression": "rate(30 days)"}
+        rows = self._run(
+            mock_client,
+            [
+                {
+                    "SecretList": [
+                        {
+                            "Name": "on-time",
+                            "RotationEnabled": True,
+                            "LastRotatedDate": self._ago(10),
+                            "RotationRules": rate30,
+                        },
+                        # RotationEnabled is absent when rotation was never set up.
+                        {"Name": "never-configured"},
+                    ]
+                },
+                {
+                    "SecretList": [
+                        {
+                            "Name": "never-rotated",
+                            "RotationEnabled": True,
+                            "RotationRules": rate30,
+                        },
+                        {
+                            "Name": "overdue",
+                            "RotationEnabled": True,
+                            "LastRotatedDate": self._ago(60),
+                            "RotationRules": rate30,
+                        },
+                        {
+                            "Name": "agentcore-owned",
+                            "OwningService": "bedrock-agentcore-identity",
+                        },
+                        {
+                            "Name": "weekday-schedule",
+                            "RotationEnabled": True,
+                            "LastRotatedDate": self._ago(1),
+                            "RotationRules": {
+                                "ScheduleExpression": "cron(0 8 15W * ? *)"
+                            },
+                        },
+                    ]
+                },
+            ],
+        )
+        failed = [r["Finding_Details"] for r in rows if r["Status"] == "Failed"]
+        passed = [r["Finding_Details"] for r in rows if r["Status"] == "Passed"]
+        na = [r["Finding_Details"] for r in rows if r["Status"] == "N/A"]
+        assert len(failed) == 3
+        assert "'never-configured' has no automatic rotation" in failed[0]
+        assert "'never-rotated'" in failed[1] and "never rotated" in failed[1]
+        assert "'overdue' last rotated 60 days ago" in failed[2]
+        assert len(passed) == 1
+        assert "on-time" in passed[0]
+        assert "1 secret(s) managed by another AWS service" in passed[0]
+        assert "agentcore-owned" not in " ".join(failed + passed + na)
+        assert len(na) == 1 and "weekday-schedule" in na[0]
+        assert all(r["Check_ID"] == "SM-40" for r in rows)
+
+    @pytest.mark.parametrize(
+        ("age_days", "expected"), [(1.5, "Passed"), (2.5, "Failed")]
+    )
+    @patch("sagemaker_app.boto3.client")
+    def test_one_day_grace_beyond_the_schedule(self, mock_client, age_days, expected):
+        rows = self._run(
+            mock_client,
+            [
+                {
+                    "SecretList": [
+                        {
+                            "Name": "daily",
+                            "RotationEnabled": True,
+                            "LastRotatedDate": self._ago(age_days),
+                            "RotationRules": {"ScheduleExpression": "rate(1 day)"},
+                        }
+                    ]
+                }
+            ],
+        )
+        assert [r["Status"] for r in rows] == [expected]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_naive_last_rotated_date_is_read_as_utc(self, mock_client):
+        rows = self._run(
+            mock_client,
+            [
+                {
+                    "SecretList": [
+                        {
+                            "Name": "naive",
+                            "RotationEnabled": True,
+                            "LastRotatedDate": self._ago(3).replace(tzinfo=None),
+                            "RotationRules": {"AutomaticallyAfterDays": 30},
+                        }
+                    ]
+                }
+            ],
+        )
+        assert [r["Status"] for r in rows] == ["Passed"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_only_service_owned_secrets_is_na_with_skip_note(self, mock_client):
+        rows = self._run(
+            mock_client,
+            [{"SecretList": [{"Name": "x", "OwningService": "appflow"}]}],
+        )
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert (
+            "1 secret(s) managed by another AWS service" in rows[0]["Finding_Details"]
+        )
+
+    @patch("sagemaker_app.boto3.client")
+    def test_no_secrets_is_na(self, mock_client):
+        rows = self._run(mock_client, [{"SecretList": []}])
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert "were skipped" not in rows[0]["Finding_Details"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_list_error_is_could_not_assess(self, mock_client):
+        client = MagicMock()
+        client.get_paginator.side_effect = _make_client_error("AccessDeniedException")
+        mock_client.return_value = client
+        rows = _rows(sagemaker_app.check_secrets_manager_rotation("us-east-1"))
+        assert len(rows) == 1
+        assert_could_not_assess_finding(rows[0])
+
+
+_IOT_TOPIC = "arn:aws:iot:us-east-1:123456789012:topic/"
+_IOT_CLIENT = "arn:aws:iot:us-east-1:123456789012:client/"
+_ATTACHED = {"Bool": {"iot:Connection.Thing.IsAttached": "true"}}
+
+
+def _iot_document(*statements):
+    return json.dumps({"Version": "2012-10-17", "Statement": list(statements)})
+
+
+def _scoped_iot_document():
+    return _iot_document(
+        {
+            "Effect": "Allow",
+            "Action": "iot:Connect",
+            "Resource": _IOT_CLIENT + "${iot:Connection.Thing.ThingName}",
+            "Condition": _ATTACHED,
+        },
+        {
+            "Effect": "Allow",
+            "Action": ["iot:Publish", "iot:Receive"],
+            "Resource": _IOT_TOPIC + "devices/${iot:Connection.Thing.ThingName}/*",
+        },
+    )
+
+
+class TestSM41IoTDeviceScopedPolicies:
+    """AIR-PHY-EDG-01: thing-name scoping plus an attached-thing condition."""
+
+    @pytest.mark.parametrize(
+        ("condition", "expected"),
+        [
+            ({"Bool": {"iot:Connection.Thing.IsAttached": "true"}}, True),
+            ({"Bool": {"iot:Connection.Thing.IsAttached": ["true"]}}, True),
+            ({"Bool": {"iot:Connection.Thing.IsAttached": True}}, True),
+            ({"Bool": {"iot:Connection.Thing.IsAttached": "false"}}, False),
+            ({"BoolIfExists": {"iot:Connection.Thing.IsAttached": "true"}}, False),
+            ({"Null": {"iot:Connection.Thing.IsAttached": "false"}}, False),
+            ({"StringNotEquals": {"iot:Connection.Thing.IsAttached": "true"}}, False),
+            ({"Bool": {"iot:Connection.Thing.IsOnline": "true"}}, False),
+            ({}, False),
+        ],
+    )
+    def test_attached_thing_condition(self, condition, expected):
+        assert (
+            sagemaker_app._iot_requires_attached_thing({"Condition": condition})
+            is expected
+        )
+
+    def _client(self, policies_pages, targets, documents):
+        client = MagicMock()
+
+        def list_targets(policyName):
+            return targets[policyName]
+
+        client.get_paginator.side_effect = _pager(
+            {"list_policies": policies_pages, "list_targets_for_policy": list_targets}
+        )
+
+        def get_policy(policyName):
+            value = documents[policyName]
+            if isinstance(value, Exception):
+                raise value
+            return {"policyName": policyName, "policyDocument": value}
+
+        client.get_policy.side_effect = get_policy
+        return client
+
+    @patch("sagemaker_app.boto3.client")
+    def test_policies_across_pages_each_judged(self, mock_client):
+        cert = [
+            "arn:aws:iot:us-east-1:123456789012:cert/"
+            "a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90"
+        ]
+        attached = [{"targets": cert}]
+        client = self._client(
+            [
+                {"policies": [{"policyName": "scoped"}, {"policyName": "broad"}]},
+                {
+                    "policies": [
+                        {"policyName": "unattached"},
+                        {"policyName": "no-attach-condition"},
+                        {"policyName": "not-action"},
+                        {"policyName": "broken"},
+                    ]
+                },
+            ],
+            {
+                # The target arrives on the second list_targets_for_policy page.
+                "scoped": [{"targets": []}, {"targets": cert}],
+                "broad": attached,
+                "unattached": [{"targets": []}],
+                "no-attach-condition": attached,
+                "not-action": attached,
+                "broken": attached,
+            },
+            {
+                "scoped": _scoped_iot_document(),
+                "broad": _iot_document(
+                    {
+                        "Effect": "Allow",
+                        "Action": "iot:Publish",
+                        "Resource": _IOT_TOPIC + "*",
+                    }
+                ),
+                "unattached": _iot_document(
+                    {"Effect": "Allow", "Action": "iot:*", "Resource": "*"}
+                ),
+                "no-attach-condition": _iot_document(
+                    {
+                        "Effect": "Allow",
+                        "Action": "iot:Connect",
+                        "Resource": _IOT_CLIENT + "${iot:Connection.Thing.ThingName}",
+                    }
+                ),
+                "not-action": _iot_document(
+                    {
+                        "Effect": "Allow",
+                        "NotAction": "iot:DescribeEndpoint",
+                        "Resource": "*",
+                        "Condition": _ATTACHED,
+                    }
+                ),
+                "broken": _make_client_error("AccessDeniedException"),
+            },
+        )
+        mock_client.return_value = client
+        rows = _rows(sagemaker_app.check_iot_device_scoped_policies("us-east-1"))
+        failed = [r["Finding_Details"] for r in rows if r["Status"] == "Failed"]
+        passed = [r["Finding_Details"] for r in rows if r["Status"] == "Passed"]
+        na = [r["Finding_Details"] for r in rows if r["Status"] == "N/A"]
+        assert len(failed) == 3
+        assert "'broad' allows Publish on '" + _IOT_TOPIC + "*'" in failed[0]
+        assert "'no-attach-condition'" in failed[1]
+        assert "without requiring the certificate to be attached" in failed[1]
+        assert "'not-action' allows Publish, Subscribe, Receive, Connect" in failed[2]
+        assert len(passed) == 1 and "scoped" in passed[0]
+        assert len(na) == 1 and "'broken'" in na[0]
+        assert "unattached" not in " ".join(failed + passed + na)
+        fetched = [c.kwargs["policyName"] for c in client.get_policy.call_args_list]
+        assert "unattached" not in fetched
+        assert all(r["Check_ID"] == "SM-41" for r in rows)
+        assert all(r["Severity"] == "High" for r in rows if r["Status"] != "N/A")
+
+    @patch("sagemaker_app.boto3.client")
+    def test_deny_and_non_device_statements_are_ignored(self, mock_client):
+        document = _iot_document(
+            {"Effect": "Deny", "Action": "iot:*", "Resource": "*"},
+            {"Effect": "Allow", "Action": "iot:DescribeEndpoint", "Resource": "*"},
+            json.loads(_scoped_iot_document())["Statement"][0],
+        )
+        client = self._client(
+            [{"policies": [{"policyName": "p"}]}],
+            {"p": [{"targets": ["arn:aws:iot:us-east-1:123456789012:thinggroup/g"]}]},
+            {"p": document},
+        )
+        mock_client.return_value = client
+        rows = _rows(sagemaker_app.check_iot_device_scoped_policies("us-east-1"))
+        assert [r["Status"] for r in rows] == ["Passed"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_no_attached_policies_is_na(self, mock_client):
+        client = self._client(
+            [{"policies": [{"policyName": "idle"}]}],
+            {"idle": [{"targets": []}]},
+            {},
+        )
+        mock_client.return_value = client
+        rows = _rows(sagemaker_app.check_iot_device_scoped_policies("us-east-1"))
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert "None of the 1 AWS IoT policies" in rows[0]["Finding_Details"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_list_error_is_could_not_assess(self, mock_client):
+        client = MagicMock()
+        client.get_paginator.side_effect = _make_client_error("AccessDeniedException")
+        mock_client.return_value = client
+        rows = _rows(sagemaker_app.check_iot_device_scoped_policies("us-east-1"))
+        assert len(rows) == 1
+        assert_could_not_assess_finding(rows[0])
+
+
+class TestScope27HandlerWiring:
+    """SM-35 is global (primary region only); SM-36..SM-41 are regional."""
+
+    @patch("sagemaker_app.boto3.client")
+    def test_sm35_emitted_once_on_primary_tagged_global(self, mock_client):
+        resp, findings = TestSageMakerHandlerMultiRegion()._run_handler_unavailable(
+            mock_client, _sagemaker_event(region="ap-south-2", region_index=0)
+        )
+        assert resp["statusCode"] == 200
+        rows = [r for f in findings for r in f.get("csv_data", [])]
+        sm35 = [r for r in rows if r["Check_ID"] == "SM-35"]
+        assert len(sm35) == len(sagemaker_app.SECURITY_SERVICE_PRINCIPALS)
+        assert {r["Region"] for r in sm35} == {"Global"}
+
+    @patch("sagemaker_app.boto3.client")
+    def test_sm35_absent_on_non_primary(self, mock_client):
+        _, findings = TestSageMakerHandlerMultiRegion()._run_handler_unavailable(
+            mock_client, _sagemaker_event(region="eu-west-1", region_index=1)
+        )
+        rows = [r for f in findings for r in f.get("csv_data", [])]
+        assert "SM-35" not in {r["Check_ID"] for r in rows}
+
+    def test_regional_checks_are_called_with_the_shared_detector_inventory(self):
+        source = open(os.path.join(_sm_dir, "app.py"), encoding="utf-8").read()
+        handler = source[source.index("def lambda_handler") :]
+        for name in (
+            "check_security_hub_ai_standard",
+            "check_eks_vpc_cni_network_policy",
+            "check_secrets_manager_rotation",
+            "check_iot_device_scoped_policies",
+        ):
+            assert f"{name}(region)" in handler or f"{name}(region=region)" in handler
+        for name in (
+            "check_guardduty_lambda_network_logs",
+            "check_guardduty_runtime_monitoring",
+        ):
+            call_at = handler.index(name)
+            assert (
+                "detector_inventory=guardduty_inventory"
+                in handler[call_at : call_at + 200]
+            )

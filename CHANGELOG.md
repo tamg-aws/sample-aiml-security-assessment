@@ -19,7 +19,7 @@ section.
   - The section is always on. It needs no deployment parameter, runs no
     additional AWS API calls, and adds no scan time, because each row restates
     the verdict of a check that already ran under an AISF control id.
-  - `AISF-` rows are excluded from the 256-check catalog total, from the report
+  - `AISF-` rows are excluded from the 263-check catalog total, from the report
     pass rate, and from Open Action Items, for the same reason OWASP-mapped
     rows are: the underlying check is already counted.
   - `AISF-08` aggregates three SageMaker checks (`SM-09`, `SM-01`, `SM-03`). It
@@ -103,6 +103,34 @@ section.
     to `FAIL_OPEN` allows requests when AWS WAF cannot be evaluated and fails
     whatever its web ACL applies. A gateway that reports no `failureMode` is
     `N/A`, because the API states no default.
+- Added 7 SageMaker assessment checks for AISF foundation controls, growing the
+  catalog from 256 to 263 checks (148 core): `SM-35` security service
+  delegated administrator, `SM-36` the Security Hub AI Security Best Practices
+  standard, `SM-37` GuardDuty Lambda Protection, `SM-38` GuardDuty Runtime
+  Monitoring, `SM-39` EKS vpc-cni network policy, `SM-40` Secrets Manager
+  rotation, and `SM-41` AWS IoT device-scoped policies. `SM-02` gains a
+  `SageMaker Service-Wide Grant in Customer Policy` finding. Behavior worth
+  knowing:
+  - `SM-35` emits one row per service from a fixed list of six and names the
+    list on every row. It runs once, on the primary region, tagged `Global`.
+    A denied `ListDelegatedAdministrators` is `N/A` for that service, because
+    the list is readable only from the management account or a delegated
+    administrator account.
+  - `SM-38` fails a detector with only the legacy `EKS_RUNTIME_MONITORING`
+    feature enabled, because that feature covers EKS only.
+  - `SM-39` passes a cluster whose managed vpc-cni add-on enables network
+    policy, which makes enforcement available; whether NetworkPolicy objects
+    restrict pod traffic is a Kubernetes-API fact the scan cannot read. EKS
+    Auto Mode clusters are `N/A`, because Auto Mode sets network policy on the
+    NodeClass, a Kubernetes object no AWS API returns.
+  - `SM-40` skips secrets that another AWS service owns (`OwningService`),
+    fails a secret with rotation turned on that has never rotated, and reports
+    `N/A` for a `cron()` form it does not interpret. It reads rotation
+    metadata only, never a secret value.
+  - `SM-02`'s new finding reads customer-managed and inline policies only. A
+    bare `"*"` and AWS managed policies are left to the existing findings.
+  - `SM-36` through `SM-41` run after the SageMaker availability probe, so a
+    region where SageMaker is unavailable does not report them.
 
 - Added six Bedrock checks, growing the catalog from 256 to 262 checks (147
   core): `BR-50` (active access keys on IAM users with a non-read Bedrock,
@@ -165,6 +193,12 @@ on the IAM permissions cache role, `iam:ListGroupsForUser`,
 `iam:GetGroupPolicy`. All are read-only. `kms:ListKeys`,
 `backup:ListBackupVaults` and `tag:GetResources` are granted on `*` because
 none has a resource type in the IAM service authorization reference.
+
+The SageMaker assessment role gains `organizations:ListDelegatedAdministrators`,
+`securityhub:GetEnabledStandards`, `eks:ListClusters`, `eks:DescribeCluster`,
+`eks:ListAddons`, `eks:DescribeAddon`, `secretsmanager:ListSecrets`, `iot:ListPolicies`,
+`iot:ListTargetsForPolicy`, and `iot:GetPolicy` for `SM-35` through `SM-41`,
+in both SAM templates. The same CodeBuild run applies them.
 
 ## 2.0.0 - 2026-09-18
 
