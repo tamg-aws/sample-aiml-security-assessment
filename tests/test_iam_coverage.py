@@ -830,6 +830,16 @@ _VERIFIED_REMEDIATION_IAM_ACTIONS |= {
     "route53resolver:ListFirewallDomains",
 }
 
+# Verified on 2026-09-26 with one IDENTITY_POLICY validate-policy run for AC-49's
+# fail-open leg, one statement per name. The three negative controls
+# route53resolver:DescribeFirewallConfig,
+# route53resolver:GetFirewallConfiguration and
+# route53resolver:ReadFirewallFailOpen came back INVALID_ACTION at statement
+# indexes 1, 2 and 3, and index 0, the name below, was not reported.
+_VERIFIED_REMEDIATION_IAM_ACTIONS |= {
+    "route53resolver:GetFirewallConfig",
+}
+
 # Verified on 2026-09-26 with one IDENTITY_POLICY validate-policy run for BR-47's
 # customization job leg, one statement per name. The three negative controls
 # bedrock:ListCustomizationJobs, bedrock:DescribeModelCustomizationJob and

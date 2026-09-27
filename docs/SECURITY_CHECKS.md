@@ -605,7 +605,7 @@ inventory is never treated as evidence of compliance.
 ### AC-07: Memory Encryption
 
 - **Severity:** Medium
-- **Description:** Checks agent memory encryption with AWS KMS.
+- **Description:** Checks agent memory encryption with AWS KMS. A memory that `GetMemory` cannot describe is informational `N/A`, and the resolution follows the error. `AccessDeniedException` names `bedrock-agentcore:GetMemory` on the memory and `kms:Decrypt` on its customer managed key through `bedrock-agentcore`, allowed by both the role's IAM policy and the key policy, because AgentCore decrypts the memory's strategies on the caller's behalf and a caller without the key grant is denied `GetMemory`. The assessment role carries that `kms:Decrypt` grant, conditioned on `kms:ViaService` `bedrock-agentcore.*.amazonaws.com`, so a denial that remains points at a key policy that does not allow the role. Only `ResourceNotFoundException` points at a memory deleted mid-assessment.
 
 ### AC-08: Amazon VPC Endpoints
 
@@ -815,7 +815,7 @@ inventory is never treated as evidence of compliance.
 ### AC-49: DNS Egress Control
 
 - **Severity:** Medium
-- **Description:** For each VPC that hosts an AgentCore runtime, browser or code interpreter, reads the Route 53 Resolver DNS Firewall rule group associations and walks them in the order DNS Firewall evaluates them: rule groups by ascending association priority, and the enforcing rules in each by ascending priority. The first match ends evaluation for `ALLOW`, `ALERT` and `BLOCK` alike, so the check judges the first rule whose customer domain list holds `*`, names its rule group and rule, and ignores every rule after it. It passes only when that rule is a `BLOCK` with no query type, which is the walled garden pattern Route 53 documents; an `ALLOW` or `ALERT` over `*` fails. `ListFirewallDomains` returns that entry fully qualified as `*.`, and the check reads either spelling. A VPC with no rule group fails, and so do rule groups with no rule over `*`, where only a `BLOCK` over an AWS managed list, over DNS threat protection, over a list without `*`, or over `*` for one query type (`Qtype`) stands, because every name or query type those rules do not match is answered. A hosting subnet that no longer exists is reported by id as not present. AC-01 and AC-15 judge egress by security group and network mode; this check judges it by destination name.
+- **Description:** For each VPC that hosts an AgentCore runtime, browser or code interpreter, reads the Route 53 Resolver DNS Firewall rule group associations and walks them in the order DNS Firewall evaluates them: rule groups by ascending association priority, and the enforcing rules in each by ascending priority. The first match ends evaluation for `ALLOW`, `ALERT` and `BLOCK` alike, so the check judges the first rule whose customer domain list holds `*`, names its rule group and rule, and ignores every rule after it. It passes only when that rule is a `BLOCK` with no query type, which is the walled garden pattern Route 53 documents; an `ALLOW` or `ALERT` over `*` fails. `ListFirewallDomains` returns that entry fully qualified as `*.`, and the check reads either spelling. A VPC with no rule group fails, and so do rule groups with no rule over `*`, where only a `BLOCK` over an AWS managed list, over DNS threat protection, over a list without `*`, or over `*` for one query type (`Qtype`) stands, because every name or query type those rules do not match is answered. A deciding `BLOCK` passes only when `GetFirewallConfig` reports `FirewallFailOpen` `DISABLED` for the VPC, which Route 53 documents as the default. `ENABLED` fails as `AgentCore DNS Egress Control Fails Open`, because VPC Resolver answers every query while DNS Firewall is impaired, including a name the rule blocks. The documentation defines no other value, so `USE_LOCAL_RESOURCE_SETTING` or a missing value is informational `N/A` with the value named, and an unreadable firewall config is informational `N/A`. A VPC whose rules already fail is not read for this setting. A hosting subnet that no longer exists is reported by id as not present. AC-01 and AC-15 judge egress by security group and network mode; this check judges it by destination name.
 
 ---
 
@@ -1039,7 +1039,7 @@ with scope limited to the Security pillar.
 - **Severity:** Source check severity
 - **Source:** AC-07
 - **Domain:** Memory & Data Privacy
-- **Description:** Maps AgentCore memory encryption controls.
+- **Description:** Maps AgentCore memory encryption controls. The row carries AC-07's details, so the row for a memory that `GetMemory` denied names the `kms:Decrypt` cause too.
 
 ### AG-20: Private AgentCore Connectivity
 
@@ -1177,9 +1177,9 @@ with scope limited to the Security pillar.
 ### AG-39: Gateway WAF Rule Coverage
 
 - **Severity:** Medium
-- **Source:** AWS WAF `GetWebACL` for the web ACL AG-27 finds
+- **Source:** AWS WAF `GetWebACL` for the web ACL AG-27 finds, and the gateway's `wafConfiguration` from `GetGateway`
 - **Domain:** Abuse & Cost Protection
-- **Description:** Judges whether the web ACL on an AgentCore gateway filters the request. It fails an ACL missing any of five filters: a rule, AWS managed rule group or default action that blocks; SQL injection inspection; cross-site scripting inspection; a rate-based rule; and a `DefaultSizeInspectionLimit` above `KB_16` for the `AGENTCORE_GATEWAY` association, since a tool call carries its arguments in the request body. Rules in `Count` are not credited. AWS managed groups are credited by name (`AWSManagedRulesSQLiRuleSet`, `AWSManagedRulesCommonRuleSet`), and their rule action overrides are not read. A customer rule group or a non-AWS managed rule group, whose rules the check does not read, turns a missing filter into informational `N/A` with the group named.
+- **Description:** Judges whether the web ACL on an AgentCore gateway filters the request. It fails an ACL missing any of five filters: a rule, AWS managed rule group or default action that blocks; SQL injection inspection; cross-site scripting inspection; a rate-based rule; and a `DefaultSizeInspectionLimit` above `KB_16` for the `AGENTCORE_GATEWAY` association, since a tool call carries its arguments in the request body. Only a rule whose action is `Block` is credited: `Allow` lets the matching request through, `Count` observes it, and `Captcha` and `Challenge` let through a request that carries a valid token. A rule group whose `OverrideAction` is `Count` is not credited. AWS managed groups are credited by name (`AWSManagedRulesSQLiRuleSet`, `AWSManagedRulesCommonRuleSet`) unless a rule that provides the filter is overridden: any `RuleActionOverrides` entry other than `Block`, or any `ExcludedRules` entry, in the SQL injection group removes its SQL injection credit, and one on a `CrossSiteScripting_` rule of the core rule set removes its cross-site scripting credit. The check does not read a group's rule list, so a group carrying such an override is credited as blocking only while it still provides one of those two filters. A customer rule group or a non-AWS managed rule group, whose rules the check does not read, turns a missing filter into informational `N/A` with the group named. The gateway's `wafConfiguration.failureMode` decides what happens when AWS WAF cannot be evaluated: `FAIL_OPEN` lets the request through, so a gateway set to it fails whatever its web ACL applies, and an ACL that applies all five filters passes only when the gateway reports `FAIL_CLOSE`. The API states no default, so a gateway that reports no `failureMode` is informational `N/A`.
 
 ### Runtime guardrail methodology note
 

@@ -901,8 +901,12 @@ ROWS = [
         "scripting coverage, no rate-based rule, or an association body inspection limit "
         "left at the 16 KB default, since a tool call carries its arguments in the body. A "
         "customer rule group or a non-AWS managed rule group, whose rules AG-39 does not "
-        "read, turns a missing filter into Not Applicable with the group named. AWS "
-        "managed groups are credited by name, and their rule overrides are not read. The subject is AgentCore gateways",
+        "read, turns a missing filter into Not Applicable with the group named. Only a "
+        "rule whose action is Block is credited. AWS managed groups are credited by name, "
+        "and not for a filter whose providing rule is overridden to an action other than "
+        "Block or excluded. A gateway whose wafConfiguration failureMode is FAIL_OPEN "
+        "fails, because it allows a request when AWS WAF cannot be evaluated, and one "
+        "that reports no failureMode is Not Applicable. The subject is AgentCore gateways",
         [],
         5,
     ),
@@ -926,7 +930,10 @@ ROWS = [
         "AC-49 reads either spelling. Rule groups whose rules only BLOCK over an AWS managed "
         'list, over DNS threat protection, over a list without "*", or over "*" for one '
         "query type fail, because every name or query type those rules do not match is "
-        "answered. An IAM Deny on the bedrock-agentcore:subnets or :securityGroups keys "
+        "answered. A deciding BLOCK passes only when the VPC's DNS Firewall config has "
+        "FirewallFailOpen DISABLED: ENABLED fails, because VPC Resolver answers every "
+        "query while DNS Firewall is impaired, and any other value is Not Applicable with "
+        "the value named. An IAM Deny on the bedrock-agentcore:subnets or :securityGroups keys "
         "does not substitute for this: the devguide lists those keys while the "
         "machine-readable IAM reference lists none for CreateGatewayTarget or "
         "UpdateGatewayTarget, so such a Deny can fail open",

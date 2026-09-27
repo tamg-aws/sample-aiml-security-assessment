@@ -275,6 +275,7 @@ _EXPECTED_ACTIONS = {
         "iam:GenerateServiceLastAccessedDetails",
         "iam:GetRole",
         "iam:GetServiceLastAccessedDetails",
+        "kms:Decrypt",
         "kms:GetKeyPolicy",
         "logs:DescribeAccountPolicies",
         "logs:DescribeDeliveries",
@@ -285,6 +286,7 @@ _EXPECTED_ACTIONS = {
         "oam:ListSinks",
         "organizations:DescribePolicy",
         "organizations:ListPolicies",
+        "route53resolver:GetFirewallConfig",
         "route53resolver:ListFirewallDomainLists",
         "route53resolver:ListFirewallDomains",
         "route53resolver:ListFirewallRuleGroupAssociations",
@@ -380,6 +382,47 @@ def test_sam_resource_actions_match_reviewed_inventory(template, logical_id):
         f"{os.path.basename(template)} {logical_id} IAM drift. "
         f"Missing: {sorted(expected - actual)}; excess: {sorted(actual - expected)}"
     )
+
+
+@pytest.mark.parametrize("template", _SAM_TEMPLATES, ids=os.path.basename)
+def test_agentcore_memory_decrypt_is_confined_to_agentcore(template):
+    """AC-07's kms:Decrypt reaches only keys AgentCore uses on the role's behalf.
+
+    GetMemory on a customer managed key memory with strategies ran kms:Decrypt
+    under the caller through forward access sessions (CloudTrail, 2026-09-27),
+    so the role needs the grant. Without the kms:ViaService condition it would
+    decrypt any ciphertext under any key in the account.
+    """
+    with open(template, encoding="utf-8") as template_file:
+        data = yaml.load(template_file, Loader=_CfnLoader)  # nosec B506
+
+    statements = [
+        statement
+        for policy in data["Resources"]["AgentCoreSecurityAssessmentFunction"][
+            "Properties"
+        ]["Policies"]
+        if isinstance(policy, dict)
+        for statement in policy.get("Statement", [])
+    ]
+    decrypting = [
+        statement
+        for statement in statements
+        if "kms:Decrypt" in (statement.get("Action") or [])
+    ]
+
+    assert decrypting == [
+        {
+            "Sid": "AgentCoreMemoryKeyDecrypt",
+            "Effect": "Allow",
+            "Action": ["kms:Decrypt"],
+            "Resource": {
+                "Fn::Sub": "arn:${AWS::Partition}:kms:*:${AWS::AccountId}:key/*"
+            },
+            "Condition": {
+                "StringLike": {"kms:ViaService": "bedrock-agentcore.*.amazonaws.com"}
+            },
+        }
+    ]
 
 
 @pytest.mark.parametrize("template", _SAM_TEMPLATES, ids=os.path.basename)
@@ -870,6 +913,10 @@ def test_aisf_phase5_reads_wildcard_only_where_iam_has_no_resource_type(template
         ("AgentCoreSecurityAssessmentFunction", "DNSFirewallDomainRead"): (
             "route53resolver:ListFirewallDomains",
             "route53resolver:*:*:firewall-domain-list/*",
+        ),
+        ("AgentCoreSecurityAssessmentFunction", "DNSFirewallConfigRead"): (
+            "route53resolver:GetFirewallConfig",
+            "route53resolver:*:${AWS::AccountId}:firewall-config/*",
         ),
         ("AgentRegistrySecurityAssessmentFunction", "RegistryEventRuleTargetRead"): (
             "events:ListTargetsByRule",
