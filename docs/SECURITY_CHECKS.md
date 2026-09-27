@@ -1,6 +1,6 @@
 # Security Checks Reference
 
-This document provides a comprehensive reference for all 256 security checks performed by the AI/ML Security Assessment framework (141 core checks across Amazon Bedrock, Amazon SageMaker AI, Amazon Bedrock AgentCore, and AWS Agent Registry, 39 Agentic AI Security checks, 64 Responsible AI GRC checks, and 12 OWASP Top 10 for LLM checks).
+This document provides a comprehensive reference for all 262 security checks performed by the AI/ML Security Assessment framework (147 core checks across Amazon Bedrock, Amazon SageMaker AI, Amazon Bedrock AgentCore, and AWS Agent Registry, 39 Agentic AI Security checks, 64 Responsible AI GRC checks, and 12 OWASP Top 10 for LLM checks).
 
 Sources differ by bucket and are not interchangeable: the core Bedrock, SageMaker, AgentCore, and AWS Agent Registry checks derive from the AWS Well-Architected **Generative AI Lens** security best practices (`gensec*`) and service security documentation; the Agentic AI Security checks from the AWS Well-Architected **Agentic AI Lens**; the `FS-*` **Responsible AI GRC** checks from the AWS GRC User Guide; and the `OW-*` checks from the OWASP Top 10 for LLM. The AWS Well-Architected **Responsible AI Lens** is not a source for any of them — see [Responsible AI GRC — scope, sources, and compatibility](RESPONSIBLE_AI_GRC_SCOPE.md).
 
@@ -14,7 +14,7 @@ The 64 Responsible AI GRC checks occupy 69 `FS-*` numbers: 64 ship as standalone
 - [Severity Levels](#severity-levels)
 - [Status Values](#status-values)
 - [Amazon SageMaker AI Security Checks (33)](#amazon-sagemaker-ai-security-checks-33)
-- [Amazon Bedrock Security Checks (49)](#amazon-bedrock-security-checks-49)
+- [Amazon Bedrock Security Checks (55)](#amazon-bedrock-security-checks-55)
 - [Amazon Bedrock AgentCore Security Checks (49)](#amazon-bedrock-agentcore-security-checks-49)
 - [AWS Agent Registry Security Checks (10)](#aws-agent-registry-security-checks-10)
 - [Agentic AI Security Checks (39)](#agentic-ai-security-checks-39)
@@ -30,7 +30,7 @@ The framework evaluates your AI/ML workloads against AWS security best practices
 | Service | Number of Checks | Focus Areas |
 | --------- | ------------------ | ------------- |
 | Amazon SageMaker AI | 33 | Security Hub controls, encryption, network isolation, GuardDuty AI Protection, HyperPod, IAM, MLOps, Model Registry policy exposure, inference data capture, Config compliance evaluation, training VPC boundary, creation guardrails |
-| Amazon Bedrock | 46 | Guardrails, prompt-attack/image filters, retention, inference profiles, automated reasoning and Marketplace endpoint governance, encryption, networking, IAM, logging, monitoring, evaluation, central guardrail enforcement, model allow-lists, Region and Marketplace subscription control, API key governance, knowledge base source classification |
+| Amazon Bedrock | 55 | Guardrails, prompt-attack/image filters, retention, inference profiles, automated reasoning and Marketplace endpoint governance, encryption, networking, IAM, logging, monitoring, evaluation, central guardrail enforcement, model allow-lists, Region and Marketplace subscription control, API key governance, knowledge base source classification |
 | Amazon Bedrock AgentCore | 17 | Runtime/tool VPC isolation, encryption, browser recording, observability, resource policies, Identity token vaults, and online evaluation |
 | AWS Agent Registry | 8 | IAM access, approval governance, discovery authorization, encryption, organization auto-detection, record lifecycle, and provenance |
 | Agentic AI Security | 38 | Bounded autonomy, agent identity, tool authorization, Registry governance and provenance, guardrail enforcement, prompt/input protection, memory privacy, auditability, continuous assurance, abuse protection |
@@ -46,7 +46,7 @@ Each security check has a unique identifier with a service prefix:
 | Prefix | Service | Example |
 | -------- | --------- | --------- |
 | **SM-XX** | Amazon SageMaker | SM-01, SM-34 (`SM-29` reserved) |
-| **BR-XX** | Amazon Bedrock | BR-01, BR-49 |
+| **BR-XX** | Amazon Bedrock | BR-01, BR-55 |
 | **AC-XX** | Amazon Bedrock AgentCore | AC-01, AC-17 |
 | **AR-XX** | AWS Agent Registry | AR-01, AR-10 |
 | **AG-XX** | Agentic AI Security | AG-01, AG-39 |
@@ -296,12 +296,12 @@ investigation and remediation.
 
 ---
 
-## Amazon Bedrock Security Checks (49)
+## Amazon Bedrock Security Checks (55)
 
 ### BR-01: AWS IAM Least Privilege
 
 - **Severity:** High
-- **Description:** Identifies roles with AmazonBedrockFullAccess policy.
+- **Description:** Identifies roles with AmazonBedrockFullAccess policy. A second finding, `Bedrock Wildcard Action Grant`, reads every customer-managed, inline and group policy on each cached role and user and fails an Allow that grants every Bedrock action (`bedrock:*` or an equivalent wildcard such as `bed*`) or that grants Bedrock through `NotAction` without excluding it. A pattern that matches every service, such as `*`, is left to the account-wide administrator checks, and AWS managed policies are left to the first finding. Permissions boundaries and service control policies are not read, so a failure names what the identity policy grants. A policy or group policy list that could not be read produces `N/A`, and the `Passed` row is then downgraded to `N/A`.
 
 ### BR-02: Amazon VPC Endpoint Configuration
 
@@ -321,7 +321,7 @@ inventory is never treated as evidence of compliance.
 ### BR-04: Model Invocation Logging
 
 - **Severity:** Medium
-- **Description:** Checks invocation logging is enabled.
+- **Description:** Checks invocation logging is enabled. For S3 delivery, the retention leg credits only an enabled lifecycle rule whose filter covers `<keyPrefix>/AWSLogs/`, the root Bedrock writes under. A rule on another prefix, or one that also filters on tags or object size, is named and not credited. When the bucket has versioning `Enabled` or `Suspended`, a rule that expires noncurrent versions is also required, because expiring the current object leaves a noncurrent version behind. An unreadable versioning status is `N/A`, never a pass.
 
 ### BR-05: Guardrail Configuration
 
@@ -361,7 +361,7 @@ inventory is never treated as evidence of compliance.
 ### BR-12: Invocation Log Encryption
 
 - **Severity:** Medium
-- **Description:** Verifies logs are encrypted with AWS KMS.
+- **Description:** Verifies logs are encrypted with AWS KMS. A second finding, `Bedrock Invocation Log Group Deletion Protection`, reads `deletionProtectionEnabled` on the CloudWatch Logs group that receives invocation logs and fails when it is not `true`; `DescribeLogGroups` omits the field on a group that never had it set, so an absent value reads as off. No CloudWatch delivery, or a group that is not returned to this account, is `N/A`.
 
 ### BR-13: Flows Guardrails
 
@@ -536,7 +536,7 @@ inventory is never treated as evidence of compliance.
 ### BR-43: Region Invocation Control
 
 - **Severity:** Medium
-- **Description:** Reads two halves of cross-Region invocation, because neither answers the other. Service control policies conditioned on `aws:RequestedRegion` bound the Region a request is sent to, and the inference profiles the account can route through determine where the inference is then served. A global profile call presents the literal `unspecified` for that condition key, so a Region allow-list bounds a global profile only when it excludes `unspecified`. A direct invocation bounded by an SCP alongside an unbounded global profile is reported as a failure.
+- **Description:** Reads two halves of cross-Region invocation, because neither answers the other. Service control policies conditioned on `aws:RequestedRegion` bound the Region a request is sent to, and the inference profiles the account can route through determine where the inference is then served. A global profile call presents the literal `unspecified` for that condition key, so a Region allow-list bounds a global profile only when it excludes `unspecified`. A direct invocation bounded by an SCP alongside an unbounded global profile is reported as a failure. A second, organization-wide finding, `Bedrock Approved Model Control`, requires a service control policy `Deny` on `bedrock:InvokeModel` and `bedrock:InvokeModelWithResponseStream` outside a named list of foundation-model or inference-profile ARNs, written either as `NotResource` or as a negated condition. A `Deny` written with `NotAction` covers every action it does not name. A list written as a wildcard over every model counts as no list, and a list that covers only one of the two actions fails because the other can invoke any model. Which models belong on the list is the customer's decision and is not judged. Batch inference jobs are not read. An unreadable organization view is `N/A`.
 
 ### BR-44: Marketplace Model Subscription Control
 
@@ -567,6 +567,36 @@ inventory is never treated as evidence of compliance.
 
 - **Severity:** High
 - **Description:** For each IAM role and user allowed to invoke a model, requires a `Deny` on `bedrock:InvokeModel` and `bedrock:InvokeModelWithResponseStream`, on an unscoped `Resource` (as defined for [BR-42](#br-42-foundation-model-invocation-allow-list)), conditioned by a negated operator or by `Null` `true` on `bedrock:GuardrailIdentifier`, so a call without an approved guardrail is refused. Those two IAM actions also authorize `Converse` and `ConverseStream`, which have no IAM action of their own. BR-34 judges the guardrail content and BR-41 the account-level enforced guardrail configuration; this check covers identities whose calls neither of those reaches. Only role and user policies (attached and inline) are read. Group policies, permissions boundaries and service control policies are not read, so a `Deny` placed in one of them is not credited.
+
+### BR-50: AI User Long-Term Access Key
+
+- **Severity:** High
+- **Description:** For each IAM user whose attached, inline or group policies allow a non-read Bedrock, SageMaker AI or AgentCore action, fails an `Active` access key and reports its age and last four characters. An action counts as read-only only when its name starts with `Get`, `List`, `Describe` or `Search`; a wildcard such as `bedrock:*`, or a `NotAction` Allow that does not exclude the service, puts the user in scope. Inactive keys cannot sign a request and are not counted. Deny statements, permissions boundaries and service control policies are not evaluated. A user whose group policies or policy documents could not be read is reported `N/A`, never clean. Without the IAM permissions cache the check reports `N/A`.
+
+### BR-51: AI User Console MFA
+
+- **Severity:** High
+- **Description:** For the BR-50 user population, fails a user with a console password (`GetLoginProfile`) and no MFA device (`ListMFADevices`). A user without a console password is not failed. Only IAM users are read: users signing in through IAM Identity Center are not covered, and every row says so. A denied read is `N/A`. Without the IAM permissions cache the check reports `N/A`.
+
+### BR-52: Bedrock Data Path Bucket Object Lock
+
+- **Severity:** Medium
+- **Description:** For each S3 bucket on the Bedrock data path (the population BR-47 reads), requires Object Lock `Enabled` with a `COMPLIANCE`-mode default retention that states `Days` or `Years`. `GOVERNANCE` mode fails, because a principal with `s3:BypassGovernanceRetention` can delete or shorten the retention. A bucket with no Object Lock configuration fails; any other read error is `N/A`. AWS Backup vaults with Vault Lock are listed with their minimum retention as evidence only and do not change the status. When the bucket list is incomplete, compliant buckets are reported `N/A` and not `Passed`.
+
+### BR-53: Bedrock Resource Owner Tag
+
+- **Severity:** Low
+- **Description:** Lists agents, knowledge bases, guardrails, custom models, imported models and provisioned throughputs, reads their tags through the Resource Groups Tagging API in batches of 100 ARNs, and fails each resource with no tag whose key contains `owner` (any case) and a non-empty value. `GetResources` omits an ARN that has no tags, so a missing ARN is reported as untagged. Failed rows are capped at 25 plus one overflow row. A tag read error is `N/A`; a list error is `N/A` and downgrades the `Passed` row. An empty inventory is `N/A`.
+
+### BR-54: Lambda Function Public Invoke Configuration
+
+- **Severity:** High
+- **Description:** Reads every Lambda function in the Region. A function URL with `AuthType` `NONE` fails. A resource-based policy `Allow` to principal `*` covering `lambda:InvokeFunction` or `lambda:InvokeFunctionUrl` fails unless it carries an `aws:SourceArn`, `aws:SourceAccount` or `aws:PrincipalOrgID` condition. The check makes no network reachability claim, and policies on aliases and versions are not read; every row says so. Per-function read errors are aggregated into one `N/A` row. A Region with no functions is `N/A`.
+
+### BR-55: KMS Key Enclave Attestation Binding
+
+- **Severity:** High
+- **Description:** For each customer-managed KMS key whose policy uses Nitro Enclaves attestation (`kms:RecipientAttestation:ImageSha384` or `kms:RecipientAttestation:PCR<ID>`), fails an `Allow` covering `kms:Decrypt`, `kms:GenerateDataKey` or `kms:GenerateDataKeyPair` that does not pin the enclave image, unless a `Deny` to principal `*` with a negated or `Null` `true` test on the attestation key already refuses such calls. A pin must use an operator that is not negated, not `Null` and not `...IfExists`, with no wildcard values. `ImageSha384` and `PCR0` both identify the enclave image. The default key-policy statement that delegates to IAM through the account root is reported as a bypass with its own text. Keys that use only NitroTPM attestation are `N/A`. Keys whose policy uses no attestation are summarized in one `N/A` row. AWS managed keys are skipped.
 
 ---
 

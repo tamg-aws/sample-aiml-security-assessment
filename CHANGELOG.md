@@ -104,6 +104,27 @@ section.
     whatever its web ACL applies. A gateway that reports no `failureMode` is
     `N/A`, because the API states no default.
 
+- Added six Bedrock checks, growing the catalog from 256 to 262 checks (147
+  core): `BR-50` (active access keys on IAM users with a non-read Bedrock,
+  SageMaker AI or AgentCore grant), `BR-51` (console password without MFA on
+  the same users), `BR-52` (COMPLIANCE-mode Object Lock on Bedrock data path
+  buckets), `BR-53` (an owner tag on agents, knowledge bases, guardrails,
+  custom and imported models, and provisioned throughputs), `BR-54` (public
+  Lambda function URLs and unconditioned `*` invoke grants), and `BR-55`
+  (KMS keys that use Nitro Enclaves attestation but allow decryption without
+  pinning the enclave image). Four existing checks gain a leg:
+  - `BR-01` fails customer-managed, inline and group policies that grant
+    every Bedrock action or grant Bedrock through `NotAction`.
+  - `BR-04` credits only a lifecycle rule that covers the `<keyPrefix>/AWSLogs/`
+    root, and on a versioned bucket also requires noncurrent-version
+    expiration.
+  - `BR-12` reports deletion protection on the invocation log group.
+  - `BR-43` adds an organization-wide finding that a service control policy
+    denies model invocation outside a named list of model ARNs.
+  - The IAM permissions cache now records each user's group policies, which
+    `BR-01`, `BR-50` and `BR-51` read. A user whose groups cannot be read is
+    reported `N/A`, never clean.
+
 ### Fixed
 
 - `AC-07` names the fix that matches the `GetMemory` error for a memory it
@@ -132,6 +153,18 @@ does not allow the role still denies it. A CodeBuild
 run that redeploys the assessment code and SAM templates applies them. No
 member-role StackSet update and no central or single-account infrastructure
 update are required.
+
+The `BR-50` to `BR-55` checks and legs above add, in both SAM templates: on the
+Bedrock assessment role, `bedrock:ListProvisionedModelThroughputs`,
+`kms:GetKeyPolicy`, `kms:ListKeys`, `iam:ListAccessKeys`,
+`iam:GetLoginProfile`, `iam:ListMFADevices`, `s3:GetBucketVersioning`,
+`s3:GetBucketObjectLockConfiguration`, `backup:ListBackupVaults`,
+`tag:GetResources`, `lambda:ListFunctionUrlConfigs` and `lambda:GetPolicy`;
+on the IAM permissions cache role, `iam:ListGroupsForUser`,
+`iam:ListAttachedGroupPolicies`, `iam:ListGroupPolicies` and
+`iam:GetGroupPolicy`. All are read-only. `kms:ListKeys`,
+`backup:ListBackupVaults` and `tag:GetResources` are granted on `*` because
+none has a resource type in the IAM service authorization reference.
 
 ## 2.0.0 - 2026-09-18
 

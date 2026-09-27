@@ -913,6 +913,180 @@ def check_stale_bedrock_access(permission_cache, region: str = "") -> Dict[str, 
         }
 
 
+AWS_MANAGED_POLICY_ARN = re.compile(r"^arn:[^:]+:iam::aws:policy/")
+
+# Stands in for any Bedrock action name. A policy never writes it, so only a
+# wildcard can match it: "bedrock:*" and "bed*" do, "bedrock:Invoke*" does not.
+ANY_BEDROCK_ACTION = "bedrock:\x00"
+
+# A pattern that also matches this is an every-service grant such as "*" or
+# "*:*", which the account-wide administrator checks own, not a Bedrock grant.
+ANY_UNRELATED_ACTION = "s3:\x00"
+
+
+def _cached_identity_policies(permissions: Dict[str, Any]) -> List[tuple]:
+    """
+    Return (source, policy) pairs for every policy the cache holds on one
+    identity: attached, inline and, for users, the policies of their groups.
+    """
+    policies = [
+        ("attached policy", policy)
+        for policy in permissions.get("attached_policies") or []
+    ]
+    policies += [
+        ("inline policy", policy) for policy in permissions.get("inline_policies") or []
+    ]
+    for policy in permissions.get("group_policies") or []:
+        kind = "policy attached to" if policy.get("arn") else "inline policy of"
+        policies.append((f"{kind} group '{policy.get('group')}'", policy))
+    return policies
+
+
+def _action_covers_every_bedrock_action(pattern: Any) -> bool:
+    """Return True when an Action entry matches every bedrock: action but not every service."""
+    if not isinstance(pattern, str):
+        return False
+    pattern = pattern.strip().lower()
+    return _wildcard_matches(pattern, ANY_BEDROCK_ACTION) and not _wildcard_matches(
+        pattern, ANY_UNRELATED_ACTION
+    )
+
+
+def _bedrock_wildcard_grants(document: Any) -> List[str]:
+    """
+    Describe each Allow statement that grants every Bedrock action.
+
+    Action may be a string or a list. An Allow written with NotAction grants
+    every action it does not name, so it counts unless NotAction excludes all
+    of Bedrock.
+    """
+    grants = []
+    for statement in _policy_statements(document):
+        if str(statement.get("Effect", "")).upper() != "ALLOW":
+            continue
+        label = (
+            f"statement '{statement['Sid']}'" if statement.get("Sid") else "a statement"
+        )
+        wildcards = [
+            action
+            for action in _as_list(statement.get("Action"))
+            if _action_covers_every_bedrock_action(action)
+        ]
+        if wildcards:
+            grants.append(f"{label} allows {', '.join(wildcards)}")
+        if "NotAction" in statement:
+            excluded = _as_list(statement.get("NotAction"))
+            if not any(
+                isinstance(action, str)
+                and _wildcard_matches(action.strip().lower(), ANY_BEDROCK_ACTION)
+                for action in excluded
+            ):
+                grants.append(
+                    f"{label} allows every action except "
+                    f"{', '.join(str(action) for action in excluded) or 'none'} "
+                    "through NotAction, which includes Bedrock"
+                )
+    return grants
+
+
+def _bedrock_wildcard_action_findings(
+    permission_cache: Dict[str, Any], region: str
+) -> List[Dict[str, Any]]:
+    """
+    Report customer-managed, inline and group policies that grant bedrock:* or a
+    NotAction Allow, on every cached role and user.
+
+    AWS managed policies are left to the AmazonBedrockFullAccess leg. Permissions
+    boundaries and service control policies are not read, so a Failed row names
+    what the identity policy grants, not what an evaluated request is allowed.
+    """
+    rows = []
+    failures = 0
+    unreadable = []
+    identities = [
+        ("Role", name, permissions)
+        for name, permissions in permission_cache["role_permissions"].items()
+    ] + [
+        ("User", name, permissions)
+        for name, permissions in permission_cache["user_permissions"].items()
+    ]
+    for identity_type, name, permissions in identities:
+        if permissions.get("group_policies_error"):
+            unreadable.append(f"{identity_type.lower()} '{name}' group policies")
+        for source, policy in _cached_identity_policies(permissions):
+            if AWS_MANAGED_POLICY_ARN.match(str(policy.get("arn") or "")):
+                continue
+            policy_name = policy.get("name") or "unnamed policy"
+            try:
+                grants = _bedrock_wildcard_grants(policy.get("document"))
+            except (ValueError, TypeError, AttributeError):
+                unreadable.append(
+                    f"{identity_type.lower()} '{name}' {source} '{policy_name}'"
+                )
+                continue
+            if not grants:
+                continue
+            failures += 1
+            rows.append(
+                create_finding(
+                    check_id="BR-01",
+                    finding_name="Bedrock Wildcard Action Grant",
+                    finding_details=(
+                        f"{identity_type} '{name}' {source} '{policy_name}': "
+                        f"{'; '.join(grants)}. Permissions boundaries and service "
+                        "control policies are not read, so this is what the "
+                        "identity policy grants."
+                    ),
+                    resolution=(
+                        "Replace the Bedrock wildcard or NotAction grant with the "
+                        "specific Bedrock actions and resources the identity uses."
+                    ),
+                    reference="https://docs.aws.amazon.com/bedrock/latest/userguide/security_iam_id-based-policy-examples.html\nhttps://docs.aws.amazon.com/IAM/latest/UserGuide/reference_policies_elements_notaction.html",
+                    severity="High",
+                    status="Failed",
+                    region=region,
+                )
+            )
+
+    for gap in unreadable:
+        rows.append(
+            create_finding(
+                check_id="BR-01",
+                finding_name="Bedrock Wildcard Action Grant",
+                finding_details=(
+                    f"The cached {gap} could not be read, so whether it grants "
+                    "every Bedrock action was not assessed."
+                ),
+                resolution=COULD_NOT_ASSESS_RESOLUTION,
+                reference="https://docs.aws.amazon.com/IAM/latest/UserGuide/access_policies.html",
+                severity="Informational",
+                status="N/A",
+                region=region,
+            )
+        )
+
+    if not failures:
+        rows.append(
+            create_finding(
+                check_id="BR-01",
+                finding_name="Bedrock Wildcard Action Grant",
+                finding_details=(
+                    f"None of the {len(identities)} cached role(s) and user(s) has "
+                    "a customer-managed, inline or group policy that allows every "
+                    "Bedrock action or grants Bedrock through NotAction. "
+                    "Permissions boundaries and service control policies are not "
+                    "read."
+                ),
+                resolution="No action required",
+                reference="https://docs.aws.amazon.com/bedrock/latest/userguide/security_iam_id-based-policy-examples.html",
+                severity="High",
+                status="N/A" if unreadable or not identities else "Passed",
+                region=region,
+            )
+        )
+    return rows
+
+
 def check_bedrock_full_access_roles(
     permission_cache, region: str = ""
 ) -> Dict[str, Any]:
@@ -967,6 +1141,13 @@ def check_bedrock_full_access_roles(
                 region=region,
             )
         )
+
+    # AIR-FND-IAM-09 extends the managed-policy leg to wildcard grants the
+    # customer writes, which carry the same reach under any policy name.
+    wildcard_rows = _bedrock_wildcard_action_findings(permission_cache, region)
+    if any(row["Status"] == "Failed" for row in wildcard_rows):
+        findings["status"] = "WARN"
+    findings["csv_data"].extend(wildcard_rows)
 
     return findings
 
@@ -1762,12 +1943,8 @@ INVOCATION_LOG_RETENTION_RESOLUTION = (
 )
 
 
-def _log_group_retention_days(log_group_name: str, region: str) -> Dict[str, Any]:
-    """Report what DescribeLogGroups says about one log group's retention.
-
-    ``found`` False means the named group was not returned to this account, which
-    is indeterminate: it is never reported as a missing retention period.
-    """
+def _describe_log_group(log_group_name: str, region: str) -> Optional[Dict[str, Any]]:
+    """Return the DescribeLogGroups entry named exactly ``log_group_name``, if any."""
     logs_client = boto3.client("logs", config=boto3_config, region_name=region)
     groups = _list_all_items(
         logs_client,
@@ -1781,45 +1958,152 @@ def _log_group_retention_days(log_group_name: str, region: str) -> Dict[str, Any
     )
     for group in groups:
         if group.get("logGroupName") == log_group_name:
-            return {"found": True, "retention_days": group.get("retentionInDays")}
-    return {"found": False, "retention_days": None}
+            return group
+    return None
 
 
-def _bucket_expiration_rules(bucket_name: str, region: str) -> List[str]:
-    """Return a description of each enabled lifecycle rule that expires objects."""
+def _log_group_retention_days(log_group_name: str, region: str) -> Dict[str, Any]:
+    """Report what DescribeLogGroups says about one log group's retention.
+
+    ``found`` False means the named group was not returned to this account, which
+    is indeterminate: it is never reported as a missing retention period.
+    """
+    group = _describe_log_group(log_group_name, region)
+    if group is None:
+        return {"found": False, "retention_days": None}
+    return {"found": True, "retention_days": group.get("retentionInDays")}
+
+
+def _lifecycle_rule_prefix(rule: Dict[str, Any]) -> Optional[str]:
+    """Return the key prefix a lifecycle rule applies to.
+
+    None means the rule also filters on tags or object size, so it leaves some
+    objects under its prefix unexpired and cannot state a period for all of them.
+    """
+    rule_filter = rule.get("Filter")
+    if rule_filter is None:
+        return rule.get("Prefix") or ""
+    conjunction = rule_filter.get("And")
+    if conjunction is not None:
+        rule_filter = dict(conjunction, Tag=conjunction.get("Tags"))
+    if (
+        rule_filter.get("Tag")
+        or "ObjectSizeGreaterThan" in rule_filter
+        or "ObjectSizeLessThan" in rule_filter
+    ):
+        return None
+    return rule_filter.get("Prefix") or ""
+
+
+def _bucket_expiration_rules(
+    bucket_name: str, region: str, key_prefix: Optional[str] = None
+) -> Dict[str, Any]:
+    """Describe how the bucket's enabled lifecycle rules expire invocation logs.
+
+    Bedrock writes under ``<keyPrefix>/AWSLogs/``, so only a rule whose filter
+    covers that root counts. On a bucket that is or was versioned, expiring the
+    current object leaves a noncurrent version behind, so a rule that expires
+    noncurrent versions is required as well. Returns ``expirations`` (the rules
+    that count), ``deficiency`` (why the bucket keeps logs forever) and
+    ``undetermined`` (why that could not be read).
+    """
     s3_client = boto3.client("s3", config=boto3_config, region_name=region)
     try:
         response = s3_client.get_bucket_lifecycle_configuration(Bucket=bucket_name)
     except ClientError as error:
-        if error.response["Error"]["Code"] == "NoSuchLifecycleConfiguration":
-            return []
-        raise
+        if error.response["Error"]["Code"] != "NoSuchLifecycleConfiguration":
+            raise
+        response = {}
+
+    stripped_prefix = (key_prefix or "").strip("/")
+    log_root = f"{stripped_prefix}/AWSLogs/" if stripped_prefix else "AWSLogs/"
 
     expirations = []
+    noncurrent_expirations = []
+    uncovering = []
     for rule in response.get("Rules", []):
         if rule.get("Status") != "Enabled":
             continue
         rule_id = rule.get("ID") or "unnamed rule"
         expiration = rule.get("Expiration") or {}
         noncurrent = rule.get("NoncurrentVersionExpiration") or {}
+        if not (
+            expiration.get("Days")
+            or expiration.get("Date")
+            or noncurrent.get("NoncurrentDays")
+        ):
+            continue
+        rule_prefix = _lifecycle_rule_prefix(rule)
+        if rule_prefix is None:
+            uncovering.append(
+                f"{rule_id} also filters on tags or object size, so it does not "
+                f"expire every object under '{log_root}'"
+            )
+            continue
+        if not log_root.startswith(rule_prefix):
+            uncovering.append(
+                f"{rule_id} applies to prefix '{rule_prefix}', which does not "
+                f"cover '{log_root}'"
+            )
+            continue
         if expiration.get("Days"):
             expirations.append(
                 f"{rule_id} expires objects after {expiration['Days']} day(s)"
             )
         elif expiration.get("Date"):
             expirations.append(f"{rule_id} expires objects on {expiration['Date']}")
-        elif noncurrent.get("NoncurrentDays"):
-            expirations.append(
+        if noncurrent.get("NoncurrentDays"):
+            noncurrent_expirations.append(
                 f"{rule_id} expires noncurrent versions after "
                 f"{noncurrent['NoncurrentDays']} day(s)"
             )
-    return expirations
+
+    uncovered_note = f" ({'; '.join(uncovering)})" if uncovering else ""
+    if not expirations:
+        return {
+            "expirations": [],
+            "deficiency": (
+                "has no enabled lifecycle rule that expires objects under "
+                f"'{log_root}', so logs are kept indefinitely{uncovered_note}"
+            ),
+            "undetermined": None,
+        }
+
+    try:
+        versioning_status = s3_client.get_bucket_versioning(Bucket=bucket_name).get(
+            "Status"
+        )
+    except Exception as error:
+        return {
+            "expirations": expirations,
+            "deficiency": None,
+            "undetermined": describe_api_error(error, "s3:GetBucketVersioning", region),
+        }
+
+    # A bucket that was never versioned returns no Status at all.
+    if versioning_status in ("Enabled", "Suspended") and not noncurrent_expirations:
+        return {
+            "expirations": expirations,
+            "deficiency": (
+                f"has versioning {versioning_status} and no enabled lifecycle rule "
+                f"that expires noncurrent versions under '{log_root}', so "
+                "overwritten and expired log objects are kept indefinitely as "
+                f"noncurrent versions{uncovered_note}"
+            ),
+            "undetermined": None,
+        }
+    return {
+        "expirations": expirations + noncurrent_expirations,
+        "deficiency": None,
+        "undetermined": None,
+    }
 
 
 def _invocation_log_retention_findings(
     s3_bucket_name: Optional[str],
     log_group_name: Optional[str],
     region: str,
+    s3_key_prefix: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """Assess a stated retention period on each configured logging destination.
 
@@ -1861,15 +2145,19 @@ def _invocation_log_retention_findings(
 
     if s3_bucket_name:
         try:
-            expirations = _bucket_expiration_rules(s3_bucket_name, region)
-            if expirations:
-                retained.append(
-                    f"S3 bucket '{s3_bucket_name}' lifecycle: {'; '.join(expirations)}"
+            lifecycle = _bucket_expiration_rules(s3_bucket_name, region, s3_key_prefix)
+            if lifecycle["undetermined"]:
+                undetermined.append(
+                    f"S3 bucket '{s3_bucket_name}': {lifecycle['undetermined']}"
+                )
+            elif lifecycle["deficiency"]:
+                unretained.append(
+                    f"S3 bucket '{s3_bucket_name}' {lifecycle['deficiency']}"
                 )
             else:
-                unretained.append(
-                    f"S3 bucket '{s3_bucket_name}' has no enabled lifecycle rule that "
-                    "expires objects, so logs are kept indefinitely"
+                retained.append(
+                    f"S3 bucket '{s3_bucket_name}' lifecycle: "
+                    f"{'; '.join(lifecycle['expirations'])}"
                 )
         except Exception as error:
             logger.warning(
@@ -2217,7 +2505,10 @@ def check_bedrock_logging_configuration(region: str = "") -> Dict[str, Any]:
             # each delivery destination rather than of the logging switch.
             findings["csv_data"].extend(
                 _invocation_log_retention_findings(
-                    s3_bucket_name, log_group_name, region
+                    s3_bucket_name,
+                    log_group_name,
+                    region,
+                    (s3_config or {}).get("keyPrefix"),
                 )
             )
 
@@ -3796,6 +4087,96 @@ def check_bedrock_custom_model_encryption(region: str = "") -> Dict[str, Any]:
         }
 
 
+INVOCATION_LOG_DELETION_FINDING = "Bedrock Invocation Log Group Deletion Protection"
+
+INVOCATION_LOG_DELETION_REFERENCE = "https://docs.aws.amazon.com/AmazonCloudWatch/latest/logs/protecting-log-groups-from-deletion.html"
+
+
+def _invocation_log_group_deletion_findings(
+    log_group_name: Optional[str], region: str
+) -> List[Dict[str, Any]]:
+    """Assess deletion protection on the invocation log group.
+
+    DescribeLogGroups omits deletionProtectionEnabled on a group that never had
+    it set, so an absent value reads as off. A group that is not returned is
+    indeterminate and never reported as unprotected.
+    """
+
+    def row(details: str, resolution: str, severity: str, status: str):
+        return create_finding(
+            check_id="BR-12",
+            finding_name=INVOCATION_LOG_DELETION_FINDING,
+            finding_details=details,
+            resolution=resolution,
+            reference=INVOCATION_LOG_DELETION_REFERENCE,
+            severity=severity,
+            status=status,
+            region=region,
+        )
+
+    if not log_group_name:
+        return [
+            row(
+                "Model invocation logging does not deliver to CloudWatch Logs, so "
+                "there is no invocation log group to protect from deletion.",
+                "No action required",
+                "Informational",
+                "N/A",
+            )
+        ]
+    try:
+        group = _describe_log_group(log_group_name, region)
+    except Exception as error:
+        logger.warning(
+            f"Unable to read deletion protection for log group {log_group_name}: "
+            f"{error}"
+        )
+        return [
+            row(
+                f"Deletion protection on invocation log group '{log_group_name}' "
+                "could not be assessed: "
+                f"{describe_api_error(error, 'logs:DescribeLogGroups', region)}.",
+                COULD_NOT_ASSESS_RESOLUTION,
+                "Informational",
+                "N/A",
+            )
+        ]
+    if group is None:
+        return [
+            row(
+                f"Invocation log group '{log_group_name}' was not returned by "
+                "DescribeLogGroups for this account, so its deletion protection "
+                "could not be assessed.",
+                COULD_NOT_ASSESS_RESOLUTION,
+                "Informational",
+                "N/A",
+            )
+        ]
+    if group.get("deletionProtectionEnabled") is True:
+        return [
+            row(
+                f"Invocation log group '{log_group_name}' has deletion protection "
+                "enabled, so it cannot be deleted until protection is turned off.",
+                "No action required",
+                "Medium",
+                "Passed",
+            )
+        ]
+    return [
+        row(
+            f"Invocation log group '{log_group_name}' does not have deletion "
+            "protection enabled (deletionProtectionEnabled is "
+            f"{group.get('deletionProtectionEnabled', 'absent')}), so a principal "
+            "allowed to delete log groups can remove the invocation record in one "
+            "call.",
+            "Enable deletion protection on the CloudWatch Logs log group that "
+            "receives Bedrock model invocation logs.",
+            "Medium",
+            "Failed",
+        )
+    ]
+
+
 def check_bedrock_invocation_log_encryption(region: str = "") -> Dict[str, Any]:
     """
     Check if S3 buckets used for model invocation logging have proper encryption
@@ -3823,6 +4204,15 @@ def check_bedrock_invocation_log_encryption(region: str = "") -> Dict[str, Any]:
 
             bucket_name = _extract_s3_bucket_name(s3_config)
 
+            # AIR-FND-DET-09 asks that the invocation record cannot be deleted,
+            # which for CloudWatch delivery is the log group's own setting.
+            deletion_rows = _invocation_log_group_deletion_findings(
+                (logging_config.get("cloudWatchConfig") or {}).get("logGroupName"),
+                region,
+            )
+            if any(r["Status"] == "Failed" for r in deletion_rows):
+                findings["status"] = "WARN"
+
             if not bucket_name:
                 findings["csv_data"].append(
                     create_finding(
@@ -3836,6 +4226,7 @@ def check_bedrock_invocation_log_encryption(region: str = "") -> Dict[str, Any]:
                         region=region,
                     )
                 )
+                findings["csv_data"].extend(deletion_rows)
                 return findings
 
             # Check S3 bucket encryption
@@ -3930,6 +4321,8 @@ def check_bedrock_invocation_log_encryption(region: str = "") -> Dict[str, Any]:
                     )
                 else:
                     raise
+
+            findings["csv_data"].extend(deletion_rows)
 
         except bedrock_client.exceptions.ValidationException:
             findings["csv_data"].append(
@@ -11773,6 +12166,254 @@ def check_bedrock_region_invocation_control(
         }
 
 
+APPROVED_MODEL_CONTROL_FINDING = "Bedrock Approved Model Control"
+
+APPROVED_MODEL_CONTROL_REFERENCE = (
+    "https://docs.aws.amazon.com/organizations/latest/userguide/"
+    "orgs_manage_policies_scps_syntax.html\n" + MODEL_ALLOW_LIST_REFERENCE
+)
+
+
+def _names_a_model_list(value: Any) -> bool:
+    """Return True when an ARN names particular models rather than all of them."""
+    if not isinstance(value, str):
+        return False
+    value = value.strip().lower()
+    return any(
+        prefix in value for prefix in MODEL_RESOURCE_TYPE_PREFIXES
+    ) and not _pattern_covers_every_model(value)
+
+
+def _scp_model_list_controls(document: Any) -> List[Dict[str, Any]]:
+    """
+    Describe every Deny statement that denies model invocation outside a list of
+    named models.
+
+    The list is either a NotResource naming model or inference-profile ARNs, or
+    a negated condition whose values name them. A Deny written with NotAction
+    covers every action it does not name. A pattern that matches every model,
+    such as arn:aws:bedrock:*::foundation-model/*, is no list at all.
+    """
+    controls = []
+    for statement in _policy_statements(document):
+        if str(statement.get("Effect", "")).upper() != "DENY":
+            continue
+        if "NotAction" in statement:
+            covered = [
+                action_name
+                for action_name in MODEL_INVOKE_ACTIONS
+                if not any(
+                    _action_pattern_covers(action, action_name)
+                    for action in _as_list(statement.get("NotAction"))
+                )
+            ]
+        else:
+            covered = [
+                action_name
+                for action_name in MODEL_INVOKE_ACTIONS
+                if any(
+                    _action_pattern_covers(action, action_name)
+                    for action in _as_list(statement.get("Action"))
+                )
+            ]
+        if not covered:
+            continue
+        named = [
+            str(value)
+            for value in _as_list(statement.get("NotResource"))
+            if _names_a_model_list(value)
+        ]
+        form = "NotResource"
+        if not named:
+            form = "condition"
+            for operator, key, values in _condition_keys_by_operator(statement):
+                if "not" not in _strip_condition_set_operator(operator):
+                    continue
+                named = [str(value) for value in values if _names_a_model_list(value)]
+                if named:
+                    form = f"{operator} on {key}"
+                    break
+        if named:
+            controls.append({"actions": covered, "form": form, "models": named})
+    return controls
+
+
+def check_bedrock_approved_model_control(
+    region: str = "", scp_inventory: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
+    """
+    BR-43 model leg: verify a service control policy denies invoking any model
+    outside a named list. Only the existence of the list is asserted; which
+    models belong on it is the customer's decision.
+    """
+    logger.debug("Starting check for Bedrock approved model control")
+    check_name = APPROVED_MODEL_CONTROL_FINDING
+    try:
+        findings = {
+            "check_name": check_name,
+            "status": "PASS",
+            "details": "",
+            "csv_data": [],
+        }
+
+        def row(details, resolution, severity, status):
+            return create_finding(
+                check_id="BR-43",
+                finding_name=check_name,
+                finding_details=details,
+                resolution=resolution,
+                reference=APPROVED_MODEL_CONTROL_REFERENCE,
+                severity=severity,
+                status=status,
+                region=region,
+            )
+
+        context = _organization_policy_context()
+        if not context["readable"]:
+            findings["status"] = "N/A"
+            findings["csv_data"].append(
+                row(
+                    "An organization-wide approved model list was not assessed "
+                    f"because {context['detail']}.",
+                    context["resolution"],
+                    "Informational",
+                    "N/A",
+                )
+            )
+            return findings
+
+        inventory = (
+            scp_inventory
+            if scp_inventory is not None
+            else get_service_control_policy_inventory()
+        )
+
+        enforcing = []
+        covered_actions = set()
+        read_errors = list(inventory["errors"])
+        if inventory["list_error"]:
+            read_errors.append(
+                f"SERVICE_CONTROL_POLICY listing: {inventory['list_error']}"
+            )
+        for item in inventory["items"]:
+            try:
+                controls = _scp_model_list_controls(item["content"] or "{}")
+            except Exception as error:
+                logger.warning(
+                    f"Unable to parse service control policy {item['name']}: {error}"
+                )
+                read_errors.append(f"policy '{item['name']}': {str(error)}")
+                continue
+            for control in controls:
+                covered_actions.update(control["actions"])
+                enforcing.append(
+                    "policy '{}' denies {} outside {} named model(s) through {} "
+                    "(for example {})".format(
+                        item["name"],
+                        ", ".join(control["actions"]),
+                        len(control["models"]),
+                        control["form"],
+                        control["models"][0],
+                    )
+                )
+
+        uncovered = [
+            action for action in MODEL_INVOKE_ACTIONS if action not in covered_actions
+        ]
+        scope_note = (
+            "The approved model list is the customer's decision and is not judged "
+            "here; batch inference jobs are not read by this leg."
+        )
+        if enforcing and not uncovered:
+            findings["details"] = "Bedrock invocation is limited to a model list"
+            findings["csv_data"].append(
+                row(
+                    "{} service control policy statement(s) deny model invocation "
+                    "outside a named list: {}. {}".format(
+                        len(enforcing), "; ".join(enforcing[:5]), scope_note
+                    ),
+                    "No action required",
+                    "Medium",
+                    "Passed",
+                )
+            )
+        elif enforcing:
+            findings["status"] = "WARN"
+            findings["details"] = "The model list leaves an invoke action open"
+            findings["csv_data"].append(
+                row(
+                    "{} service control policy statement(s) deny model invocation "
+                    "outside a named list ({}), but none of them covers {}, so "
+                    "that operation can invoke any model. {}".format(
+                        len(enforcing),
+                        "; ".join(enforcing[:5]),
+                        ", ".join(uncovered),
+                        scope_note,
+                    ),
+                    "Extend the service control policy Deny so it covers both the "
+                    "standard and the streaming model invocation actions.",
+                    "Medium",
+                    "Failed",
+                )
+            )
+        elif read_errors:
+            findings["status"] = "N/A"
+            findings["csv_data"].append(
+                row(
+                    "An organization-wide approved model list is undetermined "
+                    "because organization policies could not be read: "
+                    f"{'; '.join(read_errors[:5])}.",
+                    COULD_NOT_ASSESS_RESOLUTION,
+                    "Informational",
+                    "N/A",
+                )
+            )
+        else:
+            findings["status"] = "WARN"
+            findings["details"] = "No approved model list on Bedrock invocation"
+            findings["csv_data"].append(
+                row(
+                    "None of the {} service control policy document(s) read denies "
+                    "bedrock:InvokeModel or bedrock:InvokeModelWithResponseStream "
+                    "outside a named list of foundation-model or inference-profile "
+                    "ARNs, so any account in the organization can invoke any model "
+                    "it has access to. A list written as a wildcard over every "
+                    "model counts as no list. {}".format(
+                        len(inventory["items"]), scope_note
+                    ),
+                    "Add a service control policy that denies model invocation "
+                    "with a NotResource element listing the approved foundation "
+                    "model and inference profile ARNs.",
+                    "Medium",
+                    "Failed",
+                )
+            )
+
+        return findings
+
+    except Exception as e:
+        logger.error(
+            f"Error in check_bedrock_approved_model_control: {str(e)}", exc_info=True
+        )
+        return {
+            "check_name": check_name,
+            "status": "ERROR",
+            "details": f"Error during check: {str(e)}",
+            "csv_data": [
+                create_finding(
+                    check_id="BR-43",
+                    finding_name=check_name,
+                    finding_details=build_could_not_assess_detail(e, region),
+                    resolution=COULD_NOT_ASSESS_RESOLUTION,
+                    reference=APPROVED_MODEL_CONTROL_REFERENCE,
+                    severity="Informational",
+                    status="N/A",
+                    region=region,
+                )
+            ],
+        }
+
+
 MARKETPLACE_SUBSCRIBE_ACTION = "aws-marketplace:subscribe"
 
 MARKETPLACE_PRODUCT_CONDITION_KEY = "aws-marketplace:productid"
@@ -12317,6 +12958,454 @@ def check_bedrock_api_key_governance(
                     finding_details=build_could_not_assess_detail(e, region),
                     resolution=COULD_NOT_ASSESS_RESOLUTION,
                     reference=BEDROCK_API_KEY_REFERENCE,
+                    severity="Informational",
+                    status="N/A",
+                    region=region,
+                )
+            ],
+        }
+
+
+AI_WRITE_SERVICES = ("bedrock", "sagemaker", "bedrock-agentcore")
+
+# An action whose name starts with one of these verbs only reads. A pattern that
+# begins with any other letters, or with a wildcard, can match a write.
+AI_READ_ACTION_VERBS = ("get", "list", "describe", "search")
+
+AI_USER_SCOPE_NOTE = (
+    "The population is IAM users whose attached, inline or group policies allow a "
+    "non-read Bedrock, SageMaker AI or AgentCore action; Deny statements, "
+    "permissions boundaries and service control policies are not evaluated."
+)
+
+
+def _action_grants_ai_write(pattern: Any) -> List[str]:
+    """Return the AI services in which one Action entry allows a non-read action."""
+    if not isinstance(pattern, str):
+        return []
+    pattern = pattern.strip().lower()
+    if pattern == "*":
+        return list(AI_WRITE_SERVICES)
+    if ":" not in pattern:
+        return []
+    service_pattern, action_pattern = pattern.split(":", 1)
+    if action_pattern.startswith(AI_READ_ACTION_VERBS):
+        return []
+    return [
+        service
+        for service in AI_WRITE_SERVICES
+        if _wildcard_matches(service_pattern, service)
+    ]
+
+
+def _policy_ai_write_grants(document: Any) -> List[str]:
+    """Describe each Allow in a policy that grants a non-read AI action."""
+    grants = []
+    for statement in _policy_statements(document):
+        if str(statement.get("Effect", "")).upper() != "ALLOW":
+            continue
+        if "NotAction" in statement:
+            excluded = [
+                action.strip().lower()
+                for action in _as_list(statement.get("NotAction"))
+                if isinstance(action, str)
+            ]
+            open_services = [
+                service
+                for service in AI_WRITE_SERVICES
+                if not any(
+                    _wildcard_matches(action, f"{service}:\x00") for action in excluded
+                )
+            ]
+            if open_services:
+                grants.append(
+                    f"NotAction allows every {'/'.join(open_services)} action it "
+                    "does not name"
+                )
+            continue
+        for action in _as_list(statement.get("Action")):
+            if _action_grants_ai_write(action):
+                grants.append(f"allows {action}")
+    return grants
+
+
+def _ai_write_users(permission_cache: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Select the cached IAM users that hold a non-read Bedrock, SageMaker AI or
+    AgentCore permission, with the grants that put each one in scope.
+
+    ``unreadable`` lists users whose group policies or policy documents could
+    not be read and who were not otherwise found in scope, so a population
+    that looks empty is never reported as clean when part of it went unread.
+    """
+    users = {}
+    unreadable = {}
+    for user_name, permissions in permission_cache["user_permissions"].items():
+        evidence = []
+        gaps = []
+        if permissions.get("group_policies_error"):
+            gaps.append("group policies could not be read")
+        for source, policy in _cached_identity_policies(permissions):
+            policy_name = policy.get("name") or "unnamed policy"
+            try:
+                grants = _policy_ai_write_grants(policy.get("document"))
+            except (ValueError, TypeError, AttributeError):
+                gaps.append(f"{source} '{policy_name}' could not be parsed")
+                continue
+            if grants:
+                evidence.append(f"{source} '{policy_name}' {grants[0]}")
+        if evidence:
+            users[user_name] = evidence
+        elif gaps:
+            unreadable[user_name] = gaps
+    return {"users": users, "unreadable": unreadable}
+
+
+def _ai_user_unread_findings(
+    unreadable: Dict[str, List[str]],
+    check_id: str,
+    finding_name: str,
+    reference: str,
+    region: str,
+) -> List[Dict[str, Any]]:
+    """Emit an N/A row for each user whose policies were not all readable."""
+    return [
+        create_finding(
+            check_id=check_id,
+            finding_name=finding_name,
+            finding_details=(
+                f"IAM user '{user_name}' was not placed in or out of scope because "
+                f"{'; '.join(gaps)}. {AI_USER_SCOPE_NOTE}"
+            ),
+            resolution=COULD_NOT_ASSESS_RESOLUTION,
+            reference=reference,
+            severity="Informational",
+            status="N/A",
+            region=region,
+        )
+        for user_name, gaps in sorted(unreadable.items())
+    ]
+
+
+AI_USER_ACCESS_KEY_FINDING = "AI User Long-Term Access Key"
+
+AI_USER_ACCESS_KEY_REFERENCE = (
+    "https://docs.aws.amazon.com/IAM/latest/UserGuide/id_credentials_access-keys.html"
+)
+
+
+def _access_key_age_days(create_date: Any) -> Optional[int]:
+    """Return the age in whole days of an access key CreateDate, if parseable."""
+    if isinstance(create_date, str):
+        try:
+            create_date = datetime.fromisoformat(create_date.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    if not isinstance(create_date, datetime):
+        return None
+    if create_date.tzinfo is None:
+        create_date = create_date.replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - create_date).days
+
+
+def check_bedrock_ai_user_access_keys(
+    permission_cache, region: str = ""
+) -> Dict[str, Any]:
+    """
+    BR-50: Flag active long-term access keys on IAM users that can change
+    Bedrock, SageMaker AI or AgentCore resources. Inactive keys cannot sign a
+    request and are not counted.
+    """
+    logger.debug("Starting check for AI user long-term access keys")
+    try:
+        findings = {
+            "check_name": AI_USER_ACCESS_KEY_FINDING,
+            "status": "PASS",
+            "details": "",
+            "csv_data": [],
+        }
+
+        def row(details, resolution, severity, status):
+            return create_finding(
+                check_id="BR-50",
+                finding_name=AI_USER_ACCESS_KEY_FINDING,
+                finding_details=details,
+                resolution=resolution,
+                reference=AI_USER_ACCESS_KEY_REFERENCE,
+                severity=severity,
+                status=status,
+                region=region,
+            )
+
+        population = _ai_write_users(permission_cache)
+        findings["csv_data"].extend(
+            _ai_user_unread_findings(
+                population["unreadable"],
+                "BR-50",
+                AI_USER_ACCESS_KEY_FINDING,
+                AI_USER_ACCESS_KEY_REFERENCE,
+                region,
+            )
+        )
+        if not population["users"]:
+            findings["status"] = "N/A"
+            findings["csv_data"].append(
+                row(
+                    "No IAM user in the permissions cache holds a non-read "
+                    f"Bedrock, SageMaker AI or AgentCore permission. "
+                    f"{AI_USER_SCOPE_NOTE}",
+                    "No action required",
+                    "Informational",
+                    "N/A",
+                )
+            )
+            return findings
+
+        iam_client = boto3.client("iam", config=boto3_config)
+        without_keys = []
+        for user_name, evidence in sorted(population["users"].items()):
+            try:
+                keys = _list_all_items(
+                    iam_client,
+                    "list_access_keys",
+                    "AccessKeyMetadata",
+                    max_results_param=None,
+                    token_param="Marker",
+                    token_response_keys=("Marker",),
+                    UserName=user_name,
+                )
+            except Exception as error:
+                findings["csv_data"].append(
+                    row(
+                        f"Access keys of IAM user '{user_name}' could not be listed: "
+                        f"{describe_api_error(error, 'iam:ListAccessKeys', region)}.",
+                        COULD_NOT_ASSESS_RESOLUTION,
+                        "Informational",
+                        "N/A",
+                    )
+                )
+                continue
+
+            active = [key for key in keys if key.get("Status") == "Active"]
+            if not active:
+                without_keys.append(user_name)
+                continue
+            for key in active:
+                key_id = str(key.get("AccessKeyId") or "")
+                age = _access_key_age_days(key.get("CreateDate"))
+                findings["status"] = "WARN"
+                findings["csv_data"].append(
+                    row(
+                        f"IAM user '{user_name}' has an active long-term access key "
+                        f"ending '{key_id[-4:]}', created {key.get('CreateDate')}"
+                        f"{f' ({age} day(s) old)' if age is not None else ''}. The "
+                        f"user is in scope because {evidence[0]}. "
+                        f"{AI_USER_SCOPE_NOTE}",
+                        "Replace the access key with temporary credentials from an "
+                        "IAM role or IAM Identity Center, then deactivate and "
+                        "delete the key.",
+                        "High",
+                        "Failed",
+                    )
+                )
+
+        if without_keys:
+            findings["csv_data"].append(
+                row(
+                    "{} of the {} in-scope IAM user(s) hold no active access key: "
+                    "{}. {}".format(
+                        len(without_keys),
+                        len(population["users"]),
+                        ", ".join(without_keys[:10]),
+                        AI_USER_SCOPE_NOTE,
+                    ),
+                    "No action required",
+                    "High",
+                    "Passed",
+                )
+            )
+        return findings
+
+    except Exception as e:
+        logger.error(
+            f"Error in check_bedrock_ai_user_access_keys: {str(e)}", exc_info=True
+        )
+        return {
+            "check_name": AI_USER_ACCESS_KEY_FINDING,
+            "status": "ERROR",
+            "details": f"Error during check: {str(e)}",
+            "csv_data": [
+                create_finding(
+                    check_id="BR-50",
+                    finding_name=AI_USER_ACCESS_KEY_FINDING,
+                    finding_details=build_could_not_assess_detail(e, region),
+                    resolution=COULD_NOT_ASSESS_RESOLUTION,
+                    reference=AI_USER_ACCESS_KEY_REFERENCE,
+                    severity="Informational",
+                    status="N/A",
+                    region=region,
+                )
+            ],
+        }
+
+
+AI_USER_MFA_FINDING = "AI User Console MFA"
+
+AI_USER_MFA_REFERENCE = (
+    "https://docs.aws.amazon.com/IAM/latest/UserGuide/id_credentials_mfa.html"
+)
+
+AI_USER_MFA_SCOPE_NOTE = (
+    "Only IAM users are read: people who sign in through IAM Identity Center are "
+    "not covered, and this check does not read Identity Center MFA settings."
+)
+
+
+def check_bedrock_ai_user_console_mfa(
+    permission_cache, region: str = ""
+) -> Dict[str, Any]:
+    """
+    BR-51: Flag IAM users that can change Bedrock, SageMaker AI or AgentCore
+    resources, have a console password and have no MFA device.
+    """
+    logger.debug("Starting check for AI user console MFA")
+    try:
+        findings = {
+            "check_name": AI_USER_MFA_FINDING,
+            "status": "PASS",
+            "details": "",
+            "csv_data": [],
+        }
+
+        def row(details, resolution, severity, status):
+            return create_finding(
+                check_id="BR-51",
+                finding_name=AI_USER_MFA_FINDING,
+                finding_details=f"{details} {AI_USER_MFA_SCOPE_NOTE}",
+                resolution=resolution,
+                reference=AI_USER_MFA_REFERENCE,
+                severity=severity,
+                status=status,
+                region=region,
+            )
+
+        population = _ai_write_users(permission_cache)
+        findings["csv_data"].extend(
+            _ai_user_unread_findings(
+                population["unreadable"],
+                "BR-51",
+                AI_USER_MFA_FINDING,
+                AI_USER_MFA_REFERENCE,
+                region,
+            )
+        )
+        if not population["users"]:
+            findings["status"] = "N/A"
+            findings["csv_data"].append(
+                row(
+                    "No IAM user in the permissions cache holds a non-read "
+                    "Bedrock, SageMaker AI or AgentCore permission. "
+                    f"{AI_USER_SCOPE_NOTE}",
+                    "No action required",
+                    "Informational",
+                    "N/A",
+                )
+            )
+            return findings
+
+        iam_client = boto3.client("iam", config=boto3_config)
+        protected = []
+        no_console = []
+        for user_name, evidence in sorted(population["users"].items()):
+            try:
+                iam_client.get_login_profile(UserName=user_name)
+            except ClientError as error:
+                if error.response.get("Error", {}).get("Code") == "NoSuchEntity":
+                    no_console.append(user_name)
+                    continue
+                findings["csv_data"].append(
+                    row(
+                        f"Console access of IAM user '{user_name}' could not be "
+                        "read: "
+                        f"{describe_api_error(error, 'iam:GetLoginProfile', region)}.",
+                        COULD_NOT_ASSESS_RESOLUTION,
+                        "Informational",
+                        "N/A",
+                    )
+                )
+                continue
+            try:
+                devices = _list_all_items(
+                    iam_client,
+                    "list_mfa_devices",
+                    "MFADevices",
+                    max_results_param=None,
+                    token_param="Marker",
+                    token_response_keys=("Marker",),
+                    UserName=user_name,
+                )
+            except Exception as error:
+                findings["csv_data"].append(
+                    row(
+                        f"MFA devices of IAM user '{user_name}' could not be "
+                        "listed: "
+                        f"{describe_api_error(error, 'iam:ListMFADevices', region)}.",
+                        COULD_NOT_ASSESS_RESOLUTION,
+                        "Informational",
+                        "N/A",
+                    )
+                )
+                continue
+            if devices:
+                protected.append(user_name)
+                continue
+            findings["status"] = "WARN"
+            findings["csv_data"].append(
+                row(
+                    f"IAM user '{user_name}' has a console password and no MFA "
+                    f"device. The user is in scope because {evidence[0]}. "
+                    f"{AI_USER_SCOPE_NOTE}",
+                    "Assign an MFA device to the user, or remove the console "
+                    "password and move the person to IAM Identity Center.",
+                    "High",
+                    "Failed",
+                )
+            )
+
+        if protected or no_console:
+            findings["csv_data"].append(
+                row(
+                    "{} of the {} in-scope IAM user(s) have an MFA device ({}) and "
+                    "{} have no console password ({}). {}".format(
+                        len(protected),
+                        len(population["users"]),
+                        ", ".join(protected[:10]) or "none",
+                        len(no_console),
+                        ", ".join(no_console[:10]) or "none",
+                        AI_USER_SCOPE_NOTE,
+                    ),
+                    "No action required",
+                    "High",
+                    "Passed",
+                )
+            )
+        return findings
+
+    except Exception as e:
+        logger.error(
+            f"Error in check_bedrock_ai_user_console_mfa: {str(e)}", exc_info=True
+        )
+        return {
+            "check_name": AI_USER_MFA_FINDING,
+            "status": "ERROR",
+            "details": f"Error during check: {str(e)}",
+            "csv_data": [
+                create_finding(
+                    check_id="BR-51",
+                    finding_name=AI_USER_MFA_FINDING,
+                    finding_details=build_could_not_assess_detail(e, region),
+                    resolution=COULD_NOT_ASSESS_RESOLUTION,
+                    reference=AI_USER_MFA_REFERENCE,
                     severity="Informational",
                     status="N/A",
                     region=region,
@@ -13830,6 +14919,1032 @@ def check_bedrock_data_path_bucket_tls(region: str = "") -> Dict[str, Any]:
         }
 
 
+OBJECT_LOCK_FINDING = "Bedrock Data Path Bucket Object Lock"
+
+OBJECT_LOCK_REFERENCE = (
+    "https://docs.aws.amazon.com/AmazonS3/latest/userguide/object-lock.html"
+)
+
+
+def _backup_vault_lock_evidence(region: str) -> str:
+    """Summarize AWS Backup Vault Lock in the Region as supporting evidence."""
+    try:
+        backup_client = boto3.client("backup", config=boto3_config, region_name=region)
+        vaults = _list_all_items(
+            backup_client,
+            "list_backup_vaults",
+            "BackupVaultList",
+            max_results_param="MaxResults",
+            token_param="NextToken",
+            token_response_keys=("NextToken",),
+        )
+    except Exception as error:
+        return (
+            "AWS Backup vaults could not be listed "
+            f"({get_assessment_error_label(error)})."
+        )
+    locked = [
+        "{} (minimum retention {} day(s))".format(
+            vault.get("BackupVaultName", "unnamed"),
+            vault.get("MinRetentionDays", "not set"),
+        )
+        for vault in vaults
+        if vault.get("Locked") is True
+    ]
+    return (
+        "Supporting evidence only: {} of {} AWS Backup vault(s) in {} have Vault "
+        "Lock{}. Whether AWS Backup protects these buckets is not read.".format(
+            len(locked),
+            len(vaults),
+            region or "this region",
+            f": {', '.join(locked[:5])}" if locked else "",
+        )
+    )
+
+
+def _object_lock_deficiency(configuration: Dict[str, Any]) -> Optional[str]:
+    """Explain why an Object Lock configuration does not make objects immutable."""
+    if configuration.get("ObjectLockEnabled") != "Enabled":
+        return "does not have Object Lock enabled"
+    retention = (configuration.get("Rule") or {}).get("DefaultRetention") or {}
+    if not retention:
+        return (
+            "has Object Lock enabled with no default retention, so an object is "
+            "locked only when its writer sets a retention period on it"
+        )
+    period = (
+        f"{retention['Days']} day(s)"
+        if retention.get("Days")
+        else f"{retention.get('Years')} year(s)"
+        if retention.get("Years")
+        else None
+    )
+    if retention.get("Mode") != "COMPLIANCE":
+        return (
+            f"uses {retention.get('Mode') or 'no'} mode default retention, which a "
+            "principal holding s3:BypassGovernanceRetention can override"
+        )
+    if not period:
+        return "has COMPLIANCE default retention with no period"
+    return None
+
+
+def check_bedrock_data_path_object_lock(region: str = "") -> Dict[str, Any]:
+    """
+    BR-52: Verify every S3 bucket on the Bedrock data path locks its objects in
+    COMPLIANCE mode by default, so training data and inference records cannot be
+    deleted or overwritten before the retention period ends.
+    """
+    logger.debug("Starting check for Bedrock data path bucket Object Lock")
+    check_name = OBJECT_LOCK_FINDING
+    try:
+        findings = {
+            "check_name": check_name,
+            "status": "PASS",
+            "details": "",
+            "csv_data": [],
+        }
+
+        def row(details, resolution, severity, status):
+            return create_finding(
+                check_id="BR-52",
+                finding_name=check_name,
+                finding_details=details,
+                resolution=resolution,
+                reference=OBJECT_LOCK_REFERENCE,
+                severity=severity,
+                status=status,
+                region=region,
+            )
+
+        inventory = _ai_data_path_buckets(region)
+        gaps = inventory["errors"] + inventory["truncated"]
+        if gaps:
+            findings["csv_data"].append(
+                row(
+                    "{} data path read(s) failed or stopped at a cap, so the bucket "
+                    "list is incomplete and a bucket missing from it was not "
+                    "assessed: {}.".format(len(gaps), "; ".join(gaps[:5])),
+                    COULD_NOT_ASSESS_RESOLUTION,
+                    "Informational",
+                    "N/A",
+                )
+            )
+
+        if not inventory["buckets"]:
+            findings["status"] = "N/A"
+            findings["csv_data"].append(
+                row(
+                    "No knowledge base ingests from an S3 bucket in {}, no model "
+                    "invocation log destination is configured and no model "
+                    "customization job names a bucket, so there is no data path "
+                    "bucket to assess.".format(region or "this region"),
+                    "No action required",
+                    "Informational",
+                    "N/A",
+                )
+            )
+            return findings
+
+        evidence = _backup_vault_lock_evidence(region)
+        s3_client = boto3.client("s3", config=boto3_config, region_name=region)
+        locked = []
+        indeterminate = []
+        for bucket in sorted(inventory["buckets"]):
+            labels = "; ".join(sorted(inventory["buckets"][bucket])[:3])
+            try:
+                configuration = (
+                    s3_client.get_object_lock_configuration(Bucket=bucket).get(
+                        "ObjectLockConfiguration"
+                    )
+                    or {}
+                )
+                deficiency = _object_lock_deficiency(configuration)
+            except ClientError as error:
+                code = error.response.get("Error", {}).get("Code", "")
+                if code != "ObjectLockConfigurationNotFoundError":
+                    indeterminate.append(
+                        f"{bucket} ({labels}): {get_assessment_error_label(error)}"
+                    )
+                    continue
+                deficiency = "has no Object Lock configuration"
+            except Exception as error:
+                indeterminate.append(
+                    f"{bucket} ({labels}): {get_assessment_error_label(error)}"
+                )
+                continue
+
+            if deficiency is None:
+                locked.append(f"{bucket} ({labels})")
+                continue
+            findings["status"] = "WARN"
+            findings["csv_data"].append(
+                row(
+                    f"Bucket {bucket} is on the Bedrock data path as {labels} and "
+                    f"{deficiency}, so its objects can be deleted or overwritten. "
+                    f"{evidence}",
+                    "Enable Object Lock on the bucket and set a default retention "
+                    "in COMPLIANCE mode with a period that meets your "
+                    "record-retention requirement.",
+                    "Medium",
+                    "Failed",
+                )
+            )
+
+        if locked:
+            findings["csv_data"].append(
+                row(
+                    "{} of the {} Bedrock data path bucket(s) read lock objects in "
+                    "COMPLIANCE mode by default: {}.{} {}".format(
+                        len(locked),
+                        len(inventory["buckets"]),
+                        "; ".join(locked[:5]),
+                        " The bucket list is incomplete, so this is not a verdict "
+                        "on the whole data path."
+                        if gaps
+                        else "",
+                        evidence,
+                    ),
+                    COULD_NOT_ASSESS_RESOLUTION if gaps else "No action required",
+                    "Informational" if gaps else "Medium",
+                    "N/A" if gaps else "Passed",
+                )
+            )
+
+        if indeterminate:
+            findings["csv_data"].append(
+                row(
+                    "{} Bedrock data path bucket(s) have no readable Object Lock "
+                    "configuration, which is a permissions or ownership problem and "
+                    "not evidence that objects are unlocked: {}.".format(
+                        len(indeterminate), "; ".join(indeterminate[:5])
+                    ),
+                    COULD_NOT_ASSESS_RESOLUTION,
+                    "Informational",
+                    "N/A",
+                )
+            )
+        return findings
+
+    except Exception as e:
+        logger.error(
+            f"Error in check_bedrock_data_path_object_lock: {str(e)}", exc_info=True
+        )
+        return {
+            "check_name": check_name,
+            "status": "ERROR",
+            "details": f"Error during check: {str(e)}",
+            "csv_data": [
+                create_finding(
+                    check_id="BR-52",
+                    finding_name=check_name,
+                    finding_details=build_could_not_assess_detail(e, region),
+                    resolution=COULD_NOT_ASSESS_RESOLUTION,
+                    reference=OBJECT_LOCK_REFERENCE,
+                    severity="Informational",
+                    status="N/A",
+                    region=region,
+                )
+            ],
+        }
+
+
+RESOURCE_OWNER_FINDING = "Bedrock Resource Owner Tag"
+
+RESOURCE_OWNER_REFERENCE = "https://docs.aws.amazon.com/resourcegroupstagging/latest/APIReference/API_GetResources.html"
+
+RESOURCE_OWNER_TAG_PATTERN = re.compile("owner", re.IGNORECASE)
+
+# GetResources accepts at most 100 ARNs in ResourceARNList.
+TAGGING_ARN_BATCH = 100
+
+MAX_REPORTED_UNOWNED_RESOURCES = 25
+
+
+def _bedrock_owned_resource_arns(region: str) -> Dict[str, Any]:
+    """
+    List the ARN of every Bedrock agent, knowledge base, guardrail, custom and
+    imported model and provisioned throughput in the Region.
+
+    The population comes from the Bedrock list APIs, never from a tag query,
+    because a tag query cannot return a resource that was never tagged.
+    """
+    arns: Dict[str, str] = {}
+    errors = []
+    bedrock_client = boto3.client("bedrock", config=boto3_config, region_name=region)
+    agent_client = boto3.client(
+        "bedrock-agent", config=boto3_config, region_name=region
+    )
+    identity = boto3.client("sts", config=boto3_config).get_caller_identity()
+    partition = _caller_identity_partition(identity)
+    account = identity["Account"]
+
+    legs = (
+        ("agent", agent_client, "list_agents", "agentSummaries", None, "agentId"),
+        (
+            "knowledge base",
+            agent_client,
+            "list_knowledge_bases",
+            "knowledgeBaseSummaries",
+            None,
+            "knowledgeBaseId",
+        ),
+        ("guardrail", bedrock_client, "list_guardrails", "guardrails", "arn", None),
+        (
+            "custom model",
+            bedrock_client,
+            "list_custom_models",
+            "modelSummaries",
+            "modelArn",
+            None,
+        ),
+        (
+            "imported model",
+            bedrock_client,
+            "list_imported_models",
+            "modelSummaries",
+            "modelArn",
+            None,
+        ),
+        (
+            "provisioned throughput",
+            bedrock_client,
+            "list_provisioned_model_throughputs",
+            "provisionedModelSummaries",
+            "provisionedModelArn",
+            None,
+        ),
+    )
+    resource_types = {"agent": "agent", "knowledge base": "knowledge-base"}
+    for label, client, operation, result_key, arn_field, id_field in legs:
+        try:
+            items = _list_all_items(client, operation, result_key)
+        except Exception as error:
+            errors.append(f"{label}s: {get_assessment_error_label(error)}")
+            continue
+        for item in items:
+            if arn_field:
+                arn = item.get(arn_field)
+            elif item.get(id_field):
+                arn = (
+                    f"arn:{partition}:bedrock:{region}:{account}:"
+                    f"{resource_types[label]}/{item[id_field]}"
+                )
+            else:
+                arn = None
+            if arn:
+                arns[arn] = label
+    return {"arns": arns, "errors": errors}
+
+
+def check_bedrock_resource_owner_tag(region: str = "") -> Dict[str, Any]:
+    """
+    BR-53: Verify every Bedrock agent, knowledge base, guardrail, custom and
+    imported model and provisioned throughput carries an owner tag.
+    """
+    logger.debug("Starting check for Bedrock resource owner tags")
+    check_name = RESOURCE_OWNER_FINDING
+    try:
+        findings = {
+            "check_name": check_name,
+            "status": "PASS",
+            "details": "",
+            "csv_data": [],
+        }
+
+        def row(details, resolution, severity, status):
+            return create_finding(
+                check_id="BR-53",
+                finding_name=check_name,
+                finding_details=details,
+                resolution=resolution,
+                reference=RESOURCE_OWNER_REFERENCE,
+                severity=severity,
+                status=status,
+                region=region,
+            )
+
+        inventory = _bedrock_owned_resource_arns(region)
+        if inventory["errors"]:
+            findings["csv_data"].append(
+                row(
+                    "{} Bedrock resource list(s) could not be read, so those "
+                    "resources were not assessed: {}.".format(
+                        len(inventory["errors"]), "; ".join(inventory["errors"])
+                    ),
+                    COULD_NOT_ASSESS_RESOLUTION,
+                    "Informational",
+                    "N/A",
+                )
+            )
+        if not inventory["arns"]:
+            findings["status"] = "N/A"
+            findings["csv_data"].append(
+                row(
+                    "No Bedrock agent, knowledge base, guardrail, custom or imported "
+                    "model or provisioned throughput was listed in {}.".format(
+                        region or "this region"
+                    ),
+                    "No action required",
+                    "Informational",
+                    "N/A",
+                )
+            )
+            return findings
+
+        tagging_client = boto3.client(
+            "resourcegroupstaggingapi", config=boto3_config, region_name=region
+        )
+        arns = sorted(inventory["arns"])
+        tags_by_arn: Dict[str, List[Dict[str, Any]]] = {}
+        unread = []
+        # ResourceARNList cannot be combined with a pagination token, so each
+        # batch is one call. An ARN missing from the response has no tags.
+        for start in range(0, len(arns), TAGGING_ARN_BATCH):
+            batch = arns[start : start + TAGGING_ARN_BATCH]
+            try:
+                response = tagging_client.get_resources(ResourceARNList=batch)
+            except Exception as error:
+                unread.extend(batch)
+                logger.warning(f"Unable to read tags for {len(batch)} ARNs: {error}")
+                unread_error = get_assessment_error_label(error)
+                continue
+            for mapping in response.get("ResourceTagMappingList") or []:
+                tags_by_arn[mapping.get("ResourceARN")] = mapping.get("Tags") or []
+
+        unread_set = set(unread)
+        owned = []
+        unowned = []
+        for arn in arns:
+            if arn in unread_set:
+                continue
+            owner_tags = [
+                tag
+                for tag in tags_by_arn.get(arn, [])
+                if RESOURCE_OWNER_TAG_PATTERN.search(str(tag.get("Key", "")))
+                and str(tag.get("Value", "")).strip()
+            ]
+            if owner_tags:
+                owned.append(f"{arn} ({owner_tags[0]['Key']})")
+            else:
+                unowned.append(arn)
+
+        for arn in unowned[:MAX_REPORTED_UNOWNED_RESOURCES]:
+            findings["status"] = "WARN"
+            tags = tags_by_arn.get(arn)
+            findings["csv_data"].append(
+                row(
+                    "Bedrock {} {} has no tag whose key contains 'owner' with a "
+                    "non-empty value ({}).".format(
+                        inventory["arns"][arn],
+                        arn,
+                        "no tags returned"
+                        if not tags
+                        else "tag keys: "
+                        + ", ".join(str(tag.get("Key")) for tag in tags[:10]),
+                    ),
+                    "Tag the resource with an owner key naming the accountable "
+                    "team or person, and require the tag at creation.",
+                    "Low",
+                    "Failed",
+                )
+            )
+        if len(unowned) > MAX_REPORTED_UNOWNED_RESOURCES:
+            findings["csv_data"].append(
+                row(
+                    "{} further Bedrock resource(s) have no owner tag beyond the {} "
+                    "reported individually: {}.".format(
+                        len(unowned) - MAX_REPORTED_UNOWNED_RESOURCES,
+                        MAX_REPORTED_UNOWNED_RESOURCES,
+                        ", ".join(unowned[MAX_REPORTED_UNOWNED_RESOURCES:][:20]),
+                    ),
+                    "Tag each of these resources with an owner key.",
+                    "Low",
+                    "Failed",
+                )
+            )
+        if owned:
+            incomplete = bool(inventory["errors"] or unread)
+            findings["csv_data"].append(
+                row(
+                    "{} of the {} Bedrock resource(s) listed carry an owner tag: "
+                    "{}.{}".format(
+                        len(owned),
+                        len(arns),
+                        "; ".join(owned[:5]),
+                        " Part of the inventory was not read, so this is not a "
+                        "verdict on every resource."
+                        if incomplete
+                        else "",
+                    ),
+                    COULD_NOT_ASSESS_RESOLUTION if incomplete else "No action required",
+                    "Informational" if incomplete else "Low",
+                    "N/A" if incomplete else "Passed",
+                )
+            )
+        if unread:
+            findings["csv_data"].append(
+                row(
+                    "Tags of {} Bedrock resource(s) could not be read ({}), so "
+                    "their owner tag was not assessed: {}.".format(
+                        len(unread), unread_error, ", ".join(unread[:10])
+                    ),
+                    COULD_NOT_ASSESS_RESOLUTION,
+                    "Informational",
+                    "N/A",
+                )
+            )
+        return findings
+
+    except Exception as e:
+        logger.error(
+            f"Error in check_bedrock_resource_owner_tag: {str(e)}", exc_info=True
+        )
+        return {
+            "check_name": check_name,
+            "status": "ERROR",
+            "details": f"Error during check: {str(e)}",
+            "csv_data": [
+                create_finding(
+                    check_id="BR-53",
+                    finding_name=check_name,
+                    finding_details=build_could_not_assess_detail(e, region),
+                    resolution=COULD_NOT_ASSESS_RESOLUTION,
+                    reference=RESOURCE_OWNER_REFERENCE,
+                    severity="Informational",
+                    status="N/A",
+                    region=region,
+                )
+            ],
+        }
+
+
+LAMBDA_PUBLIC_INVOKE_FINDING = "Lambda Function Public Invoke Configuration"
+
+LAMBDA_PUBLIC_INVOKE_REFERENCE = (
+    "https://docs.aws.amazon.com/lambda/latest/dg/urls-auth.html\n"
+    "https://docs.aws.amazon.com/lambda/latest/dg/access-control-resource-based.html"
+)
+
+LAMBDA_INVOKE_ACTIONS = ("lambda:invokefunction", "lambda:invokefunctionurl")
+
+# Any one of these on the statement limits the grant to a named source.
+LAMBDA_SOURCE_CONDITION_KEYS = (
+    "aws:sourcearn",
+    "aws:sourceaccount",
+    "aws:principalorgid",
+)
+
+LAMBDA_CONFIGURATION_NOTE = (
+    "This reads configuration only and does not test whether the function can be "
+    "reached; alias and version policies are not read."
+)
+
+
+def _principal_is_everyone(principal: Any) -> bool:
+    """Return True when a Principal element names every AWS principal."""
+    if principal == "*":
+        return True
+    if isinstance(principal, dict):
+        return "*" in _as_list(principal.get("AWS"))
+    return False
+
+
+def _lambda_public_invoke_statements(document: Any) -> List[str]:
+    """Describe each Allow that lets any principal invoke with no source condition."""
+    public = []
+    for statement in _policy_statements(document):
+        if str(statement.get("Effect", "")).upper() != "ALLOW":
+            continue
+        if not _principal_is_everyone(statement.get("Principal")):
+            continue
+        actions = [
+            action_name
+            for action_name in LAMBDA_INVOKE_ACTIONS
+            if any(
+                _action_pattern_covers(action, action_name)
+                for action in _as_list(statement.get("Action"))
+            )
+        ]
+        if not actions:
+            continue
+        if any(
+            key in LAMBDA_SOURCE_CONDITION_KEYS
+            for _, key, _ in _condition_keys_by_operator(statement)
+        ):
+            continue
+        label = statement.get("Sid") or "unnamed statement"
+        public.append(f"statement '{label}' allows {', '.join(actions)} to '*'")
+    return public
+
+
+def check_lambda_public_invoke_configuration(region: str = "") -> Dict[str, Any]:
+    """
+    BR-54: Flag Lambda functions whose URL needs no IAM authentication, or whose
+    resource-based policy lets any principal invoke them with no source
+    condition. Every function is read, because a tool an agent calls need not
+    name Bedrock in its configuration.
+    """
+    logger.debug("Starting check for Lambda public invoke configuration")
+    check_name = LAMBDA_PUBLIC_INVOKE_FINDING
+    try:
+        findings = {
+            "check_name": check_name,
+            "status": "PASS",
+            "details": "",
+            "csv_data": [],
+        }
+
+        def row(details, resolution, severity, status):
+            return create_finding(
+                check_id="BR-54",
+                finding_name=check_name,
+                finding_details=f"{details} {LAMBDA_CONFIGURATION_NOTE}",
+                resolution=resolution,
+                reference=LAMBDA_PUBLIC_INVOKE_REFERENCE,
+                severity=severity,
+                status=status,
+                region=region,
+            )
+
+        lambda_client = boto3.client("lambda", config=boto3_config, region_name=region)
+        functions = _list_all_items(
+            lambda_client,
+            "list_functions",
+            "Functions",
+            max_results_param="MaxItems",
+            token_param="Marker",
+            token_response_keys=("NextMarker",),
+            max_results=50,
+        )
+        if not functions:
+            findings["status"] = "N/A"
+            findings["csv_data"].append(
+                row(
+                    f"No Lambda function exists in {region or 'this region'}.",
+                    "No action required",
+                    "Informational",
+                    "N/A",
+                )
+            )
+            return findings
+
+        compliant = []
+        indeterminate = []
+        for function in functions:
+            name = function.get("FunctionName") or function.get("FunctionArn")
+            problems = []
+            try:
+                urls = _list_all_items(
+                    lambda_client,
+                    "list_function_url_configs",
+                    "FunctionUrlConfigs",
+                    max_results_param="MaxItems",
+                    token_param="Marker",
+                    token_response_keys=("NextMarker",),
+                    max_results=50,
+                    FunctionName=name,
+                )
+                problems.extend(
+                    f"function URL {url.get('FunctionUrl', 'unknown')} has AuthType "
+                    "NONE, so it accepts requests with no IAM signature"
+                    for url in urls
+                    if url.get("AuthType") == "NONE"
+                )
+                try:
+                    policy = lambda_client.get_policy(FunctionName=name).get("Policy")
+                except ClientError as error:
+                    if (
+                        error.response.get("Error", {}).get("Code")
+                        != "ResourceNotFoundException"
+                    ):
+                        raise
+                    policy = None
+                if policy:
+                    problems.extend(_lambda_public_invoke_statements(policy))
+            except Exception as error:
+                indeterminate.append(f"{name}: {get_assessment_error_label(error)}")
+                continue
+
+            if not problems:
+                compliant.append(name)
+                continue
+            findings["status"] = "WARN"
+            findings["csv_data"].append(
+                row(
+                    f"Lambda function '{name}': {'; '.join(problems)}.",
+                    "Set the function URL AuthType to AWS_IAM, and add a source "
+                    "account, source ARN or organization condition to any "
+                    "resource-based policy statement that allows every principal "
+                    "to invoke the function.",
+                    "High",
+                    "Failed",
+                )
+            )
+
+        if compliant:
+            findings["csv_data"].append(
+                row(
+                    "{} of the {} Lambda function(s) read have no function URL with "
+                    "AuthType NONE and no resource-based policy statement letting "
+                    "every principal invoke them without a source condition.".format(
+                        len(compliant), len(functions)
+                    ),
+                    "No action required",
+                    "High",
+                    "Passed",
+                )
+            )
+        if indeterminate:
+            findings["csv_data"].append(
+                row(
+                    "The invoke configuration of {} Lambda function(s) could not be "
+                    "read: {}.".format(
+                        len(indeterminate), "; ".join(indeterminate[:5])
+                    ),
+                    COULD_NOT_ASSESS_RESOLUTION,
+                    "Informational",
+                    "N/A",
+                )
+            )
+        return findings
+
+    except Exception as e:
+        logger.error(
+            f"Error in check_lambda_public_invoke_configuration: {str(e)}",
+            exc_info=True,
+        )
+        return {
+            "check_name": check_name,
+            "status": "ERROR",
+            "details": f"Error during check: {str(e)}",
+            "csv_data": [
+                create_finding(
+                    check_id="BR-54",
+                    finding_name=check_name,
+                    finding_details=build_could_not_assess_detail(e, region),
+                    resolution=COULD_NOT_ASSESS_RESOLUTION,
+                    reference=LAMBDA_PUBLIC_INVOKE_REFERENCE,
+                    severity="Informational",
+                    status="N/A",
+                    region=region,
+                )
+            ],
+        }
+
+
+ENCLAVE_KEY_FINDING = "KMS Key Enclave Attestation Binding"
+
+ENCLAVE_KEY_REFERENCE = "https://docs.aws.amazon.com/kms/latest/developerguide/conditions-nitro-enclave.html"
+
+ATTESTATION_CONDITION_PREFIX = "kms:recipientattestation:"
+
+# ImageSha384 and PCR0 both carry the enclave image digest, so a binding on
+# either one pins the code that can use the key. PCR1 to PCR8 measure other
+# parts of the enclave and do not.
+ENCLAVE_IMAGE_KEYS = (
+    ATTESTATION_CONDITION_PREFIX + "imagesha384",
+    ATTESTATION_CONDITION_PREFIX + "pcr0",
+)
+
+NITRO_TPM_KEY_PREFIX = ATTESTATION_CONDITION_PREFIX + "nitrotpmpcr"
+
+# The operations that return key material or plaintext to the caller.
+ENCLAVE_SENSITIVE_ACTIONS = (
+    "kms:decrypt",
+    "kms:generatedatakey",
+    "kms:generatedatakeypair",
+)
+
+
+def _statement_covers_kms_actions(statement: Dict[str, Any]) -> List[str]:
+    """Return the sensitive KMS actions a statement's Action or NotAction covers."""
+    if "NotAction" in statement:
+        return [
+            action_name
+            for action_name in ENCLAVE_SENSITIVE_ACTIONS
+            if not any(
+                _action_pattern_covers(action, action_name)
+                for action in _as_list(statement.get("NotAction"))
+            )
+        ]
+    return [
+        action_name
+        for action_name in ENCLAVE_SENSITIVE_ACTIONS
+        if any(
+            _action_pattern_covers(action, action_name)
+            for action in _as_list(statement.get("Action"))
+        )
+    ]
+
+
+def _allow_pins_enclave_image(statement: Dict[str, Any]) -> bool:
+    """
+    Return True when an Allow requires an exact enclave image digest.
+
+    A negated test, a Null test, an IfExists test (which passes when the request
+    carries no attestation) or a wildcard value does not pin the image.
+    """
+    for operator, key, values in _condition_keys_by_operator(statement):
+        if key not in ENCLAVE_IMAGE_KEYS:
+            continue
+        test = _strip_condition_set_operator(operator)
+        if "not" in test or "null" in test or test.endswith("ifexists"):
+            continue
+        if values and not any(
+            "*" in str(value) or "?" in str(value) for value in values
+        ):
+            return True
+    return False
+
+
+def _deny_requires_enclave_image(statement: Dict[str, Any]) -> bool:
+    """
+    Return True when a Deny to every principal fires unless the request carries
+    the approved enclave image digest: a negated test or Null true on ImageSha384
+    or PCR0.
+    """
+    if not _principal_is_everyone(statement.get("Principal")):
+        return False
+    for operator, key, values in _condition_keys_by_operator(statement):
+        if key not in ENCLAVE_IMAGE_KEYS:
+            continue
+        test = _strip_condition_set_operator(operator)
+        if "not" in test:
+            return True
+        if test == "null" and any(str(value).lower() == "true" for value in values):
+            return True
+    return False
+
+
+def _principal_is_account_root(principal: Any) -> bool:
+    """Return True when a Principal names an account, which delegates to IAM."""
+    if not isinstance(principal, dict):
+        return False
+    return any(
+        isinstance(value, str)
+        and (value.endswith(":root") or re.fullmatch(r"\d{12}", value))
+        for value in _as_list(principal.get("AWS"))
+    )
+
+
+def _enclave_key_assessment(document: Any) -> Dict[str, Any]:
+    """
+    Classify a key policy by its RecipientAttestation conditions.
+
+    ``scope`` is "none" when no statement uses a RecipientAttestation key,
+    "tpm" when only NitroTPM keys are used, and "enclave" otherwise. For an
+    enclave key, ``pinned`` says whether any statement pins the image digest and
+    ``bypasses`` lists the Allow statements that release key material without it.
+    """
+    statements = _policy_statements(document)
+    attestation_keys = {
+        key
+        for statement in statements
+        for _, key, _ in _condition_keys_by_operator(statement)
+        if key.startswith(ATTESTATION_CONDITION_PREFIX)
+    }
+    if not attestation_keys:
+        return {"scope": "none"}
+    if all(key.startswith(NITRO_TPM_KEY_PREFIX) for key in attestation_keys):
+        return {"scope": "tpm"}
+
+    denied = set()
+    pinned = False
+    for statement in statements:
+        if str(statement.get("Effect", "")).upper() != "DENY":
+            continue
+        if _deny_requires_enclave_image(statement):
+            denied.update(_statement_covers_kms_actions(statement))
+            pinned = True
+
+    bypasses = []
+    for statement in statements:
+        if str(statement.get("Effect", "")).upper() != "ALLOW":
+            continue
+        actions = _statement_covers_kms_actions(statement)
+        if not actions:
+            continue
+        if _allow_pins_enclave_image(statement):
+            pinned = True
+            continue
+        open_actions = [action for action in actions if action not in denied]
+        if not open_actions:
+            continue
+        label = statement.get("Sid") or "unnamed statement"
+        if _principal_is_account_root(statement.get("Principal")):
+            bypasses.append(
+                f"statement '{label}' grants {', '.join(open_actions)} to the "
+                "account, which lets any IAM principal the account's policies "
+                "allow use the key with no attestation"
+            )
+        else:
+            bypasses.append(
+                f"statement '{label}' allows {', '.join(open_actions)} with no "
+                "enclave image condition"
+            )
+    return {"scope": "enclave", "pinned": pinned, "bypasses": bypasses}
+
+
+def check_kms_enclave_key_binding(region: str = "") -> Dict[str, Any]:
+    """
+    BR-55: For every KMS key whose policy declares a Nitro Enclaves attestation
+    condition, verify the policy pins the enclave image and leaves no other path
+    to decrypt or generate data keys without attestation.
+    """
+    logger.debug("Starting check for KMS enclave attestation binding")
+    check_name = ENCLAVE_KEY_FINDING
+    try:
+        findings = {
+            "check_name": check_name,
+            "status": "PASS",
+            "details": "",
+            "csv_data": [],
+        }
+
+        def row(details, resolution, severity, status):
+            return create_finding(
+                check_id="BR-55",
+                finding_name=check_name,
+                finding_details=details,
+                resolution=resolution,
+                reference=ENCLAVE_KEY_REFERENCE,
+                severity=severity,
+                status=status,
+                region=region,
+            )
+
+        kms_client = boto3.client("kms", config=boto3_config, region_name=region)
+        keys = _list_all_items(
+            kms_client,
+            "list_keys",
+            "Keys",
+            max_results_param="Limit",
+            token_param="Marker",
+            token_response_keys=("NextMarker",),
+            max_results=1000,
+        )
+
+        undeclared = 0
+        tpm_only = []
+        passed = []
+        indeterminate = []
+        for key in keys:
+            key_id = key.get("KeyArn") or key.get("KeyId")
+            try:
+                policy = kms_client.get_key_policy(
+                    KeyId=key.get("KeyId") or key_id, PolicyName="default"
+                ).get("Policy")
+                assessment = _enclave_key_assessment(policy or "{}")
+                if assessment["scope"] == "none":
+                    undeclared += 1
+                    continue
+                metadata = kms_client.describe_key(KeyId=key_id).get("KeyMetadata")
+            except Exception as error:
+                indeterminate.append(f"{key_id}: {get_assessment_error_label(error)}")
+                continue
+            if (metadata or {}).get("KeyManager") == "AWS":
+                continue
+            if assessment["scope"] == "tpm":
+                tpm_only.append(key_id)
+                continue
+
+            deficiencies = []
+            if not assessment["pinned"]:
+                deficiencies.append(
+                    "no statement requires an exact ImageSha384 or PCR0 value, so "
+                    "the key is not bound to one enclave image"
+                )
+            deficiencies.extend(assessment["bypasses"])
+            if not deficiencies:
+                passed.append(key_id)
+                continue
+            findings["status"] = "WARN"
+            findings["csv_data"].append(
+                row(
+                    f"KMS key {key_id} declares a Nitro Enclaves attestation "
+                    f"condition, but {'; '.join(deficiencies)}.",
+                    "Require an exact enclave image digest on every key policy "
+                    "statement that allows decryption or data key generation, "
+                    "and remove the account's unconditioned grant of those "
+                    "operations or deny them when the attestation is missing.",
+                    "High",
+                    "Failed",
+                )
+            )
+
+        if passed:
+            findings["csv_data"].append(
+                row(
+                    "{} enclave-bound KMS key(s) pin the enclave image and allow "
+                    "decryption and data key generation only with attestation: "
+                    "{}.".format(len(passed), ", ".join(passed[:5])),
+                    "No action required",
+                    "High",
+                    "Passed",
+                )
+            )
+        if tpm_only:
+            findings["csv_data"].append(
+                row(
+                    "{} KMS key(s) are bound only to NitroTPM attestation, which "
+                    "this Nitro Enclaves check does not judge: {}.".format(
+                        len(tpm_only), ", ".join(tpm_only[:5])
+                    ),
+                    "No action required",
+                    "Informational",
+                    "N/A",
+                )
+            )
+        if indeterminate:
+            findings["csv_data"].append(
+                row(
+                    "The key policy of {} KMS key(s) could not be read: {}.".format(
+                        len(indeterminate), "; ".join(indeterminate[:5])
+                    ),
+                    COULD_NOT_ASSESS_RESOLUTION,
+                    "Informational",
+                    "N/A",
+                )
+            )
+        if undeclared or not keys:
+            findings["csv_data"].append(
+                row(
+                    "{} of the {} KMS key(s) read carry no RecipientAttestation "
+                    "condition, so they are not declared enclave-bound and are not "
+                    "judged.".format(undeclared, len(keys)),
+                    "No action required",
+                    "Informational",
+                    "N/A",
+                )
+            )
+        if not findings["csv_data"] or all(
+            finding["Status"] == "N/A" for finding in findings["csv_data"]
+        ):
+            findings["status"] = "N/A"
+        return findings
+
+    except Exception as e:
+        logger.error(f"Error in check_kms_enclave_key_binding: {str(e)}", exc_info=True)
+        return {
+            "check_name": check_name,
+            "status": "ERROR",
+            "details": f"Error during check: {str(e)}",
+            "csv_data": [
+                create_finding(
+                    check_id="BR-55",
+                    finding_name=check_name,
+                    finding_details=build_could_not_assess_detail(e, region),
+                    resolution=COULD_NOT_ASSESS_RESOLUTION,
+                    reference=ENCLAVE_KEY_REFERENCE,
+                    severity="Informational",
+                    status="N/A",
+                    region=region,
+                )
+            ],
+        }
+
+
 AI_SERVICES_OPT_OUT_REFERENCE = "https://docs.aws.amazon.com/organizations/latest/userguide/orgs_manage_policies_ai-opt-out.html"
 
 AI_SERVICES_OPT_OUT_POLICY_TYPE = "AISERVICES_OPT_OUT_POLICY"
@@ -14846,6 +16961,12 @@ def lambda_handler(event, context):
                             "Marketplace Subscription Access Check",
                             GLOBAL_REGION_LABEL,
                         ),
+                        _permission_cache_unavailable_result(
+                            "BR-50", AI_USER_ACCESS_KEY_FINDING, GLOBAL_REGION_LABEL
+                        ),
+                        _permission_cache_unavailable_result(
+                            "BR-51", AI_USER_MFA_FINDING, GLOBAL_REGION_LABEL
+                        ),
                     ]
                 )
             else:
@@ -14877,6 +16998,20 @@ def lambda_handler(event, context):
                 )
                 all_findings.append(
                     check_bedrock_marketplace_model_control(
+                        permission_cache, region=GLOBAL_REGION_LABEL
+                    )
+                )
+
+                logger.info("Running AI user long-term access key check (BR-50)")
+                all_findings.append(
+                    check_bedrock_ai_user_access_keys(
+                        permission_cache, region=GLOBAL_REGION_LABEL
+                    )
+                )
+
+                logger.info("Running AI user console MFA check (BR-51)")
+                all_findings.append(
+                    check_bedrock_ai_user_console_mfa(
                         permission_cache, region=GLOBAL_REGION_LABEL
                     )
                 )
@@ -15042,6 +17177,11 @@ def lambda_handler(event, context):
                     region=GLOBAL_REGION_LABEL,
                     api_region=region,
                     scp_inventory=scp_inventory,
+                )
+            )
+            all_findings.append(
+                check_bedrock_approved_model_control(
+                    region=GLOBAL_REGION_LABEL, scp_inventory=scp_inventory
                 )
             )
 
@@ -15223,6 +17363,18 @@ def lambda_handler(event, context):
 
         logger.info("Running data path bucket TLS check (BR-47)")
         all_findings.append(check_bedrock_data_path_bucket_tls(region=region))
+
+        logger.info("Running data path bucket Object Lock check (BR-52)")
+        all_findings.append(check_bedrock_data_path_object_lock(region=region))
+
+        logger.info("Running Bedrock resource owner tag check (BR-53)")
+        all_findings.append(check_bedrock_resource_owner_tag(region=region))
+
+        logger.info("Running Lambda public invoke configuration check (BR-54)")
+        all_findings.append(check_lambda_public_invoke_configuration(region=region))
+
+        logger.info("Running KMS enclave attestation binding check (BR-55)")
+        all_findings.append(check_kms_enclave_key_binding(region=region))
 
         logger.info("Building Agentic AI Security findings from Bedrock results")
         all_findings.append(build_agentic_bedrock_security_findings(all_findings))
