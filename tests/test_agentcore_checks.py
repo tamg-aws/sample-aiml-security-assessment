@@ -13452,12 +13452,17 @@ class TestAC49DnsEgressControl:
         rules=None,
         domains=None,
         managed_list_ids=(),
+        fail_open="DISABLED",
     ):
         """Stub one VPC-mode runtime, optional tools, and the DNS Firewall reads.
 
         A domain list absent from domains holds "*.", which is how
         ListFirewallDomains returned the "*" catch-all the walled garden pattern
         ends in when read on 2026-09-26.
+
+        fail_open is the FirewallFailOpen every VPC reports, or a dict of it by
+        VPC id; DISABLED is what all 9 firewall configs in 178113193057 reported
+        on 2026-09-26. None omits the field.
         """
         mock_ac.list_agent_runtimes.return_value = {
             "agentRuntimes": [{"agentRuntimeId": "rt-1", "agentRuntimeName": "rt-1"}]
@@ -13498,6 +13503,17 @@ class TestAC49DnsEgressControl:
         mock_r53.list_firewall_domains.side_effect = lambda FirewallDomainListId: {
             "Domains": domains.get(FirewallDomainListId, ["*."])
         }
+
+        def get_firewall_config(ResourceId):
+            value = (
+                fail_open.get(ResourceId) if isinstance(fail_open, dict) else fail_open
+            )
+            config = {"Id": f"rslvr-fc-{ResourceId}", "ResourceId": ResourceId}
+            if value is not None:
+                config["FirewallFailOpen"] = value
+            return {"FirewallConfig": config}
+
+        mock_r53.get_firewall_config.side_effect = get_firewall_config
         mock_r53.list_firewall_domain_lists.return_value = {
             "FirewallDomainLists": [
                 {"Id": "rslvr-fdl-customer", "Name": "customer"},
@@ -14287,6 +14303,193 @@ class TestAC49DnsEgressControl:
         assert "subnet-gone" in missing["Finding_Details"]
         assert "not present" in missing["Finding_Details"]
         assert "ec2:DescribeSubnets" not in missing["Resolution"]
+
+    def _blocked(self, mock_ac, mock_ec2, mock_r53, fail_open):
+        return self._wire(
+            mock_ac,
+            mock_ec2,
+            mock_r53,
+            associations={"vpc-a": [self._association("group-1")]},
+            rules={"group-1": [self._rule("catchall", 100)]},
+            fail_open=fail_open,
+        )
+
+    @patch("agentcore_app.route53resolver_client")
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_fail_closed_vpc_passes_and_says_so(self, mock_ac, mock_ec2, mock_r53):
+        inventory = self._blocked(mock_ac, mock_ec2, mock_r53, "DISABLED")
+
+        findings = agentcore_app.check_agentcore_dns_egress_control(inventory)
+
+        assert [f["Status"] for f in findings] == ["Passed"]
+        assert "FirewallFailOpen DISABLED" in findings[0]["Finding_Details"]
+        assert [
+            call.kwargs for call in mock_r53.get_firewall_config.call_args_list
+        ] == [{"ResourceId": "vpc-a"}]
+
+    @patch("agentcore_app.route53resolver_client")
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_fail_open_vpc_fails_despite_the_terminal_block(
+        self, mock_ac, mock_ec2, mock_r53
+    ):
+        """FirewallFailOpen ENABLED answers every query while the firewall is impaired.
+
+        The block over "*" still decides normal evaluation, so without the config
+        read this VPC passes.
+        """
+        inventory = self._blocked(mock_ac, mock_ec2, mock_r53, "ENABLED")
+
+        findings = agentcore_app.check_agentcore_dns_egress_control(inventory)
+
+        assert len(findings) == 1
+        assert findings[0]["Finding"] == "AgentCore DNS Egress Control Fails Open"
+        assert findings[0]["Status"] == "Failed"
+        assert findings[0]["Severity"] == "Medium"
+        assert "FirewallFailOpen ENABLED" in findings[0]["Finding_Details"]
+        assert "'catchall'" in findings[0]["Finding_Details"]
+        assert "FirewallFailOpen to DISABLED" in findings[0]["Resolution"]
+        assert findings[0]["Reference"] == (
+            agentcore_app.DNS_FIREWALL_VPC_CONFIGURATION_REFERENCE_URL
+        )
+        assert_finding_schema(findings[0])
+
+    @pytest.mark.parametrize(
+        "fail_open, named",
+        [
+            (
+                "USE_LOCAL_RESOURCE_SETTING",
+                "FirewallFailOpen USE_LOCAL_RESOURCE_SETTING",
+            ),
+            (None, "no FirewallFailOpen value"),
+            ("", "no FirewallFailOpen value"),
+        ],
+        ids=["use-local", "absent", "empty"],
+    )
+    @patch("agentcore_app.route53resolver_client")
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_an_undocumented_fail_open_value_is_na_and_named(
+        self, mock_ac, mock_ec2, mock_r53, fail_open, named
+    ):
+        """The Route 53 documentation defines ENABLED and DISABLED only."""
+        inventory = self._blocked(mock_ac, mock_ec2, mock_r53, fail_open)
+
+        findings = agentcore_app.check_agentcore_dns_egress_control(inventory)
+
+        assert len(findings) == 1
+        assert findings[0]["Status"] == "N/A"
+        assert findings[0]["Severity"] == "Informational"
+        assert named in findings[0]["Finding_Details"]
+        assert_finding_schema(findings[0])
+
+    @patch("agentcore_app.route53resolver_client")
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_firewall_config_read_failure_is_na(self, mock_ac, mock_ec2, mock_r53):
+        inventory = self._blocked(mock_ac, mock_ec2, mock_r53, "DISABLED")
+        mock_r53.get_firewall_config.side_effect = _make_client_error(
+            "AccessDeniedException", "denied"
+        )
+
+        findings = agentcore_app.check_agentcore_dns_egress_control(inventory)
+
+        assert len(findings) == 1
+        assert findings[0]["Status"] == "N/A"
+        assert "AccessDeniedException" in findings[0]["Finding_Details"]
+        assert "vpc-a" in findings[0]["Finding_Details"]
+        assert findings[0]["Resolution"] == (
+            "Grant route53resolver:GetFirewallConfig and retry."
+        )
+        assert_finding_schema(findings[0])
+
+    @patch("agentcore_app.route53resolver_client")
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_each_vpc_is_judged_by_its_own_fail_open_setting(
+        self, mock_ac, mock_ec2, mock_r53
+    ):
+        """Three blocked VPCs: open, closed and unreadable reach three verdicts."""
+        inventory = self._wire(
+            mock_ac,
+            mock_ec2,
+            mock_r53,
+            runtime_subnets=("subnet-a", "subnet-b", "subnet-c"),
+            subnet_vpcs={"subnet-a": "vpc-a", "subnet-b": "vpc-b", "subnet-c": "vpc-c"},
+            associations={
+                "vpc-a": [self._association("group-1")],
+                "vpc-b": [self._association("group-1")],
+                "vpc-c": [self._association("group-1")],
+            },
+            rules={"group-1": [self._rule("catchall", 100)]},
+            fail_open={"vpc-a": "ENABLED", "vpc-b": "DISABLED"},
+        )
+        default = mock_r53.get_firewall_config.side_effect
+
+        def get_firewall_config(ResourceId):
+            if ResourceId == "vpc-c":
+                raise _make_client_error("ThrottlingException", "slow down")
+            return default(ResourceId=ResourceId)
+
+        mock_r53.get_firewall_config.side_effect = get_firewall_config
+
+        findings = agentcore_app.check_agentcore_dns_egress_control(inventory)
+        by_vpc = {
+            next(v for v in ("vpc-a", "vpc-b", "vpc-c") if v in f["Finding_Details"]): f
+            for f in findings
+        }
+
+        assert len(findings) == 3
+        assert by_vpc["vpc-a"]["Finding"] == "AgentCore DNS Egress Control Fails Open"
+        assert by_vpc["vpc-b"]["Status"] == "Passed"
+        assert by_vpc["vpc-c"]["Status"] == "N/A"
+        assert "ThrottlingException" in by_vpc["vpc-c"]["Finding_Details"]
+        assert sorted(
+            call.kwargs["ResourceId"]
+            for call in mock_r53.get_firewall_config.call_args_list
+        ) == ["vpc-a", "vpc-b", "vpc-c"]
+
+    @patch("agentcore_app.route53resolver_client")
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_failing_rule_verdict_does_not_read_the_firewall_config(
+        self, mock_ac, mock_ec2, mock_r53
+    ):
+        """Fail-open only weakens a block that would pass, so a failing VPC stays Failed."""
+        inventory = self._wire(
+            mock_ac,
+            mock_ec2,
+            mock_r53,
+            associations={"vpc-a": [self._association("group-1")]},
+            rules={"group-1": [self._rule("known-bad", 100)]},
+            domains={"rslvr-fdl-known-bad": ["evil.example."]},
+            fail_open="ENABLED",
+        )
+
+        findings = agentcore_app.check_agentcore_dns_egress_control(inventory)
+
+        assert [f["Finding"] for f in findings] == [
+            "AgentCore DNS Egress Control Not Default Deny"
+        ]
+        assert mock_r53.get_firewall_config.call_count == 0
+
+    def test_the_fail_open_values_are_the_ones_the_api_models(self):
+        model = agentcore_app.boto3.client(
+            "route53resolver",
+            region_name="us-east-1",
+            aws_access_key_id="testing",
+            aws_secret_access_key="testing",  # pragma: allowlist secret - synthetic test credential
+        ).meta.service_model
+        operation = model.operation_model("GetFirewallConfig")
+        config = operation.output_shape.members["FirewallConfig"]
+
+        assert list(operation.input_shape.members) == ["ResourceId"]
+        assert config.members["FirewallFailOpen"].enum == [
+            "ENABLED",
+            "DISABLED",
+            "USE_LOCAL_RESOURCE_SETTING",
+        ]
 
 
 # ===================================================================

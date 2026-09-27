@@ -285,6 +285,7 @@ _EXPECTED_ACTIONS = {
         "oam:ListSinks",
         "organizations:DescribePolicy",
         "organizations:ListPolicies",
+        "route53resolver:GetFirewallConfig",
         "route53resolver:ListFirewallDomainLists",
         "route53resolver:ListFirewallDomains",
         "route53resolver:ListFirewallRuleGroupAssociations",
@@ -870,6 +871,10 @@ def test_aisf_phase5_reads_wildcard_only_where_iam_has_no_resource_type(template
         ("AgentCoreSecurityAssessmentFunction", "DNSFirewallDomainRead"): (
             "route53resolver:ListFirewallDomains",
             "route53resolver:*:*:firewall-domain-list/*",
+        ),
+        ("AgentCoreSecurityAssessmentFunction", "DNSFirewallConfigRead"): (
+            "route53resolver:GetFirewallConfig",
+            "route53resolver:*:${AWS::AccountId}:firewall-config/*",
         ),
         ("AgentRegistrySecurityAssessmentFunction", "RegistryEventRuleTargetRead"): (
             "events:ListTargetsByRule",

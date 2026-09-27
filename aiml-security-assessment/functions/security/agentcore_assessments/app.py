@@ -240,6 +240,10 @@ DNS_FIREWALL_RULE_ACTION_REFERENCE_URL = (
     "https://docs.aws.amazon.com/Route53/latest/DeveloperGuide/"
     "resolver-dns-firewall-rule-actions.html"
 )
+DNS_FIREWALL_VPC_CONFIGURATION_REFERENCE_URL = (
+    "https://docs.aws.amazon.com/Route53/latest/DeveloperGuide/"
+    "resolver-dns-firewall-vpc-configuration.html"
+)
 WAF_RULE_ACTION_REFERENCE_URL = (
     "https://docs.aws.amazon.com/waf/latest/developerguide/waf-rule-action.html"
 )
@@ -12847,6 +12851,11 @@ def check_agentcore_dns_egress_control(
     because a rule with a Qtype matches that type alone and passes every other
     type on. A block over an AWS managed list or over DNS threat protection stops
     known bad names and answers every other one, so it never decides.
+
+    A deciding BLOCK passes only when the VPC's firewall config has
+    FirewallFailOpen DISABLED, which the Route 53 documentation names as the
+    default. ENABLED answers every query while DNS Firewall is impaired, and the
+    documentation does not say what USE_LOCAL_RESOURCE_SETTING decides.
     """
     reference = DNS_FIREWALL_RULE_ACTION_REFERENCE_URL
     managed_list_ids: Optional[Set[str]] = None
@@ -13250,24 +13259,106 @@ def check_agentcore_dns_egress_control(
         for_type = f" for query type {qtype}" if qtype else ""
 
         if action == "BLOCK":
-            findings.append(
-                create_finding(
-                    check_id="AC-49",
-                    finding_name="AgentCore DNS Egress Control",
-                    finding_details=(
-                        f"VPC {vpc_id}, which hosts {hosted}, is associated with "
-                        f"DNS Firewall rule group {group_name} ({group_id}), "
-                        f"whose rule '{rule_name}' at Priority {priority} is the "
-                        "first rule in force to match every name, and it blocks "
-                        f'{subject}, which holds "*", so a name that no earlier '
-                        "rule allows is not resolved."
-                    ),
-                    resolution="No action required.",
-                    reference=reference,
-                    severity=SeverityEnum.MEDIUM,
-                    status=StatusEnum.PASSED,
-                )
+            blocking = (
+                f"VPC {vpc_id}, which hosts {hosted}, is associated with "
+                f"DNS Firewall rule group {group_name} ({group_id}), "
+                f"whose rule '{rule_name}' at Priority {priority} is the "
+                "first rule in force to match every name, and it blocks "
+                f'{subject}, which holds "*"'
             )
+            try:
+                fail_open = (
+                    route53resolver_client.get_firewall_config(ResourceId=vpc_id).get(
+                        "FirewallConfig"
+                    )
+                    or {}
+                ).get("FirewallFailOpen")
+            except Exception as error:
+                logger.warning(
+                    f"Could not read DNS Firewall config for {vpc_id}: {error}"
+                )
+                findings.append(
+                    create_finding(
+                        check_id="AC-49",
+                        finding_name="AgentCore DNS Egress Control",
+                        finding_details=(
+                            f"{blocking}, but the DNS Firewall config of {vpc_id} "
+                            "could not be read, so whether it answers queries while "
+                            "DNS Firewall is impaired is unknown: "
+                            f"{_assessment_error_label(error)}."
+                        ),
+                        resolution=(
+                            "Grant route53resolver:GetFirewallConfig and retry."
+                        ),
+                        reference=DNS_FIREWALL_VPC_CONFIGURATION_REFERENCE_URL,
+                        severity=SeverityEnum.INFORMATIONAL,
+                        status=StatusEnum.NA,
+                    )
+                )
+                continue
+
+            if fail_open == "DISABLED":
+                findings.append(
+                    create_finding(
+                        check_id="AC-49",
+                        finding_name="AgentCore DNS Egress Control",
+                        finding_details=(
+                            f"{blocking}, so a name that no earlier rule allows is "
+                            "not resolved. The VPC's DNS Firewall config has "
+                            "FirewallFailOpen DISABLED, so a query is blocked "
+                            "while DNS Firewall is impaired."
+                        ),
+                        resolution="No action required.",
+                        reference=reference,
+                        severity=SeverityEnum.MEDIUM,
+                        status=StatusEnum.PASSED,
+                    )
+                )
+            elif fail_open == "ENABLED":
+                findings.append(
+                    create_finding(
+                        check_id="AC-49",
+                        finding_name="AgentCore DNS Egress Control Fails Open",
+                        finding_details=(
+                            f"{blocking}, but the VPC's DNS Firewall config has "
+                            "FirewallFailOpen ENABLED, so while DNS Firewall is "
+                            "impaired VPC Resolver answers every query, including "
+                            "a name the rule blocks."
+                        ),
+                        resolution=(
+                            "Set FirewallFailOpen to DISABLED in the DNS Firewall "
+                            "configuration of this VPC."
+                        ),
+                        reference=DNS_FIREWALL_VPC_CONFIGURATION_REFERENCE_URL,
+                        severity=SeverityEnum.MEDIUM,
+                        status=StatusEnum.FAILED,
+                    )
+                )
+            else:
+                reported = (
+                    f"FirewallFailOpen {fail_open}"
+                    if fail_open
+                    else "no FirewallFailOpen value"
+                )
+                findings.append(
+                    create_finding(
+                        check_id="AC-49",
+                        finding_name="AgentCore DNS Egress Control",
+                        finding_details=(
+                            f"{blocking}, but the VPC's DNS Firewall config reports "
+                            f"{reported}. The Route 53 documentation defines only "
+                            "ENABLED and DISABLED, so whether this VPC answers "
+                            "queries while DNS Firewall is impaired is not judged."
+                        ),
+                        resolution=(
+                            "Set FirewallFailOpen to DISABLED in the DNS Firewall "
+                            "configuration of this VPC."
+                        ),
+                        reference=DNS_FIREWALL_VPC_CONFIGURATION_REFERENCE_URL,
+                        severity=SeverityEnum.INFORMATIONAL,
+                        status=StatusEnum.NA,
+                    )
+                )
         else:
             findings.append(
                 create_finding(

@@ -928,7 +928,10 @@ ROWS = [
         "AC-49 reads either spelling. Rule groups whose rules only BLOCK over an AWS managed "
         'list, over DNS threat protection, over a list without "*", or over "*" for one '
         "query type fail, because every name or query type those rules do not match is "
-        "answered. An IAM Deny on the bedrock-agentcore:subnets or :securityGroups keys "
+        "answered. A deciding BLOCK passes only when the VPC's DNS Firewall config has "
+        "FirewallFailOpen DISABLED: ENABLED fails, because VPC Resolver answers every "
+        "query while DNS Firewall is impaired, and any other value is Not Applicable with "
+        "the value named. An IAM Deny on the bedrock-agentcore:subnets or :securityGroups keys "
         "does not substitute for this: the devguide lists those keys while the "
         "machine-readable IAM reference lists none for CreateGatewayTarget or "
         "UpdateGatewayTarget, so such a Deny can fail open",

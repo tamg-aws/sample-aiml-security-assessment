@@ -855,6 +855,13 @@ Resources:
               Action:
                 - route53resolver:ListFirewallDomains # AC-49
               Resource: !Sub 'arn:${AWS::Partition}:route53resolver:*:*:firewall-domain-list/*'
+            - Sid: DNSFirewallConfigRead
+              # AC-49 reads whether DNS Firewall fails open for each VPC that
+              # hosts AgentCore.
+              Effect: Allow
+              Action:
+                - route53resolver:GetFirewallConfig # AC-49
+              Resource: !Sub 'arn:${AWS::Partition}:route53resolver:*:${AWS::AccountId}:firewall-config/*'
             - Sid: ECRPermissions
               Effect: Allow
               Action:

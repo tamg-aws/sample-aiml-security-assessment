@@ -51,6 +51,11 @@ section.
     evaluation. It passes only when that rule is a `BLOCK` with no query type.
     `ListFirewallDomains` returns the walled garden catch-all as `*.`, and the
     check accepts that spelling as well as `*`.
+  - `AC-49` passes that `BLOCK` only when the VPC's DNS Firewall config has
+    `FirewallFailOpen` `DISABLED`. `ENABLED` fails, because VPC Resolver then
+    answers every query while DNS Firewall is impaired, and
+    `USE_LOCAL_RESOURCE_SETTING`, which Route 53 does not document, is `N/A`
+    with the value named.
   - `BR-47` fails a Bedrock data path bucket with no bucket policy, because S3
     then accepts plaintext requests, and passes only a `Deny` on
     `aws:SecureTransport` `false` that reaches every principal and covers
@@ -85,7 +90,8 @@ section.
 SAM templates (`aiml-security-assessment/template.yaml` and
 `aiml-security-assessment/template-multi-account.yaml`) add read-only actions
 to the assessment Lambda execution roles for the new checks, among them
-the four named `route53resolver:ListFirewall` read actions, `wafv2:GetWebACL`,
+the four named `route53resolver:ListFirewall` read actions,
+`route53resolver:GetFirewallConfig`, `wafv2:GetWebACL`,
 `organizations:DescribeEffectivePolicy`, `macie2:ListClassificationJobs`,
 `s3:GetBucketPolicy`, and `bedrock:ListModelCustomizationJobs`. A CodeBuild
 run that redeploys the assessment code and SAM templates applies them. No
