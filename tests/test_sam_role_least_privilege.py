@@ -242,6 +242,10 @@ _EXPECTED_ACTIONS = {
         "sagemaker:ListTrials",
     },
     "AgentCoreSecurityAssessmentFunction": {
+        "amplify:ListResourcesForWebACL",
+        "apprunner:ListAssociatedServicesForWebAcl",
+        "appsync:ListResourcesForWebACL",
+        "bedrock-agentcore:GatewayListResourcesForWebACL",
         "bedrock-agentcore:GetAgentRuntime",
         "bedrock-agentcore:GetBrowser",
         "bedrock-agentcore:GetCodeInterpreter",
@@ -263,15 +267,20 @@ _EXPECTED_ACTIONS = {
         "bedrock-agentcore:ListOnlineEvaluationConfigs",
         "bedrock-agentcore:ListPolicies",
         "bedrock-agentcore:ListPolicyEngines",
+        "cloudfront:ListDistributionsByWebACLId",
         "cloudtrail:GetEventSelectors",
         "cloudtrail:ListTrails",
         "cloudwatch:PutMetricData",
+        "cognito-idp:ListResourcesForWebACL",
         "ec2:DescribeRouteTables",
         "ec2:DescribeSecurityGroups",
         "ec2:DescribeSubnets",
+        "ec2:DescribeVerifiedAccessInstanceWebAclAssociations",
         "ec2:DescribeVpcEndpoints",
         "ec2:DescribeVpcs",
         "ecr:DescribeRepositories",
+        "ecr:GetRegistryScanningConfiguration",
+        "elasticloadbalancing:DescribeWebACLAssociation",
         "iam:GenerateServiceLastAccessedDetails",
         "iam:GetRole",
         "iam:GetServiceLastAccessedDetails",
@@ -294,6 +303,8 @@ _EXPECTED_ACTIONS = {
         "s3:GetObject",
         "s3:PutObject",
         "wafv2:GetWebACL",
+        "wafv2:ListResourcesForWebACL",
+        "wafv2:ListWebACLs",
     },
     "AgentRegistrySecurityAssessmentFunction": {
         "agent-registry:GetRegistry",
@@ -886,6 +897,23 @@ def test_aisf_phase5_reads_wildcard_only_where_iam_has_no_resource_type(template
         ("AgentRegistrySecurityAssessmentFunction", "RegistryEventRuleInventory"): (
             "events:ListRules",
         ),
+        ("AgentCoreSecurityAssessmentFunction", "WebACLInventory"): (
+            "wafv2:ListWebACLs",
+            "cloudfront:ListDistributionsByWebACLId",
+        ),
+        (
+            "AgentCoreSecurityAssessmentFunction",
+            "WebACLAssociationCompanionInventory",
+        ): (
+            "elasticloadbalancing:DescribeWebACLAssociation",
+            "appsync:ListResourcesForWebACL",
+            "amplify:ListResourcesForWebACL",
+            "bedrock-agentcore:GatewayListResourcesForWebACL",
+            "ec2:DescribeVerifiedAccessInstanceWebAclAssociations",
+        ),
+        ("AgentCoreSecurityAssessmentFunction", "ECRRegistryScanningRead"): (
+            "ecr:GetRegistryScanningConfiguration",
+        ),
     }
     for (logical_id, sid), actions in wildcard.items():
         statement = _statement_block(template, logical_id, sid)
@@ -904,6 +932,10 @@ def test_aisf_phase5_reads_wildcard_only_where_iam_has_no_resource_type(template
         ),
         ("AgentCoreSecurityAssessmentFunction", "AgentCoreGatewayWebACLRead"): (
             "wafv2:GetWebACL",
+            "wafv2:*:${AWS::AccountId}:regional/webacl/*/*",
+        ),
+        ("AgentCoreSecurityAssessmentFunction", "WebACLAssociationRead"): (
+            "wafv2:ListResourcesForWebACL",
             "wafv2:*:${AWS::AccountId}:regional/webacl/*/*",
         ),
         ("AgentCoreSecurityAssessmentFunction", "DNSFirewallRuleRead"): (
@@ -928,6 +960,41 @@ def test_aisf_phase5_reads_wildcard_only_where_iam_has_no_resource_type(template
         assert action in statement
         assert resource in statement
         assert not re.search(r"Resource:\s+['\"]\*['\"]", statement)
+
+
+@pytest.mark.parametrize("template", _SAM_TEMPLATES, ids=os.path.basename)
+def test_agentcore_web_acl_reads_are_scoped_to_this_accounts_acls(template):
+    """AC-51 reads CloudFront ACLs only through the us-east-1 global scope.
+
+    The Cognito and App Runner companion actions are granted on both the ACL
+    and the protected resource, each pinned to this account, because the
+    service authorization reference and the AWS WAF guide key them differently.
+    """
+    web_acl_read = _statement_block(
+        template, "AgentCoreSecurityAssessmentFunction", "AgentCoreGatewayWebACLRead"
+    )
+    assert "wafv2:us-east-1:${AWS::AccountId}:global/webacl/*/*" in web_acl_read
+    assert "wafv2:*:${AWS::AccountId}:global/" not in web_acl_read
+    assert not re.search(r"Resource:\s+['\"]\*['\"]", web_acl_read)
+
+    companion = _statement_block(
+        template,
+        "AgentCoreSecurityAssessmentFunction",
+        "WebACLAssociationCompanionScoped",
+    )
+    for action in (
+        "cognito-idp:ListResourcesForWebACL",
+        "apprunner:ListAssociatedServicesForWebAcl",
+    ):
+        assert action in companion
+    for resource in (
+        "wafv2:*:${AWS::AccountId}:regional/webacl/*/*",
+        "cognito-idp:*:${AWS::AccountId}:userpool/*",
+        "apprunner:*:${AWS::AccountId}:service/*/*",
+    ):
+        assert resource in companion
+    assert not re.search(r"Resource:\s+['\"]\*['\"]", companion)
+    assert "'*'" not in companion
 
 
 @pytest.mark.parametrize("template", _SAM_TEMPLATES, ids=os.path.basename)

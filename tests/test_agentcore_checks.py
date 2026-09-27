@@ -5319,8 +5319,12 @@ class TestAC26LogRetentionAndKeyScope:
                     {
                         "logGroupName": "/aws/bedrock-agentcore/runtimes/rt-1",
                         "retentionInDays": 90,
+                        "deletionProtectionEnabled": True,
                     },
-                    {"logGroupName": "/aws/bedrock-agentcore/runtimes/rt-2"},
+                    {
+                        "logGroupName": "/aws/bedrock-agentcore/runtimes/rt-2",
+                        "deletionProtectionEnabled": True,
+                    },
                 ]
             }
         )
@@ -5371,11 +5375,13 @@ class TestAC26LogRetentionAndKeyScope:
                         "logGroupName": "/aws/bedrock-agentcore/runtimes/rt-1",
                         "retentionInDays": 30,
                         "kmsKeyId": self._KEY,
+                        "deletionProtectionEnabled": True,
                     },
                     {
                         "logGroupName": "/aws/bedrock-agentcore/runtimes/rt-2",
                         "retentionInDays": 30,
                         "kmsKeyId": self._KEY,
+                        "deletionProtectionEnabled": True,
                     },
                 ]
             }
@@ -5399,6 +5405,7 @@ class TestAC26LogRetentionAndKeyScope:
                         "logGroupName": "/aws/bedrock-agentcore/runtimes/rt-1",
                         "retentionInDays": 30,
                         "kmsKeyId": self._KEY,
+                        "deletionProtectionEnabled": True,
                     }
                 ]
             }
@@ -15728,3 +15735,818 @@ class TestExecutionRoleAndDnsCheckRegistration:
         assignment = source.split(f"{client_name} = ", 1)[1].split(")", 1)[0]
         assert "region_name=region" in assignment
         assert "global wafv2_client, route53resolver_client" in source
+
+
+class TestAC26LogDeletionProtection:
+    """AC-26: deletion protection on runtime log groups and on aws/spans."""
+
+    @patch("agentcore_app.kms_client")
+    @patch("agentcore_app.logs_client")
+    def test_runtime_groups_are_judged_one_by_one(self, mock_logs, mock_kms):
+        mock_logs.describe_log_groups.side_effect = _log_group_side_effect(
+            {
+                "/aws/bedrock-agentcore/": [
+                    {
+                        "logGroupName": "/aws/bedrock-agentcore/runtimes/rt-1",
+                        "retentionInDays": 30,
+                        "deletionProtectionEnabled": True,
+                    },
+                    {
+                        "logGroupName": "/aws/bedrock-agentcore/runtimes/rt-2",
+                        "retentionInDays": 30,
+                        "deletionProtectionEnabled": False,
+                    },
+                ]
+            }
+        )
+
+        findings = agentcore_app.check_agentcore_log_retention_and_key_scope()
+
+        assert [finding["Status"] for finding in findings] == ["Passed", "Failed"]
+        assert "deletion protection enabled" in findings[0]["Finding_Details"]
+        assert "rt-2" in findings[1]["Finding_Details"]
+        assert "deletion protection off" in findings[1]["Finding_Details"]
+        assert "deletion protection" in findings[1]["Resolution"]
+        for finding in findings:
+            assert_finding_schema(finding)
+
+    @patch("agentcore_app.kms_client")
+    @patch("agentcore_app.logs_client")
+    def test_an_absent_deletion_protection_field_reads_as_off(
+        self, mock_logs, mock_kms
+    ):
+        mock_logs.describe_log_groups.side_effect = _log_group_side_effect(
+            {
+                "/aws/bedrock-agentcore/": [
+                    {
+                        "logGroupName": "/aws/bedrock-agentcore/runtimes/rt-1",
+                        "retentionInDays": 30,
+                    }
+                ]
+            }
+        )
+
+        findings = agentcore_app.check_agentcore_log_retention_and_key_scope()
+
+        assert [finding["Status"] for finding in findings] == ["Failed"]
+        assert "deletion protection off" in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.kms_client")
+    @patch("agentcore_app.logs_client")
+    def test_a_non_runtime_group_is_not_judged_for_deletion_protection(
+        self, mock_logs, mock_kms
+    ):
+        mock_logs.describe_log_groups.side_effect = _log_group_side_effect(
+            {
+                "/aws/vendedlogs/bedrock-agentcore/": [
+                    {
+                        "logGroupName": "/aws/vendedlogs/bedrock-agentcore/memory/m1",
+                        "retentionInDays": 30,
+                    }
+                ]
+            }
+        )
+
+        findings = agentcore_app.check_agentcore_log_retention_and_key_scope()
+
+        assert [finding["Status"] for finding in findings] == ["Passed"]
+        assert "deletion protection" not in findings[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "span_group, status",
+        [
+            (
+                {"logGroupName": "aws/spans", "deletionProtectionEnabled": True},
+                "Passed",
+            ),
+            (
+                {"logGroupName": "aws/spans", "deletionProtectionEnabled": False},
+                "Failed",
+            ),
+            ({"logGroupName": "aws/spans", "retentionInDays": 30}, "Failed"),
+        ],
+    )
+    @patch("agentcore_app.kms_client")
+    @patch("agentcore_app.logs_client")
+    def test_the_spans_group_gets_its_own_row(
+        self, mock_logs, mock_kms, span_group, status
+    ):
+        mock_logs.describe_log_groups.side_effect = _log_group_side_effect(
+            {
+                "/aws/bedrock-agentcore/": [
+                    {
+                        "logGroupName": "/aws/bedrock-agentcore/runtimes/rt-1",
+                        "retentionInDays": 30,
+                        "deletionProtectionEnabled": True,
+                    }
+                ],
+                "aws/spans": [span_group],
+            }
+        )
+
+        findings = agentcore_app.check_agentcore_log_retention_and_key_scope()
+
+        spans = [
+            finding
+            for finding in findings
+            if finding["Finding"] == "AgentCore Span Log Deletion Protection"
+        ]
+        assert [finding["Status"] for finding in spans] == [status]
+        assert spans[0]["Check_ID"] == "AC-26"
+        assert "aws/spans" in spans[0]["Finding_Details"]
+        assert_finding_schema(spans[0])
+        assert {"logGroupNamePrefix": "aws/spans"} in [
+            call.kwargs for call in mock_logs.describe_log_groups.call_args_list
+        ]
+
+    @patch("agentcore_app.kms_client")
+    @patch("agentcore_app.logs_client")
+    def test_a_prefix_lookalike_is_not_the_spans_group(self, mock_logs, mock_kms):
+        mock_logs.describe_log_groups.side_effect = _log_group_side_effect(
+            {
+                "/aws/bedrock-agentcore/": [
+                    {
+                        "logGroupName": "/aws/bedrock-agentcore/runtimes/rt-1",
+                        "retentionInDays": 30,
+                        "deletionProtectionEnabled": True,
+                    }
+                ],
+                "aws/spans": [{"logGroupName": "aws/spans-archive"}],
+            }
+        )
+
+        findings = agentcore_app.check_agentcore_log_retention_and_key_scope()
+
+        assert [finding["Finding"] for finding in findings] == [
+            "AgentCore Log Retention and Key Scope"
+        ]
+
+    @patch("agentcore_app.kms_client")
+    @patch("agentcore_app.logs_client")
+    def test_an_unreadable_spans_group_is_incomplete_beside_the_runtime_rows(
+        self, mock_logs, mock_kms
+    ):
+        runtime_groups = _log_group_side_effect(
+            {
+                "/aws/bedrock-agentcore/": [
+                    {
+                        "logGroupName": "/aws/bedrock-agentcore/runtimes/rt-1",
+                        "retentionInDays": 30,
+                        "deletionProtectionEnabled": True,
+                    }
+                ]
+            }
+        )
+
+        def describe(**kwargs):
+            if kwargs.get("logGroupNamePrefix") == "aws/spans":
+                raise _make_client_error("AccessDeniedException", "no")
+            return runtime_groups(**kwargs)
+
+        mock_logs.describe_log_groups.side_effect = describe
+
+        findings = agentcore_app.check_agentcore_log_retention_and_key_scope()
+
+        assert [finding["Status"] for finding in findings] == ["Passed", "N/A"]
+        assert findings[1]["Finding"] == (
+            "AgentCore Span Log Deletion Protection Incomplete"
+        )
+
+
+def _ecr_repo(name):
+    return {"repositoryName": name}
+
+
+def _scanning(scan_type, *rules):
+    return {
+        "scanningConfiguration": {
+            "scanType": scan_type,
+            "rules": [
+                {
+                    "scanFrequency": frequency,
+                    "repositoryFilters": [
+                        {"filter": pattern, "filterType": "WILDCARD"}
+                        for pattern in patterns
+                    ],
+                }
+                for frequency, patterns in rules
+            ],
+        }
+    }
+
+
+class TestAC50EcrEnhancedScanning:
+    """AC-50: enhanced scanning covers every AgentCore image repository."""
+
+    @patch("agentcore_app.ecr_client", None)
+    def test_no_client_is_na(self):
+        findings = agentcore_app.check_agentcore_ecr_enhanced_scanning()
+        assert [finding["Status"] for finding in findings] == ["N/A"]
+        assert findings[0]["Check_ID"] == "AC-50"
+        assert_finding_schema(findings[0])
+
+    @patch("agentcore_app.ecr_client")
+    def test_no_agentcore_repository_is_na(self, mock_ecr):
+        mock_ecr.describe_repositories.return_value = {
+            "repositories": [_ecr_repo("web-frontend")]
+        }
+
+        findings = agentcore_app.check_agentcore_ecr_enhanced_scanning()
+
+        assert [finding["Status"] for finding in findings] == ["N/A"]
+        mock_ecr.get_registry_scanning_configuration.assert_not_called()
+
+    @patch("agentcore_app.ecr_client")
+    def test_basic_scanning_fails_every_repository(self, mock_ecr):
+        mock_ecr.describe_repositories.return_value = {
+            "repositories": [_ecr_repo("agentcore-a"), _ecr_repo("bedrock-agent-b")]
+        }
+        mock_ecr.get_registry_scanning_configuration.return_value = _scanning(
+            "BASIC", ("SCAN_ON_PUSH", ["*"])
+        )
+
+        findings = agentcore_app.check_agentcore_ecr_enhanced_scanning()
+
+        assert [finding["Status"] for finding in findings] == ["Failed", "Failed"]
+        assert "agentcore-a" in findings[0]["Finding_Details"]
+        assert "bedrock-agent-b" in findings[1]["Finding_Details"]
+        for finding in findings:
+            assert "BASIC" in finding["Finding_Details"]
+            assert_finding_schema(finding)
+
+    @patch("agentcore_app.ecr_client")
+    def test_a_wildcard_filter_that_misses_a_repository_fails_that_repository(
+        self, mock_ecr
+    ):
+        mock_ecr.describe_repositories.return_value = {
+            "repositories": [
+                _ecr_repo("agentcore-a"),
+                _ecr_repo("team/bedrock-agent-b"),
+            ]
+        }
+        mock_ecr.get_registry_scanning_configuration.return_value = _scanning(
+            "ENHANCED", ("CONTINUOUS_SCAN", ["agentcore-*"])
+        )
+
+        findings = agentcore_app.check_agentcore_ecr_enhanced_scanning()
+
+        assert [finding["Status"] for finding in findings] == ["Passed", "Failed"]
+        assert "CONTINUOUS_SCAN" in findings[0]["Finding_Details"]
+        assert "team/bedrock-agent-b" in findings[1]["Finding_Details"]
+        assert "Off" in findings[1]["Finding_Details"]
+
+    @patch("agentcore_app.ecr_client")
+    def test_continuous_scanning_wins_over_scan_on_push(self, mock_ecr):
+        mock_ecr.describe_repositories.return_value = {
+            "repositories": [_ecr_repo("agentcore-a"), _ecr_repo("agentcore-b")]
+        }
+        mock_ecr.get_registry_scanning_configuration.return_value = _scanning(
+            "ENHANCED",
+            ("SCAN_ON_PUSH", ["*"]),
+            ("CONTINUOUS_SCAN", ["agentcore-a"]),
+        )
+
+        findings = agentcore_app.check_agentcore_ecr_enhanced_scanning()
+
+        assert [finding["Status"] for finding in findings] == ["Passed", "Passed"]
+        assert "CONTINUOUS_SCAN" in findings[0]["Finding_Details"]
+        assert "SCAN_ON_PUSH" in findings[1]["Finding_Details"]
+
+    @patch("agentcore_app.ecr_client")
+    def test_a_manual_frequency_rule_is_not_coverage(self, mock_ecr):
+        mock_ecr.describe_repositories.return_value = {
+            "repositories": [_ecr_repo("agentcore-a")]
+        }
+        mock_ecr.get_registry_scanning_configuration.return_value = _scanning(
+            "ENHANCED", ("MANUAL", ["*"])
+        )
+
+        findings = agentcore_app.check_agentcore_ecr_enhanced_scanning()
+
+        assert [finding["Status"] for finding in findings] == ["Failed"]
+
+    @patch("agentcore_app.ecr_client")
+    def test_an_absent_scan_type_fails(self, mock_ecr):
+        mock_ecr.describe_repositories.return_value = {
+            "repositories": [_ecr_repo("agentcore-a")]
+        }
+        mock_ecr.get_registry_scanning_configuration.return_value = {}
+
+        findings = agentcore_app.check_agentcore_ecr_enhanced_scanning()
+
+        assert [finding["Status"] for finding in findings] == ["Failed"]
+        assert "not set" in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.ecr_client")
+    def test_repositories_on_a_later_page_are_judged(self, mock_ecr):
+        mock_ecr.describe_repositories.side_effect = [
+            {"repositories": [_ecr_repo("agentcore-a")], "nextToken": "t1"},
+            {"repositories": [_ecr_repo("other"), _ecr_repo("agentcore-b")]},
+        ]
+        mock_ecr.get_registry_scanning_configuration.return_value = _scanning(
+            "ENHANCED", ("SCAN_ON_PUSH", ["agentcore-a"])
+        )
+
+        findings = agentcore_app.check_agentcore_ecr_enhanced_scanning()
+
+        assert [finding["Status"] for finding in findings] == ["Passed", "Failed"]
+        assert "agentcore-b" in findings[1]["Finding_Details"]
+        assert mock_ecr.describe_repositories.call_args_list[1].kwargs == {
+            "nextToken": "t1"
+        }
+
+    @patch("agentcore_app.ecr_client")
+    def test_an_unreadable_scanning_configuration_is_incomplete(self, mock_ecr):
+        mock_ecr.describe_repositories.return_value = {
+            "repositories": [_ecr_repo("agentcore-a")]
+        }
+        mock_ecr.get_registry_scanning_configuration.side_effect = _make_client_error(
+            "AccessDeniedException", "no"
+        )
+
+        findings = agentcore_app.check_agentcore_ecr_enhanced_scanning()
+
+        assert [finding["Status"] for finding in findings] == ["N/A"]
+        assert findings[0]["Finding"] == "AgentCore ECR Enhanced Scanning Incomplete"
+
+    # The ECR user guide's filter table ("Filters to choose which repositories
+    # are scanned"): filters down the side, repository names across the top.
+    _ECR_GUIDE_NAMES = ("prod", "repo-prod", "prod-repo", "repo-prod-repo", "prodrepo")
+    _ECR_GUIDE_TABLE = {
+        "prod": (True, True, True, True, True),
+        "*prod": (True, True, False, False, False),
+        "prod*": (True, False, True, False, True),
+    }
+
+    @pytest.mark.parametrize("pattern", sorted(_ECR_GUIDE_TABLE))
+    def test_filter_matching_follows_the_ecr_guide_table(self, pattern):
+        assert (
+            tuple(
+                agentcore_app._ecr_scanning_filter_matches(pattern, name)
+                for name in self._ECR_GUIDE_NAMES
+            )
+            == self._ECR_GUIDE_TABLE[pattern]
+        )
+
+
+def _anti_ddos_rule(name="anti-ddos", **group_overrides):
+    rule = _managed_rule(name, "AWSManagedRulesAntiDDoSRuleSet")
+    rule["Statement"]["ManagedRuleGroupStatement"].update(group_overrides)
+    return rule
+
+
+def _acl_summary(name, scope="regional"):
+    region = "us-east-1"
+    return {
+        "Name": name,
+        "Id": f"{name}-id",
+        "ARN": f"arn:aws:wafv2:{region}:123456789012:{scope}/webacl/{name}/{name}-id",
+    }
+
+
+def _wafv2_stub(mock_wafv2, acls_by_scope, resources, web_acls, errors=None):
+    """Answer list_web_acls per Scope, associations per (ACL, type), and rules.
+
+    resources maps (acl_name, resource_type) to ARNs; errors maps the same key
+    to the ClientError that call raises.
+    """
+    errors = errors or {}
+
+    def list_web_acls(**kwargs):
+        return {"WebACLs": acls_by_scope.get(kwargs["Scope"], [])}
+
+    def list_resources(**kwargs):
+        acl_name = kwargs["WebACLArn"].split("/")[-2]
+        key = (acl_name, kwargs["ResourceType"])
+        if key in errors:
+            raise errors[key]
+        return {"ResourceArns": resources.get(key, [])}
+
+    def get_web_acl(**kwargs):
+        acl_name = kwargs["ARN"].split("/")[-2]
+        if isinstance(web_acls.get(acl_name), Exception):
+            raise web_acls[acl_name]
+        return {"WebACL": web_acls[acl_name]}
+
+    mock_wafv2.list_web_acls.side_effect = list_web_acls
+    mock_wafv2.list_resources_for_web_acl.side_effect = list_resources
+    mock_wafv2.get_web_acl.side_effect = get_web_acl
+
+
+_ALB_ARN = "arn:aws:elasticloadbalancing:us-east-1:123456789012:loadbalancer/app/a/1"
+_GATEWAY_ARN = "arn:aws:bedrock-agentcore:us-east-1:123456789012:gateway/gw-1"
+
+
+class TestAC51WebAclAntiDdos:
+    """AC-51: the Anti-DDoS managed rule group on every associated web ACL."""
+
+    @patch("agentcore_app.wafv2_client", None)
+    def test_no_client_is_na(self):
+        findings = agentcore_app.check_agentcore_web_acl_anti_ddos("us-west-2")
+        assert [finding["Status"] for finding in findings] == ["N/A"]
+        assert findings[0]["Check_ID"] == "AC-51"
+
+    @patch("agentcore_app.wafv2_client")
+    def test_no_web_acls_is_na(self, mock_wafv2):
+        _wafv2_stub(mock_wafv2, {}, {}, {})
+
+        findings = agentcore_app.check_agentcore_web_acl_anti_ddos("us-west-2")
+
+        assert [finding["Status"] for finding in findings] == ["N/A"]
+        assert "No web ACLs" in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.wafv2_client")
+    def test_associated_acls_are_judged_one_by_one(self, mock_wafv2):
+        _wafv2_stub(
+            mock_wafv2,
+            {"REGIONAL": [_acl_summary("good"), _acl_summary("bad")]},
+            {
+                ("good", "AGENTCORE_GATEWAY"): [_GATEWAY_ARN],
+                ("bad", "APPLICATION_LOAD_BALANCER"): [_ALB_ARN],
+            },
+            {
+                "good": {"Name": "good", "Rules": [_anti_ddos_rule()]},
+                "bad": {"Name": "bad", "Rules": [_rate_rule()]},
+            },
+        )
+
+        findings = agentcore_app.check_agentcore_web_acl_anti_ddos("us-west-2")
+
+        assert [finding["Status"] for finding in findings] == ["Passed", "Failed"]
+        assert _GATEWAY_ARN in findings[0]["Finding_Details"]
+        assert "bad" in findings[1]["Finding_Details"]
+        assert _ALB_ARN in findings[1]["Finding_Details"]
+        for finding in findings:
+            assert finding["Check_ID"] == "AC-51"
+            assert_finding_schema(finding)
+
+    @patch("agentcore_app.wafv2_client")
+    def test_every_resource_type_is_asked_for(self, mock_wafv2):
+        _wafv2_stub(mock_wafv2, {"REGIONAL": [_acl_summary("idle")]}, {}, {})
+
+        agentcore_app.check_agentcore_web_acl_anti_ddos("us-west-2")
+
+        asked = {
+            call.kwargs["ResourceType"]
+            for call in mock_wafv2.list_resources_for_web_acl.call_args_list
+        }
+        assert asked == set(agentcore_app.WAF_REGIONAL_ASSOCIATION_RESOURCE_TYPES)
+
+    def test_the_resource_types_are_the_whole_botocore_enum(self):
+        import botocore.session
+
+        model = botocore.session.get_session().get_service_model("wafv2")
+        enum = (
+            model.operation_model("ListResourcesForWebACL")
+            .input_shape.members["ResourceType"]
+            .enum
+        )
+        assert tuple(enum) == agentcore_app.WAF_REGIONAL_ASSOCIATION_RESOURCE_TYPES
+
+    @patch("agentcore_app.wafv2_client")
+    def test_an_unassociated_acl_is_not_judged(self, mock_wafv2):
+        _wafv2_stub(
+            mock_wafv2,
+            {"REGIONAL": [_acl_summary("idle"), _acl_summary("used")]},
+            {("used", "API_GATEWAY"): ["arn:aws:apigateway:us-east-1::/restapis/a"]},
+            {
+                "idle": {"Name": "idle", "Rules": []},
+                "used": {"Name": "used", "Rules": [_anti_ddos_rule()]},
+            },
+        )
+
+        findings = agentcore_app.check_agentcore_web_acl_anti_ddos("us-west-2")
+
+        assert [finding["Status"] for finding in findings] == ["Passed"]
+        assert "used" in findings[0]["Finding_Details"]
+        assert "idle" not in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.wafv2_client")
+    def test_only_unassociated_acls_is_na(self, mock_wafv2):
+        _wafv2_stub(mock_wafv2, {"REGIONAL": [_acl_summary("idle")]}, {}, {})
+
+        findings = agentcore_app.check_agentcore_web_acl_anti_ddos("us-west-2")
+
+        assert [finding["Status"] for finding in findings] == ["N/A"]
+        assert "None of the 1" in findings[0]["Finding_Details"]
+        mock_wafv2.get_web_acl.assert_not_called()
+
+    @patch("agentcore_app.wafv2_client")
+    def test_a_count_override_on_the_group_is_not_credited(self, mock_wafv2):
+        counted = [
+            {**_anti_ddos_rule(name), "OverrideAction": {"Count": {}}}
+            for name in ("anti-ddos", "second")
+        ]
+        _wafv2_stub(
+            mock_wafv2,
+            {"REGIONAL": [_acl_summary("acl")]},
+            {("acl", "AGENTCORE_GATEWAY"): [_GATEWAY_ARN]},
+            {"acl": {"Name": "acl", "Rules": counted}},
+        )
+
+        findings = agentcore_app.check_agentcore_web_acl_anti_ddos("us-west-2")
+
+        assert [finding["Status"] for finding in findings] == ["Failed"]
+        assert "rule 'anti-ddos' sets" in findings[0]["Finding_Details"]
+        assert "rule 'second' sets" in findings[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "group_overrides, status",
+        [
+            (
+                {
+                    "RuleActionOverrides": [
+                        {
+                            "Name": "ChallengeAllDuringEvent",
+                            "ActionToUse": {"Count": {}},
+                        }
+                    ]
+                },
+                "Failed",
+            ),
+            (
+                {
+                    "RuleActionOverrides": [
+                        {"Name": "DDoSRequests", "ActionToUse": {"Allow": {}}}
+                    ]
+                },
+                "Failed",
+            ),
+            ({"ExcludedRules": [{"Name": "DDoSRequests"}]}, "Failed"),
+            (
+                {
+                    "RuleActionOverrides": [
+                        {
+                            "Name": "ChallengeDDoSRequests",
+                            "ActionToUse": {"Challenge": {}},
+                        }
+                    ]
+                },
+                "Passed",
+            ),
+        ],
+    )
+    @patch("agentcore_app.wafv2_client")
+    def test_an_inner_override_to_count_or_allow_is_not_credited(
+        self, mock_wafv2, group_overrides, status
+    ):
+        _wafv2_stub(
+            mock_wafv2,
+            {"REGIONAL": [_acl_summary("acl")]},
+            {("acl", "AGENTCORE_GATEWAY"): [_GATEWAY_ARN]},
+            {"acl": {"Name": "acl", "Rules": [_anti_ddos_rule(**group_overrides)]}},
+        )
+
+        findings = agentcore_app.check_agentcore_web_acl_anti_ddos("us-west-2")
+
+        assert [finding["Status"] for finding in findings] == [status]
+        if status == "Failed":
+            assert "Not credited" in findings[0]["Finding_Details"]
+
+    def test_anti_ddos_overrides_leave_the_ag39_override_list_alone(self):
+        coverage = agentcore_app._waf_rule_coverage(
+            {
+                "Rules": [
+                    _anti_ddos_rule(ExcludedRules=[{"Name": "DDoSRequests"}]),
+                    {
+                        **_anti_ddos_rule("counted"),
+                        "OverrideAction": {"Count": {}},
+                    },
+                ]
+            }
+        )
+        assert coverage["overridden"] == []
+        assert len(coverage["anti_ddos_overridden"]) == 2
+        assert coverage["anti_ddos"] is False
+
+    @patch("agentcore_app.wafv2_client")
+    def test_a_firewall_manager_group_is_credited(self, mock_wafv2):
+        fms_group = {
+            "Name": "fms-anti-ddos",
+            "Priority": 0,
+            "OverrideAction": {"None": {}},
+            "FirewallManagerStatement": {
+                "ManagedRuleGroupStatement": {
+                    "VendorName": "AWS",
+                    "Name": "AWSManagedRulesAntiDDoSRuleSet",
+                }
+            },
+        }
+        _wafv2_stub(
+            mock_wafv2,
+            {"REGIONAL": [_acl_summary("pre"), _acl_summary("post")]},
+            {
+                ("pre", "AGENTCORE_GATEWAY"): [_GATEWAY_ARN],
+                ("post", "AGENTCORE_GATEWAY"): [_GATEWAY_ARN],
+            },
+            {
+                "pre": {
+                    "Name": "pre",
+                    "Rules": [],
+                    "PreProcessFirewallManagerRuleGroups": [fms_group],
+                },
+                "post": {
+                    "Name": "post",
+                    "Rules": [],
+                    "PostProcessFirewallManagerRuleGroups": [fms_group],
+                },
+            },
+        )
+
+        findings = agentcore_app.check_agentcore_web_acl_anti_ddos("us-west-2")
+
+        assert [finding["Status"] for finding in findings] == ["Passed", "Passed"]
+        assert "fms-anti-ddos" in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.wafv2_client")
+    def test_a_lone_unreadable_type_is_na_and_named(self, mock_wafv2):
+        _wafv2_stub(
+            mock_wafv2,
+            {"REGIONAL": [_acl_summary("acl")]},
+            {},
+            {},
+            errors={
+                ("acl", "COGNITO_USER_POOL"): _make_client_error(
+                    "AccessDeniedException", "no"
+                )
+            },
+        )
+
+        findings = agentcore_app.check_agentcore_web_acl_anti_ddos("us-west-2")
+
+        assert [finding["Status"] for finding in findings] == ["N/A"]
+        assert (
+            "COGNITO_USER_POOL (AccessDeniedException)"
+            in (findings[0]["Finding_Details"])
+        )
+        mock_wafv2.get_web_acl.assert_not_called()
+
+    @patch("agentcore_app.wafv2_client")
+    def test_an_unreadable_type_does_not_hide_a_found_association(self, mock_wafv2):
+        _wafv2_stub(
+            mock_wafv2,
+            {"REGIONAL": [_acl_summary("acl")]},
+            {("acl", "AGENTCORE_GATEWAY"): [_GATEWAY_ARN]},
+            {"acl": {"Name": "acl", "Rules": []}},
+            errors={
+                ("acl", "COGNITO_USER_POOL"): _make_client_error(
+                    "AccessDeniedException", "no"
+                )
+            },
+        )
+
+        findings = agentcore_app.check_agentcore_web_acl_anti_ddos("us-west-2")
+
+        assert [finding["Status"] for finding in findings] == ["Failed"]
+
+    @patch("agentcore_app.wafv2_client")
+    def test_an_unreadable_web_acl_is_na(self, mock_wafv2):
+        _wafv2_stub(
+            mock_wafv2,
+            {"REGIONAL": [_acl_summary("acl")]},
+            {("acl", "AGENTCORE_GATEWAY"): [_GATEWAY_ARN]},
+            {"acl": _make_client_error("AccessDeniedException", "no")},
+        )
+
+        findings = agentcore_app.check_agentcore_web_acl_anti_ddos("us-west-2")
+
+        assert [finding["Status"] for finding in findings] == ["N/A"]
+        assert "wafv2:GetWebACL" in findings[0]["Resolution"]
+
+    @patch("agentcore_app.wafv2_client")
+    def test_an_unlistable_scope_is_incomplete(self, mock_wafv2):
+        mock_wafv2.list_web_acls.side_effect = _make_client_error(
+            "WAFInternalErrorException", "no"
+        )
+
+        findings = agentcore_app.check_agentcore_web_acl_anti_ddos("us-west-2")
+
+        assert [finding["Status"] for finding in findings] == ["N/A"]
+        assert findings[0]["Finding"].endswith("(REGIONAL) Incomplete")
+
+    @patch("agentcore_app.cloudfront_client")
+    @patch("agentcore_app.wafv2_client")
+    def test_cloudfront_acls_are_read_only_from_us_east_1(
+        self, mock_wafv2, mock_cloudfront
+    ):
+        _wafv2_stub(
+            mock_wafv2,
+            {"CLOUDFRONT": [_acl_summary("edge", scope="global")]},
+            {},
+            {"edge": {"Name": "edge", "Rules": []}},
+        )
+        mock_cloudfront.list_distributions_by_web_acl_id.return_value = {
+            "DistributionList": {
+                "IsTruncated": False,
+                "Items": [
+                    {"Id": "E1", "ARN": "arn:aws:cloudfront::123:distribution/E1"}
+                ],
+            }
+        }
+
+        elsewhere = agentcore_app.check_agentcore_web_acl_anti_ddos("us-west-2")
+        scopes = {
+            call.kwargs["Scope"] for call in mock_wafv2.list_web_acls.call_args_list
+        }
+        assert scopes == {"REGIONAL"}
+        assert [finding["Status"] for finding in elsewhere] == ["N/A"]
+
+        mock_wafv2.list_web_acls.reset_mock()
+        home = agentcore_app.check_agentcore_web_acl_anti_ddos("us-east-1")
+        scopes = {
+            call.kwargs["Scope"] for call in mock_wafv2.list_web_acls.call_args_list
+        }
+        assert scopes == {"REGIONAL", "CLOUDFRONT"}
+        assert [finding["Status"] for finding in home] == ["Failed"]
+        assert "CLOUDFRONT web ACL edge" in home[0]["Finding_Details"]
+        assert "distribution/E1" in home[0]["Finding_Details"]
+
+    @patch("agentcore_app.cloudfront_client")
+    @patch("agentcore_app.wafv2_client")
+    def test_cloudfront_distributions_are_paged(self, mock_wafv2, mock_cloudfront):
+        _wafv2_stub(
+            mock_wafv2,
+            {"CLOUDFRONT": [_acl_summary("edge", scope="global")]},
+            {},
+            {"edge": {"Name": "edge", "Rules": [_anti_ddos_rule()]}},
+        )
+        mock_cloudfront.list_distributions_by_web_acl_id.side_effect = [
+            {
+                "DistributionList": {
+                    "IsTruncated": True,
+                    "NextMarker": "m1",
+                    "Items": [],
+                }
+            },
+            {
+                "DistributionList": {
+                    "IsTruncated": False,
+                    "Items": [
+                        {"Id": "E2", "ARN": "arn:aws:cloudfront::1:distribution/E2"}
+                    ],
+                }
+            },
+        ]
+
+        findings = agentcore_app.check_agentcore_web_acl_anti_ddos("us-east-1")
+
+        assert [finding["Status"] for finding in findings] == ["Passed"]
+        second = mock_cloudfront.list_distributions_by_web_acl_id.call_args_list[1]
+        assert second.kwargs["Marker"] == "m1"
+
+    @patch("agentcore_app.cloudfront_client")
+    @patch("agentcore_app.wafv2_client")
+    def test_unreadable_cloudfront_distributions_are_na(
+        self, mock_wafv2, mock_cloudfront
+    ):
+        _wafv2_stub(
+            mock_wafv2, {"CLOUDFRONT": [_acl_summary("edge", scope="global")]}, {}, {}
+        )
+        mock_cloudfront.list_distributions_by_web_acl_id.side_effect = (
+            _make_client_error("AccessDenied", "no")
+        )
+
+        findings = agentcore_app.check_agentcore_web_acl_anti_ddos("us-east-1")
+
+        assert [finding["Status"] for finding in findings] == ["N/A"]
+        assert (
+            "CloudFront distributions (AccessDenied)"
+            in (findings[0]["Finding_Details"])
+        )
+
+
+class TestEcrScanningAndAntiDdosCheckRegistration:
+    """AC-50 and AC-51 are registered like the checks they sit beside."""
+
+    _CHECKS = {
+        "AC-50": "check_agentcore_ecr_enhanced_scanning",
+        "AC-51": "check_agentcore_web_acl_anti_ddos",
+    }
+
+    @pytest.mark.parametrize("check_id", sorted(_CHECKS))
+    def test_the_checks_are_in_both_regional_tuples(self, check_id):
+        assert check_id in agentcore_app.REGIONAL_AGENTCORE_CHECK_IDS
+        assert check_id in agentcore_app.AGENTCORE_RUNTIME_CHECK_IDS
+
+    @pytest.mark.parametrize("check_id", sorted(_CHECKS))
+    def test_timeout_backfill_emits_the_checks(self, check_id):
+        findings = agentcore_app.build_agentcore_timeout_findings("us-east-1", [])
+        assert check_id in {finding["Check_ID"] for finding in findings}
+
+    @pytest.mark.parametrize("check_id", sorted(_CHECKS))
+    def test_the_runtime_probe_backfill_emits_the_checks(self, check_id):
+        findings = []
+        agentcore_app.prepare_agentcore_runtime_incomplete_report_findings(
+            findings, "us-east-1", "ExpiredToken"
+        )
+        assert check_id in {finding["Check_ID"] for finding in findings}
+
+    @pytest.mark.parametrize("function_name", sorted(_CHECKS.values()))
+    def test_the_handler_registers_each_check_once(self, function_name):
+        source = textwrap.dedent(inspect.getsource(agentcore_app.lambda_handler))
+        assert source.count(function_name) == 1
+
+    def test_the_handler_creates_a_cloudfront_client(self):
+        source = textwrap.dedent(inspect.getsource(agentcore_app.lambda_handler))
+        assert 'cloudfront_client = boto3.client("cloudfront"' in source
+        assert "cloudfront_client" in source.split("start_time = time.time()")[0]

@@ -156,6 +156,20 @@ REQUIRED_AGENTCORE_ACTIONS = {
     "bedrock-agentcore:ListGatewayRateLimits",
     "bedrock-agentcore:ListGatewayTargets",
     "bedrock-agentcore:GetGatewayTarget",
+    # AC-50 reads the registry scanning configuration; AC-51 lists web ACLs,
+    # their associations per resource type, and the companion reads AWS WAF
+    # requires for those types.
+    "ecr:GetRegistryScanningConfiguration",
+    "wafv2:ListWebACLs",
+    "wafv2:ListResourcesForWebACL",
+    "cloudfront:ListDistributionsByWebACLId",
+    "elasticloadbalancing:DescribeWebACLAssociation",
+    "appsync:ListResourcesForWebACL",
+    "amplify:ListResourcesForWebACL",
+    "bedrock-agentcore:GatewayListResourcesForWebACL",
+    "ec2:DescribeVerifiedAccessInstanceWebAclAssociations",
+    "cognito-idp:ListResourcesForWebACL",
+    "apprunner:ListAssociatedServicesForWebAcl",
 }
 
 REQUIRED_AGENT_REGISTRY_ACTIONS = {

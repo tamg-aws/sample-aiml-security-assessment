@@ -42,6 +42,7 @@ agentcore_client = None
 kms_client = None
 organizations_client = None
 wafv2_client = None
+cloudfront_client = None
 route53resolver_client = None
 
 # Environment variables
@@ -251,6 +252,21 @@ WAF_BODY_INSPECTION_LIMIT_REFERENCE_URL = (
     "https://docs.aws.amazon.com/waf/latest/developerguide/"
     "web-acl-setting-body-inspection-limit.html"
 )
+WAF_ANTI_DDOS_REFERENCE_URL = (
+    "https://docs.aws.amazon.com/waf/latest/developerguide/"
+    "aws-managed-rule-groups-anti-ddos.html"
+)
+ECR_ENHANCED_SCANNING_REFERENCE_URL = (
+    "https://docs.aws.amazon.com/AmazonECR/latest/userguide/"
+    "image-scanning-enhanced.html"
+)
+LOGS_DELETION_PROTECTION_REFERENCE_URL = (
+    "https://docs.aws.amazon.com/AmazonCloudWatch/latest/logs/"
+    "protecting-log-groups-from-deletion.html"
+)
+# The scan frequencies under which ECR enhanced scanning scans a matched
+# repository without a manual request.
+ECR_ENHANCED_SCAN_FREQUENCIES = ("SCAN_ON_PUSH", "CONTINUOUS_SCAN")
 
 
 def _assessment_error_label(error: Exception) -> str:
@@ -446,6 +462,8 @@ REGIONAL_AGENTCORE_CHECK_IDS = (
     "AC-47",
     "AC-48",
     "AC-49",
+    "AC-50",
+    "AC-51",
 )
 
 AGENTCORE_RUNTIME_CHECK_IDS = (
@@ -489,6 +507,8 @@ AGENTCORE_RUNTIME_CHECK_IDS = (
     "AC-47",
     "AC-48",
     "AC-49",
+    "AC-50",
+    "AC-51",
 )
 
 NATIVE_AGENTIC_AGENTCORE_CHECK_NAMES = {
@@ -545,6 +565,13 @@ AGENTCORE_LOG_GROUP_PREFIXES = (
     "/aws/bedrock-agentcore/",
     "/aws/vendedlogs/bedrock-agentcore/",
 )
+
+# AC-26 asks for deletion protection on the log groups an investigation of a
+# runtime depends on: each runtime's own group, and the aws/spans group that
+# CloudWatch Transaction Search writes AgentCore trace spans to. aws/spans is
+# shared with every other traced application, so it is matched by exact name.
+AGENTCORE_RUNTIME_LOG_GROUP_PREFIX = "/aws/bedrock-agentcore/runtimes/"
+TRANSACTION_SEARCH_SPANS_LOG_GROUP = "aws/spans"
 
 # AgentCore does not configure log destinations automatically. Memory and gateway
 # application logs reach CloudWatch only through a vended-log delivery source
@@ -3060,6 +3087,173 @@ def check_agentcore_encryption() -> List[Dict[str, Any]]:
                 finding_name="AgentCore Encryption Check",
                 error=e,
                 reference=AGENTCORE_DATA_ENCRYPTION_REFERENCE_URL,
+            )
+        )
+
+    return findings
+
+
+def _agentcore_ecr_repositories() -> List[Dict[str, Any]]:
+    """List every ECR repository in the region that AC-05 treats as AgentCore's."""
+    repositories = []
+    for repo in _paginate_aws_list(ecr_client, "describe_repositories", "repositories"):
+        repo_name = repo.get("repositoryName", "").lower()
+        if "agentcore" in repo_name or "bedrock-agent" in repo_name:
+            repositories.append(repo)
+    return repositories
+
+
+def _ecr_scanning_filter_matches(repository_filter: str, repo_name: str) -> bool:
+    """Apply ECR's repository-filter rule to one repository name.
+
+    A filter with no '*' matches every name that contains it; a filter with '*'
+    must match the whole name, the '*' standing for zero or more characters.
+    """
+    if "*" not in repository_filter:
+        return repository_filter in repo_name
+    return fnmatchcase(repo_name, repository_filter)
+
+
+def _ecr_enhanced_scan_frequency(
+    repo_name: str, rules: List[Dict[str, Any]]
+) -> Optional[str]:
+    """Return the scan frequency enhanced scanning applies to a repo, or None.
+
+    Continuous scanning wins over scan on push when filters of both match.
+    """
+    matched: Set[str] = set()
+    for rule in rules:
+        frequency = rule.get("scanFrequency")
+        if frequency not in ECR_ENHANCED_SCAN_FREQUENCIES:
+            continue
+        for repository_filter in rule.get("repositoryFilters") or []:
+            if repository_filter.get("filterType") != "WILDCARD":
+                continue
+            pattern = repository_filter.get("filter")
+            if pattern and _ecr_scanning_filter_matches(pattern, repo_name):
+                matched.add(frequency)
+    if "CONTINUOUS_SCAN" in matched:
+        return "CONTINUOUS_SCAN"
+    if "SCAN_ON_PUSH" in matched:
+        return "SCAN_ON_PUSH"
+    return None
+
+
+def check_agentcore_ecr_enhanced_scanning() -> List[Dict[str, Any]]:
+    """AC-50: Require enhanced scanning to cover every AgentCore image repository.
+
+    Basic scanning reports operating-system CVEs only on the images it is asked
+    to scan; enhanced scanning adds language-package findings and, once a
+    repository matches a filter, scans it without anyone asking. Enhanced
+    scanning turns scanning off for every repository no filter matches, so a
+    registry set to ENHANCED can still leave an agent image unscanned.
+    """
+    finding_name = "AgentCore ECR Enhanced Scanning"
+    if ecr_client is None:
+        return [
+            create_finding(
+                check_id="AC-50",
+                finding_name=finding_name,
+                finding_details="Amazon ECR client not available in this region.",
+                resolution="No action required unless AgentCore runs in this region.",
+                reference=ECR_ENHANCED_SCANNING_REFERENCE_URL,
+                severity=SeverityEnum.INFORMATIONAL,
+                status=StatusEnum.NA,
+            )
+        ]
+
+    try:
+        repositories = _agentcore_ecr_repositories()
+        if not repositories:
+            return [
+                create_finding(
+                    check_id="AC-50",
+                    finding_name=finding_name,
+                    finding_details="No AgentCore ECR repositories found in this region.",
+                    resolution="No action required.",
+                    reference=ECR_ENHANCED_SCANNING_REFERENCE_URL,
+                    severity=SeverityEnum.INFORMATIONAL,
+                    status=StatusEnum.NA,
+                )
+            ]
+        scanning = (
+            ecr_client.get_registry_scanning_configuration().get(
+                "scanningConfiguration"
+            )
+            or {}
+        )
+    except Exception as error:
+        return [
+            _incomplete_check_finding(
+                check_id="AC-50",
+                finding_name=finding_name,
+                error=error,
+                reference=ECR_ENHANCED_SCANNING_REFERENCE_URL,
+            )
+        ]
+
+    scan_type = scanning.get("scanType")
+    rules = scanning.get("rules") or []
+    findings = []
+    for repo in repositories:
+        repo_name = repo.get("repositoryName", "unknown")
+        if scan_type != "ENHANCED":
+            findings.append(
+                create_finding(
+                    check_id="AC-50",
+                    finding_name=finding_name,
+                    finding_details=(
+                        f"ECR repository '{repo_name}' is in a registry whose scan "
+                        f"type is {scan_type or 'not set'}, so its agent images get "
+                        "no language-package vulnerability findings."
+                    ),
+                    resolution=(
+                        "Set the private registry's scan type to ENHANCED with a "
+                        "continuous or scan-on-push filter that matches this "
+                        "repository."
+                    ),
+                    reference=ECR_ENHANCED_SCANNING_REFERENCE_URL,
+                    severity=SeverityEnum.MEDIUM,
+                    status=StatusEnum.FAILED,
+                )
+            )
+            continue
+
+        frequency = _ecr_enhanced_scan_frequency(repo_name, rules)
+        if frequency is None:
+            findings.append(
+                create_finding(
+                    check_id="AC-50",
+                    finding_name=finding_name,
+                    finding_details=(
+                        f"ECR repository '{repo_name}' matches no enhanced scanning "
+                        "filter, so its scan frequency is Off and its agent images "
+                        "are never scanned."
+                    ),
+                    resolution=(
+                        "Add a continuous or scan-on-push repository filter to the "
+                        "registry scanning configuration that matches this "
+                        "repository."
+                    ),
+                    reference=ECR_ENHANCED_SCANNING_REFERENCE_URL,
+                    severity=SeverityEnum.MEDIUM,
+                    status=StatusEnum.FAILED,
+                )
+            )
+            continue
+
+        findings.append(
+            create_finding(
+                check_id="AC-50",
+                finding_name=finding_name,
+                finding_details=(
+                    f"ECR repository '{repo_name}' is covered by enhanced scanning "
+                    f"at frequency {frequency}."
+                ),
+                resolution="No action required.",
+                reference=ECR_ENHANCED_SCANNING_REFERENCE_URL,
+                severity=SeverityEnum.MEDIUM,
+                status=StatusEnum.PASSED,
             )
         )
 
@@ -6921,6 +7115,12 @@ def check_agentcore_log_retention_and_key_scope() -> List[Dict[str, Any]]:
     data the workload was careful about elsewhere. AC-20 asserts that a customer
     managed key is set; this check asserts that the key policy behind it narrows
     who can read through it.
+
+    A runtime log group and the aws/spans group also need deletion protection:
+    without it, a principal allowed to delete log groups erases the record an
+    investigation of the agent would start from. CloudWatch Logs leaves deletion
+    protection off by default, so an absent deletionProtectionEnabled reads as
+    off.
     """
     if logs_client is None:
         return [
@@ -6980,6 +7180,15 @@ def check_agentcore_log_retention_and_key_scope() -> List[Dict[str, Any]]:
                 "and memory record is kept indefinitely"
             )
 
+        if log_group_name.startswith(AGENTCORE_RUNTIME_LOG_GROUP_PREFIX):
+            if log_group.get("deletionProtectionEnabled") is True:
+                confirmations.append("has deletion protection enabled")
+            else:
+                problems.append(
+                    "has deletion protection off, so a principal allowed to "
+                    "delete log groups can erase the runtime's log record"
+                )
+
         if key_id:
             if key_id not in key_policy_cache:
                 try:
@@ -7027,9 +7236,10 @@ def check_agentcore_log_retention_and_key_scope() -> List[Dict[str, Any]]:
                     ),
                     resolution=(
                         "Set a retention period on the log group that matches the "
-                        "investigation window this workload commits to, and remove "
+                        "investigation window this workload commits to, remove "
                         "any unconditioned wildcard-principal decrypt grant from "
-                        "the encryption key's policy."
+                        "the encryption key's policy, and turn on deletion "
+                        "protection for each runtime log group."
                     ),
                     reference=LOGS_RETENTION_REFERENCE_URL,
                     severity=SeverityEnum.MEDIUM,
@@ -7054,7 +7264,71 @@ def check_agentcore_log_retention_and_key_scope() -> List[Dict[str, Any]]:
                 )
             )
 
+    span_finding = _agentcore_span_log_deletion_protection_finding()
+    if span_finding:
+        findings.append(span_finding)
     return findings
+
+
+def _agentcore_span_log_deletion_protection_finding() -> Optional[Dict[str, Any]]:
+    """Judge deletion protection on the aws/spans log group for AC-26.
+
+    Returns None when the group does not exist: Transaction Search is not
+    writing spans in the region, so there is no span record to protect.
+    """
+    finding_name = "AgentCore Span Log Deletion Protection"
+    try:
+        span_groups = [
+            group
+            for group in _paginate_aws_list(
+                logs_client,
+                "describe_log_groups",
+                "logGroups",
+                logGroupNamePrefix=TRANSACTION_SEARCH_SPANS_LOG_GROUP,
+            )
+            if group.get("logGroupName") == TRANSACTION_SEARCH_SPANS_LOG_GROUP
+        ]
+    except Exception as error:
+        return _incomplete_check_finding(
+            check_id="AC-26",
+            finding_name=finding_name,
+            error=error,
+            reference=LOGS_DELETION_PROTECTION_REFERENCE_URL,
+        )
+
+    if not span_groups:
+        return None
+
+    if span_groups[0].get("deletionProtectionEnabled") is True:
+        return create_finding(
+            check_id="AC-26",
+            finding_name=finding_name,
+            finding_details=(
+                f"Log group '{TRANSACTION_SEARCH_SPANS_LOG_GROUP}' has deletion "
+                "protection enabled."
+            ),
+            resolution="No action required.",
+            reference=LOGS_DELETION_PROTECTION_REFERENCE_URL,
+            severity=SeverityEnum.MEDIUM,
+            status=StatusEnum.PASSED,
+        )
+
+    return create_finding(
+        check_id="AC-26",
+        finding_name=finding_name,
+        finding_details=(
+            f"Log group '{TRANSACTION_SEARCH_SPANS_LOG_GROUP}' has deletion "
+            "protection off, so a principal allowed to delete log groups can erase "
+            "the AgentCore trace spans an investigation would start from."
+        ),
+        resolution=(
+            f"Turn on deletion protection for the "
+            f"'{TRANSACTION_SEARCH_SPANS_LOG_GROUP}' log group."
+        ),
+        reference=LOGS_DELETION_PROTECTION_REFERENCE_URL,
+        severity=SeverityEnum.MEDIUM,
+        status=StatusEnum.FAILED,
+    )
 
 
 def _statement_is_confused_deputy_exposed(statement: Dict[str, Any]) -> bool:
@@ -13431,6 +13705,25 @@ WAF_SQL_INJECTION_GROUP_TOKEN = "sqli"
 WAF_CROSS_SITE_SCRIPTING_GROUP_TOKEN = "commonruleset"
 WAF_CROSS_SITE_SCRIPTING_RULE_PREFIX = "crosssitescripting_"
 
+# AC-51 reads for the AWS managed Anti-DDoS rule group by its published name.
+# Its soft mitigation already challenges, so only an inner override to Count or
+# Allow, or an exclusion, stops a rule from mitigating.
+WAF_ANTI_DDOS_RULE_GROUP = "AWSManagedRulesAntiDDoSRuleSet"
+WAF_ANTI_DDOS_DISABLING_ACTIONS = ("Count", "Allow")
+
+# ListResourcesForWebACL answers for one ResourceType per call; these are every
+# value its ResourceType enum accepts.
+WAF_REGIONAL_ASSOCIATION_RESOURCE_TYPES = (
+    "APPLICATION_LOAD_BALANCER",
+    "API_GATEWAY",
+    "APPSYNC",
+    "COGNITO_USER_POOL",
+    "APP_RUNNER_SERVICE",
+    "VERIFIED_ACCESS_INSTANCE",
+    "AMPLIFY",
+    "AGENTCORE_GATEWAY",
+)
+
 
 def _waf_statement_nodes(statement: Any) -> List[Dict[str, Any]]:
     """Return one node per statement in a rule's statement tree.
@@ -13493,14 +13786,20 @@ def _waf_rule_coverage(web_acl: Dict[str, Any]) -> Dict[str, Any]:
     group from a vendor other than AWS both keep their rules in another resource
     this check does not read, so they are reported as opaque and leave the
     verdict indeterminate rather than absent.
+
+    The Anti-DDoS group is credited under anti_ddos while it runs; the Count
+    overrides that stop it are listed under anti_ddos_overridden, apart from
+    overridden, so the SQL injection and cross-site scripting text is unchanged.
     """
     coverage: Dict[str, Any] = {
         "block": False,
         "sqli": False,
         "xss": False,
         "rate": False,
+        "anti_ddos": False,
         "opaque": [],
         "overridden": [],
+        "anti_ddos_overridden": [],
         "evidence": {},
     }
 
@@ -13511,6 +13810,16 @@ def _waf_rule_coverage(web_acl: Dict[str, Any]) -> Dict[str, Any]:
     for rule in web_acl.get("Rules") or []:
         rule_name = rule.get("Name") or "unnamed"
         if "Count" in (rule.get("OverrideAction") or {}):
+            for node in _waf_statement_nodes(rule.get("Statement")):
+                group = node.get("ManagedRuleGroupStatement")
+                if (
+                    isinstance(group, dict)
+                    and group.get("VendorName") == "AWS"
+                    and group.get("Name") == WAF_ANTI_DDOS_RULE_GROUP
+                ):
+                    coverage["anti_ddos_overridden"].append(
+                        f"rule '{rule_name}' sets {WAF_ANTI_DDOS_RULE_GROUP} to Count"
+                    )
             continue
 
         blocks = "Block" in (rule.get("Action") or {})
@@ -13549,6 +13858,21 @@ def _waf_rule_coverage(web_acl: Dict[str, Any]) -> Dict[str, Any]:
                 continue
 
             non_blocking = _waf_group_non_blocking_rules(group)
+            if name == WAF_ANTI_DDOS_RULE_GROUP:
+                disabled = [
+                    (member, action)
+                    for member, action in non_blocking
+                    if action in WAF_ANTI_DDOS_DISABLING_ACTIONS
+                ]
+                if disabled:
+                    coverage["anti_ddos_overridden"].extend(
+                        f"{member} of {name} in rule '{rule_name}' is set to {action}"
+                        for member, action in disabled
+                    )
+                elif not coverage["anti_ddos"]:
+                    coverage["anti_ddos"] = True
+                    coverage["evidence"]["anti_ddos"] = f"rule '{rule_name}'"
+
             lowered = name.lower()
             provides = False
             if WAF_SQL_INJECTION_GROUP_TOKEN in lowered:
@@ -13790,6 +14114,261 @@ def _gateway_waf_rule_findings(
             status=StatusEnum.PASSED,
         )
     ]
+
+
+def _web_acl_with_firewall_manager_rules(web_acl: Dict[str, Any]) -> Dict[str, Any]:
+    """Return a web ACL whose Rules also hold its Firewall Manager rule groups.
+
+    Firewall Manager adds rule groups that run before and after the ACL's own
+    rules and keeps them out of Rules. Each carries its managed rule group in
+    FirewallManagerStatement, so it reads as a rule whose statement is that.
+    """
+    merged = dict(web_acl)
+    merged["Rules"] = (
+        [
+            {**group, "Statement": group.get("FirewallManagerStatement")}
+            for group in web_acl.get("PreProcessFirewallManagerRuleGroups") or []
+        ]
+        + list(web_acl.get("Rules") or [])
+        + [
+            {**group, "Statement": group.get("FirewallManagerStatement")}
+            for group in web_acl.get("PostProcessFirewallManagerRuleGroups") or []
+        ]
+    )
+    return merged
+
+
+def _regional_web_acl_associations(
+    web_acl_arn: str,
+) -> Tuple[List[str], List[str]]:
+    """Return the resources one regional web ACL protects, and what went unread.
+
+    ListResourcesForWebACL answers for one resource type per call and defaults
+    to Application Load Balancers, so every type is asked for in turn. A type
+    whose call fails is returned by name so that an ACL is never read as
+    unassociated for want of a permission.
+    """
+    resources: List[str] = []
+    unread: List[str] = []
+    for resource_type in WAF_REGIONAL_ASSOCIATION_RESOURCE_TYPES:
+        try:
+            response = wafv2_client.list_resources_for_web_acl(
+                WebACLArn=web_acl_arn, ResourceType=resource_type
+            )
+        except ClientError as error:
+            unread.append(f"{resource_type} ({_assessment_error_label(error)})")
+            continue
+        resources.extend((response or {}).get("ResourceArns") or [])
+    return resources, unread
+
+
+def _cloudfront_web_acl_associations(
+    web_acl_arn: str,
+) -> Tuple[List[str], List[str]]:
+    """Return the CloudFront distributions one global web ACL protects."""
+    if cloudfront_client is None:
+        return [], ["CloudFront distributions (client not available)"]
+
+    distributions: List[str] = []
+    marker = None
+    seen_markers: Set[str] = set()
+    try:
+        while True:
+            kwargs = {"WebACLId": web_acl_arn}
+            if marker:
+                kwargs["Marker"] = marker
+            page = (
+                cloudfront_client.list_distributions_by_web_acl_id(**kwargs) or {}
+            ).get("DistributionList") or {}
+            distributions.extend(
+                item.get("ARN") or item.get("Id") or "unknown"
+                for item in page.get("Items") or []
+            )
+            marker = page.get("NextMarker")
+            if not page.get("IsTruncated") or not marker or marker in seen_markers:
+                break
+            seen_markers.add(marker)
+    except ClientError as error:
+        return distributions, [
+            f"CloudFront distributions ({_assessment_error_label(error)})"
+        ]
+    return distributions, []
+
+
+def check_agentcore_web_acl_anti_ddos(region: str) -> List[Dict[str, Any]]:
+    """AC-51: Require the Anti-DDoS managed rule group on associated web ACLs.
+
+    AWSManagedRulesAntiDDoSRuleSet detects a layer 7 request flood against the
+    resources a web ACL protects and challenges or blocks the requests that
+    make it up. An ACL without it leaves a rate-based rule as the only volume
+    control, which counts per client and misses a flood spread over many.
+
+    Regional ACLs are read in every Region; CloudFront ACLs exist only in
+    us-east-1, so they are read there. An ACL associated with nothing protects
+    nothing and is not judged. The group is credited only while it runs: a
+    Count override on the rule that holds it, or an inner rule overridden to
+    Count or Allow or excluded, turns that mitigation off.
+    """
+    finding_name = "AgentCore Web ACL Anti-DDoS Protection"
+    if wafv2_client is None:
+        return [
+            create_finding(
+                check_id="AC-51",
+                finding_name=finding_name,
+                finding_details="AWS WAF client not available in this region.",
+                resolution="No action required unless AgentCore runs in this region.",
+                reference=WAF_ANTI_DDOS_REFERENCE_URL,
+                severity=SeverityEnum.INFORMATIONAL,
+                status=StatusEnum.NA,
+            )
+        ]
+
+    scopes = [("REGIONAL", _regional_web_acl_associations)]
+    if region == "us-east-1":
+        scopes.append(("CLOUDFRONT", _cloudfront_web_acl_associations))
+
+    findings: List[Dict[str, Any]] = []
+    web_acl_count = 0
+    for scope, list_associations in scopes:
+        try:
+            summaries = _paginate_aws_list(
+                wafv2_client,
+                "list_web_acls",
+                "WebACLs",
+                token_request_key="NextMarker",
+                token_response_key="NextMarker",
+                Scope=scope,
+            )
+        except Exception as error:
+            findings.append(
+                _incomplete_check_finding(
+                    check_id="AC-51",
+                    finding_name=f"{finding_name} ({scope})",
+                    error=error,
+                    reference=WAF_ANTI_DDOS_REFERENCE_URL,
+                )
+            )
+            continue
+
+        for summary in summaries:
+            web_acl_arn = summary.get("ARN")
+            if not web_acl_arn:
+                continue
+            web_acl_count += 1
+            acl_name = summary.get("Name") or web_acl_arn
+            resources, unread = list_associations(web_acl_arn)
+            if not resources:
+                if unread:
+                    findings.append(
+                        create_finding(
+                            check_id="AC-51",
+                            finding_name=finding_name,
+                            finding_details=(
+                                f"{scope} web ACL {acl_name} has no associated "
+                                "resource among the types that could be read, and "
+                                f"these could not be read: {'; '.join(unread)}. "
+                                "Whether it protects a resource was not judged."
+                            ),
+                            resolution=(
+                                "Grant the permission AWS WAF requires to list "
+                                "each named resource type for a web ACL, then "
+                                "rerun the assessment."
+                            ),
+                            reference=WAF_ANTI_DDOS_REFERENCE_URL,
+                            severity=SeverityEnum.INFORMATIONAL,
+                            status=StatusEnum.NA,
+                        )
+                    )
+                continue
+
+            try:
+                web_acl = (wafv2_client.get_web_acl(ARN=web_acl_arn) or {}).get(
+                    "WebACL"
+                ) or {}
+            except ClientError as error:
+                findings.append(
+                    create_finding(
+                        check_id="AC-51",
+                        finding_name=finding_name,
+                        finding_details=(
+                            f"Could not read {scope} web ACL {acl_name}, which "
+                            f"protects {len(resources)} resource(s): "
+                            f"{_assessment_error_label(error)}."
+                        ),
+                        resolution="Grant wafv2:GetWebACL, then rerun the assessment.",
+                        reference=WAF_ANTI_DDOS_REFERENCE_URL,
+                        severity=SeverityEnum.INFORMATIONAL,
+                        status=StatusEnum.NA,
+                    )
+                )
+                continue
+
+            coverage = _waf_rule_coverage(_web_acl_with_firewall_manager_rules(web_acl))
+            protects = (
+                f"{scope} web ACL {acl_name}, which protects {len(resources)} "
+                f"resource(s) including {resources[0]},"
+            )
+            if coverage["anti_ddos"]:
+                findings.append(
+                    create_finding(
+                        check_id="AC-51",
+                        finding_name=finding_name,
+                        finding_details=(
+                            f"{protects} runs {WAF_ANTI_DDOS_RULE_GROUP} from "
+                            f"{coverage['evidence']['anti_ddos']}."
+                        ),
+                        resolution="No action required.",
+                        reference=WAF_ANTI_DDOS_REFERENCE_URL,
+                        severity=SeverityEnum.MEDIUM,
+                        status=StatusEnum.PASSED,
+                    )
+                )
+                continue
+
+            not_credited = (
+                " Not credited because the group or its rules are overridden or "
+                f"excluded: {'; '.join(coverage['anti_ddos_overridden'])}."
+                if coverage["anti_ddos_overridden"]
+                else ""
+            )
+            findings.append(
+                create_finding(
+                    check_id="AC-51",
+                    finding_name=finding_name,
+                    finding_details=(
+                        f"{protects} does not run {WAF_ANTI_DDOS_RULE_GROUP}, so a "
+                        "request flood spread across many clients reaches the "
+                        f"protected resources unmitigated.{not_credited}"
+                    ),
+                    resolution=(
+                        f"Add the AWS managed rule group {WAF_ANTI_DDOS_RULE_GROUP} "
+                        "to the web ACL with no Count override on the group and "
+                        "no rule inside it overridden to Count or Allow."
+                    ),
+                    reference=WAF_ANTI_DDOS_REFERENCE_URL,
+                    severity=SeverityEnum.MEDIUM,
+                    status=StatusEnum.FAILED,
+                )
+            )
+
+    if not findings:
+        findings.append(
+            create_finding(
+                check_id="AC-51",
+                finding_name=finding_name,
+                finding_details=(
+                    f"None of the {web_acl_count} web ACL(s) readable from this "
+                    "region is associated with a resource."
+                    if web_acl_count
+                    else "No web ACLs found in this region."
+                ),
+                resolution="No action required.",
+                reference=WAF_ANTI_DDOS_REFERENCE_URL,
+                severity=SeverityEnum.INFORMATIONAL,
+                status=StatusEnum.NA,
+            )
+        )
+    return findings
 
 
 def check_agentcore_gateway_agentic_security() -> List[Dict[str, Any]]:
@@ -14201,7 +14780,7 @@ def lambda_handler(event, context):
     global start_time, iam_client, ec2_client, ecr_client, logs_client
     global cloudwatch_client, cloudtrail_client, oam_client, agentcore_client
     global kms_client, organizations_client
-    global wafv2_client, route53resolver_client
+    global wafv2_client, route53resolver_client, cloudfront_client
     start_time = time.time()
 
     try:
@@ -14236,6 +14815,9 @@ def lambda_handler(event, context):
         route53resolver_client = boto3.client(
             "route53resolver", config=boto3_config, region_name=region
         )
+        # CloudFront is global; its distributions are listed for the CLOUDFRONT
+        # scope web ACLs that AC-51 reads from us-east-1.
+        cloudfront_client = boto3.client("cloudfront", config=boto3_config)
 
         # Collect all findings
         all_findings = []
@@ -14728,6 +15310,16 @@ def lambda_handler(event, context):
                 ["AC-49"],
                 "DNS Egress Control",
                 lambda: check_agentcore_dns_egress_control(browser_inventory),
+            ),
+            (
+                ["AC-50"],
+                "ECR Enhanced Scanning",
+                check_agentcore_ecr_enhanced_scanning,
+            ),
+            (
+                ["AC-51"],
+                "Web ACL Anti-DDoS",
+                lambda: check_agentcore_web_acl_anti_ddos(region),
             ),
         ]
 

@@ -1,6 +1,6 @@
 # Security Checks Reference
 
-This document provides a comprehensive reference for all 256 security checks performed by the AI/ML Security Assessment framework (141 core checks across Amazon Bedrock, Amazon SageMaker AI, Amazon Bedrock AgentCore, and AWS Agent Registry, 39 Agentic AI Security checks, 64 Responsible AI GRC checks, and 12 OWASP Top 10 for LLM checks).
+This document provides a comprehensive reference for all 258 security checks performed by the AI/ML Security Assessment framework (143 core checks across Amazon Bedrock, Amazon SageMaker AI, Amazon Bedrock AgentCore, and AWS Agent Registry, 39 Agentic AI Security checks, 64 Responsible AI GRC checks, and 12 OWASP Top 10 for LLM checks).
 
 Sources differ by bucket and are not interchangeable: the core Bedrock, SageMaker, AgentCore, and AWS Agent Registry checks derive from the AWS Well-Architected **Generative AI Lens** security best practices (`gensec*`) and service security documentation; the Agentic AI Security checks from the AWS Well-Architected **Agentic AI Lens**; the `FS-*` **Responsible AI GRC** checks from the AWS GRC User Guide; and the `OW-*` checks from the OWASP Top 10 for LLM. The AWS Well-Architected **Responsible AI Lens** is not a source for any of them — see [Responsible AI GRC — scope, sources, and compatibility](RESPONSIBLE_AI_GRC_SCOPE.md).
 
@@ -15,7 +15,7 @@ The 64 Responsible AI GRC checks occupy 69 `FS-*` numbers: 64 ship as standalone
 - [Status Values](#status-values)
 - [Amazon SageMaker AI Security Checks (33)](#amazon-sagemaker-ai-security-checks-33)
 - [Amazon Bedrock Security Checks (49)](#amazon-bedrock-security-checks-49)
-- [Amazon Bedrock AgentCore Security Checks (49)](#amazon-bedrock-agentcore-security-checks-49)
+- [Amazon Bedrock AgentCore Security Checks (51)](#amazon-bedrock-agentcore-security-checks-51)
 - [AWS Agent Registry Security Checks (10)](#aws-agent-registry-security-checks-10)
 - [Agentic AI Security Checks (39)](#agentic-ai-security-checks-39)
 - [Responsible AI GRC Checks (64)](#responsible-ai-grc-checks-64-additional-5-upstream-extensions)
@@ -570,7 +570,7 @@ inventory is never treated as evidence of compliance.
 
 ---
 
-## Amazon Bedrock AgentCore Security Checks (49)
+## Amazon Bedrock AgentCore Security Checks (51)
 
 ### AC-01: Runtime Amazon VPC Configuration
 
@@ -700,7 +700,7 @@ inventory is never treated as evidence of compliance.
 ### AC-26: Log Retention and Key Scope
 
 - **Severity:** Medium
-- **Description:** Requires a retention period on every AgentCore log group, and requires the key policy behind its customer managed key to name the principals allowed to decrypt and the administrators allowed to disable the key or schedule it for deletion. A group with no retention keeps agent prompts, tool arguments, and memory records for as long as the account exists. AC-20 asserts that a customer managed key is set; this check judges the policy behind it. A log group whose key policy cannot be read is reported as informational `N/A` on its own row, so the retention verdict still stands.
+- **Description:** Requires a retention period on every AgentCore log group, and requires the key policy behind its customer managed key to name the principals allowed to decrypt and the administrators allowed to disable the key or schedule it for deletion. A group with no retention keeps agent prompts, tool arguments, and memory records for as long as the account exists. AC-20 asserts that a customer managed key is set; this check judges the policy behind it. A log group whose key policy cannot be read is reported as informational `N/A` on its own row, so the retention verdict still stands. Each runtime log group under `/aws/bedrock-agentcore/runtimes/` must also have deletion protection on, and so must the `aws/spans` group that Transaction Search writes AgentCore spans to, because a principal allowed to call `DeleteLogGroup` otherwise erases the runtime's record. A group that does not report `deletionProtectionEnabled` is read as unprotected. A region with no `aws/spans` group reports no spans row, and an unreadable spans group is informational `N/A`.
 
 ### AC-27: Gateway Policy Conditions
 
@@ -816,6 +816,16 @@ inventory is never treated as evidence of compliance.
 
 - **Severity:** Medium
 - **Description:** For each VPC that hosts an AgentCore runtime, browser or code interpreter, reads the Route 53 Resolver DNS Firewall rule group associations and walks them in the order DNS Firewall evaluates them: rule groups by ascending association priority, and the enforcing rules in each by ascending priority. The first match ends evaluation for `ALLOW`, `ALERT` and `BLOCK` alike, so the check judges the first rule whose customer domain list holds `*`, names its rule group and rule, and ignores every rule after it. It passes only when that rule is a `BLOCK` with no query type, which is the walled garden pattern Route 53 documents; an `ALLOW` or `ALERT` over `*` fails. `ListFirewallDomains` returns that entry fully qualified as `*.`, and the check reads either spelling. A VPC with no rule group fails, and so do rule groups with no rule over `*`, where only a `BLOCK` over an AWS managed list, over DNS threat protection, over a list without `*`, or over `*` for one query type (`Qtype`) stands, because every name or query type those rules do not match is answered. A deciding `BLOCK` passes only when `GetFirewallConfig` reports `FirewallFailOpen` `DISABLED` for the VPC, which Route 53 documents as the default. `ENABLED` fails as `AgentCore DNS Egress Control Fails Open`, because VPC Resolver answers every query while DNS Firewall is impaired, including a name the rule blocks. The documentation defines no other value, so `USE_LOCAL_RESOURCE_SETTING` or a missing value is informational `N/A` with the value named, and an unreadable firewall config is informational `N/A`. A VPC whose rules already fail is not read for this setting. A hosting subnet that no longer exists is reported by id as not present. AC-01 and AC-15 judge egress by security group and network mode; this check judges it by destination name.
+
+### AC-50: ECR Enhanced Scanning
+
+- **Severity:** Medium
+- **Description:** Requires the registry scanning configuration to put every AgentCore image repository under Amazon Inspector enhanced scanning at `SCAN_ON_PUSH` or `CONTINUOUS_SCAN` frequency. A repository is an AgentCore repository when its name contains `agentcore` or `bedrock-agent`. A registry on `BASIC` scanning fails every such repository, and so does a repository that no `WILDCARD` rule matches, which Amazon ECR scans at frequency `Off`. Filters follow the ECR rule: a filter with no `*` matches every name that contains it, and a filter with `*` must match the whole name. When two rules match, `CONTINUOUS_SCAN` is reported. AC-05 judges the encryption of the same repositories. A region with no AgentCore repository is informational `N/A`, and an unreadable scanning configuration is informational `N/A`.
+
+### AC-51: Web ACL Anti-DDoS
+
+- **Severity:** Medium
+- **Description:** Requires every AWS WAF web ACL that is associated with a resource to run the `AWSManagedRulesAntiDDoSRuleSet` managed rule group. `REGIONAL` web ACLs are read in each region, and `CLOUDFRONT` web ACLs in `us-east-1` only. Association is read with one `ListResourcesForWebACL` call per regional resource type and with `ListDistributionsByWebACLId` for CloudFront, and an unassociated web ACL is not judged. The group is not credited when its rule overrides the group action to `Count`, or when a rule inside it is overridden to `Count` or `Allow` or excluded, because the group's soft mitigation is a `Challenge`. Rule groups that Firewall Manager adds before and after the web ACL's own rules are read as part of it. A web ACL with no readable association and at least one unread resource type, and a web ACL whose rules cannot be read, are informational `N/A` that name what was not read. A web ACL associated only with a CloudFront distribution tenant reads as unassociated.
 
 ---
 
