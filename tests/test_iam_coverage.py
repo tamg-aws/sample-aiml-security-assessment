@@ -167,6 +167,8 @@ REQUIRED_AGENTCORE_ACTIONS = {
     "bedrock-agentcore:ListGatewayRateLimits",
     "bedrock-agentcore:ListGatewayTargets",
     "bedrock-agentcore:GetGatewayTarget",
+    # AC-50 reads the registry scanning configuration.
+    "ecr:GetRegistryScanningConfiguration",
 }
 
 REQUIRED_AGENT_REGISTRY_ACTIONS = {

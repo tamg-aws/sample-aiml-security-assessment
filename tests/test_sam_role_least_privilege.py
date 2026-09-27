@@ -298,6 +298,7 @@ _EXPECTED_ACTIONS = {
         "ec2:DescribeVpcEndpoints",
         "ec2:DescribeVpcs",
         "ecr:DescribeRepositories",
+        "ecr:GetRegistryScanningConfiguration",
         "iam:GenerateServiceLastAccessedDetails",
         "iam:GetRole",
         "iam:GetServiceLastAccessedDetails",
@@ -981,6 +982,9 @@ def test_aisf_phase5_reads_wildcard_only_where_iam_has_no_resource_type(template
         ),
         ("AgentRegistrySecurityAssessmentFunction", "RegistryEventRuleInventory"): (
             "events:ListRules",
+        ),
+        ("AgentCoreSecurityAssessmentFunction", "ECRRegistryScanningRead"): (
+            "ecr:GetRegistryScanningConfiguration",
         ),
     }
     for (logical_id, sid), actions in wildcard.items():

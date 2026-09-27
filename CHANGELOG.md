@@ -19,7 +19,7 @@ section.
   - The section is always on. It needs no deployment parameter, runs no
     additional AWS API calls, and adds no scan time, because each row restates
     the verdict of a check that already ran under an AISF control id.
-  - `AISF-` rows are excluded from the 263-check catalog total, from the report
+  - `AISF-` rows are excluded from the 271-check catalog total, from the report
     pass rate, and from Open Action Items, for the same reason OWASP-mapped
     rows are: the underlying check is already counted.
   - `AISF-08` aggregates three SageMaker checks (`SM-09`, `SM-01`, `SM-03`). It
@@ -36,6 +36,19 @@ section.
   - The mappings are preliminary and illustrative. Validate them with your
     security and compliance team before using a row as audit evidence.
     `docs/SECURITY_CHECKS_AISF.md` documents every row and its source checks.
+- Added `AC-50` and `AC-51`, growing the catalog from 256 to 258 checks (143
+  core), and extended `AC-26`. The assessment role gains one read-only
+  permission, `ecr:GetRegistryScanningConfiguration`.
+  - `AC-50` fails an AgentCore image repository that Amazon Inspector enhanced
+    scanning does not cover, including every repository on a `BASIC` registry.
+  - `AC-51` fails an AgentCore gateway whose web ACL does not run
+    `AWSManagedRulesAntiDDoSRuleSet`, runs it with the group or its rules set
+    to `Count`, or that has no web ACL. Other front doors such as API Gateway,
+    ALB, and CloudFront are not judged, because no API identifies them as AI
+    entry points.
+  - `AC-26` now also fails a runtime log group, or the `aws/spans` group, with
+    deletion protection off. A group that reports no setting is read as off,
+    so an `AC-26` row that passed before can now fail.
 - Added 48 checks so every machine-verifiable AISF control has a producing
   check, growing the catalog from 208 to 256 checks (141 core, 39 Agentic AI,
   64 Responsible AI GRC, and 12 OWASP): `BR-41` through `BR-49`, `SM-31`

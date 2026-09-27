@@ -896,10 +896,11 @@ Resources:
                 - ec2:DescribeSecurityGroups
               Resource: '*'
             - Sid: AgentCoreGatewayWebACLRead
-              # AG-39 reads the rules of the web ACL associated with a gateway.
+              # AG-39 reads the rules of the web ACL associated with a gateway,
+              # and AC-51 reads the same ACL for the Anti-DDoS rule group.
               Effect: Allow
               Action:
-                - wafv2:GetWebACL # AG-39
+                - wafv2:GetWebACL # AG-39, AC-51
               Resource: !Sub 'arn:${AWS::Partition}:wafv2:*:${AWS::AccountId}:regional/webacl/*/*'
             - Sid: DNSFirewallAssociationInventory
               # ListFirewallRuleGroupAssociations and ListFirewallDomainLists
@@ -948,6 +949,15 @@ Resources:
               Action:
                 - ecr:DescribeRepositories
               Resource: !Sub 'arn:${AWS::Partition}:ecr:*:${AWS::AccountId}:repository/*'
+            - Sid: ECRRegistryScanningRead
+              # AC-50 reads the private registry's scanning configuration.
+              # GetRegistryScanningConfiguration acts on the registry, which has
+              # no resource type in the service authorization reference, so it
+              # takes '*'.
+              Effect: Allow
+              Action:
+                - ecr:GetRegistryScanningConfiguration # AC-50
+              Resource: '*'
             - Sid: LogsPermissions
               Effect: Allow
               Action:
