@@ -418,8 +418,11 @@ ROWS = [
         "condition on Resource * removes an action. AR-10 asserts the observation leg: an "
         "enabled rule on the default event bus that matches the aws.agent-registry "
         "Pending Approval, Approved and Rejected state-change events and has a target. A rule that matches only the aws.bedrock-agentcore preview source is "
-        "reported apart, because that source stops routing on 30 October 2026. Rules on a "
-        "custom bus are not read, since AWS delivers these events to the default bus",
+        "reported apart, because that source stops routing on 30 October 2026. AWS delivers "
+        "these events to the default bus, so a default-bus rule whose only targets are "
+        "event buses is followed one hop to a bus in the same account and Region and "
+        "credited only if a rule there matches and has a target other than an event bus; "
+        "a forward to another account or Region is reported N/A naming the bus",
         [],
         4,
     ),

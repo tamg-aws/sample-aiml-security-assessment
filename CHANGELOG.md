@@ -66,6 +66,13 @@ section.
     creates, and AWS Config refuses its compliance results to every caller;
     such rules get their own `N/A` naming the owning service and never count
     toward a `Passed`.
+  - `AR-10` credits a default-bus rule whose only targets are event buses
+    only when the events reach a target other than an event bus. A forward to
+    a bus in the same account and Region is followed one hop, and a rule there
+    must match the events and deliver them. A forward to a bus in another
+    account or Region is reported `N/A` naming that bus, because its rules
+    cannot be read. `ListRules` on the forwarded bus is covered by the
+    existing `*` grant and `ListTargetsByRule` by the existing `rule/*` grant.
   - `AG-39` does not read the rules inside customer rule groups or non-AWS
     managed rule groups. An ACL that relies on one for a missing filter is
     reported `N/A` with the group named.

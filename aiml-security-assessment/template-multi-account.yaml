@@ -995,14 +995,16 @@ Resources:
                 - agent-registry:ListRegistryRecords
               Resource: !Sub 'arn:${AWS::Partition}:agent-registry:*:${AWS::AccountId}:registry/*'
             - Sid: RegistryEventRuleInventory
-              # AR-10 lists the default event bus's rules. ListRules has no
-              # resource-level authorization.
+              # AR-10 lists the default event bus's rules, and those of a bus in
+              # this account and Region that a Registry rule forwards to.
+              # ListRules has no resource-level authorization.
               Effect: Allow
               Action:
                 - events:ListRules # AR-10
               Resource: '*'
             - Sid: RegistryEventRuleTargetRead
-              # AR-10 counts the targets of the rules that match Registry events.
+              # AR-10 reads the targets of the rules that match Registry events.
+              # rule/* also covers custom-bus rules, rule/<bus-name>/<rule-name>.
               Effect: Allow
               Action:
                 - events:ListTargetsByRule # AR-10
