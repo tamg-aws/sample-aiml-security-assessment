@@ -23,7 +23,7 @@ row's own Status column carries the verdict.
 
 AISF_COMPLIANCE_MAP = {
     "AC-01": "AISF AIR-ACR-RT-08 | AISF AIR-FND-NET-01 (1 of 6 checks) | AISF AIR-FND-NET-06 (1 of 3 checks) | AISF AIR-SLF-RT-02",
-    "AC-02": "AISF AIR-ACR-EVAL-01 | AISF AIR-ACR-PAY-01 | AISF AIR-ACR-RT-03 (1 of 2 checks) | AISF AIR-FND-IAM-05 (1 of 4 checks) | AISF AIR-FND-IAM-09 (partial)",
+    "AC-02": "AISF AIR-ACR-EVAL-01 | AISF AIR-ACR-PAY-01 | AISF AIR-ACR-RT-03 (1 of 2 checks) | AISF AIR-FND-IAM-05 (1 of 4 checks) | AISF AIR-FND-IAM-09 (1 of 4 checks)",
     "AC-06": "AISF AIR-ACR-RT-09",
     "AC-07": "AISF AIR-ACR-MEM-01 (1 of 2 checks)",
     "AC-08": "AISF AIR-ACR-GW-04 (1 of 2 checks) | AISF AIR-ACR-RT-13 (1 of 3 checks) | AISF AIR-FND-NET-02 (1 of 2 checks)",
@@ -40,7 +40,7 @@ AISF_COMPLIANCE_MAP = {
     "AC-23": "AISF AIR-ACR-MEM-01 (1 of 2 checks)",
     "AC-24": "AISF AIR-ACR-GW-05 (1 of 2 checks)",
     "AC-25": "AISF AIR-ACR-GW-08",
-    "AC-26": "AISF AIR-ACR-EVAL-07 (1 of 3 checks) | AISF AIR-ACR-GW-10 (1 of 3 checks) | AISF AIR-FND-DET-09 (partial)",
+    "AC-26": "AISF AIR-ACR-EVAL-07 (1 of 3 checks) | AISF AIR-ACR-GW-10 (1 of 3 checks) | AISF AIR-FND-DET-09 (1 of 2 checks)",
     "AC-27": "AISF AIR-ACR-GW-03 (1 of 2 checks) | AISF AIR-ACR-GW-04 (1 of 2 checks)",
     "AC-28": "AISF AIR-ACR-GW-02",
     "AC-29": "AISF AIR-ACR-ID-04",
@@ -64,6 +64,8 @@ AISF_COMPLIANCE_MAP = {
     "AC-47": "AISF AIR-ACR-RT-13 (1 of 3 checks)",
     "AC-48": "AISF AIR-FND-IAM-05 (1 of 4 checks)",
     "AC-49": "AISF AIR-FND-NET-03 | AISF AIR-FND-NET-06 (1 of 3 checks)",
+    "AC-50": "AISF AIR-SLF-CMP-01 (1 of 2 checks)",
+    "AC-51": "AISF AIR-FND-NET-08",
     "AG-24": "AISF AIR-ACR-GW-01",
     "AG-25": "AISF AIR-ACR-POL-01 (1 of 3 checks) | AISF AIR-ACR-POL-07 (1 of 2 checks)",
     "AG-27": "AISF AIR-ACR-GW-05 (1 of 2 checks) | AISF AIR-FND-NET-04 (1 of 2 checks)",

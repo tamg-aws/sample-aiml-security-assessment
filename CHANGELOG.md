@@ -14,7 +14,7 @@ section.
 
 - Added an **AWS AI Security Framework (AISF)** section to the HTML report,
   alongside OWASP Top 10 for LLM under "By Compliance Standard". It reports 8
-  of the 78 in-scope AISF controls as `AISF-01` through `AISF-08`. Behavior
+  of the 105 in-scope AISF controls as `AISF-01` through `AISF-08`. Behavior
   worth knowing:
   - The section is always on. It needs no deployment parameter, runs no
     additional AWS API calls, and adds no scan time, because each row restates
@@ -36,9 +36,18 @@ section.
   - The mappings are preliminary and illustrative. Validate them with your
     security and compliance team before using a row as audit evidence.
     `docs/SECURITY_CHECKS_AISF.md` documents every row and its source checks.
-- Added `AC-50` and `AC-51`, growing the catalog from 256 to 258 checks (143
-  core), and extended `AC-26`. The assessment role gains one read-only
-  permission, `ecr:GetRegistryScanningConfiguration`.
+- Added 15 checks for the AISF foundation controls and extended six, growing
+  the catalog from 256 to 271 checks (156 core): `BR-50` to `BR-55` in
+  Bedrock, `SM-35` to `SM-41` in SageMaker AI, and `AC-50` and `AC-51` in
+  AgentCore, with new legs on `BR-01`, `BR-04`, `BR-12`, `BR-43`, `SM-02` and
+  `AC-26`. The three entries that follow give the per-module detail.
+- The AISF parity ledger now reports 97 of the 105 in-scope AISF controls as
+  `covered` and 8 as `not_implementable`, with none left `tighten` or `new`.
+  The 19 foundation controls that waited on those checks and legs are
+  `covered`, and the new check ids carry their AISF control in the
+  `Compliance_Frameworks` column.
+- Added `AC-50` and `AC-51`, and extended `AC-26`. The assessment role gains
+  one read-only permission, `ecr:GetRegistryScanningConfiguration`.
   - `AC-50` fails an AgentCore image repository that Amazon Inspector enhanced
     scanning does not cover, including every repository on a `BASIC` registry.
   - `AC-51` fails an AgentCore gateway whose web ACL does not run
@@ -116,9 +125,8 @@ section.
     to `FAIL_OPEN` allows requests when AWS WAF cannot be evaluated and fails
     whatever its web ACL applies. A gateway that reports no `failureMode` is
     `N/A`, because the API states no default.
-- Added 7 SageMaker assessment checks for AISF foundation controls, growing the
-  catalog from 256 to 263 checks (148 core): `SM-35` security service
-  delegated administrator, `SM-36` the Security Hub AI Security Best Practices
+- Added 7 SageMaker assessment checks for AISF foundation controls: `SM-35`
+  security service delegated administrator, `SM-36` the Security Hub AI Security Best Practices
   standard, `SM-37` GuardDuty Lambda Protection, `SM-38` GuardDuty Runtime
   Monitoring, `SM-39` EKS vpc-cni network policy, `SM-40` Secrets Manager
   rotation, and `SM-41` AWS IoT device-scoped policies. `SM-02` gains a
@@ -145,9 +153,8 @@ section.
   - `SM-36` through `SM-41` run after the SageMaker availability probe, so a
     region where SageMaker is unavailable does not report them.
 
-- Added six Bedrock checks, growing the catalog from 256 to 262 checks (147
-  core): `BR-50` (active access keys on IAM users with a non-read Bedrock,
-  SageMaker AI or AgentCore grant), `BR-51` (console password without MFA on
+- Added six Bedrock checks: `BR-50` (active access keys on IAM users with a
+  non-read Bedrock, SageMaker AI or AgentCore grant), `BR-51` (console password without MFA on
   the same users), `BR-52` (COMPLIANCE-mode Object Lock on Bedrock data path
   buckets), `BR-53` (an owner tag on agents, knowledge bases, guardrails,
   custom and imported models, and provisioned throughputs), `BR-54` (public

@@ -136,8 +136,8 @@ sample-aiml-security-assessment/
 │   ├── functions/security/
 │   │   ├── bedrock_assessments/      # Bedrock security checks (55)
 │   │   ├── sagemaker_assessments/    # SageMaker checks (40; SM-29 reserved)
-│   │   ├── agentcore_assessments/    # AgentCore security checks (17)
-│   │   ├── agent_registry_assessments/  # AWS Agent Registry checks (8)
+│   │   ├── agentcore_assessments/    # AgentCore security checks (51)
+│   │   ├── agent_registry_assessments/  # AWS Agent Registry checks (10)
 │   │   ├── responsible_ai_grc_assessments/  # Optional Responsible AI GRC checks (64)
 │   │   ├── owasp_assessments/        # Optional OWASP Top 10 for LLM checks (12)
 │   │   ├── responsible_ai_grc_tests/ # Responsible AI GRC-specific unit and coverage tests

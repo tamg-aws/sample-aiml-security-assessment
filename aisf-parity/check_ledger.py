@@ -1070,26 +1070,33 @@ def emitted_finding_names():
         except SyntaxError:
             continue
 
-        def string_consts(body):
+        def string_consts(body, known):
+            # `check_name = OBJECT_LOCK_FINDING` binds a local to a module
+            # constant, so a Name value resolves through the names already known.
             found = {}
             for node in body:
-                if isinstance(node, ast.Assign) and isinstance(
-                    node.value, ast.Constant
-                ):
-                    if isinstance(node.value.value, str):
-                        for t in node.targets:
-                            if isinstance(t, ast.Name):
-                                found[t.id] = node.value.value
+                if not isinstance(node, ast.Assign):
+                    continue
+                value = node.value
+                if isinstance(value, ast.Constant) and isinstance(value.value, str):
+                    text = value.value
+                elif isinstance(value, ast.Name) and value.id in known:
+                    text = known[value.id]
+                else:
+                    continue
+                for t in node.targets:
+                    if isinstance(t, ast.Name):
+                        found[t.id] = text
             return found
 
-        module_consts = string_consts(tree.body)
+        module_consts = string_consts(tree.body, {})
         for fn in [
             n
             for n in ast.walk(tree)
             if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
         ]:
             scope = dict(module_consts)
-            scope.update(string_consts(list(ast.walk(fn))))
+            scope.update(string_consts(list(ast.walk(fn)), module_consts))
 
             def resolve(node):
                 if isinstance(node, ast.Constant) and isinstance(node.value, str):

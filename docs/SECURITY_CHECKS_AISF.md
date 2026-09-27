@@ -16,20 +16,20 @@ and the shipped BR/SM/AC/AG check every row is derived from.
   machine-checkable AISF control, including the foundation controls, which assert
   over the account or runtime an AI workload sits on, and the ledger marks each
   foundation row. A row is a narrower claim than
-  coverage, so read this figure with the ledger census below it: 78 of the 105 are
-  `covered`, all 8 rows sit on `covered` controls, and the other 70 `covered`
+  coverage, so read this figure with the ledger census below it: 97 of the 105 are
+  `covered`, all 8 rows sit on `covered` controls, and the other 89 `covered`
   controls are named by the `Compliance_Frameworks` tag column until each is
   walked through [Adding a control](#adding-a-control), which allocates an id and
-  writes a per-control section. The 97 without a row are 70 `covered`, 9
-  `tighten`, 10 `new` and 8 `not_implementable`, with no control left
+  writes a per-control section. The 97 without a row are 89 `covered`, 0
+  `tighten`, 0 `new` and 8 `not_implementable`, with no control left
   `unassessed`. Each `not_implementable` control asks about evidence no AWS
   API returns, and the ledger names the reason for each. The parity analysis behind those figures is in
   [`aisf-parity/AISF-WORK-LEDGER.md`](../aisf-parity/AISF-WORK-LEDGER.md).
-- **Traceability:** 9 controls are `tighten`. A `tighten` control is covered
+- **Traceability:** 0 controls are `tighten`. A `tighten` control is covered
   too partly to earn an `AISF-` row at all, and its ledger row names the
   incumbent extension or the new check that closes it. The `Compliance_Frameworks` CSV
-  column names all 87 taggable controls on the producer rows themselves, the 78
-  `covered` and the 9 `tighten`, and is described under
+  column names all 97 taggable controls on the producer rows themselves, the 97
+  `covered` and the 0 `tighten`, and is described under
   [Traceability column on producer rows](#traceability-column-on-producer-rows).
   A tag carries no verdict.
 
@@ -240,9 +240,9 @@ contributes to, so a reader of `bedrock_security_report_*.csv` can trace a row
 back to the framework. The `Status` column still carries the verdict.
 
 Measured by `check_ledger.py` gate 14, which prints each of these figures on
-every run: 136 check-control pairs over 91 tagged checks in 4 modules, naming 87
-distinct controls. Tagged checks per module are bedrock 26, sagemaker 15,
-agentcore 46, agent_registry 4.
+every run: 151 check-control pairs over 106 tagged checks in 4 modules, naming 97
+distinct controls. Tagged checks per module are bedrock 32, sagemaker 22,
+agentcore 48, agent_registry 4.
 
 ### The qualifier is what makes a `tighten` control safe to name
 
@@ -258,23 +258,23 @@ trusting the literal in the file:
 | `AISF AIR-SGM-TRN-05 (1 of 3 checks)` | the control is covered, but jointly, so no single leg asserts it |
 | `AISF <control> (partial)` | the check asserts less than the control requires, and the gap is open in the ledger |
 
-Census at the current head, also printed by gate 14: 50 bare, 14 `(partial)`, 72
-joint. The 50 bare tags plus the 28 jointly covered controls account for the 78
-`covered` controls. The `(partial)` tags sit on the 9 `tighten` controls, one per
-incumbent, so a control with several incumbents carries several. A bare tag on a `tighten` row, a `(partial)` on a `covered` row, or a
+Census at the current head, also printed by gate 14: 62 bare, 0 `(partial)`, 89
+joint. The 62 bare tags plus the 35 jointly covered controls account for the 97
+`covered` controls. A `(partial)` tag sits on a `tighten` control, one per
+incumbent, and with 0 `tighten` controls open none is emitted. A bare tag on a `tighten` row, a `(partial)` on a `covered` row, or a
 dropped `(1 of N)`, fails gate 14 with the row's verdict and incumbent count
 named.
 
 A check that contributes to several controls carries them pipe-joined, with the
 `AISF ` prefix repeated on each element so a consumer that splits on `|` gets a
 complete token. 30 checks name more than one control. `AC-02` names five: bare
-on `AIR-ACR-EVAL-01` and on `AIR-ACR-PAY-01`, joint on
-`AIR-ACR-RT-03 (1 of 2 checks)` and `AIR-FND-IAM-05 (1 of 4 checks)`, and
-partial on `AIR-FND-IAM-09 (partial)`.
+on `AIR-ACR-EVAL-01` and on `AIR-ACR-PAY-01`, and joint on
+`AIR-ACR-RT-03 (1 of 2 checks)`, `AIR-FND-IAM-05 (1 of 4 checks)` and
+`AIR-FND-IAM-09 (1 of 4 checks)`.
 
-Mixing a `(partial)` with a tag of another form inside one value is the less
-common case, 7 of those 30, and in every one of them the `(partial)` names a
-foundation control that is still `tighten`. A foundational control such as `AIR-FND-NET-01` is asserted jointly by
+Mixing a `(partial)` with a tag of another form inside one value is no longer the
+common case, 0 of those 30, because no `tighten` control is left to carry a
+`(partial)`. A foundational control such as `AIR-FND-NET-01` is asserted jointly by
 checks whose own service control they fully assert, so the same check carries a
 bare tag and a `(1 of N checks)` one. Nothing in the vocabulary forbids a mix,
 and gate 14 derives each element's form from that element's own ledger row, so a
