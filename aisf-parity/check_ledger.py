@@ -73,7 +73,13 @@ from aisf_mappings import (  # noqa: E402
     SEVERITY_COLLAPSE_NOTE,
     derive_aisf_findings,
 )
-from build_ledger import ROWS, render_markdown  # noqa: E402
+from build_ledger import (  # noqa: E402
+    FOUNDATION,
+    ROWS,
+    SCOPE27,
+    TIERS,
+    render_markdown,
+)
 from gen_compliance_maps import check_owners  # noqa: E402
 from report_template import COMPLIANCE_STANDARDS  # noqa: E402
 
@@ -606,8 +612,8 @@ def tagged_control_problems(tag_controls, verdict_controls):
     The element count is deliberately NOT asserted against the set size. A
     `tighten` control with two incumbents carries two `(partial)` tags, one per
     incumbent: legal, and passes 14a. The base once stood at 29 elements over 28
-    controls with `AIR-BDR-MDL-02` carrying two, and carries none now that no row
-    is `tighten`. Asserting one tag per control
+    controls with `AIR-BDR-MDL-02` carrying two, and exceeds it again
+    wherever a foundation `tighten` row names several incumbents. Asserting one tag per control
     here would red a correct tree. Both numbers print beside the verdict, and the
     document's own one-tag-each clause is asserted by census_relations() at the
     refs that publish it.
@@ -978,6 +984,43 @@ def load_compliance_maps():
     return out
 
 
+def foundation_tier_problems(scope27, ledger_rows, source_tiers, machine_checkable):
+    """One message per way SCOPE27 and the foundation-tier rows disagree.
+
+    Three populations are compared with SCOPE27, and each is decided somewhere
+    else, which is what lets the comparison fail. The json rows carry the tier
+    build_ledger.table_fields() wrote; `source_tiers` is build_ledger.TIERS,
+    decided by which of the two verdict tables a row sits in and never by SCOPE27;
+    and `machine_checkable` is every machine-checkable control in the AISF
+    classification ledger. The third leg is the completeness claim: a
+    machine-checkable control with no ai_subject row must be in SCOPE27, so the
+    ledger has a row for every one of them and not only for the ones SCOPE27
+    already lists.
+
+    Pure, so tests/test_foundation_tier_matches_scope27.py can run it in CI, where
+    main() cannot run for want of a sibling AISF clone.
+    """
+    problems = []
+    json_foundation = {r["control"] for r in ledger_rows if r["tier"] == FOUNDATION}
+    source_foundation = {c for c, tier in source_tiers.items() if tier == FOUNDATION}
+    ai_subject = {r["control"] for r in ledger_rows if r["tier"] != FOUNDATION}
+    unrowed = set(machine_checkable) - ai_subject
+    for label, found in (
+        ("the ledger json's foundation-tier rows", json_foundation),
+        ("build_ledger.FOUNDATION_ROWS", source_foundation),
+        ("machine-checkable controls with no ai_subject row", unrowed),
+    ):
+        if found - scope27:
+            problems.append(
+                f"{sorted(found - scope27)} are in {label} and not in SCOPE27"
+            )
+        if scope27 - found:
+            problems.append(
+                f"{sorted(scope27 - found)} are in SCOPE27 and not in {label}"
+            )
+    return problems
+
+
 def emitted_check_ids():
     """check_id -> set of module dirs that emit it."""
     out = {}
@@ -1126,14 +1169,17 @@ def main():
     )
 
     # ---- gate 3: the FND tier is machine-checkable AND workload-agnostic.
-    fnd = [r for r in rows if r["area"] == "FND"]
+    # ai_subject rows only. A foundation-tier FND row asserts over the account an
+    # AI workload runs in, and the AISF classification marks some of those
+    # workload-specific, which is why they were outside the first 78.
+    fnd = [r for r in rows if r["area"] == "FND" and r["tier"] != FOUNDATION]
     wrong = [
         r["control"]
         for r in fnd
         if not classification[r["control"]].get("workload_agnostic")
     ]
     gate(
-        "FND tier is workload-agnostic",
+        "FND ai_subject rows are workload-agnostic",
         not wrong,
         f"{len(fnd) - len(wrong)}/{len(fnd)} agnostic"
         + (f", workload-specific={wrong}" if wrong else ""),
@@ -1296,7 +1342,8 @@ def main():
     # (the same reason stated at gate 10). So the entry would have to mutate a
     # digit in a generated file, which the battery's find-strings exclude.
     hosted = [r for r in rows if r["area"] in hosted_areas]
-    fnd = [r for r in rows if r["area"] == "FND"]
+    fnd = [r for r in rows if r["area"] == "FND" and r["tier"] != FOUNDATION]
+    foundation = [r for r in rows if r["tier"] == FOUNDATION]
     part = (
         summary["covered"]
         + summary["tighten"]
@@ -1307,7 +1354,9 @@ def main():
     ok = (
         part == summary["total"] == len(rows)
         and len(hosted) == 67
-        and len(fnd) == 11
+        and len(fnd) == summary["fnd_ai_subject"] == 11
+        and len(foundation) == summary["foundation"] == 27
+        and len(hosted) + len(fnd) + len(foundation) == len(rows) == 105
         and summary["tighten_extend"] + summary["tighten_new_id"] == summary["tighten"]
         and summary["new_check_functions"]
         == summary["new"] + summary["tighten_new_id"] + summary["unassessed"]
@@ -1315,7 +1364,8 @@ def main():
     gate(
         "published totals reconcile against the rows",
         ok,
-        f"partition {part}/{len(rows)} (hosted {len(hosted)}, FND {len(fnd)}), "
+        f"partition {part}/{len(rows)} (hosted {len(hosted)}, FND {len(fnd)}, "
+        f"foundation {len(foundation)}), "
         f"tighten {summary['tighten_extend']}+{summary['tighten_new_id']}"
         f"={summary['tighten']}, "
         f"new functions {summary['new_check_functions']}",
@@ -2177,6 +2227,22 @@ def main():
         f"taggable {bullet_computed['covered']}+{bullet_computed['tighten']}, "
         f"copies [{copies_note(bullet_hits)}]"
         + (f", bad={bullet_bad}" if bullet_bad else ""),
+    )
+
+    # ---- gate 22: SCOPE27 is the foundation tier, in the json, in the verdict
+    # tables, and in the AISF classification. Appended for the reason gate 21 was.
+    machine_checkable = {
+        cid for cid, flags in classification.items() if flags.get("machine_checkable")
+    }
+    tier_bad = foundation_tier_problems(SCOPE27, rows, TIERS, machine_checkable)
+    gate(
+        "SCOPE27 is the foundation tier, and every machine-checkable control has a row",
+        not tier_bad,
+        f"SCOPE27 {len(SCOPE27)}, json foundation "
+        f"{sum(1 for r in rows if r['tier'] == FOUNDATION)}, FOUNDATION_ROWS "
+        f"{sum(1 for t in TIERS.values() if t == FOUNDATION)}, machine-checkable "
+        f"{len(machine_checkable)} over {len(rows)} rows"
+        + (f", bad={tier_bad}" if tier_bad else ""),
     )
 
     failed = [n for n, ok, _ in results if not ok]

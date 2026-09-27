@@ -20,8 +20,10 @@ at the end pin both directions.
 
 import collections
 import csv
+import glob
 import importlib.util
 import os
+import re
 import subprocess
 import sys
 
@@ -236,4 +238,23 @@ def test_a_correct_set_passes_the_census_on_this_tree(tmp_path):
     result = _run(tmp_path)
     name = "every tag on a real row parses, and the forms are exercised live"
     assert _verdict(result.stdout, name) == "PASS", result.stdout
-    assert "the maps carry 0 (partial) element(s)" in result.stdout, result.stdout
+    # Counted here from the map entries, and not pinned: the figure moves each time
+    # a `tighten` row opens or closes, and the case holds at either value.
+    shipped_partial = sum(
+        len(re.findall(r"\(partial\)", line))
+        for path in glob.glob(
+            os.path.join(
+                REPO_ROOT,
+                "aiml-security-assessment",
+                "functions",
+                "security",
+                "*",
+                "aisf_compliance_*.py",
+            )
+        )
+        for line in open(path, encoding="utf-8")
+        if re.match(r'\s+"[A-Z]+-\d+": "', line)
+    )
+    assert f"the maps carry {shipped_partial} (partial) element(s)" in result.stdout, (
+        result.stdout
+    )

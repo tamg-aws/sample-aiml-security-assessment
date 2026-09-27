@@ -307,6 +307,17 @@ MUTATIONS = [
         "find": '    "BR-46": "Knowledge Base Source Data Classification",\n',
         "replace": '    "BR-46": "Knowledge Base Source Classification",\n',
     },
+    {
+        "name": "a control is dropped from SCOPE27",
+        "file": BUILD_LEDGER,
+        # Gate 22 alone reads SCOPE27, so it is the only catcher: the json, the
+        # maps and ROWS are all unchanged by this edit.
+        "defect": "the scope constant loses a foundation control while its row "
+        "stays in the verdict table, so the stated scope and the ledger's rows "
+        "no longer describe the same controls",
+        "find": '        "AIR-FND-NET-08",\n        "AIR-PHY-EDG-01",\n',
+        "replace": '        "AIR-FND-NET-08",\n',
+    },
     # ---------------------------------------------------------------- phase 2
     # The tag column. The next two entries are the two halves of the qualifier
     # vocabulary and are both here because they fail different branches of the
@@ -323,8 +334,8 @@ MUTATIONS = [
     # bedrock's qualifiers, and AC-07, which replaced it, is one of the three
     # agentcore tags feature/aisf-phase4-acr converts to `(1 of N checks)`. The
     # vocabulary is being retired map by map, so this reads the maps instead of
-    # naming one. Since the last `tighten` rows closed, no map carries a
-    # `(partial)` tag, and the entry adds one to a covered tag instead. See
+    # naming one. When no `tighten` row is open, no map carries a `(partial)`
+    # tag, and the entry adds one to a covered tag instead. See
     # partial_qualifier_mutation().
     DERIVED_PARTIAL_QUALIFIER,
     {
@@ -682,6 +693,7 @@ GROUPS: dict[str, str] = {
     "ledger markdown renders a figure from the wrong summary key": (
         "in the ledger's markdown renderer"
     ),
+    "a control is dropped from SCOPE27": "in the foundation scope",
     "the census anchor sentence is reworded": "in the census anchor",
     "a mutation group disappears from the published battery figures": (
         "in the published battery figures"

@@ -26,8 +26,14 @@ UNASSESSED = "unassessed"  # in scope, dedup pass not yet run
 EXTEND = "extend"  # incumbent name is honest, assertion merely narrower
 NEW_ID = "new_id"  # incumbent name claims more than it asserts
 
+# tier values. The tier is decided by which of the two tables below a row sits
+# in, never by SCOPE27, so check_ledger.py can compare the two and the comparison
+# can fail.
+AI_SUBJECT = "ai_subject"  # the assertion subject is an AI resource
+FOUNDATION = "foundation"  # the account or runtime an AI workload sits on
+
 # (control, verdict, disposition, module, incumbents, gap, extra_iam, phase)
-ROWS = [
+AI_SUBJECT_ROWS = [
     # ---------------- BDR: 19 controls, bedrock_assessments ----------------
     ("AIR-BDR-GRD-01", COVERED, None, "bedrock_assessments", ["BR-10"], "", [], 3),
     ("AIR-BDR-GRD-03", COVERED, None, "bedrock_assessments", ["BR-26"], "", [], 3),
@@ -945,6 +951,498 @@ ROWS = [
     ),
 ]
 
+# The 27 machine-checkable controls whose subject is the account, identity,
+# network or runtime an AI workload sits on (FND, SLF, PHY). The user brought
+# them into scope on 2026-09-27 so that the ledger covers every machine-checkable
+# AISF control, and ruled that they are hosted in the existing modules. A `new`
+# or `tighten` row names the id its check will be given; the verdict stays
+# `new` or `tighten` until that check ships.
+FOUNDATION_ROWS = [
+    # ---------------- covered: 4 controls ----------------
+    (
+        "AIR-FND-DAT-04",
+        COVERED,
+        None,
+        "bedrock_assessments",
+        ["BR-43"],
+        "BR-43 passes only when an attached service control policy denies the "
+        "Bedrock invocation actions with a condition on aws:RequestedRegion and a "
+        "global inference profile cannot route around it, which is the enforcing "
+        "half of a data-residency requirement. Which Regions are approved is the "
+        "customer's decision, so BR-43 asserts that an enforcing Deny exists and "
+        "reports the Region values it found, and never judges whether that list "
+        "is the right one",
+        [],
+        6,
+    ),
+    (
+        "AIR-FND-IAM-01",
+        COVERED,
+        None,
+        [
+            "bedrock_assessments",
+            "sagemaker_assessments",
+        ],
+        ["BR-42", "SM-02"],
+        "BR-42 fails each cached role or user whose Bedrock invocation grant reaches "
+        "every model instead of naming foundation-model or inference-profile ARNs. "
+        "SM-02 fails each cached role or user whose sagemaker:InvokeEndpoint grant "
+        "reaches every endpoint with no aws:ResourceTag condition. Together they "
+        "cover the model and the inference endpoint; which identities should hold "
+        "those grants is a workload decision, so a grant that names its resources "
+        "is not judged further",
+        [],
+        6,
+    ),
+    (
+        "AIR-FND-NET-03",
+        COVERED,
+        None,
+        "agentcore_assessments",
+        ["AC-49"],
+        "AC-49 asserts an egress allow-list by destination name on each VPC that "
+        "hosts an AgentCore runtime, browser or code interpreter. It passes only "
+        'when the first DNS Firewall rule that matches "*" is a BLOCK, which is '
+        "the walled garden pattern: the domains allowed by earlier rules are the "
+        "allow-list and every other name is refused. It fails an ALLOW or ALERT "
+        'over "*", and a VPC whose DNS Firewall fails open. The same check covers '
+        "AIR-FND-NET-06",
+        [],
+        6,
+    ),
+    (
+        "AIR-SLF-RT-02",
+        COVERED,
+        None,
+        "agentcore_assessments",
+        ["AC-01"],
+        "AC-01 fails an AgentCore runtime or built-in tool whose security groups "
+        "allow egress to 0.0.0.0/0 or ::/0, and a subnet whose route table sends "
+        "traffic to an internet gateway. The runtime is where AgentCore runs the "
+        "customer's own agent container, so this is the self-hosted egress "
+        "surface the control names",
+        [],
+        6,
+    ),
+    # ---------------- tighten / extend: 4 controls ----------------
+    (
+        "AIR-FND-ACC-02",
+        TIGHTEN,
+        EXTEND,
+        "bedrock_assessments",
+        ["BR-43"],
+        "BR-43 covers the Region half: it passes on an attached service control "
+        "policy that denies the invocation actions on aws:RequestedRegion with "
+        "global routing closed. The model half is missing. BR-43 gains a leg that "
+        "passes when an attached policy denies bedrock:InvokeModel and "
+        "bedrock:InvokeModelWithResponseStream, the two actions that also "
+        "authorize Converse and ConverseStream, with a NotResource, or a Resource "
+        "plus a condition, that names foundation-model or inference-profile ARNs. "
+        "A Deny written with NotAction is read as covering those actions, and "
+        "arn:aws:bedrock:*::foundation-model/* counts as no list. The leg asserts "
+        "that a model list exists and never which models are approved. "
+        "Organization policies are readable only from the management account, so "
+        "from a delegated administrator the leg is Not Applicable",
+        [],
+        6,
+    ),
+    (
+        "AIR-FND-DAT-08",
+        TIGHTEN,
+        EXTEND,
+        "bedrock_assessments",
+        ["BR-04"],
+        "BR-04 credits an S3 lifecycle Expiration rule on the invocation log "
+        "bucket, which deletes only current versions. On a bucket whose "
+        "versioning is Enabled or Suspended, an expired object leaves a "
+        "noncurrent version that is never deleted, so the schedule is not "
+        "enforced. BR-04 gains a leg that reads GetBucketVersioning and, on a "
+        "versioned bucket, also requires an Enabled rule with "
+        "NoncurrentVersionExpiration.NoncurrentDays. A missing Status means the "
+        "bucket was never versioned, and a rule whose filter does not cover the "
+        "log prefix does not count",
+        ["s3:GetBucketVersioning"],
+        6,
+    ),
+    (
+        "AIR-FND-DET-09",
+        TIGHTEN,
+        EXTEND,
+        [
+            "agentcore_assessments",
+            "bedrock_assessments",
+        ],
+        ["AC-26", "BR-12"],
+        "AC-26 reads retention and the key on the AgentCore runtime log groups and "
+        "aws/spans, and BR-12 the key on the S3 destination of Bedrock invocation "
+        "logging. Neither reads whether a log group can be deleted. AC-26 gains a "
+        "leg over its log groups, and BR-12 one over the CloudWatch log group the "
+        "invocation logging configuration names, that reads "
+        "deletionProtectionEnabled from DescribeLogGroups by logGroupNamePrefix and "
+        "fails a group where it is false or absent, since an administrator can "
+        "otherwise delete the audit trail with the group",
+        [],
+        6,
+    ),
+    (
+        "AIR-FND-IAM-09",
+        TIGHTEN,
+        EXTEND,
+        [
+            "bedrock_assessments",
+            "sagemaker_assessments",
+            "agentcore_assessments",
+            "agent_registry_assessments",
+        ],
+        ["BR-01", "SM-02", "AC-02", "AR-01"],
+        "AC-02 and AR-01 already fail an allow-all grant on their services in "
+        "customer-managed and inline policies. BR-01 checks only for the "
+        "AmazonBedrockFullAccess managed policy by name, and SM-02 only for "
+        "AmazonSageMakerFullAccess. Both gain a leg over the cached "
+        "customer-managed and inline policies that fails an Allow with Action "
+        '"bedrock:*" or "sagemaker:*", as a string or in a list, and an Allow '
+        'written with NotAction. A bare Action "*" is a service-agnostic '
+        "administrator grant and stays out of this leg",
+        [],
+        6,
+    ),
+    # ---------------- tighten / new_id: 5 controls ----------------
+    (
+        "AIR-FND-DET-02",
+        TIGHTEN,
+        NEW_ID,
+        "sagemaker_assessments",
+        ["SM-26", "SM-04"],
+        "SM-04 ('GuardDuty Enabled') and SM-26 ('GuardDuty AI Protection') read "
+        "the GuardDuty detector and its AI_PROTECTION feature, which is threat "
+        "detection for the account. Their names claim GuardDuty only, and the "
+        "control also asks for the Security Hub AI security standard, so new "
+        "SM-36 sits beside them. SM-36 reads GetEnabledStandards in each Region "
+        "and passes when a StandardsArn contains "
+        "standards/ai-security-best-practices/v/1.0.0 with StandardsStatus READY "
+        "or INCOMPLETE. It fails otherwise, and a Region where Security Hub is not "
+        "enabled fails with that reason",
+        ["securityhub:GetEnabledStandards"],
+        6,
+    ),
+    (
+        "AIR-FND-IAM-03",
+        TIGHTEN,
+        NEW_ID,
+        "bedrock_assessments",
+        ["BR-45"],
+        "BR-45 ('Bedrock API Key Inventory') covers the Bedrock API keys, which "
+        "are one kind of long-lived credential. IAM user access keys are the "
+        "other, and a check named for API keys should not report them, so new "
+        "BR-50 sits beside it. BR-50 reads ListAccessKeys for each cached IAM user "
+        "whose policies grant a non-read bedrock:, sagemaker: or "
+        "bedrock-agentcore: action, fails each Active key and reports its age "
+        "from CreateDate. Inactive keys do not count",
+        ["iam:ListAccessKeys"],
+        6,
+    ),
+    (
+        "AIR-FND-NET-07",
+        TIGHTEN,
+        NEW_ID,
+        "sagemaker_assessments",
+        ["SM-04"],
+        "SM-04 ('GuardDuty Enabled') reads that a detector exists and is enabled, "
+        "which does not say whether network behavior is analysed. New SM-37 reads "
+        "the detector's Features and passes when LAMBDA_NETWORK_LOGS is ENABLED, "
+        "and fails otherwise. A Region with no detector is Not Applicable, since "
+        "SM-04 already fails it",
+        [],
+        6,
+    ),
+    (
+        "AIR-SLF-CMP-01",
+        TIGHTEN,
+        NEW_ID,
+        [
+            "bedrock_assessments",
+            "agentcore_assessments",
+        ],
+        ["BR-33"],
+        "BR-33 ('Amazon Inspector Lambda Code Scanning Check') covers Lambda "
+        "functions and no container image. New AC-50 reads "
+        "GetRegistryScanningConfiguration and passes when scanType is ENHANCED "
+        "and a rule with SCAN_ON_PUSH or CONTINUOUS_SCAN has wildcard filters "
+        "that match every ECR repository AC-05 reports as AgentCore-related. BASIC "
+        "scanning fails, and a filter that misses a repository fails and names it",
+        ["ecr:GetRegistryScanningConfiguration"],
+        6,
+    ),
+    (
+        "AIR-SLF-RT-04",
+        TIGHTEN,
+        NEW_ID,
+        "sagemaker_assessments",
+        ["SM-04"],
+        "SM-04 ('GuardDuty Enabled') reads that a detector is enabled, which does "
+        "not monitor process, file or network activity inside a workload. New "
+        "SM-38 reads the detector's Features and passes when RUNTIME_MONITORING is "
+        "ENABLED, reporting the ECS_FARGATE_AGENT_MANAGEMENT, "
+        "EC2_AGENT_MANAGEMENT and EKS_ADDON_MANAGEMENT states without failing on "
+        "them. EKS_RUNTIME_MONITORING alone fails, because it covers EKS only",
+        [],
+        6,
+    ),
+    # ---------------- new: 10 controls ----------------
+    (
+        "AIR-FND-ACC-09",
+        NEW,
+        None,
+        "sagemaker_assessments",
+        [],
+        "new SM-35. It reads the management account id from DescribeOrganization "
+        "and calls ListDelegatedAdministrators for each of a fixed list of service "
+        "principals: GuardDuty, Security Hub, Inspector, Macie, Config and IAM "
+        "Access Analyzer, which the finding states. One row per service passes "
+        "when an ACTIVE delegated administrator is not the management account, "
+        "and fails when there is none or it is the management account. A member "
+        "account that cannot call the API is Not Applicable with the reason",
+        ["organizations:ListDelegatedAdministrators"],
+        6,
+    ),
+    (
+        "AIR-FND-DAT-05",
+        NEW,
+        None,
+        "bedrock_assessments",
+        [],
+        "new BR-52. It reads GetObjectLockConfiguration on each bucket on the "
+        "Bedrock data path: knowledge base sources, the invocation log bucket and "
+        "its large-data bucket, and the training, validation and output buckets of "
+        "customization jobs. A bucket passes only when Object Lock is Enabled with "
+        "a default retention in COMPLIANCE mode and a period in Days or Years. "
+        "GOVERNANCE mode fails, because a principal holding "
+        "s3:BypassGovernanceRetention can delete the objects, and so do no Object "
+        "Lock configuration and a lock with no default retention. A cross-account "
+        "bucket the role cannot read is Not Applicable. AWS Backup Vault Lock "
+        "state is printed beside the verdict and does not decide it",
+        [
+            "s3:GetBucketObjectLockConfiguration",
+            "s3:GetBucketVersioning",
+            "backup:ListBackupVaults",
+            "backup:DescribeBackupVault",
+        ],
+        6,
+    ),
+    (
+        "AIR-FND-DAT-10",
+        NEW,
+        None,
+        "bedrock_assessments",
+        [],
+        "new BR-55. It reads the default key policy of each customer-managed KMS "
+        "key. A key whose policy carries a kms:RecipientAttestation condition is "
+        "declared enclave-bound, and every other key is Not Applicable. An "
+        "enclave-bound key fails when another Allow grants kms:Decrypt, "
+        "kms:GenerateDataKey* or kms:* to a principal other than the account root "
+        "with no attestation condition, and when the only binding is on PCR0 "
+        "and not on ImageSha384. Which workloads must be enclave-bound is the "
+        "customer's decision, so a key without the condition is never failed",
+        ["kms:ListKeys", "kms:GetKeyPolicy"],
+        6,
+    ),
+    (
+        "AIR-FND-GOV-02",
+        NEW,
+        None,
+        "bedrock_assessments",
+        [],
+        "new BR-53. It passes the ARNs the module already inventories (agents, "
+        "knowledge bases, guardrails, custom and imported models, provisioned "
+        "throughput) to GetResources in batches of 100 and fails each resource "
+        "with no tag key matching owner, case-insensitive. The population is the "
+        "inventory, never a ResourceTypeFilters sweep, because GetResources "
+        "returns only resources that are or were tagged, so a sweep omits the "
+        "resources that most need an owner",
+        ["tag:GetResources"],
+        6,
+    ),
+    (
+        "AIR-FND-IAM-02",
+        NEW,
+        None,
+        "bedrock_assessments",
+        [],
+        "new BR-51. For each cached IAM user whose policies grant a non-read "
+        "bedrock:, sagemaker: or bedrock-agentcore: action, it fails a user that "
+        "has a console password (GetLoginProfile succeeds) and no MFA device. "
+        "NoSuchEntity means no console password. IAM Identity Center users are "
+        "outside it, because Identity Center's MFA setting is not readable "
+        "through any API, and the finding says so",
+        ["iam:GetLoginProfile", "iam:ListMFADevices"],
+        6,
+    ),
+    (
+        "AIR-FND-NET-08",
+        NEW,
+        None,
+        "agentcore_assessments",
+        [],
+        "new AC-51. It lists regional web ACLs in each Region and CloudFront web "
+        "ACLs in us-east-1, keeps those associated with a resource, and passes an "
+        "ACL whose rules include the AWS managed rule group "
+        "AWSManagedRulesAntiDDoSRuleSet with an override action other than Count. "
+        "It reuses AG-39's rule reader",
+        ["wafv2:ListWebACLs", "wafv2:ListResourcesForWebACL"],
+        6,
+    ),
+    (
+        "AIR-PHY-EDG-01",
+        NEW,
+        None,
+        "sagemaker_assessments",
+        [],
+        "new SM-41. It reads each AWS IoT policy that is attached to a target and "
+        "fails an Allow on iot:Publish, iot:Subscribe, iot:Receive or "
+        "iot:Connect whose Resource ends in topic/*, topicfilter/*, client/* or "
+        "is * without the ${iot:Connection.Thing.ThingName} variable, since that "
+        "policy grants every device the same reach. It also fails a Connect Allow "
+        "with no iot:Connection.Thing.IsAttached condition",
+        ["iot:ListPolicies", "iot:GetPolicy", "iot:ListTargetsForPolicy"],
+        6,
+    ),
+    (
+        "AIR-SLF-RT-05",
+        NEW,
+        None,
+        "sagemaker_assessments",
+        [],
+        "new SM-39. For each EKS cluster it reads the managed vpc-cni add-on and "
+        "passes when its configurationValues sets enableNetworkPolicy to true. "
+        "Absent or false fails. A cluster with no managed vpc-cni add-on is Not "
+        "Applicable, because a self-managed CNI's configuration is not readable "
+        "through the EKS API",
+        ["eks:ListClusters", "eks:ListAddons", "eks:DescribeAddon"],
+        6,
+    ),
+    (
+        "AIR-SLF-RT-06",
+        NEW,
+        None,
+        "sagemaker_assessments",
+        [],
+        "new SM-40. It lists Secrets Manager secrets, skipping those another "
+        "service owns, and passes a secret when rotation is enabled and the last "
+        "rotation falls within its schedule plus one day. It fails a secret with "
+        "rotation off and one that has never rotated",
+        ["secretsmanager:ListSecrets"],
+        6,
+    ),
+    (
+        "AIR-SLF-RT-08",
+        NEW,
+        None,
+        "bedrock_assessments",
+        [],
+        "new BR-54. For every Lambda function it reads the function URL's AuthType "
+        "and the resource policy. It fails a function URL with AuthType NONE, and "
+        'an Allow to Principal "*" on lambda:InvokeFunction* or lambda:* with no '
+        "aws:SourceArn, aws:SourceAccount or aws:PrincipalOrgID condition. It "
+        "reports configuration and does not claim the function is reachable",
+        ["lambda:ListFunctionUrlConfigs", "lambda:GetPolicy"],
+        6,
+    ),
+    # ---------------- not_implementable: 4 controls ----------------
+    (
+        "AIR-FND-DET-10",
+        NOT_IMPL,
+        None,
+        None,
+        [],
+        "Coordination metrics are custom metrics the customer names, and no AWS "
+        "API marks which metric measures inter-agent traffic, so a scan cannot "
+        "tell a coordination alarm from any other alarm.",
+        [],
+        None,
+    ),
+    (
+        "AIR-FND-GOV-12",
+        NOT_IMPL,
+        None,
+        None,
+        [],
+        "The review queue and its backlog metrics are customer-built and "
+        "customer-named, and no AWS API identifies which queue holds agent "
+        "decisions awaiting review.",
+        [],
+        None,
+    ),
+    (
+        "AIR-SLF-AGT-05",
+        NOT_IMPL,
+        None,
+        None,
+        [],
+        "Trust policies are readable, but no AWS API marks which roles belong to "
+        "agents or which agent-to-agent handoffs are expected, so a missing "
+        "sts:SourceIdentity condition cannot be told apart from a role that never "
+        "takes part in a handoff.",
+        [],
+        None,
+    ),
+    (
+        "AIR-SLF-CMP-08",
+        NOT_IMPL,
+        None,
+        None,
+        [],
+        "The digest check runs inside the workload's own startup code, and no AWS "
+        "API records the expected digest or whether it was verified before the "
+        "weights loaded.",
+        [],
+        None,
+    ),
+]
+
+ROWS = AI_SUBJECT_ROWS + FOUNDATION_ROWS
+
+TIERS = {
+    **dict.fromkeys((row[0] for row in AI_SUBJECT_ROWS), AI_SUBJECT),
+    **dict.fromkeys((row[0] for row in FOUNDATION_ROWS), FOUNDATION),
+}
+
+# The foundation population as the user's scope ruling states it, written out
+# independently of FOUNDATION_ROWS. check_ledger.py requires the two to be the
+# same set, and requires every machine-checkable control in the AISF
+# classification ledger to be a row, so a foundation control dropped from the
+# table, or filed in the AI-subject table, is a red and not a smaller total.
+SCOPE27 = frozenset(
+    {
+        "AIR-FND-ACC-02",
+        "AIR-FND-ACC-09",
+        "AIR-FND-DAT-04",
+        "AIR-FND-DAT-05",
+        "AIR-FND-DAT-08",
+        "AIR-FND-DAT-10",
+        "AIR-FND-DET-02",
+        "AIR-FND-DET-09",
+        "AIR-FND-DET-10",
+        "AIR-FND-GOV-02",
+        "AIR-FND-GOV-12",
+        "AIR-FND-IAM-01",
+        "AIR-FND-IAM-02",
+        "AIR-FND-IAM-03",
+        "AIR-FND-IAM-09",
+        "AIR-FND-NET-03",
+        "AIR-FND-NET-07",
+        "AIR-FND-NET-08",
+        "AIR-PHY-EDG-01",
+        "AIR-SLF-AGT-05",
+        "AIR-SLF-CMP-01",
+        "AIR-SLF-CMP-08",
+        "AIR-SLF-RT-02",
+        "AIR-SLF-RT-04",
+        "AIR-SLF-RT-05",
+        "AIR-SLF-RT-06",
+        "AIR-SLF-RT-08",
+    }
+)
+
 # Incumbent check_id -> its published finding name, extracted from the modules.
 # A NEW_ID disposition is a claim about this name versus what the check asserts,
 # so the name is recorded here rather than paraphrased.
@@ -956,7 +1454,15 @@ INCUMBENT_NAMES = {
     "BR-47": "Bedrock Data Path Bucket TLS Enforcement",
     "BR-48": "AI Services Opt-Out Policy Enforcement",
     "BR-49": "Guardrail Invocation Deny Enforcement",
-    "AC-01": "AgentCore Runtime VPC Configuration",
+    # Five names: the Passed and N/A rows carry "AgentCore VPC Configuration
+    # Check", and the Failed rows one of the other four, by resource and leg.
+    "AC-01": (
+        "AgentCore VPC Configuration Check",
+        "AgentCore Runtime VPC Configuration",
+        "AgentCore Runtime Public Subnet",
+        "AgentCore Egress Unrestricted",
+        "AgentCore Egress Filtering",
+    ),
     "AC-02": "AgentCore IAM Full Access Check",
     "AC-04": "AgentCore Observability Check",
     "AC-06": "AgentCore Browser Session Recording",
@@ -1000,6 +1506,12 @@ INCUMBENT_NAMES = {
     "AG-24": "Agentic AI Gateway Inbound Authorization",
     "AG-25": "Agentic AI Gateway Tool Policy Enforcement",
     "AG-27": "Agentic AI Gateway WAF Protection",
+    # The Passed and N/A rows carry the first name, and each Failed leg its own.
+    "AR-01": (
+        "AWS Agent Registry IAM Full Access Check",
+        "AWS Agent Registry IAM Full Access Policy",
+        "AWS Agent Registry IAM Wildcard Permissions",
+    ),
     "AR-03": "AWS Agent Registry Publication Approval Governance",
     "AR-09": "AWS Agent Registry Approval Authority Separation",
     # Four names for one check, one per status branch: the Passed row, the Failed
@@ -1007,6 +1519,12 @@ INCUMBENT_NAMES = {
     # thing -- whether a Bedrock VPC endpoint is in use -- so no single CSV filter
     # returns this check's verdicts, and filtering on the Passed name reports a
     # clean estate for an account whose only row said "not used".
+    # The second spelling is published only when the permission cache is
+    # unavailable, by the handler and not by the check.
+    "BR-01": (
+        "AmazonBedrockFullAccess role check",
+        "AmazonBedrockFullAccess Role Check",
+    ),
     "BR-02": (
         "Amazon Bedrock private connectivity",
         "Amazon Bedrock private connectivity check",
@@ -1040,6 +1558,7 @@ INCUMBENT_NAMES = {
     "BR-26": "Guardrail Sensitive Information Filter Check",
     "BR-27": "Guardrail Contextual Grounding Check",
     "BR-32": "Bedrock CloudWatch Alarm Check",
+    "BR-33": "Amazon Inspector Lambda Code Scanning Check",
     "BR-34": "Guardrail Prompt Attack Filter",
     "BR-37": "Bedrock Account Data Retention",
     "BR-39": "Marketplace Model Endpoint VPC Configuration",
@@ -1057,6 +1576,14 @@ INCUMBENT_NAMES = {
     "SM-01": "SageMaker Internet Access Check",
     "SM-02": "SageMaker IAM Permissions Check",
     "SM-03": "SageMaker Data Protection Check",
+    # One name per status branch: Passed, Failed, a disabled detector, and the
+    # error path.
+    "SM-04": (
+        "GuardDuty Enabled",
+        "GuardDuty Not Enabled",
+        "GuardDuty Detector Disabled",
+        "GuardDuty Check Error",
+    ),
     "SM-09": "SageMaker Notebook Root Access Check",
     # Failed under the first name, Passed and both N/A rows under the second.
     "SM-10": (
@@ -1066,6 +1593,7 @@ INCUMBENT_NAMES = {
     "SM-11": "SageMaker Model Network Isolation Check",
     "SM-18": "SageMaker Transform Job Encryption Check",
     "SM-22": "Model Approval Workflow Check",
+    "SM-26": "GuardDuty AI Protection",
     "SM-28": "HyperPod VPC Configuration",
     "SM-31": "Endpoint Inference Data Capture",
     # Recording is the precondition, rule compliance is the assertion.
@@ -1144,7 +1672,7 @@ def load_aisf():
 
 
 def table_fields(row):
-    """The nine ledger fields the verdict table above decides, for one ROWS entry.
+    """The ten ledger fields the verdict tables above decide, for one ROWS entry.
 
     Shared with gen_compliance_maps.rows_from_source(), which renders these same
     fields so that `--check` can compare the shipped json against this table.
@@ -1189,6 +1717,8 @@ def table_fields(row):
         "gap": gap,
         "extra_iam": extra_iam,
         "phase": phase,
+        # which table the row sits in, so the json can be checked against SCOPE27
+        "tier": TIERS[control],
     }
 
 
@@ -1222,7 +1752,8 @@ def build():
         return sum(1 for r in rows if all(r.get(k) == v for k, v in kw.items()))
 
     hosted = [r for r in rows if r["area"] in ("BDR", "SGM", "ACR")]
-    fnd = [r for r in rows if r["area"] == "FND"]
+    fnd = [r for r in rows if r["area"] == "FND" and r["tier"] == AI_SUBJECT]
+    foundation = [r for r in rows if r["tier"] == FOUNDATION]
     new_functions = (
         count(verdict=NEW)
         + count(verdict=TIGHTEN, disposition=NEW_ID)
@@ -1231,6 +1762,7 @@ def build():
     summary = {
         "hosted": len(hosted),
         "fnd_ai_subject": len(fnd),
+        "foundation": len(foundation),
         "total": len(rows),
         "covered": count(verdict=COVERED),
         "tighten": count(verdict=TIGHTEN),
@@ -1279,7 +1811,9 @@ def render_markdown(doc):
     out.append("")
     out.append(
         f"{s['total']} controls in scope: {s['hosted']} hosted (BDR, SGM, ACR) plus "
-        f"{s['fnd_ai_subject']} FND controls whose assertion subject is an AI resource."
+        f"{s['fnd_ai_subject']} FND controls whose assertion subject is an AI resource, "
+        f"plus {s['foundation']} foundation controls (FND, PHY, SLF) over the account "
+        "or runtime an AI workload sits on."
     )
     out.append("")
     out.append("| verdict | rows | meaning |")
@@ -1313,7 +1847,7 @@ def render_markdown(doc):
         holders = [r["control"] for r in doc["rows"] if action in r["extra_iam"]]
         out.append(f"- `{action}` — {', '.join(holders)}")
     out.append("")
-    for area in ("BDR", "SGM", "ACR", "FND"):
+    for area in ("BDR", "SGM", "ACR", "FND", "PHY", "SLF"):
         rows = [r for r in doc["rows"] if r["area"] == area]
         if not rows:
             continue
@@ -1328,8 +1862,9 @@ def render_markdown(doc):
             mod = ", ".join(f"`{m}`" for m in r["target_modules"]) or "—"
             gap = r["gap"].replace("|", "\\|") or "—"
             wa = "" if r["workload_agnostic"] else " *(workload-specific)*"
+            tier = " *(foundation)*" if r["tier"] == FOUNDATION else ""
             out.append(
-                f"| `{r['control']}`{wa} | {r['verdict']} | {do} | {mod} | {inc} | {gap} |"
+                f"| `{r['control']}`{wa}{tier} | {r['verdict']} | {do} | {mod} | {inc} | {gap} |"
             )
         out.append("")
     return "\n".join(out)

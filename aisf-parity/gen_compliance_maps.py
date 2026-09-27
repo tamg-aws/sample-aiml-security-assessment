@@ -64,6 +64,7 @@ LEDGER_FIELDS = (
     "gap",
     "extra_iam",
     "phase",
+    "tier",
 )
 
 
