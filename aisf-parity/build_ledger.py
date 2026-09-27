@@ -1283,12 +1283,14 @@ FOUNDATION_ROWS = [
         None,
         "agentcore_assessments",
         [],
-        "new AC-51. It lists regional web ACLs in each Region and CloudFront web "
-        "ACLs in us-east-1, keeps those associated with a resource, and passes an "
-        "ACL whose rules include the AWS managed rule group "
-        "AWSManagedRulesAntiDDoSRuleSet with an override action other than Count. "
-        "It reuses AG-39's rule reader",
-        ["wafv2:ListWebACLs", "wafv2:ListResourcesForWebACL"],
+        "new AC-51. AC-51 judges the web ACL on each AgentCore gateway for the AWS "
+        "Anti-DDoS managed rule group. Front doors other than AgentCore gateways "
+        "(API Gateway, ALB, CloudFront) are not identifiable as AI entry points by "
+        "any API, so they are not judged. The gateway's web ACL comes from the "
+        "lookup AG-27 and AG-39 already make, and the ACL passes when its rules "
+        "include AWSManagedRulesAntiDDoSRuleSet with an override action other than "
+        "Count",
+        [],
         6,
     ),
     (

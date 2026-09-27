@@ -39,8 +39,6 @@ Generated 2026-09-26 by `aisf-parity/build_ledger.py`. Do not hand-edit: change 
 - `secretsmanager:ListSecrets` — AIR-SLF-RT-06
 - `securityhub:GetEnabledStandards` — AIR-FND-DET-02
 - `tag:GetResources` — AIR-FND-GOV-02
-- `wafv2:ListResourcesForWebACL` — AIR-FND-NET-08
-- `wafv2:ListWebACLs` — AIR-FND-NET-08
 
 ## BDR (19 controls)
 
@@ -154,7 +152,7 @@ Generated 2026-09-26 by `aisf-parity/build_ledger.py`. Do not hand-edit: change 
 | `AIR-FND-DAT-10` *(workload-specific)* *(foundation)* | new | — | `bedrock_assessments` | — | new BR-55. It reads the default key policy of each customer-managed KMS key. A key whose policy carries a kms:RecipientAttestation condition is declared enclave-bound, and every other key is Not Applicable. An enclave-bound key fails when another Allow grants kms:Decrypt, kms:GenerateDataKey* or kms:* to a principal other than the account root with no attestation condition, and when the only binding is on PCR0 and not on ImageSha384. Which workloads must be enclave-bound is the customer's decision, so a key without the condition is never failed |
 | `AIR-FND-GOV-02` *(foundation)* | new | — | `bedrock_assessments` | — | new BR-53. It passes the ARNs the module already inventories (agents, knowledge bases, guardrails, custom and imported models, provisioned throughput) to GetResources in batches of 100 and fails each resource with no tag key matching owner, case-insensitive. The population is the inventory, never a ResourceTypeFilters sweep, because GetResources returns only resources that are or were tagged, so a sweep omits the resources that most need an owner |
 | `AIR-FND-IAM-02` *(foundation)* | new | — | `bedrock_assessments` | — | new BR-51. For each cached IAM user whose policies grant a non-read bedrock:, sagemaker: or bedrock-agentcore: action, it fails a user that has a console password (GetLoginProfile succeeds) and no MFA device. NoSuchEntity means no console password. IAM Identity Center users are outside it, because Identity Center's MFA setting is not readable through any API, and the finding says so |
-| `AIR-FND-NET-08` *(foundation)* | new | — | `agentcore_assessments` | — | new AC-51. It lists regional web ACLs in each Region and CloudFront web ACLs in us-east-1, keeps those associated with a resource, and passes an ACL whose rules include the AWS managed rule group AWSManagedRulesAntiDDoSRuleSet with an override action other than Count. It reuses AG-39's rule reader |
+| `AIR-FND-NET-08` *(foundation)* | new | — | `agentcore_assessments` | — | new AC-51. AC-51 judges the web ACL on each AgentCore gateway for the AWS Anti-DDoS managed rule group. Front doors other than AgentCore gateways (API Gateway, ALB, CloudFront) are not identifiable as AI entry points by any API, so they are not judged. The gateway's web ACL comes from the lookup AG-27 and AG-39 already make, and the ACL passes when its rules include AWSManagedRulesAntiDDoSRuleSet with an override action other than Count |
 | `AIR-FND-DET-10` *(workload-specific)* *(foundation)* | not_implementable | — | — | — | Coordination metrics are custom metrics the customer names, and no AWS API marks which metric measures inter-agent traffic, so a scan cannot tell a coordination alarm from any other alarm. |
 | `AIR-FND-GOV-12` *(workload-specific)* *(foundation)* | not_implementable | — | — | — | The review queue and its backlog metrics are customer-built and customer-named, and no AWS API identifies which queue holds agent decisions awaiting review. |
 

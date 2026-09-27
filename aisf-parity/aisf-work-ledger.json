@@ -38,9 +38,7 @@
       "s3:GetBucketVersioning",
       "secretsmanager:ListSecrets",
       "securityhub:GetEnabledStandards",
-      "tag:GetResources",
-      "wafv2:ListResourcesForWebACL",
-      "wafv2:ListWebACLs"
+      "tag:GetResources"
     ]
   },
   "rows": [
@@ -2392,11 +2390,8 @@
       ],
       "incumbents": [],
       "incumbent_names": [],
-      "gap": "new AC-51. It lists regional web ACLs in each Region and CloudFront web ACLs in us-east-1, keeps those associated with a resource, and passes an ACL whose rules include the AWS managed rule group AWSManagedRulesAntiDDoSRuleSet with an override action other than Count. It reuses AG-39's rule reader",
-      "extra_iam": [
-        "wafv2:ListWebACLs",
-        "wafv2:ListResourcesForWebACL"
-      ],
+      "gap": "new AC-51. AC-51 judges the web ACL on each AgentCore gateway for the AWS Anti-DDoS managed rule group. Front doors other than AgentCore gateways (API Gateway, ALB, CloudFront) are not identifiable as AI entry points by any API, so they are not judged. The gateway's web ACL comes from the lookup AG-27 and AG-39 already make, and the ACL passes when its rules include AWSManagedRulesAntiDDoSRuleSet with an override action other than Count",
+      "extra_iam": [],
       "phase": 6,
       "tier": "foundation",
       "source": "controls/baseline/network-isolation.yaml"
