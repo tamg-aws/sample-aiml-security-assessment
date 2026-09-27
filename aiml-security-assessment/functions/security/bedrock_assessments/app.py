@@ -13325,9 +13325,19 @@ def _ai_data_path_buckets(region: str = "") -> Dict[str, Any]:
     customization job reads training and validation data from S3 and writes its
     output there, so all of them sit on the AI data path. Each bucket is resolved once and the labels are collected,
     because one bucket often serves several knowledge bases.
+
+    CloudWatch Logs delivery of invocation logs moves any payload over 100 KB to
+    ``cloudWatchConfig.largeDataDeliveryS3Config``, and a distillation job can
+    read its training prompts from ``invocationLogsConfig.invocationLogSource``,
+    so both are data path buckets too.
+
+    ``truncated`` names each leg that stopped at its read cap. It is kept apart
+    from ``errors`` because no grant fixes it, and either one means the bucket
+    list is not the whole data path.
     """
     buckets: Dict[str, List[str]] = {}
     errors = []
+    truncated = []
 
     try:
         inventory = _knowledge_base_s3_sources(region)
@@ -13337,6 +13347,11 @@ def _ai_data_path_buckets(region: str = "") -> Dict[str, Any]:
         )
     else:
         errors.extend(inventory["errors"])
+        if inventory["truncated"]:
+            truncated.append(
+                "knowledge base data sources: the walk stopped after "
+                f"{MAX_KNOWLEDGE_BASE_DATA_SOURCE_DESCRIBES} data sources"
+            )
         for source in inventory["s3_sources"]:
             buckets.setdefault(source["bucket"], []).append(source["label"])
 
@@ -13345,11 +13360,16 @@ def _ai_data_path_buckets(region: str = "") -> Dict[str, Any]:
             "bedrock", config=boto3_config, region_name=region
         )
         response = bedrock_client.get_model_invocation_logging_configuration()
-        logging_bucket = _extract_s3_bucket_name(
-            (response.get("loggingConfig") or {}).get("s3Config")
+        logging_config = response.get("loggingConfig") or {}
+        logging_bucket = _extract_s3_bucket_name(logging_config.get("s3Config"))
+        large_data_bucket = _extract_s3_bucket_name(
+            (logging_config.get("cloudWatchConfig") or {}).get(
+                "largeDataDeliveryS3Config"
+            )
         )
     except Exception as error:
         logging_bucket = None
+        large_data_bucket = None
         errors.append(
             f"model invocation logging configuration: {get_assessment_error_label(error)}"
         )
@@ -13357,6 +13377,10 @@ def _ai_data_path_buckets(region: str = "") -> Dict[str, Any]:
     if logging_bucket:
         buckets.setdefault(logging_bucket, []).append(
             "the model invocation log destination"
+        )
+    if large_data_bucket:
+        buckets.setdefault(large_data_bucket, []).append(
+            "the large-data destination of CloudWatch model invocation logging"
         )
 
     try:
@@ -13379,7 +13403,7 @@ def _ai_data_path_buckets(region: str = "") -> Dict[str, Any]:
         jobs = []
         errors.append(f"model customization jobs: {get_assessment_error_label(error)}")
     if len(jobs) > MAX_CUSTOMIZATION_JOBS_READ:
-        errors.append(
+        truncated.append(
             f"model customization jobs: only the newest {MAX_CUSTOMIZATION_JOBS_READ} "
             "were read"
         )
@@ -13394,8 +13418,18 @@ def _ai_data_path_buckets(region: str = "") -> Dict[str, Any]:
                 f"customization job '{job_name}': {get_assessment_error_label(error)}"
             )
             continue
+        training = detail.get("trainingDataConfig") or {}
         locations = [
-            ("training data", (detail.get("trainingDataConfig") or {}).get("s3Uri")),
+            ("training data", training.get("s3Uri")),
+            (
+                "invocation log source",
+                (
+                    (training.get("invocationLogsConfig") or {}).get(
+                        "invocationLogSource"
+                    )
+                    or {}
+                ).get("s3Uri"),
+            ),
             ("output", (detail.get("outputDataConfig") or {}).get("s3Uri")),
         ] + [
             ("validation data", validator.get("s3Uri"))
@@ -13411,7 +13445,7 @@ def _ai_data_path_buckets(region: str = "") -> Dict[str, Any]:
                     f"the {role} of customization job '{job_name}'"
                 )
 
-    return {"buckets": buckets, "errors": errors}
+    return {"buckets": buckets, "errors": errors, "truncated": truncated}
 
 
 def check_bedrock_data_path_bucket_tls(region: str = "") -> Dict[str, Any]:
@@ -13457,6 +13491,30 @@ def check_bedrock_data_path_bucket_tls(region: str = "") -> Dict[str, Any]:
                         "bedrock:GetModelInvocationLoggingConfiguration, "
                         "bedrock:ListModelCustomizationJobs and "
                         "bedrock:GetModelCustomizationJob, then retry."
+                    ),
+                    reference=AI_DATA_PATH_TLS_REFERENCE,
+                    severity="Informational",
+                    status="N/A",
+                    region=region,
+                )
+            )
+
+        if inventory["truncated"]:
+            findings["csv_data"].append(
+                create_finding(
+                    check_id="BR-47",
+                    finding_name=check_name,
+                    finding_details=(
+                        "The data path bucket list stopped at a read cap, so buckets "
+                        "beyond it were not assessed: {}.".format(
+                            "; ".join(inventory["truncated"])
+                        )
+                    ),
+                    resolution=(
+                        "Check the bucket policy of the knowledge base data source "
+                        "and customization job buckets beyond the cap directly, or "
+                        "split the estate across Regions or accounts so each run "
+                        "reads it whole."
                     ),
                     reference=AI_DATA_PATH_TLS_REFERENCE,
                     severity="Informational",
@@ -13596,7 +13654,32 @@ def check_bedrock_data_path_bucket_tls(region: str = "") -> Dict[str, Any]:
                 )
             )
 
-        if enforced:
+        incomplete = bool(inventory["errors"] or inventory["truncated"])
+        if enforced and incomplete:
+            findings["csv_data"].append(
+                create_finding(
+                    check_id="BR-47",
+                    finding_name=check_name,
+                    finding_details=(
+                        "{} of the {} Bedrock data path bucket(s) read deny every "
+                        "plaintext request, but the bucket list is incomplete, so "
+                        "this is not a verdict on the whole data path: {}.".format(
+                            len(enforced),
+                            len(inventory["buckets"]),
+                            "; ".join(enforced[:5]),
+                        )
+                    ),
+                    resolution=(
+                        "Resolve the incomplete reads reported for this check, then "
+                        "re-run it to judge every data path bucket."
+                    ),
+                    reference=AI_DATA_PATH_TLS_REFERENCE,
+                    severity="Informational",
+                    status="N/A",
+                    region=region,
+                )
+            )
+        elif enforced:
             findings["csv_data"].append(
                 create_finding(
                     check_id="BR-47",

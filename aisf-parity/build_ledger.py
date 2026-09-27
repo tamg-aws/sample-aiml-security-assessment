@@ -742,14 +742,16 @@ ROWS = [
         "bedrock_assessments",
         ["BR-47"],
         "BR-47 reads the bucket policy of each S3 bucket on the Bedrock data path "
-        "(knowledge base S3 sources, the invocation log S3 destination, and the training, "
-        "validation and output buckets of the newest 50 customization jobs). It passes a "
+        "(knowledge base S3 sources, the invocation log S3 destination and its CloudWatch "
+        "large-data bucket, and the training, validation, output and distillation "
+        "invocation-log source buckets of the newest 50 customization jobs). It passes a "
         "bucket only when one Deny, conditioned by Bool or BoolIfExists on "
         "aws:SecureTransport false, reaches every principal, covers s3:*, and names both "
         "the bucket and its objects. A bucket with no policy fails, because S3 then "
         "accepts plaintext requests. For each Deny that falls short, the finding names the "
         "principals, resources or actions it misses, since a Deny scoped to some "
-        "principals leaves the rest able to use HTTP",
+        "principals leaves the rest able to use HTTP. A data source or job cap, or a failed "
+        "read, withholds the Passed row, since an unread bucket may accept plaintext",
         [],
         5,
     ),

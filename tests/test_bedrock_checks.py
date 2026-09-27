@@ -10058,11 +10058,12 @@ class TestBR47DataPathBucketTLS:
         )
 
         statuses = [f["Status"] for f in findings]
-        assert statuses == ["N/A", "Passed"]
+        assert statuses == ["N/A", "N/A"]
         assert "data path read(s) failed" in findings[0]["Finding_Details"]
         assert "knowledge base data sources" in findings[0]["Finding_Details"]
         assert "log-bucket" in findings[1]["Finding_Details"]
         assert "the model invocation log destination" in findings[1]["Finding_Details"]
+        assert "the bucket list is incomplete" in findings[1]["Finding_Details"]
 
     def test_br47_per_data_source_error_still_assesses_the_other_bucket(self):
         findings = self._two_bucket_estate(
@@ -10078,13 +10079,17 @@ class TestBR47DataPathBucketTLS:
             },
         )
 
-        assert [f["Status"] for f in findings] == ["N/A", "Passed"]
+        assert [f["Status"] for f in findings] == ["N/A", "N/A"]
         assert "1 data path read(s) failed" in findings[0]["Finding_Details"]
         assert (
             "data source 'hr-docs' in knowledge base 'hr-kb'"
             in findings[0]["Finding_Details"]
         )
         assert "support-bucket" in findings[1]["Finding_Details"]
+        assert (
+            "1 of the 1 Bedrock data path bucket(s) read"
+            in findings[1]["Finding_Details"]
+        )
 
     def test_br47_customization_job_buckets_are_on_the_data_path(self):
         """Training, validation and output buckets of a job are each judged.
@@ -10134,9 +10139,10 @@ class TestBR47DataPathBucketTLS:
             },
         )
 
-        assert [f["Status"] for f in findings] == ["N/A", "Passed"]
+        assert [f["Status"] for f in findings] == ["N/A", "N/A"]
         assert "model customization jobs" in findings[0]["Finding_Details"]
         assert "bedrock:ListModelCustomizationJobs" in findings[0]["Resolution"]
+        assert "the bucket list is incomplete" in findings[1]["Finding_Details"]
 
     def test_br47_one_unreadable_job_still_assesses_the_others(self):
         findings = self._run(
@@ -10154,9 +10160,10 @@ class TestBR47DataPathBucketTLS:
             },
         )
 
-        assert [f["Status"] for f in findings] == ["N/A", "Passed"]
+        assert [f["Status"] for f in findings] == ["N/A", "N/A"]
         assert "customization job 'tune-1'" in findings[0]["Finding_Details"]
         assert "train-bucket" in findings[1]["Finding_Details"]
+        assert "the bucket list is incomplete" in findings[1]["Finding_Details"]
 
     def test_br47_more_jobs_than_the_cap_is_an_incomplete_inventory(self):
         """51 jobs over two pages: the newest 50 are read, the 51st is reported."""
@@ -10180,14 +10187,181 @@ class TestBR47DataPathBucketTLS:
             customization_pages=pages,
         )
 
-        assert [f["Status"] for f in findings] == ["N/A", "Passed"]
+        assert [f["Status"] for f in findings] == ["N/A", "N/A"]
         assert "only the newest 50 were read" in findings[0]["Finding_Details"]
+        assert "stopped at a read cap" in findings[0]["Finding_Details"]
+        assert "the bucket list is incomplete" in findings[1]["Finding_Details"]
         assert self.bedrock_client.get_model_customization_job.call_count == 50
         assert (
             self.bedrock_client.list_model_customization_jobs.call_args_list[1][1][
                 "nextToken"
             ]
             == "p2"
+        )
+
+    def test_br47_data_source_cap_withholds_the_pass(self):
+        """51 data sources over two knowledge bases: 50 are read, none passes.
+
+        Every bucket read enforces TLS, so without the truncation leg the check
+        reports "50 of 50" as Passed while the 51st source went unread.
+        """
+        data_sources = {
+            "kb-1": [
+                {"dataSourceId": f"ds-{i}", "name": f"docs-{i}"} for i in range(30)
+            ],
+            "kb-2": [
+                {"dataSourceId": f"ds-{i}", "name": f"docs-{i}"} for i in range(30, 51)
+            ],
+        }
+        detail = {
+            f"ds-{i}": self._s3_source(f"ds-{i}", f"docs-{i}", f"bucket-{i}")
+            for i in range(51)
+        }
+        findings = self._run(
+            knowledge_bases=[
+                {"knowledgeBaseId": "kb-1", "name": "support-kb"},
+                {"knowledgeBaseId": "kb-2", "name": "hr-kb"},
+            ],
+            data_sources=data_sources,
+            data_source_detail=detail,
+            bucket_policies={
+                f"bucket-{i}": _bucket_policy(_tls_deny_statement([f"bucket-{i}"]))
+                for i in range(51)
+            },
+        )
+
+        assert [f["Status"] for f in findings] == ["N/A", "N/A"]
+        assert "stopped at a read cap" in findings[0]["Finding_Details"]
+        assert "stopped after 50 data sources" in findings[0]["Finding_Details"]
+        assert (
+            "50 of the 50 Bedrock data path bucket(s) read"
+            in findings[1]["Finding_Details"]
+        )
+        assert self.last_s3_client.get_bucket_policy.call_count == 50
+        for finding in findings:
+            assert_finding_schema(finding)
+
+    def test_br47_large_data_log_bucket_is_on_the_data_path(self):
+        """CloudWatch delivery moves payloads over 100 KB to a second bucket."""
+        findings = self._run(
+            logging_config={
+                "loggingConfig": {
+                    "s3Config": {"bucketName": "log-bucket"},
+                    "cloudWatchConfig": {
+                        "logGroupName": "bedrock-invocations",
+                        "largeDataDeliveryS3Config": {"bucketName": "large-bucket"},
+                    },
+                }
+            },
+            bucket_policies={
+                "log-bucket": _bucket_policy(_tls_deny_statement(["log-bucket"]))
+            },
+        )
+
+        failed = [f for f in findings if f["Status"] == "Failed"]
+        passed = [f for f in findings if f["Status"] == "Passed"]
+        assert len(failed) == 1
+        assert "Bucket large-bucket" in failed[0]["Finding_Details"]
+        assert (
+            "the large-data destination of CloudWatch model invocation logging"
+            in failed[0]["Finding_Details"]
+        )
+        assert len(passed) == 1
+        assert "1 of 2 Bedrock data path bucket(s)" in passed[0]["Finding_Details"]
+        assert "log-bucket" in passed[0]["Finding_Details"]
+
+    def test_br47_large_data_bucket_shared_with_the_s3_destination_is_read_once(self):
+        findings = self._run(
+            logging_config={
+                "loggingConfig": {
+                    "s3Config": {"bucketName": "log-bucket"},
+                    "cloudWatchConfig": {
+                        "logGroupName": "bedrock-invocations",
+                        "largeDataDeliveryS3Config": {"bucketName": "log-bucket"},
+                    },
+                }
+            },
+            bucket_policies={
+                "log-bucket": _bucket_policy(_tls_deny_statement(["log-bucket"]))
+            },
+        )
+
+        assert self.last_s3_client.get_bucket_policy.call_count == 1
+        assert [f["Status"] for f in findings] == ["Passed"]
+        assert "the model invocation log destination" in findings[0]["Finding_Details"]
+        assert (
+            "the large-data destination of CloudWatch model invocation logging"
+            in findings[0]["Finding_Details"]
+        )
+
+    def test_br47_distillation_invocation_log_sources_are_on_the_data_path(self):
+        """Two distillation jobs, each reading prompts from its own log bucket."""
+        findings = self._run(
+            customization_jobs={
+                "distill-1": {
+                    "customizationType": "DISTILLATION",
+                    "trainingDataConfig": {
+                        "invocationLogsConfig": {
+                            "usePromptResponse": True,
+                            "invocationLogSource": {"s3Uri": "s3://logs-a/AWSLogs/"},
+                        }
+                    },
+                    "outputDataConfig": {"s3Uri": "s3://out-bucket/"},
+                },
+                "distill-2": {
+                    "customizationType": "DISTILLATION",
+                    "trainingDataConfig": {
+                        "invocationLogsConfig": {
+                            "invocationLogSource": {"s3Uri": "s3://logs-b"}
+                        }
+                    },
+                    "outputDataConfig": {"s3Uri": "s3://out-bucket/two/"},
+                },
+            },
+            bucket_policies={
+                "logs-a": _bucket_policy(_tls_deny_statement(["logs-a"])),
+                "out-bucket": _bucket_policy(_tls_deny_statement(["out-bucket"])),
+            },
+        )
+
+        failed = [f for f in findings if f["Status"] == "Failed"]
+        passed = [f for f in findings if f["Status"] == "Passed"]
+        assert len(failed) == 1
+        assert "Bucket logs-b" in failed[0]["Finding_Details"]
+        assert (
+            "the invocation log source of customization job 'distill-2'"
+            in failed[0]["Finding_Details"]
+        )
+        assert len(passed) == 1
+        assert "2 of 3 Bedrock data path bucket(s)" in passed[0]["Finding_Details"]
+        assert (
+            "the invocation log source of customization job 'distill-1'"
+            in passed[0]["Finding_Details"]
+        )
+
+    def test_br47_log_destination_read_by_a_distillation_job_is_read_once(self):
+        """One bucket as log destination and job input keeps both labels."""
+        findings = self._run(
+            logging_config={
+                "loggingConfig": {"s3Config": {"bucketName": "log-bucket"}}
+            },
+            customization_jobs={
+                "distill-1": {
+                    "trainingDataConfig": {
+                        "invocationLogsConfig": {
+                            "invocationLogSource": {"s3Uri": "s3://log-bucket/logs/"}
+                        }
+                    }
+                }
+            },
+        )
+
+        assert self.last_s3_client.get_bucket_policy.call_count == 1
+        assert [f["Status"] for f in findings] == ["Failed"]
+        assert "the model invocation log destination" in findings[0]["Finding_Details"]
+        assert (
+            "the invocation log source of customization job 'distill-1'"
+            in findings[0]["Finding_Details"]
         )
 
     def test_br47_deny_over_the_bucket_only_leaves_objects_plaintext(self):
