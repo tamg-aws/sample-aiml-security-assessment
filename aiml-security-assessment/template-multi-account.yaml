@@ -862,6 +862,17 @@ Resources:
               Action:
                 - route53resolver:GetFirewallConfig # AC-49
               Resource: !Sub 'arn:${AWS::Partition}:route53resolver:*:${AWS::AccountId}:firewall-config/*'
+            - Sid: AgentCoreMemoryKeyDecrypt
+              # AC-07 calls GetMemory, and for a memory encrypted with a customer
+              # managed key AgentCore decrypts its strategies with the caller's
+              # credentials. The condition confines the grant to that path.
+              Effect: Allow
+              Action:
+                - kms:Decrypt # AC-07
+              Resource: !Sub 'arn:${AWS::Partition}:kms:*:${AWS::AccountId}:key/*'
+              Condition:
+                StringLike:
+                  kms:ViaService: 'bedrock-agentcore.*.amazonaws.com'
             - Sid: ECRPermissions
               Effect: Allow
               Action:

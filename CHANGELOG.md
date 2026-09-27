@@ -103,7 +103,11 @@ to the assessment Lambda execution roles for the new checks, among them
 the four named `route53resolver:ListFirewall` read actions,
 `route53resolver:GetFirewallConfig`, `wafv2:GetWebACL`,
 `organizations:DescribeEffectivePolicy`, `macie2:ListClassificationJobs`,
-`s3:GetBucketPolicy`, and `bedrock:ListModelCustomizationJobs`. A CodeBuild
+`s3:GetBucketPolicy`, and `bedrock:ListModelCustomizationJobs`. The AgentCore
+role also gains `kms:Decrypt` on the account's keys, allowed only when the
+request comes through `bedrock-agentcore` (`kms:ViaService`), so `AC-07` can
+describe a memory encrypted with a customer managed key. A key whose policy
+does not allow the role still denies it. A CodeBuild
 run that redeploys the assessment code and SAM templates applies them. No
 member-role StackSet update and no central or single-account infrastructure
 update are required.
