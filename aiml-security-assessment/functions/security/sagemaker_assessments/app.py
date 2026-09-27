@@ -1,5 +1,6 @@
 import boto3
 import csv
+import fnmatch
 import os
 import logging
 from datetime import datetime, timedelta, timezone
@@ -1088,6 +1089,136 @@ def _endpoint_invocation_scoping_findings(
     return emitted
 
 
+SERVICE_WIDE_GRANT_FINDING = "SageMaker Service-Wide Grant in Customer Policy"
+SERVICE_WIDE_GRANT_REFERENCE = "https://docs.aws.amazon.com/sagemaker/latest/dg/security_iam_id-based-policy-examples.html"
+SERVICE_WIDE_GRANT_RESOLUTION = (
+    "Replace the sagemaker:* grant with the specific SageMaker actions the "
+    "identity needs, separating read actions from create, update and delete "
+    "actions, and rewrite any NotAction Allow as an explicit Action list."
+)
+
+
+def _pattern_covers_all_sagemaker_actions(pattern: str) -> bool:
+    """Return whether one action pattern matches every sagemaker: action."""
+    normalized = pattern.lower()
+    if not normalized.endswith("*"):
+        return False
+    return fnmatch.fnmatchcase("sagemaker:", normalized[:-1] + "*")
+
+
+def _service_wide_sagemaker_grant(statement: Dict[str, Any]) -> Optional[str]:
+    """
+    Return why an Allow statement grants every SageMaker action, or None.
+
+    A bare "*" is an administrator grant, not a SageMaker-specific one, and is
+    left to the administrator-access checks. A NotAction Allow grants every
+    action it does not list, so it reaches all of SageMaker unless one of its
+    patterns covers the whole sagemaker: prefix.
+    """
+    if str(statement.get("Effect", "")).upper() != "ALLOW":
+        return None
+    for action in _policy_values(statement.get("Action")):
+        if action.strip() != "*" and _pattern_covers_all_sagemaker_actions(action):
+            return f"Action '{action}'"
+    if "NotAction" in statement:
+        excluded = _policy_values(statement.get("NotAction"))
+        if not any(_pattern_covers_all_sagemaker_actions(p) for p in excluded):
+            return f"NotAction {excluded}"
+    return None
+
+
+def _service_wide_grant_findings(
+    permission_cache: Dict[str, Any], region: str
+) -> List[Dict[str, Any]]:
+    """
+    Report the AIR-FND-IAM-09 leg of SM-02 over customer-managed and inline
+    policies. AWS managed policies are excluded because the full-access leg
+    already reports AmazonSageMakerFullAccess by name.
+    """
+    violations = []
+    policies_read = 0
+    for identity_type, cache_key in (
+        ("Role", "role_permissions"),
+        ("User", "user_permissions"),
+    ):
+        for name, permissions in (permission_cache.get(cache_key) or {}).items():
+            policies = [
+                policy
+                for policy in permissions.get("attached_policies") or []
+                if ":iam::aws:policy/" not in (policy.get("arn") or "")
+            ] + list(permissions.get("inline_policies") or [])
+            for policy in policies:
+                policies_read += 1
+                for statement in _sm_policy_statements(policy.get("document")):
+                    reason = _service_wide_sagemaker_grant(statement)
+                    if reason:
+                        violations.append(
+                            {
+                                "label": f"{identity_type} '{name}'",
+                                "policy": policy.get("name") or "inline policy",
+                                "reason": reason,
+                            }
+                        )
+                        break
+
+    emitted = []
+    for entry in violations[:20]:
+        emitted.append(
+            create_finding(
+                check_id="SM-02",
+                finding_name=SERVICE_WIDE_GRANT_FINDING,
+                finding_details=(
+                    f"{entry['label']} holds every SageMaker action through "
+                    f"customer policy '{entry['policy']}': an Allow statement "
+                    f"with {entry['reason']} makes read and delete permissions "
+                    "on the same resource inseparable."
+                ),
+                resolution=SERVICE_WIDE_GRANT_RESOLUTION,
+                reference=SERVICE_WIDE_GRANT_REFERENCE,
+                severity="High",
+                status="Failed",
+                region=region,
+            )
+        )
+    if len(violations) > 20:
+        emitted.append(
+            create_finding(
+                check_id="SM-02",
+                finding_name=SERVICE_WIDE_GRANT_FINDING,
+                finding_details=(
+                    f"{len(violations)} customer-managed or inline policy "
+                    "attachments grant every SageMaker action (the first 20 are "
+                    "reported individually above)."
+                ),
+                resolution=SERVICE_WIDE_GRANT_RESOLUTION,
+                reference=SERVICE_WIDE_GRANT_REFERENCE,
+                severity="High",
+                status="Failed",
+                region=region,
+            )
+        )
+    if not violations:
+        emitted.append(
+            create_finding(
+                check_id="SM-02",
+                finding_name=SERVICE_WIDE_GRANT_FINDING,
+                finding_details=(
+                    f"None of the {policies_read} customer-managed or inline "
+                    "policies read grants sagemaker:* or reaches SageMaker "
+                    "through a NotAction Allow. Whether each identity's action "
+                    "list matches its role is a workload decision this check "
+                    "does not make."
+                ),
+                resolution="No action required",
+                reference=SERVICE_WIDE_GRANT_REFERENCE,
+                severity="High",
+                status="Passed",
+                region=region,
+            )
+        )
+    return emitted
+
+
 def check_sagemaker_iam_permissions(
     permission_cache, region: str = ""
 ) -> Dict[str, Any]:
@@ -1220,6 +1351,9 @@ def check_sagemaker_iam_permissions(
         # endpoint in the account.
         findings["csv_data"].extend(
             _endpoint_invocation_scoping_findings(permission_cache, region)
+        )
+        findings["csv_data"].extend(
+            _service_wide_grant_findings(permission_cache, region)
         )
 
         return findings
@@ -6819,6 +6953,1141 @@ def check_sagemaker_creation_guardrails(
         }
 
 
+DELEGATED_ADMIN_FINDING = "Security Service Delegated Administrator"
+DELEGATED_ADMIN_REFERENCE = "https://docs.aws.amazon.com/organizations/latest/userguide/orgs_integrate_delegated_admin.html"
+
+# The security services whose administration SM-35 asserts. A fixed list: the
+# report names it so a reader knows which services were and were not examined.
+SECURITY_SERVICE_PRINCIPALS = (
+    ("Amazon GuardDuty", "guardduty.amazonaws.com"),
+    ("AWS Security Hub", "securityhub.amazonaws.com"),
+    ("Amazon Inspector", "inspector2.amazonaws.com"),
+    ("Amazon Macie", "macie.amazonaws.com"),
+    ("AWS Config", "config.amazonaws.com"),
+    ("IAM Access Analyzer", "access-analyzer.amazonaws.com"),
+)
+SECURITY_SERVICE_LIST_TEXT = ", ".join(name for name, _ in SECURITY_SERVICE_PRINCIPALS)
+
+
+def check_security_service_delegated_admin(region: str = "") -> Dict[str, Any]:
+    """
+    SM-35: Verify each security service is administered from a delegated
+    administrator account that is not the organization management account
+    (AIR-FND-ACC-09). One row per service.
+    """
+    logger.debug("Starting check for security service delegated administrators")
+    findings = {"csv_data": []}
+    scope_note = f"Services checked (fixed list): {SECURITY_SERVICE_LIST_TEXT}."
+
+    def _row(details, resolution, severity, status):
+        return create_finding(
+            check_id="SM-35",
+            finding_name=DELEGATED_ADMIN_FINDING,
+            finding_details=f"{details} {scope_note}",
+            resolution=resolution,
+            reference=DELEGATED_ADMIN_REFERENCE,
+            severity=severity,
+            status=status,
+            region=region,
+        )
+
+    orgs_client = boto3.client("organizations", config=boto3_config)
+    try:
+        master_account_id = orgs_client.describe_organization()["Organization"][
+            "MasterAccountId"
+        ]
+    except ClientError as error:
+        error_code = error.response.get("Error", {}).get("Code", "")
+        if error_code == "AWSOrganizationsNotInUseException":
+            details = (
+                "AWS Organizations is not in use for this account, so no "
+                "security service can have a delegated administrator."
+            )
+            resolution = (
+                "Create an organization with a dedicated security tooling "
+                "account if AI workloads span more than one account."
+            )
+        else:
+            details = build_could_not_assess_detail(error, region)
+            resolution = COULD_NOT_ASSESS_RESOLUTION
+        findings["csv_data"].append(_row(details, resolution, "Informational", "N/A"))
+        return findings
+    except Exception as error:
+        findings["csv_data"].append(
+            _row(
+                build_could_not_assess_detail(error, region),
+                COULD_NOT_ASSESS_RESOLUTION,
+                "Informational",
+                "N/A",
+            )
+        )
+        return findings
+
+    for service_name, principal in SECURITY_SERVICE_PRINCIPALS:
+        try:
+            admins = []
+            paginator = orgs_client.get_paginator("list_delegated_administrators")
+            for page in paginator.paginate(ServicePrincipal=principal):
+                admins.extend(page.get("DelegatedAdministrators", []))
+        except ClientError as error:
+            if error.response.get("Error", {}).get("Code", "") in (
+                ACCESS_DENIED_ERROR_CODES
+            ):
+                details = (
+                    f"Delegated administrators for {service_name} ({principal}) "
+                    "could not be listed "
+                    f"({get_assessment_error_label(error)}). The list is readable "
+                    "only from the management account or a delegated "
+                    "administrator account."
+                )
+            else:
+                details = (
+                    f"{service_name} ({principal}): "
+                    f"{build_could_not_assess_detail(error, region)}"
+                )
+            findings["csv_data"].append(
+                _row(details, COULD_NOT_ASSESS_RESOLUTION, "Informational", "N/A")
+            )
+            continue
+        except Exception as error:
+            findings["csv_data"].append(
+                _row(
+                    f"{service_name} ({principal}): "
+                    f"{build_could_not_assess_detail(error, region)}",
+                    COULD_NOT_ASSESS_RESOLUTION,
+                    "Informational",
+                    "N/A",
+                )
+            )
+            continue
+
+        active = [admin for admin in admins if admin.get("Status") == "ACTIVE"]
+        dedicated = sorted(
+            str(admin.get("Id"))
+            for admin in active
+            if admin.get("Id") and admin.get("Id") != master_account_id
+        )
+        if dedicated:
+            findings["csv_data"].append(
+                _row(
+                    f"{service_name} ({principal}) is administered from delegated "
+                    f"administrator account {', '.join(dedicated)}, which is not "
+                    "the organization management account.",
+                    "No action required",
+                    "High",
+                    "Passed",
+                )
+            )
+        elif active:
+            findings["csv_data"].append(
+                _row(
+                    f"The only active delegated administrator for {service_name} "
+                    f"({principal}) is the organization management account "
+                    f"{master_account_id}.",
+                    f"Register a dedicated security tooling account as the "
+                    f"{service_name} delegated administrator and administer the "
+                    "service from there.",
+                    "High",
+                    "Failed",
+                )
+            )
+        else:
+            findings["csv_data"].append(
+                _row(
+                    f"No active delegated administrator is registered for "
+                    f"{service_name} ({principal}), so the service is "
+                    "administered from the organization management account or "
+                    "not administered organization-wide.",
+                    f"Register a dedicated security tooling account as the "
+                    f"{service_name} delegated administrator.",
+                    "High",
+                    "Failed",
+                )
+            )
+
+    return findings
+
+
+AI_SECURITY_STANDARD_FINDING = "Security Hub AI Security Best Practices Standard"
+AI_SECURITY_STANDARD_REFERENCE = "https://docs.aws.amazon.com/securityhub/latest/userguide/standards-ai-security.html"
+AI_SECURITY_STANDARD_ARN_FRAGMENT = "standards/ai-security-best-practices/v/1.0.0"
+AI_SECURITY_STANDARD_RESOLUTION = (
+    "Enable the AWS Security Hub AI Security Best Practices v1.0.0 standard in "
+    "this region so AI resource configuration is evaluated continuously."
+)
+
+
+def check_security_hub_ai_standard(region: str = "") -> Dict[str, Any]:
+    """SM-36: Verify the Security Hub AI Security Best Practices standard is on."""
+    logger.debug("Starting check for the Security Hub AI security standard")
+    findings = {"csv_data": []}
+
+    def _row(details, resolution, severity, status):
+        return create_finding(
+            check_id="SM-36",
+            finding_name=AI_SECURITY_STANDARD_FINDING,
+            finding_details=details,
+            resolution=resolution,
+            reference=AI_SECURITY_STANDARD_REFERENCE,
+            severity=severity,
+            status=status,
+            region=region,
+        )
+
+    try:
+        client = boto3.client("securityhub", config=boto3_config, region_name=region)
+        subscriptions = []
+        paginator = client.get_paginator("get_enabled_standards")
+        for page in paginator.paginate():
+            subscriptions.extend(page.get("StandardsSubscriptions", []))
+    except ClientError as error:
+        if error.response.get("Error", {}).get("Code", "") == "InvalidAccessException":
+            findings["csv_data"].append(
+                _row(
+                    "Security Hub is not enabled in this region, so the AI "
+                    "Security Best Practices standard is not evaluating any "
+                    "resource.",
+                    AI_SECURITY_STANDARD_RESOLUTION,
+                    "High",
+                    "Failed",
+                )
+            )
+            return findings
+        findings["csv_data"].append(
+            _row(
+                build_could_not_assess_detail(error, region),
+                COULD_NOT_ASSESS_RESOLUTION,
+                "Informational",
+                "N/A",
+            )
+        )
+        return findings
+    except Exception as error:
+        findings["csv_data"].append(
+            _row(
+                build_could_not_assess_detail(error, region),
+                COULD_NOT_ASSESS_RESOLUTION,
+                "Informational",
+                "N/A",
+            )
+        )
+        return findings
+
+    matching = [
+        subscription
+        for subscription in subscriptions
+        if AI_SECURITY_STANDARD_ARN_FRAGMENT
+        in str(subscription.get("StandardsArn", ""))
+    ]
+    active = [
+        subscription
+        for subscription in matching
+        if subscription.get("StandardsStatus") in ("READY", "INCOMPLETE")
+    ]
+    if active:
+        status = active[0].get("StandardsStatus")
+        details = (
+            f"The AI Security Best Practices v1.0.0 standard is enabled "
+            f"(status {status})."
+        )
+        if status == "INCOMPLETE":
+            details += (
+                " Some of its controls could not be enabled; review the standard's "
+                "StatusReason in Security Hub."
+            )
+        findings["csv_data"].append(
+            _row(details, "No action required", "High", "Passed")
+        )
+    elif matching:
+        findings["csv_data"].append(
+            _row(
+                "The AI Security Best Practices v1.0.0 standard subscription is in "
+                f"status {matching[0].get('StandardsStatus')}, so its controls are "
+                "not evaluating resources.",
+                AI_SECURITY_STANDARD_RESOLUTION,
+                "High",
+                "Failed",
+            )
+        )
+    else:
+        findings["csv_data"].append(
+            _row(
+                f"Security Hub is enabled with {len(subscriptions)} standard(s), "
+                "but not the AI Security Best Practices v1.0.0 standard.",
+                AI_SECURITY_STANDARD_RESOLUTION,
+                "High",
+                "Failed",
+            )
+        )
+    return findings
+
+
+def _guardduty_feature(detail: Dict[str, Any], name: str) -> Optional[Dict[str, Any]]:
+    for feature in detail.get("Features") or []:
+        if feature.get("Name") == name:
+            return feature
+    return None
+
+
+LAMBDA_NETWORK_LOGS_FINDING = "GuardDuty Lambda Protection"
+LAMBDA_NETWORK_LOGS_REFERENCE = (
+    "https://docs.aws.amazon.com/guardduty/latest/ug/lambda-protection.html"
+)
+
+
+def check_guardduty_lambda_network_logs(
+    region: str = "", detector_inventory: Dict[str, Any] = None
+) -> Dict[str, Any]:
+    """
+    SM-37: Verify GuardDuty Lambda Protection (LAMBDA_NETWORK_LOGS) is enabled,
+    so anomalous network activity from AI workload functions is detected.
+    """
+    findings = {"csv_data": []}
+
+    def _row(details, resolution, severity, status):
+        return create_finding(
+            check_id="SM-37",
+            finding_name=LAMBDA_NETWORK_LOGS_FINDING,
+            finding_details=details,
+            resolution=resolution,
+            reference=LAMBDA_NETWORK_LOGS_REFERENCE,
+            severity=severity,
+            status=status,
+            region=region,
+        )
+
+    try:
+        inventory = detector_inventory or get_guardduty_detector_inventory(region)
+        if inventory.get("error"):
+            raise inventory["error"]
+        if not inventory.get("detector_id"):
+            findings["csv_data"].append(
+                _row(
+                    "No GuardDuty detector found; Lambda Protection cannot be "
+                    "assessed separately.",
+                    "Enable GuardDuty first, then enable Lambda Protection.",
+                    "Informational",
+                    "N/A",
+                )
+            )
+            return findings
+        detail = inventory.get("detail") or {}
+        feature = _guardduty_feature(detail, "LAMBDA_NETWORK_LOGS")
+        if detail.get("Status") != "ENABLED":
+            findings["csv_data"].append(
+                _row(
+                    "The GuardDuty detector is not enabled, so Lambda network "
+                    "activity is not monitored.",
+                    "Enable the GuardDuty detector and its Lambda Protection "
+                    "feature in this region.",
+                    "Medium",
+                    "Failed",
+                )
+            )
+        elif feature and feature.get("Status") == "ENABLED":
+            findings["csv_data"].append(
+                _row(
+                    "GuardDuty Lambda Protection (LAMBDA_NETWORK_LOGS) is enabled, "
+                    "so network activity from Lambda functions is monitored for "
+                    "anomalous destinations.",
+                    "No action required",
+                    "Medium",
+                    "Passed",
+                )
+            )
+        else:
+            state = feature.get("Status") if feature else "absent"
+            findings["csv_data"].append(
+                _row(
+                    "GuardDuty is enabled, but the LAMBDA_NETWORK_LOGS feature is "
+                    f"{state}, so network activity from Lambda functions is not "
+                    "monitored.",
+                    "Enable GuardDuty Lambda Protection for this region.",
+                    "Medium",
+                    "Failed",
+                )
+            )
+    except Exception as error:
+        findings["csv_data"].append(
+            _row(
+                build_could_not_assess_detail(error, region),
+                COULD_NOT_ASSESS_RESOLUTION,
+                "Informational",
+                "N/A",
+            )
+        )
+    return findings
+
+
+RUNTIME_MONITORING_FINDING = "GuardDuty Runtime Monitoring"
+RUNTIME_MONITORING_REFERENCE = (
+    "https://docs.aws.amazon.com/guardduty/latest/ug/runtime-monitoring.html"
+)
+RUNTIME_MONITORING_AGENT_CONFIGS = (
+    "EKS_ADDON_MANAGEMENT",
+    "ECS_FARGATE_AGENT_MANAGEMENT",
+    "EC2_AGENT_MANAGEMENT",
+)
+
+
+def check_guardduty_runtime_monitoring(
+    region: str = "", detector_inventory: Dict[str, Any] = None
+) -> Dict[str, Any]:
+    """
+    SM-38: Verify GuardDuty Runtime Monitoring (RUNTIME_MONITORING) is enabled
+    for self-hosted agent workloads. The legacy EKS_RUNTIME_MONITORING feature
+    covers EKS only and does not pass.
+    """
+    findings = {"csv_data": []}
+
+    def _row(details, resolution, severity, status):
+        return create_finding(
+            check_id="SM-38",
+            finding_name=RUNTIME_MONITORING_FINDING,
+            finding_details=details,
+            resolution=resolution,
+            reference=RUNTIME_MONITORING_REFERENCE,
+            severity=severity,
+            status=status,
+            region=region,
+        )
+
+    resolution = (
+        "Enable the GuardDuty Runtime Monitoring feature and automated agent "
+        "management for the EC2, ECS Fargate and EKS hosts that run agent "
+        "workloads."
+    )
+    try:
+        inventory = detector_inventory or get_guardduty_detector_inventory(region)
+        if inventory.get("error"):
+            raise inventory["error"]
+        if not inventory.get("detector_id"):
+            findings["csv_data"].append(
+                _row(
+                    "No GuardDuty detector found; Runtime Monitoring cannot be "
+                    "assessed separately.",
+                    "Enable GuardDuty first, then enable Runtime Monitoring.",
+                    "Informational",
+                    "N/A",
+                )
+            )
+            return findings
+        detail = inventory.get("detail") or {}
+        runtime = _guardduty_feature(detail, "RUNTIME_MONITORING")
+        legacy = _guardduty_feature(detail, "EKS_RUNTIME_MONITORING")
+        if detail.get("Status") != "ENABLED":
+            findings["csv_data"].append(
+                _row(
+                    "The GuardDuty detector is not enabled, so workload runtime "
+                    "behavior is not monitored.",
+                    resolution,
+                    "High",
+                    "Failed",
+                )
+            )
+        elif runtime and runtime.get("Status") == "ENABLED":
+            states = {
+                config.get("Name"): config.get("Status")
+                for config in runtime.get("AdditionalConfiguration") or []
+            }
+            agent_text = ", ".join(
+                f"{name} {states.get(name, 'not reported')}"
+                for name in RUNTIME_MONITORING_AGENT_CONFIGS
+            )
+            findings["csv_data"].append(
+                _row(
+                    "GuardDuty Runtime Monitoring (RUNTIME_MONITORING) is enabled. "
+                    f"Automated agent management: {agent_text}. A host type with "
+                    "agent management disabled is covered only where the "
+                    "security agent was installed manually.",
+                    "No action required",
+                    "High",
+                    "Passed",
+                )
+            )
+        elif legacy and legacy.get("Status") == "ENABLED":
+            findings["csv_data"].append(
+                _row(
+                    "Only the legacy EKS_RUNTIME_MONITORING feature is enabled, "
+                    "which covers EKS only; agent workloads on EC2 and ECS "
+                    "Fargate are not monitored at runtime.",
+                    resolution,
+                    "High",
+                    "Failed",
+                )
+            )
+        else:
+            state = runtime.get("Status") if runtime else "absent"
+            findings["csv_data"].append(
+                _row(
+                    "GuardDuty is enabled, but the RUNTIME_MONITORING feature is "
+                    f"{state}, so process, file and network activity inside agent "
+                    "workloads is not monitored.",
+                    resolution,
+                    "High",
+                    "Failed",
+                )
+            )
+    except Exception as error:
+        findings["csv_data"].append(
+            _row(
+                build_could_not_assess_detail(error, region),
+                COULD_NOT_ASSESS_RESOLUTION,
+                "Informational",
+                "N/A",
+            )
+        )
+    return findings
+
+
+EKS_NETWORK_POLICY_FINDING = "EKS VPC CNI Network Policy Enforcement"
+EKS_NETWORK_POLICY_REFERENCE = (
+    "https://docs.aws.amazon.com/eks/latest/userguide/cni-network-policy-configure.html"
+)
+EKS_NETWORK_POLICY_RESOLUTION = (
+    "Set enableNetworkPolicy to true in the vpc-cni add-on configuration, then "
+    "apply Kubernetes NetworkPolicy objects that limit each agent workload to "
+    "the services it needs."
+)
+
+
+def _vpc_cni_network_policy_enabled(configuration_values: Any) -> bool:
+    """
+    Return whether a vpc-cni configurationValues string turns on network policy.
+
+    EKS returns configurationValues as a JSON (or YAML) string, and the add-on
+    schema types enableNetworkPolicy as the string "true", so both the string
+    and a boolean true count.
+    """
+    if not isinstance(configuration_values, str) or not configuration_values.strip():
+        return False
+    value = None
+    try:
+        parsed = json.loads(configuration_values)
+        if isinstance(parsed, dict):
+            value = parsed.get("enableNetworkPolicy")
+    except ValueError:
+        match = re.search(
+            r"^enableNetworkPolicy\s*:\s*[\"']?([A-Za-z]+)[\"']?\s*$",
+            configuration_values,
+            re.MULTILINE,
+        )
+        if match:
+            value = match.group(1)
+    return value is True or str(value).lower() == "true"
+
+
+def check_eks_vpc_cni_network_policy(region: str = "") -> Dict[str, Any]:
+    """
+    SM-39: Verify EKS clusters that host self-hosted agent workloads enforce
+    Kubernetes network policy through the managed vpc-cni add-on.
+    """
+    logger.debug("Starting check for EKS vpc-cni network policy")
+    findings = {"csv_data": []}
+
+    def _row(details, resolution, severity, status):
+        return create_finding(
+            check_id="SM-39",
+            finding_name=EKS_NETWORK_POLICY_FINDING,
+            finding_details=details,
+            resolution=resolution,
+            reference=EKS_NETWORK_POLICY_REFERENCE,
+            severity=severity,
+            status=status,
+            region=region,
+        )
+
+    try:
+        eks_client = boto3.client("eks", config=boto3_config, region_name=region)
+        clusters = []
+        for page in eks_client.get_paginator("list_clusters").paginate():
+            clusters.extend(page.get("clusters", []))
+    except Exception as error:
+        findings["csv_data"].append(
+            _row(
+                build_could_not_assess_detail(error, region),
+                COULD_NOT_ASSESS_RESOLUTION,
+                "Informational",
+                "N/A",
+            )
+        )
+        return findings
+
+    if not clusters:
+        findings["csv_data"].append(
+            _row(
+                "No EKS clusters found in this region.",
+                "No action required",
+                "Informational",
+                "N/A",
+            )
+        )
+        return findings
+
+    enforced, not_enforced, self_managed, errors = [], [], [], []
+    for cluster in clusters:
+        try:
+            addons = []
+            paginator = eks_client.get_paginator("list_addons")
+            for page in paginator.paginate(clusterName=cluster):
+                addons.extend(page.get("addons", []))
+            if "vpc-cni" not in addons:
+                self_managed.append(cluster)
+                continue
+            addon = eks_client.describe_addon(
+                clusterName=cluster, addonName="vpc-cni"
+            ).get("addon", {})
+            if _vpc_cni_network_policy_enabled(addon.get("configurationValues")):
+                enforced.append(cluster)
+            else:
+                not_enforced.append(cluster)
+        except Exception as error:
+            errors.append((cluster, error))
+
+    for cluster in not_enforced[:20]:
+        findings["csv_data"].append(
+            _row(
+                f"EKS cluster '{cluster}' runs the managed vpc-cni add-on without "
+                "enableNetworkPolicy set to true, so Kubernetes NetworkPolicy "
+                "objects are not enforced between pods.",
+                EKS_NETWORK_POLICY_RESOLUTION,
+                "Medium",
+                "Failed",
+            )
+        )
+    if len(not_enforced) > 20:
+        findings["csv_data"].append(
+            _row(
+                f"{len(not_enforced)} EKS clusters do not enforce network policy "
+                "through vpc-cni (the first 20 are reported individually above).",
+                EKS_NETWORK_POLICY_RESOLUTION,
+                "Medium",
+                "Failed",
+            )
+        )
+    if enforced:
+        findings["csv_data"].append(
+            _row(
+                f"{len(enforced)} EKS cluster(s) enable network policy in the "
+                f"managed vpc-cni add-on: {', '.join(sorted(enforced)[:5])}. "
+                "Whether NetworkPolicy objects restrict each agent workload to its "
+                "dependencies is not read by this check.",
+                "No action required",
+                "Medium",
+                "Passed",
+            )
+        )
+    if self_managed:
+        findings["csv_data"].append(
+            _row(
+                f"{len(self_managed)} EKS cluster(s) have no managed vpc-cni "
+                f"add-on: {', '.join(sorted(self_managed)[:5])}. Network policy "
+                "enforcement is not readable for a self-managed CNI.",
+                "Confirm the cluster's CNI enforces Kubernetes NetworkPolicy, or "
+                "migrate to the managed vpc-cni add-on.",
+                "Informational",
+                "N/A",
+            )
+        )
+    for cluster, error in errors[:5]:
+        findings["csv_data"].append(
+            _row(
+                f"EKS cluster '{cluster}': {build_could_not_assess_detail(error, region)}",
+                COULD_NOT_ASSESS_RESOLUTION,
+                "Informational",
+                "N/A",
+            )
+        )
+    return findings
+
+
+SECRET_ROTATION_FINDING = "Secrets Manager Automatic Rotation"
+SECRET_ROTATION_REFERENCE = "https://docs.aws.amazon.com/secretsmanager/latest/userguide/rotate-secrets_schedule.html"
+SECRET_ROTATION_RESOLUTION = (
+    "Turn on automatic rotation with a rotation schedule for the secret, and "
+    "investigate the rotation function if a scheduled rotation did not complete."
+)
+
+_CRON_MONTHS = {
+    name: index
+    for index, name in enumerate(
+        ("JAN", "FEB", "MAR", "APR", "MAY", "JUN")
+        + ("JUL", "AUG", "SEP", "OCT", "NOV", "DEC"),
+        start=1,
+    )
+}
+_CRON_WEEKDAYS = {
+    name: index
+    for index, name in enumerate(
+        ("SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"), start=1
+    )
+}
+
+
+def _cron_field_values(
+    field: str, low: int, high: int, names: Dict[str, int]
+) -> Optional[set]:
+    """Expand one cron field of numbers, names, lists, ranges and steps."""
+    values = set()
+    for part in field.split(","):
+        step = 1
+        if "/" in part:
+            part, step_text = part.split("/", 1)
+            if not step_text.isdigit() or int(step_text) < 1:
+                return None
+            step = int(step_text)
+            part = part or "*"
+        if part == "*":
+            start, end = low, high
+        elif "-" in part:
+            start_text, end_text = part.split("-", 1)
+            start = names.get(start_text.upper()) or _cron_int(start_text)
+            end = names.get(end_text.upper()) or _cron_int(end_text)
+            if start is None or end is None:
+                return None
+        else:
+            start = names.get(part.upper()) or _cron_int(part)
+            if start is None:
+                return None
+            end = high if step > 1 else start
+        if not (low <= start <= high and low <= end <= high):
+            return None
+        values.update(range(start, end + 1, step))
+    return values
+
+
+def _cron_int(text: str) -> Optional[int]:
+    return int(text) if text.isdigit() else None
+
+
+def _cron_fire_days(expression: str, start: datetime, days: int) -> Optional[List]:
+    """
+    Return the dates a Secrets Manager cron() schedule fires on, or None when
+    the expression uses a form this check does not interpret.
+    """
+    fields = expression.split()
+    if len(fields) != 6 or fields[5] != "*":
+        return None
+    day_of_month, month_field, day_of_week = fields[2], fields[3], fields[4]
+    months = _cron_field_values(month_field, 1, 12, _CRON_MONTHS)
+    if months is None:
+        return None
+
+    dom_values, dom_last = None, False
+    if day_of_month == "L":
+        dom_last = True
+    elif day_of_month not in ("?", "*"):
+        dom_values = _cron_field_values(day_of_month, 1, 31, {})
+        if dom_values is None:
+            return None
+
+    dow_values, dow_nth, dow_last = None, None, None
+    if day_of_week not in ("?", "*"):
+        nth = re.fullmatch(r"([A-Za-z]{3}|[1-7])#([1-5])", day_of_week)
+        last = re.fullmatch(r"([A-Za-z]{3}|[1-7])L", day_of_week)
+        if nth or last:
+            token = (nth or last).group(1)
+            weekday = _CRON_WEEKDAYS.get(token.upper()) or _cron_int(token)
+            if weekday is None:
+                return None
+            if nth:
+                dow_nth = (weekday, int(nth.group(2)))
+            else:
+                dow_last = weekday
+        else:
+            dow_values = _cron_field_values(day_of_week, 1, 7, _CRON_WEEKDAYS)
+            if dow_values is None:
+                return None
+
+    fire_days = []
+    for offset in range(days):
+        day = (start + timedelta(days=offset)).date()
+        if day.month not in months:
+            continue
+        cron_weekday = (day.isoweekday() % 7) + 1
+        next_week_month = (day + timedelta(days=7)).month
+        if dom_last and (day + timedelta(days=1)).month == day.month:
+            continue
+        if dom_values is not None and day.day not in dom_values:
+            continue
+        if dow_values is not None and cron_weekday not in dow_values:
+            continue
+        if dow_nth and (
+            cron_weekday != dow_nth[0] or (day.day - 1) // 7 + 1 != dow_nth[1]
+        ):
+            continue
+        if dow_last and (cron_weekday != dow_last or next_week_month == day.month):
+            continue
+        fire_days.append(day)
+    return fire_days
+
+
+def _rotation_interval_days(rotation_rules: Dict[str, Any]) -> Optional[float]:
+    """
+    Return the longest gap, in days, between two scheduled rotations, or None
+    when the schedule cannot be interpreted.
+    """
+    expression = str(rotation_rules.get("ScheduleExpression") or "").strip()
+    if expression:
+        rate = re.fullmatch(r"rate\(\s*(\d+)\s+(hour|hours|day|days)\s*\)", expression)
+        if rate:
+            value = int(rate.group(1))
+            return value / 24 if rate.group(2).startswith("hour") else float(value)
+        cron = re.fullmatch(r"cron\((.+)\)", expression)
+        if not cron:
+            return None
+        # Two years and a leap day covers every gap a yearly-bounded schedule
+        # can produce, including a month-restricted one.
+        fire_days = _cron_fire_days(
+            cron.group(1), datetime(2024, 1, 1, tzinfo=timezone.utc), 800
+        )
+        if not fire_days or len(fire_days) < 2:
+            return None
+        return float(
+            max(
+                (later - earlier).days
+                for earlier, later in zip(fire_days, fire_days[1:])
+            )
+        )
+    days = rotation_rules.get("AutomaticallyAfterDays")
+    if isinstance(days, int) and days > 0:
+        return float(days)
+    return None
+
+
+def check_secrets_manager_rotation(region: str = "") -> Dict[str, Any]:
+    """
+    SM-40: Verify customer-managed secrets rotate automatically on a schedule and
+    the last rotation happened within that schedule. Secrets owned by another
+    AWS service (OwningService set) rotate under that service's control and are
+    skipped.
+    """
+    logger.debug("Starting check for Secrets Manager rotation")
+    findings = {"csv_data": []}
+
+    def _row(details, resolution, severity, status):
+        return create_finding(
+            check_id="SM-40",
+            finding_name=SECRET_ROTATION_FINDING,
+            finding_details=details,
+            resolution=resolution,
+            reference=SECRET_ROTATION_REFERENCE,
+            severity=severity,
+            status=status,
+            region=region,
+        )
+
+    try:
+        client = boto3.client("secretsmanager", config=boto3_config, region_name=region)
+        secrets = []
+        for page in client.get_paginator("list_secrets").paginate():
+            secrets.extend(page.get("SecretList", []))
+    except Exception as error:
+        findings["csv_data"].append(
+            _row(
+                build_could_not_assess_detail(error, region),
+                COULD_NOT_ASSESS_RESOLUTION,
+                "Informational",
+                "N/A",
+            )
+        )
+        return findings
+
+    in_scope = [secret for secret in secrets if not secret.get("OwningService")]
+    skipped = len(secrets) - len(in_scope)
+    skipped_note = (
+        f" {skipped} secret(s) managed by another AWS service (OwningService set) "
+        "were skipped."
+        if skipped
+        else ""
+    )
+    if not in_scope:
+        findings["csv_data"].append(
+            _row(
+                "No customer-managed Secrets Manager secrets found in this region."
+                + skipped_note,
+                "No action required",
+                "Informational",
+                "N/A",
+            )
+        )
+        return findings
+
+    now = datetime.now(timezone.utc)
+    failed, passed, uninterpretable = [], [], []
+    for secret in in_scope:
+        name = secret.get("Name") or secret.get("ARN") or "unnamed secret"
+        if secret.get("RotationEnabled") is not True:
+            failed.append(f"Secret '{name}' has no automatic rotation configured.")
+            continue
+        last_rotated = secret.get("LastRotatedDate")
+        if not isinstance(last_rotated, datetime):
+            failed.append(
+                f"Secret '{name}' has automatic rotation turned on but has never "
+                "rotated."
+            )
+            continue
+        if last_rotated.tzinfo is None:
+            last_rotated = last_rotated.replace(tzinfo=timezone.utc)
+        interval = _rotation_interval_days(secret.get("RotationRules") or {})
+        if interval is None:
+            uninterpretable.append(name)
+            continue
+        age_days = (now - last_rotated).total_seconds() / 86400
+        if age_days > interval + 1:
+            failed.append(
+                f"Secret '{name}' last rotated {int(age_days)} days ago, beyond its "
+                f"{interval:g}-day schedule plus one day, so a scheduled rotation "
+                "did not complete."
+            )
+        else:
+            passed.append(name)
+
+    for detail in failed[:20]:
+        findings["csv_data"].append(
+            _row(detail, SECRET_ROTATION_RESOLUTION, "Medium", "Failed")
+        )
+    if len(failed) > 20:
+        findings["csv_data"].append(
+            _row(
+                f"{len(failed)} secrets are not rotating on schedule (the first 20 "
+                "are reported individually above).",
+                SECRET_ROTATION_RESOLUTION,
+                "Medium",
+                "Failed",
+            )
+        )
+    if passed:
+        findings["csv_data"].append(
+            _row(
+                f"{len(passed)} secret(s) rotate automatically and last rotated "
+                f"within their schedule: {', '.join(sorted(passed)[:5])}. Whether "
+                "running agents pick up the rotated value is not read by this "
+                "check." + skipped_note,
+                "No action required",
+                "Medium",
+                "Passed",
+            )
+        )
+    if uninterpretable:
+        findings["csv_data"].append(
+            _row(
+                f"{len(uninterpretable)} secret(s) rotate on a schedule this check "
+                f"does not interpret: {', '.join(sorted(uninterpretable)[:5])}. "
+                "Whether their last rotation is on time was not assessed.",
+                "Confirm in the Secrets Manager console that the last rotation "
+                "date falls within the schedule.",
+                "Informational",
+                "N/A",
+            )
+        )
+    return findings
+
+
+IOT_DEVICE_POLICY_FINDING = "AWS IoT Device-Scoped Policy"
+IOT_DEVICE_POLICY_REFERENCE = (
+    "https://docs.aws.amazon.com/iot/latest/developerguide/thing-policy-variables.html"
+)
+IOT_DEVICE_POLICY_RESOLUTION = (
+    "Scope the Publish, Subscribe and Receive resources to topics that embed "
+    "${iot:Connection.Thing.ThingName}, scope Connect to that thing's client ID, "
+    "and add a Bool condition requiring iot:Connection.Thing.IsAttached to be "
+    "true on Connect."
+)
+IOT_DEVICE_ACTIONS = ("iot:publish", "iot:subscribe", "iot:receive", "iot:connect")
+IOT_THING_NAME_VARIABLE = "${iot:Connection.Thing.ThingName}"
+IOT_BROAD_RESOURCE_SUFFIXES = (":*", "topic/*", "topicfilter/*", "client/*")
+
+
+def _iot_statement_actions(statement: Dict[str, Any]) -> List[str]:
+    """Return the device actions an Allow statement reaches."""
+    if "NotAction" in statement:
+        excluded = [
+            value.lower() for value in _policy_values(statement.get("NotAction"))
+        ]
+        return [
+            action
+            for action in IOT_DEVICE_ACTIONS
+            if not any(fnmatch.fnmatchcase(action, pattern) for pattern in excluded)
+        ]
+    patterns = [value.lower() for value in _policy_values(statement.get("Action"))]
+    return [
+        action
+        for action in IOT_DEVICE_ACTIONS
+        if any(fnmatch.fnmatchcase(action, pattern) for pattern in patterns)
+    ]
+
+
+def _iot_broad_resource(statement: Dict[str, Any]) -> Optional[str]:
+    if "NotResource" in statement:
+        return "NotResource"
+    for resource in _policy_values(statement.get("Resource")):
+        if IOT_THING_NAME_VARIABLE in resource:
+            continue
+        if resource == "*" or resource.endswith(IOT_BROAD_RESOURCE_SUFFIXES):
+            return resource
+    return None
+
+
+def _iot_requires_attached_thing(statement: Dict[str, Any]) -> bool:
+    condition = statement.get("Condition", {})
+    if not isinstance(condition, dict):
+        return False
+    for operator, condition_keys in condition.items():
+        operator_name = str(operator).lower()
+        if not isinstance(condition_keys, dict) or "not" in operator_name:
+            continue
+        if operator_name.endswith("null") or operator_name.endswith("ifexists"):
+            continue
+        for key, value in condition_keys.items():
+            if str(key).lower() != "iot:connection.thing.isattached":
+                continue
+            if "true" in [str(item).lower() for item in _policy_values(value)]:
+                return True
+            if value is True:
+                return True
+    return False
+
+
+def _iot_policy_problems(document: Any) -> List[str]:
+    problems = []
+    for statement in _sm_policy_statements(document):
+        if str(statement.get("Effect", "")).upper() != "ALLOW":
+            continue
+        actions = _iot_statement_actions(statement)
+        if not actions:
+            continue
+        resource = _iot_broad_resource(statement)
+        if resource:
+            problems.append(
+                f"allows {', '.join(a.split(':')[1].capitalize() for a in actions)} on "
+                f"'{resource}' without the thing-name policy variable"
+            )
+        if "iot:connect" in actions and not _iot_requires_attached_thing(statement):
+            problems.append(
+                "allows Connect without requiring the certificate to be attached "
+                "to a thing"
+            )
+    return problems
+
+
+def check_iot_device_scoped_policies(region: str = "") -> Dict[str, Any]:
+    """
+    SM-41: Verify attached AWS IoT policies scope each device to its own topics
+    and client ID, and require the certificate to be attached to a thing
+    (AIR-PHY-EDG-01).
+    """
+    logger.debug("Starting check for AWS IoT device-scoped policies")
+    findings = {"csv_data": []}
+
+    def _row(details, resolution, severity, status):
+        return create_finding(
+            check_id="SM-41",
+            finding_name=IOT_DEVICE_POLICY_FINDING,
+            finding_details=details,
+            resolution=resolution,
+            reference=IOT_DEVICE_POLICY_REFERENCE,
+            severity=severity,
+            status=status,
+            region=region,
+        )
+
+    try:
+        iot_client = boto3.client("iot", config=boto3_config, region_name=region)
+        policies = []
+        for page in iot_client.get_paginator("list_policies").paginate():
+            policies.extend(page.get("policies", []))
+    except Exception as error:
+        findings["csv_data"].append(
+            _row(
+                build_could_not_assess_detail(error, region),
+                COULD_NOT_ASSESS_RESOLUTION,
+                "Informational",
+                "N/A",
+            )
+        )
+        return findings
+
+    failed, passed, errors = [], [], []
+    for policy in policies:
+        name = policy.get("policyName")
+        if not name:
+            continue
+        try:
+            attached = False
+            paginator = iot_client.get_paginator("list_targets_for_policy")
+            for page in paginator.paginate(policyName=name):
+                if page.get("targets"):
+                    attached = True
+                    break
+            if not attached:
+                continue
+            document = iot_client.get_policy(policyName=name).get("policyDocument")
+        except Exception as error:
+            errors.append((name, error))
+            continue
+        problems = _iot_policy_problems(document)
+        if problems:
+            failed.append((name, problems))
+        else:
+            passed.append(name)
+
+    if not failed and not passed and not errors:
+        findings["csv_data"].append(
+            _row(
+                f"None of the {len(policies)} AWS IoT policies in this region is "
+                "attached to a certificate or other principal.",
+                "No action required",
+                "Informational",
+                "N/A",
+            )
+        )
+        return findings
+
+    for name, problems in failed[:20]:
+        findings["csv_data"].append(
+            _row(
+                f"Attached AWS IoT policy '{name}' {'; '.join(problems)}, so one "
+                "compromised device credential reaches other devices' topics.",
+                IOT_DEVICE_POLICY_RESOLUTION,
+                "High",
+                "Failed",
+            )
+        )
+    if len(failed) > 20:
+        findings["csv_data"].append(
+            _row(
+                f"{len(failed)} attached AWS IoT policies are not device-scoped "
+                "(the first 20 are reported individually above).",
+                IOT_DEVICE_POLICY_RESOLUTION,
+                "High",
+                "Failed",
+            )
+        )
+    if passed:
+        findings["csv_data"].append(
+            _row(
+                f"{len(passed)} attached AWS IoT policies scope device actions to "
+                "the thing-name policy variable and require an attached thing: "
+                f"{', '.join(sorted(passed)[:5])}. Whether each device holds a "
+                "unique certificate is not read by this check.",
+                "No action required",
+                "High",
+                "Passed",
+            )
+        )
+    for name, error in errors[:5]:
+        findings["csv_data"].append(
+            _row(
+                f"AWS IoT policy '{name}': {build_could_not_assess_detail(error, region)}",
+                COULD_NOT_ASSESS_RESOLUTION,
+                "Informational",
+                "N/A",
+            )
+        )
+    return findings
+
+
 def handle_aws_throttling(func, *args, **kwargs):
     """
     Handle AWS API throttling with exponential backoff
@@ -6947,6 +8216,13 @@ def lambda_handler(event, context):
             logger.info("Running SageMaker creation guardrail check (SM-34)")
             all_findings.append(
                 check_sagemaker_creation_guardrails(region=GLOBAL_REGION_LABEL)
+            )
+
+            # Delegated administration is an organization-level setting, so it is
+            # assessed once and not once per scanned region.
+            logger.info("Running security service delegated admin check (SM-35)")
+            all_findings.append(
+                check_security_service_delegated_admin(region=GLOBAL_REGION_LABEL)
             )
 
         # Verify SageMaker is available in this region
@@ -7224,6 +8500,32 @@ def lambda_handler(event, context):
         all_findings.append(
             check_sagemaker_training_job_network_boundary(region=region)
         )
+
+        logger.info("Running Security Hub AI security standard check (SM-36)")
+        all_findings.append(check_security_hub_ai_standard(region=region))
+
+        logger.info("Running GuardDuty Lambda Protection check (SM-37)")
+        all_findings.append(
+            check_guardduty_lambda_network_logs(
+                region=region, detector_inventory=guardduty_inventory
+            )
+        )
+
+        logger.info("Running GuardDuty Runtime Monitoring check (SM-38)")
+        all_findings.append(
+            check_guardduty_runtime_monitoring(
+                region=region, detector_inventory=guardduty_inventory
+            )
+        )
+
+        logger.info("Running EKS vpc-cni network policy check (SM-39)")
+        all_findings.append(check_eks_vpc_cni_network_policy(region=region))
+
+        logger.info("Running Secrets Manager rotation check (SM-40)")
+        all_findings.append(check_secrets_manager_rotation(region=region))
+
+        logger.info("Running AWS IoT device-scoped policy check (SM-41)")
+        all_findings.append(check_iot_device_scoped_policies(region=region))
 
         # Generate and upload report
         logger.info("Generating reports")

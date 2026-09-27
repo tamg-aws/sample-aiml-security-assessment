@@ -1,6 +1,6 @@
 # Security Checks Reference
 
-This document provides a comprehensive reference for all 256 security checks performed by the AI/ML Security Assessment framework (141 core checks across Amazon Bedrock, Amazon SageMaker AI, Amazon Bedrock AgentCore, and AWS Agent Registry, 39 Agentic AI Security checks, 64 Responsible AI GRC checks, and 12 OWASP Top 10 for LLM checks).
+This document provides a comprehensive reference for all 263 security checks performed by the AI/ML Security Assessment framework (148 core checks across Amazon Bedrock, Amazon SageMaker AI, Amazon Bedrock AgentCore, and AWS Agent Registry, 39 Agentic AI Security checks, 64 Responsible AI GRC checks, and 12 OWASP Top 10 for LLM checks).
 
 Sources differ by bucket and are not interchangeable: the core Bedrock, SageMaker, AgentCore, and AWS Agent Registry checks derive from the AWS Well-Architected **Generative AI Lens** security best practices (`gensec*`) and service security documentation; the Agentic AI Security checks from the AWS Well-Architected **Agentic AI Lens**; the `FS-*` **Responsible AI GRC** checks from the AWS GRC User Guide; and the `OW-*` checks from the OWASP Top 10 for LLM. The AWS Well-Architected **Responsible AI Lens** is not a source for any of them — see [Responsible AI GRC — scope, sources, and compatibility](RESPONSIBLE_AI_GRC_SCOPE.md).
 
@@ -13,7 +13,7 @@ The 64 Responsible AI GRC checks occupy 69 `FS-*` numbers: 64 ship as standalone
 - [Report Scoring](#report-scoring)
 - [Severity Levels](#severity-levels)
 - [Status Values](#status-values)
-- [Amazon SageMaker AI Security Checks (33)](#amazon-sagemaker-ai-security-checks-33)
+- [Amazon SageMaker AI Security Checks (40)](#amazon-sagemaker-ai-security-checks-40)
 - [Amazon Bedrock Security Checks (49)](#amazon-bedrock-security-checks-49)
 - [Amazon Bedrock AgentCore Security Checks (49)](#amazon-bedrock-agentcore-security-checks-49)
 - [AWS Agent Registry Security Checks (10)](#aws-agent-registry-security-checks-10)
@@ -29,7 +29,7 @@ The framework evaluates your AI/ML workloads against AWS security best practices
 
 | Service | Number of Checks | Focus Areas |
 | --------- | ------------------ | ------------- |
-| Amazon SageMaker AI | 33 | Security Hub controls, encryption, network isolation, GuardDuty AI Protection, HyperPod, IAM, MLOps, Model Registry policy exposure, inference data capture, Config compliance evaluation, training VPC boundary, creation guardrails |
+| Amazon SageMaker AI | 40 | Security Hub controls, encryption, network isolation, GuardDuty AI Protection, HyperPod, IAM, MLOps, Model Registry policy exposure, inference data capture, Config compliance evaluation, training VPC boundary, creation guardrails, security service delegated administration, the Security Hub AI standard, GuardDuty Lambda Protection and Runtime Monitoring, EKS network policy, secret rotation, IoT device-scoped policies |
 | Amazon Bedrock | 46 | Guardrails, prompt-attack/image filters, retention, inference profiles, automated reasoning and Marketplace endpoint governance, encryption, networking, IAM, logging, monitoring, evaluation, central guardrail enforcement, model allow-lists, Region and Marketplace subscription control, API key governance, knowledge base source classification |
 | Amazon Bedrock AgentCore | 17 | Runtime/tool VPC isolation, encryption, browser recording, observability, resource policies, Identity token vaults, and online evaluation |
 | AWS Agent Registry | 8 | IAM access, approval governance, discovery authorization, encryption, organization auto-detection, record lifecycle, and provenance |
@@ -45,7 +45,7 @@ Each security check has a unique identifier with a service prefix:
 
 | Prefix | Service | Example |
 | -------- | --------- | --------- |
-| **SM-XX** | Amazon SageMaker | SM-01, SM-34 (`SM-29` reserved) |
+| **SM-XX** | Amazon SageMaker | SM-01, SM-41 (`SM-29` reserved) |
 | **BR-XX** | Amazon Bedrock | BR-01, BR-49 |
 | **AC-XX** | Amazon Bedrock AgentCore | AC-01, AC-17 |
 | **AR-XX** | AWS Agent Registry | AR-01, AR-10 |
@@ -116,7 +116,7 @@ investigation and remediation.
 
 ---
 
-## Amazon SageMaker AI Security Checks (33)
+## Amazon SageMaker AI Security Checks (40)
 
 ### SM-01: Internet Access
 
@@ -131,6 +131,12 @@ investigation and remediation.
   the shared IAM permissions cache. A missing, unreadable, or malformed cache
   produces an informational `N/A` incomplete-assessment row rather than a
   compliant result.
+  A separate `SageMaker Service-Wide Grant in Customer Policy` finding reads
+  customer-managed and inline policies on roles and users and fails any Allow
+  statement that grants every SageMaker action, through `sagemaker:*` (or a
+  pattern that covers it) or through a `NotAction` list that does not exclude
+  SageMaker. A bare `"*"` is left to the administrator-access checks, and AWS
+  managed policies are left to the full-access finding above.
 
 ### SM-03: Data Protection
 
@@ -293,6 +299,41 @@ investigation and remediation.
 
 - **Severity:** Medium
 - **Description:** Requires a service control policy that denies creation of unencrypted, internet-exposed, or non-VPC SageMaker resources, with one verdict per guardrail category: `encryption` (`sagemaker:VolumeKmsKey`, `sagemaker:OutputKmsKey`, `sagemaker:InterContainerTrafficEncryption`), `approved network` (`sagemaker:VpcSubnets`, `sagemaker:VpcSecurityGroupIds`, `sagemaker:NetworkIsolation`), and `no direct internet access` (`sagemaker:DirectInternetAccess`). Categories are reported separately because an organization commonly guards encryption at creation and leaves the network parameters unguarded. A Deny that fires when the parameter is absent or holds a non-approved value counts as enforced; a Deny naming one specific value is reported as ambiguous, because whether that value is the non-compliant one depends on the value and this check does not interpret it. An unreadable organization view produces `N/A`.
+
+### SM-35: Security Service Delegated Administrator
+
+- **Severity:** High
+- **Description:** Emits one row per security service from a fixed list (Amazon GuardDuty, AWS Security Hub, Amazon Inspector, Amazon Macie, AWS Config, IAM Access Analyzer), each row naming the list. A service passes when an `ACTIVE` delegated administrator other than the organization management account is registered, and fails when none is registered or the only active one is the management account. `ListDelegatedAdministrators` is readable only from the management account or a delegated administrator account, so an access denial for one service is `N/A` for that service alone. An account outside AWS Organizations produces one `N/A` row. Runs once, on the primary region, tagged `Global`.
+
+### SM-36: Security Hub AI Security Standard
+
+- **Severity:** High
+- **Description:** Requires the AWS Security Hub AI Security Best Practices v1.0.0 standard (`standards/ai-security-best-practices/v/1.0.0`) to be enabled in the region. `READY` passes; `INCOMPLETE` passes with a note to review the standard's `StatusReason`; any other subscription status fails. Security Hub not enabled in the region (`InvalidAccessException`) fails, because no standard is evaluating anything.
+
+### SM-37: GuardDuty Lambda Protection
+
+- **Severity:** Medium
+- **Description:** Requires the GuardDuty `LAMBDA_NETWORK_LOGS` feature to be `ENABLED` on an enabled detector, so network activity from AI workload Lambda functions is monitored. A disabled or absent feature fails and names its state. No detector produces `N/A`; SM-04 reports the missing detector.
+
+### SM-38: GuardDuty Runtime Monitoring
+
+- **Severity:** High
+- **Description:** Requires the GuardDuty `RUNTIME_MONITORING` feature to be `ENABLED` and reports the automated agent management state for EKS, ECS Fargate and EC2. The legacy `EKS_RUNTIME_MONITORING` feature covers EKS only, so a detector with only that feature enabled fails. No detector produces `N/A`.
+
+### SM-39: EKS VPC CNI Network Policy
+
+- **Severity:** Medium
+- **Description:** For each EKS cluster, reads the managed `vpc-cni` add-on's `configurationValues` and requires `enableNetworkPolicy` to be true (EKS returns the value as the string `"true"` inside a JSON or YAML document). A cluster without the managed add-on is reported `N/A`, because enforcement by a self-managed CNI is not readable through the EKS API. Whether NetworkPolicy objects restrict each workload is not read. One cluster's read error is reported for that cluster alone.
+
+### SM-40: Secrets Manager Rotation
+
+- **Severity:** Medium
+- **Description:** For each customer-managed secret, requires automatic rotation to be turned on and the last rotation to fall within the rotation schedule plus one day. A secret with rotation turned on that has never rotated fails. Schedules are read from `rate()` (hours or days), `cron()` (the longest gap between two scheduled dates), or `AutomaticallyAfterDays`; a `cron()` form this check does not interpret, such as `W`, is reported `N/A`. Secrets with `OwningService` set rotate under that service's control and are skipped and counted. Secret values are never read.
+
+### SM-41: AWS IoT Device-Scoped Policy
+
+- **Severity:** High
+- **Description:** For each AWS IoT policy attached to a certificate or other principal, fails an Allow statement that reaches `Publish`, `Subscribe`, `Receive` or `Connect` on `*`, on all topics, topic filters or client IDs, or through `NotResource`, unless the resource embeds `${iot:Connection.Thing.ThingName}`. `NotAction` Allow statements are expanded to the device actions they reach. A statement allowing `Connect` also needs a `Bool` condition requiring `iot:Connection.Thing.IsAttached` to be `true`. Unattached policies are skipped. No attached policy produces `N/A`.
 
 ---
 
