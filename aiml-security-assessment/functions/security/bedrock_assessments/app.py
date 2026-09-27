@@ -11076,12 +11076,89 @@ MODEL_ARN_CONDITION_KEY = "bedrock:modelarn"
 MODEL_ALLOW_LIST_REFERENCE = "https://docs.aws.amazon.com/bedrock/latest/userguide/security_iam_id-based-policy-examples.html"
 
 
+# The resource-segment prefixes a model invocation ARN starts with. A pattern
+# whose resource segment matches one of them and ends in "*" matches every model
+# ID after it, whatever the Region, account or partition segments say.
+MODEL_RESOURCE_TYPE_PREFIXES = ("foundation-model/", "inference-profile/")
+
+# Stands in for the first character of a model ID. No policy writes it as a
+# literal, so only ? or * can match it, and a pattern that matches it matches
+# every non-empty ID: "foundation-model/?*" does, "foundation-model/a*" does not.
+ANY_MODEL_ID_CHARACTER = "\x00"
+
+
+def _wildcard_matches(pattern: str, text: str) -> bool:
+    """
+    Match an IAM-style pattern, where * is any run and ? one character.
+
+    The pattern comes from a customer policy and can be long, so it is checked
+    in linear passes: a pattern with more literal characters than ``text`` is
+    rejected before matching, runs of * are collapsed, and the greedy two-pointer
+    walk that follows is bounded by the short, fixed ``text``.
+    """
+    if len(pattern) - pattern.count("*") > len(text):
+        return False
+    collapsed = []
+    for char in pattern:
+        if char == "*" and collapsed and collapsed[-1] == "*":
+            continue
+        collapsed.append(char)
+
+    p_index = t_index = 0
+    star = -1
+    star_text = 0
+    while t_index < len(text):
+        if p_index < len(collapsed) and collapsed[p_index] in ("?", text[t_index]):
+            p_index += 1
+            t_index += 1
+        elif p_index < len(collapsed) and collapsed[p_index] == "*":
+            star = p_index
+            star_text = t_index
+            p_index += 1
+        elif star >= 0:
+            p_index = star + 1
+            star_text += 1
+            t_index = star_text
+        else:
+            return False
+    return all(char == "*" for char in collapsed[p_index:])
+
+
+def _pattern_covers_every_model(resource: str) -> bool:
+    """
+    Return True when a Bedrock ARN pattern matches every foundation model or
+    inference profile, such as arn:aws:bedrock:*::foundation-model* or
+    arn:aws:bedrock:us-east-1:*:inference-profile/**.
+
+    The ARN is split on ":" into its six segments and each is compared on its
+    own. A pattern with fewer segments ends in a * that also covers the missing
+    ones, so they are padded with "*".
+    """
+    if not resource.endswith("*"):
+        return False
+    segments = resource.split(":", 5)
+    segments += ["*"] * (6 - len(segments))
+    return (
+        _wildcard_matches(segments[0], "arn")
+        and _wildcard_matches(segments[2], "bedrock")
+        and any(
+            _wildcard_matches(segments[5], prefix + ANY_MODEL_ID_CHARACTER)
+            for prefix in MODEL_RESOURCE_TYPE_PREFIXES
+        )
+    )
+
+
 def _resource_is_unscoped(resource: Any) -> bool:
     """Return True when a Resource entry covers every model rather than naming one."""
     if not isinstance(resource, str):
         return False
     resource = resource.strip()
-    return resource == "*" or resource.endswith("/*") or resource.endswith(":*")
+    return (
+        resource == "*"
+        or resource.endswith("/*")
+        or resource.endswith(":*")
+        or _pattern_covers_every_model(resource)
+    )
 
 
 def _statement_model_invocation_scoping(
@@ -13325,9 +13402,19 @@ def _ai_data_path_buckets(region: str = "") -> Dict[str, Any]:
     customization job reads training and validation data from S3 and writes its
     output there, so all of them sit on the AI data path. Each bucket is resolved once and the labels are collected,
     because one bucket often serves several knowledge bases.
+
+    CloudWatch Logs delivery of invocation logs moves any payload over 100 KB to
+    ``cloudWatchConfig.largeDataDeliveryS3Config``, and a distillation job can
+    read its training prompts from ``invocationLogsConfig.invocationLogSource``,
+    so both are data path buckets too.
+
+    ``truncated`` names each leg that stopped at its read cap. It is kept apart
+    from ``errors`` because no grant fixes it, and either one means the bucket
+    list is not the whole data path.
     """
     buckets: Dict[str, List[str]] = {}
     errors = []
+    truncated = []
 
     try:
         inventory = _knowledge_base_s3_sources(region)
@@ -13337,6 +13424,11 @@ def _ai_data_path_buckets(region: str = "") -> Dict[str, Any]:
         )
     else:
         errors.extend(inventory["errors"])
+        if inventory["truncated"]:
+            truncated.append(
+                "knowledge base data sources: the walk stopped after "
+                f"{MAX_KNOWLEDGE_BASE_DATA_SOURCE_DESCRIBES} data sources"
+            )
         for source in inventory["s3_sources"]:
             buckets.setdefault(source["bucket"], []).append(source["label"])
 
@@ -13345,11 +13437,16 @@ def _ai_data_path_buckets(region: str = "") -> Dict[str, Any]:
             "bedrock", config=boto3_config, region_name=region
         )
         response = bedrock_client.get_model_invocation_logging_configuration()
-        logging_bucket = _extract_s3_bucket_name(
-            (response.get("loggingConfig") or {}).get("s3Config")
+        logging_config = response.get("loggingConfig") or {}
+        logging_bucket = _extract_s3_bucket_name(logging_config.get("s3Config"))
+        large_data_bucket = _extract_s3_bucket_name(
+            (logging_config.get("cloudWatchConfig") or {}).get(
+                "largeDataDeliveryS3Config"
+            )
         )
     except Exception as error:
         logging_bucket = None
+        large_data_bucket = None
         errors.append(
             f"model invocation logging configuration: {get_assessment_error_label(error)}"
         )
@@ -13357,6 +13454,10 @@ def _ai_data_path_buckets(region: str = "") -> Dict[str, Any]:
     if logging_bucket:
         buckets.setdefault(logging_bucket, []).append(
             "the model invocation log destination"
+        )
+    if large_data_bucket:
+        buckets.setdefault(large_data_bucket, []).append(
+            "the large-data destination of CloudWatch model invocation logging"
         )
 
     try:
@@ -13379,7 +13480,7 @@ def _ai_data_path_buckets(region: str = "") -> Dict[str, Any]:
         jobs = []
         errors.append(f"model customization jobs: {get_assessment_error_label(error)}")
     if len(jobs) > MAX_CUSTOMIZATION_JOBS_READ:
-        errors.append(
+        truncated.append(
             f"model customization jobs: only the newest {MAX_CUSTOMIZATION_JOBS_READ} "
             "were read"
         )
@@ -13394,8 +13495,18 @@ def _ai_data_path_buckets(region: str = "") -> Dict[str, Any]:
                 f"customization job '{job_name}': {get_assessment_error_label(error)}"
             )
             continue
+        training = detail.get("trainingDataConfig") or {}
         locations = [
-            ("training data", (detail.get("trainingDataConfig") or {}).get("s3Uri")),
+            ("training data", training.get("s3Uri")),
+            (
+                "invocation log source",
+                (
+                    (training.get("invocationLogsConfig") or {}).get(
+                        "invocationLogSource"
+                    )
+                    or {}
+                ).get("s3Uri"),
+            ),
             ("output", (detail.get("outputDataConfig") or {}).get("s3Uri")),
         ] + [
             ("validation data", validator.get("s3Uri"))
@@ -13411,7 +13522,7 @@ def _ai_data_path_buckets(region: str = "") -> Dict[str, Any]:
                     f"the {role} of customization job '{job_name}'"
                 )
 
-    return {"buckets": buckets, "errors": errors}
+    return {"buckets": buckets, "errors": errors, "truncated": truncated}
 
 
 def check_bedrock_data_path_bucket_tls(region: str = "") -> Dict[str, Any]:
@@ -13457,6 +13568,30 @@ def check_bedrock_data_path_bucket_tls(region: str = "") -> Dict[str, Any]:
                         "bedrock:GetModelInvocationLoggingConfiguration, "
                         "bedrock:ListModelCustomizationJobs and "
                         "bedrock:GetModelCustomizationJob, then retry."
+                    ),
+                    reference=AI_DATA_PATH_TLS_REFERENCE,
+                    severity="Informational",
+                    status="N/A",
+                    region=region,
+                )
+            )
+
+        if inventory["truncated"]:
+            findings["csv_data"].append(
+                create_finding(
+                    check_id="BR-47",
+                    finding_name=check_name,
+                    finding_details=(
+                        "The data path bucket list stopped at a read cap, so buckets "
+                        "beyond it were not assessed: {}.".format(
+                            "; ".join(inventory["truncated"])
+                        )
+                    ),
+                    resolution=(
+                        "Check the bucket policy of the knowledge base data source "
+                        "and customization job buckets beyond the cap directly, or "
+                        "split the estate across Regions or accounts so each run "
+                        "reads it whole."
                     ),
                     reference=AI_DATA_PATH_TLS_REFERENCE,
                     severity="Informational",
@@ -13596,7 +13731,32 @@ def check_bedrock_data_path_bucket_tls(region: str = "") -> Dict[str, Any]:
                 )
             )
 
-        if enforced:
+        incomplete = bool(inventory["errors"] or inventory["truncated"])
+        if enforced and incomplete:
+            findings["csv_data"].append(
+                create_finding(
+                    check_id="BR-47",
+                    finding_name=check_name,
+                    finding_details=(
+                        "{} of the {} Bedrock data path bucket(s) read deny every "
+                        "plaintext request, but the bucket list is incomplete, so "
+                        "this is not a verdict on the whole data path: {}.".format(
+                            len(enforced),
+                            len(inventory["buckets"]),
+                            "; ".join(enforced[:5]),
+                        )
+                    ),
+                    resolution=(
+                        "Resolve the incomplete reads reported for this check, then "
+                        "re-run it to judge every data path bucket."
+                    ),
+                    reference=AI_DATA_PATH_TLS_REFERENCE,
+                    severity="Informational",
+                    status="N/A",
+                    region=region,
+                )
+            )
+        elif enforced:
             findings["csv_data"].append(
                 create_finding(
                     check_id="BR-47",
