@@ -14357,7 +14357,20 @@ class TestAG39GatewayWafRuleCoverage:
         acl.update(overrides)
         return acl
 
-    def _ag39(self, mock_ac, mock_waf, web_acl, web_acl_arn=_WEB_ACL_ARN):
+    def _ag39(
+        self,
+        mock_ac,
+        mock_waf,
+        web_acl,
+        web_acl_arn=_WEB_ACL_ARN,
+        failure_mode="FAIL_CLOSE",
+    ):
+        """Stub one gateway and its web ACL.
+
+        FAIL_CLOSE is what GetGateway returned for the one gateway with a web
+        ACL in 178113193057 on 2026-09-27; a failure_mode of None omits
+        wafConfiguration, which the other fifteen gateways there returned.
+        """
         mock_ac.list_gateways.return_value = {
             "items": [{"gatewayId": "gw-1", "name": "TestGateway"}]
         }
@@ -14368,6 +14381,8 @@ class TestAG39GatewayWafRuleCoverage:
         }
         if web_acl_arn:
             detail["webAclArn"] = web_acl_arn
+        if failure_mode is not None:
+            detail["wafConfiguration"] = {"failureMode": failure_mode}
         mock_ac.get_gateway.return_value = detail
         if mock_waf is not None:
             mock_waf.get_web_acl.return_value = {"WebACL": web_acl}
@@ -14394,17 +14409,6 @@ class TestAG39GatewayWafRuleCoverage:
     @pytest.mark.parametrize(
         ("missing", "acl_kwargs"),
         [
-            (
-                "a rule that blocks",
-                {
-                    "default_action": {"Allow": {}},
-                    "rules": [
-                        _match_rule("sqli", "SqliMatchStatement"),
-                        _match_rule("xss", "XssMatchStatement"),
-                        _rate_rule(Action={"Allow": {}}),
-                    ],
-                },
-            ),
             (
                 "SQL injection inspection",
                 {
@@ -14437,7 +14441,7 @@ class TestAG39GatewayWafRuleCoverage:
                 {"body_limit": ""},
             ),
         ],
-        ids=["block", "sqli", "xss", "rate", "body-limit"],
+        ids=["sqli", "xss", "rate", "body-limit"],
     )
     @patch("agentcore_app.wafv2_client")
     @patch("agentcore_app.agentcore_client")
@@ -14680,6 +14684,7 @@ class TestAG39GatewayWafRuleCoverage:
                 "name": "Filtered",
                 "authorizerType": "AWS_IAM",
                 "webAclArn": _WEB_ACL_ARN,
+                "wafConfiguration": {"failureMode": "FAIL_CLOSE"},
             },
             "gw-open": {
                 "gatewayId": "gw-open",
@@ -14714,6 +14719,409 @@ class TestAG39GatewayWafRuleCoverage:
         assert "missing 2 of the five" in failed["Finding_Details"]
         assert "cross-site scripting inspection" in failed["Finding_Details"]
         assert "a rate-based rule" in failed["Finding_Details"]
+
+    @patch("agentcore_app.wafv2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_allow_rules_are_not_filters(self, mock_ac, mock_waf):
+        # An Allow rule lets the request it matches through, so an Allow over a
+        # SQL injection, cross-site scripting or rate-based statement filters
+        # nothing. Before this, the three Allow rules below were credited and the
+        # ACL was missing only "a rule that blocks".
+        findings = self._ag39(
+            mock_ac,
+            mock_waf,
+            self._acl(
+                default_action={"Allow": {}},
+                rules=[
+                    _match_rule("sqli", "SqliMatchStatement"),
+                    _match_rule("xss", "XssMatchStatement"),
+                    _rate_rule(Action={"Allow": {}}),
+                ],
+            ),
+        )
+
+        assert findings[0]["Status"] == "Failed"
+        assert "missing 4 of the five" in findings[0]["Finding_Details"]
+        for missing in (
+            "a rule that blocks",
+            "SQL injection inspection",
+            "cross-site scripting inspection",
+            "a rate-based rule",
+        ):
+            assert missing in findings[0]["Finding_Details"]
+
+    @pytest.mark.parametrize("action", ["Allow", "Captcha", "Challenge"])
+    @patch("agentcore_app.wafv2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_non_block_match_rule_is_not_coverage_beside_a_blocking_one(
+        self, mock_ac, mock_waf, action
+    ):
+        # Two SQL injection rules, the first not Block: only the second may be
+        # credited, and the evidence names it.
+        findings = self._ag39(
+            mock_ac,
+            mock_waf,
+            self._acl(
+                rules=[
+                    _match_rule("sqli-soft", "SqliMatchStatement", Action={action: {}}),
+                    _match_rule(
+                        "sqli-block", "SqliMatchStatement", Action={"Block": {}}
+                    ),
+                    _managed_rule("common", "AWSManagedRulesCommonRuleSet"),
+                    _rate_rule(),
+                ]
+            ),
+        )
+
+        assert findings[0]["Status"] == "Passed"
+        assert "rule 'sqli-block'" in findings[0]["Finding_Details"]
+        assert "rule 'sqli-soft'" not in findings[0]["Finding_Details"]
+
+    @pytest.mark.parametrize("action", ["Allow", "Captcha", "Challenge"])
+    @patch("agentcore_app.wafv2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_non_block_rate_rule_is_not_a_rate_limit(self, mock_ac, mock_waf, action):
+        findings = self._ag39(
+            mock_ac,
+            mock_waf,
+            self._acl(
+                rules=[
+                    _managed_rule("sqli", "AWSManagedRulesSQLiRuleSet"),
+                    _managed_rule("common", "AWSManagedRulesCommonRuleSet"),
+                    _rate_rule(Action={action: {}}),
+                ]
+            ),
+        )
+
+        assert findings[0]["Status"] == "Failed"
+        assert "missing 1 of the five" in findings[0]["Finding_Details"]
+        assert "a rate-based rule" in findings[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "group_overrides",
+        [
+            {
+                "RuleActionOverrides": [
+                    {"Name": "SQLi_BODY", "ActionToUse": {"Count": {}}}
+                ]
+            },
+            {
+                "RuleActionOverrides": [
+                    {"Name": "SQLi_BODY", "ActionToUse": {"Allow": {}}}
+                ]
+            },
+            {"ExcludedRules": [{"Name": "SQLi_BODY"}]},
+        ],
+        ids=["override-count", "override-allow", "excluded"],
+    )
+    @patch("agentcore_app.wafv2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_an_overridden_sqli_rule_is_not_sqli_coverage(
+        self, mock_ac, mock_waf, group_overrides
+    ):
+        sqli = _managed_rule("sqli", "AWSManagedRulesSQLiRuleSet")
+        sqli["Statement"]["ManagedRuleGroupStatement"].update(group_overrides)
+        findings = self._ag39(
+            mock_ac,
+            mock_waf,
+            self._acl(
+                rules=[
+                    sqli,
+                    _managed_rule("common", "AWSManagedRulesCommonRuleSet"),
+                    _rate_rule(),
+                ]
+            ),
+        )
+
+        assert findings[0]["Status"] == "Failed"
+        assert "missing 1 of the five" in findings[0]["Finding_Details"]
+        assert "SQL injection inspection" in findings[0]["Finding_Details"]
+        assert (
+            "SQLi_BODY of AWSManagedRulesSQLiRuleSet in rule 'sqli'"
+            in findings[0]["Finding_Details"]
+        )
+
+    @patch("agentcore_app.wafv2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_second_unoverridden_sqli_group_still_provides_coverage(
+        self, mock_ac, mock_waf
+    ):
+        counted = _managed_rule("sqli-counted", "AWSManagedRulesSQLiRuleSet")
+        counted["Statement"]["ManagedRuleGroupStatement"]["ExcludedRules"] = [
+            {"Name": "SQLi_BODY"}
+        ]
+        findings = self._ag39(
+            mock_ac,
+            mock_waf,
+            self._acl(
+                rules=[
+                    counted,
+                    _managed_rule("sqli-clean", "AWSManagedRulesSQLiRuleSet"),
+                    _managed_rule("common", "AWSManagedRulesCommonRuleSet"),
+                    _rate_rule(),
+                ]
+            ),
+        )
+
+        assert findings[0]["Status"] == "Passed"
+        assert (
+            "AWSManagedRulesSQLiRuleSet in rule 'sqli-clean'"
+            in (findings[0]["Finding_Details"])
+        )
+
+    @patch("agentcore_app.wafv2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_an_override_to_block_keeps_the_rule_blocking(self, mock_ac, mock_waf):
+        sqli = _managed_rule("sqli", "AWSManagedRulesSQLiRuleSet")
+        sqli["Statement"]["ManagedRuleGroupStatement"]["RuleActionOverrides"] = [
+            {"Name": "SQLi_BODY", "ActionToUse": {"Block": {}}}
+        ]
+        findings = self._ag39(
+            mock_ac,
+            mock_waf,
+            self._acl(
+                rules=[
+                    sqli,
+                    _managed_rule("common", "AWSManagedRulesCommonRuleSet"),
+                    _rate_rule(),
+                ]
+            ),
+        )
+
+        assert findings[0]["Status"] == "Passed"
+
+    @patch("agentcore_app.wafv2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_an_overridden_xss_rule_is_not_xss_coverage(self, mock_ac, mock_waf):
+        # Overriding a size rule in the core rule set leaves the cross-site
+        # scripting rules blocking; overriding one of those does not.
+        common = _managed_rule("common", "AWSManagedRulesCommonRuleSet")
+        common["Statement"]["ManagedRuleGroupStatement"]["RuleActionOverrides"] = [
+            {"Name": "SizeRestrictions_BODY", "ActionToUse": {"Count": {}}},
+            {"Name": "CrossSiteScripting_BODY", "ActionToUse": {"Count": {}}},
+        ]
+        findings = self._ag39(
+            mock_ac,
+            mock_waf,
+            self._acl(
+                rules=[
+                    _managed_rule("sqli", "AWSManagedRulesSQLiRuleSet"),
+                    common,
+                    _rate_rule(),
+                ]
+            ),
+        )
+
+        assert findings[0]["Status"] == "Failed"
+        assert "missing 1 of the five" in findings[0]["Finding_Details"]
+        assert "cross-site scripting inspection" in findings[0]["Finding_Details"]
+        assert (
+            "CrossSiteScripting_BODY of AWSManagedRulesCommonRuleSet"
+            in (findings[0]["Finding_Details"])
+        )
+        assert "SizeRestrictions_BODY" not in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.wafv2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_size_rule_override_leaves_the_xss_rules_credited(
+        self, mock_ac, mock_waf
+    ):
+        common = _managed_rule("common", "AWSManagedRulesCommonRuleSet")
+        common["Statement"]["ManagedRuleGroupStatement"]["RuleActionOverrides"] = [
+            {"Name": "SizeRestrictions_BODY", "ActionToUse": {"Count": {}}}
+        ]
+        findings = self._ag39(
+            mock_ac,
+            mock_waf,
+            self._acl(
+                rules=[
+                    _managed_rule("sqli", "AWSManagedRulesSQLiRuleSet"),
+                    common,
+                    _rate_rule(),
+                ]
+            ),
+        )
+
+        assert findings[0]["Status"] == "Passed"
+
+    @patch("agentcore_app.wafv2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_an_overridden_group_is_not_the_only_block(self, mock_ac, mock_waf):
+        # The group's rule list is not read, so a group with a non-blocking
+        # override that provides neither SQL injection nor cross-site scripting
+        # inspection is not credited as blocking.
+        bad_inputs = _managed_rule("inputs", "AWSManagedRulesKnownBadInputsRuleSet")
+        bad_inputs["Statement"]["ManagedRuleGroupStatement"]["ExcludedRules"] = [
+            {"Name": "Log4JRCE_BODY"}
+        ]
+        clean = _managed_rule("inputs", "AWSManagedRulesKnownBadInputsRuleSet")
+        for group, blocks in ((bad_inputs, False), (clean, True)):
+            findings = self._ag39(
+                mock_ac,
+                mock_waf,
+                self._acl(default_action={"Allow": {}}, rules=[group]),
+            )
+
+            assert findings[0]["Status"] == "Failed"
+            details = findings[0]["Finding_Details"]
+            assert ("missing 3 of the five" in details) is blocks, details
+            assert ("reads: a rule that blocks" in details) is not blocks, details
+
+    @patch("agentcore_app.wafv2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_fail_open_gateway_fails_with_every_filter(self, mock_ac, mock_waf):
+        findings = self._ag39(mock_ac, mock_waf, self._acl(), failure_mode="FAIL_OPEN")
+
+        assert len(findings) == 1
+        assert findings[0]["Finding"] == "Agentic AI Gateway WAF Fails Open"
+        assert findings[0]["Status"] == "Failed"
+        assert findings[0]["Severity"] == "Medium"
+        assert "FAIL_OPEN" in findings[0]["Finding_Details"]
+        assert "all five request filters" in findings[0]["Finding_Details"]
+        assert "FAIL_CLOSE" in findings[0]["Resolution"]
+        assert_finding_schema(findings[0])
+
+    @patch("agentcore_app.wafv2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_fail_open_gateway_fails_even_with_an_opaque_group(
+        self, mock_ac, mock_waf
+    ):
+        # No rule inside an unread group can make a fail-open gateway pass, so
+        # the verdict is decided and is not left N/A.
+        opaque = {
+            "Name": "customer-group",
+            "OverrideAction": {"None": {}},
+            "Statement": {
+                "RuleGroupReferenceStatement": {
+                    "ARN": "arn:aws:wafv2:us-east-1:123456789012:regional/rulegroup/own/1"
+                }
+            },
+        }
+        findings = self._ag39(
+            mock_ac,
+            mock_waf,
+            self._acl(rules=[opaque, _rate_rule()]),
+            failure_mode="FAIL_OPEN",
+        )
+
+        assert findings[0]["Status"] == "Failed"
+        assert findings[0]["Finding"] == "Agentic AI Gateway WAF Fails Open"
+        assert "SQL injection inspection" in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.wafv2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_fail_open_gateway_with_gaps_names_both(self, mock_ac, mock_waf):
+        findings = self._ag39(
+            mock_ac, mock_waf, self._acl(body_limit=""), failure_mode="FAIL_OPEN"
+        )
+
+        assert findings[0]["Finding"] == "Agentic AI Gateway WAF Rule Coverage Gaps"
+        assert findings[0]["Status"] == "Failed"
+        assert "FAIL_OPEN" in findings[0]["Finding_Details"]
+        assert "FAIL_CLOSE" in findings[0]["Resolution"]
+
+    @pytest.mark.parametrize(
+        ("failure_mode", "named"),
+        [
+            (None, "no wafConfiguration failureMode"),
+            ("", "no wafConfiguration"),
+            ("FAIL_SOMETIMES", "FAIL_SOMETIMES"),
+        ],
+        ids=["absent", "empty", "unknown-value"],
+    )
+    @patch("agentcore_app.wafv2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_an_unset_failure_mode_is_not_judged(
+        self, mock_ac, mock_waf, failure_mode, named
+    ):
+        findings = self._ag39(mock_ac, mock_waf, self._acl(), failure_mode=failure_mode)
+
+        assert len(findings) == 1
+        assert findings[0]["Status"] == "N/A"
+        assert findings[0]["Severity"] == "Informational"
+        assert named in findings[0]["Finding_Details"]
+        assert "all five request filters" in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.wafv2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_each_gateway_is_judged_by_its_own_failure_mode(self, mock_ac, mock_waf):
+        mock_ac.list_gateways.return_value = {
+            "items": [
+                {"gatewayId": "gw-open", "name": "Open"},
+                {"gatewayId": "gw-closed", "name": "Closed"},
+                {"gatewayId": "gw-unset", "name": "Unset"},
+            ]
+        }
+        details = {
+            gateway_id: {
+                "gatewayId": gateway_id,
+                "name": gateway_id,
+                "authorizerType": "AWS_IAM",
+                "webAclArn": _WEB_ACL_ARN,
+                **({"wafConfiguration": {"failureMode": mode}} if mode else {}),
+            }
+            for gateway_id, mode in (
+                ("gw-open", "FAIL_OPEN"),
+                ("gw-closed", "FAIL_CLOSE"),
+                ("gw-unset", None),
+            )
+        }
+        mock_ac.get_gateway.side_effect = lambda gatewayIdentifier: details[
+            gatewayIdentifier
+        ]
+        mock_waf.get_web_acl.return_value = {"WebACL": self._acl()}
+
+        findings = [
+            finding
+            for finding in agentcore_app.check_agentcore_gateway_agentic_security()
+            if finding["Check_ID"] == "AG-39"
+        ]
+        by_gateway = {
+            gateway_id: next(
+                finding["Status"]
+                for finding in findings
+                if f"({gateway_id})" in finding["Finding_Details"]
+            )
+            for gateway_id in details
+        }
+
+        assert len(findings) == 3
+        assert by_gateway == {
+            "gw-open": "Failed",
+            "gw-closed": "Passed",
+            "gw-unset": "N/A",
+        }
+
+    def test_the_failure_mode_is_the_one_the_api_models(self):
+        model = agentcore_app.boto3.client(
+            "bedrock-agentcore-control",
+            region_name="us-east-1",
+            aws_access_key_id="testing",
+            aws_secret_access_key="testing",  # pragma: allowlist secret - synthetic test credential
+        ).meta.service_model
+        waf = model.operation_model("GetGateway").output_shape.members[
+            "wafConfiguration"
+        ]
+
+        assert waf.members["failureMode"].enum == ["FAIL_CLOSE", "FAIL_OPEN"]
+        assert "failureMode" not in (waf.required_members or [])
+
+    def test_the_override_fields_are_the_ones_the_api_models(self):
+        model = agentcore_app.boto3.client(
+            "wafv2",
+            region_name="us-east-1",
+            aws_access_key_id="testing",
+            aws_secret_access_key="testing",  # pragma: allowlist secret - synthetic test credential
+        ).meta.service_model
+        group = model.shape_for("ManagedRuleGroupStatement")
+        override = model.shape_for("RuleActionOverride")
+
+        assert {"RuleActionOverrides", "ExcludedRules"} <= set(group.members)
+        assert set(override.members) == {"Name", "ActionToUse"}
+        assert "Name" in model.shape_for("ExcludedRule").members
+        assert {"Block", "Allow", "Count", "Captcha", "Challenge"} <= set(
+            model.shape_for("RuleAction").members
+        )
 
     def test_the_body_inspection_setting_is_the_one_the_api_models(self):
         credentials = {

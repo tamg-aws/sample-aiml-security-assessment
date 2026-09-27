@@ -13310,6 +13310,7 @@ WAF_DEFAULT_BODY_INSPECTION_LIMIT = "KB_16"
 # rule action Block.
 WAF_SQL_INJECTION_GROUP_TOKEN = "sqli"
 WAF_CROSS_SITE_SCRIPTING_GROUP_TOKEN = "commonruleset"
+WAF_CROSS_SITE_SCRIPTING_RULE_PREFIX = "crosssitescripting_"
 
 
 def _waf_statement_nodes(statement: Any) -> List[Dict[str, Any]]:
@@ -13338,16 +13339,41 @@ def _waf_statement_nodes(statement: Any) -> List[Dict[str, Any]]:
     return nodes
 
 
+def _waf_group_non_blocking_rules(group: Dict[str, Any]) -> List[Tuple[str, str]]:
+    """Return the rules of one managed rule group that no longer block.
+
+    RuleActionOverrides replaces a rule's action inside the group, and the
+    legacy ExcludedRules sets a rule to Count. Only an override to Block leaves
+    the rule blocking: Captcha and Challenge let through a request that carries
+    a valid token, and Count and Allow stop nothing.
+    """
+    rules: List[Tuple[str, str]] = []
+    for override in group.get("RuleActionOverrides") or []:
+        action = override.get("ActionToUse") or {}
+        if "Block" in action:
+            continue
+        label = next(iter(action), "no action")
+        rules.append((override.get("Name") or "unnamed", label))
+    for excluded in group.get("ExcludedRules") or []:
+        rules.append((excluded.get("Name") or "unnamed", "Count"))
+    return rules
+
+
 def _waf_rule_coverage(web_acl: Dict[str, Any]) -> Dict[str, Any]:
     """Return which request filters one web ACL applies, and what it hides.
 
-    A rule whose action or override is Count observes requests without changing
-    the response, so it contributes no coverage. A referenced customer rule group
-    and a managed rule group from a vendor other than AWS both keep their rules
-    in another resource this check does not read, so they are reported as opaque
-    and leave the verdict indeterminate rather than absent. RuleActionOverrides
-    inside an AWS managed rule group are not read, so a group whose every rule is
-    individually overridden to Count still counts as blocking.
+    Only a rule whose action is Block filters: Allow lets the matching request
+    through, Count observes it, and Captcha and Challenge let through a request
+    that carries a valid token. A rule group whose OverrideAction is Count
+    blocks nothing. Inside an AWS managed rule group, a rule overridden to any
+    action but Block, or excluded, does not block, so a group is not credited
+    with SQL injection or cross-site scripting inspection when a rule that
+    provides it is overridden. The group's rule list is not read, so a group
+    with any override is credited as blocking only while it still provides one
+    of those two filters. A referenced customer rule group and a managed rule
+    group from a vendor other than AWS both keep their rules in another resource
+    this check does not read, so they are reported as opaque and leave the
+    verdict indeterminate rather than absent.
     """
     coverage: Dict[str, Any] = {
         "block": False,
@@ -13355,6 +13381,7 @@ def _waf_rule_coverage(web_acl: Dict[str, Any]) -> Dict[str, Any]:
         "xss": False,
         "rate": False,
         "opaque": [],
+        "overridden": [],
         "evidence": {},
     }
 
@@ -13364,23 +13391,22 @@ def _waf_rule_coverage(web_acl: Dict[str, Any]) -> Dict[str, Any]:
 
     for rule in web_acl.get("Rules") or []:
         rule_name = rule.get("Name") or "unnamed"
-        if "Count" in (rule.get("Action") or {}) or "Count" in (
-            rule.get("OverrideAction") or {}
-        ):
+        if "Count" in (rule.get("OverrideAction") or {}):
             continue
 
-        if "Block" in (rule.get("Action") or {}) and not coverage["block"]:
+        blocks = "Block" in (rule.get("Action") or {})
+        if blocks and not coverage["block"]:
             coverage["block"] = True
             coverage["evidence"]["block"] = f"rule '{rule_name}'"
 
         for node in _waf_statement_nodes(rule.get("Statement")):
-            if "SqliMatchStatement" in node and not coverage["sqli"]:
+            if blocks and "SqliMatchStatement" in node and not coverage["sqli"]:
                 coverage["sqli"] = True
                 coverage["evidence"]["sqli"] = f"rule '{rule_name}'"
-            if "XssMatchStatement" in node and not coverage["xss"]:
+            if blocks and "XssMatchStatement" in node and not coverage["xss"]:
                 coverage["xss"] = True
                 coverage["evidence"]["xss"] = f"rule '{rule_name}'"
-            if "RateBasedStatement" in node and not coverage["rate"]:
+            if blocks and "RateBasedStatement" in node and not coverage["rate"]:
                 coverage["rate"] = True
                 coverage["evidence"]["rate"] = f"rule '{rule_name}'"
 
@@ -13403,18 +13429,42 @@ def _waf_rule_coverage(web_acl: Dict[str, Any]) -> Dict[str, Any]:
                 )
                 continue
 
-            if not coverage["block"]:
+            non_blocking = _waf_group_non_blocking_rules(group)
+            lowered = name.lower()
+            provides = False
+            if WAF_SQL_INJECTION_GROUP_TOKEN in lowered:
+                if non_blocking:
+                    coverage["overridden"].extend(
+                        f"{member} of {name} in rule '{rule_name}' is set to {action}"
+                        for member, action in non_blocking
+                    )
+                else:
+                    provides = True
+                    if not coverage["sqli"]:
+                        coverage["sqli"] = True
+                        coverage["evidence"]["sqli"] = f"{name} in rule '{rule_name}'"
+            if WAF_CROSS_SITE_SCRIPTING_GROUP_TOKEN in lowered:
+                xss_overridden = [
+                    (member, action)
+                    for member, action in non_blocking
+                    if member.lower().startswith(WAF_CROSS_SITE_SCRIPTING_RULE_PREFIX)
+                ]
+                if xss_overridden:
+                    coverage["overridden"].extend(
+                        f"{member} of {name} in rule '{rule_name}' is set to {action}"
+                        for member, action in xss_overridden
+                    )
+                else:
+                    provides = True
+                    if not coverage["xss"]:
+                        coverage["xss"] = True
+                        coverage["evidence"]["xss"] = f"{name} in rule '{rule_name}'"
+
+            if (provides or not non_blocking) and not coverage["block"]:
                 coverage["block"] = True
                 coverage["evidence"]["block"] = (
                     f"the blocking rules of {name} in rule '{rule_name}'"
                 )
-            lowered = name.lower()
-            if WAF_SQL_INJECTION_GROUP_TOKEN in lowered and not coverage["sqli"]:
-                coverage["sqli"] = True
-                coverage["evidence"]["sqli"] = f"{name} in rule '{rule_name}'"
-            if WAF_CROSS_SITE_SCRIPTING_GROUP_TOKEN in lowered and not coverage["xss"]:
-                coverage["xss"] = True
-                coverage["evidence"]["xss"] = f"{name} in rule '{rule_name}'"
 
     return coverage
 
@@ -13427,7 +13477,7 @@ def _waf_body_inspection_limit(web_acl: Dict[str, Any]) -> str:
 
 
 def _gateway_waf_rule_findings(
-    label: str, web_acl_arn: str, web_acl: Dict[str, Any]
+    label: str, web_acl_arn: str, web_acl: Dict[str, Any], failure_mode: str = ""
 ) -> List[Dict[str, Any]]:
     """AG-39: judge whether one gateway's web ACL filters the request.
 
@@ -13437,6 +13487,11 @@ def _gateway_waf_rule_findings(
     tools. The body inspection limit is one of them because a tool call carries
     its arguments in the body, and AWS WAF inspects only the first 16 KB of it
     unless the association raises the limit.
+
+    The gateway's own wafConfiguration failureMode decides what happens when AWS
+    WAF cannot be evaluated: FAIL_OPEN lets the request through, so the ACL
+    filters nothing while AWS WAF is unreachable or times out. The API states no
+    default for an absent failureMode, so an unset value is not judged.
     """
     coverage = _waf_rule_coverage(web_acl)
     body_limit = _waf_body_inspection_limit(web_acl)
@@ -13468,24 +13523,87 @@ def _gateway_waf_rule_findings(
         for name, present, why in conditions
         if present
     )
+    overridden = (
+        " Not credited because the rule is overridden or excluded: "
+        f"{'; '.join(coverage['overridden'])}."
+        if coverage["overridden"]
+        else ""
+    )
+    fails_open = (
+        " The gateway's wafConfiguration failureMode is FAIL_OPEN, so the gateway "
+        "allows a request when AWS WAF cannot be evaluated."
+    )
 
-    if not missing:
+    if missing and not coverage["opaque"]:
+        reference = (
+            WAF_BODY_INSPECTION_LIMIT_REFERENCE_URL
+            if not body_filters and len(missing) == 1
+            else WAF_RULE_ACTION_REFERENCE_URL
+        )
         return [
             create_finding(
                 check_id="AG-39",
-                finding_name="Agentic AI Gateway WAF Rule Coverage",
+                finding_name="Agentic AI Gateway WAF Rule Coverage Gaps",
                 finding_details=(
-                    f"{label} is filtered by web ACL {acl_name}, which applies "
-                    f"all five request filters this check reads: {applied}."
+                    f"{label} is associated with web ACL {acl_name}, which is "
+                    f"missing {len(missing)} of the five request filters this "
+                    f"check reads: {', '.join(missing)}. It applies "
+                    f"{applied or 'none of the five'}.{overridden}"
+                    f"{fails_open if failure_mode == 'FAIL_OPEN' else ''}"
                 ),
-                resolution="No action required",
-                reference=WAF_RULE_ACTION_REFERENCE_URL,
+                resolution=(
+                    "Add the missing filters to the web ACL: a rule or default "
+                    "action that blocks, the AWSManagedRulesSQLiRuleSet and "
+                    "AWSManagedRulesCommonRuleSet managed rule groups without a "
+                    "Count override on the group or on their SQL injection and "
+                    "cross-site scripting rules, a rate-based rule whose action "
+                    "is Block, and a DefaultSizeInspectionLimit above KB_16 for "
+                    "the AGENTCORE_GATEWAY association, which costs additional "
+                    "WCUs."
+                    + (
+                        " Set the gateway's wafConfiguration failureMode to FAIL_CLOSE."
+                        if failure_mode == "FAIL_OPEN"
+                        else ""
+                    )
+                ),
+                reference=reference,
                 severity=SeverityEnum.MEDIUM,
-                status=StatusEnum.PASSED,
+                status=StatusEnum.FAILED,
             )
         ]
 
-    if coverage["opaque"]:
+    if failure_mode == "FAIL_OPEN":
+        judged = (
+            f"The web ACL applies all five request filters this check reads: {applied}."
+            if not missing
+            else (
+                f"The web ACL also does not apply {', '.join(missing)} in the "
+                "rules this check reads."
+            )
+        )
+        return [
+            create_finding(
+                check_id="AG-39",
+                finding_name="Agentic AI Gateway WAF Fails Open",
+                finding_details=(
+                    f"{label} is associated with web ACL {acl_name}, and its "
+                    "wafConfiguration failureMode is FAIL_OPEN, so the gateway "
+                    "allows a request when AWS WAF cannot be evaluated and the "
+                    f"ACL filters nothing while AWS WAF is unreachable or times "
+                    f"out. {judged}"
+                ),
+                resolution=(
+                    "Set the gateway's wafConfiguration failureMode to FAIL_CLOSE "
+                    "so the gateway blocks requests when AWS WAF cannot be "
+                    "evaluated."
+                ),
+                reference=AGENTCORE_GATEWAY_API_REFERENCE_URL,
+                severity=SeverityEnum.MEDIUM,
+                status=StatusEnum.FAILED,
+            )
+        ]
+
+    if missing:
         return [
             create_finding(
                 check_id="AG-39",
@@ -13496,7 +13614,7 @@ def _gateway_waf_rule_findings(
                     f"reads, and which delegates to {len(coverage['opaque'])} "
                     "rule group(s) whose rules live in another resource: "
                     f"{'; '.join(coverage['opaque'])}. Those groups may carry "
-                    "the missing filters, so the ACL was not judged."
+                    f"the missing filters, so the ACL was not judged.{overridden}"
                 ),
                 resolution=(
                     "Read the named rule groups and confirm they apply the "
@@ -13509,32 +13627,48 @@ def _gateway_waf_rule_findings(
             )
         ]
 
-    reference = (
-        WAF_BODY_INSPECTION_LIMIT_REFERENCE_URL
-        if not body_filters and len(missing) == 1
-        else WAF_RULE_ACTION_REFERENCE_URL
-    )
+    if failure_mode != "FAIL_CLOSE":
+        reported = (
+            f"reports wafConfiguration failureMode {failure_mode}"
+            if failure_mode
+            else "reports no wafConfiguration failureMode"
+        )
+        return [
+            create_finding(
+                check_id="AG-39",
+                finding_name="Agentic AI Gateway WAF Rule Coverage",
+                finding_details=(
+                    f"{label} is associated with web ACL {acl_name}, which "
+                    f"applies all five request filters this check reads: "
+                    f"{applied}. The gateway {reported}, and the AgentCore API "
+                    "states no default for it, so whether the gateway blocks or "
+                    "allows a request when AWS WAF cannot be evaluated was not "
+                    "judged."
+                ),
+                resolution=(
+                    "Set the gateway's wafConfiguration failureMode to FAIL_CLOSE "
+                    "and rerun the assessment."
+                ),
+                reference=AGENTCORE_GATEWAY_API_REFERENCE_URL,
+                severity=SeverityEnum.INFORMATIONAL,
+                status=StatusEnum.NA,
+            )
+        ]
+
     return [
         create_finding(
             check_id="AG-39",
-            finding_name="Agentic AI Gateway WAF Rule Coverage Gaps",
+            finding_name="Agentic AI Gateway WAF Rule Coverage",
             finding_details=(
-                f"{label} is associated with web ACL {acl_name}, which is "
-                f"missing {len(missing)} of the five request filters this check "
-                f"reads: {', '.join(missing)}. It applies "
-                f"{applied or 'none of the five'}."
+                f"{label} is filtered by web ACL {acl_name}, which applies "
+                f"all five request filters this check reads: {applied}. The "
+                "gateway's wafConfiguration failureMode is FAIL_CLOSE, so a "
+                "request is blocked when AWS WAF cannot be evaluated."
             ),
-            resolution=(
-                "Add the missing filters to the web ACL: a rule or default "
-                "action that blocks, the AWSManagedRulesSQLiRuleSet and "
-                "AWSManagedRulesCommonRuleSet managed rule groups without a "
-                "Count override, a rate-based rule, and a "
-                "DefaultSizeInspectionLimit above KB_16 for the "
-                "AGENTCORE_GATEWAY association, which costs additional WCUs."
-            ),
-            reference=reference,
+            resolution="No action required",
+            reference=WAF_RULE_ACTION_REFERENCE_URL,
             severity=SeverityEnum.MEDIUM,
-            status=StatusEnum.FAILED,
+            status=StatusEnum.PASSED,
         )
     ]
 
@@ -13922,8 +14056,13 @@ def check_agentcore_gateway_agentic_security() -> List[Dict[str, Any]]:
                     )
                 )
             else:
+                failure_mode = (gateway_details.get("wafConfiguration") or {}).get(
+                    "failureMode"
+                ) or ""
                 findings.extend(
-                    _gateway_waf_rule_findings(gateway_label, web_acl_arn, web_acl)
+                    _gateway_waf_rule_findings(
+                        gateway_label, web_acl_arn, web_acl, failure_mode
+                    )
                 )
 
     return findings

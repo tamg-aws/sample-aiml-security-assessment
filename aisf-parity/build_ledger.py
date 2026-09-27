@@ -899,8 +899,12 @@ ROWS = [
         "scripting coverage, no rate-based rule, or an association body inspection limit "
         "left at the 16 KB default, since a tool call carries its arguments in the body. A "
         "customer rule group or a non-AWS managed rule group, whose rules AG-39 does not "
-        "read, turns a missing filter into Not Applicable with the group named. AWS "
-        "managed groups are credited by name, and their rule overrides are not read. The subject is AgentCore gateways",
+        "read, turns a missing filter into Not Applicable with the group named. Only a "
+        "rule whose action is Block is credited. AWS managed groups are credited by name, "
+        "and not for a filter whose providing rule is overridden to an action other than "
+        "Block or excluded. A gateway whose wafConfiguration failureMode is FAIL_OPEN "
+        "fails, because it allows a request when AWS WAF cannot be evaluated, and one "
+        "that reports no failureMode is Not Applicable. The subject is AgentCore gateways",
         [],
         5,
     ),

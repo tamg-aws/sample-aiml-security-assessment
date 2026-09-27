@@ -69,6 +69,15 @@ section.
   - `AG-39` does not read the rules inside customer rule groups or non-AWS
     managed rule groups. An ACL that relies on one for a missing filter is
     reported `N/A` with the group named.
+  - `AG-39` credits a filter only to a rule whose action is `Block`. An
+    `Allow`, `Captcha` or `Challenge` rule over a SQL injection, cross-site
+    scripting or rate-based statement is not coverage, and neither is an AWS
+    managed group whose providing rule is set to another action by
+    `RuleActionOverrides` or listed in `ExcludedRules`.
+  - `AG-39` reads the gateway's `wafConfiguration.failureMode`. A gateway set
+    to `FAIL_OPEN` allows requests when AWS WAF cannot be evaluated and fails
+    whatever its web ACL applies. A gateway that reports no `failureMode` is
+    `N/A`, because the API states no default.
 
 ### Deployment impact
 
