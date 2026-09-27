@@ -19,7 +19,7 @@ section.
   - The section is always on. It needs no deployment parameter, runs no
     additional AWS API calls, and adds no scan time, because each row restates
     the verdict of a check that already ran under an AISF control id.
-  - `AISF-` rows are excluded from the 271-check catalog total, from the report
+  - `AISF-` rows are excluded from the 273-check catalog total, from the report
     pass rate, and from Open Action Items, for the same reason OWASP-mapped
     rows are: the underlying check is already counted.
   - `AISF-08` aggregates three SageMaker checks (`SM-09`, `SM-01`, `SM-03`). It
@@ -173,6 +173,25 @@ section.
   - The IAM permissions cache now records each user's group policies, which
     `BR-01`, `BR-50` and `BR-51` read. A user whose groups cannot be read is
     reported `N/A`, never clean.
+- Added `BR-56` and `AC-52`, growing the catalog from 271 to 273 checks (158
+  core). They answer two requirements in Prowler's AWS AI Security Framework
+  mapping that no check asserted, and carry no `Compliance_Frameworks` tag,
+  because Prowler's requirement ids are not AISF catalogue controls.
+  `docs/SECURITY_CHECKS_AISF.md` records the cross-reference and names five
+  Prowler requirements judged out of charter as account hygiene.
+  - `BR-56` reproduces Prowler's `cloudtrail_threat_detection_llm_jacking`
+    (AISF-AI-06). It fails an identity that called more than 40% of 14 Bedrock
+    and Marketplace actions in the last 24 hours of the Region's CloudTrail
+    event history. Event history holds management events only, so the row
+    names the Bedrock data events it cannot see. An action cut off at the
+    5-page limit, or one whose lookup failed, is reported `N/A` for every
+    identity it could push over the threshold, never passed.
+  - `AC-52` answers AISF-IAM-07 for the Cognito user pools named by an
+    AgentCore gateway or runtime JWT authorizer: MFA, threat protection
+    enforcement, admin-only sign-up, deletion protection, temporary password
+    validity, and per app client token revocation and user existence errors.
+    A pool used only through the `client_credentials` flow is judged on
+    deletion protection and token revocation alone.
 
 ### Fixed
 
@@ -220,6 +239,14 @@ The SageMaker assessment role gains `organizations:ListDelegatedAdministrators`,
 `eks:ListAddons`, `eks:DescribeAddon`, `secretsmanager:ListSecrets`, `iot:ListPolicies`,
 `iot:ListTargetsForPolicy`, and `iot:GetPolicy` for `SM-35` through `SM-41`,
 in both SAM templates. The same CodeBuild run applies them.
+
+`BR-56` and `AC-52` add, in both SAM templates: on the Bedrock assessment
+role, `cloudtrail:LookupEvents`, granted on `*` because it has no resource
+type in the IAM service authorization reference; on the AgentCore assessment
+role, `cognito-idp:DescribeUserPool`, `cognito-idp:ListUserPoolClients` and
+`cognito-idp:DescribeUserPoolClient`, scoped to the account's user pools. All
+are read-only, and the same CodeBuild run applies them. No parameter,
+deployment-stack or member-role StackSet change is required.
 
 ## 2.0.0 - 2026-09-18
 

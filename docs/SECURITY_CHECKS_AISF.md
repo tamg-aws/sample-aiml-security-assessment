@@ -62,7 +62,7 @@ map, gate 12 fails if the control text baked into the map drifts from the
 AISF control definition, and gate 13 fails if an id does not carry the
 registered `AISF-` prefix or is missing from this catalogue.
 
-**`AISF-` rows are not counted in the framework's 271-check total.** They carry
+**`AISF-` rows are not counted in the framework's 273-check total.** They carry
 no new assertion, so counting them would double-count the incumbent check. They
 are excluded from the report's pass-rate denominator and from Open Action Items
 for the same reason, which is how OWASP-mapped rows already behave.
@@ -320,6 +320,37 @@ is an empty tag and no `ImportError`, so nothing raises.
   schema field to the fieldnames list, so landing one without the other raises
   `ValueError` on the first row. `agentcore_assessments` builds its header
   twice, once for the no-findings case, and both lists are asserted.
+
+## Prowler AISF requirements
+
+Prowler publishes its own AWS AI Security Framework compliance mapping, whose
+requirement ids (`AISF-AI-06`, `AISF-IAM-07` and so on) are Prowler's and are
+not AISF catalogue control ids. Two checks answer Prowler requirements that no
+check here asserted:
+
+| Prowler requirement | Check | What it reproduces |
+| --------------------- | ------- | -------------------- |
+| AISF-AI-06 Bedrock API Audit Trail | `BR-56` Bedrock LLM Jacking Activity | `cloudtrail_threat_detection_llm_jacking`, with the departures listed in [SECURITY_CHECKS.md](SECURITY_CHECKS.md#br-56-bedrock-llm-jacking-activity) |
+| AISF-IAM-07 Cognito User Authentication for AI Apps | `AC-52` Cognito User Pool Authentication | the user pool and app client checks, for the pools an AgentCore JWT authorizer names |
+
+Neither check carries a `Compliance_Frameworks` tag. The tag names an AISF
+catalogue control, the map modules are generated from the parity ledger, and
+gates 14 and 15 compare the maps with the ledger in both directions, so a
+Prowler id written into a map fails both gates, and mapping either check to a
+catalogue control it was not adjudicated against would publish a coverage claim
+that no ledger row backs. The cross-reference lives in this table and in the code
+comment on each check instead.
+
+These Prowler requirements are out of charter and have no check here. Each is
+account hygiene that applies whether or not the account runs an AI workload,
+Prowler already checks it, and this scanner's scope is the AI/ML resources in
+the account:
+
+- `AISF-IAM-04`, root account protection.
+- `AISF-IAM-06`, the IAM password policy.
+- `AISF-IAM-08`, API Gateway authorizers.
+- `AISF-GOV-03`, the account security contact.
+- `AISF-DATA-02`, IAM Access Analyzer enablement.
 
 ## Live verification
 

@@ -1,10 +1,10 @@
 # Security Checks Reference
 
-This document provides a comprehensive reference for all 271 security checks performed by the AI/ML Security Assessment framework (156 core checks across Amazon Bedrock, Amazon SageMaker AI, Amazon Bedrock AgentCore, and AWS Agent Registry, 39 Agentic AI Security checks, 64 Responsible AI GRC checks, and 12 OWASP Top 10 for LLM checks).
+This document provides a comprehensive reference for all 273 security checks performed by the AI/ML Security Assessment framework (158 core checks across Amazon Bedrock, Amazon SageMaker AI, Amazon Bedrock AgentCore, and AWS Agent Registry, 39 Agentic AI Security checks, 64 Responsible AI GRC checks, and 12 OWASP Top 10 for LLM checks).
 
 Sources differ by bucket and are not interchangeable: the core Bedrock, SageMaker, AgentCore, and AWS Agent Registry checks derive from the AWS Well-Architected **Generative AI Lens** security best practices (`gensec*`) and service security documentation; the Agentic AI Security checks from the AWS Well-Architected **Agentic AI Lens**; the `FS-*` **Responsible AI GRC** checks from the AWS GRC User Guide; and the `OW-*` checks from the OWASP Top 10 for LLM. The AWS Well-Architected **Responsible AI Lens** is not a source for any of them — see [Responsible AI GRC — scope, sources, and compatibility](RESPONSIBLE_AI_GRC_SCOPE.md).
 
-The 64 Responsible AI GRC checks occupy 69 `FS-*` numbers: 64 ship as standalone checks and 5 are merged into upstream Bedrock/SageMaker checks. The framework also emits `BR-00`, `SM-00`, `AC-00`, `AR-00`, `FS-00`, `OW-00`, and `AISF-00` operational marker rows at runtime; these are not controls and are excluded from the 271-check total. `AISF-01` through `AISF-08` are AWS AI Security Framework view rows: each one restates the verdict of a check already counted above under an AISF control id, so they are excluded from the 271-check total for the same reason ([AWS AI Security Framework (AISF) Checks](SECURITY_CHECKS_AISF.md)). Per-control provenance, including which controls are project extensions rather than guide-derived, is recorded in [`provenance.json`](../aiml-security-assessment/functions/security/responsible_ai_grc_assessments/provenance.json).
+The 64 Responsible AI GRC checks occupy 69 `FS-*` numbers: 64 ship as standalone checks and 5 are merged into upstream Bedrock/SageMaker checks. The framework also emits `BR-00`, `SM-00`, `AC-00`, `AR-00`, `FS-00`, `OW-00`, and `AISF-00` operational marker rows at runtime; these are not controls and are excluded from the 273-check total. `AISF-01` through `AISF-08` are AWS AI Security Framework view rows: each one restates the verdict of a check already counted above under an AISF control id, so they are excluded from the 273-check total for the same reason ([AWS AI Security Framework (AISF) Checks](SECURITY_CHECKS_AISF.md)). Per-control provenance, including which controls are project extensions rather than guide-derived, is recorded in [`provenance.json`](../aiml-security-assessment/functions/security/responsible_ai_grc_assessments/provenance.json).
 
 ## Table of Contents
 
@@ -14,8 +14,8 @@ The 64 Responsible AI GRC checks occupy 69 `FS-*` numbers: 64 ship as standalone
 - [Severity Levels](#severity-levels)
 - [Status Values](#status-values)
 - [Amazon SageMaker AI Security Checks (40)](#amazon-sagemaker-ai-security-checks-40)
-- [Amazon Bedrock Security Checks (55)](#amazon-bedrock-security-checks-55)
-- [Amazon Bedrock AgentCore Security Checks (51)](#amazon-bedrock-agentcore-security-checks-51)
+- [Amazon Bedrock Security Checks (56)](#amazon-bedrock-security-checks-56)
+- [Amazon Bedrock AgentCore Security Checks (52)](#amazon-bedrock-agentcore-security-checks-52)
 - [AWS Agent Registry Security Checks (10)](#aws-agent-registry-security-checks-10)
 - [Agentic AI Security Checks (39)](#agentic-ai-security-checks-39)
 - [Responsible AI GRC Checks (64)](#responsible-ai-grc-checks-64-additional-5-upstream-extensions)
@@ -30,8 +30,8 @@ The framework evaluates your AI/ML workloads against AWS security best practices
 | Service | Number of Checks | Focus Areas |
 | --------- | ------------------ | ------------- |
 | Amazon SageMaker AI | 40 | Security Hub controls, encryption, network isolation, GuardDuty AI Protection, HyperPod, IAM, MLOps, Model Registry policy exposure, inference data capture, Config compliance evaluation, training VPC boundary, creation guardrails, security service delegated administration, the Security Hub AI standard, GuardDuty Lambda Protection and Runtime Monitoring, EKS network policy, secret rotation, IoT device-scoped policies |
-| Amazon Bedrock | 55 | Guardrails, prompt-attack/image filters, retention, inference profiles, automated reasoning and Marketplace endpoint governance, encryption, networking, IAM, logging, monitoring, evaluation, central guardrail enforcement, model allow-lists, Region and Marketplace subscription control, API key governance, knowledge base source classification |
-| Amazon Bedrock AgentCore | 51 | Runtime/tool VPC isolation, encryption, browser recording, observability, resource policies, Identity token vaults, and online evaluation |
+| Amazon Bedrock | 56 | Guardrails, prompt-attack/image filters, retention, inference profiles, automated reasoning and Marketplace endpoint governance, encryption, networking, IAM, logging, monitoring, evaluation, central guardrail enforcement, model allow-lists, Region and Marketplace subscription control, API key governance, knowledge base source classification, LLM jacking activity in CloudTrail event history |
+| Amazon Bedrock AgentCore | 52 | Runtime/tool VPC isolation, encryption, browser recording, observability, resource policies, Identity token vaults, online evaluation, and the Cognito user pools that issue tokens to gateways and runtimes |
 | AWS Agent Registry | 10 | IAM access, approval governance, discovery authorization, encryption, organization auto-detection, record lifecycle, and provenance |
 | Agentic AI Security | 39 | Bounded autonomy, agent identity, tool authorization, Registry governance and provenance, guardrail enforcement, prompt/input protection, memory privacy, auditability, continuous assurance, abuse protection |
 | Responsible AI GRC | 64 | Unbounded consumption, excessive agency, supply chain, training data poisoning, vector weaknesses, non-compliant output, misinformation, harmful output, biased output, PII disclosure, hallucination, prompt injection, improper output handling, off-topic output, out-of-date training data |
@@ -46,8 +46,8 @@ Each security check has a unique identifier with a service prefix:
 | Prefix | Service | Example |
 | -------- | --------- | --------- |
 | **SM-XX** | Amazon SageMaker | SM-01, SM-41 (`SM-29` reserved) |
-| **BR-XX** | Amazon Bedrock | BR-01, BR-55 |
-| **AC-XX** | Amazon Bedrock AgentCore | AC-01, AC-51 |
+| **BR-XX** | Amazon Bedrock | BR-01, BR-56 |
+| **AC-XX** | Amazon Bedrock AgentCore | AC-01, AC-52 |
 | **AR-XX** | AWS Agent Registry | AR-01, AR-10 |
 | **AG-XX** | Agentic AI Security | AG-01, AG-39 |
 | **FS-XX** | Responsible AI GRC | FS-01, FS-69 |
@@ -337,7 +337,7 @@ investigation and remediation.
 
 ---
 
-## Amazon Bedrock Security Checks (55)
+## Amazon Bedrock Security Checks (56)
 
 ### BR-01: AWS IAM Least Privilege
 
@@ -639,9 +639,14 @@ inventory is never treated as evidence of compliance.
 - **Severity:** High
 - **Description:** For each customer-managed KMS key whose policy uses a `kms:RecipientAttestation:` condition, fails an `Allow` covering `kms:Decrypt`, `kms:DeriveSharedSecret`, `kms:GenerateDataKey` or `kms:GenerateDataKeyPair` with no attestation pin, unless a `Deny` to principal `*` with a negated or `Null` `true` test on an attestation key already refuses such calls. `kms:GenerateRandom` also honors attestation but takes no key, so no key policy grants it. A pin is an exact value on `ImageSha384`, any `PCR<ID>` or any `NitroTPMPCR<ID>`, under an operator that is not negated, not `Null` and not `...IfExists`, with no wildcard values. `ImageSha384` corresponds to `PCR0`, so a `PCR0`-only binding passes. Every row names the family that matched: Nitro Enclave for `ImageSha384` and `PCR<ID>`, NitroTPM for `NitroTPMPCR<ID>`. The default key-policy statement that delegates to IAM through the account root is reported as a bypass with its own text, and the key can pass only when that statement carries an attestation pin or a `Deny` covers every operation it opens. A `Deny` that tests only for a missing attestation (`Null` `true`, or a negated test on wildcard values) closes that path but does not by itself pin an image. A `Deny` under a positive operator, with or without `IfExists`, is not credited. Keys whose policy uses no attestation are summarized in one `N/A` row. AWS managed keys are skipped.
 
+### BR-56: Bedrock LLM Jacking Activity
+
+- **Severity:** High
+- **Description:** Reproduces Prowler's `cloudtrail_threat_detection_llm_jacking`, which Prowler maps to its AISF-AI-06 "Bedrock API Audit Trail" requirement. Reads the Region's CloudTrail event history with `LookupEvents`, one event name at a time, over the last 24 hours, for Prowler's 14 actions: `PutUseCaseForModelAccess`, `PutFoundationModelEntitlement`, `PutModelInvocationLoggingConfiguration`, `CreateFoundationModelAgreement`, `InvokeModel`, `InvokeModelWithResponseStream`, `GetUseCaseForModelAccess`, `GetModelInvocationLoggingConfiguration`, `GetFoundationModelAvailability`, `ListFoundationModelAgreementOffers`, `ListFoundationModels`, `ListProvisionedModelThroughputs`, `SearchAgreements` and `AcceptAgreementRequest`. An identity, keyed by `userIdentity.arn` and `userIdentity.type`, fails when the share of those actions it called is above 0.4, which is 6 or more of the 14. Events with no identity ARN are skipped as AWS service calls, as Prowler does. Event history holds management events only, whether or not a trail exists: it sees `InvokeModel` and `InvokeModelWithResponseStream`, and it cannot see `InvokeModelWithBidirectionalStream`, `StartAsyncInvoke`, `GetAsyncInvoke`, `InvokeAgent` or `InvokeInlineAgent`, which Bedrock logs as data events. `Converse` and `ConverseStream` are management events but are not in Prowler's list. Every `Passed` and `N/A` row states this. Three departures from Prowler: each event name is read up to 5 pages of 50 events, where Prowler reads one page; the Region under assessment is read, where Prowler reads only its trails' home Region and passes an account with no trail; and an event name that was cut off at the page limit, failed to read, or held an unparseable event is never passed over. Such a name is credited to every identity, and an identity that could then exceed the threshold is reported in one informational `N/A` row with the names that were not read in full. The `Passed` row names any such names when crediting them changes no verdict. When every lookup fails the check is informational `N/A` with the error code.
+
 ---
 
-## Amazon Bedrock AgentCore Security Checks (51)
+## Amazon Bedrock AgentCore Security Checks (52)
 
 ### AC-01: Runtime Amazon VPC Configuration
 
@@ -897,6 +902,11 @@ inventory is never treated as evidence of compliance.
 
 - **Severity:** Medium
 - **Description:** For each AgentCore gateway, reads the web ACL that `GetGateway` reports and requires it to run the AWS managed rule group `AWSManagedRulesAntiDDoSRuleSet`. A gateway with no web ACL fails, because nothing mitigates a request flood against it, and AG-27 reports the missing association. The group is not credited when its rule overrides the group action to `Count`, when a rule inside it is overridden to `Count` or `Allow` or excluded, because the group's soft mitigation is a `Challenge`, or when a group of that name comes from a vendor other than AWS. Rule groups that Firewall Manager adds before and after the web ACL's own rules are read as part of it. A gateway whose association cannot be read, and a web ACL whose rules cannot be read, are informational `N/A` with the reason. Front doors other than AgentCore gateways (API Gateway, ALB, CloudFront) are not identifiable as AI entry points by any API, so they are not judged.
+
+### AC-52: Cognito User Pool Authentication
+
+- **Severity:** Medium
+- **Description:** Answers Prowler's AISF-IAM-07 "Cognito User Authentication for AI Apps" for the user pools an AI application uses: the pools named in the `discoveryUrl` of a `CUSTOM_JWT` inbound authorizer on an AgentCore gateway or runtime. Each pool is judged once, in one row that names every gateway and runtime using it. Per pool, reproducing Prowler's Cognito checks: `MfaConfiguration` is `ON`; threat protection (`AdvancedSecurityMode`) is `ENFORCED`, so `AUDIT` fails; `AllowAdminCreateUserOnly` is true; `DeletionProtection` is `ACTIVE`; and temporary passwords are valid for 7 days or fewer. Per app client: `EnableTokenRevocation` is on, and `PreventUserExistenceErrors` is `ENABLED`. The row names the pool's feature plan (`UserPoolTier`). A pool whose every app client allows only the `client_credentials` OAuth flow and no sign-in flow other than `ALLOW_REFRESH_TOKEN_AUTH` signs in no end user, so the MFA, threat protection, self-registration, temporary password and user existence legs do not apply to it, and it is judged on deletion protection and token revocation. A client with no `ExplicitAuthFlows` is user-facing, because Cognito gives such a client the SRP and custom sign-in flows by default. Up to 100 app clients are read per pool; when more exist, a leg the unread clients could change is reported as unproven in an informational `N/A` row, and a leg already failed by a client that was read still fails. A pool in another Region, a pool this account cannot find (another account's, or deleted), and a pool or resource that cannot be read are informational `N/A` with the reason. Issuers other than Cognito are not judged. Prowler's `cognito_user_pool_waf_acl_attached` and `cognito_identity_pool_guest_access_disabled` are not reproduced: the first needs a web ACL lookup per pool that the assessment role is not granted, and no AgentCore authorizer names an identity pool, so none can be traced to an AI application.
 
 ---
 

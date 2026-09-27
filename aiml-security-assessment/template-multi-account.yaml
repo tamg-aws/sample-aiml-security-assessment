@@ -560,6 +560,14 @@ Resources:
                 - cloudtrail:GetEventSelectors
                 - cloudtrail:GetTrailStatus
               Resource: '*'
+            - Sid: CloudTrailEventHistoryRead
+              # BR-56 reads the Region's event history. LookupEvents has no
+              # resource type in the service authorization reference, so it
+              # takes '*'.
+              Effect: Allow
+              Action:
+                - cloudtrail:LookupEvents # BR-56
+              Resource: '*'
             - Sid: LambdaInventoryPermissions
               Effect: Allow
               Action:
@@ -960,6 +968,15 @@ Resources:
               Action:
                 - ecr:GetRegistryScanningConfiguration # AC-50
               Resource: '*'
+            - Sid: CognitoUserPoolRead
+              # AC-52 reads the user pools an AgentCore JWT authorizer names,
+              # and their app clients, in the account's own pools only.
+              Effect: Allow
+              Action:
+                - cognito-idp:DescribeUserPool # AC-52
+                - cognito-idp:ListUserPoolClients # AC-52
+                - cognito-idp:DescribeUserPoolClient # AC-52
+              Resource: !Sub 'arn:${AWS::Partition}:cognito-idp:*:${AWS::AccountId}:userpool/*'
             - Sid: LogsPermissions
               Effect: Allow
               Action:

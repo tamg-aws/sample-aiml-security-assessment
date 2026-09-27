@@ -15989,6 +15989,284 @@ def check_kms_enclave_key_binding(region: str = "") -> Dict[str, Any]:
         }
 
 
+LLM_JACKING_FINDING = "Bedrock LLM Jacking Activity"
+
+LLM_JACKING_REFERENCE = (
+    "https://docs.aws.amazon.com/bedrock/latest/userguide/logging-using-cloudtrail.html"
+)
+
+# BR-56 reproduces Prowler's cloudtrail_threat_detection_llm_jacking (Prowler
+# AISF-AI-06) as of prowler-cloud/prowler c2b80924: the same 14 default event
+# names, the same 0.4 threshold compared with a strict greater-than on the
+# unrounded share of those names one identity called, the same 1440-minute
+# window, and the same identity key of userIdentity arn plus type, skipping
+# events that carry no arn. It departs from Prowler in three places. Prowler
+# reads only the first LookupEvents page per event name, discards lookup errors
+# and passes, and looks only in the Region of the account's trails, passing
+# when there is no trail. BR-56 pages up to LLM_JACKING_MAX_PAGES_PER_ACTION,
+# never passes on an event name it could not read in full, and reads event
+# history for the Region under assessment, which holds 90 days of management
+# events whether or not a trail exists.
+LLM_JACKING_ACTIONS = (
+    "PutUseCaseForModelAccess",
+    "PutFoundationModelEntitlement",
+    "PutModelInvocationLoggingConfiguration",
+    "CreateFoundationModelAgreement",
+    "InvokeModel",
+    "InvokeModelWithResponseStream",
+    "GetUseCaseForModelAccess",
+    "GetModelInvocationLoggingConfiguration",
+    "GetFoundationModelAvailability",
+    "ListFoundationModelAgreementOffers",
+    "ListFoundationModels",
+    "ListProvisionedModelThroughputs",
+    "SearchAgreements",
+    "AcceptAgreementRequest",
+)
+
+LLM_JACKING_THRESHOLD = 0.4
+
+LLM_JACKING_LOOKBACK = timedelta(minutes=1440)
+
+# LookupEvents returns at most 50 events per call and is throttled near two
+# calls per second per Region, so the page cap bounds the check at 14 x 5 calls.
+LOOKUP_EVENTS_PAGE_SIZE = 50
+
+LLM_JACKING_MAX_PAGES_PER_ACTION = 5
+
+# Event history holds management events only. Bedrock logs InvokeModel,
+# InvokeModelWithResponseStream, Converse and ConverseStream as management
+# events, and logs these as data events, which event history never holds.
+LLM_JACKING_DATA_EVENT_ACTIONS = (
+    "InvokeModelWithBidirectionalStream",
+    "StartAsyncInvoke",
+    "GetAsyncInvoke",
+    "InvokeAgent",
+    "InvokeInlineAgent",
+)
+
+
+def _llm_jacking_lookup(cloudtrail_client, event_name: str, start_time) -> Dict:
+    """Read one event name's events since start_time, up to the page cap."""
+    events = []
+    request = {
+        "LookupAttributes": [
+            {"AttributeKey": "EventName", "AttributeValue": event_name}
+        ],
+        "StartTime": start_time,
+        "MaxResults": LOOKUP_EVENTS_PAGE_SIZE,
+    }
+    for _ in range(LLM_JACKING_MAX_PAGES_PER_ACTION):
+        response = cloudtrail_client.lookup_events(**request)
+        events.extend(response.get("Events", []))
+        next_token = response.get("NextToken")
+        if not next_token:
+            return {"events": events, "truncated": False}
+        request["NextToken"] = next_token
+    return {"events": events, "truncated": True}
+
+
+def check_bedrock_llm_jacking_activity(region: str = "") -> Dict[str, Any]:
+    """
+    BR-56: flag any identity that called more than 40% of the Bedrock and
+    Marketplace actions an LLM jacking actor calls, in the last 24 hours of
+    CloudTrail event history for the Region.
+    """
+    logger.debug("Starting check for Bedrock LLM jacking activity")
+    check_name = LLM_JACKING_FINDING
+    try:
+        findings = {
+            "check_name": check_name,
+            "status": "PASS",
+            "details": "",
+            "csv_data": [],
+        }
+
+        def row(details, resolution, severity, status):
+            return create_finding(
+                check_id="BR-56",
+                finding_name=check_name,
+                finding_details=details,
+                resolution=resolution,
+                reference=LLM_JACKING_REFERENCE,
+                severity=severity,
+                status=status,
+                region=region,
+            )
+
+        total = len(LLM_JACKING_ACTIONS)
+        visibility = (
+            "The lookup reads CloudTrail event history, which holds management "
+            "events only. It sees InvokeModel and InvokeModelWithResponseStream, "
+            "which Bedrock logs as management events. It cannot see {}, which "
+            "Bedrock logs as data events. Converse and ConverseStream are "
+            "management events but are not among the {} actions judged."
+        ).format(", ".join(LLM_JACKING_DATA_EVENT_ACTIONS), total)
+
+        cloudtrail_client = boto3.client(
+            "cloudtrail", config=boto3_config, region_name=region
+        )
+        start_time = datetime.now(timezone.utc) - LLM_JACKING_LOOKBACK
+
+        identities = {}
+        # An action lands here when some of its events were not read: the
+        # page cap was reached, the lookup failed, or an event could not be
+        # parsed. Any identity could have called it unseen.
+        unseen = {}
+        errors = []
+        for event_name in LLM_JACKING_ACTIONS:
+            try:
+                result = _llm_jacking_lookup(cloudtrail_client, event_name, start_time)
+            except Exception as error:
+                label = get_assessment_error_label(error)
+                errors.append(label)
+                unseen[event_name] = f"lookup failed: {label}"
+                continue
+            if result["truncated"]:
+                unseen[event_name] = (
+                    f"more than {LLM_JACKING_MAX_PAGES_PER_ACTION} pages"
+                )
+            for event in result["events"]:
+                try:
+                    identity = json.loads(event["CloudTrailEvent"]).get(
+                        "userIdentity", {}
+                    )
+                    arn = identity.get("arn")
+                    identity_type = identity.get("type")
+                except (KeyError, TypeError, ValueError, AttributeError):
+                    unseen.setdefault(event_name, "an event could not be parsed")
+                    continue
+                # Prowler skips an event with no identity arn as an AWS service.
+                if not arn:
+                    continue
+                identities.setdefault((arn, identity_type), set()).add(event_name)
+
+        if len(errors) == total:
+            findings["status"] = "N/A"
+            findings["csv_data"].append(
+                row(
+                    "Could not assess this check in {}. Assessment error: {}.".format(
+                        region or "this Region", ", ".join(sorted(set(errors)))
+                    ),
+                    COULD_NOT_ASSESS_RESOLUTION,
+                    "Informational",
+                    "N/A",
+                )
+            )
+            return findings
+
+        # Prowler fails an identity when the share of actions it called is
+        # strictly above the threshold. A truncated action may hide a call, so
+        # an identity is proven below the threshold only if it stays below it
+        # after crediting it with every unseen action.
+        limit = LLM_JACKING_THRESHOLD * total
+        indeterminate = []
+        for (arn, identity_type), called in sorted(
+            identities.items(), key=lambda item: (item[0][0], str(item[0][1]))
+        ):
+            if len(called) > limit:
+                findings["status"] = "WARN"
+                findings["csv_data"].append(
+                    row(
+                        "Potential LLM jacking activity from AWS {} {}: it called "
+                        "{} of the {} actions judged ({}) in the last {} hours, a "
+                        "share of {:.2f}, above the {} threshold.".format(
+                            identity_type,
+                            arn,
+                            len(called),
+                            total,
+                            ", ".join(sorted(called)),
+                            int(LLM_JACKING_LOOKBACK.total_seconds() // 3600),
+                            len(called) / total,
+                            LLM_JACKING_THRESHOLD,
+                        ),
+                        "Confirm the identity is expected to enable model access, "
+                        "accept Marketplace agreements and invoke models. If it "
+                        "is not, revoke its active sessions, rotate or deactivate "
+                        "its credentials, and review its CloudTrail activity for "
+                        "other actions.",
+                        "High",
+                        "Failed",
+                    )
+                )
+            elif len(called | set(unseen)) > limit:
+                indeterminate.append(f"{identity_type} {arn}")
+
+        unseen_text = "; ".join(f"{name} ({why})" for name, why in unseen.items())
+        if len(unseen) > limit:
+            indeterminate.append(
+                "any identity with no event read, since {} of the {} actions were "
+                "not read in full".format(len(unseen), total)
+            )
+
+        if indeterminate:
+            findings["csv_data"].append(
+                row(
+                    "Could not prove every identity is below the {} threshold, "
+                    "because these actions were not read in full: {}. Identities "
+                    "that could exceed it: {}. {}".format(
+                        LLM_JACKING_THRESHOLD,
+                        unseen_text,
+                        "; ".join(indeterminate[:5]),
+                        visibility,
+                    ),
+                    COULD_NOT_ASSESS_RESOLUTION,
+                    "Informational",
+                    "N/A",
+                )
+            )
+        elif findings["status"] != "WARN":
+            truncation = (
+                " These actions were not read in full, and crediting every "
+                "identity with all of them still leaves it at or below the "
+                "threshold: {}.".format(unseen_text)
+                if unseen
+                else ""
+            )
+            findings["csv_data"].append(
+                row(
+                    "No identity called more than {:.0%} of the {} actions judged "
+                    "in the last {} hours; {} identit{} observed.{} {}".format(
+                        LLM_JACKING_THRESHOLD,
+                        total,
+                        int(LLM_JACKING_LOOKBACK.total_seconds() // 3600),
+                        len(identities),
+                        "y" if len(identities) == 1 else "ies",
+                        truncation,
+                        visibility,
+                    ),
+                    "No action required",
+                    "High",
+                    "Passed",
+                )
+            )
+        if all(finding["Status"] == "N/A" for finding in findings["csv_data"]):
+            findings["status"] = "N/A"
+        return findings
+
+    except Exception as e:
+        logger.error(
+            f"Error in check_bedrock_llm_jacking_activity: {str(e)}", exc_info=True
+        )
+        return {
+            "check_name": check_name,
+            "status": "ERROR",
+            "details": f"Error during check: {str(e)}",
+            "csv_data": [
+                create_finding(
+                    check_id="BR-56",
+                    finding_name=check_name,
+                    finding_details=build_could_not_assess_detail(e, region),
+                    resolution=COULD_NOT_ASSESS_RESOLUTION,
+                    reference=LLM_JACKING_REFERENCE,
+                    severity="Informational",
+                    status="N/A",
+                    region=region,
+                )
+            ],
+        }
+
+
 AI_SERVICES_OPT_OUT_REFERENCE = "https://docs.aws.amazon.com/organizations/latest/userguide/orgs_manage_policies_ai-opt-out.html"
 
 AI_SERVICES_OPT_OUT_POLICY_TYPE = "AISERVICES_OPT_OUT_POLICY"
@@ -17419,6 +17697,9 @@ def lambda_handler(event, context):
 
         logger.info("Running KMS enclave attestation binding check (BR-55)")
         all_findings.append(check_kms_enclave_key_binding(region=region))
+
+        logger.info("Running Bedrock LLM jacking activity check (BR-56)")
+        all_findings.append(check_bedrock_llm_jacking_activity(region=region))
 
         logger.info("Building Agentic AI Security findings from Bedrock results")
         all_findings.append(build_agentic_bedrock_security_findings(all_findings))
