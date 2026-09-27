@@ -21,9 +21,9 @@ left over is two things, and neither is the entailment.
     which need no clone.
   * The element count is not equated with the set size, deliberately. One `tighten`
     control with two incumbents carries two `(partial)` tags. The case below pins
-    that as a pass on a synthetic map, because the shipped maps have carried no
-    `(partial)` tag since the last `tighten` rows closed, and asserting one tag
-    per control would red any tree that reopens one.
+    that as a pass on a synthetic map, so the case holds whether or not the
+    shipped maps carry a multi-incumbent `tighten` row, and asserting one tag per
+    control would red any tree that does.
 
 The tag parser here is written from the published tag shape rather than imported
 from check_ledger.py. An identity checked with the gate's own parser on both sides
@@ -96,9 +96,8 @@ def test_the_shipped_maps_and_rows_satisfy_both_identities():
 
     The population is asserted first: empty sets satisfy both identities, and an
     identity over nothing is the pass this whole file would otherwise be. Only the
-    covered leg is populated in this tree. The last `tighten` rows closed, so no
-    tag carries `(partial)` and the partial leg of the identity holds over an empty
-    set here; the synthetic cases below are what exercise that leg and its parse.
+    covered leg is asserted populated: the partial leg is empty whenever no row is
+    `tighten`, and the synthetic cases below are what exercise it and its parse.
     """
     tags, elements, unparseable = tree_tag_controls()
     verdicts = tree_verdict_controls()
@@ -115,9 +114,9 @@ def test_the_shipped_maps_and_rows_satisfy_both_identities():
 def test_the_element_count_exceeding_the_control_count_is_not_a_failure_here():
     """One `tighten` control with two incumbents carries two `(partial)` tags.
 
-    Legal. The shipped maps no longer carry a `(partial)` tag, so the case is a
-    synthetic map read through the same parser, with one of the two tags inside a
-    joined value. The doc-side clause that does claim one tag each is asserted by
+    Legal. The case is a synthetic map read through the same parser, with one of
+    the two tags inside a joined value, so it does not depend on which `tighten`
+    rows the shipped maps carry. The doc-side clause that does claim one tag each is asserted by
     census_relations() at the refs that publish it, so the claim is gated where it
     is made and not where it would red a correct tree.
     """
