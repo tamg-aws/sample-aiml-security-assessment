@@ -326,6 +326,7 @@ Resources:
               Effect: Allow
               Action:
                 - bedrock:ListModelInvocationJobs
+                - bedrock:ListModelCustomizationJobs # BR-47
                 - bedrock:GetModelInvocationLoggingConfiguration
                 - bedrock:ListAgents
                 - bedrock:ListCustomModels
@@ -462,6 +463,14 @@ Resources:
               Resource:
                 - !Sub 'arn:${AWS::Partition}:organizations::*:policy/*/*/*'
                 - !Sub 'arn:${AWS::Partition}:organizations::aws:policy/*/*'
+            - Sid: OrganizationsEffectivePolicyRead
+              # BR-48 reads this account's effective AI services opt-out policy.
+              # The action authorizes on the account resource, whose ARN carries
+              # the management account's ID, so only that segment is left open.
+              Effect: Allow
+              Action:
+                - organizations:DescribeEffectivePolicy # BR-48
+              Resource: !Sub 'arn:${AWS::Partition}:organizations::*:account/o-*/${AWS::AccountId}'
             - Sid: BedrockApiKeyInventoryRead
               # BR-45 lists the bedrock.amazonaws.com service-specific
               # credentials of each cached IAM user.
@@ -481,12 +490,14 @@ Resources:
               # macie2 GetMacieSession, GetAutomatedDiscoveryConfiguration and
               # DescribeBuckets are account-level reads with no resource-level
               # authorization in IAM: DescribeBuckets returns the whole bucket
-              # inventory and names no required resource type.
+              # inventory and names no required resource type. ListClassificationJobs
+              # names no resource type either.
               Effect: Allow
               Action:
                 - macie2:GetMacieSession # BR-46
                 - macie2:GetAutomatedDiscoveryConfiguration # BR-46
                 - macie2:DescribeBuckets # BR-46
+                - macie2:ListClassificationJobs # BR-46
               Resource: '*'
             - Sid: BedrockKnowledgeBaseDataSourceRead
               # BR-46 resolves each knowledge base data source to the S3 bucket it
@@ -501,6 +512,7 @@ Resources:
               Action:
                 - s3:GetEncryptionConfiguration
                 - s3:GetLifecycleConfiguration # BR-04
+                - s3:GetBucketPolicy # BR-47
               Resource: !Sub 'arn:${AWS::Partition}:s3:::*'
             - Sid: CloudTrailPermissions
               Effect: Allow
@@ -525,6 +537,8 @@ Resources:
               Effect: Allow
               Action:
                 - ec2:DescribeVpcEndpoints
+                - ec2:DescribeSubnets # BR-39
+                - ec2:DescribeRouteTables # BR-39
                 - ec2:DescribeVpcs
               Resource: '*'
             - Sid: InspectorPermissions
@@ -667,6 +681,14 @@ Resources:
                 - organizations:DescribeOrganization # SM-34
                 - organizations:ListPolicies # SM-34
               Resource: '*'
+            - Sid: EC2SubnetExposureInventory
+              # SM-10, SM-11, SM-28 and SM-33 resolve whether a subnet routes to an
+              # internet gateway. Neither action has resource-level authorization.
+              Effect: Allow
+              Action:
+                - ec2:DescribeSubnets # SM-10, SM-11, SM-28, SM-33
+                - ec2:DescribeRouteTables # SM-10, SM-11, SM-28, SM-33
+              Resource: '*'
             - Sid: OrganizationsPolicyDocumentRead
               # SM-34 reads the policy document itself, which only
               # DescribePolicy returns.
@@ -803,6 +825,36 @@ Resources:
                 # resource-level authorization.
                 - ec2:DescribeSecurityGroups
               Resource: '*'
+            - Sid: AgentCoreGatewayWebACLRead
+              # AG-39 reads the rules of the web ACL associated with a gateway.
+              Effect: Allow
+              Action:
+                - wafv2:GetWebACL # AG-39
+              Resource: !Sub 'arn:${AWS::Partition}:wafv2:*:${AWS::AccountId}:regional/webacl/*/*'
+            - Sid: DNSFirewallAssociationInventory
+              # ListFirewallRuleGroupAssociations and ListFirewallDomainLists
+              # have no resource-level authorization.
+              Effect: Allow
+              Action:
+                - route53resolver:ListFirewallRuleGroupAssociations # AC-49
+                - route53resolver:ListFirewallDomainLists # AC-49
+              Resource: '*'
+            - Sid: DNSFirewallRuleRead
+              # AC-49 reads the rules of each rule group associated with an
+              # AgentCore VPC. A rule group can be shared through AWS RAM from
+              # another account, so the account segment stays open.
+              Effect: Allow
+              Action:
+                - route53resolver:ListFirewallRules # AC-49
+              Resource: !Sub 'arn:${AWS::Partition}:route53resolver:*:*:firewall-rule-group/*'
+            - Sid: DNSFirewallDomainRead
+              # AC-49 reads the domains of the list the terminal rule blocks. A
+              # domain list can be shared through AWS RAM, so the account
+              # segment stays open.
+              Effect: Allow
+              Action:
+                - route53resolver:ListFirewallDomains # AC-49
+              Resource: !Sub 'arn:${AWS::Partition}:route53resolver:*:*:firewall-domain-list/*'
             - Sid: ECRPermissions
               Effect: Allow
               Action:
@@ -942,6 +994,19 @@ Resources:
                 - agent-registry:GetRegistry
                 - agent-registry:ListRegistryRecords
               Resource: !Sub 'arn:${AWS::Partition}:agent-registry:*:${AWS::AccountId}:registry/*'
+            - Sid: RegistryEventRuleInventory
+              # AR-10 lists the default event bus's rules. ListRules has no
+              # resource-level authorization.
+              Effect: Allow
+              Action:
+                - events:ListRules # AR-10
+              Resource: '*'
+            - Sid: RegistryEventRuleTargetRead
+              # AR-10 counts the targets of the rules that match Registry events.
+              Effect: Allow
+              Action:
+                - events:ListTargetsByRule # AR-10
+              Resource: !Sub 'arn:${AWS::Partition}:events:*:${AWS::AccountId}:rule/*'
 
 
   ResponsibleAIGRCAssessmentFunction:

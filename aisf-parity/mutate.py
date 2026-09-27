@@ -86,6 +86,18 @@ PARTIAL_ENTRY = re.compile(
     r'"AISF (?P<control>AIR(?:-[A-Z0-9]+)+) \(partial\)",$'
 )
 
+# The same entry shape with no qualifier: a single bare tag, which is a covered
+# control. Used when no map carries a `(partial)` entry, see
+# partial_qualifier_mutation().
+BARE_ENTRY = re.compile(
+    r'^(?P<indent>[ ]+)"(?P<check>[A-Z]{2,3}-\d{2})": '
+    r'"AISF (?P<control>AIR(?:-[A-Z0-9]+)+)",$'
+)
+
+# One name for the derived entry in either direction, so GROUPS keys a string
+# that no check id, map, or verdict population can make stale.
+DERIVED_PARTIAL_QUALIFIER_NAME = "a single tag's (partial) qualifier flipped"
+
 # Placeholder for the derived `(partial)` entry, replaced in resolve_mutations()
 # before anything reads a find-string. A sentinel rather than an append, because
 # the position of the entry is the position of the comment that explains it.
@@ -307,7 +319,9 @@ MUTATIONS = [
     # bedrock's qualifiers, and AC-07, which replaced it, is one of the three
     # agentcore tags feature/aisf-phase4-acr converts to `(1 of N checks)`. The
     # vocabulary is being retired map by map, so this reads the maps instead of
-    # naming one. See partial_qualifier_mutation().
+    # naming one. Since the last `tighten` rows closed, no map carries a
+    # `(partial)` tag, and the entry adds one to a covered tag instead. See
+    # partial_qualifier_mutation().
     DERIVED_PARTIAL_QUALIFIER,
     {
         "name": "a (1 of N checks) qualifier dropped from a joint leg",
@@ -496,14 +510,18 @@ def die(msg: str, code: int = USAGE) -> None:
 
 
 def partial_qualifier_mutation(repo: Path) -> dict[str, str]:
-    """Build the `(partial)` mutation from whichever map still carries one.
+    """Build the `(partial)` mutation against whichever entry shape the maps carry.
 
     Reads the maps in sorted path order and takes the first single-tag
     `(partial)` entry, so the entry survives a rename, a re-hosting, and the
-    conversion of any one map's qualifiers. When no map carries one, this fails
-    loudly instead of skipping: an absent qualifier means gate 14's qualifier
-    branch has nothing left to break, which is a fact about the maps that the
-    reader of a mutation report has to be told, not a mutation to drop.
+    conversion of any one map's qualifiers, and drops its qualifier. When no map
+    carries one, which is the state once every `tighten` row has closed, it adds
+    the qualifier to the first single bare tag instead: gate 14 derives each
+    tag's qualifier from the ledger verdict, so a `(partial)` on a covered control
+    reds it from the other side. That direction does not reach the branch that
+    catches a dropped qualifier, and the defect text says which one ran. When
+    neither shape exists, this fails loudly instead of skipping, because gate
+    14's qualifier derivation would have nothing left to break.
     """
     maps = sorted((repo / SECURITY).glob(TAG_MAP_GLOB))
     if not maps:
@@ -515,7 +533,7 @@ def partial_qualifier_mutation(repo: Path) -> dict[str, str]:
                 continue
             check, control = found["check"], found["control"]
             return {
-                "name": f"a (partial) qualifier dropped from {check}'s tag",
+                "name": DERIVED_PARTIAL_QUALIFIER_NAME,
                 "file": path.relative_to(repo).as_posix(),
                 "defect": (
                     f"{check}'s tag reads as a full assertion of {control}, a "
@@ -527,9 +545,30 @@ def partial_qualifier_mutation(repo: Path) -> dict[str, str]:
                 "find": f"{line}\n",
                 "replace": f'{found["indent"]}"{check}": "AISF {control}",\n',
             }
+    for path in maps:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            found = BARE_ENTRY.match(line)
+            if not found:
+                continue
+            check, control = found["check"], found["control"]
+            return {
+                "name": DERIVED_PARTIAL_QUALIFIER_NAME,
+                "file": path.relative_to(repo).as_posix(),
+                "defect": (
+                    f"{check}'s tag marks {control} as partly covered, a control "
+                    "the ledger says is covered, so the tag column understates a "
+                    "verdict the ledger publishes. No map carries a (partial) "
+                    "tag, so this is the added-qualifier direction; the "
+                    "dropped-qualifier branch of gate 14 is not reached"
+                ),
+                "find": f"{line}\n",
+                "replace": (
+                    f'{found["indent"]}"{check}": "AISF {control} (partial)",\n'
+                ),
+            }
     die(
-        "no tag map carries a single-tag (partial) entry, so this mutation has "
-        f"nothing to break. Maps read, in order: "
+        "no tag map carries a single-tag entry, bare or (partial), so this "
+        f"mutation has nothing to break. Maps read, in order: "
         f"{', '.join(p.relative_to(repo).as_posix() for p in maps)}.\n"
         "  If the qualifier has been retired on purpose, delete the derived "
         "entry and say so in the commit; do not leave a mutation that cannot "
@@ -572,7 +611,7 @@ GROUPS: dict[str, str] = {
     "the knowledge base loop truncated to the first entry": (
         "in `BR-20`'s S3 Vectors legs"
     ),
-    "a (partial) qualifier dropped from AR-03's tag": "in the tag column",
+    DERIVED_PARTIAL_QUALIFIER_NAME: "in the tag column",
     "a (1 of N checks) qualifier dropped from a joint leg": "in the tag column",
     "a tag placed in a module that does not emit the check": "in the tag column",
     "the tag sentinel defaults to empty instead of None (length-identical)": (

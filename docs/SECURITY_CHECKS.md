@@ -1,6 +1,6 @@
 # Security Checks Reference
 
-This document provides a comprehensive reference for all 249 security checks performed by the AI/ML Security Assessment framework (135 core checks across Amazon Bedrock, Amazon SageMaker AI, Amazon Bedrock AgentCore, and AWS Agent Registry, 38 Agentic AI Security checks, 64 Responsible AI GRC checks, and 12 OWASP Top 10 for LLM checks).
+This document provides a comprehensive reference for all 256 security checks performed by the AI/ML Security Assessment framework (141 core checks across Amazon Bedrock, Amazon SageMaker AI, Amazon Bedrock AgentCore, and AWS Agent Registry, 39 Agentic AI Security checks, 64 Responsible AI GRC checks, and 12 OWASP Top 10 for LLM checks).
 
 Sources differ by bucket and are not interchangeable: the core Bedrock, SageMaker, AgentCore, and AWS Agent Registry checks derive from the AWS Well-Architected **Generative AI Lens** security best practices (`gensec*`) and service security documentation; the Agentic AI Security checks from the AWS Well-Architected **Agentic AI Lens**; the `FS-*` **Responsible AI GRC** checks from the AWS GRC User Guide; and the `OW-*` checks from the OWASP Top 10 for LLM. The AWS Well-Architected **Responsible AI Lens** is not a source for any of them — see [Responsible AI GRC — scope, sources, and compatibility](RESPONSIBLE_AI_GRC_SCOPE.md).
 
@@ -14,10 +14,10 @@ The 64 Responsible AI GRC checks occupy 69 `FS-*` numbers: 64 ship as standalone
 - [Severity Levels](#severity-levels)
 - [Status Values](#status-values)
 - [Amazon SageMaker AI Security Checks (33)](#amazon-sagemaker-ai-security-checks-33)
-- [Amazon Bedrock Security Checks (46)](#amazon-bedrock-security-checks-46)
-- [Amazon Bedrock AgentCore Security Checks (47)](#amazon-bedrock-agentcore-security-checks-47)
-- [AWS Agent Registry Security Checks (9)](#aws-agent-registry-security-checks-9)
-- [Agentic AI Security Checks (38)](#agentic-ai-security-checks-38)
+- [Amazon Bedrock Security Checks (49)](#amazon-bedrock-security-checks-49)
+- [Amazon Bedrock AgentCore Security Checks (49)](#amazon-bedrock-agentcore-security-checks-49)
+- [AWS Agent Registry Security Checks (10)](#aws-agent-registry-security-checks-10)
+- [Agentic AI Security Checks (39)](#agentic-ai-security-checks-39)
 - [Responsible AI GRC Checks (64)](#responsible-ai-grc-checks-64-additional-5-upstream-extensions)
 - [OWASP Top 10 for LLM Checks (12)](#owasp-top-10-for-llm-checks-12)
 
@@ -46,10 +46,10 @@ Each security check has a unique identifier with a service prefix:
 | Prefix | Service | Example |
 | -------- | --------- | --------- |
 | **SM-XX** | Amazon SageMaker | SM-01, SM-34 (`SM-29` reserved) |
-| **BR-XX** | Amazon Bedrock | BR-01, BR-46 |
+| **BR-XX** | Amazon Bedrock | BR-01, BR-49 |
 | **AC-XX** | Amazon Bedrock AgentCore | AC-01, AC-17 |
-| **AR-XX** | AWS Agent Registry | AR-01, AR-08 |
-| **AG-XX** | Agentic AI Security | AG-01, AG-38 |
+| **AR-XX** | AWS Agent Registry | AR-01, AR-10 |
+| **AG-XX** | Agentic AI Security | AG-01, AG-39 |
 | **FS-XX** | Responsible AI GRC | FS-01, FS-69 |
 | **OW-XX** | OWASP Top 10 for LLM | OW-01, OW-12 |
 
@@ -296,7 +296,7 @@ investigation and remediation.
 
 ---
 
-## Amazon Bedrock Security Checks (46)
+## Amazon Bedrock Security Checks (49)
 
 ### BR-01: AWS IAM Least Privilege
 
@@ -551,11 +551,26 @@ inventory is never treated as evidence of compliance.
 ### BR-46: Knowledge Base Source Data Classification
 
 - **Severity:** High
-- **Description:** Requires Amazon Macie automated discovery to monitor every S3 bucket a knowledge base ingests from, read from `DescribeBuckets[].automatedDiscoveryMonitoringStatus`. The assertion is per source bucket, and the coverage figure counts knowledge base source buckets, not every bucket Macie reports. `GetClassificationScope` is deliberately not used: its `s3` member is `excludes.bucketNames`, an exclusion list, so a check built on it would pass precisely when the knowledge base buckets are excluded from discovery. `GetDataSource` describes are capped at 50 per invocation; reaching the cap adds an `N/A` row recording the truncation and still reports the verdict for the sources that were read. When Macie is not enabled in the Region, the check reports `N/A` and no bucket failure. FS-44 asserts the two account-level Macie legs and disclaims bucket-level coverage, which is what this check supplies.
+- **Description:** Requires Amazon Macie automated discovery to monitor every S3 bucket a knowledge base ingests from, read from `DescribeBuckets[].automatedDiscoveryMonitoringStatus`. The assertion is per source bucket, and the coverage figure counts knowledge base source buckets, not every bucket Macie reports. `GetClassificationScope` is deliberately not used: its `s3` member is `excludes.bucketNames`, an exclusion list, so a check built on it would pass precisely when the knowledge base buckets are excluded from discovery. `GetDataSource` describes are capped at 50 per invocation; reaching the cap adds an `N/A` row recording the truncation and still reports the verdict for the sources that were read. When Macie is not enabled in the Region, the check reports `N/A` and no bucket failure. FS-44 asserts the two account-level Macie legs and disclaims bucket-level coverage, which is what this check supplies. A second finding, `Knowledge Base Source Classification Job Coverage`, reads `ListClassificationJobs` for each source bucket that automated discovery does not monitor, and credits only a `SCHEDULED` job that is `RUNNING` or `IDLE`, whose last run did not error, and that names the bucket. A job that selects buckets by criteria is reported and not credited, because the criteria are resolved when the job runs.
+
+### BR-47: Bedrock Data Path Bucket TLS Enforcement
+
+- **Severity:** High
+- **Description:** Reads the bucket policy of each S3 bucket on the Bedrock data path: knowledge base S3 data sources, the S3 destination of model invocation logging, and the training, validation and output buckets of the newest 50 model customization jobs. A bucket passes only when one `Deny` statement, conditioned by `Bool` or `BoolIfExists` on `aws:SecureTransport` `false`, applies to principal `*`, covers `s3:*`, and names both the bucket and `bucket/*`. A `Deny` that falls short is reported with the principals, resources or actions it misses, and `NotPrincipal` or `NotAction` counts as falling short. A bucket with no bucket policy fails, because S3 then accepts plaintext requests. Any other policy read error is informational `N/A`.
+
+### BR-48: AI Services Opt-Out Policy Enforcement
+
+- **Severity:** High
+- **Description:** Reads `DescribeEffectivePolicy` for `AISERVICES_OPT_OUT_POLICY`. No effective policy, or the policy type not enabled, fails, because the account is then opted in to AI service data use. An account outside an organization, or a denied read, is informational `N/A`. The effective document has its inheritance operators stripped, so from the management account the check also reads every opt-out policy in the organization through `ListPolicies` and `DescribePolicy` and names any that set `@@operators_allowed_for_child_policies`, which would let a child policy override the opt-out. That delegation leg changes the finding text and not its status.
+
+### BR-49: Guardrail Invocation Deny Enforcement
+
+- **Severity:** High
+- **Description:** For each IAM role and user allowed to invoke a model, requires a `Deny` on `bedrock:InvokeModel` and `bedrock:InvokeModelWithResponseStream`, on an unscoped `Resource`, conditioned by a negated operator or by `Null` `true` on `bedrock:GuardrailIdentifier`, so a call without an approved guardrail is refused. Those two IAM actions also authorize `Converse` and `ConverseStream`, which have no IAM action of their own. BR-34 judges the guardrail content and BR-41 the account-level enforced guardrail configuration; this check covers identities whose calls neither of those reaches.
 
 ---
 
-## Amazon Bedrock AgentCore Security Checks (47)
+## Amazon Bedrock AgentCore Security Checks (49)
 
 ### AC-01: Runtime Amazon VPC Configuration
 
@@ -792,9 +807,19 @@ inventory is never treated as evidence of compliance.
 - **Severity:** High for the caller leg; Medium for the network-path leg
 - **Description:** Judges who may invoke each runtime and over what path. A runtime carrying neither an `allowedWorkloadConfiguration` on its JWT authorizer nor a resource policy naming the principals allowed to invoke it fails, because a caller that satisfies its inbound authentication then reaches the agent directly and the tool policy, rate limits, and audit trail of the gateway in front of it do not apply. The network leg fails a resource policy with no `aws:SourceVpc`, `aws:SourceVpce`, `aws:VpcSourceIp`, or `aws:SourceIp` condition. AC-10 reports that a resource policy exists; the conditions inside it are what restrict anything. An unreadable runtime or resource policy is informational `N/A`.
 
+### AC-48: Execution Role Trust and Sharing
+
+- **Severity:** High for the trust leg; Medium for the sharing leg
+- **Description:** Reads the trust policy of the execution role named by every runtime, gateway, browser and custom code interpreter. A statement that trusts the service principal, or `*`, with no `aws:SourceAccount` or `aws:SourceArn` condition fails as a confused-deputy gap, and an account-root or bare account-id principal with no condition fails as account-wide trust. A second finding fails a role that more than one AgentCore resource names, because the shared role carries the union of the permissions each workload needs. AC-27 reads the gateway roles for the same deputy guard. An unreadable role is informational `N/A`.
+
+### AC-49: DNS Egress Control
+
+- **Severity:** Medium
+- **Description:** For each VPC that hosts an AgentCore runtime, browser or code interpreter, reads the Route 53 Resolver DNS Firewall rule group associations and judges the last rule DNS Firewall evaluates: the enforcing rule with the largest priority in the rule group with the largest association priority. It passes only a `BLOCK` over a customer domain list that holds `*`, which is the walled garden pattern Route 53 documents. `ListFirewallDomains` returns that entry fully qualified as `*.`, and the check reads either spelling. A VPC with no rule group fails, and so does a terminal `BLOCK` over an AWS managed list, over DNS threat protection, or over a list without `*`, because every name those rules do not match is answered. AC-01 and AC-15 judge egress by security group and network mode; this check judges it by destination name.
+
 ---
 
-## AWS Agent Registry Security Checks (9)
+## AWS Agent Registry Security Checks (10)
 
 AWS Agent Registry checks use the `AR-XX` namespace and run in a dedicated
 regional Lambda that writes its own CSV artifact and HTML report area. They are
@@ -860,9 +885,14 @@ error-specific remediation rather than to a failure.
 - **Severity:** High
 - **Description:** Fails any cached IAM role or user that can both write a registry record (`CreateRegistryRecord`, `UpdateRegistryRecord`, or `SubmitRegistryRecordForApproval`) and approve one with `UpdateRegistryRecordStatus`, the only operation in the registry control plane that can set a record's status to `APPROVED`. Such a principal is the publisher and the curator of the same entry, so the review the approval workflow exists to impose never happens. AR-03 reads the auto-approval setting and only when `REQUIRE_AGENT_REGISTRY_MANUAL_APPROVAL` is set, so it asserts nothing about who holds the two authorities. Both IAM namespace spellings are read, because a policy written during the public preview grants the same authorities under `bedrock-agentcore` until 30 October 2026, and a single-namespace read would answer "no collision" for it. A `Deny` scoped to one registry or carrying a condition is not treated as an account-wide `Deny`, so a narrower `Deny` reports the principal instead of excusing it. Service-agnostic administrator grants stay with AR-01. An empty permission cache is an informational `N/A` tooling condition. Reported once under the `Global` region.
 
+### AR-10: Registry Lifecycle Event Routing
+
+- **Severity:** Medium
+- **Description:** Requires an enabled EventBridge rule on the `default` event bus that matches source `aws.agent-registry` and the `Registry Record State changed to Pending Approval`, `Approved` and `Rejected` detail types, and that has at least one target, so every approval transition is recorded or reviewed. A rule that matches only the public-preview `aws.bedrock-agentcore` source is reported apart, because that source stops routing on 30 October 2026. Rules on custom event buses are not read, because AWS delivers these events to the default bus. An unreadable rule list is informational `N/A`.
+
 ---
 
-## Agentic AI Security Checks (38)
+## Agentic AI Security Checks (39)
 
 Agentic AI Security checks use the `AG-XX` namespace and are included with the
 default assessment. They follow a hybrid model:
@@ -1143,6 +1173,13 @@ with scope limited to the Security pillar.
 - **Source:** AR-08
 - **Domain:** Auditability & Continuous Assurance
 - **Description:** Maps Agent Registry creator attribution and auto-detected runtime or gateway lineage into the Agentic AI Security view.
+
+### AG-39: Gateway WAF Rule Coverage
+
+- **Severity:** Medium
+- **Source:** AWS WAF `GetWebACL` for the web ACL AG-27 finds
+- **Domain:** Abuse & Cost Protection
+- **Description:** Judges whether the web ACL on an AgentCore gateway filters the request. It fails an ACL missing any of five filters: a rule, AWS managed rule group or default action that blocks; SQL injection inspection; cross-site scripting inspection; a rate-based rule; and a `DefaultSizeInspectionLimit` above `KB_16` for the `AGENTCORE_GATEWAY` association, since a tool call carries its arguments in the request body. Rules in `Count` are not credited. AWS managed groups are credited by name (`AWSManagedRulesSQLiRuleSet`, `AWSManagedRulesCommonRuleSet`), and their rule action overrides are not read. A customer rule group or a non-AWS managed rule group, whose rules the check does not read, turns a missing filter into informational `N/A` with the group named.
 
 ### Runtime guardrail methodology note
 

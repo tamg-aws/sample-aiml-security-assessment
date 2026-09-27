@@ -200,6 +200,95 @@ class TestAC01VPCConfiguration:
         assert "subnet-public" in public[0]["Finding_Details"]
         mock_ec2.describe_subnets.assert_called_once_with(SubnetIds=["subnet-public"])
 
+    def _vpc_runtime(self, mock_ac, mock_ec2):
+        mock_ac.list_agent_runtimes.return_value = {
+            "agentRuntimes": [{"agentRuntimeId": "rt-1", "agentRuntimeName": "TestRT"}]
+        }
+        mock_ac.get_agent_runtime.return_value = {
+            "networkConfiguration": {
+                "networkMode": "VPC",
+                "networkModeConfig": {"subnets": ["subnet-main"]},
+            }
+        }
+        mock_ec2.describe_subnets.return_value = {
+            "Subnets": [{"SubnetId": "subnet-main", "VpcId": "vpc-1"}]
+        }
+
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_ac01_unassociated_subnet_reads_the_main_route_table(
+        self, mock_ac, mock_ec2
+    ):
+        """A subnet with no explicit association routes through the main table.
+
+        Without the fallback the association filter returns no table, no route
+        is read, and a subnet the main table sends to an igw- passes.
+        """
+        self._vpc_runtime(mock_ac, mock_ec2)
+
+        def route_tables(Filters):
+            if Filters[0]["Name"] == "association.subnet-id":
+                return {"RouteTables": []}
+            assert {"Name": "association.main", "Values": ["true"]} in Filters
+            assert {"Name": "vpc-id", "Values": ["vpc-1"]} in Filters
+            return {"RouteTables": [{"Routes": [{"GatewayId": "igw-0main"}]}]}
+
+        mock_ec2.describe_route_tables.side_effect = route_tables
+        findings = extract_csv_data(agentcore_app.check_agentcore_vpc_configuration())
+        public = [
+            f for f in findings if f["Finding"] == "AgentCore Runtime Public Subnet"
+        ]
+
+        assert len(public) == 1
+        assert "subnet-main" in public[0]["Finding_Details"]
+        assert mock_ec2.describe_route_tables.call_count == 2
+
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_ac01_blackholed_igw_route_is_not_exposure(self, mock_ac, mock_ec2):
+        self._vpc_runtime(mock_ac, mock_ec2)
+        mock_ec2.describe_route_tables.return_value = {
+            "RouteTables": [
+                {"Routes": [{"GatewayId": "igw-0gone", "State": "blackhole"}]}
+            ]
+        }
+
+        findings = extract_csv_data(agentcore_app.check_agentcore_vpc_configuration())
+
+        # The egress leg reports separately; the subnet verdict is the one
+        # named for the VPC configuration.
+        verdicts = [
+            f["Status"]
+            for f in findings
+            if f["Finding"] == "AgentCore VPC Configuration Check"
+        ]
+        assert verdicts == ["Passed"]
+        assert not [
+            f for f in findings if f["Finding"] == "AgentCore Runtime Public Subnet"
+        ]
+
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_ac01_route_read_failure_is_na_not_a_pass(self, mock_ac, mock_ec2):
+        self._vpc_runtime(mock_ac, mock_ec2)
+        mock_ec2.describe_route_tables.side_effect = _make_client_error(
+            "UnauthorizedOperation", "denied"
+        )
+
+        findings = extract_csv_data(agentcore_app.check_agentcore_vpc_configuration())
+        subnet_verdicts = [
+            f
+            for f in findings
+            if f["Finding"]
+            in (
+                "AgentCore Runtime VPC Configuration",
+                "AgentCore VPC Configuration Check",
+            )
+        ]
+
+        assert [f["Status"] for f in subnet_verdicts] == ["N/A"]
+        assert "ec2:DescribeRouteTables" in subnet_verdicts[0]["Resolution"]
+
     @patch("agentcore_app.agentcore_client")
     def test_ac01_exception_returns_incomplete_na(self, mock_ac):
         mock_ac.list_agent_runtimes.side_effect = Exception("VPC error")
@@ -13217,6 +13306,27 @@ class TestAC48ExecutionRoleTrustAndSharing:
         assert "[browser family]" in findings[0]["Finding_Details"]
         assert mock_iam.get_role.call_count == 0
 
+    @patch("agentcore_app.iam_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_the_sharing_pass_counts_only_resources_that_name_a_role(
+        self, mock_ac, mock_iam
+    ):
+        """A resource with no execution role is not one that names a role."""
+        inventory = self._wire(
+            mock_ac, mock_iam, runtimes=["RuntimeRole"], browsers=["BrowserRole", None]
+        )
+
+        findings = agentcore_app.check_agentcore_execution_role_trust_and_sharing(
+            inventory
+        )
+        sharing = self._named(findings, "AgentCore Execution Role Sharing")
+
+        assert len(sharing) == 1
+        assert sharing[0]["Finding_Details"].startswith(
+            "The 2 AgentCore resource(s) that name an execution role name 2 "
+            "distinct role ARN(s)"
+        )
+
     def test_the_family_words_come_from_the_tool_label_prefixes(self):
         # _agentcore_tool_details merges browsers and code interpreters into one
         # list, so the family a failing role belongs to is recovered from the
@@ -13265,8 +13375,15 @@ class TestAC49DnsEgressControl:
         subnet_vpcs=None,
         associations=None,
         rules=None,
+        domains=None,
+        managed_list_ids=(),
     ):
-        """Stub one VPC-mode runtime, optional tools, and the DNS Firewall reads."""
+        """Stub one VPC-mode runtime, optional tools, and the DNS Firewall reads.
+
+        A domain list absent from domains holds "*.", which is how
+        ListFirewallDomains returned the "*" catch-all the walled garden pattern
+        ends in when read on 2026-09-26.
+        """
         mock_ac.list_agent_runtimes.return_value = {
             "agentRuntimes": [{"agentRuntimeId": "rt-1", "agentRuntimeName": "rt-1"}]
         }
@@ -13301,6 +13418,22 @@ class TestAC49DnsEgressControl:
         rules = rules or {}
         mock_r53.list_firewall_rules.side_effect = lambda FirewallRuleGroupId: {
             "FirewallRules": rules.get(FirewallRuleGroupId, [])
+        }
+        domains = domains or {}
+        mock_r53.list_firewall_domains.side_effect = lambda FirewallDomainListId: {
+            "Domains": domains.get(FirewallDomainListId, ["*."])
+        }
+        mock_r53.list_firewall_domain_lists.return_value = {
+            "FirewallDomainLists": [
+                {"Id": "rslvr-fdl-customer", "Name": "customer"},
+                *[
+                    {
+                        "Id": list_id,
+                        "ManagedOwnerName": "Route 53 Resolver DNS Firewall",
+                    }
+                    for list_id in managed_list_ids
+                ],
+            ]
         }
         return {"items": [], "errors": [], "list_error": None}
 
@@ -13363,8 +13496,130 @@ class TestAC49DnsEgressControl:
         assert "rslvr-fdl-catchall" in findings[0]["Finding_Details"]
         assert "Priority 100" in findings[0]["Finding_Details"]
         assert_finding_schema(findings[0])
-        # The domain list's own contents are a separate API and a separate
-        # grant, so the check never reads them.
+        mock_r53.list_firewall_domains.assert_called_once_with(
+            FirewallDomainListId="rslvr-fdl-catchall"
+        )
+
+    @patch("agentcore_app.route53resolver_client")
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_the_catch_all_passes_in_either_spelling(self, mock_ac, mock_ec2, mock_r53):
+        """ListFirewallDomains returns "*." for the "*" a customer enters.
+
+        Comparing against the bare "*" failed every correctly built walled
+        garden, because the API qualifies each name with a trailing dot.
+        """
+        for spelling in ("*.", "*"):
+            inventory = self._wire(
+                mock_ac,
+                mock_ec2,
+                mock_r53,
+                associations={"vpc-a": [self._association("group-1")]},
+                rules={"group-1": [self._rule("catchall", 100)]},
+                domains={"rslvr-fdl-catchall": ["example.com.", spelling]},
+            )
+
+            findings = agentcore_app.check_agentcore_dns_egress_control(inventory)
+
+            assert [f["Status"] for f in findings] == ["Passed"], spelling
+
+    @patch("agentcore_app.route53resolver_client")
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_terminal_block_over_a_list_without_the_catch_all_fails(
+        self, mock_ac, mock_ec2, mock_r53
+    ):
+        """A BLOCK over named domains answers every name it does not list.
+
+        Without the domain read this group passes, because its last rule is a
+        BLOCK; it is a deny-list and fails the default-deny the row asks for.
+        """
+        inventory = self._wire(
+            mock_ac,
+            mock_ec2,
+            mock_r53,
+            associations={"vpc-a": [self._association("group-1")]},
+            rules={
+                "group-1": [
+                    self._rule("allowed", 10, action="ALLOW"),
+                    self._rule("known-bad", 100),
+                ]
+            },
+            domains={"rslvr-fdl-known-bad": ["evil.example.", "*.evil.example."]},
+        )
+
+        findings = agentcore_app.check_agentcore_dns_egress_control(inventory)
+
+        assert len(findings) == 1
+        assert findings[0]["Finding"] == "AgentCore DNS Egress Control Not Default Deny"
+        assert findings[0]["Status"] == "Failed"
+        assert "2 name(s)" in findings[0]["Finding_Details"]
+        assert_finding_schema(findings[0])
+
+    @patch("agentcore_app.route53resolver_client")
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_terminal_block_over_a_managed_list_fails_without_reading_it(
+        self, mock_ac, mock_ec2, mock_r53
+    ):
+        inventory = self._wire(
+            mock_ac,
+            mock_ec2,
+            mock_r53,
+            associations={"vpc-a": [self._association("group-1")]},
+            rules={"group-1": [self._rule("malware", 100)]},
+            managed_list_ids=("rslvr-fdl-malware",),
+        )
+
+        findings = agentcore_app.check_agentcore_dns_egress_control(inventory)
+
+        assert len(findings) == 1
+        assert findings[0]["Finding"] == "AgentCore DNS Egress Control Not Default Deny"
+        assert "AWS managed domain list" in findings[0]["Finding_Details"]
+        assert mock_r53.list_firewall_domains.call_count == 0
+
+    @patch("agentcore_app.route53resolver_client")
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_domain_list_read_failure_is_na(self, mock_ac, mock_ec2, mock_r53):
+        inventory = self._wire(
+            mock_ac,
+            mock_ec2,
+            mock_r53,
+            associations={"vpc-a": [self._association("group-1")]},
+            rules={"group-1": [self._rule("catchall", 100)]},
+        )
+        mock_r53.list_firewall_domains.side_effect = _make_client_error(
+            "AccessDeniedException", "denied"
+        )
+
+        findings = agentcore_app.check_agentcore_dns_egress_control(inventory)
+
+        assert len(findings) == 1
+        assert findings[0]["Status"] == "N/A"
+        assert "route53resolver:ListFirewallDomains " in findings[0]["Resolution"]
+        assert "rslvr-fdl-catchall" in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.route53resolver_client")
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_domain_list_inventory_failure_is_na(self, mock_ac, mock_ec2, mock_r53):
+        inventory = self._wire(
+            mock_ac,
+            mock_ec2,
+            mock_r53,
+            associations={"vpc-a": [self._association("group-1")]},
+            rules={"group-1": [self._rule("catchall", 100)]},
+        )
+        mock_r53.list_firewall_domain_lists.side_effect = _make_client_error(
+            "AccessDeniedException", "denied"
+        )
+
+        findings = agentcore_app.check_agentcore_dns_egress_control(inventory)
+
+        assert len(findings) == 1
+        assert findings[0]["Status"] == "N/A"
+        assert "route53resolver:ListFirewallDomainLists" in findings[0]["Resolution"]
         assert mock_r53.list_firewall_domains.call_count == 0
 
     @patch("agentcore_app.route53resolver_client")
@@ -13566,6 +13821,45 @@ class TestAC49DnsEgressControl:
     @patch("agentcore_app.route53resolver_client")
     @patch("agentcore_app.ec2_client")
     @patch("agentcore_app.agentcore_client")
+    def test_each_vpc_reads_its_own_domain_list_and_the_inventory_once(
+        self, mock_ac, mock_ec2, mock_r53
+    ):
+        inventory = self._wire(
+            mock_ac,
+            mock_ec2,
+            mock_r53,
+            runtime_subnets=("subnet-a",),
+            tool_subnets=("subnet-b",),
+            subnet_vpcs={"subnet-a": "vpc-a", "subnet-b": "vpc-b"},
+            associations={
+                "vpc-a": [self._association("group-a")],
+                "vpc-b": [self._association("group-b")],
+            },
+            rules={
+                "group-a": [self._rule("all-a", 100)],
+                "group-b": [self._rule("some-b", 100)],
+            },
+            domains={"rslvr-fdl-some-b": ["example.com."]},
+        )
+
+        findings = agentcore_app.check_agentcore_dns_egress_control(inventory)
+        by_vpc = {
+            "vpc-a" if "vpc-a" in finding["Finding_Details"] else "vpc-b": finding
+            for finding in findings
+        }
+
+        assert len(findings) == 2
+        assert by_vpc["vpc-a"]["Status"] == "Passed"
+        assert by_vpc["vpc-b"]["Status"] == "Failed"
+        assert mock_r53.list_firewall_domain_lists.call_count == 1
+        assert sorted(
+            call.kwargs["FirewallDomainListId"]
+            for call in mock_r53.list_firewall_domains.call_args_list
+        ) == ["rslvr-fdl-all-a", "rslvr-fdl-some-b"]
+
+    @patch("agentcore_app.route53resolver_client")
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
     def test_a_terminal_threat_protection_rule_names_what_it_matches(
         self, mock_ac, mock_ec2, mock_r53
     ):
@@ -13587,9 +13881,13 @@ class TestAC49DnsEgressControl:
 
         findings = agentcore_app.check_agentcore_dns_egress_control(inventory)
 
-        assert findings[0]["Status"] == "Passed"
+        # Threat protection blocks the names it judges malicious and answers the
+        # rest, so a group that ends in it has an open default.
+        assert findings[0]["Status"] == "Failed"
+        assert findings[0]["Finding"] == "AgentCore DNS Egress Control Not Default Deny"
         assert "DNS threat protection DGA" in findings[0]["Finding_Details"]
         assert "confidence HIGH" in findings[0]["Finding_Details"]
+        assert mock_r53.list_firewall_domain_lists.call_count == 0
 
     @patch("agentcore_app.route53resolver_client")
     @patch("agentcore_app.ec2_client")

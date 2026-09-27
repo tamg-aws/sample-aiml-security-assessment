@@ -605,8 +605,9 @@ def tagged_control_problems(tag_controls, verdict_controls):
 
     The element count is deliberately NOT asserted against the set size. A
     `tighten` control with two incumbents carries two `(partial)` tags, one per
-    incumbent: legal, passes 14a, and the state of this base at 29 elements over
-    28 controls with `AIR-BDR-MDL-02` carrying two. Asserting one tag per control
+    incumbent: legal, and passes 14a. The base once stood at 29 elements over 28
+    controls with `AIR-BDR-MDL-02` carrying two, and carries none now that no row
+    is `tighten`. Asserting one tag per control
     here would red a correct tree. Both numbers print beside the verdict, and the
     document's own one-tag-each clause is asserted by census_relations() at the
     refs that publish it.

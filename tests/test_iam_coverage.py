@@ -819,6 +819,28 @@ _VERIFIED_REMEDIATION_IAM_ACTIONS |= {
     "events:ListTargetsByRule",
 }
 
+# Verified on 2026-09-26 with one IDENTITY_POLICY validate-policy run for AC-49's
+# domain-list leg, one statement per name. The three negative controls
+# route53resolver:DescribeFirewallDomainLists, route53resolver:GetFirewallDomains
+# and route53resolver:ListFirewallDomainNames came back INVALID_ACTION at
+# statement indexes 2, 3 and 4, and indexes 0 and 1, the two names below, were
+# not reported.
+_VERIFIED_REMEDIATION_IAM_ACTIONS |= {
+    "route53resolver:ListFirewallDomainLists",
+    "route53resolver:ListFirewallDomains",
+}
+
+# Verified on 2026-09-26 with one IDENTITY_POLICY validate-policy run for BR-47's
+# customization job leg, one statement per name. The three negative controls
+# bedrock:ListCustomizationJobs, bedrock:DescribeModelCustomizationJob and
+# bedrock:ListModelCustomizationJob came back INVALID_ACTION at statement
+# indexes 2, 3 and 4, and indexes 0 and 1, the two names below, were not
+# reported.
+_VERIFIED_REMEDIATION_IAM_ACTIONS |= {
+    "bedrock:ListModelCustomizationJobs",
+    "bedrock:GetModelCustomizationJob",
+}
+
 # Verified on 2026-09-26 with one IDENTITY_POLICY validate-policy run for the
 # phase-5 Bedrock legs, one statement per name so a finding's path index names
 # the entry it belongs to. Nine negative controls were submitted alongside:

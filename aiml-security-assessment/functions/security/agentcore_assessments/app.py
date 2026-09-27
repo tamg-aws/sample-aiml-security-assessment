@@ -14,7 +14,7 @@ import time
 from fnmatch import fnmatchcase
 from io import StringIO
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 from botocore.config import Config
 from botocore.exceptions import ClientError, EndpointConnectionError
 
@@ -1661,7 +1661,9 @@ def check_agentcore_vpc_configuration(
                                     for subnet in subnets_response.get("Subnets", []):
                                         subnet_id = subnet["SubnetId"]
 
-                                        # Check route tables for internet gateway
+                                        # Check route tables for internet gateway.
+                                        # A subnet with no explicit association
+                                        # uses its VPC's main route table.
                                         route_tables = ec2_client.describe_route_tables(
                                             Filters=[
                                                 {
@@ -1670,10 +1672,29 @@ def check_agentcore_vpc_configuration(
                                                 }
                                             ]
                                         )
+                                        if not route_tables.get("RouteTables"):
+                                            route_tables = (
+                                                ec2_client.describe_route_tables(
+                                                    Filters=[
+                                                        {
+                                                            "Name": "vpc-id",
+                                                            "Values": [
+                                                                subnet.get("VpcId")
+                                                            ],
+                                                        },
+                                                        {
+                                                            "Name": "association.main",
+                                                            "Values": ["true"],
+                                                        },
+                                                    ]
+                                                )
+                                            )
 
                                         for rt in route_tables.get("RouteTables", []):
                                             for route in rt.get("Routes", []):
                                                 if route.get(
+                                                    "State"
+                                                ) != "blackhole" and route.get(
                                                     "GatewayId", ""
                                                 ).startswith("igw-"):
                                                     findings.append(
@@ -1691,6 +1712,25 @@ def check_agentcore_vpc_configuration(
                                 except ClientError as e:
                                     logger.warning(
                                         f"Error checking subnet configuration: {e}"
+                                    )
+                                    findings.append(
+                                        create_finding(
+                                            check_id="AC-01",
+                                            finding_name="AgentCore Runtime VPC Configuration",
+                                            finding_details=(
+                                                f"Whether the subnets of runtime "
+                                                f"'{runtime_name}' ({runtime_id}) reach an "
+                                                "internet gateway could not be read: "
+                                                f"{_assessment_error_label(e)}."
+                                            ),
+                                            resolution=(
+                                                "Grant ec2:DescribeSubnets and "
+                                                "ec2:DescribeRouteTables and retry."
+                                            ),
+                                            reference=AGENTCORE_VPC_REFERENCE_URL,
+                                            severity=SeverityEnum.INFORMATIONAL,
+                                            status=StatusEnum.NA,
+                                        )
                                     )
 
                     except ClientError as e:
@@ -12573,7 +12613,8 @@ def check_agentcore_execution_role_trust_and_sharing(
                 check_id="AC-48",
                 finding_name="AgentCore Execution Role Sharing",
                 finding_details=(
-                    f"The {len(references)} AgentCore resource(s) that name an "
+                    f"The {sum(len(users) for users in roles.values())} AgentCore "
+                    "resource(s) that name an "
                     f"execution role name {len(roles)} distinct role ARN(s), so "
                     "no role is assumed on behalf of more than one resource."
                 ),
@@ -12673,6 +12714,27 @@ def _dns_firewall_enforcing_rules(
     return [rule for rule in rules if (rule.get("Status") or "COMPLETE") == "COMPLETE"]
 
 
+def _dns_firewall_managed_domain_list_ids() -> Set[str]:
+    """Return the ids of the AWS managed domain lists visible to the account.
+
+    ListFirewallDomainLists reports ManagedOwnerName only on the lists AWS
+    maintains, and those lists name threat categories, so a rule over one is a
+    deny-list whatever its action.
+    """
+    domain_lists = _paginate_aws_list(
+        route53resolver_client,
+        "list_firewall_domain_lists",
+        "FirewallDomainLists",
+        token_request_key="NextToken",
+        token_response_key="NextToken",
+    )
+    return {
+        domain_list.get("Id")
+        for domain_list in domain_lists
+        if domain_list.get("Id") and domain_list.get("ManagedOwnerName")
+    }
+
+
 def check_agentcore_dns_egress_control(
     browser_inventory: Dict[str, Any] = None,
 ) -> List[Dict[str, Any]]:
@@ -12690,8 +12752,15 @@ def check_agentcore_dns_egress_control(
     not match: if that rule allows, the group is an allow-list with an open
     default. The same ordering applies to the groups associated with one VPC, so
     the association with the largest Priority holds the terminal rule.
+
+    A terminal block is a default deny only when it matches every name. The
+    walled garden pattern AWS documents is a BLOCK over a domain list holding
+    "*", so the terminal rule passes only when its own domain list holds "*". A
+    block over an AWS managed list or over DNS threat protection stops known bad
+    names and answers every other one.
     """
     reference = DNS_FIREWALL_RULE_ACTION_REFERENCE_URL
+    managed_list_ids: Optional[Set[str]] = None
     if agentcore_client is None:
         return [
             create_finding(
@@ -12937,6 +13006,85 @@ def check_agentcore_dns_egress_control(
         subject = _dns_firewall_rule_subject(terminal_rule)
 
         if action == "BLOCK":
+            domain_list_id = terminal_rule.get("FirewallDomainListId")
+            not_default_deny = None
+            if not domain_list_id:
+                not_default_deny = "matches no domain list"
+            else:
+                try:
+                    if managed_list_ids is None:
+                        managed_list_ids = _dns_firewall_managed_domain_list_ids()
+                    if domain_list_id in managed_list_ids:
+                        not_default_deny = "uses an AWS managed domain list"
+                    else:
+                        domains = _paginate_aws_list(
+                            route53resolver_client,
+                            "list_firewall_domains",
+                            "Domains",
+                            token_request_key="NextToken",
+                            token_response_key="NextToken",
+                            FirewallDomainListId=domain_list_id,
+                        )
+                        # ListFirewallDomains returns names fully qualified,
+                        # so the "*" a walled garden is built from reads "*.".
+                        if "*" not in {str(domain).rstrip(".") for domain in domains}:
+                            not_default_deny = (
+                                f"uses a domain list of {len(domains)} name(s) "
+                                'that does not hold "*"'
+                            )
+                except Exception as error:
+                    logger.warning(
+                        f"Could not read DNS Firewall domain list {domain_list_id}: "
+                        f"{error}"
+                    )
+                    findings.append(
+                        create_finding(
+                            check_id="AC-49",
+                            finding_name="AgentCore DNS Egress Control",
+                            finding_details=(
+                                f"The domain list {domain_list_id} of rule "
+                                f"'{rule_name}', the last rule of DNS Firewall "
+                                f"rule group {group_name} ({group_id}) associated "
+                                f"with {vpc_id}, could not be read, so whether it "
+                                "blocks every name is unknown: "
+                                f"{_assessment_error_label(error)}."
+                            ),
+                            resolution=(
+                                "Grant route53resolver:ListFirewallDomainLists and "
+                                "route53resolver:ListFirewallDomains and retry."
+                            ),
+                            reference=reference,
+                            severity=SeverityEnum.INFORMATIONAL,
+                            status=StatusEnum.NA,
+                        )
+                    )
+                    continue
+
+            if not_default_deny:
+                findings.append(
+                    create_finding(
+                        check_id="AC-49",
+                        finding_name="AgentCore DNS Egress Control Not Default Deny",
+                        finding_details=(
+                            f"VPC {vpc_id}, which hosts {hosted}, is associated "
+                            f"with DNS Firewall rule group {group_name} "
+                            f"({group_id}), whose last rule '{rule_name}' at "
+                            f"Priority {priority} blocks {subject} but "
+                            f"{not_default_deny}. A name that no rule matches is "
+                            "answered, so the rule group is a deny-list."
+                        ),
+                        resolution=(
+                            "Make the last rule in this rule group a BLOCK over a "
+                            'domain list that holds "*", and allow the names '
+                            "agents need in rules with a lower Priority."
+                        ),
+                        reference=reference,
+                        severity=SeverityEnum.MEDIUM,
+                        status=StatusEnum.FAILED,
+                    )
+                )
+                continue
+
             findings.append(
                 create_finding(
                     check_id="AC-49",
@@ -12945,13 +13093,10 @@ def check_agentcore_dns_egress_control(
                         f"VPC {vpc_id}, which hosts {hosted}, is associated with "
                         f"DNS Firewall rule group {group_name} ({group_id}), "
                         f"whose last rule '{rule_name}' at Priority {priority} "
-                        f"blocks {subject}."
+                        f'blocks {subject}, which holds "*", so a name that no '
+                        "earlier rule allows is not resolved."
                     ),
-                    resolution=(
-                        "No action required. Confirm the blocked domain list is "
-                        "wide enough that the earlier allow rules are the only "
-                        "names an agent can resolve."
-                    ),
+                    resolution="No action required.",
                     reference=reference,
                     severity=SeverityEnum.MEDIUM,
                     status=StatusEnum.PASSED,

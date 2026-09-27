@@ -143,6 +143,7 @@ _EXPECTED_ACTIONS = {
         "bedrock:ListInferenceProfiles",
         "bedrock:ListKnowledgeBases",
         "bedrock:ListMarketplaceModelEndpoints",
+        "bedrock:ListModelCustomizationJobs",
         "bedrock:ListModelInvocationJobs",
         "bedrock:ListPrompts",
         "bedrock:ListTagsForResource",
@@ -151,6 +152,8 @@ _EXPECTED_ACTIONS = {
         "cloudtrail:GetTrailStatus",
         "cloudtrail:ListTrails",
         "cloudwatch:DescribeAlarms",
+        "ec2:DescribeRouteTables",
+        "ec2:DescribeSubnets",
         "ec2:DescribeVpcEndpoints",
         "ec2:DescribeVpcs",
         "iam:GenerateServiceLastAccessedDetails",
@@ -165,11 +168,14 @@ _EXPECTED_ACTIONS = {
         "macie2:DescribeBuckets",
         "macie2:GetAutomatedDiscoveryConfiguration",
         "macie2:GetMacieSession",
+        "macie2:ListClassificationJobs",
+        "organizations:DescribeEffectivePolicy",
         "organizations:DescribeOrganization",
         "organizations:DescribePolicy",
         "organizations:ListPolicies",
         "organizations:ListRoots",
         "organizations:ListTargetsForPolicy",
+        "s3:GetBucketPolicy",
         "s3:GetEncryptionConfiguration",
         "s3:GetLifecycleConfiguration",
         "s3:GetObject",
@@ -185,6 +191,8 @@ _EXPECTED_ACTIONS = {
         "config:DescribeComplianceByConfigRule",
         "config:DescribeConfigRules",
         "config:DescribeConfigurationRecorders",
+        "ec2:DescribeRouteTables",
+        "ec2:DescribeSubnets",
         "guardduty:GetDetector",
         "guardduty:ListDetectors",
         "iam:GenerateServiceLastAccessedDetails",
@@ -277,13 +285,20 @@ _EXPECTED_ACTIONS = {
         "oam:ListSinks",
         "organizations:DescribePolicy",
         "organizations:ListPolicies",
+        "route53resolver:ListFirewallDomainLists",
+        "route53resolver:ListFirewallDomains",
+        "route53resolver:ListFirewallRuleGroupAssociations",
+        "route53resolver:ListFirewallRules",
         "s3:GetObject",
         "s3:PutObject",
+        "wafv2:GetWebACL",
     },
     "AgentRegistrySecurityAssessmentFunction": {
         "agent-registry:GetRegistry",
         "agent-registry:ListRegistries",
         "agent-registry:ListRegistryRecords",
+        "events:ListRules",
+        "events:ListTargetsByRule",
         "iam:GenerateServiceLastAccessedDetails",
         "iam:GetServiceLastAccessedDetails",
         "s3:GetObject",
@@ -794,6 +809,78 @@ def test_agentcore_observability_and_governance_reads_are_scoped_where_iam_allow
     assert "iam::${AWS::AccountId}:role/*" in gateway_role
     assert "iam::*:role/" not in gateway_role
     assert not re.search(r"Resource:\s+['\"]\*['\"]", gateway_role)
+
+
+@pytest.mark.parametrize("template", _SAM_TEMPLATES, ids=os.path.basename)
+def test_aisf_phase5_reads_wildcard_only_where_iam_has_no_resource_type(template):
+    """The phase-5 AISF grants take '*' only on actions with no resource type.
+
+    Each wildcard action below names no resource type in the IAM service
+    authorization reference. Each scoped action does, and is pinned to this
+    account except ListFirewallRules, whose rule group can be shared from
+    another account through AWS RAM.
+    """
+    wildcard = {
+        ("BedrockSecurityAssessmentFunction", "MaciePermissions"): (
+            "macie2:ListClassificationJobs",
+        ),
+        ("BedrockSecurityAssessmentFunction", "EC2Permissions"): (
+            "ec2:DescribeSubnets",
+            "ec2:DescribeRouteTables",
+        ),
+        (
+            "BedrockSecurityAssessmentFunction",
+            "BedrockAccountInventoryPermissions",
+        ): ("bedrock:ListModelCustomizationJobs",),
+        ("SagemakerSecurityAssessmentFunction", "EC2SubnetExposureInventory"): (
+            "ec2:DescribeSubnets",
+            "ec2:DescribeRouteTables",
+        ),
+        ("AgentCoreSecurityAssessmentFunction", "DNSFirewallAssociationInventory"): (
+            "route53resolver:ListFirewallRuleGroupAssociations",
+            "route53resolver:ListFirewallDomainLists",
+        ),
+        ("AgentRegistrySecurityAssessmentFunction", "RegistryEventRuleInventory"): (
+            "events:ListRules",
+        ),
+    }
+    for (logical_id, sid), actions in wildcard.items():
+        statement = _statement_block(template, logical_id, sid)
+        for action in actions:
+            assert action in statement
+        assert re.search(r"Resource:\s+['\"]\*['\"]", statement)
+
+    scoped = {
+        ("BedrockSecurityAssessmentFunction", "S3BucketEncryptionPermissions"): (
+            "s3:GetBucketPolicy",
+            "s3:::*",
+        ),
+        ("BedrockSecurityAssessmentFunction", "OrganizationsEffectivePolicyRead"): (
+            "organizations:DescribeEffectivePolicy",
+            "organizations::*:account/o-*/${AWS::AccountId}",
+        ),
+        ("AgentCoreSecurityAssessmentFunction", "AgentCoreGatewayWebACLRead"): (
+            "wafv2:GetWebACL",
+            "wafv2:*:${AWS::AccountId}:regional/webacl/*/*",
+        ),
+        ("AgentCoreSecurityAssessmentFunction", "DNSFirewallRuleRead"): (
+            "route53resolver:ListFirewallRules",
+            "route53resolver:*:*:firewall-rule-group/*",
+        ),
+        ("AgentCoreSecurityAssessmentFunction", "DNSFirewallDomainRead"): (
+            "route53resolver:ListFirewallDomains",
+            "route53resolver:*:*:firewall-domain-list/*",
+        ),
+        ("AgentRegistrySecurityAssessmentFunction", "RegistryEventRuleTargetRead"): (
+            "events:ListTargetsByRule",
+            "events:*:${AWS::AccountId}:rule/*",
+        ),
+    }
+    for (logical_id, sid), (action, resource) in scoped.items():
+        statement = _statement_block(template, logical_id, sid)
+        assert action in statement
+        assert resource in statement
+        assert not re.search(r"Resource:\s+['\"]\*['\"]", statement)
 
 
 @pytest.mark.parametrize("template", _SAM_TEMPLATES, ids=os.path.basename)

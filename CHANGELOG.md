@@ -19,7 +19,7 @@ section.
   - The section is always on. It needs no deployment parameter, runs no
     additional AWS API calls, and adds no scan time, because each row restates
     the verdict of a check that already ran under an AISF control id.
-  - `AISF-` rows are excluded from the 208-check catalog total, from the report
+  - `AISF-` rows are excluded from the 256-check catalog total, from the report
     pass rate, and from Open Action Items, for the same reason OWASP-mapped
     rows are: the underlying check is already counted.
   - `AISF-08` aggregates three SageMaker checks (`SM-09`, `SM-01`, `SM-03`). It
@@ -36,12 +36,40 @@ section.
   - The mappings are preliminary and illustrative. Validate them with your
     security and compliance team before using a row as audit evidence.
     `docs/SECURITY_CHECKS_AISF.md` documents every row and its source checks.
+- Added 48 checks so every machine-verifiable AISF control has a producing
+  check, growing the catalog from 208 to 256 checks (141 core, 39 Agentic AI,
+  64 Responsible AI GRC, and 12 OWASP): `BR-41` through `BR-49`, `SM-31`
+  through `SM-34`, `AC-18` through `AC-49`, `AR-09`, `AR-10`, and `AG-39`.
+  Of the 78 in-scope AISF controls, 74 are now covered by a shipped check and
+  the other 4 ask about evidence no AWS API returns; the parity ledger in
+  `aisf-parity/AISF-WORK-LEDGER.md` names the reason for each. Each producer
+  row names its AISF controls in the `Compliance_Frameworks` CSV column.
+  Behavior worth knowing:
+  - `AC-49` reads Route 53 Resolver DNS Firewall. `ListFirewallDomains`
+    returns the walled garden catch-all as `*.`, and the check accepts that
+    spelling as well as `*`.
+  - `BR-47` fails a Bedrock data path bucket with no bucket policy, because S3
+    then accepts plaintext requests, and passes only a `Deny` on
+    `aws:SecureTransport` `false` that reaches every principal and covers
+    `s3:*` on both the bucket and its objects.
+  - `BR-48` reads the organization's effective AI services opt-out policy.
+    From the management account it also reads every opt-out policy to name
+    any that let a child policy override the opt-out; from a member account
+    that leg is skipped.
+  - `AG-39` does not read the rules inside customer rule groups or non-AWS
+    managed rule groups. An ACL that relies on one for a missing filter is
+    reported `N/A` with the group named.
 
 ### Deployment impact
 
-**CodeBuild run required.** No template, parameter, or IAM change: the AISF
-section is produced by the existing report generation code, so a CodeBuild run
-that redeploys the assessment code and AWS SAM templates is sufficient. No
+**CodeBuild run required.** No parameter or deployment-stack change. The AWS
+SAM templates (`aiml-security-assessment/template.yaml` and
+`aiml-security-assessment/template-multi-account.yaml`) add read-only actions
+to the assessment Lambda execution roles for the new checks, among them
+the four named `route53resolver:ListFirewall` read actions, `wafv2:GetWebACL`,
+`organizations:DescribeEffectivePolicy`, `macie2:ListClassificationJobs`,
+`s3:GetBucketPolicy`, and `bedrock:ListModelCustomizationJobs`. A CodeBuild
+run that redeploys the assessment code and SAM templates applies them. No
 member-role StackSet update and no central or single-account infrastructure
 update are required.
 

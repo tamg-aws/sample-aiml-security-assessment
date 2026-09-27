@@ -102,21 +102,19 @@ ROWS = [
     ),
     (
         "AIR-BDR-MDL-08",
-        TIGHTEN,
-        EXTEND,
+        COVERED,
+        None,
         "bedrock_assessments",
         ["BR-07"],
-        "BR-07 holds the catalog leg (ListPrompts non-empty is its Passed row, zero prompts "
-        "is Not Applicable) and its second row only counts variants. The "
-        "production-version leg is unwritten and cannot be written on the calls BR-07 "
-        "already makes: bare ListPrompts returns each prompt's DRAFT, and BR-07's "
-        "get_prompt omits promptVersion, which the API documents as returning the working "
-        "draft, so a version != DRAFT test over either reports Failed for every prompt in "
-        "every account and no configuration clears it. The falsifiable form is "
-        "ListPrompts(promptIdentifier=...) for that prompt's version list, "
-        "GetPrompt(promptVersion=N) for customerEncryptionKeyArn, which PromptSummary does "
-        "not carry, and for flows the prompt node's resource.promptArn version suffix, "
-        "with inline being the hardcoded prompt the control names",
+        "BR-07 holds the catalog leg (ListPrompts non-empty is its Passed row, zero prompts"
+        " is Not Applicable) and now the production-version leg as well. For each prompt it"
+        " calls ListPrompts(promptIdentifier=...) for the numbered versions, fails a prompt"
+        " that has only its DRAFT, and reads GetPrompt(promptVersion=N) on the highest "
+        "numbered version for customerEncryptionKeyArn, which PromptSummary does not carry. For flows it reads "
+        "the prompt node's resource.promptArn and fails a node that pins no version suffix,"
+        " since an unversioned ARN resolves to the working draft. A version != DRAFT test "
+        "on bare ListPrompts or on a GetPrompt with no promptVersion would have failed "
+        "every prompt in every account, because both return the draft",
         [],
         4,
     ),
@@ -405,22 +403,24 @@ ROWS = [
     ),
     (
         "AIR-ACR-REG-02",
-        TIGHTEN,
-        NEW_ID,
+        COVERED,
+        None,
         "agent_registry_assessments",
-        ["AR-03", "AR-09"],
-        'AR-03 is named "Publication Approval Governance" but covers auto-approval only, '
-        "behind the REQUIRE_AGENT_REGISTRY_MANUAL_APPROVAL env gate, so a default "
-        "deployment skips it. AR-09 now asserts the separation leg: it fails any role or "
-        "user whose effective policy reaches both a record write (CreateRegistryRecord, "
+        ["AR-03", "AR-09", "AR-10"],
+        'AR-03 is named "Publication Approval Governance" and covers auto-approval, behind '
+        "the REQUIRE_AGENT_REGISTRY_MANUAL_APPROVAL env gate. AR-09 asserts the separation "
+        "leg: it fails any role or user whose attached and inline policies allow, by an "
+        "action pattern that names the service, both a record write (CreateRegistryRecord, "
         "UpdateRegistryRecord, SubmitRegistryRecordForApproval) and "
         "UpdateRegistryRecordStatus, the one operation that can set a record to APPROVED, "
         "in either the agent-registry namespace or the public-preview bedrock-agentcore "
-        "spelling of it. The EventBridge leg stays unasserted: no check reads whether an "
-        "enabled rule matches the aws.agent-registry approval state-change events and "
-        "carries a target, which needs events:ListRules and events:ListTargetsByRule on "
-        "AgentRegistrySecurityAssessmentFunction",
-        ["events:ListRules", "events:ListTargetsByRule"],
+        "spelling of it. A bare * grant is reported under AR-01, and only a Deny with no "
+        "condition on Resource * removes an action. AR-10 asserts the observation leg: an "
+        "enabled rule on the default event bus that matches the aws.agent-registry "
+        "Pending Approval, Approved and Rejected state-change events and has a target. A rule that matches only the aws.bedrock-agentcore preview source is "
+        "reported apart, because that source stops routing on 30 October 2026. Rules on a "
+        "custom bus are not read, since AWS delivers these events to the default bus",
+        [],
         4,
     ),
     (
@@ -715,310 +715,214 @@ ROWS = [
     # ------- FND, AI-resource subject: 11 controls -------
     (
         "AIR-FND-DAT-01",
-        TIGHTEN,
-        EXTEND,
-        ["bedrock_assessments", "sagemaker_assessments"],
+        COVERED,
+        None,
+        [
+            "bedrock_assessments",
+            "sagemaker_assessments",
+        ],
         ["BR-20", "BR-11", "BR-17", "SM-03"],
-        "four checks cover the stores this control names: BR-20 the knowledge "
-        "base's vector store keys, BR-11 and BR-17 the custom model artefacts, "
-        "SM-03 the training output and volume keys. BR-11's half of that was not "
-        "being read: it hops from the model to its customization job to look for "
-        "outputDataConfig.kmsKeyId, and GetModelCustomizationJob returns an "
-        "outputDataConfig holding s3Uri alone, reporting the key as a top-level "
-        "outputModelKmsKeyArn. Its unit test set the same absent key, so the test "
-        "and the code agreed with each other and with nothing else, the passing "
-        "branch was unreachable against a live job, and every custom model was "
-        "reported as needing review. BR-17 was the live reader of the two, on the "
-        "model's own modelKmsKeyArn. Reading the documented field is a precondition "
-        "of this row rather than part of it, and is done: BR-11 now answers for the "
-        "customization output and BR-17 for the model, which is the split their "
-        "names already claim. The unread store is the one "
-        "the ingested objects sit in before any of those exist -- the knowledge "
-        "base's own data source bucket. FS-65 was listed beside BR-20 and is not "
-        'an incumbent for encryption at rest: its finding is "KB Data Source '
-        'Buckets Missing S3 Event Notifications", which asserts notification '
-        "wiring and says nothing about keys, and it runs only when the execution "
-        "input carries enableResponsibleAIGRC. EXTEND and not new_id because the "
-        "bucket is a second resource inside the subject BR-20's name already "
-        "claims, the knowledge base, so that name stays accurate once the leg "
-        "lands. It costs no IAM either: the bedrock function already holds "
-        "s3:GetEncryptionConfiguration",
+        "four checks cover the stores this control names: BR-20 the customer-managed key "
+        "of a managed or S3 Vectors store, reporting any other vector store as needing a "
+        "storage-layer review, and the default encryption of each data source bucket, which is where "
+        "the ingested objects sit before any index exists; BR-11 the customization job "
+        "output, read from outputModelKmsKeyArn, the field GetModelCustomizationJob "
+        "returns; BR-17 the custom model's own modelKmsKeyArn; SM-03 the training output "
+        "and volume keys. BR-11 used to read outputDataConfig.kmsKeyId, which the API never"
+        " returns, so every custom model read as needing review until the documented field "
+        "was read. FS-65 is not an incumbent: its finding is about S3 event notifications "
+        "and says nothing about keys",
         [],
         5,
     ),
     (
         "AIR-FND-DAT-02",
-        NEW,
+        COVERED,
         None,
         "bedrock_assessments",
+        ["BR-47"],
+        "BR-47 reads the bucket policy of each S3 bucket on the Bedrock data path "
+        "(knowledge base S3 sources, the invocation log S3 destination, and the training, "
+        "validation and output buckets of the newest 50 customization jobs). It passes a "
+        "bucket only when one Deny, conditioned by Bool or BoolIfExists on "
+        "aws:SecureTransport false, reaches every principal, covers s3:*, and names both "
+        "the bucket and its objects. A bucket with no policy fails, because S3 then "
+        "accepts plaintext requests. For each Deny that falls short, the finding names the "
+        "principals, resources or actions it misses, since a Deny scoped to some "
+        "principals leaves the rest able to use HTTP",
         [],
-        "no check in any producer reads a bucket policy. s3:GetBucketPolicy is "
-        "granted to no function, and neither aws:SecureTransport nor s3:TlsVersion "
-        "appears anywhere in the corpus, so no incumbent asserts any part of this "
-        "control. On S3 the assertion is a bucket-policy Deny for requests that "
-        "are not TLS, over the buckets the AI data path reads and writes. The "
-        "check reports which principals that Deny reaches rather than passing on "
-        "its presence: a Deny written without regard for the path a service takes "
-        "when it reads under a customer-supplied execution role can strand a "
-        "knowledge base sync, and an operator who cannot see the principal scope "
-        "cannot tell a correct policy from one about to break ingestion",
-        ["s3:GetBucketPolicy"],
         5,
     ),
     (
         "AIR-FND-DAT-03",
-        TIGHTEN,
-        EXTEND,
+        COVERED,
+        None,
         "bedrock_assessments",
         ["BR-46"],
-        "re-hosted off responsible_ai_grc_assessments, which the state machine invokes only "
-        "when the execution input carries enableResponsibleAIGRC, so a row hosted there "
-        "ships conditionally, and the candidate incumbent is here rather than there: BR-46 "
-        "reads automatedDiscoveryMonitoringStatus per knowledge base source bucket, which is "
-        "the automated-discovery leg of this control. The move costs no IAM, since that check "
-        "already holds macie2:GetMacieSession, GetAutomatedDiscoveryConfiguration and "
-        "DescribeBuckets. The unwritten leg is the one the control keeps separate: automated "
-        "discovery samples objects, so per-object assurance over what is about to be ingested "
-        "needs a targeted discovery job over the actual source prefixes, which takes "
-        "macie2:ListClassificationJobs, granted to no function today. One action and "
-        "not two: DescribeClassificationJob was claimed here as well and is not "
-        "needed, because a ListClassificationJobs item already carries "
-        "bucketDefinitions[].buckets[], bucketCriteria.includes/excludes, jobType "
-        "and jobStatus, which is every field deciding whether a job covers the "
-        "source prefixes and is still running. The subject is also wider than "
-        "knowledge bases, and the pre-ingest Comprehend detection the control "
-        "recommends is a call the application makes, not a configuration this "
-        "scanner can read",
-        ["macie2:ListClassificationJobs"],
+        "BR-46 holds both legs. It reads automatedDiscoveryMonitoringStatus for each "
+        "knowledge base source bucket, which is the sampling leg, and, for a bucket "
+        "automated discovery does not monitor, whether a SCHEDULED classification job that "
+        "is RUNNING or IDLE and whose last run did not error names the bucket, which is the "
+        "per-object leg the control keeps separate because automated discovery samples. A "
+        "job that selects buckets by criteria is reported, not credited, and neither leg "
+        "is read unless the Macie session and automated discovery are enabled. A ListClassificationJobs item carries "
+        "bucketDefinitions, bucketCriteria, jobType and jobStatus, so "
+        "DescribeClassificationJob is not needed. The pre-ingest Comprehend detection the "
+        "control also recommends is a call the application makes, which no account "
+        "configuration records",
+        [],
         5,
     ),
     (
         "AIR-FND-DAT-09",
-        NEW,
+        COVERED,
         None,
         "bedrock_assessments",
+        ["BR-48"],
+        "BR-48 reads both surfaces. DescribeEffectivePolicy on AISERVICES_OPT_OUT_POLICY "
+        "answers what resolves for the account, and an absent effective policy fails "
+        "because the account is then opted in. The effective document has the inheritance "
+        "operators stripped, so from the management account BR-48 also reads every AI "
+        "services opt-out policy in the organization through ListPolicies and "
+        "DescribePolicy, and names any that set @@operators_allowed_for_child_policies",
         [],
-        "the AI-services opt-out is the most AI-specific control in the FND area "
-        "and nothing reads it: neither AISERVICES nor any opt-out string appears in "
-        "the corpus. Two surfaces, not one. DescribeEffectivePolicy on "
-        "AISERVICES_OPT_OUT_POLICY proves what resolves for the account, which is "
-        "the verdict an operator wants, but it returns the merged document with the "
-        "inheritance operators stripped, so @@assign and "
-        "@@operators_allowed_for_child_policies are invisible in it and it cannot "
-        "answer whether a child OU may re-enable a service the root opted out of. "
-        "The source document answers that, and the bedrock function already holds "
-        "organizations:DescribePolicy, ListPolicies and ListTargetsForPolicy, so "
-        "the effective read is the only new grant",
-        ["organizations:DescribeEffectivePolicy"],
         5,
     ),
     (
         "AIR-FND-DET-01",
-        TIGHTEN,
-        EXTEND,
+        COVERED,
+        None,
         "bedrock_assessments",
         ["BR-04", "BR-12"],
-        "between them BR-04 and BR-12 assert that invocation logging is on and "
-        "that its destination is encrypted: BR-04 reads loggingConfig.s3Config and "
-        "cloudWatchConfig.logGroupName for presence and checks the log group's "
-        "retention, BR-12 the key. Two fields decide whether anything useful is "
-        "actually written, and neither is read. The five modality flags on "
-        "LoggingConfig -- textDataDeliveryEnabled, imageDataDeliveryEnabled, "
-        "embeddingDataDeliveryEnabled, videoDataDeliveryEnabled and "
-        "audioDataDeliveryEnabled -- gate what reaches the destination, so a "
-        "configuration with every one of them false passes today while logging no "
-        "prompt or completion at all. And cloudWatchConfig.largeDataDeliveryS3Config "
-        "is where CloudWatch puts payloads too large to inline, so a CloudWatch "
-        "destination without it drops exactly the largest prompts. The tightening "
-        "must not fail an S3-only configuration on the second field: "
-        "largeDataDeliveryS3Config sits on CloudWatchConfig and does not apply "
-        "there. No new IAM: both fields come back on the same "
-        "GetModelInvocationLoggingConfiguration call BR-04 already makes",
+        "BR-04 reads loggingConfig for a destination, the log group's retention, the five "
+        "modality flags (textDataDeliveryEnabled, imageDataDeliveryEnabled, "
+        "embeddingDataDeliveryEnabled, videoDataDeliveryEnabled, audioDataDeliveryEnabled) "
+        "and, for a CloudWatch destination, cloudWatchConfig.largeDataDeliveryS3Config, "
+        "without which CloudWatch drops the largest payloads. Any modality flag set false "
+        "fails, since that modality's prompts and completions go unlogged, and an absent "
+        "flag is Not Applicable. An S3-only configuration is not failed on the "
+        "large-payload field, which sits on CloudWatchConfig. BR-12 asserts a "
+        "customer-managed key on the S3 destination bucket and reports a CloudWatch-only "
+        "configuration as Not Applicable",
         [],
         5,
     ),
     (
         "AIR-FND-DET-04",
-        TIGHTEN,
-        NEW_ID,
+        COVERED,
+        None,
         "bedrock_assessments",
-        ["BR-34"],
-        'BR-34 publishes "Guardrail Prompt Attack Filter" and asserts that some '
-        "guardrail carries a PROMPT_ATTACK filter with inputEnabled true, an "
-        "inputAction of BLOCK and an inputStrength of HIGH, reporting the content "
-        "policy tier alongside. Every field it reads belongs to a guardrail's own "
-        "configuration, and a guardrail no request references filters nothing, so "
-        "the name promises that prompt attacks are being filtered while the "
-        "assertion reaches only that a filter exists somewhere in the account. That "
-        "is the overclaim, and it is why the missing leg gets an id of its own "
-        "rather than widening a check named for a filter. The falsifiable leg is "
-        "enforcement: bedrock:ListEnforcedGuardrailsConfiguration returns "
-        "guardrailsConfig, an array of at most one item carrying guardrailArn, "
-        "guardrailVersion, modelEnforcement and selectiveContentGuarding. Reading "
-        "those two objects rather than their presence is the whole leg, because "
-        "modelEnforcement is not a scalar: it is excludedModels and includedModels, "
-        "both required, and the includedModels pattern permits the literal ALL. So "
-        "ALL with an empty excludedModels is every model enforced, a named list "
-        "leaves every other model unguarded, and a non-empty excludedModels carves "
-        "holes even under ALL, which the finding has to name. "
-        "selectiveContentGuarding is messages and system, each SELECTIVE or "
-        "COMPREHENSIVE, so a configuration can guard the prompt and not the system "
-        "instructions. inputTags is deprecated and carries no verdict. Where no "
-        "account-level configuration exists the fallback leg is a "
-        "paired Allow and Deny on bedrock:GuardrailIdentifier over InvokeModel, "
-        "InvokeModelWithResponseStream, Converse and ConverseStream, which is an "
-        "identity-policy read this function can already do. No new IAM: this leg was "
-        "recorded as needing bedrock:ListEnforcedGuardrailsConfiguration, and the "
-        "Bedrock function has held that action since the grant block was written "
-        "(template.yaml:338). The claim was wrong in the direction that costs "
-        "nothing to make and would have widened a policy for no reason, which is why "
-        "the grant ledger is gated against the template and not against a reading of "
-        "the API reference",
+        ["BR-34", "BR-41", "BR-49"],
+        "three checks, one per enforcement surface. BR-34 asserts a guardrail carries a "
+        "PROMPT_ATTACK filter with inputEnabled true, inputAction BLOCK and inputStrength "
+        "HIGH. BR-41 reads ListEnforcedGuardrailsConfiguration, including "
+        "modelEnforcement.includedModels and excludedModels, where ALL with an empty "
+        "excludedModels is every model and a non-empty excludedModels leaves holes, and "
+        "selectiveContentGuarding, where SELECTIVE on either the system or the messages "
+        "field leaves content the caller does not tag unguarded. "
+        "BR-49 asserts the identity-policy fallback: each identity allowed to invoke a "
+        "model is denied bedrock:InvokeModel and bedrock:InvokeModelWithResponseStream "
+        "without an approved bedrock:GuardrailIdentifier. Those two actions authorize "
+        "Converse and ConverseStream as well; the Converse operations have no IAM action of"
+        " their own",
         [],
         5,
     ),
     (
         "AIR-FND-IAM-05",
-        TIGHTEN,
-        NEW_ID,
+        COVERED,
+        None,
         "agentcore_assessments",
-        ["AC-43", "AC-45", "AC-02"],
-        "the permission side of this control is well covered and the trust side is "
-        "covered once. AC-45 scopes what a tool execution role may do and AC-02 "
-        'flags wildcard grants across every cached role. "AgentCore Evaluation Role '
-        'Trust" is the only check that reads a trust policy at all: AC-43 calls '
-        "iam:GetRole and asserts the confused-deputy guard, an aws:SourceAccount or "
-        "aws:SourceArn condition, on evaluation execution roles. Four other role "
-        "families -- runtime, gateway, browser and code interpreter -- have no trust "
-        "policy read by anything, and no check asserts the control's other half, "
-        "that two workloads do not share one execution role. NEW_ID rather than "
-        "extend, and the deciding fact is the name: AC-43's name is accurate for "
-        "what it reads today, and would stop being accurate the moment its subject "
-        "grew to roles that have nothing to do with evaluation. iam:GetRole is "
-        "already granted, so the widened assertion needs no new IAM, only a new id",
+        ["AC-43", "AC-45", "AC-02", "AC-48"],
+        "AC-45 scopes what a tool execution role may do and AC-02 flags wildcard or "
+        "allow-except AgentCore grants on all resources across every cached role. AC-43 "
+        "asserts the confused-deputy guard on evaluation roles. AC-48 reads the trust "
+        "policy of every runtime, gateway, browser and code interpreter execution role: it "
+        "fails a service principal or * with no aws:SourceAccount or aws:SourceArn "
+        "condition and an account-root or bare account-id principal with no condition, "
+        "and it fails a role that more than one AgentCore resource names, since the shared "
+        "role carries the union of what each needs. AC-27 also reads the gateway roles",
         [],
         5,
     ),
     (
         "AIR-FND-NET-01",
-        TIGHTEN,
-        EXTEND,
+        COVERED,
+        None,
         [
             "agentcore_assessments",
             "sagemaker_assessments",
             "bedrock_assessments",
         ],
         ["AC-01", "SM-10", "SM-11", "SM-28", "SM-33", "BR-39"],
-        "spans three modules, because 'AI workloads run privately' has no single "
-        "host, which is why the FND area has no module of its own. Six checks assert "
-        "that a resource names subnets and security groups: AC-01 for the runtime, "
-        "SM-10 for notebooks, SM-11 for models, SM-28 for HyperPod clusters, SM-33 "
-        "for training jobs together with EnableNetworkIsolation, and BR-39 for "
-        "marketplace model endpoints. Exactly one of them goes on to prove those "
-        "subnets are private: AC-01 reads their route tables and fails an internet "
-        "gateway route. That leg was written against Bedrock's spelling of the "
-        "field, subnetIds, which GetAgentRuntime does not return -- a runtime "
-        "reports its subnets under networkModeConfig, as subnets -- so while the "
-        "two spellings disagreed the leg could not run and nothing in the corpus "
-        "proved a subnet private at all. Reading the documented field is a "
-        "precondition of this row rather than part of it, and is done. SM-11 says "
-        "as much itself -- its Passed text asks the reader "
-        "to confirm the subnets are private and that callers arrive over an "
-        "interface VPC endpoint, because the model configuration does not record "
-        "it. A subnet id is not a privacy claim, so the tightening is to do for the "
-        "other five what AC-01 now does. That needs ec2:DescribeSubnets and "
-        "ec2:DescribeRouteTables on the SageMaker and Bedrock functions: SageMaker "
-        "holds no ec2 action at all, Bedrock holds DescribeVpcEndpoints and "
-        "DescribeVpcs but neither of these, and the AgentCore function already has "
-        "both, which is what a grant looks like when it outlives the code path that "
-        "earned it. EXTEND because every one of the six keeps its name and its "
-        "subject and gains a leg one of them already carries",
-        ["ec2:DescribeSubnets", "ec2:DescribeRouteTables"],
+        "spans three modules, because 'AI workloads run privately' has no single host. Six "
+        "checks read the subnets a resource names and resolve each subnet's route table, "
+        "the explicit association first and the VPC main table otherwise, and fail a route "
+        "to an igw- gateway that is not a blackhole: AC-01 for the runtime, SM-10 for "
+        "notebooks, SM-11 for models, SM-28 for HyperPod clusters, SM-33 for training jobs "
+        "together with EnableNetworkIsolation, and BR-39 for marketplace model endpoints. "
+        "An egress-only gateway, a NAT gateway and a peering connection do not make a "
+        "subnet public. A route read that fails is reported Not Applicable and never passes",
+        [],
         5,
     ),
     (
         "AIR-FND-NET-02",
-        TIGHTEN,
-        EXTEND,
-        ["agentcore_assessments", "bedrock_assessments"],
+        COVERED,
+        None,
+        [
+            "agentcore_assessments",
+            "bedrock_assessments",
+        ],
         ["AC-08", "BR-02"],
-        "AC-08 already asserts the three things this control asks of an endpoint -- "
-        "private DNS enabled, a policy attached, and the network scope that policy "
-        'grants -- but only for endpoints whose service name contains "agentcore". '
-        "The S3 and DynamoDB gateway endpoints an agent's data path traverses, and "
-        "the sagemaker.api and sagemaker.runtime interface endpoints, fall outside "
-        "that match and are therefore unasserted. BR-02 covers Bedrock with the "
-        "narrower claim: it reports that an endpoint exists, reading neither private "
-        "DNS nor the endpoint policy. Widening the service-name match and adding the "
-        "two field reads to BR-02 costs no IAM, since both functions already hold "
-        "ec2:DescribeVpcEndpoints. EXTEND on both counts: AC-08's name says VPC "
-        "endpoints without qualifying which, and BR-02's says connectivity",
+        "AC-08 judges private DNS on interface endpoints, the endpoint policy, and whether "
+        "the endpoint's security groups admit inbound traffic from 0.0.0.0/0 or ::/0, on "
+        "the AgentCore interface endpoints and on the S3, DynamoDB and SageMaker endpoints "
+        "in the same VPCs, so an endpoint left on the default full-access policy is "
+        "reported. BR-02 reads "
+        "private DNS and the endpoint policy on the Bedrock endpoints, where it used to "
+        "report only that an endpoint existed",
         [],
         5,
     ),
     (
         "AIR-FND-NET-04",
-        TIGHTEN,
-        NEW_ID,
+        COVERED,
+        None,
         "agentcore_assessments",
-        ["AG-27"],
-        'AG-27 publishes "Agentic AI Gateway WAF Protection" and passes on webAclArn '
-        "being present, with a detail line saying the gateway is associated with that "
-        "web ACL. It makes no wafv2 call, so a web ACL holding no rules at all, or "
-        "holding every rule in COUNT mode, satisfies it -- the name says protection "
-        "and the assertion reaches association. That is the overclaim, and it is why "
-        "the inspection leg takes a new id. What that leg needs is the web ACL's rule "
-        "content: at least one rule in BLOCK, coverage for SQL injection and "
-        "cross-site scripting, a rate-based rule, and the association's body "
-        "inspection limit. All of it comes from wafv2:GetWebACL, which is granted "
-        "only to the GRC function, and that module runs only when the execution "
-        "input carries enableResponsibleAIGRC, so the row is hosted here, where the "
-        "incumbent lives, and claims the grant for the AgentCore function instead of "
-        "shipping conditionally. The association leg itself stays free, since AG-27 "
-        "reads webAclArn off the gateway with no wafv2 permission at all. The subject "
-        "narrows to AgentCore gateways",
-        ["wafv2:GetWebACL"],
+        ["AG-27", "AG-39"],
+        "AG-27 asserts association: a gateway names a webAclArn. AG-39 reads the rule "
+        "content behind it through wafv2:GetWebACL and fails an ACL with no rule, AWS "
+        "managed rule group or default action that blocks, no SQL injection or cross-site "
+        "scripting coverage, no rate-based rule, or an association body inspection limit "
+        "left at the 16 KB default, since a tool call carries its arguments in the body. A "
+        "customer rule group or a non-AWS managed rule group, whose rules AG-39 does not "
+        "read, turns a missing filter into Not Applicable with the group named. AWS "
+        "managed groups are credited by name, and their rule overrides are not read. The subject is AgentCore gateways",
+        [],
         5,
     ),
     (
         "AIR-FND-NET-06",
-        TIGHTEN,
-        NEW_ID,
+        COVERED,
+        None,
         "agentcore_assessments",
-        ["AC-01", "AC-15"],
-        "overlaps RT-08; resolve the two together. AC-01 reads the runtime's network "
-        "mode and its security-group egress under the ec2:DescribeSecurityGroups "
-        'grant the template carries for RT-08, and AC-15 publishes "AgentCore Code '
-        "Interpreter Network Isolation\" off a sandbox's network mode. So egress is "
-        "asserted by port and by CIDR, and not once by destination name, which is "
-        "the allow-list this control asks for. A check named for network isolation "
-        "passing a workload whose security group permits 0.0.0.0/0 on 443 is the "
-        "overclaim here, and it is why the leg takes a new id. Route 53 Resolver DNS "
-        "Firewall is the readable mechanism: "
-        "route53resolver:ListFirewallRuleGroupAssociations names the rule groups "
-        "bound to the VPC the workload runs in, and route53resolver:ListFirewallRules "
-        "shows whether the group's terminal rule blocks. Terminal means the largest "
-        "Priority, since rules are processed lowest first and Priority is unique "
-        "within a group, and enforcing means a Status of COMPLETE or absent, because "
-        "a rule needing no async provisioning reports none and reading absent as "
-        "not-enforcing would fail a correct configuration. What this leg does not "
-        "assert is that the blocked domain list is a catch-all, which is what would "
-        "make the configuration an allow-list of permitted destinations rather than a "
-        "deny-list of known-bad ones: proving catch-all membership needs "
-        "route53resolver:ListFirewallDomains, a third action this row does not claim, "
-        "so the finding reports the terminal rule's FirewallDomainListId and leaves "
-        "that confirmation to the operator. Note also that a DNS Firewall Advanced "
-        "rule is a tagged union and may carry no FirewallDomainListId at all. "
-        "Recorded because it looks like a cheaper "
-        "answer and is not: an IAM Deny on bedrock-agentcore:subnets or "
-        ":securityGroups does not close this gap, because the devguide lists those "
-        "condition keys while the machine-readable IAM reference lists none for "
-        "CreateGatewayTarget or UpdateGatewayTarget, so a Deny written against them "
-        "can fail open on the very calls that would change the network path",
-        [
-            "route53resolver:ListFirewallRuleGroupAssociations",
-            "route53resolver:ListFirewallRules",
-        ],
+        ["AC-01", "AC-15", "AC-49"],
+        "AC-01 fails a runtime or built-in tool whose security groups allow egress to "
+        "0.0.0.0/0 or ::/0, and AC-15 requires each custom code interpreter to run in VPC "
+        "mode with subnets and security groups. AC-49 asserts egress by destination "
+        "name on each VPC that hosts an AgentCore runtime, browser or code interpreter: it "
+        "reads the DNS Firewall rule group with the largest association Priority, takes the"
+        " enforcing rule with the largest Priority, and passes only a BLOCK over a customer"
+        ' domain list that holds "*", which is the walled garden pattern Route 53 '
+        'documents. ListFirewallDomains returns that entry fully qualified as "*.", and '
+        "AC-49 reads either spelling. A terminal BLOCK over an AWS managed list, over DNS threat protection, "
+        'or over a list without "*" fails, because every name those rules do not match is '
+        "answered. An IAM Deny on the bedrock-agentcore:subnets or :securityGroups keys "
+        "does not substitute for this: the devguide lists those keys while the "
+        "machine-readable IAM reference lists none for CreateGatewayTarget or "
+        "UpdateGatewayTarget, so such a Deny can fail open",
+        [],
         5,
     ),
 ]
@@ -1027,6 +931,13 @@ ROWS = [
 # A NEW_ID disposition is a claim about this name versus what the check asserts,
 # so the name is recorded here rather than paraphrased.
 INCUMBENT_NAMES = {
+    "AC-48": "AgentCore Execution Role Trust",
+    "AC-49": "AgentCore DNS Egress Control",
+    "AG-39": "Agentic AI Gateway WAF Rule Coverage",
+    "AR-10": "AWS Agent Registry Lifecycle Event Routing",
+    "BR-47": "Bedrock Data Path Bucket TLS Enforcement",
+    "BR-48": "AI Services Opt-Out Policy Enforcement",
+    "BR-49": "Guardrail Invocation Deny Enforcement",
     "AC-01": "AgentCore Runtime VPC Configuration",
     "AC-02": "AgentCore IAM Full Access Check",
     "AC-04": "AgentCore Observability Check",

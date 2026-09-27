@@ -9822,6 +9822,9 @@ class TestBR47DataPathBucketTLS:
         bucket_policies=None,
         list_knowledge_bases_error=None,
         get_data_source_error=None,
+        customization_jobs=None,
+        list_customization_jobs_error=None,
+        customization_pages=None,
     ):
         agent_client = MagicMock()
         if list_knowledge_bases_error:
@@ -9847,6 +9850,7 @@ class TestBR47DataPathBucketTLS:
         agent_client.get_data_source.side_effect = get_data_source
 
         bedrock_client = MagicMock()
+        self.bedrock_client = bedrock_client
         if logging_error:
             bedrock_client.get_model_invocation_logging_configuration.side_effect = (
                 logging_error
@@ -9855,6 +9859,33 @@ class TestBR47DataPathBucketTLS:
             bedrock_client.get_model_invocation_logging_configuration.return_value = (
                 logging_config or {}
             )
+        jobs = customization_jobs or {}
+        if list_customization_jobs_error:
+            bedrock_client.list_model_customization_jobs.side_effect = (
+                list_customization_jobs_error
+            )
+        elif customization_pages:
+            bedrock_client.list_model_customization_jobs.side_effect = (
+                customization_pages
+            )
+        else:
+            bedrock_client.list_model_customization_jobs.return_value = {
+                "modelCustomizationJobSummaries": [
+                    {
+                        "jobArn": f"arn:aws:bedrock:us-east-1:111122223333:model-customization-job/{name}",
+                        "jobName": name,
+                    }
+                    for name in jobs
+                ]
+            }
+
+        def get_job(jobIdentifier):
+            detail = jobs[jobIdentifier.rsplit("/", 1)[-1]]
+            if isinstance(detail, Exception):
+                raise detail
+            return detail
+
+        bedrock_client.get_model_customization_job.side_effect = get_job
 
         s3_client = MagicMock()
         policies = bucket_policies or {}
@@ -10030,6 +10061,110 @@ class TestBR47DataPathBucketTLS:
             in findings[0]["Finding_Details"]
         )
         assert "support-bucket" in findings[1]["Finding_Details"]
+
+    def test_br47_customization_job_buckets_are_on_the_data_path(self):
+        """Training, validation and output buckets of a job are each judged.
+
+        Without the customization leg this estate has no data path bucket and
+        reports N/A, though the training corpus bucket accepts plaintext.
+        """
+        findings = self._run(
+            customization_jobs={
+                "tune-1": {
+                    "trainingDataConfig": {"s3Uri": "s3://train-bucket/corpus/"},
+                    "validationDataConfig": {
+                        "validators": [{"s3Uri": "s3://valid-bucket/set.jsonl"}]
+                    },
+                    "outputDataConfig": {"s3Uri": "s3://out-bucket/"},
+                }
+            },
+            bucket_policies={
+                "valid-bucket": _bucket_policy(_tls_deny_statement(["valid-bucket"])),
+                "out-bucket": _bucket_policy(_tls_deny_statement(["out-bucket"])),
+            },
+        )
+
+        failed = [f for f in findings if f["Status"] == "Failed"]
+        passed = [f for f in findings if f["Status"] == "Passed"]
+        assert len(failed) == 1
+        assert "Bucket train-bucket" in failed[0]["Finding_Details"]
+        assert (
+            "the training data of customization job 'tune-1'"
+            in failed[0]["Finding_Details"]
+        )
+        assert len(passed) == 1
+        assert "2 of 3 Bedrock data path bucket(s)" in passed[0]["Finding_Details"]
+        for finding in findings:
+            assert_finding_schema(finding)
+
+    def test_br47_customization_job_list_error_is_an_incomplete_inventory(self):
+        findings = self._run(
+            list_customization_jobs_error=_client_error(
+                "AccessDeniedException", operation="ListModelCustomizationJobs"
+            ),
+            logging_config={
+                "loggingConfig": {"s3Config": {"bucketName": "log-bucket"}}
+            },
+            bucket_policies={
+                "log-bucket": _bucket_policy(_tls_deny_statement(["log-bucket"]))
+            },
+        )
+
+        assert [f["Status"] for f in findings] == ["N/A", "Passed"]
+        assert "model customization jobs" in findings[0]["Finding_Details"]
+        assert "bedrock:ListModelCustomizationJobs" in findings[0]["Resolution"]
+
+    def test_br47_one_unreadable_job_still_assesses_the_others(self):
+        findings = self._run(
+            customization_jobs={
+                "tune-1": _client_error(
+                    "AccessDeniedException", operation="GetModelCustomizationJob"
+                ),
+                "tune-2": {
+                    "trainingDataConfig": {"s3Uri": "s3://train-bucket/"},
+                    "outputDataConfig": {"s3Uri": "s3://train-bucket/out/"},
+                },
+            },
+            bucket_policies={
+                "train-bucket": _bucket_policy(_tls_deny_statement(["train-bucket"]))
+            },
+        )
+
+        assert [f["Status"] for f in findings] == ["N/A", "Passed"]
+        assert "customization job 'tune-1'" in findings[0]["Finding_Details"]
+        assert "train-bucket" in findings[1]["Finding_Details"]
+
+    def test_br47_more_jobs_than_the_cap_is_an_incomplete_inventory(self):
+        """51 jobs over two pages: the newest 50 are read, the 51st is reported."""
+        summaries = [
+            {
+                "jobArn": f"arn:aws:bedrock:us-east-1:111122223333:model-customization-job/j{i}",
+                "jobName": f"j{i}",
+            }
+            for i in range(51)
+        ]
+        pages = [
+            {"modelCustomizationJobSummaries": summaries[:30], "nextToken": "p2"},
+            {"modelCustomizationJobSummaries": summaries[30:]},
+        ]
+        detail = {"trainingDataConfig": {"s3Uri": "s3://train-bucket/"}}
+        findings = self._run(
+            customization_jobs={f"j{i}": detail for i in range(51)},
+            bucket_policies={
+                "train-bucket": _bucket_policy(_tls_deny_statement(["train-bucket"]))
+            },
+            customization_pages=pages,
+        )
+
+        assert [f["Status"] for f in findings] == ["N/A", "Passed"]
+        assert "only the newest 50 were read" in findings[0]["Finding_Details"]
+        assert self.bedrock_client.get_model_customization_job.call_count == 50
+        assert (
+            self.bedrock_client.list_model_customization_jobs.call_args_list[1][1][
+                "nextToken"
+            ]
+            == "p2"
+        )
 
     def test_br47_deny_over_the_bucket_only_leaves_objects_plaintext(self):
         """AIR-FND-DAT-02: a Deny without the /* ARN leaves GetObject over HTTP."""
@@ -11604,6 +11739,48 @@ class TestBR39MarketplaceSubnetPrivacy:
         )
 
         assert [row["Status"] for row in rows] == ["Passed"]
+
+    def test_br39_blackhole_internet_gateway_route_stays_private(self):
+        """A route whose internet gateway was deleted carries no traffic."""
+        blackhole = self._table(
+            "rtb-blackhole",
+            [
+                {"DestinationCidrBlock": "10.0.0.0/16", "GatewayId": "local"},
+                {
+                    "DestinationCidrBlock": "0.0.0.0/0",
+                    "GatewayId": "igw-deleted",
+                    "State": "blackhole",
+                },
+            ],
+            subnet_id="subnet-orphaned-igw",
+        )
+        rows = self._privacy_rows(
+            self._run(
+                self._inventory(
+                    self._endpoint("arn:endpoint-1", ["subnet-orphaned-igw"])
+                ),
+                self._ec2([self._subnet("subnet-orphaned-igw")], [blackhole]),
+            )
+        )
+
+        assert [row["Status"] for row in rows] == ["Passed"]
+
+    def test_br39_route_read_timeout_is_na_and_does_not_escape(self):
+        """A non-ClientError used to escape the check and abort the region."""
+        from botocore.exceptions import ReadTimeoutError
+
+        ec2_client = self._ec2(
+            [self._subnet("subnet-private")],
+            tables_error=ReadTimeoutError(endpoint_url="https://ec2.us-east-1"),
+        )
+        rows = self._privacy_rows(
+            self._run(
+                self._inventory(self._endpoint("arn:endpoint-1", ["subnet-private"])),
+                ec2_client,
+            )
+        )
+
+        assert [row["Status"] for row in rows] == ["N/A"]
 
     def test_br39_two_endpoints_reach_both_verdicts(self):
         findings = self._run(

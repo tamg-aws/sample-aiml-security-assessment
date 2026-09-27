@@ -21,7 +21,9 @@ left over is two things, and neither is the entailment.
     which need no clone.
   * The element count is not equated with the set size, deliberately. One `tighten`
     control with two incumbents carries two `(partial)` tags. The case below pins
-    that as a pass, because asserting one tag per control would red this tree.
+    that as a pass on a synthetic map, because the shipped maps have carried no
+    `(partial)` tag since the last `tighten` rows closed, and asserting one tag
+    per control would red any tree that reopens one.
 
 The tag parser here is written from the published tag shape rather than imported
 from check_ledger.py. An identity checked with the gate's own parser on both sides
@@ -48,17 +50,20 @@ ELEMENT = re.compile(
 )
 
 
-def tree_tag_controls():
+def tree_tag_controls(maps=None):
     """kind -> the controls that kind of tag names, read from the shipped maps.
 
     Returns the element tally beside it: the two differ whenever one control
     carries several tags of one kind, and that difference is the thing gate 14d
-    prints and does not assert.
+    prints and does not assert. `maps` replaces the shipped maps with a
+    synthetic input and leaves the parser unchanged.
     """
+    if maps is None:
+        maps = check_ledger.load_compliance_maps()
     controls = collections.defaultdict(set)
     elements = collections.Counter()
     unparseable = []
-    for module_dir, mapping in check_ledger.load_compliance_maps().items():
+    for module_dir, mapping in maps.items():
         for check_id, tag in mapping.items():
             for element in tag.split(" | "):
                 found = ELEMENT.fullmatch(element)
@@ -90,16 +95,19 @@ def test_the_shipped_maps_and_rows_satisfy_both_identities():
     """The real tree, through a parser the gate does not share.
 
     The population is asserted first: empty sets satisfy both identities, and an
-    identity over nothing is the pass this whole file would otherwise be.
+    identity over nothing is the pass this whole file would otherwise be. Only the
+    covered leg is populated in this tree. The last `tighten` rows closed, so no
+    tag carries `(partial)` and the partial leg of the identity holds over an empty
+    set here; the synthetic cases below are what exercise that leg and its parse.
     """
     tags, elements, unparseable = tree_tag_controls()
     verdicts = tree_verdict_controls()
     assert not unparseable, f"tags this test cannot read: {unparseable}"
-    assert elements["bare"] and elements["partial"] and elements["joint"], (
-        f"one of the three tag kinds is unpopulated {dict(elements)}, so the "
-        "identities below hold over an empty set"
+    assert elements["bare"] and elements["joint"], (
+        f"a covered tag kind is unpopulated {dict(elements)}, so the covered "
+        "identity below holds over an empty set"
     )
-    assert verdicts["covered"] and verdicts["tighten"]
+    assert verdicts["covered"]
 
     assert check_ledger.tagged_control_problems(tags, verdicts) == []
 
@@ -107,17 +115,24 @@ def test_the_shipped_maps_and_rows_satisfy_both_identities():
 def test_the_element_count_exceeding_the_control_count_is_not_a_failure_here():
     """One `tighten` control with two incumbents carries two `(partial)` tags.
 
-    Legal, and the state of this tree. The doc-side clause that does claim one tag
-    each is asserted by census_relations() at the refs that publish it, so the
-    claim is gated where it is made and not where it would red a correct tree.
+    Legal. The shipped maps no longer carry a `(partial)` tag, so the case is a
+    synthetic map read through the same parser, with one of the two tags inside a
+    joined value. The doc-side clause that does claim one tag each is asserted by
+    census_relations() at the refs that publish it, so the claim is gated where it
+    is made and not where it would red a correct tree.
     """
-    tags, elements, _ = tree_tag_controls()
-    assert elements["partial"] > len(tags["partial"]), (
-        "no control carries two tags of one kind in this tree, so this case no "
-        f"longer measures anything: {elements['partial']} element(s) over "
-        f"{len(tags['partial'])} control(s)"
-    )
-    assert check_ledger.tagged_control_problems(tags, tree_verdict_controls()) == []
+    maps = {
+        "bedrock_assessments": {
+            "BR-90": "AISF AIR-BDR-GRD-02 (partial)",
+            "BR-91": "AISF AIR-BDR-GRD-01 | AISF AIR-BDR-GRD-02 (partial)",
+        }
+    }
+    tags, elements, unparseable = tree_tag_controls(maps)
+    assert unparseable == []
+    assert elements["partial"] == 2
+    assert tags["partial"] == {"AIR-BDR-GRD-02"}
+    verdicts = {"covered": {"AIR-BDR-GRD-01"}, "tighten": {"AIR-BDR-GRD-02"}}
+    assert check_ledger.tagged_control_problems(tags, verdicts) == []
 
 
 def test_two_populations_of_one_size_over_different_members_fail():

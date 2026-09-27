@@ -10440,7 +10440,7 @@ def _subnet_route_privacy(
             for subnet in page.get("Subnets", []):
                 if subnet.get("SubnetId"):
                     vpc_by_subnet[subnet["SubnetId"]] = subnet.get("VpcId") or ""
-    except ClientError as error:
+    except Exception as error:
         result["error"] = get_assessment_error_label(error)
         return result
 
@@ -10466,7 +10466,7 @@ def _subnet_route_privacy(
                         main_by_vpc[table.get("VpcId") or ""] = table
                     elif association.get("SubnetId"):
                         explicit[association["SubnetId"]] = table
-    except ClientError as error:
+    except Exception as error:
         result["error"] = get_assessment_error_label(error)
         return result
 
@@ -10483,6 +10483,7 @@ def _subnet_route_privacy(
             route
             for route in table.get("Routes", [])
             if str(route.get("GatewayId") or "").startswith("igw-")
+            and route.get("State") != "blackhole"
         ]
         if internet_routes:
             route = internet_routes[0]
@@ -13092,6 +13093,18 @@ S3_ALL_ACTIONS = "s3:*"
 
 MAX_REPORTED_PLAINTEXT_BUCKETS = 20
 
+# Each customization job's buckets take one GetModelCustomizationJob call, and
+# the summaries ListModelCustomizationJobs returns carry no S3 location, so the
+# newest jobs are read and a longer history is reported as an incomplete list.
+MAX_CUSTOMIZATION_JOBS_READ = 50
+
+
+def _s3_uri_bucket(uri: Any) -> Optional[str]:
+    """Return the bucket of an s3://bucket/prefix URI, or None for anything else."""
+    if not isinstance(uri, str) or not uri.startswith("s3://"):
+        return None
+    return uri[len("s3://") :].split("/", 1)[0] or None
+
 
 def _strip_condition_set_operator(operator: Any) -> str:
     """
@@ -13276,9 +13289,10 @@ def _ai_data_path_buckets(region: str = "") -> Dict[str, Any]:
     Resolve the S3 buckets that Bedrock reads training data from and writes
     inference records to.
 
-    Knowledge base data sources carry the retrieval corpus and the model
-    invocation log destination carries prompts and completions, so both sit on
-    the AI data path. Each bucket is resolved once and the labels are collected,
+    Knowledge base data sources carry the retrieval corpus, the model
+    invocation log destination carries prompts and completions, and a model
+    customization job reads training and validation data from S3 and writes its
+    output there, so all of them sit on the AI data path. Each bucket is resolved once and the labels are collected,
     because one bucket often serves several knowledge bases.
     """
     buckets: Dict[str, List[str]] = {}
@@ -13313,6 +13327,58 @@ def _ai_data_path_buckets(region: str = "") -> Dict[str, Any]:
         buckets.setdefault(logging_bucket, []).append(
             "the model invocation log destination"
         )
+
+    try:
+        jobs = []
+        request = {"sortBy": "CreationTime", "sortOrder": "Descending"}
+        while len(jobs) <= MAX_CUSTOMIZATION_JOBS_READ:
+            page = bedrock_client.list_model_customization_jobs(**request)
+            if not isinstance(page, dict):
+                break
+            jobs.extend(page.get("modelCustomizationJobSummaries") or [])
+            token = page.get("nextToken")
+            if (
+                not isinstance(token, str)
+                or not token
+                or token == request.get("nextToken")
+            ):
+                break
+            request["nextToken"] = token
+    except Exception as error:
+        jobs = []
+        errors.append(f"model customization jobs: {get_assessment_error_label(error)}")
+    if len(jobs) > MAX_CUSTOMIZATION_JOBS_READ:
+        errors.append(
+            f"model customization jobs: only the newest {MAX_CUSTOMIZATION_JOBS_READ} "
+            "were read"
+        )
+    for job in jobs[:MAX_CUSTOMIZATION_JOBS_READ]:
+        job_name = job.get("jobName") or job.get("jobArn") or "unnamed"
+        try:
+            detail = bedrock_client.get_model_customization_job(
+                jobIdentifier=job.get("jobArn") or job_name
+            )
+        except Exception as error:
+            errors.append(
+                f"customization job '{job_name}': {get_assessment_error_label(error)}"
+            )
+            continue
+        locations = [
+            ("training data", (detail.get("trainingDataConfig") or {}).get("s3Uri")),
+            ("output", (detail.get("outputDataConfig") or {}).get("s3Uri")),
+        ] + [
+            ("validation data", validator.get("s3Uri"))
+            for validator in (detail.get("validationDataConfig") or {}).get(
+                "validators"
+            )
+            or []
+        ]
+        for role, uri in locations:
+            bucket = _s3_uri_bucket(uri)
+            if bucket:
+                buckets.setdefault(bucket, []).append(
+                    f"the {role} of customization job '{job_name}'"
+                )
 
     return {"buckets": buckets, "errors": errors}
 
@@ -13356,8 +13422,10 @@ def check_bedrock_data_path_bucket_tls(region: str = "") -> Dict[str, Any]:
                     ),
                     resolution=(
                         "Grant bedrock:ListKnowledgeBases, bedrock:ListDataSources, "
-                        "bedrock:GetDataSource and "
-                        "bedrock:GetModelInvocationLoggingConfiguration, then retry."
+                        "bedrock:GetDataSource, "
+                        "bedrock:GetModelInvocationLoggingConfiguration, "
+                        "bedrock:ListModelCustomizationJobs and "
+                        "bedrock:GetModelCustomizationJob, then retry."
                     ),
                     reference=AI_DATA_PATH_TLS_REFERENCE,
                     severity="Informational",
@@ -13372,9 +13440,10 @@ def check_bedrock_data_path_bucket_tls(region: str = "") -> Dict[str, Any]:
                     check_id="BR-47",
                     finding_name=check_name,
                     finding_details=(
-                        "No knowledge base ingests from an S3 bucket in {} and no "
-                        "model invocation log destination is configured, so there is "
-                        "no data path bucket whose transport can be "
+                        "No knowledge base ingests from an S3 bucket in {}, no "
+                        "model invocation log destination is configured and no "
+                        "model customization job names a bucket, so there is no "
+                        "data path bucket whose transport can be "
                         "assessed.".format(region or "this region")
                     ),
                     resolution="No action required",
@@ -13511,7 +13580,8 @@ def check_bedrock_data_path_bucket_tls(region: str = "") -> Dict[str, Any]:
                     ),
                     resolution=(
                         "No action required. Re-check whenever a knowledge base data "
-                        "source or a log destination adds a bucket."
+                        "source, a log destination or a customization job adds a "
+                        "bucket."
                     ),
                     reference=AI_DATA_PATH_TLS_REFERENCE,
                     severity="Medium",
