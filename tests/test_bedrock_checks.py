@@ -13816,7 +13816,13 @@ class TestBR54LambdaPublicInvoke:
         )
         assert [r["Status"] for r in rows] == ["Failed", "Passed"]
         assert "'b-open'" in rows[0]["Finding_Details"]
-        assert "AuthType NONE" in rows[0]["Finding_Details"]
+        assert (
+            "AuthType NONE, which disables IAM authentication"
+            in rows[0]["Finding_Details"]
+        )
+        assert "grants no public access today" in rows[0]["Finding_Details"]
+        assert "does not accept requests yet" in rows[0]["Finding_Details"]
+        assert "unauthenticated callers can invoke" not in rows[0]["Finding_Details"]
         assert (
             "does not test whether the function can be reached"
             in rows[0]["Finding_Details"]
@@ -13892,6 +13898,75 @@ class TestBR54LambdaPublicInvoke:
             },
         )
         assert [r["Status"] for r in rows] == ["Failed"]
+
+    def test_br54_url_none_with_the_public_pair_is_invocable(self):
+        pair = self._policy_json(
+            dict(
+                self.PUBLIC,
+                Sid="FunctionURLAllowPublicAccess",
+                Action="lambda:InvokeFunctionUrl",
+                Condition={"StringEquals": {"lambda:FunctionUrlAuthType": "NONE"}},
+            ),
+            dict(
+                self.PUBLIC,
+                Sid="FunctionURLInvokeAllowPublicAccess",
+                Action="lambda:InvokeFunction",
+                Condition={"Bool": {"lambda:InvokedViaFunctionUrl": "true"}},
+            ),
+        )
+        _, rows, _ = self._run(
+            ["a-private", "b-open"],
+            urls={
+                "a-private": [{"FunctionUrl": "https://a", "AuthType": "AWS_IAM"}],
+                "b-open": [{"FunctionUrl": "https://b", "AuthType": "NONE"}],
+            },
+            policies={"b-open": pair},
+        )
+        assert [r["Status"] for r in rows] == ["Failed", "Passed"]
+        details = rows[0]["Finding_Details"]
+        assert (
+            "function URL https://b has AuthType NONE and the resource-based "
+            "policy grants public access, so unauthenticated callers can invoke it"
+        ) in details
+        assert "no public access today" not in details
+        assert (
+            "statement 'FunctionURLAllowPublicAccess' allows "
+            "lambda:invokefunctionurl to '*'" in details
+        )
+        assert (
+            "statement 'FunctionURLInvokeAllowPublicAccess' allows "
+            "lambda:invokefunction to '*'" in details
+        )
+
+    def test_br54_invoked_via_url_condition_does_not_restrict_but_source_arn_does(
+        self,
+    ):
+        _, rows, _ = self._run(
+            ["a-source-arn", "b-via-url"],
+            policies={
+                "a-source-arn": self._policy_json(
+                    dict(
+                        self.PUBLIC,
+                        Condition={
+                            "ArnLike": {
+                                "aws:SourceArn": "arn:aws:execute-api:us-east-1:"
+                                "123456789012:abc123/*"
+                            }
+                        },
+                    )
+                ),
+                "b-via-url": self._policy_json(
+                    dict(
+                        self.PUBLIC,
+                        Condition={"Bool": {"lambda:InvokedViaFunctionUrl": "true"}},
+                    )
+                ),
+            },
+        )
+        assert [r["Status"] for r in rows] == ["Failed", "Passed"]
+        assert "'b-via-url'" in rows[0]["Finding_Details"]
+        assert "with no source condition" in rows[0]["Finding_Details"]
+        assert "1 of the 2 Lambda function(s)" in rows[1]["Finding_Details"]
 
     def test_br54_second_page_of_functions_is_read(self):
         _, rows, lam = self._run(
@@ -14013,10 +14088,14 @@ class TestBR55EnclaveKeyBinding:
         assert [r["Status"] for r in rows] == ["Failed", "Passed"]
         assert "arn:k/b-root" in rows[0]["Finding_Details"]
         assert (
-            "grants kms:decrypt, kms:generatedatakey, kms:generatedatakeypair to the account"
+            "grants kms:decrypt, kms:derivesharedsecret, kms:generatedatakey, "
+            "kms:generatedatakeypair to the account" in rows[0]["Finding_Details"]
+        )
+        assert (
+            "declares a Nitro Enclave attestation condition"
             in rows[0]["Finding_Details"]
         )
-        assert "arn:k/a-pinned" in rows[1]["Finding_Details"]
+        assert "arn:k/a-pinned (Nitro Enclave)" in rows[1]["Finding_Details"]
         assert result["status"] == "WARN"
 
     def test_br55_pcr0_pins_the_image_like_imagesha384(self):
@@ -14025,15 +14104,24 @@ class TestBR55EnclaveKeyBinding:
         )
         assert [r["Status"] for r in rows] == ["Passed"]
 
-    def test_br55_binding_on_other_pcrs_only_fails(self):
+    def test_br55_binding_on_any_pcr_pins_the_key(self):
         _, rows, _ = self._run(
-            {"k": [self._enclave_allow(key="kms:RecipientAttestation:PCR8")]}
+            {
+                "a-pcr8": [self._enclave_allow(key="kms:RecipientAttestation:PCR8")],
+                "b-unpinned": [
+                    self._enclave_allow(
+                        condition={"Null": {"kms:RecipientAttestation:PCR8": "false"}}
+                    )
+                ],
+            }
         )
-        assert [r["Status"] for r in rows] == ["Failed"]
+        assert [r["Status"] for r in rows] == ["Failed", "Passed"]
+        assert "arn:k/b-unpinned" in rows[0]["Finding_Details"]
         assert (
-            "no statement requires an exact ImageSha384 or PCR0"
+            "no statement requires an exact ImageSha384, PCR or NitroTPMPCR value"
             in rows[0]["Finding_Details"]
         )
+        assert "arn:k/a-pcr8 (Nitro Enclave)" in rows[1]["Finding_Details"]
 
     def test_br55_if_exists_negated_and_wildcard_tests_do_not_pin(self):
         key = "kms:RecipientAttestation:ImageSha384"
@@ -14045,7 +14133,7 @@ class TestBR55EnclaveKeyBinding:
         ):
             _, rows, _ = self._run({"k": [self._enclave_allow(condition=condition)]})
             assert [r["Status"] for r in rows] == ["Failed"], condition
-            assert "with no enclave image condition" in rows[0]["Finding_Details"]
+            assert "with no attestation condition" in rows[0]["Finding_Details"]
 
     def test_br55_set_operator_prefix_on_the_operator_is_stripped(self):
         _, rows, _ = self._run(
@@ -14068,7 +14156,7 @@ class TestBR55EnclaveKeyBinding:
             "Sid": "DenyUnattested",
             "Effect": "Deny",
             "Principal": "*",
-            "Action": ["kms:Decrypt", "kms:GenerateDataKey*"],
+            "Action": ["kms:Decrypt", "kms:DeriveSharedSecret", "kms:GenerateDataKey*"],
             "Resource": "*",
             "Condition": {
                 "StringNotEqualsIgnoreCase": {
@@ -14106,12 +14194,70 @@ class TestBR55EnclaveKeyBinding:
         )
         assert kms.describe_key.call_count == 1
 
-    def test_br55_nitro_tpm_only_key_is_na(self):
+    def test_br55_nitro_tpm_key_is_judged_and_named(self):
+        tpm = "kms:RecipientAttestation:NitroTPMPCR4"
         _, rows, _ = self._run(
-            {"k": [self._enclave_allow(key="kms:RecipientAttestation:NitroTPMPCR4")]}
+            {
+                "a-tpm": [self._enclave_allow(key=tpm)],
+                "b-tpm-root": [self.ROOT, self._enclave_allow(key=tpm)],
+            }
         )
-        assert [r["Status"] for r in rows] == ["N/A"]
-        assert "NitroTPM" in rows[0]["Finding_Details"]
+        assert [r["Status"] for r in rows] == ["Failed", "Passed"]
+        assert "arn:k/b-tpm-root" in rows[0]["Finding_Details"]
+        assert "declares a NitroTPM attestation condition" in rows[0]["Finding_Details"]
+        assert "arn:k/a-tpm (NitroTPM)" in rows[1]["Finding_Details"]
+
+    def test_br55_mixed_families_are_both_named(self):
+        statements = [
+            self._enclave_allow(),
+            dict(
+                self._enclave_allow(key="kms:RecipientAttestation:NitroTPMPCR0"),
+                Sid="Tpm",
+            ),
+        ]
+        _, rows, _ = self._run({"k": statements})
+        assert [r["Status"] for r in rows] == ["Passed"]
+        assert "arn:k/k (Nitro Enclave and NitroTPM)" in rows[0]["Finding_Details"]
+
+    def test_br55_derive_shared_secret_is_a_bypass_action(self):
+        derive = {
+            "Sid": "Derive",
+            "Effect": "Allow",
+            "Principal": {"AWS": "arn:aws:iam::123456789012:role/app"},
+            "Action": "kms:DeriveSharedSecret",
+            "Resource": "*",
+        }
+        _, rows, _ = self._run(
+            {
+                "a-pinned": [self._enclave_allow()],
+                "b-derive": [derive, self._enclave_allow()],
+            }
+        )
+        assert [r["Status"] for r in rows] == ["Failed", "Passed"]
+        assert "arn:k/b-derive" in rows[0]["Finding_Details"]
+        assert (
+            "statement 'Derive' allows kms:derivesharedsecret with no attestation "
+            "condition" in rows[0]["Finding_Details"]
+        )
+
+    def test_br55_deny_missing_derive_shared_secret_leaves_it_open(self):
+        deny = {
+            "Sid": "DenyUnattested",
+            "Effect": "Deny",
+            "Principal": "*",
+            "Action": ["kms:Decrypt", "kms:GenerateDataKey*"],
+            "Resource": "*",
+            "Condition": {
+                "StringNotEqualsIgnoreCase": {
+                    "kms:RecipientAttestation:ImageSha384": self.DIGEST
+                }
+            },
+        }
+        _, rows, _ = self._run({"k": [self.ROOT, deny]})
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert (
+            "grants kms:derivesharedsecret to the account" in rows[0]["Finding_Details"]
+        )
 
     def test_br55_second_page_of_keys_is_read(self):
         kms_pages = [

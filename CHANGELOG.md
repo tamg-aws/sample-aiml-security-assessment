@@ -111,8 +111,9 @@ section.
   buckets), `BR-53` (an owner tag on agents, knowledge bases, guardrails,
   custom and imported models, and provisioned throughputs), `BR-54` (public
   Lambda function URLs and unconditioned `*` invoke grants), and `BR-55`
-  (KMS keys that use Nitro Enclaves attestation but allow decryption without
-  pinning the enclave image). Four existing checks gain a leg:
+  (KMS keys that use Nitro Enclave or NitroTPM attestation but allow
+  decryption, shared secret derivation or data key generation without an
+  attestation pin). Four existing checks gain a leg:
   - `BR-01` fails customer-managed, inline and group policies that grant
     every Bedrock action or grant Bedrock through `NotAction`.
   - `BR-04` credits only a lifecycle rule that covers the `<keyPrefix>/AWSLogs/`

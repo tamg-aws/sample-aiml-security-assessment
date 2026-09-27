@@ -15429,6 +15429,10 @@ LAMBDA_PUBLIC_INVOKE_REFERENCE = (
 LAMBDA_INVOKE_ACTIONS = ("lambda:invokefunction", "lambda:invokefunctionurl")
 
 # Any one of these on the statement limits the grant to a named source.
+# AddPermission is the only writer of a function policy, and these are its only
+# caller-scoping parameters. lambda:FunctionUrlAuthType and
+# lambda:InvokedViaFunctionUrl, which it also writes, say how the function is
+# called and not who calls it, so neither clears a "*" principal.
 LAMBDA_SOURCE_CONDITION_KEYS = (
     "aws:sourcearn",
     "aws:sourceaccount",
@@ -15545,12 +15549,11 @@ def check_lambda_public_invoke_configuration(region: str = "") -> Dict[str, Any]
                     max_results=50,
                     FunctionName=name,
                 )
-                problems.extend(
-                    f"function URL {url.get('FunctionUrl', 'unknown')} has AuthType "
-                    "NONE, so it accepts requests with no IAM signature"
+                open_urls = [
+                    url.get("FunctionUrl", "unknown")
                     for url in urls
                     if url.get("AuthType") == "NONE"
-                )
+                ]
                 try:
                     policy = lambda_client.get_policy(FunctionName=name).get("Policy")
                 except ClientError as error:
@@ -15560,12 +15563,31 @@ def check_lambda_public_invoke_configuration(region: str = "") -> Dict[str, Any]
                     ):
                         raise
                     policy = None
-                if policy:
-                    problems.extend(_lambda_public_invoke_statements(policy))
+                public = _lambda_public_invoke_statements(policy) if policy else []
             except Exception as error:
                 indeterminate.append(f"{name}: {get_assessment_error_label(error)}")
                 continue
 
+            # With AuthType NONE the resource policy still decides, so a URL
+            # is callable without a signature only when a public statement
+            # also exists.
+            for url in open_urls:
+                if public:
+                    problems.append(
+                        f"function URL {url} has AuthType NONE and the "
+                        "resource-based policy grants public access, so "
+                        "unauthenticated callers can invoke it"
+                    )
+                else:
+                    problems.append(
+                        f"function URL {url} has AuthType NONE, which disables IAM "
+                        "authentication; the resource-based policy grants no "
+                        "public access today, so the URL does not accept requests "
+                        "yet, but one permission granted to '*' would open it"
+                    )
+            problems.extend(
+                f"{statement} with no source condition" for statement in public
+            )
             if not problems:
                 compliant.append(name)
                 continue
@@ -15639,22 +15661,28 @@ ENCLAVE_KEY_REFERENCE = "https://docs.aws.amazon.com/kms/latest/developerguide/c
 
 ATTESTATION_CONDITION_PREFIX = "kms:recipientattestation:"
 
-# ImageSha384 and PCR0 both carry the enclave image digest, so a binding on
-# either one pins the code that can use the key. PCR1 to PCR8 measure other
-# parts of the enclave and do not.
-ENCLAVE_IMAGE_KEYS = (
-    ATTESTATION_CONDITION_PREFIX + "imagesha384",
-    ATTESTATION_CONDITION_PREFIX + "pcr0",
+# The attestation measurements a key can be bound to. ImageSha384 corresponds to
+# PCR0, so both, and every other PCR<n>, bind a Nitro Enclave; NitroTPMPCR<n>
+# binds NitroTPM attestation instead.
+ATTESTATION_BINDING_KEY = re.compile(
+    r"^kms:recipientattestation:(imagesha384|pcr\d+|nitrotpmpcr\d+)$"
 )
 
 NITRO_TPM_KEY_PREFIX = ATTESTATION_CONDITION_PREFIX + "nitrotpmpcr"
 
-# The operations that return key material or plaintext to the caller.
+# The key operations that honor RecipientAttestation. GenerateRandom also does,
+# but it takes no key, so a key policy cannot grant it.
 ENCLAVE_SENSITIVE_ACTIONS = (
     "kms:decrypt",
+    "kms:derivesharedsecret",
     "kms:generatedatakey",
     "kms:generatedatakeypair",
 )
+
+
+def _attestation_family(key: str) -> str:
+    """Name the attestation family a RecipientAttestation condition key belongs to."""
+    return "NitroTPM" if key.startswith(NITRO_TPM_KEY_PREFIX) else "Nitro Enclave"
 
 
 def _statement_covers_kms_actions(statement: Dict[str, Any]) -> List[str]:
@@ -15680,13 +15708,13 @@ def _statement_covers_kms_actions(statement: Dict[str, Any]) -> List[str]:
 
 def _allow_pins_enclave_image(statement: Dict[str, Any]) -> bool:
     """
-    Return True when an Allow requires an exact enclave image digest.
+    Return True when an Allow requires an exact attestation measurement.
 
     A negated test, a Null test, an IfExists test (which passes when the request
     carries no attestation) or a wildcard value does not pin the image.
     """
     for operator, key, values in _condition_keys_by_operator(statement):
-        if key not in ENCLAVE_IMAGE_KEYS:
+        if not ATTESTATION_BINDING_KEY.match(key):
             continue
         test = _strip_condition_set_operator(operator)
         if "not" in test or "null" in test or test.endswith("ifexists"):
@@ -15701,13 +15729,13 @@ def _allow_pins_enclave_image(statement: Dict[str, Any]) -> bool:
 def _deny_requires_enclave_image(statement: Dict[str, Any]) -> bool:
     """
     Return True when a Deny to every principal fires unless the request carries
-    the approved enclave image digest: a negated test or Null true on ImageSha384
-    or PCR0.
+    the approved attestation measurement: a negated test or Null true on an
+    ImageSha384, PCR<n> or NitroTPMPCR<n> key.
     """
     if not _principal_is_everyone(statement.get("Principal")):
         return False
     for operator, key, values in _condition_keys_by_operator(statement):
-        if key not in ENCLAVE_IMAGE_KEYS:
+        if not ATTESTATION_BINDING_KEY.match(key):
             continue
         test = _strip_condition_set_operator(operator)
         if "not" in test:
@@ -15732,10 +15760,11 @@ def _enclave_key_assessment(document: Any) -> Dict[str, Any]:
     """
     Classify a key policy by its RecipientAttestation conditions.
 
-    ``scope`` is "none" when no statement uses a RecipientAttestation key,
-    "tpm" when only NitroTPM keys are used, and "enclave" otherwise. For an
-    enclave key, ``pinned`` says whether any statement pins the image digest and
-    ``bypasses`` lists the Allow statements that release key material without it.
+    ``scope`` is "none" when no statement uses a RecipientAttestation key and
+    "attested" otherwise. For an attested key, ``families`` names the
+    attestation families its conditions use, ``pinned`` says whether any
+    statement pins a measurement and ``bypasses`` lists the Allow statements
+    that release key material without it.
     """
     statements = _policy_statements(document)
     attestation_keys = {
@@ -15746,8 +15775,13 @@ def _enclave_key_assessment(document: Any) -> Dict[str, Any]:
     }
     if not attestation_keys:
         return {"scope": "none"}
-    if all(key.startswith(NITRO_TPM_KEY_PREFIX) for key in attestation_keys):
-        return {"scope": "tpm"}
+    families = sorted(
+        {
+            _attestation_family(key)
+            for key in attestation_keys
+            if ATTESTATION_BINDING_KEY.match(key)
+        }
+    )
 
     denied = set()
     pinned = False
@@ -15781,16 +15815,21 @@ def _enclave_key_assessment(document: Any) -> Dict[str, Any]:
         else:
             bypasses.append(
                 f"statement '{label}' allows {', '.join(open_actions)} with no "
-                "enclave image condition"
+                "attestation condition"
             )
-    return {"scope": "enclave", "pinned": pinned, "bypasses": bypasses}
+    return {
+        "scope": "attested",
+        "families": families,
+        "pinned": pinned,
+        "bypasses": bypasses,
+    }
 
 
 def check_kms_enclave_key_binding(region: str = "") -> Dict[str, Any]:
     """
-    BR-55: For every KMS key whose policy declares a Nitro Enclaves attestation
-    condition, verify the policy pins the enclave image and leaves no other path
-    to decrypt or generate data keys without attestation.
+    BR-55: For every KMS key whose policy declares a RecipientAttestation
+    condition, verify the policy pins an attestation measurement and leaves no
+    other path to the attested key operations without attestation.
     """
     logger.debug("Starting check for KMS enclave attestation binding")
     check_name = ENCLAVE_KEY_FINDING
@@ -15826,7 +15865,6 @@ def check_kms_enclave_key_binding(region: str = "") -> Dict[str, Any]:
         )
 
         undeclared = 0
-        tpm_only = []
         passed = []
         indeterminate = []
         for key in keys:
@@ -15845,29 +15883,31 @@ def check_kms_enclave_key_binding(region: str = "") -> Dict[str, Any]:
                 continue
             if (metadata or {}).get("KeyManager") == "AWS":
                 continue
-            if assessment["scope"] == "tpm":
-                tpm_only.append(key_id)
-                continue
+            family = (
+                " and ".join(assessment["families"])
+                or "an unrecognized RecipientAttestation"
+            )
 
             deficiencies = []
             if not assessment["pinned"]:
                 deficiencies.append(
-                    "no statement requires an exact ImageSha384 or PCR0 value, so "
-                    "the key is not bound to one enclave image"
+                    "no statement requires an exact ImageSha384, PCR or NitroTPMPCR "
+                    "value, so the key is not bound to one attested image"
                 )
             deficiencies.extend(assessment["bypasses"])
             if not deficiencies:
-                passed.append(key_id)
+                passed.append(f"{key_id} ({family})")
                 continue
             findings["status"] = "WARN"
             findings["csv_data"].append(
                 row(
-                    f"KMS key {key_id} declares a Nitro Enclaves attestation "
-                    f"condition, but {'; '.join(deficiencies)}.",
-                    "Require an exact enclave image digest on every key policy "
-                    "statement that allows decryption or data key generation, "
-                    "and remove the account's unconditioned grant of those "
-                    "operations or deny them when the attestation is missing.",
+                    f"KMS key {key_id} declares a {family} attestation condition, "
+                    f"but {'; '.join(deficiencies)}.",
+                    "Require an exact attestation measurement on every key policy "
+                    "statement that allows decryption, shared secret derivation "
+                    "or data key generation, and remove the account's "
+                    "unconditioned grant of those operations or deny them when "
+                    "the attestation is missing.",
                     "High",
                     "Failed",
                 )
@@ -15876,24 +15916,14 @@ def check_kms_enclave_key_binding(region: str = "") -> Dict[str, Any]:
         if passed:
             findings["csv_data"].append(
                 row(
-                    "{} enclave-bound KMS key(s) pin the enclave image and allow "
-                    "decryption and data key generation only with attestation: "
-                    "{}.".format(len(passed), ", ".join(passed[:5])),
+                    "{} attestation-bound KMS key(s) pin an attestation measurement "
+                    "and allow decryption, shared secret derivation and data key "
+                    "generation only with attestation: {}.".format(
+                        len(passed), ", ".join(passed[:5])
+                    ),
                     "No action required",
                     "High",
                     "Passed",
-                )
-            )
-        if tpm_only:
-            findings["csv_data"].append(
-                row(
-                    "{} KMS key(s) are bound only to NitroTPM attestation, which "
-                    "this Nitro Enclaves check does not judge: {}.".format(
-                        len(tpm_only), ", ".join(tpm_only[:5])
-                    ),
-                    "No action required",
-                    "Informational",
-                    "N/A",
                 )
             )
         if indeterminate:
@@ -15911,7 +15941,7 @@ def check_kms_enclave_key_binding(region: str = "") -> Dict[str, Any]:
             findings["csv_data"].append(
                 row(
                     "{} of the {} KMS key(s) read carry no RecipientAttestation "
-                    "condition, so they are not declared enclave-bound and are not "
+                    "condition, so they are not declared attestation-bound and are not "
                     "judged.".format(undeclared, len(keys)),
                     "No action required",
                     "Informational",
