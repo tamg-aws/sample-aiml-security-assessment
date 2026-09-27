@@ -145,6 +145,7 @@ REQUIRED_SAGEMAKER_ACTIONS = {
     "organizations:ListDelegatedAdministrators",
     "securityhub:GetEnabledStandards",
     "eks:ListClusters",
+    "eks:DescribeCluster",
     "eks:ListAddons",
     "eks:DescribeAddon",
     "secretsmanager:ListSecrets",

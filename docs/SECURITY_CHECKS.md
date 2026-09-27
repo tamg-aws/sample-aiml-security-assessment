@@ -323,7 +323,7 @@ investigation and remediation.
 ### SM-39: EKS VPC CNI Network Policy
 
 - **Severity:** Medium
-- **Description:** For each EKS cluster, reads the managed `vpc-cni` add-on's `configurationValues` and requires `enableNetworkPolicy` to be true (EKS returns the value as the string `"true"` inside a JSON or YAML document). A cluster without the managed add-on is reported `N/A`, because enforcement by a self-managed CNI is not readable through the EKS API. Whether NetworkPolicy objects restrict each workload is not read. One cluster's read error is reported for that cluster alone.
+- **Description:** For each EKS cluster, reads the managed `vpc-cni` add-on's `configurationValues` and requires `enableNetworkPolicy` to be true (EKS returns the value as the string `"true"` inside a JSON or YAML document). A pass means network-policy enforcement is enabled on the add-on; whether NetworkPolicy objects restrict pod traffic is a Kubernetes-API fact this scan cannot read. An EKS Auto Mode cluster (`computeConfig.enabled`) is reported `N/A`, because Auto Mode sets network policy on the NodeClass, a Kubernetes object no AWS API returns. Any other cluster without the managed add-on is reported `N/A`, because enforcement by a self-managed CNI is not readable through the EKS API. One cluster's read error is reported for that cluster alone.
 
 ### SM-40: Secrets Manager Rotation
 

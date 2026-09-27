@@ -716,6 +716,7 @@ Resources:
             - Sid: EKSAddonRead
               Effect: Allow
               Action:
+                - eks:DescribeCluster # SM-39
                 - eks:ListAddons # SM-39
                 - eks:DescribeAddon # SM-39
               Resource:

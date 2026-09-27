@@ -5364,6 +5364,94 @@ class TestSM39EksVpcCniNetworkPolicy:
             clusterName="agents-good", addonName="vpc-cni"
         )
 
+    @staticmethod
+    def _cluster_client(clusters, config_by_cluster, compute_by_cluster=None):
+        """Every cluster runs the managed vpc-cni add-on with the given value."""
+        compute_by_cluster = compute_by_cluster or {}
+        client = MagicMock()
+        client.get_paginator.side_effect = _pager(
+            {
+                "list_clusters": [{"clusters": clusters}],
+                "list_addons": lambda clusterName: [{"addons": ["vpc-cni"]}],
+            }
+        )
+        client.describe_cluster.side_effect = lambda name: {
+            "cluster": {"name": name, **compute_by_cluster.get(name, {})}
+        }
+
+        def describe_addon(clusterName, addonName):
+            addon = {"addonName": addonName}
+            if config_by_cluster.get(clusterName) is not None:
+                addon["configurationValues"] = config_by_cluster[clusterName]
+            return {"addon": addon}
+
+        client.describe_addon.side_effect = describe_addon
+        return client
+
+    @patch("sagemaker_app.boto3.client")
+    def test_true_then_missing_configuration_values_is_passed_then_failed(
+        self, mock_client
+    ):
+        mock_client.return_value = self._cluster_client(
+            ["agents-a", "agents-b"],
+            {"agents-a": '{"enableNetworkPolicy":"true"}', "agents-b": None},
+        )
+        rows = _rows(sagemaker_app.check_eks_vpc_cni_network_policy("us-east-1"))
+        assert sorted(r["Status"] for r in rows) == ["Failed", "Passed"]
+        failed = next(r for r in rows if r["Status"] == "Failed")
+        passed = next(r for r in rows if r["Status"] == "Passed")
+        assert "'agents-b'" in failed["Finding_Details"]
+        assert "agents-a" in passed["Finding_Details"]
+        assert "agents-b" not in passed["Finding_Details"]
+        assert (
+            "Network-policy enforcement is enabled on the VPC CNI add-on; whether "
+            "NetworkPolicy objects restrict pod traffic is a Kubernetes-API fact "
+            "this scan cannot read." in passed["Finding_Details"]
+        )
+
+    @patch("sagemaker_app.boto3.client")
+    def test_boolean_true_configuration_value_passes(self, mock_client):
+        mock_client.return_value = self._cluster_client(
+            ["agents-bool"], {"agents-bool": '{"enableNetworkPolicy": true}'}
+        )
+        rows = _rows(sagemaker_app.check_eks_vpc_cni_network_policy("us-east-1"))
+        assert [r["Status"] for r in rows] == ["Passed"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_auto_mode_cluster_is_na_with_the_nodeclass_reason(self, mock_client):
+        client = self._cluster_client(
+            ["agents-standard", "agents-auto", "agents-auto-off"],
+            {
+                "agents-standard": '{"enableNetworkPolicy":"true"}',
+                "agents-auto-off": '{"enableNetworkPolicy":"true"}',
+            },
+            {
+                "agents-auto": {"computeConfig": {"enabled": True}},
+                # computeConfig present but disabled is a standard cluster.
+                "agents-auto-off": {"computeConfig": {"enabled": False}},
+            },
+        )
+        mock_client.return_value = client
+        rows = _rows(sagemaker_app.check_eks_vpc_cni_network_policy("us-east-1"))
+        assert sorted(r["Status"] for r in rows) == ["N/A", "Passed"]
+        na = next(r for r in rows if r["Status"] == "N/A")
+        passed = next(r for r in rows if r["Status"] == "Passed")
+        assert "agents-auto" in na["Finding_Details"]
+        assert "agents-auto-off" not in na["Finding_Details"]
+        assert (
+            "EKS Auto Mode sets network policy on the NodeClass, a Kubernetes "
+            "object no AWS API returns" in na["Finding_Details"]
+        )
+        assert "self-managed CNI" not in na["Finding_Details"]
+        assert na["Severity"] == "Informational"
+        assert "2 EKS cluster(s)" in passed["Finding_Details"]
+        assert "agents-auto-off" in passed["Finding_Details"]
+        client.describe_cluster.assert_any_call(name="agents-auto")
+        assert all(
+            c.kwargs["clusterName"] != "agents-auto"
+            for c in client.describe_addon.call_args_list
+        )
+
     @patch("sagemaker_app.boto3.client")
     def test_no_clusters_is_na(self, mock_client):
         client = MagicMock()

@@ -194,6 +194,7 @@ _EXPECTED_ACTIONS = {
         "ec2:DescribeRouteTables",
         "ec2:DescribeSubnets",
         "eks:DescribeAddon",
+        "eks:DescribeCluster",
         "eks:ListAddons",
         "eks:ListClusters",
         "guardduty:GetDetector",
@@ -750,7 +751,7 @@ def test_sagemaker_scope27_reads_wildcard_only_where_iam_has_no_resource_type(
         ),
         (
             "EKSAddonRead",
-            ("eks:ListAddons", "eks:DescribeAddon"),
+            ("eks:DescribeCluster", "eks:ListAddons", "eks:DescribeAddon"),
             (
                 "eks:*:${AWS::AccountId}:cluster/*",
                 "eks:*:${AWS::AccountId}:addon/*/*/*",

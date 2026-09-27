@@ -7524,9 +7524,15 @@ def check_eks_vpc_cni_network_policy(region: str = "") -> Dict[str, Any]:
         )
         return findings
 
-    enforced, not_enforced, self_managed, errors = [], [], [], []
+    enforced, not_enforced, self_managed, auto_mode, errors = [], [], [], [], []
     for cluster in clusters:
         try:
+            detail = eks_client.describe_cluster(name=cluster).get("cluster", {})
+            # Auto Mode sets network policy on the NodeClass and runs no managed
+            # vpc-cni add-on, so it must not read as a self-managed CNI.
+            if (detail.get("computeConfig") or {}).get("enabled") is True:
+                auto_mode.append(cluster)
+                continue
             addons = []
             paginator = eks_client.get_paginator("list_addons")
             for page in paginator.paginate(clusterName=cluster):
@@ -7568,10 +7574,11 @@ def check_eks_vpc_cni_network_policy(region: str = "") -> Dict[str, Any]:
     if enforced:
         findings["csv_data"].append(
             _row(
-                f"{len(enforced)} EKS cluster(s) enable network policy in the "
-                f"managed vpc-cni add-on: {', '.join(sorted(enforced)[:5])}. "
-                "Whether NetworkPolicy objects restrict each agent workload to its "
-                "dependencies is not read by this check.",
+                f"{len(enforced)} EKS cluster(s): "
+                f"{', '.join(sorted(enforced)[:5])}. Network-policy enforcement "
+                "is enabled on the VPC CNI add-on; whether NetworkPolicy objects "
+                "restrict pod traffic is a Kubernetes-API fact this scan cannot "
+                "read.",
                 "No action required",
                 "Medium",
                 "Passed",
@@ -7585,6 +7592,18 @@ def check_eks_vpc_cni_network_policy(region: str = "") -> Dict[str, Any]:
                 "enforcement is not readable for a self-managed CNI.",
                 "Confirm the cluster's CNI enforces Kubernetes NetworkPolicy, or "
                 "migrate to the managed vpc-cni add-on.",
+                "Informational",
+                "N/A",
+            )
+        )
+    if auto_mode:
+        findings["csv_data"].append(
+            _row(
+                f"{len(auto_mode)} EKS cluster(s) run in EKS Auto Mode: "
+                f"{', '.join(sorted(auto_mode)[:5])}. EKS Auto Mode sets network "
+                "policy on the NodeClass, a Kubernetes object no AWS API returns.",
+                "Confirm the cluster's NodeClass enables network policy and that "
+                "NetworkPolicy objects restrict each agent workload.",
                 "Informational",
                 "N/A",
             )

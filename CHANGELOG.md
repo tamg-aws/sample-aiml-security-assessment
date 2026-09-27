@@ -118,6 +118,11 @@ section.
     administrator account.
   - `SM-38` fails a detector with only the legacy `EKS_RUNTIME_MONITORING`
     feature enabled, because that feature covers EKS only.
+  - `SM-39` passes a cluster whose managed vpc-cni add-on enables network
+    policy, which makes enforcement available; whether NetworkPolicy objects
+    restrict pod traffic is a Kubernetes-API fact the scan cannot read. EKS
+    Auto Mode clusters are `N/A`, because Auto Mode sets network policy on the
+    NodeClass, a Kubernetes object no AWS API returns.
   - `SM-40` skips secrets that another AWS service owns (`OwningService`),
     fails a secret with rotation turned on that has never rotated, and reports
     `N/A` for a `cron()` form it does not interpret. It reads rotation
@@ -157,8 +162,8 @@ member-role StackSet update and no central or single-account infrastructure
 update are required.
 
 The SageMaker assessment role gains `organizations:ListDelegatedAdministrators`,
-`securityhub:GetEnabledStandards`, `eks:ListClusters`, `eks:ListAddons`,
-`eks:DescribeAddon`, `secretsmanager:ListSecrets`, `iot:ListPolicies`,
+`securityhub:GetEnabledStandards`, `eks:ListClusters`, `eks:DescribeCluster`,
+`eks:ListAddons`, `eks:DescribeAddon`, `secretsmanager:ListSecrets`, `iot:ListPolicies`,
 `iot:ListTargetsForPolicy`, and `iot:GetPolicy` for `SM-35` through `SM-41`,
 in both SAM templates. The same CodeBuild run applies them.
 
