@@ -14167,6 +14167,123 @@ class TestBR55EnclaveKeyBinding:
         _, rows, _ = self._run({"k": [self.ROOT, deny]})
         assert [r["Status"] for r in rows] == ["Passed"]
 
+    def _null_deny(self, action=None, **kwargs):
+        statement = {
+            "Sid": "DenyUnattested",
+            "Effect": "Deny",
+            "Principal": "*",
+            "Resource": "*",
+            "Condition": {"Null": {"kms:RecipientAttestation:ImageSha384": "true"}},
+        }
+        if "not_action" in kwargs:
+            statement["NotAction"] = kwargs["not_action"]
+        else:
+            statement["Action"] = action or [
+                "kms:Decrypt",
+                "kms:DeriveSharedSecret",
+                "kms:GenerateDataKey*",
+                "kms:GenerateRandom",
+            ]
+        return statement
+
+    def test_br55_default_root_without_deny_fails_and_names_the_null_fix(self):
+        _, rows, _ = self._run(
+            {
+                "a-denied": [self.ROOT, self._enclave_allow(), self._null_deny()],
+                "b-root": [self.ROOT, self._enclave_allow()],
+            }
+        )
+        assert [r["Status"] for r in rows] == ["Failed", "Passed"]
+        assert "arn:k/b-root" in rows[0]["Finding_Details"]
+        assert "to the account" in rows[0]["Finding_Details"]
+        assert "delegates to the account root" in rows[0]["Resolution"]
+        assert (
+            "Deny statement for every principal on those operations with a Null "
+            "condition that is true on the RecipientAttestation key"
+        ) in rows[0]["Resolution"]
+        assert "arn:k/a-denied" in rows[1]["Finding_Details"]
+
+    def test_br55_null_deny_forms_that_cover_the_family_close_the_root_path(self):
+        for deny in (
+            self._null_deny(),
+            self._null_deny(action="kms:*"),
+            self._null_deny(not_action=["kms:Describe*", "kms:List*"]),
+        ):
+            _, rows, _ = self._run(
+                {
+                    "a-denied": [self.ROOT, self._enclave_allow(), deny],
+                    "b-root": [self.ROOT, self._enclave_allow()],
+                }
+            )
+            assert [r["Status"] for r in rows] == ["Failed", "Passed"], deny
+            assert "arn:k/a-denied" in rows[1]["Finding_Details"], deny
+
+    def test_br55_null_deny_omitting_derive_shared_secret_fails(self):
+        deny = self._null_deny(action=["kms:Decrypt", "kms:GenerateDataKey*"])
+        _, rows, _ = self._run(
+            {
+                "a-denied": [self.ROOT, self._enclave_allow(), self._null_deny()],
+                "b-partial": [self.ROOT, self._enclave_allow(), deny],
+            }
+        )
+        assert [r["Status"] for r in rows] == ["Failed", "Passed"]
+        assert "arn:k/b-partial" in rows[0]["Finding_Details"]
+        assert (
+            "grants kms:derivesharedsecret to the account" in rows[0]["Finding_Details"]
+        )
+
+    def test_br55_positive_if_exists_deny_is_not_credited(self):
+        key = "kms:RecipientAttestation:ImageSha384"
+        for condition in (
+            {"StringEqualsIgnoreCaseIfExists": {key: self.DIGEST}},
+            {"StringEqualsIgnoreCase": {key: self.DIGEST}},
+            {"Null": {key: "false"}},
+        ):
+            deny = dict(self._null_deny(), Condition=condition)
+            _, rows, _ = self._run(
+                {
+                    "a-denied": [self.ROOT, self._enclave_allow(), self._null_deny()],
+                    "b-if-exists": [self.ROOT, self._enclave_allow(), deny],
+                }
+            )
+            assert [r["Status"] for r in rows] == ["Failed", "Passed"], condition
+            assert "arn:k/b-if-exists" in rows[0]["Finding_Details"], condition
+
+    def test_br55_root_statement_with_attestation_condition_passes(self):
+        attested_root = dict(
+            self.ROOT,
+            Condition={
+                "StringEqualsIgnoreCase": {"kms:RecipientAttestation:PCR0": self.DIGEST}
+            },
+        )
+        _, rows, _ = self._run(
+            {
+                "a-attested-root": [attested_root],
+                "b-root": [self.ROOT, self._enclave_allow()],
+            }
+        )
+        assert [r["Status"] for r in rows] == ["Failed", "Passed"]
+        assert "arn:k/a-attested-root" in rows[1]["Finding_Details"]
+
+    def test_br55_deny_on_missing_attestation_alone_does_not_pin_an_image(self):
+        key = "kms:RecipientAttestation:ImageSha384"
+        for condition in (
+            {"Null": {key: "true"}},
+            {"StringNotLike": {key: "*"}},
+        ):
+            deny = dict(self._null_deny(), Condition=condition)
+            _, rows, _ = self._run(
+                {
+                    "a-pinned": [self.ROOT, self._enclave_allow(), self._null_deny()],
+                    "b-null-only": [self.ROOT, deny],
+                }
+            )
+            assert [r["Status"] for r in rows] == ["Failed", "Passed"], condition
+            details = rows[0]["Finding_Details"]
+            assert "arn:k/b-null-only" in details, condition
+            assert "not bound to one attested image" in details, condition
+            assert "to the account" not in details, condition
+
     def test_br55_not_action_allow_is_a_bypass(self):
         statement = {
             "Sid": "Broad",

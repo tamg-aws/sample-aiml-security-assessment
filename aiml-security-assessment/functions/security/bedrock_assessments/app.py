@@ -15726,23 +15726,33 @@ def _allow_pins_enclave_image(statement: Dict[str, Any]) -> bool:
     return False
 
 
-def _deny_requires_enclave_image(statement: Dict[str, Any]) -> bool:
+def _deny_attestation_test(statement: Dict[str, Any]) -> Optional[str]:
     """
-    Return True when a Deny to every principal fires unless the request carries
-    the approved attestation measurement: a negated test or Null true on an
-    ImageSha384, PCR<n> or NitroTPMPCR<n> key.
+    Describe how a Deny to every principal refuses unattested requests.
+
+    Returns "pins" for a negated test on exact ImageSha384, PCR<n> or
+    NitroTPMPCR<n> values, which refuses a missing or a wrong measurement;
+    "missing" for Null true, or a negated test on wildcard values, which
+    refuses only a request with no attestation; and None when the Deny does
+    not fire on a missing attestation. A positive operator, IfExists or not,
+    passes a request that carries no attestation, so it is never credited.
     """
     if not _principal_is_everyone(statement.get("Principal")):
-        return False
+        return None
+    outcome = None
     for operator, key, values in _condition_keys_by_operator(statement):
         if not ATTESTATION_BINDING_KEY.match(key):
             continue
         test = _strip_condition_set_operator(operator)
         if "not" in test:
-            return True
-        if test == "null" and any(str(value).lower() == "true" for value in values):
-            return True
-    return False
+            if values and not any(
+                "*" in str(value) or "?" in str(value) for value in values
+            ):
+                return "pins"
+            outcome = "missing"
+        elif test == "null" and any(str(value).lower() == "true" for value in values):
+            outcome = "missing"
+    return outcome
 
 
 def _principal_is_account_root(principal: Any) -> bool:
@@ -15788,9 +15798,10 @@ def _enclave_key_assessment(document: Any) -> Dict[str, Any]:
     for statement in statements:
         if str(statement.get("Effect", "")).upper() != "DENY":
             continue
-        if _deny_requires_enclave_image(statement):
+        test = _deny_attestation_test(statement)
+        if test:
             denied.update(_statement_covers_kms_actions(statement))
-            pinned = True
+            pinned = pinned or test == "pins"
 
     bypasses = []
     for statement in statements:
@@ -15905,9 +15916,12 @@ def check_kms_enclave_key_binding(region: str = "") -> Dict[str, Any]:
                     f"but {'; '.join(deficiencies)}.",
                     "Require an exact attestation measurement on every key policy "
                     "statement that allows decryption, shared secret derivation "
-                    "or data key generation, and remove the account's "
-                    "unconditioned grant of those operations or deny them when "
-                    "the attestation is missing.",
+                    "or data key generation, including the statement that "
+                    "delegates to the account root. Where that statement must "
+                    "stay unconditioned, add a Deny statement for every "
+                    "principal on those operations with a Null condition that "
+                    "is true on the RecipientAttestation key, so a request "
+                    "without attestation is refused.",
                     "High",
                     "Failed",
                 )
