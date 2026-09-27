@@ -1495,22 +1495,95 @@ def _classify_event_pattern(rule: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def _rule_target_count(
-    rule_name: Optional[str],
-) -> tuple[Optional[int], Optional[Exception]]:
-    """Count one rule's targets, isolating a per-rule failure from the sweep."""
+def _event_bus_target(
+    rule: Dict[str, Any], target_arn: str
+) -> Optional[Dict[str, Any]]:
+    """Read a target ARN as an event bus, or None when it is any other target.
+
+    `local` is True when the bus is in the rule's own partition, account and
+    Region, which is the only case where this function's credentials can list
+    the rules that receive the forwarded events.
+    """
+    parts = target_arn.split(":", 5)
+    if len(parts) != 6 or parts[2] != "events" or not parts[5].startswith("event-bus/"):
+        return None
+    rule_parts = str(rule.get("Arn", "")).split(":", 5)
+    return {
+        "arn": target_arn,
+        "name": parts[5][len("event-bus/") :],
+        "local": len(rule_parts) == 6 and rule_parts[1:5] == parts[1:5],
+    }
+
+
+def _rule_targets(
+    rule: Dict[str, Any], bus_name: str
+) -> tuple[Optional[int], List[Dict[str, Any]], Optional[Exception]]:
+    """Count one rule's targets and read which of them are event buses.
+
+    Isolates a per-rule failure from the sweep.
+    """
+    rule_name = rule.get("Name")
     if not rule_name:
-        return None, ValueError("Missing rule name")
+        return None, [], ValueError("Missing rule name")
     try:
         paginator = events_client.get_paginator("list_targets_by_rule")
         targets = 0
-        for page in paginator.paginate(
-            Rule=rule_name, EventBusName=REGISTRY_EVENT_BUS_NAME
-        ):
-            targets += len(page.get("Targets", []))
-        return targets, None
+        buses = []
+        for page in paginator.paginate(Rule=rule_name, EventBusName=bus_name):
+            for target in page.get("Targets", []):
+                targets += 1
+                bus = _event_bus_target(rule, target.get("Arn", ""))
+                if bus is not None:
+                    buses.append(bus)
+        return targets, buses, None
     except Exception as error:
-        return None, error
+        return None, [], error
+
+
+def _registry_rule_entries(bus_name: str, inventory: Dict[str, Any]) -> tuple:
+    """List one bus's rules and read the targets of those matching Registry events.
+
+    Returns the entries and the number of rules examined, or sets `timed_out` on
+    the inventory and returns what was read. A listing failure propagates.
+    """
+    entries = []
+    examined = 0
+    paginator = events_client.get_paginator("list_rules")
+    for page in paginator.paginate(EventBusName=bus_name):
+        if not check_timeout():
+            inventory["timed_out"] = True
+            return entries, examined
+        for rule in page.get("Rules", []):
+            examined += 1
+            classification = _classify_event_pattern(rule)
+            if classification["kind"] == "other":
+                continue
+            entry = {
+                "rule": rule,
+                "classification": classification,
+                "targets": None,
+                "bus_targets": [],
+                "target_error": None,
+            }
+            if classification["kind"] != "unreadable":
+                (
+                    entry["targets"],
+                    entry["bus_targets"],
+                    entry["target_error"],
+                ) = _rule_targets(rule, bus_name)
+            entries.append(entry)
+    return entries, examined
+
+
+def _forwards_only(entry: Dict[str, Any]) -> bool:
+    """Whether an enabled, unfiltered GA-source rule targets only event buses."""
+    return (
+        entry["classification"]["kind"] == "registry"
+        and not entry["classification"]["narrowed_by"]
+        and entry["rule"].get("State") != "DISABLED"
+        and bool(entry["targets"])
+        and entry["targets"] == len(entry["bus_targets"])
+    )
 
 
 def get_registry_event_rule_inventory() -> Dict[str, Any]:
@@ -1518,11 +1591,16 @@ def get_registry_event_rule_inventory() -> Dict[str, Any]:
 
     Targets are listed only for the rules whose pattern can receive Registry
     events, so an account with hundreds of unrelated rules costs one ListRules
-    sweep rather than a ListTargetsByRule call per rule.
+    sweep rather than a ListTargetsByRule call per rule. A matching rule whose
+    only targets are event buses in this account and Region is followed one hop:
+    that bus's rules are read the same way. One hop is enough because a
+    forwarded event keeps its source and detail type, and stopping there means a
+    bus-to-bus cycle cannot loop the sweep.
     """
     inventory = {
         "items": [],
         "rules_examined": 0,
+        "forwarded_buses": {},
         "list_error": None,
         "client_missing": events_client is None,
         "unavailable": False,
@@ -1531,30 +1609,27 @@ def get_registry_event_rule_inventory() -> Dict[str, Any]:
     if events_client is None:
         return inventory
     try:
-        paginator = events_client.get_paginator("list_rules")
-        for page in paginator.paginate(EventBusName=REGISTRY_EVENT_BUS_NAME):
-            if not check_timeout():
-                inventory["timed_out"] = True
-                return inventory
-            for rule in page.get("Rules", []):
-                inventory["rules_examined"] += 1
-                classification = _classify_event_pattern(rule)
-                if classification["kind"] == "other":
-                    continue
-                entry = {
-                    "rule": rule,
-                    "classification": classification,
-                    "targets": None,
-                    "target_error": None,
-                }
-                if classification["kind"] != "unreadable":
-                    entry["targets"], entry["target_error"] = _rule_target_count(
-                        rule.get("Name")
-                    )
-                inventory["items"].append(entry)
+        inventory["items"], inventory["rules_examined"] = _registry_rule_entries(
+            REGISTRY_EVENT_BUS_NAME, inventory
+        )
     except Exception as error:
         inventory["list_error"] = error
         inventory["unavailable"] = _is_unavailable(error)
+        return inventory
+    for entry in inventory["items"]:
+        if not _forwards_only(entry):
+            continue
+        for bus in entry["bus_targets"]:
+            if inventory["timed_out"]:
+                return inventory
+            if not bus["local"] or bus["name"] in inventory["forwarded_buses"]:
+                continue
+            forwarded = {"items": [], "list_error": None}
+            try:
+                forwarded["items"], _ = _registry_rule_entries(bus["name"], inventory)
+            except Exception as error:
+                forwarded["list_error"] = error
+            inventory["forwarded_buses"][bus["name"]] = forwarded
     return inventory
 
 
@@ -1597,7 +1672,7 @@ def _event_rule_inventory_start(
             _na(
                 "AR-10",
                 f"{finding} Incomplete",
-                f"Assessment stopped before reading every rule on the {REGISTRY_EVENT_BUS_NAME} event bus because the Lambda timeout was approaching.",
+                f"Assessment stopped before reading every rule on the {REGISTRY_EVENT_BUS_NAME} event bus and the event buses it forwards Registry events to, because the Lambda timeout was approaching.",
                 EVENT_ROUTING_REFERENCE_URL,
                 "Re-run the assessment to complete the event rule inventory.",
             )
@@ -1614,6 +1689,109 @@ def _registry_scope_label(inventory: Dict[str, Any]) -> str:
     if len(names) > 3:
         listed += f" and {len(names) - 3} more"
     return f"registry {listed}" if len(names) == 1 else f"registries {listed}"
+
+
+def _forwarded_routing(
+    entry: Dict[str, Any], rule_inventory: Dict[str, Any], scope: str, finding: str
+) -> Dict[str, Any]:
+    """Judge a default-bus rule whose only targets are event buses.
+
+    AWS services deliver their events to the default bus, so a rule on another
+    bus sees Registry events only through a forwarding rule like this one. A bus
+    in this account and Region was read one hop deep by the inventory; a bus in
+    another account or Region cannot be read, so the detail types forwarded there
+    are returned as `unseen` rather than as covered or missing.
+    """
+    result = {"findings": [], "labels": [], "covered": set(), "unseen": set()}
+    name = entry["rule"].get("Name", "unknown")
+    detail_types = entry["classification"]["detail_types"]
+    for bus in entry["bus_targets"]:
+        if not bus["local"]:
+            result["unseen"].update(detail_types)
+            result["findings"].append(
+                _na(
+                    "AR-10",
+                    finding,
+                    f"EventBridge rule '{name}' forwards the lifecycle events of {scope} to event bus '{bus['arn']}' in another account or Region, whose rules this assessment cannot read, so whether they reach a target there is not assessed.",
+                    EVENT_ROUTING_REFERENCE_URL,
+                    f"In the account and Region that own that event bus, confirm an enabled rule matches source '{REGISTRY_EVENT_SOURCE}' and the approval detail types and has a target other than an event bus.",
+                )
+            )
+            continue
+        forwarded = rule_inventory["forwarded_buses"].get(
+            bus["name"], {"items": [], "list_error": None}
+        )
+        if forwarded["list_error"] is not None:
+            result["findings"].append(
+                _na(
+                    "AR-10",
+                    f"{finding} Incomplete",
+                    f"EventBridge rule '{name}' forwards Registry lifecycle events to event bus '{bus['name']}', but that bus's rules could not be listed: {_error_detail(forwarded['list_error'])}.",
+                    EVENT_ROUTING_REFERENCE_URL,
+                    _error_resolution(forwarded["list_error"], "events:ListRules"),
+                )
+            )
+            continue
+        credited = False
+        undecided = []
+        target_error = None
+        for hop in forwarded["items"]:
+            hop_name = hop["rule"].get("Name", "unknown")
+            classification = hop["classification"]
+            if classification["kind"] == "unreadable":
+                undecided.append(hop_name)
+                continue
+            if hop["target_error"] is not None:
+                target_error = target_error or hop["target_error"]
+                undecided.append(hop_name)
+                continue
+            # Bus targets on this bus are not followed: the sweep stops at one hop.
+            delivering = (hop["targets"] or 0) - len(hop["bus_targets"])
+            if (
+                classification["kind"] != "registry"
+                or hop["rule"].get("State") == "DISABLED"
+                or delivering == 0
+            ):
+                continue
+            if classification["narrowed_by"]:
+                undecided.append(hop_name)
+                continue
+            credited = True
+            result["labels"].append(
+                f"'{name}' via event bus '{bus['name']}' rule '{hop_name}' ({delivering} target(s))"
+            )
+            result["covered"].update(detail_types & classification["detail_types"])
+        if credited:
+            continue
+        if undecided:
+            result["findings"].append(
+                _na(
+                    "AR-10",
+                    f"{finding} Incomplete" if target_error else finding,
+                    "EventBridge rule '{}' forwards Registry lifecycle events to event bus '{}', where rule(s) {} match them but could not be assessed, because a pattern or target list could not be read or the pattern also filters on detail, resources or account.".format(
+                        name,
+                        bus["name"],
+                        ", ".join(f"'{hop_name}'" for hop_name in undecided),
+                    ),
+                    EVENT_ROUTING_REFERENCE_URL,
+                    _error_resolution(target_error, "events:ListTargetsByRule")
+                    if target_error
+                    else f"Review those rules on event bus '{bus['name']}' manually against source '{REGISTRY_EVENT_SOURCE}' and the approval detail types.",
+                )
+            )
+            continue
+        result["findings"].append(
+            create_finding(
+                "AR-10",
+                finding,
+                f"EventBridge rule '{name}' forwards the lifecycle events of {scope} only to event bus '{bus['name']}', where no enabled rule matching source '{REGISTRY_EVENT_SOURCE}' has a target other than an event bus, so every forwarded state change is discarded.",
+                f"Add an enabled rule on event bus '{bus['name']}' matching source '{REGISTRY_EVENT_SOURCE}' with a target that records or reviews the events, or give rule '{name}' such a target directly.",
+                EVENT_ROUTING_REFERENCE_URL,
+                SeverityEnum.MEDIUM,
+                StatusEnum.FAILED,
+            )
+        )
+    return result
 
 
 def check_agent_registry_lifecycle_event_routing(
@@ -1642,6 +1820,7 @@ def check_agent_registry_lifecycle_event_routing(
     findings: List[Dict[str, Any]] = []
     routing_labels: List[str] = []
     covered: set = set()
+    unseen: set = set()
     narrowed_rules = 0
     for entry in rule_inventory["items"]:
         rule = entry["rule"]
@@ -1730,15 +1909,26 @@ def check_agent_registry_lifecycle_event_routing(
                 )
             )
             continue
+        if _forwards_only(entry):
+            forwarded = _forwarded_routing(entry, rule_inventory, scope, finding)
+            findings.extend(forwarded["findings"])
+            routing_labels.extend(forwarded["labels"])
+            covered.update(forwarded["covered"])
+            unseen.update(forwarded["unseen"])
+            continue
         routing_labels.append(f"'{name}' ({targets} target(s))")
         covered.update(classification["detail_types"])
 
+    # A transition forwarded to a bus this check cannot read is neither covered
+    # nor missing; the forwarding rule's N/A row carries it.
     missing = [
         detail_type
         for detail_type in REGISTRY_APPROVAL_DETAIL_TYPES
-        if detail_type not in covered
+        if detail_type not in covered and detail_type not in unseen
     ]
-    if not routing_labels:
+    if not missing and not covered.issuperset(REGISTRY_APPROVAL_DETAIL_TYPES):
+        return findings
+    if not routing_labels and not unseen:
         matching = len(
             [
                 entry
@@ -1765,11 +1955,16 @@ def check_agent_registry_lifecycle_event_routing(
             )
         )
     elif missing:
+        routed = (
+            f"EventBridge rule(s) {', '.join(routing_labels)} route Registry lifecycle events for {scope}, but"
+            if routing_labels
+            else f"For {scope},"
+        )
         findings.append(
             create_finding(
                 "AR-10",
                 finding,
-                f"EventBridge rule(s) {', '.join(routing_labels)} route Registry lifecycle events for {scope}, but no rule matches detail type(s) {', '.join(missing)}, so those approval transitions reach no target.",
+                f"{routed} no rule matches detail type(s) {', '.join(missing)}, so those approval transitions reach no target.",
                 f"Add the missing detail type(s) to an existing rule's event pattern, or create a rule matching them on the {REGISTRY_EVENT_BUS_NAME} event bus.",
                 EVENT_ROUTING_REFERENCE_URL,
                 SeverityEnum.MEDIUM,

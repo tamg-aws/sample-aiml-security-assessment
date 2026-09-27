@@ -1246,12 +1246,12 @@ def test_ar09_reports_a_permission_cache_failure_as_indeterminate():
 # ===================================================================
 # AR-10: AIR-ACR-REG-02, registry lifecycle events are actually routed
 # ===================================================================
-def _rule(name, pattern=None, state="ENABLED"):
+def _rule(name, pattern=None, state="ENABLED", bus="default"):
     rule = {
         "Name": name,
-        "Arn": f"arn:aws:events:us-east-1:123456789012:rule/default/{name}",
+        "Arn": f"arn:aws:events:us-east-1:123456789012:rule/{bus}/{name}",
         "State": state,
-        "EventBusName": "default",
+        "EventBusName": bus,
     }
     if pattern is not None:
         rule["EventPattern"] = (
@@ -1267,12 +1267,29 @@ def _approval_pattern(source=None, detail_types=None):
     return pattern
 
 
-def _events_client(rules, targets=None, list_error=None, target_errors=None):
-    """An EventBridge client over ListRules and ListTargetsByRule."""
+def _events_client(
+    rules,
+    targets=None,
+    list_error=None,
+    target_errors=None,
+    bus_rules=None,
+    target_arns=None,
+    bus_list_errors=None,
+):
+    """An EventBridge client over ListRules and ListTargetsByRule.
+
+    `rules` are the default bus's rules and `bus_rules` those of other buses in
+    the account. `targets` gives a rule a count of SNS targets; `target_arns`
+    gives it an explicit target ARN list instead.
+    """
     client = MagicMock()
     targets = targets or {}
     target_errors = target_errors or {}
+    bus_rules = bus_rules or {}
+    target_arns = target_arns or {}
+    bus_list_errors = bus_list_errors or {}
     client.target_calls = []
+    client.rule_calls = []
 
     def get_paginator(operation_name):
         paginator = MagicMock()
@@ -1281,8 +1298,15 @@ def _events_client(rules, targets=None, list_error=None, target_errors=None):
             def paginate_rules(**kwargs):
                 if list_error is not None:
                     raise list_error
-                assert kwargs == {"EventBusName": "default"}
-                return [{"Rules": rules}]
+                assert list(kwargs) == ["EventBusName"]
+                bus = kwargs["EventBusName"]
+                client.rule_calls.append(bus)
+                if bus == "default":
+                    return [{"Rules": rules}]
+                if bus in bus_list_errors:
+                    raise bus_list_errors[bus]
+                assert bus in bus_rules, f"unexpected ListRules on bus {bus}"
+                return [{"Rules": bus_rules[bus]}]
 
             paginator.paginate.side_effect = paginate_rules
         elif operation_name == "list_targets_by_rule":
@@ -1291,6 +1315,15 @@ def _events_client(rules, targets=None, list_error=None, target_errors=None):
                 client.target_calls.append(Rule)
                 if Rule in target_errors:
                     raise target_errors[Rule]
+                if Rule in target_arns:
+                    return [
+                        {
+                            "Targets": [
+                                {"Id": f"target-{index}", "Arn": arn}
+                                for index, arn in enumerate(target_arns[Rule])
+                            ]
+                        }
+                    ]
                 count = targets.get(Rule, 0)
                 return [
                     {
@@ -1699,6 +1732,263 @@ def test_ar10_names_every_registry_the_verdict_covers():
     )
     assert [f["Status"] for f in findings] == ["Passed"]
     assert "registries 'reg-0', 'reg-1'" in findings[0]["Finding_Details"]
+
+
+_SNS_TARGET = "arn:aws:sns:us-east-1:123456789012:registry-review"
+_AUDIT_BUS = "arn:aws:events:us-east-1:123456789012:event-bus/audit-bus"
+
+
+def _forward(name="forward-to-audit", bus_arn=_AUDIT_BUS, detail_types=None):
+    """A default-bus rule matching Registry events whose only target is a bus."""
+    return (
+        _rule(name, _approval_pattern(detail_types=detail_types)),
+        {name: [bus_arn]},
+    )
+
+
+def test_ar10_a_rule_forwarding_to_a_local_bus_is_credited_by_that_bus_rule():
+    # AWS services deliver to the default bus, so the rule on audit-bus sees the
+    # Registry events only because forward-to-audit sends them there. The
+    # unrelated rule on audit-bus has a target too, and must not be the one
+    # credited.
+    forward, arns = _forward()
+    findings, client = _routing_findings(
+        [forward],
+        target_arns={
+            **arns,
+            "audit-s3": [_SNS_TARGET],
+            "audit-approvals": [_SNS_TARGET],
+        },
+        bus_rules={
+            "audit-bus": [
+                _rule("audit-s3", {"source": ["aws.s3"]}, bus="audit-bus"),
+                _rule("audit-approvals", _approval_pattern(), bus="audit-bus"),
+            ]
+        },
+    )
+    assert [f["Status"] for f in findings] == ["Passed"]
+    details = findings[0]["Finding_Details"]
+    assert (
+        "'forward-to-audit' via event bus 'audit-bus' rule 'audit-approvals' "
+        "(1 target(s))" in details
+    )
+    assert "audit-s3" not in details
+    assert client.rule_calls == ["default", "audit-bus"]
+    assert client.target_calls == ["forward-to-audit", "audit-approvals"]
+
+
+def test_ar10_a_forward_to_a_bus_with_no_delivering_rule_is_failed():
+    # Both audit-bus rules match; one has no target and the other only sends the
+    # events back to the default bus. Neither delivers, and the second is not
+    # followed, so a bus-to-bus cycle stops after one hop.
+    forward, arns = _forward()
+    default_bus = "arn:aws:events:us-east-1:123456789012:event-bus/default"
+    findings, client = _routing_findings(
+        [forward],
+        target_arns={**arns, "audit-empty": [], "audit-loop": [default_bus]},
+        bus_rules={
+            "audit-bus": [
+                _rule("audit-empty", _approval_pattern(), bus="audit-bus"),
+                _rule("audit-loop", _approval_pattern(), bus="audit-bus"),
+            ]
+        },
+    )
+    assert [f["Status"] for f in findings] == ["Failed", "Failed"]
+    assert "forward-to-audit" in findings[0]["Finding_Details"]
+    assert "only to event bus 'audit-bus'" in findings[0]["Finding_Details"]
+    assert "route none of them to a target" in findings[1]["Finding_Details"]
+    assert client.rule_calls == ["default", "audit-bus"]
+
+
+def test_ar10_a_disabled_rule_on_the_forwarded_bus_delivers_nothing():
+    forward, arns = _forward()
+    findings, _ = _routing_findings(
+        [forward],
+        target_arns={**arns, "audit-paused": [_SNS_TARGET]},
+        bus_rules={
+            "audit-bus": [
+                _rule(
+                    "audit-paused",
+                    _approval_pattern(),
+                    state="DISABLED",
+                    bus="audit-bus",
+                )
+            ]
+        },
+    )
+    assert [f["Status"] for f in findings] == ["Failed", "Failed"]
+
+
+@pytest.mark.parametrize(
+    "bus_arn",
+    [
+        "arn:aws:events:us-east-1:111122223333:event-bus/central-audit",
+        "arn:aws:events:eu-west-1:123456789012:event-bus/audit-bus",
+    ],
+    ids=["cross-account", "cross-region"],
+)
+def test_ar10_a_forward_to_a_bus_this_check_cannot_read_is_indeterminate(bus_arn):
+    forward, arns = _forward(bus_arn=bus_arn)
+    findings, client = _routing_findings([forward], target_arns=arns)
+    assert [f["Status"] for f in findings] == ["N/A"]
+    assert bus_arn in findings[0]["Finding_Details"]
+    assert "another account or Region" in findings[0]["Finding_Details"]
+    assert client.rule_calls == ["default"]
+
+
+def test_ar10_an_unreadable_forward_leaves_only_its_own_transitions_open():
+    # The remote forward carries Pending Approval only, so the local rule's
+    # missing Approved and Rejected transitions are still reported as missing.
+    approval_types = list(agent_registry_app.REGISTRY_APPROVAL_DETAIL_TYPES)
+    forward, arns = _forward(
+        bus_arn="arn:aws:events:us-east-1:111122223333:event-bus/central-audit",
+        detail_types=approval_types[:1],
+    )
+    findings, _ = _routing_findings([forward], target_arns=arns)
+    assert [f["Status"] for f in findings] == ["N/A", "Failed"]
+    for detail_type in approval_types[1:]:
+        assert detail_type in findings[1]["Finding_Details"]
+    assert approval_types[0] not in findings[1]["Finding_Details"]
+
+
+def test_ar10_local_routing_plus_an_unreadable_forward_is_not_passed():
+    approval_types = list(agent_registry_app.REGISTRY_APPROVAL_DETAIL_TYPES)
+    forward, arns = _forward(
+        bus_arn="arn:aws:events:us-east-1:111122223333:event-bus/central-audit",
+        detail_types=approval_types[:1],
+    )
+    findings, _ = _routing_findings(
+        [
+            forward,
+            _rule("decisions", _approval_pattern(detail_types=approval_types[1:])),
+        ],
+        target_arns={**arns, "decisions": [_SNS_TARGET]},
+    )
+    assert [f["Status"] for f in findings] == ["N/A"]
+
+
+def test_ar10_a_forwarded_rule_is_credited_only_with_both_hops_detail_types():
+    approval_types = list(agent_registry_app.REGISTRY_APPROVAL_DETAIL_TYPES)
+    forward, arns = _forward(detail_types=approval_types[:1])
+    findings, _ = _routing_findings(
+        [forward],
+        target_arns={**arns, "audit-approvals": [_SNS_TARGET]},
+        bus_rules={
+            "audit-bus": [
+                _rule("audit-approvals", _approval_pattern(), bus="audit-bus")
+            ]
+        },
+    )
+    assert [f["Status"] for f in findings] == ["Failed"]
+    for detail_type in approval_types[1:]:
+        assert detail_type in findings[0]["Finding_Details"]
+    assert "via event bus 'audit-bus'" in findings[0]["Finding_Details"]
+
+
+def test_ar10_a_rule_with_a_bus_and_a_delivering_target_is_not_followed():
+    findings, client = _routing_findings(
+        [_rule("mixed-targets", _approval_pattern())],
+        target_arns={
+            "mixed-targets": [
+                _AUDIT_BUS,
+                "arn:aws:events:us-east-1:123456789012:api-destination/review/abc",
+            ]
+        },
+    )
+    assert [f["Status"] for f in findings] == ["Passed"]
+    assert "'mixed-targets' (2 target(s))" in findings[0]["Finding_Details"]
+    assert client.rule_calls == ["default"]
+
+
+def test_ar10_two_forwards_to_one_bus_list_that_bus_once():
+    first, first_arns = _forward("forward-one")
+    second, second_arns = _forward("forward-two")
+    findings, client = _routing_findings(
+        [first, second],
+        target_arns={
+            **first_arns,
+            **second_arns,
+            "audit-approvals": [_SNS_TARGET],
+        },
+        bus_rules={
+            "audit-bus": [
+                _rule("audit-approvals", _approval_pattern(), bus="audit-bus")
+            ]
+        },
+    )
+    assert [f["Status"] for f in findings] == ["Passed"]
+    assert "'forward-one' via event bus" in findings[0]["Finding_Details"]
+    assert "'forward-two' via event bus" in findings[0]["Finding_Details"]
+    assert client.rule_calls == ["default", "audit-bus"]
+
+
+@pytest.mark.parametrize(
+    "audit_rule",
+    [
+        _rule("audit-opaque", {"source": [{"prefix": "aws."}]}, bus="audit-bus"),
+        _rule(
+            "audit-opaque",
+            {
+                "source": [agent_registry_app.REGISTRY_EVENT_SOURCE],
+                "detail": {"registryId": ["reg-one"]},
+            },
+            bus="audit-bus",
+        ),
+    ],
+    ids=["content-filter", "narrowed"],
+)
+def test_ar10_a_forwarded_bus_rule_this_check_cannot_decide_is_indeterminate(
+    audit_rule,
+):
+    forward, arns = _forward()
+    findings, _ = _routing_findings(
+        [forward],
+        target_arns={**arns, "audit-opaque": [_SNS_TARGET]},
+        bus_rules={"audit-bus": [audit_rule]},
+    )
+    assert [f["Status"] for f in findings] == ["N/A", "Failed"]
+    assert "'audit-opaque'" in findings[0]["Finding_Details"]
+    assert "event bus 'audit-bus'" in findings[0]["Finding_Details"]
+
+
+def test_ar10_a_forwarded_bus_rule_listing_failure_is_incomplete():
+    forward, arns = _forward()
+    findings, _ = _routing_findings(
+        [forward],
+        target_arns=arns,
+        bus_list_errors={
+            "audit-bus": ClientError(
+                {"Error": {"Code": "AccessDeniedException", "Message": "Denied"}},
+                "ListRules",
+            )
+        },
+    )
+    assert [f["Status"] for f in findings] == ["N/A", "Failed"]
+    assert findings[0]["Finding"].endswith("Incomplete")
+    assert "event bus 'audit-bus'" in findings[0]["Finding_Details"]
+    assert "events:ListRules" in findings[0]["Resolution"]
+
+
+def test_ar10_a_forwarded_bus_rule_target_failure_is_incomplete():
+    forward, arns = _forward()
+    findings, _ = _routing_findings(
+        [forward],
+        target_arns=arns,
+        bus_rules={
+            "audit-bus": [
+                _rule("audit-approvals", _approval_pattern(), bus="audit-bus")
+            ]
+        },
+        target_errors={
+            "audit-approvals": ClientError(
+                {"Error": {"Code": "AccessDeniedException", "Message": "Denied"}},
+                "ListTargetsByRule",
+            )
+        },
+    )
+    assert [f["Status"] for f in findings] == ["N/A", "Failed"]
+    assert findings[0]["Finding"].endswith("Incomplete")
+    assert "events:ListTargetsByRule" in findings[0]["Resolution"]
 
 
 def test_handler_emits_ar10_for_the_assessed_region():
