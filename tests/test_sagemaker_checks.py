@@ -3528,6 +3528,123 @@ class TestSM32ConfigComplianceEvaluation:
         assert [f["Status"] for f in rule_rows] == ["Failed"]
         assert "0 SageMaker-related rule(s)" in rule_rows[0]["Finding_Details"]
 
+    @staticmethod
+    def _rule(name, created_by=None):
+        rule = {
+            "ConfigRuleName": name,
+            "ConfigRuleState": "ACTIVE",
+            "Scope": {"ComplianceResourceTypes": ["AWS::SageMaker::NotebookInstance"]},
+            "Source": {"Owner": "AWS", "SourceIdentifier": "OTHER"},
+        }
+        if created_by:
+            rule["CreatedBy"] = created_by
+        return rule
+
+    @staticmethod
+    def _rule_rows(findings):
+        return [
+            f
+            for f in findings
+            if f["Finding"] == sagemaker_app.CONFIG_RULE_COMPLIANCE_FINDING
+        ]
+
+    def test_service_linked_rules_only_are_na_naming_the_owner(self):
+        # Live 2026-09-26: every SageMaker rule in the account carried
+        # CreatedBy securityhub.amazonaws.com, and DescribeComplianceByConfigRule
+        # on them was AccessDeniedException for admin too.
+        with patch("sagemaker_app.boto3.client") as mock_client:
+            config_client = self._config(
+                mock_client,
+                [{"name": "default", "recordingGroup": {"allSupported": True}}],
+                [
+                    self._rule(
+                        "securityhub-sagemaker-a-1", "securityhub.amazonaws.com"
+                    ),
+                    self._rule(
+                        "securityhub-sagemaker-b-2", "securityhub.amazonaws.com"
+                    ),
+                ],
+                [],
+            )
+            findings = extract_csv_data(
+                sagemaker_app.check_sagemaker_config_compliance_evaluation(
+                    region="us-east-1"
+                )
+            )
+        rule_rows = self._rule_rows(findings)
+        assert [f["Status"] for f in rule_rows] == ["N/A"]
+        assert "2 ACTIVE SageMaker Config rule(s)" in rule_rows[0]["Finding_Details"]
+        assert "securityhub.amazonaws.com" in rule_rows[0]["Finding_Details"]
+        assert "Grant" not in rule_rows[0]["Resolution"]
+        requested = [c.args[0] for c in config_client.get_paginator.call_args_list]
+        assert "describe_compliance_by_config_rule" not in requested
+
+    def test_mixed_rules_read_only_the_customer_rule_and_count_it(self):
+        with patch("sagemaker_app.boto3.client") as mock_client:
+            config_client = self._config(
+                mock_client,
+                [{"name": "default", "recordingGroup": {"allSupported": True}}],
+                [
+                    self._rule(
+                        "securityhub-sagemaker-a-1", "securityhub.amazonaws.com"
+                    ),
+                    self._rule("customer-sagemaker-rule"),
+                ],
+                [
+                    {
+                        "ConfigRuleName": "customer-sagemaker-rule",
+                        "Compliance": {"ComplianceType": "COMPLIANT"},
+                    }
+                ],
+            )
+            findings = extract_csv_data(
+                sagemaker_app.check_sagemaker_config_compliance_evaluation(
+                    region="us-east-1"
+                )
+            )
+        rule_rows = self._rule_rows(findings)
+        assert [f["Status"] for f in rule_rows] == ["N/A", "Passed"]
+        assert "1 ACTIVE SageMaker Config rule(s)" in rule_rows[0]["Finding_Details"]
+        assert "1 ACTIVE AWS Config rule(s) evaluate" in rule_rows[1]["Finding_Details"]
+        compliance_paginator = config_client.get_paginator(
+            "describe_compliance_by_config_rule"
+        )
+        compliance_paginator.paginate.assert_called_once_with(
+            ConfigRuleNames=["customer-sagemaker-rule"]
+        )
+
+    def test_a_read_error_on_the_customer_rule_keeps_the_grant_advice(self):
+        with patch("sagemaker_app.boto3.client") as mock_client:
+            config_client = self._config(
+                mock_client,
+                [{"name": "default", "recordingGroup": {"allSupported": True}}],
+                [
+                    self._rule(
+                        "securityhub-sagemaker-a-1", "securityhub.amazonaws.com"
+                    ),
+                    self._rule("customer-sagemaker-rule"),
+                ],
+                [],
+            )
+            config_client.get_paginator(
+                "describe_compliance_by_config_rule"
+            ).paginate.side_effect = _make_client_error("AccessDeniedException")
+            findings = extract_csv_data(
+                sagemaker_app.check_sagemaker_config_compliance_evaluation(
+                    region="us-east-1"
+                )
+            )
+        rule_rows = self._rule_rows(findings)
+        assert [f["Status"] for f in rule_rows] == ["N/A", "N/A"]
+        assert "securityhub.amazonaws.com" in rule_rows[0]["Finding_Details"]
+        assert (
+            "1 ACTIVE SageMaker Config rule(s) were" in rule_rows[1]["Finding_Details"]
+        )
+        assert "AccessDeniedException" in rule_rows[1]["Finding_Details"]
+        assert (
+            "Grant config:DescribeComplianceByConfigRule" in rule_rows[1]["Resolution"]
+        )
+
     def test_exception_returns_could_not_assess(self):
         with patch("sagemaker_app.boto3.client") as mock_client:
             mock_client.side_effect = Exception("boom")

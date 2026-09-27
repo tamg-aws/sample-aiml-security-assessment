@@ -61,6 +61,11 @@ section.
     any whose value a child policy may change. An unset
     `@@operators_allowed_for_child_policies` means `@@all`, and only
     `["@@none"]` locks the value; from a member account that leg is skipped.
+  - `SM-32` reads compliance only for customer-managed Config rules. A rule
+    with `CreatedBy` set is service-linked, for example one Security Hub
+    creates, and AWS Config refuses its compliance results to every caller;
+    such rules get their own `N/A` naming the owning service and never count
+    toward a `Passed`.
   - `AG-39` does not read the rules inside customer rule groups or non-AWS
     managed rule groups. An ACL that relies on one for a missing filter is
     reported `N/A` with the group named.

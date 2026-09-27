@@ -282,7 +282,7 @@ investigation and remediation.
 ### SM-32: SageMaker Configuration Compliance Evaluation
 
 - **Severity:** Medium
-- **Description:** Two independent legs, each with its own finding. `SageMaker Configuration Recording` requires an AWS Config recorder whose recording group covers SageMaker resource types. `SageMaker Config Rule Compliance` requires at least one active Config rule evaluating SageMaker and reports that rule's current compliance result. Neither verdict implies the other: a recorder with no rules evaluates nothing, and a rule with no recorder cannot see configuration changes.
+- **Description:** Two independent legs, each with its own finding. `SageMaker Configuration Recording` requires an AWS Config recorder whose recording group covers SageMaker resource types. `SageMaker Config Rule Compliance` requires at least one active Config rule evaluating SageMaker and reports that rule's current compliance result. Neither verdict implies the other: a recorder with no rules evaluates nothing, and a rule with no recorder cannot see configuration changes. Service-linked rules, which carry `CreatedBy` (for example `securityhub.amazonaws.com`), are reported `N/A` naming the owning service, because AWS Config returns their compliance results to no caller.
 
 ### SM-33: Training Job Network Boundary
 

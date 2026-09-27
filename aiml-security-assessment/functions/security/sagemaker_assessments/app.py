@@ -6042,9 +6042,43 @@ def check_sagemaker_config_compliance_evaluation(region: str = "") -> Dict[str, 
             )
             return findings
 
+        # DescribeConfigRules sets CreatedBy only on a service-linked rule. The
+        # owning service holds its compliance results: Config returns
+        # AccessDeniedException to every caller, so these rules can neither
+        # earn a Passed nor be blamed on this assessment's permissions.
+        service_linked = [rule for rule in active_rules if rule.get("CreatedBy")]
+        readable_rules = [rule for rule in active_rules if not rule.get("CreatedBy")]
+        if service_linked:
+            owners = ", ".join(sorted({rule["CreatedBy"] for rule in service_linked}))
+            findings["csv_data"].append(
+                create_finding(
+                    check_id="SM-32",
+                    finding_name=CONFIG_RULE_COMPLIANCE_FINDING,
+                    finding_details=(
+                        f"{len(service_linked)} ACTIVE SageMaker Config rule(s) "
+                        f"in {region or 'this region'} are service-linked rules "
+                        f"owned by {owners}. AWS Config does not return their "
+                        "compliance results to any caller, so this check cannot "
+                        "read them; the owning service reports them, for example "
+                        "as Security Hub control findings."
+                    ),
+                    resolution=(
+                        "Review these rules' results in the owning service, or "
+                        "add a customer-managed Config rule for SageMaker so the "
+                        "result can be read here."
+                    ),
+                    reference=CONFIG_REFERENCE,
+                    severity="Informational",
+                    status="N/A",
+                    region=region,
+                )
+            )
+            if not readable_rules:
+                return findings
+
         rule_names = [
             rule.get("ConfigRuleName")
-            for rule in active_rules
+            for rule in readable_rules
             if rule.get("ConfigRuleName")
         ]
         compliance_by_rule = {}
@@ -6113,7 +6147,7 @@ def check_sagemaker_config_compliance_evaluation(region: str = "") -> Dict[str, 
                     check_id="SM-32",
                     finding_name=CONFIG_RULE_COMPLIANCE_FINDING,
                     finding_details=(
-                        f"{len(active_rules)} ACTIVE AWS Config rule(s) evaluate "
+                        f"{len(readable_rules)} ACTIVE AWS Config rule(s) evaluate "
                         f"SageMaker in {region or 'this region'} and report no "
                         f"non-compliant resource: {described}. AWS Config records "
                         "configuration items for the AWS::SageMaker::* types only, "
@@ -6134,7 +6168,7 @@ def check_sagemaker_config_compliance_evaluation(region: str = "") -> Dict[str, 
                     check_id="SM-32",
                     finding_name=CONFIG_RULE_COMPLIANCE_FINDING,
                     finding_details=(
-                        f"{len(active_rules)} ACTIVE SageMaker Config rule(s) were "
+                        f"{len(readable_rules)} ACTIVE SageMaker Config rule(s) were "
                         "found, but their compliance results could not be read. "
                         f"Assessment error: {compliance_error}."
                     ),
