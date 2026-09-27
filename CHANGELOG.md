@@ -92,7 +92,8 @@ section.
   because AgentCore decrypts the memory's strategies on the caller's behalf,
   and the derived `AG-19` row carries that cause. Only
   `ResourceNotFoundException` still suggests a memory deleted mid-assessment.
-  The assessment role is unchanged.
+  The AgentCore assessment role gains that `kms:Decrypt` grant, and a
+  remaining denial names the key policy, which must also allow the role.
 
 ### Deployment impact
 

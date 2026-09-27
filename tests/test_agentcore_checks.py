@@ -2441,6 +2441,8 @@ class TestAC07MemoryConfiguration:
         denied, gone, throttled = findings[:3]
         assert "'Denied' (mem-1)" in denied["Finding_Details"]
         assert "kms:Decrypt" in denied["Resolution"]
+        assert "key policy" in denied["Resolution"]
+        assert "kms:ViaService" in denied["Resolution"]
         assert "bedrock-agentcore:GetMemory" in denied["Resolution"]
         assert "kms:Decrypt" in denied["Finding_Details"]
         assert "deleted mid-assessment" not in denied["Resolution"]

@@ -3765,9 +3765,13 @@ def check_agentcore_memory_configuration() -> List[Dict[str, Any]]:
                         "the caller's behalf."
                     )
                     resolution = (
-                        "Grant bedrock-agentcore:GetMemory on this memory and, "
-                        "if it is encrypted with a customer managed key, "
-                        "kms:Decrypt on that key, then rerun the assessment."
+                        "Grant bedrock-agentcore:GetMemory on this memory. If it "
+                        "is encrypted with a customer managed key, the assessment "
+                        "role also needs kms:Decrypt on that key through "
+                        "bedrock-agentcore (kms:ViaService), allowed both by its "
+                        "IAM policy and by the key policy, because a key policy "
+                        "that does not delegate to IAM overrides the IAM grant. "
+                        "Then rerun the assessment."
                     )
                 elif (
                     e.response.get("Error", {}).get("Code")
