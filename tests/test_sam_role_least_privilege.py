@@ -97,12 +97,16 @@ _EXPECTED_ACTIONS = {
         "s3:ListBucket",
     },
     "IAMPermissionCachingFunction": {
+        "iam:GetGroupPolicy",
         "iam:GetPolicy",
         "iam:GetPolicyVersion",
         "iam:GetRolePolicy",
         "iam:GetUserPolicy",
+        "iam:ListAttachedGroupPolicies",
         "iam:ListAttachedRolePolicies",
         "iam:ListAttachedUserPolicies",
+        "iam:ListGroupPolicies",
+        "iam:ListGroupsForUser",
         "iam:ListRolePolicies",
         "iam:ListRoles",
         "iam:ListUserPolicies",
@@ -116,6 +120,7 @@ _EXPECTED_ACTIONS = {
         "s3:PutObject",
     },
     "BedrockSecurityAssessmentFunction": {
+        "backup:ListBackupVaults",
         "bedrock:GetAccountDataRetention",
         "bedrock:GetAgent",
         "bedrock:GetAgentActionGroup",
@@ -146,6 +151,7 @@ _EXPECTED_ACTIONS = {
         "bedrock:ListModelCustomizationJobs",
         "bedrock:ListModelInvocationJobs",
         "bedrock:ListPrompts",
+        "bedrock:ListProvisionedModelThroughputs",
         "bedrock:ListTagsForResource",
         "cloudtrail:GetEventSelectors",
         "cloudtrail:GetTrail",
@@ -157,11 +163,18 @@ _EXPECTED_ACTIONS = {
         "ec2:DescribeVpcEndpoints",
         "ec2:DescribeVpcs",
         "iam:GenerateServiceLastAccessedDetails",
+        "iam:GetLoginProfile",
         "iam:GetServiceLastAccessedDetails",
+        "iam:ListAccessKeys",
+        "iam:ListMFADevices",
         "iam:ListServiceSpecificCredentials",
         "inspector2:BatchGetAccountStatus",
         "kms:DescribeKey",
+        "kms:GetKeyPolicy",
+        "kms:ListKeys",
         "lambda:GetFunction",
+        "lambda:GetPolicy",
+        "lambda:ListFunctionUrlConfigs",
         "lambda:ListFunctions",
         "logs:DescribeLogGroups",
         "logs:DescribeMetricFilters",
@@ -175,7 +188,9 @@ _EXPECTED_ACTIONS = {
         "organizations:ListPolicies",
         "organizations:ListRoots",
         "organizations:ListTargetsForPolicy",
+        "s3:GetBucketObjectLockConfiguration",
         "s3:GetBucketPolicy",
+        "s3:GetBucketVersioning",
         "s3:GetEncryptionConfiguration",
         "s3:GetLifecycleConfiguration",
         "s3:GetObject",
@@ -186,6 +201,7 @@ _EXPECTED_ACTIONS = {
         "servicequotas:GetAWSDefaultServiceQuota",
         "servicequotas:GetServiceQuota",
         "servicequotas:ListServiceQuotas",
+        "tag:GetResources",
     },
     "SagemakerSecurityAssessmentFunction": {
         "config:DescribeComplianceByConfigRule",
@@ -524,6 +540,7 @@ def test_iam_permission_cache_identity_reads_are_resource_scoped(template):
     required_resources = {
         "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/*",
         "arn:${AWS::Partition}:iam::${AWS::AccountId}:user/*",
+        "arn:${AWS::Partition}:iam::${AWS::AccountId}:group/*",
         "arn:${AWS::Partition}:iam::${AWS::AccountId}:policy/*",
         "arn:${AWS::Partition}:iam::aws:policy/*",
     }
@@ -572,6 +589,7 @@ def test_bedrock_resource_level_actions_are_arn_scoped(template):
         "bedrock:ListGuardrails",
         "bedrock:ListPrompts",
         "bedrock:ListAutomatedReasoningPolicies",
+        "bedrock:ListProvisionedModelThroughputs",
     ):
         assert action in inventory
     for action in (
@@ -875,6 +893,11 @@ def test_aisf_phase5_reads_wildcard_only_where_iam_has_no_resource_type(template
             "BedrockSecurityAssessmentFunction",
             "BedrockAccountInventoryPermissions",
         ): ("bedrock:ListModelCustomizationJobs",),
+        ("BedrockSecurityAssessmentFunction", "KMSKeyInventory"): ("kms:ListKeys",),
+        ("BedrockSecurityAssessmentFunction", "BackupVaultInventory"): (
+            "backup:ListBackupVaults",
+        ),
+        ("BedrockSecurityAssessmentFunction", "ResourceTagRead"): ("tag:GetResources",),
         ("SagemakerSecurityAssessmentFunction", "EC2SubnetExposureInventory"): (
             "ec2:DescribeSubnets",
             "ec2:DescribeRouteTables",
@@ -897,6 +920,18 @@ def test_aisf_phase5_reads_wildcard_only_where_iam_has_no_resource_type(template
         ("BedrockSecurityAssessmentFunction", "S3BucketEncryptionPermissions"): (
             "s3:GetBucketPolicy",
             "s3:::*",
+        ),
+        ("BedrockSecurityAssessmentFunction", "KMSPermissions"): (
+            "kms:GetKeyPolicy",
+            "kms:*:${AWS::AccountId}:key/*",
+        ),
+        ("BedrockSecurityAssessmentFunction", "LambdaPermissions"): (
+            "lambda:GetPolicy",
+            "lambda:*:${AWS::AccountId}:function:*",
+        ),
+        ("BedrockSecurityAssessmentFunction", "BedrockApiKeyInventoryRead"): (
+            "iam:ListMFADevices",
+            "iam::${AWS::AccountId}:user/*",
         ),
         ("BedrockSecurityAssessmentFunction", "OrganizationsEffectivePolicyRead"): (
             "organizations:DescribeEffectivePolicy",

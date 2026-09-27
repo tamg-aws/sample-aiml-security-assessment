@@ -70,6 +70,7 @@ class IAMPermissionCache:
         self.role_permissions = {}
         self.user_permissions = {}
         self.policy_cache = {}
+        self.group_policy_cache = {}
 
     def initialize(self):
         """
@@ -96,6 +97,45 @@ class IAMPermissionCache:
                 )
                 return None
         return self.policy_cache[cache_key]
+
+    def _group_policies(self, group_name):
+        """
+        Return a group's attached and inline policies, read once per group
+        """
+        if group_name in self.group_policy_cache:
+            return self.group_policy_cache[group_name]
+
+        policies = []
+        paginator = self.iam_client.get_paginator("list_attached_group_policies")
+        for page in paginator.paginate(GroupName=group_name):
+            for policy in page["AttachedPolicies"]:
+                policy_arn = policy["PolicyArn"]
+                policy_info = self.iam_client.get_policy(PolicyArn=policy_arn)["Policy"]
+                policy_doc = self._get_policy_document(
+                    policy_arn, policy_info["DefaultVersionId"]
+                )
+                if policy_doc:
+                    policies.append(
+                        {
+                            "name": policy["PolicyName"],
+                            "arn": policy_arn,
+                            "group": group_name,
+                            "document": policy_doc,
+                        }
+                    )
+
+        paginator = self.iam_client.get_paginator("list_group_policies")
+        for page in paginator.paginate(GroupName=group_name):
+            for policy_name in page["PolicyNames"]:
+                policy_doc = self.iam_client.get_group_policy(
+                    GroupName=group_name, PolicyName=policy_name
+                )["PolicyDocument"]
+                policies.append(
+                    {"name": policy_name, "group": group_name, "document": policy_doc}
+                )
+
+        self.group_policy_cache[group_name] = policies
+        return policies
 
     def _cache_role_permissions(self):
         """
@@ -230,6 +270,26 @@ class IAMPermissionCache:
                     logger.error(
                         f"Error getting inline policies for user {user_name}: {str(e)}"
                     )
+
+                # Group policies apply to the member as if attached to the user,
+                # so they are cached per user; a failed read is recorded rather
+                # than left looking like a user with no groups.
+                try:
+                    group_policies = []
+                    group_paginator = self.iam_client.get_paginator(
+                        "list_groups_for_user"
+                    )
+                    for group_page in group_paginator.paginate(UserName=user_name):
+                        for group in group_page["Groups"]:
+                            group_policies.extend(
+                                self._group_policies(group["GroupName"])
+                            )
+                    self.user_permissions[user_name]["group_policies"] = group_policies
+                except Exception as e:
+                    logger.error(
+                        f"Error getting group policies for user {user_name}: {str(e)}"
+                    )
+                    self.user_permissions[user_name]["group_policies_error"] = str(e)
 
 
 def lambda_handler(event, context):

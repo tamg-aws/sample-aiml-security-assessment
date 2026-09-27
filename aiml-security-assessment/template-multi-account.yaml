@@ -217,7 +217,15 @@ Resources:
                 - iam:ListAttachedUserPolicies
                 - iam:ListUserPolicies
                 - iam:GetUserPolicy
+                - iam:ListGroupsForUser # group policies apply to members
               Resource: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:user/*'
+            - Sid: IAMGroupPolicyRead
+              Effect: Allow
+              Action:
+                - iam:ListAttachedGroupPolicies
+                - iam:ListGroupPolicies
+                - iam:GetGroupPolicy
+              Resource: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:group/*'
             - Sid: IAMManagedPolicyRead
               Effect: Allow
               Action:
@@ -334,6 +342,7 @@ Resources:
                 - bedrock:ListKnowledgeBases
                 - bedrock:ListEvaluationJobs # BR-18
                 - bedrock:ListImportedModels # BR-30
+                - bedrock:ListProvisionedModelThroughputs # BR-53
                 - bedrock:ListInferenceProfiles
                 - bedrock:GetAccountDataRetention
                 - bedrock:ListMarketplaceModelEndpoints
@@ -422,8 +431,16 @@ Resources:
             - Sid: KMSPermissions
               Effect: Allow
               Action:
-                - kms:DescribeKey # BR-40
+                - kms:DescribeKey # BR-40, BR-55
+                - kms:GetKeyPolicy # BR-55
               Resource: !Sub 'arn:${AWS::Partition}:kms:*:${AWS::AccountId}:key/*'
+            - Sid: KMSKeyInventory
+              # BR-55 enumerates the account's keys; kms:ListKeys has no
+              # resource type in the IAM service authorization reference.
+              Effect: Allow
+              Action:
+                - kms:ListKeys # BR-55
+              Resource: '*'
             - Sid: ServiceQuotasInventoryPermissions
               Effect: Allow
               Action:
@@ -477,6 +494,9 @@ Resources:
               Effect: Allow
               Action:
                 - iam:ListServiceSpecificCredentials # BR-45
+                - iam:ListAccessKeys # BR-50
+                - iam:GetLoginProfile # BR-51
+                - iam:ListMFADevices # BR-51
               Resource: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:user/*'
             - Sid: BedrockInvocationLogInspection
               # BR-04 reads the retention period of the invocation log group and
@@ -513,7 +533,25 @@ Resources:
                 - s3:GetEncryptionConfiguration
                 - s3:GetLifecycleConfiguration # BR-04
                 - s3:GetBucketPolicy # BR-47
+                - s3:GetBucketVersioning # BR-04, BR-52
+                - s3:GetBucketObjectLockConfiguration # BR-52
               Resource: !Sub 'arn:${AWS::Partition}:s3:::*'
+            - Sid: BackupVaultInventory
+              # BR-52 lists backup vaults and their Locked and MinRetentionDays
+              # fields as supporting evidence; backup:ListBackupVaults has no
+              # resource type in the IAM service authorization reference.
+              Effect: Allow
+              Action:
+                - backup:ListBackupVaults # BR-52
+              Resource: '*'
+            - Sid: ResourceTagRead
+              # BR-53 reads the tags of named Bedrock resource ARNs;
+              # tag:GetResources has no resource type in the IAM service
+              # authorization reference.
+              Effect: Allow
+              Action:
+                - tag:GetResources # BR-53
+              Resource: '*'
             - Sid: CloudTrailPermissions
               Effect: Allow
               Action:
@@ -532,6 +570,8 @@ Resources:
               Effect: Allow
               Action:
                 - lambda:GetFunction
+                - lambda:ListFunctionUrlConfigs # BR-54
+                - lambda:GetPolicy # BR-54
               Resource: !Sub 'arn:${AWS::Partition}:lambda:*:${AWS::AccountId}:function:*'
             - Sid: EC2Permissions
               Effect: Allow

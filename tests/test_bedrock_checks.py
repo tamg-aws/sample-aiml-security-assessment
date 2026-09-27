@@ -875,7 +875,9 @@ class TestBR04LoggingConfiguration:
     RETENTION_FINDING = "Bedrock Invocation Log Retention"
 
     @staticmethod
-    def _retention_clients(logging_config, log_group_pages=None, lifecycle=None):
+    def _retention_clients(
+        logging_config, log_group_pages=None, lifecycle=None, versioning=None
+    ):
         """Dispatch the bedrock, logs and s3 clients the retention leg reads."""
         mock_bedrock = MagicMock()
         mock_bedrock.get_model_invocation_logging_configuration.return_value = {
@@ -904,6 +906,8 @@ class TestBR04LoggingConfiguration:
             )
         else:
             mock_s3.get_bucket_lifecycle_configuration.return_value = lifecycle
+        # A bucket that was never versioned returns no Status key.
+        mock_s3.get_bucket_versioning.return_value = versioning or {}
 
         clients = {"bedrock": mock_bedrock, "logs": mock_logs, "s3": mock_s3}
         return (lambda service_name, **kwargs: clients[service_name]), clients
@@ -3043,6 +3047,10 @@ class TestBedrockHandlerMultiRegion:
         "check_bedrock_batch_inference_output_encryption": "BR-31",
         "check_bedrock_cloudwatch_alarms": "BR-32",
         "check_inspector_lambda_code_scanning": "BR-33",
+        "check_bedrock_data_path_object_lock": "BR-52",
+        "check_bedrock_resource_owner_tag": "BR-53",
+        "check_lambda_public_invoke_configuration": "BR-54",
+        "check_kms_enclave_key_binding": "BR-55",
     }
 
     # Checks that read a global surface (the IAM permissions cache or the
@@ -3051,8 +3059,11 @@ class TestBedrockHandlerMultiRegion:
         "check_bedrock_central_guardrail_enforcement",  # BR-41
         "check_bedrock_model_allow_list",  # BR-42
         "check_bedrock_region_invocation_control",  # BR-43
+        "check_bedrock_approved_model_control",  # BR-43 model leg
         "check_bedrock_marketplace_model_control",  # BR-44
         "check_bedrock_api_key_governance",  # BR-45
+        "check_bedrock_ai_user_access_keys",  # BR-50
+        "check_bedrock_ai_user_console_mfa",  # BR-51
     )
 
     def _run_handler_with_check_spies(self, event):
@@ -3098,8 +3109,11 @@ class TestBedrockHandlerMultiRegion:
             "check_bedrock_central_guardrail_enforcement",  # BR-41 (global)
             "check_bedrock_model_allow_list",  # BR-42 (global)
             "check_bedrock_region_invocation_control",  # BR-43 (global)
+            "check_bedrock_approved_model_control",  # BR-43 model leg (global)
             "check_bedrock_marketplace_model_control",  # BR-44 (global)
             "check_bedrock_api_key_governance",  # BR-45 (global)
+            "check_bedrock_ai_user_access_keys",  # BR-50 (global)
+            "check_bedrock_ai_user_console_mfa",  # BR-51 (global)
             "check_bedrock_knowledge_base_source_classification",  # BR-46
             "check_bedrock_guardrail_tier",
             "check_bedrock_custom_model_kms_encryption",
@@ -12433,3 +12447,1861 @@ class TestBR39MarketplaceSubnetPrivacy:
             assert_finding_schema(finding)
             assert finding["Check_ID"] == "BR-39"
             assert finding["Region"] == "us-east-1"
+
+
+# ===================================================================
+# Scope 27: BR-01, BR-04, BR-12 and BR-43 extensions, BR-50 to BR-55
+# ===================================================================
+def _policy(*statements):
+    return {"Version": "2012-10-17", "Statement": list(statements)}
+
+
+def _identity(attached=(), inline=(), groups=(), group_error=None):
+    permissions = {
+        "attached_policies": list(attached),
+        "inline_policies": list(inline),
+    }
+    if groups:
+        permissions["group_policies"] = list(groups)
+    if group_error:
+        permissions["group_policies_error"] = group_error
+    return permissions
+
+
+def _customer_policy(name, *statements):
+    return {
+        "name": name,
+        "arn": f"arn:aws:iam::123456789012:policy/{name}",
+        "document": _policy(*statements),
+    }
+
+
+class TestBR01WildcardActionGrant:
+    """BR-01: customer-written bedrock:* and NotAction grants."""
+
+    FINDING = "Bedrock Wildcard Action Grant"
+
+    def _rows(self, cache):
+        return [
+            f
+            for f in extract_csv_data(
+                bedrock_app.check_bedrock_full_access_roles(cache)
+            )
+            if f["Finding"] == self.FINDING
+        ]
+
+    def test_br01_second_role_with_bedrock_wildcard_fails_first_passes(self):
+        cache = {
+            "role_permissions": {
+                "ScopedRole": _identity(
+                    attached=[
+                        _customer_policy(
+                            "Scoped",
+                            {
+                                "Effect": "Allow",
+                                "Action": ["bedrock:InvokeModel"],
+                                "Resource": "*",
+                            },
+                        )
+                    ]
+                ),
+                "WildRole": _identity(
+                    inline=[
+                        {
+                            "name": "wild",
+                            "document": _policy(
+                                {
+                                    "Effect": "Allow",
+                                    "Action": "bedrock:*",
+                                    "Resource": "*",
+                                }
+                            ),
+                        }
+                    ]
+                ),
+            },
+            "user_permissions": {},
+        }
+        rows = self._rows(cache)
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "Role 'WildRole' inline policy 'wild'" in rows[0]["Finding_Details"]
+        assert "allows bedrock:*" in rows[0]["Finding_Details"]
+        assert rows[0]["Severity"] == "High"
+        result = bedrock_app.check_bedrock_full_access_roles(cache)
+        assert result["status"] == "WARN"
+
+    def test_br01_action_as_string_and_as_list_both_match(self):
+        for action in ("bedrock:*", ["s3:GetObject", "Bedrock:*"]):
+            cache = {
+                "role_permissions": {
+                    "R": _identity(
+                        attached=[
+                            _customer_policy(
+                                "P",
+                                {"Effect": "Allow", "Action": action, "Resource": "*"},
+                            )
+                        ]
+                    )
+                },
+                "user_permissions": {},
+            }
+            assert [r["Status"] for r in self._rows(cache)] == ["Failed"], action
+
+    def test_br01_every_service_wildcard_is_not_a_bedrock_grant(self):
+        cache = {
+            "role_permissions": {
+                "Admin": _identity(
+                    attached=[
+                        _customer_policy(
+                            "Admin", {"Effect": "Allow", "Action": "*", "Resource": "*"}
+                        ),
+                        _customer_policy(
+                            "Admin2",
+                            {"Effect": "Allow", "Action": "*:*", "Resource": "*"},
+                        ),
+                    ]
+                )
+            },
+            "user_permissions": {},
+        }
+        assert [r["Status"] for r in self._rows(cache)] == ["Passed"]
+
+    def test_br01_not_action_allow_counts_unless_it_excludes_bedrock(self):
+        cache = {
+            "role_permissions": {
+                "ExcludesBedrock": _identity(
+                    attached=[
+                        _customer_policy(
+                            "NotBedrock",
+                            {
+                                "Effect": "Allow",
+                                "NotAction": ["bedrock:*", "iam:*"],
+                                "Resource": "*",
+                            },
+                        )
+                    ]
+                ),
+                "IncludesBedrock": _identity(
+                    attached=[
+                        _customer_policy(
+                            "NotIam",
+                            {"Effect": "Allow", "NotAction": "iam:*", "Resource": "*"},
+                        )
+                    ]
+                ),
+            },
+            "user_permissions": {},
+        }
+        rows = self._rows(cache)
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "IncludesBedrock" in rows[0]["Finding_Details"]
+        assert "through NotAction" in rows[0]["Finding_Details"]
+
+    def test_br01_aws_managed_policy_is_left_to_the_managed_leg(
+        self, permission_cache_with_full_access
+    ):
+        assert [r["Status"] for r in self._rows(permission_cache_with_full_access)] == [
+            "Passed"
+        ]
+
+    def test_br01_group_policy_grant_is_attributed_to_the_user(self):
+        cache = {
+            "role_permissions": {},
+            "user_permissions": {
+                "clean": _identity(),
+                "member": _identity(
+                    groups=[
+                        {
+                            "name": "GroupWild",
+                            "group": "ml-admins",
+                            "document": _policy(
+                                {
+                                    "Effect": "Allow",
+                                    "Action": "bedrock:*",
+                                    "Resource": "*",
+                                }
+                            ),
+                        }
+                    ]
+                ),
+            },
+        }
+        rows = self._rows(cache)
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert (
+            "User 'member' inline policy of group 'ml-admins' 'GroupWild'"
+            in rows[0]["Finding_Details"]
+        )
+
+    def test_br01_unread_group_policies_make_the_summary_na(self):
+        cache = {
+            "role_permissions": {},
+            "user_permissions": {"u": _identity(group_error="AccessDenied")},
+        }
+        rows = self._rows(cache)
+        assert [r["Status"] for r in rows] == ["N/A", "N/A"]
+        assert "user 'u' group policies" in rows[0]["Finding_Details"]
+
+    def test_br01_no_identities_is_na(self, empty_permission_cache):
+        assert [r["Status"] for r in self._rows(empty_permission_cache)] == ["N/A"]
+
+    def test_br01_wildcard_rows_pass_the_schema(self):
+        cache = {
+            "role_permissions": {
+                "R": _identity(
+                    attached=[
+                        _customer_policy(
+                            "P",
+                            {"Effect": "Allow", "Action": "bedrock:*", "Resource": "*"},
+                        )
+                    ]
+                )
+            },
+            "user_permissions": {"u": _identity(group_error="boom")},
+        }
+        for finding in self._rows(cache):
+            assert_finding_schema(finding)
+
+
+class TestBR04LogPrefixAndVersioning:
+    """BR-04 retention: the lifecycle rule must cover <keyPrefix>/AWSLogs/ and,
+    on a versioned bucket, expire noncurrent versions too."""
+
+    FINDING = "Bedrock Invocation Log Retention"
+
+    def _rows(self, logging_config, lifecycle, versioning=None, versioning_error=None):
+        factory, clients = TestBR04LoggingConfiguration._retention_clients(
+            logging_config, lifecycle=lifecycle, versioning=versioning
+        )
+        if versioning_error is not None:
+            clients["s3"].get_bucket_versioning.side_effect = versioning_error
+        with (
+            patch("boto3.client", side_effect=factory),
+            patch("bedrock_app.detect_bedrock_regional_footprint", return_value=True),
+        ):
+            findings = extract_csv_data(
+                bedrock_app.check_bedrock_logging_configuration(region="us-east-1")
+            )
+        return [f for f in findings if f["Finding"] == self.FINDING]
+
+    PREFIXED = {"s3Config": {"bucketName": "log-bucket", "keyPrefix": "bedrock"}}
+
+    def test_br04_rule_on_the_key_prefix_covers_the_log_root(self):
+        rows = self._rows(
+            self.PREFIXED,
+            {
+                "Rules": [
+                    {
+                        "ID": "prefix-rule",
+                        "Status": "Enabled",
+                        "Filter": {"Prefix": "bedrock/"},
+                        "Expiration": {"Days": 30},
+                    }
+                ]
+            },
+        )
+        assert [r["Status"] for r in rows] == ["Passed"]
+
+    def test_br04_rule_on_another_prefix_does_not_count(self):
+        rows = self._rows(
+            self.PREFIXED,
+            {
+                "Rules": [
+                    {
+                        "ID": "other-rule",
+                        "Status": "Enabled",
+                        "Filter": {"Prefix": "other/"},
+                        "Expiration": {"Days": 30},
+                    }
+                ]
+            },
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert (
+            "other-rule applies to prefix 'other/', which does not cover "
+            "'bedrock/AWSLogs/'" in rows[0]["Finding_Details"]
+        )
+
+    def test_br04_second_rule_covering_the_root_is_found_after_a_miss(self):
+        rows = self._rows(
+            self.PREFIXED,
+            {
+                "Rules": [
+                    {
+                        "ID": "other-rule",
+                        "Status": "Enabled",
+                        "Prefix": "other/",
+                        "Expiration": {"Days": 30},
+                    },
+                    {
+                        "ID": "legacy-root",
+                        "Status": "Enabled",
+                        "Prefix": "",
+                        "Expiration": {"Days": 60},
+                    },
+                ]
+            },
+        )
+        assert [r["Status"] for r in rows] == ["Passed"]
+        assert (
+            "legacy-root expires objects after 60 day(s)" in rows[0]["Finding_Details"]
+        )
+
+    def test_br04_tag_or_size_filtered_rule_does_not_count(self):
+        for rule_filter in (
+            {"And": {"Prefix": "", "Tags": [{"Key": "k", "Value": "v"}]}},
+            {"Tag": {"Key": "k", "Value": "v"}},
+            {"ObjectSizeGreaterThan": 1024},
+        ):
+            rows = self._rows(
+                {"s3Config": {"bucketName": "log-bucket"}},
+                {
+                    "Rules": [
+                        {
+                            "ID": "filtered",
+                            "Status": "Enabled",
+                            "Filter": rule_filter,
+                            "Expiration": {"Days": 30},
+                        }
+                    ]
+                },
+            )
+            assert [r["Status"] for r in rows] == ["Failed"], rule_filter
+            assert "also filters on tags or object size" in rows[0]["Finding_Details"]
+
+    def test_br04_versioned_bucket_needs_a_noncurrent_expiration(self):
+        lifecycle = {
+            "Rules": [
+                {"ID": "current", "Status": "Enabled", "Expiration": {"Days": 30}}
+            ]
+        }
+        for status in ("Enabled", "Suspended"):
+            rows = self._rows(
+                {"s3Config": {"bucketName": "log-bucket"}},
+                lifecycle,
+                versioning={"Status": status},
+            )
+            assert [r["Status"] for r in rows] == ["Failed"], status
+            assert (
+                f"has versioning {status} and no enabled lifecycle rule that "
+                "expires noncurrent versions" in rows[0]["Finding_Details"]
+            )
+
+    def test_br04_versioned_bucket_with_noncurrent_expiration_passes(self):
+        rows = self._rows(
+            {"s3Config": {"bucketName": "log-bucket"}},
+            {
+                "Rules": [
+                    {
+                        "ID": "both",
+                        "Status": "Enabled",
+                        "Expiration": {"Days": 30},
+                        "NoncurrentVersionExpiration": {"NoncurrentDays": 7},
+                    }
+                ]
+            },
+            versioning={"Status": "Enabled"},
+        )
+        assert [r["Status"] for r in rows] == ["Passed"]
+        assert (
+            "expires noncurrent versions after 7 day(s)" in rows[0]["Finding_Details"]
+        )
+
+    def test_br04_noncurrent_only_rule_is_not_a_current_expiration(self):
+        rows = self._rows(
+            {"s3Config": {"bucketName": "log-bucket"}},
+            {
+                "Rules": [
+                    {
+                        "ID": "noncurrent-only",
+                        "Status": "Enabled",
+                        "NoncurrentVersionExpiration": {"NoncurrentDays": 7},
+                    }
+                ]
+            },
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "so logs are kept indefinitely" in rows[0]["Finding_Details"]
+
+    def test_br04_unreadable_versioning_is_na(self):
+        rows = self._rows(
+            {"s3Config": {"bucketName": "log-bucket"}},
+            {"Rules": [{"ID": "c", "Status": "Enabled", "Expiration": {"Days": 3}}]},
+            versioning_error=_make_client_error("AccessDenied"),
+        )
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert "s3:GetBucketVersioning" in rows[0]["Finding_Details"]
+
+
+class TestBR12InvocationLogDeletionProtection:
+    """BR-12: deletion protection on the CloudWatch invocation log group."""
+
+    FINDING = "Bedrock Invocation Log Group Deletion Protection"
+
+    def _run(self, logging_config, log_groups=None, logs_error=None):
+        bedrock = MagicMock()
+        bedrock.get_model_invocation_logging_configuration.return_value = {
+            "loggingConfig": logging_config
+        }
+        s3 = MagicMock()
+        s3.get_bucket_encryption.return_value = {
+            "ServerSideEncryptionConfiguration": {
+                "Rules": [
+                    {
+                        "ApplyServerSideEncryptionByDefault": {
+                            "SSEAlgorithm": "aws:kms",
+                            "KMSMasterKeyID": "arn:aws:kms:us-east-1:123456789012:key/k",
+                        }
+                    }
+                ]
+            }
+        }
+        logs = MagicMock()
+        if logs_error is not None:
+            logs.describe_log_groups.side_effect = logs_error
+        else:
+            logs.describe_log_groups.return_value = {"logGroups": log_groups or []}
+        clients = {"bedrock": bedrock, "s3": s3, "logs": logs}
+        with patch(
+            "boto3.client",
+            side_effect=lambda service, **kwargs: clients.setdefault(
+                service, MagicMock()
+            ),
+        ):
+            result = bedrock_app.check_bedrock_invocation_log_encryption(
+                region="us-east-1"
+            )
+        return result, [
+            f for f in extract_csv_data(result) if f["Finding"] == self.FINDING
+        ]
+
+    CW = {"cloudWatchConfig": {"logGroupName": "/aws/bedrock/invocations"}}
+
+    def test_br12_protected_group_passes(self):
+        _, rows = self._run(
+            self.CW,
+            [
+                {"logGroupName": "/aws/bedrock/invocations-old"},
+                {
+                    "logGroupName": "/aws/bedrock/invocations",
+                    "deletionProtectionEnabled": True,
+                },
+            ],
+        )
+        assert [r["Status"] for r in rows] == ["Passed"]
+
+    def test_br12_absent_flag_reads_as_unprotected(self):
+        result, rows = self._run(
+            self.CW, [{"logGroupName": "/aws/bedrock/invocations"}]
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "deletionProtectionEnabled is absent" in rows[0]["Finding_Details"]
+        assert result["status"] == "WARN"
+
+    def test_br12_explicit_false_fails(self):
+        _, rows = self._run(
+            self.CW,
+            [
+                {
+                    "logGroupName": "/aws/bedrock/invocations",
+                    "deletionProtectionEnabled": False,
+                }
+            ],
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "deletionProtectionEnabled is False" in rows[0]["Finding_Details"]
+
+    def test_br12_group_not_returned_is_na(self):
+        _, rows = self._run(self.CW, [{"logGroupName": "/aws/bedrock/other"}])
+        assert [r["Status"] for r in rows] == ["N/A"]
+
+    def test_br12_access_denied_is_na(self):
+        _, rows = self._run(self.CW, logs_error=_make_client_error("AccessDenied"))
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert "logs:DescribeLogGroups" in rows[0]["Finding_Details"]
+
+    def test_br12_no_cloudwatch_destination_is_na_alongside_s3(self):
+        _, rows = self._run({"s3Config": {"bucketName": "b"}})
+        assert [r["Status"] for r in rows] == ["N/A"]
+
+    def test_br12_no_bucket_branch_still_reports_the_group(self):
+        _, rows = self._run(
+            self.CW,
+            [
+                {
+                    "logGroupName": "/aws/bedrock/invocations",
+                    "deletionProtectionEnabled": True,
+                }
+            ],
+        )
+        assert rows and rows[0]["Check_ID"] == "BR-12"
+        for finding in rows:
+            assert_finding_schema(finding)
+
+
+class TestBR43ApprovedModelControl:
+    """BR-43 model leg: an SCP that denies invocation outside a named model list."""
+
+    MODELS = [
+        "arn:aws:bedrock:*::foundation-model/anthropic.claude-sonnet-5",
+        "arn:aws:bedrock:*:*:inference-profile/global.anthropic.claude-opus-5-5",
+    ]
+
+    @staticmethod
+    def _inventory(*documents, errors=(), list_error=None):
+        return {
+            "items": [
+                {"name": f"policy-{i}", "id": f"p-{i}", "content": json.dumps(doc)}
+                for i, doc in enumerate(documents)
+            ],
+            "errors": list(errors),
+            "list_error": list_error,
+        }
+
+    def _run(self, inventory, readable=True):
+        context = {
+            "readable": readable,
+            "detail": "the organization could not be read",
+            "resolution": "Grant access.",
+            "account": "123456789012",
+        }
+        with patch.object(
+            bedrock_app, "_organization_policy_context", return_value=context
+        ):
+            return extract_csv_data(
+                bedrock_app.check_bedrock_approved_model_control(
+                    region="Global", scp_inventory=inventory
+                )
+            )
+
+    def test_br43_model_not_resource_list_passes_after_an_unrelated_policy(self):
+        rows = self._run(
+            self._inventory(
+                _policy({"Effect": "Deny", "Action": "s3:*", "Resource": "*"}),
+                _policy(
+                    {
+                        "Effect": "Deny",
+                        "Action": [
+                            "bedrock:InvokeModel",
+                            "bedrock:InvokeModelWithResponseStream",
+                        ],
+                        "NotResource": self.MODELS,
+                    }
+                ),
+            )
+        )
+        assert [r["Status"] for r in rows] == ["Passed"]
+        assert "through NotResource" in rows[0]["Finding_Details"]
+        assert "policy 'policy-1'" in rows[0]["Finding_Details"]
+
+    def test_br43_negated_condition_with_set_operator_passes(self):
+        rows = self._run(
+            self._inventory(
+                _policy(
+                    {
+                        "Effect": "Deny",
+                        "Action": "bedrock:Invoke*",
+                        "Resource": "*",
+                        "Condition": {
+                            "ForAnyValue:ArnNotLike": {
+                                "bedrock:InferenceProfileArn": self.MODELS[1:]
+                            }
+                        },
+                    }
+                )
+            )
+        )
+        assert [r["Status"] for r in rows] == ["Passed"]
+        assert "foranyvalue:arnnotlike" in rows[0]["Finding_Details"]
+
+    def test_br43_not_action_deny_covers_the_actions_it_does_not_name(self):
+        rows = self._run(
+            self._inventory(
+                _policy(
+                    {
+                        "Effect": "Deny",
+                        "NotAction": "bedrock:InvokeModelWithResponseStream",
+                        "NotResource": self.MODELS,
+                    }
+                )
+            )
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert (
+            "none of them covers bedrock:invokemodelwithresponsestream"
+            in rows[0]["Finding_Details"].lower()
+        )
+
+    def test_br43_wildcard_over_every_model_is_no_list(self):
+        rows = self._run(
+            self._inventory(
+                _policy(
+                    {
+                        "Effect": "Deny",
+                        "Action": "bedrock:InvokeModel*",
+                        "NotResource": "arn:aws:bedrock:*::foundation-model/*",
+                    }
+                )
+            )
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "counts as no list" in rows[0]["Finding_Details"]
+
+    def test_br43_positive_condition_is_not_a_list(self):
+        rows = self._run(
+            self._inventory(
+                _policy(
+                    {
+                        "Effect": "Deny",
+                        "Action": "bedrock:InvokeModel*",
+                        "Resource": "*",
+                        "Condition": {
+                            "ArnLike": {"bedrock:InferenceProfileArn": self.MODELS}
+                        },
+                    }
+                )
+            )
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+
+    def test_br43_unreadable_organization_is_na(self):
+        rows = self._run(self._inventory(), readable=False)
+        assert [r["Status"] for r in rows] == ["N/A"]
+
+    def test_br43_read_errors_without_a_control_are_na(self):
+        rows = self._run(self._inventory(errors=["policy 'x': AccessDenied"]))
+        assert [r["Status"] for r in rows] == ["N/A"]
+
+    def test_br43_model_rows_pass_the_schema(self):
+        for finding in self._run(self._inventory()):
+            assert_finding_schema(finding)
+            assert finding["Check_ID"] == "BR-43"
+
+
+def _ai_user_cache():
+    """Two users hold an AI write grant; a third only reads, so is out of scope."""
+    return {
+        "role_permissions": {},
+        "user_permissions": {
+            "alice": _identity(
+                attached=[
+                    _customer_policy(
+                        "BedrockWrite",
+                        {
+                            "Effect": "Allow",
+                            "Action": "bedrock:CreateAgent",
+                            "Resource": "*",
+                        },
+                    )
+                ]
+            ),
+            "bob": _identity(
+                groups=[
+                    {
+                        "name": "SageMakerAll",
+                        "arn": "arn:aws:iam::123456789012:policy/SageMakerAll",
+                        "group": "ml",
+                        "document": _policy(
+                            {
+                                "Effect": "Allow",
+                                "Action": "sagemaker:*",
+                                "Resource": "*",
+                            }
+                        ),
+                    }
+                ]
+            ),
+            "reader": _identity(
+                attached=[
+                    _customer_policy(
+                        "ReadOnly",
+                        {
+                            "Effect": "Allow",
+                            "Action": ["bedrock:Get*", "bedrock:List*"],
+                            "Resource": "*",
+                        },
+                    )
+                ]
+            ),
+        },
+    }
+
+
+class TestAIWriteUserPopulation:
+    """BR-50 and BR-51 share one population: users with a non-read AI grant."""
+
+    def test_population_selects_write_grants_from_attached_and_group_policies(self):
+        population = bedrock_app._ai_write_users(_ai_user_cache())
+        assert sorted(population["users"]) == ["alice", "bob"]
+        assert "group 'ml'" in population["users"]["bob"][0]
+        assert population["unreadable"] == {}
+
+    def test_population_not_action_counts_unless_it_excludes_every_service(self):
+        cache = {
+            "role_permissions": {},
+            "user_permissions": {
+                "excludes": _identity(
+                    inline=[
+                        {
+                            "name": "p",
+                            "document": _policy(
+                                {
+                                    "Effect": "Allow",
+                                    "NotAction": [
+                                        "bedrock:*",
+                                        "sagemaker:*",
+                                        "bedrock-agentcore:*",
+                                    ],
+                                    "Resource": "*",
+                                }
+                            ),
+                        }
+                    ]
+                ),
+                "opens": _identity(
+                    inline=[
+                        {
+                            "name": "p",
+                            "document": _policy(
+                                {
+                                    "Effect": "Allow",
+                                    "NotAction": "bedrock:*",
+                                    "Resource": "*",
+                                }
+                            ),
+                        }
+                    ]
+                ),
+            },
+        }
+        population = bedrock_app._ai_write_users(cache)
+        assert list(population["users"]) == ["opens"]
+        assert "sagemaker/bedrock-agentcore" in population["users"]["opens"][0]
+
+    def test_population_every_service_wildcard_is_in_scope(self):
+        assert bedrock_app._action_grants_ai_write("*") == list(
+            bedrock_app.AI_WRITE_SERVICES
+        )
+        assert bedrock_app._action_grants_ai_write("bedrock:Describe*") == []
+        assert bedrock_app._action_grants_ai_write("*:Put*") == list(
+            bedrock_app.AI_WRITE_SERVICES
+        )
+
+    def test_population_unread_group_policies_are_reported_not_dropped(self):
+        cache = {
+            "role_permissions": {},
+            "user_permissions": {"hidden": _identity(group_error="AccessDenied")},
+        }
+        population = bedrock_app._ai_write_users(cache)
+        assert population["users"] == {}
+        assert population["unreadable"] == {
+            "hidden": ["group policies could not be read"]
+        }
+
+
+class TestBR50AIUserAccessKeys:
+    """BR-50: active long-term access keys on AI write users."""
+
+    def _run(self, cache, keys_by_user=None, error=None, pages=None):
+        iam = MagicMock()
+
+        def list_access_keys(UserName, **kwargs):
+            if error is not None:
+                raise error
+            if pages is not None:
+                return pages[1] if kwargs.get("Marker") else pages[0]
+            return {"AccessKeyMetadata": (keys_by_user or {}).get(UserName, [])}
+
+        iam.list_access_keys.side_effect = list_access_keys
+        with patch("boto3.client", return_value=iam):
+            result = bedrock_app.check_bedrock_ai_user_access_keys(
+                cache, region="Global"
+            )
+        return result, extract_csv_data(result), iam
+
+    def test_br50_first_user_without_keys_passes_second_with_key_fails(self):
+        result, rows, _ = self._run(
+            _ai_user_cache(),
+            {
+                "alice": [
+                    {
+                        "AccessKeyId": "AKIAEXAMPLEOLDKEY001",  # pragma: allowlist secret - fake test key id
+                        "Status": "Inactive",
+                        "CreateDate": "2020-01-01T00:00:00Z",
+                    }
+                ],
+                "bob": [
+                    {
+                        "AccessKeyId": "AKIAEXAMPLEACTIVE123",  # pragma: allowlist secret - fake test key id
+                        "Status": "Active",
+                        "CreateDate": "2024-01-01T00:00:00Z",
+                    }
+                ],
+            },
+        )
+        assert [r["Status"] for r in rows] == ["Failed", "Passed"]
+        assert "IAM user 'bob'" in rows[0]["Finding_Details"]
+        assert "ending 'E123'" in rows[0]["Finding_Details"]
+        assert (
+            "AKIAEXAMPLEACTIVE123"  # pragma: allowlist secret - fake test key id
+            not in rows[0]["Finding_Details"]
+        )
+        assert "day(s) old" in rows[0]["Finding_Details"]
+        assert "1 of the 2 in-scope IAM user(s)" in rows[1]["Finding_Details"]
+        assert "alice" in rows[1]["Finding_Details"]
+        assert "reader" not in json.dumps(rows)
+        assert result["status"] == "WARN"
+
+    def test_br50_second_page_of_keys_is_read(self):
+        cache = {
+            "role_permissions": {},
+            "user_permissions": {
+                "alice": _ai_user_cache()["user_permissions"]["alice"]
+            },
+        }
+        _, rows, iam = self._run(
+            cache,
+            pages=[
+                {"AccessKeyMetadata": [], "Marker": "page-2"},
+                {
+                    "AccessKeyMetadata": [
+                        {
+                            "AccessKeyId": "AKIAEXAMPLEPAGE2KEY9",  # pragma: allowlist secret - fake test key id
+                            "Status": "Active",
+                            "CreateDate": "2024-01-01T00:00:00Z",
+                        }
+                    ]
+                },
+            ],
+        )
+        iam.list_access_keys.assert_any_call(UserName="alice", Marker="page-2")
+        assert [r["Status"] for r in rows] == ["Failed"]
+
+    def test_br50_access_denied_is_na_per_user(self):
+        _, rows, _ = self._run(
+            _ai_user_cache(), error=_make_client_error("AccessDenied")
+        )
+        assert [r["Status"] for r in rows] == ["N/A", "N/A"]
+        assert "iam:ListAccessKeys" in rows[0]["Finding_Details"]
+
+    def test_br50_empty_population_is_na(self, empty_permission_cache):
+        _, rows, iam = self._run(empty_permission_cache)
+        assert [r["Status"] for r in rows] == ["N/A"]
+        iam.list_access_keys.assert_not_called()
+
+    def test_br50_unreadable_user_is_na_not_clean(self):
+        cache = _ai_user_cache()
+        cache["user_permissions"]["hidden"] = _identity(group_error="AccessDenied")
+        _, rows, _ = self._run(cache, {})
+        assert rows[0]["Status"] == "N/A"
+        assert (
+            "'hidden' was not placed in or out of scope" in rows[0]["Finding_Details"]
+        )
+
+    def test_br50_exception_is_could_not_assess(self):
+        rows = extract_csv_data(
+            bedrock_app.check_bedrock_ai_user_access_keys({}, region="Global")
+        )
+        assert_could_not_assess_finding(rows[0])
+
+    def test_br50_rows_pass_the_schema(self):
+        _, rows, _ = self._run(
+            _ai_user_cache(),
+            {"bob": [{"AccessKeyId": "AKIAX", "Status": "Active", "CreateDate": "x"}]},
+        )
+        for finding in rows:
+            assert_finding_schema(finding)
+            assert finding["Check_ID"] == "BR-50"
+
+
+class TestBR51AIUserConsoleMFA:
+    """BR-51: console password without MFA on AI write users."""
+
+    def _run(self, cache, login=None, devices=None, mfa_error=None):
+        iam = MagicMock()
+        login = login or {}
+
+        def get_login_profile(UserName):
+            outcome = login.get(UserName, "none")
+            if outcome == "none":
+                raise _make_client_error("NoSuchEntity")
+            if isinstance(outcome, Exception):
+                raise outcome
+            return {"LoginProfile": {"UserName": UserName}}
+
+        def list_mfa_devices(UserName, **kwargs):
+            if mfa_error is not None:
+                raise mfa_error
+            return {"MFADevices": (devices or {}).get(UserName, [])}
+
+        iam.get_login_profile.side_effect = get_login_profile
+        iam.list_mfa_devices.side_effect = list_mfa_devices
+        with patch("boto3.client", return_value=iam):
+            result = bedrock_app.check_bedrock_ai_user_console_mfa(
+                cache, region="Global"
+            )
+        return result, extract_csv_data(result)
+
+    def test_br51_first_user_with_mfa_passes_second_without_fails(self):
+        result, rows = self._run(
+            _ai_user_cache(),
+            login={"alice": "yes", "bob": "yes"},
+            devices={"alice": [{"SerialNumber": "arn:aws:iam::123456789012:mfa/a"}]},
+        )
+        assert [r["Status"] for r in rows] == ["Failed", "Passed"]
+        assert (
+            "IAM user 'bob' has a console password and no MFA"
+            in rows[0]["Finding_Details"]
+        )
+        assert (
+            "1 of the 2 in-scope IAM user(s) have an MFA device (alice)"
+            in rows[1]["Finding_Details"]
+        )
+        assert result["status"] == "WARN"
+
+    def test_br51_user_without_console_password_is_not_failed(self):
+        _, rows = self._run(
+            _ai_user_cache(),
+            login={"alice": "yes"},
+            devices={"alice": [{"SerialNumber": "s"}]},
+        )
+        assert [r["Status"] for r in rows] == ["Passed"]
+        assert "1 have no console password (bob)" in rows[0]["Finding_Details"]
+
+    def test_br51_every_row_names_the_identity_center_limit(self):
+        _, rows = self._run(_ai_user_cache(), login={"bob": "yes"})
+        for finding in rows:
+            assert "IAM Identity Center are not covered" in finding["Finding_Details"]
+
+    def test_br51_login_profile_access_denied_is_na(self):
+        _, rows = self._run(
+            _ai_user_cache(),
+            login={
+                "alice": _make_client_error("AccessDenied"),
+                "bob": _make_client_error("AccessDenied"),
+            },
+        )
+        assert [r["Status"] for r in rows] == ["N/A", "N/A"]
+        assert "iam:GetLoginProfile" in rows[0]["Finding_Details"]
+
+    def test_br51_mfa_list_error_is_na(self):
+        _, rows = self._run(
+            _ai_user_cache(),
+            login={"alice": "yes"},
+            mfa_error=_make_client_error("AccessDenied"),
+        )
+        assert [r["Status"] for r in rows] == ["N/A", "Passed"]
+        assert "iam:ListMFADevices" in rows[0]["Finding_Details"]
+
+    def test_br51_empty_population_is_na(self, empty_permission_cache):
+        _, rows = self._run(empty_permission_cache)
+        assert [r["Status"] for r in rows] == ["N/A"]
+
+    def test_br51_exception_is_could_not_assess(self):
+        rows = extract_csv_data(
+            bedrock_app.check_bedrock_ai_user_console_mfa({}, region="Global")
+        )
+        assert_could_not_assess_finding(rows[0])
+
+
+class TestBR52DataPathObjectLock:
+    """BR-52: COMPLIANCE-mode default retention on data path buckets."""
+
+    COMPLIANT = {
+        "ObjectLockConfiguration": {
+            "ObjectLockEnabled": "Enabled",
+            "Rule": {"DefaultRetention": {"Mode": "COMPLIANCE", "Days": 365}},
+        }
+    }
+
+    def _run(self, buckets, configurations, errors=(), truncated=(), vaults=None):
+        s3 = MagicMock()
+
+        def get_object_lock_configuration(Bucket):
+            outcome = configurations[Bucket]
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+
+        s3.get_object_lock_configuration.side_effect = get_object_lock_configuration
+        backup = MagicMock()
+        backup.list_backup_vaults.return_value = {
+            "BackupVaultList": vaults
+            if vaults is not None
+            else [
+                {"BackupVaultName": "locked", "Locked": True, "MinRetentionDays": 30},
+                {"BackupVaultName": "open"},
+            ]
+        }
+        inventory = {
+            "buckets": buckets,
+            "errors": list(errors),
+            "truncated": list(truncated),
+        }
+        with (
+            patch.object(bedrock_app, "_ai_data_path_buckets", return_value=inventory),
+            patch(
+                "boto3.client",
+                side_effect=lambda service, **kwargs: {"s3": s3, "backup": backup}[
+                    service
+                ],
+            ),
+        ):
+            result = bedrock_app.check_bedrock_data_path_object_lock(region="us-east-1")
+        return result, extract_csv_data(result)
+
+    def test_br52_first_bucket_compliant_second_governance_fails(self):
+        result, rows = self._run(
+            {"a-locked": ["knowledge base kb1"], "b-governed": ["invocation log"]},
+            {
+                "a-locked": self.COMPLIANT,
+                "b-governed": {
+                    "ObjectLockConfiguration": {
+                        "ObjectLockEnabled": "Enabled",
+                        "Rule": {
+                            "DefaultRetention": {"Mode": "GOVERNANCE", "Days": 30}
+                        },
+                    }
+                },
+            },
+        )
+        assert [r["Status"] for r in rows] == ["Failed", "Passed"]
+        assert "b-governed" in rows[0]["Finding_Details"]
+        assert "s3:BypassGovernanceRetention" in rows[0]["Finding_Details"]
+        assert "s3:" not in rows[0]["Resolution"]
+        assert "1 of 2 AWS Backup vault(s)" in rows[0]["Finding_Details"]
+        assert "locked (minimum retention 30 day(s))" in rows[0]["Finding_Details"]
+        assert "a-locked" in rows[1]["Finding_Details"]
+        assert result["status"] == "WARN"
+
+    def test_br52_missing_or_partial_configuration_fails(self):
+        cases = {
+            "no-config": _make_client_error("ObjectLockConfigurationNotFoundError"),
+            "no-default": {"ObjectLockConfiguration": {"ObjectLockEnabled": "Enabled"}},
+            "no-period": {
+                "ObjectLockConfiguration": {
+                    "ObjectLockEnabled": "Enabled",
+                    "Rule": {"DefaultRetention": {"Mode": "COMPLIANCE"}},
+                }
+            },
+            "years": {
+                "ObjectLockConfiguration": {
+                    "ObjectLockEnabled": "Enabled",
+                    "Rule": {"DefaultRetention": {"Mode": "COMPLIANCE", "Years": 7}},
+                }
+            },
+        }
+        _, rows = self._run({name: ["label"] for name in cases}, cases)
+        failed = {
+            r["Finding_Details"].split()[1]: r["Finding_Details"]
+            for r in rows
+            if r["Status"] == "Failed"
+        }
+        assert sorted(failed) == ["no-config", "no-default", "no-period"]
+        assert "has no Object Lock configuration" in failed["no-config"]
+        assert "no default retention" in failed["no-default"]
+        assert "with no period" in failed["no-period"]
+        assert [r["Status"] for r in rows if "years" in r["Finding_Details"]] == [
+            "Passed"
+        ]
+
+    def test_br52_access_denied_is_na_not_unlocked(self):
+        _, rows = self._run(
+            {"a-locked": ["kb"], "b-denied": ["kb"]},
+            {
+                "a-locked": self.COMPLIANT,
+                "b-denied": _make_client_error("AccessDenied"),
+            },
+        )
+        assert [r["Status"] for r in rows] == ["Passed", "N/A"]
+        assert "b-denied" in rows[1]["Finding_Details"]
+
+    def test_br52_incomplete_bucket_list_downgrades_the_pass(self):
+        _, rows = self._run(
+            {"a-locked": ["kb"]},
+            {"a-locked": self.COMPLIANT},
+            errors=["knowledge bases: AccessDenied"],
+        )
+        assert [r["Status"] for r in rows] == ["N/A", "N/A"]
+        assert "not a verdict on the whole data path" in rows[1]["Finding_Details"]
+
+    def test_br52_no_data_path_bucket_is_na(self):
+        _, rows = self._run({}, {})
+        assert [r["Status"] for r in rows] == ["N/A"]
+
+    def test_br52_backup_list_error_is_evidence_only(self):
+        s3 = MagicMock()
+        s3.get_object_lock_configuration.return_value = self.COMPLIANT
+        backup = MagicMock()
+        backup.list_backup_vaults.side_effect = _make_client_error("AccessDenied")
+        with (
+            patch.object(
+                bedrock_app,
+                "_ai_data_path_buckets",
+                return_value={"buckets": {"a": ["kb"]}, "errors": [], "truncated": []},
+            ),
+            patch(
+                "boto3.client",
+                side_effect=lambda service, **kwargs: {"s3": s3, "backup": backup}[
+                    service
+                ],
+            ),
+        ):
+            rows = extract_csv_data(
+                bedrock_app.check_bedrock_data_path_object_lock(region="us-east-1")
+            )
+        assert [r["Status"] for r in rows] == ["Passed"]
+        assert "AWS Backup vaults could not be listed" in rows[0]["Finding_Details"]
+
+    def test_br52_exception_is_could_not_assess(self):
+        with patch.object(
+            bedrock_app, "_ai_data_path_buckets", side_effect=RuntimeError("boom")
+        ):
+            rows = extract_csv_data(
+                bedrock_app.check_bedrock_data_path_object_lock(region="us-east-1")
+            )
+        assert_could_not_assess_finding(rows[0])
+
+    def test_br52_rows_pass_the_schema(self):
+        _, rows = self._run(
+            {"a": ["kb"], "b": ["kb"]},
+            {"a": self.COMPLIANT, "b": _make_client_error("AccessDenied")},
+            truncated=["capped"],
+        )
+        for finding in rows:
+            assert_finding_schema(finding)
+            assert finding["Check_ID"] == "BR-52"
+
+
+class TestBR53ResourceOwnerTag:
+    """BR-53: owner tag on every listed Bedrock resource."""
+
+    GUARDRAIL_OWNED = "arn:aws:bedrock:us-east-1:123456789012:guardrail/g-owned"
+    GUARDRAIL_BARE = "arn:aws:bedrock:us-east-1:123456789012:guardrail/g-bare"
+    AGENT = "arn:aws:bedrock:us-east-1:123456789012:agent/AGENT1"
+
+    def _run(self, listings=None, tag_mappings=None, tag_error=None, list_errors=None):
+        listings = listings or {}
+        list_errors = list_errors or {}
+        bedrock = MagicMock()
+        agent = MagicMock()
+        result_keys = {
+            "list_agents": "agentSummaries",
+            "list_knowledge_bases": "knowledgeBaseSummaries",
+            "list_guardrails": "guardrails",
+            "list_custom_models": "modelSummaries",
+            "list_imported_models": "modelSummaries",
+            "list_provisioned_model_throughputs": "provisionedModelSummaries",
+        }
+        for operation, key in result_keys.items():
+            client = (
+                agent
+                if operation.startswith(("list_agents", "list_knowledge"))
+                else bedrock
+            )
+            method = getattr(client, operation)
+            if operation in list_errors:
+                method.side_effect = list_errors[operation]
+            else:
+                method.return_value = {key: listings.get(operation, [])}
+        sts = MagicMock()
+        sts.get_caller_identity.return_value = {
+            "Account": "123456789012",
+            "Arn": "arn:aws:sts::123456789012:assumed-role/r/s",
+        }
+        tagging = MagicMock()
+        if tag_error is not None:
+            tagging.get_resources.side_effect = tag_error
+        else:
+            tagging.get_resources.return_value = {
+                "ResourceTagMappingList": tag_mappings or []
+            }
+        clients = {
+            "bedrock": bedrock,
+            "bedrock-agent": agent,
+            "sts": sts,
+            "resourcegroupstaggingapi": tagging,
+        }
+        with patch(
+            "boto3.client", side_effect=lambda service, **kwargs: clients[service]
+        ):
+            result = bedrock_app.check_bedrock_resource_owner_tag(region="us-east-1")
+        return result, extract_csv_data(result), tagging
+
+    def test_br53_first_resource_owned_second_absent_from_tag_response_fails(self):
+        result, rows, tagging = self._run(
+            {
+                "list_guardrails": [
+                    {"arn": self.GUARDRAIL_OWNED},
+                    {"arn": self.GUARDRAIL_BARE},
+                ]
+            },
+            [
+                {
+                    "ResourceARN": self.GUARDRAIL_OWNED,
+                    "Tags": [{"Key": "Owner", "Value": "ml-platform"}],
+                }
+            ],
+        )
+        assert [r["Status"] for r in rows] == ["Failed", "Passed"]
+        assert self.GUARDRAIL_BARE in rows[0]["Finding_Details"]
+        assert "no tags returned" in rows[0]["Finding_Details"]
+        assert "1 of the 2 Bedrock resource(s)" in rows[1]["Finding_Details"]
+        assert result["status"] == "WARN"
+        tagging.get_resources.assert_called_once_with(
+            ResourceARNList=sorted([self.GUARDRAIL_OWNED, self.GUARDRAIL_BARE])
+        )
+
+    def test_br53_empty_owner_value_fails_and_key_match_is_case_insensitive(self):
+        _, rows, _ = self._run(
+            {
+                "list_guardrails": [
+                    {"arn": self.GUARDRAIL_OWNED},
+                    {"arn": self.GUARDRAIL_BARE},
+                ]
+            },
+            [
+                {
+                    "ResourceARN": self.GUARDRAIL_OWNED,
+                    "Tags": [{"Key": "team:OWNER", "Value": "x"}],
+                },
+                {
+                    "ResourceARN": self.GUARDRAIL_BARE,
+                    "Tags": [
+                        {"Key": "owner", "Value": "  "},
+                        {"Key": "env", "Value": "prod"},
+                    ],
+                },
+            ],
+        )
+        assert [r["Status"] for r in rows] == ["Failed", "Passed"]
+        assert "tag keys: owner, env" in rows[0]["Finding_Details"]
+
+    def test_br53_agent_and_knowledge_base_arns_are_built_from_ids(self):
+        _, rows, tagging = self._run(
+            {
+                "list_agents": [{"agentId": "AGENT1"}],
+                "list_knowledge_bases": [{"knowledgeBaseId": "KB1"}],
+                "list_provisioned_model_throughputs": [
+                    {
+                        "provisionedModelArn": "arn:aws:bedrock:us-east-1:123456789012:provisioned-model/pm1"
+                    }
+                ],
+            }
+        )
+        arns = tagging.get_resources.call_args.kwargs["ResourceARNList"]
+        assert self.AGENT in arns
+        assert "arn:aws:bedrock:us-east-1:123456789012:knowledge-base/KB1" in arns
+        assert len(arns) == 3
+        assert [r["Status"] for r in rows] == ["Failed"] * 3
+
+    def test_br53_arns_are_sent_in_batches_of_100(self):
+        guardrails = [
+            {"arn": f"arn:aws:bedrock:us-east-1:123456789012:guardrail/g{i:03d}"}
+            for i in range(150)
+        ]
+        _, rows, tagging = self._run({"list_guardrails": guardrails})
+        sizes = [
+            len(c.kwargs["ResourceARNList"])
+            for c in tagging.get_resources.call_args_list
+        ]
+        assert sizes == [100, 50]
+        failed = [r for r in rows if r["Status"] == "Failed"]
+        assert len(failed) == bedrock_app.MAX_REPORTED_UNOWNED_RESOURCES + 1
+        assert "125 further Bedrock resource(s)" in failed[-1]["Finding_Details"]
+
+    def test_br53_tagging_error_is_na(self):
+        _, rows, _ = self._run(
+            {"list_guardrails": [{"arn": self.GUARDRAIL_OWNED}]},
+            tag_error=_make_client_error("AccessDeniedException"),
+        )
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert "could not be read" in rows[0]["Finding_Details"]
+
+    def test_br53_list_error_downgrades_the_pass(self):
+        _, rows, _ = self._run(
+            {"list_guardrails": [{"arn": self.GUARDRAIL_OWNED}]},
+            [
+                {
+                    "ResourceARN": self.GUARDRAIL_OWNED,
+                    "Tags": [{"Key": "owner", "Value": "a"}],
+                }
+            ],
+            list_errors={"list_agents": _make_client_error("AccessDeniedException")},
+        )
+        assert [r["Status"] for r in rows] == ["N/A", "N/A"]
+        assert "agents:" in rows[0]["Finding_Details"]
+
+    def test_br53_empty_inventory_is_na(self):
+        _, rows, tagging = self._run()
+        assert [r["Status"] for r in rows] == ["N/A"]
+        tagging.get_resources.assert_not_called()
+
+    def test_br53_exception_is_could_not_assess(self):
+        with patch("boto3.client", side_effect=RuntimeError("boom")):
+            rows = extract_csv_data(
+                bedrock_app.check_bedrock_resource_owner_tag(region="us-east-1")
+            )
+        assert_could_not_assess_finding(rows[0])
+
+    def test_br53_rows_pass_the_schema(self):
+        _, rows, _ = self._run(
+            {"list_guardrails": [{"arn": self.GUARDRAIL_BARE}]},
+            list_errors={"list_custom_models": _make_client_error("Throttling")},
+        )
+        for finding in rows:
+            assert_finding_schema(finding)
+            assert finding["Check_ID"] == "BR-53"
+
+
+class TestBR54LambdaPublicInvoke:
+    """BR-54: function URL AuthType NONE and public resource policies."""
+
+    @staticmethod
+    def _policy_json(*statements):
+        return json.dumps(_policy(*statements))
+
+    def _run(self, functions, urls=None, policies=None, function_pages=None):
+        lam = MagicMock()
+        if function_pages is not None:
+            lam.list_functions.side_effect = lambda **kwargs: (
+                function_pages[1] if kwargs.get("Marker") else function_pages[0]
+            )
+        else:
+            lam.list_functions.return_value = {
+                "Functions": [{"FunctionName": name} for name in functions]
+            }
+        urls = urls or {}
+        policies = policies or {}
+
+        def list_function_url_configs(FunctionName, **kwargs):
+            outcome = urls.get(FunctionName, [])
+            if isinstance(outcome, Exception):
+                raise outcome
+            return {"FunctionUrlConfigs": outcome}
+
+        def get_policy(FunctionName):
+            outcome = policies.get(FunctionName)
+            if outcome is None:
+                raise _make_client_error("ResourceNotFoundException")
+            if isinstance(outcome, Exception):
+                raise outcome
+            return {"Policy": outcome}
+
+        lam.list_function_url_configs.side_effect = list_function_url_configs
+        lam.get_policy.side_effect = get_policy
+        with patch("boto3.client", return_value=lam):
+            result = bedrock_app.check_lambda_public_invoke_configuration(
+                region="us-east-1"
+            )
+        return result, extract_csv_data(result), lam
+
+    PUBLIC = {
+        "Sid": "public",
+        "Effect": "Allow",
+        "Principal": "*",
+        "Action": "lambda:InvokeFunction",
+        "Resource": "*",
+    }
+
+    def test_br54_first_function_private_second_url_none_fails(self):
+        result, rows, _ = self._run(
+            ["a-private", "b-open"],
+            urls={
+                "a-private": [
+                    {"FunctionUrl": "https://a.example", "AuthType": "AWS_IAM"}
+                ],
+                "b-open": [{"FunctionUrl": "https://b.example", "AuthType": "NONE"}],
+            },
+        )
+        assert [r["Status"] for r in rows] == ["Failed", "Passed"]
+        assert "'b-open'" in rows[0]["Finding_Details"]
+        assert "AuthType NONE" in rows[0]["Finding_Details"]
+        assert (
+            "does not test whether the function can be reached"
+            in rows[0]["Finding_Details"]
+        )
+        assert "1 of the 2 Lambda function(s)" in rows[1]["Finding_Details"]
+        assert result["status"] == "WARN"
+
+    def test_br54_public_principal_forms_fail_without_a_source_condition(self):
+        for principal in ("*", {"AWS": "*"}, {"AWS": ["111122223333", "*"]}):
+            statement = dict(self.PUBLIC, Principal=principal)
+            _, rows, _ = self._run(
+                ["a-ok", "b-public"],
+                policies={
+                    "a-ok": self._policy_json(
+                        dict(
+                            self.PUBLIC,
+                            Condition={
+                                "StringEquals": {"AWS:SourceAccount": "123456789012"}
+                            },
+                        )
+                    ),
+                    "b-public": self._policy_json(statement),
+                },
+            )
+            assert [r["Status"] for r in rows] == ["Failed", "Passed"], principal
+            assert (
+                "statement 'public' allows lambda:invokefunction to '*'"
+                in rows[0]["Finding_Details"]
+            )
+
+    def test_br54_action_wildcards_cover_invoke(self):
+        for action in ("lambda:*", "*", ["lambda:Get*", "lambda:InvokeFunction*"]):
+            _, rows, _ = self._run(
+                ["f"],
+                policies={"f": self._policy_json(dict(self.PUBLIC, Action=action))},
+            )
+            assert [r["Status"] for r in rows] == ["Failed"], action
+
+    def test_br54_named_principal_or_org_condition_passes(self):
+        _, rows, _ = self._run(
+            ["a-account", "b-org"],
+            policies={
+                "a-account": self._policy_json(
+                    dict(
+                        self.PUBLIC, Principal={"AWS": "arn:aws:iam::111122223333:root"}
+                    )
+                ),
+                "b-org": self._policy_json(
+                    dict(
+                        self.PUBLIC,
+                        Condition={
+                            "StringEquals": {"aws:PrincipalOrgID": "o-a1b2c3d4e5"}
+                        },
+                    )
+                ),
+            },
+        )
+        assert [r["Status"] for r in rows] == ["Passed"]
+
+    def test_br54_url_auth_type_condition_alone_does_not_restrict(self):
+        _, rows, _ = self._run(
+            ["f"],
+            policies={
+                "f": self._policy_json(
+                    dict(
+                        self.PUBLIC,
+                        Action="lambda:InvokeFunctionUrl",
+                        Condition={
+                            "StringEquals": {"lambda:FunctionUrlAuthType": "NONE"}
+                        },
+                    )
+                )
+            },
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+
+    def test_br54_second_page_of_functions_is_read(self):
+        _, rows, lam = self._run(
+            [],
+            function_pages=[
+                {"Functions": [{"FunctionName": "page1"}], "NextMarker": "m2"},
+                {"Functions": [{"FunctionName": "page2"}]},
+            ],
+            urls={"page2": [{"FunctionUrl": "https://p2", "AuthType": "NONE"}]},
+        )
+        lam.list_functions.assert_any_call(MaxItems=50, Marker="m2")
+        assert [r["Status"] for r in rows] == ["Failed", "Passed"]
+        assert "'page2'" in rows[0]["Finding_Details"]
+
+    def test_br54_per_function_error_is_na(self):
+        _, rows, _ = self._run(
+            ["a-ok", "b-denied"],
+            urls={"b-denied": _make_client_error("AccessDeniedException")},
+        )
+        assert [r["Status"] for r in rows] == ["Passed", "N/A"]
+        assert "b-denied" in rows[1]["Finding_Details"]
+
+    def test_br54_no_functions_is_na(self):
+        _, rows, _ = self._run([])
+        assert [r["Status"] for r in rows] == ["N/A"]
+
+    def test_br54_list_error_is_could_not_assess(self):
+        lam = MagicMock()
+        lam.list_functions.side_effect = _make_client_error("AccessDeniedException")
+        with patch("boto3.client", return_value=lam):
+            rows = extract_csv_data(
+                bedrock_app.check_lambda_public_invoke_configuration(region="us-east-1")
+            )
+        assert_could_not_assess_finding(rows[0])
+
+    def test_br54_rows_pass_the_schema(self):
+        _, rows, _ = self._run(
+            ["a", "b", "c"],
+            urls={
+                "b": [{"FunctionUrl": "https://b", "AuthType": "NONE"}],
+                "c": _make_client_error("Throttling"),
+            },
+        )
+        for finding in rows:
+            assert_finding_schema(finding)
+            assert finding["Check_ID"] == "BR-54"
+
+
+class TestBR55EnclaveKeyBinding:
+    """BR-55: KMS keys declared enclave-bound must pin the image and leave no
+    unattested decrypt path."""
+
+    DIGEST = "a" * 96
+    ROOT = {
+        "Sid": "Enable IAM User Permissions",
+        "Effect": "Allow",
+        "Principal": {"AWS": "arn:aws:iam::123456789012:root"},
+        "Action": "kms:*",
+        "Resource": "*",
+    }
+
+    def _enclave_allow(self, key="kms:RecipientAttestation:ImageSha384", **kwargs):
+        statement = {
+            "Sid": "EnclaveDecrypt",
+            "Effect": "Allow",
+            "Principal": {"AWS": "arn:aws:iam::123456789012:role/enclave"},
+            "Action": ["kms:Decrypt", "kms:GenerateDataKey"],
+            "Resource": "*",
+            "Condition": kwargs.get(
+                "condition", {"StringEqualsIgnoreCase": {key: self.DIGEST}}
+            ),
+        }
+        return statement
+
+    def _admin(self):
+        return {
+            "Sid": "Admin",
+            "Effect": "Allow",
+            "Principal": {"AWS": "arn:aws:iam::123456789012:role/admin"},
+            "Action": ["kms:Describe*", "kms:Put*", "kms:ScheduleKeyDeletion"],
+            "Resource": "*",
+        }
+
+    def _run(self, policies, key_manager=None, pages=None, policy_error=None):
+        kms = MagicMock()
+        if pages is not None:
+            kms.list_keys.side_effect = lambda **kwargs: (
+                pages[1] if kwargs.get("Marker") else pages[0]
+            )
+        else:
+            kms.list_keys.return_value = {
+                "Keys": [
+                    {"KeyId": key_id, "KeyArn": f"arn:k/{key_id}"}
+                    for key_id in policies
+                ]
+            }
+
+        def get_key_policy(KeyId, PolicyName):
+            assert PolicyName == "default"
+            if policy_error and KeyId in policy_error:
+                raise policy_error[KeyId]
+            return {"Policy": json.dumps(_policy(*policies[KeyId]))}
+
+        kms.get_key_policy.side_effect = get_key_policy
+        kms.describe_key.side_effect = lambda KeyId: {
+            "KeyMetadata": {"KeyManager": (key_manager or {}).get(KeyId, "CUSTOMER")}
+        }
+        with patch("boto3.client", return_value=kms):
+            result = bedrock_app.check_kms_enclave_key_binding(region="us-east-1")
+        return result, extract_csv_data(result), kms
+
+    def test_br55_first_key_pinned_second_root_bypass_fails(self):
+        result, rows, _ = self._run(
+            {
+                "a-pinned": [self._admin(), self._enclave_allow()],
+                "b-root": [self.ROOT, self._enclave_allow()],
+            }
+        )
+        assert [r["Status"] for r in rows] == ["Failed", "Passed"]
+        assert "arn:k/b-root" in rows[0]["Finding_Details"]
+        assert (
+            "grants kms:decrypt, kms:generatedatakey, kms:generatedatakeypair to the account"
+            in rows[0]["Finding_Details"]
+        )
+        assert "arn:k/a-pinned" in rows[1]["Finding_Details"]
+        assert result["status"] == "WARN"
+
+    def test_br55_pcr0_pins_the_image_like_imagesha384(self):
+        _, rows, _ = self._run(
+            {"k": [self._enclave_allow(key="kms:RecipientAttestation:PCR0")]}
+        )
+        assert [r["Status"] for r in rows] == ["Passed"]
+
+    def test_br55_binding_on_other_pcrs_only_fails(self):
+        _, rows, _ = self._run(
+            {"k": [self._enclave_allow(key="kms:RecipientAttestation:PCR8")]}
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert (
+            "no statement requires an exact ImageSha384 or PCR0"
+            in rows[0]["Finding_Details"]
+        )
+
+    def test_br55_if_exists_negated_and_wildcard_tests_do_not_pin(self):
+        key = "kms:RecipientAttestation:ImageSha384"
+        for condition in (
+            {"StringEqualsIgnoreCaseIfExists": {key: self.DIGEST}},
+            {"StringNotEquals": {key: self.DIGEST}},
+            {"StringLike": {key: "a*"}},
+            {"Null": {key: "false"}},
+        ):
+            _, rows, _ = self._run({"k": [self._enclave_allow(condition=condition)]})
+            assert [r["Status"] for r in rows] == ["Failed"], condition
+            assert "with no enclave image condition" in rows[0]["Finding_Details"]
+
+    def test_br55_set_operator_prefix_on_the_operator_is_stripped(self):
+        _, rows, _ = self._run(
+            {
+                "k": [
+                    self._enclave_allow(
+                        condition={
+                            "ForAnyValue:StringEqualsIgnoreCase": {
+                                "kms:RecipientAttestation:ImageSha384": [self.DIGEST]
+                            }
+                        }
+                    )
+                ]
+            }
+        )
+        assert [r["Status"] for r in rows] == ["Passed"]
+
+    def test_br55_deny_without_attestation_closes_the_root_path(self):
+        deny = {
+            "Sid": "DenyUnattested",
+            "Effect": "Deny",
+            "Principal": "*",
+            "Action": ["kms:Decrypt", "kms:GenerateDataKey*"],
+            "Resource": "*",
+            "Condition": {
+                "StringNotEqualsIgnoreCase": {
+                    "kms:RecipientAttestation:ImageSha384": self.DIGEST
+                }
+            },
+        }
+        _, rows, _ = self._run({"k": [self.ROOT, deny]})
+        assert [r["Status"] for r in rows] == ["Passed"]
+
+    def test_br55_not_action_allow_is_a_bypass(self):
+        statement = {
+            "Sid": "Broad",
+            "Effect": "Allow",
+            "Principal": {"AWS": "arn:aws:iam::123456789012:role/app"},
+            "NotAction": "kms:ScheduleKeyDeletion",
+            "Resource": "*",
+        }
+        _, rows, _ = self._run({"k": [statement, self._enclave_allow()]})
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "statement 'Broad' allows kms:decrypt" in rows[0]["Finding_Details"]
+
+    def test_br55_undeclared_and_aws_managed_keys_are_not_judged(self):
+        _, rows, kms = self._run(
+            {
+                "plain": [self.ROOT],
+                "managed": [self.ROOT, self._enclave_allow()],
+            },
+            key_manager={"arn:k/managed": "AWS"},
+        )
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert (
+            "1 of the 2 KMS key(s) read carry no RecipientAttestation"
+            in rows[0]["Finding_Details"]
+        )
+        assert kms.describe_key.call_count == 1
+
+    def test_br55_nitro_tpm_only_key_is_na(self):
+        _, rows, _ = self._run(
+            {"k": [self._enclave_allow(key="kms:RecipientAttestation:NitroTPMPCR4")]}
+        )
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert "NitroTPM" in rows[0]["Finding_Details"]
+
+    def test_br55_second_page_of_keys_is_read(self):
+        kms_pages = [
+            {"Keys": [{"KeyId": "p1", "KeyArn": "arn:k/p1"}], "NextMarker": "m2"},
+            {"Keys": [{"KeyId": "p2", "KeyArn": "arn:k/p2"}]},
+        ]
+        _, rows, kms = self._run(
+            {"p1": [self.ROOT], "p2": [self.ROOT, self._enclave_allow()]},
+            pages=kms_pages,
+        )
+        kms.list_keys.assert_any_call(Limit=1000, Marker="m2")
+        assert [r["Status"] for r in rows] == ["Failed", "N/A"]
+        assert "arn:k/p2" in rows[0]["Finding_Details"]
+
+    def test_br55_access_denied_policy_is_na(self):
+        _, rows, _ = self._run(
+            {"a": [self._enclave_allow()], "b": []},
+            policy_error={"b": _make_client_error("AccessDeniedException")},
+        )
+        assert [r["Status"] for r in rows] == ["Passed", "N/A"]
+        assert "arn:k/b" in rows[1]["Finding_Details"]
+
+    def test_br55_no_keys_is_na(self):
+        result, rows, _ = self._run({})
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert result["status"] == "N/A"
+
+    def test_br55_list_error_is_could_not_assess(self):
+        kms = MagicMock()
+        kms.list_keys.side_effect = _make_client_error("AccessDeniedException")
+        with patch("boto3.client", return_value=kms):
+            rows = extract_csv_data(
+                bedrock_app.check_kms_enclave_key_binding(region="us-east-1")
+            )
+        assert_could_not_assess_finding(rows[0])
+
+    def test_br55_rows_pass_the_schema(self):
+        _, rows, _ = self._run(
+            {
+                "a": [self._enclave_allow()],
+                "b": [self.ROOT, self._enclave_allow()],
+                "c": [self.ROOT],
+            }
+        )
+        for finding in rows:
+            assert_finding_schema(finding)
+            assert finding["Check_ID"] == "BR-55"
+
+
+def test_handler_reports_br50_and_br51_unassessed_without_a_cache():
+    test_client = MagicMock()
+    test_client.get_model_invocation_logging_configuration.side_effect = (
+        _make_client_error("ValidationException")
+    )
+    captured = {}
+
+    def fake_csv(findings):
+        captured["findings"] = findings
+        return "csv"
+
+    with (
+        patch.object(bedrock_app.boto3, "client", return_value=test_client),
+        patch.object(bedrock_app, "get_permissions_cache", return_value=None),
+        patch.object(bedrock_app, "generate_csv_report", side_effect=fake_csv),
+        patch.object(bedrock_app, "write_to_s3", return_value="s3://b/r.csv"),
+    ):
+        resp = bedrock_app.lambda_handler(
+            _bedrock_event(region="us-east-1", region_index=0), None
+        )
+    assert resp["statusCode"] == 200
+    rows = {
+        r["Check_ID"]: r
+        for f in captured["findings"]
+        for r in f.get("csv_data", [])
+        if r["Check_ID"] in ("BR-50", "BR-51")
+    }
+    assert sorted(rows) == ["BR-50", "BR-51"]
+    assert all(r["Status"] == "N/A" for r in rows.values())
+
+
+_cache_spec = importlib.util.spec_from_file_location(
+    "iam_permission_caching_app",
+    os.path.join(
+        os.path.dirname(__file__),
+        "..",
+        "aiml-security-assessment/functions/security/iam_permission_caching/app.py",
+    ),
+)
+cache_app = importlib.util.module_from_spec(_cache_spec)
+_cache_spec.loader.exec_module(cache_app)
+
+
+class TestPermissionCacheGroupPolicies:
+    """The cache reads each user's group policies, paginated, once per group."""
+
+    GROUP_DOC = _policy({"Effect": "Allow", "Action": "bedrock:*", "Resource": "*"})
+
+    def _iam(self, groups_for_user, group_error=None):
+        iam = MagicMock()
+        pages = {
+            "list_users": [
+                {"Users": [{"UserName": "alice"}, {"UserName": "bob"}]},
+            ],
+            "list_attached_group_policies": {
+                "ml": [
+                    {"AttachedPolicies": []},
+                    {
+                        "AttachedPolicies": [
+                            {
+                                "PolicyName": "MlManaged",
+                                "PolicyArn": "arn:aws:iam::123456789012:policy/MlManaged",
+                            }
+                        ]
+                    },
+                ],
+                "ops": [{"AttachedPolicies": []}],
+            },
+            "list_group_policies": {
+                "ml": [{"PolicyNames": []}],
+                "ops": [{"PolicyNames": ["OpsInline"]}],
+            },
+        }
+
+        def get_paginator(name):
+            paginator = MagicMock()
+            if name == "list_users":
+                paginator.paginate.return_value = pages["list_users"]
+            elif name == "list_groups_for_user":
+
+                def paginate(UserName):
+                    if group_error and UserName in group_error:
+                        raise group_error[UserName]
+                    return [
+                        {
+                            "Groups": [
+                                {"GroupName": g} for g in groups_for_user[UserName][:1]
+                            ]
+                        },
+                        {
+                            "Groups": [
+                                {"GroupName": g} for g in groups_for_user[UserName][1:]
+                            ]
+                        },
+                    ]
+
+                paginator.paginate.side_effect = paginate
+            else:
+                paginator.paginate.side_effect = lambda GroupName: pages[name][
+                    GroupName
+                ]
+            return paginator
+
+        iam.get_paginator.side_effect = get_paginator
+        iam.list_attached_user_policies.return_value = {"AttachedPolicies": []}
+        iam.list_user_policies.return_value = {"PolicyNames": []}
+        iam.get_policy.return_value = {"Policy": {"DefaultVersionId": "v1"}}
+        iam.get_policy_version.return_value = {
+            "PolicyVersion": {"Document": self.GROUP_DOC}
+        }
+        iam.get_group_policy.return_value = {"PolicyDocument": self.GROUP_DOC}
+        return iam
+
+    def test_group_policies_are_cached_per_user_across_pages(self):
+        iam = self._iam({"alice": ["ml", "ops"], "bob": ["ml"]})
+        cache = cache_app.IAMPermissionCache(iam)
+        cache._cache_user_permissions()
+
+        alice = cache.user_permissions["alice"]["group_policies"]
+        assert [(p["group"], p["name"], "arn" in p) for p in alice] == [
+            ("ml", "MlManaged", True),
+            ("ops", "OpsInline", False),
+        ]
+        assert [p["name"] for p in cache.user_permissions["bob"]["group_policies"]] == [
+            "MlManaged"
+        ]
+        # The ml group is shared by both users and read once.
+        iam.get_group_policy.assert_called_once_with(
+            GroupName="ops", PolicyName="OpsInline"
+        )
+        assert iam.get_policy.call_count == 1
+
+    def test_group_read_failure_is_recorded_not_left_empty(self):
+        iam = self._iam(
+            {"alice": ["ml"], "bob": ["ml"]},
+            group_error={"alice": _make_client_error("AccessDenied")},
+        )
+        cache = cache_app.IAMPermissionCache(iam)
+        cache._cache_user_permissions()
+
+        alice = cache.user_permissions["alice"]
+        assert "group_policies" not in alice
+        assert "AccessDenied" in alice["group_policies_error"]
+        assert cache.user_permissions["bob"]["group_policies"][0]["group"] == "ml"
