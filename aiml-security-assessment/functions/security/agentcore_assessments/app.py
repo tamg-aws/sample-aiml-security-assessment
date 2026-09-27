@@ -42,7 +42,6 @@ agentcore_client = None
 kms_client = None
 organizations_client = None
 wafv2_client = None
-cloudfront_client = None
 route53resolver_client = None
 
 # Environment variables
@@ -13711,19 +13710,6 @@ WAF_CROSS_SITE_SCRIPTING_RULE_PREFIX = "crosssitescripting_"
 WAF_ANTI_DDOS_RULE_GROUP = "AWSManagedRulesAntiDDoSRuleSet"
 WAF_ANTI_DDOS_DISABLING_ACTIONS = ("Count", "Allow")
 
-# ListResourcesForWebACL answers for one ResourceType per call; these are every
-# value its ResourceType enum accepts.
-WAF_REGIONAL_ASSOCIATION_RESOURCE_TYPES = (
-    "APPLICATION_LOAD_BALANCER",
-    "API_GATEWAY",
-    "APPSYNC",
-    "COGNITO_USER_POOL",
-    "APP_RUNNER_SERVICE",
-    "VERIFIED_ACCESS_INSTANCE",
-    "AMPLIFY",
-    "AGENTCORE_GATEWAY",
-)
-
 
 def _waf_statement_nodes(statement: Any) -> List[Dict[str, Any]]:
     """Return one node per statement in a rule's statement tree.
@@ -14138,236 +14124,168 @@ def _web_acl_with_firewall_manager_rules(web_acl: Dict[str, Any]) -> Dict[str, A
     return merged
 
 
-def _regional_web_acl_associations(
-    web_acl_arn: str,
-) -> Tuple[List[str], List[str]]:
-    """Return the resources one regional web ACL protects, and what went unread.
-
-    ListResourcesForWebACL answers for one resource type per call and defaults
-    to Application Load Balancers, so every type is asked for in turn. A type
-    whose call fails is returned by name so that an ACL is never read as
-    unassociated for want of a permission.
-    """
-    resources: List[str] = []
-    unread: List[str] = []
-    for resource_type in WAF_REGIONAL_ASSOCIATION_RESOURCE_TYPES:
-        try:
-            response = wafv2_client.list_resources_for_web_acl(
-                WebACLArn=web_acl_arn, ResourceType=resource_type
-            )
-        except ClientError as error:
-            unread.append(f"{resource_type} ({_assessment_error_label(error)})")
-            continue
-        resources.extend((response or {}).get("ResourceArns") or [])
-    return resources, unread
+AC51_OUT_OF_SCOPE_FRONT_DOORS = (
+    "Front doors other than AgentCore gateways (API Gateway, ALB, CloudFront) are "
+    "not identifiable as AI entry points by any API, so they are not judged."
+)
 
 
-def _cloudfront_web_acl_associations(
-    web_acl_arn: str,
-) -> Tuple[List[str], List[str]]:
-    """Return the CloudFront distributions one global web ACL protects."""
-    if cloudfront_client is None:
-        return [], ["CloudFront distributions (client not available)"]
-
-    distributions: List[str] = []
-    marker = None
-    seen_markers: Set[str] = set()
-    try:
-        while True:
-            kwargs = {"WebACLId": web_acl_arn}
-            if marker:
-                kwargs["Marker"] = marker
-            page = (
-                cloudfront_client.list_distributions_by_web_acl_id(**kwargs) or {}
-            ).get("DistributionList") or {}
-            distributions.extend(
-                item.get("ARN") or item.get("Id") or "unknown"
-                for item in page.get("Items") or []
-            )
-            marker = page.get("NextMarker")
-            if not page.get("IsTruncated") or not marker or marker in seen_markers:
-                break
-            seen_markers.add(marker)
-    except ClientError as error:
-        return distributions, [
-            f"CloudFront distributions ({_assessment_error_label(error)})"
-        ]
-    return distributions, []
-
-
-def check_agentcore_web_acl_anti_ddos(region: str) -> List[Dict[str, Any]]:
-    """AC-51: Require the Anti-DDoS managed rule group on associated web ACLs.
+def check_agentcore_web_acl_anti_ddos() -> List[Dict[str, Any]]:
+    """AC-51: Require the Anti-DDoS managed rule group on each gateway's web ACL.
 
     AWSManagedRulesAntiDDoSRuleSet detects a layer 7 request flood against the
     resources a web ACL protects and challenges or blocks the requests that
     make it up. An ACL without it leaves a rate-based rule as the only volume
     control, which counts per client and misses a flood spread over many.
 
-    Regional ACLs are read in every Region; CloudFront ACLs exist only in
-    us-east-1, so they are read there. An ACL associated with nothing protects
-    nothing and is not judged. The group is credited only while it runs: a
-    Count override on the rule that holds it, or an inner rule overridden to
-    Count or Allow or excluded, turns that mitigation off.
+    The population is the AgentCore gateways, the one front door an API names
+    as an AI entry point, and each is judged by the web ACL GetGateway reports.
+    The group is credited only while it runs: a Count override on the rule that
+    holds it, or an inner rule overridden to Count or Allow or excluded, turns
+    that mitigation off.
     """
-    finding_name = "AgentCore Web ACL Anti-DDoS Protection"
-    if wafv2_client is None:
+    finding_name = "AgentCore Gateway Anti-DDoS Protection"
+
+    def finding(details, resolution, severity, status):
+        return create_finding(
+            check_id="AC-51",
+            finding_name=finding_name,
+            finding_details=f"{details} {AC51_OUT_OF_SCOPE_FRONT_DOORS}",
+            resolution=resolution,
+            reference=WAF_ANTI_DDOS_REFERENCE_URL,
+            severity=severity,
+            status=status,
+        )
+
+    if agentcore_client is None:
         return [
-            create_finding(
-                check_id="AC-51",
-                finding_name=finding_name,
-                finding_details="AWS WAF client not available in this region.",
-                resolution="No action required unless AgentCore runs in this region.",
-                reference=WAF_ANTI_DDOS_REFERENCE_URL,
-                severity=SeverityEnum.INFORMATIONAL,
-                status=StatusEnum.NA,
+            finding(
+                "AgentCore client not available in this region.",
+                "Deploy in a region where Amazon Bedrock AgentCore is available.",
+                SeverityEnum.INFORMATIONAL,
+                StatusEnum.NA,
             )
         ]
 
-    scopes = [("REGIONAL", _regional_web_acl_associations)]
-    if region == "us-east-1":
-        scopes.append(("CLOUDFRONT", _cloudfront_web_acl_associations))
+    try:
+        gateways = _agentcore_list_all("list_gateways", ["items", "gateways"])
+    except (AttributeError, ClientError) as error:
+        return [
+            _incomplete_check_finding(
+                check_id="AC-51",
+                finding_name=finding_name,
+                error=error,
+                reference=WAF_ANTI_DDOS_REFERENCE_URL,
+            )
+        ]
+
+    if not gateways:
+        return [
+            finding(
+                "No AgentCore Gateways found.",
+                "No action required.",
+                SeverityEnum.INFORMATIONAL,
+                StatusEnum.NA,
+            )
+        ]
 
     findings: List[Dict[str, Any]] = []
-    web_acl_count = 0
-    for scope, list_associations in scopes:
+    for gateway in gateways:
+        gateway_id = gateway.get("gatewayId", "unknown")
+        label = f"Gateway '{gateway.get('name', gateway_id)}' ({gateway_id})"
+
         try:
-            summaries = _paginate_aws_list(
-                wafv2_client,
-                "list_web_acls",
-                "WebACLs",
-                token_request_key="NextMarker",
-                token_response_key="NextMarker",
-                Scope=scope,
-            )
-        except Exception as error:
+            gateway_details = agentcore_client.get_gateway(gatewayIdentifier=gateway_id)
+        except ClientError as error:
             findings.append(
-                _incomplete_check_finding(
-                    check_id="AC-51",
-                    finding_name=f"{finding_name} ({scope})",
-                    error=error,
-                    reference=WAF_ANTI_DDOS_REFERENCE_URL,
+                finding(
+                    f"Could not read which web ACL {label} is associated with: "
+                    f"{_assessment_error_label(error)}.",
+                    "Grant bedrock-agentcore:GetGateway, then rerun the assessment.",
+                    SeverityEnum.INFORMATIONAL,
+                    StatusEnum.NA,
                 )
             )
             continue
 
-        for summary in summaries:
-            web_acl_arn = summary.get("ARN")
-            if not web_acl_arn:
-                continue
-            web_acl_count += 1
-            acl_name = summary.get("Name") or web_acl_arn
-            resources, unread = list_associations(web_acl_arn)
-            if not resources:
-                if unread:
-                    findings.append(
-                        create_finding(
-                            check_id="AC-51",
-                            finding_name=finding_name,
-                            finding_details=(
-                                f"{scope} web ACL {acl_name} has no associated "
-                                "resource among the types that could be read, and "
-                                f"these could not be read: {'; '.join(unread)}. "
-                                "Whether it protects a resource was not judged."
-                            ),
-                            resolution=(
-                                "Grant the permission AWS WAF requires to list "
-                                "each named resource type for a web ACL, then "
-                                "rerun the assessment."
-                            ),
-                            reference=WAF_ANTI_DDOS_REFERENCE_URL,
-                            severity=SeverityEnum.INFORMATIONAL,
-                            status=StatusEnum.NA,
-                        )
-                    )
-                continue
-
-            try:
-                web_acl = (wafv2_client.get_web_acl(ARN=web_acl_arn) or {}).get(
-                    "WebACL"
-                ) or {}
-            except ClientError as error:
-                findings.append(
-                    create_finding(
-                        check_id="AC-51",
-                        finding_name=finding_name,
-                        finding_details=(
-                            f"Could not read {scope} web ACL {acl_name}, which "
-                            f"protects {len(resources)} resource(s): "
-                            f"{_assessment_error_label(error)}."
-                        ),
-                        resolution="Grant wafv2:GetWebACL, then rerun the assessment.",
-                        reference=WAF_ANTI_DDOS_REFERENCE_URL,
-                        severity=SeverityEnum.INFORMATIONAL,
-                        status=StatusEnum.NA,
-                    )
-                )
-                continue
-
-            coverage = _waf_rule_coverage(_web_acl_with_firewall_manager_rules(web_acl))
-            protects = (
-                f"{scope} web ACL {acl_name}, which protects {len(resources)} "
-                f"resource(s) including {resources[0]},"
-            )
-            if coverage["anti_ddos"]:
-                findings.append(
-                    create_finding(
-                        check_id="AC-51",
-                        finding_name=finding_name,
-                        finding_details=(
-                            f"{protects} runs {WAF_ANTI_DDOS_RULE_GROUP} from "
-                            f"{coverage['evidence']['anti_ddos']}."
-                        ),
-                        resolution="No action required.",
-                        reference=WAF_ANTI_DDOS_REFERENCE_URL,
-                        severity=SeverityEnum.MEDIUM,
-                        status=StatusEnum.PASSED,
-                    )
-                )
-                continue
-
-            not_credited = (
-                " Not credited because the group or its rules are overridden or "
-                f"excluded: {'; '.join(coverage['anti_ddos_overridden'])}."
-                if coverage["anti_ddos_overridden"]
-                else ""
-            )
+        web_acl_arn = gateway_details.get("webAclArn")
+        if not web_acl_arn:
             findings.append(
-                create_finding(
-                    check_id="AC-51",
-                    finding_name=finding_name,
-                    finding_details=(
-                        f"{protects} does not run {WAF_ANTI_DDOS_RULE_GROUP}, so a "
-                        "request flood spread across many clients reaches the "
-                        f"protected resources unmitigated.{not_credited}"
-                    ),
-                    resolution=(
-                        f"Add the AWS managed rule group {WAF_ANTI_DDOS_RULE_GROUP} "
-                        "to the web ACL with no Count override on the group and "
-                        "no rule inside it overridden to Count or Allow."
-                    ),
-                    reference=WAF_ANTI_DDOS_REFERENCE_URL,
-                    severity=SeverityEnum.MEDIUM,
-                    status=StatusEnum.FAILED,
+                finding(
+                    f"{label} has no web ACL associated, so nothing mitigates a "
+                    "request flood against it. AG-27 reports the missing "
+                    "association.",
+                    "Associate a web ACL with the gateway and add the AWS managed "
+                    f"rule group {WAF_ANTI_DDOS_RULE_GROUP} to it.",
+                    SeverityEnum.MEDIUM,
+                    StatusEnum.FAILED,
                 )
             )
+            continue
 
-    if not findings:
+        if wafv2_client is None:
+            findings.append(
+                finding(
+                    f"{label} is associated with web ACL {web_acl_arn}, but the AWS "
+                    "WAF client is not available in this region, so its rules "
+                    "were not read.",
+                    "No action required unless AWS WAF runs in this region.",
+                    SeverityEnum.INFORMATIONAL,
+                    StatusEnum.NA,
+                )
+            )
+            continue
+
+        try:
+            web_acl = (wafv2_client.get_web_acl(ARN=web_acl_arn) or {}).get(
+                "WebACL"
+            ) or {}
+        except ClientError as error:
+            findings.append(
+                finding(
+                    f"{label} is associated with web ACL {web_acl_arn}, whose rules "
+                    f"could not be read: {_assessment_error_label(error)}.",
+                    "Grant wafv2:GetWebACL on the web ACL, then rerun the assessment.",
+                    SeverityEnum.INFORMATIONAL,
+                    StatusEnum.NA,
+                )
+            )
+            continue
+
+        coverage = _waf_rule_coverage(_web_acl_with_firewall_manager_rules(web_acl))
+        acl_name = web_acl.get("Name") or web_acl_arn
+        if coverage["anti_ddos"]:
+            findings.append(
+                finding(
+                    f"{label} is associated with web ACL {acl_name}, which runs "
+                    f"{WAF_ANTI_DDOS_RULE_GROUP} from "
+                    f"{coverage['evidence']['anti_ddos']}.",
+                    "No action required.",
+                    SeverityEnum.MEDIUM,
+                    StatusEnum.PASSED,
+                )
+            )
+            continue
+
+        not_credited = (
+            " Not credited because the group or its rules are overridden or "
+            f"excluded: {'; '.join(coverage['anti_ddos_overridden'])}."
+            if coverage["anti_ddos_overridden"]
+            else ""
+        )
         findings.append(
-            create_finding(
-                check_id="AC-51",
-                finding_name=finding_name,
-                finding_details=(
-                    f"None of the {web_acl_count} web ACL(s) readable from this "
-                    "region is associated with a resource."
-                    if web_acl_count
-                    else "No web ACLs found in this region."
-                ),
-                resolution="No action required.",
-                reference=WAF_ANTI_DDOS_REFERENCE_URL,
-                severity=SeverityEnum.INFORMATIONAL,
-                status=StatusEnum.NA,
+            finding(
+                f"{label} is associated with web ACL {acl_name}, which does not "
+                f"run {WAF_ANTI_DDOS_RULE_GROUP}, so a request flood spread across "
+                f"many clients reaches the gateway unmitigated.{not_credited}",
+                f"Add the AWS managed rule group {WAF_ANTI_DDOS_RULE_GROUP} to the "
+                "web ACL with no Count override on the group and no rule inside it "
+                "overridden to Count or Allow.",
+                SeverityEnum.MEDIUM,
+                StatusEnum.FAILED,
             )
         )
+
     return findings
 
 
@@ -14780,7 +14698,7 @@ def lambda_handler(event, context):
     global start_time, iam_client, ec2_client, ecr_client, logs_client
     global cloudwatch_client, cloudtrail_client, oam_client, agentcore_client
     global kms_client, organizations_client
-    global wafv2_client, route53resolver_client, cloudfront_client
+    global wafv2_client, route53resolver_client
     start_time = time.time()
 
     try:
@@ -14815,9 +14733,6 @@ def lambda_handler(event, context):
         route53resolver_client = boto3.client(
             "route53resolver", config=boto3_config, region_name=region
         )
-        # CloudFront is global; its distributions are listed for the CLOUDFRONT
-        # scope web ACLs that AC-51 reads from us-east-1.
-        cloudfront_client = boto3.client("cloudfront", config=boto3_config)
 
         # Collect all findings
         all_findings = []
@@ -15319,7 +15234,7 @@ def lambda_handler(event, context):
             (
                 ["AC-51"],
                 "Web ACL Anti-DDoS",
-                lambda: check_agentcore_web_acl_anti_ddos(region),
+                check_agentcore_web_acl_anti_ddos,
             ),
         ]
 

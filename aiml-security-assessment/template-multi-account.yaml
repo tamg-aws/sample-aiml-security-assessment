@@ -826,57 +826,12 @@ Resources:
                 - ec2:DescribeSecurityGroups
               Resource: '*'
             - Sid: AgentCoreGatewayWebACLRead
-              # AG-39 reads the rules of the web ACL associated with a gateway.
-              # AC-51 reads the rules of every associated web ACL, including
-              # CloudFront ACLs, whose ARNs use the global scope in us-east-1.
+              # AG-39 reads the rules of the web ACL associated with a gateway,
+              # and AC-51 reads the same ACL for the Anti-DDoS rule group.
               Effect: Allow
               Action:
                 - wafv2:GetWebACL # AG-39, AC-51
-              Resource:
-                - !Sub 'arn:${AWS::Partition}:wafv2:*:${AWS::AccountId}:regional/webacl/*/*'
-                - !Sub 'arn:${AWS::Partition}:wafv2:us-east-1:${AWS::AccountId}:global/webacl/*/*'
-            - Sid: WebACLInventory
-              # AC-51 lists the web ACLs in each scope and the CloudFront
-              # distributions a global ACL protects. ListWebACLs and
-              # ListDistributionsByWebACLId have no resource-level authorization.
-              Effect: Allow
-              Action:
-                - wafv2:ListWebACLs # AC-51
-                - cloudfront:ListDistributionsByWebACLId # AC-51
-              Resource: '*'
-            - Sid: WebACLAssociationRead
-              # AC-51 asks ListResourcesForWebACL for each resource type a
-              # regional web ACL can protect.
-              Effect: Allow
-              Action:
-                - wafv2:ListResourcesForWebACL # AC-51
               Resource: !Sub 'arn:${AWS::Partition}:wafv2:*:${AWS::AccountId}:regional/webacl/*/*'
-            - Sid: WebACLAssociationCompanionInventory
-              # AWS WAF answers ListResourcesForWebACL for these resource types
-              # only when the caller also holds the owning service's action.
-              # None of the five has a resource type in the service
-              # authorization reference, so each takes '*'.
-              Effect: Allow
-              Action:
-                - elasticloadbalancing:DescribeWebACLAssociation # AC-51
-                - appsync:ListResourcesForWebACL # AC-51
-                - amplify:ListResourcesForWebACL # AC-51
-                - bedrock-agentcore:GatewayListResourcesForWebACL # AC-51
-                - ec2:DescribeVerifiedAccessInstanceWebAclAssociations # AC-51
-              Resource: '*'
-            - Sid: WebACLAssociationCompanionScoped
-              # The Cognito and App Runner companion actions are keyed on the
-              # web ACL in the service authorization reference and on the
-              # protected resource in the AWS WAF guide. Both ARNs are granted,
-              # pinned to this account, so the call authorizes under either.
-              Effect: Allow
-              Action:
-                - cognito-idp:ListResourcesForWebACL # AC-51
-                - apprunner:ListAssociatedServicesForWebAcl # AC-51
-              Resource:
-                - !Sub 'arn:${AWS::Partition}:wafv2:*:${AWS::AccountId}:regional/webacl/*/*'
-                - !Sub 'arn:${AWS::Partition}:cognito-idp:*:${AWS::AccountId}:userpool/*'
-                - !Sub 'arn:${AWS::Partition}:apprunner:*:${AWS::AccountId}:service/*/*'
             - Sid: DNSFirewallAssociationInventory
               # ListFirewallRuleGroupAssociations and ListFirewallDomainLists
               # have no resource-level authorization.

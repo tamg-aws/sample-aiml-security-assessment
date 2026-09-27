@@ -16089,166 +16089,177 @@ class TestAC50EcrEnhancedScanning:
         )
 
 
-def _anti_ddos_rule(name="anti-ddos", **group_overrides):
-    rule = _managed_rule(name, "AWSManagedRulesAntiDDoSRuleSet")
+def _anti_ddos_rule(name="anti-ddos", vendor="AWS", **group_overrides):
+    rule = _managed_rule(name, "AWSManagedRulesAntiDDoSRuleSet", vendor=vendor)
     rule["Statement"]["ManagedRuleGroupStatement"].update(group_overrides)
     return rule
 
 
-def _acl_summary(name, scope="regional"):
-    region = "us-east-1"
-    return {
-        "Name": name,
-        "Id": f"{name}-id",
-        "ARN": f"arn:aws:wafv2:{region}:123456789012:{scope}/webacl/{name}/{name}-id",
+def _gateway_acl_arn(acl_name):
+    return f"arn:aws:wafv2:us-east-1:123456789012:regional/webacl/{acl_name}/id"
+
+
+def _gateway_stub(mock_ac, mock_waf, gateways, web_acls):
+    """Answer GetGateway per gateway id and GetWebACL per ACL name.
+
+    gateways maps a gateway id to the web ACL name GetGateway reports, None
+    for no association, or the ClientError GetGateway raises. web_acls maps an
+    ACL name to the WebACL body or the ClientError GetWebACL raises.
+    """
+    mock_ac.list_gateways.return_value = {
+        "items": [
+            {"gatewayId": gateway_id, "name": f"name-{gateway_id}"}
+            for gateway_id in gateways
+        ]
     }
 
+    def get_gateway(gatewayIdentifier):
+        answer = gateways[gatewayIdentifier]
+        if isinstance(answer, Exception):
+            raise answer
+        detail = {"gatewayId": gatewayIdentifier, "authorizerType": "AWS_IAM"}
+        if answer:
+            detail["webAclArn"] = _gateway_acl_arn(answer)
+        return detail
 
-def _wafv2_stub(mock_wafv2, acls_by_scope, resources, web_acls, errors=None):
-    """Answer list_web_acls per Scope, associations per (ACL, type), and rules.
+    def get_web_acl(ARN):
+        answer = web_acls[ARN.split("/")[-2]]
+        if isinstance(answer, Exception):
+            raise answer
+        return {"WebACL": answer}
 
-    resources maps (acl_name, resource_type) to ARNs; errors maps the same key
-    to the ClientError that call raises.
-    """
-    errors = errors or {}
-
-    def list_web_acls(**kwargs):
-        return {"WebACLs": acls_by_scope.get(kwargs["Scope"], [])}
-
-    def list_resources(**kwargs):
-        acl_name = kwargs["WebACLArn"].split("/")[-2]
-        key = (acl_name, kwargs["ResourceType"])
-        if key in errors:
-            raise errors[key]
-        return {"ResourceArns": resources.get(key, [])}
-
-    def get_web_acl(**kwargs):
-        acl_name = kwargs["ARN"].split("/")[-2]
-        if isinstance(web_acls.get(acl_name), Exception):
-            raise web_acls[acl_name]
-        return {"WebACL": web_acls[acl_name]}
-
-    mock_wafv2.list_web_acls.side_effect = list_web_acls
-    mock_wafv2.list_resources_for_web_acl.side_effect = list_resources
-    mock_wafv2.get_web_acl.side_effect = get_web_acl
+    mock_ac.get_gateway.side_effect = get_gateway
+    if mock_waf is not None:
+        mock_waf.get_web_acl.side_effect = get_web_acl
 
 
-_ALB_ARN = "arn:aws:elasticloadbalancing:us-east-1:123456789012:loadbalancer/app/a/1"
-_GATEWAY_ARN = "arn:aws:bedrock-agentcore:us-east-1:123456789012:gateway/gw-1"
+class TestAC51GatewayAntiDdos:
+    """AC-51: the Anti-DDoS managed rule group on each gateway's web ACL."""
 
-
-class TestAC51WebAclAntiDdos:
-    """AC-51: the Anti-DDoS managed rule group on every associated web ACL."""
-
-    @patch("agentcore_app.wafv2_client", None)
-    def test_no_client_is_na(self):
-        findings = agentcore_app.check_agentcore_web_acl_anti_ddos("us-west-2")
+    @patch("agentcore_app.agentcore_client", None)
+    def test_no_agentcore_client_is_na(self):
+        findings = agentcore_app.check_agentcore_web_acl_anti_ddos()
         assert [finding["Status"] for finding in findings] == ["N/A"]
         assert findings[0]["Check_ID"] == "AC-51"
 
     @patch("agentcore_app.wafv2_client")
-    def test_no_web_acls_is_na(self, mock_wafv2):
-        _wafv2_stub(mock_wafv2, {}, {}, {})
+    @patch("agentcore_app.agentcore_client")
+    def test_no_gateways_is_na(self, mock_ac, mock_waf):
+        _gateway_stub(mock_ac, mock_waf, {}, {})
 
-        findings = agentcore_app.check_agentcore_web_acl_anti_ddos("us-west-2")
+        findings = agentcore_app.check_agentcore_web_acl_anti_ddos()
 
         assert [finding["Status"] for finding in findings] == ["N/A"]
-        assert "No web ACLs" in findings[0]["Finding_Details"]
+        assert "No AgentCore Gateways found" in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_an_unlistable_gateway_inventory_is_incomplete(self, mock_ac):
+        mock_ac.list_gateways.side_effect = _make_client_error(
+            "AccessDeniedException", "no"
+        )
+
+        findings = agentcore_app.check_agentcore_web_acl_anti_ddos()
+
+        assert [finding["Status"] for finding in findings] == ["N/A"]
+        assert findings[0]["Finding"].endswith("Incomplete")
 
     @patch("agentcore_app.wafv2_client")
-    def test_associated_acls_are_judged_one_by_one(self, mock_wafv2):
-        _wafv2_stub(
-            mock_wafv2,
-            {"REGIONAL": [_acl_summary("good"), _acl_summary("bad")]},
+    @patch("agentcore_app.agentcore_client")
+    def test_block_then_count_passes_then_fails(self, mock_ac, mock_waf):
+        _gateway_stub(
+            mock_ac,
+            mock_waf,
+            {"gw-1": "blocking", "gw-2": "counted"},
             {
-                ("good", "AGENTCORE_GATEWAY"): [_GATEWAY_ARN],
-                ("bad", "APPLICATION_LOAD_BALANCER"): [_ALB_ARN],
-            },
-            {
-                "good": {"Name": "good", "Rules": [_anti_ddos_rule()]},
-                "bad": {"Name": "bad", "Rules": [_rate_rule()]},
+                "blocking": {"Name": "blocking", "Rules": [_anti_ddos_rule()]},
+                "counted": {
+                    "Name": "counted",
+                    "Rules": [{**_anti_ddos_rule(), "OverrideAction": {"Count": {}}}],
+                },
             },
         )
 
-        findings = agentcore_app.check_agentcore_web_acl_anti_ddos("us-west-2")
+        findings = agentcore_app.check_agentcore_web_acl_anti_ddos()
 
         assert [finding["Status"] for finding in findings] == ["Passed", "Failed"]
-        assert _GATEWAY_ARN in findings[0]["Finding_Details"]
-        assert "bad" in findings[1]["Finding_Details"]
-        assert _ALB_ARN in findings[1]["Finding_Details"]
+        assert "(gw-1)" in findings[0]["Finding_Details"]
+        assert "(gw-2)" in findings[1]["Finding_Details"]
+        assert "rule 'anti-ddos' sets" in findings[1]["Finding_Details"]
         for finding in findings:
             assert finding["Check_ID"] == "AC-51"
-            assert_finding_schema(finding)
+            assert finding["Severity"] == "Medium"
 
     @patch("agentcore_app.wafv2_client")
-    def test_every_resource_type_is_asked_for(self, mock_wafv2):
-        _wafv2_stub(mock_wafv2, {"REGIONAL": [_acl_summary("idle")]}, {}, {})
-
-        agentcore_app.check_agentcore_web_acl_anti_ddos("us-west-2")
-
-        asked = {
-            call.kwargs["ResourceType"]
-            for call in mock_wafv2.list_resources_for_web_acl.call_args_list
-        }
-        assert asked == set(agentcore_app.WAF_REGIONAL_ASSOCIATION_RESOURCE_TYPES)
-
-    def test_the_resource_types_are_the_whole_botocore_enum(self):
-        import botocore.session
-
-        model = botocore.session.get_session().get_service_model("wafv2")
-        enum = (
-            model.operation_model("ListResourcesForWebACL")
-            .input_shape.members["ResourceType"]
-            .enum
+    @patch("agentcore_app.agentcore_client")
+    def test_an_absent_group_fails(self, mock_ac, mock_waf):
+        _gateway_stub(
+            mock_ac,
+            mock_waf,
+            {"gw-1": "bare"},
+            {"bare": {"Name": "bare", "Rules": [_rate_rule()]}},
         )
-        assert tuple(enum) == agentcore_app.WAF_REGIONAL_ASSOCIATION_RESOURCE_TYPES
+
+        findings = agentcore_app.check_agentcore_web_acl_anti_ddos()
+
+        assert [finding["Status"] for finding in findings] == ["Failed"]
+        assert "Not credited" not in findings[0]["Finding_Details"]
 
     @patch("agentcore_app.wafv2_client")
-    def test_an_unassociated_acl_is_not_judged(self, mock_wafv2):
-        _wafv2_stub(
-            mock_wafv2,
-            {"REGIONAL": [_acl_summary("idle"), _acl_summary("used")]},
-            {("used", "API_GATEWAY"): ["arn:aws:apigateway:us-east-1::/restapis/a"]},
+    @patch("agentcore_app.agentcore_client")
+    def test_a_gateway_with_no_web_acl_fails_and_names_ag27(self, mock_ac, mock_waf):
+        _gateway_stub(
+            mock_ac,
+            mock_waf,
+            {"gw-1": "blocking", "gw-2": None},
+            {"blocking": {"Name": "blocking", "Rules": [_anti_ddos_rule()]}},
+        )
+
+        findings = agentcore_app.check_agentcore_web_acl_anti_ddos()
+
+        assert [finding["Status"] for finding in findings] == ["Passed", "Failed"]
+        assert "(gw-2) has no web ACL" in findings[1]["Finding_Details"]
+        assert "AG-27" in findings[1]["Finding_Details"]
+        assert mock_waf.get_web_acl.call_count == 1
+
+    @patch("agentcore_app.wafv2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_an_access_denied_association_read_is_na(self, mock_ac, mock_waf):
+        _gateway_stub(
+            mock_ac,
+            mock_waf,
             {
-                "idle": {"Name": "idle", "Rules": []},
-                "used": {"Name": "used", "Rules": [_anti_ddos_rule()]},
+                "gw-1": _make_client_error("AccessDeniedException", "no"),
+                "gw-2": "blocking",
+            },
+            {"blocking": {"Name": "blocking", "Rules": [_anti_ddos_rule()]}},
+        )
+
+        findings = agentcore_app.check_agentcore_web_acl_anti_ddos()
+
+        assert [finding["Status"] for finding in findings] == ["N/A", "Passed"]
+        assert "AccessDeniedException" in findings[0]["Finding_Details"]
+        assert "bedrock-agentcore:GetGateway" in findings[0]["Resolution"]
+
+    @patch("agentcore_app.wafv2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_same_named_group_from_another_vendor_is_not_credited(
+        self, mock_ac, mock_waf
+    ):
+        _gateway_stub(
+            mock_ac,
+            mock_waf,
+            {"gw-1": "lookalike"},
+            {
+                "lookalike": {
+                    "Name": "lookalike",
+                    "Rules": [_anti_ddos_rule(vendor="SomeVendor")],
+                }
             },
         )
 
-        findings = agentcore_app.check_agentcore_web_acl_anti_ddos("us-west-2")
-
-        assert [finding["Status"] for finding in findings] == ["Passed"]
-        assert "used" in findings[0]["Finding_Details"]
-        assert "idle" not in findings[0]["Finding_Details"]
-
-    @patch("agentcore_app.wafv2_client")
-    def test_only_unassociated_acls_is_na(self, mock_wafv2):
-        _wafv2_stub(mock_wafv2, {"REGIONAL": [_acl_summary("idle")]}, {}, {})
-
-        findings = agentcore_app.check_agentcore_web_acl_anti_ddos("us-west-2")
-
-        assert [finding["Status"] for finding in findings] == ["N/A"]
-        assert "None of the 1" in findings[0]["Finding_Details"]
-        mock_wafv2.get_web_acl.assert_not_called()
-
-    @patch("agentcore_app.wafv2_client")
-    def test_a_count_override_on_the_group_is_not_credited(self, mock_wafv2):
-        counted = [
-            {**_anti_ddos_rule(name), "OverrideAction": {"Count": {}}}
-            for name in ("anti-ddos", "second")
-        ]
-        _wafv2_stub(
-            mock_wafv2,
-            {"REGIONAL": [_acl_summary("acl")]},
-            {("acl", "AGENTCORE_GATEWAY"): [_GATEWAY_ARN]},
-            {"acl": {"Name": "acl", "Rules": counted}},
-        )
-
-        findings = agentcore_app.check_agentcore_web_acl_anti_ddos("us-west-2")
+        findings = agentcore_app.check_agentcore_web_acl_anti_ddos()
 
         assert [finding["Status"] for finding in findings] == ["Failed"]
-        assert "rule 'anti-ddos' sets" in findings[0]["Finding_Details"]
-        assert "rule 'second' sets" in findings[0]["Finding_Details"]
 
     @pytest.mark.parametrize(
         "group_overrides, status",
@@ -16287,17 +16298,18 @@ class TestAC51WebAclAntiDdos:
         ],
     )
     @patch("agentcore_app.wafv2_client")
+    @patch("agentcore_app.agentcore_client")
     def test_an_inner_override_to_count_or_allow_is_not_credited(
-        self, mock_wafv2, group_overrides, status
+        self, mock_ac, mock_waf, group_overrides, status
     ):
-        _wafv2_stub(
-            mock_wafv2,
-            {"REGIONAL": [_acl_summary("acl")]},
-            {("acl", "AGENTCORE_GATEWAY"): [_GATEWAY_ARN]},
+        _gateway_stub(
+            mock_ac,
+            mock_waf,
+            {"gw-1": "acl"},
             {"acl": {"Name": "acl", "Rules": [_anti_ddos_rule(**group_overrides)]}},
         )
 
-        findings = agentcore_app.check_agentcore_web_acl_anti_ddos("us-west-2")
+        findings = agentcore_app.check_agentcore_web_acl_anti_ddos()
 
         assert [finding["Status"] for finding in findings] == [status]
         if status == "Failed":
@@ -16320,7 +16332,8 @@ class TestAC51WebAclAntiDdos:
         assert coverage["anti_ddos"] is False
 
     @patch("agentcore_app.wafv2_client")
-    def test_a_firewall_manager_group_is_credited(self, mock_wafv2):
+    @patch("agentcore_app.agentcore_client")
+    def test_a_firewall_manager_group_is_credited(self, mock_ac, mock_waf):
         fms_group = {
             "Name": "fms-anti-ddos",
             "Priority": 0,
@@ -16332,13 +16345,10 @@ class TestAC51WebAclAntiDdos:
                 }
             },
         }
-        _wafv2_stub(
-            mock_wafv2,
-            {"REGIONAL": [_acl_summary("pre"), _acl_summary("post")]},
-            {
-                ("pre", "AGENTCORE_GATEWAY"): [_GATEWAY_ARN],
-                ("post", "AGENTCORE_GATEWAY"): [_GATEWAY_ARN],
-            },
+        _gateway_stub(
+            mock_ac,
+            mock_waf,
+            {"gw-1": "pre", "gw-2": "post"},
             {
                 "pre": {
                     "Name": "pre",
@@ -16353,166 +16363,75 @@ class TestAC51WebAclAntiDdos:
             },
         )
 
-        findings = agentcore_app.check_agentcore_web_acl_anti_ddos("us-west-2")
+        findings = agentcore_app.check_agentcore_web_acl_anti_ddos()
 
         assert [finding["Status"] for finding in findings] == ["Passed", "Passed"]
         assert "fms-anti-ddos" in findings[0]["Finding_Details"]
 
     @patch("agentcore_app.wafv2_client")
-    def test_a_lone_unreadable_type_is_na_and_named(self, mock_wafv2):
-        _wafv2_stub(
-            mock_wafv2,
-            {"REGIONAL": [_acl_summary("acl")]},
-            {},
-            {},
-            errors={
-                ("acl", "COGNITO_USER_POOL"): _make_client_error(
-                    "AccessDeniedException", "no"
-                )
-            },
-        )
-
-        findings = agentcore_app.check_agentcore_web_acl_anti_ddos("us-west-2")
-
-        assert [finding["Status"] for finding in findings] == ["N/A"]
-        assert (
-            "COGNITO_USER_POOL (AccessDeniedException)"
-            in (findings[0]["Finding_Details"])
-        )
-        mock_wafv2.get_web_acl.assert_not_called()
-
-    @patch("agentcore_app.wafv2_client")
-    def test_an_unreadable_type_does_not_hide_a_found_association(self, mock_wafv2):
-        _wafv2_stub(
-            mock_wafv2,
-            {"REGIONAL": [_acl_summary("acl")]},
-            {("acl", "AGENTCORE_GATEWAY"): [_GATEWAY_ARN]},
-            {"acl": {"Name": "acl", "Rules": []}},
-            errors={
-                ("acl", "COGNITO_USER_POOL"): _make_client_error(
-                    "AccessDeniedException", "no"
-                )
-            },
-        )
-
-        findings = agentcore_app.check_agentcore_web_acl_anti_ddos("us-west-2")
-
-        assert [finding["Status"] for finding in findings] == ["Failed"]
-
-    @patch("agentcore_app.wafv2_client")
-    def test_an_unreadable_web_acl_is_na(self, mock_wafv2):
-        _wafv2_stub(
-            mock_wafv2,
-            {"REGIONAL": [_acl_summary("acl")]},
-            {("acl", "AGENTCORE_GATEWAY"): [_GATEWAY_ARN]},
+    @patch("agentcore_app.agentcore_client")
+    def test_an_unreadable_web_acl_is_na(self, mock_ac, mock_waf):
+        _gateway_stub(
+            mock_ac,
+            mock_waf,
+            {"gw-1": "acl"},
             {"acl": _make_client_error("AccessDeniedException", "no")},
         )
 
-        findings = agentcore_app.check_agentcore_web_acl_anti_ddos("us-west-2")
+        findings = agentcore_app.check_agentcore_web_acl_anti_ddos()
 
         assert [finding["Status"] for finding in findings] == ["N/A"]
         assert "wafv2:GetWebACL" in findings[0]["Resolution"]
 
-    @patch("agentcore_app.wafv2_client")
-    def test_an_unlistable_scope_is_incomplete(self, mock_wafv2):
-        mock_wafv2.list_web_acls.side_effect = _make_client_error(
-            "WAFInternalErrorException", "no"
-        )
+    @patch("agentcore_app.wafv2_client", None)
+    @patch("agentcore_app.agentcore_client")
+    def test_no_wafv2_client_with_an_acl_is_na(self, mock_ac):
+        _gateway_stub(mock_ac, None, {"gw-1": "acl"}, {})
 
-        findings = agentcore_app.check_agentcore_web_acl_anti_ddos("us-west-2")
-
-        assert [finding["Status"] for finding in findings] == ["N/A"]
-        assert findings[0]["Finding"].endswith("(REGIONAL) Incomplete")
-
-    @patch("agentcore_app.cloudfront_client")
-    @patch("agentcore_app.wafv2_client")
-    def test_cloudfront_acls_are_read_only_from_us_east_1(
-        self, mock_wafv2, mock_cloudfront
-    ):
-        _wafv2_stub(
-            mock_wafv2,
-            {"CLOUDFRONT": [_acl_summary("edge", scope="global")]},
-            {},
-            {"edge": {"Name": "edge", "Rules": []}},
-        )
-        mock_cloudfront.list_distributions_by_web_acl_id.return_value = {
-            "DistributionList": {
-                "IsTruncated": False,
-                "Items": [
-                    {"Id": "E1", "ARN": "arn:aws:cloudfront::123:distribution/E1"}
-                ],
-            }
-        }
-
-        elsewhere = agentcore_app.check_agentcore_web_acl_anti_ddos("us-west-2")
-        scopes = {
-            call.kwargs["Scope"] for call in mock_wafv2.list_web_acls.call_args_list
-        }
-        assert scopes == {"REGIONAL"}
-        assert [finding["Status"] for finding in elsewhere] == ["N/A"]
-
-        mock_wafv2.list_web_acls.reset_mock()
-        home = agentcore_app.check_agentcore_web_acl_anti_ddos("us-east-1")
-        scopes = {
-            call.kwargs["Scope"] for call in mock_wafv2.list_web_acls.call_args_list
-        }
-        assert scopes == {"REGIONAL", "CLOUDFRONT"}
-        assert [finding["Status"] for finding in home] == ["Failed"]
-        assert "CLOUDFRONT web ACL edge" in home[0]["Finding_Details"]
-        assert "distribution/E1" in home[0]["Finding_Details"]
-
-    @patch("agentcore_app.cloudfront_client")
-    @patch("agentcore_app.wafv2_client")
-    def test_cloudfront_distributions_are_paged(self, mock_wafv2, mock_cloudfront):
-        _wafv2_stub(
-            mock_wafv2,
-            {"CLOUDFRONT": [_acl_summary("edge", scope="global")]},
-            {},
-            {"edge": {"Name": "edge", "Rules": [_anti_ddos_rule()]}},
-        )
-        mock_cloudfront.list_distributions_by_web_acl_id.side_effect = [
-            {
-                "DistributionList": {
-                    "IsTruncated": True,
-                    "NextMarker": "m1",
-                    "Items": [],
-                }
-            },
-            {
-                "DistributionList": {
-                    "IsTruncated": False,
-                    "Items": [
-                        {"Id": "E2", "ARN": "arn:aws:cloudfront::1:distribution/E2"}
-                    ],
-                }
-            },
-        ]
-
-        findings = agentcore_app.check_agentcore_web_acl_anti_ddos("us-east-1")
-
-        assert [finding["Status"] for finding in findings] == ["Passed"]
-        second = mock_cloudfront.list_distributions_by_web_acl_id.call_args_list[1]
-        assert second.kwargs["Marker"] == "m1"
-
-    @patch("agentcore_app.cloudfront_client")
-    @patch("agentcore_app.wafv2_client")
-    def test_unreadable_cloudfront_distributions_are_na(
-        self, mock_wafv2, mock_cloudfront
-    ):
-        _wafv2_stub(
-            mock_wafv2, {"CLOUDFRONT": [_acl_summary("edge", scope="global")]}, {}, {}
-        )
-        mock_cloudfront.list_distributions_by_web_acl_id.side_effect = (
-            _make_client_error("AccessDenied", "no")
-        )
-
-        findings = agentcore_app.check_agentcore_web_acl_anti_ddos("us-east-1")
+        findings = agentcore_app.check_agentcore_web_acl_anti_ddos()
 
         assert [finding["Status"] for finding in findings] == ["N/A"]
-        assert (
-            "CloudFront distributions (AccessDenied)"
-            in (findings[0]["Finding_Details"])
+
+    @patch("agentcore_app.wafv2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_every_row_names_the_front_doors_it_does_not_judge(self, mock_ac, mock_waf):
+        _gateway_stub(
+            mock_ac,
+            mock_waf,
+            {
+                "gw-1": "blocking",
+                "gw-2": None,
+                "gw-3": _make_client_error("AccessDeniedException", "no"),
+            },
+            {"blocking": {"Name": "blocking", "Rules": [_anti_ddos_rule()]}},
         )
+
+        findings = agentcore_app.check_agentcore_web_acl_anti_ddos()
+
+        assert len(findings) == 3
+        for finding in findings:
+            assert finding["Finding_Details"].endswith(
+                "Front doors other than AgentCore gateways (API Gateway, ALB, "
+                "CloudFront) are not identifiable as AI entry points by any API, "
+                "so they are not judged."
+            )
+
+    @patch("agentcore_app.wafv2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_the_population_is_the_gateways_and_not_the_web_acls(
+        self, mock_ac, mock_waf
+    ):
+        _gateway_stub(
+            mock_ac,
+            mock_waf,
+            {"gw-1": "blocking"},
+            {"blocking": {"Name": "blocking", "Rules": [_anti_ddos_rule()]}},
+        )
+
+        agentcore_app.check_agentcore_web_acl_anti_ddos()
+
+        mock_waf.list_web_acls.assert_not_called()
+        mock_waf.list_resources_for_web_acl.assert_not_called()
 
 
 class TestEcrScanningAndAntiDdosCheckRegistration:
@@ -16545,8 +16464,3 @@ class TestEcrScanningAndAntiDdosCheckRegistration:
     def test_the_handler_registers_each_check_once(self, function_name):
         source = textwrap.dedent(inspect.getsource(agentcore_app.lambda_handler))
         assert source.count(function_name) == 1
-
-    def test_the_handler_creates_a_cloudfront_client(self):
-        source = textwrap.dedent(inspect.getsource(agentcore_app.lambda_handler))
-        assert 'cloudfront_client = boto3.client("cloudfront"' in source
-        assert "cloudfront_client" in source.split("start_time = time.time()")[0]

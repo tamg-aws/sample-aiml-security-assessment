@@ -48,11 +48,6 @@ NON_PAGEABLE_CALLS = {
         "check_foundation_model_lifecycle_policy",
         "list_foundation_models",
     ),
-    (
-        "agentcore_assessments/app.py",
-        "_regional_web_acl_associations",
-        "list_resources_for_web_acl",
-    ),
 }
 
 # Direct bounded calls are permitted only at these reviewed call sites. Most
