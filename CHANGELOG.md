@@ -63,6 +63,12 @@ section.
     went unreported and the check read "50 of 50" as `Passed`; a cap or a
     failed read now turns the enforced buckets into an `N/A` row that names
     how many were read.
+  - `BR-42` and `BR-49` read a `Resource` whose resource segment carries a
+    `*` that still matches every model, such as
+    `arn:aws:bedrock:*::foundation-model*`, `foundation-model/**` or
+    `inference-profile/?*`, as unscoped. Before, only `*` and entries ending
+    in `/*` or `:*` were, so `BR-42` passed such an Allow as a named model
+    list and `BR-49` refused credit to such a Deny.
   - `BR-48` reads the organization's effective AI services opt-out policy.
     From the management account it also reads every opt-out policy to name
     any whose value a child policy may change. An unset

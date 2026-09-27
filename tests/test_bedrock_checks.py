@@ -11,6 +11,7 @@ Each check is tested for:
 
 import contextlib
 import json
+import time
 import sys
 import os
 import importlib.util
@@ -4179,6 +4180,45 @@ class TestBR42ModelAllowList:
         assert len(failed) == 1
         assert "arn:aws:bedrock:*::foundation-model/*" in failed[0]["Finding_Details"]
         assert not [f for f in findings if f["Status"] == "Passed"]
+
+    def test_br42_wildcard_inside_the_resource_segment_is_not_an_allow_list(self):
+        """foundation-model* has no "/*" or ":*" ending yet names every model."""
+        findings = self._run(
+            _identity_cache(
+                roles={
+                    "ScopedRole": [
+                        ("ScopedInvoke", _allow("bedrock:InvokeModel", self.MODEL_ARN))
+                    ],
+                    "StarSegmentRole": [
+                        (
+                            "StarSegment",
+                            _allow(
+                                "bedrock:InvokeModel",
+                                ["arn:aws:bedrock:*::foundation-model*"],
+                            ),
+                        )
+                    ],
+                    "ProfileRole": [
+                        (
+                            "ProfileStar",
+                            _allow(
+                                "bedrock:InvokeModel",
+                                ["arn:aws:bedrock:us-east-1:*:inference-profile/?*"],
+                            ),
+                        )
+                    ],
+                }
+            )
+        )
+
+        failed = [f for f in findings if f["Status"] == "Failed"]
+        passed = [f for f in findings if f["Status"] == "Passed"]
+        failed_text = " ".join(f["Finding_Details"] for f in failed)
+        assert len(failed) == 2
+        assert "Role 'StarSegmentRole'" in failed_text
+        assert "Role 'ProfileRole'" in failed_text
+        assert len(passed) == 1
+        assert "ScopedRole" in passed[0]["Finding_Details"]
 
     def test_br42_model_arn_condition_does_not_scope_the_streaming_action(self):
         condition = {"StringEquals": {"bedrock:ModelArn": self.MODEL_ARN}}
@@ -10944,6 +10984,79 @@ _ALLOW_ALL_BEDROCK = {
 }
 
 
+class TestResourceIsUnscoped:
+    """Which Resource entries grant every model, for BR-42 and BR-49."""
+
+    @pytest.mark.parametrize(
+        "resource",
+        [
+            "*",
+            "arn:aws:bedrock:*::foundation-model/*",
+            "arn:aws:bedrock:us-west-2::foundation-model/*",
+            "arn:aws:bedrock:::foundation-model/*",
+            "arn:${Partition}:bedrock:*::foundation-model/*",
+            "arn:aws:bedrock:*:*:*",
+            "arn:*:bedrock:*",
+            "arn:aws:bedrock:us-east-1:111122223333:inference-profile/*",
+            " arn:aws:bedrock:eu-west-1::foundation-model/* ",
+        ],
+    )
+    def test_forms_already_read_as_unscoped_stay_unscoped(self, resource):
+        assert bedrock_app._resource_is_unscoped(resource)
+
+    @pytest.mark.parametrize(
+        "resource",
+        [
+            "arn:aws:bedrock:*::foundation-model*",
+            "arn:aws:bedrock:us-east-1::foundation-model/**",
+            "arn:aws:bedrock:::foundation-model/?*",
+            "arn:aws-us-gov:bedrock:us-gov-west-1::f*",
+            "arn:aws:bedrock:*::?oundation-model*",
+            "arn:aws:bedrock*",
+            "arn:aws:bed*",
+            "arn:*:bedrock:*:*:inference-profile*",
+            "arn:aws:bedrock:us-east-1:111122223333:inference-profile/?*",
+        ],
+    )
+    def test_wildcard_inside_a_segment_is_unscoped(self, resource):
+        assert bedrock_app._resource_is_unscoped(resource)
+
+    @pytest.mark.parametrize(
+        "resource",
+        [
+            "arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-v2",
+            "arn:aws:bedrock:*::foundation-model/anthropic.*",
+            "arn:aws:bedrock:us-east-1:111122223333:inference-profile/us.*",
+            "arn:aws:bedrock:us-east-1::foundation-model",
+            "arn:aws:s3:::foundation-model*",
+            "arn:aws:bedrock:*::custom-model*",
+            "arn:aws:bedrock:*::foundation-model/a*",
+            "",
+            None,
+            {"Fn::Sub": "arn:aws:bedrock:*::foundation-model*"},
+        ],
+    )
+    def test_named_models_and_families_are_scoped(self, resource):
+        assert not bedrock_app._resource_is_unscoped(resource)
+
+    @pytest.mark.parametrize(
+        "resource",
+        [
+            "arn:aws:bedrock:*::" + "*a" * 50000 + "*",
+            "arn:aws:bedrock:*::" + "*?" * 9 + "*b" * 20000 + "*",
+            "arn:aws:bedrock:*::" + "*" * 100000 + "f" + "*" * 100000,
+            "arn:aws:bedrock:*::" + "*?" * 9 + "*",
+            "*" + "*a" * 50000,
+            "a" * 100000 + "*",
+        ],
+    )
+    def test_pathological_patterns_finish_fast(self, resource):
+        """A backtracking matcher hung on a 31-character input; these are longer."""
+        started = time.monotonic()
+        bedrock_app._resource_is_unscoped(resource)
+        assert time.monotonic() - started < 0.5
+
+
 class TestBR49GuardrailInvocationDeny:
     """BR-49: every invoke permission must be paired with a conditioned Deny."""
 
@@ -11228,6 +11341,46 @@ class TestBR49GuardrailInvocationDeny:
         )
 
         assert [f["Status"] for f in findings] == ["Passed"]
+
+    def test_br49_deny_with_a_star_inside_the_resource_segment_is_credited(self):
+        """foundation-model/?* denies every model, so the identity is guarded.
+
+        A second identity whose Deny names one model family is not credited,
+        so the two verdicts cannot both come from one reading of the cache.
+        """
+        cache = _invoke_cache(
+            _ALLOW_ALL_BEDROCK,
+            _guardrail_deny_statement(
+                resources=["arn:aws:bedrock:*::foundation-model/?*"]
+            ),
+        )
+        cache["role_permissions"]["FamilyRole"] = {
+            "attached_policies": [
+                {
+                    "name": "FamilyDeny",
+                    "document": {
+                        "Version": "2012-10-17",
+                        "Statement": [
+                            _ALLOW_ALL_BEDROCK,
+                            _guardrail_deny_statement(
+                                resources=[
+                                    "arn:aws:bedrock:*::foundation-model/anthropic.*"
+                                ]
+                            ),
+                        ],
+                    },
+                }
+            ],
+            "inline_policies": [],
+            "permission_boundary": None,
+        }
+
+        findings = self._run(cache)
+
+        assert [f["Status"] for f in findings] == ["Failed", "Passed"]
+        assert "role 'FamilyRole'" in findings[0]["Finding_Details"]
+        assert "1 of 2 identity/identities" in findings[1]["Finding_Details"]
+        assert "role 'AppRole'" in findings[1]["Finding_Details"]
 
     def test_br49_unparseable_policy_document_adds_an_na_row(self):
         cache = _invoke_cache(_ALLOW_ALL_BEDROCK, _guardrail_deny_statement())

@@ -11076,12 +11076,89 @@ MODEL_ARN_CONDITION_KEY = "bedrock:modelarn"
 MODEL_ALLOW_LIST_REFERENCE = "https://docs.aws.amazon.com/bedrock/latest/userguide/security_iam_id-based-policy-examples.html"
 
 
+# The resource-segment prefixes a model invocation ARN starts with. A pattern
+# whose resource segment matches one of them and ends in "*" matches every model
+# ID after it, whatever the Region, account or partition segments say.
+MODEL_RESOURCE_TYPE_PREFIXES = ("foundation-model/", "inference-profile/")
+
+# Stands in for the first character of a model ID. No policy writes it as a
+# literal, so only ? or * can match it, and a pattern that matches it matches
+# every non-empty ID: "foundation-model/?*" does, "foundation-model/a*" does not.
+ANY_MODEL_ID_CHARACTER = "\x00"
+
+
+def _wildcard_matches(pattern: str, text: str) -> bool:
+    """
+    Match an IAM-style pattern, where * is any run and ? one character.
+
+    The pattern comes from a customer policy and can be long, so it is checked
+    in linear passes: a pattern with more literal characters than ``text`` is
+    rejected before matching, runs of * are collapsed, and the greedy two-pointer
+    walk that follows is bounded by the short, fixed ``text``.
+    """
+    if len(pattern) - pattern.count("*") > len(text):
+        return False
+    collapsed = []
+    for char in pattern:
+        if char == "*" and collapsed and collapsed[-1] == "*":
+            continue
+        collapsed.append(char)
+
+    p_index = t_index = 0
+    star = -1
+    star_text = 0
+    while t_index < len(text):
+        if p_index < len(collapsed) and collapsed[p_index] in ("?", text[t_index]):
+            p_index += 1
+            t_index += 1
+        elif p_index < len(collapsed) and collapsed[p_index] == "*":
+            star = p_index
+            star_text = t_index
+            p_index += 1
+        elif star >= 0:
+            p_index = star + 1
+            star_text += 1
+            t_index = star_text
+        else:
+            return False
+    return all(char == "*" for char in collapsed[p_index:])
+
+
+def _pattern_covers_every_model(resource: str) -> bool:
+    """
+    Return True when a Bedrock ARN pattern matches every foundation model or
+    inference profile, such as arn:aws:bedrock:*::foundation-model* or
+    arn:aws:bedrock:us-east-1:*:inference-profile/**.
+
+    The ARN is split on ":" into its six segments and each is compared on its
+    own. A pattern with fewer segments ends in a * that also covers the missing
+    ones, so they are padded with "*".
+    """
+    if not resource.endswith("*"):
+        return False
+    segments = resource.split(":", 5)
+    segments += ["*"] * (6 - len(segments))
+    return (
+        _wildcard_matches(segments[0], "arn")
+        and _wildcard_matches(segments[2], "bedrock")
+        and any(
+            _wildcard_matches(segments[5], prefix + ANY_MODEL_ID_CHARACTER)
+            for prefix in MODEL_RESOURCE_TYPE_PREFIXES
+        )
+    )
+
+
 def _resource_is_unscoped(resource: Any) -> bool:
     """Return True when a Resource entry covers every model rather than naming one."""
     if not isinstance(resource, str):
         return False
     resource = resource.strip()
-    return resource == "*" or resource.endswith("/*") or resource.endswith(":*")
+    return (
+        resource == "*"
+        or resource.endswith("/*")
+        or resource.endswith(":*")
+        or _pattern_covers_every_model(resource)
+    )
 
 
 def _statement_model_invocation_scoping(

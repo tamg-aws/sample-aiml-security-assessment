@@ -531,7 +531,7 @@ inventory is never treated as evidence of compliance.
 ### BR-42: Foundation Model Invocation Allow-List
 
 - **Severity:** High
-- **Description:** Requires identity policies to scope `bedrock:InvokeModel` and `bedrock:InvokeModelWithResponseStream` to named foundation model or inference-profile ARNs. Only Allow statements that cover an invoke action are judged, so a policy that never grants invocation is not counted against this control. An unscoped resource with no `bedrock:ModelArn` condition fails, because every model available in the account can then be invoked. An unscoped resource carrying a `bedrock:ModelArn` condition also fails for the streaming action, which does not support that condition key.
+- **Description:** Requires identity policies to scope `bedrock:InvokeModel` and `bedrock:InvokeModelWithResponseStream` to named foundation model or inference-profile ARNs. Only Allow statements that cover an invoke action are judged, so a policy that never grants invocation is not counted against this control. An unscoped resource with no `bedrock:ModelArn` condition fails, because every model available in the account can then be invoked. An unscoped resource carrying a `bedrock:ModelArn` condition also fails for the streaming action, which does not support that condition key. A resource is unscoped when it is `*`, ends in `/*` or `:*`, or is a Bedrock ARN pattern whose resource segment ends in `*` and matches `foundation-model/` or `inference-profile/` followed by any model ID, such as `arn:aws:bedrock:*::foundation-model*` or `arn:aws:bedrock:::foundation-model/?*`, in any Region, account or partition. A family pattern such as `foundation-model/anthropic.*` is not unscoped.
 
 ### BR-43: Region Invocation Control
 
@@ -566,7 +566,7 @@ inventory is never treated as evidence of compliance.
 ### BR-49: Guardrail Invocation Deny Enforcement
 
 - **Severity:** High
-- **Description:** For each IAM role and user allowed to invoke a model, requires a `Deny` on `bedrock:InvokeModel` and `bedrock:InvokeModelWithResponseStream`, on an unscoped `Resource`, conditioned by a negated operator or by `Null` `true` on `bedrock:GuardrailIdentifier`, so a call without an approved guardrail is refused. Those two IAM actions also authorize `Converse` and `ConverseStream`, which have no IAM action of their own. BR-34 judges the guardrail content and BR-41 the account-level enforced guardrail configuration; this check covers identities whose calls neither of those reaches. Only role and user policies (attached and inline) are read. Group policies, permissions boundaries and service control policies are not read, so a `Deny` placed in one of them is not credited.
+- **Description:** For each IAM role and user allowed to invoke a model, requires a `Deny` on `bedrock:InvokeModel` and `bedrock:InvokeModelWithResponseStream`, on an unscoped `Resource` (as defined for [BR-42](#br-42-foundation-model-invocation-allow-list)), conditioned by a negated operator or by `Null` `true` on `bedrock:GuardrailIdentifier`, so a call without an approved guardrail is refused. Those two IAM actions also authorize `Converse` and `ConverseStream`, which have no IAM action of their own. BR-34 judges the guardrail content and BR-41 the account-level enforced guardrail configuration; this check covers identities whose calls neither of those reaches. Only role and user policies (attached and inline) are read. Group policies, permissions boundaries and service control policies are not read, so a `Deny` placed in one of them is not credited.
 
 ---
 
