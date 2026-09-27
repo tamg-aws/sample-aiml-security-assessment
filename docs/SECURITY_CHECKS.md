@@ -605,7 +605,7 @@ inventory is never treated as evidence of compliance.
 ### AC-07: Memory Encryption
 
 - **Severity:** Medium
-- **Description:** Checks agent memory encryption with AWS KMS.
+- **Description:** Checks agent memory encryption with AWS KMS. A memory that `GetMemory` cannot describe is informational `N/A`, and the resolution follows the error. `AccessDeniedException` names `bedrock-agentcore:GetMemory` on the memory and `kms:Decrypt` on its customer managed key, because AgentCore decrypts the memory's strategies on the caller's behalf and a caller without the key grant is denied `GetMemory`. Only `ResourceNotFoundException` points at a memory deleted mid-assessment.
 
 ### AC-08: Amazon VPC Endpoints
 
@@ -1039,7 +1039,7 @@ with scope limited to the Security pillar.
 - **Severity:** Source check severity
 - **Source:** AC-07
 - **Domain:** Memory & Data Privacy
-- **Description:** Maps AgentCore memory encryption controls.
+- **Description:** Maps AgentCore memory encryption controls. The row carries AC-07's details, so the row for a memory that `GetMemory` denied names the `kms:Decrypt` cause too.
 
 ### AG-20: Private AgentCore Connectivity
 

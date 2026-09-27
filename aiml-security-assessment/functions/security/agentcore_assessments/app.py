@@ -3755,6 +3755,33 @@ def check_agentcore_memory_configuration() -> List[Dict[str, Any]]:
                 # GetMemory call failed reported the same aggregate pass as a run
                 # that read every memory.
                 logger.error(f"Error describing memory {memory_id}: {e}")
+                cause = ""
+                if _is_access_denied_client_error(e):
+                    cause = (
+                        " GetMemory is denied when the caller lacks "
+                        "bedrock-agentcore:GetMemory on the memory, or lacks "
+                        "kms:Decrypt on the memory's customer managed key, "
+                        "because AgentCore decrypts the memory's strategies on "
+                        "the caller's behalf."
+                    )
+                    resolution = (
+                        "Grant bedrock-agentcore:GetMemory on this memory and, "
+                        "if it is encrypted with a customer managed key, "
+                        "kms:Decrypt on that key, then rerun the assessment."
+                    )
+                elif (
+                    e.response.get("Error", {}).get("Code")
+                    == "ResourceNotFoundException"
+                ):
+                    resolution = (
+                        "Remove a memory deleted mid-assessment from the "
+                        "inventory, then rerun the assessment."
+                    )
+                else:
+                    resolution = (
+                        "Grant bedrock-agentcore:GetMemory on this memory, then "
+                        "rerun the assessment."
+                    )
                 findings.append(
                     create_finding(
                         check_id="AC-07",
@@ -3762,12 +3789,9 @@ def check_agentcore_memory_configuration() -> List[Dict[str, Any]]:
                         finding_details=(
                             f"Memory {memory_label} could not be described. "
                             f"Assessment error: {_assessment_error_label(e)}."
+                            f"{cause}"
                         ),
-                        resolution=(
-                            "Grant bedrock-agentcore:GetMemory on this memory, or "
-                            "remove a memory deleted mid-assessment from the "
-                            "inventory, then rerun the assessment."
-                        ),
+                        resolution=resolution,
                         reference=AGENTCORE_MEMORY_REFERENCE_URL,
                         severity=SeverityEnum.INFORMATIONAL,
                         status=StatusEnum.NA,

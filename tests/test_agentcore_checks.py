@@ -2403,6 +2403,94 @@ class TestAC07MemoryConfiguration:
         assert [f["Status"] for f in findings] == ["N/A"]
         assert "bedrock-agentcore:GetMemory" in findings[0]["Resolution"]
 
+    @patch("agentcore_app.agentcore_client")
+    def test_ac07_each_describe_error_names_its_own_fix(self, mock_ac):
+        """AccessDenied can come from KMS, and only NotFound means deleted.
+
+        A caller that holds bedrock-agentcore:GetMemory but not kms:Decrypt on a
+        memory's customer managed key is denied GetMemory, so a resolution that
+        names only the AgentCore grant, or a deleted memory, sends the reader to
+        the wrong fix.
+        """
+        mock_ac.list_memories.return_value = {
+            "memories": [
+                {"id": "mem-1", "name": "Denied"},
+                {"id": "mem-2", "name": "Gone"},
+                {"id": "mem-3", "name": "Throttled"},
+                {"id": "mem-4", "name": "Readable"},
+            ]
+        }
+        mock_ac.get_memory.side_effect = [
+            _make_client_error("AccessDeniedException", "no"),
+            _make_client_error("ResourceNotFoundException", "gone"),
+            _make_client_error("ThrottledException", "slow down"),
+            {"memory": self._memory_detail()},
+        ]
+
+        findings = extract_csv_data(
+            agentcore_app.check_agentcore_memory_configuration()
+        )
+
+        assert [f["Status"] for f in findings] == [
+            "N/A",
+            "N/A",
+            "N/A",
+            "Passed",
+            "Passed",
+        ]
+        denied, gone, throttled = findings[:3]
+        assert "'Denied' (mem-1)" in denied["Finding_Details"]
+        assert "kms:Decrypt" in denied["Resolution"]
+        assert "bedrock-agentcore:GetMemory" in denied["Resolution"]
+        assert "kms:Decrypt" in denied["Finding_Details"]
+        assert "deleted mid-assessment" not in denied["Resolution"]
+        assert "'Gone' (mem-2)" in gone["Finding_Details"]
+        assert "deleted mid-assessment" in gone["Resolution"]
+        assert "kms:Decrypt" not in gone["Resolution"] + gone["Finding_Details"]
+        assert "'Throttled' (mem-3)" in throttled["Finding_Details"]
+        assert "bedrock-agentcore:GetMemory" in throttled["Resolution"]
+        assert "deleted mid-assessment" not in throttled["Resolution"]
+        assert "kms:Decrypt" not in throttled["Resolution"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_ac07_access_denied_cause_reaches_the_ag19_row(self, mock_ac):
+        """AG-19 copies AC-07's details, not its resolution, so the cause is there."""
+        mock_ac.list_memories.return_value = {
+            "memories": [
+                {"id": "mem-1", "name": "Denied"},
+                {"id": "mem-2", "name": "Gone"},
+            ]
+        }
+        mock_ac.get_memory.side_effect = [
+            _make_client_error("AccessDeniedException", "no"),
+            _make_client_error("ResourceNotFoundException", "gone"),
+        ]
+
+        derived = agentcore_app.build_agentic_agentcore_security_findings(
+            extract_csv_data(agentcore_app.check_agentcore_memory_configuration())
+        )
+
+        assert [f["Check_ID"] for f in derived] == ["AG-19", "AG-19"]
+        assert [f["Status"] for f in derived] == ["N/A", "N/A"]
+        assert [f["Severity"] for f in derived] == ["Informational", "Informational"]
+        assert "kms:Decrypt" in derived[0]["Finding_Details"]
+        assert "'Denied' (mem-1)" in derived[0]["Finding_Details"]
+        assert "kms:Decrypt" not in derived[1]["Finding_Details"]
+        assert "'Gone' (mem-2)" in derived[1]["Finding_Details"]
+        for finding in derived:
+            assert_finding_schema(finding)
+
+    def test_ac07_distinguishes_the_error_codes_get_memory_models(self):
+        model = agentcore_app.boto3.client(
+            "bedrock-agentcore-control",
+            region_name="us-east-1",
+            aws_access_key_id="testing",
+            aws_secret_access_key="testing",  # pragma: allowlist secret - synthetic test credential
+        ).meta.service_model
+        errors = {e.name for e in model.operation_model("GetMemory").error_shapes}
+
+        assert {"AccessDeniedException", "ResourceNotFoundException"} <= errors
+
     def test_memory_namespace_is_a_customer_supplied_input(self):
         # The Failed verdict is only reachable because the namespace is an
         # optional CreateMemory input: if the service required an actor-scoped

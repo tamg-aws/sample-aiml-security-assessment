@@ -84,6 +84,16 @@ section.
     whatever its web ACL applies. A gateway that reports no `failureMode` is
     `N/A`, because the API states no default.
 
+### Fixed
+
+- `AC-07` names the fix that matches the `GetMemory` error for a memory it
+  cannot describe. `AccessDeniedException` now names `kms:Decrypt` on the
+  memory's customer managed key as well as `bedrock-agentcore:GetMemory`,
+  because AgentCore decrypts the memory's strategies on the caller's behalf,
+  and the derived `AG-19` row carries that cause. Only
+  `ResourceNotFoundException` still suggests a memory deleted mid-assessment.
+  The assessment role is unchanged.
+
 ### Deployment impact
 
 **CodeBuild run required.** No parameter or deployment-stack change. The AWS
