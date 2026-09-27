@@ -1230,17 +1230,20 @@ FOUNDATION_ROWS = [
         "BR-55 reads the default key policy of each customer-managed KMS key. A "
         "key whose policy carries a kms:RecipientAttestation condition is declared "
         "enclave-bound, and every other key is Not Applicable. The condition keys "
-        "come in two families, PCR<n> for Nitro Enclaves and NitroTPMPCR<n> for "
-        "NitroTPM, and a key bound only by NitroTPM keys is Not Applicable. "
-        "ImageSha384 and PCR0 both carry the enclave image digest, so an exact "
-        "value on either one pins the image. An enclave-bound key fails when no "
-        "statement pins the image, and when an Allow grants kms:Decrypt, "
-        "kms:GenerateDataKey or kms:GenerateDataKeyPair with no image condition "
-        "and no Deny that requires the image covers it. "
-        "The default statement that grants the account root is reported as such a "
-        "bypass, because it lets any IAM principal the account's policies allow "
-        "use the key with no attestation. Which workloads must be enclave-bound is "
-        "the customer's decision, so a key without the condition is never failed",
+        "come in two families, ImageSha384 and PCR<n> for Nitro Enclaves and "
+        "NitroTPMPCR<n> for NitroTPM. Both are judged and each row names the "
+        "family. An exact value on any of those keys pins the key. An "
+        "enclave-bound key fails when no statement pins it, and when an Allow "
+        "grants kms:Decrypt, kms:DeriveSharedSecret, kms:GenerateDataKey or "
+        "kms:GenerateDataKeyPair with no attestation condition and no Deny covers "
+        "it. A Deny to every principal counts when it covers all four operations "
+        "and tests the attestation key with Null true or a negated operator. A "
+        "positive operator, with or without IfExists, does not count. The default "
+        "statement that grants the account root is such a bypass unless it "
+        "carries an attestation pin or that Deny is present. A Null Deny alone "
+        "refuses a missing attestation but admits any image, so a key with no "
+        "exact pin still fails. Which workloads must be enclave-bound is the "
+        "customer's decision, so a key without the condition is never failed",
         [],
         6,
     ),
@@ -1343,9 +1346,12 @@ FOUNDATION_ROWS = [
         "bedrock_assessments",
         ["BR-54"],
         "BR-54 reads the function URL's AuthType and the resource policy of every "
-        "Lambda function. It fails a function URL with AuthType NONE, and an "
-        'Allow to Principal "*" on lambda:InvokeFunction* or lambda:* with no '
-        "aws:SourceArn, aws:SourceAccount or aws:PrincipalOrgID condition. It "
+        "Lambda function. It fails a function URL with AuthType NONE, and says "
+        "the URL accepts no requests yet when no statement grants public invoke. "
+        'It fails an Allow to Principal "*" on lambda:InvokeFunction* or lambda:* '
+        "with no aws:SourceArn, aws:SourceAccount or aws:PrincipalOrgID "
+        "condition. lambda:FunctionUrlAuthType and lambda:InvokedViaFunctionUrl "
+        "do not clear it, because they describe how the function is called. It "
         "reports configuration and does not claim the function is reachable",
         [],
         6,
