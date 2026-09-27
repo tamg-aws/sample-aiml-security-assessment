@@ -289,6 +289,81 @@ class TestAC01VPCConfiguration:
         assert [f["Status"] for f in subnet_verdicts] == ["N/A"]
         assert "ec2:DescribeRouteTables" in subnet_verdicts[0]["Resolution"]
 
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_ac01_unreadable_runtime_is_na_not_a_pass(self, mock_ac, mock_ec2):
+        """A GetAgentRuntime error other than not-found must not read as a pass.
+
+        The error used to be logged only, so the runtime contributed no finding
+        and the empty list became "All AgentCore resources have proper VPC
+        configuration".
+        """
+        mock_ac.list_agent_runtimes.return_value = {
+            "agentRuntimes": [{"agentRuntimeId": "rt-1", "agentRuntimeName": "TestRT"}]
+        }
+        mock_ac.get_agent_runtime.side_effect = _make_client_error(
+            "AccessDeniedException", "denied"
+        )
+
+        findings = extract_csv_data(agentcore_app.check_agentcore_vpc_configuration())
+
+        assert "Passed" not in [f["Status"] for f in findings]
+        unread = [f for f in findings if "rt-1" in f["Finding_Details"]]
+        assert [f["Status"] for f in unread] == ["N/A"]
+        assert unread[0]["Severity"] == "Informational"
+        assert "TestRT" in unread[0]["Finding_Details"]
+        assert "AccessDeniedException" in unread[0]["Finding_Details"]
+        assert "bedrock-agentcore:GetAgentRuntime" in unread[0]["Resolution"]
+        assert_finding_schema(unread[0])
+
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_ac01_missing_subnet_is_reported_and_the_others_still_judged(
+        self, mock_ac, mock_ec2
+    ):
+        """DescribeSubnets fails the whole call when one id does not exist.
+
+        Without the per-subnet retry the public subnet beside the missing one is
+        never judged, and the finding asks for ec2:DescribeSubnets, which the
+        role already holds.
+        """
+        mock_ac.list_agent_runtimes.return_value = {
+            "agentRuntimes": [{"agentRuntimeId": "rt-1", "agentRuntimeName": "TestRT"}]
+        }
+        mock_ac.get_agent_runtime.return_value = {
+            "networkConfiguration": {
+                "networkMode": "VPC",
+                "networkModeConfig": {"subnets": ["subnet-public", "subnet-gone"]},
+            }
+        }
+
+        def describe_subnets(SubnetIds):
+            if "subnet-gone" in SubnetIds:
+                raise _make_client_error("InvalidSubnetID.NotFound", "not found")
+            return {"Subnets": [{"SubnetId": s, "VpcId": "vpc-1"} for s in SubnetIds]}
+
+        mock_ec2.describe_subnets.side_effect = describe_subnets
+        mock_ec2.describe_route_tables.return_value = {
+            "RouteTables": [{"Routes": [{"GatewayId": "igw-0abc"}]}]
+        }
+
+        findings = extract_csv_data(agentcore_app.check_agentcore_vpc_configuration())
+
+        public = [
+            f for f in findings if f["Finding"] == "AgentCore Runtime Public Subnet"
+        ]
+        assert len(public) == 1
+        assert "subnet-public" in public[0]["Finding_Details"]
+        missing = [f for f in findings if "subnet-gone" in f["Finding_Details"]]
+        assert [f["Status"] for f in missing] == ["N/A"]
+        assert "not present" in missing[0]["Finding_Details"]
+        assert "ec2:DescribeSubnets" not in missing[0]["Resolution"]
+        assert "Passed" not in [
+            f["Status"]
+            for f in findings
+            if f["Finding"] == "AgentCore VPC Configuration Check"
+        ]
+
     @patch("agentcore_app.agentcore_client")
     def test_ac01_exception_returns_incomplete_na(self, mock_ac):
         mock_ac.list_agent_runtimes.side_effect = Exception("VPC error")
@@ -13485,6 +13560,7 @@ class TestAC49DnsEgressControl:
                     self._rule("catchall", 100),
                 ]
             },
+            domains={"rslvr-fdl-allowed": ["example.com."]},
         )
 
         findings = agentcore_app.check_agentcore_dns_egress_control(inventory)
@@ -13496,9 +13572,12 @@ class TestAC49DnsEgressControl:
         assert "rslvr-fdl-catchall" in findings[0]["Finding_Details"]
         assert "Priority 100" in findings[0]["Finding_Details"]
         assert_finding_schema(findings[0])
-        mock_r53.list_firewall_domains.assert_called_once_with(
-            FirewallDomainListId="rslvr-fdl-catchall"
-        )
+        # Every rule up to the deciding one is read in Priority order, because an
+        # earlier rule over "*" would decide instead.
+        assert [
+            call.kwargs["FirewallDomainListId"]
+            for call in mock_r53.list_firewall_domains.call_args_list
+        ] == ["rslvr-fdl-allowed", "rslvr-fdl-catchall"]
 
     @patch("agentcore_app.route53resolver_client")
     @patch("agentcore_app.ec2_client")
@@ -13545,7 +13624,10 @@ class TestAC49DnsEgressControl:
                     self._rule("known-bad", 100),
                 ]
             },
-            domains={"rslvr-fdl-known-bad": ["evil.example.", "*.evil.example."]},
+            domains={
+                "rslvr-fdl-allowed": ["example.com."],
+                "rslvr-fdl-known-bad": ["evil.example.", "*.evil.example."],
+            },
         )
 
         findings = agentcore_app.check_agentcore_dns_egress_control(inventory)
@@ -13637,6 +13719,7 @@ class TestAC49DnsEgressControl:
                     self._rule("everything-else", 100, action="ALLOW"),
                 ]
             },
+            domains={"rslvr-fdl-blocked": ["evil.example."]},
         )
 
         findings = agentcore_app.check_agentcore_dns_egress_control(inventory)
@@ -13729,6 +13812,7 @@ class TestAC49DnsEgressControl:
                     self._rule("catchall", 100),
                 ]
             },
+            domains={"rslvr-fdl-allowed": ["example.com."]},
         )
 
         findings = agentcore_app.check_agentcore_dns_egress_control(inventory)
@@ -13756,9 +13840,13 @@ class TestAC49DnsEgressControl:
     @patch("agentcore_app.route53resolver_client")
     @patch("agentcore_app.ec2_client")
     @patch("agentcore_app.agentcore_client")
-    def test_the_last_associated_group_decides(self, mock_ac, mock_ec2, mock_r53):
-        # Groups process in Priority order too, so the group with the largest
-        # Priority holds the rule that answers a query no earlier group matched.
+    def test_the_first_associated_group_to_match_every_name_decides(
+        self, mock_ac, mock_ec2, mock_r53
+    ):
+        # Groups process from the lowest association Priority up and the first
+        # match ends evaluation, so the BLOCK "*" in the earlier group decides and
+        # the later group's ALLOW is never reached. This test asserted the reverse
+        # while AC-49 judged the highest-Priority group alone.
         inventory = self._wire(
             mock_ac,
             mock_ec2,
@@ -13778,9 +13866,10 @@ class TestAC49DnsEgressControl:
         findings = agentcore_app.check_agentcore_dns_egress_control(inventory)
 
         assert len(findings) == 1
-        assert findings[0]["Status"] == "Failed"
+        assert findings[0]["Status"] == "Passed"
+        assert "group-early" in findings[0]["Finding_Details"]
         mock_r53.list_firewall_rules.assert_called_once_with(
-            FirewallRuleGroupId="group-late"
+            FirewallRuleGroupId="group-early"
         )
 
     @patch("agentcore_app.route53resolver_client")
@@ -14010,6 +14099,194 @@ class TestAC49DnsEgressControl:
         assert statuses.count("N/A") == 1
         assert statuses.count("Passed") == 1
         assert "rt-2" in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.route53resolver_client")
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_an_earlier_allow_over_every_name_decides_before_the_block(
+        self, mock_ac, mock_ec2, mock_r53
+    ):
+        """The first rule that matches ends evaluation, so ALLOW "*" opens all.
+
+        Judging only the highest Priority rule passes this group, because its
+        last rule is a BLOCK over "*"; every query matches the ALLOW first.
+        """
+        inventory = self._wire(
+            mock_ac,
+            mock_ec2,
+            mock_r53,
+            associations={"vpc-a": [self._association("group-1")]},
+            rules={
+                "group-1": [
+                    self._rule("open", 10, action="ALLOW"),
+                    self._rule("catchall", 100),
+                ]
+            },
+        )
+
+        findings = agentcore_app.check_agentcore_dns_egress_control(inventory)
+
+        assert [f["Status"] for f in findings] == ["Failed"]
+        assert findings[0]["Finding"] == "AgentCore DNS Egress Control Not Terminal"
+        assert "'open'" in findings[0]["Finding_Details"]
+        assert "Priority 10" in findings[0]["Finding_Details"]
+        assert "group-1" in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.route53resolver_client")
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_an_earlier_group_that_alerts_on_every_name_decides(
+        self, mock_ac, mock_ec2, mock_r53
+    ):
+        """Groups run in ascending association Priority, and ALERT also ends it.
+
+        The later group ends in BLOCK "*", which the old max() read as the
+        verdict; an ALERT over "*" in the first group answers every query.
+        """
+        inventory = self._wire(
+            mock_ac,
+            mock_ec2,
+            mock_r53,
+            associations={
+                "vpc-a": [
+                    self._association("group-late", priority=200),
+                    self._association("group-early", priority=100),
+                ]
+            },
+            rules={
+                "group-early": [self._rule("watch", 100, action="ALERT")],
+                "group-late": [self._rule("catchall", 100)],
+            },
+        )
+
+        findings = agentcore_app.check_agentcore_dns_egress_control(inventory)
+
+        assert [f["Status"] for f in findings] == ["Failed"]
+        assert "group-early" in findings[0]["Finding_Details"]
+        assert "'watch'" in findings[0]["Finding_Details"]
+        assert "ALERT" in findings[0]["Finding_Details"]
+        mock_r53.list_firewall_rules.assert_called_once_with(
+            FirewallRuleGroupId="group-early"
+        )
+
+    @patch("agentcore_app.route53resolver_client")
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_later_group_with_a_managed_list_is_unreachable_after_the_block(
+        self, mock_ac, mock_ec2, mock_r53
+    ):
+        """Review case A: nothing after a BLOCK over "*" is evaluated."""
+        inventory = self._wire(
+            mock_ac,
+            mock_ec2,
+            mock_r53,
+            associations={
+                "vpc-a": [
+                    self._association("group-early", priority=100),
+                    self._association("group-late", priority=200),
+                ]
+            },
+            rules={
+                "group-early": [
+                    self._rule("allowed", 10, action="ALLOW"),
+                    self._rule("catchall", 100),
+                ],
+                "group-late": [self._rule("malware", 100)],
+            },
+            domains={"rslvr-fdl-allowed": ["example.com."]},
+            managed_list_ids=("rslvr-fdl-malware",),
+        )
+
+        findings = agentcore_app.check_agentcore_dns_egress_control(inventory)
+
+        assert [f["Status"] for f in findings] == ["Passed"]
+        assert "group-early" in findings[0]["Finding_Details"]
+        assert "'catchall'" in findings[0]["Finding_Details"]
+        mock_r53.list_firewall_rules.assert_called_once_with(
+            FirewallRuleGroupId="group-early"
+        )
+
+    @patch("agentcore_app.route53resolver_client")
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_an_alert_after_the_block_is_unreachable(self, mock_ac, mock_ec2, mock_r53):
+        """Review case B: an ALERT at a higher Priority than BLOCK "*" never runs."""
+        inventory = self._wire(
+            mock_ac,
+            mock_ec2,
+            mock_r53,
+            associations={"vpc-a": [self._association("group-1")]},
+            rules={
+                "group-1": [
+                    self._rule("catchall", 100),
+                    self._rule("watch", 200, action="ALERT"),
+                ]
+            },
+        )
+
+        findings = agentcore_app.check_agentcore_dns_egress_control(inventory)
+
+        assert [f["Status"] for f in findings] == ["Passed"]
+        assert "'catchall'" in findings[0]["Finding_Details"]
+        assert "Priority 100" in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.route53resolver_client")
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_block_over_every_name_for_one_query_type_is_not_default_deny(
+        self, mock_ac, mock_ec2, mock_r53
+    ):
+        """A rule with a Qtype applies to that query type only.
+
+        Without reading Qtype, BLOCK "*" for type A passes, and a TXT query,
+        the usual tunnelling carrier, is answered.
+        """
+        inventory = self._wire(
+            mock_ac,
+            mock_ec2,
+            mock_r53,
+            associations={"vpc-a": [self._association("group-1")]},
+            rules={"group-1": [self._rule("catchall", 100, Qtype="A")]},
+        )
+
+        findings = agentcore_app.check_agentcore_dns_egress_control(inventory)
+
+        assert [f["Status"] for f in findings] == ["Failed"]
+        assert findings[0]["Finding"] == "AgentCore DNS Egress Control Not Default Deny"
+        assert "query type A" in findings[0]["Finding_Details"]
+        assert "'catchall'" in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.route53resolver_client")
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_missing_hosting_subnet_is_not_present_and_the_rest_judged(
+        self, mock_ac, mock_ec2, mock_r53
+    ):
+        """One nonexistent subnet id fails a batched DescribeSubnets outright."""
+        inventory = self._wire(
+            mock_ac,
+            mock_ec2,
+            mock_r53,
+            runtime_subnets=("subnet-a", "subnet-gone"),
+            associations={"vpc-a": [self._association("group-1")]},
+            rules={"group-1": [self._rule("catchall", 100)]},
+        )
+
+        def describe_subnets(SubnetIds):
+            if "subnet-gone" in SubnetIds:
+                raise _make_client_error("InvalidSubnetID.NotFound", "not found")
+            return {"Subnets": [{"SubnetId": s, "VpcId": "vpc-a"} for s in SubnetIds]}
+
+        mock_ec2.describe_subnets.side_effect = describe_subnets
+
+        findings = agentcore_app.check_agentcore_dns_egress_control(inventory)
+        statuses = sorted(f["Status"] for f in findings)
+
+        assert statuses == ["N/A", "Passed"]
+        missing = [f for f in findings if f["Status"] == "N/A"][0]
+        assert "subnet-gone" in missing["Finding_Details"]
+        assert "not present" in missing["Finding_Details"]
+        assert "ec2:DescribeSubnets" not in missing["Resolution"]
 
 
 # ===================================================================

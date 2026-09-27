@@ -9981,6 +9981,30 @@ class TestBR47DataPathBucketTLS:
         for finding in findings:
             assert_finding_schema(finding)
 
+    def test_br47_a_deny_narrowed_by_another_condition_key_is_not_credited(self):
+        """A second condition key limits the Deny to the requests that match it.
+
+        With aws:SourceVpce under StringNotEquals beside aws:SecureTransport, a
+        plaintext request through the named endpoint is not denied, so the
+        statement does not close the bucket.
+        """
+        narrowed = _tls_deny_statement(["hr-bucket"])
+        narrowed["Condition"]["StringNotEquals"] = {"aws:SourceVpce": "vpce-1a2b3c4d"}
+        findings = self._two_bucket_estate(
+            bucket_policies={
+                "support-bucket": _bucket_policy(
+                    _tls_deny_statement(["support-bucket"])
+                ),
+                "hr-bucket": _bucket_policy(narrowed),
+            }
+        )
+
+        failed = [f for f in findings if f["Status"] == "Failed"]
+        assert len(failed) == 1
+        assert "Bucket hr-bucket" in failed[0]["Finding_Details"]
+        assert "aws:sourcevpce" in failed[0]["Finding_Details"].lower()
+        assert [f["Status"] for f in findings] == ["Failed", "Passed"]
+
     def test_br47_missing_bucket_policy_is_failed_not_unassessed(self):
         findings = self._two_bucket_estate(
             bucket_policies={
@@ -10557,6 +10581,51 @@ class TestBR48AIServicesOptOut:
             in findings[0]["Finding_Details"]
         )
 
+    def test_br48_absent_child_operator_is_reported_as_open_to_children(self):
+        """An absent @@operators_allowed_for_child_policies defaults to @@all.
+
+        The text used to read absence as "no source policy delegates", which is
+        the locked state, and named any explicit value including @@none as a
+        delegation.
+        """
+        findings = self._run(
+            effective_content={"services": {"default": {"opt_out_policy": "optOut"}}},
+            source_policies=[{"Id": "p-1", "Name": "ai-opt-out"}],
+            source_documents={
+                "p-1": {
+                    "services": {"default": {"opt_out_policy": {"@@assign": "optOut"}}}
+                }
+            },
+        )
+
+        assert [f["Status"] for f in findings] == ["Passed"]
+        details = findings[0]["Finding_Details"]
+        assert "No source policy delegates the value" not in details
+        assert "'ai-opt-out' delegates @@all to child policies" in details
+
+    def test_br48_none_child_operator_locks_the_value(self):
+        findings = self._run(
+            effective_content={"services": {"default": {"opt_out_policy": "optOut"}}},
+            source_policies=[{"Id": "p-1", "Name": "ai-opt-out"}],
+            source_documents={
+                "p-1": {
+                    "services": {
+                        "default": {
+                            "opt_out_policy": {
+                                "@@operators_allowed_for_child_policies": ["@@none"],
+                                "@@assign": "optOut",
+                            }
+                        }
+                    }
+                }
+            },
+        )
+
+        assert [f["Status"] for f in findings] == ["Passed"]
+        details = findings[0]["Finding_Details"]
+        assert "delegates @@none" not in details
+        assert "No source policy delegates the value to a child policy" in details
+
     def test_br48_member_account_says_the_child_leg_was_not_assessed(self):
         findings = self._run(
             effective_content={"services": {"default": {"opt_out_policy": "optOut"}}},
@@ -10762,6 +10831,21 @@ class TestBR49GuardrailInvocationDeny:
         )
         assert "bedrock:Converse and" not in findings[0]["Resolution"]
         assert "bedrock:InvokeModelWithResponseStream" in findings[0]["Resolution"]
+
+    def test_br49_failed_row_names_the_policy_types_it_does_not_read(self):
+        """The check reads role and user policies only.
+
+        It used to recommend a permissions boundary, a surface it never reads,
+        so following the advice would leave the row Failed.
+        """
+        findings = self._run(_invoke_cache(_ALLOW_ALL_BEDROCK))
+
+        assert [f["Status"] for f in findings] == ["Failed"]
+        details = findings[0]["Finding_Details"]
+        assert "Group policies" in details
+        assert "permissions boundaries" in details
+        assert "service control policies" in details
+        assert "boundary" not in findings[0]["Resolution"]
 
     def test_br49_allow_on_converse_name_grants_nothing_to_assess(self):
         """bedrock:Converse is not an IAM action, so allowing it grants no invocation."""
@@ -11015,6 +11099,28 @@ class TestBR49GuardrailInvocationDeny:
         assert findings[-1]["Status"] == "Failed"
         assert "3 further identity/identities" in findings[-1]["Finding_Details"]
         assert "OpenRole10" in findings[-1]["Finding_Details"]
+
+    def test_br49_overflow_row_does_not_recommend_a_permissions_boundary(self):
+        cache = {"role_permissions": {}, "user_permissions": {}}
+        for index in range(bedrock_app.MAX_REPORTED_UNGUARDED_IDENTITIES + 1):
+            cache["role_permissions"][f"OpenRole{index:02d}"] = {
+                "attached_policies": [
+                    {
+                        "name": "BedrockOpen",
+                        "document": {
+                            "Version": "2012-10-17",
+                            "Statement": [_ALLOW_ALL_BEDROCK],
+                        },
+                    }
+                ],
+                "inline_policies": [],
+            }
+
+        findings = self._run(cache)
+
+        assert "further identity" in findings[-1]["Finding_Details"]
+        assert "boundary" not in findings[-1]["Resolution"]
+        assert "permissions boundaries" in findings[-1]["Finding_Details"]
 
 
 # ===================================================================
@@ -11852,6 +11958,38 @@ class TestBR39MarketplaceSubnetPrivacy:
         )
 
         assert [row["Status"] for row in rows] == ["Failed"]
+
+    def test_br39_one_nonexistent_subnet_does_not_hide_the_others(self):
+        """DescribeSubnets fails the whole request when one id does not exist.
+
+        Without the per-subnet retry the public subnet beside the missing one
+        reads as an error and the row asks for ec2:DescribeSubnets.
+        """
+        ec2_client = self._ec2([self._subnet("subnet-public")], [self._PUBLIC_TABLE])
+
+        def paginate(SubnetIds):
+            if "subnet-gone" in SubnetIds:
+                raise _client_error(
+                    "InvalidSubnetID.NotFound", "not found", "DescribeSubnets"
+                )
+            return [{"Subnets": [self._subnet(s) for s in SubnetIds]}]
+
+        ec2_client.subnets_paginator.paginate.side_effect = paginate
+        rows = self._privacy_rows(
+            self._run(
+                self._inventory(
+                    self._endpoint("arn:endpoint-1", ["subnet-public", "subnet-gone"]),
+                    self._endpoint("arn:endpoint-2", ["subnet-gone"]),
+                ),
+                ec2_client,
+            )
+        )
+
+        assert [row["Status"] for row in rows] == ["Failed", "N/A"]
+        assert "subnet-public" in rows[0]["Finding_Details"]
+        assert "subnet-gone" in rows[1]["Finding_Details"]
+        assert "not present in this Region" in rows[1]["Finding_Details"]
+        assert "ec2:DescribeSubnets" not in rows[1]["Resolution"]
 
     def test_br39_describe_subnets_denied_is_na_not_private(self):
         rows = self._privacy_rows(

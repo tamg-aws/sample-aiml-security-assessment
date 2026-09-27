@@ -1478,11 +1478,20 @@ def _classify_event_pattern(rule: Dict[str, Any]) -> Dict[str, Any]:
             "kind": "unreadable",
             "reason": "a content filter decides which detail types it matches",
         }
+    if (
+        not matches_ga
+        and detail_types is not None
+        and not set(detail_types) & set(REGISTRY_APPROVAL_DETAIL_TYPES)
+    ):
+        return {"kind": "other"}
     return {
         "kind": "registry" if matches_ga else "preview",
         "detail_types": set(REGISTRY_LIFECYCLE_DETAIL_TYPES)
         if detail_types is None
         else set(detail_types),
+        "narrowed_by": sorted(
+            field for field in ("detail", "resources", "account") if field in pattern
+        ),
     }
 
 
@@ -1633,6 +1642,7 @@ def check_agent_registry_lifecycle_event_routing(
     findings: List[Dict[str, Any]] = []
     routing_labels: List[str] = []
     covered: set = set()
+    narrowed_rules = 0
     for entry in rule_inventory["items"]:
         rule = entry["rule"]
         name = rule.get("Name", "unknown")
@@ -1701,6 +1711,25 @@ def check_agent_registry_lifecycle_event_routing(
                 )
             )
             continue
+        if classification["narrowed_by"]:
+            narrowed_rules += 1
+            findings.append(
+                _na(
+                    "AR-10",
+                    finding,
+                    "EventBridge rule '{}' routes Registry lifecycle events to {} target(s), but its pattern also filters on {}, so only the events that match that filter reach a target and the rule is not credited as covering every approval transition of {}.".format(
+                        name,
+                        targets,
+                        ", ".join(
+                            f"'{field}'" for field in classification["narrowed_by"]
+                        ),
+                        scope,
+                    ),
+                    EVENT_ROUTING_REFERENCE_URL,
+                    "Confirm the filter passes every approval event you need reviewed, or add a rule matching the approval detail types with no detail, resources or account filter.",
+                )
+            )
+            continue
         routing_labels.append(f"'{name}' ({targets} target(s))")
         covered.update(classification["detail_types"])
 
@@ -1722,6 +1751,8 @@ def check_agent_registry_lifecycle_event_routing(
             if not matching
             else f"The {matching} rule(s) on the {REGISTRY_EVENT_BUS_NAME} event bus that match Registry lifecycle events route none of them to a target, so no lifecycle state change of {scope} is observed."
         )
+        if narrowed_rules:
+            details += f" {narrowed_rules} of them filter on detail, resources or account and are reported separately, because they route only the events that match the filter."
         findings.append(
             create_finding(
                 "AR-10",

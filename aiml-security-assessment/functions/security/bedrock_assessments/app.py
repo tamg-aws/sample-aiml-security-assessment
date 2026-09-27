@@ -10433,13 +10433,31 @@ def _subnet_route_privacy(
 
     client = ec2_client or boto3.client("ec2", config=boto3_config, region_name=region)
 
-    try:
-        vpc_by_subnet = {}
+    def describe(ids: List[str]) -> None:
         paginator = client.get_paginator("describe_subnets")
-        for page in paginator.paginate(SubnetIds=checked):
+        for page in paginator.paginate(SubnetIds=ids):
             for subnet in page.get("Subnets", []):
                 if subnet.get("SubnetId"):
                     vpc_by_subnet[subnet["SubnetId"]] = subnet.get("VpcId") or ""
+
+    vpc_by_subnet = {}
+    try:
+        try:
+            describe(checked)
+        except ClientError as error:
+            # One absent id fails the whole request, so retry per subnet and
+            # let the absent ones fall through to "not present" below.
+            if get_assessment_error_label(error) != "InvalidSubnetID.NotFound":
+                raise
+            for subnet_id in checked:
+                try:
+                    describe([subnet_id])
+                except ClientError as single_error:
+                    if (
+                        get_assessment_error_label(single_error)
+                        != "InvalidSubnetID.NotFound"
+                    ):
+                        raise
     except Exception as error:
         result["error"] = get_assessment_error_label(error)
         return result
@@ -13256,6 +13274,19 @@ def _bucket_tls_enforcement(bucket: str, policy_document: Any) -> Dict[str, Any]
                 "unnamed action stays reachable over HTTP"
             )
 
+        narrowing_keys = sorted(
+            {
+                f"{operator} {key}"
+                for operator, key, _values in _condition_keys_by_operator(statement)
+                if key != SECURE_TRANSPORT_CONDITION_KEY
+            }
+        )
+        if narrowing_keys:
+            gaps.append(
+                "its Condition also tests {}, so a plaintext request that does "
+                "not match those keys is not denied".format(", ".join(narrowing_keys))
+            )
+
         if not gaps:
             return {
                 "enforced": True,
@@ -13816,20 +13847,43 @@ def _ai_services_opt_out_child_overrides() -> Dict[str, Any]:
     return result
 
 
-def _collect_child_operator_delegations(node: Any) -> set:
-    """Collect every operator an opt-out policy document delegates to children."""
+def _collect_child_operator_delegations(
+    node: Any, inherited: tuple = ("@@all",)
+) -> set:
+    """
+    Collect the operators an opt-out policy document leaves to child policies.
+
+    An unset @@operators_allowed_for_child_policies means @@all, and a value set
+    on a parent key applies to every key below it. Only ["@@none"] locks an
+    opt_out_policy value against child policies.
+    """
     delegated = set()
     if isinstance(node, dict):
+        control = inherited
+        if AI_OPT_OUT_CHILD_OPERATORS_KEY in node:
+            control = tuple(
+                str(operator)
+                for operator in _as_list(node[AI_OPT_OUT_CHILD_OPERATORS_KEY])
+                if operator
+            )
         for key, value in node.items():
             if str(key) == AI_OPT_OUT_CHILD_OPERATORS_KEY:
-                delegated.update(
-                    str(operator) for operator in _as_list(value) if operator
-                )
                 continue
-            delegated.update(_collect_child_operator_delegations(value))
+            if str(key) == "opt_out_policy":
+                leaf = control
+                if isinstance(value, dict) and AI_OPT_OUT_CHILD_OPERATORS_KEY in value:
+                    leaf = tuple(
+                        str(operator)
+                        for operator in _as_list(value[AI_OPT_OUT_CHILD_OPERATORS_KEY])
+                        if operator
+                    )
+                if list(leaf) != ["@@none"]:
+                    delegated.update(leaf)
+                continue
+            delegated.update(_collect_child_operator_delegations(value, control))
     elif isinstance(node, list):
         for child in node:
-            delegated.update(_collect_child_operator_delegations(child))
+            delegated.update(_collect_child_operator_delegations(child, inherited))
     return delegated
 
 
@@ -13975,9 +14029,9 @@ def check_bedrock_ai_services_opt_out(region: str = "") -> Dict[str, Any]:
             }
 
         child_clause = (
-            " Child policies may change it: {}.".format(
-                "; ".join(overrides["delegating"][:3])
-            )
+            " Child policies may change it: {}. An unset "
+            "@@operators_allowed_for_child_policies allows @@all; only "
+            '["@@none"] locks the value.'.format("; ".join(overrides["delegating"][:3]))
             if overrides["delegating"]
             else " No source policy delegates the value to a child policy."
             if overrides["readable"] and not overrides["errors"]
@@ -14301,6 +14355,10 @@ def check_bedrock_guardrail_invocation_deny(
         unguarded = []
         guarded = []
         notes = []
+        unread_surfaces = (
+            "Group policies, permissions boundaries and service control policies "
+            "(SCPs) are not read, so a Deny placed in one of them is not credited."
+        )
 
         for label, policies in identities:
             coverage = _identity_guardrail_deny_coverage(policies)
@@ -14350,13 +14408,14 @@ def check_bedrock_guardrail_invocation_deny(
                     finding_details=(
                         "{} may call {} with no guardrail attached, because no policy "
                         "on it denies {} unless the request carries an approved "
-                        "bedrock:GuardrailIdentifier{}.".format(
+                        "bedrock:GuardrailIdentifier{}. {}".format(
                             entry["label"],
                             ", ".join(coverage["allowed"]),
                             ", ".join(coverage["uncovered"]),
                             "; " + "; ".join(coverage["uncredited"][:2])
                             if coverage["uncredited"]
                             else "",
+                            unread_surfaces,
                         )
                     ),
                     resolution=(
@@ -14381,7 +14440,7 @@ def check_bedrock_guardrail_invocation_deny(
                     finding_name=check_name,
                     finding_details=(
                         "{} further identity/identities can invoke a model without a "
-                        "guardrail beyond the {} reported individually: {}.".format(
+                        "guardrail beyond the {} reported individually: {}. {}".format(
                             len(unguarded) - MAX_REPORTED_UNGUARDED_IDENTITIES,
                             MAX_REPORTED_UNGUARDED_IDENTITIES,
                             ", ".join(
@@ -14390,11 +14449,11 @@ def check_bedrock_guardrail_invocation_deny(
                                     MAX_REPORTED_UNGUARDED_IDENTITIES:
                                 ][:20]
                             ),
+                            unread_surfaces,
                         )
                     ),
                     resolution=(
-                        "Apply the same conditioned Deny to each of these identities, "
-                        "or attach it once as a permissions boundary."
+                        "Apply the same conditioned Deny to each of these identities."
                     ),
                     reference=GUARDRAIL_DENY_REFERENCE,
                     severity="High",

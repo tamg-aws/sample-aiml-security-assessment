@@ -45,17 +45,22 @@ section.
   `aisf-parity/AISF-WORK-LEDGER.md` names the reason for each. Each producer
   row names its AISF controls in the `Compliance_Frameworks` CSV column.
   Behavior worth knowing:
-  - `AC-49` reads Route 53 Resolver DNS Firewall. `ListFirewallDomains`
-    returns the walled garden catch-all as `*.`, and the check accepts that
-    spelling as well as `*`.
+  - `AC-49` reads Route 53 Resolver DNS Firewall in evaluation order: rule
+    groups by ascending association priority, rules by ascending priority, and
+    the first rule over a `*` domain list decides, because the first match ends
+    evaluation. It passes only when that rule is a `BLOCK` with no query type.
+    `ListFirewallDomains` returns the walled garden catch-all as `*.`, and the
+    check accepts that spelling as well as `*`.
   - `BR-47` fails a Bedrock data path bucket with no bucket policy, because S3
     then accepts plaintext requests, and passes only a `Deny` on
     `aws:SecureTransport` `false` that reaches every principal and covers
-    `s3:*` on both the bucket and its objects.
+    `s3:*` on both the bucket and its objects. A `Deny` whose `Condition`
+    also tests another key, such as `aws:SourceVpce`, is not credited.
   - `BR-48` reads the organization's effective AI services opt-out policy.
     From the management account it also reads every opt-out policy to name
-    any that let a child policy override the opt-out; from a member account
-    that leg is skipped.
+    any whose value a child policy may change. An unset
+    `@@operators_allowed_for_child_policies` means `@@all`, and only
+    `["@@none"]` locks the value; from a member account that leg is skipped.
   - `AG-39` does not read the rules inside customer rule groups or non-AWS
     managed rule groups. An ACL that relies on one for a missing filter is
     reported `N/A` with the group named.

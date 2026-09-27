@@ -1432,6 +1432,79 @@ def test_ar10_preview_only_source_is_reported_not_accepted_as_coverage():
     assert "route none of them to a target" in findings[1]["Finding_Details"]
 
 
+def test_ar10_preview_source_rule_for_other_agentcore_events_is_not_a_registry_rule():
+    # aws.bedrock-agentcore also carries events that are not Registry
+    # approvals; a rule filtered to those is not a Registry rule going stale.
+    findings, client = _routing_findings(
+        [
+            _rule(
+                "runtime-events",
+                _approval_pattern(
+                    source=[agent_registry_app.REGISTRY_PREVIEW_EVENT_SOURCE],
+                    detail_types=["AgentCore Runtime Endpoint Status Change"],
+                ),
+            )
+        ],
+        targets={"runtime-events": 1},
+    )
+    assert [f["Status"] for f in findings] == ["Failed"]
+    assert "None of the 1 rule(s)" in findings[0]["Finding_Details"]
+    assert (
+        agent_registry_app.REGISTRY_PREVIEW_EVENT_SOURCE_END
+        not in (findings[0]["Finding_Details"])
+    )
+    assert client.target_calls == []
+
+
+def test_ar10_preview_source_rule_naming_an_approval_type_is_still_stale():
+    findings, _ = _routing_findings(
+        [
+            _rule(
+                "preview-approvals",
+                _approval_pattern(
+                    source=[agent_registry_app.REGISTRY_PREVIEW_EVENT_SOURCE],
+                    detail_types=[
+                        "AgentCore Runtime Endpoint Status Change",
+                        agent_registry_app.REGISTRY_APPROVAL_DETAIL_TYPES[0],
+                    ],
+                ),
+            )
+        ],
+        targets={"preview-approvals": 1},
+    )
+    assert [f["Status"] for f in findings] == ["Failed", "Failed"]
+    assert (
+        agent_registry_app.REGISTRY_PREVIEW_EVENT_SOURCE_END
+        in findings[0]["Finding_Details"]
+    )
+
+
+@pytest.mark.parametrize(
+    "narrowing",
+    [
+        {"detail": {"registryId": ["reg-one"]}},
+        {"resources": ["arn:aws:bedrock-agentcore:us-east-1:123456789012:registry/r1"]},
+        {"account": ["111122223333"]},
+    ],
+)
+def test_ar10_a_rule_narrowed_beyond_source_and_detail_type_is_not_full_coverage(
+    narrowing,
+):
+    # A detail, resources or account filter passes only the matching events,
+    # so the rule cannot be credited with every approval transition.
+    pattern = _approval_pattern()
+    pattern.update(narrowing)
+    field = next(iter(narrowing))
+    findings, _ = _routing_findings(
+        [_rule("filtered-approvals", pattern)],
+        targets={"filtered-approvals": 2},
+    )
+    assert [f["Status"] for f in findings] == ["N/A", "Failed"]
+    assert "filtered-approvals" in findings[0]["Finding_Details"]
+    assert f"'{field}'" in findings[0]["Finding_Details"]
+    assert "route none of them to a target" in findings[1]["Finding_Details"]
+
+
 def test_ar10_rule_listing_both_sources_counts_as_ga_coverage():
     findings, _ = _routing_findings(
         [

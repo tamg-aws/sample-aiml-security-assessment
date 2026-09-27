@@ -1655,10 +1655,37 @@ def check_agentcore_vpc_configuration(
                             if subnet_ids:
                                 # Check if subnets are private
                                 try:
-                                    subnets_response = ec2_client.describe_subnets(
-                                        SubnetIds=subnet_ids
-                                    )
-                                    for subnet in subnets_response.get("Subnets", []):
+                                    (
+                                        described_subnets,
+                                        missing_subnets,
+                                    ) = _describe_subnets_reporting_missing(subnet_ids)
+                                    if missing_subnets:
+                                        findings.append(
+                                            create_finding(
+                                                check_id="AC-01",
+                                                finding_name="AgentCore Runtime VPC Configuration",
+                                                finding_details=(
+                                                    f"Runtime '{runtime_name}' "
+                                                    f"({runtime_id}) names "
+                                                    f"{len(missing_subnets)} subnet(s) "
+                                                    "that are not present in this "
+                                                    "account and Region "
+                                                    "(InvalidSubnetID.NotFound): "
+                                                    f"{', '.join(missing_subnets)}, so "
+                                                    "whether they reach an internet "
+                                                    "gateway was not judged."
+                                                ),
+                                                resolution=(
+                                                    "Update the runtime's network "
+                                                    "configuration to name subnets "
+                                                    "that exist, then retry."
+                                                ),
+                                                reference=AGENTCORE_VPC_REFERENCE_URL,
+                                                severity=SeverityEnum.INFORMATIONAL,
+                                                status=StatusEnum.NA,
+                                            )
+                                        )
+                                    for subnet in described_subnets:
                                         subnet_id = subnet["SubnetId"]
 
                                         # Check route tables for internet gateway.
@@ -1738,6 +1765,26 @@ def check_agentcore_vpc_configuration(
                             logger.warning(f"Runtime {runtime_id} not found")
                         else:
                             logger.error(f"Error describing runtime {runtime_id}: {e}")
+                            findings.append(
+                                create_finding(
+                                    check_id="AC-01",
+                                    finding_name="AgentCore Runtime VPC Configuration",
+                                    finding_details=(
+                                        f"The network configuration of runtime "
+                                        f"'{runtime_name}' ({runtime_id}) could not "
+                                        "be read, so whether it runs in a VPC with "
+                                        "private subnets was not established: "
+                                        f"{_assessment_error_label(e)}."
+                                    ),
+                                    resolution=(
+                                        "Grant bedrock-agentcore:GetAgentRuntime "
+                                        "and retry."
+                                    ),
+                                    reference=AGENTCORE_VPC_REFERENCE_URL,
+                                    severity=SeverityEnum.INFORMATIONAL,
+                                    status=StatusEnum.NA,
+                                )
+                            )
 
         except ClientError as e:
             if e.response["Error"]["Code"] == "ResourceNotFoundException":
@@ -12628,6 +12675,50 @@ def check_agentcore_execution_role_trust_and_sharing(
     return findings
 
 
+def _describe_subnets_reporting_missing(
+    subnet_ids: List[str],
+) -> Tuple[List[Dict[str, Any]], List[str]]:
+    """Return (described subnets, ids that do not exist) for a DescribeSubnets.
+
+    One id that does not exist fails the whole call with InvalidSubnetID.NotFound,
+    so on that error each id is described alone and the missing ones are named.
+    Any other error propagates.
+    """
+    try:
+        described = _paginate_aws_list(
+            ec2_client,
+            "describe_subnets",
+            "Subnets",
+            token_request_key="NextToken",
+            token_response_key="NextToken",
+            SubnetIds=subnet_ids,
+        )
+        return described, []
+    except ClientError as error:
+        if _assessment_error_label(error) != "InvalidSubnetID.NotFound":
+            raise
+
+    described: List[Dict[str, Any]] = []
+    missing: List[str] = []
+    for subnet_id in subnet_ids:
+        try:
+            described.extend(
+                _paginate_aws_list(
+                    ec2_client,
+                    "describe_subnets",
+                    "Subnets",
+                    token_request_key="NextToken",
+                    token_response_key="NextToken",
+                    SubnetIds=[subnet_id],
+                )
+            )
+        except ClientError as error:
+            if _assessment_error_label(error) != "InvalidSubnetID.NotFound":
+                raise
+            missing.append(subnet_id)
+    return described, missing
+
+
 def _agentcore_hosting_subnets(
     browser_inventory: Dict[str, Any] = None,
 ) -> Tuple[List[Tuple[str, str]], List[Tuple[str, Exception, str]]]:
@@ -12746,18 +12837,16 @@ def check_agentcore_dns_egress_control(
     private subnet without any outbound connection at all. Route 53 Resolver DNS
     Firewall is the control for it.
 
-    A rule group is only worth its association if it ends in a block. Rules
-    process from the lowest Priority up and Priority is unique inside a group, so
-    the rule with the largest Priority decides every query the earlier rules did
-    not match: if that rule allows, the group is an allow-list with an open
-    default. The same ordering applies to the groups associated with one VPC, so
-    the association with the largest Priority holds the terminal rule.
-
-    A terminal block is a default deny only when it matches every name. The
-    walled garden pattern AWS documents is a BLOCK over a domain list holding
-    "*", so the terminal rule passes only when its own domain list holds "*". A
-    block over an AWS managed list or over DNS threat protection stops known bad
-    names and answers every other one.
+    DNS Firewall evaluates the groups associated with a VPC from the lowest
+    association Priority up, and the rules inside each group from the lowest rule
+    Priority up, and the first rule that matches ends evaluation whether its
+    action is ALLOW, ALERT or BLOCK. So the verdict is decided by the first rule
+    in force whose domain list holds "*": rules before it over named domains are
+    allow-lists or deny-lists for those names, and rules after it are never
+    reached. That rule passes only when it is a BLOCK that names no query type,
+    because a rule with a Qtype matches that type alone and passes every other
+    type on. A block over an AWS managed list or over DNS threat protection stops
+    known bad names and answers every other one, so it never decides.
     """
     reference = DNS_FIREWALL_RULE_ACTION_REFERENCE_URL
     managed_list_ids: Optional[Set[str]] = None
@@ -12829,14 +12918,7 @@ def check_agentcore_dns_egress_control(
 
     subnet_ids = sorted({subnet_id for _, subnet_id in subnet_references})
     try:
-        described = _paginate_aws_list(
-            ec2_client,
-            "describe_subnets",
-            "Subnets",
-            token_request_key="NextToken",
-            token_response_key="NextToken",
-            SubnetIds=subnet_ids,
-        )
+        described, missing_subnets = _describe_subnets_reporting_missing(subnet_ids)
     except Exception as error:
         logger.warning(f"Could not describe AgentCore subnets: {error}")
         findings.append(
@@ -12866,6 +12948,38 @@ def check_agentcore_dns_egress_control(
         vpc_id = subnet_vpcs.get(subnet_id)
         if vpc_id:
             vpc_users.setdefault(vpc_id, set()).add(label)
+
+    if missing_subnets:
+        named_by = sorted(
+            {
+                label
+                for label, subnet_id in subnet_references
+                if subnet_id in missing_subnets
+            }
+        )
+        findings.append(
+            create_finding(
+                check_id="AC-49",
+                finding_name="AgentCore DNS Egress Control",
+                finding_details=(
+                    f"{len(missing_subnets)} subnet(s) named by "
+                    f"{', '.join(named_by)} are not present in this account and "
+                    f"Region (InvalidSubnetID.NotFound): {', '.join(missing_subnets)}. "
+                    "No VPC could be resolved for them, so their DNS egress was "
+                    "not judged."
+                ),
+                resolution=(
+                    "Update the network configuration of these resources to name "
+                    "subnets that exist, then retry."
+                ),
+                reference=reference,
+                severity=SeverityEnum.INFORMATIONAL,
+                status=StatusEnum.NA,
+            )
+        )
+
+    if not vpc_users and missing_subnets and len(missing_subnets) == len(subnet_ids):
+        return findings
 
     if not vpc_users:
         findings.append(
@@ -12944,110 +13058,96 @@ def check_agentcore_dns_egress_control(
             )
             continue
 
-        terminal_association = max(live, key=lambda item: item.get("Priority") or 0)
-        group_id = terminal_association.get("FirewallRuleGroupId") or "unknown"
-        group_name = terminal_association.get("Name") or group_id
-
-        try:
-            rules = _paginate_aws_list(
-                route53resolver_client,
-                "list_firewall_rules",
-                "FirewallRules",
-                token_request_key="NextToken",
-                token_response_key="NextToken",
-                FirewallRuleGroupId=group_id,
-            )
-        except Exception as error:
-            logger.warning(f"Could not list DNS Firewall rules in {group_id}: {error}")
-            findings.append(
-                create_finding(
+        ordered = sorted(live, key=lambda item: item.get("Priority") or 0)
+        deciding = None
+        last_seen = None
+        scoped_blocks: List[str] = []
+        rules_returned = 0
+        enforcing_count = 0
+        unreadable = None
+        for association in ordered:
+            group_id = association.get("FirewallRuleGroupId") or "unknown"
+            group_name = association.get("Name") or group_id
+            try:
+                rules = _paginate_aws_list(
+                    route53resolver_client,
+                    "list_firewall_rules",
+                    "FirewallRules",
+                    token_request_key="NextToken",
+                    token_response_key="NextToken",
+                    FirewallRuleGroupId=group_id,
+                )
+            except Exception as error:
+                logger.warning(
+                    f"Could not list DNS Firewall rules in {group_id}: {error}"
+                )
+                unreadable = create_finding(
                     check_id="AC-49",
                     finding_name="AgentCore DNS Egress Control",
                     finding_details=(
                         f"The rules of DNS Firewall rule group {group_name} "
-                        f"({group_id}), the last group associated with {vpc_id}, "
-                        f"could not be listed: {_assessment_error_label(error)}."
+                        f"({group_id}), associated with {vpc_id} at Priority "
+                        f"{association.get('Priority')}, could not be listed: "
+                        f"{_assessment_error_label(error)}."
                     ),
                     resolution="Grant route53resolver:ListFirewallRules and retry.",
                     reference=reference,
                     severity=SeverityEnum.INFORMATIONAL,
                     status=StatusEnum.NA,
                 )
+                break
+
+            rules_returned += len(rules)
+            enforcing = sorted(
+                _dns_firewall_enforcing_rules(rules),
+                key=lambda item: item.get("Priority") or 0,
             )
-            continue
-
-        enforcing = _dns_firewall_enforcing_rules(rules)
-        if not enforcing:
-            findings.append(
-                create_finding(
-                    check_id="AC-49",
-                    finding_name="AgentCore DNS Egress Control Missing",
-                    finding_details=(
-                        f"VPC {vpc_id}, which hosts {hosted}, is associated with "
-                        f"DNS Firewall rule group {group_name} ({group_id}), "
-                        f"which has no rule in force out of {len(rules)} "
-                        "returned, so no domain an agent resolves is blocked."
-                    ),
-                    resolution=(
-                        "Add a rule to this rule group whose action is BLOCK and "
-                        "whose Priority is the highest in the group."
-                    ),
-                    reference=reference,
-                    severity=SeverityEnum.MEDIUM,
-                    status=StatusEnum.FAILED,
-                )
-            )
-            continue
-
-        terminal_rule = max(enforcing, key=lambda item: item.get("Priority") or 0)
-        rule_name = terminal_rule.get("Name") or "unnamed"
-        priority = terminal_rule.get("Priority")
-        action = terminal_rule.get("Action") or "unspecified"
-        subject = _dns_firewall_rule_subject(terminal_rule)
-
-        if action == "BLOCK":
-            domain_list_id = terminal_rule.get("FirewallDomainListId")
-            not_default_deny = None
-            if not domain_list_id:
-                not_default_deny = "matches no domain list"
-            else:
-                try:
-                    if managed_list_ids is None:
-                        managed_list_ids = _dns_firewall_managed_domain_list_ids()
-                    if domain_list_id in managed_list_ids:
-                        not_default_deny = "uses an AWS managed domain list"
-                    else:
-                        domains = _paginate_aws_list(
-                            route53resolver_client,
-                            "list_firewall_domains",
-                            "Domains",
-                            token_request_key="NextToken",
-                            token_response_key="NextToken",
-                            FirewallDomainListId=domain_list_id,
-                        )
-                        # ListFirewallDomains returns names fully qualified,
-                        # so the "*" a walled garden is built from reads "*.".
-                        if "*" not in {str(domain).rstrip(".") for domain in domains}:
-                            not_default_deny = (
-                                f"uses a domain list of {len(domains)} name(s) "
-                                'that does not hold "*"'
+            enforcing_count += len(enforcing)
+            for rule in enforcing:
+                rule_name = rule.get("Name") or "unnamed"
+                domain_list_id = rule.get("FirewallDomainListId")
+                partial = None
+                if not domain_list_id:
+                    partial = "matches no domain list"
+                else:
+                    try:
+                        if managed_list_ids is None:
+                            managed_list_ids = _dns_firewall_managed_domain_list_ids()
+                        if domain_list_id in managed_list_ids:
+                            partial = "uses an AWS managed domain list"
+                        else:
+                            domains = _paginate_aws_list(
+                                route53resolver_client,
+                                "list_firewall_domains",
+                                "Domains",
+                                token_request_key="NextToken",
+                                token_response_key="NextToken",
+                                FirewallDomainListId=domain_list_id,
                             )
-                except Exception as error:
-                    logger.warning(
-                        f"Could not read DNS Firewall domain list {domain_list_id}: "
-                        f"{error}"
-                    )
-                    findings.append(
-                        create_finding(
+                            # ListFirewallDomains returns names fully qualified,
+                            # so the "*" a walled garden is built from reads "*.".
+                            if "*" not in {
+                                str(domain).rstrip(".") for domain in domains
+                            }:
+                                partial = (
+                                    f"uses a domain list of {len(domains)} name(s) "
+                                    'that does not hold "*"'
+                                )
+                    except Exception as error:
+                        logger.warning(
+                            "Could not read DNS Firewall domain list "
+                            f"{domain_list_id}: {error}"
+                        )
+                        unreadable = create_finding(
                             check_id="AC-49",
                             finding_name="AgentCore DNS Egress Control",
                             finding_details=(
                                 f"The domain list {domain_list_id} of rule "
-                                f"'{rule_name}', the last rule of DNS Firewall "
-                                f"rule group {group_name} ({group_id}) associated "
-                                f"with {vpc_id}, could not be read, so whether it "
-                                "blocks every name is unknown: "
-                                f"{_assessment_error_label(error)}."
+                                f"'{rule_name}' at Priority {rule.get('Priority')} "
+                                f"in DNS Firewall rule group {group_name} "
+                                f"({group_id}) associated with {vpc_id} could not "
+                                "be read, so whether it matches every name is "
+                                f"unknown: {_assessment_error_label(error)}."
                             ),
                             resolution=(
                                 "Grant route53resolver:ListFirewallDomainLists and "
@@ -13057,34 +13157,99 @@ def check_agentcore_dns_egress_control(
                             severity=SeverityEnum.INFORMATIONAL,
                             status=StatusEnum.NA,
                         )
+                        break
+
+                qtype = rule.get("Qtype")
+                if not partial and qtype and rule.get("Action") == "BLOCK":
+                    # A rule with a query type matches that type only, so every
+                    # other type passes on to the rules after it.
+                    partial = f"applies only to query type {qtype}"
+                    scoped_blocks.append(
+                        f"'{rule_name}' in {group_name} ({group_id}) blocks every "
+                        f"name for query type {qtype} only"
                     )
+                if partial:
+                    last_seen = (group_name, group_id, rule, partial)
                     continue
+                deciding = (group_name, group_id, rule)
+                break
+            if unreadable or deciding:
+                break
 
-            if not_default_deny:
-                findings.append(
-                    create_finding(
-                        check_id="AC-49",
-                        finding_name="AgentCore DNS Egress Control Not Default Deny",
-                        finding_details=(
-                            f"VPC {vpc_id}, which hosts {hosted}, is associated "
-                            f"with DNS Firewall rule group {group_name} "
-                            f"({group_id}), whose last rule '{rule_name}' at "
-                            f"Priority {priority} blocks {subject} but "
-                            f"{not_default_deny}. A name that no rule matches is "
-                            "answered, so the rule group is a deny-list."
-                        ),
-                        resolution=(
-                            "Make the last rule in this rule group a BLOCK over a "
-                            'domain list that holds "*", and allow the names '
-                            "agents need in rules with a lower Priority."
-                        ),
-                        reference=reference,
-                        severity=SeverityEnum.MEDIUM,
-                        status=StatusEnum.FAILED,
-                    )
+        if unreadable:
+            findings.append(unreadable)
+            continue
+
+        if not enforcing_count:
+            findings.append(
+                create_finding(
+                    check_id="AC-49",
+                    finding_name="AgentCore DNS Egress Control Missing",
+                    finding_details=(
+                        f"VPC {vpc_id}, which hosts {hosted}, is associated with "
+                        f"{len(ordered)} DNS Firewall rule group(s), which have no "
+                        f"rule in force out of {rules_returned} returned, so no "
+                        "domain an agent resolves is blocked."
+                    ),
+                    resolution=(
+                        "Add a rule whose action is BLOCK over a domain list that "
+                        'holds "*" after the rules that allow the names agents '
+                        "need."
+                    ),
+                    reference=reference,
+                    severity=SeverityEnum.MEDIUM,
+                    status=StatusEnum.FAILED,
                 )
-                continue
+            )
+            continue
 
+        if deciding is None:
+            group_name, group_id, rule, partial = last_seen
+            action = rule.get("Action") or "unspecified"
+            scoped = (
+                " Rule {}, so every other query type is answered.".format(
+                    "; rule ".join(scoped_blocks[:3])
+                )
+                if scoped_blocks
+                else ""
+            )
+            findings.append(
+                create_finding(
+                    check_id="AC-49",
+                    finding_name="AgentCore DNS Egress Control Not Default Deny",
+                    finding_details=(
+                        f"VPC {vpc_id}, which hosts {hosted}, is associated with "
+                        f"{len(ordered)} DNS Firewall rule group(s), and no rule in "
+                        "force in them matches every name for every query type. "
+                        f"The last rule evaluated, '{rule.get('Name') or 'unnamed'}' "
+                        f"at Priority {rule.get('Priority')} in {group_name} "
+                        f"({group_id}), has action {action} on "
+                        f"{_dns_firewall_rule_subject(rule)} but {partial}. A name "
+                        "that no rule matches is answered, so the rule groups are a "
+                        f"deny-list.{scoped}"
+                    ),
+                    resolution=(
+                        "End the last rule group associated with this VPC in a "
+                        'BLOCK rule over a domain list that holds "*" and names no '
+                        "query type, and allow the names agents need in rules "
+                        "evaluated before it."
+                    ),
+                    reference=reference,
+                    severity=SeverityEnum.MEDIUM,
+                    status=StatusEnum.FAILED,
+                )
+            )
+            continue
+
+        group_name, group_id, rule = deciding
+        rule_name = rule.get("Name") or "unnamed"
+        priority = rule.get("Priority")
+        action = rule.get("Action") or "unspecified"
+        subject = _dns_firewall_rule_subject(rule)
+        qtype = rule.get("Qtype")
+        for_type = f" for query type {qtype}" if qtype else ""
+
+        if action == "BLOCK":
             findings.append(
                 create_finding(
                     check_id="AC-49",
@@ -13092,9 +13257,10 @@ def check_agentcore_dns_egress_control(
                     finding_details=(
                         f"VPC {vpc_id}, which hosts {hosted}, is associated with "
                         f"DNS Firewall rule group {group_name} ({group_id}), "
-                        f"whose last rule '{rule_name}' at Priority {priority} "
-                        f'blocks {subject}, which holds "*", so a name that no '
-                        "earlier rule allows is not resolved."
+                        f"whose rule '{rule_name}' at Priority {priority} is the "
+                        "first rule in force to match every name, and it blocks "
+                        f'{subject}, which holds "*", so a name that no earlier '
+                        "rule allows is not resolved."
                     ),
                     resolution="No action required.",
                     reference=reference,
@@ -13110,14 +13276,16 @@ def check_agentcore_dns_egress_control(
                     finding_details=(
                         f"VPC {vpc_id}, which hosts {hosted}, is associated with "
                         f"DNS Firewall rule group {group_name} ({group_id}), "
-                        f"whose last rule '{rule_name}' at Priority {priority} "
-                        f"has action {action} on {subject}. Every query the "
-                        "earlier rules did not match is answered."
+                        f"whose rule '{rule_name}' at Priority {priority} is the "
+                        "first rule in force to match every name, and it has "
+                        f"action {action} on {subject}{for_type}. Evaluation stops "
+                        "at the first match, so every query that reaches it is "
+                        "answered and no later rule is evaluated."
                     ),
                     resolution=(
-                        "Add a rule whose action is BLOCK at the highest "
-                        "Priority in this rule group, so a name no earlier rule "
-                        "allowed is not resolved."
+                        'Remove the ALLOW or ALERT rule over "*" or give it a '
+                        "domain list of the names agents need, and end the rule "
+                        'groups in a BLOCK over a domain list that holds "*".'
                     ),
                     reference=reference,
                     severity=SeverityEnum.MEDIUM,
