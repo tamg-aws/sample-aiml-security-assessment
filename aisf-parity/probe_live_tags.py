@@ -309,6 +309,21 @@ def qualifier_census(tags) -> collections.Counter:
 # --------------------------------------------------------------------------- #
 # Loading the real producer code, each with its own schema.
 # --------------------------------------------------------------------------- #
+def census_exercises_the_shipped_forms(observed, shipped) -> bool:
+    """Every real tag parses, bare tags occur, and `(partial)` occurs exactly when shipped.
+
+    `shipped` is the census of the maps themselves. A `(partial)` tag exists only for a
+    tighten row, so once the ledger holds none the maps carry none, and a live
+    `(partial)` would then be a tag no map wrote. Requiring one unconditionally made a
+    correct run fail on this line alone.
+    """
+    if observed["unparseable"] or not observed["bare"]:
+        return False
+    if shipped["partial"]:
+        return observed["partial"] > 0
+    return observed["partial"] == 0
+
+
 def load_module(directory: Path, filename: str, alias: str, extra=None):
     """Import one file under a unique alias, seeding `extra` into sys.modules.
 
@@ -715,13 +730,17 @@ def main() -> int:
             f"{len(wrong)} tag mismatch(es)" + (f": {wrong[:3]}" if wrong else ""),
         )
 
+    shipped = qualifier_census(
+        tag for module in PRODUCERS for tag in loaded[module][2].values()
+    )
     print("\n=== qualifier forms observed on real rows ===")
     report.check(
         "every tag on a real row parses, and the forms are exercised live",
-        census["unparseable"] == 0 and census["bare"] and census["partial"],
+        census_exercises_the_shipped_forms(census, shipped),
         f"bare={census['bare']} partial={census['partial']} joint={census['joint']} "
         f"multi-control={census['multi']} unparseable={census['unparseable']} "
-        f"over {totals['tagged']}/{totals['rows']} tagged row(s)",
+        f"over {totals['tagged']}/{totals['rows']} tagged row(s); the maps carry "
+        f"{shipped['partial']} (partial) element(s)",
     )
 
     print("\n=== what this cannot see ===")

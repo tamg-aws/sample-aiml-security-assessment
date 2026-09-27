@@ -12,12 +12,13 @@ the first.
 
 The end-to-end cases build a `--csv-dir` set from this tree's own maps, so they
 measure the probe's wiring and not a snapshot of the maps. They assert named
-assertion lines and not the overall verdict: on this tree a correct set still ends
-`PROBE FAIL`, on the qualifier census alone, because no map carries a `(partial)`
-tag any more and the census requires one. That is a defect in the census and is not
-asserted either way here.
+assertion lines. The qualifier census once required a live `(partial)` tag even
+after the maps stopped carrying any, so a correct set failed on that line alone; it
+now requires `(partial)` exactly when the shipped maps carry it, and the census tests
+at the end pin both directions.
 """
 
+import collections
 import csv
 import importlib.util
 import os
@@ -181,3 +182,58 @@ def test_one_wrong_row_fails_its_producer_as_written_and_nothing_else(tmp_path):
         "tree's map" in result.stdout
     )
     assert "1 producer(s) disagreeing" in result.stdout
+
+
+# --------------------------------------------------------------------------- #
+# The qualifier census follows the shipped maps.
+# --------------------------------------------------------------------------- #
+def _census(**counts):
+    return collections.Counter(counts)
+
+
+def test_no_shipped_partial_and_none_observed_passes():
+    probe = load_probe()
+    assert probe.census_exercises_the_shipped_forms(
+        _census(bare=3, joint=2), _census(bare=40, joint=70)
+    )
+
+
+def test_a_live_partial_the_maps_do_not_carry_fails():
+    probe = load_probe()
+    assert not probe.census_exercises_the_shipped_forms(
+        _census(bare=3, partial=1), _census(bare=40, joint=70)
+    )
+
+
+def test_shipped_partial_that_no_row_exercises_fails():
+    probe = load_probe()
+    assert not probe.census_exercises_the_shipped_forms(
+        _census(bare=3), _census(bare=40, partial=2)
+    )
+
+
+def test_shipped_partial_that_a_row_exercises_passes():
+    probe = load_probe()
+    assert probe.census_exercises_the_shipped_forms(
+        _census(bare=3, partial=1), _census(bare=40, partial=2)
+    )
+
+
+def test_an_unparseable_tag_or_no_bare_tag_fails_whatever_is_shipped():
+    probe = load_probe()
+    for shipped in (_census(bare=40), _census(bare=40, partial=2)):
+        assert not probe.census_exercises_the_shipped_forms(
+            _census(bare=3, partial=1, unparseable=1), shipped
+        )
+        assert not probe.census_exercises_the_shipped_forms(
+            _census(partial=1, joint=2), shipped
+        )
+
+
+def test_a_correct_set_passes_the_census_on_this_tree(tmp_path):
+    probe = load_probe()
+    _write_set(probe, tmp_path)
+    result = _run(tmp_path)
+    name = "every tag on a real row parses, and the forms are exercised live"
+    assert _verdict(result.stdout, name) == "PASS", result.stdout
+    assert "the maps carry 0 (partial) element(s)" in result.stdout, result.stdout

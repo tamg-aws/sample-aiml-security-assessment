@@ -132,11 +132,11 @@ inverted). Before those fixtures, three of the four survived every probe test.
 `--selftest` covers the classifiers with synthetic input (12 cases, no
 credentials).
 
-A correct synthetic set passes 12 of 13 assertions and exits 1 on the qualifier
-census alone: that assertion requires a `(partial)` element, and since the last
-`tighten` rows closed no map carries one. A live run built from this tree fails the
-same way, so the census assertion predates the retired vocabulary and is not a
-finding about the run.
+The qualifier census requires a live `(partial)` element exactly when the shipped
+maps carry one. It used to require one unconditionally, so after the last `tighten`
+rows closed, a correct set passed 12 of 13 assertions and exited 1 on the census
+alone. With the maps at 0 `(partial)` elements, a live `(partial)` now fails the line,
+and its detail prints the maps' own count beside the observed one.
 
 ## What each fixture unblocks
 
