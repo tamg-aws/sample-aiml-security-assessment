@@ -24,6 +24,7 @@ boto3_config = Config(retries=dict(max_attempts=10, mode="adaptive"))
 s3_client = boto3.client("s3", config=boto3_config)
 iam_client = None
 agent_registry_control_client = None
+events_client = None
 start_time = None
 
 BUCKET_NAME = os.environ.get("AIML_ASSESSMENT_BUCKET_NAME")
@@ -42,6 +43,35 @@ REGISTRY_PUBLISH_ACTIONS = (
     "SubmitRegistryRecordForApproval",
 )
 REGISTRY_APPROVAL_ACTION = "UpdateRegistryRecordStatus"
+# Registry lifecycle events are delivered to the default event bus in the
+# resource's own account, so a rule on a custom bus never receives them.
+REGISTRY_EVENT_BUS_NAME = "default"
+REGISTRY_EVENT_SOURCE = "aws.agent-registry"
+# The public-preview event source. It stops publishing on the date below, so a
+# rule that matches only this source routes nothing after it.
+REGISTRY_PREVIEW_EVENT_SOURCE = "aws.bedrock-agentcore"
+REGISTRY_PREVIEW_EVENT_SOURCE_END = "30 October 2026"
+# The record transitions that carry an approval decision. AR-03 and AR-09 assert
+# how the approval workflow is configured and who may decide; routing these three
+# is what makes the decisions observable.
+REGISTRY_APPROVAL_DETAIL_TYPES = (
+    "Registry Record State changed to Pending Approval",
+    "Registry Record State changed to Approved",
+    "Registry Record State changed to Rejected",
+)
+# Every detail type the GA source publishes. A rule with no detail-type filter
+# matches all of them.
+REGISTRY_LIFECYCLE_DETAIL_TYPES = REGISTRY_APPROVAL_DETAIL_TYPES + (
+    "Registry Record State changed to Draft",
+    "Registry Record State changed to Deprecated",
+    "Registry Creating",
+    "Registry Ready",
+    "Registry Create Failed",
+    "Registry Updating",
+    "Registry Update Failed",
+    "Registry Deleting",
+    "Registry Delete Failed",
+)
 REGION_UNAVAILABLE_ERROR_CODES = {
     "AuthFailure",
     "InvalidClientTokenId",
@@ -89,6 +119,9 @@ RECORD_LIFECYCLE_REFERENCE_URL = (
 PROVENANCE_REFERENCE_URL = (
     "https://docs.aws.amazon.com/agent-registry-control/latest/APIReference/"
     "API_Provenance.html"
+)
+EVENT_ROUTING_REFERENCE_URL = (
+    "https://docs.aws.amazon.com/eventbridge/latest/userguide/eb-rules.html"
 )
 
 
@@ -1395,6 +1428,338 @@ def check_agent_registry_record_provenance(
     return findings
 
 
+def _event_pattern_literals(pattern: Dict[str, Any], key: str) -> Optional[List[str]]:
+    """The literal values an event pattern requires for one top-level field.
+
+    None means the field is absent, which in EventBridge matches every value. An
+    empty list means the field is present but carries a content matcher, such as
+    `prefix` or `anything-but`, whose reach this check cannot decide.
+    """
+    if key not in pattern:
+        return None
+    value = pattern[key]
+    values = value if isinstance(value, list) else [value]
+    return [item for item in values if isinstance(item, str)]
+
+
+def _classify_event_pattern(rule: Dict[str, Any]) -> Dict[str, Any]:
+    """Read one rule's event pattern for Registry source and detail-type reach.
+
+    `kind` is `other` when the rule cannot receive Registry events, `registry`
+    when it matches the GA source, `preview` when it matches only the
+    discontinued public-preview source, and `unreadable` when the pattern is not
+    JSON or a content matcher decides the source or the detail type.
+    """
+    raw_pattern = rule.get("EventPattern")
+    if not raw_pattern:
+        return {"kind": "other"}
+    try:
+        pattern = json.loads(raw_pattern)
+    except (TypeError, ValueError):
+        return {"kind": "unreadable", "reason": "its event pattern is not valid JSON"}
+    if not isinstance(pattern, dict):
+        return {
+            "kind": "unreadable",
+            "reason": "its event pattern is not a JSON object",
+        }
+    sources = _event_pattern_literals(pattern, "source")
+    if sources is not None and not sources:
+        return {
+            "kind": "unreadable",
+            "reason": "a content filter decides which event sources it matches",
+        }
+    matches_ga = sources is None or REGISTRY_EVENT_SOURCE in sources
+    matches_preview = sources is not None and REGISTRY_PREVIEW_EVENT_SOURCE in sources
+    if not matches_ga and not matches_preview:
+        return {"kind": "other"}
+    detail_types = _event_pattern_literals(pattern, "detail-type")
+    if detail_types is not None and not detail_types:
+        return {
+            "kind": "unreadable",
+            "reason": "a content filter decides which detail types it matches",
+        }
+    return {
+        "kind": "registry" if matches_ga else "preview",
+        "detail_types": set(REGISTRY_LIFECYCLE_DETAIL_TYPES)
+        if detail_types is None
+        else set(detail_types),
+    }
+
+
+def _rule_target_count(
+    rule_name: Optional[str],
+) -> tuple[Optional[int], Optional[Exception]]:
+    """Count one rule's targets, isolating a per-rule failure from the sweep."""
+    if not rule_name:
+        return None, ValueError("Missing rule name")
+    try:
+        paginator = events_client.get_paginator("list_targets_by_rule")
+        targets = 0
+        for page in paginator.paginate(
+            Rule=rule_name, EventBusName=REGISTRY_EVENT_BUS_NAME
+        ):
+            targets += len(page.get("Targets", []))
+        return targets, None
+    except Exception as error:
+        return None, error
+
+
+def get_registry_event_rule_inventory() -> Dict[str, Any]:
+    """List the default bus once and count the targets of the Registry rules.
+
+    Targets are listed only for the rules whose pattern can receive Registry
+    events, so an account with hundreds of unrelated rules costs one ListRules
+    sweep rather than a ListTargetsByRule call per rule.
+    """
+    inventory = {
+        "items": [],
+        "rules_examined": 0,
+        "list_error": None,
+        "client_missing": events_client is None,
+        "unavailable": False,
+        "timed_out": False,
+    }
+    if events_client is None:
+        return inventory
+    try:
+        paginator = events_client.get_paginator("list_rules")
+        for page in paginator.paginate(EventBusName=REGISTRY_EVENT_BUS_NAME):
+            if not check_timeout():
+                inventory["timed_out"] = True
+                return inventory
+            for rule in page.get("Rules", []):
+                inventory["rules_examined"] += 1
+                classification = _classify_event_pattern(rule)
+                if classification["kind"] == "other":
+                    continue
+                entry = {
+                    "rule": rule,
+                    "classification": classification,
+                    "targets": None,
+                    "target_error": None,
+                }
+                if classification["kind"] != "unreadable":
+                    entry["targets"], entry["target_error"] = _rule_target_count(
+                        rule.get("Name")
+                    )
+                inventory["items"].append(entry)
+    except Exception as error:
+        inventory["list_error"] = error
+        inventory["unavailable"] = _is_unavailable(error)
+    return inventory
+
+
+def _event_rule_inventory_start(
+    rule_inventory: Dict[str, Any], finding: str
+) -> Optional[List[Dict[str, Any]]]:
+    if rule_inventory.get("client_missing"):
+        return [
+            _na(
+                "AR-10",
+                f"{finding} Incomplete",
+                "Assessment could not initialize the EventBridge client needed to read event rules.",
+                EVENT_ROUTING_REFERENCE_URL,
+                "Resolve the EventBridge client initialization error and re-run the assessment.",
+            )
+        ]
+    if rule_inventory.get("unavailable"):
+        return [
+            _na(
+                "AR-10",
+                finding,
+                "Amazon EventBridge is not available in this region, so Registry lifecycle event routing could not be assessed.",
+                EVENT_ROUTING_REFERENCE_URL,
+                "No action required unless Amazon EventBridge is expected in this region.",
+            )
+        ]
+    if rule_inventory.get("list_error"):
+        error = rule_inventory["list_error"]
+        return [
+            _na(
+                "AR-10",
+                f"{finding} Incomplete",
+                f"Assessment could not enumerate EventBridge rules on the {REGISTRY_EVENT_BUS_NAME} event bus: {_error_detail(error)}.",
+                EVENT_ROUTING_REFERENCE_URL,
+                _error_resolution(error, "events:ListRules"),
+            )
+        ]
+    if rule_inventory.get("timed_out"):
+        return [
+            _na(
+                "AR-10",
+                f"{finding} Incomplete",
+                f"Assessment stopped before reading every rule on the {REGISTRY_EVENT_BUS_NAME} event bus because the Lambda timeout was approaching.",
+                EVENT_ROUTING_REFERENCE_URL,
+                "Re-run the assessment to complete the event rule inventory.",
+            )
+        ]
+    return None
+
+
+def _registry_scope_label(inventory: Dict[str, Any]) -> str:
+    """Name the registries whose lifecycle events the routing verdict covers."""
+    names = sorted(_registry_context(item)[1] for item in inventory.get("items", []))
+    if not names:
+        return "the registries in this account and region"
+    listed = ", ".join(f"'{name}'" for name in names[:3])
+    if len(names) > 3:
+        listed += f" and {len(names) - 3} more"
+    return f"registry {listed}" if len(names) == 1 else f"registries {listed}"
+
+
+def check_agent_registry_lifecycle_event_routing(
+    inventory: Optional[Dict[str, Any]] = None,
+    rule_inventory: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, Any]]:
+    """AR-10: assert Registry lifecycle state changes reach an EventBridge target.
+
+    AR-03 and AR-09 assert how the approval workflow is configured and who may
+    decide an approval. Neither asks whether the decision is observed anywhere: a
+    state change that reaches no target is an approval nobody reviewed. The rules
+    read are those on the default event bus, which is where these events land.
+    """
+    inventory = inventory or get_agent_registry_inventory()
+    finding = "AWS Agent Registry Lifecycle Event Routing"
+    early = _inventory_start(inventory, "AR-10", finding, EVENT_ROUTING_REFERENCE_URL)
+    if early:
+        return early
+    if rule_inventory is None:
+        rule_inventory = get_registry_event_rule_inventory()
+    early = _event_rule_inventory_start(rule_inventory, finding)
+    if early:
+        return early
+
+    scope = _registry_scope_label(inventory)
+    findings: List[Dict[str, Any]] = []
+    routing_labels: List[str] = []
+    covered: set = set()
+    for entry in rule_inventory["items"]:
+        rule = entry["rule"]
+        name = rule.get("Name", "unknown")
+        classification = entry["classification"]
+        if classification["kind"] == "unreadable":
+            findings.append(
+                _na(
+                    "AR-10",
+                    finding,
+                    f"EventBridge rule '{name}' could not be assessed because {classification['reason']}.",
+                    EVENT_ROUTING_REFERENCE_URL,
+                    f"Review the rule's event pattern manually against source '{REGISTRY_EVENT_SOURCE}' and the Registry lifecycle detail types.",
+                )
+            )
+            continue
+        if entry["target_error"] is not None:
+            findings.append(
+                _na(
+                    "AR-10",
+                    f"{finding} Incomplete",
+                    f"EventBridge rule '{name}' matches Registry lifecycle events but its targets could not be read: {_error_detail(entry['target_error'])}.",
+                    EVENT_ROUTING_REFERENCE_URL,
+                    _error_resolution(
+                        entry["target_error"], "events:ListTargetsByRule"
+                    ),
+                )
+            )
+            continue
+        if classification["kind"] == "preview":
+            findings.append(
+                create_finding(
+                    "AR-10",
+                    finding,
+                    f"EventBridge rule '{name}' matches only the discontinued public-preview event source '{REGISTRY_PREVIEW_EVENT_SOURCE}', which stops publishing on {REGISTRY_PREVIEW_EVENT_SOURCE_END}, so it will stop routing lifecycle events for {scope}.",
+                    f"Change the rule's event pattern to match source '{REGISTRY_EVENT_SOURCE}' before {REGISTRY_PREVIEW_EVENT_SOURCE_END}.",
+                    EVENT_ROUTING_REFERENCE_URL,
+                    SeverityEnum.MEDIUM,
+                    StatusEnum.FAILED,
+                )
+            )
+            continue
+        targets = entry["targets"] or 0
+        if rule.get("State") == "DISABLED":
+            findings.append(
+                create_finding(
+                    "AR-10",
+                    finding,
+                    f"EventBridge rule '{name}' matches the lifecycle events of {scope} but is DISABLED, so no state change reaches its {targets} target(s).",
+                    "Enable the rule so Registry lifecycle state changes reach its targets.",
+                    EVENT_ROUTING_REFERENCE_URL,
+                    SeverityEnum.MEDIUM,
+                    StatusEnum.FAILED,
+                )
+            )
+            continue
+        if targets == 0:
+            findings.append(
+                create_finding(
+                    "AR-10",
+                    finding,
+                    f"EventBridge rule '{name}' matches the lifecycle events of {scope} but has no targets, so every matched state change is discarded.",
+                    "Add a target to the rule, such as an SNS topic, a Lambda function, or a CloudWatch Logs group.",
+                    EVENT_ROUTING_REFERENCE_URL,
+                    SeverityEnum.MEDIUM,
+                    StatusEnum.FAILED,
+                )
+            )
+            continue
+        routing_labels.append(f"'{name}' ({targets} target(s))")
+        covered.update(classification["detail_types"])
+
+    missing = [
+        detail_type
+        for detail_type in REGISTRY_APPROVAL_DETAIL_TYPES
+        if detail_type not in covered
+    ]
+    if not routing_labels:
+        matching = len(
+            [
+                entry
+                for entry in rule_inventory["items"]
+                if entry["classification"]["kind"] != "unreadable"
+            ]
+        )
+        details = (
+            f"None of the {rule_inventory['rules_examined']} rule(s) on the {REGISTRY_EVENT_BUS_NAME} event bus matches source '{REGISTRY_EVENT_SOURCE}', so no lifecycle state change of {scope} is routed anywhere."
+            if not matching
+            else f"The {matching} rule(s) on the {REGISTRY_EVENT_BUS_NAME} event bus that match Registry lifecycle events route none of them to a target, so no lifecycle state change of {scope} is observed."
+        )
+        findings.append(
+            create_finding(
+                "AR-10",
+                finding,
+                details,
+                f"Create an enabled rule on the {REGISTRY_EVENT_BUS_NAME} event bus matching source '{REGISTRY_EVENT_SOURCE}' and detail types {', '.join(REGISTRY_APPROVAL_DETAIL_TYPES)}, with a target that records or reviews them.",
+                EVENT_ROUTING_REFERENCE_URL,
+                SeverityEnum.MEDIUM,
+                StatusEnum.FAILED,
+            )
+        )
+    elif missing:
+        findings.append(
+            create_finding(
+                "AR-10",
+                finding,
+                f"EventBridge rule(s) {', '.join(routing_labels)} route Registry lifecycle events for {scope}, but no rule matches detail type(s) {', '.join(missing)}, so those approval transitions reach no target.",
+                f"Add the missing detail type(s) to an existing rule's event pattern, or create a rule matching them on the {REGISTRY_EVENT_BUS_NAME} event bus.",
+                EVENT_ROUTING_REFERENCE_URL,
+                SeverityEnum.MEDIUM,
+                StatusEnum.FAILED,
+            )
+        )
+    else:
+        findings.append(
+            create_finding(
+                "AR-10",
+                finding,
+                f"EventBridge rule(s) {', '.join(routing_labels)} on the {REGISTRY_EVENT_BUS_NAME} event bus route every approval transition of {scope} ({', '.join(REGISTRY_APPROVAL_DETAIL_TYPES)}) to at least one target.",
+                "No action required",
+                EVENT_ROUTING_REFERENCE_URL,
+                SeverityEnum.MEDIUM,
+                StatusEnum.PASSED,
+            )
+        )
+    return findings
+
+
 def build_agentic_agent_registry_findings(
     findings: Iterable[Dict[str, Any]],
 ) -> List[Dict[str, Any]]:
@@ -1482,7 +1847,7 @@ def _run_check_safely(
 
 def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     """Run the standalone AWS Agent Registry assessment for one target region."""
-    global agent_registry_control_client, iam_client, start_time
+    global agent_registry_control_client, events_client, iam_client, start_time
     start_time = time.time()
     execution_id = _execution_name(event)
     region = event.get("Region") or os.environ.get("AWS_DEFAULT_REGION", "us-east-1")
@@ -1501,6 +1866,13 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             )
         except Exception as error:
             initialization_error = error
+        try:
+            events_client = boto3.client(
+                "events", config=boto3_config, region_name=region
+            )
+        except Exception:
+            logger.exception("Unable to initialize EventBridge client")
+            events_client = None
 
         if is_primary_region:
             try:
@@ -1605,6 +1977,12 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                 "AWS Agent Registry Organization Auto-Detection",
                 AUTO_DETECTION_REFERENCE_URL,
                 check_agent_registry_auto_detection,
+            ),
+            (
+                "AR-10",
+                "AWS Agent Registry Lifecycle Event Routing",
+                EVENT_ROUTING_REFERENCE_URL,
+                check_agent_registry_lifecycle_event_routing,
             ),
         ):
             findings.extend(_run_check_safely(*check, inventory))

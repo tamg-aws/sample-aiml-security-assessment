@@ -90,6 +90,284 @@ def build_could_not_assess_detail(error: Exception, region: str = "") -> str:
     )
 
 
+# DescribeSubnets and DescribeRouteTables accept up to 200 filter values; 100
+# keeps each request well inside that bound while still batching.
+SUBNET_LOOKUP_BATCH_SIZE = 100
+MAX_SUBNET_EXPOSURE_FINDINGS = 20
+
+
+def _chunked(values: List[str], size: int) -> Iterator[List[str]]:
+    for start in range(0, len(values), size):
+        yield values[start : start + size]
+
+
+def _route_reaches_internet_gateway(route: Dict[str, Any]) -> bool:
+    """Whether one route table entry hands traffic to an internet gateway.
+
+    An egress-only gateway (``eigw-``), a NAT gateway or a peering connection is
+    not an internet gateway: none of them accepts inbound connections, and AWS
+    calls a subnet private exactly when no route reaches an ``igw-``. A blackhole
+    route names a deleted gateway and carries no traffic.
+    """
+    if route.get("State") == "blackhole":
+        return False
+    return str(route.get("GatewayId") or "").startswith("igw-")
+
+
+def _route_destination(route: Dict[str, Any]) -> str:
+    return (
+        route.get("DestinationCidrBlock")
+        or route.get("DestinationIpv6CidrBlock")
+        or route.get("DestinationPrefixListId")
+        or "an unnamed destination"
+    )
+
+
+def resolve_subnet_internet_exposure(
+    subnet_ids: List[str], region: str = ""
+) -> Dict[str, Any]:
+    """Classify subnets by whether their route table reaches an internet gateway.
+
+    A subnet id in a workload's VpcConfig says the workload is attached to a
+    customer network; it does not say that network is private. This resolves the
+    route table that actually applies to each subnet, preferring an explicit
+    subnet association and falling back to the VPC main route table, which is
+    what an unassociated subnet uses.
+
+    Returns ``public`` as subnet id -> the route that exposes it, ``private`` as
+    the subnet ids whose applicable route table was read and has no such route,
+    ``unresolved`` as the subnet ids no route table could be found for, and
+    ``error`` as a report-safe label when the EC2 sweep itself failed.
+    """
+    unique = sorted({subnet_id for subnet_id in subnet_ids if subnet_id})
+    exposure = {
+        "public": {},
+        "private": set(),
+        "unresolved": set(unique),
+        "error": None,
+    }
+    if not unique:
+        return exposure
+
+    try:
+        ec2_client = boto3.client("ec2", config=boto3_config, region_name=region)
+
+        subnet_vpcs = {}
+        subnet_paginator = ec2_client.get_paginator("describe_subnets")
+        for chunk in _chunked(unique, SUBNET_LOOKUP_BATCH_SIZE):
+            # Filters tolerate an id that no longer exists; SubnetIds= raises
+            # InvalidSubnetID.NotFound and loses the whole batch with it.
+            for page in subnet_paginator.paginate(
+                Filters=[{"Name": "subnet-id", "Values": chunk}]
+            ):
+                for subnet in page.get("Subnets", []):
+                    if subnet.get("SubnetId"):
+                        subnet_vpcs[subnet["SubnetId"]] = subnet.get("VpcId")
+
+        vpc_ids = sorted({vpc_id for vpc_id in subnet_vpcs.values() if vpc_id})
+        explicit_tables = {}
+        main_tables = {}
+        route_paginator = ec2_client.get_paginator("describe_route_tables")
+        for chunk in _chunked(vpc_ids, SUBNET_LOOKUP_BATCH_SIZE):
+            for page in route_paginator.paginate(
+                Filters=[{"Name": "vpc-id", "Values": chunk}]
+            ):
+                for table in page.get("RouteTables", []):
+                    for association in table.get("Associations", []):
+                        if association.get("SubnetId"):
+                            explicit_tables[association["SubnetId"]] = table
+                        elif association.get("Main") is True and table.get("VpcId"):
+                            main_tables[table["VpcId"]] = table
+
+        for subnet_id, vpc_id in subnet_vpcs.items():
+            table = explicit_tables.get(subnet_id) or main_tables.get(vpc_id)
+            if table is None:
+                continue
+            exposure["unresolved"].discard(subnet_id)
+            exposing = next(
+                (
+                    route
+                    for route in table.get("Routes", [])
+                    if _route_reaches_internet_gateway(route)
+                ),
+                None,
+            )
+            if exposing is None:
+                exposure["private"].add(subnet_id)
+            else:
+                exposure["public"][subnet_id] = {
+                    "gateway": exposing.get("GatewayId"),
+                    "destination": _route_destination(exposing),
+                    "route_table": table.get("RouteTableId", "unknown"),
+                }
+    except Exception as error:
+        logger.warning(f"Error resolving subnet internet exposure: {str(error)}")
+        exposure["error"] = get_assessment_error_label(error)
+
+    return exposure
+
+
+def _subnet_exposure_findings(
+    check_id: str,
+    finding_name: str,
+    resources: List[Dict[str, Any]],
+    region: str,
+    reference: str,
+    resolution: str,
+    severity: str,
+) -> List[Dict[str, Any]]:
+    """Report AIR-FND-NET-01 for resources already known to be in a VPC.
+
+    ``resources`` entries carry ``name``, a phrase naming the resource as the
+    report should read, and ``subnets``. Public, private and unreadable
+    resources are reported separately, so one public resource cannot suppress
+    the passing verdict the private ones earned.
+    """
+    emitted: List[Dict[str, Any]] = []
+    if not resources:
+        return emitted
+
+    exposure = resolve_subnet_internet_exposure(
+        [subnet for resource in resources for subnet in resource.get("subnets", [])],
+        region,
+    )
+    if exposure["error"]:
+        return [
+            create_finding(
+                check_id=check_id,
+                finding_name=f"{finding_name} Incomplete",
+                finding_details=(
+                    f"The subnets of {len(resources)} resource(s) could not be "
+                    "checked for an internet gateway route. Assessment error: "
+                    f"{exposure['error']}."
+                ),
+                resolution=(
+                    "Grant ec2:DescribeSubnets and ec2:DescribeRouteTables to the "
+                    "assessment role and rerun the assessment."
+                ),
+                reference=reference,
+                severity="Informational",
+                status="N/A",
+                region=region,
+            )
+        ]
+
+    public_resources = []
+    private_resources = []
+    unresolved_resources = []
+    for resource in resources:
+        subnets = list(resource.get("subnets", []))
+        exposed = {
+            subnet: exposure["public"][subnet]
+            for subnet in subnets
+            if subnet in exposure["public"]
+        }
+        if exposed:
+            public_resources.append((resource, exposed))
+        elif all(subnet in exposure["private"] for subnet in subnets):
+            private_resources.append(resource)
+        else:
+            unresolved_resources.append(resource)
+
+    for resource, exposed in public_resources[:MAX_SUBNET_EXPOSURE_FINDINGS]:
+        described = "; ".join(
+            f"{subnet} routes {route['destination']} to {route['gateway']} "
+            f"through route table {route['route_table']}"
+            for subnet, route in sorted(exposed.items())
+        )
+        emitted.append(
+            create_finding(
+                check_id=check_id,
+                finding_name=finding_name,
+                finding_details=(
+                    f"{resource['name']} runs in a public subnet: {described}. The "
+                    "VPC attachment alone is not a privacy claim while a subnet "
+                    "carrying the workload has a route to an internet gateway."
+                ),
+                resolution=resolution,
+                reference=reference,
+                severity=severity,
+                status="Failed",
+                region=region,
+            )
+        )
+
+    if len(public_resources) > MAX_SUBNET_EXPOSURE_FINDINGS:
+        emitted.append(
+            create_finding(
+                check_id=check_id,
+                finding_name=finding_name,
+                finding_details=(
+                    f"{len(public_resources)} resource(s) run in subnets with a "
+                    f"route to an internet gateway (the first "
+                    f"{MAX_SUBNET_EXPOSURE_FINDINGS} are reported individually "
+                    "above)."
+                ),
+                resolution=resolution,
+                reference=reference,
+                severity=severity,
+                status="Failed",
+                region=region,
+            )
+        )
+
+    if private_resources:
+        named = ", ".join(resource["name"] for resource in private_resources[:3])
+        remainder = (
+            f" and {len(private_resources) - 3} more"
+            if len(private_resources) > 3
+            else ""
+        )
+        emitted.append(
+            create_finding(
+                check_id=check_id,
+                finding_name=finding_name,
+                finding_details=(
+                    f"{len(private_resources)} resource(s) run only in subnets "
+                    "whose route tables have no route to an internet gateway: "
+                    f"{named}{remainder}."
+                ),
+                resolution="No action required",
+                reference=reference,
+                severity=severity,
+                status="Passed",
+                region=region,
+            )
+        )
+
+    if unresolved_resources:
+        unreadable = sorted(
+            {
+                subnet
+                for resource in unresolved_resources
+                for subnet in resource.get("subnets", [])
+                if subnet in exposure["unresolved"]
+            }
+        )
+        emitted.append(
+            create_finding(
+                check_id=check_id,
+                finding_name=f"{finding_name} Incomplete",
+                finding_details=(
+                    f"{len(unresolved_resources)} resource(s) could not be checked "
+                    "for an internet gateway route because no route table was "
+                    f"found for subnet(s) {', '.join(unreadable) or 'they reference'}."
+                ),
+                resolution=(
+                    "Confirm those subnets still exist and that the assessment "
+                    "role holds ec2:DescribeSubnets and ec2:DescribeRouteTables, "
+                    "then rerun the assessment."
+                ),
+                reference=reference,
+                severity="Informational",
+                status="N/A",
+                region=region,
+            )
+        )
+
+    return emitted
+
+
 def iter_model_packages(sagemaker_client, group_name: str) -> Iterator[Dict[str, Any]]:
     """Yield every model package in a SageMaker model package group."""
     paginator = sagemaker_client.get_paginator("list_model_packages")
@@ -2093,6 +2371,31 @@ def check_sagemaker_notebook_vpc_deployment(region: str = "") -> Dict[str, Any]:
                     )
                 )
 
+        # AIR-FND-NET-01: a subnet id is not a privacy claim. A notebook in a
+        # subnet that routes to an internet gateway reaches the internet
+        # whatever DirectInternetAccess says, so the route table decides.
+        findings["csv_data"].extend(
+            _subnet_exposure_findings(
+                check_id="SM-10",
+                finding_name="SageMaker Notebook Subnet Internet Exposure",
+                resources=[
+                    {
+                        "name": f"Notebook instance '{notebook['name']}'",
+                        "subnets": [notebook["subnet_id"]],
+                    }
+                    for notebook in notebooks_with_vpc
+                ],
+                region=region,
+                reference="https://docs.aws.amazon.com/sagemaker/latest/dg/appendix-notebook-and-internet-access.html",
+                resolution=(
+                    "Recreate the notebook instance in a subnet whose route table "
+                    "has no internet gateway route, or remove that route from the "
+                    "subnet's route table."
+                ),
+                severity="High",
+            )
+        )
+
         return findings
 
     except Exception as e:
@@ -2116,6 +2419,7 @@ def check_sagemaker_notebook_vpc_deployment(region: str = "") -> Dict[str, Any]:
 
 
 MODEL_VPC_ATTACHMENT_FINDING = "SageMaker Model VPC Attachment"
+MODEL_SUBNET_EXPOSURE_FINDING = "SageMaker Model Subnet Internet Exposure"
 MODEL_VPC_ATTACHMENT_REFERENCE = (
     "https://docs.aws.amazon.com/sagemaker/latest/dg/host-vpc.html"
 )
@@ -2187,13 +2491,16 @@ def _model_vpc_attachment_findings(
                 finding_name=MODEL_VPC_ATTACHMENT_FINDING,
                 finding_details=(
                     f"{len(models_in_vpc)} model(s) are attached to customer "
-                    f"subnets: {described}. Confirm those subnets are private and "
-                    "that callers reach the endpoint through an interface VPC "
-                    "endpoint, which the model configuration does not record."
+                    f"subnets: {described}. Whether those subnets have a route to "
+                    "an internet gateway is reported under "
+                    f"'{MODEL_SUBNET_EXPOSURE_FINDING}'. Callers still reach the "
+                    "public runtime endpoint unless an interface VPC endpoint is "
+                    "in place, which the model configuration does not record."
                 ),
                 resolution=(
-                    "No action required on the model. Confirm the subnets have no "
-                    "route to an internet gateway."
+                    "No action required on the model. Reach it through a "
+                    "com.amazonaws.<region>.sagemaker.runtime interface VPC "
+                    "endpoint with an endpoint policy."
                 ),
                 reference=MODEL_VPC_ATTACHMENT_REFERENCE,
                 severity="Medium",
@@ -2201,6 +2508,28 @@ def _model_vpc_attachment_findings(
                 region=region,
             )
         )
+
+    # AIR-FND-NET-01: VpcConfig names the subnets but not their route tables, so
+    # the privacy the Passed row above used to ask the reader to confirm is
+    # asserted here instead.
+    emitted.extend(
+        _subnet_exposure_findings(
+            check_id="SM-11",
+            finding_name=MODEL_SUBNET_EXPOSURE_FINDING,
+            resources=[
+                {"name": f"Model '{model['name']}'", "subnets": model["subnets"]}
+                for model in models_in_vpc
+            ],
+            region=region,
+            reference=MODEL_VPC_ATTACHMENT_REFERENCE,
+            resolution=(
+                "Recreate the model with VpcConfig naming subnets whose route "
+                "tables have no internet gateway route, or remove that route from "
+                "the subnets' route tables."
+            ),
+            severity="Medium",
+        )
+    )
 
     return emitted
 
@@ -4878,6 +5207,7 @@ def check_hyperpod_vpc_configuration(
         )
         return findings
 
+    groups_in_vpc = []
     for item in inventory.get("items", []):
         detail = item["detail"]
         cluster_name = detail.get(
@@ -4890,6 +5220,16 @@ def check_hyperpod_vpc_configuration(
             compliant = bool(effective_vpc.get("Subnets")) and bool(
                 effective_vpc.get("SecurityGroupIds")
             )
+            if effective_vpc.get("Subnets"):
+                groups_in_vpc.append(
+                    {
+                        "name": (
+                            f"HyperPod cluster '{cluster_name}' instance group "
+                            f"'{group_name}'"
+                        ),
+                        "subnets": list(effective_vpc["Subnets"]),
+                    }
+                )
             findings["csv_data"].append(
                 create_finding(
                     check_id="SM-28",
@@ -4924,6 +5264,24 @@ def check_hyperpod_vpc_configuration(
                 region=region,
             )
         )
+
+    # AIR-FND-NET-01: the subnets above are read from the effective VPC config,
+    # which records no route table. One EC2 sweep covers every instance group.
+    findings["csv_data"].extend(
+        _subnet_exposure_findings(
+            check_id="SM-28",
+            finding_name="HyperPod Subnet Internet Exposure",
+            resources=groups_in_vpc,
+            region=region,
+            reference="https://docs.aws.amazon.com/sagemaker/latest/dg/sagemaker-hyperpod-security.html",
+            resolution=(
+                "Point the cluster or the instance group's OverrideVpcConfig at "
+                "subnets whose route tables have no internet gateway route, or "
+                "remove that route from the subnets' route tables."
+            ),
+            severity="Medium",
+        )
+    )
     return findings
 
 
@@ -5814,6 +6172,7 @@ def check_sagemaker_config_compliance_evaluation(region: str = "") -> Dict[str, 
 
 
 TRAINING_NETWORK_BOUNDARY_FINDING = "Training Job Network Boundary"
+TRAINING_SUBNET_EXPOSURE_FINDING = "SageMaker Training Job Subnet Internet Exposure"
 TRAINING_NETWORK_BOUNDARY_REFERENCE = (
     "https://docs.aws.amazon.com/sagemaker/latest/dg/train-vpc.html"
 )
@@ -5962,13 +6321,14 @@ def check_sagemaker_training_job_network_boundary(region: str = "") -> Dict[str,
                     finding_details=(
                         f"{len(jobs_in_vpc)} of the {jobs_sampled} most recent "
                         f"training jobs ran in customer subnets: {described}. "
-                        "Whether those subnets are private, and whether the job "
-                        "needed outbound access at all, is a workload decision the "
-                        "owner still has to confirm."
+                        "Whether those subnets have a route to an internet gateway "
+                        f"is reported under '{TRAINING_SUBNET_EXPOSURE_FINDING}'. "
+                        "Whether the job needed outbound access at all is a "
+                        "workload decision the owner still has to confirm."
                     ),
                     resolution=(
-                        "No action required on the VPC attachment. Confirm the "
-                        "subnets have no route to an internet gateway."
+                        "No action required on the VPC attachment. Review whether "
+                        "the job needed outbound access at all."
                     ),
                     reference=TRAINING_NETWORK_BOUNDARY_REFERENCE,
                     severity="Medium",
@@ -5993,6 +6353,30 @@ def check_sagemaker_training_job_network_boundary(region: str = "") -> Dict[str,
                     region=region,
                 )
             )
+
+        # AIR-FND-NET-01: a job's VpcConfig subnets decide nothing about egress
+        # until their route tables are read.
+        findings["csv_data"].extend(
+            _subnet_exposure_findings(
+                check_id="SM-33",
+                finding_name=TRAINING_SUBNET_EXPOSURE_FINDING,
+                resources=[
+                    {
+                        "name": f"Training job '{entry['name']}'",
+                        "subnets": entry["subnets"],
+                    }
+                    for entry in jobs_in_vpc
+                ],
+                region=region,
+                reference=TRAINING_NETWORK_BOUNDARY_REFERENCE,
+                resolution=(
+                    "Run training jobs with VpcConfig naming subnets whose route "
+                    "tables have no internet gateway route, or remove that route "
+                    "from the subnets' route tables."
+                ),
+                severity="Medium",
+            )
+        )
 
         return findings
 

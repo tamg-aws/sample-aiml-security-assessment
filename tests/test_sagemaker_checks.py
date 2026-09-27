@@ -383,7 +383,10 @@ class TestProposedSageMakerChecks:
         assert finding["Status"] == "Failed"
         assert finding["Severity"] == "High"
 
-    def test_sm27_and_sm28_share_hyperpod_inventory(self):
+    # SM-28 now reads the route tables of the effective VPC subnets, so boto3 is
+    # patched here to keep this unit test off the network.
+    @patch("sagemaker_app.boto3.client")
+    def test_sm27_and_sm28_share_hyperpod_inventory(self, mock_client):
         inventory = {
             "items": [
                 {
@@ -3846,3 +3849,736 @@ class TestSM34CreationGuardrails:
         )
         assert [f["Status"] for f in findings] == ["N/A"]
         assert "could not be listed" in findings[0]["Finding_Details"]
+
+
+# ===================================================================
+# AIR-FND-NET-01: a subnet id is not a privacy claim
+# ===================================================================
+def _subnet(subnet_id, vpc_id="vpc-1"):
+    return {"SubnetId": subnet_id, "VpcId": vpc_id, "AvailabilityZone": "us-east-1a"}
+
+
+def _route_table(route_table_id, routes, associations, vpc_id="vpc-1"):
+    return {
+        "RouteTableId": route_table_id,
+        "VpcId": vpc_id,
+        "OwnerId": "123456789012",
+        "Associations": associations,
+        "Routes": routes,
+        "PropagatingVgws": [],
+    }
+
+
+LOCAL_ROUTE = {
+    "DestinationCidrBlock": "10.0.0.0/16",
+    "GatewayId": "local",
+    "State": "active",
+    "Origin": "CreateRouteTable",
+}
+IGW_ROUTE = {
+    "DestinationCidrBlock": "0.0.0.0/0",
+    "GatewayId": "igw-public1",
+    "State": "active",
+    "Origin": "CreateRoute",
+}
+NAT_ROUTE = {
+    "DestinationCidrBlock": "0.0.0.0/0",
+    "NatGatewayId": "nat-0abc",
+    "State": "active",
+    "Origin": "CreateRoute",
+}
+
+
+def _explicit(subnet_id, association_id="rtbassoc-1"):
+    return [
+        {
+            "RouteTableAssociationId": association_id,
+            "SubnetId": subnet_id,
+            "Main": False,
+            "AssociationState": {"State": "associated"},
+        }
+    ]
+
+
+def _main_association():
+    return [
+        {
+            "RouteTableAssociationId": "rtbassoc-main",
+            "Main": True,
+            "AssociationState": {"State": "associated"},
+        }
+    ]
+
+
+def _ec2_exposure_client(subnets, route_tables):
+    """An EC2 client whose paginators return DescribeSubnets/DescribeRouteTables."""
+    ec2 = MagicMock()
+    calls = {"describe_subnets": [], "describe_route_tables": []}
+
+    def get_paginator(operation_name):
+        if operation_name not in calls:
+            raise AssertionError(f"unexpected ec2 paginator: {operation_name}")
+        paginator = MagicMock()
+
+        def paginate(**kwargs):
+            calls[operation_name].append(kwargs)
+            if operation_name == "describe_subnets":
+                return [{"Subnets": subnets}]
+            return [{"RouteTables": route_tables}]
+
+        paginator.paginate.side_effect = paginate
+        return paginator
+
+    ec2.get_paginator.side_effect = get_paginator
+    ec2.paginate_calls = calls
+    return ec2
+
+
+PUBLIC_SUBNET_FIXTURE = (
+    [_subnet("subnet-public")],
+    [_route_table("rtb-public", [LOCAL_ROUTE, IGW_ROUTE], _explicit("subnet-public"))],
+)
+PRIVATE_SUBNET_FIXTURE = (
+    [_subnet("subnet-private")],
+    [
+        _route_table(
+            "rtb-private", [LOCAL_ROUTE, NAT_ROUTE], _explicit("subnet-private")
+        )
+    ],
+)
+
+
+class TestResolveSubnetInternetExposure:
+    """The route-table leg behind SM-10, SM-11, SM-28 and SM-33."""
+
+    @patch("sagemaker_app.boto3.client")
+    def test_no_subnets_makes_no_ec2_call(self, mock_client):
+        exposure = sagemaker_app.resolve_subnet_internet_exposure([], "us-east-1")
+        assert exposure == {
+            "public": {},
+            "private": set(),
+            "unresolved": set(),
+            "error": None,
+        }
+        mock_client.assert_not_called()
+
+    @patch("sagemaker_app.boto3.client")
+    def test_explicitly_associated_igw_route_is_public(self, mock_client):
+        mock_client.side_effect = _sm_client_factory(
+            ec2=_ec2_exposure_client(*PUBLIC_SUBNET_FIXTURE)
+        )
+        exposure = sagemaker_app.resolve_subnet_internet_exposure(
+            ["subnet-public"], "us-east-1"
+        )
+        assert exposure["public"] == {
+            "subnet-public": {
+                "gateway": "igw-public1",
+                "destination": "0.0.0.0/0",
+                "route_table": "rtb-public",
+            }
+        }
+        assert exposure["private"] == set()
+        assert exposure["unresolved"] == set()
+
+    @patch("sagemaker_app.boto3.client")
+    def test_unassociated_subnet_uses_the_vpc_main_route_table(self, mock_client):
+        # A subnet with no explicit association routes through the main table, so
+        # reading only explicit associations would call this subnet unresolved.
+        mock_client.side_effect = _sm_client_factory(
+            ec2=_ec2_exposure_client(
+                [_subnet("subnet-implicit")],
+                [
+                    _route_table(
+                        "rtb-main", [LOCAL_ROUTE, IGW_ROUTE], _main_association()
+                    )
+                ],
+            )
+        )
+        exposure = sagemaker_app.resolve_subnet_internet_exposure(
+            ["subnet-implicit"], "us-east-1"
+        )
+        assert set(exposure["public"]) == {"subnet-implicit"}
+        assert exposure["public"]["subnet-implicit"]["route_table"] == "rtb-main"
+
+    @patch("sagemaker_app.boto3.client")
+    def test_explicit_association_wins_over_the_main_route_table(self, mock_client):
+        mock_client.side_effect = _sm_client_factory(
+            ec2=_ec2_exposure_client(
+                [_subnet("subnet-private")],
+                [
+                    _route_table(
+                        "rtb-main", [LOCAL_ROUTE, IGW_ROUTE], _main_association()
+                    ),
+                    _route_table(
+                        "rtb-private",
+                        [LOCAL_ROUTE, NAT_ROUTE],
+                        _explicit("subnet-private"),
+                    ),
+                ],
+            )
+        )
+        exposure = sagemaker_app.resolve_subnet_internet_exposure(
+            ["subnet-private"], "us-east-1"
+        )
+        assert exposure["private"] == {"subnet-private"}
+        assert exposure["public"] == {}
+
+    @pytest.mark.parametrize(
+        ("route", "label"),
+        [
+            (NAT_ROUTE, "nat gateway"),
+            (
+                {
+                    "DestinationIpv6CidrBlock": "::/0",
+                    "EgressOnlyInternetGatewayId": "eigw-0abc",
+                    "State": "active",
+                },
+                "egress-only gateway",
+            ),
+            (
+                {
+                    "DestinationCidrBlock": "0.0.0.0/0",
+                    "GatewayId": "igw-deleted",
+                    "State": "blackhole",
+                },
+                "blackhole igw route",
+            ),
+            (
+                {
+                    "DestinationCidrBlock": "192.168.0.0/16",
+                    "VpcPeeringConnectionId": "pcx-0abc",
+                    "State": "active",
+                },
+                "peering connection",
+            ),
+        ],
+    )
+    @patch("sagemaker_app.boto3.client")
+    def test_non_internet_gateway_routes_stay_private(self, mock_client, route, label):
+        mock_client.side_effect = _sm_client_factory(
+            ec2=_ec2_exposure_client(
+                [_subnet("subnet-private")],
+                [
+                    _route_table(
+                        "rtb-private", [LOCAL_ROUTE, route], _explicit("subnet-private")
+                    )
+                ],
+            )
+        )
+        exposure = sagemaker_app.resolve_subnet_internet_exposure(
+            ["subnet-private"], "us-east-1"
+        )
+        assert exposure["private"] == {"subnet-private"}, label
+        assert exposure["public"] == {}, label
+
+    @patch("sagemaker_app.boto3.client")
+    def test_ipv6_default_route_to_an_igw_is_public(self, mock_client):
+        # The exposing route family is "any route to an igw-", not the one
+        # 0.0.0.0/0 member of it.
+        ipv6_route = {
+            "DestinationIpv6CidrBlock": "::/0",
+            "GatewayId": "igw-public1",
+            "State": "active",
+        }
+        mock_client.side_effect = _sm_client_factory(
+            ec2=_ec2_exposure_client(
+                [_subnet("subnet-v6")],
+                [
+                    _route_table(
+                        "rtb-v6", [LOCAL_ROUTE, ipv6_route], _explicit("subnet-v6")
+                    )
+                ],
+            )
+        )
+        exposure = sagemaker_app.resolve_subnet_internet_exposure(
+            ["subnet-v6"], "us-east-1"
+        )
+        assert exposure["public"]["subnet-v6"]["destination"] == "::/0"
+
+    @patch("sagemaker_app.boto3.client")
+    def test_subnet_that_no_longer_exists_is_unresolved(self, mock_client):
+        mock_client.side_effect = _sm_client_factory(
+            ec2=_ec2_exposure_client(*PUBLIC_SUBNET_FIXTURE)
+        )
+        exposure = sagemaker_app.resolve_subnet_internet_exposure(
+            ["subnet-public", "subnet-deleted"], "us-east-1"
+        )
+        assert exposure["unresolved"] == {"subnet-deleted"}
+        assert set(exposure["public"]) == {"subnet-public"}
+
+    @patch("sagemaker_app.boto3.client")
+    def test_subnet_with_no_applicable_route_table_is_unresolved(self, mock_client):
+        mock_client.side_effect = _sm_client_factory(
+            ec2=_ec2_exposure_client([_subnet("subnet-orphan")], [])
+        )
+        exposure = sagemaker_app.resolve_subnet_internet_exposure(
+            ["subnet-orphan"], "us-east-1"
+        )
+        assert exposure["unresolved"] == {"subnet-orphan"}
+        assert exposure["private"] == set()
+
+    @patch("sagemaker_app.boto3.client")
+    def test_access_denied_is_reported_as_an_error_label(self, mock_client):
+        ec2 = MagicMock()
+        ec2.get_paginator.side_effect = _make_client_error("AccessDeniedException")
+        mock_client.side_effect = _sm_client_factory(ec2=ec2)
+        exposure = sagemaker_app.resolve_subnet_internet_exposure(
+            ["subnet-a"], "us-east-1"
+        )
+        assert exposure["error"] == "AccessDeniedException"
+        assert exposure["public"] == {}
+
+    @patch("sagemaker_app.boto3.client")
+    def test_lookups_are_batched_not_one_call_per_subnet(self, mock_client):
+        subnet_ids = [f"subnet-{index:04d}" for index in range(150)]
+        ec2 = _ec2_exposure_client(
+            [_subnet(subnet_id) for subnet_id in subnet_ids],
+            [_route_table("rtb-main", [LOCAL_ROUTE], _main_association())],
+        )
+        mock_client.side_effect = _sm_client_factory(ec2=ec2)
+        exposure = sagemaker_app.resolve_subnet_internet_exposure(
+            subnet_ids, "us-east-1"
+        )
+        subnet_calls = ec2.paginate_calls["describe_subnets"]
+        assert len(subnet_calls) == 2
+        assert [len(call["Filters"][0]["Values"]) for call in subnet_calls] == [100, 50]
+        assert ec2.paginate_calls["describe_route_tables"] == [
+            {"Filters": [{"Name": "vpc-id", "Values": ["vpc-1"]}]}
+        ]
+        assert len(exposure["private"]) == 150
+
+
+class TestSubnetExposureFindings:
+    """One public resource must not cost the private ones their Passed row."""
+
+    @patch("sagemaker_app.boto3.client")
+    def test_public_resource_does_not_suppress_the_passed_row(self, mock_client):
+        mock_client.side_effect = _sm_client_factory(
+            ec2=_ec2_exposure_client(
+                [_subnet("subnet-public"), _subnet("subnet-private")],
+                [
+                    _route_table(
+                        "rtb-public",
+                        [LOCAL_ROUTE, IGW_ROUTE],
+                        _explicit("subnet-public"),
+                    ),
+                    _route_table(
+                        "rtb-private",
+                        [LOCAL_ROUTE, NAT_ROUTE],
+                        _explicit("subnet-private", "rtbassoc-2"),
+                    ),
+                ],
+            )
+        )
+        findings = sagemaker_app._subnet_exposure_findings(
+            check_id="SM-11",
+            finding_name="SageMaker Model Subnet Internet Exposure",
+            resources=[
+                {"name": "Model 'open'", "subnets": ["subnet-public"]},
+                {"name": "Model 'closed'", "subnets": ["subnet-private"]},
+            ],
+            region="us-east-1",
+            reference=sagemaker_app.MODEL_VPC_ATTACHMENT_REFERENCE,
+            resolution="Move it",
+            severity="Medium",
+        )
+        statuses = [f["Status"] for f in findings]
+        assert statuses.count("Failed") == 1
+        assert statuses.count("Passed") == 1
+        failed = next(f for f in findings if f["Status"] == "Failed")
+        passed = next(f for f in findings if f["Status"] == "Passed")
+        assert "Model 'open'" in failed["Finding_Details"]
+        assert "igw-public1" in failed["Finding_Details"]
+        assert "Model 'closed'" in passed["Finding_Details"]
+        for finding in findings:
+            assert_finding_schema(finding)
+
+    @patch("sagemaker_app.boto3.client")
+    def test_more_than_twenty_public_resources_are_summarised(self, mock_client):
+        subnet_ids = [f"subnet-p{index:02d}" for index in range(25)]
+        mock_client.side_effect = _sm_client_factory(
+            ec2=_ec2_exposure_client(
+                [_subnet(subnet_id) for subnet_id in subnet_ids],
+                [
+                    _route_table(
+                        "rtb-main", [LOCAL_ROUTE, IGW_ROUTE], _main_association()
+                    )
+                ],
+            )
+        )
+        findings = sagemaker_app._subnet_exposure_findings(
+            check_id="SM-33",
+            finding_name=sagemaker_app.TRAINING_SUBNET_EXPOSURE_FINDING,
+            resources=[
+                {"name": f"Training job 'job-{index}'", "subnets": [subnet_id]}
+                for index, subnet_id in enumerate(subnet_ids)
+            ],
+            region="us-east-1",
+            reference=sagemaker_app.TRAINING_NETWORK_BOUNDARY_REFERENCE,
+            resolution="Move it",
+            severity="Medium",
+        )
+        failed = [f for f in findings if f["Status"] == "Failed"]
+        assert len(failed) == 21
+        assert "25 resource(s)" in failed[-1]["Finding_Details"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_unreadable_route_tables_are_na_not_passed(self, mock_client):
+        mock_client.side_effect = _sm_client_factory(
+            ec2=_ec2_exposure_client([_subnet("subnet-orphan")], [])
+        )
+        findings = sagemaker_app._subnet_exposure_findings(
+            check_id="SM-10",
+            finding_name="SageMaker Notebook Subnet Internet Exposure",
+            resources=[
+                {"name": "Notebook instance 'nb'", "subnets": ["subnet-orphan"]}
+            ],
+            region="us-east-1",
+            reference="https://docs.aws.amazon.com/sagemaker/latest/dg/security.html",
+            resolution="Move it",
+            severity="High",
+        )
+        assert [f["Status"] for f in findings] == ["N/A"]
+        assert "subnet-orphan" in findings[0]["Finding_Details"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_ec2_failure_reports_one_incomplete_row(self, mock_client):
+        ec2 = MagicMock()
+        ec2.get_paginator.side_effect = _make_client_error("AccessDeniedException")
+        mock_client.side_effect = _sm_client_factory(ec2=ec2)
+        findings = sagemaker_app._subnet_exposure_findings(
+            check_id="SM-28",
+            finding_name="HyperPod Subnet Internet Exposure",
+            resources=[
+                {
+                    "name": "HyperPod cluster 'c' instance group 'g'",
+                    "subnets": ["subnet-a"],
+                }
+            ],
+            region="us-east-1",
+            reference="https://docs.aws.amazon.com/sagemaker/latest/dg/sagemaker-hyperpod-security.html",
+            resolution="Move it",
+            severity="Medium",
+        )
+        assert [f["Status"] for f in findings] == ["N/A"]
+        assert "AccessDeniedException" in findings[0]["Finding_Details"]
+        assert "ec2:DescribeRouteTables" in findings[0]["Resolution"]
+
+
+class TestSubnetExposurePerCheck:
+    """Each of SM-10, SM-11, SM-28 and SM-33 reads the route tables itself."""
+
+    @staticmethod
+    def _notebooks(mock_client, notebooks, ec2):
+        mock_sm = MagicMock()
+        paginator = MagicMock()
+        mock_sm.get_paginator.return_value = paginator
+        paginator.paginate.return_value = [
+            {
+                "NotebookInstances": [
+                    {"NotebookInstanceName": name} for name in notebooks
+                ]
+            }
+        ]
+        mock_sm.describe_notebook_instance.side_effect = lambda NotebookInstanceName: (
+            notebooks[NotebookInstanceName]
+        )
+        mock_client.side_effect = _sm_client_factory(sagemaker=mock_sm, ec2=ec2)
+
+    @patch("sagemaker_app.boto3.client")
+    def test_sm10_notebook_in_a_public_subnet_is_failed(self, mock_client):
+        self._notebooks(
+            mock_client,
+            {
+                "nb-public": {
+                    "NotebookInstanceName": "nb-public",
+                    "SubnetId": "subnet-public",
+                    "VpcId": "vpc-1",
+                }
+            },
+            _ec2_exposure_client(*PUBLIC_SUBNET_FIXTURE),
+        )
+        findings = extract_csv_data(
+            sagemaker_app.check_sagemaker_notebook_vpc_deployment(region="us-east-1")
+        )
+        exposure_rows = [
+            f
+            for f in findings
+            if f["Finding"] == "SageMaker Notebook Subnet Internet Exposure"
+        ]
+        assert [f["Status"] for f in exposure_rows] == ["Failed"]
+        assert "nb-public" in exposure_rows[0]["Finding_Details"]
+        assert "subnet-public" in exposure_rows[0]["Finding_Details"]
+        assert "igw-public1" in exposure_rows[0]["Finding_Details"]
+        for f in findings:
+            assert f["Check_ID"] == "SM-10"
+            assert_finding_schema(f)
+
+    @patch("sagemaker_app.boto3.client")
+    def test_sm10_notebook_in_a_private_subnet_passes_both_legs(self, mock_client):
+        self._notebooks(
+            mock_client,
+            {
+                "nb-private": {
+                    "NotebookInstanceName": "nb-private",
+                    "SubnetId": "subnet-private",
+                    "VpcId": "vpc-1",
+                }
+            },
+            _ec2_exposure_client(*PRIVATE_SUBNET_FIXTURE),
+        )
+        findings = extract_csv_data(
+            sagemaker_app.check_sagemaker_notebook_vpc_deployment(region="us-east-1")
+        )
+        assert [f["Status"] for f in findings] == ["Passed", "Passed"]
+
+    @staticmethod
+    def _models(mock_client, details, ec2):
+        mock_sm = MagicMock()
+        paginator = MagicMock()
+        mock_sm.get_paginator.return_value = paginator
+        paginator.paginate.return_value = [
+            {"Models": [{"ModelName": name} for name in details]}
+        ]
+        mock_sm.describe_model.side_effect = lambda ModelName: details[ModelName]
+        mock_client.side_effect = _sm_client_factory(sagemaker=mock_sm, ec2=ec2)
+
+    @patch("sagemaker_app.boto3.client")
+    def test_sm11_model_in_a_public_subnet_is_failed(self, mock_client):
+        self._models(
+            mock_client,
+            {
+                "public-model": {
+                    "EnableNetworkIsolation": True,
+                    "VpcConfig": {
+                        "Subnets": ["subnet-public"],
+                        "SecurityGroupIds": ["sg-1"],
+                    },
+                }
+            },
+            _ec2_exposure_client(*PUBLIC_SUBNET_FIXTURE),
+        )
+        findings = extract_csv_data(
+            sagemaker_app.check_sagemaker_model_network_isolation(region="us-east-1")
+        )
+        exposure_rows = [
+            f
+            for f in findings
+            if f["Finding"] == sagemaker_app.MODEL_SUBNET_EXPOSURE_FINDING
+        ]
+        assert [f["Status"] for f in exposure_rows] == ["Failed"]
+        assert "Model 'public-model'" in exposure_rows[0]["Finding_Details"]
+        assert "igw-public1" in exposure_rows[0]["Finding_Details"]
+        attachment_rows = [
+            f
+            for f in findings
+            if f["Finding"] == sagemaker_app.MODEL_VPC_ATTACHMENT_FINDING
+        ]
+        assert [f["Status"] for f in attachment_rows] == ["Passed"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_sm11_passed_attachment_row_no_longer_asks_the_reader_to_confirm(
+        self, mock_client
+    ):
+        self._models(
+            mock_client,
+            {
+                "private-model": {
+                    "EnableNetworkIsolation": True,
+                    "VpcConfig": {
+                        "Subnets": ["subnet-private"],
+                        "SecurityGroupIds": ["sg-1"],
+                    },
+                }
+            },
+            _ec2_exposure_client(*PRIVATE_SUBNET_FIXTURE),
+        )
+        findings = extract_csv_data(
+            sagemaker_app.check_sagemaker_model_network_isolation(region="us-east-1")
+        )
+        attachment = next(
+            f
+            for f in findings
+            if f["Finding"] == sagemaker_app.MODEL_VPC_ATTACHMENT_FINDING
+        )
+        exposure = next(
+            f
+            for f in findings
+            if f["Finding"] == sagemaker_app.MODEL_SUBNET_EXPOSURE_FINDING
+        )
+        assert "Confirm those subnets are private" not in attachment["Finding_Details"]
+        assert (
+            "Confirm the subnets have no route to an internet gateway"
+            not in attachment["Resolution"]
+        )
+        assert (
+            sagemaker_app.MODEL_SUBNET_EXPOSURE_FINDING in attachment["Finding_Details"]
+        )
+        assert exposure["Status"] == "Passed"
+
+    @staticmethod
+    def _hyperpod_inventory(subnets, override=None):
+        group = {"InstanceGroupName": "workers"}
+        if override is not None:
+            group["OverrideVpcConfig"] = override
+        return {
+            "items": [
+                {
+                    "summary": {"ClusterName": "cluster-1"},
+                    "detail": {
+                        "ClusterName": "cluster-1",
+                        "VpcConfig": {
+                            "Subnets": subnets,
+                            "SecurityGroupIds": ["sg-1"],
+                        },
+                        "InstanceGroups": [group],
+                    },
+                }
+            ],
+            "errors": [],
+            "list_error": None,
+        }
+
+    @patch("sagemaker_app.boto3.client")
+    def test_sm28_instance_group_in_a_public_subnet_is_failed(self, mock_client):
+        mock_client.side_effect = _sm_client_factory(
+            ec2=_ec2_exposure_client(*PUBLIC_SUBNET_FIXTURE)
+        )
+        findings = extract_csv_data(
+            sagemaker_app.check_hyperpod_vpc_configuration(
+                "us-east-1", self._hyperpod_inventory(["subnet-public"])
+            )
+        )
+        exposure_rows = [
+            f for f in findings if f["Finding"] == "HyperPod Subnet Internet Exposure"
+        ]
+        assert [f["Status"] for f in exposure_rows] == ["Failed"]
+        assert "instance group 'workers'" in exposure_rows[0]["Finding_Details"]
+        assert "igw-public1" in exposure_rows[0]["Finding_Details"]
+        assert [
+            f["Status"]
+            for f in findings
+            if f["Finding"] == "HyperPod VPC Configuration"
+        ] == ["Passed"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_sm28_reads_the_override_subnets_not_the_cluster_subnets(self, mock_client):
+        mock_client.side_effect = _sm_client_factory(
+            ec2=_ec2_exposure_client(
+                [_subnet("subnet-public"), _subnet("subnet-private")],
+                [
+                    _route_table(
+                        "rtb-public",
+                        [LOCAL_ROUTE, IGW_ROUTE],
+                        _explicit("subnet-public"),
+                    ),
+                    _route_table(
+                        "rtb-private",
+                        [LOCAL_ROUTE, NAT_ROUTE],
+                        _explicit("subnet-private", "rtbassoc-2"),
+                    ),
+                ],
+            )
+        )
+        findings = extract_csv_data(
+            sagemaker_app.check_hyperpod_vpc_configuration(
+                "us-east-1",
+                self._hyperpod_inventory(
+                    ["subnet-private"],
+                    override={
+                        "Subnets": ["subnet-public"],
+                        "SecurityGroupIds": ["sg-2"],
+                    },
+                ),
+            )
+        )
+        exposure_rows = [
+            f for f in findings if f["Finding"] == "HyperPod Subnet Internet Exposure"
+        ]
+        assert [f["Status"] for f in exposure_rows] == ["Failed"]
+        assert "subnet-public" in exposure_rows[0]["Finding_Details"]
+
+    @staticmethod
+    def _jobs(mock_client, jobs, ec2):
+        mock_sm = MagicMock()
+        paginator = MagicMock()
+        mock_sm.get_paginator.return_value = paginator
+        paginator.paginate.return_value = [
+            {"TrainingJobSummaries": [{"TrainingJobName": name} for name in jobs]}
+        ]
+        mock_sm.describe_training_job.side_effect = lambda TrainingJobName: jobs[
+            TrainingJobName
+        ]
+        mock_client.side_effect = _sm_client_factory(sagemaker=mock_sm, ec2=ec2)
+
+    @patch("sagemaker_app.boto3.client")
+    def test_sm33_training_job_in_a_public_subnet_is_failed(self, mock_client):
+        self._jobs(
+            mock_client,
+            {
+                "public-job": {
+                    "VpcConfig": {
+                        "Subnets": ["subnet-public"],
+                        "SecurityGroupIds": ["sg-1"],
+                    },
+                    "EnableNetworkIsolation": True,
+                }
+            },
+            _ec2_exposure_client(*PUBLIC_SUBNET_FIXTURE),
+        )
+        findings = extract_csv_data(
+            sagemaker_app.check_sagemaker_training_job_network_boundary(
+                region="us-east-1"
+            )
+        )
+        exposure_rows = [
+            f
+            for f in findings
+            if f["Finding"] == sagemaker_app.TRAINING_SUBNET_EXPOSURE_FINDING
+        ]
+        assert [f["Status"] for f in exposure_rows] == ["Failed"]
+        assert "Training job 'public-job'" in exposure_rows[0]["Finding_Details"]
+        assert "igw-public1" in exposure_rows[0]["Finding_Details"]
+        for f in findings:
+            assert f["Check_ID"] == "SM-33"
+            assert_finding_schema(f)
+
+    @patch("sagemaker_app.boto3.client")
+    def test_sm33_passed_boundary_row_no_longer_asks_the_reader_to_confirm(
+        self, mock_client
+    ):
+        self._jobs(
+            mock_client,
+            {
+                "private-job": {
+                    "VpcConfig": {
+                        "Subnets": ["subnet-private"],
+                        "SecurityGroupIds": ["sg-1"],
+                    },
+                    "EnableNetworkIsolation": True,
+                }
+            },
+            _ec2_exposure_client(*PRIVATE_SUBNET_FIXTURE),
+        )
+        findings = extract_csv_data(
+            sagemaker_app.check_sagemaker_training_job_network_boundary(
+                region="us-east-1"
+            )
+        )
+        boundary = next(
+            f
+            for f in findings
+            if f["Finding"] == sagemaker_app.TRAINING_NETWORK_BOUNDARY_FINDING
+        )
+        exposure = next(
+            f
+            for f in findings
+            if f["Finding"] == sagemaker_app.TRAINING_SUBNET_EXPOSURE_FINDING
+        )
+        assert "Whether those subnets are private" not in boundary["Finding_Details"]
+        assert (
+            "Confirm the subnets have no route to an internet gateway"
+            not in boundary["Resolution"]
+        )
+        assert exposure["Status"] == "Passed"
+        assert "Training job 'private-job'" in exposure["Finding_Details"]

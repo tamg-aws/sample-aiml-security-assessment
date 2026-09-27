@@ -2,6 +2,7 @@
 
 import csv
 import importlib.util
+import json
 import os
 import sys
 from datetime import datetime, timedelta, timezone
@@ -1240,3 +1241,448 @@ def test_ar09_reports_a_permission_cache_failure_as_indeterminate():
     ]
     assert [(row["Status"], row["Region"]) for row in rows] == [("N/A", "Global")]
     assert "IAM permission cache" in rows[0]["Finding_Details"]
+
+
+# ===================================================================
+# AR-10: AIR-ACR-REG-02, registry lifecycle events are actually routed
+# ===================================================================
+def _rule(name, pattern=None, state="ENABLED"):
+    rule = {
+        "Name": name,
+        "Arn": f"arn:aws:events:us-east-1:123456789012:rule/default/{name}",
+        "State": state,
+        "EventBusName": "default",
+    }
+    if pattern is not None:
+        rule["EventPattern"] = (
+            pattern if isinstance(pattern, str) else json.dumps(pattern)
+        )
+    return rule
+
+
+def _approval_pattern(source=None, detail_types=None):
+    pattern = {"source": source or [agent_registry_app.REGISTRY_EVENT_SOURCE]}
+    if detail_types is not None:
+        pattern["detail-type"] = detail_types
+    return pattern
+
+
+def _events_client(rules, targets=None, list_error=None, target_errors=None):
+    """An EventBridge client over ListRules and ListTargetsByRule."""
+    client = MagicMock()
+    targets = targets or {}
+    target_errors = target_errors or {}
+    client.target_calls = []
+
+    def get_paginator(operation_name):
+        paginator = MagicMock()
+        if operation_name == "list_rules":
+
+            def paginate_rules(**kwargs):
+                if list_error is not None:
+                    raise list_error
+                assert kwargs == {"EventBusName": "default"}
+                return [{"Rules": rules}]
+
+            paginator.paginate.side_effect = paginate_rules
+        elif operation_name == "list_targets_by_rule":
+
+            def paginate_targets(Rule, EventBusName):
+                client.target_calls.append(Rule)
+                if Rule in target_errors:
+                    raise target_errors[Rule]
+                count = targets.get(Rule, 0)
+                return [
+                    {
+                        "Targets": [
+                            {
+                                "Id": f"target-{index}",
+                                "Arn": f"arn:aws:sns:us-east-1:123456789012:t{index}",
+                            }
+                            for index in range(count)
+                        ]
+                    }
+                ]
+
+            paginator.paginate.side_effect = paginate_targets
+        else:
+            raise AssertionError(f"unexpected events paginator: {operation_name}")
+        return paginator
+
+    client.get_paginator.side_effect = get_paginator
+    return client
+
+
+def _routing_findings(rules, inventory=None, **client_kwargs):
+    client = _events_client(rules, **client_kwargs)
+    with patch.object(agent_registry_app, "events_client", client):
+        rule_inventory = agent_registry_app.get_registry_event_rule_inventory()
+    findings = agent_registry_app.check_agent_registry_lifecycle_event_routing(
+        inventory if inventory is not None else _ready_registry_inventory(),
+        rule_inventory,
+    )
+    for finding in findings:
+        assert finding["Check_ID"] == "AR-10"
+        assert_finding_schema(finding)
+    return findings, client
+
+
+def test_ar10_routed_approval_events_pass_and_name_the_rule():
+    findings, client = _routing_findings(
+        [
+            _rule(
+                "registry-approvals",
+                _approval_pattern(
+                    detail_types=list(agent_registry_app.REGISTRY_APPROVAL_DETAIL_TYPES)
+                ),
+            )
+        ],
+        targets={"registry-approvals": 1},
+    )
+    assert [f["Status"] for f in findings] == ["Passed"]
+    assert "registry-approvals" in findings[0]["Finding_Details"]
+    assert "1 target(s)" in findings[0]["Finding_Details"]
+    assert "'inventory'" in findings[0]["Finding_Details"]
+    assert client.target_calls == ["registry-approvals"]
+
+
+def test_ar10_rule_with_no_detail_type_filter_matches_every_transition():
+    # An absent event-pattern field matches every value, so a rule filtered on
+    # source alone routes all three approval transitions.
+    findings, _ = _routing_findings(
+        [_rule("all-registry-events", _approval_pattern())],
+        targets={"all-registry-events": 2},
+    )
+    assert [f["Status"] for f in findings] == ["Passed"]
+    assert "2 target(s)" in findings[0]["Finding_Details"]
+
+
+def test_ar10_rule_with_no_source_filter_matches_the_registry_source():
+    findings, _ = _routing_findings(
+        [
+            _rule(
+                "catch-all",
+                {"detail-type": ["Registry Record State changed to Approved"]},
+            )
+        ],
+        targets={"catch-all": 1},
+    )
+    statuses = [f["Status"] for f in findings]
+    assert statuses == ["Failed"]
+    # It reaches the source but only one of the three approval transitions.
+    assert (
+        "Registry Record State changed to Pending Approval"
+        in (findings[0]["Finding_Details"])
+    )
+    assert "catch-all" in findings[0]["Finding_Details"]
+
+
+def test_ar10_matching_rule_with_zero_targets_is_failed_twice_over():
+    findings, _ = _routing_findings(
+        [_rule("discarding-rule", _approval_pattern())],
+        targets={"discarding-rule": 0},
+    )
+    assert [f["Status"] for f in findings] == ["Failed", "Failed"]
+    assert "has no targets" in findings[0]["Finding_Details"]
+    assert "discarding-rule" in findings[0]["Finding_Details"]
+    assert "route none of them to a target" in findings[1]["Finding_Details"]
+
+
+def test_ar10_no_rules_at_all_is_failed_and_says_how_many_were_examined():
+    findings, client = _routing_findings([])
+    assert [f["Status"] for f in findings] == ["Failed"]
+    assert "None of the 0 rule(s)" in findings[0]["Finding_Details"]
+    assert client.target_calls == []
+
+
+def test_ar10_unrelated_rules_are_counted_but_not_queried_for_targets():
+    findings, client = _routing_findings(
+        [
+            _rule("s3-events", {"source": ["aws.s3"]}),
+            _rule("ec2-events", {"source": "aws.ec2"}),
+            _rule("scheduled", None),
+        ]
+    )
+    assert [f["Status"] for f in findings] == ["Failed"]
+    assert "None of the 3 rule(s)" in findings[0]["Finding_Details"]
+    assert client.target_calls == []
+
+
+def test_ar10_preview_only_source_is_reported_not_accepted_as_coverage():
+    findings, _ = _routing_findings(
+        [
+            _rule(
+                "preview-rule",
+                _approval_pattern(
+                    source=[agent_registry_app.REGISTRY_PREVIEW_EVENT_SOURCE]
+                ),
+            )
+        ],
+        targets={"preview-rule": 3},
+    )
+    assert [f["Status"] for f in findings] == ["Failed", "Failed"]
+    assert (
+        agent_registry_app.REGISTRY_PREVIEW_EVENT_SOURCE
+        in findings[0]["Finding_Details"]
+    )
+    assert (
+        agent_registry_app.REGISTRY_PREVIEW_EVENT_SOURCE_END
+        in findings[0]["Finding_Details"]
+    )
+    assert "route none of them to a target" in findings[1]["Finding_Details"]
+
+
+def test_ar10_rule_listing_both_sources_counts_as_ga_coverage():
+    findings, _ = _routing_findings(
+        [
+            _rule(
+                "both-sources",
+                _approval_pattern(
+                    source=[
+                        agent_registry_app.REGISTRY_PREVIEW_EVENT_SOURCE,
+                        agent_registry_app.REGISTRY_EVENT_SOURCE,
+                    ]
+                ),
+            )
+        ],
+        targets={"both-sources": 1},
+    )
+    assert [f["Status"] for f in findings] == ["Passed"]
+
+
+def test_ar10_disabled_rule_routes_nothing():
+    findings, _ = _routing_findings(
+        [_rule("paused-rule", _approval_pattern(), state="DISABLED")],
+        targets={"paused-rule": 1},
+    )
+    assert [f["Status"] for f in findings] == ["Failed", "Failed"]
+    assert "is DISABLED" in findings[0]["Finding_Details"]
+
+
+def test_ar10_cloudtrail_management_state_still_counts_as_enabled():
+    findings, _ = _routing_findings(
+        [
+            _rule(
+                "audited-rule",
+                _approval_pattern(),
+                state="ENABLED_WITH_ALL_CLOUDTRAIL_MANAGEMENT_EVENTS",
+            )
+        ],
+        targets={"audited-rule": 1},
+    )
+    assert [f["Status"] for f in findings] == ["Passed"]
+
+
+def test_ar10_two_rules_together_cover_the_approval_transitions():
+    approval_types = list(agent_registry_app.REGISTRY_APPROVAL_DETAIL_TYPES)
+    findings, _ = _routing_findings(
+        [
+            _rule("pending-rule", _approval_pattern(detail_types=approval_types[:1])),
+            _rule("decision-rule", _approval_pattern(detail_types=approval_types[1:])),
+        ],
+        targets={"pending-rule": 1, "decision-rule": 1},
+    )
+    assert [f["Status"] for f in findings] == ["Passed"]
+    assert "pending-rule" in findings[0]["Finding_Details"]
+    assert "decision-rule" in findings[0]["Finding_Details"]
+
+
+def test_ar10_partial_detail_type_coverage_names_the_missing_transitions():
+    approval_types = list(agent_registry_app.REGISTRY_APPROVAL_DETAIL_TYPES)
+    findings, _ = _routing_findings(
+        [_rule("pending-only", _approval_pattern(detail_types=approval_types[:1]))],
+        targets={"pending-only": 1},
+    )
+    assert [f["Status"] for f in findings] == ["Failed"]
+    for detail_type in approval_types[1:]:
+        assert detail_type in findings[0]["Finding_Details"]
+    assert "pending-only" in findings[0]["Finding_Details"]
+
+
+@pytest.mark.parametrize(
+    ("pattern", "reason"),
+    [
+        ("{not json", "not valid JSON"),
+        ("[]", "not a JSON object"),
+        ({"source": [{"prefix": "aws.agent-"}]}, "which event sources"),
+        (
+            {
+                "source": [agent_registry_app.REGISTRY_EVENT_SOURCE],
+                "detail-type": [{"prefix": "Registry Record State"}],
+            },
+            "which detail types",
+        ),
+    ],
+)
+def test_ar10_a_pattern_this_check_cannot_decide_is_indeterminate(pattern, reason):
+    findings, _ = _routing_findings([_rule("opaque-rule", pattern)])
+    assert [f["Status"] for f in findings] == ["N/A", "Failed"]
+    assert "opaque-rule" in findings[0]["Finding_Details"]
+    assert reason in findings[0]["Finding_Details"]
+
+
+def test_ar10_target_listing_failure_is_indeterminate_for_that_rule():
+    denied = ClientError(
+        {"Error": {"Code": "AccessDeniedException", "Message": "Denied"}},
+        "ListTargetsByRule",
+    )
+    findings, _ = _routing_findings(
+        [
+            _rule("unreadable-rule", _approval_pattern()),
+            _rule("good-rule", _approval_pattern()),
+        ],
+        targets={"good-rule": 1},
+        target_errors={"unreadable-rule": denied},
+    )
+    assert [f["Status"] for f in findings] == ["N/A", "Passed"]
+    assert "unreadable-rule" in findings[0]["Finding_Details"]
+    assert "events:ListTargetsByRule" in findings[0]["Resolution"]
+    assert "good-rule" in findings[1]["Finding_Details"]
+
+
+def test_ar10_rule_listing_access_denied_is_indeterminate():
+    findings, _ = _routing_findings(
+        [],
+        list_error=ClientError(
+            {"Error": {"Code": "AccessDeniedException", "Message": "Denied"}},
+            "ListRules",
+        ),
+    )
+    assert [f["Status"] for f in findings] == ["N/A"]
+    assert "events:ListRules" in findings[0]["Resolution"]
+
+
+def test_ar10_eventbridge_unavailable_in_region_is_indeterminate():
+    findings, _ = _routing_findings(
+        [],
+        list_error=ClientError(
+            {"Error": {"Code": "UnrecognizedClientException", "Message": "no"}},
+            "ListRules",
+        ),
+    )
+    assert [f["Status"] for f in findings] == ["N/A"]
+    assert "not available in this region" in findings[0]["Finding_Details"]
+
+
+def test_ar10_missing_events_client_is_indeterminate():
+    with patch.object(agent_registry_app, "events_client", None):
+        rule_inventory = agent_registry_app.get_registry_event_rule_inventory()
+    findings = agent_registry_app.check_agent_registry_lifecycle_event_routing(
+        _ready_registry_inventory(), rule_inventory
+    )
+    assert [f["Status"] for f in findings] == ["N/A"]
+    assert "EventBridge client" in findings[0]["Finding_Details"]
+
+
+def test_ar10_timeout_during_the_rule_sweep_is_indeterminate():
+    client = _events_client([_rule("late-rule", _approval_pattern())])
+    with patch.object(agent_registry_app, "events_client", client):
+        with patch.object(agent_registry_app, "check_timeout", return_value=False):
+            rule_inventory = agent_registry_app.get_registry_event_rule_inventory()
+    findings = agent_registry_app.check_agent_registry_lifecycle_event_routing(
+        _ready_registry_inventory(), rule_inventory
+    )
+    assert [f["Status"] for f in findings] == ["N/A"]
+    assert "Lambda timeout" in findings[0]["Finding_Details"]
+    assert client.target_calls == []
+
+
+def test_ar10_matrix_covers_no_registries_and_registry_access_denied():
+    no_registries, _ = _routing_findings(
+        [_rule("registry-approvals", _approval_pattern())],
+        inventory=_registry_inventory(),
+        targets={"registry-approvals": 1},
+    )
+    denied, _ = _routing_findings(
+        [_rule("registry-approvals", _approval_pattern())],
+        inventory=_access_denied_registry_inventory(),
+        targets={"registry-approvals": 1},
+    )
+    assert [f["Status"] for f in no_registries] == ["N/A"]
+    assert (
+        "No AWS Agent Registry registries found"
+        in (no_registries[0]["Finding_Details"])
+    )
+    assert [f["Status"] for f in denied] == ["N/A"]
+
+
+def test_ar10_names_every_registry_the_verdict_covers():
+    inventory = _registry_inventory()
+    inventory["items"] = [
+        {
+            "summary": {"registryId": f"registry-{index}", "name": f"registry-{index}"},
+            "detail": {
+                "registryId": f"registry-{index}",
+                "name": f"reg-{index}",
+                "status": "READY",
+            },
+        }
+        for index in range(2)
+    ]
+    findings, _ = _routing_findings(
+        [_rule("registry-approvals", _approval_pattern())],
+        inventory=inventory,
+        targets={"registry-approvals": 1},
+    )
+    assert [f["Status"] for f in findings] == ["Passed"]
+    assert "registries 'reg-0', 'reg-1'" in findings[0]["Finding_Details"]
+
+
+def test_handler_emits_ar10_for_the_assessed_region():
+    captured = {}
+
+    def fake_write(_execution_id, csv_content, _region):
+        captured["csv"] = csv_content
+        return "s3://test-assessment-bucket/report.csv"
+
+    events = _events_client(
+        [_rule("registry-approvals", _approval_pattern())],
+        targets={"registry-approvals": 1},
+    )
+
+    def client_factory(service_name, **kwargs):
+        if service_name == "events":
+            assert kwargs.get("region_name") == "us-east-1"
+            return events
+        return MagicMock()
+
+    with (
+        patch.object(agent_registry_app.boto3, "client", side_effect=client_factory),
+        patch.object(
+            agent_registry_app,
+            "_get_permissions_cache",
+            return_value={"role_permissions": {}, "user_permissions": {}},
+        ),
+        patch.object(
+            agent_registry_app, "check_agent_registry_full_access", return_value=[]
+        ),
+        patch.object(
+            agent_registry_app, "check_agent_registry_stale_access", return_value=[]
+        ),
+        patch.object(
+            agent_registry_app,
+            "get_agent_registry_inventory",
+            return_value=_ready_registry_inventory(),
+        ),
+        patch.object(
+            agent_registry_app,
+            "get_agent_registry_record_inventory",
+            return_value=_record_inventory(),
+        ),
+        patch.object(agent_registry_app, "write_to_s3", side_effect=fake_write),
+    ):
+        response = agent_registry_app.lambda_handler(
+            {"Execution": {"Name": "exec-123"}, "Region": "us-east-1"},
+            None,
+        )
+
+    assert response["statusCode"] == 200
+    rows = [
+        row
+        for row in csv.DictReader(StringIO(captured["csv"]))
+        if row["Check_ID"] == "AR-10"
+    ]
+    assert [row["Status"] for row in rows] == ["Passed"]
+    assert rows[0]["Finding"] == "AWS Agent Registry Lifecycle Event Routing"
+    assert rows[0]["Region"] == "us-east-1"
+    assert events.target_calls == ["registry-approvals"]
