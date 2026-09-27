@@ -122,11 +122,21 @@ restore to verify. They are the discriminating pair: the third shows the as-writ
 assertion fails where **every replay passes**, so it is not riding on the replay,
 which is the whole reason it was added.
 
-This stays a manual control rather than a `mutate.py` entry because it needs a
-run's CSVs, and those carry account ids and resource ARNs, so they cannot be
-committed as a fixture. `--selftest` covers the classifiers with synthetic input
-(12 cases, no credentials); the table above is what proves the live wiring calls
-them.
+The table itself stays a manual control because it needs a run's CSVs, and those
+carry account ids and resource ARNs, so they cannot be committed as a fixture. The
+comparison it exercises is in the battery instead:
+`tests/test_probe_live_tags_assertions.py` builds a two-row-per-producer `--csv-dir`
+set from this tree's maps, and four `mutate.py` entries break the probe (first row
+only, any row instead of all, the as-written verdict discarded, the comparison
+inverted). Before those fixtures, three of the four survived every probe test.
+`--selftest` covers the classifiers with synthetic input (12 cases, no
+credentials).
+
+A correct synthetic set passes 12 of 13 assertions and exits 1 on the qualifier
+census alone: that assertion requires a `(partial)` element, and since the last
+`tighten` rows closed no map carries one. A live run built from this tree fails the
+same way, so the census assertion predates the retired vocabulary and is not a
+finding about the run.
 
 ## What each fixture unblocks
 
