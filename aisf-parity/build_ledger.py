@@ -729,12 +729,18 @@ AI_SUBJECT_ROWS = [
         None,
         "agentcore_assessments",
         ["AC-46"],
-        "AC-46 fails a runtime that configures neither idleRuntimeSessionTimeout nor "
-        "maxLifetime, or that sets either at the service ceiling of 1209600 seconds, which is "
-        "the setting that lets one runaway session hold its resources for 14 days. AgentCore "
-        "exposes no per-session memory or cost limit to read, so the time bound is the only "
-        "limit the API can answer for, and every verdict says which values it found so the "
-        "workload owner can judge whether the bound suits the task",
+        "AC-46 fails a runtime that sets idleRuntimeSessionTimeout or maxLifetime at the "
+        "service ceiling of 1209600 seconds, which lets one runaway session hold its "
+        "resources for 14 days, that has no USAGE_LOGS delivery source of its own with a "
+        "delivery to a destination, or that runs in a region where no alarm with actions "
+        "reads ActiveSessionCount in AWS/Bedrock-AgentCore for Service AgentCore.Runtime. A "
+        "runtime missing either lifecycle field, and a delivery or alarm inventory that could "
+        "not be read, read N/A and never Passed. AgentCore exposes no per-session memory or "
+        "cost limit to read, so usage is judged by whether it is recorded and alarmed. "
+        "GetAgentRuntime reports the defaults of 900 and 28800 seconds for a runtime that "
+        "sets neither field, so whether the owner chose the values is not readable, and every "
+        "verdict says which values it found so the workload owner can judge whether the bound "
+        "suits the task",
         [],
         4,
     ),
@@ -1556,7 +1562,11 @@ INCUMBENT_NAMES = {
     "AC-43": "AgentCore Evaluation Role Trust",
     "AC-44": "AgentCore Evaluation Judge Model Scope",
     "AC-45": "AgentCore Tool Execution Role Scope",
-    "AC-46": "AgentCore Runtime Session Limits",
+    "AC-46": (
+        "AgentCore Runtime Session Limits",
+        "AgentCore Runtime Session Limit Unbounded",
+        "AgentCore Runtime Session Usage Unmonitored",
+    ),
     "AC-47": "AgentCore Runtime Invocation Path",
     "AG-24": "Agentic AI Gateway Inbound Authorization",
     "AG-25": "Agentic AI Gateway Tool Policy Enforcement",

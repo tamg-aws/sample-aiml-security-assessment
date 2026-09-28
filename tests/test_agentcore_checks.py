@@ -18071,11 +18071,14 @@ class TestAC46RuntimeSessionLimits:
         assert findings[0]["Status"] == "N/A"
         assert findings[0]["Severity"] == "Informational"
 
+    @patch("agentcore_app.cloudwatch_client")
+    @patch("agentcore_app.logs_client")
     @patch("agentcore_app.agentcore_client")
-    def test_the_documented_defaults_pass(self, mock_ac):
+    def test_the_documented_defaults_pass(self, mock_ac, mock_logs, mock_cw):
         _wire_runtimes(
             mock_ac, self._lifecycle(idleRuntimeSessionTimeout=900, maxLifetime=28800)
         )
+        _wire_session_monitoring(mock_logs, mock_cw)
 
         findings = agentcore_app.check_agentcore_runtime_session_limits()
 
@@ -18113,16 +18116,20 @@ class TestAC46RuntimeSessionLimits:
         assert name in findings[0]["Finding_Details"]
         assert_finding_schema(findings[0])
 
+    @patch("agentcore_app.cloudwatch_client")
+    @patch("agentcore_app.logs_client")
     @patch("agentcore_app.agentcore_client")
-    def test_one_second_below_the_ceiling_passes(self, mock_ac):
+    def test_one_second_below_the_ceiling_passes(self, mock_ac, mock_logs, mock_cw):
         # The assertion is the service ceiling itself, not a duration this
         # check would prefer: a shorter limit is the workload's decision.
         _wire_runtimes(
             mock_ac,
             self._lifecycle(
-                maxLifetime=agentcore_app.AGENTCORE_LIFECYCLE_CEILING_SECONDS - 1
+                idleRuntimeSessionTimeout=900,
+                maxLifetime=agentcore_app.AGENTCORE_LIFECYCLE_CEILING_SECONDS - 1,
             ),
         )
+        _wire_session_monitoring(mock_logs, mock_cw)
 
         findings = agentcore_app.check_agentcore_runtime_session_limits()
 
@@ -18159,17 +18166,26 @@ class TestAC46RuntimeSessionLimits:
         assert findings[0]["Status"] == "N/A"
         assert "GetAgentRuntime" in findings[0]["Resolution"]
 
+    @patch("agentcore_app.cloudwatch_client")
+    @patch("agentcore_app.logs_client")
     @patch("agentcore_app.agentcore_client")
-    def test_every_runtime_is_judged(self, mock_ac):
+    def test_every_runtime_is_judged(self, mock_ac, mock_logs, mock_cw):
         bounded_summary, bounded = _vpc_runtime("rt-bounded")
-        bounded["lifecycleConfiguration"] = {"maxLifetime": 3600}
+        bounded["lifecycleConfiguration"] = {
+            "idleRuntimeSessionTimeout": 900,
+            "maxLifetime": 3600,
+        }
         unbounded_summary, unbounded = _vpc_runtime("rt-unbounded")
         unbounded["lifecycleConfiguration"] = {
-            "maxLifetime": agentcore_app.AGENTCORE_LIFECYCLE_CEILING_SECONDS
+            "idleRuntimeSessionTimeout": 900,
+            "maxLifetime": agentcore_app.AGENTCORE_LIFECYCLE_CEILING_SECONDS,
         }
         _wire_runtimes(
             mock_ac,
             [(bounded_summary, bounded), (unbounded_summary, unbounded)],
+        )
+        _wire_session_monitoring(
+            mock_logs, mock_cw, delivered_ids=("rt-bounded", "rt-unbounded")
         )
 
         findings = agentcore_app.check_agentcore_runtime_session_limits()
@@ -18198,6 +18214,298 @@ class TestAC46RuntimeSessionLimits:
                 member.metadata["max"]
                 == agentcore_app.AGENTCORE_LIFECYCLE_CEILING_SECONDS
             )
+
+
+_SESSION_DIMENSION = {"Name": "Service", "Value": "AgentCore.Runtime"}
+
+
+def _session_alarm(name="runtime-sessions", **overrides):
+    """One alarm with actions on the runtime's ActiveSessionCount series."""
+    alarm = {
+        "AlarmName": name,
+        "ActionsEnabled": True,
+        "AlarmActions": ["arn:aws:sns:us-east-1:123456789012:ops"],
+        "Namespace": "AWS/Bedrock-AgentCore",
+        "MetricName": "ActiveSessionCount",
+        "Dimensions": [_SESSION_DIMENSION],
+    }
+    alarm.update(overrides)
+    return alarm
+
+
+def _wire_session_monitoring(mock_logs, mock_cw, delivered_ids=("rt-1",), alarms=None):
+    """Deliver USAGE_LOGS for each runtime id and hold the given session alarms."""
+    mock_logs.describe_delivery_sources.return_value = {
+        "deliverySources": [
+            _delivery_source(f"usage-{rid}", _runtime_arn(rid), "USAGE_LOGS")
+            for rid in delivered_ids
+        ]
+    }
+    mock_logs.describe_deliveries.return_value = _delivered(
+        *(f"usage-{rid}" for rid in delivered_ids)
+    )
+    mock_cw.describe_alarms.return_value = {
+        "MetricAlarms": [_session_alarm()] if alarms is None else alarms
+    }
+
+
+def _bounded_runtime(runtime_id="rt-1"):
+    summary, detail = _vpc_runtime(runtime_id)
+    detail["lifecycleConfiguration"] = {
+        "idleRuntimeSessionTimeout": 900,
+        "maxLifetime": 28800,
+    }
+    return summary, detail
+
+
+class TestAC46SessionMonitoring:
+    """AC-46: per-session usage must be delivered and the session count alarmed."""
+
+    @patch("agentcore_app.cloudwatch_client")
+    @patch("agentcore_app.logs_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_each_runtime_needs_its_own_usage_delivery(
+        self, mock_ac, mock_logs, mock_cw
+    ):
+        _wire_runtimes(mock_ac, [_bounded_runtime("rt-1"), _bounded_runtime("rt-2")])
+        _wire_session_monitoring(mock_logs, mock_cw, delivered_ids=("rt-1",))
+
+        findings = agentcore_app.check_agentcore_runtime_session_limits()
+
+        assert [finding["Status"] for finding in findings] == ["Passed", "Failed"]
+        assert findings[0]["Finding"] == "AgentCore Runtime Session Limits"
+        assert "usage-rt-1" in findings[0]["Finding_Details"]
+        assert findings[1]["Finding"] == "AgentCore Runtime Session Usage Unmonitored"
+        assert (
+            "(rt-2) has no bedrock-agentcore USAGE_LOGS"
+            in findings[1]["Finding_Details"]
+        )
+        assert findings[1]["Severity"] == "Medium"
+        assert_finding_schema(findings[1])
+
+    @patch("agentcore_app.cloudwatch_client")
+    @patch("agentcore_app.logs_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_application_logs_do_not_stand_in_for_usage_logs(
+        self, mock_ac, mock_logs, mock_cw
+    ):
+        _wire_runtimes(mock_ac, [_bounded_runtime()])
+        _wire_session_monitoring(mock_logs, mock_cw, delivered_ids=())
+        mock_logs.describe_delivery_sources.return_value = {
+            "deliverySources": [
+                _delivery_source("app-rt-1", _runtime_arn("rt-1"), "APPLICATION_LOGS")
+            ]
+        }
+        mock_logs.describe_deliveries.return_value = _delivered("app-rt-1")
+
+        findings = agentcore_app.check_agentcore_runtime_session_limits()
+
+        assert findings[0]["Status"] == "Failed"
+        assert "USAGE_LOGS" in findings[0]["Resolution"]
+
+    @patch("agentcore_app.cloudwatch_client")
+    @patch("agentcore_app.logs_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_usage_source_with_no_delivery_fails(self, mock_ac, mock_logs, mock_cw):
+        _wire_runtimes(mock_ac, [_bounded_runtime()])
+        _wire_session_monitoring(mock_logs, mock_cw)
+        mock_logs.describe_deliveries.return_value = _delivered()
+
+        findings = agentcore_app.check_agentcore_runtime_session_limits()
+
+        assert findings[0]["Status"] == "Failed"
+        assert "usage-rt-1 but no delivery" in findings[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "overrides",
+        [
+            {"ActionsEnabled": False},
+            {"AlarmActions": []},
+            {"Dimensions": [{"Name": "Service", "Value": "AgentCore.Browser"}]},
+            {"Dimensions": []},
+            {"Namespace": "AWS/Bedrock"},
+            {"MetricName": "Invocations"},
+        ],
+    )
+    @patch("agentcore_app.cloudwatch_client")
+    @patch("agentcore_app.logs_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_an_alarm_that_notifies_nobody_of_sessions_fails_every_runtime(
+        self, mock_ac, mock_logs, mock_cw, overrides
+    ):
+        _wire_runtimes(mock_ac, [_bounded_runtime("rt-1"), _bounded_runtime("rt-2")])
+        _wire_session_monitoring(
+            mock_logs,
+            mock_cw,
+            delivered_ids=("rt-1", "rt-2"),
+            alarms=[_session_alarm(**overrides)],
+        )
+
+        findings = agentcore_app.check_agentcore_runtime_session_limits()
+
+        assert [finding["Status"] for finding in findings] == ["Failed", "Failed"]
+        for finding in findings:
+            assert "ActiveSessionCount" in finding["Finding_Details"]
+            assert "notifies nobody" in finding["Finding_Details"]
+
+    @patch("agentcore_app.cloudwatch_client")
+    @patch("agentcore_app.logs_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_metric_math_alarm_on_the_session_count_counts(
+        self, mock_ac, mock_logs, mock_cw
+    ):
+        math_alarm = _session_alarm(name="session-math")
+        for key in ("Namespace", "MetricName", "Dimensions"):
+            del math_alarm[key]
+        math_alarm["Metrics"] = [
+            {"Id": "e1", "Expression": "m1 * 2"},
+            {
+                "Id": "m1",
+                "MetricStat": {
+                    "Metric": {
+                        "Namespace": "AWS/Bedrock-AgentCore",
+                        "MetricName": "ActiveSessionCount",
+                        "Dimensions": [_SESSION_DIMENSION],
+                    }
+                },
+            },
+        ]
+        _wire_runtimes(mock_ac, [_bounded_runtime()])
+        _wire_session_monitoring(mock_logs, mock_cw, alarms=[math_alarm])
+
+        findings = agentcore_app.check_agentcore_runtime_session_limits()
+
+        assert findings[0]["Status"] == "Passed"
+        assert "session-math" in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.cloudwatch_client")
+    @patch("agentcore_app.logs_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_an_alarm_on_the_second_page_is_found(self, mock_ac, mock_logs, mock_cw):
+        _wire_runtimes(mock_ac, [_bounded_runtime()])
+        _wire_session_monitoring(mock_logs, mock_cw)
+        pages = {
+            None: {
+                "MetricAlarms": [_session_alarm(name="other", MetricName="Errors")],
+                "NextToken": "page-2",
+            },
+            "page-2": {"MetricAlarms": [_session_alarm(name="on-page-two")]},
+        }
+        mock_cw.describe_alarms.side_effect = lambda **kwargs: pages[
+            kwargs.get("NextToken")
+        ]
+
+        findings = agentcore_app.check_agentcore_runtime_session_limits()
+
+        assert findings[0]["Status"] == "Passed"
+        assert "on-page-two" in findings[0]["Finding_Details"]
+        assert "other" not in findings[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "unreadable, grant",
+        [
+            ("describe_alarms", "cloudwatch:DescribeAlarms"),
+            ("describe_delivery_sources", "logs:DescribeDeliverySources"),
+            ("describe_deliveries", "logs:DescribeDeliveries"),
+        ],
+    )
+    @patch("agentcore_app.cloudwatch_client")
+    @patch("agentcore_app.logs_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_an_unreadable_monitoring_inventory_is_na_not_passed(
+        self, mock_ac, mock_logs, mock_cw, unreadable, grant
+    ):
+        _wire_runtimes(mock_ac, [_bounded_runtime("rt-1"), _bounded_runtime("rt-2")])
+        _wire_session_monitoring(mock_logs, mock_cw, delivered_ids=("rt-1", "rt-2"))
+        client = mock_cw if unreadable == "describe_alarms" else mock_logs
+        getattr(client, unreadable).side_effect = _make_client_error(
+            "AccessDeniedException", "denied"
+        )
+
+        findings = agentcore_app.check_agentcore_runtime_session_limits()
+
+        assert [finding["Status"] for finding in findings] == ["N/A", "N/A"]
+        for finding in findings:
+            assert "Not read:" in finding["Finding_Details"]
+            assert grant in finding["Resolution"]
+
+    @pytest.mark.parametrize("client_name", ["logs_client", "cloudwatch_client"])
+    @patch("agentcore_app.cloudwatch_client")
+    @patch("agentcore_app.logs_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_missing_monitoring_client_is_na_not_passed(
+        self, mock_ac, mock_logs, mock_cw, client_name
+    ):
+        _wire_runtimes(mock_ac, [_bounded_runtime()])
+        _wire_session_monitoring(mock_logs, mock_cw)
+
+        with patch(f"agentcore_app.{client_name}", None):
+            findings = agentcore_app.check_agentcore_runtime_session_limits()
+
+        assert findings[0]["Status"] == "N/A"
+        assert "client is not available" in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.cloudwatch_client")
+    @patch("agentcore_app.logs_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_an_unreadable_alarm_inventory_does_not_hide_a_ceiling(
+        self, mock_ac, mock_logs, mock_cw
+    ):
+        summary, detail = _bounded_runtime()
+        detail["lifecycleConfiguration"]["maxLifetime"] = (
+            agentcore_app.AGENTCORE_LIFECYCLE_CEILING_SECONDS
+        )
+        _wire_runtimes(mock_ac, [(summary, detail)])
+        _wire_session_monitoring(mock_logs, mock_cw)
+        mock_cw.describe_alarms.side_effect = _make_client_error(
+            "ThrottlingException", "slow down"
+        )
+
+        findings = agentcore_app.check_agentcore_runtime_session_limits()
+
+        assert findings[0]["Status"] == "Failed"
+        assert findings[0]["Finding"].endswith("Unbounded")
+        assert (
+            "Not read: the region's CloudWatch alarms" in findings[0]["Finding_Details"]
+        )
+        assert "cloudwatch:DescribeAlarms" in findings[0]["Resolution"]
+
+    @pytest.mark.parametrize("field", ["idleRuntimeSessionTimeout", "maxLifetime"])
+    @patch("agentcore_app.cloudwatch_client")
+    @patch("agentcore_app.logs_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_one_absent_lifecycle_field_is_na_not_passed(
+        self, mock_ac, mock_logs, mock_cw, field
+    ):
+        summary, detail = _bounded_runtime()
+        del detail["lifecycleConfiguration"][field]
+        _wire_runtimes(mock_ac, [(summary, detail)])
+        _wire_session_monitoring(mock_logs, mock_cw)
+
+        findings = agentcore_app.check_agentcore_runtime_session_limits()
+
+        assert findings[0]["Status"] == "N/A"
+        assert f"no integer {field}" in findings[0]["Finding_Details"]
+        assert "GetAgentRuntime on this runtime" not in findings[0]["Resolution"]
+
+    @patch("agentcore_app.cloudwatch_client")
+    @patch("agentcore_app.logs_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_passed_verdict_says_defaults_are_indistinguishable(
+        self, mock_ac, mock_logs, mock_cw
+    ):
+        _wire_runtimes(mock_ac, [_bounded_runtime()])
+        _wire_session_monitoring(mock_logs, mock_cw)
+
+        findings = agentcore_app.check_agentcore_runtime_session_limits()
+
+        assert findings[0]["Status"] == "Passed"
+        assert (
+            "whether these values were chosen is not readable"
+            in findings[0]["Finding_Details"]
+        )
+        mock_cw.describe_alarms.assert_called_once()
+        mock_logs.describe_delivery_sources.assert_called_once()
 
 
 class TestAC47RuntimeInvocationPath:

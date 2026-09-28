@@ -722,6 +722,8 @@ TRANSACTION_SEARCH_SPANS_LOG_GROUP = "aws/spans"
 AGENTCORE_VENDED_LOG_SERVICE = "bedrock-agentcore"
 AGENTCORE_VENDED_LOG_TYPE = "APPLICATION_LOGS"
 AGENTCORE_VENDED_TRACE_TYPE = "TRACES"
+# A runtime's per-session resource usage, which AC-46 requires delivered.
+AGENTCORE_VENDED_USAGE_TYPE = "USAGE_LOGS"
 # The vended deliveries AC-19 requires per resource family. A runtime writes its
 # service-provided logs to a log group AgentCore creates for it, so only its
 # traces need a delivery; a memory or gateway has no log destination until one
@@ -734,6 +736,7 @@ AGENTCORE_RESOURCE_DELIVERY_TYPES = (
 AGENTCORE_DELIVERY_TYPE_LABELS = {
     AGENTCORE_VENDED_LOG_TYPE: "application logs",
     AGENTCORE_VENDED_TRACE_TYPE: "traces",
+    AGENTCORE_VENDED_USAGE_TYPE: "usage logs",
 }
 
 # Condition keys that bind a cross-account observability sink policy to a known
@@ -18016,9 +18019,61 @@ AGENTCORE_LIFECYCLE_FIELDS = (
     ("maxLifetime", "maximum session lifetime"),
 )
 
+# The runtime publishes ActiveSessionCount per service, with Service as its only
+# dimension, so the AgentCore.Runtime series counts the sessions of every
+# runtime in the region and one alarm on it covers all of them. An alarm on the
+# metric name without that dimension reads a series that does not exist.
+AGENTCORE_SESSION_METRIC_NAMESPACE = "AWS/Bedrock-AgentCore"
+AGENTCORE_SESSION_METRIC_NAME = "ActiveSessionCount"
+AGENTCORE_SESSION_METRIC_DIMENSION = {"Name": "Service", "Value": "AgentCore.Runtime"}
+AGENTCORE_SESSION_ALARM_LABEL = (
+    f"{AGENTCORE_SESSION_METRIC_NAME} in {AGENTCORE_SESSION_METRIC_NAMESPACE} "
+    f"with Service={AGENTCORE_SESSION_METRIC_DIMENSION['Value']}"
+)
+
+
+def _alarm_reads_session_count(alarm: Dict[str, Any]) -> bool:
+    """Return whether a metric alarm reads the runtime's ActiveSessionCount.
+
+    A single-metric alarm names the metric on itself; a metric-math alarm names
+    one per MetricStat in Metrics. A SEARCH expression names no metric and is
+    not counted.
+    """
+    metrics = [alarm]
+    metrics.extend(
+        (query.get("MetricStat") or {}).get("Metric") or {}
+        for query in alarm.get("Metrics") or []
+        if isinstance(query, dict)
+    )
+    return any(
+        metric.get("Namespace") == AGENTCORE_SESSION_METRIC_NAMESPACE
+        and metric.get("MetricName") == AGENTCORE_SESSION_METRIC_NAME
+        and AGENTCORE_SESSION_METRIC_DIMENSION in (metric.get("Dimensions") or [])
+        for metric in metrics
+    )
+
+
+def _agentcore_session_count_alarms() -> List[str]:
+    """Name every alarm with actions that reads the runtime's session count."""
+    alarms = _paginate_aws_list(
+        cloudwatch_client,
+        "describe_alarms",
+        "MetricAlarms",
+        token_request_key="NextToken",
+        token_response_key="NextToken",
+    )
+    return sorted(
+        alarm.get("AlarmName", "unnamed")
+        for alarm in alarms
+        if isinstance(alarm, dict)
+        and alarm.get("ActionsEnabled") is True
+        and alarm.get("AlarmActions")
+        and _alarm_reads_session_count(alarm)
+    )
+
 
 def check_agentcore_runtime_session_limits() -> List[Dict[str, Any]]:
-    """AC-46: Judge the per-session lifetime limits of each agent runtime.
+    """AC-46: Judge the per-session limits and usage monitoring of each runtime.
 
     Each runtimeSessionId gets its own microVM with independent lifecycle timers,
     so lifecycleConfiguration is the per-session bound: the idle timeout ends a
@@ -18028,9 +18083,15 @@ def check_agentcore_runtime_session_limits() -> List[Dict[str, Any]]:
 
     How long this workload's sessions should live is the workload owner's
     decision, so the assertion is the one that holds regardless: a limit set to
-    the service ceiling of 14 days bounds nothing a session could do. The control
-    plane carries no per-session memory or cost limit, so those two halves of the
-    control are named in the finding for the owner to confirm elsewhere.
+    the service ceiling of 14 days bounds nothing a session could do. GetAgentRuntime
+    reports 900 and 28800 for a runtime that sets neither field, so a value
+    chosen by the owner reads the same as the default and is not judged.
+
+    The control plane carries no per-session memory or cost limit, so usage is
+    judged by whether anyone sees it: each runtime must deliver its USAGE_LOGS,
+    which carry per-session resource consumption, and the region must hold an
+    alarm with actions on the runtime's ActiveSessionCount. A delivery or alarm
+    inventory that could not be read withholds Passed and never hides a Failed.
     """
     if agentcore_client is None:
         return [
@@ -18070,6 +18131,27 @@ def check_agentcore_runtime_session_limits() -> List[Dict[str, Any]]:
             )
         ]
 
+    arn_sources: Dict[str, Dict[str, List[str]]] = {}
+    delivered_source_names: Set[str] = set()
+    delivery_error = None
+    if logs_client is None:
+        delivery_error = "the CloudWatch Logs client is not available"
+    else:
+        try:
+            arn_sources, delivered_source_names = _agentcore_delivery_configuration()
+        except Exception as error:
+            delivery_error = _assessment_error_label(error)
+
+    alarm_names: List[str] = []
+    alarm_error = None
+    if cloudwatch_client is None:
+        alarm_error = "the CloudWatch client is not available"
+    else:
+        try:
+            alarm_names = _agentcore_session_count_alarms()
+        except Exception as error:
+            alarm_error = _assessment_error_label(error)
+
     findings = []
     for runtime in runtimes:
         runtime_id = runtime.get("agentRuntimeId", "unknown")
@@ -18098,64 +18180,139 @@ def check_agentcore_runtime_session_limits() -> List[Dict[str, Any]]:
             )
             continue
 
+        problems: List[str] = []
+        fixes: List[str] = []
+        unread: List[str] = []
+        retries: List[str] = []
+
         lifecycle = detail.get("lifecycleConfiguration") or {}
         values = {
             field: lifecycle.get(field)
             for field, _ in AGENTCORE_LIFECYCLE_FIELDS
             if isinstance(lifecycle.get(field), int)
         }
-        if not values:
-            findings.append(
-                create_finding(
-                    check_id="AC-46",
-                    finding_name="AgentCore Runtime Session Limits",
-                    finding_details=(
-                        f"{label} reported no idleRuntimeSessionTimeout and no "
-                        "maxLifetime, so how long one session can hold its microVM "
-                        "could not be judged."
-                    ),
-                    resolution=(
-                        "Grant bedrock-agentcore:GetAgentRuntime on this runtime "
-                        "and retry."
-                    ),
-                    reference=AGENTCORE_RUNTIME_LIFECYCLE_REFERENCE_URL,
-                    severity=SeverityEnum.INFORMATIONAL,
-                    status=StatusEnum.NA,
-                )
+        missing = [
+            field for field, _ in AGENTCORE_LIFECYCLE_FIELDS if field not in values
+        ]
+        if missing:
+            unread.append(f"GetAgentRuntime returned no integer {' or '.join(missing)}")
+            retries.append(
+                "Retry the assessment: GetAgentRuntime reports both lifecycle "
+                "fields, with the defaults of 900 and 28800 seconds when neither "
+                "is set, so a missing value is an unexpected response."
             )
-            continue
-
         at_ceiling = [
             name
             for field, name in AGENTCORE_LIFECYCLE_FIELDS
-            if values.get(field) is not None
-            and values[field] >= AGENTCORE_LIFECYCLE_CEILING_SECONDS
+            if field in values and values[field] >= AGENTCORE_LIFECYCLE_CEILING_SECONDS
         ]
         reported = ", ".join(
             f"{name} {values[field]}s"
             for field, name in AGENTCORE_LIFECYCLE_FIELDS
             if field in values
         )
-
         if at_ceiling:
+            problems.append(
+                f"sets its {' and '.join(at_ceiling)} to the service ceiling of "
+                f"{AGENTCORE_LIFECYCLE_CEILING_SECONDS} seconds (14 days), so one "
+                f"session holds its microVM, its filesystem and its accumulated "
+                f"context for two weeks ({reported})"
+            )
+            fixes.append(
+                "Set idleRuntimeSessionTimeout and maxLifetime to the longest a "
+                "single task in this workload legitimately runs."
+            )
+
+        usage_note = ""
+        if delivery_error:
+            unread.append(f"its usage log deliveries ({delivery_error})")
+            retries.append(
+                "Grant logs:DescribeDeliverySources and logs:DescribeDeliveries "
+                "and retry."
+            )
+        else:
+            usage_sources = _delivery_source_names_for(
+                f":runtime/{runtime_id}", arn_sources, AGENTCORE_VENDED_USAGE_TYPE
+            )
+            usage_delivered = sorted(
+                name for name in usage_sources if name in delivered_source_names
+            )
+            if usage_delivered:
+                usage_note = (
+                    f"delivers usage logs through delivery source "
+                    f"{', '.join(usage_delivered)}"
+                )
+            elif usage_sources:
+                problems.append(
+                    f"has {AGENTCORE_VENDED_USAGE_TYPE} delivery source "
+                    f"{', '.join(sorted(usage_sources))} but no delivery to a "
+                    "destination, so its per-session resource usage is not stored"
+                )
+            else:
+                problems.append(
+                    f"has no bedrock-agentcore {AGENTCORE_VENDED_USAGE_TYPE} "
+                    "delivery source, so its per-session resource usage is not "
+                    "collected"
+                )
+            if not usage_delivered:
+                fixes.append(
+                    "Create a USAGE_LOGS delivery source for this runtime and a "
+                    "delivery to a log group, bucket or stream."
+                )
+
+        if alarm_error:
+            unread.append(f"the region's CloudWatch alarms ({alarm_error})")
+            retries.append("Grant cloudwatch:DescribeAlarms and retry.")
+        elif not alarm_names:
+            problems.append(
+                f"runs in a region where no alarm with ActionsEnabled true and an "
+                f"AlarmActions target reads {AGENTCORE_SESSION_ALARM_LABEL}, so a "
+                "surge of concurrent sessions notifies nobody"
+            )
+            fixes.append(
+                f"Create a CloudWatch alarm with actions on "
+                f"{AGENTCORE_SESSION_ALARM_LABEL}."
+            )
+
+        not_read = f" Not read: {'; '.join(unread)}." if unread else ""
+
+        if problems:
+            failed = dict(
+                finding_details=f"{label} {'; '.join(problems)}.{not_read}",
+                resolution=" ".join(fixes + retries),
+                reference=AGENTCORE_RUNTIME_LIFECYCLE_REFERENCE_URL,
+                severity=SeverityEnum.MEDIUM,
+                status=StatusEnum.FAILED,
+            )
+            if at_ceiling:
+                findings.append(
+                    create_finding(
+                        check_id="AC-46",
+                        finding_name="AgentCore Runtime Session Limit Unbounded",
+                        **failed,
+                    )
+                )
+            else:
+                findings.append(
+                    create_finding(
+                        check_id="AC-46",
+                        finding_name="AgentCore Runtime Session Usage Unmonitored",
+                        **failed,
+                    )
+                )
+        elif unread:
             findings.append(
                 create_finding(
                     check_id="AC-46",
-                    finding_name="AgentCore Runtime Session Limit Unbounded",
+                    finding_name="AgentCore Runtime Session Limits",
                     finding_details=(
-                        f"{label} sets its {' and '.join(at_ceiling)} to the "
-                        f"service ceiling of "
-                        f"{AGENTCORE_LIFECYCLE_CEILING_SECONDS} seconds (14 days), "
-                        f"so one session holds its microVM, its filesystem and its "
-                        f"accumulated context for two weeks: {reported}."
+                        f"{label} could not be judged, so it is not reported as "
+                        f"bounded.{not_read}"
                     ),
-                    resolution=(
-                        "Set idleRuntimeSessionTimeout and maxLifetime to the "
-                        "longest a single task in this workload legitimately runs."
-                    ),
+                    resolution=" ".join(retries),
                     reference=AGENTCORE_RUNTIME_LIFECYCLE_REFERENCE_URL,
-                    severity=SeverityEnum.MEDIUM,
-                    status=StatusEnum.FAILED,
+                    severity=SeverityEnum.INFORMATIONAL,
+                    status=StatusEnum.NA,
                 )
             )
         else:
@@ -18165,8 +18322,12 @@ def check_agentcore_runtime_session_limits() -> List[Dict[str, Any]]:
                     finding_name="AgentCore Runtime Session Limits",
                     finding_details=(
                         f"{label} bounds each session below the service ceiling of "
-                        f"{AGENTCORE_LIFECYCLE_CEILING_SECONDS} seconds: "
-                        f"{reported}."
+                        f"{AGENTCORE_LIFECYCLE_CEILING_SECONDS} seconds ({reported}), "
+                        f"{usage_note}, and alarm {', '.join(alarm_names)} reads "
+                        f"{AGENTCORE_SESSION_ALARM_LABEL}. GetAgentRuntime reports "
+                        "900 and 28800 seconds for a runtime that sets neither "
+                        "lifecycle field, so whether these values were chosen is "
+                        "not readable."
                     ),
                     resolution=(
                         "No action required for this check. Confirm these values "

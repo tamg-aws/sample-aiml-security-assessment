@@ -1107,7 +1107,7 @@ Resources:
             - Sid: EvaluationScoreAlarmRead
               Effect: Allow
               Action:
-                - cloudwatch:DescribeAlarms # AC-40
+                - cloudwatch:DescribeAlarms # AC-40, AC-46
               Resource: !Sub 'arn:${AWS::Partition}:cloudwatch:*:${AWS::AccountId}:alarm:*'
 
 

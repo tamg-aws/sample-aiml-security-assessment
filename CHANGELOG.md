@@ -456,6 +456,13 @@ section.
     more characters now fails under a credential name even when it holds a
     slash, where every slashed value read as a secret name. A region with
     targets or harnesses and no runtime is scanned, where it read `N/A`.
+  - `AC-46` fails a runtime with no delivered `USAGE_LOGS` source of its own,
+    and every runtime in a region with no alarm with actions on
+    `ActiveSessionCount` (`AWS/Bedrock-AgentCore`, `Service=AgentCore.Runtime`),
+    where only the lifecycle ceiling was judged. A runtime reporting one
+    lifecycle field and not the other is `N/A`, where it passed on the one it
+    reported, and a missing lifecycle value no longer tells the reader to grant
+    `GetAgentRuntime`, a call that had succeeded.
 
 ### Deployment impact
 
@@ -578,6 +585,11 @@ scan: without it `AC-14` reads the payment provider list as unread and reports
 `GetGatewayTarget`, already on the role. Its harness leg calls
 `bedrock-agentcore:ListHarnesses`, which the role does not hold pending
 approval, so harnesses read `N/A` and are never reported clean.
+
+`AC-46` adds no grant. It reads deliveries with `logs:DescribeDeliverySources`
+and `logs:DescribeDeliveries` and alarms with `cloudwatch:DescribeAlarms`, all
+already on the AgentCore role. No runtime delivers `USAGE_LOGS` until one is
+configured, so expect `AC-46` to fail runtimes that passed before.
 
 ## 2.0.0 - 2026-09-18
 
