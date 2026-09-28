@@ -23466,7 +23466,130 @@ def _ai_data_path_buckets(region: str = "") -> Dict[str, Any]:
             f"the {location['role']} of customization job '{location['job']}'"
         )
 
+    try:
+        batch_jobs = []
+        paginator = boto3.client(
+            "bedrock", config=boto3_config, region_name=region
+        ).get_paginator("list_model_invocation_jobs")
+        for page in paginator.paginate():
+            batch_jobs.extend(page.get("invocationJobSummaries") or [])
+    except (ClientError, BotoCoreError, TypeError) as error:
+        batch_jobs = []
+        errors.append(
+            "batch inference jobs were not read with bedrock:ListModelInvocationJobs "
+            f"({get_assessment_error_label(error)})"
+        )
+    for job in batch_jobs:
+        name = job.get("jobName") or job.get("jobArn") or "unnamed"
+        for role, uri in (
+            (
+                "input",
+                ((job.get("inputDataConfig") or {}).get("s3InputDataConfig") or {}).get(
+                    "s3Uri"
+                ),
+            ),
+            (
+                "output",
+                (
+                    (job.get("outputDataConfig") or {}).get("s3OutputDataConfig") or {}
+                ).get("s3Uri"),
+            ),
+        ):
+            if _s3_uri_bucket(uri):
+                buckets.setdefault(_s3_uri_bucket(uri), []).append(
+                    f"the {role} of batch inference job '{name}'"
+                )
+
+    sagemaker = _sagemaker_training_locations(region)
+    errors.extend(sagemaker["errors"])
+    for location in sagemaker["locations"]:
+        buckets.setdefault(_s3_uri_bucket(location["uri"]), []).append(
+            f"the {location['role']} of SageMaker training job '{location['job']}'"
+        )
+
+    agentcore = _agentcore_s3_locations(region)
+    errors.extend(agentcore["errors"])
+    for bucket, label in agentcore["locations"]:
+        buckets.setdefault(bucket, []).append(label)
+
     return {"buckets": buckets, "errors": errors}
+
+
+def _agentcore_s3_locations(region: str = "") -> Dict[str, Any]:
+    """
+    Read the S3 buckets AgentCore reads code from or writes recordings to: the
+    code artifact of every runtime's listed version and the session recording
+    destination of every browser with recording enabled. Every page is read.
+    Returns {"locations": [(bucket, label)], "errors"}.
+    """
+    locations = []
+    errors = []
+    client = boto3.client(
+        "bedrock-agentcore-control", config=boto3_config, region_name=region
+    )
+    try:
+        runtimes = _list_all_items(client, "list_agent_runtimes", "agentRuntimes")
+    except (ClientError, BotoCoreError, TypeError) as error:
+        runtimes = []
+        errors.append(
+            "AgentCore runtimes were not listed with "
+            f"bedrock-agentcore:ListAgentRuntimes ({get_assessment_error_label(error)})"
+        )
+    for runtime in runtimes:
+        name = runtime.get("agentRuntimeName") or runtime.get("agentRuntimeId")
+        try:
+            detail = client.get_agent_runtime(
+                agentRuntimeId=runtime.get("agentRuntimeId"),
+                agentRuntimeVersion=str(runtime.get("agentRuntimeVersion") or ""),
+            )
+        except (ClientError, BotoCoreError) as error:
+            errors.append(
+                f"AgentCore runtime '{name}' was not read with "
+                f"bedrock-agentcore:GetAgentRuntime ({get_assessment_error_label(error)})"
+            )
+            continue
+        code = (
+            (
+                (detail.get("agentRuntimeArtifact") or {}).get("codeConfiguration")
+                or {}
+            ).get("code")
+            or {}
+        ).get("s3") or {}
+        if code.get("bucket"):
+            locations.append(
+                (
+                    str(code["bucket"]),
+                    f"the code artifact of AgentCore runtime '{name}' version "
+                    f"{runtime.get('agentRuntimeVersion')}",
+                )
+            )
+    try:
+        browsers = _list_all_items(
+            client, "list_browsers", "browserSummaries", type="CUSTOM"
+        )
+    except (ClientError, BotoCoreError, TypeError) as error:
+        browsers = []
+        errors.append(
+            "AgentCore browsers were not listed with bedrock-agentcore:ListBrowsers "
+            f"({get_assessment_error_label(error)})"
+        )
+    for browser in browsers:
+        name = browser.get("name") or browser.get("browserId")
+        try:
+            detail = client.get_browser(browserId=browser.get("browserId"))
+        except (ClientError, BotoCoreError) as error:
+            errors.append(
+                f"AgentCore browser '{name}' was not read with "
+                f"bedrock-agentcore:GetBrowser ({get_assessment_error_label(error)})"
+            )
+            continue
+        recording = detail.get("recording") or {}
+        bucket = (recording.get("s3Location") or {}).get("bucket")
+        if recording.get("enabled") and bucket:
+            locations.append(
+                (str(bucket), f"the session recording destination of browser '{name}'")
+            )
+    return {"locations": locations, "errors": errors}
 
 
 def check_bedrock_data_path_bucket_tls(region: str = "") -> Dict[str, Any]:
@@ -23507,11 +23630,18 @@ def check_bedrock_data_path_bucket_tls(region: str = "") -> Dict[str, Any]:
                         )
                     ),
                     resolution=(
-                        "Grant bedrock:ListKnowledgeBases, bedrock:ListDataSources, "
-                        "bedrock:GetDataSource, "
+                        "Grant the action each failed read names, then retry. The "
+                        "data path reads are bedrock:ListKnowledgeBases, "
+                        "bedrock:ListDataSources, bedrock:GetDataSource, "
                         "bedrock:GetModelInvocationLoggingConfiguration, "
-                        "bedrock:ListModelCustomizationJobs and "
-                        "bedrock:GetModelCustomizationJob, then retry."
+                        "bedrock:ListModelCustomizationJobs, "
+                        "bedrock:GetModelCustomizationJob, "
+                        "bedrock:ListModelInvocationJobs, sagemaker:ListTrainingJobs, "
+                        "sagemaker:DescribeTrainingJob, "
+                        "bedrock-agentcore:ListAgentRuntimes, "
+                        "bedrock-agentcore:GetAgentRuntime, "
+                        "bedrock-agentcore:ListBrowsers and "
+                        "bedrock-agentcore:GetBrowser."
                     ),
                     reference=AI_DATA_PATH_TLS_REFERENCE,
                     severity="Informational",
@@ -23527,9 +23657,10 @@ def check_bedrock_data_path_bucket_tls(region: str = "") -> Dict[str, Any]:
                     finding_name=check_name,
                     finding_details=(
                         "No knowledge base ingests from an S3 bucket in {}, no "
-                        "model invocation log destination is configured and no "
-                        "model customization job names a bucket, so there is no "
-                        "data path bucket whose transport can be "
+                        "model invocation log destination is configured, and no "
+                        "model customization, batch inference or SageMaker training "
+                        "job, AgentCore runtime or recording browser names a bucket, "
+                        "so there is no data path bucket whose transport can be "
                         "assessed.".format(region or "this region")
                     ),
                     resolution="No action required",
@@ -23910,9 +24041,63 @@ def _bucket_backup_lock(
             ),
         }
     state = _vault_lock_state(vault, now)
+    if not state["immutable"]:
+        return {"status": "unlocked", "detail": f"{point_text} ({state['described']})"}
+    lock_date = vault["LockDate"]
+    if lock_date.tzinfo is None:
+        lock_date = lock_date.replace(tzinfo=timezone.utc)
+    created = newest["CreationDate"]
+    if created.tzinfo is None:
+        created = created.replace(tzinfo=timezone.utc)
+    if created >= lock_date:
+        return {"status": "locked", "detail": f"{point_text} ({state['described']})"}
+    # The minimum retention binds backup jobs run after the lock; a recovery
+    # point already in the vault keeps its own lifecycle.
+    try:
+        point = backup_client.describe_recovery_point(
+            BackupVaultName=vault_name,
+            RecoveryPointArn=newest.get("RecoveryPointArn"),
+        )
+    except (ClientError, BotoCoreError) as error:
+        return {
+            "status": "unread",
+            "detail": (
+                f"{point_text} ({state['described']}), and it was created before "
+                "the lock date, so its own retention decides how long it is kept, "
+                "but it was not read (backup:DescribeRecoveryPoint: "
+                f"{get_assessment_error_label(error)})"
+            ),
+        }
+    delete_at = (point.get("CalculatedLifecycle") or {}).get("DeleteAt")
+    kept = _days_between(created, delete_at) if delete_at else None
+    if delete_at and kept is None:
+        return {
+            "status": "unread",
+            "detail": (
+                f"{point_text} ({state['described']}), created before the lock "
+                f"date, with a DeleteAt ({delete_at}) that could not be read"
+            ),
+        }
+    if kept is not None and kept < vault["MinRetentionDays"]:
+        return {
+            "status": "unlocked",
+            "detail": (
+                f"{point_text} ({state['described']}), but it was created before "
+                f"the lock date and is deleted at {delete_at}, {kept:.0f} day(s) "
+                "after creation, which is shorter than the minimum retention the "
+                "lock enforces on later backups"
+            ),
+        }
     return {
-        "status": "locked" if state["immutable"] else "unlocked",
-        "detail": f"{point_text} ({state['described']})",
+        "status": "locked",
+        "detail": (
+            f"{point_text} ({state['described']}), created before the lock date "
+            + (
+                f"and kept until {delete_at}"
+                if delete_at
+                else "with no scheduled deletion"
+            )
+        ),
     }
 
 

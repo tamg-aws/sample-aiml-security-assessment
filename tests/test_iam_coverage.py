@@ -1102,6 +1102,12 @@ _VERIFIED_REMEDIATION_IAM_ACTIONS |= {
     "sagemaker:DescribeNotebookInstance",
 }
 
+# BR-46 and BR-47 training job legs, 2026-09-28: validate-policy reported the
+# negative control sagemaker:ListTrainingJob as INVALID_ACTION at statement
+# index 1 and nothing at index 0. The name is also in the sagemaker service
+# reference JSON.
+_VERIFIED_REMEDIATION_IAM_ACTIONS |= {"sagemaker:ListTrainingJobs"}
+
 _NON_IAM_REMEDIATION_TOKENS = {
     # SM-41 names the AWS IoT Core policy variables
     # ${iot:Connection.Thing.ThingName} and iot:Connection.Thing.IsAttached, and

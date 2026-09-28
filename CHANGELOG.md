@@ -237,6 +237,11 @@ section.
   condition it cannot compare as `N/A`, fails a source that an ingestion,
   customization or SageMaker training job read before its Macie job was
   created, and adds SageMaker training data buckets to the population.
+- `BR-47` and `BR-52` add batch inference, SageMaker training, AgentCore
+  runtime code and AgentCore browser recording buckets to the data path, and
+  name each unread leg. `BR-52` no longer credits a recovery point created
+  before its vault's lock date whose own lifecycle deletes it before the
+  vault's minimum retention.
 - Bedrock checks judge values that they used to credit on presence. `BR-07`,
   `BR-17`, `BR-20` (S3 Vectors), `BR-30` and `BR-38` describe each named KMS
   key and pass only an enabled customer managed key. `BR-07` also fails inline

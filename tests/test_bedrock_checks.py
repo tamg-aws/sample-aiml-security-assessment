@@ -18548,6 +18548,13 @@ class TestBR47DataPathBucketTLS:
         customization_jobs=None,
         list_customization_jobs_error=None,
         customization_pages=None,
+        batch_jobs=(),
+        batch_error=None,
+        training_jobs=None,
+        training_error=None,
+        runtimes=None,
+        browsers=None,
+        agentcore_error=None,
     ):
         agent_client = MagicMock()
         if list_knowledge_bases_error:
@@ -18609,6 +18616,60 @@ class TestBR47DataPathBucketTLS:
             return detail
 
         bedrock_client.get_model_customization_job.side_effect = get_job
+        batch_paginator = MagicMock()
+        if batch_error:
+            batch_paginator.paginate.side_effect = batch_error
+        else:
+            batch_paginator.paginate.return_value = [
+                {"invocationJobSummaries": list(batch_jobs)}
+            ]
+        bedrock_client.get_paginator.side_effect = lambda operation: {
+            "list_model_invocation_jobs": batch_paginator
+        }[operation]
+
+        sagemaker_client = MagicMock()
+        training_jobs = training_jobs or {}
+        if training_error:
+            sagemaker_client.list_training_jobs.side_effect = training_error
+        else:
+            sagemaker_client.list_training_jobs.return_value = {
+                "TrainingJobSummaries": [
+                    {"TrainingJobName": name} for name in training_jobs
+                ]
+            }
+        sagemaker_client.describe_training_job.side_effect = lambda TrainingJobName: (
+            training_jobs[TrainingJobName]
+        )
+
+        # runtimes and browsers map an id to its Get response.
+        agentcore_client = MagicMock()
+        runtimes = runtimes or {}
+        browsers = browsers or {}
+        if agentcore_error:
+            agentcore_client.list_agent_runtimes.side_effect = agentcore_error
+            agentcore_client.list_browsers.side_effect = agentcore_error
+        else:
+            agentcore_client.list_agent_runtimes.return_value = {
+                "agentRuntimes": [
+                    {
+                        "agentRuntimeId": runtime_id,
+                        "agentRuntimeName": runtime_id,
+                        "agentRuntimeVersion": "3",
+                    }
+                    for runtime_id in runtimes
+                ]
+            }
+            agentcore_client.list_browsers.return_value = {
+                "browserSummaries": [
+                    {"browserId": browser_id, "name": browser_id}
+                    for browser_id in browsers
+                ]
+            }
+        agentcore_client.get_agent_runtime.side_effect = (
+            lambda agentRuntimeId, agentRuntimeVersion: runtimes[agentRuntimeId]
+        )
+        agentcore_client.get_browser.side_effect = lambda browserId: browsers[browserId]
+        self.agentcore_client = agentcore_client
 
         s3_client = MagicMock()
         policies = bucket_policies or {}
@@ -18628,6 +18689,8 @@ class TestBR47DataPathBucketTLS:
                 "bedrock-agent": agent_client,
                 "bedrock": bedrock_client,
                 "s3": s3_client,
+                "sagemaker": sagemaker_client,
+                "bedrock-agentcore-control": agentcore_client,
             }[service],
         ):
             return extract_csv_data(
@@ -18908,6 +18971,150 @@ class TestBR47DataPathBucketTLS:
         assert "2 of 3 Bedrock data path bucket(s)" in passed[0]["Finding_Details"]
         for finding in findings:
             assert_finding_schema(finding)
+
+    @staticmethod
+    def _enforced(*buckets):
+        return {
+            bucket: _bucket_policy(_tls_deny_statement([bucket])) for bucket in buckets
+        }
+
+    def test_br47_batch_inference_buckets_are_on_the_data_path(self):
+        """Without the batch leg this estate has no bucket and reports N/A."""
+        findings = self._run(
+            batch_jobs=[
+                {
+                    "jobName": "nightly",
+                    "inputDataConfig": {
+                        "s3InputDataConfig": {"s3Uri": "s3://batch-in/prompts/"}
+                    },
+                    "outputDataConfig": {
+                        "s3OutputDataConfig": {"s3Uri": "s3://batch-out/"}
+                    },
+                }
+            ],
+            bucket_policies=self._enforced("batch-out"),
+        )
+        failed = [f for f in findings if f["Status"] == "Failed"]
+        assert len(failed) == 1, [f["Finding_Details"] for f in findings]
+        assert "Bucket batch-in" in failed[0]["Finding_Details"]
+        assert (
+            "the input of batch inference job 'nightly'"
+            in (failed[0]["Finding_Details"])
+        )
+        passed = [f for f in findings if f["Status"] == "Passed"]
+        assert "1 of 2 Bedrock data path bucket(s)" in passed[0]["Finding_Details"]
+
+    def test_br47_sagemaker_training_buckets_are_on_the_data_path(self):
+        findings = self._run(
+            training_jobs={
+                "tj-1": {
+                    "InputDataConfig": [
+                        {
+                            "ChannelName": "train",
+                            "DataSource": {
+                                "S3DataSource": {"S3Uri": "s3://sm-train/data/"}
+                            },
+                        }
+                    ],
+                    "OutputDataConfig": {"S3OutputPath": "s3://sm-out/"},
+                    "ModelArtifacts": {"S3ModelArtifacts": "s3://sm-out/model.tar.gz"},
+                }
+            },
+            bucket_policies=self._enforced("sm-out"),
+        )
+        failed = [f for f in findings if f["Status"] == "Failed"]
+        assert len(failed) == 1, [f["Finding_Details"] for f in findings]
+        assert (
+            "Bucket sm-train is on the Bedrock data path as the training data "
+            "channel 'train' of SageMaker training job 'tj-1'"
+        ) in failed[0]["Finding_Details"]
+        passed = [f for f in findings if f["Status"] == "Passed"]
+        assert "1 of 2 Bedrock data path bucket(s)" in passed[0]["Finding_Details"]
+
+    def test_br47_agentcore_code_and_recording_buckets_are_on_the_data_path(self):
+        """A browser with recording off adds no bucket."""
+        findings = self._run(
+            runtimes={
+                "rt-1": {
+                    "agentRuntimeArtifact": {
+                        "codeConfiguration": {
+                            "code": {"s3": {"bucket": "agent-code", "prefix": "a.zip"}}
+                        }
+                    }
+                }
+            },
+            browsers={
+                "br-on": {
+                    "recording": {
+                        "enabled": True,
+                        "s3Location": {"bucket": "recordings"},
+                    }
+                },
+                "br-off": {
+                    "recording": {
+                        "enabled": False,
+                        "s3Location": {"bucket": "unused-recordings"},
+                    }
+                },
+            },
+            bucket_policies=self._enforced("agent-code"),
+        )
+        failed = [f for f in findings if f["Status"] == "Failed"]
+        assert len(failed) == 1, [f["Finding_Details"] for f in findings]
+        assert "Bucket recordings" in failed[0]["Finding_Details"]
+        assert (
+            "the session recording destination of browser 'br-on'"
+            in (failed[0]["Finding_Details"])
+        )
+        passed = [f for f in findings if f["Status"] == "Passed"]
+        assert "1 of 2 Bedrock data path bucket(s)" in passed[0]["Finding_Details"]
+        assert (
+            "the code artifact of AgentCore runtime 'rt-1' version 3"
+            in (passed[0]["Finding_Details"])
+        )
+        assert "unused-recordings" not in " ".join(
+            f["Finding_Details"] for f in findings
+        )
+
+    @pytest.mark.parametrize(
+        "unread, action",
+        [
+            ("batch_error", "bedrock:ListModelInvocationJobs"),
+            ("training_error", "sagemaker:ListTrainingJobs"),
+            ("agentcore_error", "bedrock-agentcore:ListAgentRuntimes"),
+            ("agentcore_error", "bedrock-agentcore:ListBrowsers"),
+        ],
+    )
+    def test_br47_an_unread_data_path_leg_withholds_the_pass(self, unread, action):
+        denied = ClientError(
+            {"Error": {"Code": "AccessDeniedException", "Message": "no"}}, "List"
+        )
+        findings = self._two_bucket_estate(
+            bucket_policies=self._enforced("support-bucket", "hr-bucket"),
+            **{unread: denied},
+        )
+        assert not [f for f in findings if f["Status"] == "Passed"]
+        assert action in " ".join(
+            f["Finding_Details"] for f in findings if f["Status"] == "N/A"
+        )
+
+    def test_br47_a_principal_arn_exemption_is_not_credited(self):
+        """An exempted role can still send plaintext requests to the bucket."""
+        exempted = _tls_deny_statement(["hr-bucket"])
+        exempted["Condition"]["ArnNotLike"] = {
+            "aws:PrincipalArn": "arn:aws:iam::123456789012:role/ingest"
+        }
+        findings = self._two_bucket_estate(
+            bucket_policies={
+                **self._enforced("support-bucket"),
+                "hr-bucket": _bucket_policy(exempted),
+            }
+        )
+        failed = [f for f in findings if f["Status"] == "Failed"]
+        assert len(failed) == 1
+        assert "Bucket hr-bucket" in failed[0]["Finding_Details"]
+        assert "arnnotlike aws:principalarn" in failed[0]["Finding_Details"].lower()
+        assert [f["Status"] for f in findings] == ["Failed", "Passed"]
 
     def test_br47_customization_job_list_error_is_an_incomplete_inventory(self):
         findings = self._run(
@@ -22851,6 +23058,7 @@ class TestBR52DataPathObjectLock:
         vaults=None,
         recovery_points=None,
         vault_details=None,
+        point_details=None,
     ):
         s3 = MagicMock()
 
@@ -22890,6 +23098,16 @@ class TestBR52DataPathObjectLock:
             return {"BackupVaultName": BackupVaultName, **outcome}
 
         backup.describe_backup_vault.side_effect = describe_backup_vault
+        # Keyed by vault name; a point with no entry has no scheduled deletion.
+        lifecycles = point_details or {}
+
+        def describe_recovery_point(BackupVaultName, RecoveryPointArn):
+            outcome = lifecycles.get(BackupVaultName, {})
+            if isinstance(outcome, Exception):
+                raise outcome
+            return {"CalculatedLifecycle": outcome}
+
+        backup.describe_recovery_point.side_effect = describe_recovery_point
         self.backup = backup
         inventory = {
             "buckets": buckets,
@@ -23167,6 +23385,63 @@ class TestBR52DataPathObjectLock:
         assert "a (kb) through AWS Backup" in rows[0]["Finding_Details"]
         assert "1 of the 2" in rows[0]["Finding_Details"]
         assert "b (kb)" in rows[1]["Finding_Details"]
+
+    def test_br52_a_point_older_than_the_lock_keeps_its_own_short_retention(self):
+        """The minimum retention does not bind a point already in the vault.
+
+        Both points sit in a compliance vault locked after they were created;
+        only a's point is deleted before the 35-day minimum.
+        """
+        from datetime import datetime, timezone
+
+        _, rows = self._run(
+            {"a": ["kb"], "b": ["kb"]},
+            {"a": self.GOVERNED, "b": self.GOVERNED},
+            recovery_points={
+                "a": [self._point("vault-short", 20)],
+                "b": [self._point("vault-long", 20)],
+            },
+            vault_details={
+                "vault-short": self._vault(lock_days_ago=1),
+                "vault-long": self._vault(lock_days_ago=1),
+            },
+            point_details={
+                "vault-short": {"DeleteAt": datetime(2026, 9, 27, tzinfo=timezone.utc)},
+                "vault-long": {"DeleteAt": datetime(2027, 9, 20, tzinfo=timezone.utc)},
+            },
+        )
+        assert [r["Status"] for r in rows] == ["Failed", "Passed"]
+        assert "Bucket a" in rows[0]["Finding_Details"]
+        assert (
+            "created before the lock date and is deleted at 2026-09-27 00:00:00+00:00, "
+            "7 day(s) after creation" in rows[0]["Finding_Details"]
+        )
+        assert "b (kb) through AWS Backup" in rows[1]["Finding_Details"]
+        assert "kept until 2027-09-20" in rows[1]["Finding_Details"]
+
+    def test_br52_a_point_after_the_lock_is_not_described(self):
+        _, rows = self._run(
+            {"a": ["kb"]},
+            {"a": self.GOVERNED},
+            recovery_points={"a": [self._point("vault-c", 20)]},
+            vault_details={"vault-c": self._vault(lock_days_ago=365)},
+        )
+        assert [r["Status"] for r in rows] == ["Passed"]
+        assert self.backup.describe_recovery_point.call_count == 0
+
+    def test_br52_an_unread_older_point_does_not_clear_the_bucket(self):
+        """Object Lock alone fails a, so an unread backup leaves it Failed."""
+        _, rows = self._run(
+            {"a": ["kb"], "b": ["kb"]},
+            {"a": self.GOVERNED, "b": self.COMPLIANT},
+            recovery_points={"a": [self._point("vault-c", 20)]},
+            vault_details={"vault-c": self._vault(lock_days_ago=1)},
+            point_details={"vault-c": _make_client_error("AccessDeniedException")},
+        )
+        assert [r["Status"] for r in rows] == ["Failed", "Passed"]
+        assert "Bucket a" in rows[0]["Finding_Details"]
+        assert "backup:DescribeRecoveryPoint" in rows[0]["Finding_Details"]
+        assert "b (" in rows[1]["Finding_Details"]
 
     def test_br52_vault_describe_failure_is_named_and_cached(self):
         _, rows = self._run(
