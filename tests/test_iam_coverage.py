@@ -1101,6 +1101,81 @@ _VERIFIED_REMEDIATION_IAM_ACTIONS |= {
     "sagemaker:ListNotebookInstances",
     "sagemaker:DescribeNotebookInstance",
 }
+# Verified on 2026-09-28 with one IDENTITY_POLICY validate-policy run for
+# AC-08's endpoint inbound-scope leg, which reads each VPC's CIDR blocks. The
+# negative control ec2:DescribeVpc came back INVALID_ACTION at statement index
+# 1, and index 0 drew nothing. DescribeVpcs is also listed in the ec2 service
+# reference JSON.
+_VERIFIED_REMEDIATION_IAM_ACTIONS |= {"ec2:DescribeVpcs"}
+# Verified on 2026-09-28 against the ec2 service reference JSON, which lists
+# GetManagedPrefixListEntries on the prefix-list resource type. AC-01 and AC-08
+# name it when a security group rule references a prefix list whose entries
+# could not be read.
+_VERIFIED_REMEDIATION_IAM_ACTIONS |= {"ec2:GetManagedPrefixListEntries"}
+# Verified on 2026-09-28 against the bedrock-agentcore service reference JSON,
+# which lists ListAgentRuntimeVersions as a List action with no resource type,
+# and botocore's bedrock-agentcore-control model, which defines the operation.
+# AC-01 names it when a runtime's versions cannot be listed.
+_VERIFIED_REMEDIATION_IAM_ACTIONS |= {"bedrock-agentcore:ListAgentRuntimeVersions"}
+# Verified on 2026-09-28 with one IDENTITY_POLICY validate-policy run for the
+# AC-47 runtime invoke actions, one statement per name on a runtime ARN.
+# aws:ViaAWSService at index 0 and bedrock-agentcore:InvokeAgentRuntimeForUser,
+# InvokeAgentRuntimeWithWebSocketStream and
+# InvokeAgentRuntimeWithWebSocketStreamForUser at indexes 2 to 4 were not
+# reported. The negative controls aws:ViaAWSServiceNotReal (index 1),
+# InvokeAgentRuntimeForUsers and InvokeAgentRuntimeWithWebSocketStreams
+# (indexes 5 and 6) came back INVALID_GLOBAL_CONDITION_KEY and INVALID_ACTION.
+_VERIFIED_REMEDIATION_IAM_ACTIONS |= {
+    "bedrock-agentcore:InvokeAgentRuntimeForUser",
+    "bedrock-agentcore:InvokeAgentRuntimeWithWebSocketStream",
+    "bedrock-agentcore:InvokeAgentRuntimeWithWebSocketStreamForUser",
+}
+_VERIFIED_REMEDIATION_CONDITION_KEYS |= {"aws:ViaAWSService"}
+# Verified on 2026-09-28 against the kms service reference JSON, which lists the
+# condition key kms:EncryptionContext:${EncryptionContextKey}. AC-12 names it
+# with the gateway context key aws:bedrock-agentcore-gateway:arn from the
+# gateway encryption guide's example key policy, and the token scan stops at
+# the second colon.
+_VERIFIED_REMEDIATION_CONDITION_KEYS |= {"kms:EncryptionContext"}
+# Verified on 2026-09-28 against the xray service reference JSON, which lists
+# GetTraceSegmentDestination as a Read action with no resource type. AC-19
+# names it when the Transaction Search destination cannot be read.
+_VERIFIED_REMEDIATION_IAM_ACTIONS |= {"xray:GetTraceSegmentDestination"}
+# Verified on 2026-09-28 against the logs service reference JSON, which lists
+# DescribeDeliveryDestinations as a List action with no resource type. AC-20
+# names it with DescribeDeliveries and DescribeDeliverySources when the log
+# groups behind AgentCore deliveries cannot be resolved.
+_VERIFIED_REMEDIATION_IAM_ACTIONS |= {"logs:DescribeDeliveryDestinations"}
+# Verified on 2026-09-28 against the oam service reference JSON, which lists
+# ListLinks with no resource type. AC-22 names it when an account with no sink
+# cannot list the links it shares telemetry through.
+_VERIFIED_REMEDIATION_IAM_ACTIONS |= {"oam:ListLinks"}
+# Verified on 2026-09-28 against the bedrock-agentcore service reference JSON,
+# which lists ListAgentRuntimeEndpoints with no resource type, and botocore's
+# bedrock-agentcore-control model, which defines the operation. AC-30 names it
+# when the versions a runtime's endpoints serve cannot be listed.
+_VERIFIED_REMEDIATION_IAM_ACTIONS |= {"bedrock-agentcore:ListAgentRuntimeEndpoints"}
+# Verified on 2026-09-28 against the bedrock-agentcore service reference JSON,
+# which lists GetEvaluator on the evaluator resource type, ListBatchEvaluations
+# with no resource type and GetBatchEvaluation on batch-evaluate, and botocore's
+# models: GetEvaluator is in bedrock-agentcore-control, the two batch reads in
+# the bedrock-agentcore data plane. AC-44 and AC-41 name them when an evaluator
+# or a batch evaluation cannot be read.
+_VERIFIED_REMEDIATION_IAM_ACTIONS |= {
+    "bedrock-agentcore:GetEvaluator",
+    "bedrock-agentcore:ListBatchEvaluations",
+    "bedrock-agentcore:GetBatchEvaluation",
+}
+# Verified on 2026-09-28 against the cloudwatch service reference JSON, which
+# lists ListMetrics as a list action, and botocore's cloudwatch model, which
+# defines the operation with a Namespace filter. AC-40 names it when the score
+# metrics an alarm reads cannot be listed.
+_VERIFIED_REMEDIATION_IAM_ACTIONS |= {"cloudwatch:ListMetrics"}
+# Verified on 2026-09-28 against the inspector2 service reference JSON, which
+# lists ListCoverage with no resource type, and botocore's inspector2 model,
+# which defines the operation with a resourceType filter. AC-50 names it when
+# Inspector's coverage of an agent image repository cannot be listed.
+_VERIFIED_REMEDIATION_IAM_ACTIONS |= {"inspector2:ListCoverage"}
 
 # BR-46 and BR-47 training job legs, 2026-09-28: validate-policy reported the
 # negative control sagemaker:ListTrainingJob as INVALID_ACTION at statement

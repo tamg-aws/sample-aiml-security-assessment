@@ -1076,21 +1076,22 @@ Resources:
               Resource:
                 - !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/*'
                 - !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:user/*'
-            - Sid: IAMServiceLastAccessResults
+            - Sid: AgentCoreReadsWithoutResourceType
+              # Every Allow on Resource '*' with no condition, folded into one
+              # statement to keep the role under its inline-policy budget. Each
+              # group names the statement it came from.
               Effect: Allow
               Action:
-                - iam:GetServiceLastAccessedDetails
-              Resource: '*'
-            - Sid: AgentCoreAccountInventoryPermissions
-              Effect: Allow
-              Action:
-                - bedrock-agentcore:ListAgentRuntimes
-                - bedrock-agentcore:ListMemories
-                - bedrock-agentcore:ListGateways
-                - bedrock-agentcore:ListPolicyEngines
-                - bedrock-agentcore:ListCodeInterpreters
-                - bedrock-agentcore:ListBrowsers
-                - bedrock-agentcore:ListOnlineEvaluationConfigs
+                # Formerly IAMServiceLastAccessResults
+                - iam:GetServiceLastAccessedDetails # AC-03
+                # Formerly AgentCoreAccountInventoryPermissions
+                - bedrock-agentcore:ListAgentRuntimes # AC-01, AC-04, AC-08, AC-10, AC-17, AC-19, AC-30, AC-34, AC-45, AC-46, AC-47, AC-48, AC-49, AC-50, AC-52, AC-53
+                - bedrock-agentcore:ListMemories # AC-07, AC-19, AC-48
+                - bedrock-agentcore:ListGateways # AC-08, AC-10, AC-12, AC-13, AC-19, AC-24, AC-25, AC-27, AC-31, AC-34, AC-35, AC-37, AC-38, AC-48, AC-51, AC-52, AC-53
+                - bedrock-agentcore:ListPolicyEngines # AC-11, AC-36, AC-53
+                - bedrock-agentcore:ListCodeInterpreters # AC-01, AC-15, AC-45, AC-48, AC-49
+                - bedrock-agentcore:ListBrowsers # AC-01, AC-06, AC-16, AC-45, AC-48, AC-49
+                - bedrock-agentcore:ListOnlineEvaluationConfigs # AC-17, AC-39, AC-40, AC-41, AC-42, AC-43, AC-44
                 # AC-40 classifies the evaluators an online evaluation attaches
                 # against the account's catalogue. ListEvaluators has no
                 # resource-level authorization: its "Resource types" cell is
@@ -1098,7 +1099,81 @@ Resources:
                 # https://docs.aws.amazon.com/service-authorization/latest/reference/list_bedrock-agentcore.html
                 # while GetEvaluator in the same table carries evaluator*, so an
                 # ARN on this action denies the call.
-                - bedrock-agentcore:ListEvaluators
+                - bedrock-agentcore:ListEvaluators # AC-40
+                # Formerly AgentCoreTokenVaultRead
+                # GetTokenVault authorizes against "*" at runtime despite the
+                # token-vault resource type documented for the action.
+                - bedrock-agentcore:GetTokenVault # AC-14
+                # Formerly EC2Permissions
+                - ec2:DescribeSubnets # AC-01, AC-08, AC-49
+                - ec2:DescribeRouteTables # AC-01, AC-49
+                - ec2:DescribeVpcEndpoints # AC-08
+                - ec2:DescribeVpcs # AC-08
+                # AC-08 reads the inbound rules of each AgentCore endpoint's
+                # security groups, and AC-01 the outbound rules of each VPC
+                # runtime and built-in tool group. DescribeSecurityGroups has no
+                # resource-level authorization.
+                - ec2:DescribeSecurityGroups # AC-01, AC-08
+                # Formerly DNSFirewallAssociationInventory
+                # ListFirewallRuleGroupAssociations and ListFirewallDomainLists
+                # have no resource-level authorization.
+                - route53resolver:ListFirewallRuleGroupAssociations # AC-49
+                - route53resolver:ListFirewallDomainLists # AC-49
+                # Formerly ECRRegistryScanningRead
+                # AC-50 reads the private registry's scanning configuration.
+                # GetRegistryScanningConfiguration acts on the registry, which has
+                # no resource type in the service authorization reference, so it
+                # takes '*'.
+                - ecr:GetRegistryScanningConfiguration # AC-50
+                # Formerly LogsPermissions
+                - logs:DescribeLogGroups # AC-04, AC-20, AC-26, AC-41
+                # Formerly CloudTrailTrailInventory
+                # ListTrails takes no resource.
+                - cloudtrail:ListTrails # AC-18, AC-26
+                # Formerly LogsDeliveryInventory
+                # AC-19 pairs each AgentCore delivery source with its delivery.
+                - logs:DescribeDeliverySources # AC-04, AC-19, AC-20, AC-46
+                - logs:DescribeDeliveries # AC-04, AC-19, AC-20, AC-46
+                # Formerly LogsAccountPolicyInventory
+                - logs:DescribeAccountPolicies # AC-20
+                # Formerly ObservabilitySinkInventory
+                - oam:ListSinks # AC-22
+                # Formerly OrganizationsInventoryPermissions
+                # ListPolicies takes no resource.
+                - organizations:ListPolicies # AC-26, AC-28, AC-29
+                # Formerly AgentCoreCompositeAlarmRead
+                # AC-36, AC-40, AC-45, AC-46 and AC-53 credit an alarm actioned
+                # through a composite alarm. The CloudWatch API reference page
+                # API_DescribeAlarms says composite alarm information is returned
+                # only when the permission is scoped to '*'.
+                - cloudwatch:DescribeAlarms # AC-36, AC-40, AC-45, AC-46, AC-53
+                # Formerly AgentCoreApprovedReadsWithoutResourceType
+                # Read-only reads approved for the AgentCore legs. None of these
+                # has a resource type in the service authorization reference, so
+                # each needs Resource '*'.
+                - xray:GetTraceSegmentDestination # AC-19
+                - logs:DescribeDeliveryDestinations # AC-20
+                - organizations:DescribeOrganization # AC-22
+                - oam:ListLinks # AC-22
+                - s3:GetAccountPublicAccessBlock # AC-06
+                - events:ListRules # AC-36, AC-50
+                - inspector2:ListCoverage # AC-50
+                - bedrock-agentcore:ListPaymentManagers # AC-02, AC-48
+                - bedrock-agentcore:ListHarnesses # AC-34, AC-48
+                - bedrock-agentcore:ListBatchEvaluations # AC-41
+                - bedrock-agentcore:ListAgentRuntimeEndpoints # AC-17, AC-30
+                - bedrock-agentcore:ListAgentRuntimeVersions # AC-01
+                - ec2:DescribeNatGateways # AC-49
+                - bedrock:GetModelInvocationLoggingConfiguration # AC-26
+                # Formerly AgentCoreApprovedEnumerations
+                # These three list every resource of their type and name none in
+                # the request. The service authorization reference gives each a
+                # resource type (firewall, dataset, anomalysubscription), but a
+                # request that names no resource is authorized against '*', so an
+                # ARN here would deny the call the way it does for GetTokenVault.
+                - network-firewall:ListFirewalls # AC-49
+                - cloudwatch:ListMetrics # AC-40, AC-53
+                - ce:GetAnomalySubscriptions # AC-46
               Resource: '*'
             - Sid: AgentCoreResourceReadPermissions
               Effect: Allow
@@ -1136,13 +1211,6 @@ Resources:
                 - !Sub 'arn:${AWS::Partition}:bedrock-agentcore:*:${AWS::AccountId}:online-evaluation-config/*'
                 - !Sub 'arn:${AWS::Partition}:bedrock-agentcore:*:${AWS::AccountId}:payment-manager/*'
                 - !Sub 'arn:${AWS::Partition}:bedrock-agentcore:*:${AWS::AccountId}:harness/*'
-            - Sid: AgentCoreTokenVaultRead
-              Effect: Allow
-              Action:
-                # GetTokenVault authorizes against "*" at runtime despite the
-                # token-vault resource type documented for the action.
-                - bedrock-agentcore:GetTokenVault
-              Resource: '*'
             # AC-18 counts workload identities and credential providers to decide
             # which identity data-event types are in use, and AC-14 reads the
             # token vault each provider ARN names. The service authorization
@@ -1176,19 +1244,6 @@ Resources:
               Action:
                 - iam:GetRole
               Resource: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/*'
-            - Sid: EC2Permissions
-              Effect: Allow
-              Action:
-                - ec2:DescribeSubnets
-                - ec2:DescribeRouteTables
-                - ec2:DescribeVpcEndpoints
-                - ec2:DescribeVpcs
-                # AC-08 reads the inbound rules of each AgentCore endpoint's
-                # security groups, and AC-01 the outbound rules of each VPC
-                # runtime and built-in tool group. DescribeSecurityGroups has no
-                # resource-level authorization.
-                - ec2:DescribeSecurityGroups
-              Resource: '*'
             - Sid: AgentCoreGatewayWebACLRead
               # AG-39 reads the rules of the web ACL associated with a gateway,
               # and AC-51 reads the same ACL for the Anti-DDoS rule group.
@@ -1196,14 +1251,6 @@ Resources:
               Action:
                 - wafv2:GetWebACL # AG-39, AC-51
               Resource: !Sub 'arn:${AWS::Partition}:wafv2:*:${AWS::AccountId}:regional/webacl/*/*'
-            - Sid: DNSFirewallAssociationInventory
-              # ListFirewallRuleGroupAssociations and ListFirewallDomainLists
-              # have no resource-level authorization.
-              Effect: Allow
-              Action:
-                - route53resolver:ListFirewallRuleGroupAssociations # AC-49
-                - route53resolver:ListFirewallDomainLists # AC-49
-              Resource: '*'
             - Sid: DNSFirewallRuleRead
               # AC-49 reads the rules of each rule group associated with an
               # AgentCore VPC. A rule group can be shared through AWS RAM from
@@ -1243,15 +1290,6 @@ Resources:
               Action:
                 - ecr:DescribeRepositories
               Resource: !Sub 'arn:${AWS::Partition}:ecr:*:${AWS::AccountId}:repository/*'
-            - Sid: ECRRegistryScanningRead
-              # AC-50 reads the private registry's scanning configuration.
-              # GetRegistryScanningConfiguration acts on the registry, which has
-              # no resource type in the service authorization reference, so it
-              # takes '*'.
-              Effect: Allow
-              Action:
-                - ecr:GetRegistryScanningConfiguration # AC-50
-              Resource: '*'
             - Sid: CognitoUserPoolRead
               # AC-52 reads the user pools an AgentCore JWT authorizer names,
               # and their app clients, in the account's own pools only.
@@ -1261,19 +1299,8 @@ Resources:
                 - cognito-idp:ListUserPoolClients # AC-52
                 - cognito-idp:DescribeUserPoolClient # AC-52
               Resource: !Sub 'arn:${AWS::Partition}:cognito-idp:*:${AWS::AccountId}:userpool/*'
-            - Sid: LogsPermissions
-              Effect: Allow
-              Action:
-                - logs:DescribeLogGroups
-              Resource: '*'
             # AC-18 reads which trails select AgentCore resource types for data
-            # events. ListTrails takes no resource; GetEventSelectors is scoped to
-            # the trail resource type.
-            - Sid: CloudTrailTrailInventory
-              Effect: Allow
-              Action:
-                - cloudtrail:ListTrails
-              Resource: '*'
+            # events. GetEventSelectors is scoped to the trail resource type.
             - Sid: CloudTrailEventSelectorRead
               Effect: Allow
               Action:
@@ -1281,31 +1308,14 @@ Resources:
                 - cloudtrail:GetTrail # AC-26 log file validation, AC-18 trail region
                 - cloudtrail:GetTrailStatus # AC-18 IsLogging
               Resource: !Sub 'arn:${AWS::Partition}:cloudtrail:*:${AWS::AccountId}:trail/*'
-            # AC-19 pairs each AgentCore delivery source with its delivery.
-            - Sid: LogsDeliveryInventory
-              Effect: Allow
-              Action:
-                - logs:DescribeDeliverySources
-                - logs:DescribeDeliveries
-              Resource: '*'
             # AC-20 reads masking configuration at both scopes: an account-wide
             # data-protection policy and a per-log-group one.
-            - Sid: LogsAccountPolicyInventory
-              Effect: Allow
-              Action:
-                - logs:DescribeAccountPolicies
-              Resource: '*'
             - Sid: LogsDataProtectionPolicyRead
               Effect: Allow
               Action:
                 - logs:GetDataProtectionPolicy
               Resource: !Sub 'arn:${AWS::Partition}:logs:*:${AWS::AccountId}:log-group:*'
             # AC-22 reads the cross-account observability sink policy.
-            - Sid: ObservabilitySinkInventory
-              Effect: Allow
-              Action:
-                - oam:ListSinks
-              Resource: '*'
             - Sid: ObservabilitySinkPolicyRead
               Effect: Allow
               Action:
@@ -1329,14 +1339,9 @@ Resources:
               Resource: !Sub 'arn:${AWS::Partition}:kms:*:${AWS::AccountId}:key/*'
             # AC-28 reads the organization's service control policies to see
             # whether one denies creating a gateway with no inbound authorizer.
-            # ListPolicies takes no resource; DescribePolicy is scoped to the
-            # policy resource type, whose ARN carries the management account and
-            # the organization id, neither of which is known in this template.
-            - Sid: OrganizationsInventoryPermissions
-              Effect: Allow
-              Action:
-                - organizations:ListPolicies
-              Resource: '*'
+            # DescribePolicy is scoped to the policy resource type, whose ARN
+            # carries the management account and the organization id, neither of
+            # which is known in this template.
             - Sid: OrganizationsPolicyRead
               Effect: Allow
               Action:
@@ -1367,11 +1372,60 @@ Resources:
               Condition:
                 StringEquals:
                   cloudwatch:namespace: AIMLSecurity/AgentCore
-            - Sid: EvaluationScoreAlarmRead
+            - Sid: NetworkFirewallRead
+              # AC-49 reads each firewall a hosting subnet routes to, in this
+              # account. A rule group can be shared through AWS RAM from another
+              # account, so its account segment stays open.
               Effect: Allow
               Action:
-                - cloudwatch:DescribeAlarms # AC-40, AC-46
-              Resource: !Sub 'arn:${AWS::Partition}:cloudwatch:*:${AWS::AccountId}:alarm:*'
+                - network-firewall:DescribeFirewall # AC-49
+                - network-firewall:DescribeRuleGroup # AC-49
+              Resource:
+                - !Sub 'arn:${AWS::Partition}:network-firewall:*:${AWS::AccountId}:firewall/*'
+                - !Sub 'arn:${AWS::Partition}:network-firewall:*:*:stateful-rulegroup/*'
+            - Sid: FirewallPolicyRead
+              # AC-49 reads the policy each such firewall names, in this account.
+              Effect: Allow
+              Action:
+                - network-firewall:DescribeFirewallPolicy # AC-49
+              Resource: !Sub 'arn:${AWS::Partition}:network-firewall:*:${AWS::AccountId}:firewall-policy/*'
+            - Sid: PrefixListEntryRead
+              # AC-01 and AC-08 resolve the prefix lists a security group rule
+              # names. AWS-managed lists carry the account segment aws, and a
+              # customer list can be shared through AWS RAM, so the account
+              # segment stays open.
+              Effect: Allow
+              Action:
+                - ec2:GetManagedPrefixListEntries # AC-01, AC-08
+              Resource: !Sub 'arn:${AWS::Partition}:ec2:*:*:prefix-list/*'
+            - Sid: AgentCoreEvaluationRead
+              # AC-41 and AC-44 read each custom evaluator and batch evaluation.
+              Effect: Allow
+              Action:
+                - bedrock-agentcore:GetEvaluator # AC-41, AC-44
+                - bedrock-agentcore:GetBatchEvaluation # AC-41
+              Resource:
+                - !Sub 'arn:${AWS::Partition}:bedrock-agentcore:*:${AWS::AccountId}:evaluator/*'
+                - !Sub 'arn:${AWS::Partition}:bedrock-agentcore:*:${AWS::AccountId}:batch-evaluate/*'
+            - Sid: EventRuleTargetRead
+              # AC-50 reads the targets of each rule matching Inspector findings.
+              # rule/* covers rules on the default bus and on a custom bus.
+              Effect: Allow
+              Action:
+                - events:ListTargetsByRule # AC-50
+              Resource: !Sub 'arn:${AWS::Partition}:events:*:${AWS::AccountId}:rule/*'
+            - Sid: MetricFilterRead
+              # AC-36 and AC-45 read the metric filters that feed an alarm.
+              Effect: Allow
+              Action:
+                - logs:DescribeMetricFilters # AC-36, AC-45
+              Resource: !Sub 'arn:${AWS::Partition}:logs:*:${AWS::AccountId}:log-group:*'
+            - Sid: CostAnomalyMonitorRead
+              # AC-46 reads the monitors its anomaly subscriptions name.
+              Effect: Allow
+              Action:
+                - ce:GetAnomalyMonitors # AC-46
+              Resource: !Sub 'arn:${AWS::Partition}:ce::${AWS::AccountId}:anomalymonitor/*'
             - Sid: BrowserRecordingBucketRead
               # AC-06 reads the configuration of each custom browser's recording
               # bucket. The bucket name is customer-chosen, so it is not known at

@@ -16,19 +16,19 @@ and the shipped BR/SM/AC/AG check every row is derived from.
   machine-checkable AISF control, including the foundation controls, which assert
   over the account or runtime an AI workload sits on, and the ledger marks each
   foundation row. A row is a narrower claim than
-  coverage, so read this figure with the ledger census below it: 102 of the 105 are
-  `covered`, all 8 rows sit on `covered` controls, and the other 94 `covered`
+  coverage, so read this figure with the ledger census below it: 103 of the 105 are
+  `covered`, all 8 rows sit on `covered` controls, and the other 95 `covered`
   controls are named by the `Compliance_Frameworks` tag column until each is
   walked through [Adding a control](#adding-a-control), which allocates an id and
-  writes a per-control section. The 97 without a row are 94 `covered`, 0
-  `tighten`, 0 `new` and 3 `not_implementable`, with no control left
+  writes a per-control section. The 97 without a row are 95 `covered`, 0
+  `tighten`, 0 `new` and 2 `not_implementable`, with no control left
   `unassessed`. Each `not_implementable` control asks about evidence no AWS
   API returns, and the ledger names the reason for each. The parity analysis behind those figures is in
   [`aisf-parity/AISF-WORK-LEDGER.md`](../aisf-parity/AISF-WORK-LEDGER.md).
 - **Traceability:** 0 controls are `tighten`. A `tighten` control is covered
   too partly to earn an `AISF-` row at all, and its ledger row names the
   incumbent extension or the new check that closes it. The `Compliance_Frameworks` CSV
-  column names all 102 taggable controls on the producer rows themselves, the 102
+  column names all 103 taggable controls on the producer rows themselves, the 103
   `covered` and the 0 `tighten`, and is described under
   [Traceability column on producer rows](#traceability-column-on-producer-rows).
   A tag carries no verdict.
@@ -62,7 +62,7 @@ map, gate 12 fails if the control text baked into the map drifts from the
 AISF control definition, and gate 13 fails if an id does not carry the
 registered `AISF-` prefix or is missing from this catalogue.
 
-**`AISF-` rows are not counted in the framework's 276-check total.** They carry
+**`AISF-` rows are not counted in the framework's 277-check total.** They carry
 no new assertion, so counting them would double-count the incumbent check. They
 are excluded from the report's pass-rate denominator and from Open Action Items
 for the same reason, which is how OWASP-mapped rows already behave.
@@ -248,9 +248,9 @@ contributes to, so a reader of `bedrock_security_report_*.csv` can trace a row
 back to the framework. The `Status` column still carries the verdict.
 
 Measured by `check_ledger.py` gate 14, which prints each of these figures on
-every run: 166 check-control pairs over 111 tagged checks in 4 modules, naming 102
+every run: 167 check-control pairs over 112 tagged checks in 4 modules, naming 103
 distinct controls. Tagged checks per module are bedrock 33, sagemaker 26,
-agentcore 48, agent_registry 4.
+agentcore 49, agent_registry 4.
 
 ### The qualifier is what makes a `tighten` control safe to name
 
@@ -266,8 +266,8 @@ trusting the literal in the file:
 | `AISF AIR-SGM-TRN-05 (1 of 3 checks)` | the control is covered, but jointly, so no single leg asserts it |
 | `AISF <control> (partial)` | the check asserts less than the control requires, and the gap is open in the ledger |
 
-Census at the current head, also printed by gate 14: 60 bare, 0 `(partial)`, 106
-joint. The 60 bare tags plus the 42 jointly covered controls account for the 102
+Census at the current head, also printed by gate 14: 61 bare, 0 `(partial)`, 106
+joint. The 61 bare tags plus the 42 jointly covered controls account for the 103
 `covered` controls. A `(partial)` tag sits on a `tighten` control, one per
 incumbent, and with 0 `tighten` controls open none is emitted. A bare tag on a `tighten` row, a `(partial)` on a `covered` row, or a
 dropped `(1 of N)`, fails gate 14 with the row's verdict and incumbent count

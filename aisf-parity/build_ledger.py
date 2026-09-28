@@ -1301,7 +1301,7 @@ AI_SUBJECT_ROWS = [
 # AISF control, and ruled that they are hosted in the existing modules. Each
 # covered row names every check id whose shipped code asserts it.
 FOUNDATION_ROWS = [
-    # ---------------- covered: 25 controls ----------------
+    # ---------------- covered: 26 controls ----------------
     (
         "AIR-FND-DAT-04",
         COVERED,
@@ -1845,19 +1845,31 @@ FOUNDATION_ROWS = [
         [],
         6,
     ),
-    # ---------------- not_implementable: 2 controls ----------------
     (
         "AIR-FND-DET-10",
-        NOT_IMPL,
+        COVERED,
         None,
-        None,
+        "agentcore_assessments",
+        ["AC-53"],
+        "AC-53 takes the agent pairs from Application Signals: ListMetrics on the "
+        "ApplicationSignals namespace lists an Error, Fault and Latency metric per "
+        "caller and callee, and a pair is judged when its Environment starts with "
+        "bedrock-agentcore: and its RemoteService names another AgentCore runtime "
+        "or gateway. A gateway's call to its policy engine is not a pair. Each "
+        "pair fails without a metric alarm that reaches an action, on its own or "
+        "through an acting composite alarm, whose ThresholdMetricId names an "
+        "ANOMALY_DETECTION_BAND over one of those metrics, with the "
+        "pair's Service and RemoteService, whatever other dimensions it carries. "
+        "A pair whose RemoteService is UnknownRemoteService is N/A by name. An "
+        "account with no agent pair reads N/A, never Passed. Partial, ceiling "
+        "reached: "
+        "runtimes not instrumented with Application Signals publish no pair, and "
+        "no AWS API records workflow execution frequency, per-workflow metric "
+        "definitions, or whether a new pair raises an alert",
         [],
-        "Coordination metrics are custom metrics the customer names, and no AWS "
-        "API marks which metric measures inter-agent traffic, so a scan cannot "
-        "tell a coordination alarm from any other alarm.",
-        [],
-        None,
+        6,
     ),
+    # ---------------- not_implementable: 1 control ----------------
     (
         "AIR-FND-GOV-12",
         NOT_IMPL,
@@ -1931,6 +1943,7 @@ INCUMBENT_NAMES = {
     "AC-49": "AgentCore DNS Egress Control",
     "AC-50": "AgentCore ECR Enhanced Scanning",
     "AC-51": "AgentCore Gateway Anti-DDoS Protection",
+    "AC-53": "AgentCore Inter-Agent Anomaly Alarms",
     "AG-39": "Agentic AI Gateway WAF Rule Coverage",
     "AR-10": "AWS Agent Registry Lifecycle Event Routing",
     "BR-47": "Bedrock Data Path Bucket TLS Enforcement",
