@@ -5817,6 +5817,205 @@ class TestAC22TelemetrySinkScope:
         assert mock_oam.list_sinks.call_args_list[1].kwargs == {"NextToken": "page-2"}
 
 
+class TestAC22SinkScopeValues:
+    """AC-22: a sink is scoped by the values it names, not by the keys present."""
+
+    _SINK = TestAC22TelemetrySinkScope._SINK
+
+    @staticmethod
+    def _policy(*statements):
+        return {"Policy": json.dumps({"Statement": list(statements)})}
+
+    @staticmethod
+    def _open(condition=None, **extra):
+        statement = {
+            "Effect": "Allow",
+            "Principal": "*",
+            "Action": "oam:CreateLink",
+            "Resource": "*",
+        }
+        if condition is not None:
+            statement["Condition"] = condition
+        statement.update(extra)
+        return statement
+
+    @pytest.mark.parametrize(
+        "principal",
+        [
+            {"AWS": "arn:aws:iam::*:root"},
+            {"AWS": ["arn:aws:iam::111122223333:root", "arn:aws:iam::*:root"]},
+            ["arn:aws:iam::111122223333:root", "*"],
+        ],
+    )
+    @patch("agentcore_app.oam_client")
+    def test_a_wildcard_in_any_principal_value_fails(self, mock_oam, principal):
+        mock_oam.list_sinks.return_value = {"Items": [self._SINK]}
+        statement = self._open()
+        statement["Principal"] = principal
+        mock_oam.get_sink_policy.return_value = self._policy(statement)
+
+        findings = agentcore_app.check_agentcore_telemetry_sink_scope()
+
+        assert findings[0]["Status"] == "Failed"
+
+    @patch("agentcore_app.oam_client")
+    def test_a_not_principal_allow_is_not_scoped_by_its_list(self, mock_oam):
+        mock_oam.list_sinks.return_value = {"Items": [self._SINK]}
+        statement = self._open()
+        del statement["Principal"]
+        statement["NotPrincipal"] = {"AWS": "arn:aws:iam::444455556666:root"}
+        mock_oam.get_sink_policy.return_value = self._policy(statement)
+
+        findings = agentcore_app.check_agentcore_telemetry_sink_scope()
+
+        assert findings[0]["Status"] == "Failed"
+        assert "NotPrincipal" in findings[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "operator",
+        [
+            "StringNotEquals",
+            "StringNotLike",
+            "StringEqualsIfExists",
+            "StringLikeIfExists",
+            "ForAllValues:StringEquals",
+            "ForAnyValue:StringNotEquals",
+            "ArnLike",
+            "Null",
+        ],
+    )
+    @patch("agentcore_app.oam_client")
+    def test_an_org_key_under_a_non_binding_operator_fails(self, mock_oam, operator):
+        mock_oam.list_sinks.return_value = {"Items": [self._SINK]}
+        mock_oam.get_sink_policy.return_value = self._policy(
+            self._open({operator: {"aws:PrincipalOrgID": "o-a1b2c3d4e5"}})
+        )
+
+        findings = agentcore_app.check_agentcore_telemetry_sink_scope()
+
+        assert findings[0]["Status"] == "Failed"
+
+    @pytest.mark.parametrize(
+        "key, value",
+        [
+            ("aws:PrincipalOrgID", "o-*"),
+            ("aws:PrincipalOrgID", "*"),
+            ("aws:PrincipalOrgID", "o-a1b2c3d4e?"),
+            ("aws:PrincipalOrgID", ["o-a1b2c3d4e5", "o-*"]),
+            ("aws:PrincipalOrgPaths", "o-*/r-ab12/*"),
+            ("aws:PrincipalOrgPaths", "*"),
+            ("aws:PrincipalOrgPaths", ["o-a1b2c3d4e5/*", "*/r-ab12/*"]),
+            ("aws:PrincipalOrgID", []),
+        ],
+    )
+    @patch("agentcore_app.oam_client")
+    def test_a_wildcard_organization_value_fails(self, mock_oam, key, value):
+        mock_oam.list_sinks.return_value = {"Items": [self._SINK]}
+        mock_oam.get_sink_policy.return_value = self._policy(
+            self._open({"StringLike": {key: value}})
+        )
+
+        findings = agentcore_app.check_agentcore_telemetry_sink_scope()
+
+        assert findings[0]["Status"] == "Failed"
+
+    @pytest.mark.parametrize(
+        "operator, key, value",
+        [
+            ("StringEquals", "aws:PrincipalOrgID", "o-a1b2c3d4e5"),
+            ("StringEqualsIgnoreCase", "aws:PrincipalOrgID", "o-a1b2c3d4e5"),
+            ("ForAnyValue:StringLike", "aws:PrincipalOrgPaths", "o-a1b2c3d4e5/*"),
+            (
+                "ForAnyValue:StringLike",
+                "aws:PrincipalOrgPaths",
+                ["o-a1b2c3d4e5/r-ab12/ou-ab12-11111111/*", "o-a1b2c3d4e5/r-ab12/*"],
+            ),
+        ],
+    )
+    @patch("agentcore_app.oam_client")
+    def test_a_named_organization_still_passes(self, mock_oam, operator, key, value):
+        mock_oam.list_sinks.return_value = {"Items": [self._SINK]}
+        mock_oam.get_sink_policy.return_value = self._policy(
+            self._open({operator: {key: value}})
+        )
+
+        findings = agentcore_app.check_agentcore_telemetry_sink_scope()
+
+        assert findings[0]["Status"] == "Passed"
+
+    @patch("agentcore_app.oam_client")
+    def test_a_binding_key_beside_a_non_binding_one_passes(self, mock_oam):
+        mock_oam.list_sinks.return_value = {"Items": [self._SINK]}
+        mock_oam.get_sink_policy.return_value = self._policy(
+            self._open(
+                {
+                    "StringEqualsIfExists": {"aws:PrincipalOrgPaths": "o-*/*"},
+                    "StringEquals": {"aws:PrincipalOrgID": "o-a1b2c3d4e5"},
+                }
+            )
+        )
+
+        findings = agentcore_app.check_agentcore_telemetry_sink_scope()
+
+        assert findings[0]["Status"] == "Passed"
+
+    @patch("agentcore_app.oam_client")
+    def test_one_wildcard_sink_among_scoped_ones_fails_alone(self, mock_oam):
+        second = dict(
+            self._SINK,
+            Arn="arn:aws:oam:us-east-1:123456789012:sink/s-2",
+            Name="open-sink",
+        )
+        mock_oam.list_sinks.return_value = {"Items": [self._SINK, second]}
+        policies = {
+            self._SINK["Arn"]: self._policy(
+                self._open({"StringEquals": {"aws:PrincipalOrgID": "o-a1b2c3d4e5"}})
+            ),
+            second["Arn"]: self._policy(
+                self._open({"StringLike": {"aws:PrincipalOrgID": "o-*"}})
+            ),
+        }
+        mock_oam.get_sink_policy.side_effect = lambda SinkIdentifier: policies[
+            SinkIdentifier
+        ]
+
+        findings = agentcore_app.check_agentcore_telemetry_sink_scope()
+
+        by_sink = {
+            ("open-sink" if "open-sink" in f["Finding_Details"] else "central"): f[
+                "Status"
+            ]
+            for f in findings
+        }
+        assert by_sink == {"central": "Passed", "open-sink": "Failed"}
+
+    @patch("agentcore_app.oam_client")
+    def test_a_negated_statement_beside_a_scoped_one_fails(self, mock_oam):
+        mock_oam.list_sinks.return_value = {"Items": [self._SINK]}
+        mock_oam.get_sink_policy.return_value = self._policy(
+            self._open({"StringEquals": {"aws:PrincipalOrgID": "o-a1b2c3d4e5"}}),
+            self._open(
+                {"StringNotEquals": {"aws:PrincipalOrgID": "o-a1b2c3d4e5"}},
+                Action="oam:UpdateLink",
+            ),
+        )
+
+        findings = agentcore_app.check_agentcore_telemetry_sink_scope()
+
+        assert findings[0]["Status"] == "Failed"
+        assert "1 Allow statement" in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.oam_client")
+    def test_no_sink_names_the_unread_source_link_leg(self, mock_oam):
+        mock_oam.list_sinks.return_value = {"Items": []}
+
+        findings = agentcore_app.check_agentcore_telemetry_sink_scope()
+
+        assert findings[0]["Status"] == "N/A"
+        assert "oam:ListLinks" in findings[0]["Finding_Details"]
+        mock_oam.list_links.assert_not_called()
+
+
 # ===================================================================
 # AC-23: check_agentcore_memory_record_access_scope
 # ===================================================================
@@ -6593,6 +6792,9 @@ class TestAC26LogRetentionAndKeyScope:
     """AC-26: retention on every AgentCore log group, scoped key policy on its CMK."""
 
     _KEY = "arn:aws:kms:us-east-1:123456789012:key/k1"
+    # Before the CloudWatch Logs service-grant leg this fixture named the logs
+    # service with no condition and read as scoped. That grant serves log
+    # groups in any account, so the scoped fixture now binds it to this one.
     _SCOPED_KEY_POLICY = json.dumps(
         {
             "Statement": [
@@ -6601,6 +6803,13 @@ class TestAC26LogRetentionAndKeyScope:
                     "Principal": {"Service": "logs.us-east-1.amazonaws.com"},
                     "Action": ["kms:Decrypt", "kms:GenerateDataKey"],
                     "Resource": "*",
+                    "Condition": {
+                        "ArnLike": {
+                            "kms:EncryptionContext:aws:logs:arn": (
+                                "arn:aws:logs:us-east-1:123456789012:log-group:*"
+                            )
+                        }
+                    },
                 }
             ]
         }
@@ -6767,8 +6976,11 @@ class TestAC26LogRetentionAndKeyScope:
                 }
             )
         )
-        # A condition on the wildcard principal is the scoping this asks for.
-        assert not agentcore_app._kms_key_policy_allows_open_decrypt(
+        # Before the key-policy value checks this asserted that kms:ViaService
+        # alone scoped the wildcard principal. It names the service, not the
+        # caller, so any account reaching logs here can decrypt; the grant is
+        # open now, and binding the caller's account closes it.
+        assert agentcore_app._kms_key_policy_allows_open_decrypt(
             json.dumps(
                 {
                     "Statement": [
@@ -6780,6 +6992,26 @@ class TestAC26LogRetentionAndKeyScope:
                             "Condition": {
                                 "StringEquals": {
                                     "kms:ViaService": "logs.us-east-1.amazonaws.com"
+                                }
+                            },
+                        }
+                    ]
+                }
+            )
+        )
+        assert not agentcore_app._kms_key_policy_allows_open_decrypt(
+            json.dumps(
+                {
+                    "Statement": [
+                        {
+                            "Effect": "Allow",
+                            "Principal": "*",
+                            "Action": "kms:Decrypt",
+                            "Resource": "*",
+                            "Condition": {
+                                "StringEquals": {
+                                    "kms:ViaService": "logs.us-east-1.amazonaws.com",
+                                    "kms:CallerAccount": "123456789012",
                                 }
                             },
                         }
@@ -11554,6 +11786,349 @@ class TestAC36PolicyEngineKeyScope:
         assert findings[0]["Check_ID"] == "AC-36"
 
 
+def _key_policy(*statements):
+    return json.dumps({"Statement": list(statements)})
+
+
+def _key_grant(action="kms:Decrypt", principal="*", condition=None, **extra):
+    statement = {
+        "Effect": "Allow",
+        "Principal": principal,
+        "Action": action,
+        "Resource": "*",
+    }
+    if condition is not None:
+        statement["Condition"] = condition
+    statement.update(extra)
+    return statement
+
+
+class TestKmsKeyPolicyValueScope:
+    """AC-26 and AC-36 read who a key grant reaches by value, not by presence."""
+
+    @pytest.mark.parametrize(
+        "principal",
+        [
+            {"AWS": "arn:aws:iam::*:root"},
+            {"AWS": ["arn:aws:iam::123456789012:root", "arn:aws:iam::*:root"]},
+            {"AWS": ["arn:aws:iam::123456789012:root", "*"]},
+        ],
+    )
+    def test_a_wildcard_in_any_principal_value_is_open(self, principal):
+        assert agentcore_app._kms_key_policy_allows_open_decrypt(
+            _key_policy(_key_grant(principal=principal))
+        )
+
+    def test_a_not_principal_allow_is_open(self):
+        statement = _key_grant()
+        del statement["Principal"]
+        statement["NotPrincipal"] = {"AWS": "arn:aws:iam::444455556666:root"}
+
+        assert agentcore_app._kms_key_policy_allows_open_decrypt(_key_policy(statement))
+
+    def test_not_action_grants_every_action_it_omits(self):
+        statement = _key_grant()
+        del statement["Action"]
+        statement["NotAction"] = ["kms:ScheduleKeyDeletion", "kms:DisableKey"]
+        policy = _key_policy(statement)
+
+        assert agentcore_app._kms_key_policy_allows_open_decrypt(policy)
+        assert agentcore_app._kms_key_policy_open_actions(
+            policy, agentcore_app.KMS_KEY_DISABLING_ACTIONS
+        ) == ["disablekeyrotation", "putkeypolicy"]
+
+    @pytest.mark.parametrize(
+        "condition",
+        [
+            {"StringEquals": {"kms:ViaService": "logs.us-east-1.amazonaws.com"}},
+            {
+                "ArnLike": {
+                    "kms:EncryptionContext:aws:logs:arn": (
+                        "arn:aws:logs:us-east-1:123456789012:log-group:*"
+                    )
+                }
+            },
+            {"Bool": {"aws:SecureTransport": "true"}},
+            {"StringNotEquals": {"kms:CallerAccount": "123456789012"}},
+            {"StringEqualsIfExists": {"kms:CallerAccount": "123456789012"}},
+            {"ForAllValues:StringEquals": {"aws:PrincipalOrgID": "o-a1b2c3d4e5"}},
+            {"Null": {"aws:PrincipalOrgID": "false"}},
+            {"StringLike": {"kms:CallerAccount": "*"}},
+            {"StringLike": {"aws:PrincipalOrgID": "o-*"}},
+            {"StringLike": {"kms:CallerAccount": ["123456789012", "4444*"]}},
+            {"ArnLike": {"aws:PrincipalArn": "arn:aws:iam::*:role/agent"}},
+            {"ArnLike": {"aws:SourceArn": "arn:aws:logs:us-east-1:*:log-group:*"}},
+            {"ArnLike": {"aws:PrincipalArn": "*"}},
+            {"StringEquals": {"kms:CallerAccount": []}},
+        ],
+    )
+    def test_a_condition_that_binds_no_caller_leaves_the_grant_open(self, condition):
+        assert agentcore_app._kms_key_policy_allows_open_decrypt(
+            _key_policy(_key_grant(condition=condition))
+        )
+
+    @pytest.mark.parametrize(
+        "condition",
+        [
+            {"StringEquals": {"kms:CallerAccount": "123456789012"}},
+            {"StringEquals": {"aws:PrincipalOrgID": "o-a1b2c3d4e5"}},
+            {"ForAnyValue:StringEquals": {"aws:PrincipalAccount": "123456789012"}},
+            {"ArnLike": {"aws:PrincipalArn": "arn:aws:iam::123456789012:role/*"}},
+            {
+                "ArnLike": {
+                    "aws:SourceArn": "arn:aws:logs:us-east-1:123456789012:log-group:*"
+                }
+            },
+            {
+                "StringEquals": {
+                    "kms:ViaService": "logs.us-east-1.amazonaws.com",
+                    "kms:CallerAccount": "123456789012",
+                },
+                "StringEqualsIfExists": {"aws:SourceAccount": "*"},
+            },
+        ],
+    )
+    def test_a_condition_naming_one_caller_population_binds(self, condition):
+        assert not agentcore_app._kms_key_policy_allows_open_decrypt(
+            _key_policy(_key_grant(condition=condition))
+        )
+
+    def test_the_default_root_statement_is_not_open(self):
+        policy = _key_policy(
+            _key_grant(
+                action="kms:*",
+                principal={"AWS": "arn:aws:iam::123456789012:root"},
+            )
+        )
+
+        assert not agentcore_app._kms_key_policy_allows_open_decrypt(policy)
+        assert (
+            agentcore_app._kms_key_policy_open_actions(
+                policy, agentcore_app.KMS_KEY_DISABLING_ACTIONS
+            )
+            == []
+        )
+
+    def test_a_bound_statement_does_not_hide_an_open_one(self):
+        policy = _key_policy(
+            _key_grant(
+                condition={"StringEquals": {"kms:CallerAccount": "123456789012"}}
+            ),
+            _key_grant(
+                action="kms:GenerateDataKey",
+                condition={
+                    "StringEqualsIfExists": {"kms:CallerAccount": "123456789012"}
+                },
+            ),
+        )
+
+        assert agentcore_app._kms_key_policy_open_actions(
+            policy, agentcore_app.KMS_DECRYPT_ACTIONS
+        ) == ["generatedatakey"]
+
+    @pytest.mark.parametrize(
+        "condition",
+        [
+            None,
+            {"StringEquals": {"kms:ViaService": "logs.us-east-1.amazonaws.com"}},
+            {
+                "ArnLike": {
+                    "kms:EncryptionContext:aws:logs:arn": (
+                        "arn:aws:logs:us-east-1:*:log-group:*"
+                    )
+                }
+            },
+            {
+                "ArnLikeIfExists": {
+                    "kms:EncryptionContext:aws:logs:arn": (
+                        "arn:aws:logs:us-east-1:123456789012:log-group:*"
+                    )
+                }
+            },
+            {"StringNotEquals": {"aws:SourceAccount": "123456789012"}},
+        ],
+    )
+    def test_an_unbound_logs_service_grant_is_open(self, condition):
+        assert agentcore_app._kms_logs_service_grant_is_unbound(
+            _key_policy(
+                _key_grant(
+                    action=["kms:Decrypt", "kms:GenerateDataKey*"],
+                    principal={"Service": ["logs.us-east-1.amazonaws.com"]},
+                    condition=condition,
+                )
+            )
+        )
+
+    @pytest.mark.parametrize(
+        "condition",
+        [
+            {
+                "ArnLike": {
+                    "kms:EncryptionContext:aws:logs:arn": (
+                        "arn:aws:logs:us-east-1:123456789012:log-group:*"
+                    )
+                }
+            },
+            {"StringEquals": {"aws:SourceAccount": "123456789012"}},
+        ],
+    )
+    def test_a_logs_service_grant_bound_to_this_account_is_closed(self, condition):
+        assert not agentcore_app._kms_logs_service_grant_is_unbound(
+            _key_policy(
+                _key_grant(
+                    principal={"Service": "logs.us-east-1.amazonaws.com"},
+                    condition=condition,
+                )
+            )
+        )
+
+    def test_a_logs_service_grant_without_decrypt_is_not_this_leg(self):
+        assert not agentcore_app._kms_logs_service_grant_is_unbound(
+            _key_policy(
+                _key_grant(
+                    action="kms:DescribeKey",
+                    principal={"Service": "logs.us-east-1.amazonaws.com"},
+                )
+            )
+        )
+
+    @patch("agentcore_app.kms_client")
+    @patch("agentcore_app.logs_client")
+    def test_an_unbound_logs_service_key_fails_its_log_group_alone(
+        self, mock_logs, mock_kms
+    ):
+        bound_key = "arn:aws:kms:us-east-1:123456789012:key/bound"
+        open_key = "arn:aws:kms:us-east-1:123456789012:key/open"
+        mock_logs.describe_log_groups.side_effect = _log_group_side_effect(
+            {
+                "/aws/bedrock-agentcore/": [
+                    {
+                        "logGroupName": f"/aws/bedrock-agentcore/runtimes/rt-{name}",
+                        "retentionInDays": 30,
+                        "kmsKeyId": key,
+                        "deletionProtectionEnabled": True,
+                    }
+                    for name, key in (("1", bound_key), ("2", open_key))
+                ]
+            }
+        )
+        policies = {
+            bound_key: TestAC26LogRetentionAndKeyScope._SCOPED_KEY_POLICY,
+            open_key: _key_policy(
+                _key_grant(principal={"Service": "logs.us-east-1.amazonaws.com"})
+            ),
+        }
+        mock_kms.get_key_policy.side_effect = lambda KeyId: {"Policy": policies[KeyId]}
+
+        findings = agentcore_app.check_agentcore_log_retention_and_key_scope()
+
+        statuses = {
+            finding["Finding_Details"].split("'")[1]: finding["Status"]
+            for finding in findings
+        }
+        assert statuses == {
+            "/aws/bedrock-agentcore/runtimes/rt-1": "Passed",
+            "/aws/bedrock-agentcore/runtimes/rt-2": "Failed",
+        }
+        failed = next(f for f in findings if f["Status"] == "Failed")
+        assert "log groups in any account" in failed["Finding_Details"]
+
+    @patch("agentcore_app.kms_client")
+    @patch("agentcore_app.logs_client")
+    def test_one_open_key_among_bound_ones_fails_its_log_group_alone(
+        self, mock_logs, mock_kms
+    ):
+        bound_key = "arn:aws:kms:us-east-1:123456789012:key/bound"
+        open_key = "arn:aws:kms:us-east-1:123456789012:key/open"
+        mock_logs.describe_log_groups.side_effect = _log_group_side_effect(
+            {
+                "/aws/bedrock-agentcore/": [
+                    {
+                        "logGroupName": f"/aws/bedrock-agentcore/runtimes/rt-{name}",
+                        "retentionInDays": 30,
+                        "kmsKeyId": key,
+                        "deletionProtectionEnabled": True,
+                    }
+                    for name, key in (("1", bound_key), ("2", open_key))
+                ]
+            }
+        )
+        policies = {
+            bound_key: _key_policy(
+                _key_grant(
+                    condition={"StringEquals": {"kms:CallerAccount": "123456789012"}}
+                )
+            ),
+            open_key: _key_policy(
+                _key_grant(
+                    condition={
+                        "StringEqualsIfExists": {"kms:CallerAccount": "123456789012"}
+                    }
+                )
+            ),
+        }
+        mock_kms.get_key_policy.side_effect = lambda KeyId: {"Policy": policies[KeyId]}
+
+        findings = agentcore_app.check_agentcore_log_retention_and_key_scope()
+
+        statuses = {
+            finding["Finding_Details"].split("'")[1]: finding["Status"]
+            for finding in findings
+        }
+        assert statuses == {
+            "/aws/bedrock-agentcore/runtimes/rt-1": "Passed",
+            "/aws/bedrock-agentcore/runtimes/rt-2": "Failed",
+        }
+        passed = next(f for f in findings if f["Status"] == "Passed")
+        assert "names the principals" not in passed["Finding_Details"]
+        assert "unless a condition binds" in passed["Finding_Details"]
+
+    @patch("agentcore_app.kms_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_one_engine_key_open_to_deletion_by_not_action_fails_alone(
+        self, mock_ac, mock_kms
+    ):
+        bound_key = "arn:aws:kms:us-east-1:123456789012:key/pe-bound"
+        open_key = "arn:aws:kms:us-east-1:123456789012:key/pe-open"
+        mock_ac.list_policy_engines.return_value = {
+            "policyEngines": [
+                {"policyEngineId": "pe-1", "name": "Payments"},
+                {"policyEngineId": "pe-2", "name": "Support"},
+            ]
+        }
+        mock_ac.get_policy_engine.side_effect = lambda policyEngineId: {
+            "encryptionKeyArn": bound_key if policyEngineId == "pe-1" else open_key
+        }
+        open_statement = _key_grant(principal={"AWS": "arn:aws:iam::*:root"})
+        del open_statement["Action"]
+        open_statement["NotAction"] = ["kms:Decrypt", "kms:GenerateDataKey*"]
+        policies = {
+            bound_key: _key_policy(
+                _key_grant(
+                    action="kms:*",
+                    principal={"AWS": "arn:aws:iam::123456789012:root"},
+                )
+            ),
+            open_key: _key_policy(open_statement),
+        }
+        mock_kms.get_key_policy.side_effect = lambda KeyId: {"Policy": policies[KeyId]}
+
+        findings = agentcore_app.check_agentcore_policy_engine_key_scope()
+
+        by_engine = {
+            ("pe-1" if "(pe-1)" in f["Finding_Details"] else "pe-2"): f
+            for f in findings
+        }
+        assert by_engine["pe-1"]["Status"] == "Passed"
+        assert "names the principals" not in by_engine["pe-1"]["Finding_Details"]
+        assert by_engine["pe-2"]["Status"] == "Failed"
+        details = by_engine["pe-2"]["Finding_Details"]
+        assert "disablekey, disablekeyrotation, putkeypolicy, schedulekeydeletion" in (
+            details
+        )
+        assert "every principal decrypt" in details
+
+
 class TestAC36CheckRegistration:
     """AC-36 reads regional policy engines and their regional keys."""
 
@@ -12962,9 +13537,41 @@ class TestAC41EvaluationResultProtection:
         group.update(overrides)
         return group
 
+    # Each Passed below reads the results key's policy. Before AC-41 read the key
+    # policy itself these tests stubbed no KMS client and passed on the key's
+    # presence; they now need a policy whose decrypt grant is bound.
+    @staticmethod
+    def _bound_key(mock_kms):
+        mock_kms.get_key_policy.return_value = {
+            "Policy": json.dumps(
+                {
+                    "Statement": [
+                        {
+                            "Effect": "Allow",
+                            "Principal": {"Service": "logs.us-east-1.amazonaws.com"},
+                            "Action": ["kms:Decrypt", "kms:GenerateDataKey*"],
+                            "Resource": "*",
+                            "Condition": {
+                                "ArnLike": {
+                                    "kms:EncryptionContext:aws:logs:arn": (
+                                        "arn:aws:logs:us-east-1:123456789012:"
+                                        "log-group:*"
+                                    )
+                                }
+                            },
+                        }
+                    ]
+                }
+            )
+        }
+
+    @patch("agentcore_app.kms_client")
     @patch("agentcore_app.logs_client")
     @patch("agentcore_app.agentcore_client")
-    def test_a_retained_encrypted_prefixed_group_passes(self, mock_ac, mock_logs):
+    def test_a_retained_encrypted_prefixed_group_passes(
+        self, mock_ac, mock_logs, mock_kms
+    ):
+        self._bound_key(mock_kms)
         _online_evaluation_client(mock_ac)
         mock_logs.describe_log_groups.return_value = {"logGroups": [self._log_group()]}
 
@@ -13087,9 +13694,11 @@ class TestAC41EvaluationResultProtection:
         assert findings[0]["Status"] == "N/A"
         assert "DescribeLogGroups" in findings[0]["Resolution"]
 
+    @patch("agentcore_app.kms_client")
     @patch("agentcore_app.logs_client")
     @patch("agentcore_app.agentcore_client")
-    def test_the_group_lookup_is_paginated(self, mock_ac, mock_logs):
+    def test_the_group_lookup_is_paginated(self, mock_ac, mock_logs, mock_kms):
+        self._bound_key(mock_kms)
         _online_evaluation_client(mock_ac)
         mock_logs.describe_log_groups.side_effect = [
             {
@@ -13103,9 +13712,13 @@ class TestAC41EvaluationResultProtection:
 
         assert findings[0]["Status"] == "Passed"
 
+    @patch("agentcore_app.kms_client")
     @patch("agentcore_app.logs_client")
     @patch("agentcore_app.agentcore_client")
-    def test_every_configuration_is_judged_not_only_the_first(self, mock_ac, mock_logs):
+    def test_every_configuration_is_judged_not_only_the_first(
+        self, mock_ac, mock_logs, mock_kms
+    ):
+        self._bound_key(mock_kms)
         _online_evaluation_client(
             mock_ac,
             [
@@ -13159,6 +13772,173 @@ class TestAC41EvaluationResultProtection:
         findings = agentcore_app.check_agentcore_evaluation_result_protection()
         assert findings[0]["Status"] == "N/A"
         assert findings[0]["Check_ID"] == "AC-41"
+
+
+class TestAC41ResultsKeyPolicy:
+    """AC-41 reads the results group's key policy itself, not through AC-26's sweep."""
+
+    _log_group = staticmethod(TestAC41EvaluationResultProtection._log_group)
+    _OPEN = json.dumps(
+        {
+            "Statement": [
+                {
+                    "Effect": "Allow",
+                    "Principal": {"AWS": "arn:aws:iam::*:root"},
+                    "Action": "kms:Decrypt",
+                    "Resource": "*",
+                }
+            ]
+        }
+    )
+    _BOUND = json.dumps(
+        {
+            "Statement": [
+                {
+                    "Effect": "Allow",
+                    "Principal": "*",
+                    "Action": "kms:Decrypt",
+                    "Resource": "*",
+                    "Condition": {
+                        "StringEquals": {"kms:CallerAccount": "123456789012"}
+                    },
+                }
+            ]
+        }
+    )
+
+    @staticmethod
+    def _two_configurations(mock_ac):
+        _online_evaluation_client(
+            mock_ac,
+            [
+                _online_evaluation_detail(),
+                _online_evaluation_detail(
+                    onlineEvaluationConfigId="oec-2",
+                    onlineEvaluationConfigName="second",
+                    outputConfig={
+                        "cloudWatchConfig": {
+                            "logGroupName": (
+                                "/aws/bedrock-agentcore/evaluations/results/oec-2"
+                            )
+                        }
+                    },
+                ),
+            ],
+        )
+
+    @patch("agentcore_app.kms_client")
+    @patch("agentcore_app.logs_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_an_open_results_key_fails_a_retained_prefixed_group(
+        self, mock_ac, mock_logs, mock_kms
+    ):
+        _online_evaluation_client(mock_ac)
+        mock_logs.describe_log_groups.return_value = {"logGroups": [self._log_group()]}
+        mock_kms.get_key_policy.return_value = {"Policy": self._OPEN}
+
+        findings = agentcore_app.check_agentcore_evaluation_result_protection()
+
+        assert findings[0]["Status"] == "Failed"
+        assert "every principal to decrypt" in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.kms_client")
+    @patch("agentcore_app.logs_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_one_open_key_among_two_configurations_fails_alone(
+        self, mock_ac, mock_logs, mock_kms
+    ):
+        self._two_configurations(mock_ac)
+        mock_logs.describe_log_groups.side_effect = lambda logGroupNamePrefix: {
+            "logGroups": [
+                self._log_group(
+                    logGroupNamePrefix,
+                    kmsKeyId=(
+                        "arn:aws:kms:us-east-1:123456789012:key/"
+                        + ("bound" if logGroupNamePrefix.endswith("oec-1") else "open")
+                    ),
+                )
+            ]
+        }
+        mock_kms.get_key_policy.side_effect = lambda KeyId: {
+            "Policy": self._BOUND if KeyId.endswith("bound") else self._OPEN
+        }
+
+        findings = agentcore_app.check_agentcore_evaluation_result_protection()
+
+        assert [finding["Status"] for finding in findings] == ["Passed", "Failed"]
+        assert "key/open" in findings[1]["Finding_Details"]
+
+    @patch("agentcore_app.kms_client")
+    @patch("agentcore_app.logs_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_shared_key_is_read_once(self, mock_ac, mock_logs, mock_kms):
+        self._two_configurations(mock_ac)
+        mock_logs.describe_log_groups.side_effect = lambda logGroupNamePrefix: {
+            "logGroups": [self._log_group(logGroupNamePrefix)]
+        }
+        mock_kms.get_key_policy.return_value = {"Policy": self._BOUND}
+
+        findings = agentcore_app.check_agentcore_evaluation_result_protection()
+
+        assert [finding["Status"] for finding in findings] == ["Passed", "Passed"]
+        assert mock_kms.get_key_policy.call_count == 1
+
+    @patch("agentcore_app.kms_client")
+    @patch("agentcore_app.logs_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_an_unreadable_key_policy_is_na_not_passed(
+        self, mock_ac, mock_logs, mock_kms
+    ):
+        _online_evaluation_client(mock_ac)
+        mock_logs.describe_log_groups.return_value = {"logGroups": [self._log_group()]}
+        mock_kms.get_key_policy.side_effect = _make_client_error(
+            "AccessDeniedException", "denied"
+        )
+
+        findings = agentcore_app.check_agentcore_evaluation_result_protection()
+
+        assert findings[0]["Status"] == "N/A"
+        assert "could not be read" in findings[0]["Finding_Details"]
+        assert "kms:GetKeyPolicy" in findings[0]["Resolution"]
+
+    @patch("agentcore_app.kms_client")
+    @patch("agentcore_app.logs_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_an_unreadable_key_does_not_hide_a_missing_retention(
+        self, mock_ac, mock_logs, mock_kms
+    ):
+        _online_evaluation_client(mock_ac)
+        group = self._log_group()
+        group.pop("retentionInDays")
+        mock_logs.describe_log_groups.return_value = {"logGroups": [group]}
+        mock_kms.get_key_policy.side_effect = _make_client_error(
+            "AccessDeniedException", "denied"
+        )
+
+        findings = agentcore_app.check_agentcore_evaluation_result_protection()
+
+        assert findings[0]["Status"] == "Failed"
+        assert "kept indefinitely" in findings[0]["Finding_Details"]
+        assert "could not be read" in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.kms_client")
+    @patch("agentcore_app.logs_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_passed_group_names_the_retention_ceiling_and_no_ac26_claim(
+        self, mock_ac, mock_logs, mock_kms
+    ):
+        _online_evaluation_client(mock_ac)
+        mock_logs.describe_log_groups.return_value = {
+            "logGroups": [self._log_group(retentionInDays=1)]
+        }
+        mock_kms.get_key_policy.return_value = {"Policy": self._BOUND}
+
+        findings = agentcore_app.check_agentcore_evaluation_result_protection()
+
+        assert findings[0]["Status"] == "Passed"
+        assert "AC-26 judges" not in findings[0]["Finding_Details"]
+        assert "unless a condition binds" in findings[0]["Finding_Details"]
+        assert "no API field states" in findings[0]["Resolution"]
 
 
 def _pass_role_policy(resource, condition=None, action="iam:PassRole"):

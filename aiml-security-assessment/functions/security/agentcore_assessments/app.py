@@ -717,11 +717,18 @@ AGENTCORE_VENDED_LOG_SERVICE = "bedrock-agentcore"
 AGENTCORE_VENDED_LOG_TYPE = "APPLICATION_LOGS"
 
 # Condition keys that bind a cross-account observability sink policy to a known
-# set of principals. Operators may be prefixed (ForAnyValue:StringLike), so the
-# key names are compared, not the operators.
+# set of principals, and the operators under which they bind. ForAllValues and
+# the IfExists forms are true when the key is absent from the request, and the
+# negated operators admit every organization but the one named, so none of them
+# binds the sink.
 SINK_PRINCIPAL_SCOPE_CONDITION_KEYS = {
     "aws:principalorgid",
     "aws:principalorgpaths",
+}
+SINK_SCOPE_BINDING_OPERATORS = {
+    "stringequals",
+    "stringequalsignorecase",
+    "stringlike",
 }
 
 # Namespace variable that partitions long-term memory records per end user. AWS
@@ -7727,21 +7734,61 @@ def _sink_statement_principals(statement: Dict[str, Any]) -> List[str]:
     return []
 
 
+def _sink_org_condition_binds(operator: str, key: str, raw: Any) -> bool:
+    """Return whether one organization condition entry limits who can link.
+
+    The operator has to be a positive string match, optionally ForAnyValue, and
+    every value has to name its organization with no wildcard: `o-*` in
+    aws:PrincipalOrgID, or in the first segment of an aws:PrincipalOrgPaths
+    path, matches every organization. A wildcard after the organization segment
+    narrows within one organization, so it still binds.
+    """
+    operator = str(operator).strip().lower()
+    if operator.startswith("forallvalues:") or operator.endswith("ifexists"):
+        return False
+    if operator.startswith("foranyvalue:"):
+        operator = operator[len("foranyvalue:") :]
+    if operator not in SINK_SCOPE_BINDING_OPERATORS:
+        return False
+    values = [value.strip() for value in _condition_values(raw)]
+    if not values:
+        return False
+    for value in values:
+        org_segment = (
+            value.split("/", 1)[0] if key == "aws:principalorgpaths" else value
+        )
+        if not org_segment or "*" in org_segment or "?" in org_segment:
+            return False
+    return True
+
+
 def _sink_statement_is_scoped(statement: Dict[str, Any]) -> bool:
-    """Return whether one sink-policy statement binds the sink to known callers."""
+    """Return whether one sink-policy statement binds the sink to known callers.
+
+    Named principals bind it only when no value carries `*`: `*` alone and an
+    ARN such as an account-wildcard root both admit every account. A NotPrincipal
+    Allow admits everyone outside its list, so only a condition can bind it.
+    """
     principals = _sink_statement_principals(statement)
-    if principals and "*" not in principals:
+    if (
+        "NotPrincipal" not in statement
+        and principals
+        and not any("*" in principal for principal in principals)
+    ):
         return True
 
     conditions = statement.get("Condition")
     if not isinstance(conditions, dict):
         return False
 
-    for condition_values in conditions.values():
+    for operator, condition_values in conditions.items():
         if not isinstance(condition_values, dict):
             continue
-        for condition_key in condition_values:
-            if str(condition_key).lower() in SINK_PRINCIPAL_SCOPE_CONDITION_KEYS:
+        for condition_key, raw in condition_values.items():
+            key = str(condition_key).strip().lower()
+            if key in SINK_PRINCIPAL_SCOPE_CONDITION_KEYS and _sink_org_condition_binds(
+                operator, key, raw
+            ):
                 return True
 
     return False
@@ -7799,7 +7846,10 @@ def check_agentcore_telemetry_sink_scope() -> List[Dict[str, Any]]:
                 finding_name="AgentCore Telemetry Sink Scope",
                 finding_details=(
                     "No observability sink found in this region, so no telemetry "
-                    "is aggregated into this account."
+                    "is aggregated into this account. Whether this account links "
+                    "its own telemetry to a sink elsewhere is not read: "
+                    "oam:ListLinks has no resource type and needs Resource '*', "
+                    "which this role is not granted."
                 ),
                 resolution=(
                     "No action required for a single-account deployment. Create a "
@@ -7926,7 +7976,9 @@ def check_agentcore_telemetry_sink_scope() -> List[Dict[str, Any]]:
                     finding_name="AgentCore Telemetry Sink Scope",
                     finding_details=(
                         f"Sink '{sink_name}' restricts every Allow statement to "
-                        "named principals or to an organization condition key."
+                        "principals named with no wildcard, or to an organization "
+                        "condition that names its organization under a positive "
+                        "string operator."
                     ),
                     resolution=(
                         "No action required. Confirm the organization or account "
@@ -7945,8 +7997,10 @@ def check_agentcore_telemetry_sink_scope() -> List[Dict[str, Any]]:
                 finding_name="AgentCore Telemetry Sink Scope",
                 finding_details=(
                     f"Sink '{sink_name}' has {unscoped_count} Allow statement(s) "
-                    "that name no principal and carry no organization condition, "
-                    "so any account can link telemetry into it."
+                    "whose principal is a wildcard or a NotPrincipal and whose "
+                    "organization condition is absent, negated, IfExists, "
+                    "ForAllValues or wildcarded, so any account can link "
+                    "telemetry into it."
                     if unscoped_count
                     else f"Sink '{sink_name}' policy contains no Allow statement "
                     "binding it to a known set of principals."
@@ -8934,31 +8988,167 @@ def check_agentcore_gateway_role_scope(
     return findings
 
 
-def _kms_key_policy_allows_open_decrypt(policy_document: Any) -> bool:
-    """Return whether a key policy lets every principal decrypt with no condition.
+# Condition keys that bind a key-policy grant to one caller population, by the
+# kind of value each carries. kms:ViaService and the encryption context are not
+# here: both narrow how the key is reached, and a wildcard principal holding
+# either still reaches the key from any account.
+KMS_KEY_POLICY_BINDING_KEYS = {
+    "kms:calleraccount": "account",
+    "aws:principalaccount": "account",
+    "aws:sourceaccount": "account",
+    "aws:principalorgid": "account",
+    "aws:principalarn": "arn",
+    "aws:sourcearn": "arn",
+}
+KMS_KEY_POLICY_BINDING_OPERATORS = {
+    "stringequals",
+    "stringequalsignorecase",
+    "stringlike",
+    "arnequals",
+    "arnlike",
+}
 
-    A customer managed key on a log group only keeps the log data under the
-    account's control while the key policy narrows who may use it. An Allow to
-    `Principal: "*"` with no condition puts the plaintext within reach of every
-    principal the account trusts, which is the posture the CMK was meant to
-    replace.
+
+def _kms_condition_value_is_bounded(kind: str, value: str) -> bool:
+    """Return whether one condition value names a single account or principal."""
+    value = value.strip()
+    if not value:
+        return False
+    if kind == "account":
+        return "*" not in value and "?" not in value
+    parts = value.split(":", 5)
+    if len(parts) < 6 or parts[0].lower() != "arn":
+        return False
+    return not any(
+        wildcard in segment for segment in parts[1:3] + parts[4:5] for wildcard in "*?"
+    )
+
+
+def _kms_statement_condition_binds(
+    statement: Dict[str, Any], binding_keys: Optional[Dict[str, str]] = None
+) -> bool:
+    """Return whether a condition limits one Allow to a known caller population.
+
+    The key has to be one of KMS_KEY_POLICY_BINDING_KEYS under a positive
+    operator, optionally ForAnyValue, and every value has to name one account,
+    organization or principal. ForAllValues and IfExists are true when the key
+    is absent, the negated operators admit every caller but the one named, and
+    Condition blocks are AND-ed, so one binding entry binds the statement.
     """
-    for statement in _document_statements(policy_document, effect="Allow"):
-        if statement.get("Condition"):
+    conditions = statement.get("Condition")
+    if not isinstance(conditions, dict):
+        return False
+    for operator, entries in conditions.items():
+        if not isinstance(entries, dict):
             continue
-        if "*" not in _statement_principals(statement):
+        name = str(operator).strip().lower()
+        if name.startswith("forallvalues:") or name.endswith("ifexists"):
             continue
-        for pattern in _statement_actions(statement):
-            if pattern == "*":
-                return True
-            namespace, _, action_pattern = pattern.partition(":")
-            if namespace != "kms":
+        if name.startswith("foranyvalue:"):
+            name = name[len("foranyvalue:") :]
+        if name not in KMS_KEY_POLICY_BINDING_OPERATORS:
+            continue
+        for key, raw in entries.items():
+            kind = (binding_keys or KMS_KEY_POLICY_BINDING_KEYS).get(
+                str(key).strip().lower()
+            )
+            if kind is None:
                 continue
-            if any(
-                fnmatchcase(action, action_pattern) for action in KMS_DECRYPT_ACTIONS
+            values = _condition_values(raw)
+            if values and all(
+                _kms_condition_value_is_bounded(kind, value) for value in values
             ):
                 return True
     return False
+
+
+def _kms_key_policy_open_actions(
+    policy_document: Any, actions: Tuple[str, ...]
+) -> List[str]:
+    """Return which of these KMS actions an unbounded principal may take.
+
+    A principal is unbounded when an Allow names it with NotPrincipal or with a
+    value carrying `*`, which covers `*`, {"AWS": "*"} and an account-wildcard
+    root ARN.
+    Such a grant is open unless a condition binds the caller's account,
+    organization, principal ARN or source. NotAction grants every action it does
+    not list. Deny statements are not subtracted, so a Deny that removes the
+    grant can only produce a false Failed.
+    """
+    opened: Set[str] = set()
+    for statement in _document_statements(policy_document, effect="Allow"):
+        principals = _statement_principals(statement)
+        if "NotPrincipal" not in statement and not any(
+            "*" in principal for principal in principals
+        ):
+            continue
+        if _kms_statement_condition_binds(statement):
+            continue
+        for action in actions:
+            qualified = f"kms:{action}"
+            if "NotAction" in statement:
+                if not any(
+                    fnmatchcase(qualified, pattern)
+                    for pattern in _statement_not_actions(statement)
+                ):
+                    opened.add(action)
+            elif any(
+                fnmatchcase(qualified, pattern)
+                for pattern in _statement_actions(statement)
+            ):
+                opened.add(action)
+    return sorted(opened)
+
+
+# A grant to the CloudWatch Logs service principal is bound to this account's
+# log groups only by the log-group encryption context or the source keys; with
+# neither, CloudWatch Logs will use the key for a log group in any account.
+KMS_LOGS_SERVICE_BINDING_KEYS = {
+    **KMS_KEY_POLICY_BINDING_KEYS,
+    "kms:encryptioncontext:aws:logs:arn": "arn",
+}
+
+
+def _kms_logs_service_grant_is_unbound(policy_document: Any) -> bool:
+    """Return whether a CloudWatch Logs service grant reaches any account's groups.
+
+    A statement naming a logs.<region>.amazonaws.com service principal and
+    reaching a decrypt action is bound only when a positive condition names
+    this account's log groups through kms:EncryptionContext:aws:logs:arn, or
+    the caller's source account or ARN, with a literal account segment.
+    """
+    for statement in _document_statements(policy_document, effect="Allow"):
+        principal = statement.get("Principal")
+        services = principal.get("Service") if isinstance(principal, dict) else None
+        if isinstance(services, str):
+            services = [services]
+        if not isinstance(services, list) or not any(
+            isinstance(service, str)
+            and fnmatchcase(service.strip().lower(), "logs.*amazonaws.com")
+            for service in services
+        ):
+            continue
+        if _kms_statement_condition_binds(statement, KMS_LOGS_SERVICE_BINDING_KEYS):
+            continue
+        if any(
+            fnmatchcase(f"kms:{action}", pattern)
+            for action in KMS_DECRYPT_ACTIONS
+            for pattern in _statement_actions(statement)
+        ):
+            return True
+    return False
+
+
+def _kms_key_policy_allows_open_decrypt(policy_document: Any) -> bool:
+    """Return whether a key policy lets an unbounded principal decrypt.
+
+    A customer managed key on a log group only keeps the log data under the
+    account's control while the key policy narrows who may use it. A decrypt
+    grant to a wildcard or NotPrincipal principal that no condition binds to a
+    known caller puts the plaintext within reach of any account, which is the
+    posture the CMK was meant to replace.
+    """
+    return bool(_kms_key_policy_open_actions(policy_document, KMS_DECRYPT_ACTIONS))
 
 
 def check_agentcore_log_retention_and_key_scope() -> List[Dict[str, Any]]:
@@ -9072,12 +9262,24 @@ def check_agentcore_log_retention_and_key_scope() -> List[Dict[str, Any]]:
             elif _kms_key_policy_allows_open_decrypt(key_policy):
                 problems.append(
                     f"is encrypted with {key_id}, whose key policy allows every "
-                    "principal to decrypt with no condition"
+                    "principal to decrypt with no condition binding the caller's "
+                    "account, organization, principal ARN or source"
+                )
+            elif _kms_logs_service_grant_is_unbound(key_policy):
+                problems.append(
+                    f"is encrypted with {key_id}, whose key policy lets the "
+                    "CloudWatch Logs service decrypt with no "
+                    "kms:EncryptionContext:aws:logs:arn or source condition "
+                    "naming this account, so the key serves log groups in any "
+                    "account"
                 )
             else:
                 confirmations.append(
-                    f"is encrypted with {key_id}, whose key policy names the "
-                    "principals allowed to decrypt"
+                    f"is encrypted with {key_id}, whose key policy grants "
+                    "decrypt to no wildcard or NotPrincipal principal unless a "
+                    "condition binds the caller's account, organization, "
+                    "principal ARN or source, and binds the CloudWatch Logs "
+                    "service grant to this account's log groups"
                 )
 
         if problems:
@@ -9090,9 +9292,10 @@ def check_agentcore_log_retention_and_key_scope() -> List[Dict[str, Any]]:
                     ),
                     resolution=(
                         "Set a retention period on the log group that matches the "
-                        "investigation window this workload commits to, remove "
-                        "any unconditioned wildcard-principal decrypt grant from "
-                        "the encryption key's policy, and turn on deletion "
+                        "investigation window this workload commits to, bind "
+                        "every wildcard-principal decrypt grant in the encryption "
+                        "key's policy with kms:CallerAccount, aws:PrincipalOrgID "
+                        "or aws:PrincipalArn, and turn on deletion "
                         "protection for each runtime log group."
                     ),
                     reference=LOGS_RETENTION_REFERENCE_URL,
@@ -13347,32 +13550,6 @@ def check_agentcore_policy_tool_scope() -> List[Dict[str, Any]]:
     return findings
 
 
-def _kms_key_policy_open_actions(
-    policy_document: Any, actions: Tuple[str, ...]
-) -> List[str]:
-    """Return which of these KMS actions any principal may take unconditioned.
-
-    AC-26 asks the same question of a log group's key for the decrypt actions;
-    this asks it for the actions that take the key away.
-    """
-    opened: List[str] = []
-    for statement in _document_statements(policy_document, effect="Allow"):
-        if statement.get("Condition"):
-            continue
-        if "*" not in _statement_principals(statement):
-            continue
-        for pattern in _statement_actions(statement):
-            if pattern == "*":
-                return sorted(actions)
-            namespace, _, action_pattern = pattern.partition(":")
-            if namespace != "kms":
-                continue
-            opened.extend(
-                action for action in actions if fnmatchcase(action, action_pattern)
-            )
-    return sorted(set(opened))
-
-
 def check_agentcore_policy_engine_key_scope() -> List[Dict[str, Any]]:
     """AC-36: Report who may use and who may take away a policy engine's key.
 
@@ -13494,16 +13671,17 @@ def check_agentcore_policy_engine_key_scope() -> List[Dict[str, Any]]:
         problems: List[str] = []
         if _kms_key_policy_allows_open_decrypt(key_policy):
             problems.append(
-                "lets every principal decrypt with no condition, so the stored "
-                "authorization rules are readable by every principal the account "
-                "trusts"
+                "lets every principal decrypt with no condition binding the "
+                "caller's account, organization, principal ARN or source, so the "
+                "stored authorization rules are readable from any account"
             )
         disabling = _kms_key_policy_open_actions(key_policy, KMS_KEY_DISABLING_ACTIONS)
         if disabling:
             problems.append(
                 f"lets every principal call {', '.join(disabling)} with no "
-                "condition, so any of them can make every stored policy "
-                "unreadable, and the engine cannot be repointed at a new key"
+                "condition binding the caller, so any of them can make every "
+                "stored policy unreadable, and the engine cannot be repointed at "
+                "a new key"
             )
 
         if problems:
@@ -13534,9 +13712,10 @@ def check_agentcore_policy_engine_key_scope() -> List[Dict[str, Any]]:
                     finding_name="AgentCore Policy Engine Key Scope",
                     finding_details=(
                         f"{label} is encrypted with {key_arn}, whose key policy "
-                        "names the principals allowed to decrypt with it and the "
-                        "administrators allowed to disable it or schedule it for "
-                        "deletion."
+                        "grants decrypt, disable, deletion, key-policy and rotation "
+                        "actions to no wildcard or NotPrincipal principal unless a "
+                        "condition binds the caller's account, organization, "
+                        "principal ARN or source."
                     ),
                     resolution=(
                         "No action required. This check reads the key policy; "
@@ -14743,7 +14922,9 @@ def check_agentcore_evaluation_result_protection() -> List[Dict[str, Any]]:
     names start with an AgentCore prefix, and outputConfig names whichever log
     group the configuration's creator chose, so a results group outside those
     prefixes is judged by neither. This check anchors on the configuration instead
-    of on the name.
+    of on the name, and reads the group's key policy itself. The retention value
+    is read as present or absent only: no AgentCore or CloudWatch Logs field
+    states the schedule the workload commits to, so no value can be judged short.
     """
     if agentcore_client is None or logs_client is None:
         return [
@@ -14795,6 +14976,7 @@ def check_agentcore_evaluation_result_protection() -> List[Dict[str, Any]]:
         LOGS_RETENTION_REFERENCE_URL,
     )
 
+    key_policy_cache: Dict[str, Any] = {}
     for label, detail in details:
         output = (detail.get("outputConfig") or {}).get("cloudWatchConfig") or {}
         group_name = output.get("logGroupName")
@@ -14876,6 +15058,7 @@ def check_agentcore_evaluation_result_protection() -> List[Dict[str, Any]]:
 
         problems: List[str] = []
         confirmations: List[str] = []
+        unread: List[str] = []
 
         retention = group.get("retentionInDays")
         if retention:
@@ -14888,7 +15071,42 @@ def check_agentcore_evaluation_result_protection() -> List[Dict[str, Any]]:
 
         key_id = group.get("kmsKeyId")
         if key_id:
-            confirmations.append(f"is encrypted with {key_id}")
+            if key_id not in key_policy_cache:
+                try:
+                    key_policy_cache[key_id] = kms_client.get_key_policy(KeyId=key_id)[
+                        "Policy"
+                    ]
+                except Exception as error:
+                    logger.warning(f"Could not read key policy for {key_id}: {error}")
+                    key_policy_cache[key_id] = error
+            key_policy = key_policy_cache[key_id]
+            if isinstance(key_policy, Exception):
+                unread.append(
+                    f"is encrypted with {key_id}, whose key policy could not be "
+                    f"read: {_assessment_error_label(key_policy)}"
+                )
+            elif _kms_key_policy_allows_open_decrypt(key_policy):
+                problems.append(
+                    f"is encrypted with {key_id}, whose key policy allows every "
+                    "principal to decrypt with no condition binding the caller's "
+                    "account, organization, principal ARN or source"
+                )
+            elif _kms_logs_service_grant_is_unbound(key_policy):
+                problems.append(
+                    f"is encrypted with {key_id}, whose key policy lets the "
+                    "CloudWatch Logs service decrypt with no "
+                    "kms:EncryptionContext:aws:logs:arn or source condition "
+                    "naming this account, so the key serves log groups in any "
+                    "account"
+                )
+            else:
+                confirmations.append(
+                    f"is encrypted with {key_id}, whose key policy grants decrypt "
+                    "to no wildcard or NotPrincipal principal unless a condition "
+                    "binds the caller's account, organization, principal ARN or "
+                    "source, and binds the CloudWatch Logs service grant to this "
+                    "account's log groups"
+                )
         else:
             problems.append(
                 "has no customer managed encryption key, so who can read the stored "
@@ -14899,13 +15117,13 @@ def check_agentcore_evaluation_result_protection() -> List[Dict[str, Any]]:
         if group_name.startswith(AGENTCORE_LOG_GROUP_PREFIXES):
             confirmations.append(
                 "sits under an AgentCore log group prefix, so AC-20 judges its "
-                "masking policy and AC-26 judges its key policy"
+                "masking policy"
             )
         else:
             problems.append(
                 "sits outside the AgentCore log group prefixes "
-                f"({', '.join(AGENTCORE_LOG_GROUP_PREFIXES)}), so the masking and "
-                "key-policy controls that sweep log groups by name do not reach it"
+                f"({', '.join(AGENTCORE_LOG_GROUP_PREFIXES)}), so the masking "
+                "control that sweeps log groups by name does not reach it"
             )
 
         if problems:
@@ -14915,17 +15133,34 @@ def check_agentcore_evaluation_result_protection() -> List[Dict[str, Any]]:
                     finding_name="AgentCore Evaluation Results Unprotected",
                     finding_details=(
                         f"{label} writes results to log group '{group_name}', which "
-                        f"{' and '.join(problems)}."
+                        f"{' and '.join(problems + unread)}."
                     ),
                     resolution=(
                         "Set a retention period matching the schedule this workload "
-                        "commits to, encrypt the group with a customer managed key, "
-                        "and keep the results under an AgentCore log group prefix so "
-                        "the masking and key-scope controls cover it."
+                        "commits to, encrypt the group with a customer managed key "
+                        "whose decrypt grants are bound to the account, and keep the "
+                        "results under an AgentCore log group prefix so the masking "
+                        "control covers it."
                     ),
                     reference=LOGS_RETENTION_REFERENCE_URL,
                     severity=SeverityEnum.MEDIUM,
                     status=StatusEnum.FAILED,
+                )
+            )
+        elif unread:
+            findings.append(
+                create_finding(
+                    check_id="AC-41",
+                    finding_name="AgentCore Evaluation Result Protection",
+                    finding_details=(
+                        f"{label} writes results to log group '{group_name}', which "
+                        f"{' and '.join(confirmations + unread)}, so who can "
+                        "decrypt the results is unknown."
+                    ),
+                    resolution="Grant kms:GetKeyPolicy on the key and retry.",
+                    reference=KMS_KEY_POLICY_REFERENCE_URL,
+                    severity=SeverityEnum.INFORMATIONAL,
+                    status=StatusEnum.NA,
                 )
             )
         else:
@@ -14941,7 +15176,8 @@ def check_agentcore_evaluation_result_protection() -> List[Dict[str, Any]]:
                         "No action required for this check. Tag values and the "
                         "configuration's own description are free-form text this "
                         "check cannot judge, so confirm neither carries personal "
-                        "data."
+                        "data. Confirm the retention period matches the workload's "
+                        "schedule, which no API field states."
                     ),
                     reference=LOGS_RETENTION_REFERENCE_URL,
                     severity=SeverityEnum.MEDIUM,

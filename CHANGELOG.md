@@ -360,6 +360,26 @@ section.
     longer counts, nor does a trail that is not logging or that neither spans
     all Regions nor is homed in the scanned one. An unreadable trail status is
     `N/A`.
+  - `AC-22` reads a sink policy's principal and organization condition by
+    value. A statement naming principals passes only when no principal is a
+    wildcard and no `NotPrincipal` is present; otherwise it needs
+    `aws:PrincipalOrgID` or `aws:PrincipalOrgPaths` under `StringEquals`,
+    `StringEqualsIgnoreCase` or `StringLike` with a value whose organization
+    segment has no wildcard. A negated, `IfExists` or `ForAllValues` operator
+    and a wildcard organization no longer pass.
+  - `AC-26`, `AC-36` and `AC-41` read a key policy by value. An Allow whose
+    principal is a wildcard or a `NotPrincipal` fails unless a condition
+    binds the caller's account, organization, principal ARN or source with a
+    bounded value under a positive operator. `kms:ViaService` alone no longer
+    passes, because it narrows the path and not the caller, and neither do
+    `IfExists`, `ForAllValues` or a wildcard account. A grant to the CloudWatch
+    Logs service principal that does not bind the account or the
+    `kms:EncryptionContext:aws:logs:arn` value fails, because it serves log
+    groups in any account. `AC-41` now reads the results group's key policy
+    itself, so a results group outside an AgentCore prefix is judged by the
+    same rules, and an unreadable key policy is `N/A` and never `Passed`.
+    Retention length is reported and not judged: no API field states the
+    workload's schedule.
 
 ### Deployment impact
 
@@ -434,6 +454,10 @@ account's `trail/*` ARNs, and `bedrock-agentcore:ListWorkloadIdentities`,
 templates, so `AC-18` can read each trail's logging state and count the
 identity resources. All are read-only, and the same CodeBuild run applies
 them. Until it runs, the `AC-18` identity family reports `N/A`.
+
+`AC-22`, `AC-26`, `AC-36` and `AC-41` change no IAM grant: `kms:GetKeyPolicy`
+is already scoped to `key/*` in both SAM templates. Rows of these checks that
+passed before can now fail after the same CodeBuild run.
 
 ## 2.0.0 - 2026-09-18
 

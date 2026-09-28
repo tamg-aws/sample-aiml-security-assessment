@@ -778,6 +778,10 @@ _VERIFIED_REMEDIATION_CONDITION_KEYS = {
     "bedrock-agentcore:InboundJwtClaim",
     # Same second run as the AC-42 action block above.
     "iam:PassedToService",
+    # Verified 2026-09-28 with ValidatePolicy (RESOURCE_POLICY) on a key policy
+    # statement: kms:CallerAccountNotReal came back INVALID_SERVICE_CONDITION_KEY
+    # and kms:CallerAccount raised nothing.
+    "kms:CallerAccount",
 }
 
 # Verified the same way and on the same date: ValidatePolicy reports an
