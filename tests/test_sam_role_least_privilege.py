@@ -26,6 +26,8 @@ _RESOURCE_HEADER_RE = re.compile(r"^  [A-Za-z][A-Za-z0-9]*:\s*$", re.MULTILINE)
 _LARGEST_PARTITION = "aws-us-gov"
 _INLINE_ROLE_POLICY_LIMIT = 10_240
 _INLINE_ROLE_POLICY_BUDGET = 9_000
+_MANAGED_POLICY_LIMIT = 6_144
+_MANAGED_POLICY_BUDGET = 5_500
 
 
 class _CfnLoader(yaml.SafeLoader):
@@ -87,22 +89,24 @@ def _unconditioned_wildcard_actions(path, logical_id):
     }
 
 
-def _render_policy_intrinsics(value):
+def _render_policy_intrinsics(value, partition=_LARGEST_PARTITION):
     """Render policy intrinsics conservatively for IAM character-count checks."""
     if isinstance(value, list):
-        return [_render_policy_intrinsics(item) for item in value]
+        return [_render_policy_intrinsics(item, partition) for item in value]
     if not isinstance(value, dict):
         return value
     if set(value) == {"Fn::Sub"}:
         template = value["Fn::Sub"]
         assert isinstance(template, str), "size guard supports string !Sub values"
-        return template.replace("${AWS::Partition}", _LARGEST_PARTITION).replace(
+        return template.replace("${AWS::Partition}", partition).replace(
             "${AWS::AccountId}", "123456789012"
         )
     if len(value) == 1 and next(iter(value)).startswith("Fn::"):
         # A realistic upper-bound placeholder for !GetAtt/!Ref policy values.
         return "x" * 128
-    return {key: _render_policy_intrinsics(item) for key, item in value.items()}
+    return {
+        key: _render_policy_intrinsics(item, partition) for key, item in value.items()
+    }
 
 
 _EXPECTED_ACTIONS = {
@@ -137,10 +141,16 @@ _EXPECTED_ACTIONS = {
         "s3:ListBucket",
         "s3:PutObject",
     },
-    "BedrockSecurityAssessmentFunction": {
-        "aoss:BatchGetCollection",
+    "BedrockAssessmentReadsPolicy": {
         "aoss:GetAccessPolicy",
         "aoss:ListAccessPolicies",
+        "bedrock:ListIngestionJobs",
+        "cloudtrail:GetEventDataStore",
+        "sagemaker:DescribeTrainingJob",
+        "sagemaker:ListTrainingJobs",
+    },
+    "BedrockSecurityAssessmentFunction": {
+        "aoss:BatchGetCollection",
         "backup:DescribeBackupVault",
         "backup:ListBackupVaults",
         "bedrock-agentcore:GetAgentRuntime",
@@ -188,7 +198,6 @@ _EXPECTED_ACTIONS = {
         "bedrock:ListPrompts",
         "bedrock:ListProvisionedModelThroughputs",
         "bedrock:ListTagsForResource",
-        "cloudtrail:GetEventDataStore",
         "cloudtrail:GetEventSelectors",
         "cloudtrail:GetTrail",
         "cloudtrail:GetTrailStatus",
@@ -653,6 +662,129 @@ def test_sam_lambda_inline_policy_documents_stay_within_budget(template):
             f"budget and never exceed IAM's aggregate "
             f"{_INLINE_ROLE_POLICY_LIMIT:,}-character role quota."
         )
+
+
+def _references(value, logical_id):
+    """Whether a parsed template value refers to logical_id by any intrinsic."""
+    if isinstance(value, list):
+        return any(_references(item, logical_id) for item in value)
+    if isinstance(value, dict):
+        return any(
+            _references(key, logical_id) or _references(item, logical_id)
+            for key, item in value.items()
+        )
+    return isinstance(value, str) and re.search(rf"\b{logical_id}\b", value) is not None
+
+
+@pytest.mark.parametrize("template", _SAM_TEMPLATES, ids=os.path.basename)
+@pytest.mark.parametrize("partition", ["aws", "aws-us-gov"])
+def test_bedrock_managed_policy_renders_within_its_budget(template, partition):
+    with open(template, encoding="utf-8") as template_file:
+        data = yaml.load(template_file, Loader=_CfnLoader)  # nosec B506
+
+    document = data["Resources"]["BedrockAssessmentReadsPolicy"]["Properties"][
+        "PolicyDocument"
+    ]
+    rendered = json.dumps(
+        _render_policy_intrinsics(document, partition), separators=(",", ":")
+    )
+    assert partition + ":" in rendered
+    assert len(rendered) <= _MANAGED_POLICY_BUDGET, (
+        f"{os.path.basename(template)} BedrockAssessmentReadsPolicy renders to "
+        f"{len(rendered):,} characters in {partition}; keep it below the "
+        f"{_MANAGED_POLICY_BUDGET:,}-character project budget and never exceed "
+        f"IAM's {_MANAGED_POLICY_LIMIT:,}-character managed policy limit."
+    )
+
+
+@pytest.mark.parametrize("template", _SAM_TEMPLATES, ids=os.path.basename)
+def test_bedrock_managed_policy_holds_exactly_the_approved_grants(template):
+    with open(template, encoding="utf-8") as template_file:
+        data = yaml.load(template_file, Loader=_CfnLoader)  # nosec B506
+
+    resource = data["Resources"]["BedrockAssessmentReadsPolicy"]
+    assert resource["Type"] == "AWS::IAM::ManagedPolicy"
+    document = resource["Properties"]["PolicyDocument"]
+    grants = sorted(
+        (
+            statement["Effect"],
+            action,
+            json.dumps(statement["Resource"], sort_keys=True),
+        )
+        for statement in document["Statement"]
+        for action in statement["Action"]
+    )
+    assert all(
+        set(s) <= {"Sid", "Effect", "Action", "Resource"} for s in document["Statement"]
+    )
+    assert grants == sorted(
+        [
+            ("Allow", "aoss:ListAccessPolicies", '"*"'),
+            ("Allow", "aoss:GetAccessPolicy", '"*"'),
+            ("Allow", "sagemaker:ListTrainingJobs", '"*"'),
+            (
+                "Allow",
+                "cloudtrail:GetEventDataStore",
+                json.dumps(
+                    {
+                        "Fn::Sub": "arn:${AWS::Partition}:cloudtrail:*:"
+                        "${AWS::AccountId}:eventdatastore/*"
+                    }
+                ),
+            ),
+            (
+                "Allow",
+                "bedrock:ListIngestionJobs",
+                json.dumps(
+                    {
+                        "Fn::Sub": "arn:${AWS::Partition}:bedrock:*:"
+                        "${AWS::AccountId}:knowledge-base/*"
+                    }
+                ),
+            ),
+            (
+                "Allow",
+                "sagemaker:DescribeTrainingJob",
+                json.dumps(
+                    {
+                        "Fn::Sub": "arn:${AWS::Partition}:sagemaker:*:"
+                        "${AWS::AccountId}:training-job/*"
+                    }
+                ),
+            ),
+        ]
+    )
+    inline = _actions(template, "BedrockSecurityAssessmentFunction")
+    assert not {action for _, action, _ in grants} & inline
+
+
+@pytest.mark.parametrize("template", _SAM_TEMPLATES, ids=os.path.basename)
+def test_bedrock_managed_policy_is_attached_only_to_the_bedrock_function(template):
+    with open(template, encoding="utf-8") as template_file:
+        data = yaml.load(template_file, Loader=_CfnLoader)  # nosec B506
+
+    managed = {
+        logical_id
+        for logical_id, resource in data["Resources"].items()
+        if resource.get("Type") == "AWS::IAM::ManagedPolicy"
+    }
+    assert managed == {"BedrockAssessmentReadsPolicy"}
+    properties = data["Resources"]["BedrockAssessmentReadsPolicy"]["Properties"]
+    assert not {"Roles", "Users", "Groups"} & set(properties)
+
+    referencing = {
+        logical_id
+        for logical_id, resource in data["Resources"].items()
+        if logical_id != "BedrockAssessmentReadsPolicy"
+        and _references(resource, "BedrockAssessmentReadsPolicy")
+    }
+    assert referencing == {"BedrockSecurityAssessmentFunction"}
+    policies = data["Resources"]["BedrockSecurityAssessmentFunction"]["Properties"][
+        "Policies"
+    ]
+    references = [p for p in policies if _references(p, "BedrockAssessmentReadsPolicy")]
+    assert references == [{"Fn::Ref": "BedrockAssessmentReadsPolicy"}]
+    assert not _references(data.get("Outputs", {}), "BedrockAssessmentReadsPolicy")
 
 
 _ARTIFACT_PREFIXES = {
@@ -1353,8 +1485,6 @@ def test_aisf_phase5_reads_wildcard_only_where_iam_has_no_resource_type(template
             "ec2:DescribeRouteTables",
             "bedrock:ListModelCustomizationJobs",
             "aoss:BatchGetCollection",
-            "aoss:ListAccessPolicies",
-            "aoss:GetAccessPolicy",
             "comprehend:ListPiiEntitiesDetectionJobs",
             "sso:ListInstances",
             "bedrock-agentcore:ListAgentRuntimes",
@@ -1446,7 +1576,7 @@ def test_aisf_phase5_reads_wildcard_only_where_iam_has_no_resource_type(template
             "sso:ListPermissionSets",
             "sso:::instance/*",
         ),
-        ("BedrockSecurityAssessmentFunction", "CloudTrailEventDataStoreRead"): (
+        ("BedrockAssessmentReadsPolicy", "CloudTrailEventDataStoreRead"): (
             "cloudtrail:GetEventDataStore",
             "cloudtrail:*:${AWS::AccountId}:eventdatastore/*",
         ),

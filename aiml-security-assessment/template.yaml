@@ -282,6 +282,46 @@ Resources:
               Action:
                 - s3:DeleteObject
               Resource: !Sub '${AIMLAssessmentBucket.Arn}/permissions_cache_*.json'
+  BedrockAssessmentReadsPolicy:
+    # Reads that do not fit the Bedrock function's 9000-byte inline policy
+    # budget. Attached only to BedrockSecurityAssessmentFunction through its
+    # Policies list. A managed policy document is limited to 6144 characters.
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Description: Read-only grants for the Bedrock security assessment function
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: ManagedReadsOnWildcard
+            # None of these actions has a resource type in the service
+            # authorization reference.
+            Effect: Allow
+            Action:
+              - aoss:ListAccessPolicies # BR-20
+              - aoss:GetAccessPolicy # BR-20
+              - sagemaker:ListTrainingJobs # BR-46, BR-47, BR-52
+            Resource: '*'
+          - Sid: CloudTrailEventDataStoreRead
+            # BR-06 reads each event data store's Status and
+            # AdvancedEventSelectors. ListEventDataStores has no resource
+            # type and is granted on '*' in the function's inline policy.
+            Effect: Allow
+            Action:
+              - cloudtrail:GetEventDataStore # BR-06
+            Resource: !Sub 'arn:${AWS::Partition}:cloudtrail:*:${AWS::AccountId}:eventdatastore/*'
+          - Sid: BedrockIngestionJobList
+            # BR-46 reads when each knowledge base data source last ingested.
+            Effect: Allow
+            Action:
+              - bedrock:ListIngestionJobs # BR-46
+            Resource: !Sub 'arn:${AWS::Partition}:bedrock:*:${AWS::AccountId}:knowledge-base/*'
+          - Sid: SageMakerTrainingJobRead
+            # BR-46, BR-47 and BR-52 resolve each training job's input
+            # channels and output path to the S3 buckets it reads and writes.
+            Effect: Allow
+            Action:
+              - sagemaker:DescribeTrainingJob # BR-46, BR-47, BR-52
+            Resource: !Sub 'arn:${AWS::Partition}:sagemaker:*:${AWS::AccountId}:training-job/*'
   BedrockSecurityAssessmentFunction:
     Type: AWS::Serverless::Function
     Properties:
@@ -350,8 +390,6 @@ Resources:
                 - bedrock:ListPrompts # BR-04, BR-05, BR-06, BR-07, BR-18, BR-22, BR-32, BR-53
                 - bedrock:ListAutomatedReasoningPolicies # BR-38
                 - aoss:BatchGetCollection # BR-20
-                - aoss:ListAccessPolicies # BR-20
-                - aoss:GetAccessPolicy # BR-20
                 - comprehend:ListPiiEntitiesDetectionJobs # BR-26
                 - sso:ListInstances # BR-51
                 - bedrock-agentcore:ListAgentRuntimes # BR-42, BR-47, BR-52, BR-53, BR-57
@@ -474,14 +512,6 @@ Resources:
                 - bedrock:ListDataSources # BR-46
                 - bedrock:GetDataSource # BR-46
               Resource: !Sub 'arn:${AWS::Partition}:bedrock:*:${AWS::AccountId}:knowledge-base/*'
-            - Sid: CloudTrailEventDataStoreRead
-              # BR-06 reads each event data store's Status and
-              # AdvancedEventSelectors. ListEventDataStores has no resource
-              # type and is granted on '*' in AccountReadsOnWildcard.
-              Effect: Allow
-              Action:
-                - cloudtrail:GetEventDataStore # BR-06
-              Resource: !Sub 'arn:${AWS::Partition}:cloudtrail:*:${AWS::AccountId}:eventdatastore/*'
             - Sid: S3VectorsKnowledgeBaseStoreRead
               # BR-20 follows a knowledge base's s3VectorsConfiguration.vectorBucketArn
               # to the vector bucket, and its indexArn/indexName to the one index that
@@ -500,9 +530,9 @@ Resources:
               # BR-20 follows a bring-your-own vector store to the key it is
               # encrypted with, and a third-party store to its credentials
               # secret. The region is wildcarded for the same reason as above.
-              # aoss:BatchGetCollection, ListAccessPolicies and GetAccessPolicy
-              # have no resource type and are granted on '*' in
-              # AccountReadsOnWildcard.
+              # aoss:BatchGetCollection has no resource type and is granted on
+              # '*' in AccountReadsOnWildcard. ListAccessPolicies and
+              # GetAccessPolicy are in BedrockAssessmentReadsPolicy.
               Effect: Allow
               Action:
                 - rds:DescribeDBClusters # BR-20
@@ -686,6 +716,7 @@ Resources:
               Resource:
                 - !Sub 'arn:${AWS::Partition}:sso:::instance/*'
                 - !Sub 'arn:${AWS::Partition}:sso:::permissionSet/*/*'
+        - !Ref BedrockAssessmentReadsPolicy
   SagemakerSecurityAssessmentFunction:
     Type: AWS::Serverless::Function
     Properties:

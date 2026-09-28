@@ -295,6 +295,10 @@ section.
   name each unread leg. `BR-52` no longer credits a recovery point created
   before its vault's lock date whose own lifecycle deletes it before the
   vault's minimum retention.
+- The `BR-04` row `AgentCore Memory Event Retention` no longer names
+  `bedrock-agentcore:GetMemory` as a missing grant. AISF `AIR-ACR-MEM-07` and
+  `AIR-FND-DAT-08` set no maximum retention period, so the row reads Partial,
+  ceiling reached, and assumes no threshold for `eventExpiryDuration`.
 - `BR-34` fails a Region whose model invocation logging is off or does not
   deliver text, so a guardrail intervention leaves no record. `AIR-FND-DET-04`
   now also counts `SM-26`, which reads GuardDuty AI Protection.
@@ -1103,9 +1107,7 @@ the account's `function:*` ARNs (`BR-33`), `ecs:DescribeServices` on
 `service/*` (`BR-02`), `sagemaker:DescribeNotebookInstance` on
 `notebook-instance/*` (`BR-02`), `sso:ListPermissionSets` on Identity Center
 `instance/*` ARNs, and `sso:GetInlinePolicyForPermissionSet` on `instance/*`
-and `permissionSet/*/*` ARNs (`BR-51`). It gains `aoss:ListAccessPolicies`
-and `aoss:GetAccessPolicy` on `*` (`BR-20`), and `cloudtrail:GetEventDataStore`
-on the account's `eventdatastore/*` ARNs (`BR-06`). `bedrock:GetResourcePolicy`
+and `permissionSet/*/*` ARNs (`BR-51`). `bedrock:GetResourcePolicy`
 (`BR-43`) and `bedrock:ListDataSources` and `bedrock:GetDataSource` (`BR-46`)
 move into the statements that already grant the same `custom-model/*` and
 `knowledge-base/*` resources. Every unconditioned `*` statement of
@@ -1113,6 +1115,21 @@ the role is folded into one `AccountReadsOnWildcard` statement, which keeps
 the rendered inline policy under 9000 characters; the folded statement grants
 exactly the actions the former statements did, plus the new ones. All are
 read-only, and the same CodeBuild run applies them.
+
+Both SAM templates add one new resource, `BedrockAssessmentReadsPolicy`, an
+`AWS::IAM::ManagedPolicy` attached only to the Bedrock assessment function
+through its `Policies` list, for reads that do not fit the 9000-character
+inline budget. It renders to under 5500 of IAM's 6144-character managed
+policy limit and holds: `aoss:ListAccessPolicies` and `aoss:GetAccessPolicy`
+on `*` (`BR-20`), `cloudtrail:GetEventDataStore` on the account's
+`eventdatastore/*` ARNs (`BR-06`), `bedrock:ListIngestionJobs` on the
+account's `knowledge-base/*` ARNs (`BR-46`), `sagemaker:ListTrainingJobs` on
+`*` and `sagemaker:DescribeTrainingJob` on the account's `training-job/*`
+ARNs (`BR-46`, `BR-47`, `BR-52`). `aoss:ListAccessPolicies`,
+`aoss:GetAccessPolicy` and `sagemaker:ListTrainingJobs` have no resource type
+in the IAM service authorization reference. All six are read-only, and the
+same CodeBuild run creates the policy and attaches it, so each stack creates
+one more customer managed policy.
 
 The AgentCore assessment role gains `bedrock-agentcore:GetPaymentManager` and
 `bedrock-agentcore:GetHarness`, scoped to the account's `payment-manager/*` and

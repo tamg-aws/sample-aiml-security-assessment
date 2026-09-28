@@ -4151,26 +4151,27 @@ AGENTCORE_MEMORY_EXPIRY_FINDING = "AgentCore Memory Event Retention"
 
 
 def _agentcore_memory_expiry_finding(region: str) -> Dict[str, Any]:
-    """Report the AgentCore Memory retention leg of AIR-FND-DAT-08 as unread.
+    """Report the AgentCore Memory retention leg of AIR-FND-DAT-08 as a ceiling.
 
-    Each memory's eventExpiryDuration sets how long its events are kept. Only
-    GetMemory returns it, and the Bedrock assessment role holds
-    bedrock-agentcore:ListMemories (for BR-53) but not
-    bedrock-agentcore:GetMemory, so no memory in the account is judged.
+    Each memory's eventExpiryDuration sets how long its events are kept, but
+    neither AIR-ACR-MEM-07 nor AIR-FND-DAT-08 sets a maximum retention period,
+    so there is no bound to judge the value against. No threshold is assumed.
     """
     return create_finding(
         check_id="BR-04",
         finding_name=AGENTCORE_MEMORY_EXPIRY_FINDING,
         finding_details=(
-            "AgentCore Memory event retention was not read: each memory's "
-            "eventExpiryDuration is returned only by GetMemory, and the "
-            "assessment role does not hold bedrock-agentcore:GetMemory, so no "
-            "memory in this account was judged on how long it keeps session "
-            "events."
+            "AgentCore Memory event retention is Partial, ceiling reached: each "
+            "memory's eventExpiryDuration sets how many days it keeps session "
+            "events, but AIR-ACR-MEM-07 and AIR-FND-DAT-08 set no maximum "
+            "retention period, so there is no bound to judge the value against. "
+            "No memory in this account was judged, and no retention threshold is "
+            "assumed. What is missing is a numeric retention bound in the "
+            "framework, not a permission."
         ),
         resolution=(
-            "Grant the Bedrock assessment role bedrock-agentcore:GetMemory, then "
-            "re-run the assessment."
+            "Set each memory's eventExpiryDuration to the retention period your "
+            "data retention policy requires."
         ),
         reference=(
             "https://docs.aws.amazon.com/bedrock-agentcore-control/latest/APIReference/"

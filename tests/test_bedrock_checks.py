@@ -3228,6 +3228,63 @@ class TestBR06SelectorValues:
             in (kb["Finding_Details"])
         )
 
+    def test_event_data_store_closes_only_the_rows_its_selectors_cover(self):
+        """lake-a selects knowledge bases only, lake-b two of four inference types."""
+        rows = self._run(
+            {"a": {"advanced": [_management()]}},
+            event_data_stores=self._two_page_stores(),
+            store_details={
+                self.STORE_ARN + "1": {
+                    "Status": "ENABLED",
+                    "AdvancedEventSelectors": [_data([KB_DATA_TYPE])],
+                },
+                self.STORE_ARN + "2": {
+                    "Status": "ENABLED",
+                    "AdvancedEventSelectors": [_data(INFERENCE_TYPES[:2])],
+                },
+            },
+        )
+        kb = rows["Bedrock Knowledge Base Retrieval Data Event Logging"]
+        assert kb["Status"] == "Passed"
+        assert "event data store lake-a" in kb["Finding_Details"]
+        assert "lake-b" not in kb["Finding_Details"]
+        model = rows["Bedrock Model Invocation Data Event Logging"]
+        assert model["Status"] == "Failed"
+        for missing in INFERENCE_TYPES[2:]:
+            assert missing in model["Finding_Details"]
+            assert missing in model["Resolution"]
+        for covered in INFERENCE_TYPES[:2]:
+            assert covered not in model["Resolution"]
+
+    def test_event_data_stores_together_close_the_inference_row(self):
+        """Each store selects two inference types; only both together cover it."""
+        rows = self._run(
+            {"a": {"advanced": [_management()]}},
+            event_data_stores=self._two_page_stores(),
+            store_details={
+                self.STORE_ARN + "1": {
+                    "Status": "ENABLED",
+                    "AdvancedEventSelectors": [_data(INFERENCE_TYPES[:2])],
+                },
+                self.STORE_ARN + "2": {
+                    "Status": "ENABLED",
+                    "AdvancedEventSelectors": [_data(INFERENCE_TYPES[2:])],
+                },
+            },
+        )
+        model = rows["Bedrock Model Invocation Data Event Logging"]
+        assert model["Status"] == "Passed"
+        assert (
+            "AWS::Bedrock::Model by event data store lake-a"
+            in (model["Finding_Details"])
+        )
+        assert (
+            "AWS::Bedrock::InlineAgent by event data store lake-b"
+            in (model["Finding_Details"])
+        )
+        kb = rows["Bedrock Knowledge Base Retrieval Data Event Logging"]
+        assert kb["Status"] == "Failed"
+
     def test_model_only_selector_misses_three_inference_paths(self):
         rows = self._run({"a": {"advanced": [_data(["AWS::Bedrock::Model"])]}})
         row = rows["Bedrock Model Invocation Data Event Logging"]
@@ -11905,20 +11962,31 @@ class TestBR46KnowledgeBaseSourceClassification:
         ingestion_error=None,
         training_jobs=None,
         training_error=None,
+        ingestion_pages=None,
     ):
         agent_client = MagicMock()
         ingestion_jobs = ingestion_jobs or {}
-        agent_client.list_ingestion_jobs.side_effect = (
-            ingestion_error
-            if ingestion_error
-            else lambda **kwargs: {
+        ingestion_pages = ingestion_pages or {}
+
+        def list_ingestion_jobs(**kwargs):
+            # ingestion_pages maps a data source to a list of pages of startedAt
+            # values; every other data source answers with one page.
+            pages = ingestion_pages.get(kwargs["dataSourceId"]) or [
+                ingestion_jobs.get(kwargs["dataSourceId"], [])
+            ]
+            index = int(kwargs.get("nextToken", "page-0").split("-")[1])
+            response = {
                 "ingestionJobSummaries": [
-                    {"ingestionJobId": f"ing-{index}", "startedAt": started}
-                    for index, started in enumerate(
-                        ingestion_jobs.get(kwargs["dataSourceId"], [])
-                    )
+                    {"ingestionJobId": f"ing-{index}-{n}", "startedAt": started}
+                    for n, started in enumerate(pages[index])
                 ]
             }
+            if index + 1 < len(pages):
+                response["nextToken"] = f"page-{index + 1}"
+            return response
+
+        agent_client.list_ingestion_jobs.side_effect = (
+            ingestion_error if ingestion_error else list_ingestion_jobs
         )
         agent_client.list_knowledge_bases.return_value = {
             "knowledgeBaseSummaries": list(knowledge_bases)
@@ -12699,6 +12767,90 @@ class TestBR46ClassificationJobCoverage:
         assert "bedrock:ListIngestionJobs" in " ".join(
             f["Finding_Details"] for f in findings
         )
+
+    def test_br46_full_read_reports_no_incomplete_source_list(self):
+        """Every data source, customization job and training job was read."""
+        findings = self._run(
+            [self._job("nightly-hr"), self._job("train-a", ["train-a"])],
+            {
+                "job-nightly-hr": self._detail(createdAt=self.CREATED),
+                "job-train-a": self._detail(createdAt=self.CREATED),
+            },
+            macie_buckets=self._BUCKETS + [{"bucketName": "train-a"}],
+            ingestion_jobs={"ds-2": ["2026-08-20T00:00:00Z"]},
+            training_jobs={"tj-a": self._training_job("s3://train-a/data/")},
+        )
+        assert not [f for f in findings if f["Status"] in ("Failed", "N/A")], [
+            f["Finding_Details"] for f in findings
+        ]
+        text = " ".join(f["Finding_Details"] for f in findings)
+        assert "source list is incomplete" not in text
+        passed = [f for f in findings if f["Status"] == "Passed"]
+        assert "3 of 3 AI data source(s)" in passed[0]["Finding_Details"]
+
+    def test_br46_earliest_ingestion_on_the_second_page_fails(self):
+        """Page one holds only later ingestions, so one page would pass hr."""
+        findings = self._run(
+            [self._job("nightly-hr")],
+            {"job-nightly-hr": self._detail(createdAt=self.CREATED)},
+            ingestion_pages={
+                "ds-2": [["2026-09-10T00:00:00Z"], ["2026-08-01T00:00:00Z"]]
+            },
+        )
+        self._hr_fails_because(
+            findings,
+            "the first ingestion job started at 2026-08-01T00:00:00Z, before the "
+            "job was created at 2026-08-15T00:00:00Z",
+        )
+
+    def test_br46_second_training_channel_is_its_own_source(self):
+        """tj-a's train channel is classified and its validation channel is not."""
+        job = self._training_job("s3://train-a/data/")
+        job["InputDataConfig"].append(
+            {
+                "ChannelName": "validation",
+                "DataSource": {"S3DataSource": {"S3Uri": "s3://train-b/val/"}},
+            }
+        )
+        findings = self._run(
+            [self._job("nightly-hr"), self._job("train-a", ["train-a"])],
+            {"job-train-a": self._detail(createdAt=self.CREATED)},
+            macie_buckets=self._BUCKETS
+            + [{"bucketName": "train-a"}, {"bucketName": "train-b"}],
+            training_jobs={"tj-a": job},
+        )
+        failed = [f for f in findings if f["Status"] == "Failed"]
+        assert len(failed) == 1, [f["Finding_Details"] for f in findings]
+        assert (
+            "the training data channel 'validation' of SageMaker training job 'tj-a'"
+            in failed[0]["Finding_Details"]
+        )
+        assert "'train' of" not in failed[0]["Finding_Details"]
+        passed = [f for f in findings if f["Status"] == "Passed"]
+        assert "3 of 4 AI data source(s)" in passed[0]["Finding_Details"]
+
+    def test_br46_training_job_created_before_the_macie_job_fails(self):
+        """Newest first: tj-new is after the job, tj-old on the same bucket before."""
+        findings = self._run(
+            [self._job("nightly-hr"), self._job("train-a", ["train-a"])],
+            {"job-train-a": self._detail(createdAt=self.CREATED)},
+            macie_buckets=self._BUCKETS + [{"bucketName": "train-a"}],
+            training_jobs={
+                "tj-new": self._training_job(
+                    "s3://train-a/data/", created="2026-08-20T00:00:00Z"
+                ),
+                "tj-old": self._training_job(
+                    "s3://train-a/data/", created="2026-08-01T00:00:00Z"
+                ),
+            },
+        )
+        failed = [f for f in findings if f["Status"] == "Failed"]
+        assert len(failed) == 1, [f["Finding_Details"] for f in findings]
+        details = failed[0]["Finding_Details"]
+        assert "SageMaker training job 'tj-old' started at 2026-08-01" in details
+        assert "tj-new" not in details
+        passed = [f for f in findings if f["Status"] == "Passed"]
+        assert "3 of 4 AI data source(s)" in passed[0]["Finding_Details"]
 
     def test_br46_customization_before_the_job_was_created_fails(self):
         estate = TestBR46KnowledgeBaseSourceClassification()
@@ -20524,6 +20676,46 @@ class TestBR47DataPathBucketTLS:
         passed = [f for f in findings if f["Status"] == "Passed"]
         assert "1 of 2 Bedrock data path bucket(s)" in passed[0]["Finding_Details"]
 
+    def test_br47_second_training_channel_bucket_fails_with_a_complete_list(self):
+        """The first channel and the output enforce TLS; the second channel does not."""
+        findings = self._run(
+            training_jobs={
+                "tj-1": {
+                    "InputDataConfig": [
+                        {
+                            "ChannelName": "train",
+                            "DataSource": {
+                                "S3DataSource": {"S3Uri": "s3://sm-train/data/"}
+                            },
+                        },
+                        {
+                            "ChannelName": "validation",
+                            "DataSource": {
+                                "S3DataSource": {"S3Uri": "s3://sm-val/data/"}
+                            },
+                        },
+                    ],
+                    "OutputDataConfig": {"S3OutputPath": "s3://sm-out/"},
+                    "ModelArtifacts": {"S3ModelArtifacts": "s3://sm-out/model.tar.gz"},
+                }
+            },
+            bucket_policies=self._enforced("sm-train", "sm-out"),
+        )
+        assert not [f for f in findings if f["Status"] == "N/A"], [
+            f["Finding_Details"] for f in findings
+        ]
+        assert "bucket list is incomplete" not in " ".join(
+            f["Finding_Details"] for f in findings
+        )
+        failed = [f for f in findings if f["Status"] == "Failed"]
+        assert len(failed) == 1, [f["Finding_Details"] for f in findings]
+        assert (
+            "Bucket sm-val is on the Bedrock data path as the training data "
+            "channel 'validation' of SageMaker training job 'tj-1'"
+        ) in failed[0]["Finding_Details"]
+        passed = [f for f in findings if f["Status"] == "Passed"]
+        assert "2 of 3 Bedrock data path bucket(s)" in passed[0]["Finding_Details"]
+
     def test_br47_agentcore_code_and_recording_buckets_are_on_the_data_path(self):
         """A browser with recording off adds no bucket."""
         findings = self._run(
@@ -25121,6 +25313,110 @@ class TestBR52DataPathObjectLock:
         assert [r["Status"] for r in rows] == ["N/A", "N/A"]
         assert "not a verdict on the whole data path" in rows[1]["Finding_Details"]
 
+    @staticmethod
+    def _training_inventory(pages, list_error=None):
+        """
+        Build the data path inventory with the real reader, from SageMaker
+        training jobs alone. ``pages`` is a list of pages of {name: detail}.
+        """
+
+        def list_training_jobs(**kwargs):
+            if list_error:
+                raise list_error
+            index = int(kwargs.get("NextToken", "page-0").split("-")[1])
+            response = {
+                "TrainingJobSummaries": [
+                    {"TrainingJobName": name} for name in pages[index]
+                ]
+            }
+            if index + 1 < len(pages):
+                response["NextToken"] = f"page-{index + 1}"
+            return response
+
+        details = {name: job for page in pages for name, job in page.items()}
+        sagemaker = MagicMock()
+        sagemaker.list_training_jobs.side_effect = list_training_jobs
+        sagemaker.describe_training_job.side_effect = lambda TrainingJobName: details[
+            TrainingJobName
+        ]
+        agent = MagicMock()
+        agent.list_knowledge_bases.return_value = {"knowledgeBaseSummaries": []}
+        bedrock = MagicMock()
+        bedrock.get_model_invocation_logging_configuration.return_value = {}
+        bedrock.list_model_customization_jobs.return_value = {
+            "modelCustomizationJobSummaries": []
+        }
+        batch = MagicMock()
+        batch.paginate.return_value = [{"invocationJobSummaries": []}]
+        bedrock.get_paginator.side_effect = lambda operation: {
+            "list_model_invocation_jobs": batch
+        }[operation]
+        agentcore = MagicMock()
+        agentcore.list_agent_runtimes.return_value = {"agentRuntimes": []}
+        agentcore.list_browsers.return_value = {"browserSummaries": []}
+        with patch(
+            "bedrock_app.boto3.client",
+            side_effect=lambda service, **kwargs: {
+                "bedrock-agent": agent,
+                "bedrock": bedrock,
+                "sagemaker": sagemaker,
+                "bedrock-agentcore-control": agentcore,
+            }[service],
+        ):
+            inventory = bedrock_app._ai_data_path_buckets(region="us-east-1")
+        return inventory, sagemaker
+
+    def test_br52_training_buckets_on_the_second_page_are_judged(self):
+        """tj-old is on page two, and its channel bucket has no Object Lock."""
+
+        def job(uri, output):
+            return {
+                "InputDataConfig": [
+                    {
+                        "ChannelName": "train",
+                        "DataSource": {"S3DataSource": {"S3Uri": uri}},
+                    }
+                ],
+                "OutputDataConfig": {"S3OutputPath": output},
+            }
+
+        inventory, sagemaker = self._training_inventory(
+            [
+                {"tj-new": job("s3://lock-a/data/", "s3://lock-a/out/")},
+                {"tj-old": job("s3://open-b/data/", "s3://lock-a/out/")},
+            ]
+        )
+        assert inventory["errors"] == []
+        assert sagemaker.describe_training_job.call_count == 2
+        _, rows = self._run(
+            inventory["buckets"],
+            {
+                "lock-a": self.COMPLIANT,
+                "open-b": _make_client_error("ObjectLockConfigurationNotFoundError"),
+            },
+            errors=inventory["errors"],
+        )
+        assert [r["Status"] for r in rows] == ["Failed", "Passed"]
+        assert "open-b" in rows[0]["Finding_Details"]
+        assert "SageMaker training job 'tj-old'" in rows[0]["Finding_Details"]
+        assert "lock-a" in rows[1]["Finding_Details"]
+        assert "not a verdict on the whole data path" not in " ".join(
+            r["Finding_Details"] for r in rows
+        )
+
+    def test_br52_unread_training_job_leaves_the_list_incomplete(self):
+        inventory, _ = self._training_inventory(
+            [{}], list_error=_make_client_error("AccessDenied")
+        )
+        assert len(inventory["errors"]) == 1
+        _, rows = self._run(
+            {"lock-a": ["kb"]}, {"lock-a": self.COMPLIANT}, errors=inventory["errors"]
+        )
+        assert [r["Status"] for r in rows] == ["N/A", "N/A"]
+        assert "sagemaker:ListTrainingJobs" in " ".join(
+            r["Finding_Details"] for r in rows
+        )
+
     def test_br52_no_data_path_bucket_is_na(self):
         _, rows = self._run({}, {})
         assert [r["Status"] for r in rows] == ["N/A"]
@@ -27469,7 +27765,7 @@ def test_handler_reports_guardrail_condition_pins_unread_without_a_cache():
     assert "IAM permissions cache was unavailable" in received["errors"][0]
 
 
-def test_handler_reports_agentcore_memory_retention_as_unread():
+def test_handler_reports_agentcore_memory_retention_as_a_ceiling():
     test_client = MagicMock()
     test_client.get_model_invocation_logging_configuration.side_effect = (
         _make_client_error("ValidationException")
@@ -27496,8 +27792,15 @@ def test_handler_reports_agentcore_memory_retention_as_unread():
         if r["Finding"] == "AgentCore Memory Event Retention"
     ]
     assert [(r["Check_ID"], r["Status"]) for r in rows] == [("BR-04", "N/A")]
-    assert "eventExpiryDuration" in rows[0]["Finding_Details"]
-    assert "bedrock-agentcore:GetMemory" in rows[0]["Finding_Details"]
+    details = rows[0]["Finding_Details"]
+    assert "eventExpiryDuration" in details
+    # No framework bound exists, so the row is a ceiling and names no grant.
+    assert "Partial, ceiling reached" in details
+    assert "AIR-ACR-MEM-07 and AIR-FND-DAT-08 set no maximum" in details
+    assert "no retention threshold is assumed" in details
+    assert "GetMemory" not in details
+    assert "GetMemory" not in rows[0]["Resolution"]
+    assert "Grant" not in rows[0]["Resolution"]
     # ListMemories is granted for BR-53, so the row must not call it missing.
     assert "ListMemories" not in rows[0]["Finding_Details"]
     assert "ListMemories" not in rows[0]["Resolution"]

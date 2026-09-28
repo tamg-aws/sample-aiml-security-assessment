@@ -1417,8 +1417,8 @@ FOUNDATION_ROWS = [
         "default retention beside the rule fails, since Lifecycle does not delete a "
         "retained version. A replicated log bucket is N/A, because per-object "
         "ReplicationStatus needs s3:GetObject, which is not granted, and AgentCore "
-        "Memory eventExpiryDuration is N/A naming bedrock-agentcore:GetMemory, the "
-        "only operation that returns it",
+        "Memory eventExpiryDuration is N/A as a ceiling: MEM-07 and DAT-08 set no "
+        "maximum retention period, so no threshold is assumed",
         [],
         6,
     ),
