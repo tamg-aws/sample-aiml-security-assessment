@@ -16464,3 +16464,401 @@ class TestEcrScanningAndAntiDdosCheckRegistration:
     def test_the_handler_registers_each_check_once(self, function_name):
         source = textwrap.dedent(inspect.getsource(agentcore_app.lambda_handler))
         assert source.count(function_name) == 1
+
+
+def _cognito_url(pool_id, region="us-east-1"):
+    return (
+        f"https://cognito-idp.{region}.amazonaws.com/{pool_id}"
+        "/.well-known/openid-configuration"
+    )
+
+
+def _cognito_pool(**overrides):
+    pool = {
+        "MfaConfiguration": "ON",
+        "UserPoolAddOns": {"AdvancedSecurityMode": "ENFORCED"},
+        "UserPoolTier": "PLUS",
+        "DeletionProtection": "ACTIVE",
+        "AdminCreateUserConfig": {"AllowAdminCreateUserOnly": True},
+        "Policies": {"PasswordPolicy": {"TemporaryPasswordValidityDays": 7}},
+    }
+    pool.update(overrides)
+    return pool
+
+
+def _user_client(client_id, **overrides):
+    client = {
+        "ClientId": client_id,
+        "AllowedOAuthFlows": ["code"],
+        "ExplicitAuthFlows": ["ALLOW_USER_SRP_AUTH", "ALLOW_REFRESH_TOKEN_AUTH"],
+        "EnableTokenRevocation": True,
+        "PreventUserExistenceErrors": "ENABLED",
+    }
+    client.update(overrides)
+    return client
+
+
+def _m2m_client(client_id, **overrides):
+    client = {
+        "ClientId": client_id,
+        "AllowedOAuthFlows": ["client_credentials"],
+        "ExplicitAuthFlows": ["ALLOW_REFRESH_TOKEN_AUTH"],
+        "EnableTokenRevocation": True,
+        "PreventUserExistenceErrors": "LEGACY",
+    }
+    client.update(overrides)
+    return client
+
+
+def _cognito_stub(mock_ac, mock_cog, gateways=None, runtimes=None, pools=None):
+    """gateways and runtimes map an id to the discoveryUrl its JWT authorizer
+    names, None for a SigV4 resource, or the ClientError its Get raises. pools
+    maps a pool id to (UserPool body or ClientError, [app clients])."""
+    gateways = gateways or {}
+    runtimes = runtimes or {}
+    pools = pools or {}
+    mock_ac.list_gateways.return_value = {
+        "items": [{"gatewayId": g, "name": f"name-{g}"} for g in gateways]
+    }
+    mock_ac.list_agent_runtimes.return_value = {
+        "agentRuntimes": [
+            {"agentRuntimeId": r, "agentRuntimeName": f"name-{r}"} for r in runtimes
+        ]
+    }
+
+    def jwt(url):
+        return {"customJWTAuthorizer": {"discoveryUrl": url}}
+
+    def get_gateway(gatewayIdentifier):
+        value = gateways[gatewayIdentifier]
+        if isinstance(value, ClientError):
+            raise value
+        if value is None:
+            return {"authorizerType": "AWS_IAM"}
+        return {"authorizerType": "CUSTOM_JWT", "authorizerConfiguration": jwt(value)}
+
+    def get_agent_runtime(agentRuntimeId):
+        value = runtimes[agentRuntimeId]
+        if isinstance(value, ClientError):
+            raise value
+        return {"authorizerConfiguration": jwt(value)} if value else {}
+
+    mock_ac.get_gateway.side_effect = get_gateway
+    mock_ac.get_agent_runtime.side_effect = get_agent_runtime
+
+    mock_cog.meta.region_name = "us-east-1"
+
+    def describe_user_pool(UserPoolId):
+        body = pools[UserPoolId][0]
+        if isinstance(body, ClientError):
+            raise body
+        return {"UserPool": {"Id": UserPoolId, **body}}
+
+    def list_user_pool_clients(UserPoolId, MaxResults, NextToken=None):
+        assert MaxResults == 60
+        clients = pools[UserPoolId][1]
+        # Two pages, so the continuation token is followed.
+        half = (len(clients) + 1) // 2
+        if NextToken:
+            return {
+                "UserPoolClients": [{"ClientId": c["ClientId"]} for c in clients[half:]]
+            }
+        response = {
+            "UserPoolClients": [{"ClientId": c["ClientId"]} for c in clients[:half]]
+        }
+        if clients[half:]:
+            response["NextToken"] = "page-2"
+        return response
+
+    def describe_user_pool_client(UserPoolId, ClientId):
+        client = next(c for c in pools[UserPoolId][1] if c["ClientId"] == ClientId)
+        return {"UserPoolClient": client}
+
+    mock_cog.describe_user_pool.side_effect = describe_user_pool
+    mock_cog.list_user_pool_clients.side_effect = list_user_pool_clients
+    mock_cog.describe_user_pool_client.side_effect = describe_user_pool_client
+
+
+class TestCognitoUserPoolAuthentication:
+    """AC-52: the Cognito user pools that issue tokens to AgentCore."""
+
+    POOL_A = "us-east-1_AAAAAAAA1"
+    POOL_B = "us-east-1_BBBBBBBB2"
+
+    def _run(self):
+        return agentcore_app.check_agentcore_cognito_user_pool_authentication()
+
+    @patch("agentcore_app.cognito_client", None)
+    @patch("agentcore_app.agentcore_client")
+    def test_no_cognito_client_is_na(self, mock_ac):
+        findings = self._run()
+        assert [f["Status"] for f in findings] == ["N/A"]
+        assert findings[0]["Check_ID"] == "AC-52"
+
+    @patch("agentcore_app.cognito_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_no_cognito_issuer_is_na(self, mock_ac, mock_cog):
+        _cognito_stub(
+            mock_ac,
+            mock_cog,
+            gateways={
+                "gw-1": None,
+                "gw-2": "https://login.example.com/.well-known/openid-configuration",
+            },
+            runtimes={"rt-1": None},
+        )
+        findings = self._run()
+        assert [f["Status"] for f in findings] == ["N/A"]
+        assert "None of the 3" in findings[0]["Finding_Details"]
+        assert "1 name another issuer" in findings[0]["Finding_Details"]
+        mock_cog.describe_user_pool.assert_not_called()
+
+    @patch("agentcore_app.cognito_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_compliant_pool_passes_and_weak_pool_fails_each_leg(
+        self, mock_ac, mock_cog
+    ):
+        _cognito_stub(
+            mock_ac,
+            mock_cog,
+            gateways={"gw-1": _cognito_url(self.POOL_A)},
+            runtimes={"rt-1": _cognito_url(self.POOL_B)},
+            pools={
+                self.POOL_A: (
+                    _cognito_pool(),
+                    [_user_client("a1"), _user_client("a2")],
+                ),
+                self.POOL_B: (
+                    _cognito_pool(
+                        MfaConfiguration="OPTIONAL",
+                        UserPoolAddOns={"AdvancedSecurityMode": "AUDIT"},
+                        UserPoolTier="ESSENTIALS",
+                        DeletionProtection="INACTIVE",
+                        AdminCreateUserConfig={"AllowAdminCreateUserOnly": False},
+                        Policies={
+                            "PasswordPolicy": {"TemporaryPasswordValidityDays": 8}
+                        },
+                    ),
+                    [
+                        _user_client("b1"),
+                        _user_client(
+                            "b2",
+                            EnableTokenRevocation=False,
+                            PreventUserExistenceErrors="LEGACY",
+                        ),
+                    ],
+                ),
+            },
+        )
+        findings = self._run()
+        assert [f["Status"] for f in findings] == ["Passed", "Failed"]
+        passed, failed = (f["Finding_Details"] for f in findings)
+        assert self.POOL_A in passed and "gateway 'name-gw-1'" in passed
+        assert "Feature plan PLUS" in passed
+        assert self.POOL_B in failed and "runtime 'name-rt-1'" in failed
+        assert "fails 7 leg(s)" in failed
+        for text in (
+            "MfaConfiguration is OPTIONAL",
+            "AdvancedSecurityMode is AUDIT",
+            "DeletionProtection is INACTIVE",
+            "users can sign themselves up",
+            "valid for 8 days",
+            "token revocation is off on app client(s) b2",
+            "not ENABLED on user-facing app client(s) b2",
+            "Feature plan ESSENTIALS",
+        ):
+            assert text in failed
+        # The compliant client b1 is not named as failing a leg.
+        assert "b1" not in failed
+        for f in findings:
+            assert f["Check_ID"] == "AC-52"
+            assert f["Severity"] == "Medium"
+
+    @patch("agentcore_app.cognito_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_pool_shared_by_two_gateways_is_judged_once(self, mock_ac, mock_cog):
+        _cognito_stub(
+            mock_ac,
+            mock_cog,
+            gateways={
+                "gw-1": _cognito_url(self.POOL_A),
+                "gw-2": _cognito_url(self.POOL_A),
+            },
+            runtimes={"rt-1": _cognito_url(self.POOL_A)},
+            pools={self.POOL_A: (_cognito_pool(), [_user_client("a1")])},
+        )
+        findings = self._run()
+        assert [f["Status"] for f in findings] == ["Passed"]
+        details = findings[0]["Finding_Details"]
+        for consumer in ("(gw-1)", "(gw-2)", "(rt-1)"):
+            assert consumer in details
+        mock_cog.describe_user_pool.assert_called_once_with(UserPoolId=self.POOL_A)
+
+    @patch("agentcore_app.cognito_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_m2m_only_pool_is_not_failed_on_user_legs(self, mock_ac, mock_cog):
+        weak_user_settings = dict(
+            MfaConfiguration="OFF",
+            UserPoolAddOns={"AdvancedSecurityMode": "OFF"},
+            AdminCreateUserConfig={"AllowAdminCreateUserOnly": False},
+            Policies={},
+        )
+        _cognito_stub(
+            mock_ac,
+            mock_cog,
+            gateways={
+                "gw-1": _cognito_url(self.POOL_A),
+                "gw-2": _cognito_url(self.POOL_B),
+            },
+            pools={
+                self.POOL_A: (
+                    _cognito_pool(**weak_user_settings),
+                    [_m2m_client("m1"), _m2m_client("m2")],
+                ),
+                self.POOL_B: (
+                    _cognito_pool(**weak_user_settings),
+                    [_m2m_client("m3"), _m2m_client("m4", EnableTokenRevocation=False)],
+                ),
+            },
+        )
+        findings = self._run()
+        assert [f["Status"] for f in findings] == ["Passed", "Failed"]
+        passed, failed = (f["Finding_Details"] for f in findings)
+        assert (
+            "passes every applicable leg: deletion protection, token revocation"
+            in passed
+        )
+        assert "allows only the client_credentials flow" in passed
+        assert "fails 1 leg(s): token revocation" in failed
+        assert "MfaConfiguration" not in failed
+
+    @patch("agentcore_app.cognito_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_client_credentials_without_explicit_flows_is_user_facing(
+        self, mock_ac, mock_cog
+    ):
+        _cognito_stub(
+            mock_ac,
+            mock_cog,
+            gateways={"gw-1": _cognito_url(self.POOL_A)},
+            pools={
+                self.POOL_A: (
+                    _cognito_pool(MfaConfiguration="OFF"),
+                    [_m2m_client("m1"), _m2m_client("m2", ExplicitAuthFlows=[])],
+                )
+            },
+        )
+        findings = self._run()
+        assert [f["Status"] for f in findings] == ["Failed"]
+        assert "MfaConfiguration is OFF" in findings[0]["Finding_Details"]
+        assert "user-facing app client(s) m2" in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.cognito_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_unreadable_and_foreign_pools_are_na(self, mock_ac, mock_cog):
+        _cognito_stub(
+            mock_ac,
+            mock_cog,
+            gateways={
+                "gw-1": _cognito_url(self.POOL_A),
+                "gw-2": _cognito_url(self.POOL_B),
+                "gw-3": _cognito_url("eu-west-1_CCCCCCCC3", region="eu-west-1"),
+            },
+            pools={
+                self.POOL_A: (_make_client_error("AccessDeniedException", "no"), []),
+                self.POOL_B: (_make_client_error("ResourceNotFoundException"), []),
+            },
+        )
+        findings = self._run()
+        assert [f["Status"] for f in findings] == ["N/A", "N/A", "N/A"]
+        by_pool = {
+            pool: next(
+                f["Finding_Details"] for f in findings if pool in f["Finding_Details"]
+            )
+            for pool in (self.POOL_A, self.POOL_B, "eu-west-1_CCCCCCCC3")
+        }
+        assert "could not be read: AccessDeniedException" in by_pool[self.POOL_A]
+        assert "another account or was deleted" in by_pool[self.POOL_B]
+        assert "is in eu-west-1" in by_pool["eu-west-1_CCCCCCCC3"]
+        for f in findings:
+            assert f["Severity"] == "Informational"
+
+    @patch("agentcore_app.AC52_MAX_CLIENTS_PER_POOL", 2)
+    @patch("agentcore_app.cognito_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_unread_clients_hold_legs_they_could_change(self, mock_ac, mock_cog):
+        _cognito_stub(
+            mock_ac,
+            mock_cog,
+            gateways={
+                "gw-1": _cognito_url(self.POOL_A),
+                "gw-2": _cognito_url(self.POOL_B),
+            },
+            pools={
+                # Every client read is M2M, so the MFA leg cannot be failed.
+                self.POOL_A: (
+                    _cognito_pool(MfaConfiguration="OFF"),
+                    [_m2m_client("m1"), _m2m_client("m2"), _user_client("u3")],
+                ),
+                # A user-facing client was read, so the MFA leg is proven failed.
+                self.POOL_B: (
+                    _cognito_pool(MfaConfiguration="OFF"),
+                    [_user_client("u1"), _m2m_client("m2"), _m2m_client("m3")],
+                ),
+            },
+        )
+        findings = self._run()
+        assert [f["Status"] for f in findings] == ["N/A", "Failed"]
+        held, failed = (f["Finding_Details"] for f in findings)
+        assert "could not be proven" in held
+        assert "MfaConfiguration is OFF" in held
+        assert "1 of its 3 app clients were not read" in held
+        assert "fails 1 leg(s): MFA" in failed
+        assert "1 of its 3 app clients were not read" in failed
+        assert mock_cog.describe_user_pool_client.call_count == 4
+
+    @patch("agentcore_app.cognito_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_an_unreadable_resource_is_na_beside_a_judged_pool(self, mock_ac, mock_cog):
+        _cognito_stub(
+            mock_ac,
+            mock_cog,
+            gateways={
+                "gw-1": _make_client_error("AccessDeniedException", "no"),
+                "gw-2": _cognito_url(self.POOL_A),
+            },
+            pools={self.POOL_A: (_cognito_pool(), [_user_client("a1")])},
+        )
+        mock_ac.list_agent_runtimes.side_effect = _make_client_error(
+            "AccessDeniedException", "no"
+        )
+        findings = self._run()
+        assert [f["Status"] for f in findings] == ["N/A", "N/A", "Passed"]
+        assert "(gw-1)" in findings[0]["Finding_Details"]
+        assert "AccessDeniedException" in findings[0]["Finding_Details"]
+        assert findings[1]["Finding"].endswith("Incomplete")
+        assert "(gw-2)" in findings[2]["Finding_Details"]
+
+
+class TestCognitoUserPoolCheckRegistration:
+    """AC-52 is registered like the checks it sits beside."""
+
+    def test_the_check_is_in_both_regional_tuples(self):
+        assert "AC-52" in agentcore_app.REGIONAL_AGENTCORE_CHECK_IDS
+        assert "AC-52" in agentcore_app.AGENTCORE_RUNTIME_CHECK_IDS
+
+    def test_timeout_backfill_emits_the_check(self):
+        findings = agentcore_app.build_agentcore_timeout_findings("us-east-1", [])
+        assert "AC-52" in {finding["Check_ID"] for finding in findings}
+
+    def test_the_runtime_probe_backfill_emits_the_check(self):
+        findings = []
+        agentcore_app.prepare_agentcore_runtime_incomplete_report_findings(
+            findings, "us-east-1", "ExpiredToken"
+        )
+        assert "AC-52" in {finding["Check_ID"] for finding in findings}
+
+    def test_the_handler_registers_the_check_once_and_builds_its_client(self):
+        source = textwrap.dedent(inspect.getsource(agentcore_app.lambda_handler))
+        assert source.count("check_agentcore_cognito_user_pool_authentication") == 1
+        assert '"cognito-idp", config=boto3_config, region_name=region' in source

@@ -3051,6 +3051,7 @@ class TestBedrockHandlerMultiRegion:
         "check_bedrock_resource_owner_tag": "BR-53",
         "check_lambda_public_invoke_configuration": "BR-54",
         "check_kms_enclave_key_binding": "BR-55",
+        "check_bedrock_llm_jacking_activity": "BR-56",
     }
 
     # Checks that read a global surface (the IAM permissions cache or the
@@ -14568,3 +14569,181 @@ class TestPermissionCacheGroupPolicies:
         assert "group_policies" not in alice
         assert "AccessDenied" in alice["group_policies_error"]
         assert cache.user_permissions["bob"]["group_policies"][0]["group"] == "ml"
+
+
+class TestBedrockLlmJackingActivity:
+    """BR-56: Prowler's LLM jacking threshold over CloudTrail event history."""
+
+    ALICE = "arn:aws:iam::123456789012:user/alice"
+    BOB = "arn:aws:sts::123456789012:assumed-role/ops/bob"
+    ACTIONS = bedrock_app.LLM_JACKING_ACTIONS
+
+    @staticmethod
+    def _event(arn, identity_type="IAMUser"):
+        identity = {"type": identity_type}
+        if arn:
+            identity["arn"] = arn
+        return {"CloudTrailEvent": json.dumps({"userIdentity": identity})}
+
+    def _run(self, calls, errors=None, truncated=(), malformed=(), pages=None):
+        """calls maps an identity arn to the actions it made; truncated actions
+        always return a NextToken; pages maps an action to its list of pages."""
+        by_action = {}
+        for arn, actions in calls.items():
+            for action in actions:
+                by_action.setdefault(action, []).append(self._event(arn))
+
+        def lookup_events(**kwargs):
+            name = kwargs["LookupAttributes"][0]["AttributeValue"]
+            assert kwargs["MaxResults"] == bedrock_app.LOOKUP_EVENTS_PAGE_SIZE
+            if errors and name in errors:
+                raise errors[name]
+            if name in malformed:
+                return {"Events": [{"CloudTrailEvent": "{not json"}]}
+            if pages and name in pages:
+                index = int(kwargs.get("NextToken", "0"))
+                response = {"Events": pages[name][index]}
+                if index + 1 < len(pages[name]):
+                    response["NextToken"] = str(index + 1)
+                return response
+            response = {"Events": by_action.get(name, [])}
+            if name in truncated:
+                response["NextToken"] = "more"
+            return response
+
+        cloudtrail = MagicMock()
+        cloudtrail.lookup_events.side_effect = lookup_events
+        with patch("boto3.client", return_value=cloudtrail):
+            result = bedrock_app.check_bedrock_llm_jacking_activity(region="us-east-1")
+        return result, extract_csv_data(result), cloudtrail
+
+    def test_identity_above_threshold_fails_and_one_at_five_does_not(self):
+        result, rows, _ = self._run(
+            {
+                self.ALICE: self.ACTIONS[:6],
+                self.BOB: self.ACTIONS[:5],
+                None: self.ACTIONS,
+            }
+        )
+        assert result["status"] == "WARN"
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert rows[0]["Check_ID"] == "BR-56"
+        assert rows[0]["Severity"] == "High"
+        assert self.ALICE in rows[0]["Finding_Details"]
+        assert "6 of the 14" in rows[0]["Finding_Details"]
+        assert "0.43" in rows[0]["Finding_Details"]
+        assert self.BOB not in rows[0]["Finding_Details"]
+
+    def test_two_identities_below_threshold_pass_and_name_the_blind_spots(self):
+        result, rows, cloudtrail = self._run(
+            {self.ALICE: self.ACTIONS[:5], self.BOB: self.ACTIONS[5:10]}
+        )
+        assert result["status"] == "PASS"
+        assert [r["Status"] for r in rows] == ["Passed"]
+        details = rows[0]["Finding_Details"]
+        assert "2 identities observed" in details
+        assert "InvokeModelWithBidirectionalStream" in details
+        assert "Converse and ConverseStream" in details
+        assert "not read in full" not in details
+        assert cloudtrail.lookup_events.call_count == len(self.ACTIONS)
+        start = cloudtrail.lookup_events.call_args.kwargs["StartTime"]
+        assert start.tzinfo is not None
+
+    def test_every_lookup_denied_is_not_applicable(self):
+        denied = {a: _make_client_error("AccessDeniedException") for a in self.ACTIONS}
+        result, rows, _ = self._run({}, errors=denied)
+        assert result["status"] == "N/A"
+        assert len(rows) == 1
+        assert rows[0]["Status"] == "N/A"
+        assert "AccessDeniedException" in rows[0]["Finding_Details"]
+        assert rows[0]["Resolution"] == bedrock_app.COULD_NOT_ASSESS_RESOLUTION
+
+    def test_truncated_action_holds_an_identity_it_could_push_over(self):
+        result, rows, cloudtrail = self._run(
+            {
+                self.ALICE: self.ACTIONS[5:10],
+                self.BOB: self.ACTIONS[10:12],
+            },
+            truncated=("InvokeModel",),
+        )
+        assert result["status"] == "N/A"
+        assert [r["Status"] for r in rows] == ["N/A"]
+        details = rows[0]["Finding_Details"]
+        assert "InvokeModel (more than 5 pages)" in details
+        assert self.ALICE in details
+        assert self.BOB not in details
+        invoke_calls = [
+            c
+            for c in cloudtrail.lookup_events.call_args_list
+            if c.kwargs["LookupAttributes"][0]["AttributeValue"] == "InvokeModel"
+        ]
+        assert len(invoke_calls) == bedrock_app.LLM_JACKING_MAX_PAGES_PER_ACTION
+
+    def test_truncation_that_cannot_change_a_verdict_passes_and_says_so(self):
+        result, rows, _ = self._run(
+            {self.ALICE: self.ACTIONS[:4], self.BOB: self.ACTIONS[6:9]},
+            truncated=("InvokeModel",),
+        )
+        assert result["status"] == "PASS"
+        assert [r["Status"] for r in rows] == ["Passed"]
+        assert "InvokeModel (more than 5 pages)" in rows[0]["Finding_Details"]
+
+    def test_failure_still_reported_beside_a_truncated_action(self):
+        result, rows, _ = self._run(
+            {self.ALICE: self.ACTIONS[5:12], self.BOB: self.ACTIONS[6:11]},
+            truncated=("InvokeModel",),
+        )
+        assert result["status"] == "WARN"
+        assert sorted(r["Status"] for r in rows) == ["Failed", "N/A"]
+        failed = next(r for r in rows if r["Status"] == "Failed")
+        assert self.ALICE in failed["Finding_Details"]
+        held = next(r for r in rows if r["Status"] == "N/A")
+        assert self.BOB in held["Finding_Details"]
+
+    def test_partial_lookup_error_is_reported_not_passed(self):
+        result, rows, _ = self._run(
+            {self.ALICE: self.ACTIONS[1:6], self.BOB: self.ACTIONS[1:3]},
+            errors={self.ACTIONS[0]: _make_client_error("ThrottlingException")},
+        )
+        assert result["status"] == "N/A"
+        details = rows[0]["Finding_Details"]
+        assert f"{self.ACTIONS[0]} (lookup failed: ThrottlingException)" in details
+        assert self.ALICE in details
+
+    def test_enough_unread_actions_hold_every_unseen_identity(self):
+        errors = {a: _make_client_error("AccessDenied") for a in self.ACTIONS[:6]}
+        result, rows, _ = self._run({self.ALICE: self.ACTIONS[6:7]}, errors=errors)
+        assert result["status"] == "N/A"
+        assert "any identity with no event read" in rows[0]["Finding_Details"]
+
+    def test_unparseable_event_marks_its_action_unread(self):
+        result, rows, _ = self._run(
+            {self.ALICE: self.ACTIONS[1:6]}, malformed=(self.ACTIONS[0],)
+        )
+        assert result["status"] == "N/A"
+        assert (
+            f"{self.ACTIONS[0]} (an event could not be parsed)"
+            in rows[0]["Finding_Details"]
+        )
+
+    def test_every_page_is_read_before_the_cap(self):
+        name = self.ACTIONS[0]
+        pages = {
+            name: [[self._event(self.ALICE)], [self._event(self.BOB)]],
+            self.ACTIONS[1]: [[self._event(self.BOB)]],
+        }
+        for action in self.ACTIONS[2:7]:
+            pages[action] = [[], [self._event(self.ALICE)]]
+        result, rows, _ = self._run({}, pages=pages)
+        assert result["status"] == "WARN"
+        failed = [r for r in rows if r["Status"] == "Failed"]
+        assert len(failed) == 1
+        assert "6 of the 14" in failed[0]["Finding_Details"]
+
+    def test_client_failure_is_not_applicable(self):
+        with patch("boto3.client", side_effect=_make_client_error("AccessDenied")):
+            result = bedrock_app.check_bedrock_llm_jacking_activity(region="us-east-1")
+        rows = extract_csv_data(result)
+        assert result["status"] == "ERROR"
+        assert rows[0]["Status"] == "N/A"
+        assert "AccessDenied" in rows[0]["Finding_Details"]

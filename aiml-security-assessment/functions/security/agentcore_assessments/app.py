@@ -10,6 +10,7 @@ import csv
 import json
 import logging
 import os
+import re
 import time
 from fnmatch import fnmatchcase
 from io import StringIO
@@ -43,6 +44,7 @@ kms_client = None
 organizations_client = None
 wafv2_client = None
 route53resolver_client = None
+cognito_client = None
 
 # Environment variables
 BUCKET_NAME = os.environ.get("AIML_ASSESSMENT_BUCKET_NAME")
@@ -463,6 +465,7 @@ REGIONAL_AGENTCORE_CHECK_IDS = (
     "AC-49",
     "AC-50",
     "AC-51",
+    "AC-52",
 )
 
 AGENTCORE_RUNTIME_CHECK_IDS = (
@@ -508,6 +511,7 @@ AGENTCORE_RUNTIME_CHECK_IDS = (
     "AC-49",
     "AC-50",
     "AC-51",
+    "AC-52",
 )
 
 NATIVE_AGENTIC_AGENTCORE_CHECK_NAMES = {
@@ -14289,6 +14293,437 @@ def check_agentcore_web_acl_anti_ddos() -> List[Dict[str, Any]]:
     return findings
 
 
+COGNITO_USER_POOL_SECURITY_REFERENCE_URL = (
+    "https://docs.aws.amazon.com/cognito/latest/developerguide/"
+    "user-pool-security-best-practices.html"
+)
+# The OpenID discovery URL a Cognito user pool publishes as a JWT issuer.
+COGNITO_DISCOVERY_URL_PATTERN = re.compile(
+    r"^https://cognito-idp\.([a-z0-9-]+)\.amazonaws\.com(?:\.cn)?/"
+    r"([\w-]+_[A-Za-z0-9]+)/\.well-known/openid-configuration$"
+)
+# Each app client costs one DescribeUserPoolClient call, so a pool with more
+# clients than this is judged on the ones read and the rest are reported.
+AC52_MAX_CLIENTS_PER_POOL = 100
+# Prowler cognito_user_pool_temporary_password_expiration fails above 7 days.
+AC52_MAX_TEMPORARY_PASSWORD_DAYS = 7
+# A client that authorizes only machine-to-machine requests. The auth flow set
+# is non-empty because CreateUserPoolClient gives a client with no
+# ExplicitAuthFlows the SRP and custom user sign-in flows by default.
+AC52_M2M_OAUTH_FLOWS = {"client_credentials"}
+AC52_M2M_EXPLICIT_AUTH_FLOWS = {"ALLOW_REFRESH_TOKEN_AUTH"}
+
+
+def _ac52_signs_in_no_user(clients: List[Dict[str, Any]], unread_clients: int) -> bool:
+    """True when every app client of the pool was read and none admits an
+    end-user sign-in flow."""
+    return not unread_clients and all(_ac52_is_m2m_client(c) for c in clients)
+
+
+def _ac52_is_m2m_client(client: Dict[str, Any]) -> bool:
+    """True when an app client admits no end-user sign-in flow."""
+    explicit = set(client.get("ExplicitAuthFlows") or [])
+    return (
+        set(client.get("AllowedOAuthFlows") or []) == AC52_M2M_OAUTH_FLOWS
+        and bool(explicit)
+        and explicit <= AC52_M2M_EXPLICIT_AUTH_FLOWS
+    )
+
+
+def _ac52_pool_legs(
+    pool: Dict[str, Any], clients: List[Dict[str, Any]], unread_clients: int
+) -> List[Tuple[str, Optional[bool], str]]:
+    """Judge one user pool. Each leg is (name, verdict, detail), verdict None
+    when the clients left unread could change it."""
+    m2m_only = _ac52_signs_in_no_user(clients, unread_clients)
+    user_clients = [c for c in clients if not _ac52_is_m2m_client(c)]
+    legs: List[Tuple[str, Optional[bool], str]] = []
+
+    deletion = pool.get("DeletionProtection") or "INACTIVE"
+    legs.append(
+        (
+            "deletion protection",
+            deletion == "ACTIVE",
+            f"DeletionProtection is {deletion}",
+        )
+    )
+
+    no_revocation = sorted(
+        c.get("ClientId", "unknown")
+        for c in clients
+        if not c.get("EnableTokenRevocation")
+    )
+    if no_revocation:
+        legs.append(
+            (
+                "token revocation",
+                False,
+                "token revocation is off on app client(s) "
+                + ", ".join(no_revocation[:5]),
+            )
+        )
+    else:
+        legs.append(
+            (
+                "token revocation",
+                None if unread_clients else True,
+                f"token revocation is on for the {len(clients)} app client(s) read",
+            )
+        )
+
+    if m2m_only:
+        return legs
+
+    # A pool whose read clients are all machine-to-machine may still have an
+    # unread user-facing client, so a user-facing leg that fails is held as
+    # unproven until a user-facing client has been read.
+    def user_leg(name, ok, detail):
+        if ok:
+            legs.append((name, True, detail))
+        else:
+            legs.append((name, None if not user_clients else False, detail))
+
+    mfa = pool.get("MfaConfiguration") or "OFF"
+    user_leg("MFA", mfa == "ON", f"MfaConfiguration is {mfa}")
+
+    mode = (pool.get("UserPoolAddOns") or {}).get("AdvancedSecurityMode") or "OFF"
+    user_leg("threat protection", mode == "ENFORCED", f"AdvancedSecurityMode is {mode}")
+
+    admin_only = bool(
+        (pool.get("AdminCreateUserConfig") or {}).get("AllowAdminCreateUserOnly")
+    )
+    user_leg(
+        "self-registration",
+        admin_only,
+        "only administrators create users"
+        if admin_only
+        else "users can sign themselves up",
+    )
+
+    days = ((pool.get("Policies") or {}).get("PasswordPolicy") or {}).get(
+        "TemporaryPasswordValidityDays"
+    )
+    user_leg(
+        "temporary password validity",
+        isinstance(days, int) and days <= AC52_MAX_TEMPORARY_PASSWORD_DAYS,
+        f"temporary passwords are valid for {days} days"
+        if days is not None
+        else "the pool reports no temporary password validity",
+    )
+
+    leaking = sorted(
+        c.get("ClientId", "unknown")
+        for c in user_clients
+        if c.get("PreventUserExistenceErrors") != "ENABLED"
+    )
+    if leaking:
+        legs.append(
+            (
+                "user existence errors",
+                False,
+                "PreventUserExistenceErrors is not ENABLED on user-facing app client(s) "
+                + ", ".join(leaking[:5]),
+            )
+        )
+    else:
+        legs.append(
+            (
+                "user existence errors",
+                None if unread_clients or not user_clients else True,
+                f"PreventUserExistenceErrors is ENABLED on the {len(user_clients)} "
+                "user-facing app client(s) read",
+            )
+        )
+    return legs
+
+
+def check_agentcore_cognito_user_pool_authentication() -> List[Dict[str, Any]]:
+    """AC-52: Judge the Cognito user pools that issue tokens to AgentCore.
+
+    Answers Prowler AISF-IAM-07 for the user pools an AI application uses: the
+    pools named by the CUSTOM_JWT inbound authorizer discoveryUrl of an
+    AgentCore gateway or runtime. Each pool is judged once however many
+    resources name it. The legs reproduce these Prowler checks as of
+    prowler-cloud/prowler c2b80924: cognito_user_pool_mfa_enabled (MFA ON),
+    cognito_user_pool_advanced_security_enabled (ENFORCED, AUDIT fails),
+    cognito_user_pool_self_registration_disabled,
+    cognito_user_pool_deletion_protection_enabled,
+    cognito_user_pool_temporary_password_expiration (7 days or fewer),
+    cognito_user_pool_client_token_revocation_enabled and
+    cognito_user_pool_client_prevent_user_existence_errors. Prowler reads MFA
+    from GetUserPoolMfaConfig; this reads MfaConfiguration from
+    DescribeUserPool.
+
+    Two IAM-07 checks are not reproduced. cognito_user_pool_waf_acl_attached
+    needs a web ACL association lookup per pool, which the approved grants do
+    not include. cognito_identity_pool_guest_access_disabled judges identity
+    pools, which no AgentCore authorizer names, so none can be traced to an AI
+    application.
+
+    A pool whose every app client allows only the client_credentials flow
+    signs in no end user, so the MFA, threat protection, self-registration,
+    temporary password and user existence legs do not apply to it.
+    """
+    finding_name = "AgentCore Cognito User Pool Authentication"
+    could_not_assess = (
+        "No action required on the assessed workload. Resolve the assessment "
+        "permission or API error and rerun the assessment."
+    )
+
+    def finding(details, resolution, severity, status):
+        return create_finding(
+            check_id="AC-52",
+            finding_name=finding_name,
+            finding_details=details,
+            resolution=resolution,
+            reference=COGNITO_USER_POOL_SECURITY_REFERENCE_URL,
+            severity=severity,
+            status=status,
+        )
+
+    if agentcore_client is None or cognito_client is None:
+        return [
+            finding(
+                "AgentCore or Amazon Cognito client not available in this region.",
+                "No action required unless AgentCore runs in this region.",
+                SeverityEnum.INFORMATIONAL,
+                StatusEnum.NA,
+            )
+        ]
+
+    findings: List[Dict[str, Any]] = []
+    discovery_urls: List[Tuple[str, str]] = []
+    resource_count = 0
+
+    try:
+        gateways = _agentcore_list_all("list_gateways", ["items", "gateways"])
+    except (AttributeError, ClientError) as error:
+        findings.append(
+            _incomplete_check_finding(
+                "AC-52", finding_name, error, COGNITO_USER_POOL_SECURITY_REFERENCE_URL
+            )
+        )
+        gateways = []
+    for gateway in gateways:
+        resource_count += 1
+        gateway_id = gateway.get("gatewayId", "unknown")
+        label = f"gateway '{gateway.get('name', gateway_id)}' ({gateway_id})"
+        try:
+            detail = agentcore_client.get_gateway(gatewayIdentifier=gateway_id)
+        except ClientError as error:
+            findings.append(
+                finding(
+                    f"Could not read which issuer {label} accepts tokens from: "
+                    f"{_assessment_error_label(error)}.",
+                    could_not_assess,
+                    SeverityEnum.INFORMATIONAL,
+                    StatusEnum.NA,
+                )
+            )
+            continue
+        if detail.get("authorizerType") != GATEWAY_AUTHORIZER_JWT_VALUE:
+            continue
+        url = (
+            (detail.get("authorizerConfiguration") or {}).get("customJWTAuthorizer")
+            or {}
+        ).get("discoveryUrl")
+        if url:
+            discovery_urls.append((url, label))
+
+    try:
+        runtimes = _agentcore_list_all("list_agent_runtimes", ["agentRuntimes"])
+    except (AttributeError, ClientError) as error:
+        findings.append(
+            _incomplete_check_finding(
+                "AC-52", finding_name, error, COGNITO_USER_POOL_SECURITY_REFERENCE_URL
+            )
+        )
+        runtimes = []
+    for runtime in runtimes:
+        resource_count += 1
+        runtime_id = runtime.get("agentRuntimeId", "unknown")
+        label = (
+            f"runtime '{runtime.get('agentRuntimeName', runtime_id)}' ({runtime_id})"
+        )
+        try:
+            detail = agentcore_client.get_agent_runtime(agentRuntimeId=runtime_id)
+        except ClientError as error:
+            findings.append(
+                finding(
+                    f"Could not read which issuer {label} accepts tokens from: "
+                    f"{_assessment_error_label(error)}.",
+                    could_not_assess,
+                    SeverityEnum.INFORMATIONAL,
+                    StatusEnum.NA,
+                )
+            )
+            continue
+        url = (
+            (detail.get("authorizerConfiguration") or {}).get("customJWTAuthorizer")
+            or {}
+        ).get("discoveryUrl")
+        if url:
+            discovery_urls.append((url, label))
+
+    pools: Dict[str, Dict[str, Any]] = {}
+    other_issuers = 0
+    for url, label in discovery_urls:
+        match = COGNITO_DISCOVERY_URL_PATTERN.match(url.strip())
+        if not match:
+            other_issuers += 1
+            continue
+        entry = pools.setdefault(
+            match.group(2), {"region": match.group(1), "consumers": []}
+        )
+        entry["consumers"].append(label)
+
+    if not pools:
+        if not findings:
+            findings.append(
+                finding(
+                    f"None of the {resource_count} AgentCore gateway(s) and runtime(s) "
+                    "in this region names an Amazon Cognito user pool as its JWT "
+                    f"issuer; {other_issuers} name another issuer, which is not judged.",
+                    "No action required.",
+                    SeverityEnum.INFORMATIONAL,
+                    StatusEnum.NA,
+                )
+            )
+        return findings
+
+    assessed_region = cognito_client.meta.region_name
+    for pool_id in sorted(pools):
+        entry = pools[pool_id]
+        consumers = entry["consumers"]
+        named_by = (
+            "named by "
+            + ", ".join(consumers[:5])
+            + (f" and {len(consumers) - 5} more" if len(consumers) > 5 else "")
+        )
+        label = f"User pool {pool_id} ({named_by})"
+
+        if entry["region"] != assessed_region:
+            findings.append(
+                finding(
+                    f"{label} is in {entry['region']}, and this assessment reads "
+                    f"Amazon Cognito in {assessed_region} only, so it is not judged.",
+                    "No action required. Review the pool's settings in its own region.",
+                    SeverityEnum.INFORMATIONAL,
+                    StatusEnum.NA,
+                )
+            )
+            continue
+
+        try:
+            pool = (
+                cognito_client.describe_user_pool(UserPoolId=pool_id).get("UserPool")
+                or {}
+            )
+            summaries = _paginate_aws_list(
+                cognito_client,
+                "list_user_pool_clients",
+                "UserPoolClients",
+                "NextToken",
+                "NextToken",
+                UserPoolId=pool_id,
+                MaxResults=60,
+            )
+            clients = [
+                cognito_client.describe_user_pool_client(
+                    UserPoolId=pool_id, ClientId=summary.get("ClientId")
+                ).get("UserPoolClient")
+                or {}
+                for summary in summaries[:AC52_MAX_CLIENTS_PER_POOL]
+            ]
+        except ClientError as error:
+            code = _assessment_error_label(error)
+            reason = (
+                "was not found in this account, so it belongs to another account "
+                "or was deleted"
+                if code == "ResourceNotFoundException"
+                else f"could not be read: {code}"
+            )
+            findings.append(
+                finding(
+                    f"{label} {reason}.",
+                    "No action required. Review the pool's settings in the account "
+                    "that owns it."
+                    if code == "ResourceNotFoundException"
+                    else could_not_assess,
+                    SeverityEnum.INFORMATIONAL,
+                    StatusEnum.NA,
+                )
+            )
+            continue
+
+        unread = max(len(summaries) - AC52_MAX_CLIENTS_PER_POOL, 0)
+        legs = _ac52_pool_legs(pool, clients, unread)
+        m2m_only = _ac52_signs_in_no_user(clients, unread)
+        context = [f"feature plan {pool.get('UserPoolTier') or 'not reported'}"]
+        if m2m_only:
+            context.append(
+                (
+                    f"each of its {len(clients)} app client(s) allows only the "
+                    "client_credentials flow"
+                    if clients
+                    else "it has no app client"
+                )
+                + ", so no end user signs in and the MFA, threat protection, "
+                "self-registration, temporary password and user existence legs "
+                "do not apply"
+            )
+        if unread:
+            context.append(
+                f"{unread} of its {len(summaries)} app clients were not read, above "
+                f"the {AC52_MAX_CLIENTS_PER_POOL}-client limit"
+            )
+
+        failed = [f"{name}: {detail}" for name, ok, detail in legs if ok is False]
+        unproven = [f"{name}: {detail}" for name, ok, detail in legs if ok is None]
+        passed = [name for name, ok, _ in legs if ok]
+        context_text = "; ".join(context)
+        suffix = " " + context_text[0].upper() + context_text[1:] + "."
+        if failed:
+            findings.append(
+                finding(
+                    f"{label} fails {len(failed)} leg(s): {'; '.join(failed)}. "
+                    f"Passed: {', '.join(passed) or 'none'}."
+                    + (f" Unproven: {'; '.join(unproven)}." if unproven else "")
+                    + suffix,
+                    "Turn on deletion protection and token revocation. For a pool "
+                    "that signs in end users, require MFA, set threat protection "
+                    "to full-function enforcement, allow only administrators to "
+                    "create users, keep temporary passwords valid for 7 days or "
+                    "fewer, and set PreventUserExistenceErrors to ENABLED on every "
+                    "user-facing app client.",
+                    SeverityEnum.MEDIUM,
+                    StatusEnum.FAILED,
+                )
+            )
+        elif unproven:
+            findings.append(
+                finding(
+                    f"{label} passes {', '.join(passed) or 'no leg'}, but these legs "
+                    f"could not be proven: {'; '.join(unproven)}.{suffix}",
+                    "No action required on the legs that passed. Reduce the pool's "
+                    "app clients or review the unread clients in the Amazon Cognito console.",
+                    SeverityEnum.INFORMATIONAL,
+                    StatusEnum.NA,
+                )
+            )
+        else:
+            findings.append(
+                finding(
+                    f"{label} passes every applicable leg: {', '.join(passed)}.{suffix}",
+                    "No action required.",
+                    SeverityEnum.MEDIUM,
+                    StatusEnum.PASSED,
+                )
+            )
+
+    return findings
+
+
 def check_agentcore_gateway_agentic_security() -> List[Dict[str, Any]]:
     """
     Check API-provable AgentCore Gateway controls for agentic tool execution.
@@ -14698,7 +15133,7 @@ def lambda_handler(event, context):
     global start_time, iam_client, ec2_client, ecr_client, logs_client
     global cloudwatch_client, cloudtrail_client, oam_client, agentcore_client
     global kms_client, organizations_client
-    global wafv2_client, route53resolver_client
+    global wafv2_client, route53resolver_client, cognito_client
     start_time = time.time()
 
     try:
@@ -14732,6 +15167,10 @@ def lambda_handler(event, context):
         wafv2_client = boto3.client("wafv2", config=boto3_config, region_name=region)
         route53resolver_client = boto3.client(
             "route53resolver", config=boto3_config, region_name=region
+        )
+        # AC-52 judges only the user pools in the assessed region.
+        cognito_client = boto3.client(
+            "cognito-idp", config=boto3_config, region_name=region
         )
 
         # Collect all findings
@@ -15235,6 +15674,11 @@ def lambda_handler(event, context):
                 ["AC-51"],
                 "Web ACL Anti-DDoS",
                 check_agentcore_web_acl_anti_ddos,
+            ),
+            (
+                ["AC-52"],
+                "Cognito User Pool Authentication",
+                check_agentcore_cognito_user_pool_authentication,
             ),
         ]
 

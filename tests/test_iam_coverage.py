@@ -169,6 +169,10 @@ REQUIRED_AGENTCORE_ACTIONS = {
     "bedrock-agentcore:GetGatewayTarget",
     # AC-50 reads the registry scanning configuration.
     "ecr:GetRegistryScanningConfiguration",
+    # AC-52 reads the Cognito user pools AgentCore JWT authorizers name.
+    "cognito-idp:DescribeUserPool",
+    "cognito-idp:ListUserPoolClients",
+    "cognito-idp:DescribeUserPoolClient",
 }
 
 REQUIRED_AGENT_REGISTRY_ACTIONS = {

@@ -157,6 +157,7 @@ _EXPECTED_ACTIONS = {
         "cloudtrail:GetTrail",
         "cloudtrail:GetTrailStatus",
         "cloudtrail:ListTrails",
+        "cloudtrail:LookupEvents",
         "cloudwatch:DescribeAlarms",
         "ec2:DescribeRouteTables",
         "ec2:DescribeSubnets",
@@ -292,6 +293,9 @@ _EXPECTED_ACTIONS = {
         "cloudtrail:GetEventSelectors",
         "cloudtrail:ListTrails",
         "cloudwatch:PutMetricData",
+        "cognito-idp:DescribeUserPool",
+        "cognito-idp:DescribeUserPoolClient",
+        "cognito-idp:ListUserPoolClients",
         "ec2:DescribeRouteTables",
         "ec2:DescribeSecurityGroups",
         "ec2:DescribeSubnets",
@@ -986,6 +990,9 @@ def test_aisf_phase5_reads_wildcard_only_where_iam_has_no_resource_type(template
         ("AgentCoreSecurityAssessmentFunction", "ECRRegistryScanningRead"): (
             "ecr:GetRegistryScanningConfiguration",
         ),
+        ("BedrockSecurityAssessmentFunction", "CloudTrailEventHistoryRead"): (
+            "cloudtrail:LookupEvents",
+        ),
     }
     for (logical_id, sid), actions in wildcard.items():
         statement = _statement_block(template, logical_id, sid)
@@ -1033,6 +1040,10 @@ def test_aisf_phase5_reads_wildcard_only_where_iam_has_no_resource_type(template
         ("AgentRegistrySecurityAssessmentFunction", "RegistryEventRuleTargetRead"): (
             "events:ListTargetsByRule",
             "events:*:${AWS::AccountId}:rule/*",
+        ),
+        ("AgentCoreSecurityAssessmentFunction", "CognitoUserPoolRead"): (
+            "cognito-idp:DescribeUserPoolClient",
+            "cognito-idp:*:${AWS::AccountId}:userpool/*",
         ),
     }
     for (logical_id, sid), (action, resource) in scoped.items():
