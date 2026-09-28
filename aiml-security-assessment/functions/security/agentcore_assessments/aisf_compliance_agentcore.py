@@ -66,6 +66,7 @@ AISF_COMPLIANCE_MAP = {
     "AC-49": "AISF AIR-FND-NET-03 | AISF AIR-FND-NET-06 (1 of 3 checks)",
     "AC-50": "AISF AIR-SLF-CMP-01 (1 of 2 checks)",
     "AC-51": "AISF AIR-FND-NET-08",
+    "AC-53": "AISF AIR-FND-DET-10",
     "AG-24": "AISF AIR-ACR-GW-01",
     "AG-25": "AISF AIR-ACR-POL-01 (1 of 3 checks) | AISF AIR-ACR-POL-07 (1 of 2 checks)",
     "AG-27": "AISF AIR-ACR-GW-05 (1 of 2 checks) | AISF AIR-FND-NET-04 (1 of 2 checks)",

@@ -7,12 +7,12 @@
     "fnd_ai_subject": 11,
     "foundation": 27,
     "total": 105,
-    "covered": 100,
+    "covered": 101,
     "tighten": 0,
     "tighten_extend": 0,
     "tighten_new_id": 0,
     "new": 0,
-    "not_implementable": 5,
+    "not_implementable": 4,
     "unassessed": 0,
     "new_check_functions": 0,
     "extensions": 0,
@@ -2564,14 +2564,20 @@
       "question": "Are coordination-level metrics for multi-agent workflows \u2014 inter-agent message rates, per-agent-pair error rates, workflow execution frequency, and communication topology \u2014 baselined and alarmed on, rather than only each agent's own health and error metrics?",
       "assert": "Coordination metric definitions per workflow + an anomaly-detection alarm on a per-agent-pair metric",
       "workload_agnostic": false,
-      "verdict": "not_implementable",
+      "verdict": "covered",
       "disposition": null,
-      "target_modules": [],
-      "incumbents": [],
-      "incumbent_names": [],
-      "gap": "Coordination metrics are custom metrics the customer names, and no AWS API marks which metric measures inter-agent traffic, so a scan cannot tell a coordination alarm from any other alarm.",
+      "target_modules": [
+        "agentcore_assessments"
+      ],
+      "incumbents": [
+        "AC-53"
+      ],
+      "incumbent_names": [
+        "AgentCore Inter-Agent Anomaly Alarms"
+      ],
+      "gap": "AC-53 takes the agent pairs from Application Signals: ListMetrics on the ApplicationSignals namespace lists an Error, Fault and Latency metric per caller and callee, and a pair is judged when its Environment starts with bedrock-agentcore: and its RemoteService names another AgentCore runtime or gateway. A gateway's call to its policy engine is not a pair. Each pair fails without a metric alarm with actions whose ThresholdMetricId names an ANOMALY_DETECTION_BAND over one of those metrics, with the pair's Service and RemoteService, on a listed dimension set and with no Operation. No pair is N/A, never Passed. Partial, ceiling reached: runtimes not instrumented with Application Signals publish no pair, and no AWS API records workflow execution frequency, per-workflow metric definitions, or whether a new pair raises an alert",
       "extra_iam": [],
-      "phase": null,
+      "phase": 6,
       "tier": "foundation",
       "source": "controls/baseline/threat-detection.yaml"
     },

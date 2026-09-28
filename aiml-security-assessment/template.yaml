@@ -1320,7 +1320,7 @@ Resources:
             - Sid: EvaluationScoreAlarmRead
               Effect: Allow
               Action:
-                - cloudwatch:DescribeAlarms # AC-40, AC-46
+                - cloudwatch:DescribeAlarms # AC-40, AC-46, AC-53
               Resource: !Sub 'arn:${AWS::Partition}:cloudwatch:*:${AWS::AccountId}:alarm:*'
             - Sid: AgentCoreApprovedReadsWithoutResourceType
               # Read-only reads approved for the AgentCore legs. None of these
@@ -1349,7 +1349,7 @@ Resources:
               Effect: Allow
               Action:
                 - network-firewall:ListFirewalls # AC-49
-                - cloudwatch:ListMetrics # AC-40
+                - cloudwatch:ListMetrics # AC-40, AC-53
                 - ce:GetAnomalySubscriptions # AC-46
               Resource: '*'
             - Sid: NetworkFirewallRead

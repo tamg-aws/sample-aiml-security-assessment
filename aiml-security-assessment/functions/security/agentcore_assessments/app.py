@@ -506,6 +506,7 @@ REGIONAL_AGENTCORE_CHECK_IDS = (
     "AC-50",
     "AC-51",
     "AC-52",
+    "AC-53",
 )
 
 # A regional leg of a check id that is otherwise global. The id is reported by
@@ -588,6 +589,7 @@ AGENTCORE_RUNTIME_CHECK_IDS = (
     "AC-50",
     "AC-51",
     "AC-52",
+    "AC-53",
 )
 
 NATIVE_AGENTIC_AGENTCORE_CHECK_NAMES = {
@@ -27456,6 +27458,290 @@ def check_agentcore_cognito_user_pool_authentication() -> List[Dict[str, Any]]:
     return findings
 
 
+APPLICATION_SIGNALS_NAMESPACE = "ApplicationSignals"
+# Application Signals sets the Environment dimension of a metric an AgentCore
+# runtime or gateway emits to this prefix followed by the environment name.
+AGENTCORE_APPLICATION_SIGNALS_ENVIRONMENT_PREFIX = "bedrock-agentcore:"
+# The dependency metrics Application Signals publishes per caller and callee.
+APPLICATION_SIGNALS_EDGE_METRIC_NAMES = ("Error", "Fault", "Latency")
+# A dependency metric scoped to one operation watches part of an edge only.
+APPLICATION_SIGNALS_OPERATION_DIMENSIONS = ("Operation", "RemoteOperation")
+ANOMALY_DETECTION_BAND_PATTERN = re.compile(
+    r"^\s*ANOMALY_DETECTION_BAND\s*\(\s*([A-Za-z0-9_]+)"
+)
+AGENTCORE_COORDINATION_ALARM_FINDING = "AgentCore Inter-Agent Anomaly Alarms"
+APPLICATION_SIGNALS_METRICS_REFERENCE_URL = (
+    "https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/"
+    "AppSignals-MetricsCollected.html"
+)
+AGENTCORE_COORDINATION_UNREADABLE_NOTE = (
+    " Not assessed, because no AWS API records them: how often each multi-agent "
+    "workflow runs, which metrics a workflow defines as its own, and whether a "
+    "new caller and callee pair raises an alert when it first appears."
+)
+
+
+def _agentcore_signal_identity(
+    value: str, resources: List[Tuple[str, str, str]]
+) -> Optional[Tuple[str, str, str]]:
+    """Return the runtime or gateway an Application Signals service value names.
+
+    A gateway's service value is its gateway id. A runtime's is
+    <agentRuntimeName>.<endpointName>, or the runtime id. A remote service value
+    can carry an AWS:: prefix. Each resource is (kind, id, name).
+    """
+    value = value[len("AWS::") :] if value.startswith("AWS::") else value
+    for resource in resources:
+        for identity in resource[1:]:
+            if identity and (value == identity or value.startswith(f"{identity}.")):
+                return resource
+    return None
+
+
+def _anomaly_band_edge_keys(alarm: Dict[str, Any]) -> List[Tuple[str, frozenset]]:
+    """Return the metric keys one alarm judges against an anomaly detection band.
+
+    Only a band the alarm's ThresholdMetricId names is its threshold, and only
+    the MetricStat the band's first argument names is what it watches.
+    """
+    queries = [query for query in alarm.get("Metrics") or [] if isinstance(query, dict)]
+    by_id = {query.get("Id"): query for query in queries}
+    keys: List[Tuple[str, frozenset]] = []
+    for query in queries:
+        if query.get("Id") != alarm.get("ThresholdMetricId"):
+            continue
+        match = ANOMALY_DETECTION_BAND_PATTERN.match(str(query.get("Expression") or ""))
+        if not match:
+            continue
+        watched = by_id.get(match.group(1)) or {}
+        metric = (watched.get("MetricStat") or {}).get("Metric") or {}
+        if metric.get("Namespace") != APPLICATION_SIGNALS_NAMESPACE:
+            continue
+        keys.append(
+            (
+                str(metric.get("MetricName")),
+                frozenset(
+                    (dimension.get("Name"), dimension.get("Value"))
+                    for dimension in metric.get("Dimensions") or []
+                ),
+            )
+        )
+    return keys
+
+
+def check_agentcore_coordination_anomaly_alarms() -> List[Dict[str, Any]]:
+    """AC-53: Alarm on each AgentCore caller and callee pair's anomalies.
+
+    Answers AIR-FND-DET-10 for the pairs Application Signals records. ListMetrics
+    on the ApplicationSignals namespace lists a dependency metric per caller
+    (Service) and callee (RemoteService). An edge is a pair whose Environment
+    starts with bedrock-agentcore: and whose RemoteService resolves to another
+    AgentCore runtime or gateway in ListAgentRuntimes or ListGateways. A call
+    from a gateway to its policy engine is excluded, because Policy in AgentCore
+    decides tool access and is not an agent.
+
+    Each edge needs a metric alarm with actions whose threshold is an
+    ANOMALY_DETECTION_BAND over the edge's Error, Fault or Latency metric, with
+    the edge's Service and RemoteService, on a dimension set ListMetrics lists
+    and with no Operation or RemoteOperation, since a per-operation alarm
+    watches part of the edge. A runtime not instrumented with Application
+    Signals publishes no edge, so it cannot be assessed.
+    """
+    could_not_assess = (
+        "No action is required on the assessed workload based on this result. "
+        "Resolve the assessment permission or API error and rerun the assessment."
+    )
+
+    def finding(details, resolution, severity, status):
+        return create_finding(
+            check_id="AC-53",
+            finding_name=AGENTCORE_COORDINATION_ALARM_FINDING,
+            finding_details=details + AGENTCORE_COORDINATION_UNREADABLE_NOTE,
+            resolution=resolution,
+            reference=APPLICATION_SIGNALS_METRICS_REFERENCE_URL,
+            severity=severity,
+            status=status,
+        )
+
+    def unread(action: str, error: Exception) -> List[Dict[str, Any]]:
+        return [
+            finding(
+                f"{action} failed with {_assessment_error_label(error)}, so which "
+                "AgentCore runtimes and gateways call one another, and whether "
+                "each pair is alarmed, was not established.",
+                could_not_assess,
+                SeverityEnum.INFORMATIONAL,
+                StatusEnum.NA,
+            )
+        ]
+
+    if agentcore_client is None or cloudwatch_client is None:
+        return [
+            finding(
+                "AgentCore or CloudWatch client not available in this region.",
+                "No action required unless AgentCore runs in this region.",
+                SeverityEnum.INFORMATIONAL,
+                StatusEnum.NA,
+            )
+        ]
+
+    resources: List[Tuple[str, str, str]] = []
+    try:
+        for runtime in _agentcore_list_all("list_agent_runtimes", ["agentRuntimes"]):
+            resources.append(
+                (
+                    "runtime",
+                    runtime.get("agentRuntimeId") or "",
+                    runtime.get("agentRuntimeName") or "",
+                )
+            )
+    except (BotoCoreError, ClientError) as error:
+        return unread("bedrock-agentcore:ListAgentRuntimes", error)
+    try:
+        for gateway in _agentcore_list_all("list_gateways", ["items", "gateways"]):
+            resources.append(
+                ("gateway", gateway.get("gatewayId") or "", gateway.get("name") or "")
+            )
+    except (BotoCoreError, ClientError) as error:
+        return unread("bedrock-agentcore:ListGateways", error)
+    try:
+        engines = [
+            (
+                "policy engine",
+                engine.get("policyEngineId") or "",
+                engine.get("name") or "",
+            )
+            for engine in _agentcore_list_all("list_policy_engines", ["policyEngines"])
+        ]
+    except (BotoCoreError, ClientError) as error:
+        return unread("bedrock-agentcore:ListPolicyEngines", error)
+
+    published: set = set()
+    edges: Dict[Tuple[str, str], Tuple[str, str]] = {}
+    try:
+        for metric_name in APPLICATION_SIGNALS_EDGE_METRIC_NAMES:
+            for metric in _paginate_aws_list(
+                cloudwatch_client,
+                "list_metrics",
+                "Metrics",
+                token_request_key="NextToken",
+                token_response_key="NextToken",
+                Namespace=APPLICATION_SIGNALS_NAMESPACE,
+                MetricName=metric_name,
+            ):
+                if not isinstance(metric, dict):
+                    continue
+                dimensions = {
+                    dimension.get("Name"): dimension.get("Value")
+                    for dimension in metric.get("Dimensions") or []
+                }
+                published.add(
+                    (str(metric.get("MetricName")), frozenset(dimensions.items()))
+                )
+                service = dimensions.get("Service")
+                remote = dimensions.get("RemoteService")
+                if not (
+                    isinstance(service, str)
+                    and isinstance(remote, str)
+                    and str(dimensions.get("Environment") or "").startswith(
+                        AGENTCORE_APPLICATION_SIGNALS_ENVIRONMENT_PREFIX
+                    )
+                ):
+                    continue
+                if _agentcore_signal_identity(remote, engines):
+                    continue
+                callee = _agentcore_signal_identity(remote, resources)
+                if callee is None or callee == _agentcore_signal_identity(
+                    service, resources
+                ):
+                    continue
+                edges[(service, remote)] = (callee[0], callee[1])
+    except (BotoCoreError, ClientError) as error:
+        return unread("cloudwatch:ListMetrics", error)
+
+    if not edges:
+        return [
+            finding(
+                f"ListMetrics on {APPLICATION_SIGNALS_NAMESPACE} records no call "
+                "from an AgentCore runtime or gateway to another AgentCore "
+                "runtime or gateway, so there is no caller and callee pair to "
+                "judge. A runtime or gateway not instrumented with Application "
+                "Signals publishes no such metric and cannot be assessed.",
+                "If agents in this region call one another, instrument them with "
+                "Application Signals and rerun the assessment.",
+                SeverityEnum.INFORMATIONAL,
+                StatusEnum.NA,
+            )
+        ]
+
+    try:
+        alarms = _paginate_aws_list(
+            cloudwatch_client,
+            "describe_alarms",
+            "MetricAlarms",
+            token_request_key="NextToken",
+            token_response_key="NextToken",
+        )
+    except (BotoCoreError, ClientError) as error:
+        return unread("cloudwatch:DescribeAlarms", error)
+
+    alarmed: Dict[Tuple[str, str], List[str]] = {}
+    for alarm in alarms:
+        if not (
+            isinstance(alarm, dict)
+            and alarm.get("ActionsEnabled") is True
+            and alarm.get("AlarmActions")
+        ):
+            continue
+        for metric_name, dimension_set in _anomaly_band_edge_keys(alarm):
+            dimensions = dict(dimension_set)
+            if (metric_name, dimension_set) not in published or any(
+                name in dimensions for name in APPLICATION_SIGNALS_OPERATION_DIMENSIONS
+            ):
+                continue
+            edge = (dimensions.get("Service"), dimensions.get("RemoteService"))
+            if edge in edges:
+                alarmed.setdefault(edge, []).append(
+                    f"{alarm.get('AlarmName', 'unnamed')} on {metric_name}"
+                )
+
+    findings: List[Dict[str, Any]] = []
+    for (service, remote), (kind, callee_id) in sorted(edges.items()):
+        if (service, remote) in alarmed:
+            continue
+        findings.append(
+            finding(
+                f"Calls from '{service}' to {kind} {callee_id} (RemoteService "
+                f"'{remote}') have no alarm with actions whose threshold is an "
+                "ANOMALY_DETECTION_BAND over the pair's Error, Fault or Latency "
+                "metric, so a change in how often that pair fails or how long it "
+                "takes notifies nobody.",
+                "Create a CloudWatch alarm with an anomaly detection band on the "
+                f"{APPLICATION_SIGNALS_NAMESPACE} Error, Fault or Latency metric "
+                "with this pair's Environment, Service and RemoteService "
+                "dimensions, and give it an alarm action.",
+                SeverityEnum.MEDIUM,
+                StatusEnum.FAILED,
+            )
+        )
+    if findings:
+        return findings
+    covered = "; ".join(
+        f"'{service}' to '{remote}' by {', '.join(sorted(alarmed[(service, remote)]))}"
+        for service, remote in sorted(edges)
+    )
+    return [
+        finding(
+            f"Every one of the {len(edges)} AgentCore caller and callee pair(s) "
+            "Application Signals records has an alarm with actions on an anomaly "
+            f"detection band: {covered}.",
+            "No action required.",
+            SeverityEnum.MEDIUM,
+            StatusEnum.PASSED,
+        )
+    ]
+
+
 def _gateway_jwt_authorization_finding(
     label: str, gateway_details: Dict[str, Any]
 ) -> Dict[str, Any]:
@@ -28700,6 +28986,11 @@ def lambda_handler(event, context):
                 ["AC-52"],
                 "Cognito User Pool Authentication",
                 check_agentcore_cognito_user_pool_authentication,
+            ),
+            (
+                ["AC-53"],
+                "Inter-Agent Anomaly Alarms",
+                check_agentcore_coordination_anomaly_alarms,
             ),
         ]
 

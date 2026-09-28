@@ -1,10 +1,10 @@
 # Security Checks Reference
 
-This document provides a comprehensive reference for all 274 security checks performed by the AI/ML Security Assessment framework (159 core checks across Amazon Bedrock, Amazon SageMaker AI, Amazon Bedrock AgentCore, and AWS Agent Registry, 39 Agentic AI Security checks, 64 Responsible AI GRC checks, and 12 OWASP Top 10 for LLM checks).
+This document provides a comprehensive reference for all 275 security checks performed by the AI/ML Security Assessment framework (160 core checks across Amazon Bedrock, Amazon SageMaker AI, Amazon Bedrock AgentCore, and AWS Agent Registry, 39 Agentic AI Security checks, 64 Responsible AI GRC checks, and 12 OWASP Top 10 for LLM checks).
 
 Sources differ by bucket and are not interchangeable: the core Bedrock, SageMaker, AgentCore, and AWS Agent Registry checks derive from the AWS Well-Architected **Generative AI Lens** security best practices (`gensec*`) and service security documentation; the Agentic AI Security checks from the AWS Well-Architected **Agentic AI Lens**; the `FS-*` **Responsible AI GRC** checks from the AWS GRC User Guide; and the `OW-*` checks from the OWASP Top 10 for LLM. The AWS Well-Architected **Responsible AI Lens** is not a source for any of them — see [Responsible AI GRC — scope, sources, and compatibility](RESPONSIBLE_AI_GRC_SCOPE.md).
 
-The 64 Responsible AI GRC checks occupy 69 `FS-*` numbers: 64 ship as standalone checks and 5 are merged into upstream Bedrock/SageMaker checks. The framework also emits `BR-00`, `SM-00`, `AC-00`, `AR-00`, `FS-00`, `OW-00`, and `AISF-00` operational marker rows at runtime; these are not controls and are excluded from the 274-check total. `AISF-01` through `AISF-08` are AWS AI Security Framework view rows: each one restates the verdict of a check already counted above under an AISF control id, so they are excluded from the 274-check total for the same reason ([AWS AI Security Framework (AISF) Checks](SECURITY_CHECKS_AISF.md)). Per-control provenance, including which controls are project extensions rather than guide-derived, is recorded in [`provenance.json`](../aiml-security-assessment/functions/security/responsible_ai_grc_assessments/provenance.json).
+The 64 Responsible AI GRC checks occupy 69 `FS-*` numbers: 64 ship as standalone checks and 5 are merged into upstream Bedrock/SageMaker checks. The framework also emits `BR-00`, `SM-00`, `AC-00`, `AR-00`, `FS-00`, `OW-00`, and `AISF-00` operational marker rows at runtime; these are not controls and are excluded from the 275-check total. `AISF-01` through `AISF-08` are AWS AI Security Framework view rows: each one restates the verdict of a check already counted above under an AISF control id, so they are excluded from the 275-check total for the same reason ([AWS AI Security Framework (AISF) Checks](SECURITY_CHECKS_AISF.md)). Per-control provenance, including which controls are project extensions rather than guide-derived, is recorded in [`provenance.json`](../aiml-security-assessment/functions/security/responsible_ai_grc_assessments/provenance.json).
 
 ## Table of Contents
 
@@ -15,7 +15,7 @@ The 64 Responsible AI GRC checks occupy 69 `FS-*` numbers: 64 ship as standalone
 - [Status Values](#status-values)
 - [Amazon SageMaker AI Security Checks (40)](#amazon-sagemaker-ai-security-checks-40)
 - [Amazon Bedrock Security Checks (57)](#amazon-bedrock-security-checks-57)
-- [Amazon Bedrock AgentCore Security Checks (52)](#amazon-bedrock-agentcore-security-checks-52)
+- [Amazon Bedrock AgentCore Security Checks (53)](#amazon-bedrock-agentcore-security-checks-53)
 - [AWS Agent Registry Security Checks (10)](#aws-agent-registry-security-checks-10)
 - [Agentic AI Security Checks (39)](#agentic-ai-security-checks-39)
 - [Responsible AI GRC Checks (64)](#responsible-ai-grc-checks-64-additional-5-upstream-extensions)
@@ -47,7 +47,7 @@ Each security check has a unique identifier with a service prefix:
 | -------- | --------- | --------- |
 | **SM-XX** | Amazon SageMaker | SM-01, SM-41 (`SM-29` reserved) |
 | **BR-XX** | Amazon Bedrock | BR-01, BR-57 |
-| **AC-XX** | Amazon Bedrock AgentCore | AC-01, AC-52 |
+| **AC-XX** | Amazon Bedrock AgentCore | AC-01, AC-53 |
 | **AR-XX** | AWS Agent Registry | AR-01, AR-10 |
 | **AG-XX** | Agentic AI Security | AG-01, AG-39 |
 | **FS-XX** | Responsible AI GRC | FS-01, FS-69 |
@@ -655,7 +655,7 @@ inventory is never treated as evidence of compliance.
 
 ---
 
-## Amazon Bedrock AgentCore Security Checks (52)
+## Amazon Bedrock AgentCore Security Checks (53)
 
 ### AC-01: Runtime Amazon VPC Configuration
 
@@ -918,6 +918,11 @@ inventory is never treated as evidence of compliance.
 
 - **Severity:** Medium
 - **Description:** Answers Prowler's AISF-IAM-07 "Cognito User Authentication for AI Apps" for the user pools an AI application uses: the pools named in the `discoveryUrl` of a `CUSTOM_JWT` inbound authorizer on an AgentCore gateway or runtime. Each pool is judged once, in one row that names every gateway and runtime using it. Per pool, reproducing Prowler's Cognito checks: `MfaConfiguration` is `ON`; threat protection (`AdvancedSecurityMode`) is `ENFORCED`, so `AUDIT` fails; `AllowAdminCreateUserOnly` is true; `DeletionProtection` is `ACTIVE`; and temporary passwords are valid for 7 days or fewer. Per app client: `EnableTokenRevocation` is on, and `PreventUserExistenceErrors` is `ENABLED`. The row names the pool's feature plan (`UserPoolTier`). A pool whose every app client allows only the `client_credentials` OAuth flow and no sign-in flow other than `ALLOW_REFRESH_TOKEN_AUTH` signs in no end user, so the MFA, threat protection, self-registration, temporary password and user existence legs do not apply to it, and it is judged on deletion protection and token revocation. A client with no `ExplicitAuthFlows` is user-facing, because Cognito gives such a client the SRP and custom sign-in flows by default. Up to 100 app clients are read per pool; when more exist, a leg the unread clients could change is reported as unproven in an informational `N/A` row, and a leg already failed by a client that was read still fails. A pool in another Region, a pool this account cannot find (another account's, or deleted), and a pool or resource that cannot be read are informational `N/A` with the reason. Issuers other than Cognito are not judged. Prowler's `cognito_user_pool_waf_acl_attached` and `cognito_identity_pool_guest_access_disabled` are not reproduced: the first needs a web ACL lookup per pool that the assessment role is not granted, and no AgentCore authorizer names an identity pool, so none can be traced to an AI application.
+
+### AC-53: Inter-Agent Anomaly Alarms
+
+- **Severity:** Medium
+- **Description:** Answers AISF `AIR-FND-DET-10` for the agent-to-agent calls Application Signals records. `ListMetrics` on the `ApplicationSignals` namespace, for `Error`, `Fault` and `Latency`, lists a dependency metric per caller (`Service`) and callee (`RemoteService`). A pair is judged when its `Environment` starts with `bedrock-agentcore:` and its `RemoteService`, with any `AWS::` prefix removed, names another runtime or gateway from `ListAgentRuntimes` or `ListGateways`: a gateway by its id or name, a runtime by its id or name or `<agentRuntimeName>.<endpointName>`. A call from a gateway to its policy engine (`ListPolicyEngines`) is excluded, as is a call a resource makes to itself. Each pair fails without a metric alarm whose actions are enabled and non-empty and whose `ThresholdMetricId` names an `ANOMALY_DETECTION_BAND` expression over a `MetricStat` in `ApplicationSignals` on one of the three metrics. That metric must carry the pair's `Service` and `RemoteService`, on a dimension set `ListMetrics` lists, with no `Operation` or `RemoteOperation`, because a per-operation alarm watches part of the pair. Passed names each pair and its alarms. With no pair the row is informational `N/A` and says a runtime or gateway not instrumented with Application Signals cannot be assessed. Every row names what no AWS API records: how often each multi-agent workflow runs, which metrics a workflow defines as its own, and whether a new pair raises an alert when it first appears. A denied or failed `ListAgentRuntimes`, `ListGateways`, `ListPolicyEngines`, `ListMetrics` or `DescribeAlarms` read is informational `N/A` naming the action. Composite alarms are not read.
 
 ---
 

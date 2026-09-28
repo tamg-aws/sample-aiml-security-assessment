@@ -12,6 +12,20 @@ section.
 
 ### Added
 
+- Added `AC-53` Inter-Agent Anomaly Alarms, growing the catalog from 274 to
+  275 checks (160 core). It covers AISF `AIR-FND-DET-10`, which the ledger
+  had marked `not_implementable`. Application Signals publishes an `Error`,
+  `Fault` and `Latency` metric per caller and callee, so `ListMetrics` on the
+  `ApplicationSignals` namespace names each pair where an AgentCore runtime
+  or gateway calls another one. Each pair fails without a metric alarm that
+  has actions and whose threshold is an `ANOMALY_DETECTION_BAND` over one of
+  those metrics, with the pair's `Service` and `RemoteService` and no
+  `Operation`. A gateway's call to its policy engine is not a pair. With no
+  pair the row is `N/A` and says runtimes not instrumented with Application
+  Signals cannot be assessed. Every row names what no API records: workflow
+  run frequency, per-workflow metric definitions, and alerting on a new pair.
+  The check uses the role's existing `cloudwatch:ListMetrics` and
+  `cloudwatch:DescribeAlarms` grants.
 - Added `BR-57` Agent Handoff Source Identity, growing the catalog from 273
   to 274 checks (159 core). It covers AISF `AIR-SLF-AGT-05`, which the ledger
   had marked `not_implementable`. It fails a Bedrock collaborator that runs as

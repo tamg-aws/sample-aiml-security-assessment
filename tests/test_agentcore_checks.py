@@ -37298,3 +37298,349 @@ class TestAC50ImageScanGate:
         findings = self._run(repos=())
 
         assert [f["Status"] for f in findings] == ["N/A"]
+
+
+class TestAC53CoordinationAnomalyAlarms:
+    """AC-53: every AgentCore caller and callee pair needs an anomaly band alarm."""
+
+    RUNTIMES = [
+        {"agentRuntimeId": "alpha-AAAAAAAAAA", "agentRuntimeName": "alpha"},
+        {"agentRuntimeId": "beta-BBBBBBBBBB", "agentRuntimeName": "beta"},
+        {"agentRuntimeId": "gamma-CCCCCCCCCC", "agentRuntimeName": "gamma"},
+    ]
+    GATEWAYS = [{"gatewayId": "tools-gw-dddddddddd", "name": "tools-gw"}]
+    ENGINES = [{"policyEngineId": "guard_pe-eeeeeeeeee", "name": "guard_pe"}]
+
+    @staticmethod
+    def _metric(name, service, remote, env="bedrock-agentcore:default", **extra):
+        dims = {"Environment": env, "Service": service, "RemoteService": remote}
+        dims.update(extra)
+        return {
+            "Namespace": "ApplicationSignals",
+            "MetricName": name,
+            "Dimensions": [{"Name": k, "Value": v} for k, v in dims.items()],
+        }
+
+    @staticmethod
+    def _band_alarm(
+        alarm_name,
+        metric,
+        threshold_id="ad1",
+        band_of="m1",
+        expression=None,
+        actions=True,
+    ):
+        return {
+            "AlarmName": alarm_name,
+            "ActionsEnabled": actions,
+            "AlarmActions": ["arn:aws:sns:us-east-1:111122223333:ops"]
+            if actions
+            else [],
+            "ThresholdMetricId": threshold_id,
+            "ComparisonOperator": "LessThanLowerOrGreaterThanUpperThreshold",
+            "Metrics": [
+                {
+                    "Id": "m1",
+                    "MetricStat": {
+                        "Metric": {
+                            "Namespace": metric["Namespace"],
+                            "MetricName": metric["MetricName"],
+                            "Dimensions": metric["Dimensions"],
+                        },
+                        "Period": 300,
+                        "Stat": "Sum",
+                    },
+                    "ReturnData": True,
+                },
+                {
+                    "Id": "ad1",
+                    "Expression": expression or f"ANOMALY_DETECTION_BAND({band_of}, 2)",
+                    "ReturnData": True,
+                },
+            ],
+        }
+
+    def _run(self, metrics, alarms, runtimes=None, gateways=None, engines=None):
+        agentcore = MagicMock()
+        agentcore.list_agent_runtimes.return_value = {
+            "agentRuntimes": self.RUNTIMES if runtimes is None else runtimes
+        }
+        agentcore.list_gateways.return_value = {
+            "items": self.GATEWAYS if gateways is None else gateways
+        }
+        agentcore.list_policy_engines.return_value = {
+            "policyEngines": self.ENGINES if engines is None else engines
+        }
+        cloudwatch = MagicMock()
+
+        def list_metrics(**kwargs):
+            if isinstance(metrics, Exception):
+                raise metrics
+            return {
+                "Metrics": [
+                    m for m in metrics if m["MetricName"] == kwargs["MetricName"]
+                ]
+            }
+
+        cloudwatch.list_metrics.side_effect = list_metrics
+        if isinstance(alarms, Exception):
+            cloudwatch.describe_alarms.side_effect = alarms
+        else:
+            cloudwatch.describe_alarms.return_value = {"MetricAlarms": alarms}
+        with (
+            patch.object(agentcore_app, "agentcore_client", agentcore),
+            patch.object(agentcore_app, "cloudwatch_client", cloudwatch),
+        ):
+            findings = agentcore_app.check_agentcore_coordination_anomaly_alarms()
+        for finding in findings:
+            assert finding["Check_ID"] == "AC-53"
+            assert (
+                "how often each multi-agent workflow runs" in finding["Finding_Details"]
+            )
+            assert "new caller and callee pair" in finding["Finding_Details"]
+        return findings, cloudwatch
+
+    def test_an_unalarmed_runtime_to_runtime_edge_fails(self):
+        edge = self._metric("Fault", "alpha.DEFAULT", "beta.DEFAULT")
+        findings, _ = self._run([edge], [])
+        assert [f["Status"] for f in findings] == ["Failed"]
+        assert "'alpha.DEFAULT'" in findings[0]["Finding_Details"]
+        assert "runtime beta-BBBBBBBBBB" in findings[0]["Finding_Details"]
+
+    def test_an_anomaly_band_alarm_on_the_edge_passes(self):
+        edge = self._metric("Fault", "alpha.DEFAULT", "beta.DEFAULT")
+        findings, cloudwatch = self._run([edge], [self._band_alarm("a-to-b", edge)])
+        assert [f["Status"] for f in findings] == ["Passed"]
+        assert "a-to-b on Fault" in findings[0]["Finding_Details"]
+        called = {
+            c.kwargs["MetricName"] for c in cloudwatch.list_metrics.call_args_list
+        }
+        assert called == {"Error", "Fault", "Latency"}
+        for call in cloudwatch.list_metrics.call_args_list:
+            assert call.kwargs["Namespace"] == "ApplicationSignals"
+
+    def test_only_the_second_of_two_edges_alarmed_fails_the_first(self):
+        first = self._metric("Latency", "alpha.DEFAULT", "beta.DEFAULT")
+        second = self._metric("Latency", "alpha.DEFAULT", "gamma.DEFAULT")
+        findings, _ = self._run([first, second], [self._band_alarm("a-to-g", second)])
+        assert [f["Status"] for f in findings] == ["Failed"]
+        assert "gamma-CCCCCCCCCC" not in findings[0]["Finding_Details"]
+        assert "beta-BBBBBBBBBB" in findings[0]["Finding_Details"]
+
+    def test_only_the_first_of_two_edges_alarmed_fails_the_second(self):
+        first = self._metric("Latency", "alpha.DEFAULT", "beta.DEFAULT")
+        second = self._metric("Latency", "alpha.DEFAULT", "gamma.DEFAULT")
+        findings, _ = self._run([first, second], [self._band_alarm("a-to-b", first)])
+        assert [f["Status"] for f in findings] == ["Failed"]
+        assert "gamma-CCCCCCCCCC" in findings[0]["Finding_Details"]
+        assert "beta-BBBBBBBBBB" not in findings[0]["Finding_Details"]
+
+    def test_two_unalarmed_edges_fail_one_row_each(self):
+        first = self._metric("Error", "alpha.DEFAULT", "beta.DEFAULT")
+        second = self._metric("Error", "beta.DEFAULT", "tools-gw-dddddddddd")
+        findings, _ = self._run([first, second], [])
+        assert [f["Status"] for f in findings] == ["Failed", "Failed"]
+        details = " ".join(f["Finding_Details"] for f in findings)
+        assert "runtime beta-BBBBBBBBBB" in details
+        assert "gateway tools-gw-dddddddddd" in details
+
+    def test_every_edge_alarmed_passes_and_names_each(self):
+        first = self._metric("Error", "alpha.DEFAULT", "beta.DEFAULT")
+        second = self._metric("Fault", "tools-gw-dddddddddd", "AWS::gamma-CCCCCCCCCC")
+        findings, _ = self._run(
+            [first, second],
+            [self._band_alarm("one", first), self._band_alarm("two", second)],
+        )
+        assert [f["Status"] for f in findings] == ["Passed"]
+        assert "2 AgentCore caller and callee pair" in findings[0]["Finding_Details"]
+        assert "one on Error" in findings[0]["Finding_Details"]
+        assert "two on Fault" in findings[0]["Finding_Details"]
+
+    def test_a_static_threshold_alarm_does_not_count(self):
+        edge = self._metric("Fault", "alpha.DEFAULT", "beta.DEFAULT")
+        alarm = self._band_alarm("static", edge, expression="m1 * 2")
+        findings, _ = self._run([edge], [alarm])
+        assert [f["Status"] for f in findings] == ["Failed"]
+
+    def test_a_band_that_is_not_the_threshold_does_not_count(self):
+        edge = self._metric("Fault", "alpha.DEFAULT", "beta.DEFAULT")
+        alarm = self._band_alarm("display-only", edge, threshold_id="m1")
+        findings, _ = self._run([edge], [alarm])
+        assert [f["Status"] for f in findings] == ["Failed"]
+
+    def test_a_band_over_another_query_does_not_count(self):
+        edge = self._metric("Fault", "alpha.DEFAULT", "beta.DEFAULT")
+        alarm = self._band_alarm("other", edge, band_of="m9")
+        findings, _ = self._run([edge], [alarm])
+        assert [f["Status"] for f in findings] == ["Failed"]
+
+    def test_a_band_on_another_callee_does_not_cover_the_edge(self):
+        edge = self._metric("Fault", "alpha.DEFAULT", "beta.DEFAULT")
+        elsewhere = self._metric("Fault", "alpha.DEFAULT", "gamma.DEFAULT")
+        findings, _ = self._run([edge], [self._band_alarm("wrong", elsewhere)])
+        assert [f["Status"] for f in findings] == ["Failed"]
+
+    def test_a_band_on_an_unpublished_dimension_set_does_not_count(self):
+        edge = self._metric("Fault", "alpha.DEFAULT", "beta.DEFAULT")
+        unpublished = dict(edge)
+        unpublished["Dimensions"] = [
+            d for d in edge["Dimensions"] if d["Name"] != "Environment"
+        ]
+        findings, _ = self._run([edge], [self._band_alarm("never", unpublished)])
+        assert [f["Status"] for f in findings] == ["Failed"]
+
+    def test_a_per_operation_band_watches_part_of_the_edge_only(self):
+        edge = self._metric("Fault", "alpha.DEFAULT", "beta.DEFAULT")
+        one_op = self._metric(
+            "Fault", "alpha.DEFAULT", "beta.DEFAULT", Operation="POST /invocations"
+        )
+        findings, _ = self._run([edge, one_op], [self._band_alarm("one-op", one_op)])
+        assert [f["Status"] for f in findings] == ["Failed"]
+
+    def test_an_alarm_without_enabled_actions_does_not_count(self):
+        edge = self._metric("Fault", "alpha.DEFAULT", "beta.DEFAULT")
+        silent = self._band_alarm("silent", edge, actions=False)
+        disabled = self._band_alarm("disabled", edge)
+        disabled["ActionsEnabled"] = False
+        findings, _ = self._run([edge], [silent, disabled])
+        assert [f["Status"] for f in findings] == ["Failed"]
+
+    def test_a_band_on_the_same_metric_in_another_namespace_does_not_count(self):
+        edge = self._metric("Fault", "alpha.DEFAULT", "beta.DEFAULT")
+        custom = dict(edge, Namespace="Custom/Agents")
+        findings, _ = self._run([edge], [self._band_alarm("custom", custom)])
+        assert [f["Status"] for f in findings] == ["Failed"]
+
+    def test_a_band_on_a_non_edge_metric_name_does_not_count(self):
+        edge = self._metric("Fault", "alpha.DEFAULT", "beta.DEFAULT")
+        other = dict(edge, MetricName="Availability")
+        findings, _ = self._run([edge, other], [self._band_alarm("avail", other)])
+        assert [f["Status"] for f in findings] == ["Failed"]
+
+    def test_a_non_agentcore_environment_publishes_no_edge(self):
+        edge = self._metric(
+            "Fault", "alpha.DEFAULT", "beta.DEFAULT", env="lambda:default"
+        )
+        findings, _ = self._run([edge], [])
+        assert [f["Status"] for f in findings] == ["N/A"]
+        assert (
+            "not instrumented with Application Signals"
+            in findings[0]["Finding_Details"]
+        )
+        assert "cannot be assessed" in findings[0]["Finding_Details"]
+
+    def test_a_callee_that_is_no_agentcore_resource_publishes_no_edge(self):
+        findings, _ = self._run(
+            [
+                self._metric("Fault", "alpha.DEFAULT", "UnknownRemoteService"),
+                self._metric("Fault", "alpha.DEFAULT", "AWS::S3"),
+            ],
+            [],
+        )
+        assert [f["Status"] for f in findings] == ["N/A"]
+
+    def test_a_call_to_itself_is_not_an_edge(self):
+        findings, _ = self._run(
+            [self._metric("Fault", "alpha.DEFAULT", "alpha-AAAAAAAAAA")], []
+        )
+        assert [f["Status"] for f in findings] == ["N/A"]
+
+    def test_the_gateway_to_policy_engine_edge_is_excluded(self):
+        # The live shape: a gateway's Service is its id, and its call to its
+        # policy engine carries RemoteService AWS::<policyEngineId>.
+        edge = self._metric("Fault", "tools-gw-dddddddddd", "AWS::guard_pe-eeeeeeeeee")
+        findings, _ = self._run([edge], [])
+        assert [f["Status"] for f in findings] == ["N/A"]
+
+    def test_a_policy_engine_is_excluded_even_when_a_runtime_shares_its_name(self):
+        # Runtime and policy engine ids share the <name>-<suffix> form. Without
+        # the exclusion this remote resolves to the runtime whose id matches and
+        # the unalarmed pair would fail.
+        runtimes = self.RUNTIMES + [
+            {"agentRuntimeId": "guard_pe-eeeeeeeeee", "agentRuntimeName": "guard_pe"}
+        ]
+        edge = self._metric("Fault", "tools-gw-dddddddddd", "AWS::guard_pe-eeeeeeeeee")
+        findings, _ = self._run([edge], [], runtimes=runtimes)
+        assert [f["Status"] for f in findings] == ["N/A"]
+        findings, _ = self._run([edge], [], runtimes=runtimes, engines=[])
+        assert [f["Status"] for f in findings] == ["Failed"]
+
+    def test_edges_on_a_second_metrics_page_are_judged(self):
+        edge = self._metric("Fault", "alpha.DEFAULT", "beta.DEFAULT")
+        agentcore = MagicMock()
+        agentcore.list_agent_runtimes.return_value = {"agentRuntimes": self.RUNTIMES}
+        agentcore.list_gateways.return_value = {"items": []}
+        agentcore.list_policy_engines.return_value = {"policyEngines": []}
+        cloudwatch = MagicMock()
+
+        def list_metrics(**kwargs):
+            if kwargs["MetricName"] != "Fault":
+                return {"Metrics": []}
+            if kwargs.get("NextToken") == "page-2":
+                return {"Metrics": [edge]}
+            return {"Metrics": [], "NextToken": "page-2"}
+
+        cloudwatch.list_metrics.side_effect = list_metrics
+        cloudwatch.describe_alarms.return_value = {"MetricAlarms": []}
+        with (
+            patch.object(agentcore_app, "agentcore_client", agentcore),
+            patch.object(agentcore_app, "cloudwatch_client", cloudwatch),
+        ):
+            findings = agentcore_app.check_agentcore_coordination_anomaly_alarms()
+        assert [f["Status"] for f in findings] == ["Failed"]
+
+    @pytest.mark.parametrize(
+        "operation, action",
+        [
+            ("list_metrics", "cloudwatch:ListMetrics"),
+            ("describe_alarms", "cloudwatch:DescribeAlarms"),
+        ],
+    )
+    def test_a_denied_cloudwatch_read_is_na_naming_the_action(self, operation, action):
+        denied = ClientError(
+            {"Error": {"Code": "AccessDeniedException", "Message": "denied"}},
+            operation,
+        )
+        edge = self._metric("Fault", "alpha.DEFAULT", "beta.DEFAULT")
+        findings, _ = self._run(
+            denied if operation == "list_metrics" else [edge],
+            denied if operation == "describe_alarms" else [],
+        )
+        assert [f["Status"] for f in findings] == ["N/A"]
+        assert action in findings[0]["Finding_Details"]
+        assert "AccessDeniedException" in findings[0]["Finding_Details"]
+
+    def test_a_denied_inventory_read_is_na_and_never_passes(self):
+        agentcore = MagicMock()
+        agentcore.list_agent_runtimes.side_effect = ClientError(
+            {"Error": {"Code": "AccessDeniedException", "Message": "denied"}},
+            "ListAgentRuntimes",
+        )
+        with (
+            patch.object(agentcore_app, "agentcore_client", agentcore),
+            patch.object(agentcore_app, "cloudwatch_client", MagicMock()),
+        ):
+            findings = agentcore_app.check_agentcore_coordination_anomaly_alarms()
+        assert [f["Status"] for f in findings] == ["N/A"]
+        assert "ListAgentRuntimes" in findings[0]["Finding_Details"]
+
+    def test_no_client_is_na(self):
+        with patch.object(agentcore_app, "cloudwatch_client", None):
+            findings = agentcore_app.check_agentcore_coordination_anomaly_alarms()
+        assert [f["Status"] for f in findings] == ["N/A"]
+
+
+class TestAC53Registration:
+    """AC-53 is registered like the checks it sits beside."""
+
+    def test_the_check_is_in_both_regional_tuples(self):
+        assert "AC-53" in agentcore_app.REGIONAL_AGENTCORE_CHECK_IDS
+        assert "AC-53" in agentcore_app.AGENTCORE_RUNTIME_CHECK_IDS
+
+    def test_timeout_backfill_emits_the_check(self):
+        findings = agentcore_app.build_agentcore_timeout_findings("us-east-1", [])
+        assert "AC-53" in {finding["Check_ID"] for finding in findings}
+
+    def test_the_handler_registers_the_check_once(self):
+        source = textwrap.dedent(inspect.getsource(agentcore_app.lambda_handler))
+        assert source.count("check_agentcore_coordination_anomaly_alarms") == 1
