@@ -15453,6 +15453,66 @@ class TestBR47DataPathBucketTLS:
         assert "aws:sourcevpce" in failed[0]["Finding_Details"].lower()
         assert [f["Status"] for f in findings] == ["Failed", "Passed"]
 
+    def test_br47_aws_service_exception_on_false_is_credited(self):
+        """The S3 example policy exempts AWS service principals and still enforces.
+
+        Both buckets carry the exception, in the two forms a policy can hold it
+        (a string and a JSON boolean). Before the fix both failed as narrowed.
+        """
+        string_form = _tls_deny_statement(["support-bucket"])
+        string_form["Condition"]["Bool"]["aws:PrincipalIsAWSService"] = "false"
+        bool_form = _tls_deny_statement(["hr-bucket"], operator="BoolIfExists")
+        bool_form["Condition"]["BoolIfExists"]["aws:PrincipalIsAWSService"] = False
+        findings = self._two_bucket_estate(
+            bucket_policies={
+                "support-bucket": _bucket_policy(string_form),
+                "hr-bucket": _bucket_policy(bool_form),
+            }
+        )
+
+        assert [f["Status"] for f in findings] == ["Passed"]
+        assert "2 of 2 Bedrock data path bucket(s)" in findings[0]["Finding_Details"]
+        assert (
+            "exempting only AWS service principals through "
+            "aws:PrincipalIsAWSService false"
+        ) in findings[0]["Finding_Details"]
+
+    def test_br47_aws_service_test_on_true_is_not_credited(self):
+        """A true test limits the Deny to service principals, so identities keep HTTP."""
+        inverted = _tls_deny_statement(["hr-bucket"])
+        inverted["Condition"]["Bool"]["aws:PrincipalIsAWSService"] = "true"
+        findings = self._two_bucket_estate(
+            bucket_policies={
+                "support-bucket": _bucket_policy(
+                    _tls_deny_statement(["support-bucket"])
+                ),
+                "hr-bucket": _bucket_policy(inverted),
+            }
+        )
+
+        assert [f["Status"] for f in findings] == ["Failed", "Passed"]
+        assert "Bucket hr-bucket" in findings[0]["Finding_Details"]
+        assert "aws:principalisawsservice" in findings[0]["Finding_Details"]
+        assert "exempting" not in findings[1]["Finding_Details"]
+
+    def test_br47_aws_service_exception_beside_another_key_is_not_credited(self):
+        """The exception clears only itself: a second narrowing key still fails."""
+        narrowed = _tls_deny_statement(["hr-bucket"])
+        narrowed["Condition"]["Bool"]["aws:PrincipalIsAWSService"] = "false"
+        narrowed["Condition"]["StringNotEquals"] = {"aws:SourceVpce": "vpce-1a2b3c4d"}
+        findings = self._two_bucket_estate(
+            bucket_policies={
+                "support-bucket": _bucket_policy(
+                    _tls_deny_statement(["support-bucket"])
+                ),
+                "hr-bucket": _bucket_policy(narrowed),
+            }
+        )
+
+        assert [f["Status"] for f in findings] == ["Failed", "Passed"]
+        assert "aws:sourcevpce" in findings[0]["Finding_Details"]
+        assert "aws:principalisawsservice" not in findings[0]["Finding_Details"]
+
     def test_br47_missing_bucket_policy_is_failed_not_unassessed(self):
         findings = self._two_bucket_estate(
             bucket_policies={
@@ -19195,7 +19255,16 @@ class TestBR52DataPathObjectLock:
         }
     }
 
-    def _run(self, buckets, configurations, errors=(), truncated=(), vaults=None):
+    def _run(
+        self,
+        buckets,
+        configurations,
+        errors=(),
+        truncated=(),
+        vaults=None,
+        recovery_points=None,
+        vault_details=None,
+    ):
         s3 = MagicMock()
 
         def get_object_lock_configuration(Bucket):
@@ -19214,6 +19283,27 @@ class TestBR52DataPathObjectLock:
                 {"BackupVaultName": "open"},
             ]
         }
+        points = recovery_points or {}
+
+        def list_recovery_points_by_resource(ResourceArn, **kwargs):
+            outcome = points.get(ResourceArn.split(":::", 1)[1], [])
+            if isinstance(outcome, Exception):
+                raise outcome
+            return {"RecoveryPoints": outcome}
+
+        backup.list_recovery_points_by_resource.side_effect = (
+            list_recovery_points_by_resource
+        )
+        details = vault_details or {}
+
+        def describe_backup_vault(BackupVaultName):
+            outcome = details[BackupVaultName]
+            if isinstance(outcome, Exception):
+                raise outcome
+            return {"BackupVaultName": BackupVaultName, **outcome}
+
+        backup.describe_backup_vault.side_effect = describe_backup_vault
+        self.backup = backup
         inventory = {
             "buckets": buckets,
             "errors": list(errors),
@@ -19333,6 +19423,181 @@ class TestBR52DataPathObjectLock:
             )
         assert [r["Status"] for r in rows] == ["Passed"]
         assert "AWS Backup vaults could not be listed" in rows[0]["Finding_Details"]
+
+    GOVERNED = {
+        "ObjectLockConfiguration": {
+            "ObjectLockEnabled": "Enabled",
+            "Rule": {"DefaultRetention": {"Mode": "GOVERNANCE", "Days": 30}},
+        }
+    }
+
+    @staticmethod
+    def _point(vault, day, status="COMPLETED"):
+        from datetime import datetime, timezone
+
+        return {
+            "BackupVaultName": vault,
+            "CreationDate": datetime(2026, 9, day, tzinfo=timezone.utc),
+            "Status": status,
+        }
+
+    @staticmethod
+    def _vault(lock_days_ago=None, retention=35, locked=True):
+        from datetime import datetime, timedelta, timezone
+
+        vault = {"Locked": locked}
+        if retention is not None:
+            vault["MinRetentionDays"] = retention
+        if lock_days_ago is not None:
+            vault["LockDate"] = datetime.now(timezone.utc) - timedelta(
+                days=lock_days_ago
+            )
+        return vault
+
+    def test_br52_compliance_locked_backup_clears_one_bucket_not_the_other(self):
+        """Two buckets without COMPLIANCE Object Lock: only the vault's mode differs."""
+        result, rows = self._run(
+            {"a-backed": ["kb"], "b-governed-vault": ["invocation log"]},
+            {
+                "a-backed": self.GOVERNED,
+                "b-governed-vault": _make_client_error(
+                    "ObjectLockConfigurationNotFoundError"
+                ),
+            },
+            recovery_points={
+                "a-backed": [self._point("vault-c", 20)],
+                "b-governed-vault": [self._point("vault-g", 20)],
+            },
+            vault_details={
+                "vault-c": self._vault(lock_days_ago=10),
+                "vault-g": self._vault(),
+            },
+        )
+        assert [r["Status"] for r in rows] == ["Failed", "Passed"]
+        assert "Bucket b-governed-vault" in rows[0]["Finding_Details"]
+        assert "No immutable backup covers it" in rows[0]["Finding_Details"]
+        assert "vault vault-g" in rows[0]["Finding_Details"]
+        assert "in governance mode" in rows[0]["Finding_Details"]
+        assert "a-backed (kb) through AWS Backup" in rows[1]["Finding_Details"]
+        assert "vault vault-c" in rows[1]["Finding_Details"]
+        assert (
+            "minimum retention 35 day(s), in compliance mode, immutable since"
+            in (rows[1]["Finding_Details"])
+        )
+        assert result["status"] == "WARN"
+
+    def test_br52_vault_in_its_grace_period_is_not_immutable(self):
+        _, rows = self._run(
+            {"a": ["kb"], "b": ["kb"]},
+            {"a": self.COMPLIANT, "b": self.GOVERNED},
+            recovery_points={"b": [self._point("vault-grace", 20)]},
+            vault_details={"vault-grace": self._vault(lock_days_ago=-2)},
+        )
+        assert [r["Status"] for r in rows] == ["Failed", "Passed"]
+        assert "grace period running until" in rows[0]["Finding_Details"]
+        assert "so the lock can still be removed" in rows[0]["Finding_Details"]
+
+    def test_br52_compliance_lock_without_minimum_retention_is_not_immutable(self):
+        _, rows = self._run(
+            {"a": ["kb"], "b": ["kb"]},
+            {"a": self.COMPLIANT, "b": self.GOVERNED},
+            recovery_points={"b": [self._point("vault-open", 20)]},
+            vault_details={"vault-open": self._vault(lock_days_ago=5, retention=None)},
+        )
+        assert [r["Status"] for r in rows] == ["Failed", "Passed"]
+        assert "with no minimum retention" in rows[0]["Finding_Details"]
+
+    def test_br52_only_the_newest_completed_recovery_point_counts(self):
+        """An old point in a locked vault does not protect data written since.
+
+        The newest PARTIAL point is skipped, so the newest completed one is judged.
+        """
+        _, rows = self._run(
+            {"a": ["kb"], "b": ["kb"]},
+            {"a": self.GOVERNED, "b": self.GOVERNED},
+            recovery_points={
+                "a": [
+                    self._point("vault-c", 1),
+                    self._point("vault-unlocked", 15),
+                    self._point("vault-c", 25, status="PARTIAL"),
+                ],
+                "b": [
+                    self._point("vault-unlocked", 1),
+                    self._point("vault-c", 15),
+                ],
+            },
+            vault_details={
+                "vault-c": self._vault(lock_days_ago=30),
+                "vault-unlocked": self._vault(locked=False),
+            },
+        )
+        assert [r["Status"] for r in rows] == ["Failed", "Passed"]
+        assert "Bucket a " in rows[0]["Finding_Details"]
+        assert (
+            "vault vault-unlocked (minimum retention 35 day(s), has no Vault Lock)"
+            in (rows[0]["Finding_Details"])
+        )
+        assert "b (kb) through AWS Backup" in rows[1]["Finding_Details"]
+        assert self.backup.describe_backup_vault.call_count == 2
+
+    def test_br52_no_recovery_point_is_named_in_the_failure(self):
+        _, rows = self._run({"a": ["kb"]}, {"a": self.GOVERNED})
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert (
+            "AWS Backup holds no completed recovery point of it"
+            in (rows[0]["Finding_Details"])
+        )
+
+    def test_br52_unread_recovery_points_are_named_and_never_clear_a_bucket(self):
+        _, rows = self._run(
+            {"a": ["kb"], "b": ["kb"]},
+            {"a": self.GOVERNED, "b": _make_client_error("AccessDenied")},
+            recovery_points={
+                "a": _make_client_error("AccessDeniedException"),
+                "b": _make_client_error("AccessDeniedException"),
+            },
+        )
+        assert [r["Status"] for r in rows] == ["Failed", "N/A"]
+        assert (
+            "Whether an immutable backup covers it is unknown"
+            in (rows[0]["Finding_Details"])
+        )
+        assert "backup:ListRecoveryPointsByResource" in rows[0]["Finding_Details"]
+        assert "backup:ListRecoveryPointsByResource" in rows[1]["Finding_Details"]
+        assert "b (kb)" in rows[1]["Finding_Details"]
+
+    def test_br52_locked_backup_clears_a_bucket_whose_object_lock_is_unreadable(self):
+        _, rows = self._run(
+            {"a": ["kb"], "b": ["kb"]},
+            {
+                "a": _make_client_error("AccessDenied"),
+                "b": _make_client_error("AccessDenied"),
+            },
+            recovery_points={"a": [self._point("vault-c", 20)]},
+            vault_details={"vault-c": self._vault(lock_days_ago=3)},
+        )
+        assert [r["Status"] for r in rows] == ["Passed", "N/A"]
+        assert "a (kb) through AWS Backup" in rows[0]["Finding_Details"]
+        assert "1 of the 2" in rows[0]["Finding_Details"]
+        assert "b (kb)" in rows[1]["Finding_Details"]
+
+    def test_br52_vault_describe_failure_is_named_and_cached(self):
+        _, rows = self._run(
+            {"a": ["kb"], "b": ["kb"]},
+            {"a": self.GOVERNED, "b": self.GOVERNED},
+            recovery_points={
+                "a": [self._point("vault-x", 20)],
+                "b": [self._point("vault-x", 21)],
+            },
+            vault_details={"vault-x": _make_client_error("AccessDeniedException")},
+        )
+        assert [r["Status"] for r in rows] == ["Failed", "Failed"]
+        for row in rows:
+            assert (
+                "whose Vault Lock was not read (backup:DescribeBackupVault"
+                in (row["Finding_Details"])
+            )
+        assert self.backup.describe_backup_vault.call_count == 1
 
     def test_br52_exception_is_could_not_assess(self):
         with patch.object(

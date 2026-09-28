@@ -20240,6 +20240,12 @@ SECURE_TRANSPORT_CONDITION_KEY = "aws:securetransport"
 
 SECURE_TRANSPORT_OPERATORS = ("bool", "boolifexists")
 
+# The S3 TLS-only example policy exempts AWS service principals with
+# aws:PrincipalIsAWSService false. The Deny still reaches every IAM identity and
+# anonymous caller, so that exception alone does not narrow it. The value is
+# matched: a true test turns the Deny into one that reaches only services.
+PRINCIPAL_IS_AWS_SERVICE_CONDITION_KEY = "aws:principalisawsservice"
+
 # The documented TLS-only bucket policy denies s3:* so that a future object or
 # bucket action is covered without editing the policy. A Deny naming individual
 # actions leaves every unnamed action reachable over HTTP, so the action entry
@@ -20283,6 +20289,16 @@ def _statement_denies_plaintext_transport(statement: Dict[str, Any]) -> bool:
         if values and all(str(value).strip().lower() == "false" for value in values):
             return True
     return False
+
+
+def _exempts_only_aws_services(operator: Any, key: str, values: List[Any]) -> bool:
+    """Return True for a Bool or BoolIfExists aws:PrincipalIsAWSService false test."""
+    return (
+        _strip_condition_set_operator(operator) in SECURE_TRANSPORT_OPERATORS
+        and key == PRINCIPAL_IS_AWS_SERVICE_CONDITION_KEY
+        and bool(values)
+        and all(str(value).strip().lower() == "false" for value in values)
+    )
 
 
 def _deny_principal_reach(statement: Dict[str, Any]) -> Dict[str, Any]:
@@ -20409,9 +20425,14 @@ def _bucket_tls_enforcement(bucket: str, policy_document: Any) -> Dict[str, Any]
         narrowing_keys = sorted(
             {
                 f"{operator} {key}"
-                for operator, key, _values in _condition_keys_by_operator(statement)
+                for operator, key, values in _condition_keys_by_operator(statement)
                 if key != SECURE_TRANSPORT_CONDITION_KEY
+                and not _exempts_only_aws_services(operator, key, values)
             }
+        )
+        service_exception = any(
+            _exempts_only_aws_services(operator, key, values)
+            for operator, key, values in _condition_keys_by_operator(statement)
         )
         if narrowing_keys:
             gaps.append(
@@ -20426,6 +20447,12 @@ def _bucket_tls_enforcement(bucket: str, policy_document: Any) -> Dict[str, Any]
                     f"'{statement_id}' denies s3:* to every principal over both "
                     f"arn:aws:s3:::{bucket} and its objects when "
                     "aws:SecureTransport is false"
+                    + (
+                        ", exempting only AWS service principals through "
+                        "aws:PrincipalIsAWSService false"
+                        if service_exception
+                        else ""
+                    )
                 ),
             }
         reasons.append(f"'{statement_id}' does not enforce because {'; '.join(gaps)}")
@@ -20874,8 +20901,58 @@ OBJECT_LOCK_REFERENCE = (
 )
 
 
-def _backup_vault_lock_evidence(region: str) -> str:
-    """Summarize AWS Backup Vault Lock in the Region as supporting evidence."""
+RECOVERY_POINT_USABLE_STATUSES = ("COMPLETED", "AVAILABLE")
+
+
+def _vault_lock_state(vault: Dict[str, Any], now: datetime) -> Dict[str, Any]:
+    """
+    Judge whether a backup vault makes its recovery points immutable.
+
+    Vault Lock without a LockDate is governance mode and can be removed at any
+    time. With a LockDate in the future the lock is in its grace period and can
+    still be removed. A lock with no minimum retention lets a backup job set any
+    retention period. Returns {"immutable", "retention", "mode", "described"}.
+    """
+    retention = vault.get("MinRetentionDays")
+    retention_text = f"minimum retention {retention if retention else 'not set'} day(s)"
+    lock_date = vault.get("LockDate")
+    immutable = False
+    if vault.get("Locked") is not True:
+        mode = "has no Vault Lock"
+    elif not lock_date:
+        mode = (
+            "in governance mode, so a principal with "
+            "backup:DeleteBackupVaultLockConfiguration can remove the lock"
+        )
+    elif not isinstance(lock_date, datetime):
+        mode = f"with a LockDate ({lock_date}) that could not be read"
+    else:
+        stamp = lock_date.isoformat()
+        if lock_date.tzinfo is None:
+            lock_date = lock_date.replace(tzinfo=timezone.utc)
+        if lock_date > now:
+            mode = (
+                f"in compliance mode with its grace period running until {stamp}, "
+                "so the lock can still be removed"
+            )
+        elif not retention:
+            mode = (
+                f"in compliance mode since {stamp}, but with no minimum retention "
+                "a backup job may set any retention period"
+            )
+        else:
+            immutable = True
+            mode = f"in compliance mode, immutable since {stamp}"
+    return {
+        "immutable": immutable,
+        "retention": retention_text,
+        "mode": mode,
+        "described": f"{retention_text}, {mode}",
+    }
+
+
+def _backup_vault_lock_evidence(region: str, now: datetime) -> str:
+    """Summarize AWS Backup Vault Lock in the Region, with each lock's mode."""
     try:
         backup_client = boto3.client("backup", config=boto3_config, region_name=region)
         vaults = _list_all_items(
@@ -20892,22 +20969,95 @@ def _backup_vault_lock_evidence(region: str) -> str:
             f"({get_assessment_error_label(error)})."
         )
     locked = [
-        "{} (minimum retention {} day(s))".format(
+        "{} ({}) {}".format(
             vault.get("BackupVaultName", "unnamed"),
-            vault.get("MinRetentionDays", "not set"),
+            _vault_lock_state(vault, now)["retention"],
+            _vault_lock_state(vault, now)["mode"],
         )
         for vault in vaults
         if vault.get("Locked") is True
     ]
     return (
-        "Supporting evidence only: {} of {} AWS Backup vault(s) in {} have Vault "
-        "Lock{}. Whether AWS Backup protects these buckets is not read.".format(
+        "Region evidence: {} of {} AWS Backup vault(s) in {} have Vault Lock{}.".format(
             len(locked),
             len(vaults),
             region or "this region",
-            f": {', '.join(locked[:5])}" if locked else "",
+            f": {'; '.join(locked[:5])}" if locked else "",
         )
     )
+
+
+def _bucket_backup_lock(
+    backup_client, bucket: str, vault_cache: Dict[str, Any], now: datetime
+) -> Dict[str, str]:
+    """
+    Judge whether the newest AWS Backup recovery point of a bucket is immutable.
+
+    Returns {"status", "detail"}: status is "locked" when the newest completed
+    recovery point sits in a vault under a compliance-mode Vault Lock past its
+    grace period with a minimum retention, "unlocked" when it does not or no
+    recovery point exists, and "unread" when a read failed.
+    """
+    try:
+        points = _list_all_items(
+            backup_client,
+            "list_recovery_points_by_resource",
+            "RecoveryPoints",
+            max_results_param="MaxResults",
+            token_param="NextToken",
+            token_response_keys=("NextToken",),
+            ResourceArn=f"arn:aws:s3:::{bucket}",
+        )
+    except (ClientError, BotoCoreError) as error:
+        return {
+            "status": "unread",
+            "detail": (
+                "its AWS Backup recovery points were not read "
+                f"(backup:ListRecoveryPointsByResource: "
+                f"{get_assessment_error_label(error)})"
+            ),
+        }
+    usable = [
+        point
+        for point in points
+        if point.get("Status") in RECOVERY_POINT_USABLE_STATUSES
+        and isinstance(point.get("CreationDate"), datetime)
+    ]
+    if not usable:
+        return {
+            "status": "unlocked",
+            "detail": (
+                "AWS Backup holds no completed recovery point of it in this Region "
+                f"({len(points)} recovery point(s) listed)"
+            ),
+        }
+    newest = max(usable, key=lambda point: point["CreationDate"])
+    vault_name = str(newest.get("BackupVaultName") or "")
+    if vault_name not in vault_cache:
+        try:
+            vault_cache[vault_name] = backup_client.describe_backup_vault(
+                BackupVaultName=vault_name
+            )
+        except (ClientError, BotoCoreError) as error:
+            vault_cache[vault_name] = error
+    vault = vault_cache[vault_name]
+    point_text = (
+        f"its newest recovery point ({newest['CreationDate'].isoformat()}) is in "
+        f"vault {vault_name}"
+    )
+    if isinstance(vault, Exception):
+        return {
+            "status": "unread",
+            "detail": (
+                f"{point_text}, whose Vault Lock was not read "
+                f"(backup:DescribeBackupVault: {get_assessment_error_label(vault)})"
+            ),
+        }
+    state = _vault_lock_state(vault, now)
+    return {
+        "status": "locked" if state["immutable"] else "unlocked",
+        "detail": f"{point_text} ({state['described']})",
+    }
 
 
 def _object_lock_deficiency(configuration: Dict[str, Any]) -> Optional[str]:
@@ -20994,12 +21144,16 @@ def check_bedrock_data_path_object_lock(region: str = "") -> Dict[str, Any]:
             )
             return findings
 
-        evidence = _backup_vault_lock_evidence(region)
+        now = datetime.now(timezone.utc)
+        evidence = _backup_vault_lock_evidence(region, now)
         s3_client = boto3.client("s3", config=boto3_config, region_name=region)
+        backup_client = boto3.client("backup", config=boto3_config, region_name=region)
+        vault_cache: Dict[str, Any] = {}
         locked = []
         indeterminate = []
         for bucket in sorted(inventory["buckets"]):
             labels = "; ".join(sorted(inventory["buckets"][bucket])[:3])
+            unread = None
             try:
                 configuration = (
                     s3_client.get_object_lock_configuration(Bucket=bucket).get(
@@ -21011,26 +21165,39 @@ def check_bedrock_data_path_object_lock(region: str = "") -> Dict[str, Any]:
             except ClientError as error:
                 code = error.response.get("Error", {}).get("Code", "")
                 if code != "ObjectLockConfigurationNotFoundError":
-                    indeterminate.append(
-                        f"{bucket} ({labels}): {get_assessment_error_label(error)}"
-                    )
-                    continue
-                deficiency = "has no Object Lock configuration"
+                    unread = get_assessment_error_label(error)
+                    deficiency = None
+                else:
+                    deficiency = "has no Object Lock configuration"
             except Exception as error:
-                indeterminate.append(
-                    f"{bucket} ({labels}): {get_assessment_error_label(error)}"
-                )
-                continue
+                unread = get_assessment_error_label(error)
+                deficiency = None
 
-            if deficiency is None:
+            if deficiency is None and unread is None:
                 locked.append(f"{bucket} ({labels})")
                 continue
+            backup = _bucket_backup_lock(backup_client, bucket, vault_cache, now)
+            if backup["status"] == "locked":
+                locked.append(
+                    f"{bucket} ({labels}) through AWS Backup: {backup['detail']}"
+                )
+                continue
+            if unread is not None:
+                indeterminate.append(
+                    f"{bucket} ({labels}): {unread}, and {backup['detail']}"
+                )
+                continue
             findings["status"] = "WARN"
+            backup_text = (
+                f"No immutable backup covers it: {backup['detail']}."
+                if backup["status"] == "unlocked"
+                else f"Whether an immutable backup covers it is unknown: {backup['detail']}."
+            )
             findings["csv_data"].append(
                 row(
                     f"Bucket {bucket} is on the Bedrock data path as {labels} and "
                     f"{deficiency}, so its objects can be deleted or overwritten. "
-                    f"{evidence}",
+                    f"{backup_text} {evidence}",
                     "Enable Object Lock on the bucket and set a default retention "
                     "in COMPLIANCE mode with a period that meets your "
                     "record-retention requirement.",
@@ -21043,7 +21210,8 @@ def check_bedrock_data_path_object_lock(region: str = "") -> Dict[str, Any]:
             findings["csv_data"].append(
                 row(
                     "{} of the {} Bedrock data path bucket(s) read lock objects in "
-                    "COMPLIANCE mode by default: {}.{} {}".format(
+                    "COMPLIANCE mode by default or hold their newest backup in a "
+                    "compliance-mode Vault Lock: {}.{} {}".format(
                         len(locked),
                         len(inventory["buckets"]),
                         "; ".join(locked[:5]),

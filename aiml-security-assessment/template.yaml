@@ -608,6 +608,13 @@ Resources:
               Action:
                 - backup:ListBackupVaults # BR-52
               Resource: '*'
+            - Sid: BackupVaultLockRead
+              # BR-52 reads the Vault Lock mode, lock date and minimum retention
+              # of the vault holding a data path bucket's newest recovery point.
+              Effect: Allow
+              Action:
+                - backup:DescribeBackupVault # BR-52
+              Resource: !Sub 'arn:${AWS::Partition}:backup:*:${AWS::AccountId}:backup-vault:*'
             - Sid: ResourceTagRead
               # BR-53 reads the tags of named Bedrock resource ARNs;
               # tag:GetResources has no resource type in the IAM service

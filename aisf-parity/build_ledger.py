@@ -762,7 +762,9 @@ AI_SUBJECT_ROWS = [
         "the bucket and its objects. A bucket with no policy fails, because S3 then "
         "accepts plaintext requests. For each Deny that falls short, the finding names the "
         "principals, resources or actions it misses, since a Deny scoped to some "
-        "principals leaves the rest able to use HTTP. Every data source and job is read "
+        "principals leaves the rest able to use HTTP. The aws:PrincipalIsAWSService "
+        "false exception of the S3 example policy is credited, since the Deny still "
+        "reaches every identity. Every data source and job is read "
         "with no cap, and a failed read withholds the Passed row, since an unread bucket "
         "may accept plaintext",
         [],
@@ -1221,8 +1223,11 @@ FOUNDATION_ROWS = [
         "s3:BypassGovernanceRetention can delete the objects, and so do no Object "
         "Lock configuration and a lock with no default retention. A bucket whose "
         "configuration the role cannot read, such as one in another account, is "
-        "Not Applicable. AWS Backup Vault Lock state is printed beside the verdict "
-        "and does not decide it",
+        "Not Applicable. A bucket without that lock can pass through AWS Backup: its "
+        "newest completed recovery point must sit in a vault whose Vault Lock is in "
+        "compliance mode past its LockDate grace period with a minimum retention. "
+        "Governance mode, a grace period and an unread recovery point list do not "
+        "clear a bucket",
         [],
         6,
     ),

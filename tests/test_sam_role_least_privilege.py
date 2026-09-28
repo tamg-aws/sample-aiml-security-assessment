@@ -120,6 +120,7 @@ _EXPECTED_ACTIONS = {
         "s3:PutObject",
     },
     "BedrockSecurityAssessmentFunction": {
+        "backup:DescribeBackupVault",
         "backup:ListBackupVaults",
         "bedrock:GetAccountDataRetention",
         "bedrock:GetAgent",
