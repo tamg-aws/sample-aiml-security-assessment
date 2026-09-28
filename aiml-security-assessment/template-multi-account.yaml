@@ -830,6 +830,44 @@ Resources:
                 - iot:ListPolicies # SM-41
                 - cloudtrail:LookupEvents # SM-40
               Resource: '*'
+            - Sid: EC2NetworkPostureInventory
+              # SM-02, SM-11, SM-18 and SM-33 read interface VPC endpoints, SM-37
+              # reads flow logs and SM-39 reads workload security groups. None of
+              # these three actions has a resource type in IAM.
+              Effect: Allow
+              Action:
+                - ec2:DescribeVpcEndpoints # SM-02, SM-11, SM-18, SM-33
+                - ec2:DescribeFlowLogs # SM-37
+                - ec2:DescribeSecurityGroups # SM-39
+              Resource: '*'
+            - Sid: ConformancePackInventory
+              # SM-32 lists conformance packs. The action has no resource type.
+              Effect: Allow
+              Action:
+                - config:DescribeConformancePacks # SM-32
+              Resource: '*'
+            - Sid: IoTDeviceDefenderAuditRead
+              # SM-41 reads the Device Defender audit configuration and its
+              # findings. Neither action has a resource type.
+              Effect: Allow
+              Action:
+                - iot:DescribeAccountAuditConfiguration # SM-41
+                - iot:ListAuditFindings # SM-41
+              Resource: '*'
+            - Sid: InspectorAccountStatusRead
+              # SM-38 reads whether Inspector Lambda scanning is enabled. The
+              # action has no resource type.
+              Effect: Allow
+              Action:
+                - inspector2:BatchGetAccountStatus # SM-38
+              Resource: '*'
+            - Sid: LambdaFunctionInventory
+              # SM-38, SM-39 and SM-40 enumerate Lambda functions. The action has
+              # no resource type.
+              Effect: Allow
+              Action:
+                - lambda:ListFunctions # SM-38, SM-39, SM-40
+              Resource: '*'
             - Sid: EKSAddonRead
               Effect: Allow
               Action:

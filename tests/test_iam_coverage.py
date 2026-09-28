@@ -152,6 +152,15 @@ REQUIRED_SAGEMAKER_ACTIONS = {
     "iot:ListPolicies",
     "iot:GetPolicy",
     "iot:ListTargetsForPolicy",
+    # Approved '*' reads for actions with no IAM resource type.
+    "ec2:DescribeVpcEndpoints",  # SM-02, SM-11, SM-18, SM-33
+    "ec2:DescribeFlowLogs",  # SM-37
+    "ec2:DescribeSecurityGroups",  # SM-39
+    "config:DescribeConformancePacks",  # SM-32
+    "iot:DescribeAccountAuditConfiguration",  # SM-41
+    "iot:ListAuditFindings",  # SM-41
+    "inspector2:BatchGetAccountStatus",  # SM-38
+    "lambda:ListFunctions",  # SM-38, SM-39, SM-40
 }
 
 REQUIRED_AGENTCORE_ACTIONS = {

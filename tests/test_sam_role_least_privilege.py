@@ -289,6 +289,14 @@ _EXPECTED_ACTIONS = {
         "config:DescribeConfigurationRecorderStatus",
         "config:DescribeConformancePackCompliance",
         "sagemaker:DescribeInferenceComponent",
+        "ec2:DescribeVpcEndpoints",
+        "ec2:DescribeFlowLogs",
+        "ec2:DescribeSecurityGroups",
+        "config:DescribeConformancePacks",
+        "iot:DescribeAccountAuditConfiguration",
+        "iot:ListAuditFindings",
+        "inspector2:BatchGetAccountStatus",
+        "lambda:ListFunctions",
     },
     "AgentCoreSecurityAssessmentFunction": {
         "bedrock-agentcore:GetAgentRuntime",
@@ -793,6 +801,21 @@ def test_sagemaker_scope27_reads_wildcard_only_where_iam_has_no_resource_type(
                 "cloudtrail:LookupEvents",
             ),
         ),
+        (
+            "EC2NetworkPostureInventory",
+            (
+                "ec2:DescribeVpcEndpoints",
+                "ec2:DescribeFlowLogs",
+                "ec2:DescribeSecurityGroups",
+            ),
+        ),
+        ("ConformancePackInventory", ("config:DescribeConformancePacks",)),
+        (
+            "IoTDeviceDefenderAuditRead",
+            ("iot:DescribeAccountAuditConfiguration", "iot:ListAuditFindings"),
+        ),
+        ("InspectorAccountStatusRead", ("inspector2:BatchGetAccountStatus",)),
+        ("LambdaFunctionInventory", ("lambda:ListFunctions",)),
     ):
         statement = _statement_block(
             template, "SagemakerSecurityAssessmentFunction", sid
