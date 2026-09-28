@@ -239,6 +239,26 @@ section.
   forwarded bus only when its rule has one. Before, any target passed, so a
   rule delivering only to a CloudWatch Logs group or an API destination
   passed; it now fails.
+- `BR-01`, `SM-02` and `AC-02` each gain a finding that fails a wildcard or
+  `NotAction` Allow granting both a read and a write action on one resource
+  type of the service (AIR-FND-IAM-09): `Bedrock or Data Store Read and Write
+  Merged in One Grant`, `SageMaker Read and Write Merged in One Grant` and
+  `AgentCore Read and Write Merged in One Grant`. They read every attached,
+  inline and group policy of every cached role and user, AWS managed
+  included, apply account-wide Denies and the permissions boundary, and drop
+  resource types the statement's `Resource` entries cannot name. `BR-01` also
+  reads the `s3`, `dynamodb` and `s3vectors` namespaces for an identity
+  granted a Bedrock action. A bare `*`, a `*:*`, a partial pattern such as
+  `bedrock:*Guardrail*` and `bedrock-agentcore:Get*` (which reaches
+  `GetWorkloadAccessToken`) now fail where they passed before. The
+  `Bedrock Wildcard Action Grant` and `SageMaker Service-Wide Grant in
+  Customer Policy` findings now count a bare `*` and skip an identity whose
+  permissions boundary allows no action of the service; the SageMaker one
+  also reads group policies and reports a policy it cannot parse as `N/A`.
+  All three checks hold a `Passed` row as `N/A` while `principal_errors`
+  names an unread principal, and `AC-02`'s incomplete row names the
+  principals whose policies it could not parse. `iam_access_levels.json`
+  now carries each resource type's ARN formats.
 
 ### Deployment impact
 

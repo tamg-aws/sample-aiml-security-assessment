@@ -537,9 +537,12 @@ class TestAC02FullAccessRoles:
         ],
         ids=["administrator-except-iam", "administrator-except-one-action"],
     )
-    def test_ac02_ignores_not_action_that_names_no_platform_namespace(self, not_action):
+    def test_ac02_reports_not_action_that_names_no_platform_namespace_as_merged(
+        self, not_action
+    ):
         """A NotAction naming no platform namespace is an administrator-style
-        grant, which AC-02 ignores exactly as it ignores ``Action: "*"``."""
+        grant. The wildcard legs leave it to the administrator checks, and the
+        merged read-and-write leg (AIR-FND-IAM-09) reports it."""
         permission_cache = {
             "role_permissions": {
                 "AllowExceptRole": {
@@ -562,8 +565,11 @@ class TestAC02FullAccessRoles:
 
         findings = agentcore_app.check_agentcore_full_access_roles(permission_cache)
 
-        assert len(findings) == 1
-        assert findings[0]["Status"] == "Passed"
+        assert [finding["Finding"] for finding in findings] == [
+            "AgentCore Read and Write Merged in One Grant"
+        ]
+        assert findings[0]["Status"] == "Failed"
+        assert findings[0]["Finding_Details"].startswith("Role 'AllowExceptRole': ")
 
     @pytest.mark.parametrize(
         "not_action",
@@ -649,14 +655,40 @@ class TestAC02FullAccessRoles:
         assert len(findings) == 1
         assert findings[0]["Status"] == "Passed"
 
+    def test_ac02_reports_administrator_access_as_merged(self):
+        """``Action: "*"`` is left to the administrator checks by the wildcard
+        legs, and reported by the merged read-and-write leg."""
+        permission_cache = {
+            "role_permissions": {
+                "Administrator": {
+                    "attached_policies": [
+                        {
+                            "name": "AdministratorAccess",
+                            "document": {
+                                "Statement": {
+                                    "Effect": "Allow",
+                                    "Action": "*",
+                                    "Resource": "*",
+                                }
+                            },
+                        }
+                    ],
+                    "inline_policies": [],
+                }
+            }
+        }
+
+        findings = agentcore_app.check_agentcore_full_access_roles(permission_cache)
+
+        assert [finding["Finding"] for finding in findings] == [
+            "AgentCore Read and Write Merged in One Grant"
+        ]
+        assert findings[0]["Status"] == "Failed"
+        assert findings[0]["Finding_Details"].startswith("Role 'Administrator': ")
+
     @pytest.mark.parametrize(
         "statements",
         [
-            {
-                "Effect": "Allow",
-                "Action": "*",
-                "Resource": "*",
-            },
             [
                 {
                     "Effect": "Allow",
@@ -670,7 +702,7 @@ class TestAC02FullAccessRoles:
                 },
             ],
         ],
-        ids=["administrator-access", "administrator-access-with-platform-deny"],
+        ids=["administrator-access-with-platform-deny"],
     )
     def test_ac02_ignores_service_agnostic_wildcard_actions(self, statements):
         permission_cache = {
@@ -809,14 +841,12 @@ class TestAC02FullAccessRoles:
             "bedrock-agentcore:Get*",
             "bedrock-agentcore:*Runtime*",
             "unrelated-service:*Evaluator",
-            "*",
         ],
         ids=[
             "named-write",
             "read-prefix",
             "other-resource-family",
             "other-service",
-            "service-agnostic",
         ],
     )
     def test_ac02_ignores_patterns_that_reach_no_evaluation_write(self, action):
@@ -830,6 +860,22 @@ class TestAC02FullAccessRoles:
             "AgentCore IAM Full Access Check"
         ]
         assert findings[0]["Status"] == "Passed"
+
+    def test_ac02_a_service_agnostic_evaluation_grant_is_merged_not_evaluation(
+        self,
+    ):
+        permission_cache = self._evaluation_admin_cache(
+            "*", self._EVALUATION_CONFIG_ARN
+        )
+
+        findings = agentcore_app.check_agentcore_full_access_roles(permission_cache)
+
+        assert [finding["Finding"] for finding in findings] == [
+            "AgentCore Read and Write Merged in One Grant"
+        ]
+        assert findings[0]["Status"] == "Failed"
+        assert findings[0]["Finding_Details"].startswith("Role 'EvaluationAdmin': ")
+        assert "online-evaluation-config" in findings[0]["Finding_Details"]
 
     def test_ac02_reads_a_deny_statement_as_no_grant(self):
         permission_cache = {

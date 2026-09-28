@@ -4782,7 +4782,10 @@ class TestSM02ServiceWideGrant:
         )
         rows = self._grant_rows(cache)
         assert [f["Status"] for f in rows] == ["Passed"]
-        assert "None of the 2 customer-managed or inline" in rows[0]["Finding_Details"]
+        assert (
+            "None of the 2 customer-managed, inline or group"
+            in rows[0]["Finding_Details"]
+        )
 
     def test_notaction_allow_reaches_sagemaker_and_fails(self):
         document = {
@@ -4803,11 +4806,13 @@ class TestSM02ServiceWideGrant:
         rows = self._grant_rows(_role_cache({"ExcludesRole": [("EX", document)]}))
         assert [f["Status"] for f in rows] == ["Passed"]
 
-    def test_bare_star_is_left_to_the_administrator_checks(self):
+    def test_bare_star_grants_every_sagemaker_action(self):
         rows = self._grant_rows(
             _role_cache({"AdminRole": [("Admin", _identity_policy("*", "*"))]})
         )
-        assert [f["Status"] for f in rows] == ["Passed"]
+        assert [f["Status"] for f in rows] == ["Failed"]
+        assert "Role 'AdminRole'" in rows[0]["Finding_Details"]
+        assert "Action '*'" in rows[0]["Finding_Details"]
 
     def test_aws_managed_policy_is_excluded(self):
         cache = {

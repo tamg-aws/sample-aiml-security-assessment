@@ -2,6 +2,9 @@
  "services": {
   "bedrock": {
    "advanced-prompt-optimization-job": {
+    "arns": [
+     "arn:*:bedrock:*:*:advanced-prompt-optimization-job/*"
+    ],
     "read": [
      "GetAdvancedPromptOptimizationJob",
      "ListTagsForResource"
@@ -12,6 +15,9 @@
     ]
    },
    "agent": {
+    "arns": [
+     "arn:*:bedrock:*:*:agent/*"
+    ],
     "read": [
      "GetAgent",
      "GetAgentActionGroup",
@@ -43,6 +49,9 @@
     ]
    },
    "agent-alias": {
+    "arns": [
+     "arn:*:bedrock:*:*:agent-alias/*/*"
+    ],
     "read": [
      "GetAgentAlias",
      "GetAgentMemory",
@@ -56,6 +65,9 @@
     ]
    },
    "application-inference-profile": {
+    "arns": [
+     "arn:*:bedrock:*:*:application-inference-profile/*"
+    ],
     "read": [
      "GetInferenceProfile",
      "InvokeModel",
@@ -70,6 +82,9 @@
     ]
    },
    "automated-reasoning-policy": {
+    "arns": [
+     "arn:*:bedrock:*:*:automated-reasoning-policy/*"
+    ],
     "read": [
      "ExportAutomatedReasoningPolicyVersion",
      "GetAutomatedReasoningPolicy",
@@ -103,6 +118,9 @@
     ]
    },
    "automated-reasoning-policy-version": {
+    "arns": [
+     "arn:*:bedrock:*:*:automated-reasoning-policy/*:*"
+    ],
     "read": [
      "ExportAutomatedReasoningPolicyVersion",
      "GetAutomatedReasoningPolicy",
@@ -116,6 +134,9 @@
     ]
    },
    "bedrock-marketplace-model-endpoint": {
+    "arns": [
+     "arn:*:bedrock:*:*:marketplace/model-endpoint/all-access"
+    ],
     "read": [
      "GetMarketplaceModelEndpoint",
      "InvokeModel",
@@ -129,6 +150,9 @@
     ]
    },
    "blueprint": {
+    "arns": [
+     "arn:*:bedrock:*:*:blueprint/*"
+    ],
     "read": [
      "GetBlueprint",
      "ListDataAutomationProjects",
@@ -147,6 +171,9 @@
     ]
    },
    "custom-model": {
+    "arns": [
+     "arn:*:bedrock:*:*:custom-model/*"
+    ],
     "read": [
      "GetCustomModel",
      "GetResourcePolicy",
@@ -168,6 +195,9 @@
     ]
    },
    "custom-model-deployment": {
+    "arns": [
+     "arn:*:bedrock:*:*:custom-model-deployment/*"
+    ],
     "read": [
      "GetCustomModelDeployment",
      "InvokeModel",
@@ -180,6 +210,9 @@
     ]
    },
    "data-automation-library": {
+    "arns": [
+     "arn:*:bedrock:*:*:data-automation-library/*"
+    ],
     "read": [
      "GetDataAutomationLibrary",
      "GetDataAutomationLibraryEntity",
@@ -196,6 +229,9 @@
     ]
    },
    "data-automation-project": {
+    "arns": [
+     "arn:*:bedrock:*:*:data-automation-project/*"
+    ],
     "read": [
      "GetDataAutomationProject",
      "ListBlueprints",
@@ -211,6 +247,9 @@
     ]
    },
    "default-prompt-router": {
+    "arns": [
+     "arn:*:bedrock:*:*:default-prompt-router/*"
+    ],
     "read": [
      "GetPromptRouter",
      "InvokeModel",
@@ -221,6 +260,9 @@
     ]
    },
    "evaluation-job": {
+    "arns": [
+     "arn:*:bedrock:*:*:evaluation-job/*"
+    ],
     "read": [
      "GetEvaluationJob",
      "ListTagsForResource"
@@ -231,6 +273,9 @@
     ]
    },
    "flow": {
+    "arns": [
+     "arn:*:bedrock:*:*:flow/*"
+    ],
     "read": [
      "GetExecutionFlowSnapshot",
      "GetFlow",
@@ -254,6 +299,9 @@
     ]
    },
    "flow-alias": {
+    "arns": [
+     "arn:*:bedrock:*:*:flow/*/alias/*"
+    ],
     "read": [
      "GetExecutionFlowSnapshot",
      "GetFlowAlias",
@@ -271,6 +319,9 @@
     ]
    },
    "flow-execution": {
+    "arns": [
+     "arn:*:bedrock:*:*:flow/*/alias/*/execution/*"
+    ],
     "read": [
      "GetExecutionFlowSnapshot",
      "GetFlowExecution",
@@ -281,6 +332,9 @@
     ]
    },
    "foundation-model": {
+    "arns": [
+     "arn:*:bedrock:*::foundation-model/*"
+    ],
     "read": [
      "CountTokens",
      "DetectGeneratedContent",
@@ -301,6 +355,9 @@
     ]
    },
    "guardrail": {
+    "arns": [
+     "arn:*:bedrock:*:*:guardrail/*"
+    ],
     "read": [
      "ApplyGuardrail",
      "GetGuardrail",
@@ -317,6 +374,9 @@
     ]
    },
    "guardrail-profile": {
+    "arns": [
+     "arn:*:bedrock:*:*:guardrail-profile/*"
+    ],
     "read": [
      "ApplyGuardrail",
      "GetResourcePolicy"
@@ -329,6 +389,9 @@
     ]
    },
    "imported-model": {
+    "arns": [
+     "arn:*:bedrock:*:*:imported-model/*"
+    ],
     "read": [
      "GetImportedModel",
      "InvokeModel",
@@ -340,6 +403,9 @@
     ]
    },
    "inference-profile": {
+    "arns": [
+     "arn:*:bedrock:*:*:inference-profile/*"
+    ],
     "read": [
      "GetInferenceProfile",
      "InvokeModel",
@@ -352,6 +418,9 @@
     ]
    },
    "knowledge-base": {
+    "arns": [
+     "arn:*:bedrock:*:*:knowledge-base/*"
+    ],
     "read": [
      "GetAgentKnowledgeBase",
      "GetDataSource",
@@ -384,6 +453,9 @@
     ]
    },
    "model-customization-job": {
+    "arns": [
+     "arn:*:bedrock:*:*:model-customization-job/*"
+    ],
     "read": [
      "GetModelCustomizationJob",
      "ListTagsForResource"
@@ -393,6 +465,9 @@
     ]
    },
    "model-invocation-job": {
+    "arns": [
+     "arn:*:bedrock:*:*:model-invocation-job/*"
+    ],
     "read": [
      "GetModelInvocationJob",
      "ListTagsForResource"
@@ -403,6 +478,9 @@
     ]
    },
    "project": {
+    "arns": [
+     "arn:*:bedrock:*:*:project/*"
+    ],
     "read": [
      "GetInvoke",
      "InvokeModel"
@@ -413,6 +491,9 @@
     ]
    },
    "prompt": {
+    "arns": [
+     "arn:*:bedrock:*:*:prompt/*"
+    ],
     "read": [
      "GetPrompt",
      "ListPrompts",
@@ -426,6 +507,9 @@
     ]
    },
    "prompt-router": {
+    "arns": [
+     "arn:*:bedrock:*:*:prompt-router/*"
+    ],
     "read": [
      "GetPromptRouter",
      "InvokeModel",
@@ -438,6 +522,9 @@
     ]
    },
    "prompt-version": {
+    "arns": [
+     "arn:*:bedrock:*:*:prompt/*:*"
+    ],
     "read": [
      "GetPrompt",
      "ListTagsForResource",
@@ -448,6 +535,9 @@
     ]
    },
    "provisioned-model": {
+    "arns": [
+     "arn:*:bedrock:*:*:provisioned-model/*"
+    ],
     "read": [
      "GetProvisionedModelThroughput",
      "InvokeModel",
@@ -460,6 +550,9 @@
     ]
    },
    "session": {
+    "arns": [
+     "arn:*:bedrock:*:*:session/*"
+    ],
     "read": [
      "GetInvocationStep",
      "GetSession",
@@ -478,6 +571,9 @@
   },
   "dynamodb": {
    "backup": {
+    "arns": [
+     "arn:*:dynamodb:*:*:table/*/backup/*"
+    ],
     "read": [
      "DescribeBackup"
     ],
@@ -487,6 +583,9 @@
     ]
    },
    "global-table": {
+    "arns": [
+     "arn:*:dynamodb::*:global-table/*"
+    ],
     "read": [
      "DescribeGlobalTable",
      "DescribeGlobalTableSettings"
@@ -499,6 +598,9 @@
     ]
    },
    "index": {
+    "arns": [
+     "arn:*:dynamodb:*:*:table/*/index/*"
+    ],
     "read": [
      "DescribeContributorInsights",
      "PartiQLSelect",
@@ -511,6 +613,9 @@
     ]
    },
    "stream": {
+    "arns": [
+     "arn:*:dynamodb:*:*:table/*/stream/*"
+    ],
     "read": [
      "DescribeStream",
      "GetRecords",
@@ -524,6 +629,9 @@
     ]
    },
    "table": {
+    "arns": [
+     "arn:*:dynamodb:*:*:table/*"
+    ],
     "read": [
      "BatchGetItem",
      "ConditionCheckItem",
@@ -587,6 +695,9 @@
   },
   "s3": {
    "accessgrant": {
+    "arns": [
+     "arn:*:s3:*:*:access-grants/default/grant/*"
+    ],
     "read": [
      "GetAccessGrant",
      "ListTagsForResource"
@@ -597,6 +708,9 @@
     ]
    },
    "accessgrantsinstance": {
+    "arns": [
+     "arn:*:s3:*:*:access-grants/default"
+    ],
     "read": [
      "GetAccessGrantsInstance",
      "GetAccessGrantsInstanceForPrefix",
@@ -617,6 +731,9 @@
     ]
    },
    "accessgrantslocation": {
+    "arns": [
+     "arn:*:s3:*:*:access-grants/default/location/*"
+    ],
     "read": [
      "GetAccessGrantsLocation",
      "ListTagsForResource"
@@ -628,6 +745,9 @@
     ]
    },
    "accesspoint": {
+    "arns": [
+     "arn:*:s3:*:*:accesspoint/*"
+    ],
     "read": [
      "GetAccessPointPolicy",
      "GetAccessPointPolicyStatus",
@@ -648,6 +768,9 @@
     ]
    },
    "accesspointobject": {
+    "arns": [
+     "arn:*:s3:*:*:accesspoint/*/object/*"
+    ],
     "read": [
      "GetObject",
      "GetObjectAcl",
@@ -684,6 +807,9 @@
     ]
    },
    "bucket": {
+    "arns": [
+     "arn:*:s3:::*"
+    ],
     "read": [
      "AllowVendedLogDeliveryForResource",
      "GetAccelerateConfiguration",
@@ -749,6 +875,9 @@
     ]
    },
    "job": {
+    "arns": [
+     "arn:*:s3:*:*:job/*"
+    ],
     "read": [
      "DescribeJob",
      "GetJobTagging"
@@ -759,6 +888,9 @@
     ]
    },
    "multiregionaccesspoint": {
+    "arns": [
+     "arn:*:s3::*:accesspoint/*"
+    ],
     "read": [
      "GetMultiRegionAccessPoint",
      "GetMultiRegionAccessPointPolicy",
@@ -773,6 +905,9 @@
     ]
    },
    "object": {
+    "arns": [
+     "arn:*:s3:::*/*"
+    ],
     "read": [
      "GetObject",
      "GetObjectAcl",
@@ -818,6 +953,9 @@
     ]
    },
    "objectlambdaaccesspoint": {
+    "arns": [
+     "arn:*:s3-object-lambda:*:*:accesspoint/*"
+    ],
     "read": [
      "GetAccessPointConfigurationForObjectLambda",
      "GetAccessPointForObjectLambda",
@@ -833,6 +971,9 @@
     ]
    },
    "storagelensconfiguration": {
+    "arns": [
+     "arn:*:s3:*:*:storage-lens/*"
+    ],
     "read": [
      "GetStorageLensConfiguration",
      "GetStorageLensConfigurationTagging",
@@ -843,6 +984,9 @@
     ]
    },
    "storagelensgroup": {
+    "arns": [
+     "arn:*:s3:*:*:storage-lens-group/*"
+    ],
     "read": [
      "GetStorageLensGroup",
      "ListTagsForResource"
@@ -855,6 +999,9 @@
   },
   "s3vectors": {
    "Index": {
+    "arns": [
+     "arn:*:s3vectors:*:*:bucket/*/index/*"
+    ],
     "read": [
      "GetIndex",
      "GetVectors",
@@ -870,6 +1017,9 @@
     ]
    },
    "VectorBucket": {
+    "arns": [
+     "arn:*:s3vectors:*:*:bucket/*"
+    ],
     "read": [
      "GetVectorBucket",
      "GetVectorBucketPolicy",

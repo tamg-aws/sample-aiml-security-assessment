@@ -2,6 +2,9 @@
  "services": {
   "bedrock-agentcore": {
    "ab-test": {
+    "arns": [
+     "arn:*:bedrock-agentcore:*:*:ab-test/*"
+    ],
     "read": [
      "GetABTest"
     ],
@@ -11,6 +14,9 @@
     ]
    },
    "apikeycredentialprovider": {
+    "arns": [
+     "arn:*:bedrock-agentcore:*:*:token-vault/*/apikeycredentialprovider/*"
+    ],
     "read": [
      "GetApiKeyCredentialProvider",
      "GetResourceApiKey",
@@ -24,6 +30,9 @@
     ]
    },
    "batch-evaluate": {
+    "arns": [
+     "arn:*:bedrock-agentcore:*:*:batch-evaluate/*"
+    ],
     "read": [
      "GetBatchEvaluation"
     ],
@@ -33,6 +42,9 @@
     ]
    },
    "browser": {
+    "arns": [
+     "arn:*:bedrock-agentcore:*:aws:browser/*"
+    ],
     "read": [
      "GetBrowserSession"
     ],
@@ -44,6 +56,9 @@
     ]
    },
    "browser-custom": {
+    "arns": [
+     "arn:*:bedrock-agentcore:*:*:browser-custom/*"
+    ],
     "read": [
      "GetBrowser",
      "GetBrowserSession",
@@ -58,6 +73,9 @@
     ]
    },
    "browser-profile": {
+    "arns": [
+     "arn:*:bedrock-agentcore:*:*:browser-profile/*"
+    ],
     "read": [
      "GetBrowserProfile",
      "ListTagsForResource"
@@ -69,6 +87,9 @@
     ]
    },
    "capacity-provider": {
+    "arns": [
+     "arn:*:bedrock-agentcore:*:*:capacity-provider/*"
+    ],
     "read": [
      "GetCapacityProvider",
      "ListTagsForResource"
@@ -82,6 +103,9 @@
     ]
    },
    "code-interpreter": {
+    "arns": [
+     "arn:*:bedrock-agentcore:*:aws:code-interpreter/*"
+    ],
     "read": [
      "GetCodeInterpreterSession",
      "ListCodeInterpreterSessions"
@@ -93,6 +117,9 @@
     ]
    },
    "code-interpreter-custom": {
+    "arns": [
+     "arn:*:bedrock-agentcore:*:*:code-interpreter-custom/*"
+    ],
     "read": [
      "GetCodeInterpreter",
      "GetCodeInterpreterSession",
@@ -107,6 +134,9 @@
     ]
    },
    "configuration-bundle": {
+    "arns": [
+     "arn:*:bedrock-agentcore:*:*:configuration-bundle/*"
+    ],
     "read": [
      "GetConfigurationBundle",
      "GetConfigurationBundleVersion",
@@ -118,6 +148,9 @@
     ]
    },
    "consent-portal": {
+    "arns": [
+     "arn:*:bedrock-agentcore:*:*:consent-portal/*"
+    ],
     "read": [
      "GetConsentPortal"
     ],
@@ -128,6 +161,9 @@
     ]
    },
    "dataset": {
+    "arns": [
+     "arn:*:bedrock-agentcore:*:*:dataset/*"
+    ],
     "read": [
      "GetDataset",
      "ListDatasetExamples",
@@ -143,6 +179,9 @@
     ]
    },
    "evaluator": {
+    "arns": [
+     "arn:*:bedrock-agentcore:*:*:evaluator/*"
+    ],
     "read": [
      "GetEvaluator",
      "ListTagsForResource"
@@ -154,6 +193,9 @@
     ]
    },
    "gateway": {
+    "arns": [
+     "arn:*:bedrock-agentcore:*:*:gateway/*"
+    ],
     "read": [
      "GatewayGetWebACLForResource",
      "GetGateway",
@@ -191,6 +233,9 @@
     ]
    },
    "harness": {
+    "arns": [
+     "arn:*:bedrock-agentcore:*:*:harness/*"
+    ],
     "read": [
      "GetHarness",
      "GetHarnessEndpoint",
@@ -206,6 +251,9 @@
     ]
    },
    "harness-endpoint": {
+    "arns": [
+     "arn:*:bedrock-agentcore:*:*:harness/*/harness-endpoint/*"
+    ],
     "read": [
      "GetHarnessEndpoint"
     ],
@@ -216,6 +264,9 @@
     ]
    },
    "memory": {
+    "arns": [
+     "arn:*:bedrock-agentcore:*:*:memory/*"
+    ],
     "read": [
      "GetEvent",
      "GetMemory",
@@ -242,6 +293,9 @@
     ]
    },
    "oauth2credentialprovider": {
+    "arns": [
+     "arn:*:bedrock-agentcore:*:*:token-vault/*/oauth2credentialprovider/*"
+    ],
     "read": [
      "CompleteResourceTokenAuth",
      "GetOauth2CredentialProvider",
@@ -256,6 +310,9 @@
     ]
    },
    "online-evaluation-config": {
+    "arns": [
+     "arn:*:bedrock-agentcore:*:*:online-evaluation-config/*"
+    ],
     "read": [
      "GetOnlineEvaluationConfig",
      "ListTagsForResource"
@@ -266,6 +323,9 @@
     ]
    },
    "payment-manager": {
+    "arns": [
+     "arn:*:bedrock-agentcore:*:*:payment-manager/*"
+    ],
     "read": [
      "GetPaymentConnector",
      "GetPaymentInstrument",
@@ -292,6 +352,9 @@
     ]
    },
    "paymentcredentialprovider": {
+    "arns": [
+     "arn:*:bedrock-agentcore:*:*:token-vault/*/paymentcredentialprovider/*"
+    ],
     "read": [
      "GetPaymentCredentialProvider",
      "GetResourcePaymentToken",
@@ -305,6 +368,9 @@
     ]
    },
    "policy": {
+    "arns": [
+     "arn:*:bedrock-agentcore:*:*:policy-engine/*/policy/*"
+    ],
     "read": [
      "GetPolicy",
      "GetPolicySummary"
@@ -315,6 +381,9 @@
     ]
    },
    "policy-engine": {
+    "arns": [
+     "arn:*:bedrock-agentcore:*:*:policy-engine/*"
+    ],
     "read": [
      "GetPolicy",
      "GetPolicyEngine",
@@ -341,6 +410,9 @@
     ]
    },
    "recommendation": {
+    "arns": [
+     "arn:*:bedrock-agentcore:*:*:recommendation/*"
+    ],
     "read": [
      "GetRecommendation"
     ],
@@ -349,6 +421,9 @@
     ]
    },
    "runtime": {
+    "arns": [
+     "arn:*:bedrock-agentcore:*:*:runtime/*"
+    ],
     "read": [
      "GetAgentCard",
      "GetAgentRuntime",
@@ -374,6 +449,9 @@
     ]
    },
    "runtime-endpoint": {
+    "arns": [
+     "arn:*:bedrock-agentcore:*:*:runtime/*/runtime-endpoint/*"
+    ],
     "read": [
      "GetAgentCard",
      "GetAgentRuntimeEndpoint",
@@ -395,6 +473,9 @@
     ]
    },
    "token-vault": {
+    "arns": [
+     "arn:*:bedrock-agentcore:*:*:token-vault/*"
+    ],
     "read": [
      "CompleteResourceTokenAuth",
      "GetApiKeyCredentialProvider",
@@ -423,6 +504,9 @@
     ]
    },
    "workload-identity": {
+    "arns": [
+     "arn:*:bedrock-agentcore:*:*:workload-identity-directory/*/workload-identity/*"
+    ],
     "read": [
      "CompleteResourceTokenAuth",
      "GetResourceApiKey",
@@ -442,6 +526,9 @@
     ]
    },
    "workload-identity-directory": {
+    "arns": [
+     "arn:*:bedrock-agentcore:*:*:workload-identity-directory/*"
+    ],
     "read": [
      "CompleteResourceTokenAuth",
      "GetResourceApiKey",

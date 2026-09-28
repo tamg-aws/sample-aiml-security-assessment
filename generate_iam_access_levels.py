@@ -7,7 +7,9 @@ authorization reference publishes them. An action is a write when its
 annotations mark it IsWrite or IsPermissionManagement and not IsTaggingOnly,
 and a read when none of the three is set. Tagging actions are left out. Only resource types
 with at least one read and one write are kept, because a single grant can merge
-the two only there.
+the two only there. Each type also carries its ARN formats with every
+${Variable} replaced by "*", so a consumer can tell which types a
+resource-scoped statement reaches.
 
 Source: https://servicereference.us-east-1.amazonaws.com/v1/<service>/<service>.json
 
@@ -24,6 +26,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 import urllib.request
 
@@ -57,6 +60,12 @@ def _fetch(service: str) -> dict:
 
 
 def _table(reference: dict, scope: str | None) -> dict:
+    arns = {
+        resource["Name"]: sorted(
+            re.sub(r"\$\{[^}]*\}", "*", arn) for arn in resource.get("ARNFormats", [])
+        )
+        for resource in reference.get("Resources", [])
+    }
     types: dict = {}
     for action in reference.get("Actions", []):
         props = action.get("Annotations", {}).get("Properties", {})
@@ -76,7 +85,11 @@ def _table(reference: dict, scope: str | None) -> dict:
             if write:
                 entry["write"].add(action["Name"])
     return {
-        name: {"read": sorted(entry["read"]), "write": sorted(entry["write"])}
+        name: {
+            "arns": arns.get(name) or ["*"],
+            "read": sorted(entry["read"]),
+            "write": sorted(entry["write"]),
+        }
         for name, entry in sorted(types.items())
         if entry["read"] and entry["write"]
     }

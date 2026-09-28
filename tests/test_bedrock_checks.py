@@ -12548,7 +12548,7 @@ class TestBR01WildcardActionGrant:
             }
             assert [r["Status"] for r in self._rows(cache)] == ["Failed"], action
 
-    def test_br01_every_service_wildcard_is_not_a_bedrock_grant(self):
+    def test_br01_every_service_wildcard_is_a_bedrock_grant(self):
         cache = {
             "role_permissions": {
                 "Admin": _identity(
@@ -12565,7 +12565,10 @@ class TestBR01WildcardActionGrant:
             },
             "user_permissions": {},
         }
-        assert [r["Status"] for r in self._rows(cache)] == ["Passed"]
+        rows = self._rows(cache)
+        assert [r["Status"] for r in rows] == ["Failed", "Failed"]
+        assert "policy 'Admin': a statement allows *" in rows[0]["Finding_Details"]
+        assert "policy 'Admin2': a statement allows *:*" in rows[1]["Finding_Details"]
 
     def test_br01_not_action_allow_counts_unless_it_excludes_bedrock(self):
         cache = {

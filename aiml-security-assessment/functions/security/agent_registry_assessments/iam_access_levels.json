@@ -2,6 +2,9 @@
  "services": {
   "agent-registry": {
    "registry": {
+    "arns": [
+     "arn:*:agent-registry:*:*:registry/*"
+    ],
     "read": [
      "GetRegistry",
      "GetResourcePolicy",
@@ -20,6 +23,9 @@
     ]
    },
    "registry-record": {
+    "arns": [
+     "arn:*:agent-registry:*:*:registry/*/record/*"
+    ],
     "read": [
      "GetDiscoverableRegistryRecord",
      "GetRegistryRecord",
@@ -35,6 +41,9 @@
   },
   "bedrock-agentcore": {
    "registry": {
+    "arns": [
+     "arn:*:bedrock-agentcore:*:*:registry/*"
+    ],
     "read": [
      "GetRegistry",
      "InvokeRegistryMcp",
@@ -48,6 +57,9 @@
     ]
    },
    "registry-record": {
+    "arns": [
+     "arn:*:bedrock-agentcore:*:*:registry/*/record/*"
+    ],
     "read": [
      "GetRegistryRecord"
     ],
