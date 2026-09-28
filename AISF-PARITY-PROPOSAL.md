@@ -205,13 +205,14 @@ contents only the workload owner knows (model ARNs, account ids, regions, FQDNs,
 scanner can catch a blanket allow but cannot confirm the list is right.
 
 This repo already solves that with deploy-time parameters, and the pattern is fully wired and
-tested. Eight slots exist today, but only two are allow-lists: `ApprovedExternalAccountIds` and
-`ApprovedOrganizationIds`, both consumed by the single check SM-30. The other six carry no value
+tested. Seven slots exist today, but only two are allow-lists: `ApprovedExternalAccountIds` and
+`ApprovedOrganizationIds`, both consumed by the single check SM-30. The other five carry no value
 list. `RequireBedrockZeroDataRetention` (BR-37), `RequireMarketplaceEndpointCMK` (BR-40),
-`RequireAgentCoreOnlineEvaluation` (AC-17), `RequireAgentRegistryManualApproval` (AR-03), and
-`RequireAgentRegistryCMK` (AR-05) are booleans that flip a verdict; `AgentCoreTokenVaultId` (AC-14)
-names one vault. So the mechanism is proven, but there is one precedent for the shape AISF needs, not
-eight.
+`RequireAgentCoreOnlineEvaluation` (AC-17) and `RequireAgentRegistryCMK` (AR-05) are booleans that
+flip a verdict; `AgentCoreTokenVaultId` (AC-14) names one vault. A former eighth slot,
+`RequireAgentRegistryManualApproval` (AR-03), was removed because it gated a required leg behind a
+default-off switch; AR-03 now judges manual approval on every run (see `CHANGELOG.md`). So the
+mechanism is proven, but there is one precedent for the shape AISF needs, not seven.
 
 The chain for `ApprovedExternalAccountIds` runs: CFN parameter
 (`template.yaml:87`, `template-multi-account.yaml:87`) to Lambda env var

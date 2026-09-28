@@ -12,6 +12,19 @@ section.
 
 ### Added
 
+- Added `BR-57` Agent Handoff Source Identity, growing the catalog from 273
+  to 274 checks (159 core). It covers AISF `AIR-SLF-AGT-05`, which the ledger
+  had marked `not_implementable`. It fails a Bedrock collaborator that runs as
+  its supervisor's own role, and a role trust statement that an agent role can
+  use to call `sts:AssumeRole` without an `sts:SourceIdentity` condition naming
+  exact values. The agent roles are the Bedrock agent roles of every routed
+  version and the AgentCore runtime roles. ECS task and Lambda execution roles
+  are not marked as agents by any AWS API and are not judged. The Bedrock
+  assessment role gains `bedrock:ListAgentCollaborators` on the account's
+  agents and `bedrock-agentcore:GetAgentRuntime` on its runtimes, both
+  read-only. Listing runtimes needs `bedrock-agentcore:ListAgentRuntimes` and
+  `bedrock-agentcore:ListAgentRuntimeEndpoints` on `*`, which are not granted,
+  so the runtime leg reports `N/A` naming them.
 - Added an **AWS AI Security Framework (AISF)** section to the HTML report,
   alongside OWASP Top 10 for LLM under "By Compliance Standard". It reports 8
   of the 105 in-scope AISF controls as `AISF-01` through `AISF-08`. Behavior
@@ -19,7 +32,7 @@ section.
   - The section is always on. It needs no deployment parameter, runs no
     additional AWS API calls, and adds no scan time, because each row restates
     the verdict of a check that already ran under an AISF control id.
-  - `AISF-` rows are excluded from the 273-check catalog total, from the report
+  - `AISF-` rows are excluded from the 274-check catalog total, from the report
     pass rate, and from Open Action Items, for the same reason OWASP-mapped
     rows are: the underlying check is already counted.
   - `AISF-08` aggregates three SageMaker checks (`SM-09`, `SM-01`, `SM-03`). It
@@ -41,8 +54,8 @@ section.
   Bedrock, `SM-35` to `SM-41` in SageMaker AI, and `AC-50` and `AC-51` in
   AgentCore, with new legs on `BR-01`, `BR-04`, `BR-12`, `BR-43`, `SM-02` and
   `AC-26`. The three entries that follow give the per-module detail.
-- The AISF parity ledger now reports 97 of the 105 in-scope AISF controls as
-  `covered` and 8 as `not_implementable`, with none left `tighten` or `new`.
+- The AISF parity ledger now reports 100 of the 105 in-scope AISF controls as
+  `covered` and 5 as `not_implementable`, with none left `tighten` or `new`.
   The 19 foundation controls that waited on those checks and legs are
   `covered`, and the new check ids carry their AISF control in the
   `Compliance_Frameworks` column.
@@ -195,6 +208,13 @@ section.
 
 ### Fixed
 
+- `AC-04` no longer fails every runtime. It read `loggingConfig` and
+  `tracingConfig` from `GetAgentRuntime`, which returns neither, so each
+  runtime failed both legs whatever its configuration. It now reports one row
+  per runtime from the runtime's log groups under
+  `/aws/bedrock-agentcore/runtimes/<runtimeId>-` and a `bedrock-agentcore`
+  `TRACES` delivery source with a delivery, the reads `AC-19` uses. A read
+  that fails leaves the runtime `N/A`. No IAM grant changes.
 - `AC-07` names the fix that matches the `GetMemory` error for a memory it
   cannot describe. `AccessDeniedException` now names `kms:Decrypt` on the
   memory's customer managed key as well as `bedrock-agentcore:GetMemory`,
@@ -280,6 +300,285 @@ section.
   principal, and `AR-02` leaves it out of its population. The `N/A` row
   names it.
 
+- AgentCore checks that read the IAM permissions cache, trust policies and
+  resource policies now judge the values they read and the whole population
+  they cover:
+  - The cache consumers accept the version 2 contract. A principal named in
+    `principal_errors` withholds `Passed` from every population-wide claim
+    that includes it and is named in an `N/A` row; a permissions boundary is
+    intersected with the principal's grants; a version 1 cache is read with a
+    note that principal read errors were not recorded. SCPs are not evaluated
+    per principal, and the finding text says so.
+  - `AC-02` reads users and group policies as well as roles, counts a bare
+    `Action: "*"` and a `NotAction` that leaves AgentCore in, and adds three
+    legs: evaluator author and reader separation, the payments `iam:PassRole`
+    scope, and each payment manager's retrieval role trust, which must name
+    only `bedrock-agentcore.amazonaws.com` and pin `aws:SourceArn` to that
+    manager.
+  - The confused-deputy guard in `AC-27`, `AC-43` and `AC-48` counts only when
+    every `aws:SourceAccount` or `aws:SourceArn` value names the assessed
+    account. `IfExists`, `ForAllValues` and wildcard values no longer pass.
+    `AC-27` fails a gateway role that trusts a second principal.
+  - `AC-10` fails an Allow statement that opens a runtime or gateway to any
+    principal without binding the caller's account or organization, and
+    reports a failed runtime or gateway list instead of passing.
+  - `AC-48` adds memory, payment manager and harness execution roles to the
+    population, withholds the sharing `Passed` when any family could not be
+    listed, and clears an account-root trust only when its condition names
+    the calling principal.
+  - `AC-03`, `AC-21` and `AC-23` count a bare `Action: "*"`, any pattern or
+    `NotAction` that reaches the action, and group policies on users, and
+    drop a grant the principal's own Deny or boundary removes. A policy that
+    cannot be parsed is named in an `N/A` row. Rows that passed before can now
+    fail.
+  - `AC-03` pages through the last-accessed report and names every principal
+    whose report failed, was throttled or errored, instead of passing
+    without it.
+  - `AC-21` treats a log group resource as unbounded only when the group name
+    is wildcard-only or a wider ARN segment is a wildcard.
+  - `AC-23` judges each read by the key that action carries: `namespace` for
+    record reads, `actorId` or `sessionId` for event reads. A `strategyId`
+    condition alone, an `IfExists`, `ForAllValues` or negated operator, and a
+    wildcard-only value no longer pass. A scoped principal is reported as
+    bound to the caller when every value carries a policy variable, and as
+    fixed otherwise.
+  - `AC-32`, `AC-33`, `AC-42` and `AC-44` read the same way as `AC-23`: a
+    bare `Action: "*"` and group policies count, a grant the principal's own
+    Deny or boundary removes does not, and a principal the IAM cache could
+    not read is named in an `N/A` row that withholds `Passed`.
+  - `AC-32` accepts an issuer pin only by value: every value of
+    `InboundJwtClaim/iss` must be a literal or a pattern narrower than `*`.
+  - `AC-33` fails a token grant written with `NotResource`, or with a
+    wildcard in the region or account of the workload identity ARN.
+  - `AC-42` reads a `NotResource` pass-role grant as reaching every role it
+    does not list, and adds a writer leg on the primary region that fails a
+    principal able to create or update an online evaluation configuration
+    whose `iam:PassRole` grant does not name its roles or does not pin
+    `iam:PassedToService` to `bedrock-agentcore.amazonaws.com`.
+  - `AC-44` fails a model grant whose service, account or resource type
+    segment is a wildcard (`arn:aws:bedrock:*::*`) or that uses
+    `NotResource`. A region wildcard on a named model still passes.
+  - `AC-45` reads a tool role's resources by value, so `arn:aws:s3:::*`,
+    `table/*` and a region or account wildcard fail, and fails an action
+    pattern such as `s3:Get*` and an Allow written with `NotAction`. On the
+    primary region it adds a Global row naming every principal that can run a
+    command or open a shell in a runtime session through a grant that does not
+    name `bedrock-agentcore:InvokeAgentRuntimeCommandShell` or
+    `InvokeAgentRuntimeCommand`, or that reaches every runtime.
+  - `AC-37` reads each `BedrockGuardrails` call by value and fails a guardrail
+    policy that no returned score (0, 0.2, 0.4, 0.6, 0.8, 1.0) can make act,
+    or whose call names no category or data path. A `suppressOutput` policy
+    in a plain `when` block now counts, a threshold it cannot read is named
+    in an `N/A` row, and the gateway role's grant counts after its own Deny
+    and boundary. A readable grant beside an unparseable policy no longer
+    passes.
+  - `AC-27` and `AC-47` pass the network leg only on a resource policy Deny
+    that refuses the invoke action to every principal outside a bounded
+    `aws:SourceVpc`, `aws:SourceVpce`, `aws:VpcSourceIp` or `aws:SourceIp`
+    value. A Deny form now passes on `AC-27`, which read Allow statements only.
+    An Allow condition alone, a positive or `ForAnyValue` operator, a
+    wildcard endpoint, an address list covering every address (the split
+    `0.0.0.0/1` plus `128.0.0.0/1` included), and a Deny that ANDs in
+    another key or names specific principals now fail, and the finding names
+    the reason. The `AC-47` caller leg no longer passes on an Allow naming
+    principals, account root included, because an Allow does not stop a
+    same-account caller. It passes on `allowedWorkloadConfiguration` or a
+    Deny refusing every principal outside a bounded `aws:PrincipalArn` list.
+  - `AC-28` and `AC-29` count a guarding service control policy only when it
+    is attached to the assessed account, to an organizational unit above it,
+    or to the root, read with `organizations:ListParents` and
+    `organizations:ListTargetsForPolicy`. A guard attached elsewhere fails as
+    `Unattached`, the management account fails as `Not Enforced` because no
+    SCP restricts it, and an unreadable parent chain or attachment list is
+    `N/A` and never `Passed`. `IfExists` operators now read as their plain
+    form, so `StringEqualsIfExists` on the denied value counts. An inverted
+    `AC-29` policy is reported only when it is attached.
+  - `AC-01` adds a preventive leg, reported once under `Global`: an attached
+    service control policy has to deny `CreateAgentRuntime`,
+    `UpdateAgentRuntime`, `CreateCodeInterpreter` and `CreateBrowser` with a
+    `Null` true test on `bedrock-agentcore:subnets` or
+    `bedrock-agentcore:securityGroups`, and a second one has to pin both keys
+    with `ForAnyValue:StringNotEquals` to IDs without wildcards. The egress leg
+    now unions the outbound ranges of every security group on a resource, so
+    `0.0.0.0/1` plus `128.0.0.0/1` fails as `0.0.0.0/0` does. A tool in
+    `SANDBOX` network mode now fails at Medium severity instead of passing,
+    because no customer security group names what it reaches.
+  - `AC-26` adds two legs. A `Global` leg requires an attached service control
+    policy that denies `logs:DeleteLogGroup`, `logs:PutRetentionPolicy`,
+    `logs:PutLogGroupDeletionProtection` and `logs:DeleteSubscriptionFilter`
+    on the AgentCore log groups and `aws/spans` in every Region, exempting at
+    most principals named by `aws:PrincipalArn`. A regional leg reads every
+    trail with `cloudtrail:GetTrail` and fails a trail that records the
+    Region with log file validation off; an unreadable trail is `N/A` and
+    blocks a `Passed`.
+  - `AC-30`, `AC-31` and `AG-24` judge the values of a JWT authorizer. An
+    `allowedAudience` or `allowedClients` list holding a blank value or a `*`
+    names no single application and no longer counts, and a `discoveryUrl`
+    that is not `https` fails as `Issuer Not HTTPS` whatever the allow-lists
+    hold. `AG-24` stops passing a `CUSTOM_JWT` gateway on its authorizer type:
+    it passes only when that check would, fails as `Unbounded` when no
+    audience or client list pins the application, and is `N/A` when the
+    gateway reports no `customJWTAuthorizer`. The `AC-30` pass now states that
+    it read the version `GetAgentRuntime` returns by default.
+  - `AC-24` no longer counts a limit keyed on `$.context.jwt.jti`, `iat`,
+    `exp` or `nbf`, claims that take a new value with every token, so a
+    caller who mints a fresh token no longer escapes a limit that passed.
+  - `AG-27` reads the gateway's `wafConfiguration` `failureMode` beside the
+    web ACL association. `FAIL_OPEN` fails, an unset value is `N/A`, and only
+    `FAIL_CLOSE` passes, so an `AG-27` row that passed before can now be
+    `Failed` or `N/A`.
+  - `AC-25` adds a `Gateway Role Scope` row per gateway. It reads the
+    attached and inline policies of the gateway's `roleArn` from the IAM
+    permission cache with the `AC-45` rules, so a wildcard action, a
+    `Resource: "*"` or an unbounded ARN segment that no Deny or permissions
+    boundary removes fails as `Unscoped`. A role the cache records as
+    unreadable, a role missing from the cache, and a missing cache are `N/A`
+    and never `Passed`. No new IAM action.
+  - `AG-25` reads the text of each enforcing policy it used to count. A
+    permit over every action with no condition fails as `Allows All`, and an
+    enforcing policy with no readable text is `N/A`, so a gateway that passed
+    on a policy count can now be `Failed` or `N/A`.
+  - `AC-35` reads the principal and resource of every permit over named
+    tools. A bare `principal` that no condition reads fails as
+    `Caller Scope Unbounded`, and a resource named by type alone or not at all
+    fails as `Gateway Scope Unbounded`. A policy with no readable text, or a
+    head without three scope positions, now withholds the gateway's `Passed`
+    where it was reported beside one.
+  - `AC-38` reads each event pattern of a temporal policy and fails one with
+    no `eventResource` as `Session Rule Resource Unscoped`. A temporal policy
+    with no readable event pattern is `N/A` and no longer passes.
+  - `AC-18` requires every data-event type in use, where one selected type
+    used to pass its family. Runtimes need `RuntimeEndpoint` as well as
+    `Runtime`, the AWS-managed code interpreter and browser need the
+    unsuffixed types, and gateways, identity (workload identities and
+    credential providers) and policy engines are new families. A selector
+    narrowed by `readOnly`, `eventName`, `resources.ARN` or any other field no
+    longer counts, nor does a trail that is not logging or that neither spans
+    all Regions nor is homed in the scanned one. An unreadable trail status is
+    `N/A`.
+  - `AC-22` reads a sink policy's principal and organization condition by
+    value. A statement naming principals passes only when no principal is a
+    wildcard and no `NotPrincipal` is present; otherwise it needs
+    `aws:PrincipalOrgID` or `aws:PrincipalOrgPaths` under `StringEquals`,
+    `StringEqualsIgnoreCase` or `StringLike` with a value whose organization
+    segment has no wildcard. A negated, `IfExists` or `ForAllValues` operator
+    and a wildcard organization no longer pass.
+  - `AC-26`, `AC-36` and `AC-41` read a key policy by value. An Allow whose
+    principal is a wildcard or a `NotPrincipal` fails unless a condition
+    binds the caller's account, organization, principal ARN or source with a
+    bounded value under a positive operator. `kms:ViaService` alone no longer
+    passes, because it narrows the path and not the caller, and neither do
+    `IfExists`, `ForAllValues` or a wildcard account. A grant to the CloudWatch
+    Logs service principal that does not bind the account or the
+    `kms:EncryptionContext:aws:logs:arn` value fails, because it serves log
+    groups in any account. `AC-41` now reads the results group's key policy
+    itself, so a results group outside an AgentCore prefix is judged by the
+    same rules, and an unreadable key policy is `N/A` and never `Passed`.
+    Retention length is reported and not judged: no API field states the
+    workload's schedule.
+  - `AC-19` adds runtimes to its population and requires a `TRACES`
+    delivery for every runtime, gateway and memory, beside the
+    `APPLICATION_LOGS` delivery it already required for gateways and
+    memories. A delivery source reporting `INACTIVE` no longer counts, and an
+    unlistable runtime inventory is `N/A`. A gateway or memory that passed on
+    application logs alone now fails.
+  - `AC-20` states in its `Passed` text that `AC-26` judges the key policy
+    and that delivery destination log groups outside the AgentCore prefixes
+    are not read.
+  - `AC-17` reports one finding per runtime and no longer waits on
+    `RequireAgentCoreOnlineEvaluation`. A runtime that no running online
+    evaluation reads by its log group and service name fails, where it was
+    `N/A` with the parameter unset. The parameter now decides only a region
+    with no runtime. An unreadable configuration or runtime inventory is
+    `N/A`. `AC-39` also reads `logGroupNamePrefixes` as an input source.
+  - `AC-40` counts only `Builtin.ToolSelectionAccuracy` and
+    `Builtin.ToolParameterAccuracy` as tool-choice evaluators, where any
+    `TOOL_CALL` level evaluator counted, so a skill evaluator no longer
+    passes the leg. It also fails a configuration whose scores no CloudWatch
+    alarm with actions reads, matched on the configuration's
+    `metricsNamespace` or the default `Bedrock-AgentCore/Evaluations`.
+    Unreadable alarms are `N/A`, never `Passed`.
+  - `AC-39` accepts `resultDestination` `SOURCE_LOG_GROUP` as an output,
+    which names no log group and failed before. `AC-41` reports such a
+    configuration as `N/A` and names `AC-20` and `AC-26` as the checks that
+    judge the input log groups.
+  - `AC-08` judges a region that holds gateways and no runtime, where it
+    reported `N/A`. It requires an available
+    `com.amazonaws.<region>.bedrock-agentcore` endpoint when runtimes exist
+    and an available `com.amazonaws.<region>.bedrock-agentcore.gateway`
+    endpoint when gateways exist, where any endpoint whose service name
+    carried `agentcore`, the control-plane endpoint included, passed. The
+    inbound leg fails security groups whose ranges together cover
+    `0.0.0.0/0` or `::/0`, which passed when split across narrower ranges.
+    VPCs are read across every page.
+  - `AG-39` credits a customer `SqliMatchStatement` only at `SensitivityLevel`
+    `HIGH`, where the `LOW` default passed, and a customer SQL injection or
+    cross-site scripting statement on the body only with `OversizeHandling`
+    `MATCH`, or `NO_MATCH` beside a rule that blocks an oversized body, where
+    the `CONTINUE` default passed.
+  - `AC-51` names the Block and Challenge sensitivities the Anti-DDoS group
+    runs with, and says that Shield Advanced enrollment is not judged because
+    `shield:CreateProtection` accepts no AgentCore gateway ARN.
+  - `AC-50` judges every repository an AgentCore runtime's `containerUri`
+    names, where only repositories named for AgentCore were judged, and
+    fails `SCAN_ON_PUSH` alone, which passed. A runtime whose image could
+    not be read or lives in another registry is `N/A`.
+  - `AC-11` reads each policy engine key with `kms:DescribeKey` and fails a
+    key whose `KeyManager` is not `CUSTOMER` or whose `KeyState` is not
+    `Enabled`, where any named key passed. A disabled key or one pending
+    deletion makes every decision the engine takes `DENY`. An engine whose
+    detail or key could not be read is `N/A`, where a denied
+    `GetPolicyEngine` dropped the engine from the finding.
+  - `AC-36` requires the key policy statements the policy encryption guide
+    shows: `kms:CreateGrant` only with `kms:ViaService` for the engine's
+    Region and `kms:GrantConstraintType` `EncryptionContextSubset`, and
+    `kms:Decrypt` and `kms:GenerateDataKey` through AgentCore only with an
+    `aws:SourceAccount` or `aws:SourceArn` naming the account. An `IfExists`
+    or wildcard `kms:ViaService` is not credited. It also requires the
+    key to carry a separate management and evaluation grant bound to the
+    engine ARN, read with `kms:ListGrants` across every page. A key whose
+    grants could not be listed is `N/A`, where it passed.
+  - `AC-14` judges every token vault a credential provider ARN names, read
+    from the OAuth2, API key and payment provider lists across every page,
+    beside the configured vault, where only the configured vault was read.
+    The vault key must be customer managed and `Enabled` by `kms:DescribeKey`,
+    where any named key passed. A vault that returns not found while a
+    provider names it, a rejected vault id, and a provider list that could not
+    be read are `N/A` naming what was not read, where the first two read
+    `N/A` with "No action required".
+  - `AC-34` scans gateway targets and harnesses as well as runtimes, over
+    every field those APIs model as sensitive, and fails a URL carrying a
+    password or a credential-named query value. A base64 string of 40 or
+    more characters now fails under a credential name even when it holds a
+    slash, where every slashed value read as a secret name. A region with
+    targets or harnesses and no runtime is scanned, where it read `N/A`.
+  - `AC-46` fails a runtime with no delivered `USAGE_LOGS` source of its own,
+    and every runtime in a region with no alarm with actions on
+    `ActiveSessionCount` (`AWS/Bedrock-AgentCore`, `Service=AgentCore.Runtime`),
+    where only the lifecycle ceiling was judged. A runtime reporting one
+    lifecycle field and not the other is `N/A`, where it passed on the one it
+    reported, and a missing lifecycle value no longer tells the reader to grant
+    `GetAgentRuntime`, a call that had succeeded.
+  - `AC-06` judges where a custom browser's recordings go, where it passed on
+    `recording.enabled` and a bucket name. The bucket, read with
+    `ExpectedBucketOwner` set to the browser's account, must encrypt by
+    default with `aws:kms` or `aws:kms:dsse`, deny every principal
+    `s3:GetObject` and `s3:PutObject` on the recording prefix when
+    `aws:SecureTransport` is false, and expire the prefix with an enabled
+    lifecycle rule carrying no tag or size filter, plus a noncurrent-version
+    expiration when the bucket is versioned. A browser with no
+    `executionRoleArn`, or whose role no identity policy or bucket policy
+    statement allows to write the prefix, or whose boundary or a Deny refuses
+    the write, fails. Bucket Block Public Access left off, a leg that could
+    not be read, a role the permission cache did not read and a conditioned
+    grant are `N/A`.
+  - `AC-07` reads the key each memory names with `kms:DescribeKey` and passes
+    it only when KMS reports it customer managed and `Enabled`, where any
+    named key passed. A key that is not customer managed, is disabled or is
+    pending deletion fails, and a key that could not be described, one in
+    another account included, is `N/A`, so a memory that passed before can
+    now be `Failed` or `N/A`.
+
 ### Deployment impact
 
 **Deployment-stack update and CodeBuild run required.** The
@@ -328,6 +627,104 @@ role, `cognito-idp:DescribeUserPool`, `cognito-idp:ListUserPoolClients` and
 `cognito-idp:DescribeUserPoolClient`, scoped to the account's user pools. All
 are read-only, and the same CodeBuild run applies them. No parameter,
 deployment-stack or member-role StackSet change is required.
+
+The AgentCore assessment role gains `bedrock-agentcore:GetPaymentManager` and
+`bedrock-agentcore:GetHarness`, scoped to the account's `payment-manager/*` and
+`harness/*` ARNs, in both SAM templates. Both are read-only, and the same
+CodeBuild run applies them. `bedrock-agentcore:ListPaymentManagers` and
+`bedrock-agentcore:ListHarnesses` have no resource type and are not granted;
+until they are, the payment manager and harness legs of `AC-02` and `AC-48`
+report `N/A` naming the missing action.
+
+The AgentCore assessment role gains `organizations:ListTargetsForPolicy`,
+scoped to `service_control_policy` ARNs, and `organizations:ListParents`,
+scoped to this account's own `account` ARN and to `ou` ARNs, in both SAM
+templates, so `AC-28` and `AC-29` can read attachment. Both are read-only, and
+the same CodeBuild run applies them. A member account that cannot list the
+organization's policies still reports `N/A`, as before.
+
+The AgentCore assessment role gains `cloudtrail:GetTrail`, scoped to the
+account's `trail/*` ARNs, in both SAM templates, so `AC-26` can read log file
+validation. It is read-only, and the same CodeBuild run applies it. The new
+`AC-01` and `AC-26` service control policy legs use the Organizations grants
+added for `AC-28` and `AC-29`.
+
+The AgentCore assessment role gains `cloudtrail:GetTrailStatus`, scoped to the
+account's `trail/*` ARNs, and `bedrock-agentcore:ListWorkloadIdentities`,
+`bedrock-agentcore:ListOauth2CredentialProviders` and
+`bedrock-agentcore:ListApiKeyCredentialProviders`, scoped to the account's
+`workload-identity-directory/*` and `token-vault/*` ARNs, in both SAM
+templates, so `AC-18` can read each trail's logging state and count the
+identity resources. All are read-only, and the same CodeBuild run applies
+them. Until it runs, the `AC-18` identity family reports `N/A`.
+
+`AC-22`, `AC-26`, `AC-36` and `AC-41` change no IAM grant: `kms:GetKeyPolicy`
+is already scoped to `key/*` in both SAM templates. Rows of these checks that
+passed before can now fail after the same CodeBuild run.
+
+`AC-19` changes no IAM grant: it reads runtimes with
+`bedrock-agentcore:ListAgentRuntimes`, which the role already holds.
+
+`AC-17` changes no IAM grant either, and reads the same two list calls. The
+`RequireAgentCoreOnlineEvaluation` parameter keeps its name and default, and
+only its description changes in both templates. With the default `false`, a
+region with runtimes that online evaluation does not score now reports
+`Failed` rows where it reported `N/A`.
+
+The AgentCore assessment role gains `cloudwatch:DescribeAlarms`, scoped to the
+account's `alarm:*` ARNs, in both SAM templates, so `AC-40` can read the
+alarms on evaluation scores. It is read-only, and the same CodeBuild run
+applies it. Until it runs, `AC-40` rows that meet the evaluator legs report
+`N/A`, and a configuration whose scores no alarm reads now fails.
+
+`AC-08` changes no IAM grant: `bedrock-agentcore:ListGateways` and
+`ec2:DescribeVpcs` are already on the AgentCore role. A region whose only
+AgentCore endpoint is the control-plane or runtime endpoint now fails where
+its gateways are in use.
+
+`AG-39`, `AC-50` and `AC-51` change no IAM grant: they read fields of
+`wafv2:GetWebACL`, `bedrock-agentcore:ListAgentRuntimes`,
+`bedrock-agentcore:GetAgentRuntime` and `ecr:DescribeRepositories`, which
+the AgentCore role already holds. A web ACL whose customer SQL injection or
+cross-site scripting statements use the API defaults, and a repository
+scanned at `SCAN_ON_PUSH` alone, now fail where they passed.
+
+`AC-11` and `AC-36` add `kms:DescribeKey` and `kms:ListGrants` to the AgentCore
+role in both templates, scoped to `arn:${AWS::Partition}:kms:*:${AWS::AccountId}:key/*`
+under the new Sid `PolicyEngineKeyStateRead`. Redeploy the stack before the
+next scan: without the grants every policy engine reads as `N/A` in `AC-11`
+and `AC-36`. A key policy missing the guide's service-use statements, and a
+key missing either engine grant, now fail where they passed.
+
+`AC-14` adds `bedrock-agentcore:ListPaymentCredentialProviders` to the
+`AgentCoreIdentityInventory` Sid in both templates, scoped to the
+`token-vault/*` ARN beside the two provider lists already there, and reads the
+vault key with the `kms:DescribeKey` grant above. Redeploy before the next
+scan: without it `AC-14` reads the payment provider list as unread and reports
+`N/A`. `AC-34` adds no grant. Its gateway leg uses `ListGatewayTargets` and
+`GetGatewayTarget`, already on the role. Its harness leg calls
+`bedrock-agentcore:ListHarnesses`, which the role does not hold pending
+approval, so harnesses read `N/A` and are never reported clean.
+
+`AC-46` adds no grant. It reads deliveries with `logs:DescribeDeliverySources`
+and `logs:DescribeDeliveries` and alarms with `cloudwatch:DescribeAlarms`, all
+already on the AgentCore role. No runtime delivers `USAGE_LOGS` until one is
+configured, so expect `AC-46` to fail runtimes that passed before.
+
+`AC-06` adds the `BrowserRecordingBucketRead` Sid to the AgentCore role in both
+templates: `s3:GetEncryptionConfiguration`, `s3:GetBucketPublicAccessBlock`,
+`s3:GetBucketPolicy`, `s3:GetLifecycleConfiguration` and
+`s3:GetBucketVersioning` on `arn:${AWS::Partition}:s3:::*`, because the
+recording bucket is named by the customer. Redeploy before the next scan:
+without it every recording browser reads `N/A`. The account-level Block Public
+Access read, `s3:GetAccountPublicAccessBlock`, is not granted pending approval,
+so a bucket that leaves its own setting off reads `N/A`. Expect `AC-06` to
+fail recording browsers that passed before.
+
+`AC-07` adds no grant. It reads memory keys with `kms:DescribeKey`, which the
+AgentCore role already holds on this account's keys in the
+`PolicyEngineKeyStateRead` Sid. A memory whose key lives in another account
+reads `N/A`.
 
 The IAM permissions cache role gains `iam:GetRole` on the account's roles and
 `iam:GetUser` on its users in both SAM templates, because only those calls
@@ -404,6 +801,14 @@ Upgrading is not a single step and is not fully backward compatible:
 
 ### Changed
 
+- `BR-07` now reads the encryption key of every numbered prompt version, so an
+  older version with no `customerEncryptionKeyArn` fails even when the latest
+  version carries a customer managed key, and an unread version is `N/A`. Its
+  flow leg reads each flow version an alias routes to (`ListFlowAliases`,
+  `GetFlowVersion`) as well as the working draft, so a deployed version that
+  references an unversioned prompt fails. The `Bedrock Prompt Variants Check`
+  row is now an Informational `N/A` advisory and no longer sets the check
+  status to `WARN`.
 - Hardened assessment deployment roles. `AIMLSecurityMemberRole` now contains
   only cross-account deployment, Step Functions polling, and report-retrieval
   permissions; assessment APIs remain exclusively on the SAM-created Lambda

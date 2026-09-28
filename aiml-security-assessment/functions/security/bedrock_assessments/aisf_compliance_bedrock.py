@@ -32,11 +32,11 @@ AISF_COMPLIANCE_MAP = {
     "BR-12": "AISF AIR-BDR-MDL-02 (1 of 2 checks) | AISF AIR-FND-DET-01 (1 of 2 checks) | AISF AIR-FND-DET-09 (1 of 2 checks)",
     "BR-17": "AISF AIR-FND-DAT-01 (1 of 4 checks)",
     "BR-20": "AISF AIR-BDR-KB-03 | AISF AIR-FND-DAT-01 (1 of 4 checks)",
-    "BR-26": "AISF AIR-BDR-GRD-03",
+    "BR-26": "AISF AIR-BDR-GRD-03 | AISF AIR-BDR-KB-08",
     "BR-27": "AISF AIR-BDR-GRD-09",
     "BR-32": "AISF AIR-BDR-GRD-04",
     "BR-33": "AISF AIR-SLF-CMP-01 (1 of 2 checks)",
-    "BR-34": "AISF AIR-BDR-GRD-02 | AISF AIR-FND-DET-04 (1 of 3 checks)",
+    "BR-34": "AISF AIR-BDR-GRD-02 | AISF AIR-BDR-KB-05 | AISF AIR-FND-DET-04 (1 of 3 checks)",
     "BR-37": "AISF AIR-BDR-MDL-10",
     "BR-39": "AISF AIR-FND-NET-01 (1 of 6 checks)",
     "BR-41": "AISF AIR-BDR-GRD-10 | AISF AIR-FND-DET-04 (1 of 3 checks)",
@@ -54,6 +54,7 @@ AISF_COMPLIANCE_MAP = {
     "BR-53": "AISF AIR-FND-GOV-02",
     "BR-54": "AISF AIR-SLF-RT-08",
     "BR-55": "AISF AIR-FND-DAT-10",
+    "BR-57": "AISF AIR-SLF-AGT-05",
 }
 
 

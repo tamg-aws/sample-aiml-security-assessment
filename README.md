@@ -6,9 +6,9 @@
 
 **Open-source automated security scanner for generative AI and machine learning workloads on AWS.** It brings together separate assessments for Amazon Bedrock, Amazon SageMaker AI, Amazon Bedrock AgentCore, and AWS Agent Registry. Core checks are guided by the [AWS Well-Architected Generative AI Lens](https://docs.aws.amazon.com/wellarchitected/latest/generative-ai-lens/generative-ai-lens.html). The optional **Responsible AI GRC** module adds technical checks for AI governance, risk, and compliance. Optional **OWASP Top 10 for LLM** checks extend coverage across common LLM security risks. Responsible AI GRC checks draw on the [AWS User Guide to Governance, Risk, and Compliance for Responsible AI Adoption](https://d1.awsstatic.com/whitepapers/compliance/AWS-User-Guide-Governance-Risk-Compliance-for-Responsible-AI-Adoption-Financial-Services.pdf).
 
-Run **[273 checks](docs/SECURITY_CHECKS.md)** across AWS accounts and regions:
+Run **[274 checks](docs/SECURITY_CHECKS.md)** across AWS accounts and regions:
 
-- **158 always-on core checks** for Amazon Bedrock, Amazon SageMaker AI, Amazon Bedrock AgentCore, and AWS Agent Registry
+- **159 always-on core checks** for Amazon Bedrock, Amazon SageMaker AI, Amazon Bedrock AgentCore, and AWS Agent Registry
 - **39 always-on Agentic AI Security checks**, synthesized from service findings and native AgentCore gateway checks
 - **64 optional Responsible AI GRC checks** for selected technical controls informed by AWS governance, risk, and compliance guidance
 - **12 optional OWASP Top 10 for LLM checks**, including mapping-based coverage and native system-prompt-leakage checks
@@ -53,7 +53,7 @@ The framework generates professional, interactive security assessment reports wi
 
 - **Executive Summary** with severity counts and service breakdown
 - **Priority Recommendations** highlighting critical issues requiring immediate attention
-- **[273 Security Checks](docs/SECURITY_CHECKS.md)** across Amazon Bedrock, Amazon SageMaker AI, Amazon Bedrock AgentCore, AWS Agent Registry, Agentic AI Security, Responsible AI GRC, and OWASP Top 10 for LLM
+- **[274 Security Checks](docs/SECURITY_CHECKS.md)** across Amazon Bedrock, Amazon SageMaker AI, Amazon Bedrock AgentCore, AWS Agent Registry, Agentic AI Security, Responsible AI GRC, and OWASP Top 10 for LLM
 - **Multi-Region Support** within the standard AWS commercial partition for core Bedrock, SageMaker, AgentCore, and AWS Agent Registry checks, with per-region risk breakdown
 - **Interactive Filtering** by account, region, service, severity, and status
 - **Light/Dark Mode Toggle** with persistent user preference
@@ -98,7 +98,7 @@ Designed for workloads using [Amazon Bedrock](https://aws.amazon.com/bedrock/), 
 | Challenge | How This Framework Helps |
 | --- | --- |
 | **Manual security audits are time-consuming** | Fully automated scanning with one-click CloudFormation deployment |
-| **Inconsistent security checks across teams** | Standardized 273-check assessment based on AWS Well-Architected Generative AI Lens and Agentic AI Lens best practices, AWS Responsible AI governance/risk/compliance guidance, and OWASP Top 10 for LLM |
+| **Inconsistent security checks across teams** | Standardized 274-check assessment based on AWS Well-Architected Generative AI Lens and Agentic AI Lens best practices, AWS Responsible AI governance/risk/compliance guidance, and OWASP Top 10 for LLM |
 | **Difficulty tracking AI/ML security posture** | Interactive HTML dashboards with severity breakdown and per-account visibility |
 | **Multi-account complexity** | Consolidated reporting across AWS Organizations with cross-account role assumption |
 | **Compliance and audit support** | Exportable reports to supplement your compliance program, with remediation guidance linked to AWS documentation |
@@ -136,7 +136,7 @@ This tool operates within the [AWS Shared Responsibility Model](https://aws.amaz
 
 **No guarantee of security or compliance.** This framework identifies common misconfigurations based on AWS best practices and the AWS Well-Architected Framework. It does not cover all possible security risks, does not replace formal compliance audits (SOC 2, HIPAA, and similar), and does not guarantee that your workloads are secure. Use the results as one input into your broader security program.
 
-**273 checks across seven areas.** The assessment covers Amazon Bedrock, Amazon SageMaker AI, Amazon Bedrock AgentCore, AWS Agent Registry, always-on Agentic AI Security, optional Responsible AI GRC checks, and optional OWASP Top 10 for LLM checks. Other AI/ML services (Amazon Comprehend, Amazon Rekognition, Amazon Textract, and others) are not currently assessed.
+**274 checks across seven areas.** The assessment covers Amazon Bedrock, Amazon SageMaker AI, Amazon Bedrock AgentCore, AWS Agent Registry, always-on Agentic AI Security, optional Responsible AI GRC checks, and optional OWASP Top 10 for LLM checks. Other AI/ML services (Amazon Comprehend, Amazon Rekognition, Amazon Textract, and others) are not currently assessed.
 
 **AWS partition support.** The deployment and assessment are validated only in
 the standard AWS commercial partition (`aws`). AWS GovCloud (US)
@@ -318,11 +318,11 @@ enforced by default.
 
 | CloudFormation parameter | Default | Affected check | Behavior |
 | --- | --- | --- | --- |
-| `RequireBedrockZeroDataRetention` | `false` | BR-37 | When `true`, the Bedrock account retention modes `default` and `inherit` fail the explicit zero-data-retention baseline. `provider_data_share` fails regardless of this setting. |
+| `RequireBedrockZeroDataRetention` | `false` | BR-37 | No longer read. BR-37 fails `default`, `inherit` and `provider_data_share` at every setting, and passes only `none`. |
 | `RequireMarketplaceEndpointCMK` | `true` | BR-40 | When `true`, a Bedrock Marketplace model endpoint without a customer-managed KMS key fails. BR-40 uses `kms:DescribeKey` and requires `KeyManager=CUSTOMER`; AWS-managed keys do not pass. When `false`, a missing or AWS-managed key is reported as an informational `N/A` hardening advisory. |
-| `RequireAgentCoreOnlineEvaluation` | `false` | AC-17 | When `true`, missing or incomplete active AgentCore online evaluation coverage fails. When `false`, absent coverage is informational. |
+| `RequireAgentCoreOnlineEvaluation` | `false` | AC-17 | When `true`, a region with no AgentCore runtime fails unless a running online evaluation configuration exists. When `false`, that region is informational. Every runtime is judged either way. |
 | `RequireAgentRegistryCMK` | `false` | AR-05 | When `true`, registries using the default AWS owned encryption key fail. When `false`, AWS owned key encryption is reported as an informational hardening advisory; registries with a customer-managed KMS key pass. |
-| `AgentCoreTokenVaultId` | `default` | AC-14 | Selects the regional AgentCore Identity token vault whose customer-managed KMS encryption is assessed. |
+| `AgentCoreTokenVaultId` | `default` | AC-14 | Names a regional AgentCore Identity token vault whose customer-managed KMS encryption is assessed, beside every vault a credential provider ARN names. |
 | `ApprovedExternalAccountIds` | Empty | SM-30 | Comma-separated 12-digit AWS account IDs approved to receive SageMaker Model Registry access. Accounts outside the configured boundary fail. |
 | `ApprovedOrganizationIds` | Empty | SM-30 | Comma-separated AWS Organizations IDs approved to receive SageMaker Model Registry access. Organizations outside the configured boundary fail. |
 
@@ -636,9 +636,9 @@ If you need to reduce scope, review the role policies in:
 | Document | Description |
 | --- | --- |
 | [Changelog](CHANGELOG.md) | User-facing changes and required deployment actions for unreleased work and tagged versions |
-| [Security Checks Reference](docs/SECURITY_CHECKS.md) | Complete reference for all 273 security checks with severity levels |
+| [Security Checks Reference](docs/SECURITY_CHECKS.md) | Complete reference for all 274 security checks with severity levels |
 | [OWASP Top 10 for LLM Checks](docs/SECURITY_CHECKS_OWASP.md) | Complete OW-01..12 reference: mapping-derived OWASP LLM01..LLM10 rows, native LLM07 checks, source dependencies, references, and status semantics |
-| [AWS AI Security Framework (AISF) Checks](docs/SECURITY_CHECKS_AISF.md) | Complete AISF-00..08 reference: the AISF control each row reports on, the shipped checks each is derived from, severity and status semantics, and why these rows are excluded from the 273-check total |
+| [AWS AI Security Framework (AISF) Checks](docs/SECURITY_CHECKS_AISF.md) | Complete AISF-00..08 reference: the AISF control each row reports on, the shipped checks each is derived from, severity and status semantics, and why these rows are excluded from the 274-check total |
 | [Responsible AI GRC Scope](docs/RESPONSIBLE_AI_GRC_SCOPE.md) | What Responsible AI GRC is and is not, its relationship to the AWS Well-Architected Responsible AI Lens, the per-bucket source catalog, check-count reconciliation, terminology, and the compatibility policy for preserved identifiers |
 | [Responsible AI GRC Checks](docs/SECURITY_CHECKS_RESPONSIBLE_AI_GRC.md) | Complete FS-01..69 reference: shared introduction, severity rubric, upstream-overlap table, compliance framework mapping, and all check definitions (Part 1 infrastructure controls, Part 2 guardrails & content safety, Part 3 app-layer controls & gaps) |
 | [Responsible AI GRC Severity Methodology](docs/SECURITY_CHECKS_RESPONSIBLE_AI_GRC_SEVERITY_METHODOLOGY.md) | Likelihood × Impact → ASFF severity model, disposition rules, and research basis for FS check severities |
