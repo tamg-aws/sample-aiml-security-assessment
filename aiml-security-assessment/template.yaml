@@ -684,6 +684,7 @@ Resources:
                 - sagemaker:DescribeCluster
                 - sagemaker:GetModelPackageGroupPolicy
                 - sagemaker:DescribeUserProfile # SM-09
+                - sagemaker:DescribeInferenceComponent # SM-22
               Resource:
                 - !Sub 'arn:${AWS::Partition}:sagemaker:*:${AWS::AccountId}:notebook-instance/*'
                 - !Sub 'arn:${AWS::Partition}:sagemaker:*:${AWS::AccountId}:domain/*'
@@ -704,6 +705,7 @@ Resources:
                 - !Sub 'arn:${AWS::Partition}:sagemaker:*:${AWS::AccountId}:automl-job/*'
                 - !Sub 'arn:${AWS::Partition}:sagemaker:*:${AWS::AccountId}:cluster/*'
                 - !Sub 'arn:${AWS::Partition}:sagemaker:*:${AWS::AccountId}:user-profile/*/*'
+                - !Sub 'arn:${AWS::Partition}:sagemaker:*:${AWS::AccountId}:inference-component/*'
         - Statement:
             - Sid: GuardDutyInventoryPermissions
               Effect: Allow

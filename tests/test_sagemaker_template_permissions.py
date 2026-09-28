@@ -56,6 +56,7 @@ SCOPED_SAGEMAKER_GRANTS = {
     "s3:GetBucketPolicy": ":s3:::*'",
     "kms:DescribeKey": ":key/*'",
     "sagemaker:DescribeUserProfile": ":user-profile/*/*'",
+    "sagemaker:DescribeInferenceComponent": ":inference-component/*'",
     "cloudtrail:GetTrailStatus": ":cloudtrail:*:*:trail/*'",
     "cloudtrail:GetEventSelectors": ":cloudtrail:*:*:trail/*'",
     "config:DescribeConfigurationRecorderStatus": ":configuration-recorder/*/*'",

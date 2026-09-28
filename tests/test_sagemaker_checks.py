@@ -3239,7 +3239,7 @@ class TestSM22ApproverAttribution:
             assert_finding_schema(f)
 
     @patch("sagemaker_app.boto3.client")
-    def test_approval_description_alone_counts_as_attribution(self, mock_client):
+    def test_approval_description_alone_is_not_attribution(self, mock_client):
         self._registry(
             mock_client,
             {
@@ -3258,8 +3258,9 @@ class TestSM22ApproverAttribution:
             for f in findings
             if f["Finding"] == sagemaker_app.APPROVER_ATTRIBUTION_FINDING
         ]
-        assert [f["Status"] for f in rows] == ["Passed"]
+        assert [f["Status"] for f in rows] == ["Failed"]
         assert "CAB-4412" in rows[0]["Finding_Details"]
+        assert "free text, not an identity" in rows[0]["Finding_Details"]
 
     @patch("sagemaker_app.boto3.client")
     def test_iam_role_arn_counts_as_attribution(self, mock_client):
@@ -3287,7 +3288,7 @@ class TestSM22ApproverAttribution:
         assert "assumed-role/Approver" in rows[0]["Finding_Details"]
 
     @patch("sagemaker_app.boto3.client")
-    def test_describe_count_is_capped(self, mock_client):
+    def test_every_approved_version_is_described(self, mock_client):
         packages = {
             f"arn:aws:sagemaker:::model-package/fraud/{index}": {
                 "ModelPackageName": f"fraud/{index}",
@@ -3300,10 +3301,413 @@ class TestSM22ApproverAttribution:
         extract_csv_data(
             sagemaker_app.check_model_approval_workflow(region="us-east-1")
         )
-        assert (
-            mock_sm.describe_model_package.call_count
-            == sagemaker_app.MAX_APPROVAL_ATTRIBUTION_DESCRIBES
+        assert mock_sm.describe_model_package.call_count == 40
+        failed = [
+            f
+            for f in extract_csv_data(
+                sagemaker_app.check_model_approval_workflow(region="us-east-1")
+            )
+            if f["Finding"] == sagemaker_app.APPROVER_ATTRIBUTION_FINDING
+            and f["Status"] == "Failed"
+        ]
+        assert "40 approved model package versions record no approver" in " ".join(
+            f["Finding_Details"] for f in failed
         )
+
+
+class TestSM22RegistryLegs:
+    """AIR-SGM-GOV-01: SM-22 reads the approver, the lifecycle stage, the
+    serving models' registry origin and RAM sharing, and never passes on an
+    unread leg."""
+
+    APPROVER = {"IamIdentity": {"Arn": "arn:aws:sts::123456789012:assumed-role/A/x"}}
+    STAGED = {"Stage": "Production", "StageStatus": "Approved"}
+
+    @staticmethod
+    def _client(
+        mock_client,
+        packages,
+        groups=("fraud",),
+        endpoints=None,
+        models=None,
+        components=None,
+        ram=None,
+        errors=None,
+    ):
+        errors = errors or {}
+        endpoints = endpoints or {}
+        models = models or {}
+        components = components or {}
+        ram = ram if ram is not None else {"SELF": ["arn:grp"], "OTHER-ACCOUNTS": []}
+        mock_sm = MagicMock()
+        mock_ram = MagicMock()
+        mock_client.side_effect = lambda service, **_: (
+            mock_ram if service == "ram" else mock_sm
+        )
+
+        def fail(name):
+            if name in errors:
+                raise _make_client_error(errors[name], name)
+
+        def sm_paginator(name):
+            pager = MagicMock()
+
+            def paginate(**kwargs):
+                fail(name)
+                if name == "list_model_package_groups":
+                    return [
+                        {
+                            "ModelPackageGroupSummaryList": [
+                                {"ModelPackageGroupName": g} for g in groups
+                            ]
+                        }
+                    ]
+                if name == "list_model_packages":
+                    group = kwargs["ModelPackageGroupName"]
+                    return [
+                        {
+                            "ModelPackageSummaryList": [
+                                {
+                                    "ModelPackageArn": arn,
+                                    "ModelApprovalStatus": detail.get(
+                                        "ModelApprovalStatus", "Approved"
+                                    ),
+                                }
+                                for arn, detail in packages.items()
+                                if detail.get("ModelPackageGroupName", "fraud") == group
+                            ]
+                        }
+                    ]
+                if name == "list_endpoints":
+                    return [{"Endpoints": [{"EndpointName": e} for e in endpoints]}]
+                if name == "list_inference_components":
+                    key = (kwargs["EndpointNameEquals"], kwargs["VariantNameEquals"])
+                    return [
+                        {
+                            "InferenceComponents": [
+                                {"InferenceComponentName": c}
+                                for c in components.get(key, {})
+                            ]
+                        }
+                    ]
+                return [{}]
+
+            pager.paginate.side_effect = paginate
+            return pager
+
+        mock_sm.get_paginator.side_effect = sm_paginator
+
+        def describe_model_package(ModelPackageName):
+            fail("describe_model_package")
+            return packages[ModelPackageName]
+
+        mock_sm.describe_model_package.side_effect = describe_model_package
+        mock_sm.describe_endpoint.side_effect = lambda EndpointName: {
+            "EndpointConfigName": f"{EndpointName}-config"
+        }
+        mock_sm.describe_endpoint_config.side_effect = lambda EndpointConfigName: {
+            "ProductionVariants": endpoints[EndpointConfigName[: -len("-config")]]
+        }
+
+        def describe_model(ModelName):
+            fail("describe_model")
+            return models[ModelName]
+
+        mock_sm.describe_model.side_effect = describe_model
+        mock_sm.describe_inference_component.side_effect = (
+            lambda InferenceComponentName: {
+                "Specification": {
+                    "ModelName": {
+                        c: m for v in components.values() for c, m in v.items()
+                    }[InferenceComponentName]
+                }
+            }
+        )
+
+        ram_pager = MagicMock()
+
+        def ram_paginate(resourceOwner, resourceType):
+            fail("ram_list_resources")
+            assert resourceType == "sagemaker:ModelPackageGroup"
+            return [{"resources": [{"arn": a} for a in ram[resourceOwner]]}]
+
+        ram_pager.paginate.side_effect = ram_paginate
+        mock_ram.get_paginator.return_value = ram_pager
+        return mock_sm
+
+    @classmethod
+    def _good_package(cls, **extra):
+        detail = {
+            "ModelPackageName": "fraud/1",
+            "ModelPackageGroupName": "fraud",
+            "ModelApprovalStatus": "Approved",
+            "LastModifiedBy": cls.APPROVER,
+            "ModelLifeCycle": cls.STAGED,
+        }
+        detail.update(extra)
+        return detail
+
+    @staticmethod
+    def _rows(finding=None):
+        rows = extract_csv_data(
+            sagemaker_app.check_model_approval_workflow(region="us-east-1")
+        )
+        for row in rows:
+            assert_finding_schema(row)
+        if finding is None:
+            return rows
+        return [r for r in rows if r["Finding"].startswith(finding)]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_clean_registry_passes_every_leg(self, mock_client):
+        self._client(
+            mock_client,
+            {"p1": self._good_package()},
+            endpoints={"ep": [{"VariantName": "v", "ModelName": "m1"}]},
+            models={"m1": {"PrimaryContainer": {"ModelPackageName": "p1"}}},
+        )
+        rows = self._rows()
+        assert not [r for r in rows if r["Status"] not in ("Passed",)], [
+            (r["Finding"], r["Status"], r["Finding_Details"]) for r in rows
+        ]
+        names = {r["Finding"] for r in rows}
+        assert {
+            sagemaker_app.MODEL_LIFECYCLE_FINDING,
+            sagemaker_app.DEPLOYED_MODEL_REGISTRATION_FINDING,
+            sagemaker_app.REGISTRY_SHARING_FINDING,
+            sagemaker_app.APPROVER_ATTRIBUTION_FINDING,
+        } <= names
+
+    @patch("sagemaker_app.boto3.client")
+    def test_created_by_only_is_failed_and_names_the_registrant(self, mock_client):
+        self._client(
+            mock_client,
+            {
+                "p1": self._good_package(),
+                "p2": self._good_package(
+                    ModelPackageName="fraud/2",
+                    LastModifiedBy={},
+                    CreatedBy={"UserProfileName": "registrant-bob"},
+                ),
+            },
+        )
+        rows = self._rows(sagemaker_app.APPROVER_ATTRIBUTION_FINDING)
+        failed = [r for r in rows if r["Status"] == "Failed"]
+        assert len(failed) == 1
+        assert "fraud/2" in failed[0]["Finding_Details"]
+        assert "registrant-bob" in failed[0]["Finding_Details"]
+        assert "records no approver" in failed[0]["Finding_Details"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_one_unstaged_version_among_staged_fails_lifecycle(self, mock_client):
+        self._client(
+            mock_client,
+            {
+                "p1": self._good_package(),
+                "p2": self._good_package(ModelPackageName="fraud/2"),
+                "p3": self._good_package(
+                    ModelPackageName="fraud/3", ModelLifeCycle={"Stage": "Dev"}
+                ),
+            },
+        )
+        rows = self._rows(sagemaker_app.MODEL_LIFECYCLE_FINDING)
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "1 of 3" in rows[0]["Finding_Details"]
+        assert "fraud/3" in rows[0]["Finding_Details"]
+        assert "fraud/2" not in rows[0]["Finding_Details"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_one_unregistered_model_among_registered_fails(self, mock_client):
+        self._client(
+            mock_client,
+            {"p1": self._good_package()},
+            endpoints={
+                "ep1": [{"VariantName": "v", "ModelName": "m1"}],
+                "ep2": [
+                    {"VariantName": "a", "ModelName": "m1"},
+                    {"VariantName": "b", "ModelName": "m2"},
+                ],
+            },
+            models={
+                "m1": {"PrimaryContainer": {"ModelPackageName": "p1"}},
+                "m2": {
+                    "Containers": [
+                        {"ModelPackageName": "p1"},
+                        {"Image": "123.dkr.ecr/x", "ModelDataUrl": "s3://b/k"},
+                    ]
+                },
+            },
+        )
+        rows = self._rows(sagemaker_app.DEPLOYED_MODEL_REGISTRATION_FINDING)
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "'m2'" in rows[0]["Finding_Details"]
+        assert "ep2/b" in rows[0]["Finding_Details"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_model_from_unapproved_package_fails(self, mock_client):
+        self._client(
+            mock_client,
+            {
+                "p1": self._good_package(),
+                "p2": self._good_package(
+                    ModelPackageName="fraud/2",
+                    ModelApprovalStatus="PendingManualApproval",
+                ),
+            },
+            endpoints={
+                "ep": [
+                    {"VariantName": "a", "ModelName": "m1"},
+                    {"VariantName": "b", "ModelName": "m2"},
+                ]
+            },
+            models={
+                "m1": {"PrimaryContainer": {"ModelPackageName": "p1"}},
+                "m2": {"PrimaryContainer": {"ModelPackageName": "p2"}},
+            },
+        )
+        rows = self._rows(sagemaker_app.DEPLOYED_MODEL_REGISTRATION_FINDING)
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "PendingManualApproval" in rows[0]["Finding_Details"]
+        assert "'m2'" in rows[0]["Finding_Details"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_inference_component_model_is_followed(self, mock_client):
+        self._client(
+            mock_client,
+            {"p1": self._good_package()},
+            endpoints={"ep": [{"VariantName": "v"}]},
+            components={("ep", "v"): {"ic-good": "m1", "ic-bad": "m2"}},
+            models={
+                "m1": {"PrimaryContainer": {"ModelPackageName": "p1"}},
+                "m2": {"PrimaryContainer": {"Image": "img"}},
+            },
+        )
+        rows = self._rows(sagemaker_app.DEPLOYED_MODEL_REGISTRATION_FINDING)
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "ep/v/ic-bad" in rows[0]["Finding_Details"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_inference_component_list_denied_is_not_a_pass(self, mock_client):
+        self._client(
+            mock_client,
+            {"p1": self._good_package()},
+            endpoints={"ep": [{"VariantName": "v"}]},
+            errors={"list_inference_components": "AccessDeniedException"},
+        )
+        rows = self._rows(sagemaker_app.DEPLOYED_MODEL_REGISTRATION_FINDING)
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert "ep/v" in rows[0]["Finding_Details"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_describe_model_denied_withholds_the_pass(self, mock_client):
+        self._client(
+            mock_client,
+            {"p1": self._good_package()},
+            endpoints={"ep": [{"VariantName": "v", "ModelName": "m1"}]},
+            models={"m1": {"PrimaryContainer": {"ModelPackageName": "p1"}}},
+            errors={"describe_model": "AccessDeniedException"},
+        )
+        rows = self._rows(sagemaker_app.DEPLOYED_MODEL_REGISTRATION_FINDING)
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert "m1" in rows[0]["Finding_Details"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_list_endpoints_denied_is_not_read(self, mock_client):
+        self._client(
+            mock_client,
+            {"p1": self._good_package()},
+            errors={"list_endpoints": "AccessDeniedException"},
+        )
+        rows = self._rows(sagemaker_app.DEPLOYED_MODEL_REGISTRATION_FINDING)
+        assert [r["Status"] for r in rows] == ["N/A"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_no_endpoints_adds_no_deployment_row(self, mock_client):
+        self._client(mock_client, {"p1": self._good_package()})
+        assert self._rows(sagemaker_app.DEPLOYED_MODEL_REGISTRATION_FINDING) == []
+
+    @patch("sagemaker_app.boto3.client")
+    def test_describe_package_denied_withholds_the_aggregate_pass(self, mock_client):
+        self._client(
+            mock_client,
+            {"p1": self._good_package()},
+            errors={"describe_model_package": "AccessDeniedException"},
+        )
+        rows = self._rows("Model Approval Workflow Check")
+        assert "Passed" not in [r["Status"] for r in rows]
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert "p1" in rows[0]["Finding_Details"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_list_packages_denied_withholds_the_aggregate_pass(self, mock_client):
+        self._client(
+            mock_client,
+            {"p1": self._good_package()},
+            errors={"list_model_packages": "AccessDeniedException"},
+        )
+        rows = self._rows("Model Approval Workflow Check")
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert "fraud" in rows[0]["Finding_Details"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_group_list_denied_is_not_read(self, mock_client):
+        self._client(
+            mock_client,
+            {},
+            errors={"list_model_package_groups": "AccessDeniedException"},
+        )
+        rows = self._rows("Model Approval Workflow Check")
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert "ListModelPackageGroups" in rows[0]["Finding_Details"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_no_groups_and_nothing_shared_is_failed(self, mock_client):
+        self._client(mock_client, {}, groups=(), ram={"SELF": [], "OTHER-ACCOUNTS": []})
+        rows = self._rows("Model Approval Workflow Check")
+        assert [r["Status"] for r in rows] == ["Failed"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_no_groups_with_shared_in_group_passes(self, mock_client):
+        self._client(
+            mock_client,
+            {},
+            groups=(),
+            ram={"SELF": [], "OTHER-ACCOUNTS": ["arn:aws:sagemaker:::grp/central"]},
+        )
+        rows = self._rows("Model Approval Workflow Check")
+        assert [r["Status"] for r in rows] == ["Passed"]
+        assert "central" in rows[0]["Finding_Details"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_no_groups_and_ram_denied_is_not_read(self, mock_client):
+        self._client(
+            mock_client,
+            {},
+            groups=(),
+            errors={"ram_list_resources": "AccessDeniedException"},
+        )
+        rows = self._rows("Model Approval Workflow Check")
+        assert [r["Status"] for r in rows] == ["N/A"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_unshared_registry_fails_sharing(self, mock_client):
+        self._client(
+            mock_client,
+            {"p1": self._good_package()},
+            ram={"SELF": [], "OTHER-ACCOUNTS": []},
+        )
+        rows = self._rows(sagemaker_app.REGISTRY_SHARING_FINDING)
+        assert [r["Status"] for r in rows] == ["Failed"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_ram_denied_sharing_is_not_read(self, mock_client):
+        self._client(
+            mock_client,
+            {"p1": self._good_package()},
+            errors={"ram_list_resources": "AccessDeniedException"},
+        )
+        rows = self._rows(sagemaker_app.REGISTRY_SHARING_FINDING)
+        assert [r["Status"] for r in rows] == ["N/A"]
 
 
 class TestSM31EndpointDataCapture:

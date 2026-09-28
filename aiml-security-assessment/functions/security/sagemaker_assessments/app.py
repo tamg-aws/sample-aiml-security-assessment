@@ -6515,17 +6515,27 @@ APPROVER_ATTRIBUTION_RESOLUTION = (
     "auditable approver."
 )
 
-# Reading approver metadata costs one DescribeModelPackage per approved version.
-# The registry has no bulk read for it, so the sample is bounded and the finding
-# says how many versions it covered.
-MAX_APPROVAL_ATTRIBUTION_DESCRIBES = 25
+MODEL_LIFECYCLE_FINDING = "Model Registry Lifecycle Stage"
+MODEL_LIFECYCLE_REFERENCE = (
+    "https://docs.aws.amazon.com/sagemaker/latest/dg/"
+    "model-registry-staging-construct.html"
+)
+DEPLOYED_MODEL_REGISTRATION_FINDING = "Deployed Model Registration"
+DEPLOYED_MODEL_REGISTRATION_REFERENCE = (
+    "https://docs.aws.amazon.com/sagemaker/latest/dg/model-registry-deploy.html"
+)
+REGISTRY_SHARING_FINDING = "Model Registry Cross-Account Visibility"
+REGISTRY_SHARING_REFERENCE = (
+    "https://docs.aws.amazon.com/sagemaker/latest/dg/model-registry-ram.html"
+)
+MODEL_PACKAGE_GROUP_RAM_TYPE = "sagemaker:ModelPackageGroup"
+MODEL_APPROVAL_REFERENCE = (
+    "https://docs.aws.amazon.com/sagemaker/latest/dg/model-registry-approve.html"
+)
 
 
-def _approver_attribution(model_package_detail: Dict[str, Any]) -> Optional[str]:
-    """Return the recorded approver of a model package version, if there is one."""
-    context = model_package_detail.get("LastModifiedBy") or model_package_detail.get(
-        "CreatedBy"
-    )
+def _user_context_identity(context: Any) -> Optional[str]:
+    """Return the identity a SageMaker UserContext names, if there is one."""
     if isinstance(context, dict):
         user_profile = context.get("UserProfileName")
         if user_profile:
@@ -6539,6 +6549,40 @@ def _approver_attribution(model_package_detail: Dict[str, Any]) -> Optional[str]
             if arn:
                 return arn
     return None
+
+
+def _approver_attribution(model_package_detail: Dict[str, Any]) -> Optional[str]:
+    """
+    Return the recorded approver of a model package version, if there is one.
+
+    Approval is applied through UpdateModelPackage, so the approver is the last
+    modifier. CreatedBy names the registrant and is not read as the approver.
+    """
+    return _user_context_identity(model_package_detail.get("LastModifiedBy"))
+
+
+def _unapproved_reason(model_package_detail: Dict[str, Any]) -> str:
+    """Say why an approved version records no approver."""
+    parts = []
+    registrant = _user_context_identity(model_package_detail.get("CreatedBy"))
+    if registrant:
+        parts.append(
+            "LastModifiedBy carries no identity, so no UpdateModelPackage call "
+            f"recorded an approver; CreatedBy names only the registrant {registrant}"
+        )
+    else:
+        parts.append(
+            "LastModifiedBy and CreatedBy carry no user profile, source identity "
+            "or IAM ARN"
+        )
+    description = (model_package_detail.get("ApprovalDescription") or "").strip()
+    if description:
+        parts.append(
+            f"ApprovalDescription '{description[:60]}' is free text, not an identity"
+        )
+    else:
+        parts.append("ApprovalDescription is empty")
+    return ", and ".join(parts)
 
 
 def _approval_attribution_findings(
@@ -6565,9 +6609,7 @@ def _approval_attribution_findings(
                 finding_name=APPROVER_ATTRIBUTION_FINDING,
                 finding_details=(
                     f"Approved model package '{entry['name']}' in group "
-                    f"'{entry['group']}' records no approver: LastModifiedBy and "
-                    "CreatedBy carry no user profile, source identity or IAM ARN, "
-                    "and ApprovalDescription is empty."
+                    f"'{entry['group']}' records no approver: {entry['reason']}."
                 ),
                 resolution=APPROVER_ATTRIBUTION_RESOLUTION,
                 reference=APPROVER_ATTRIBUTION_REFERENCE,
@@ -6620,6 +6662,301 @@ def _approval_attribution_findings(
     return emitted
 
 
+def _lifecycle_finding(
+    unstaged: List[str], examined: int, region: str
+) -> Dict[str, Any]:
+    """Report whether each approved version carries a ModelLifeCycle stage."""
+    if unstaged:
+        return create_finding(
+            check_id="SM-22",
+            finding_name=MODEL_LIFECYCLE_FINDING,
+            finding_details=(
+                f"{len(unstaged)} of {examined} approved model package versions "
+                "carry no ModelLifeCycle Stage and StageStatus, so the registry "
+                "holds their current approval status but no staging history: "
+                f"{', '.join(unstaged[:10])}."
+            ),
+            resolution=(
+                "Set ModelLifeCycle (Stage, StageStatus, StageDescription) with "
+                "UpdateModelPackage at each promotion so the transition is recorded "
+                "on the package and emitted to EventBridge."
+            ),
+            reference=MODEL_LIFECYCLE_REFERENCE,
+            severity="Low",
+            status="Failed",
+            region=region,
+        )
+    return create_finding(
+        check_id="SM-22",
+        finding_name=MODEL_LIFECYCLE_FINDING,
+        finding_details=(
+            f"All {examined} approved model package versions carry a ModelLifeCycle "
+            "Stage and StageStatus."
+        ),
+        resolution="No action required",
+        reference=MODEL_LIFECYCLE_REFERENCE,
+        severity="Low",
+        status="Passed",
+        region=region,
+    )
+
+
+def _registry_sharing(region: str) -> Dict[str, Any]:
+    """Read model package groups shared through AWS RAM, in both directions."""
+    try:
+        ram_client = boto3.client("ram", config=boto3_config, region_name=region)
+        result = {}
+        for owner, key in (("SELF", "shared_out"), ("OTHER-ACCOUNTS", "shared_in")):
+            arns = []
+            for page in ram_client.get_paginator("list_resources").paginate(
+                resourceOwner=owner, resourceType=MODEL_PACKAGE_GROUP_RAM_TYPE
+            ):
+                arns.extend(str(item.get("arn")) for item in page.get("resources", []))
+            result[key] = sorted(set(arns))
+        return result
+    except Exception as error:
+        return {"error": f"ram:ListResources {get_assessment_error_label(error)}"}
+
+
+def _registry_sharing_finding(
+    sharing: Dict[str, Any], groups: int, region: str
+) -> Dict[str, Any]:
+    if "error" in sharing:
+        return _unread_resources_finding(
+            "SM-22",
+            REGISTRY_SHARING_FINDING,
+            [sharing["error"]],
+            f"{groups} model package group(s) were read.",
+            REGISTRY_SHARING_REFERENCE,
+            region,
+        )
+    shared = sharing["shared_out"] + sharing["shared_in"]
+    if shared:
+        return create_finding(
+            check_id="SM-22",
+            finding_name=REGISTRY_SHARING_FINDING,
+            finding_details=(
+                f"{len(sharing['shared_out'])} model package group(s) are shared "
+                f"from this account and {len(sharing['shared_in'])} are shared with "
+                f"it through AWS RAM: {', '.join(shared[:5])}."
+            ),
+            resolution="No action required",
+            reference=REGISTRY_SHARING_REFERENCE,
+            severity="Low",
+            status="Passed",
+            region=region,
+        )
+    return create_finding(
+        check_id="SM-22",
+        finding_name=REGISTRY_SHARING_FINDING,
+        finding_details=(
+            f"None of the {groups} model package group(s) is shared through AWS "
+            "RAM, and none is shared with this account, so the registry is visible "
+            "only to principals in this account."
+        ),
+        resolution=(
+            "Share the model package groups other accounts deploy from with AWS "
+            "RAM so the registry is the record those accounts read."
+        ),
+        reference=REGISTRY_SHARING_REFERENCE,
+        severity="Low",
+        status="Failed",
+        region=region,
+    )
+
+
+def _endpoint_variant_models(
+    sagemaker_client: Any, unread: List[str]
+) -> Tuple[Dict[str, List[str]], int]:
+    """Map each model serving on an endpoint to the endpoint/variant labels."""
+    models = {}
+    endpoints = 0
+    for page in sagemaker_client.get_paginator("list_endpoints").paginate():
+        for summary in page.get("Endpoints", []):
+            endpoint = summary.get("EndpointName")
+            endpoints += 1
+            try:
+                config_name = sagemaker_client.describe_endpoint(
+                    EndpointName=endpoint
+                ).get("EndpointConfigName")
+                variants = sagemaker_client.describe_endpoint_config(
+                    EndpointConfigName=config_name
+                ).get("ProductionVariants", [])
+            except Exception as error:
+                unread.append(
+                    f"endpoint {endpoint} ({get_assessment_error_label(error)})"
+                )
+                continue
+            for variant in variants:
+                label = f"{endpoint}/{variant.get('VariantName')}"
+                if variant.get("ModelName"):
+                    models.setdefault(variant["ModelName"], []).append(label)
+                    continue
+                # A variant with no ModelName hosts inference components, each of
+                # which names its own model.
+                try:
+                    for ic_page in sagemaker_client.get_paginator(
+                        "list_inference_components"
+                    ).paginate(
+                        EndpointNameEquals=endpoint,
+                        VariantNameEquals=variant.get("VariantName"),
+                    ):
+                        for component in ic_page.get("InferenceComponents", []):
+                            name = component.get("InferenceComponentName")
+                            spec = (
+                                sagemaker_client.describe_inference_component(
+                                    InferenceComponentName=name
+                                ).get("Specification")
+                                or {}
+                            )
+                            if spec.get("ModelName"):
+                                models.setdefault(spec["ModelName"], []).append(
+                                    f"{label}/{name}"
+                                )
+                except Exception as error:
+                    unread.append(
+                        f"inference components of {label} "
+                        f"({get_assessment_error_label(error)})"
+                    )
+    return models, endpoints
+
+
+def _deployed_model_registration_findings(
+    sagemaker_client: Any, region: str
+) -> List[Dict[str, Any]]:
+    """
+    Report whether every model serving on an endpoint was created from an
+    Approved version in a model package group.
+    """
+    unread = []
+    try:
+        models, endpoints = _endpoint_variant_models(sagemaker_client, unread)
+    except Exception as error:
+        return [
+            _unread_resources_finding(
+                "SM-22",
+                DEPLOYED_MODEL_REGISTRATION_FINDING,
+                [f"sagemaker:ListEndpoints ({get_assessment_error_label(error)})"],
+                "no endpoint was read.",
+                DEPLOYED_MODEL_REGISTRATION_REFERENCE,
+                region,
+            )
+        ]
+    if not endpoints:
+        return []
+    problems = []
+    registered = 0
+    for model_name, labels in sorted(models.items()):
+        where = ", ".join(labels[:3])
+        try:
+            model = sagemaker_client.describe_model(ModelName=model_name)
+        except Exception as error:
+            unread.append(f"model {model_name} ({get_assessment_error_label(error)})")
+            continue
+        containers = [model.get("PrimaryContainer")] + list(
+            model.get("Containers") or []
+        )
+        containers = [container for container in containers if container]
+        packages = [container.get("ModelPackageName") for container in containers]
+        if not containers or not all(packages):
+            problems.append(
+                f"model '{model_name}' on {where} has a container with no "
+                "ModelPackageName, so it was not created from the registry"
+            )
+            continue
+        verdicts = []
+        for package in packages:
+            try:
+                detail = sagemaker_client.describe_model_package(
+                    ModelPackageName=package
+                )
+            except Exception as error:
+                unread.append(
+                    f"model package {package} ({get_assessment_error_label(error)})"
+                )
+                verdicts.append(None)
+                continue
+            if not detail.get("ModelPackageGroupName"):
+                verdicts.append(f"package {package} belongs to no model package group")
+            elif detail.get("ModelApprovalStatus") != "Approved":
+                verdicts.append(
+                    f"package {package} is "
+                    f"{detail.get('ModelApprovalStatus') or 'without an approval status'}"
+                )
+            else:
+                verdicts.append("")
+        failures = [verdict for verdict in verdicts if verdict]
+        if failures:
+            problems.append(f"model '{model_name}' on {where}: {'; '.join(failures)}")
+        elif None not in verdicts:
+            registered += 1
+    rows = []
+    for problem in problems[:20]:
+        rows.append(
+            create_finding(
+                check_id="SM-22",
+                finding_name=DEPLOYED_MODEL_REGISTRATION_FINDING,
+                finding_details=f"Deployed {problem}.",
+                resolution=(
+                    "Deploy only models created from an Approved model package "
+                    "version (CreateModel with ModelPackageName), so each serving "
+                    "model has a registry entry with its approval status and "
+                    "approver."
+                ),
+                reference=DEPLOYED_MODEL_REGISTRATION_REFERENCE,
+                severity="Medium",
+                status="Failed",
+                region=region,
+            )
+        )
+    if len(problems) > 20:
+        rows.append(
+            create_finding(
+                check_id="SM-22",
+                finding_name=DEPLOYED_MODEL_REGISTRATION_FINDING,
+                finding_details=(
+                    f"{len(problems)} deployed models are unregistered or "
+                    "unapproved (the first 20 are reported individually above)."
+                ),
+                resolution="Deploy only models created from an Approved model package version.",
+                reference=DEPLOYED_MODEL_REGISTRATION_REFERENCE,
+                severity="Medium",
+                status="Failed",
+                region=region,
+            )
+        )
+    if unread:
+        rows.append(
+            _unread_resources_finding(
+                "SM-22",
+                DEPLOYED_MODEL_REGISTRATION_FINDING,
+                unread,
+                f"{endpoints} endpoint(s) and {len(models)} serving model(s) were "
+                "found.",
+                DEPLOYED_MODEL_REGISTRATION_REFERENCE,
+                region,
+            )
+        )
+    elif not problems:
+        rows.append(
+            create_finding(
+                check_id="SM-22",
+                finding_name=DEPLOYED_MODEL_REGISTRATION_FINDING,
+                finding_details=(
+                    f"All {registered} model(s) serving on the {endpoints} endpoint(s) "
+                    "read were created from an Approved version in a model package "
+                    "group. Batch transform jobs are not part of this population."
+                ),
+                resolution="No action required",
+                reference=DEPLOYED_MODEL_REGISTRATION_REFERENCE,
+                severity="Medium",
+                status="Passed",
+                region=region,
+            )
+        )
+    return rows
+
+
 def check_model_approval_workflow(region: str = "") -> Dict[str, Any]:
     """
     Check if Model Registry has proper approval workflows configured.
@@ -6643,6 +6980,9 @@ def check_model_approval_workflow(region: str = "") -> Dict[str, Any]:
         approvals_with_approver = []
         approvals_without_approver = []
         approval_versions_examined = 0
+        unstaged_versions = []
+        unread = []
+        group_list_error = None
 
         try:
             paginator = sagemaker_client.get_paginator("list_model_package_groups")
@@ -6691,13 +7031,9 @@ def check_model_approval_workflow(region: str = "") -> Dict[str, Any]:
                                 )
 
                             # AIR-SGM-GOV-01 asks who approved each version,
-                            # which only DescribeModelPackage answers.
+                            # which only DescribeModelPackage answers, so every
+                            # approved version is described.
                             for model in model_packages:
-                                if (
-                                    approval_versions_examined
-                                    >= MAX_APPROVAL_ATTRIBUTION_DESCRIBES
-                                ):
-                                    break
                                 if model.get("ModelApprovalStatus") != "Approved":
                                     continue
                                 package_id = model.get("ModelPackageArn") or model.get(
@@ -6714,6 +7050,10 @@ def check_model_approval_workflow(region: str = "") -> Dict[str, Any]:
                                         "Error describing model package "
                                         f"{package_id}: {str(error)}"
                                     )
+                                    unread.append(
+                                        f"sagemaker:DescribeModelPackage {package_id} "
+                                        f"({get_assessment_error_label(error)})"
+                                    )
                                     continue
                                 approval_versions_examined += 1
                                 version_label = (
@@ -6722,7 +7062,6 @@ def check_model_approval_workflow(region: str = "") -> Dict[str, Any]:
                                     or package_id
                                 )
                                 approver = _approver_attribution(detail)
-                                description = detail.get("ApprovalDescription") or ""
                                 if approver:
                                     approvals_with_approver.append(
                                         {
@@ -6731,21 +7070,20 @@ def check_model_approval_workflow(region: str = "") -> Dict[str, Any]:
                                             "approver": approver,
                                         }
                                     )
-                                elif description.strip():
-                                    approvals_with_approver.append(
+                                else:
+                                    approvals_without_approver.append(
                                         {
                                             "name": version_label,
                                             "group": group_name,
-                                            "approver": (
-                                                "ApprovalDescription "
-                                                f"'{description.strip()[:60]}'"
-                                            ),
+                                            "reason": _unapproved_reason(detail),
                                         }
                                     )
-                                else:
-                                    approvals_without_approver.append(
-                                        {"name": version_label, "group": group_name}
-                                    )
+                                lifecycle = detail.get("ModelLifeCycle") or {}
+                                if not (
+                                    lifecycle.get("Stage")
+                                    and lifecycle.get("StageStatus")
+                                ):
+                                    unstaged_versions.append(version_label)
 
                             # Check for models stuck in pending
                             if pending_count > 5:
@@ -6762,20 +7100,59 @@ def check_model_approval_workflow(region: str = "") -> Dict[str, Any]:
                             logger.warning(
                                 f"Error checking model group {group_name}: {str(e)}"
                             )
+                            unread.append(
+                                f"sagemaker:ListModelPackages {group_name} "
+                                f"({get_assessment_error_label(e)})"
+                            )
 
         except Exception as e:
             logger.error(f"Error listing model package groups: {str(e)}")
+            group_list_error = get_assessment_error_label(e)
+            unread.append(f"sagemaker:ListModelPackageGroups ({group_list_error})")
 
-        if groups_checked == 0:
+        sharing = _registry_sharing(region)
+
+        if groups_checked == 0 and group_list_error:
+            pass
+        elif groups_checked == 0 and sharing.get("shared_in"):
             findings["csv_data"].append(
                 create_finding(
                     check_id="SM-22",
                     finding_name="Model Approval Workflow Check",
-                    finding_details="No model package groups found. Model Registry is not being used for model governance.",
+                    finding_details=(
+                        "This account registers no model package group of its own "
+                        f"and reads {len(sharing['shared_in'])} group(s) shared "
+                        "with it through AWS RAM: "
+                        f"{', '.join(sharing['shared_in'][:5])}. The approval "
+                        "record for those groups is read in the owning account."
+                    ),
+                    resolution="No action required",
+                    reference=MODEL_APPROVAL_REFERENCE,
+                    severity="Medium",
+                    status="Passed",
+                    region=region,
+                )
+            )
+        elif groups_checked == 0:
+            findings["csv_data"].append(
+                create_finding(
+                    check_id="SM-22",
+                    finding_name="Model Approval Workflow Check",
+                    finding_details=(
+                        "No model package groups found, and "
+                        + (
+                            "no group is shared with this account through AWS RAM"
+                            if "error" not in sharing
+                            else f"AWS RAM sharing was not read ({sharing['error']})"
+                        )
+                        + ". Model Registry is not being used for model governance, "
+                        "so no model version, approval status or approver is "
+                        "recorded."
+                    ),
                     resolution="Implement Model Registry to track model versions and enforce approval workflows before production deployment.",
-                    reference="https://docs.aws.amazon.com/sagemaker/latest/dg/model-registry-approve.html",
-                    severity="Informational",
-                    status="N/A",
+                    reference=MODEL_APPROVAL_REFERENCE,
+                    severity="Medium",
+                    status="Failed" if "error" not in sharing else "N/A",
                     region=region,
                 )
             )
@@ -6796,7 +7173,7 @@ def check_model_approval_workflow(region: str = "") -> Dict[str, Any]:
                         region=region,
                     )
                 )
-        else:
+        elif not unread:
             findings["csv_data"].append(
                 create_finding(
                     check_id="SM-22",
@@ -6818,6 +7195,31 @@ def check_model_approval_workflow(region: str = "") -> Dict[str, Any]:
                 region,
             )
         )
+        if approval_versions_examined:
+            findings["csv_data"].append(
+                _lifecycle_finding(
+                    unstaged_versions, approval_versions_examined, region
+                )
+            )
+        findings["csv_data"].extend(
+            _deployed_model_registration_findings(sagemaker_client, region)
+        )
+        if groups_checked:
+            findings["csv_data"].append(
+                _registry_sharing_finding(sharing, groups_checked, region)
+            )
+        if unread:
+            findings["csv_data"].append(
+                _unread_resources_finding(
+                    "SM-22",
+                    "Model Approval Workflow Check",
+                    unread,
+                    f"{groups_checked} model package group(s) and "
+                    f"{approval_versions_examined} approved version(s) were read.",
+                    MODEL_APPROVAL_REFERENCE,
+                    region,
+                )
+            )
 
         return findings
 

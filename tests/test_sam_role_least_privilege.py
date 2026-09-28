@@ -285,6 +285,7 @@ _EXPECTED_ACTIONS = {
         "cloudtrail:GetEventSelectors",
         "config:DescribeConfigurationRecorderStatus",
         "config:DescribeConformancePackCompliance",
+        "sagemaker:DescribeInferenceComponent",
     },
     "AgentCoreSecurityAssessmentFunction": {
         "bedrock-agentcore:GetAgentRuntime",
