@@ -277,9 +277,7 @@ section.
   rollout that does not report `requireServiceS3Endpoint`, since an unset
   field keeps the service-managed Amazon S3 gateway. A runtime that
   `GetAgentRuntime` cannot find is now `N/A` by name; it was dropped, and the
-  `Passed` row reported all runtimes without it. The assessment roles hold no
-  `bedrock-agentcore:ListAgentRuntimeVersions` grant, so each runtime is `N/A`
-  naming that action until it is added.
+  `Passed` row reported all runtimes without it. A denied `bedrock-agentcore:ListAgentRuntimeVersions` read makes each runtime `N/A` naming that action.
 - `AC-19` reads the region's X-Ray trace segment destination when AgentCore
   runtimes, gateways or memories exist, and fails `XRay`, because AgentCore
   tracing needs CloudWatch Transaction Search, which sends segments to
@@ -300,8 +298,7 @@ section.
   Alerting` row: the account needs a Cost Anomaly Detection subscription that
   notifies someone about a monitor for every AWS service. The check reported
   that no cost limit could be read. The AgentCore assessment role gains
-  `ce:GetAnomalySubscriptions`. It holds no `ce:GetAnomalyMonitors` grant, so
-  the row is `N/A` naming that action until it is added.
+  `ce:GetAnomalySubscriptions`. A denied `ce:GetAnomalyMonitors` read makes the row `N/A` naming that action.
 - `AC-06` reads the recording account's Block Public Access settings when the
   recording bucket leaves one off, and fails a setting off on both. Such a
   bucket was `N/A`. The AgentCore assessment role gains
@@ -338,16 +335,13 @@ section.
   groups. DNS Firewall alone passed a VPC whose agents could connect to any
   address. The AgentCore assessment role gains
   `network-firewall:ListFirewalls`, `DescribeFirewall` and `DescribeRuleGroup`.
-  It holds no `network-firewall:DescribeFirewallPolicy` or
-  `ec2:DescribeNatGateways` grant, so the rows are `N/A` naming the action
-  until it is added.
+  A denied `network-firewall:DescribeFirewallPolicy` or `ec2:DescribeNatGateways` read makes the rows `N/A` naming the action.
 - `AC-50` reads Inspector coverage per AgentCore repository and requires an
   EventBridge rule with a target that matches Inspector findings on ECR
   images. A registry scanning rule passed while Inspector reported the
   repository `INACTIVE`, and no finding had to reach a deploy stage. The
   AgentCore assessment role gains `inspector2:ListCoverage` and
-  `events:ListRules`. It holds no `events:ListTargetsByRule` grant, so the
-  gate row is `N/A` naming that action until it is added.
+  `events:ListRules`. A denied `events:ListTargetsByRule` read makes the gate row `N/A` naming that action.
 - `AC-45` judges each AgentCore runtime's own execution role by the rules it
   applies to a tool role. No check read a runtime role outside the AgentCore
   namespace, so one granting `s3:*` or every foundation model passed.
@@ -907,6 +901,18 @@ section.
     now be `Failed` or `N/A`.
 
 ### Deployment impact
+
+**AgentCore role grants.** The AgentCore assessment role gains seven
+read-only grants: `events:ListTargetsByRule` on `rule/*`,
+`logs:DescribeMetricFilters` on `log-group:*`, `ce:GetAnomalyMonitors` on
+`anomalymonitor/*` and `network-firewall:DescribeFirewallPolicy` on
+`firewall-policy/*` in this account, and `ec2:DescribeNatGateways`,
+`bedrock:GetModelInvocationLoggingConfiguration` and
+`bedrock-agentcore:ListAgentRuntimeVersions` on `'*'`, which have no resource
+type. Its fifteen unconditioned `Resource: '*'` statements are folded into one,
+`AgentCoreReadsWithoutResourceType`, with the same set of granted actions, so
+the role renders to 8,480 inline-policy characters in `aws-us-gov`, below the
+9,000-character project budget.
 
 **Deployment-stack update and CodeBuild run required.** The
 `RequireAgentRegistryManualApproval` parameter is removed from both SAM

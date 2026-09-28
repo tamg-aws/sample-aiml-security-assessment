@@ -71,6 +71,22 @@ def _statement_block(path, logical_id, sid):
     return resource[start:end]
 
 
+def _unconditioned_wildcard_actions(path, logical_id):
+    """Actions an Allow statement grants on Resource '*' with no Condition."""
+    with open(path, encoding="utf-8") as fh:
+        data = yaml.load(fh, Loader=_CfnLoader)  # nosec B506
+    return {
+        action
+        for policy in data["Resources"][logical_id]["Properties"]["Policies"]
+        if isinstance(policy, dict)
+        for statement in policy.get("Statement", [])
+        if statement.get("Effect") == "Allow"
+        and statement.get("Resource") == "*"
+        and not {"Condition", "NotAction", "NotResource"} & set(statement)
+        for action in statement.get("Action") or []
+    }
+
+
 def _render_policy_intrinsics(value):
     """Render policy intrinsics conservatively for IAM character-count checks."""
     if isinstance(value, list):
@@ -433,6 +449,13 @@ _EXPECTED_ACTIONS = {
         "organizations:DescribeOrganization",
         "s3:GetAccountPublicAccessBlock",
         "xray:GetTraceSegmentDestination",
+        "bedrock:GetModelInvocationLoggingConfiguration",
+        "bedrock-agentcore:ListAgentRuntimeVersions",
+        "ce:GetAnomalyMonitors",
+        "ec2:DescribeNatGateways",
+        "events:ListTargetsByRule",
+        "logs:DescribeMetricFilters",
+        "network-firewall:DescribeFirewallPolicy",
     },
     "AgentRegistrySecurityAssessmentFunction": {
         "agent-registry:GetRegistry",
@@ -692,7 +715,15 @@ def test_service_last_access_generation_is_identity_scoped(template, logical_id)
     assert "arn:${AWS::Partition}:iam::${AWS::AccountId}:user/*" in generation
     assert not re.search(r"Resource:\s+['\"]\*['\"]", generation)
 
-    results = _statement_block(template, logical_id, "IAMServiceLastAccessResults")
+    assert "iam:GetServiceLastAccessedDetails" in _unconditioned_wildcard_actions(
+        template, logical_id
+    )
+    if logical_id == "AgentCoreSecurityAssessmentFunction":
+        results = _statement_block(
+            template, logical_id, "AgentCoreReadsWithoutResourceType"
+        )
+    else:
+        results = _statement_block(template, logical_id, "IAMServiceLastAccessResults")
     assert "iam:GetServiceLastAccessedDetails" in results
     assert re.search(r"Resource:\s+['\"]\*['\"]", results)
 
@@ -953,15 +984,18 @@ def test_sagemaker_scope27_reads_wildcard_only_where_iam_has_no_resource_type(
 
 @pytest.mark.parametrize("template", _SAM_TEMPLATES, ids=os.path.basename)
 def test_agentcore_resource_reads_and_metric_writes_are_constrained(template):
-    inventory = _statement_block(
+    wildcard = _unconditioned_wildcard_actions(
+        template, "AgentCoreSecurityAssessmentFunction"
+    )
+    merged = _statement_block(
         template,
         "AgentCoreSecurityAssessmentFunction",
-        "AgentCoreAccountInventoryPermissions",
+        "AgentCoreReadsWithoutResourceType",
     )
-    assert "bedrock-agentcore:ListAgentRuntimes" in inventory
-    assert "bedrock-agentcore:GetAgentRuntime" not in inventory
-    assert "bedrock-agentcore:ListPolicies" not in inventory
-    assert re.search(r"Resource:\s+['\"]\*['\"]", inventory)
+    assert "bedrock-agentcore:ListAgentRuntimes" in wildcard
+    assert "bedrock-agentcore:GetAgentRuntime" not in wildcard
+    assert "bedrock-agentcore:ListPolicies" not in wildcard
+    assert re.search(r"Resource:\s+['\"]\*['\"]", merged)
 
     reads = _statement_block(
         template,
@@ -985,14 +1019,9 @@ def test_agentcore_resource_reads_and_metric_writes_are_constrained(template):
         assert resource in reads
     assert not re.search(r"Resource:\s+['\"]\*['\"]", reads)
 
-    token_vault = _statement_block(
-        template,
-        "AgentCoreSecurityAssessmentFunction",
-        "AgentCoreTokenVaultRead",
-    )
-    assert "bedrock-agentcore:GetTokenVault" in token_vault
-    assert re.search(r"Resource:\s+['\"]\*['\"]", token_vault)
-    assert "token-vault/" not in token_vault
+    assert "bedrock-agentcore:GetTokenVault" in wildcard
+    assert re.search(r"Resource:\s+['\"]\*['\"]", merged)
+    assert "token-vault/" not in merged
 
     service_role = _statement_block(
         template, "AgentCoreSecurityAssessmentFunction", "IAMRolePermissions"
@@ -1042,13 +1071,20 @@ def test_agentcore_observability_and_governance_reads_are_scoped_where_iam_allow
         "ObservabilitySinkInventory": ("oam:ListSinks",),
         "OrganizationsInventoryPermissions": ("organizations:ListPolicies",),
     }
-    for sid, actions in wildcard_enumerations.items():
-        statement = _statement_block(
-            template, "AgentCoreSecurityAssessmentFunction", sid
-        )
+    # Keyed by the Sid each group held before the fold into
+    # AgentCoreReadsWithoutResourceType.
+    wildcard = _unconditioned_wildcard_actions(
+        template, "AgentCoreSecurityAssessmentFunction"
+    )
+    merged = _statement_block(
+        template,
+        "AgentCoreSecurityAssessmentFunction",
+        "AgentCoreReadsWithoutResourceType",
+    )
+    for former_sid, actions in wildcard_enumerations.items():
         for action in actions:
-            assert action in statement
-        assert re.search(r"Resource:\s+['\"]\*['\"]", statement)
+            assert action in wildcard, former_sid
+        assert re.search(r"Resource:\s+['\"]\*['\"]", merged)
 
     scoped_reads = {
         "CloudTrailEventSelectorRead": (
@@ -1102,13 +1138,9 @@ def test_agentcore_observability_and_governance_reads_are_scoped_where_iam_allow
     assert "bedrock-agentcore:*:${AWS::AccountId}:token-vault/*" in identity
 
     # DescribeSecurityGroups has no resource-level authorization either, so it
-    # joins the existing EC2 enumeration statement instead of getting a wildcard
-    # statement of its own.
-    network = _statement_block(
-        template, "AgentCoreSecurityAssessmentFunction", "EC2Permissions"
-    )
-    assert "ec2:DescribeSecurityGroups" in network
-    assert re.search(r"Resource:\s+['\"]\*['\"]", network)
+    # is granted on '*' with no condition.
+    assert "ec2:DescribeSecurityGroups" in wildcard
+    assert re.search(r"Resource:\s+['\"]\*['\"]", merged)
 
     # The gateway execution role's name is chosen by whoever created the gateway,
     # so the trust read covers role/* in this account and no other account.
@@ -1142,15 +1174,19 @@ def test_agentcore_observability_and_governance_reads_are_scoped_where_iam_allow
 def test_agentcore_round2_reads_wildcard_only_enumerations(template):
     """The round-2 AgentCore reads take '*' only where no resource is named.
 
-    The first statement's actions have no resource type in the service
-    authorization reference. The second statement's actions list every
-    resource of their type, so the request names no ARN to match. Every
-    per-resource read is scoped to its resource type.
+    The first group's actions have no resource type in the service
+    authorization reference. The second group's actions list every
+    resource of their type, so the request names no ARN to match. Both are
+    granted on '*' with no condition. Every per-resource read is scoped to
+    its resource type.
     """
-    unscoped = _statement_block(
+    unscoped = _unconditioned_wildcard_actions(
+        template, "AgentCoreSecurityAssessmentFunction"
+    )
+    merged = _statement_block(
         template,
         "AgentCoreSecurityAssessmentFunction",
-        "AgentCoreApprovedReadsWithoutResourceType",
+        "AgentCoreReadsWithoutResourceType",
     )
     for action in (
         "xray:GetTraceSegmentDestination",
@@ -1164,27 +1200,32 @@ def test_agentcore_round2_reads_wildcard_only_enumerations(template):
         "bedrock-agentcore:ListHarnesses",
         "bedrock-agentcore:ListBatchEvaluations",
         "bedrock-agentcore:ListAgentRuntimeEndpoints",
+        "bedrock-agentcore:ListAgentRuntimeVersions",
+        "ec2:DescribeNatGateways",
+        "bedrock:GetModelInvocationLoggingConfiguration",
     ):
         assert action in unscoped
-    assert re.search(r"Resource:\s+['\"]\*['\"]", unscoped)
+    assert re.search(r"Resource:\s+['\"]\*['\"]", merged)
 
-    enumerations = _statement_block(
-        template, "AgentCoreSecurityAssessmentFunction", "AgentCoreApprovedEnumerations"
-    )
     for action in (
         "network-firewall:ListFirewalls",
         "cloudwatch:ListMetrics",
         "ce:GetAnomalySubscriptions",
     ):
-        assert action in enumerations
-    assert "network-firewall:Describe" not in enumerations
+        assert action in unscoped
+    assert not any(a.startswith("network-firewall:Describe") for a in unscoped)
 
     scoped = {
         "NetworkFirewallRead": (
-            ("network-firewall:DescribeFirewall", "network-firewall:DescribeRuleGroup"),
+            (
+                "network-firewall:DescribeFirewall",
+                "network-firewall:DescribeRuleGroup",
+                "network-firewall:DescribeFirewallPolicy",
+            ),
             (
                 "network-firewall:*:${AWS::AccountId}:firewall/*",
                 "network-firewall:*:*:stateful-rulegroup/*",
+                "network-firewall:*:${AWS::AccountId}:firewall-policy/*",
             ),
         ),
         "PrefixListEntryRead": (
@@ -1198,6 +1239,20 @@ def test_agentcore_round2_reads_wildcard_only_enumerations(template):
                 "bedrock-agentcore:*:${AWS::AccountId}:batch-evaluate/*",
             ),
         ),
+        # rule/* covers both service reference formats, rule/${RuleName} on the
+        # default bus and rule/${EventBusName}/${RuleName} on a custom one.
+        "EventRuleTargetRead": (
+            ("events:ListTargetsByRule",),
+            ("events:*:${AWS::AccountId}:rule/*",),
+        ),
+        "MetricFilterRead": (
+            ("logs:DescribeMetricFilters",),
+            ("logs:*:${AWS::AccountId}:log-group:*",),
+        ),
+        "CostAnomalyMonitorRead": (
+            ("ce:GetAnomalyMonitors",),
+            ("ce::${AWS::AccountId}:anomalymonitor/*",),
+        ),
     }
     for sid, (actions, resources) in scoped.items():
         statement = _statement_block(
@@ -1209,20 +1264,9 @@ def test_agentcore_round2_reads_wildcard_only_enumerations(template):
             assert resource in statement
         assert not re.search(r"Resource:\s+['\"]\*['\"]", statement)
 
-    # These calls are made by the AgentCore legs but were not approved, so the
-    # legs report N/A naming them until they are.
+    # Not approved, so the AgentCore role must not hold it.
     agentcore = _actions(template, "AgentCoreSecurityAssessmentFunction")
-    for action in (
-        "network-firewall:DescribeFirewallPolicy",
-        "events:ListTargetsByRule",
-        "ec2:DescribeNatGateways",
-        "ce:GetAnomalyMonitors",
-        "logs:DescribeMetricFilters",
-        "bedrock:GetModelInvocationLoggingConfiguration",
-        "bedrock-agentcore:ListAgentRuntimeVersions",
-        "wafv2:GetSampledRequests",
-    ):
-        assert action not in agentcore
+    assert "wafv2:GetSampledRequests" not in agentcore
 
 
 @pytest.mark.parametrize("template", _SAM_TEMPLATES, ids=os.path.basename)
@@ -1255,15 +1299,13 @@ def test_aisf_phase5_reads_wildcard_only_where_iam_has_no_resource_type(template
             "ec2:DescribeSubnets",
             "ec2:DescribeRouteTables",
         ),
-        ("AgentCoreSecurityAssessmentFunction", "DNSFirewallAssociationInventory"): (
+        ("AgentCoreSecurityAssessmentFunction", "AgentCoreReadsWithoutResourceType"): (
             "route53resolver:ListFirewallRuleGroupAssociations",
             "route53resolver:ListFirewallDomainLists",
+            "ecr:GetRegistryScanningConfiguration",
         ),
         ("AgentRegistrySecurityAssessmentFunction", "RegistryEventRuleInventory"): (
             "events:ListRules",
-        ),
-        ("AgentCoreSecurityAssessmentFunction", "ECRRegistryScanningRead"): (
-            "ecr:GetRegistryScanningConfiguration",
         ),
         ("BedrockSecurityAssessmentFunction", "CloudTrailEventHistoryRead"): (
             "cloudtrail:LookupEvents",
@@ -1271,8 +1313,10 @@ def test_aisf_phase5_reads_wildcard_only_where_iam_has_no_resource_type(template
     }
     for (logical_id, sid), actions in wildcard.items():
         statement = _statement_block(template, logical_id, sid)
+        unconditioned = _unconditioned_wildcard_actions(template, logical_id)
         for action in actions:
             assert action in statement
+            assert action in unconditioned
         assert re.search(r"Resource:\s+['\"]\*['\"]", statement)
 
     scoped = {
@@ -1480,15 +1524,14 @@ def test_agentcore_reads_alarms_on_star_so_composites_are_returned(template):
         if "cloudwatch:DescribeAlarms" in (statement.get("Action") or [])
     ]
 
-    assert reading == [
-        {
-            "Sid": "AgentCoreCompositeAlarmRead",
-            "Effect": "Allow",
-            "Action": ["cloudwatch:DescribeAlarms"],
-            "Resource": "*",
-        }
-    ]
+    assert len(reading) == 1
+    assert reading[0]["Sid"] == "AgentCoreReadsWithoutResourceType"
+    assert reading[0]["Effect"] == "Allow"
+    assert reading[0]["Resource"] == "*"
+    assert "Condition" not in reading[0]
     block = _statement_block(
-        template, "AgentCoreSecurityAssessmentFunction", "AgentCoreCompositeAlarmRead"
+        template,
+        "AgentCoreSecurityAssessmentFunction",
+        "AgentCoreReadsWithoutResourceType",
     )
     assert "API_DescribeAlarms" in block
