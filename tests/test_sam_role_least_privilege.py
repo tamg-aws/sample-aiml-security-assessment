@@ -272,6 +272,9 @@ _EXPECTED_ACTIONS = {
         "securityhub:DescribeOrganizationConfiguration",
         "securityhub:GetEnabledStandards",
         "securityhub:ListEnabledProductsForImport",
+        "cloudwatch:DescribeAlarms",
+        "logs:DescribeMetricFilters",
+        "events:ListTargetsByRule",
     },
     "AgentCoreSecurityAssessmentFunction": {
         "bedrock-agentcore:GetAgentRuntime",

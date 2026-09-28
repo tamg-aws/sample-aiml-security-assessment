@@ -772,6 +772,21 @@ Resources:
                 - securityhub:DescribeOrganizationConfiguration # SM-36
                 - securityhub:ListEnabledProductsForImport # SM-04
               Resource: !Sub 'arn:${AWS::Partition}:securityhub:*:${AWS::AccountId}:hub/default'
+            - Sid: FlowLogMetricFilterRead
+              Effect: Allow
+              Action:
+                - logs:DescribeMetricFilters # SM-37
+              Resource: !Sub 'arn:${AWS::Partition}:logs:*:${AWS::AccountId}:log-group:*'
+            - Sid: FlowLogAlarmRead
+              Effect: Allow
+              Action:
+                - cloudwatch:DescribeAlarms # SM-37
+              Resource: !Sub 'arn:${AWS::Partition}:cloudwatch:*:${AWS::AccountId}:alarm:*'
+            - Sid: GuardDutyAlertRuleTargetRead
+              Effect: Allow
+              Action:
+                - events:ListTargetsByRule # SM-04
+              Resource: !Sub 'arn:${AWS::Partition}:events:*:${AWS::AccountId}:rule/*'
             - Sid: AccountInventoryWithoutResourceType
               # SM-39, SM-40 and SM-41 enumerate clusters, secrets and IoT policies.
               # None of these three list actions has a resource type in IAM.

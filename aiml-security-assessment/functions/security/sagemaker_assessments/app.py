@@ -954,6 +954,7 @@ def check_guardduty_enabled(
                 )
             )
             findings["csv_data"].append(_guardduty_security_hub_routing_finding(region))
+            findings["csv_data"].append(_guardduty_eventbridge_routing_finding(region))
         else:
             findings["csv_data"].append(
                 create_finding(
@@ -1051,6 +1052,99 @@ def _guardduty_security_hub_routing_finding(region: str) -> Dict[str, Any]:
         "integration(s), none of them GuardDuty, so GuardDuty findings do not "
         "reach the Security Hub view.",
         "Enable the GuardDuty integration in Security Hub for this region.",
+        "Medium",
+        "Failed",
+    )
+
+
+GUARDDUTY_EVENTBRIDGE_FINDING = "GuardDuty Findings Routed to Alerting"
+GUARDDUTY_EVENTBRIDGE_REFERENCE = (
+    "https://docs.aws.amazon.com/guardduty/latest/ug/"
+    "guardduty_findings_eventbridge.html"
+)
+
+
+def _rule_matches_guardduty(rule: Dict[str, Any]) -> bool:
+    """True for an ENABLED rule whose pattern names the aws.guardduty source."""
+    if rule.get("State") != "ENABLED":
+        return False
+    try:
+        pattern = json.loads(rule.get("EventPattern") or "{}")
+    except ValueError:
+        return False
+    sources = pattern.get("source") if isinstance(pattern, dict) else None
+    if isinstance(sources, str):
+        sources = [sources]
+    return isinstance(sources, list) and "aws.guardduty" in sources
+
+
+def _guardduty_eventbridge_routing_finding(region: str) -> Dict[str, Any]:
+    """SM-04: an ENABLED default-bus rule on aws.guardduty with a target."""
+
+    def _row(details, resolution, severity, status, name=GUARDDUTY_EVENTBRIDGE_FINDING):
+        return create_finding(
+            check_id="SM-04",
+            finding_name=name,
+            finding_details=details,
+            resolution=resolution,
+            reference=GUARDDUTY_EVENTBRIDGE_REFERENCE,
+            severity=severity,
+            status=status,
+            region=region,
+        )
+
+    try:
+        client = boto3.client("events", config=boto3_config, region_name=region)
+        rules = []
+        for page in client.get_paginator("list_rules").paginate():
+            rules.extend(page.get("Rules", []))
+    except Exception as error:
+        return _row(
+            "Whether GuardDuty findings reach an alerting target was not read: "
+            "events:ListRules failed. " + build_could_not_assess_detail(error, region),
+            COULD_NOT_ASSESS_RESOLUTION,
+            "Informational",
+            "N/A",
+            name=f"{GUARDDUTY_EVENTBRIDGE_FINDING} Incomplete",
+        )
+    matching = [rule for rule in rules if _rule_matches_guardduty(rule)]
+    unread = []
+    for rule in matching:
+        try:
+            targets = []
+            for page in client.get_paginator("list_targets_by_rule").paginate(
+                Rule=rule.get("Name")
+            ):
+                targets.extend(page.get("Targets", []))
+        except Exception as error:
+            unread.append(
+                f"rule '{rule.get('Name')}' ({get_assessment_error_label(error)})"
+            )
+            continue
+        if targets:
+            return _row(
+                f"The ENABLED EventBridge rule '{rule.get('Name')}' matches source "
+                f"aws.guardduty and sends to {len(targets)} target(s).",
+                "No action required",
+                "Medium",
+                "Passed",
+            )
+    if unread:
+        return _unread_resources_finding(
+            "SM-04",
+            GUARDDUTY_EVENTBRIDGE_FINDING,
+            unread,
+            "no rule read so far sends GuardDuty findings to a target.",
+            GUARDDUTY_EVENTBRIDGE_REFERENCE,
+            region,
+        )
+    return _row(
+        f"Of {len(rules)} EventBridge rule(s) on the default event bus, "
+        f"{len(matching)} ENABLED rule(s) name the source aws.guardduty and none "
+        "has a target, so no GuardDuty finding raises an alert. Only a rule whose "
+        "pattern lists aws.guardduty under source is credited.",
+        "Create an ENABLED EventBridge rule with the pattern "
+        '{"source": ["aws.guardduty"]} and an alerting target such as an SNS topic.',
         "Medium",
         "Failed",
     )
@@ -8913,6 +9007,293 @@ def check_guardduty_lambda_network_logs(
     return findings
 
 
+ENDPOINT_FLOW_LOG_ALERTING_FINDING = "SageMaker Endpoint Network Anomaly Alerting"
+ENDPOINT_FLOW_LOG_ALERTING_REFERENCE = (
+    "https://docs.aws.amazon.com/vpc/latest/userguide/flow-logs-cwl.html"
+)
+ENDPOINT_FLOW_LOG_ALERTING_RESOLUTION = (
+    "Publish VPC Flow Logs (traffic type ALL or ACCEPT) for every VPC or subnet "
+    "an endpoint runs in to CloudWatch Logs, add a metric filter on that log "
+    "group, and alarm on the metric with a static threshold or an anomaly "
+    "detection band that has an alarm action."
+)
+ENDPOINT_FLOW_LOG_SCOPE_NOTE = (
+    "GuardDuty foundational flow-log analysis covers EC2 network interfaces, not "
+    "SageMaker endpoints, so the customer flow log is the only network telemetry "
+    "for an endpoint. AgentCore Runtime is not read by this module. Whether an "
+    "alarm has fired and been triaged is not recorded by any CloudWatch API and "
+    "was not assessed."
+)
+FLOW_LOG_ALERTING_TRAFFIC_TYPES = ("ALL", "ACCEPT")
+
+
+def _alarm_metrics(alarm: Dict[str, Any]) -> List[tuple]:
+    """Every (namespace, metric name) a metric alarm evaluates."""
+    metrics = []
+    if alarm.get("MetricName"):
+        metrics.append((alarm.get("Namespace"), alarm.get("MetricName")))
+    for query in alarm.get("Metrics") or []:
+        metric = (query.get("MetricStat") or {}).get("Metric") or {}
+        if metric.get("MetricName"):
+            metrics.append((metric.get("Namespace"), metric.get("MetricName")))
+    return metrics
+
+
+def check_sagemaker_endpoint_flow_log_alerting(region: str = "") -> Dict[str, Any]:
+    """
+    SM-37: Verify every SageMaker endpoint's network carries alerting telemetry.
+
+    An endpoint passes only when each subnet it runs in is covered by an ACTIVE
+    VPC or subnet flow log that captures accepted traffic into CloudWatch Logs,
+    and that log group has a metric filter whose metric an alarm with an action
+    evaluates.
+    """
+    findings = {"csv_data": []}
+
+    def _row(details, resolution, severity, status):
+        return create_finding(
+            check_id="SM-37",
+            finding_name=ENDPOINT_FLOW_LOG_ALERTING_FINDING,
+            finding_details=details,
+            resolution=resolution,
+            reference=ENDPOINT_FLOW_LOG_ALERTING_REFERENCE,
+            severity=severity,
+            status=status,
+            region=region,
+        )
+
+    try:
+        sagemaker_client = boto3.client(
+            "sagemaker", config=boto3_config, region_name=region
+        )
+        inventory = _endpoint_hosting_inventory(sagemaker_client)
+    except Exception as error:
+        findings["csv_data"].append(
+            _row(
+                build_could_not_assess_detail(error, region),
+                COULD_NOT_ASSESS_RESOLUTION,
+                "Informational",
+                "N/A",
+            )
+        )
+        return findings
+
+    unread = list(inventory["unread"])
+    endpoint_subnets = {}
+    model_subnets = {}
+    for endpoint in inventory["endpoints"]:
+        subnets = set((endpoint["config"].get("VpcConfig") or {}).get("Subnets") or [])
+        model_unread = False
+        for model_name in endpoint["models"]:
+            if model_name not in model_subnets:
+                try:
+                    model = sagemaker_client.describe_model(ModelName=model_name)
+                    model_subnets[model_name] = list(
+                        (model.get("VpcConfig") or {}).get("Subnets") or []
+                    )
+                except Exception as error:
+                    model_subnets[model_name] = None
+                    unread.append(
+                        f"model '{model_name}' of endpoint '{endpoint['name']}' "
+                        f"({get_assessment_error_label(error)})"
+                    )
+            if model_subnets[model_name] is None:
+                model_unread = True
+            else:
+                subnets.update(model_subnets[model_name])
+        if not model_unread:
+            endpoint_subnets[endpoint["name"]] = sorted(subnets)
+
+    if not inventory["endpoints"] and not unread:
+        findings["csv_data"].append(
+            _row(
+                "No SageMaker endpoints were found in this region.",
+                "No action required",
+                "Informational",
+                "N/A",
+            )
+        )
+        return findings
+
+    ec2_client = boto3.client("ec2", config=boto3_config, region_name=region)
+    all_subnets = sorted({s for subnets in endpoint_subnets.values() for s in subnets})
+    subnet_vpc = {}
+    subnet_error = None
+    try:
+        for batch in _chunked(all_subnets, SUBNET_LOOKUP_BATCH_SIZE):
+            for page in ec2_client.get_paginator("describe_subnets").paginate(
+                SubnetIds=batch
+            ):
+                for subnet in page.get("Subnets", []):
+                    if subnet.get("SubnetId") in batch and subnet.get("VpcId"):
+                        subnet_vpc[subnet["SubnetId"]] = subnet["VpcId"]
+    except Exception as error:
+        subnet_error = get_assessment_error_label(error)
+
+    resource_ids = sorted(set(all_subnets) | set(subnet_vpc.values()))
+    flow_logs = []
+    flow_log_error = None
+    try:
+        for batch in _chunked(resource_ids, SUBNET_LOOKUP_BATCH_SIZE):
+            for page in ec2_client.get_paginator("describe_flow_logs").paginate(
+                Filter=[{"Name": "resource-id", "Values": batch}]
+            ):
+                flow_logs.extend(page.get("FlowLogs", []))
+    except Exception as error:
+        flow_log_error = get_assessment_error_label(error)
+
+    alerting_logs = {}
+    for flow_log in flow_logs:
+        if (
+            flow_log.get("ResourceId") in resource_ids
+            and flow_log.get("FlowLogStatus") == "ACTIVE"
+            and flow_log.get("LogDestinationType") == "cloud-watch-logs"
+            and flow_log.get("TrafficType") in FLOW_LOG_ALERTING_TRAFFIC_TYPES
+            and flow_log.get("LogGroupName")
+        ):
+            alerting_logs.setdefault(flow_log["ResourceId"], set()).add(
+                flow_log["LogGroupName"]
+            )
+
+    logs_client = boto3.client("logs", config=boto3_config, region_name=region)
+    group_metrics = {}
+    group_errors = {}
+    for group in sorted({g for groups in alerting_logs.values() for g in groups}):
+        try:
+            metrics = set()
+            for page in logs_client.get_paginator("describe_metric_filters").paginate(
+                logGroupName=group
+            ):
+                for metric_filter in page.get("metricFilters", []):
+                    if metric_filter.get("logGroupName") not in (None, group):
+                        continue
+                    for transformation in (
+                        metric_filter.get("metricTransformations") or []
+                    ):
+                        metrics.add(
+                            (
+                                transformation.get("metricNamespace"),
+                                transformation.get("metricName"),
+                            )
+                        )
+            group_metrics[group] = metrics
+        except Exception as error:
+            group_errors[group] = get_assessment_error_label(error)
+
+    alarmed_metrics = set()
+    alarm_error = None
+    if any(group_metrics.values()):
+        try:
+            cloudwatch_client = boto3.client(
+                "cloudwatch", config=boto3_config, region_name=region
+            )
+            for page in cloudwatch_client.get_paginator("describe_alarms").paginate(
+                AlarmTypes=["MetricAlarm"]
+            ):
+                for alarm in page.get("MetricAlarms", []):
+                    if alarm.get("ActionsEnabled") and alarm.get("AlarmActions"):
+                        alarmed_metrics.update(_alarm_metrics(alarm))
+        except Exception as error:
+            alarm_error = get_assessment_error_label(error)
+
+    failed = []
+    passed = []
+    for endpoint in inventory["endpoints"]:
+        name = endpoint["name"]
+        if name not in endpoint_subnets:
+            continue
+        subnets = endpoint_subnets[name]
+        if not subnets:
+            failed.append(
+                f"endpoint '{name}' runs outside any customer VPC, so no flow log "
+                "can capture its traffic"
+            )
+            continue
+        if subnet_error and any(s not in subnet_vpc for s in subnets):
+            unread.append(
+                f"subnets of endpoint '{name}' (ec2:DescribeSubnets: {subnet_error})"
+            )
+            continue
+        if flow_log_error:
+            unread.append(
+                f"flow logs of endpoint '{name}' (ec2:DescribeFlowLogs: {flow_log_error})"
+            )
+            continue
+        uncovered = []
+        groups = set()
+        for subnet in subnets:
+            covering = alerting_logs.get(subnet, set()) | alerting_logs.get(
+                subnet_vpc.get(subnet), set()
+            )
+            if not covering:
+                uncovered.append(subnet)
+            groups |= covering
+        if uncovered:
+            failed.append(
+                f"endpoint '{name}': no ACTIVE flow log capturing accepted traffic "
+                f"into CloudWatch Logs covers {', '.join(uncovered)}"
+            )
+            continue
+        unread_groups = sorted(g for g in groups if g in group_errors)
+        alarmed = [
+            g for g in sorted(groups) if group_metrics.get(g, set()) & alarmed_metrics
+        ]
+        if alarmed:
+            passed.append(f"endpoint '{name}' (log group {alarmed[0]})")
+        elif unread_groups:
+            unread.append(
+                f"metric filters of {', '.join(unread_groups)} for endpoint '{name}' "
+                f"(logs:DescribeMetricFilters: {group_errors[unread_groups[0]]})"
+            )
+        elif alarm_error:
+            unread.append(
+                f"alarms for endpoint '{name}' (cloudwatch:DescribeAlarms: {alarm_error})"
+            )
+        else:
+            failed.append(
+                f"endpoint '{name}': flow log group(s) {', '.join(sorted(groups))} "
+                "have no metric filter whose metric an alarm with an action evaluates"
+            )
+
+    if failed:
+        shown = "; ".join(failed[:10])
+        if len(failed) > 10:
+            shown += f"; and {len(failed) - 10} more"
+        findings["csv_data"].append(
+            _row(
+                f"{len(failed)} endpoint(s) have no network anomaly alerting: {shown}. "
+                + ENDPOINT_FLOW_LOG_SCOPE_NOTE,
+                ENDPOINT_FLOW_LOG_ALERTING_RESOLUTION,
+                "Medium",
+                "Failed",
+            )
+        )
+    if unread:
+        findings["csv_data"].append(
+            _unread_resources_finding(
+                "SM-37",
+                ENDPOINT_FLOW_LOG_ALERTING_FINDING,
+                unread,
+                f"{len(passed)} endpoint(s) passed and {len(failed)} failed. "
+                + ENDPOINT_FLOW_LOG_SCOPE_NOTE,
+                ENDPOINT_FLOW_LOG_ALERTING_REFERENCE,
+                region,
+            )
+        )
+    if not failed and not unread:
+        findings["csv_data"].append(
+            _row(
+                f"All {len(passed)} endpoint(s) run in subnets covered by an ACTIVE "
+                "flow log in CloudWatch Logs whose metric filter feeds an alarm with "
+                f"an action: {'; '.join(passed[:10])}. " + ENDPOINT_FLOW_LOG_SCOPE_NOTE,
+                "No action required",
+                "Medium",
+                "Passed",
+            )
+        )
+    return findings
+
+
 RUNTIME_MONITORING_FINDING = "GuardDuty Runtime Monitoring"
 RUNTIME_MONITORING_REFERENCE = (
     "https://docs.aws.amazon.com/guardduty/latest/ug/runtime-monitoring.html"
@@ -10125,6 +10506,9 @@ def lambda_handler(event, context):
                 region=region, detector_inventory=guardduty_inventory
             )
         )
+
+        logger.info("Running SageMaker endpoint flow log alerting check (SM-37)")
+        all_findings.append(check_sagemaker_endpoint_flow_log_alerting(region=region))
 
         logger.info("Running GuardDuty Runtime Monitoring check (SM-38)")
         all_findings.append(

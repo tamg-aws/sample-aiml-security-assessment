@@ -366,7 +366,7 @@ class TestSM04SecurityHubRouting:
             client.get_paginator.side_effect = error
         else:
             client.get_paginator.side_effect = _pager(
-                {"list_enabled_products_for_import": pages}
+                {"list_enabled_products_for_import": pages, "list_rules": []}
             )
         mock_client.return_value = client
         inventory = {
@@ -401,6 +401,7 @@ class TestSM04SecurityHubRouting:
         assert [r["Finding"] for r in rows] == [
             "GuardDuty Enabled",
             sagemaker_app.GUARDDUTY_ROUTING_FINDING,
+            sagemaker_app.GUARDDUTY_EVENTBRIDGE_FINDING,
         ]
         assert rows[1]["Status"] == "Passed"
 
@@ -428,6 +429,105 @@ class TestSM04SecurityHubRouting:
         assert rows[1]["Status"] == "N/A"
         assert rows[1]["Finding"].endswith("Incomplete")
         assert "ListEnabledProductsForImport" in rows[1]["Finding_Details"]
+
+    GUARDDUTY_PATTERN = (
+        '{"source": ["aws.guardduty"], "detail-type": ["GuardDuty Finding"]}'
+    )
+
+    def _eventbridge(self, mock_client, rules, targets=None, errors=None):
+        errors = errors or {}
+        targets = targets or {}
+        client = MagicMock()
+
+        def list_rules():
+            if "list_rules" in errors:
+                raise errors["list_rules"]
+            return [{"Rules": rules[:1]}, {"Rules": rules[1:]}]
+
+        def list_targets_by_rule(Rule):
+            if Rule in errors:
+                raise errors[Rule]
+            return [{"Targets": targets.get(Rule, [])}]
+
+        client.get_paginator.side_effect = _pager(
+            {
+                "list_enabled_products_for_import": [
+                    {"ProductSubscriptions": [self.GUARDDUTY]}
+                ],
+                "list_rules": list_rules,
+                "list_targets_by_rule": list_targets_by_rule,
+            }
+        )
+        mock_client.return_value = client
+        inventory = {
+            "detector_id": "d-1",
+            "detail": {"Status": "ENABLED"},
+            "error": None,
+        }
+        rows = extract_csv_data(
+            sagemaker_app.check_guardduty_enabled("us-east-1", inventory)
+        )
+        assert rows[2]["Check_ID"] == "SM-04"
+        return rows[2]
+
+    def _rule(self, name, pattern=None, state="ENABLED"):
+        return {
+            "Name": name,
+            "State": state,
+            "EventPattern": pattern or self.GUARDDUTY_PATTERN,
+        }
+
+    @patch("sagemaker_app.boto3.client")
+    def test_targeted_guardduty_rule_on_a_later_page_passes(self, mock_client):
+        row = self._eventbridge(
+            mock_client,
+            [
+                self._rule("hub", '{"source": ["aws.securityhub"]}'),
+                self._rule("gd"),
+            ],
+            targets={"hub": [{"Id": "t"}], "gd": [{"Id": "sns"}]},
+        )
+        assert row["Finding"] == sagemaker_app.GUARDDUTY_EVENTBRIDGE_FINDING
+        assert row["Status"] == "Passed"
+        assert "'gd'" in row["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "rule,targets",
+        [
+            ({"state": "DISABLED"}, [{"Id": "sns"}]),
+            ({"pattern": '{"source": ["aws.securityhub"]}'}, [{"Id": "sns"}]),
+            ({"pattern": '{"source": [{"prefix": "aws.guard"}]}'}, [{"Id": "sns"}]),
+            ({"pattern": "not json"}, [{"Id": "sns"}]),
+            ({}, []),
+        ],
+    )
+    @patch("sagemaker_app.boto3.client")
+    def test_rule_that_cannot_alert_on_guardduty_fails(
+        self, mock_client, rule, targets
+    ):
+        row = self._eventbridge(
+            mock_client, [self._rule("gd", **rule)], targets={"gd": targets}
+        )
+        assert row["Status"] == "Failed"
+        assert "none has a target" in row["Finding_Details"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_list_rules_failure_is_incomplete(self, mock_client):
+        row = self._eventbridge(
+            mock_client, [], errors={"list_rules": _make_client_error("AccessDenied")}
+        )
+        assert row["Status"] == "N/A"
+        assert "events:ListRules" in row["Finding_Details"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_unread_targets_are_incomplete_not_failed(self, mock_client):
+        row = self._eventbridge(
+            mock_client,
+            [self._rule("gd-a"), self._rule("gd-b")],
+            errors={"gd-b": _make_client_error("AccessDenied")},
+        )
+        assert row["Status"] == "N/A"
+        assert "rule 'gd-b'" in row["Finding_Details"]
 
     @patch("sagemaker_app.boto3.client")
     def test_disabled_detector_reads_no_routing(self, mock_client):
@@ -5788,6 +5888,329 @@ def _detector(status="ENABLED", features=None):
         "detail": {"Status": status, "Features": features or []},
         "error": None,
     }
+
+
+class TestSM37EndpointFlowLogAlerting:
+    """AIR-FND-NET-07: customer flow logs with an alarm for each endpoint."""
+
+    check = staticmethod(sagemaker_app.check_sagemaker_endpoint_flow_log_alerting)
+
+    def _flow_log(self, resource, group="/flow/a", **overrides):
+        flow_log = {
+            "ResourceId": resource,
+            "FlowLogStatus": "ACTIVE",
+            "LogDestinationType": "cloud-watch-logs",
+            "TrafficType": "ALL",
+            "LogGroupName": group,
+        }
+        flow_log.update(overrides)
+        return flow_log
+
+    def _alarm(self, metric="Egress", namespace="Flow", **overrides):
+        alarm = {
+            "AlarmName": "egress",
+            "MetricName": metric,
+            "Namespace": namespace,
+            "ActionsEnabled": True,
+            "AlarmActions": ["arn:aws:sns:us-east-1:111122223333:alerts"],
+        }
+        alarm.update(overrides)
+        return alarm
+
+    def _run(
+        self,
+        mock_client,
+        endpoints=None,
+        models=None,
+        flow_logs=None,
+        filters=None,
+        alarms=None,
+        errors=None,
+    ):
+        errors = errors or {}
+        endpoints = (
+            endpoints
+            if endpoints is not None
+            else {"ep-1": {"models": ["m-1"]}, "ep-2": {"models": ["m-2"]}}
+        )
+        models = (
+            models if models is not None else {"m-1": ["subnet-1"], "m-2": ["subnet-2"]}
+        )
+        subnet_vpc = {"subnet-1": "vpc-1", "subnet-2": "vpc-2", "subnet-3": "vpc-1"}
+        flow_logs = (
+            flow_logs
+            if flow_logs is not None
+            else [self._flow_log("vpc-1"), self._flow_log("vpc-2")]
+        )
+        filters = (
+            filters
+            if filters is not None
+            else {
+                "/flow/a": [
+                    {
+                        "logGroupName": "/flow/a",
+                        "metricTransformations": [
+                            {"metricNamespace": "Flow", "metricName": "Egress"}
+                        ],
+                    }
+                ]
+            }
+        )
+        alarms = alarms if alarms is not None else [self._alarm()]
+
+        sagemaker = MagicMock()
+        sagemaker.get_paginator.side_effect = _pager(
+            {
+                "list_endpoints": [
+                    {
+                        "Endpoints": [
+                            {"EndpointName": name, "EndpointStatus": "InService"}
+                            for name in endpoints
+                        ]
+                    }
+                ]
+            }
+        )
+        sagemaker.describe_endpoint.side_effect = lambda EndpointName: {
+            "EndpointConfigName": f"cfg-{EndpointName}"
+        }
+
+        def describe_endpoint_config(EndpointConfigName):
+            spec = endpoints[EndpointConfigName[len("cfg-") :]]
+            config = {
+                "ProductionVariants": [
+                    {"VariantName": "v", "ModelName": m} for m in spec["models"]
+                ]
+            }
+            if spec.get("subnets"):
+                config["VpcConfig"] = {"Subnets": spec["subnets"]}
+            return config
+
+        sagemaker.describe_endpoint_config.side_effect = describe_endpoint_config
+
+        def describe_model(ModelName):
+            if "describe_model" in errors:
+                raise errors["describe_model"]
+            subnets = models[ModelName]
+            return {"VpcConfig": {"Subnets": subnets}} if subnets else {}
+
+        sagemaker.describe_model.side_effect = describe_model
+
+        def subnets(SubnetIds):
+            if "describe_subnets" in errors:
+                raise errors["describe_subnets"]
+            # The mock ignores the filter; the check keeps only requested ids.
+            return [
+                {
+                    "Subnets": [
+                        {"SubnetId": sid, "VpcId": vpc}
+                        for sid, vpc in subnet_vpc.items()
+                    ]
+                }
+            ]
+
+        def describe_flow_logs(Filter):
+            if "describe_flow_logs" in errors:
+                raise errors["describe_flow_logs"]
+            return [{"FlowLogs": flow_logs[:1]}, {"FlowLogs": flow_logs[1:]}]
+
+        ec2 = MagicMock()
+        ec2.get_paginator.side_effect = _pager(
+            {"describe_subnets": subnets, "describe_flow_logs": describe_flow_logs}
+        )
+
+        def metric_filters(logGroupName):
+            if "describe_metric_filters" in errors:
+                raise errors["describe_metric_filters"]
+            return [{"metricFilters": filters.get(logGroupName, [])}]
+
+        logs = MagicMock()
+        logs.get_paginator.side_effect = _pager(
+            {"describe_metric_filters": metric_filters}
+        )
+
+        def describe_alarms(AlarmTypes):
+            if "describe_alarms" in errors:
+                raise errors["describe_alarms"]
+            return [{"MetricAlarms": alarms[:1]}, {"MetricAlarms": alarms[1:]}]
+
+        cloudwatch = MagicMock()
+        cloudwatch.get_paginator.side_effect = _pager(
+            {"describe_alarms": describe_alarms}
+        )
+        clients = {
+            "sagemaker": sagemaker,
+            "ec2": ec2,
+            "logs": logs,
+            "cloudwatch": cloudwatch,
+        }
+        mock_client.side_effect = lambda service, **_: clients[service]
+        return _rows(self.check(region="us-east-1"))
+
+    @patch("sagemaker_app.boto3.client")
+    def test_every_endpoint_alarmed_passes(self, mock_client):
+        rows = self._run(mock_client)
+        assert [r["Status"] for r in rows] == ["Passed"]
+        assert rows[0]["Check_ID"] == "SM-37"
+        assert "All 2 endpoint(s)" in rows[0]["Finding_Details"]
+        assert "AgentCore Runtime is not read" in rows[0]["Finding_Details"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_one_endpoint_vpc_without_a_flow_log_fails(self, mock_client):
+        rows = self._run(mock_client, flow_logs=[self._flow_log("vpc-1")])
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "endpoint 'ep-2'" in rows[0]["Finding_Details"]
+        assert "subnet-2" in rows[0]["Finding_Details"]
+        assert "endpoint 'ep-1'" not in rows[0]["Finding_Details"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_subnet_level_flow_log_covers_its_subnet(self, mock_client):
+        rows = self._run(
+            mock_client,
+            flow_logs=[self._flow_log("subnet-1"), self._flow_log("vpc-2")],
+        )
+        assert [r["Status"] for r in rows] == ["Passed"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_second_subnet_of_one_endpoint_uncovered_fails(self, mock_client):
+        rows = self._run(
+            mock_client,
+            endpoints={"ep-1": {"models": ["m-1"]}},
+            models={"m-1": ["subnet-1", "subnet-2"]},
+            flow_logs=[self._flow_log("vpc-1")],
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "covers subnet-2" in rows[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "overrides",
+        [
+            {"FlowLogStatus": "INACTIVE"},
+            {"LogDestinationType": "s3"},
+            {"TrafficType": "REJECT"},
+        ],
+    )
+    @patch("sagemaker_app.boto3.client")
+    def test_flow_log_that_cannot_alert_on_egress_fails(self, mock_client, overrides):
+        rows = self._run(
+            mock_client,
+            flow_logs=[self._flow_log("vpc-1"), self._flow_log("vpc-2", **overrides)],
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "endpoint 'ep-2'" in rows[0]["Finding_Details"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_endpoint_outside_a_vpc_fails(self, mock_client):
+        rows = self._run(mock_client, models={"m-1": ["subnet-1"], "m-2": []})
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert (
+            "endpoint 'ep-2' runs outside any customer VPC"
+            in (rows[0]["Finding_Details"])
+        )
+
+    @patch("sagemaker_app.boto3.client")
+    def test_endpoint_config_vpc_is_read_for_inference_components(self, mock_client):
+        rows = self._run(
+            mock_client,
+            endpoints={"ep-1": {"models": [], "subnets": ["subnet-2"]}},
+            flow_logs=[self._flow_log("vpc-1")],
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "covers subnet-2" in rows[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "alarm",
+        [
+            {"ActionsEnabled": False},
+            {"AlarmActions": []},
+            {"MetricName": "Other"},
+            {"Namespace": "Other"},
+        ],
+    )
+    @patch("sagemaker_app.boto3.client")
+    def test_alarm_that_does_not_alert_on_the_filter_metric_fails(
+        self, mock_client, alarm
+    ):
+        rows = self._run(mock_client, alarms=[self._alarm(**alarm)])
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "no metric filter whose metric an alarm" in rows[0]["Finding_Details"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_anomaly_band_alarm_on_a_later_page_passes(self, mock_client):
+        band = self._alarm(MetricName=None, Namespace=None)
+        band["Metrics"] = [
+            {
+                "Id": "m1",
+                "MetricStat": {"Metric": {"Namespace": "Flow", "MetricName": "Egress"}},
+            },
+            {"Id": "ad1", "Expression": "ANOMALY_DETECTION_BAND(m1, 2)"},
+        ]
+        rows = self._run(mock_client, alarms=[self._alarm(MetricName="Other"), band])
+        assert [r["Status"] for r in rows] == ["Passed"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_filter_on_another_log_group_does_not_count(self, mock_client):
+        rows = self._run(
+            mock_client,
+            flow_logs=[
+                self._flow_log("vpc-1"),
+                self._flow_log("vpc-2", group="/flow/b"),
+            ],
+            filters={
+                "/flow/a": [
+                    {
+                        "logGroupName": "/flow/a",
+                        "metricTransformations": [
+                            {"metricNamespace": "Flow", "metricName": "Egress"}
+                        ],
+                    }
+                ],
+                "/flow/b": [
+                    {
+                        "logGroupName": "/flow/a",
+                        "metricTransformations": [
+                            {"metricNamespace": "Flow", "metricName": "Egress"}
+                        ],
+                    }
+                ],
+            },
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "endpoint 'ep-2'" in rows[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "operation,action",
+        [
+            ("describe_flow_logs", "ec2:DescribeFlowLogs"),
+            ("describe_subnets", "ec2:DescribeSubnets"),
+            ("describe_metric_filters", "logs:DescribeMetricFilters"),
+            ("describe_alarms", "cloudwatch:DescribeAlarms"),
+            ("describe_model", "model 'm-1'"),
+        ],
+    )
+    @patch("sagemaker_app.boto3.client")
+    def test_failed_read_is_incomplete_never_passed(
+        self, mock_client, operation, action
+    ):
+        rows = self._run(
+            mock_client, errors={operation: _make_client_error("AccessDenied")}
+        )
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert rows[0]["Finding"].endswith("Incomplete")
+        assert action in rows[0]["Finding_Details"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_endpoint_listing_failure_is_could_not_assess(self, mock_client):
+        mock_client.side_effect = _make_client_error("AccessDeniedException")
+        rows = _rows(self.check(region="us-east-1"))
+        assert len(rows) == 1
+        assert_could_not_assess_finding(rows[0])
+
+    @patch("sagemaker_app.boto3.client")
+    def test_no_endpoints_is_not_applicable(self, mock_client):
+        rows = self._run(mock_client, endpoints={}, models={})
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert "No SageMaker endpoints" in rows[0]["Finding_Details"]
 
 
 class TestSM37GuardDutyLambdaNetworkLogs:

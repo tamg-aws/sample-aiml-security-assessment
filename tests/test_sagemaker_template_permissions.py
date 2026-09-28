@@ -47,6 +47,9 @@ SCOPED_SAGEMAKER_GRANTS = {
     "organizations:ListParents": ":account/o-*/${AWS::AccountId}'",
     "securityhub:DescribeOrganizationConfiguration": ":hub/default'",
     "securityhub:ListEnabledProductsForImport": ":hub/default'",
+    "logs:DescribeMetricFilters": ":log-group:*'",
+    "cloudwatch:DescribeAlarms": ":alarm:*'",
+    "events:ListTargetsByRule": ":rule/*'",
 }
 
 
