@@ -4432,6 +4432,66 @@ CLOUDTRAIL_DATA_EVENT_RESOLUTION = (
 
 INFERENCE_FORENSIC_RECORD_FINDING = "Bedrock Inference Forensic Record"
 
+# A CloudTrail Lake event data store can record Bedrock data events in place of
+# a trail. ListEventDataStores returns only each store's ARN and name (botocore
+# marks AdvancedEventSelectors "no longer returned by ListEventDataStores"), and
+# GetEventDataStore, which returns the selectors, is not granted.
+EVENT_DATA_STORE_CEILING = (
+    "Partial, ceiling reached: the stores' AdvancedEventSelectors are returned "
+    "only by cloudtrail:GetEventDataStore, which the assessment role does not "
+    "hold (https://docs.aws.amazon.com/awscloudtrail/latest/APIReference/"
+    "API_GetEventDataStore.html)."
+)
+
+EVENT_DATA_STORE_ELSEWHERE_NOTE = (
+    "No CloudTrail Lake event data store is homed in this Region. A multi-Region "
+    "event data store homed in another Region would also record these calls and "
+    "is named in that Region's row."
+)
+
+
+def _event_data_store_names(cloudtrail_client) -> Dict[str, Any]:
+    """List the Region's CloudTrail Lake event data stores by name."""
+    try:
+        stores = _list_all_items(
+            cloudtrail_client,
+            "list_event_data_stores",
+            "EventDataStores",
+            max_results_param="MaxResults",
+            max_results=1000,
+            token_param="NextToken",
+            token_response_keys=("NextToken",),
+        )
+    except (ClientError, BotoCoreError, TypeError) as error:
+        return {
+            "names": [],
+            "error": "CloudTrail Lake event data stores were not listed with "
+            f"cloudtrail:ListEventDataStores ({get_assessment_error_label(error)})",
+        }
+    return {
+        "names": sorted(
+            str(store.get("Name") or store.get("EventDataStoreArn") or "unnamed")
+            for store in stores
+        ),
+        "error": None,
+    }
+
+
+def _event_data_store_unread(event_data_stores: Dict[str, Any]) -> str:
+    """Name what keeps a trail gap from being a verdict, or return ''."""
+    if event_data_stores["error"]:
+        return (
+            f"{event_data_stores['error']}, and an event data store could record "
+            "these calls"
+        )
+    if event_data_stores["names"]:
+        return (
+            "event data store(s) {} in this Region could record these calls. {}".format(
+                ", ".join(event_data_stores["names"]), EVENT_DATA_STORE_CEILING
+            )
+        )
+    return ""
+
 
 def _selector_field_map(selector: Any) -> Dict[str, Dict[str, Any]]:
     """Map each Field of one advanced event selector to its field selector."""
@@ -4634,11 +4694,15 @@ def _bedrock_data_event_findings(
     knowledge_base_count: Optional[int],
     record: Dict[str, Any],
     region: str,
+    event_data_stores: Dict[str, Any],
 ) -> List[Dict[str, Any]]:
     """
     BR-06 data-event legs: knowledge base retrieval traceability
     (AIR-BDR-KB-06) and end-to-end inference traceability (AIR-BDR-MDL-07).
+    A trail gap is a verdict only when the Region has no event data store,
+    because a store's selectors are not read.
     """
+    store_unread = _event_data_store_unread(event_data_stores)
     observed = ", ".join(sorted(data_event_trails)) or "none"
     narrowed_note = "".join(
         f" {resource_type} is named only in selector(s) narrowed by "
@@ -4684,9 +4748,9 @@ def _bedrock_data_event_findings(
         )
     else:
         kb_gaps = []
-        if not kb_trails and not unread_trails:
+        if not kb_trails and not unread_trails and not store_unread:
             kb_gaps.append(
-                f"no logging multi-region trail names {BEDROCK_KNOWLEDGE_BASE_DATA_EVENT_TYPE} in a resources.type field selector with no narrowing field, so a retrieved chunk cannot be traced back to the knowledge base that produced it"
+                f"no logging multi-region trail names {BEDROCK_KNOWLEDGE_BASE_DATA_EVENT_TYPE} in a resources.type field selector with no narrowing field, so a retrieved chunk cannot be traced back to the knowledge base that produced it. {EVENT_DATA_STORE_ELSEWHERE_NOTE}"
             )
         if record["logging"] is False:
             kb_gaps.append(
@@ -4697,6 +4761,10 @@ def _bedrock_data_event_findings(
                 "model invocation logging has textDataDeliveryEnabled not true, so the text of the response a retrieval informed is not recorded"
             )
         unread = list(unread_trails) if not kb_trails else []
+        if not kb_trails and not unread_trails and store_unread:
+            unread.append(
+                f"no logging multi-region trail names {BEDROCK_KNOWLEDGE_BASE_DATA_EVENT_TYPE} in a resources.type field selector with no narrowing field, but {store_unread}"
+            )
         if record["logging"] is None:
             unread.extend(record["unread"])
         elif record["logging"] is True and record["text_delivery"] is None:
@@ -4769,12 +4837,25 @@ def _bedrock_data_event_findings(
                 region=region,
             )
         )
+    elif store_unread:
+        data_event_findings.append(
+            create_finding(
+                check_id="BR-06",
+                finding_name="Bedrock Model Invocation Data Event Logging",
+                finding_details=f"No logging multi-region trail names {', '.join(missing)} in a resources.type field selector with no narrowing field (observed data-event resource types: {observed}), but {store_unread}{narrowed_note}",
+                resolution=COULD_NOT_ASSESS_RESOLUTION,
+                reference="https://docs.aws.amazon.com/awscloudtrail/latest/APIReference/API_GetEventDataStore.html",
+                severity="Informational",
+                status="N/A",
+                region=region,
+            )
+        )
     else:
         data_event_findings.append(
             create_finding(
                 check_id="BR-06",
                 finding_name="Bedrock Model Invocation Data Event Logging",
-                finding_details=f"No logging multi-region trail names {', '.join(missing)} in a resources.type field selector with no narrowing field, so an inference on those paths cannot be traced from the invoking identity to the model or agent that answered it (observed data-event resource types: {observed}).{narrowed_note}",
+                finding_details=f"No logging multi-region trail names {', '.join(missing)} in a resources.type field selector with no narrowing field, so an inference on those paths cannot be traced from the invoking identity to the model or agent that answered it (observed data-event resource types: {observed}). {EVENT_DATA_STORE_ELSEWHERE_NOTE}{narrowed_note}",
                 resolution=CLOUDTRAIL_DATA_EVENT_RESOLUTION.format(", ".join(missing)),
                 reference="https://docs.aws.amazon.com/bedrock/latest/userguide/logging-using-cloudtrail.html",
                 severity="Medium",
@@ -5011,6 +5092,7 @@ def check_bedrock_cloudtrail_logging(region: str = "") -> Dict[str, Any]:
                     knowledge_base_count,
                     _invocation_record_state(region),
                     region,
+                    _event_data_store_names(cloudtrail_client),
                 )
             )
 
@@ -11080,9 +11162,7 @@ def _assess_storage_layer_encryption(
             return _store_verdict(
                 "N/A",
                 f"uses {located}. Its encryption key could not be read: "
-                f"{_store_read_error(error, 'aoss:BatchGetCollection', store_region)}. "
-                "The deployed assessment role does not carry this grant, because "
-                "the action has no resource type and needs Resource '*'.",
+                f"{_store_read_error(error, 'aoss:BatchGetCollection', store_region)}.",
             )
         details = response.get("collectionDetails") or []
         if not details:
@@ -15824,7 +15904,7 @@ def check_bedrock_cloudwatch_alarms(
                 lambda ns, _name: ns == "AWS/Bedrock"
             )
             silent_note = (
-                f" Alarm(s) {', '.join(silent_bedrock_alarms)} evaluate AWS/Bedrock metrics but reach no action: ActionsEnabled is false, AlarmActions is empty, and no acting composite alarm reads them."
+                f" Alarm(s) {', '.join(silent_bedrock_alarms)} evaluate AWS/Bedrock metrics but reach no action: ActionsEnabled is false or AlarmActions is empty, and no acting composite alarm reads them."
                 if silent_bedrock_alarms
                 else ""
             )
@@ -21873,9 +21953,44 @@ AI_USER_MFA_REFERENCE = (
 AI_USER_MFA_SCOPE_NOTE = (
     "IAM users and the trust policies of IAM roles are read. People who sign in "
     "through IAM Identity Center are not covered: the sso-admin API publishes no "
-    "operation that returns the MFA mode, and the permission-set Deny keyed on "
-    'aws:PrincipalTag needs sso:ListInstances, which authorizes only on "*".'
+    "operation that returns an instance's MFA settings, and permission-set "
+    "policies need sso:ListPermissionSets and "
+    "sso:GetInlinePolicyForPermissionSet, which are not granted."
 )
+
+IDENTITY_CENTER_MFA_REFERENCE = (
+    "https://docs.aws.amazon.com/singlesignon/latest/userguide/mfa-configure.html"
+)
+
+
+def _identity_center_instances(region: str) -> Dict[str, Any]:
+    """List the IAM Identity Center instances visible to this account in a Region."""
+    try:
+        instances = _list_all_items(
+            boto3.client("sso-admin", config=boto3_config, region_name=region),
+            "list_instances",
+            "Instances",
+            max_results_param="MaxResults",
+            token_param="NextToken",
+            token_response_keys=("NextToken",),
+        )
+    except (ClientError, BotoCoreError, TypeError) as error:
+        return {
+            "instances": [],
+            "error": f"sso:ListInstances in {region} "
+            f"({get_assessment_error_label(error)})",
+        }
+    return {
+        "instances": sorted(
+            "{} (owner {})".format(
+                instance.get("InstanceArn") or "unknown",
+                instance.get("OwnerAccountId") or "unknown",
+            )
+            for instance in instances
+        ),
+        "error": None,
+    }
+
 
 MFA_PRESENT_CONDITION_KEY = "aws:multifactorauthpresent"
 
@@ -22029,14 +22144,15 @@ def _trust_statements_without_mfa(trust_policy: Any) -> List[str]:
 
 
 def check_bedrock_ai_user_console_mfa(
-    permission_cache, region: str = ""
+    permission_cache, region: str = "", identity_center_region: str = ""
 ) -> Dict[str, Any]:
     """
     BR-51: Flag identities that can change Bedrock, SageMaker AI or AgentCore
     resources without MFA: an IAM user with a console password and no MFA
     device, an IAM user with an active access key and no Deny requiring MFA,
     and an IAM role whose trust policy lets a user or account assume it
-    without MFA.
+    without MFA. An IAM Identity Center instance visible in
+    identity_center_region keeps the IAM-only Passed row at N/A.
     """
     logger.debug("Starting check for AI user console MFA")
     try:
@@ -22259,13 +22375,42 @@ def check_bedrock_ai_user_console_mfa(
                 trusted.append(role_name)
 
         if protected or no_console or deny_protected or trusted:
+            sso_region = identity_center_region or os.environ.get(
+                "AWS_REGION", "us-east-1"
+            )
+            identity_center = _identity_center_instances(sso_region)
+            if identity_center["error"]:
+                sso_note = (
+                    "Identity Center instances were not listed with "
+                    f"{identity_center['error']}, so people who sign in through "
+                    "one may hold AI write access."
+                )
+                status, severity = "N/A", "Informational"
+            elif identity_center["instances"]:
+                sso_note = (
+                    "IAM Identity Center instance(s) {} are visible to this "
+                    "account, and the people who sign in through them are judged "
+                    "by no row. Partial, ceiling reached: the instance's MFA "
+                    "settings are returned by no sso-admin operation ({}).".format(
+                        ", ".join(identity_center["instances"][:5]),
+                        IDENTITY_CENTER_MFA_REFERENCE,
+                    )
+                )
+                status, severity = "N/A", "Informational"
+            else:
+                sso_note = (
+                    f"sso:ListInstances in {sso_region} returned no IAM Identity "
+                    "Center instance. An instance homed only in another Region is "
+                    "not listed here."
+                )
+                status, severity = "Passed", "High"
             findings["csv_data"].append(
                 row(
                     "{} of the {} in-scope IAM user(s) have an MFA device ({}) and "
                     "{} have no console password ({}) and no active access key. "
                     "{} user(s) are held to MFA by a Deny ({}). {} of the {} "
                     "in-scope IAM role(s) cannot be assumed by a user or account "
-                    "without MFA ({}). {}".format(
+                    "without MFA ({}). {} {}".format(
                         len(protected),
                         len(population["users"]),
                         ", ".join(protected[:10]) or "none",
@@ -22277,10 +22422,13 @@ def check_bedrock_ai_user_console_mfa(
                         len(roles["users"]),
                         ", ".join(trusted[:10]) or "none",
                         AI_USER_SCOPE_NOTE,
+                        sso_note,
                     ),
-                    "No action required",
-                    "High",
-                    "Passed",
+                    "No action required"
+                    if status == "Passed"
+                    else COULD_NOT_ASSESS_RESOLUTION,
+                    severity,
+                    status,
                 )
             )
         return finish()
@@ -25015,11 +25163,11 @@ RESOURCE_OWNER_SWEEP_SERVICES = (
 )
 
 # The list actions that would enumerate SageMaker and AgentCore resources that
-# were never tagged. The Bedrock role holds none of them.
+# were never tagged. The Bedrock role holds none of them. Agent runtimes are
+# enumerated with bedrock-agentcore:ListAgentRuntimes, which it holds.
 RESOURCE_OWNER_SWEEP_UNGRANTED = (
     "sagemaker:ListEndpoints, sagemaker:ListModels, sagemaker:ListNotebookInstances, "
-    "bedrock-agentcore:ListAgentRuntimes, bedrock-agentcore:ListGateways and "
-    "bedrock-agentcore:ListMemories"
+    "bedrock-agentcore:ListGateways and bedrock-agentcore:ListMemories"
 )
 
 
@@ -25050,6 +25198,8 @@ def check_ai_resource_owner_tag_sweep(region: str = "") -> Dict[str, Any]:
     owned = 0
     unowned = []
     unread = []
+    returned_arns = set()
+    read_filters = set()
     for type_filter, label in RESOURCE_OWNER_SWEEP_SERVICES:
         try:
             mappings = _list_all_items(
@@ -25067,11 +25217,13 @@ def check_ai_resource_owner_tag_sweep(region: str = "") -> Dict[str, Any]:
                 f"({get_assessment_error_label(error)})"
             )
             continue
+        read_filters.add(type_filter)
         for mapping in mappings:
             arn = mapping.get("ResourceARN")
             if not arn:
                 continue
             returned += 1
+            returned_arns.add(arn)
             tags = mapping.get("Tags") or []
             rejections = []
             credited = False
@@ -25086,13 +25238,50 @@ def check_ai_resource_owner_tag_sweep(region: str = "") -> Dict[str, Any]:
             else:
                 unowned.append((label, arn, tags, rejections))
 
+    runtime_note = ""
+    if "bedrock-agentcore" in read_filters:
+        try:
+            runtimes = _list_all_items(
+                boto3.client(
+                    "bedrock-agentcore-control", config=boto3_config, region_name=region
+                ),
+                "list_agent_runtimes",
+                "agentRuntimes",
+            )
+        except (ClientError, BotoCoreError, TypeError) as error:
+            unread.append(
+                "bedrock-agentcore:ListAgentRuntimes "
+                f"({get_assessment_error_label(error)}), so agent runtimes never "
+                "tagged are not listed"
+            )
+        else:
+            untagged = sorted(
+                {
+                    runtime["agentRuntimeArn"]
+                    for runtime in runtimes
+                    if runtime.get("agentRuntimeArn")
+                    and runtime["agentRuntimeArn"] not in returned_arns
+                }
+            )
+            for arn in untagged:
+                unowned.append(("AgentCore", arn, None, []))
+            runtime_note = (
+                " bedrock-agentcore:ListAgentRuntimes listed {} agent runtime(s), "
+                "{} of them absent from GetResources and so never tagged.".format(
+                    len(runtimes), len(untagged)
+                )
+            )
+
     for label, arn, tags, rejections in unowned[:MAX_REPORTED_UNOWNED_RESOURCES]:
         findings["csv_data"].append(
             row(
                 "{} resource {} has no owner tag whose value names someone ({}).{}".format(
                     label,
                     arn,
-                    "no tags returned"
+                    "listed by bedrock-agentcore:ListAgentRuntimes and not returned "
+                    "by tag:GetResources, so it was never tagged"
+                    if tags is None
+                    else "no tags returned"
                     if not tags
                     else "tag keys: "
                     + ", ".join(str(tag.get("Key")) for tag in tags[:10]),
@@ -25131,9 +25320,13 @@ def check_ai_resource_owner_tag_sweep(region: str = "") -> Dict[str, Any]:
             "{} of the {} SageMaker and AgentCore resource(s) GetResources returned "
             "carry an owner tag with a non-placeholder value. GetResources returns "
             "only resources that are or were tagged, so a resource never tagged is "
-            "not listed, and the Bedrock role holds none of {} to enumerate them. "
-            "This is not a verdict on every SageMaker or AgentCore resource.{}".format(
-                owned, returned, RESOURCE_OWNER_SWEEP_UNGRANTED, unread_note
+            "not listed, and the Bedrock role holds none of {} to enumerate them."
+            "{} This is not a verdict on every SageMaker or AgentCore resource.{}".format(
+                owned,
+                returned,
+                RESOURCE_OWNER_SWEEP_UNGRANTED,
+                runtime_note,
+                unread_note,
             ),
             COULD_NOT_ASSESS_RESOLUTION,
             "Informational",
@@ -28333,7 +28526,9 @@ def lambda_handler(event, context):
                 logger.info("Running AI user console MFA check (BR-51)")
                 all_findings.append(
                     check_bedrock_ai_user_console_mfa(
-                        permission_cache, region=GLOBAL_REGION_LABEL
+                        permission_cache,
+                        region=GLOBAL_REGION_LABEL,
+                        identity_center_region=region,
                     )
                 )
 

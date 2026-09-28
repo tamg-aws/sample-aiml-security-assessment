@@ -105,8 +105,8 @@ AI_SUBJECT_ROWS = [
         "sets none. It never passes one. An account-enforced configuration is "
         "credited only when it applies to every model and every message, without "
         "SELECTIVE guarding or inputTags HONOR. comprehend:ListPiiEntitiesDetectionJobs has "
-        "no resource type and is not granted, so an S3 source reads as not judged "
-        "until it is. The ceiling: a transformation Lambda's logic and a Glue job's "
+        "no resource type and is granted on *, and a failed read leaves an S3 "
+        "source not judged. The ceiling: a transformation Lambda's logic and a Glue job's "
         "effect are not recorded, and a direct RetrieveAndGenerate caller supplies "
         "guardrailId per request",
         [],
@@ -1575,12 +1575,13 @@ FOUNDATION_ROWS = [
         "population is the inventory, never a ResourceTypeFilters sweep, because "
         "GetResources returns only resources that are or were tagged, so a sweep "
         "omits the resources that most need an owner. SageMaker and AgentCore "
-        "resources are read through a ResourceTypeFilters sweep, since the Bedrock "
-        "role holds no list action for either service: each returned resource "
-        "without an owner tag fails, and the sweep never passes. Ceiling: a "
-        "SageMaker or AgentCore resource that was never tagged, which only "
-        "sagemaker:ListEndpoints, bedrock-agentcore:ListAgentRuntimes and the "
-        "other list APIs return",
+        "resources are read through a ResourceTypeFilters sweep: each returned "
+        "resource without an owner tag fails, and the sweep never passes. Agent "
+        "runtimes listed by bedrock-agentcore:ListAgentRuntimes and absent from "
+        "the sweep fail as never tagged. Ceiling: any other SageMaker or AgentCore "
+        "resource that was never tagged, which only sagemaker:ListEndpoints, "
+        "bedrock-agentcore:ListGateways and the other list APIs the Bedrock role "
+        "does not hold return",
         [],
         6,
     ),
@@ -1594,8 +1595,10 @@ FOUNDATION_ROWS = [
         "policies grant a non-read bedrock:, sagemaker: or bedrock-agentcore: "
         "action, and fails a user that has a console password (GetLoginProfile "
         "succeeds) and no MFA device. NoSuchEntity means no console password. "
-        "IAM Identity Center users are outside it: the check does not read "
-        "Identity Center MFA settings, and the finding says so",
+        "IAM Identity Center users are outside it: no sso-admin operation returns "
+        "an instance's MFA settings, and the finding says so. When "
+        "sso:ListInstances in the primary scan Region returns an instance or "
+        "cannot be read, the Passed row is N/A, partial, ceiling reached",
         [],
         6,
     ),
@@ -1710,9 +1713,8 @@ FOUNDATION_ROWS = [
         "collaborator alias, trust policy or cached principal reports N/A, never "
         "Passed. Partial, ceiling reached: no AWS API marks which ECS task or "
         "Lambda execution roles host an agent, GetAgentRuntime returns no field "
-        "for a runtime session's token scope, and the runtime list needs "
-        "bedrock-agentcore:ListAgentRuntimes and ListAgentRuntimeEndpoints on *, "
-        "which are not granted",
+        "for a runtime session's token scope, and a role in another account that "
+        "trusts an agent role is not read",
         [],
         6,
     ),

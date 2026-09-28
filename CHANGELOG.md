@@ -22,9 +22,9 @@ section.
   are not marked as agents by any AWS API and are not judged. The Bedrock
   assessment role gains `bedrock:ListAgentCollaborators` on the account's
   agents and `bedrock-agentcore:GetAgentRuntime` on its runtimes, both
-  read-only. Listing runtimes needs `bedrock-agentcore:ListAgentRuntimes` and
-  `bedrock-agentcore:ListAgentRuntimeEndpoints` on `*`, which are not granted,
-  so the runtime leg reports `N/A` naming them.
+  read-only. Runtimes are listed with `bedrock-agentcore:ListAgentRuntimes`
+  and `bedrock-agentcore:ListAgentRuntimeEndpoints` on `*`, and a failed list
+  reports `N/A` naming the action.
 - Added an **AWS AI Security Framework (AISF)** section to the HTML report,
   alongside OWASP Top 10 for LLM under "By Compliance Standard". It reports 8
   of the 105 in-scope AISF controls as `AISF-01` through `AISF-08`. Behavior
@@ -256,6 +256,24 @@ section.
 - `BR-33` scopes Lambda functions by the Bedrock and AgentCore grants on
   their role as well as by name, and fails a function Inspector does not
   scan: one encrypted with a customer managed key, or tagged for exclusion.
+- `BR-32` now sees composite alarms. The Bedrock assessment role read
+  `cloudwatch:DescribeAlarms` on the account's `alarm:*` ARNs, and
+  DescribeAlarms returns no composite alarm to a grant narrower than `*`, so a
+  runtime or guardrail alarm reached only through an acting composite alarm
+  was reported as reaching no action. The grant is now on `*`.
+- `BR-06` lists the Region's CloudTrail Lake event data stores. A trail gap
+  on the knowledge base or inference data-event row, which a store could
+  close, is `N/A` with "Partial, ceiling reached" when a store exists, because
+  only `cloudtrail:GetEventDataStore` returns its selectors. With no store the
+  row stays `Failed`.
+- `BR-51` no longer passes an account whose IAM Identity Center instance it
+  cannot judge. The `Passed` row becomes `N/A` when `sso:ListInstances` in the
+  primary scan Region returns an instance, or cannot be read.
+- `BR-53` fails an AgentCore agent runtime that `ListAgentRuntimes` lists and
+  `GetResources` does not return, since such a runtime was never tagged.
+- `BR-20` reads OpenSearch Serverless collections with
+  `aoss:BatchGetCollection`, now granted, and names the action when the read
+  fails.
 - Bedrock checks judge values that they used to credit on presence. `BR-07`,
   `BR-17`, `BR-20` (S3 Vectors), `BR-30` and `BR-38` describe each named KMS
   key and pass only an enabled customer managed key. `BR-07` also fails inline
@@ -694,6 +712,18 @@ role, `cognito-idp:DescribeUserPool`, `cognito-idp:ListUserPoolClients` and
 `cognito-idp:DescribeUserPoolClient`, scoped to the account's user pools. All
 are read-only, and the same CodeBuild run applies them. No parameter,
 deployment-stack or member-role StackSet change is required.
+
+The Bedrock assessment role gains, in both SAM templates, on `*` because none
+has a resource type in the IAM service authorization reference:
+`aoss:BatchGetCollection` (`BR-20`), `comprehend:ListPiiEntitiesDetectionJobs`
+(`BR-26`), `cloudtrail:ListEventDataStores` (`BR-06`), `sso:ListInstances`
+(`BR-51`), `bedrock-agentcore:ListAgentRuntimes` (`BR-47`, `BR-53`, `BR-57`)
+and `bedrock-agentcore:ListAgentRuntimeEndpoints` (`BR-57`). Its
+`cloudwatch:DescribeAlarms` grant moves from the account's `alarm:*` ARNs to
+`*`, because DescribeAlarms returns composite alarms only to a `*` grant
+(`BR-32`). `inspector2:BatchGetAccountStatus` moves from its own statement
+into the `LambdaInventoryPermissions` statement, still on `*`. All are
+read-only, and the same CodeBuild run applies them.
 
 The AgentCore assessment role gains `bedrock-agentcore:GetPaymentManager` and
 `bedrock-agentcore:GetHarness`, scoped to the account's `payment-manager/*` and

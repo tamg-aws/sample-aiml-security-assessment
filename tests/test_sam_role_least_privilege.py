@@ -122,9 +122,12 @@ _EXPECTED_ACTIONS = {
         "s3:PutObject",
     },
     "BedrockSecurityAssessmentFunction": {
+        "aoss:BatchGetCollection",
         "backup:DescribeBackupVault",
         "backup:ListBackupVaults",
         "bedrock-agentcore:GetAgentRuntime",
+        "bedrock-agentcore:ListAgentRuntimeEndpoints",
+        "bedrock-agentcore:ListAgentRuntimes",
         "bedrock:GetAccountDataRetention",
         "bedrock:GetAgent",
         "bedrock:GetAgentActionGroup",
@@ -167,9 +170,11 @@ _EXPECTED_ACTIONS = {
         "cloudtrail:GetEventSelectors",
         "cloudtrail:GetTrail",
         "cloudtrail:GetTrailStatus",
+        "cloudtrail:ListEventDataStores",
         "cloudtrail:ListTrails",
         "cloudtrail:LookupEvents",
         "cloudwatch:DescribeAlarms",
+        "comprehend:ListPiiEntitiesDetectionJobs",
         "ec2:DescribeRouteTables",
         "ec2:DescribeSubnets",
         "ec2:DescribeVpcEndpoints",
@@ -226,6 +231,7 @@ _EXPECTED_ACTIONS = {
         "servicequotas:GetAWSDefaultServiceQuota",
         "servicequotas:GetServiceQuota",
         "servicequotas:ListServiceQuotas",
+        "sso:ListInstances",
         "tag:GetResources",
     },
     "SagemakerSecurityAssessmentFunction": {
@@ -770,9 +776,15 @@ def test_bedrock_quota_and_alarm_reads_are_arn_scoped(template):
     alarms = _statement_block(
         template, "BedrockSecurityAssessmentFunction", "CloudWatchPermissions"
     )
+    # API_DescribeAlarms returns composite alarms only to a grant scoped to
+    # '*', and BR-32 credits an acting composite, so alarm:* would hide them.
     assert "cloudwatch:DescribeAlarms" in alarms
-    assert "cloudwatch:*:${AWS::AccountId}:alarm:*" in alarms
-    assert not re.search(r"Resource:\s+['\"]\*['\"]", alarms)
+    assert re.search(r"Resource:\s+['\"]\*['\"]", alarms)
+    assert "cloudwatch:*:${AWS::AccountId}:alarm:*" not in alarms
+    assert "composite alarms if your" in alarms
+    assert re.findall(r"-\s+([a-z0-9-]+:[A-Za-z0-9]+)", alarms) == [
+        "cloudwatch:DescribeAlarms"
+    ]
 
 
 @pytest.mark.parametrize("template", _SAM_TEMPLATES, ids=os.path.basename)
@@ -1122,7 +1134,21 @@ def test_aisf_phase5_reads_wildcard_only_where_iam_has_no_resource_type(template
         (
             "BedrockSecurityAssessmentFunction",
             "BedrockAccountInventoryPermissions",
-        ): ("bedrock:ListModelCustomizationJobs",),
+        ): (
+            "bedrock:ListModelCustomizationJobs",
+            "aoss:BatchGetCollection",
+            "comprehend:ListPiiEntitiesDetectionJobs",
+            "sso:ListInstances",
+            "bedrock-agentcore:ListAgentRuntimes",
+            "bedrock-agentcore:ListAgentRuntimeEndpoints",
+        ),
+        ("BedrockSecurityAssessmentFunction", "CloudTrailPermissions"): (
+            "cloudtrail:ListEventDataStores",
+        ),
+        ("BedrockSecurityAssessmentFunction", "LambdaInventoryPermissions"): (
+            "lambda:ListFunctions",
+            "inspector2:BatchGetAccountStatus",
+        ),
         ("BedrockSecurityAssessmentFunction", "KMSKeyInventory"): ("kms:ListKeys",),
         ("BedrockSecurityAssessmentFunction", "BackupVaultInventory"): (
             "backup:ListBackupVaults",

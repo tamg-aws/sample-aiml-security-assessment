@@ -2110,6 +2110,7 @@ class TestBR06CloudTrailLogging:
         mock_ct.list_knowledge_bases.return_value = {
             "knowledgeBaseSummaries": list(knowledge_bases)
         }
+        mock_ct.list_event_data_stores.return_value = {"EventDataStores": []}
         return mock_ct
 
     @staticmethod
@@ -2292,8 +2293,16 @@ class TestBR06SelectorValues:
     """AIR-BDR-KB-06 and AIR-BDR-MDL-07: selectors are judged by every field."""
 
     @staticmethod
-    def _run(trails, record=None, knowledge_bases=({"knowledgeBaseId": "kb-1"},)):
-        """trails: {name: {"advanced": [...], "basic": [...], "error": code}}."""
+    def _run(
+        trails,
+        record=None,
+        knowledge_bases=({"knowledgeBaseId": "kb-1"},),
+        event_data_stores=({"EventDataStores": []},),
+    ):
+        """
+        trails: {name: {"advanced": [...], "basic": [...], "error": code}}.
+        event_data_stores: ListEventDataStores pages, or an exception to raise.
+        """
 
         def name_of(arn):
             return arn.rsplit("/", 1)[-1]
@@ -2325,6 +2334,12 @@ class TestBR06SelectorValues:
         client.list_knowledge_bases.return_value = {
             "knowledgeBaseSummaries": list(knowledge_bases)
         }
+        client.list_event_data_stores.side_effect = (
+            event_data_stores
+            if isinstance(event_data_stores, Exception)
+            else list(event_data_stores)
+        )
+        TestBR06SelectorValues.store_client = client
         with (
             patch("boto3.client", return_value=client),
             patch("bedrock_app.detect_bedrock_regional_footprint", return_value=True),
@@ -2511,6 +2526,97 @@ class TestBR06SelectorValues:
         assert "AWS::Bedrock::Model by a" in row["Finding_Details"]
         assert "AWS::Bedrock::InlineAgent by b" in row["Finding_Details"]
         assert "bedrock-mantle endpoint are not read" in row["Finding_Details"]
+
+    # --- CloudTrail Lake event data stores ------------------------------------
+
+    def test_no_event_data_store_keeps_the_trail_gap_failed(self):
+        rows = self._run({"a": {"advanced": [_management()]}})
+        self.store_client.list_event_data_stores.assert_called_once_with(
+            MaxResults=1000
+        )
+        for name in (
+            "Bedrock Knowledge Base Retrieval Data Event Logging",
+            "Bedrock Model Invocation Data Event Logging",
+        ):
+            assert rows[name]["Status"] == "Failed", name
+            assert (
+                "No CloudTrail Lake event data store is homed in this Region"
+                in rows[name]["Finding_Details"]
+            )
+
+    def test_event_data_stores_on_any_page_make_the_trail_gap_a_ceiling(self):
+        arn = "arn:aws:cloudtrail:us-east-1:123:eventdatastore/"
+        rows = self._run(
+            {"a": {"advanced": [_management()]}},
+            event_data_stores=(
+                {
+                    "EventDataStores": [
+                        {"EventDataStoreArn": arn + "1", "Name": "lake-a"}
+                    ],
+                    "NextToken": "page-2",
+                },
+                {
+                    "EventDataStores": [
+                        {"EventDataStoreArn": arn + "2", "Name": "lake-b"}
+                    ]
+                },
+            ),
+        )
+        assert self.store_client.list_event_data_stores.call_args_list[1] == call(
+            MaxResults=1000, NextToken="page-2"
+        )
+        for name in (
+            "Bedrock Knowledge Base Retrieval Data Event Logging",
+            "Bedrock Model Invocation Data Event Logging",
+        ):
+            row = rows[name]
+            assert row["Status"] == "N/A", name
+            assert (
+                "event data store(s) lake-a, lake-b in this Region"
+                in (row["Finding_Details"])
+            )
+            assert "Partial, ceiling reached" in row["Finding_Details"]
+            assert "AdvancedEventSelectors" in row["Finding_Details"]
+            assert "cloudtrail:GetEventDataStore" in row["Finding_Details"]
+            assert "API_GetEventDataStore" in row["Finding_Details"]
+            assert "homed in this Region" not in row["Finding_Details"]
+
+    def test_unlisted_event_data_stores_leave_the_trail_gap_unjudged(self):
+        rows = self._run(
+            {"a": {"advanced": [_management()]}},
+            event_data_stores=ClientError(
+                {"Error": {"Code": "AccessDeniedException", "Message": "x"}},
+                "ListEventDataStores",
+            ),
+        )
+        for name in (
+            "Bedrock Knowledge Base Retrieval Data Event Logging",
+            "Bedrock Model Invocation Data Event Logging",
+        ):
+            row = rows[name]
+            assert row["Status"] == "N/A", name
+            assert "cloudtrail:ListEventDataStores" in row["Finding_Details"]
+            assert "AccessDeniedException" in row["Finding_Details"]
+
+    def test_event_data_store_hides_neither_a_covering_trail_nor_another_gap(self):
+        store = ({"EventDataStores": [{"Name": "lake-a"}]},)
+        rows = self._run(
+            {"full": {"advanced": [_management(), _data(INFERENCE_TYPES)]}},
+            record={
+                "logging": False,
+                "text_delivery": None,
+                "gaps": ["model invocation logging is off"],
+                "unread": [],
+            },
+            event_data_stores=store,
+        )
+        assert rows["Bedrock Model Invocation Data Event Logging"]["Status"] == "Passed"
+        kb = rows["Bedrock Knowledge Base Retrieval Data Event Logging"]
+        assert kb["Status"] == "Failed"
+        assert (
+            "Model invocation logging is off, so the response"
+            in (kb["Finding_Details"])
+        )
 
     def test_model_only_selector_misses_three_inference_paths(self):
         rows = self._run({"a": {"advanced": [_data(["AWS::Bedrock::Model"])]}})
@@ -16823,6 +16929,7 @@ class TestBR32ActingIntervention:
             {"MetricAlarms": alarms, "CompositeAlarms": composites or []}
         ]
         cw_client.get_paginator.return_value = paginator
+        self.alarm_paginator = paginator
         bedrock_client = MagicMock()
         bedrock_client.get_model_invocation_logging_configuration.return_value = {
             "loggingConfig": logging_config
@@ -17253,8 +17360,73 @@ class TestBR32ActingIntervention:
             in runtime[0]["Finding_Details"]
         )
         assert (
-            "muted-throttle evaluate AWS/Bedrock metrics but reach no action"
+            "muted-throttle evaluate AWS/Bedrock metrics but reach no action: "
+            "ActionsEnabled is false or AlarmActions is empty"
             in runtime[0]["Finding_Details"]
+        )
+
+    def test_runtime_alarm_reached_only_through_a_composite_passes(self):
+        # The composite is the only action: its child and the orphan beside it
+        # both have empty AlarmActions.
+        runtime, _ = self._run(
+            [
+                dict(ACTING_RUNTIME_ALARM, AlarmName="child-throttle", AlarmActions=[]),
+                dict(
+                    ACTING_RUNTIME_ALARM, AlarmName="orphan-throttle", AlarmActions=[]
+                ),
+            ],
+            composites=[
+                {
+                    "AlarmName": "bedrock-parent",
+                    "AlarmRule": 'ALARM("child-throttle")',
+                    "ActionsEnabled": True,
+                    "AlarmActions": [SNS_TOPIC],
+                }
+            ],
+        )
+        self.alarm_paginator.paginate.assert_called_once_with(
+            AlarmTypes=["MetricAlarm", "CompositeAlarm"]
+        )
+        assert runtime[0]["Status"] == "Passed"
+        assert (
+            "1 CloudWatch alarm(s) that reach an action evaluate Amazon Bedrock "
+            "runtime metrics (AWS/Bedrock namespace): child-throttle."
+            in runtime[0]["Finding_Details"]
+        )
+        assert (
+            "Alarm(s) orphan-throttle evaluate AWS/Bedrock metrics but reach no "
+            "action: ActionsEnabled is false or AlarmActions is empty, and no "
+            "acting composite alarm reads them." in runtime[0]["Finding_Details"]
+        )
+
+    def test_runtime_alarm_under_a_silent_or_negated_composite_fails(self):
+        runtime, _ = self._run(
+            [
+                dict(ACTING_RUNTIME_ALARM, AlarmName="child-throttle", AlarmActions=[]),
+                dict(
+                    ACTING_RUNTIME_ALARM, AlarmName="sibling-throttle", AlarmActions=[]
+                ),
+            ],
+            composites=[
+                {
+                    "AlarmName": "silent-parent",
+                    "AlarmRule": 'ALARM("child-throttle")',
+                    "ActionsEnabled": False,
+                    "AlarmActions": [SNS_TOPIC],
+                },
+                {
+                    "AlarmName": "negated-parent",
+                    "AlarmRule": 'NOT ALARM("sibling-throttle")',
+                    "ActionsEnabled": True,
+                    "AlarmActions": [SNS_TOPIC],
+                },
+            ],
+        )
+        assert runtime[0]["Status"] == "Failed"
+        assert (
+            "Alarm(s) child-throttle, sibling-throttle evaluate AWS/Bedrock metrics "
+            "but reach no action: ActionsEnabled is false or AlarmActions is empty, "
+            "and no acting composite alarm reads them." in runtime[0]["Finding_Details"]
         )
 
     def test_log_forwarding_is_reported(self):
@@ -23216,9 +23388,22 @@ class TestBR50AIUserAccessKeys:
 class TestBR51AIUserConsoleMFA:
     """BR-51: console password without MFA on AI write users."""
 
-    def _run(self, cache, login=None, devices=None, mfa_error=None, keys=None):
+    def _run(
+        self,
+        cache,
+        login=None,
+        devices=None,
+        mfa_error=None,
+        keys=None,
+        instances=None,
+    ):
         iam = MagicMock()
         login = login or {}
+        if isinstance(instances, Exception):
+            iam.list_instances.side_effect = instances
+        else:
+            iam.list_instances.side_effect = list(instances or [{"Instances": []}])
+        self.clients = []
         iam.list_access_keys.side_effect = lambda UserName, **kwargs: {
             "AccessKeyMetadata": (keys or {}).get(UserName, [])
         }
@@ -23238,11 +23423,86 @@ class TestBR51AIUserConsoleMFA:
 
         iam.get_login_profile.side_effect = get_login_profile
         iam.list_mfa_devices.side_effect = list_mfa_devices
-        with patch("boto3.client", return_value=iam):
+
+        def client(service, **kwargs):
+            self.clients.append((service, kwargs.get("region_name")))
+            return iam
+
+        self.iam = iam
+        with patch("boto3.client", side_effect=client):
             result = bedrock_app.check_bedrock_ai_user_console_mfa(
-                cache, region="Global"
+                cache, region="Global", identity_center_region="eu-west-1"
             )
         return result, extract_csv_data(result)
+
+    def test_br51_no_identity_center_instance_keeps_passed(self):
+        _, rows = self._run(
+            _ai_user_cache(),
+            login={"alice": "yes"},
+            devices={"alice": [{"SerialNumber": "s"}]},
+        )
+        assert [r["Status"] for r in rows] == ["Passed"]
+        assert ("sso-admin", "eu-west-1") in self.clients
+        self.iam.list_instances.assert_called_once_with(MaxResults=100)
+        assert (
+            "sso:ListInstances in eu-west-1 returned no IAM Identity Center "
+            "instance. An instance homed only in another Region is not listed here."
+            in rows[0]["Finding_Details"]
+        )
+
+    def test_br51_identity_center_instance_on_any_page_stops_passed(self):
+        _, rows = self._run(
+            _ai_user_cache(),
+            login={"alice": "yes"},
+            devices={"alice": [{"SerialNumber": "s"}]},
+            instances=[
+                {"Instances": [], "NextToken": "p2"},
+                {
+                    "Instances": [
+                        {
+                            "InstanceArn": "arn:aws:sso:::instance/ssoins-1",
+                            "OwnerAccountId": "111122223333",
+                        }
+                    ]
+                },
+            ],
+        )
+        assert [r["Status"] for r in rows] == ["N/A"]
+        self.iam.list_instances.assert_has_calls(
+            [call(MaxResults=100), call(MaxResults=100, NextToken="p2")]
+        )
+        details = rows[0]["Finding_Details"]
+        assert (
+            "arn:aws:sso:::instance/ssoins-1 (owner 111122223333) are visible"
+            in details
+        )
+        assert "Partial, ceiling reached" in details
+        assert "userguide/mfa-configure.html" in details
+        assert "IAM Identity Center are not covered" in details
+        assert rows[0]["Severity"] == "Informational"
+
+    def test_br51_unlisted_identity_center_stops_passed(self):
+        _, rows = self._run(
+            _ai_user_cache(),
+            login={"alice": "yes"},
+            devices={"alice": [{"SerialNumber": "s"}]},
+            instances=_make_client_error("AccessDeniedException"),
+        )
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert (
+            "Identity Center instances were not listed with sso:ListInstances "
+            "in eu-west-1" in rows[0]["Finding_Details"]
+        )
+
+    def test_br51_identity_center_instance_does_not_hide_an_iam_failure(self):
+        _, rows = self._run(
+            _ai_user_cache(),
+            login={"alice": "yes", "bob": "yes"},
+            devices={"alice": [{"SerialNumber": "s"}]},
+            instances=[{"Instances": [{"InstanceArn": "arn:aws:sso:::instance/x"}]}],
+        )
+        assert [r["Status"] for r in rows] == ["Failed", "N/A"]
+        assert "'bob'" in rows[0]["Finding_Details"]
 
     def test_br51_first_user_with_mfa_passes_second_without_fails(self):
         result, rows = self._run(
@@ -23425,6 +23685,7 @@ class TestBR51AIUserConsoleMFA:
             return roles[RoleName]
 
         iam.get_role.side_effect = get_role
+        iam.list_instances.return_value = {"Instances": []}
         with patch("boto3.client", return_value=iam):
             rows = extract_csv_data(
                 bedrock_app.check_bedrock_ai_user_console_mfa(cache, region="Global")
@@ -23914,9 +24175,15 @@ class TestBR53OwnerTagSweep:
     SM_LATE = "arn:aws:sagemaker:us-east-1:123456789012:model/late"
     AC_BARE = "arn:aws:bedrock-agentcore:us-east-1:123456789012:runtime/rt-1"
 
-    def _run(self, pages, errors=None):
+    def _run(self, pages, errors=None, runtimes=None):
         errors = errors or {}
         tagging = MagicMock()
+        if isinstance(runtimes, Exception):
+            tagging.list_agent_runtimes.side_effect = runtimes
+        else:
+            tagging.list_agent_runtimes.side_effect = list(
+                runtimes or [{"agentRuntimes": []}]
+            )
 
         def get_resources(**kwargs):
             (type_filter,) = kwargs["ResourceTypeFilters"]
@@ -24023,6 +24290,72 @@ class TestBR53OwnerTagSweep:
             "tag:GetResources for ResourceTypeFilters bedrock-agentcore"
             in rows[1]["Finding_Details"]
         )
+
+    AC_OWNED = "arn:aws:bedrock-agentcore:us-east-1:123456789012:runtime/rt-owned"
+    AC_NEVER = "arn:aws:bedrock-agentcore:us-east-1:123456789012:runtime/rt-never"
+
+    def test_a_runtime_never_tagged_fails_beside_a_tagged_one(self):
+        _, rows, tagging = self._run(
+            {
+                "bedrock-agentcore": [
+                    [
+                        {
+                            "ResourceARN": self.AC_OWNED,
+                            "Tags": [{"Key": "Owner", "Value": "agents"}],
+                        }
+                    ]
+                ]
+            },
+            runtimes=[
+                {
+                    "agentRuntimes": [{"agentRuntimeArn": self.AC_OWNED}],
+                    "nextToken": "p2",
+                },
+                {"agentRuntimes": [{"agentRuntimeArn": self.AC_NEVER}]},
+            ],
+        )
+        assert [r["Status"] for r in rows] == ["Failed", "N/A"]
+        assert f"AgentCore resource {self.AC_NEVER}" in rows[0]["Finding_Details"]
+        assert (
+            "listed by bedrock-agentcore:ListAgentRuntimes and not returned by "
+            "tag:GetResources, so it was never tagged" in rows[0]["Finding_Details"]
+        )
+        assert self.AC_OWNED not in rows[0]["Finding_Details"]
+        assert (
+            "bedrock-agentcore:ListAgentRuntimes listed 2 agent runtime(s), 1 of "
+            "them absent from GetResources and so never tagged."
+            in rows[1]["Finding_Details"]
+        )
+        tagging.list_agent_runtimes.assert_has_calls(
+            [call(maxResults=100), call(maxResults=100, nextToken="p2")]
+        )
+
+    def test_unlisted_runtimes_are_named_and_the_tagged_sweep_still_judged(self):
+        _, rows, _ = self._run(
+            {"sagemaker": [[{"ResourceARN": self.SM_TBD, "Tags": []}]]},
+            runtimes=_make_client_error("AccessDeniedException"),
+        )
+        assert [r["Status"] for r in rows] == ["Failed", "N/A"]
+        assert self.SM_TBD in rows[0]["Finding_Details"]
+        assert (
+            "bedrock-agentcore:ListAgentRuntimes (AccessDeniedException), so agent "
+            "runtimes never tagged are not listed" in rows[1]["Finding_Details"]
+        )
+
+    def test_unread_agentcore_tags_do_not_turn_every_runtime_into_untagged(self):
+        _, rows, tagging = self._run(
+            {},
+            errors={"bedrock-agentcore": _make_client_error("AccessDeniedException")},
+            runtimes=[{"agentRuntimes": [{"agentRuntimeArn": self.AC_OWNED}]}],
+        )
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert (
+            "never tagged"
+            not in rows[0]["Finding_Details"].split(
+                "a resource never tagged is not listed"
+            )[1]
+        )
+        tagging.list_agent_runtimes.assert_not_called()
 
 
 class TestBR53ResourceOwnerTag:
@@ -27087,6 +27420,8 @@ class TestBR20ValueDepth:
         )
         assert [r["Status"] for r in rows] == ["N/A"]
         assert "aoss:BatchGetCollection" in rows[0]["Finding_Details"]
+        # The role holds the grant on '*', so the row names the denial alone.
+        assert "does not carry this grant" not in rows[0]["Finding_Details"]
 
     def test_opensearch_serverless_missing_collection_is_na(self):
         rows = self._run(

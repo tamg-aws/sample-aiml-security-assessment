@@ -348,6 +348,13 @@ Resources:
                 - bedrock:ListGuardrails
                 - bedrock:ListPrompts
                 - bedrock:ListAutomatedReasoningPolicies
+                # None of these has a resource type in the service
+                # authorization reference.
+                - aoss:BatchGetCollection # BR-20
+                - comprehend:ListPiiEntitiesDetectionJobs # BR-26
+                - sso:ListInstances # BR-51
+                - bedrock-agentcore:ListAgentRuntimes # BR-47, BR-53, BR-57
+                - bedrock-agentcore:ListAgentRuntimeEndpoints # BR-57
               Resource: '*'
             - Sid: BedrockGuardrailRead
               Effect: Allow
@@ -380,9 +387,9 @@ Resources:
               Resource: !Sub 'arn:${AWS::Partition}:bedrock:*:${AWS::AccountId}:agent/*'
             - Sid: AgentCoreRuntimeRoleRead
               # BR-57 reads the role each AgentCore runtime version runs as.
-              # ListAgentRuntimes and ListAgentRuntimeEndpoints need Resource
-              # '*' and are not granted, so BR-57 reports the runtime leg as
-              # not read until they are.
+              # ListAgentRuntimes and ListAgentRuntimeEndpoints have no
+              # resource type and are granted on '*' in
+              # BedrockAccountInventoryPermissions.
               Effect: Allow
               Action:
                 - bedrock-agentcore:GetAgentRuntime # BR-57
@@ -427,8 +434,8 @@ Resources:
               # BR-20 follows a bring-your-own vector store to the key it is
               # encrypted with, and a third-party store to its credentials
               # secret. The region is wildcarded for the same reason as above.
-              # aoss:BatchGetCollection has no resource type, so it is not
-              # granted here and the OpenSearch Serverless leg reports N/A.
+              # aoss:BatchGetCollection has no resource type and is granted on
+              # '*' in BedrockAccountInventoryPermissions.
               Effect: Allow
               Action:
                 - rds:DescribeDBClusters # BR-20
@@ -488,10 +495,14 @@ Resources:
                 - servicequotas:GetServiceQuota # BR-22
               Resource: !Sub 'arn:${AWS::Partition}:servicequotas:*:${AWS::AccountId}:bedrock/*'
             - Sid: CloudWatchPermissions
+              # BR-32 reads composite alarms. API_DescribeAlarms: "You can't
+              # return information about composite alarms if your
+              # cloudwatch:DescribeAlarms permission has a narrower scope."
+              # Under an alarm:* grant no composite alarm comes back.
               Effect: Allow
               Action:
-                - cloudwatch:DescribeAlarms
-              Resource: !Sub 'arn:${AWS::Partition}:cloudwatch:*:${AWS::AccountId}:alarm:*'
+                - cloudwatch:DescribeAlarms # BR-32
+              Resource: '*'
             - Sid: OrganizationsInventoryPermissions
               Effect: Allow
               Action:
@@ -641,6 +652,7 @@ Resources:
                 - cloudtrail:GetTrail
                 - cloudtrail:GetEventSelectors
                 - cloudtrail:GetTrailStatus
+                - cloudtrail:ListEventDataStores # BR-06
               Resource: '*'
             - Sid: CloudTrailEventHistoryRead
               # BR-56 reads the Region's event history; BR-32 and BR-04 read whether
@@ -656,6 +668,7 @@ Resources:
               Action:
                 # BR-33 inventories Lambda functions before checking Inspector status.
                 - lambda:ListFunctions
+                - inspector2:BatchGetAccountStatus # BR-33
               Resource: '*'
             - Sid: LambdaPermissions
               Effect: Allow
@@ -673,11 +686,6 @@ Resources:
                 - ec2:DescribeSubnets # BR-39
                 - ec2:DescribeRouteTables # BR-39
                 - ec2:DescribeVpcs
-              Resource: '*'
-            - Sid: InspectorPermissions
-              Effect: Allow
-              Action:
-                - inspector2:BatchGetAccountStatus # BR-33
               Resource: '*'
 
   SagemakerSecurityAssessmentFunction:
