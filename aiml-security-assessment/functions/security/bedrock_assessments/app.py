@@ -21269,7 +21269,59 @@ RESOURCE_OWNER_FINDING = "Bedrock Resource Owner Tag"
 
 RESOURCE_OWNER_REFERENCE = "https://docs.aws.amazon.com/resourcegroupstagging/latest/APIReference/API_GetResources.html"
 
-RESOURCE_OWNER_TAG_PATTERN = re.compile("owner", re.IGNORECASE)
+# An owner key is "owner" after any namespace prefix, alone or beside words that
+# only say which owner it is or how to reach them. Any other word (previous,
+# former, backup) makes the key something other than the accountable owner, so
+# the list is closed and an unknown word is not credited.
+OWNER_KEY_QUALIFIERS = frozenset(
+    {
+        "accountable",
+        "alias",
+        "app",
+        "application",
+        "business",
+        "contact",
+        "data",
+        "email",
+        "group",
+        "id",
+        "name",
+        "oncall",
+        "primary",
+        "product",
+        "resource",
+        "security",
+        "service",
+        "system",
+        "team",
+        "tech",
+        "technical",
+        "workload",
+    }
+)
+
+# Values that fill the tag without naming anyone.
+OWNER_PLACEHOLDER_VALUES = frozenset(
+    {
+        "-",
+        "changeme",
+        "default",
+        "n/a",
+        "na",
+        "nil",
+        "nobody",
+        "none",
+        "null",
+        "owner",
+        "placeholder",
+        "tba",
+        "tbd",
+        "test",
+        "todo",
+        "unassigned",
+        "unknown",
+    }
+)
 
 # GetResources accepts at most 100 ARNs in ResourceARNList.
 TAGGING_ARN_BATCH = 100
@@ -21277,10 +21329,35 @@ TAGGING_ARN_BATCH = 100
 MAX_REPORTED_UNOWNED_RESOURCES = 25
 
 
+def _owner_tag_rejection(tag: Dict[str, Any]) -> Optional[str]:
+    """
+    Return why a tag does not name an owner, "" when it does, and None when the
+    key is not an owner key at all.
+    """
+    key = str(tag.get("Key", ""))
+    local = re.split(r"[:/]", key)[-1]
+    words = re.split(
+        r"[^a-z0-9]+", re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", local).lower()
+    )
+    words = [word for word in words if word]
+    if "owner" not in words:
+        return None
+    others = [word for word in words if word != "owner"]
+    if any(word not in OWNER_KEY_QUALIFIERS for word in others):
+        return f"key '{key}' names something other than the accountable owner"
+    value = str(tag.get("Value", "")).strip()
+    if not value:
+        return f"key '{key}' has an empty value"
+    if value.lower() in OWNER_PLACEHOLDER_VALUES:
+        return f"key '{key}' holds the placeholder '{value}'"
+    return ""
+
+
 def _bedrock_owned_resource_arns(region: str) -> Dict[str, Any]:
     """
-    List the ARN of every Bedrock agent, knowledge base, guardrail, custom and
-    imported model and provisioned throughput in the Region.
+    List the ARN of every Bedrock agent, knowledge base, flow, prompt,
+    guardrail, custom and imported model, provisioned throughput and application
+    inference profile in the Region.
 
     The population comes from the Bedrock list APIs, never from a tag query,
     because a tag query cannot return a resource that was never tagged.
@@ -21305,6 +21382,8 @@ def _bedrock_owned_resource_arns(region: str) -> Dict[str, Any]:
             None,
             "knowledgeBaseId",
         ),
+        ("flow", agent_client, "list_flows", "flowSummaries", "arn", None),
+        ("prompt", agent_client, "list_prompts", "promptSummaries", "arn", None),
         ("guardrail", bedrock_client, "list_guardrails", "guardrails", "arn", None),
         (
             "custom model",
@@ -21330,11 +21409,28 @@ def _bedrock_owned_resource_arns(region: str) -> Dict[str, Any]:
             "provisionedModelArn",
             None,
         ),
+        (
+            "application inference profile",
+            bedrock_client,
+            "list_inference_profiles",
+            "inferenceProfileSummaries",
+            "inferenceProfileArn",
+            None,
+        ),
     )
     resource_types = {"agent": "agent", "knowledge base": "knowledge-base"}
     for label, client, operation, result_key, arn_field, id_field in legs:
         try:
-            items = _list_all_items(client, operation, result_key)
+            items = _list_all_items(
+                client,
+                operation,
+                result_key,
+                **(
+                    {"typeEquals": "APPLICATION"}
+                    if operation == "list_inference_profiles"
+                    else {}
+                ),
+            )
         except Exception as error:
             errors.append(f"{label}s: {get_assessment_error_label(error)}")
             continue
@@ -21355,8 +21451,9 @@ def _bedrock_owned_resource_arns(region: str) -> Dict[str, Any]:
 
 def check_bedrock_resource_owner_tag(region: str = "") -> Dict[str, Any]:
     """
-    BR-53: Verify every Bedrock agent, knowledge base, guardrail, custom and
-    imported model and provisioned throughput carries an owner tag.
+    BR-53: Verify every Bedrock agent, knowledge base, flow, prompt, guardrail,
+    custom and imported model, provisioned throughput and application inference
+    profile carries an owner tag whose value names someone.
     """
     logger.debug("Starting check for Bedrock resource owner tags")
     check_name = RESOURCE_OWNER_FINDING
@@ -21397,8 +21494,9 @@ def check_bedrock_resource_owner_tag(region: str = "") -> Dict[str, Any]:
             findings["status"] = "N/A"
             findings["csv_data"].append(
                 row(
-                    "No Bedrock agent, knowledge base, guardrail, custom or imported "
-                    "model or provisioned throughput was listed in {}.".format(
+                    "No Bedrock agent, knowledge base, flow, prompt, guardrail, custom "
+                    "or imported model, provisioned throughput or application "
+                    "inference profile was listed in {}.".format(
                         region or "this region"
                     ),
                     "No action required",
@@ -21431,15 +21529,17 @@ def check_bedrock_resource_owner_tag(region: str = "") -> Dict[str, Any]:
         unread_set = set(unread)
         owned = []
         unowned = []
+        rejections: Dict[str, List[str]] = {}
         for arn in arns:
             if arn in unread_set:
                 continue
-            owner_tags = [
-                tag
-                for tag in tags_by_arn.get(arn, [])
-                if RESOURCE_OWNER_TAG_PATTERN.search(str(tag.get("Key", "")))
-                and str(tag.get("Value", "")).strip()
-            ]
+            owner_tags = []
+            for tag in tags_by_arn.get(arn, []):
+                rejection = _owner_tag_rejection(tag)
+                if rejection == "":
+                    owner_tags.append(tag)
+                elif rejection:
+                    rejections.setdefault(arn, []).append(rejection)
             if owner_tags:
                 owned.append(f"{arn} ({owner_tags[0]['Key']})")
             else:
@@ -21450,14 +21550,16 @@ def check_bedrock_resource_owner_tag(region: str = "") -> Dict[str, Any]:
             tags = tags_by_arn.get(arn)
             findings["csv_data"].append(
                 row(
-                    "Bedrock {} {} has no tag whose key contains 'owner' with a "
-                    "non-empty value ({}).".format(
+                    "Bedrock {} {} has no owner tag whose value names someone ({}).{}".format(
                         inventory["arns"][arn],
                         arn,
                         "no tags returned"
                         if not tags
                         else "tag keys: "
                         + ", ".join(str(tag.get("Key")) for tag in tags[:10]),
+                        " Not credited: {}.".format("; ".join(rejections[arn][:5]))
+                        if arn in rejections
+                        else "",
                     ),
                     "Tag the resource with an owner key naming the accountable "
                     "team or person, and require the tag at creation.",
@@ -21483,8 +21585,10 @@ def check_bedrock_resource_owner_tag(region: str = "") -> Dict[str, Any]:
             incomplete = bool(inventory["errors"] or unread)
             findings["csv_data"].append(
                 row(
-                    "{} of the {} Bedrock resource(s) listed carry an owner tag: "
-                    "{}.{}".format(
+                    "{} of the {} Bedrock resource(s) listed carry an owner tag with "
+                    "a non-placeholder value: {}. Whether each value resolves to a "
+                    "person or an on-call rotation is not verified, and production "
+                    "resources are not told apart from others.{}".format(
                         len(owned),
                         len(arns),
                         "; ".join(owned[:5]),

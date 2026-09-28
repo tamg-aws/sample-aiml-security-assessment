@@ -1271,9 +1271,15 @@ FOUNDATION_ROWS = [
         "bedrock_assessments",
         ["BR-53"],
         "BR-53 passes the ARNs the module inventories from the Bedrock list APIs "
-        "(agents, knowledge bases, guardrails, custom and imported models, "
-        "provisioned throughput) to GetResources in batches of 100 and fails each "
-        "resource with no tag key containing owner, case-insensitive. The "
+        "(agents, knowledge bases, flows, prompts, guardrails, custom and imported "
+        "models, provisioned throughput, application inference profiles) to "
+        "GetResources in batches of 100 and fails each resource with no owner tag "
+        "whose value names someone. The key must be owner after any namespace, "
+        "alone or with a closed list of qualifiers, so previous_owner is not "
+        "credited, and a placeholder value such as TBD is not credited. Whether a "
+        "value resolves to a person is not verified, and no API marks a resource "
+        "as production. SageMaker and AgentCore resources belong to their own "
+        "modules. The "
         "population is the inventory, never a ResourceTypeFilters sweep, because "
         "GetResources returns only resources that are or were tagged, so a sweep "
         "omits the resources that most need an owner",

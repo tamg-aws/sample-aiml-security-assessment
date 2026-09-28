@@ -19827,11 +19827,16 @@ class TestBR53ResourceOwnerTag:
             "list_custom_models": "modelSummaries",
             "list_imported_models": "modelSummaries",
             "list_provisioned_model_throughputs": "provisionedModelSummaries",
+            "list_flows": "flowSummaries",
+            "list_prompts": "promptSummaries",
+            "list_inference_profiles": "inferenceProfileSummaries",
         }
         for operation, key in result_keys.items():
             client = (
                 agent
-                if operation.startswith(("list_agents", "list_knowledge"))
+                if operation.startswith(
+                    ("list_agents", "list_knowledge", "list_flows", "list_prompts")
+                )
                 else bedrock
             )
             method = getattr(client, operation)
@@ -19861,6 +19866,7 @@ class TestBR53ResourceOwnerTag:
             "boto3.client", side_effect=lambda service, **kwargs: clients[service]
         ):
             result = bedrock_app.check_bedrock_resource_owner_tag(region="us-east-1")
+        self.bedrock = bedrock
         return result, extract_csv_data(result), tagging
 
     def test_br53_first_resource_owned_second_absent_from_tag_response_fails(self):
@@ -19987,6 +19993,115 @@ class TestBR53ResourceOwnerTag:
         for finding in rows:
             assert_finding_schema(finding)
             assert finding["Check_ID"] == "BR-53"
+
+    def _owner_run(self, tags_by_guardrail):
+        guardrails = sorted(tags_by_guardrail)
+        return self._run(
+            {"list_guardrails": [{"arn": arn} for arn in guardrails]},
+            [
+                {"ResourceARN": arn, "Tags": tags}
+                for arn, tags in tags_by_guardrail.items()
+            ],
+        )
+
+    def test_br53_owner_key_forms_are_credited(self):
+        base = "arn:aws:bedrock:us-east-1:123456789012:guardrail/"
+        keys = ["Owner", "team:owner", "BusinessOwner", "owner-email", "app/Owner"]
+        _, rows, _ = self._owner_run(
+            {
+                f"{base}g{i}": [{"Key": key, "Value": "ml-platform@example.com"}]
+                for i, key in enumerate(keys)
+            }
+        )
+        assert [r["Status"] for r in rows] == ["Passed"]
+        assert "5 of the 5 Bedrock resource(s)" in rows[0]["Finding_Details"]
+        assert (
+            "Whether each value resolves to a person or an on-call rotation is not "
+            "verified" in rows[0]["Finding_Details"]
+        )
+
+    def test_br53_keys_that_merely_contain_owner_are_not_credited(self):
+        """The old substring match credited previous_owner and ownership-notes."""
+        base = "arn:aws:bedrock:us-east-1:123456789012:guardrail/"
+        _, rows, _ = self._owner_run(
+            {
+                f"{base}a-owned": [{"Key": "owner", "Value": "alice"}],
+                f"{base}b-previous": [{"Key": "previous_owner", "Value": "bob"}],
+                f"{base}c-former": [{"Key": "FormerOwner", "Value": "carol"}],
+                f"{base}d-coowner": [{"Key": "coowner", "Value": "dan"}],
+            }
+        )
+        assert [r["Status"] for r in rows] == ["Failed", "Failed", "Failed", "Passed"]
+        assert (
+            "Not credited: key 'previous_owner' names something other than the "
+            "accountable owner" in rows[0]["Finding_Details"]
+        )
+        assert (
+            "key 'FormerOwner' names something other than the accountable owner"
+            in rows[1]["Finding_Details"]
+        )
+        assert f"{base}d-coowner" in rows[2]["Finding_Details"]
+        assert "Not credited" not in rows[2]["Finding_Details"]
+        assert "1 of the 4 Bedrock resource(s)" in rows[3]["Finding_Details"]
+
+    def test_br53_placeholder_owner_values_are_not_credited(self):
+        base = "arn:aws:bedrock:us-east-1:123456789012:guardrail/"
+        _, rows, _ = self._owner_run(
+            {
+                f"{base}a-named": [{"Key": "Owner", "Value": "fraud-oncall"}],
+                f"{base}b-tbd": [{"Key": "Owner", "Value": " TBD "}],
+                f"{base}c-unknown": [
+                    {"Key": "owner", "Value": "unknown"},
+                    {"Key": "Owner", "Value": "n/a"},
+                ],
+            }
+        )
+        assert [r["Status"] for r in rows] == ["Failed", "Failed", "Passed"]
+        assert "key 'Owner' holds the placeholder 'TBD'" in rows[0]["Finding_Details"]
+        assert (
+            "key 'owner' holds the placeholder 'unknown'; key 'Owner' holds the "
+            "placeholder 'n/a'" in rows[1]["Finding_Details"]
+        )
+
+    def test_br53_flows_prompts_and_application_profiles_are_in_the_population(self):
+        flow = "arn:aws:bedrock:us-east-1:123456789012:flow/F1"
+        prompt = "arn:aws:bedrock:us-east-1:123456789012:prompt/P1"
+        profile = (
+            "arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/ip1"
+        )
+        _, rows, tagging = self._run(
+            {
+                "list_flows": [{"arn": flow}],
+                "list_prompts": [{"arn": prompt}],
+                "list_inference_profiles": [{"inferenceProfileArn": profile}],
+            },
+            [{"ResourceARN": prompt, "Tags": [{"Key": "Owner", "Value": "ops"}]}],
+        )
+        arns = tagging.get_resources.call_args.kwargs["ResourceARNList"]
+        assert sorted(arns) == sorted([flow, prompt, profile])
+        assert [r["Status"] for r in rows] == ["Failed", "Failed", "Passed"]
+        assert (
+            f"Bedrock application inference profile {profile}"
+            in rows[0]["Finding_Details"]
+        )
+        assert f"Bedrock flow {flow}" in rows[1]["Finding_Details"]
+        self.bedrock.list_inference_profiles.assert_called_once_with(
+            typeEquals="APPLICATION", maxResults=100
+        )
+
+    def test_br53_unread_flow_list_downgrades_the_pass(self):
+        _, rows, _ = self._run(
+            {"list_guardrails": [{"arn": self.GUARDRAIL_OWNED}]},
+            [
+                {
+                    "ResourceARN": self.GUARDRAIL_OWNED,
+                    "Tags": [{"Key": "owner", "Value": "a"}],
+                }
+            ],
+            list_errors={"list_flows": _make_client_error("AccessDeniedException")},
+        )
+        assert [r["Status"] for r in rows] == ["N/A", "N/A"]
+        assert "flows:" in rows[0]["Finding_Details"]
 
 
 class TestBR54LambdaPublicInvoke:
