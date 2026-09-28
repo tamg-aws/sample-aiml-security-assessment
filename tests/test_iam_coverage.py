@@ -897,6 +897,22 @@ _VERIFIED_REMEDIATION_CONDITION_KEYS |= {
     "aws:SecureTransport",
 }
 
+# Verified on 2026-09-27 with one IDENTITY_POLICY validate-policy run for the
+# NET-01 processing-job and Studio domain legs of SM-33 and SM-10, one
+# statement per name. The three negative controls sagemaker:ListProcessingJob,
+# sagemaker:GetDomain and sagemaker:DescribeStudioDomain came back
+# INVALID_ACTION at statement indexes 6, 7 and 8, and indexes 0 to 5, the six
+# names below, were not reported. All six are also listed in the sagemaker
+# service reference JSON.
+_VERIFIED_REMEDIATION_IAM_ACTIONS |= {
+    "sagemaker:ListProcessingJobs",
+    "sagemaker:DescribeProcessingJob",
+    "sagemaker:ListDomains",
+    "sagemaker:DescribeDomain",
+    "sagemaker:ListNotebookInstances",
+    "sagemaker:DescribeNotebookInstance",
+}
+
 _NON_IAM_REMEDIATION_TOKENS = {
     # SM-41 names the AWS IoT Core policy variables
     # ${iot:Connection.Thing.ThingName} and iot:Connection.Thing.IsAttached, and

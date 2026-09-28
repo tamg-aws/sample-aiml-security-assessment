@@ -43,9 +43,88 @@ REGISTRY_PUBLISH_ACTIONS = (
     "SubmitRegistryRecordForApproval",
 )
 REGISTRY_APPROVAL_ACTION = "UpdateRegistryRecordStatus"
+# Every Registry action in each namespace, from the service authorization
+# reference (agent-registry and bedrock-agentcore, version v1.4).
+REGISTRY_ACTIONS = tuple(
+    f"{REGISTRY_IAM_NAMESPACE}:{name}"
+    for name in (
+        "CreateRegistry",
+        "CreateRegistryRecord",
+        "DeleteRegistry",
+        "DeleteRegistryRecord",
+        "DeleteResourcePolicy",
+        "GetDiscoverableRegistryRecord",
+        "GetRegistry",
+        "GetRegistryRecord",
+        "GetResourcePolicy",
+        "InvokeRegistryMcp",
+        "ListDiscoverableRegistryRecords",
+        "ListRegistries",
+        "ListRegistryRecords",
+        "ListTagsForResource",
+        "PutResourcePolicy",
+        "SearchDiscoverableRegistryRecords",
+        "SubmitRegistryRecordForApproval",
+        "TagResource",
+        "UntagResource",
+        "UpdateRegistry",
+        "UpdateRegistryRecord",
+        "UpdateRegistryRecordStatus",
+    )
+) + tuple(
+    f"bedrock-agentcore:{name}"
+    for name in (
+        "CreateRegistry",
+        "CreateRegistryRecord",
+        "DeleteRegistry",
+        "DeleteRegistryRecord",
+        "GetRegistry",
+        "GetRegistryRecord",
+        "InvokeRegistryMcp",
+        "ListRegistries",
+        "ListRegistryRecords",
+        "SearchRegistryRecords",
+        "SubmitRegistryRecordForApproval",
+        "UpdateRegistry",
+        "UpdateRegistryRecord",
+        "UpdateRegistryRecordStatus",
+    )
+)
+# Per resource type, the actions that read it and the actions that write it,
+# generated from the service authorization reference by
+# generate_iam_access_levels.py.
+with open(
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "iam_access_levels.json"),
+    encoding="utf-8",
+) as _levels:
+    ACCESS_LEVELS: Dict[str, Dict[str, Dict[str, List[str]]]] = json.load(_levels)[
+        "services"
+    ]
+UNRECORDED_PRINCIPAL_ERRORS_NOTE = (
+    "The IAM permissions cache predates schema version 2 and did not record "
+    "per-principal read errors, so a principal whose policies could not be read "
+    "looks the same as one with no policies."
+)
+SCP_NOT_EVALUATED_NOTE = (
+    "Service control policies were not evaluated per principal. They only remove "
+    "permissions, so an SCP can make this finding a false Failed but cannot hide "
+    "a grant it reports."
+)
 # Registry lifecycle events are delivered to the default event bus in the
 # resource's own account, so a rule on a custom bus never receives them.
 REGISTRY_EVENT_BUS_NAME = "default"
+# The review pipelines a Registry lifecycle event can be routed to: a Lambda
+# function, an SNS topic, an SQS queue or a Step Functions state machine, named
+# by the service segment of the target ARN.
+REVIEW_PIPELINE_SERVICES = {
+    "lambda": "Lambda function",
+    "sns": "SNS topic",
+    "sqs": "SQS queue",
+    "states": "Step Functions state machine",
+}
+REVIEW_PIPELINE_LABEL = (
+    "a Lambda function, SNS topic, SQS queue or Step Functions state machine"
+)
 REGISTRY_EVENT_SOURCE = "aws.agent-registry"
 # The public-preview event source. It stops publishing on the date below, so a
 # rule that matches only this source routes nothing after it.
@@ -268,11 +347,81 @@ def _as_list(value: Any) -> List[str]:
     return [str(item).lower() for item in value] if isinstance(value, list) else []
 
 
+def _identity_policies(permissions: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Attached, inline and, for a user, group policies of one cached identity."""
+    return [
+        *(permissions.get("attached_policies") or []),
+        *(permissions.get("inline_policies") or []),
+        *(permissions.get("group_policies") or []),
+    ]
+
+
+def _statement_matches(statement: Dict[str, Any], action: str) -> bool:
+    """Whether one statement's Action or NotAction names a concrete action."""
+    if "Action" in statement:
+        return any(
+            fnmatchcase(action.lower(), pattern)
+            for pattern in _as_list(statement.get("Action"))
+        )
+    return "NotAction" in statement and not any(
+        fnmatchcase(action.lower(), pattern)
+        for pattern in _as_list(statement.get("NotAction"))
+    )
+
+
+def _granted_actions(permissions: Dict[str, Any], actions: Iterable[str]) -> set:
+    """Return the concrete ``actions`` one identity is granted.
+
+    An action counts when an identity-policy Allow names it, no account-wide
+    Deny removes it, and the permissions boundary, when there is one, allows it
+    too: the effective grant is the intersection of the two. A conditioned or
+    resource-scoped boundary Allow still counts as allowing, so an uncertain
+    case keeps the grant and can only over-report.
+    """
+    statements = [
+        statement
+        for policy in _identity_policies(permissions)
+        for statement in _policy_statements(policy)
+    ]
+    boundary = permissions.get("permissions_boundary")
+    boundary_statements = (
+        None if boundary is None else _policy_statements({"document": boundary})
+    )
+    granted = set()
+    for action in actions:
+        if not any(
+            s.get("Effect") == "Allow" and _statement_matches(s, action)
+            for s in statements
+        ):
+            continue
+        if any(
+            s.get("Effect") == "Deny" and _statement_denies_registry_action(s, action)
+            for s in statements
+        ):
+            continue
+        if boundary_statements is not None and (
+            any(
+                s.get("Effect") == "Deny"
+                and _statement_denies_registry_action(s, action)
+                for s in boundary_statements
+            )
+            or not any(
+                s.get("Effect") == "Allow" and _statement_matches(s, action)
+                for s in boundary_statements
+            )
+        ):
+            continue
+        granted.add(action)
+    return granted
+
+
 def _has_registry_access(permissions: Dict[str, Any], wildcard_only: bool) -> bool:
-    for policy in [
-        *permissions.get("attached_policies", []),
-        *permissions.get("inline_policies", []),
-    ]:
+    if not _granted_actions(
+        permissions,
+        [a for a in REGISTRY_ACTIONS if a.startswith(f"{REGISTRY_IAM_NAMESPACE}:")],
+    ):
+        return False
+    for policy in _identity_policies(permissions):
         for statement in _policy_statements(policy):
             if statement.get("Effect") != "Allow":
                 continue
@@ -299,37 +448,255 @@ def _has_registry_access(permissions: Dict[str, Any], wildcard_only: bool) -> bo
     return False
 
 
+def _principal_read_errors(
+    permission_cache: Dict[str, Any],
+) -> Optional[List[str]]:
+    """Label each principal whose cache read failed, or None for a cache that
+    predates ``principal_errors``."""
+    errors = permission_cache.get("principal_errors")
+    if not isinstance(errors, list):
+        return None
+    failed: Dict[str, List[str]] = {}
+    for error in errors:
+        if isinstance(error, dict) and error.get("name"):
+            label = f"{error.get('type', 'principal')} '{error['name']}'"
+            failed.setdefault(label, []).append(str(error.get("stage", "unknown")))
+    return [
+        f"{label} ({', '.join(stages)})" for label, stages in sorted(failed.items())
+    ]
+
+
+def _unread_principals_detail(unread: List[str]) -> str:
+    shown = ", ".join(unread[:10])
+    if len(unread) > 10:
+        shown += f" and {len(unread) - 10} more"
+    return (
+        f"{len(unread)} principal(s) could not be fully read into the IAM "
+        f"permissions cache, so their grants are unknown: {shown}."
+    )
+
+
+def _cache_completeness_findings(
+    check_id: str,
+    finding: str,
+    reference: str,
+    permission_cache: Dict[str, Any],
+    findings: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Hold back a Passed row while the cache names an unread principal.
+
+    Each Passed row becomes N/A naming the principals, and a check that found
+    something still reports it beside one incomplete row. A cache without
+    ``principal_errors`` keeps its verdict and says the errors were not recorded.
+    """
+    unread = _principal_read_errors(permission_cache)
+    if unread is None:
+        for row in findings:
+            if row["Status"] == StatusEnum.PASSED.value:
+                row["Finding_Details"] += " " + UNRECORDED_PRINCIPAL_ERRORS_NOTE
+        return findings
+    if not unread:
+        return findings
+    detail = _unread_principals_detail(unread)
+    resolution = (
+        "Grant the IAM Permission Caching task read access to the listed "
+        "principals, then re-run the assessment."
+    )
+    kept = [row for row in findings if row["Status"] != StatusEnum.PASSED.value]
+    passed = [row for row in findings if row["Status"] == StatusEnum.PASSED.value]
+    if passed:
+        return kept + [
+            _na(
+                check_id,
+                f"{finding} Incomplete",
+                f"{row['Finding_Details']} {detail}",
+                reference,
+                resolution,
+            )
+            for row in passed
+        ]
+    return kept + [
+        _na(check_id, f"{finding} Incomplete", detail, reference, resolution)
+    ]
+
+
+def _all_access_level_actions() -> List[str]:
+    return sorted(
+        {
+            f"{namespace}:{action}"
+            for namespace, types in ACCESS_LEVELS.items()
+            for levels in types.values()
+            for action in levels["read"] + levels["write"]
+        }
+    )
+
+
+def _merged_read_write_grants(permissions: Dict[str, Any]) -> List[str]:
+    """Describe each wildcard or NotAction Allow that grants both a read and a
+    write action on one Registry resource type.
+
+    An explicit action list separates read from write however long it is; a
+    pattern or a NotAction cannot, because it grants whatever it matches. Only
+    actions the identity is granted after Denies and its permissions boundary
+    count. A condition or resource scope on the Allow applies to the read and
+    the write alike, so it does not separate them and is not read.
+    """
+    effective = {
+        action.lower()
+        for action in _granted_actions(permissions, _all_access_level_actions())
+    }
+    grants = []
+    for policy in _identity_policies(permissions):
+        for statement in _policy_statements(policy):
+            if statement.get("Effect") != "Allow":
+                continue
+            if "Action" in statement:
+                triggers = [
+                    (f"Action '{pattern}'", {"Action": pattern})
+                    for pattern in _as_list(statement.get("Action"))
+                    if "*" in pattern or "?" in pattern
+                ]
+            elif "NotAction" in statement:
+                triggers = [
+                    (
+                        f"NotAction {_as_list(statement.get('NotAction'))}",
+                        {"NotAction": statement.get("NotAction")},
+                    )
+                ]
+            else:
+                triggers = []
+            for label, trigger in triggers:
+                for namespace, types in ACCESS_LEVELS.items():
+                    merged = []
+                    for resource_type, levels in types.items():
+                        reads = [
+                            f"{namespace}:{a}"
+                            for a in levels["read"]
+                            if f"{namespace}:{a}".lower() in effective
+                            and _statement_matches(trigger, f"{namespace}:{a}")
+                        ]
+                        writes = [
+                            f"{namespace}:{a}"
+                            for a in levels["write"]
+                            if f"{namespace}:{a}".lower() in effective
+                            and _statement_matches(trigger, f"{namespace}:{a}")
+                        ]
+                        if reads and writes:
+                            merged.append((resource_type, reads, writes))
+                    if not merged:
+                        continue
+                    resource_type, reads, writes = max(
+                        merged,
+                        key=lambda item: any(
+                            w.split(":", 1)[1].startswith("Delete") for w in item[2]
+                        ),
+                    )
+                    write = next(
+                        (w for w in writes if w.split(":", 1)[1].startswith("Delete")),
+                        writes[0],
+                    )
+                    grants.append(
+                        f"{label} grants read and write on {len(merged)} "
+                        f"{namespace} resource type(s), for example {reads[0]} and "
+                        f"{write} on {resource_type}"
+                    )
+    return grants
+
+
+MERGED_READ_WRITE_FINDING = "AWS Agent Registry Read and Write in One Grant"
+
+
+def _merged_read_write_findings(
+    identities: List[tuple],
+) -> List[Dict[str, Any]]:
+    """AIR-FND-IAM-09 leg of AR-01: a grant that cannot tell read from write."""
+    flagged = []
+    for kind, name, permissions in identities:
+        grants = _merged_read_write_grants(permissions)
+        if grants:
+            flagged.append((kind, name, grants))
+    rows = [
+        create_finding(
+            "AR-01",
+            MERGED_READ_WRITE_FINDING,
+            f"{kind.capitalize()} '{name}': {'; '.join(grants[:5])}. An explicit "
+            "action list is the only form that grants the read without the write; "
+            "a condition or resource scope applies to both alike. "
+            + SCP_NOT_EVALUATED_NOTE,
+            "Replace the wildcard or NotAction grant with the specific AWS Agent "
+            "Registry read actions the identity needs, and grant record writes, "
+            "status changes and deletes separately to the principals that make them.",
+            IAM_FULL_ACCESS_REFERENCE_URL,
+            SeverityEnum.HIGH,
+            StatusEnum.FAILED,
+        )
+        for kind, name, grants in flagged[:20]
+    ]
+    if len(flagged) > 20:
+        rows.append(
+            create_finding(
+                "AR-01",
+                MERGED_READ_WRITE_FINDING,
+                f"{len(flagged)} principals hold an AWS Agent Registry grant that "
+                "merges read and write (the first 20 are reported individually).",
+                "Replace each wildcard or NotAction grant with explicit actions.",
+                IAM_FULL_ACCESS_REFERENCE_URL,
+                SeverityEnum.HIGH,
+                StatusEnum.FAILED,
+            )
+        )
+    return rows
+
+
 def check_agent_registry_full_access(
     permission_cache: Dict[str, Any],
 ) -> List[Dict[str, Any]]:
-    """AR-01: find explicit full-access and wildcard Registry grants."""
+    """AR-01: find full-access, wildcard and read-write-merging Registry grants,
+    on every cached role and user."""
+    finding = "AWS Agent Registry IAM Full Access Check"
     roles = permission_cache.get("role_permissions", {})
-    if not roles:
-        return [
-            _na(
-                "AR-01",
-                "AWS Agent Registry IAM Full Access Check",
-                "No IAM role permissions found in cache.",
-                IAM_FULL_ACCESS_REFERENCE_URL,
-            )
-        ]
+    users = permission_cache.get("user_permissions", {})
+    if not roles and not users:
+        return _cache_completeness_findings(
+            "AR-01",
+            finding,
+            IAM_FULL_ACCESS_REFERENCE_URL,
+            permission_cache,
+            [
+                _na(
+                    "AR-01",
+                    finding,
+                    "No IAM role or user permissions found in cache.",
+                    IAM_FULL_ACCESS_REFERENCE_URL,
+                )
+            ],
+        )
+    identities = [("role", name, perms) for name, perms in roles.items()] + [
+        ("user", name, perms) for name, perms in users.items()
+    ]
     full_access, wildcard = [], []
-    for role_name, permissions in roles.items():
-        attached = permissions.get("attached_policies", [])
+    for kind, name, permissions in identities:
+        label = name if kind == "role" else f"user {name}"
         if any(
-            "AgentRegistryFullAccess" in policy.get("name", "") for policy in attached
-        ):
-            full_access.append(role_name)
+            "AgentRegistryFullAccess" in policy.get("name", "")
+            for policy in [
+                *(permissions.get("attached_policies") or []),
+                *(permissions.get("group_policies") or []),
+            ]
+        ) and _granted_actions(permissions, REGISTRY_ACTIONS):
+            full_access.append(label)
         if _has_registry_access(permissions, wildcard_only=True):
-            wildcard.append(role_name)
+            wildcard.append(label)
     findings = []
     if full_access:
         findings.append(
             create_finding(
                 "AR-01",
                 "AWS Agent Registry IAM Full Access Policy",
-                "The following roles have AWS Agent Registry full-access policies: "
-                + ", ".join(sorted(full_access)),
+                "The following principals have AWS Agent Registry full-access policies: "
+                + ", ".join(sorted(full_access))
+                + ". "
+                + SCP_NOT_EVALUATED_NOTE,
                 "Replace full-access policies with least-privilege AWS Agent Registry actions and scoped resources.",
                 IAM_FULL_ACCESS_REFERENCE_URL,
                 SeverityEnum.HIGH,
@@ -341,25 +708,38 @@ def check_agent_registry_full_access(
             create_finding(
                 "AR-01",
                 "AWS Agent Registry IAM Wildcard Permissions",
-                "The following roles have wildcard or allow-except AWS Agent Registry permissions on all resources: "
-                + ", ".join(sorted(wildcard)),
+                "The following principals have wildcard or allow-except AWS Agent Registry permissions on all resources: "
+                + ", ".join(sorted(wildcard))
+                + ". "
+                + SCP_NOT_EVALUATED_NOTE,
                 "Replace wildcard permissions with required AWS Agent Registry actions and scoped resources.",
                 IAM_FULL_ACCESS_REFERENCE_URL,
                 SeverityEnum.HIGH,
                 StatusEnum.FAILED,
             )
         )
-    return findings or [
-        create_finding(
-            "AR-01",
-            "AWS Agent Registry IAM Full Access Check",
-            "No roles with overly permissive AWS Agent Registry access found.",
-            "No action required",
-            IAM_FULL_ACCESS_REFERENCE_URL,
-            SeverityEnum.HIGH,
-            StatusEnum.PASSED,
-        )
-    ]
+    findings.extend(_merged_read_write_findings(identities))
+    return _cache_completeness_findings(
+        "AR-01",
+        finding,
+        IAM_FULL_ACCESS_REFERENCE_URL,
+        permission_cache,
+        findings
+        or [
+            create_finding(
+                "AR-01",
+                finding,
+                f"None of the {len(identities)} cached roles and users has an "
+                "AWS Agent Registry full-access policy, a wildcard or allow-except "
+                "Registry grant on all resources, or a grant that merges Registry "
+                "read and write actions on one resource type.",
+                "No action required",
+                IAM_FULL_ACCESS_REFERENCE_URL,
+                SeverityEnum.HIGH,
+                StatusEnum.PASSED,
+            )
+        ],
+    )
 
 
 def check_agent_registry_stale_access(
@@ -566,42 +946,29 @@ def check_agent_registry_stale_access(
                 "Review and remove unused AWS Agent Registry permissions following least privilege.",
             )
         )
-    return findings or [
-        create_finding(
-            "AR-02",
-            finding,
-            f"All {len(principals)} principals with AWS Agent Registry permissions accessed the service within the last 60 days.",
-            "No action required",
-            IAM_LAST_ACCESSED_REFERENCE_URL,
-            SeverityEnum.LOW,
-            StatusEnum.PASSED,
-        )
-    ]
+    return _cache_completeness_findings(
+        "AR-02",
+        finding,
+        IAM_LAST_ACCESSED_REFERENCE_URL,
+        permission_cache,
+        findings
+        or [
+            create_finding(
+                "AR-02",
+                finding,
+                f"All {len(principals)} principals with AWS Agent Registry permissions accessed the service within the last 60 days.",
+                "No action required",
+                IAM_LAST_ACCESSED_REFERENCE_URL,
+                SeverityEnum.LOW,
+                StatusEnum.PASSED,
+            )
+        ],
+    )
 
 
 def _qualified_registry_actions(local_name: str) -> tuple[str, ...]:
     """Both namespace spellings of one Registry action, as IAM publishes them."""
     return tuple(f"{namespace}:{local_name}" for namespace in REGISTRY_IAM_NAMESPACES)
-
-
-def _pattern_names_a_service(pattern: str) -> bool:
-    """Whether one IAM action pattern names a service rather than all of them."""
-    service, separator, _ = pattern.partition(":")
-    return bool(separator) and service != "*"
-
-
-def _statement_allows_registry_action(statement: Dict[str, Any], action: str) -> bool:
-    """Whether one Allow statement names a Registry action by service.
-
-    A service-agnostic pattern is out of scope, as it is in AR-01's wildcard leg:
-    an account administrator is reported once, under the full-access question, and
-    not again under every narrower Registry question. Both spellings of that grant
-    are read alike, a bare `*` and a `*:*`.
-    """
-    return any(
-        _pattern_names_a_service(pattern) and fnmatchcase(action.lower(), pattern)
-        for pattern in _as_list(statement.get("Action", []))
-    )
 
 
 def _statement_denies_registry_action(statement: Dict[str, Any], action: str) -> bool:
@@ -626,30 +993,25 @@ def _statement_denies_registry_action(statement: Dict[str, Any], action: str) ->
 
 
 def _registry_authority_actions(permissions: Dict[str, Any]) -> tuple[set, set]:
-    """Return the Registry authority actions one principal is allowed and denied."""
+    """Return the Registry authority actions one principal is allowed, and those
+    of them an account-wide Deny or the permissions boundary removes.
+
+    Every Allow counts, a service-agnostic `*` or `*:*` and a NotAction among
+    them, because each one grants the action.
+    """
     watched = _qualified_registry_actions(REGISTRY_APPROVAL_ACTION) + tuple(
         action
         for local_name in REGISTRY_PUBLISH_ACTIONS
         for action in _qualified_registry_actions(local_name)
     )
-    allowed: set = set()
-    denied: set = set()
-    for policy in [
-        *permissions.get("attached_policies", []),
-        *permissions.get("inline_policies", []),
-    ]:
-        for statement in _policy_statements(policy):
-            effect = statement.get("Effect")
-            for action in watched:
-                if effect == "Allow" and _statement_allows_registry_action(
-                    statement, action
-                ):
-                    allowed.add(action)
-                elif effect == "Deny" and _statement_denies_registry_action(
-                    statement, action
-                ):
-                    denied.add(action)
-    return allowed, denied
+    allowed = {
+        action
+        for action in watched
+        for policy in _identity_policies(permissions)
+        for statement in _policy_statements(policy)
+        if statement.get("Effect") == "Allow" and _statement_matches(statement, action)
+    }
+    return allowed, allowed - _granted_actions(permissions, watched)
 
 
 def _registry_approval_collisions(
@@ -696,11 +1058,12 @@ def check_agent_registry_approval_separation(
         *_registry_approval_collisions(users, "user"),
     ]
     if collisions:
-        return [
+        findings = [
             create_finding(
                 "AR-09",
                 finding,
-                "The following principals can both publish an AWS Agent Registry record and approve it: "
+                SCP_NOT_EVALUATED_NOTE
+                + " The following principals can both publish an AWS Agent Registry record and approve it: "
                 + ", ".join(collisions),
                 f"Split the publisher and curator personas: leave {REGISTRY_IAM_NAMESPACE}:{REGISTRY_APPROVAL_ACTION} to the curator and remove it from principals that create, update, or submit records.",
                 APPROVAL_SEPARATION_REFERENCE_URL,
@@ -708,17 +1071,21 @@ def check_agent_registry_approval_separation(
                 StatusEnum.FAILED,
             )
         ]
-    return [
-        create_finding(
-            "AR-09",
-            finding,
-            f"None of the {len(roles) + len(users)} cached IAM identities hold both AWS Agent Registry record-publication and record-approval permissions.",
-            "No action required",
-            APPROVAL_SEPARATION_REFERENCE_URL,
-            SeverityEnum.HIGH,
-            StatusEnum.PASSED,
-        )
-    ]
+    else:
+        findings = [
+            create_finding(
+                "AR-09",
+                finding,
+                f"None of the {len(roles) + len(users)} cached IAM identities hold both AWS Agent Registry record-publication and record-approval permissions.",
+                "No action required",
+                APPROVAL_SEPARATION_REFERENCE_URL,
+                SeverityEnum.HIGH,
+                StatusEnum.PASSED,
+            )
+        ]
+    return _cache_completeness_findings(
+        "AR-09", finding, APPROVAL_SEPARATION_REFERENCE_URL, permission_cache, findings
+    )
 
 
 def get_agent_registry_inventory(
@@ -869,17 +1236,17 @@ def _registry_errors(
 def check_agent_registry_approval_governance(
     inventory: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
-    """AR-03: report or require manual Registry record approval."""
+    """AR-03: fail a Registry that approves submitted records automatically.
+
+    GetRegistry documents that submitted records require manual review when
+    ``autoApprovalRules`` is omitted or empty, so a registry that returns no
+    ``approvalConfiguration`` at all reviews manually as well.
+    """
     inventory = inventory or get_agent_registry_inventory()
     finding = "AWS Agent Registry Publication Approval Governance"
     early = _inventory_start(inventory, "AR-03", finding, APPROVAL_REFERENCE_URL)
     if early:
         return early
-    required = os.environ.get("REQUIRE_AGENT_REGISTRY_MANUAL_APPROVAL", "").lower() in {
-        "true",
-        "1",
-        "yes",
-    }
     findings = _registry_errors(inventory, "AR-03", finding, APPROVAL_REFERENCE_URL)
     for item in inventory["items"]:
         registry_id, name, status = _registry_context(item)
@@ -894,29 +1261,19 @@ def check_agent_registry_approval_governance(
                 )
             )
             continue
-        detail = item["detail"]
-        if "approvalConfiguration" not in detail:
-            findings.append(
-                _na(
-                    "AR-03",
-                    finding,
-                    f"Registry '{name}' ({registry_id}) did not return optional approval configuration.",
-                    APPROVAL_REFERENCE_URL,
-                    "No action required. Retry after the service returns approval configuration metadata.",
-                )
-            )
-        elif (detail.get("approvalConfiguration") or {}).get("autoApprovalRules"):
+        rules = (item["detail"].get("approvalConfiguration") or {}).get(
+            "autoApprovalRules"
+        )
+        if rules:
             findings.append(
                 create_finding(
                     "AR-03",
                     finding,
-                    f"Registry '{name}' ({registry_id}) automatically approves submitted records.",
-                    "Remove auto-approval rules so submitted records require manual review."
-                    if required
-                    else "No action required under the current baseline. Set REQUIRE_AGENT_REGISTRY_MANUAL_APPROVAL=true to require manual review.",
+                    f"Registry '{name}' ({registry_id}) automatically approves submitted records (autoApprovalRules: {', '.join(map(str, rules))}).",
+                    "Remove auto-approval rules so submitted records require manual review.",
                     APPROVAL_REFERENCE_URL,
-                    SeverityEnum.MEDIUM if required else SeverityEnum.INFORMATIONAL,
-                    StatusEnum.FAILED if required else StatusEnum.NA,
+                    SeverityEnum.MEDIUM,
+                    StatusEnum.FAILED,
                 )
             )
         else:
@@ -924,7 +1281,7 @@ def check_agent_registry_approval_governance(
                 create_finding(
                     "AR-03",
                     finding,
-                    f"Registry '{name}' ({registry_id}) requires manual review for submitted records.",
+                    f"Registry '{name}' ({registry_id}) requires manual review for submitted records: it returns no auto-approval rules.",
                     "No action required",
                     APPROVAL_REFERENCE_URL,
                     SeverityEnum.MEDIUM,
@@ -1515,29 +1872,39 @@ def _event_bus_target(
     }
 
 
+def _is_review_pipeline(target_arn: str) -> bool:
+    parts = target_arn.split(":", 5)
+    return len(parts) == 6 and parts[2] in REVIEW_PIPELINE_SERVICES
+
+
 def _rule_targets(
     rule: Dict[str, Any], bus_name: str
-) -> tuple[Optional[int], List[Dict[str, Any]], Optional[Exception]]:
-    """Count one rule's targets and read which of them are event buses.
+) -> tuple[Optional[int], List[Dict[str, Any]], List[str], Optional[Exception]]:
+    """Count one rule's targets and read which of them are event buses and
+    which are review pipelines.
 
     Isolates a per-rule failure from the sweep.
     """
     rule_name = rule.get("Name")
     if not rule_name:
-        return None, [], ValueError("Missing rule name")
+        return None, [], [], ValueError("Missing rule name")
     try:
         paginator = events_client.get_paginator("list_targets_by_rule")
         targets = 0
         buses = []
+        pipelines = []
         for page in paginator.paginate(Rule=rule_name, EventBusName=bus_name):
             for target in page.get("Targets", []):
                 targets += 1
-                bus = _event_bus_target(rule, target.get("Arn", ""))
+                arn = target.get("Arn", "")
+                bus = _event_bus_target(rule, arn)
                 if bus is not None:
                     buses.append(bus)
-        return targets, buses, None
+                elif _is_review_pipeline(arn):
+                    pipelines.append(arn)
+        return targets, buses, pipelines, None
     except Exception as error:
-        return None, [], error
+        return None, [], [], error
 
 
 def _registry_rule_entries(bus_name: str, inventory: Dict[str, Any]) -> tuple:
@@ -1563,12 +1930,14 @@ def _registry_rule_entries(bus_name: str, inventory: Dict[str, Any]) -> tuple:
                 "classification": classification,
                 "targets": None,
                 "bus_targets": [],
+                "pipeline_targets": [],
                 "target_error": None,
             }
             if classification["kind"] != "unreadable":
                 (
                     entry["targets"],
                     entry["bus_targets"],
+                    entry["pipeline_targets"],
                     entry["target_error"],
                 ) = _rule_targets(rule, bus_name)
             entries.append(entry)
@@ -1576,13 +1945,14 @@ def _registry_rule_entries(bus_name: str, inventory: Dict[str, Any]) -> tuple:
 
 
 def _forwards_only(entry: Dict[str, Any]) -> bool:
-    """Whether an enabled, unfiltered GA-source rule targets only event buses."""
+    """Whether an enabled, unfiltered GA-source rule reaches a review pipeline,
+    if at all, only through the event buses it targets."""
     return (
         entry["classification"]["kind"] == "registry"
         and not entry["classification"]["narrowed_by"]
         and entry["rule"].get("State") != "DISABLED"
-        and bool(entry["targets"])
-        and entry["targets"] == len(entry["bus_targets"])
+        and bool(entry["bus_targets"])
+        and not entry.get("pipeline_targets")
     )
 
 
@@ -1746,7 +2116,7 @@ def _forwarded_routing(
                 undecided.append(hop_name)
                 continue
             # Bus targets on this bus are not followed: the sweep stops at one hop.
-            delivering = (hop["targets"] or 0) - len(hop["bus_targets"])
+            delivering = len(hop.get("pipeline_targets", []))
             if (
                 classification["kind"] != "registry"
                 or hop["rule"].get("State") == "DISABLED"
@@ -1784,8 +2154,8 @@ def _forwarded_routing(
             create_finding(
                 "AR-10",
                 finding,
-                f"EventBridge rule '{name}' forwards the lifecycle events of {scope} only to event bus '{bus['name']}', where no enabled rule matching source '{REGISTRY_EVENT_SOURCE}' has a target other than an event bus, so every forwarded state change is discarded.",
-                f"Add an enabled rule on event bus '{bus['name']}' matching source '{REGISTRY_EVENT_SOURCE}' with a target that records or reviews the events, or give rule '{name}' such a target directly.",
+                f"EventBridge rule '{name}' forwards the lifecycle events of {scope} only to event bus '{bus['name']}', where no enabled rule matching source '{REGISTRY_EVENT_SOURCE}' has a target that is {REVIEW_PIPELINE_LABEL}, so no forwarded state change reaches a review pipeline.",
+                f"Add an enabled rule on event bus '{bus['name']}' matching source '{REGISTRY_EVENT_SOURCE}' with {REVIEW_PIPELINE_LABEL} as a target, or give rule '{name}' such a target directly.",
                 EVENT_ROUTING_REFERENCE_URL,
                 SeverityEnum.MEDIUM,
                 StatusEnum.FAILED,
@@ -1916,7 +2286,21 @@ def check_agent_registry_lifecycle_event_routing(
             covered.update(forwarded["covered"])
             unseen.update(forwarded["unseen"])
             continue
-        routing_labels.append(f"'{name}' ({targets} target(s))")
+        pipelines = len(entry.get("pipeline_targets", []))
+        if not pipelines:
+            findings.append(
+                create_finding(
+                    "AR-10",
+                    finding,
+                    f"EventBridge rule '{name}' routes the lifecycle events of {scope} to {targets} target(s), none of which is {REVIEW_PIPELINE_LABEL}, so no state change reaches a review pipeline.",
+                    f"Add {REVIEW_PIPELINE_LABEL} as a target of the rule, keeping any existing log or stream target as the record.",
+                    EVENT_ROUTING_REFERENCE_URL,
+                    SeverityEnum.MEDIUM,
+                    StatusEnum.FAILED,
+                )
+            )
+            continue
+        routing_labels.append(f"'{name}' ({pipelines} target(s))")
         covered.update(classification["detail_types"])
 
     # A transition forwarded to a bus this check cannot read is neither covered

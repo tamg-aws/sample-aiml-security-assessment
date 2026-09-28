@@ -19,7 +19,6 @@ Metadata:
           - RequireBedrockZeroDataRetention
           - RequireMarketplaceEndpointCMK
           - RequireAgentCoreOnlineEvaluation
-          - RequireAgentRegistryManualApproval
           - RequireAgentRegistryCMK
           - AgentCoreTokenVaultId
           - ApprovedExternalAccountIds
@@ -70,11 +69,6 @@ Parameters:
     Default: "false"
     AllowedValues: ["true", "false"]
     Description: Fail AC-17 when no complete active online evaluation configuration is found.
-  RequireAgentRegistryManualApproval:
-    Type: String
-    Default: "false"
-    AllowedValues: ["true", "false"]
-    Description: Fail AR-03 when an Agent Registry automatically approves submitted records.
   RequireAgentRegistryCMK:
     Type: String
     Default: "false"
@@ -210,6 +204,7 @@ Resources:
                 - iam:ListAttachedRolePolicies
                 - iam:ListRolePolicies
                 - iam:GetRolePolicy
+                - iam:GetRole # PermissionsBoundary is on GetRole only
               Resource: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/*'
             - Sid: IAMUserPolicyRead
               Effect: Allow
@@ -218,6 +213,7 @@ Resources:
                 - iam:ListUserPolicies
                 - iam:GetUserPolicy
                 - iam:ListGroupsForUser # group policies apply to members
+                - iam:GetUser # PermissionsBoundary is on GetUser only
               Resource: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:user/*'
             - Sid: IAMGroupPolicyRead
               Effect: Allow
@@ -1074,7 +1070,6 @@ Resources:
         Variables:
           AIML_ASSESSMENT_BUCKET_NAME: !Ref AIMLAssessmentBucket
           TARGET_REGIONS: !Ref TargetRegions
-          REQUIRE_AGENT_REGISTRY_MANUAL_APPROVAL: !Ref RequireAgentRegistryManualApproval
           REQUIRE_AGENT_REGISTRY_CMK: !Ref RequireAgentRegistryCMK
       Policies:
         - Statement:

@@ -413,22 +413,25 @@ AI_SUBJECT_ROWS = [
         None,
         "agent_registry_assessments",
         ["AR-03", "AR-09", "AR-10"],
-        'AR-03 is named "Publication Approval Governance" and covers auto-approval, behind '
-        "the REQUIRE_AGENT_REGISTRY_MANUAL_APPROVAL env gate. AR-09 asserts the separation "
-        "leg: it fails any role or user whose attached and inline policies allow, by an "
-        "action pattern that names the service, both a record write (CreateRegistryRecord, "
-        "UpdateRegistryRecord, SubmitRegistryRecordForApproval) and "
+        'AR-03 is named "Publication Approval Governance" and fails, by default, a '
+        "registry whose approvalConfiguration.autoApprovalRules is non-empty; an omitted "
+        "or empty list is manual review and passes. AR-09 asserts the separation "
+        "leg: it fails any role or user whose attached, inline and group policies allow, "
+        "by any Allow including a bare *, a *:* and a NotAction, both a record write "
+        "(CreateRegistryRecord, UpdateRegistryRecord, SubmitRegistryRecordForApproval) and "
         "UpdateRegistryRecordStatus, the one operation that can set a record to APPROVED, "
         "in either the agent-registry namespace or the public-preview bedrock-agentcore "
-        "spelling of it. A bare * grant is reported under AR-01, and only a Deny with no "
-        "condition on Resource * removes an action. AR-10 asserts the observation leg: an "
+        "spelling of it. A permissions boundary that does not allow an action removes it, "
+        "as does a Deny with no condition on Resource *, and a principal whose policies "
+        "could not be read blocks a Passed. AR-10 asserts the observation leg: an "
         "enabled rule on the default event bus that matches the aws.agent-registry "
-        "Pending Approval, Approved and Rejected state-change events and has a target. A rule that matches only the aws.bedrock-agentcore preview source is "
+        "Pending Approval, Approved and Rejected state-change events and has a Lambda, "
+        "SNS, SQS or Step Functions target. A rule that matches only the aws.bedrock-agentcore preview source is "
         "reported apart, because that source stops routing on 30 October 2026. AWS delivers "
-        "these events to the default bus, so a default-bus rule whose only targets are "
-        "event buses is followed one hop to a bus in the same account and Region and "
-        "credited only if a rule there matches and has a target other than an event bus; "
-        "a forward to another account or Region is reported N/A naming the bus",
+        "these events to the default bus, so a default-bus rule with an event-bus target "
+        "and no review-pipeline target is followed one hop to a bus in the same account "
+        "and Region and credited only if a rule there matches and has a review-pipeline "
+        "target; a forward to another account or Region is reported N/A naming the bus",
         [],
         4,
     ),
@@ -875,7 +878,14 @@ AI_SUBJECT_ROWS = [
         "notebooks, SM-11 for models, SM-28 for HyperPod clusters, SM-33 for training jobs "
         "together with EnableNetworkIsolation, and BR-39 for marketplace model endpoints. "
         "An egress-only gateway, a NAT gateway and a peering connection do not make a "
-        "subnet public. A route read that fails is reported Not Applicable and never passes",
+        "subnet public. A route read that fails is reported Not Applicable and never passes. "
+        "AC-01 also reads custom Code Interpreter and Browser subnets and fails a VPC "
+        "runtime reporting requireServiceS3Endpoint true; SM-10 also reads every Studio "
+        "domain's AppNetworkAccessType and SubnetIds; SM-33 also reads every processing "
+        "job's NetworkConfig and every training job with no item cap; BR-39 resolves "
+        "every subnet. Ceiling: Lambda GetFunctionConfiguration and ECS DescribeServices "
+        "return no field that marks a function or service as AI inference, so general "
+        "Lambda and ECS compute is not in the population",
         [],
         5,
     ),
@@ -1093,15 +1103,22 @@ FOUNDATION_ROWS = [
             "agent_registry_assessments",
         ],
         ["BR-01", "SM-02", "AC-02", "AR-01"],
-        "AC-02 and AR-01 fail an allow-all grant on their services in "
-        "customer-managed and inline policies. BR-01 reads the cached "
-        "customer-managed, inline and group policies of every role and user and "
-        "fails an Allow whose Action matches every bedrock: action, such as "
-        '"bedrock:*", as a string or in a list. SM-02 does the same for '
-        '"sagemaker:*" over the cached customer-managed and inline policies. Both '
-        "fail an Allow written with NotAction unless it excludes the whole "
-        'service. A bare Action "*" is a service-agnostic administrator grant and '
-        "stays out of these legs",
+        "BR-01, SM-02, AC-02 and AR-01 each read every attached, inline and "
+        "group policy of every cached role and user, AWS managed included, and "
+        "fail a wildcard Action pattern or a NotAction Allow that grants both a "
+        "read and a write action on one resource type, as the service "
+        'authorization reference classifies them. A bare "*", "*:*" and a '
+        'partial pattern such as "bedrock:*Guardrail*" count. BR-01 reads the '
+        "bedrock namespace, and the s3, dynamodb and s3vectors namespaces for an "
+        "identity granted a Bedrock action. An action counts only after "
+        "account-wide Denies and the permissions boundary. A condition applies "
+        "to the read and the write alike, so ABAC does not separate them, and "
+        "the Resource entries drop only the resource types they cannot name. A "
+        "Passed is held as N/A while principal_errors names an unread "
+        "principal. Service control policies are not evaluated per principal "
+        "and can only make a row a false Failed. API Gateway method authorizers "
+        "and Verified Permissions policy stores are not read: no field ties one "
+        "to an AI workload",
         [],
         6,
     ),
