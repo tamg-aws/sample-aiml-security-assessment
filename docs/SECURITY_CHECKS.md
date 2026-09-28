@@ -676,7 +676,7 @@ inventory is never treated as evidence of compliance.
 ### AC-06: Browser Tool Recording
 
 - **Severity:** Medium
-- **Description:** Uses custom browser inventory and requires `recording.enabled=true` with a non-empty S3 recording bucket.
+- **Description:** Uses custom browser inventory and requires `recording.enabled=true` with a non-empty S3 recording bucket. The bucket is read with `ExpectedBucketOwner` set to the account in the browser ARN, and must encrypt by default with `aws:kms` or `aws:kms:dsse`, carry a bucket policy Deny for every principal on `s3:GetObject` and `s3:PutObject` over the recording prefix conditioned only on `aws:SecureTransport` false, and expire the prefix with an enabled lifecycle rule that has no tag or size filter, with `NoncurrentVersionExpiration` as well when versioning is `Enabled` or `Suspended`. The browser must name an `executionRoleArn`, and the permission cache must show that role allowed `s3:PutObject` on the prefix by an unconditioned identity policy or a bucket policy statement naming its ARN, allowed by its permissions boundary, and reached by no Deny other than one keyed only on `aws:SecureTransport`. Bucket Block Public Access left off is `N/A` because the account-level setting is not read. A bucket read that fails, a role the cache did not read, and a conditioned grant or Deny are `N/A`. SCPs, the bucket key policy and the role's use of that key are not evaluated, so a Passed write can still be refused. The AWS managed browser is outside the population: it has no recording configuration.
 
 ### AC-07: Memory Encryption
 

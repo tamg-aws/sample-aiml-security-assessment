@@ -335,6 +335,11 @@ _EXPECTED_ACTIONS = {
         "route53resolver:ListFirewallDomains",
         "route53resolver:ListFirewallRuleGroupAssociations",
         "route53resolver:ListFirewallRules",
+        "s3:GetBucketPolicy",
+        "s3:GetBucketPublicAccessBlock",
+        "s3:GetBucketVersioning",
+        "s3:GetEncryptionConfiguration",
+        "s3:GetLifecycleConfiguration",
         "s3:GetObject",
         "s3:PutObject",
         "wafv2:GetWebACL",
@@ -982,6 +987,23 @@ def test_agentcore_observability_and_governance_reads_are_scoped_where_iam_allow
     assert "iam::${AWS::AccountId}:role/*" in gateway_role
     assert "iam::*:role/" not in gateway_role
     assert not re.search(r"Resource:\s+['\"]\*['\"]", gateway_role)
+
+    # AC-06 reads each recording bucket, whose name the customer chose, so the
+    # grant covers bucket ARNs and nothing wider.
+    recording = _statement_block(
+        template, "AgentCoreSecurityAssessmentFunction", "BrowserRecordingBucketRead"
+    )
+    for action in (
+        "s3:GetEncryptionConfiguration",
+        "s3:GetBucketPublicAccessBlock",
+        "s3:GetBucketPolicy",
+        "s3:GetLifecycleConfiguration",
+        "s3:GetBucketVersioning",
+    ):
+        assert action in recording
+    assert "Resource: !Sub 'arn:${AWS::Partition}:s3:::*'" in recording
+    assert "s3:GetAccountPublicAccessBlock" not in recording
+    assert not re.search(r"Resource:\s+['\"]\*['\"]", recording)
 
 
 @pytest.mark.parametrize("template", _SAM_TEMPLATES, ids=os.path.basename)

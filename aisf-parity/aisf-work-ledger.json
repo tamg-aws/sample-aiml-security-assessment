@@ -745,7 +745,7 @@
       "incumbent_names": [
         "AgentCore Browser Session Recording"
       ],
-      "gap": "recording.enabled is True plus an S3 bucket",
+      "gap": "AC-06 judges every custom browser's recording destination as well as recording.enabled and a bucket name. The bucket, read with ExpectedBucketOwner set to the browser's account, must encrypt by default with a KMS key, deny every principal reads and writes of the recording prefix without TLS, and expire the prefix by lifecycle rule, including noncurrent versions when versioned. The execution role must be named and allowed to write the prefix by an identity or bucket policy and by its boundary, with no Deny refusing it. Bucket Block Public Access left off reads N/A because the account-level setting is not read. SCPs, the bucket key policy and the role's use of that key are not evaluated, so a Passed write can still be refused. Who else can read the recordings is not judged. The AWS managed browser has no recording configuration and is outside the population",
       "extra_iam": [],
       "phase": 4,
       "tier": "ai_subject",

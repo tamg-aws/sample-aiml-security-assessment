@@ -463,6 +463,19 @@ section.
     lifecycle field and not the other is `N/A`, where it passed on the one it
     reported, and a missing lifecycle value no longer tells the reader to grant
     `GetAgentRuntime`, a call that had succeeded.
+  - `AC-06` judges where a custom browser's recordings go, where it passed on
+    `recording.enabled` and a bucket name. The bucket, read with
+    `ExpectedBucketOwner` set to the browser's account, must encrypt by
+    default with `aws:kms` or `aws:kms:dsse`, deny every principal
+    `s3:GetObject` and `s3:PutObject` on the recording prefix when
+    `aws:SecureTransport` is false, and expire the prefix with an enabled
+    lifecycle rule carrying no tag or size filter, plus a noncurrent-version
+    expiration when the bucket is versioned. A browser with no
+    `executionRoleArn`, or whose role no identity policy or bucket policy
+    statement allows to write the prefix, or whose boundary or a Deny refuses
+    the write, fails. Bucket Block Public Access left off, a leg that could
+    not be read, a role the permission cache did not read and a conditioned
+    grant are `N/A`.
 
 ### Deployment impact
 
@@ -590,6 +603,16 @@ approval, so harnesses read `N/A` and are never reported clean.
 and `logs:DescribeDeliveries` and alarms with `cloudwatch:DescribeAlarms`, all
 already on the AgentCore role. No runtime delivers `USAGE_LOGS` until one is
 configured, so expect `AC-46` to fail runtimes that passed before.
+
+`AC-06` adds the `BrowserRecordingBucketRead` Sid to the AgentCore role in both
+templates: `s3:GetEncryptionConfiguration`, `s3:GetBucketPublicAccessBlock`,
+`s3:GetBucketPolicy`, `s3:GetLifecycleConfiguration` and
+`s3:GetBucketVersioning` on `arn:${AWS::Partition}:s3:::*`, because the
+recording bucket is named by the customer. Redeploy before the next scan:
+without it every recording browser reads `N/A`. The account-level Block Public
+Access read, `s3:GetAccountPublicAccessBlock`, is not granted pending approval,
+so a bucket that leaves its own setting off reads `N/A`. Expect `AC-06` to
+fail recording browsers that passed before.
 
 ## 2.0.0 - 2026-09-18
 

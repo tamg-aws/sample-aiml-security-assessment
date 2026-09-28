@@ -4573,10 +4573,475 @@ def check_agentcore_ecr_enhanced_scanning() -> List[Dict[str, Any]]:
     return runtime_findings + findings
 
 
+# AC-06 judges where recordings go as well as whether they are on. A recording
+# holds every page the agent saw, so its bucket must encrypt with a KMS key,
+# block public access, refuse the recordings over plaintext and expire them,
+# and the browser's execution role must be able to write them.
+BROWSER_RECORDING_KMS_ALGORITHMS = ("aws:kms", "aws:kms:dsse")
+S3_PUBLIC_ACCESS_BLOCK_FIELDS = (
+    "BlockPublicAcls",
+    "IgnorePublicAcls",
+    "BlockPublicPolicy",
+    "RestrictPublicBuckets",
+)
+# Each bucket read, the error code S3 returns when the configuration is absent,
+# and the grant it needs. Versioning has no absent code: an unversioned bucket
+# returns an empty response.
+BROWSER_RECORDING_BUCKET_READS = (
+    (
+        "encryption",
+        "get_bucket_encryption",
+        "ServerSideEncryptionConfigurationNotFoundError",
+        "s3:GetEncryptionConfiguration",
+    ),
+    (
+        "public_access_block",
+        "get_public_access_block",
+        "NoSuchPublicAccessBlockConfiguration",
+        "s3:GetBucketPublicAccessBlock",
+    ),
+    ("policy", "get_bucket_policy", "NoSuchBucketPolicy", "s3:GetBucketPolicy"),
+    (
+        "lifecycle",
+        "get_bucket_lifecycle_configuration",
+        "NoSuchLifecycleConfiguration",
+        "s3:GetLifecycleConfiguration",
+    ),
+    ("versioning", "get_bucket_versioning", None, "s3:GetBucketVersioning"),
+)
+BROWSER_RECORDING_WRITE_ACTION = "s3:putobject"
+BROWSER_RECORDING_WRITE_CEILING = (
+    "Service control policies, the bucket key's policy and the role's use of "
+    "that key are not evaluated for this write, so any of them may still refuse "
+    "it: this leg can report a write the account would block."
+)
+
+
+def _s3_error_code(error: Exception) -> str:
+    """Return the S3 error code of a ClientError, or an empty string."""
+    if isinstance(error, ClientError):
+        return str(error.response.get("Error", {}).get("Code", ""))
+    return ""
+
+
+def _browser_recording_key_prefix(prefix: Any) -> str:
+    """Return the key prefix recordings are written under.
+
+    Recordings land at prefix/session-id/, so `rec` and `rec/` name the same
+    keys and the prefix is read with one trailing slash, or as the whole bucket
+    when empty.
+    """
+    trimmed = str(prefix or "").strip("/")
+    return f"{trimmed}/" if trimmed else ""
+
+
+def _read_recording_bucket(bucket: str, account: str) -> Dict[str, Tuple[str, Any]]:
+    """Read every configuration AC-06 judges on one recording bucket.
+
+    Each leg is ("read", response), ("absent", None) or ("error", label).
+    ExpectedBucketOwner makes a bucket owned by another account an error and
+    not a configuration the assessed account controls.
+    """
+    reads: Dict[str, Tuple[str, Any]] = {}
+    for leg, operation, absent_code, _ in BROWSER_RECORDING_BUCKET_READS:
+        try:
+            reads[leg] = (
+                "read",
+                getattr(s3_client, operation)(
+                    Bucket=bucket, ExpectedBucketOwner=account
+                ),
+            )
+        except Exception as error:
+            if absent_code and _s3_error_code(error) == absent_code:
+                reads[leg] = ("absent", None)
+            else:
+                reads[leg] = ("error", _assessment_error_label(error))
+    return reads
+
+
+def _statement_refuses_plaintext(statement: Dict[str, Any], object_arn: str) -> bool:
+    """Return whether one bucket statement denies the recordings over plaintext.
+
+    It must deny every principal both s3:GetObject and s3:PutObject on the whole
+    recording prefix, conditioned only on aws:SecureTransport being false. A
+    second condition key is ANDed in, so a request that fails it is not denied.
+    """
+    if statement.get("Effect") != "Deny" or "NotPrincipal" in statement:
+        return False
+    if "*" not in _statement_principals(statement):
+        return False
+    if not all(
+        _statement_matches_action(statement, action)
+        for action in ("s3:getobject", BROWSER_RECORDING_WRITE_ACTION)
+    ):
+        return False
+    if not _statement_resource_covers(statement, [object_arn]):
+        return False
+    conditions = statement.get("Condition")
+    if not isinstance(conditions, dict) or len(conditions) != 1:
+        return False
+    operator, entries = next(iter(conditions.items()))
+    if str(operator).lower() not in ("bool", "boolifexists"):
+        return False
+    if not isinstance(entries, dict) or len(entries) != 1:
+        return False
+    key, raw = next(iter(entries.items()))
+    return str(key).strip().lower() == "aws:securetransport" and [
+        value.lower() for value in _condition_values(raw)
+    ] == ["false"]
+
+
+def _lifecycle_rule_covers(rule: Any, key_prefix: str) -> bool:
+    """Return whether an enabled lifecycle rule applies to every recording key.
+
+    A tag or object-size filter applies to only some objects, so it does not
+    cover the recordings whatever its prefix.
+    """
+    if not isinstance(rule, dict) or rule.get("Status") != "Enabled":
+        return False
+    if "Filter" in rule:
+        rule_filter = rule.get("Filter") or {}
+        if "And" in rule_filter:
+            rule_filter = rule_filter.get("And") or {}
+            if rule_filter.get("Tags"):
+                return False
+        if any(
+            key in rule_filter
+            for key in ("Tag", "ObjectSizeGreaterThan", "ObjectSizeLessThan")
+        ):
+            return False
+        prefix = rule_filter.get("Prefix") or ""
+    else:
+        prefix = rule.get("Prefix") or ""
+    return key_prefix.startswith(str(prefix))
+
+
+def _positive_int(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
+def _recording_bucket_gaps(
+    reads: Dict[str, Tuple[str, Any]], bucket: str, key_prefix: str, object_arn: str
+) -> Tuple[List[str], List[str], List[str], List[str], List[str]]:
+    """Judge one recording bucket for the keys under one browser's prefix.
+
+    Returns problems, fixes, unread legs, retries and the facts a Passed row
+    states. A leg that could not be read is never a pass.
+    """
+    problems: List[str] = []
+    fixes: List[str] = []
+    unread: List[str] = []
+    retries: List[str] = []
+    facts: List[str] = []
+    grants = {leg: grant for leg, _, _, grant in BROWSER_RECORDING_BUCKET_READS}
+    location = f"s3://{bucket}/{key_prefix}"
+
+    def not_read(leg: str, what: str) -> None:
+        unread.append(f"bucket '{bucket}' {what} ({reads[leg][1]})")
+        retries.append(f"Grant {grants[leg]} on the recording bucket and retry.")
+
+    state, response = reads["encryption"]
+    if state == "error":
+        not_read("encryption", "default encryption")
+    else:
+        rules = ((response or {}).get("ServerSideEncryptionConfiguration") or {}).get(
+            "Rules"
+        ) or []
+        algorithms = sorted(
+            {
+                str(
+                    (rule.get("ApplyServerSideEncryptionByDefault") or {}).get(
+                        "SSEAlgorithm", ""
+                    )
+                )
+                for rule in rules
+                if isinstance(rule, dict)
+            }
+            - {""}
+        )
+        kms = [name for name in algorithms if name in BROWSER_RECORDING_KMS_ALGORITHMS]
+        if kms:
+            facts.append(f"encrypts with {', '.join(kms)}")
+        else:
+            problems.append(
+                f"bucket '{bucket}' encrypts new objects with "
+                f"{', '.join(algorithms) or 'no default algorithm'}, not a KMS "
+                "key, so bucket access alone decides who reads a recording"
+            )
+            fixes.append(
+                "Set the recording bucket's default encryption to SSE-KMS with a "
+                "customer managed key."
+            )
+
+    state, response = reads["public_access_block"]
+    if state == "error":
+        not_read("public_access_block", "Block Public Access settings")
+    else:
+        config = (response or {}).get("PublicAccessBlockConfiguration") or {}
+        off = [
+            field
+            for field in S3_PUBLIC_ACCESS_BLOCK_FIELDS
+            if config.get(field) is not True
+        ]
+        if off:
+            unread.append(
+                f"whether account-level Block Public Access sets {', '.join(off)}, "
+                f"which bucket '{bucket}' leaves off (s3:GetAccountPublicAccessBlock "
+                "is not granted)"
+            )
+            retries.append(
+                "Turn on all four Block Public Access settings on the recording bucket."
+            )
+        else:
+            facts.append("blocks all public access")
+
+    state, response = reads["policy"]
+    if state == "error":
+        not_read("policy", "bucket policy")
+    else:
+        statements = _document_statements((response or {}).get("Policy"))
+        if any(_statement_refuses_plaintext(st, object_arn) for st in statements):
+            facts.append(f"denies {location} without TLS")
+        else:
+            problems.append(
+                f"bucket '{bucket}' "
+                + (
+                    "policy has no statement that"
+                    if state == "read"
+                    else "has no bucket policy, so nothing"
+                )
+                + " denies every principal s3:GetObject and s3:PutObject on "
+                f"{object_arn} when aws:SecureTransport is false, so a recording "
+                "can move without TLS"
+            )
+            fixes.append(
+                "Add a bucket policy statement that denies s3:* to Principal '*' "
+                "on the bucket and its objects when aws:SecureTransport is false."
+            )
+
+    state, response = reads["lifecycle"]
+    if state == "error":
+        not_read("lifecycle", "lifecycle configuration")
+    else:
+        rules = (response or {}).get("Rules") or []
+        expiring = [
+            str(rule.get("ID") or "unnamed")
+            for rule in rules
+            if _lifecycle_rule_covers(rule, key_prefix)
+            and (
+                _positive_int((rule.get("Expiration") or {}).get("Days"))
+                or (rule.get("Expiration") or {}).get("Date")
+            )
+        ]
+        noncurrent = [
+            str(rule.get("ID") or "unnamed")
+            for rule in rules
+            if _lifecycle_rule_covers(rule, key_prefix)
+            and _positive_int(
+                (rule.get("NoncurrentVersionExpiration") or {}).get("NoncurrentDays")
+            )
+        ]
+        versioning_state, versioning = reads["versioning"]
+        status = (
+            str((versioning or {}).get("Status") or "")
+            if versioning_state == "read"
+            else ""
+        )
+        if not expiring:
+            problems.append(
+                f"no enabled lifecycle rule without a tag or size filter expires "
+                f"{location}, so recordings are kept until someone deletes them"
+            )
+            fixes.append(
+                "Add an enabled lifecycle rule with an Expiration on the recording "
+                "prefix."
+            )
+        elif versioning_state == "error":
+            not_read(
+                "versioning",
+                "versioning state, which decides whether an expired recording "
+                "stays as a noncurrent version",
+            )
+        elif status in ("Enabled", "Suspended") and not noncurrent:
+            problems.append(
+                f"bucket '{bucket}' versioning is {status} and no enabled rule "
+                f"sets NoncurrentVersionExpiration on {location}, so each expired "
+                "recording stays as a noncurrent version"
+            )
+            fixes.append(
+                "Add NoncurrentVersionExpiration to a lifecycle rule on the "
+                "recording prefix."
+            )
+        else:
+            facts.append(f"expires it by lifecycle rule {', '.join(expiring)}")
+
+    return problems, fixes, unread, retries, facts
+
+
+def _recording_write_verdict(
+    role_arn: str,
+    permission_cache: Any,
+    bucket_statements: Optional[List[Dict[str, Any]]],
+    object_arn: str,
+    account: str,
+    partition: str,
+) -> Tuple[str, str]:
+    """Judge whether a browser's execution role may write its recordings.
+
+    Returns ("failed" | "unread" | "granted", text). The write needs an Allow
+    from an identity policy or from a bucket policy statement naming the role,
+    the role's permissions boundary must allow it too, and no Deny in any of
+    them may reach it. A Deny keyed only on aws:SecureTransport does not refuse
+    the service, which writes over TLS. Any other condition is not evaluated,
+    so it withholds the verdict.
+    """
+    if not isinstance(permission_cache, dict):
+        return "unread", (
+            "whether the execution role can write the recordings (no IAM "
+            "permission cache was produced)"
+        )
+    role_name = str(role_arn).rsplit("/", 1)[-1]
+    unread_roles = {
+        str(entry.get("name", ""))
+        for entry in (permission_cache.get("principal_errors") or [])
+        if isinstance(entry, dict) and entry.get("type") == "role"
+    }
+    if role_name in unread_roles:
+        return "unread", (
+            f"execution role {role_name}, whose policies the IAM permission cache "
+            "could not read"
+        )
+    permissions = (permission_cache.get("role_permissions") or {}).get(role_name)
+    if not isinstance(permissions, dict):
+        return "unread", (
+            f"execution role {role_arn}, which is not in the IAM permission cache"
+        )
+    try:
+        identity = [
+            statement
+            for policy in _principal_policies(permissions)
+            for statement in _document_statements(_policy_document(policy))
+        ]
+    except (TypeError, ValueError):
+        return "unread", (
+            f"a cached policy document on execution role {role_name}, which could "
+            "not be parsed"
+        )
+    boundary = _principal_boundary(permissions)
+    boundary_statements = _document_statements(boundary) if boundary else []
+    bucket_known = bucket_statements is not None
+    bucket_statements = bucket_statements or []
+    account_principals = {
+        "*",
+        role_arn,
+        account,
+        f"arn:{partition}:iam::{account}:root",
+    }
+
+    def reaches(statement: Dict[str, Any]) -> bool:
+        if not _statement_matches_action(statement, BROWSER_RECORDING_WRITE_ACTION):
+            return False
+        if "NotResource" in statement:
+            return _statement_resource_covers(statement, [object_arn])
+        return any(
+            fnmatchcase(object_arn, pattern) or fnmatchcase(pattern, object_arn)
+            for pattern in _statement_resources(statement)
+        )
+
+    def applies_to_role(statement: Dict[str, Any]) -> bool:
+        if "NotPrincipal" in statement:
+            excluded = _statement_principals({"Principal": statement["NotPrincipal"]})
+            return role_arn not in excluded
+        return bool(account_principals & set(_statement_principals(statement)))
+
+    conditional: List[str] = []
+    deny_sources = (
+        [("an identity policy", st) for st in identity]
+        + [("the permissions boundary", st) for st in boundary_statements]
+        + [("the bucket policy", st) for st in bucket_statements if applies_to_role(st)]
+    )
+    for source, statement in deny_sources:
+        if statement.get("Effect") != "Deny" or not reaches(statement):
+            continue
+        keys = _statement_condition_keys(statement)
+        if keys and set(keys) == {"aws:securetransport"}:
+            continue
+        if not statement.get("Condition") and _statement_resource_covers(
+            statement, [object_arn]
+        ):
+            return "failed", (
+                f"a Deny in {source} refuses execution role {role_name} "
+                f"s3:PutObject on {object_arn}"
+            )
+        conditional.append(f"a Deny in {source}")
+
+    def allow(statements: List[Dict[str, Any]], source: str) -> bool:
+        granted = False
+        for statement in statements:
+            if statement.get("Effect") != "Allow" or not reaches(statement):
+                continue
+            if not statement.get("Condition") and _statement_resource_covers(
+                statement, [object_arn]
+            ):
+                granted = True
+            else:
+                conditional.append(f"an Allow in {source}")
+        return granted
+
+    sources = []
+    if allow(identity, "an identity policy"):
+        sources.append("an identity policy")
+    if allow(
+        [st for st in bucket_statements if role_arn in _statement_principals(st)],
+        "the bucket policy",
+    ):
+        sources.append("the bucket policy")
+    if not sources and not conditional:
+        return "failed", (
+            f"no identity policy of execution role {role_name} and no bucket "
+            f"policy statement naming it allows s3:PutObject on {object_arn}, so "
+            "the browser cannot store its recordings"
+        )
+    before = len(conditional)
+    if (
+        boundary is not None
+        and not allow(boundary_statements, "the permissions boundary")
+        and len(conditional) == before
+    ):
+        return "failed", (
+            f"the permissions boundary of execution role {role_name} does not "
+            f"allow s3:PutObject on {object_arn}"
+        )
+    if conditional or not sources:
+        return "unread", (
+            f"whether execution role {role_name} can write {object_arn}: "
+            f"{', '.join(sorted(set(conditional)))} carries a condition or a "
+            "partial resource match that is not evaluated"
+        )
+    if not bucket_known:
+        return "unread", (
+            f"whether the bucket policy denies execution role {role_name} the "
+            "write (the bucket policy was not read)"
+        )
+    return "granted", (
+        f"execution role {role_name} may write s3:PutObject on {object_arn} "
+        f"through {' and '.join(sources)}"
+    )
+
+
 def check_browser_tool_recording(
     browser_inventory: Dict[str, Any] = None,
+    permission_cache: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
-    """AC-06: Require recording and an S3 destination on custom browsers."""
+    """AC-06: Require recording on custom browsers, to a destination that keeps it.
+
+    The population is every custom browser. The AWS managed browser has no
+    recording configuration to change. A recording browser passes only when its
+    bucket, owned by the browser's account, encrypts with a KMS key, blocks
+    public access, denies the recording prefix without TLS and expires it, and
+    its execution role may write the prefix. A bucket leg or role that could
+    not be read is N/A and never Passed, and it never hides a Failed leg.
+    """
     findings = []
 
     if agentcore_client is None:
@@ -4625,38 +5090,164 @@ def check_browser_tool_recording(
             )
             return findings
 
+        bucket_reads: Dict[str, Dict[str, Tuple[str, Any]]] = {}
         for item in browsers:
             summary = item["summary"]
             detail = item["detail"]
             browser_id = summary.get("browserId", "unknown")
             browser_name = summary.get("name", browser_id)
+            label = f"Custom browser '{browser_name}' ({browser_id})"
             recording = detail.get("recording") or {}
             s3_location = recording.get("s3Location") or {}
             enabled = recording.get("enabled") is True
             bucket = s3_location.get("bucket")
-            configured = enabled and bool(bucket)
-
-            findings.append(
-                create_finding(
-                    check_id="AC-06",
-                    finding_name=AGENTCORE_BROWSER_RECORDING_FINDING_NAME,
-                    finding_details=(
-                        f"Custom browser '{browser_name}' ({browser_id}) has session "
-                        f"recording enabled with S3 bucket '{bucket}'."
-                        if configured
-                        else f"Custom browser '{browser_name}' ({browser_id}) does not "
-                        "have session recording enabled with an S3 destination."
-                    ),
-                    resolution=(
-                        "No action required"
-                        if configured
-                        else "Enable browser session recording and configure a non-empty S3 recording destination."
-                    ),
-                    reference=AGENTCORE_SECURITY_HUB_REFERENCE_URL,
-                    severity=SeverityEnum.MEDIUM,
-                    status=StatusEnum.PASSED if configured else StatusEnum.FAILED,
+            if not (enabled and bucket):
+                findings.append(
+                    create_finding(
+                        check_id="AC-06",
+                        finding_name=AGENTCORE_BROWSER_RECORDING_FINDING_NAME,
+                        finding_details=(
+                            f"{label} does not have session recording enabled "
+                            "with an S3 destination."
+                        ),
+                        resolution=(
+                            "Enable browser session recording and configure a "
+                            "non-empty S3 recording destination."
+                        ),
+                        reference=AGENTCORE_SECURITY_HUB_REFERENCE_URL,
+                        severity=SeverityEnum.MEDIUM,
+                        status=StatusEnum.FAILED,
+                    )
                 )
+                continue
+
+            problems: List[str] = []
+            fixes: List[str] = []
+            unread: List[str] = []
+            retries: List[str] = []
+            facts: List[str] = []
+            key_prefix = _browser_recording_key_prefix(s3_location.get("prefix"))
+            arn_parts = str(
+                detail.get("browserArn") or summary.get("browserArn") or ""
+            ).split(":")
+            partition, account = (
+                (arn_parts[1], arn_parts[4])
+                if len(arn_parts) >= 6 and arn_parts[1] and arn_parts[4]
+                else ("", "")
             )
+            object_arn = f"arn:{partition}:s3:::{bucket}/{key_prefix}*"
+            role_arn = detail.get("executionRoleArn")
+            if not role_arn:
+                problems.append(
+                    "names no executionRoleArn, so no role is authorized to write "
+                    "its recordings to the bucket"
+                )
+                fixes.append(
+                    "Set an execution role on the browser that may write "
+                    "s3:PutObject to the recording prefix."
+                )
+            write_note = ""
+            if not account:
+                unread.append(
+                    "the recording bucket, because GetBrowser returned no browserArn "
+                    "naming the account that must own it"
+                )
+                retries.append("Grant bedrock-agentcore:GetBrowser and retry.")
+            else:
+                if bucket not in bucket_reads:
+                    bucket_reads[bucket] = _read_recording_bucket(bucket, account)
+                reads = bucket_reads[bucket]
+                for found, bucket_list in zip(
+                    (problems, fixes, unread, retries, facts),
+                    _recording_bucket_gaps(reads, bucket, key_prefix, object_arn),
+                ):
+                    found.extend(bucket_list)
+                if role_arn:
+                    policy_state, policy = reads["policy"]
+                    verdict, text = _recording_write_verdict(
+                        str(role_arn),
+                        permission_cache,
+                        (
+                            None
+                            if policy_state == "error"
+                            else _document_statements((policy or {}).get("Policy"))
+                        ),
+                        object_arn,
+                        account,
+                        partition,
+                    )
+                    if verdict == "failed":
+                        problems.append(text)
+                        fixes.append(
+                            "Allow the execution role s3:PutObject on the recording "
+                            "prefix in its identity policy and permissions boundary, "
+                            "and remove the Deny that refuses it."
+                        )
+                    elif verdict == "unread":
+                        unread.append(text)
+                        retries.append(
+                            "Produce the IAM permission cache with the role's "
+                            "policies, or remove the condition, and retry."
+                        )
+                    else:
+                        write_note = text
+
+            not_read = f" Not read: {'; '.join(unread)}." if unread else ""
+            destination = f"s3://{bucket}/{key_prefix}"
+            if problems:
+                findings.append(
+                    create_finding(
+                        check_id="AC-06",
+                        finding_name=AGENTCORE_BROWSER_RECORDING_FINDING_NAME,
+                        finding_details=(
+                            f"{label} records to {destination} but "
+                            f"{'; '.join(problems)}.{not_read}"
+                        ),
+                        resolution=" ".join(fixes + retries),
+                        reference=AGENTCORE_SECURITY_HUB_REFERENCE_URL,
+                        severity=SeverityEnum.MEDIUM,
+                        status=StatusEnum.FAILED,
+                    )
+                )
+            elif unread:
+                findings.append(
+                    create_finding(
+                        check_id="AC-06",
+                        finding_name=AGENTCORE_BROWSER_RECORDING_FINDING_NAME,
+                        finding_details=(
+                            f"{label} records to {destination}, but the destination "
+                            f"could not be judged, so it is not reported as "
+                            f"protected.{not_read}"
+                        ),
+                        resolution=" ".join(retries),
+                        reference=AGENTCORE_SECURITY_HUB_REFERENCE_URL,
+                        severity=SeverityEnum.INFORMATIONAL,
+                        status=StatusEnum.NA,
+                    )
+                )
+            else:
+                v1_note = (
+                    ""
+                    if _cache_schema_version(permission_cache)
+                    >= IAM_CACHE_SCHEMA_VERSION
+                    else " " + IAM_CACHE_V1_NOTE
+                )
+                findings.append(
+                    create_finding(
+                        check_id="AC-06",
+                        finding_name=AGENTCORE_BROWSER_RECORDING_FINDING_NAME,
+                        finding_details=(
+                            f"{label} has session recording enabled to "
+                            f"{destination}. Bucket '{bucket}' {', '.join(facts)}, "
+                            f"and {write_note}. {BROWSER_RECORDING_WRITE_CEILING}"
+                            f"{v1_note}"
+                        ),
+                        resolution="No action required",
+                        reference=AGENTCORE_SECURITY_HUB_REFERENCE_URL,
+                        severity=SeverityEnum.MEDIUM,
+                        status=StatusEnum.PASSED,
+                    )
+                )
 
         for item in inventory.get("errors", []):
             summary = item["summary"]
@@ -21958,7 +22549,9 @@ def lambda_handler(event, context):
             (
                 ["AC-06"],
                 "Browser Tool Recording",
-                lambda: check_browser_tool_recording(browser_inventory),
+                lambda: check_browser_tool_recording(
+                    browser_inventory, permission_cache
+                ),
             ),
             (["AC-07"], "Memory Configuration", check_agentcore_memory_configuration),
             (["AC-13"], "Gateway Configuration", check_agentcore_gateway_configuration),

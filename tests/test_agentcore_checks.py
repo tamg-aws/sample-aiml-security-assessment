@@ -2992,6 +2992,739 @@ class TestAC06BrowserToolRecording:
         }
 
 
+_RECORDER_ROLE = "arn:aws:iam::123456789012:role/browser-recorder"
+_RECORDING_OBJECTS = "arn:aws:s3:::recordings/rec/*"
+
+
+def _recorded_browser(
+    browser_id="br-1", bucket="recordings", prefix="rec/", role=_RECORDER_ROLE
+):
+    detail = {
+        "browserArn": (
+            f"arn:aws:bedrock-agentcore:us-east-1:123456789012:browser-custom/{browser_id}"
+        ),
+        "recording": {
+            "enabled": True,
+            "s3Location": {"bucket": bucket, "prefix": prefix},
+        },
+    }
+    if role:
+        detail["executionRoleArn"] = role
+    return {
+        "summary": {"browserId": browser_id, "name": f"browser-{browser_id}"},
+        "detail": detail,
+    }
+
+
+def _browser_inventory(*items):
+    return {"items": list(items), "errors": [], "list_error": None}
+
+
+def _plaintext_deny(**overrides):
+    statement = {
+        "Sid": "DenyPlaintext",
+        "Effect": "Deny",
+        "Principal": "*",
+        "Action": "s3:*",
+        "Resource": ["arn:aws:s3:::recordings", "arn:aws:s3:::recordings/*"],
+        "Condition": {"Bool": {"aws:SecureTransport": "false"}},
+    }
+    statement.update(overrides)
+    return statement
+
+
+def _expire_rule(**overrides):
+    rule = {
+        "ID": "expire-recordings",
+        "Status": "Enabled",
+        "Filter": {"Prefix": "rec/"},
+        "Expiration": {"Days": 30},
+    }
+    rule.update(overrides)
+    return rule
+
+
+def _wire_recording_bucket(
+    mock_s3,
+    algorithm="aws:kms",
+    block=True,
+    statements=None,
+    rules=None,
+    versioning=None,
+):
+    """One recording bucket that passes every AC-06 leg unless overridden."""
+    mock_s3.get_bucket_encryption.return_value = {
+        "ServerSideEncryptionConfiguration": {
+            "Rules": [
+                {"ApplyServerSideEncryptionByDefault": {"SSEAlgorithm": algorithm}}
+            ]
+        }
+    }
+    mock_s3.get_public_access_block.return_value = {
+        "PublicAccessBlockConfiguration": {
+            field: block for field in agentcore_app.S3_PUBLIC_ACCESS_BLOCK_FIELDS
+        }
+    }
+    mock_s3.get_bucket_policy.return_value = {
+        "Policy": json.dumps(
+            {
+                "Version": "2012-10-17",
+                "Statement": [_plaintext_deny()] if statements is None else statements,
+            }
+        )
+    }
+    mock_s3.get_bucket_lifecycle_configuration.return_value = {
+        "Rules": [_expire_rule()] if rules is None else rules
+    }
+    mock_s3.get_bucket_versioning.return_value = versioning or {}
+
+
+def _recorder_cache(statements=None, boundary=None, errors=None, version=2):
+    permissions = {
+        "attached_policies": [
+            {
+                "policy_name": "write-recordings",
+                "document": {
+                    "Version": "2012-10-17",
+                    "Statement": (
+                        [
+                            {
+                                "Effect": "Allow",
+                                "Action": "s3:PutObject",
+                                "Resource": _RECORDING_OBJECTS,
+                            }
+                        ]
+                        if statements is None
+                        else statements
+                    ),
+                },
+            }
+        ]
+    }
+    if boundary is not None:
+        permissions["permissions_boundary"] = boundary
+    return {
+        "cache_schema_version": version,
+        "role_permissions": {"browser-recorder": permissions},
+        "principal_errors": errors or [],
+    }
+
+
+def _record(inventory, cache=None):
+    with patch("agentcore_app.agentcore_client", MagicMock()):
+        return agentcore_app.check_browser_tool_recording(
+            inventory, _recorder_cache() if cache is None else cache
+        )
+
+
+class TestAC06RecordingDestination:
+    """AC-06: a recording browser passes only when its destination keeps it safe."""
+
+    @patch("agentcore_app.s3_client")
+    def test_a_protected_destination_passes_and_states_its_ceiling(self, mock_s3):
+        _wire_recording_bucket(mock_s3)
+
+        findings = _record(_browser_inventory(_recorded_browser()))
+
+        assert [finding["Status"] for finding in findings] == ["Passed"]
+        details = findings[0]["Finding_Details"]
+        assert "encrypts with aws:kms" in details
+        assert "blocks all public access" in details
+        assert "expires it by lifecycle rule expire-recordings" in details
+        assert f"may write s3:PutObject on {_RECORDING_OBJECTS}" in details
+        assert agentcore_app.BROWSER_RECORDING_WRITE_CEILING in details
+        mock_s3.get_bucket_policy.assert_called_once_with(
+            Bucket="recordings", ExpectedBucketOwner="123456789012"
+        )
+        assert_finding_schema(findings[0])
+
+    @patch("agentcore_app.s3_client")
+    def test_one_bad_bucket_fails_only_its_browser(self, mock_s3):
+        _wire_recording_bucket(mock_s3)
+        good = mock_s3.get_bucket_encryption.return_value
+
+        def encryption(Bucket, ExpectedBucketOwner):
+            if Bucket == "recordings":
+                return good
+            return {
+                "ServerSideEncryptionConfiguration": {
+                    "Rules": [
+                        {
+                            "ApplyServerSideEncryptionByDefault": {
+                                "SSEAlgorithm": "AES256"
+                            }
+                        }
+                    ]
+                }
+            }
+
+        mock_s3.get_bucket_encryption.side_effect = encryption
+        cache = _recorder_cache(
+            statements=[{"Effect": "Allow", "Action": "s3:PutObject", "Resource": "*"}]
+        )
+
+        findings = _record(
+            _browser_inventory(
+                _recorded_browser("br-1"), _recorded_browser("br-2", bucket="other")
+            ),
+            cache,
+        )
+
+        assert [finding["Status"] for finding in findings] == ["Passed", "Failed"]
+        assert "(br-2)" in findings[1]["Finding_Details"]
+        assert (
+            "encrypts new objects with AES256, not a KMS key"
+            in findings[1]["Finding_Details"]
+        )
+        assert findings[1]["Finding"] == "AgentCore Browser Session Recording"
+
+    @patch("agentcore_app.s3_client")
+    def test_a_shared_bucket_is_read_once(self, mock_s3):
+        _wire_recording_bucket(mock_s3)
+
+        findings = _record(
+            _browser_inventory(_recorded_browser("br-1"), _recorded_browser("br-2"))
+        )
+
+        assert [finding["Status"] for finding in findings] == ["Passed", "Passed"]
+        mock_s3.get_bucket_encryption.assert_called_once()
+
+    @pytest.mark.parametrize(
+        "algorithm, status",
+        [("AES256", "Failed"), ("aws:kms:dsse", "Passed"), ("aws:kms", "Passed")],
+    )
+    @patch("agentcore_app.s3_client")
+    def test_only_kms_default_encryption_passes(self, mock_s3, algorithm, status):
+        _wire_recording_bucket(mock_s3, algorithm=algorithm)
+
+        assert _record(_browser_inventory(_recorded_browser()))[0]["Status"] == status
+
+    @patch("agentcore_app.s3_client")
+    def test_no_default_encryption_fails(self, mock_s3):
+        _wire_recording_bucket(mock_s3)
+        mock_s3.get_bucket_encryption.side_effect = _make_client_error(
+            "ServerSideEncryptionConfigurationNotFoundError", "none"
+        )
+
+        finding = _record(_browser_inventory(_recorded_browser()))[0]
+
+        assert finding["Status"] == "Failed"
+        assert "no default algorithm" in finding["Finding_Details"]
+
+    @pytest.mark.parametrize("field", ["BlockPublicAcls", "RestrictPublicBuckets"])
+    @patch("agentcore_app.s3_client")
+    def test_bucket_public_access_left_off_is_na_not_passed(self, mock_s3, field):
+        _wire_recording_bucket(mock_s3)
+        mock_s3.get_public_access_block.return_value["PublicAccessBlockConfiguration"][
+            field
+        ] = False
+
+        finding = _record(_browser_inventory(_recorded_browser()))[0]
+
+        assert finding["Status"] == "N/A"
+        assert field in finding["Finding_Details"]
+        assert (
+            "s3:GetAccountPublicAccessBlock is not granted"
+            in finding["Finding_Details"]
+        )
+
+    @patch("agentcore_app.s3_client")
+    def test_no_bucket_public_access_block_is_na_not_passed(self, mock_s3):
+        _wire_recording_bucket(mock_s3)
+        mock_s3.get_public_access_block.side_effect = _make_client_error(
+            "NoSuchPublicAccessBlockConfiguration", "none"
+        )
+
+        finding = _record(_browser_inventory(_recorded_browser()))[0]
+
+        assert finding["Status"] == "N/A"
+        assert "BlockPublicAcls, IgnorePublicAcls" in finding["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "statements",
+        [
+            [],
+            [_plaintext_deny(Resource="arn:aws:s3:::other/*")],
+            [_plaintext_deny(Principal={"AWS": _RECORDER_ROLE})],
+            [_plaintext_deny(Action="s3:GetObject")],
+            [
+                _plaintext_deny(
+                    Condition={
+                        "Bool": {"aws:SecureTransport": "false"},
+                        "StringEquals": {"aws:PrincipalAccount": "111122223333"},
+                    }
+                )
+            ],
+            [_plaintext_deny(Condition={"Bool": {"aws:SecureTransport": "true"}})],
+            [_plaintext_deny(Effect="Allow")],
+        ],
+    )
+    @patch("agentcore_app.s3_client")
+    def test_a_policy_that_does_not_refuse_plaintext_fails(self, mock_s3, statements):
+        _wire_recording_bucket(mock_s3, statements=statements)
+
+        finding = _record(_browser_inventory(_recorded_browser()))[0]
+
+        assert finding["Status"] == "Failed"
+        assert "aws:SecureTransport is false" in finding["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "statement",
+        [
+            _plaintext_deny(Condition={"BoolIfExists": {"aws:SecureTransport": False}}),
+            _plaintext_deny(
+                Principal={"AWS": "*"}, Resource="arn:aws:s3:::recordings/rec/*"
+            ),
+            _plaintext_deny(Action=["s3:GetObject", "s3:PutObject"]),
+        ],
+    )
+    @patch("agentcore_app.s3_client")
+    def test_equivalent_plaintext_denies_pass(self, mock_s3, statement):
+        _wire_recording_bucket(mock_s3, statements=[statement])
+
+        assert _record(_browser_inventory(_recorded_browser()))[0]["Status"] == "Passed"
+
+    @patch("agentcore_app.s3_client")
+    def test_no_bucket_policy_fails(self, mock_s3):
+        _wire_recording_bucket(mock_s3)
+        mock_s3.get_bucket_policy.side_effect = _make_client_error(
+            "NoSuchBucketPolicy", "none"
+        )
+
+        finding = _record(_browser_inventory(_recorded_browser()))[0]
+
+        assert finding["Status"] == "Failed"
+        assert "has no bucket policy" in finding["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "rules",
+        [
+            [],
+            [_expire_rule(Status="Disabled")],
+            [_expire_rule(Filter={"Prefix": "logs/"})],
+            [_expire_rule(Filter={"Tag": {"Key": "k", "Value": "v"}})],
+            [
+                _expire_rule(
+                    Filter={
+                        "And": {"Prefix": "rec/", "Tags": [{"Key": "k", "Value": "v"}]}
+                    }
+                )
+            ],
+            [_expire_rule(Filter={"Prefix": "rec/", "ObjectSizeGreaterThan": 1024})],
+            [_expire_rule(Expiration={"ExpiredObjectDeleteMarker": True})],
+            [_expire_rule(Expiration={"Days": 0})],
+        ],
+    )
+    @patch("agentcore_app.s3_client")
+    def test_recordings_no_rule_expires_fail(self, mock_s3, rules):
+        _wire_recording_bucket(mock_s3, rules=rules)
+
+        finding = _record(_browser_inventory(_recorded_browser()))[0]
+
+        assert finding["Status"] == "Failed"
+        assert "kept until someone deletes them" in finding["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "rule",
+        [
+            _expire_rule(Filter={}),
+            _expire_rule(Filter={"And": {"Prefix": "re"}}),
+            {
+                "ID": "legacy",
+                "Status": "Enabled",
+                "Prefix": "",
+                "Expiration": {"Date": "2027-01-01T00:00:00Z"},
+            },
+        ],
+    )
+    @patch("agentcore_app.s3_client")
+    def test_a_rule_over_a_wider_prefix_expires_the_recordings(self, mock_s3, rule):
+        _wire_recording_bucket(mock_s3, rules=[_expire_rule(Status="Disabled"), rule])
+
+        assert _record(_browser_inventory(_recorded_browser()))[0]["Status"] == "Passed"
+
+    @patch("agentcore_app.s3_client")
+    def test_the_prefix_is_read_with_one_trailing_slash(self, mock_s3):
+        _wire_recording_bucket(mock_s3)
+
+        findings = _record(
+            _browser_inventory(
+                _recorded_browser("br-1", prefix="rec"),
+                _recorded_browser("br-2", prefix="recordings-other/"),
+            )
+        )
+
+        assert [finding["Status"] for finding in findings] == ["Passed", "Failed"]
+        assert "s3://recordings/recordings-other/" in findings[1]["Finding_Details"]
+
+    @pytest.mark.parametrize("status", ["Enabled", "Suspended"])
+    @patch("agentcore_app.s3_client")
+    def test_a_versioned_bucket_must_expire_noncurrent_recordings(
+        self, mock_s3, status
+    ):
+        _wire_recording_bucket(mock_s3, versioning={"Status": status})
+        failed = _record(_browser_inventory(_recorded_browser()))[0]
+
+        _wire_recording_bucket(
+            mock_s3,
+            versioning={"Status": status},
+            rules=[
+                _expire_rule(NoncurrentVersionExpiration={"NoncurrentDays": 7}),
+            ],
+        )
+        passed = _record(_browser_inventory(_recorded_browser()))[0]
+
+        assert failed["Status"] == "Failed"
+        assert f"versioning is {status}" in failed["Finding_Details"]
+        assert passed["Status"] == "Passed"
+
+    @pytest.mark.parametrize(
+        "operation, grant",
+        [
+            ("get_bucket_encryption", "s3:GetEncryptionConfiguration"),
+            ("get_public_access_block", "s3:GetBucketPublicAccessBlock"),
+            ("get_bucket_policy", "s3:GetBucketPolicy"),
+            ("get_bucket_lifecycle_configuration", "s3:GetLifecycleConfiguration"),
+            ("get_bucket_versioning", "s3:GetBucketVersioning"),
+        ],
+    )
+    @patch("agentcore_app.s3_client")
+    def test_an_unreadable_bucket_leg_is_na_not_passed(self, mock_s3, operation, grant):
+        _wire_recording_bucket(mock_s3)
+        getattr(mock_s3, operation).side_effect = _make_client_error(
+            "AccessDenied", "denied"
+        )
+
+        findings = _record(
+            _browser_inventory(_recorded_browser("br-1"), _recorded_browser("br-2"))
+        )
+
+        assert [finding["Status"] for finding in findings] == ["N/A", "N/A"]
+        for finding in findings:
+            assert "Not read:" in finding["Finding_Details"]
+            assert grant in finding["Resolution"]
+
+    @patch("agentcore_app.s3_client")
+    def test_an_unreadable_leg_does_not_hide_a_failed_one(self, mock_s3):
+        _wire_recording_bucket(mock_s3, algorithm="AES256")
+        mock_s3.get_bucket_policy.side_effect = _make_client_error(
+            "AccessDenied", "denied"
+        )
+
+        finding = _record(_browser_inventory(_recorded_browser()))[0]
+
+        assert finding["Status"] == "Failed"
+        assert "AES256" in finding["Finding_Details"]
+        assert (
+            "Not read: bucket 'recordings' bucket policy" in finding["Finding_Details"]
+        )
+
+    @patch("agentcore_app.s3_client")
+    def test_a_bucket_owned_elsewhere_is_na(self, mock_s3):
+        _wire_recording_bucket(mock_s3)
+        for leg in agentcore_app.BROWSER_RECORDING_BUCKET_READS:
+            getattr(mock_s3, leg[1]).side_effect = _make_client_error(
+                "AccessDenied", "owner mismatch"
+            )
+
+        finding = _record(_browser_inventory(_recorded_browser()))[0]
+
+        assert finding["Status"] == "N/A"
+        for call in mock_s3.get_bucket_encryption.call_args_list:
+            assert call.kwargs["ExpectedBucketOwner"] == "123456789012"
+
+    @patch("agentcore_app.s3_client")
+    def test_no_browser_arn_is_na_and_reads_no_bucket(self, mock_s3):
+        browser = _recorded_browser()
+        del browser["detail"]["browserArn"]
+
+        finding = _record(_browser_inventory(browser))[0]
+
+        assert finding["Status"] == "N/A"
+        assert "no browserArn" in finding["Finding_Details"]
+        mock_s3.get_bucket_encryption.assert_not_called()
+
+    @patch("agentcore_app.s3_client")
+    def test_no_execution_role_fails(self, mock_s3):
+        _wire_recording_bucket(mock_s3)
+
+        finding = _record(_browser_inventory(_recorded_browser(role=None)))[0]
+
+        assert finding["Status"] == "Failed"
+        assert "names no executionRoleArn" in finding["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "cache, text",
+        [
+            (
+                _recorder_cache(
+                    errors=[
+                        {
+                            "type": "role",
+                            "name": "browser-recorder",
+                            "stage": "list_attached_role_policies",
+                            "error": "AccessDenied",
+                        }
+                    ]
+                ),
+                "could not read",
+            ),
+            (
+                {
+                    "cache_schema_version": 2,
+                    "role_permissions": {},
+                    "principal_errors": [],
+                },
+                "not in the IAM permission cache",
+            ),
+            (
+                _recorder_cache(
+                    statements=[
+                        {
+                            "Effect": "Allow",
+                            "Action": "s3:PutObject",
+                            "Resource": _RECORDING_OBJECTS,
+                            "Condition": {"StringEquals": {"aws:SourceVpc": "vpc-1"}},
+                        }
+                    ]
+                ),
+                "not evaluated",
+            ),
+            (
+                _recorder_cache(
+                    statements=[
+                        {"Effect": "Allow", "Action": "s3:PutObject", "Resource": "*"},
+                        {
+                            "Effect": "Deny",
+                            "Action": "s3:*",
+                            "Resource": "*",
+                            "Condition": {
+                                "StringNotEquals": {"aws:SourceVpce": "vpce-1"}
+                            },
+                        },
+                    ]
+                ),
+                "not evaluated",
+            ),
+            (
+                _recorder_cache(
+                    statements=[
+                        {"Effect": "Allow", "Action": "s3:PutObject", "Resource": "*"},
+                        {
+                            "Effect": "Deny",
+                            "Action": "s3:PutObject",
+                            "Resource": "arn:aws:s3:::recordings/rec/private/*",
+                        },
+                    ]
+                ),
+                "partial resource match",
+            ),
+        ],
+    )
+    @patch("agentcore_app.s3_client")
+    def test_an_unjudgeable_write_is_na_not_passed(self, mock_s3, cache, text):
+        _wire_recording_bucket(mock_s3)
+
+        finding = _record(_browser_inventory(_recorded_browser()), cache)[0]
+
+        assert finding["Status"] == "N/A"
+        assert text in finding["Finding_Details"]
+
+    @patch("agentcore_app.s3_client")
+    def test_no_permission_cache_is_na_not_passed(self, mock_s3):
+        _wire_recording_bucket(mock_s3)
+
+        with patch("agentcore_app.agentcore_client", MagicMock()):
+            finding = agentcore_app.check_browser_tool_recording(
+                _browser_inventory(_recorded_browser())
+            )[0]
+
+        assert finding["Status"] == "N/A"
+        assert "no IAM permission cache" in finding["Finding_Details"]
+
+    @patch("agentcore_app.s3_client")
+    def test_an_unparseable_cached_policy_is_na(self, mock_s3):
+        _wire_recording_bucket(mock_s3)
+        cache = _recorder_cache()
+        cache["role_permissions"]["browser-recorder"]["inline_policies"] = [
+            {"policy_name": "broken", "document": "{not json"}
+        ]
+
+        finding = _record(_browser_inventory(_recorded_browser()), cache)[0]
+
+        assert finding["Status"] == "N/A"
+        assert "could not be parsed" in finding["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "statements, bucket_statements, boundary, text",
+        [
+            (
+                [
+                    {
+                        "Effect": "Allow",
+                        "Action": "s3:PutObject",
+                        "Resource": "arn:aws:s3:::recordings/other/*",
+                    }
+                ],
+                None,
+                None,
+                "no identity policy",
+            ),
+            (
+                [{"Effect": "Allow", "Action": "s3:GetObject", "Resource": "*"}],
+                None,
+                None,
+                "no identity policy",
+            ),
+            (
+                [
+                    {"Effect": "Allow", "Action": "s3:*", "Resource": "*"},
+                    {
+                        "Effect": "Deny",
+                        "Action": "s3:Put*",
+                        "Resource": "arn:aws:s3:::recordings/*",
+                    },
+                ],
+                None,
+                None,
+                "a Deny in an identity policy",
+            ),
+            (
+                None,
+                [
+                    _plaintext_deny(),
+                    {
+                        "Effect": "Deny",
+                        "Principal": "*",
+                        "Action": "s3:PutObject",
+                        "Resource": "arn:aws:s3:::recordings/*",
+                    },
+                ],
+                None,
+                "a Deny in the bucket policy",
+            ),
+            (
+                None,
+                None,
+                {
+                    "Version": "2012-10-17",
+                    "Statement": [
+                        {
+                            "Effect": "Allow",
+                            "Action": "bedrock-agentcore:*",
+                            "Resource": "*",
+                        }
+                    ],
+                },
+                "permissions boundary",
+            ),
+            (
+                [],
+                [
+                    _plaintext_deny(),
+                    {
+                        "Effect": "Allow",
+                        "Principal": {"AWS": "arn:aws:iam::123456789012:root"},
+                        "Action": "s3:PutObject",
+                        "Resource": _RECORDING_OBJECTS,
+                    },
+                ],
+                None,
+                "no identity policy",
+            ),
+        ],
+    )
+    @patch("agentcore_app.s3_client")
+    def test_a_role_that_cannot_write_fails(
+        self, mock_s3, statements, bucket_statements, boundary, text
+    ):
+        _wire_recording_bucket(mock_s3, statements=bucket_statements)
+
+        findings = _record(
+            _browser_inventory(
+                _recorded_browser("br-1"),
+                _recorded_browser("br-2", role="arn:aws:iam::123456789012:role/other"),
+            ),
+            _recorder_cache(statements=statements, boundary=boundary),
+        )
+
+        assert findings[0]["Status"] == "Failed"
+        assert text in findings[0]["Finding_Details"]
+        assert findings[1]["Status"] == "N/A"
+
+    @pytest.mark.parametrize(
+        "statements, bucket_statements, boundary",
+        [
+            (
+                [],
+                [
+                    _plaintext_deny(),
+                    {
+                        "Effect": "Allow",
+                        "Principal": {"AWS": _RECORDER_ROLE},
+                        "Action": "s3:PutObject",
+                        "Resource": _RECORDING_OBJECTS,
+                    },
+                ],
+                None,
+            ),
+            (
+                None,
+                None,
+                {
+                    "Version": "2012-10-17",
+                    "Statement": [
+                        {"Effect": "Allow", "Action": "s3:*", "Resource": "*"}
+                    ],
+                },
+            ),
+            (
+                [
+                    {"Effect": "Allow", "NotAction": "iam:*", "Resource": "*"},
+                    {
+                        "Effect": "Deny",
+                        "Action": "s3:*",
+                        "Resource": "*",
+                        "Condition": {"Bool": {"aws:SecureTransport": "false"}},
+                    },
+                ],
+                None,
+                None,
+            ),
+        ],
+    )
+    @patch("agentcore_app.s3_client")
+    def test_a_role_that_can_write_passes(
+        self, mock_s3, statements, bucket_statements, boundary
+    ):
+        _wire_recording_bucket(mock_s3, statements=bucket_statements)
+
+        finding = _record(
+            _browser_inventory(_recorded_browser()),
+            _recorder_cache(statements=statements, boundary=boundary),
+        )[0]
+
+        assert finding["Status"] == "Passed"
+
+    @patch("agentcore_app.s3_client")
+    def test_a_v1_cache_says_principal_errors_were_not_recorded(self, mock_s3):
+        _wire_recording_bucket(mock_s3)
+
+        finding = _record(
+            _browser_inventory(_recorded_browser()), _recorder_cache(version=1)
+        )[0]
+
+        assert finding["Status"] == "Passed"
+        assert agentcore_app.IAM_CACHE_V1_NOTE in finding["Finding_Details"]
+
+    def test_the_handler_passes_the_permission_cache(self):
+        source = textwrap.dedent(inspect.getsource(agentcore_app.lambda_handler))
+
+        assert "check_browser_tool_recording(browser_inventory, permission_cache)" in (
+            " ".join(source.split()).replace("( ", "(").replace(" )", ")")
+        )
+
+
 # ===================================================================
 # AC-07: check_agentcore_memory_configuration
 # ===================================================================
@@ -4588,16 +5321,27 @@ class TestProposedAgentCoreChecks:
                         },
                         "recording": {
                             "enabled": True,
-                            "s3Location": {"bucket": "recordings"},
+                            "s3Location": {"bucket": "recordings", "prefix": "rec/"},
                         },
+                        "browserArn": (
+                            "arn:aws:bedrock-agentcore:us-east-1:123456789012:"
+                            "browser-custom/br-1"
+                        ),
+                        "executionRoleArn": _RECORDER_ROLE,
                     },
                 }
             ],
             "errors": [],
             "list_error": None,
         }
-        with patch("agentcore_app.agentcore_client", MagicMock()):
-            ac06 = agentcore_app.check_browser_tool_recording(inventory)[0]
+        with (
+            patch("agentcore_app.agentcore_client", MagicMock()),
+            patch("agentcore_app.s3_client") as mock_s3,
+        ):
+            _wire_recording_bucket(mock_s3)
+            ac06 = agentcore_app.check_browser_tool_recording(
+                inventory, _recorder_cache()
+            )[0]
             ac16 = agentcore_app.check_agentcore_browser_network_isolation(inventory)[0]
         assert ac06["Status"] == "Passed"
         assert ac16["Status"] == "Passed"
