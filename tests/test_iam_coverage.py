@@ -600,6 +600,7 @@ _VERIFIED_REMEDIATION_IAM_ACTIONS = {
     "macie2:GetAutomatedDiscoveryConfiguration",
     "macie2:GetMacieSession",
     "organizations:DescribeOrganization",
+    "organizations:ListParents",
     "organizations:ListPolicies",
     "organizations:ListRoots",
     "organizations:ListTargetsForPolicy",
@@ -618,14 +619,41 @@ _VERIFIED_REMEDIATION_IAM_ACTIONS = {
 # AWS Knowledge like the block above.
 _VERIFIED_REMEDIATION_IAM_ACTIONS |= {"s3vectors:PutVectorBucketPolicy"}
 
+# Verified on 2026-09-27 against the Service Authorization Reference JSON
+# (servicereference.us-east-1.amazonaws.com/v1/<service>/<service>.json): the
+# bedrock-mantle file lists CreateInference with the bedrock-mantle:Model action
+# condition key, and the s3 file lists GetObject.
+_VERIFIED_REMEDIATION_IAM_ACTIONS |= {
+    "bedrock-mantle:CreateInference",
+    "s3:GetObject",
+}
+
+# Verified on 2026-09-27 against the same Service Authorization Reference JSON:
+# the logs file lists AssociateKmsKey on the log-group resource.
+_VERIFIED_REMEDIATION_IAM_ACTIONS |= {"logs:AssociateKmsKey"}
+
+# Verified on 2026-09-28 against the same Service Authorization Reference JSON:
+# the bedrock file lists ListFlowAliases and GetFlowVersion on the flow resource.
+_VERIFIED_REMEDIATION_IAM_ACTIONS |= {
+    "bedrock:GetFlowVersion",
+    "bedrock:ListFlowAliases",
+}
+
 # Verified on 2026-09-25 by submitting a policy naming each action to
 # iam-access-analyzer ValidatePolicy (a read-only call that creates nothing):
 # an action the service does not define comes back as INVALID_ACTION, and every
 # action below came back clean.
 _VERIFIED_REMEDIATION_IAM_ACTIONS |= {
     "aws-marketplace:Subscribe",
+    "aws-marketplace:Unsubscribe",
     "bedrock:CallWithBearerToken",
     "bedrock-mantle:CallWithBearerToken",
+    # BR-02's EC2 workload leg: same method, 2026-09-27.
+    "ec2:DescribeInstances",
+    "iam:GetInstanceProfile",
+    # The two PutAccountDataRetention actions: same method, 2026-09-27.
+    "bedrock-mantle:PutAccountDataRetention",
+    "bedrock:PutAccountDataRetention",
     "iam:CreateServiceSpecificCredential",
     "iam:ListServiceSpecificCredentials",
     "logs:DescribeLogGroups",
@@ -803,10 +831,17 @@ _VERIFIED_REMEDIATION_CONDITION_KEYS |= {
     "aws-marketplace:ProductId",
     "aws:RequestedRegion",
     "bedrock:BearerTokenType",
+    "bedrock-mantle:BearerTokenType",
+    # The two DataRetentionMode keys: same method, 2026-09-27.
+    "bedrock-mantle:DataRetentionMode",
+    "bedrock:DataRetentionMode",
     "bedrock:ModelArn",
     "iam:ServiceSpecificCredentialAgeDays",
     "iam:ServiceSpecificCredentialServiceName",
 }
+
+# Verified with the bedrock-mantle:CreateInference entry above.
+_VERIFIED_REMEDIATION_CONDITION_KEYS |= {"bedrock-mantle:Model"}
 
 # Verified the same way on 2026-09-25 for the SageMaker phase-3 checks. The
 # condition key was submitted in its qualified aws:ResourceTag/<key> form, which

@@ -60,6 +60,13 @@ BOUNDED_DIRECT_CALLS = {
         "detect_bedrock_regional_footprint",
         "list_guardrails",
     ): ("maxResults", 1),
+    # A member account probes whether it is a delegated administrator for
+    # policy management; the result of the read decides, not its content.
+    (
+        "bedrock_assessments/app.py",
+        "_organization_policy_context",
+        "list_policies",
+    ): ("MaxResults", 1),
     (
         "bedrock_assessments/app.py",
         "detect_bedrock_regional_footprint",
