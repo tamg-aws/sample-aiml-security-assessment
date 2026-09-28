@@ -1,5 +1,5 @@
 {
-  "generated": "2026-09-26",
+  "generated": "2026-09-27",
   "generator": "aisf-parity/build_ledger.py",
   "aisf_repo": "/Users/tamg/WorkDocs/Builder/aws-ai-security-framework-assessment",
   "summary": {
@@ -315,7 +315,8 @@
         "BR-42"
       ],
       "incumbent_names": [
-        "Foundation Model Invocation Allow-List"
+        "Foundation Model Invocation Allow-List",
+        "Bedrock Approved Model Control"
       ],
       "gap": "",
       "extra_iam": [],
@@ -339,7 +340,10 @@
       ],
       "incumbent_names": [
         "Bedrock Region Invocation Control",
-        "Bedrock Approved Model Control"
+        "Bedrock Approved Model Control",
+        "Bedrock Inference Region Evidence",
+        "AI Service Region Control",
+        "Bedrock Custom Model Cross-Account Access"
       ],
       "gap": "",
       "extra_iam": [],
@@ -1925,7 +1929,10 @@
       ],
       "incumbent_names": [
         "Bedrock Region Invocation Control",
-        "Bedrock Approved Model Control"
+        "Bedrock Approved Model Control",
+        "Bedrock Inference Region Evidence",
+        "AI Service Region Control",
+        "Bedrock Custom Model Cross-Account Access"
       ],
       "gap": "BR-43 passes only when an attached service control policy denies the Bedrock invocation actions with a condition on aws:RequestedRegion and a global inference profile cannot route around it, which is the enforcing half of a data-residency requirement. Which Regions are approved is the customer's decision, so BR-43 asserts that an enforcing Deny exists and reports the Region values it found, and never judges whether that list is the right one",
       "extra_iam": [],
@@ -1951,6 +1958,7 @@
       ],
       "incumbent_names": [
         "Foundation Model Invocation Allow-List",
+        "Bedrock Approved Model Control",
         "SageMaker IAM Permissions Check",
         "SageMaker Service-Wide Grant in Customer Policy"
       ],
@@ -2026,7 +2034,10 @@
       ],
       "incumbent_names": [
         "Bedrock Region Invocation Control",
-        "Bedrock Approved Model Control"
+        "Bedrock Approved Model Control",
+        "Bedrock Inference Region Evidence",
+        "AI Service Region Control",
+        "Bedrock Custom Model Cross-Account Access"
       ],
       "gap": "BR-43 covers the Region half: it passes on an attached service control policy that denies the invocation actions on aws:RequestedRegion with global routing closed. Its model leg, published as 'Bedrock Approved Model Control', passes when an attached service control policy denies bedrock:InvokeModel and bedrock:InvokeModelWithResponseStream outside a named list of foundation-model or inference-profile ARNs, given as a NotResource or as a negated condition. Converse and ConverseStream have no IAM action of their own and are authorized by those two, so the leg matches only them. A Deny written with NotAction is read as covering those actions, and arn:aws:bedrock:*::foundation-model/* counts as no list. The leg asserts that a model list exists and never which models are approved. Organization policies are readable only from the management account, so from a delegated administrator the leg is Not Applicable",
       "extra_iam": [],

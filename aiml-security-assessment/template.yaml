@@ -358,6 +358,11 @@ Resources:
                 - bedrock:GetGuardrail
                 - bedrock:GetResourcePolicy # BR-41
               Resource: !Sub 'arn:${AWS::Partition}:bedrock:*:${AWS::AccountId}:guardrail/*'
+            - Sid: BedrockCustomModelPolicyRead
+              Effect: Allow
+              Action:
+                - bedrock:GetResourcePolicy # BR-43
+              Resource: !Sub 'arn:${AWS::Partition}:bedrock:*:${AWS::AccountId}:custom-model/*'
             - Sid: BedrockPromptRead
               Effect: Allow
               Action:

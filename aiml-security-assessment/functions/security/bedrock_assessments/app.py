@@ -5485,20 +5485,26 @@ GUARDRAIL_ORG_CONDITION_KEYS = {
 }
 
 
-def _guardrail_share_grants(document: Any, owner_account: str) -> Dict[str, Any]:
+def _guardrail_share_grants(
+    document: Any,
+    owner_account: str,
+    action: Optional[str] = GUARDRAIL_SHARE_ACTION,
+    action_label: str = "bedrock:ApplyGuardrail",
+) -> Dict[str, Any]:
     """
-    Describe how a guardrail resource policy shares the guardrail with other
-    accounts through bedrock:ApplyGuardrail.
+    Describe how a resource policy shares a resource with other accounts through
+    ``action``, or through any action when ``action`` is None.
 
     An Allow counts when it is scoped to the organization by aws:PrincipalOrgID
     or aws:PrincipalOrgPaths, or names principals in other accounts. A '*'
-    principal with neither key shares the guardrail with every AWS account.
+    principal, or one with a wildcard in its account segment, with neither key
+    shares the resource with every AWS account.
     """
     observed = {"shared": [], "unbounded": []}
     for statement in _policy_statements(document):
         if str(statement.get("Effect", "")).upper() != "ALLOW":
             continue
-        if not _statement_matches_action(statement, GUARDRAIL_SHARE_ACTION):
+        if action is not None and not _statement_matches_action(statement, action):
             continue
         principal = statement.get("Principal")
         if isinstance(principal, dict):
@@ -5518,18 +5524,35 @@ def _guardrail_share_grants(document: Any, owner_account: str) -> Dict[str, Any]
             for item in principals
             if item != "*" and owner_account and owner_account not in item
         ]
+        # A wildcard in the account segment of a principal ARN names no account.
+        open_principals = [
+            item
+            for item in principals
+            if item == "*"
+            or (
+                item.startswith("arn:")
+                and any(
+                    char in (item.split(":") + ["", "", "", "", ""])[4] for char in "*?"
+                )
+            )
+        ]
         if org_scopes:
             observed["shared"].append(
-                "an Allow of bedrock:ApplyGuardrail scoped by " + "; ".join(org_scopes)
+                f"an Allow of {action_label} scoped by " + "; ".join(org_scopes)
             )
-        elif "*" in principals:
+        elif open_principals:
             observed["unbounded"].append(
-                "an Allow of bedrock:ApplyGuardrail to every principal with no "
-                "aws:PrincipalOrgID or aws:PrincipalOrgPaths condition"
+                f"an Allow of {action_label} to "
+                + (
+                    "every principal"
+                    if "*" in open_principals
+                    else ", ".join(open_principals[:5])
+                )
+                + " with no aws:PrincipalOrgID or aws:PrincipalOrgPaths condition"
             )
         elif others:
             observed["shared"].append(
-                "an Allow of bedrock:ApplyGuardrail to " + ", ".join(others[:5])
+                f"an Allow of {action_label} to " + ", ".join(others[:5])
             )
     return observed
 
@@ -12120,10 +12143,6 @@ MODEL_INVOKE_ACTIONS = (
     "bedrock:invokemodelwithresponsestream",
 )
 
-MODEL_STREAMING_INVOKE_ACTION = "bedrock:invokemodelwithresponsestream"
-
-MODEL_ARN_CONDITION_KEY = "bedrock:modelarn"
-
 MODEL_ALLOW_LIST_REFERENCE = "https://docs.aws.amazon.com/bedrock/latest/userguide/security_iam_id-based-policy-examples.html"
 
 
@@ -12212,75 +12231,462 @@ def _resource_is_unscoped(resource: Any) -> bool:
     )
 
 
-def _statement_model_invocation_scoping(
-    statement: Dict[str, Any],
+# The condition keys each invoke action defines, from the Service Authorization
+# Reference. A bedrock: key the action does not define is never in its request
+# context, so a positive test on it never matches and the Allow grants nothing.
+MODEL_INVOKE_CONDITION_KEYS = {
+    "bedrock:invokemodel": frozenset(
+        {
+            "bedrock:guardrailidentifier",
+            "bedrock:inferenceprofilearn",
+            "bedrock:modelarn",
+            "bedrock:projectarn",
+            "bedrock:promptrouterarn",
+            "bedrock:servicetier",
+        }
+    ),
+    "bedrock:invokemodelwithresponsestream": frozenset(
+        {
+            "bedrock:guardrailidentifier",
+            "bedrock:inferenceprofilearn",
+            "bedrock:promptrouterarn",
+            "bedrock:servicetier",
+        }
+    ),
+}
+
+MODEL_SCOPING_CONDITION_KEYS = ("bedrock:modelarn", "bedrock:inferenceprofilearn")
+
+POSITIVE_MATCH_OPERATORS = (
+    "stringequals",
+    "stringequalsignorecase",
+    "stringlike",
+    "arnequals",
+    "arnlike",
+)
+
+# The bedrock-mantle endpoint authorizes inference against a project ARN, so the
+# model is named only by the bedrock-mantle:Model condition key.
+MANTLE_INFERENCE_ACTION = "bedrock-mantle:createinference"
+
+MANTLE_MODEL_CONDITION_KEY = "bedrock-mantle:model"
+
+TRAINING_DATA_READ_ACTION = "s3:getobject"
+
+# The _ai_data_path_buckets labels that name a customization job's input.
+TRAINING_DATA_LABEL_PREFIXES = (
+    "the training data of",
+    "the validation data of",
+    "the invocation log source of",
+)
+
+# Stands in for any object key when asking whether a pattern reaches a bucket.
+ANY_OBJECT_KEY = "\x00"
+
+
+def _names_one_model(value: Any) -> bool:
+    """
+    Return True when a Bedrock ARN names one resource: no wildcard in the
+    partition or account segment, the resource type or the resource ID.
+
+    A wildcard in the Region segment is accepted, because the documented
+    allow-list form arn:aws:bedrock:*::foundation-model/<id> uses one and it
+    still names a single model.
+    """
+    if not isinstance(value, str):
+        return False
+    segments = value.strip().lower().split(":", 5)
+    if len(segments) != 6 or segments[0] != "arn" or segments[2] != "bedrock":
+        return False
+    resource_type, _, resource_id = segments[5].partition("/")
+    return bool(resource_type and resource_id) and not any(
+        char in segments[1] + segments[4] + resource_type + resource_id for char in "*?"
+    )
+
+
+def _condition_is_positive_match(operator: str) -> bool:
+    """
+    Return True for an operator that matches only when the key is present and
+    equal to a listed value. ForAllValues and IfExists match an absent key.
+    """
+    text = str(operator).strip().lower()
+    return not text.startswith("forallvalues:") and (
+        _strip_condition_set_operator(text) in POSITIVE_MATCH_OPERATORS
+    )
+
+
+def _statement_invoke_scoping(
+    statement: Dict[str, Any], action: str
 ) -> Optional[Dict[str, Any]]:
     """
-    Describe how one Allow statement scopes Bedrock model invocation.
+    Describe how one Allow statement scopes one model invoke action.
 
-    Returns None when the statement allows neither invoke action, so a policy
-    that never grants invocation is not judged against this control.
+    Returns None when the statement does not allow the action. ``inert_keys``
+    names bedrock: keys the action does not define that the statement tests
+    positively; such a statement never applies to the action.
     """
     if str(statement.get("Effect", "")).upper() != "ALLOW":
         return None
-
-    covered = [
-        invoke_action
-        for invoke_action in MODEL_INVOKE_ACTIONS
-        if any(
-            _action_pattern_covers(action, invoke_action)
-            for action in _as_list(statement.get("Action"))
-        )
-    ]
-    if not covered:
+    if not _statement_matches_action(statement, action):
         return None
 
-    resources = [
-        resource
-        for resource in _as_list(statement.get("Resource"))
-        if isinstance(resource, str)
-    ]
-    unscoped = [resource for resource in resources if _resource_is_unscoped(resource)]
-    named = [resource for resource in resources if not _resource_is_unscoped(resource)]
-    has_model_arn_condition = any(
-        MODEL_ARN_CONDITION_KEY in key
-        for _, key, _ in _condition_keys_by_operator(statement)
-    )
+    inert_keys = []
+    condition_models = []
+    loose_conditions = []
+    for operator, key, values in _condition_keys_by_operator(statement):
+        if (
+            key.startswith("bedrock:")
+            and key not in MODEL_INVOKE_CONDITION_KEYS[action]
+        ):
+            if _condition_is_positive_match(operator):
+                inert_keys.append(key)
+            continue
+        if key not in MODEL_SCOPING_CONDITION_KEYS:
+            continue
+        if (
+            _condition_is_positive_match(operator)
+            and values
+            and all(_names_one_model(value) for value in values)
+        ):
+            condition_models.extend(str(value) for value in values)
+        else:
+            loose_conditions.append(f"{operator} on {key}")
+
+    if "NotResource" in statement:
+        unscoped = [
+            "NotResource {}".format(
+                ", ".join(str(value) for value in _as_list(statement["NotResource"]))
+            )
+        ]
+        named = []
+    else:
+        resources = [
+            resource
+            for resource in _as_list(statement.get("Resource"))
+            if isinstance(resource, str)
+        ]
+        unscoped = [
+            resource for resource in resources if not _names_one_model(resource)
+        ]
+        named = [resource for resource in resources if _names_one_model(resource)]
 
     return {
-        "actions": covered,
-        "unscoped_resources": unscoped,
-        "named_resources": named,
-        "has_model_arn_condition": has_model_arn_condition,
+        "inert_keys": inert_keys,
+        "unscoped_resources": [] if condition_models else unscoped,
+        "named_resources": named + condition_models,
+        "loose_conditions": loose_conditions,
     }
 
 
-def _model_invocation_statement_deficiency(scoping: Dict[str, Any]) -> Optional[str]:
-    """Explain why an invoke statement is not restricted to an approved model."""
-    if not scoping["unscoped_resources"]:
-        return None
+def _identity_denies_everywhere(statement: Dict[str, Any], action: str) -> bool:
+    """Return True for an unconditioned Deny of an action on Resource '*'."""
+    return (
+        str(statement.get("Effect", "")).upper() == "DENY"
+        and not statement.get("Condition")
+        and "NotResource" not in statement
+        and any(
+            str(resource).strip() == "*"
+            for resource in _as_list(statement.get("Resource"))
+        )
+        and _statement_matches_action(statement, action)
+    )
 
-    observed = ", ".join(scoping["unscoped_resources"])
-    if not scoping["has_model_arn_condition"]:
-        return (
-            f"it allows {', '.join(scoping['actions'])} on {observed}, so every "
-            "model available in the account can be invoked"
+
+def _boundary_named_resources(
+    permissions: Dict[str, Any], action: str, names_one: Any
+) -> Optional[List[str]]:
+    """
+    Return the resources a permissions boundary limits an action to when every
+    allowing boundary statement names them one by one, else None.
+    """
+    document = _boundary_document(permissions)
+    if document is None:
+        return None
+    allowing = [
+        statement
+        for statement in _policy_statements(document)
+        if str(statement.get("Effect", "")).upper() == "ALLOW"
+        and _statement_matches_action(statement, action)
+    ]
+    resources = []
+    for statement in allowing:
+        if "NotResource" in statement:
+            return None
+        for resource in _as_list(statement.get("Resource")):
+            if not names_one(resource):
+                return None
+            resources.append(str(resource))
+    return resources or None
+
+
+def _mantle_statement_scoping(statement: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """
+    Describe how one Allow statement scopes bedrock-mantle:CreateInference, or
+    None when it does not allow that action.
+    """
+    if str(statement.get("Effect", "")).upper() != "ALLOW":
+        return None
+    if not _statement_matches_action(statement, MANTLE_INFERENCE_ACTION):
+        return None
+    models = []
+    for operator, key, values in _condition_keys_by_operator(statement):
+        if key != MANTLE_MODEL_CONDITION_KEY or not _condition_is_positive_match(
+            operator
+        ):
+            continue
+        if values and not any(char in str(value) for value in values for char in "*?"):
+            models.extend(str(value) for value in values)
+    resources = [str(value) for value in _as_list(statement.get("Resource"))]
+    if "NotResource" in statement:
+        resources = [
+            "NotResource " + ", ".join(map(str, _as_list(statement["NotResource"])))
+        ]
+    return {"models": models, "resources": resources}
+
+
+def _s3_bucket_pattern_is_open(resource: Any, bucket: str) -> bool:
+    """
+    Return True when an S3 Resource pattern reaches objects in ``bucket`` through
+    a wildcard in its bucket name, such as "*", arn:aws:s3:::* or
+    arn:aws:s3:::train*/*.
+    """
+    if not isinstance(resource, str):
+        return False
+    pattern = resource.strip().lower()
+    if not _wildcard_matches(
+        pattern, f"arn:aws:s3:::{bucket.lower()}/{ANY_OBJECT_KEY}"
+    ):
+        return False
+    segments = pattern.split(":", 5)
+    if len(segments) != 6:
+        return True
+    bucket_segment = segments[5].split("/", 1)[0]
+    return "*" in bucket_segment or "?" in bucket_segment
+
+
+def _training_data_reach(
+    statements: List[Dict[str, Any]], bucket: str
+) -> Dict[str, List[str]]:
+    """
+    Split the s3:GetObject Allow resources of some statements into those that
+    reach ``bucket`` through a bucket wildcard and those that name it.
+    """
+    reach = {"open": [], "named": []}
+    target = f"arn:aws:s3:::{bucket.lower()}/{ANY_OBJECT_KEY}"
+    for statement in statements:
+        if str(statement.get("Effect", "")).upper() != "ALLOW":
+            continue
+        if not _statement_matches_action(statement, TRAINING_DATA_READ_ACTION):
+            continue
+        if "NotResource" in statement:
+            excluded = any(
+                isinstance(value, str)
+                and _wildcard_matches(value.strip().lower(), target)
+                for value in _as_list(statement["NotResource"])
+            )
+            if not excluded:
+                reach["open"].append(
+                    "NotResource "
+                    + ", ".join(map(str, _as_list(statement["NotResource"])))
+                )
+            continue
+        for resource in _as_list(statement.get("Resource")):
+            if _s3_bucket_pattern_is_open(resource, bucket):
+                reach["open"].append(str(resource))
+            elif isinstance(resource, str) and _wildcard_matches(
+                resource.strip().lower(), target
+            ):
+                reach["named"].append(str(resource))
+    return reach
+
+
+def _training_data_buckets() -> Dict[str, Any]:
+    """
+    Resolve the S3 buckets model customization jobs read training, validation
+    and distillation input from, in every assessed Region.
+    """
+    buckets: Dict[str, List[str]] = {}
+    errors = []
+    truncated = []
+    regions = _assessed_regions()
+    for region in regions:
+        inventory = _ai_data_path_buckets(region)
+        for bucket, labels in inventory["buckets"].items():
+            inputs = [
+                label
+                for label in labels
+                if label.startswith(TRAINING_DATA_LABEL_PREFIXES)
+            ]
+            if inputs:
+                buckets.setdefault(bucket, []).extend(
+                    f"{label} in {region}" for label in inputs
+                )
+        errors.extend(
+            f"{region} {error}"
+            for error in inventory["errors"]
+            if error.startswith(("model customization jobs", "customization job "))
         )
-    if MODEL_STREAMING_INVOKE_ACTION in scoping["actions"]:
-        return (
-            f"it allows {MODEL_STREAMING_INVOKE_ACTION} on {observed} and relies on "
-            f"a {MODEL_ARN_CONDITION_KEY} condition, which that operation does not "
-            "support, so the streaming call is unrestricted"
+        truncated.extend(
+            f"{region} {note}"
+            for note in inventory["truncated"]
+            if note.startswith("model customization jobs")
         )
-    return None
+    return {
+        "buckets": buckets,
+        "errors": errors,
+        "truncated": truncated,
+        "regions": regions,
+    }
+
+
+def _identity_model_access(
+    permissions: Dict[str, Any], training_buckets: Dict[str, List[str]]
+) -> Dict[str, Any]:
+    """
+    Read one identity's model invocation, bedrock-mantle inference and training
+    data grants, with its identity Deny statements and permissions boundary.
+    """
+    access = {
+        "grants": False,
+        "unrestricted": [],
+        "inert": [],
+        "mantle": [],
+        "training": [],
+        "scoped": set(),
+    }
+    documents = []
+    for source, policy in _cached_identity_policies(permissions):
+        try:
+            statements = _policy_statements(policy.get("document"))
+        except Exception as error:
+            logger.warning(f"Unable to parse policy {policy.get('name')}: {error}")
+            continue
+        documents.append((source, policy, statements))
+
+    def denied(action):
+        return (
+            any(
+                _identity_denies_everywhere(statement, action)
+                for _, _, statements in documents
+                for statement in statements
+            )
+            or _boundary_allowance(permissions, action) == "denied"
+        )
+
+    for action in MODEL_INVOKE_ACTIONS:
+        if denied(action):
+            continue
+        listed_by_deny = any(
+            action in control["actions"]
+            for _, policy, _ in documents
+            for control in _scp_model_list_controls(policy.get("document") or "{}")
+        )
+        bounded = _boundary_named_resources(permissions, action, _names_one_model)
+        for _, policy, statements in documents:
+            for statement in statements:
+                scoping = _statement_invoke_scoping(statement, action)
+                if scoping is None:
+                    continue
+                if scoping["inert_keys"]:
+                    access["inert"].append(
+                        "policy '{}' allows {} only under a {} condition, which that "
+                        "operation does not support, so the Allow never matches the "
+                        "call and the key enforces nothing; a Deny written the same "
+                        "way would fail open".format(
+                            policy.get("name"),
+                            action,
+                            ", ".join(sorted(set(scoping["inert_keys"]))),
+                        )
+                    )
+                    continue
+                access["grants"] = True
+                access["scoped"].update(scoping["named_resources"])
+                if not scoping["unscoped_resources"]:
+                    continue
+                if listed_by_deny or bounded:
+                    access["scoped"].update(bounded or [])
+                    continue
+                loose = (
+                    " (its {} condition names no bounded model list)".format(
+                        ", ".join(scoping["loose_conditions"])
+                    )
+                    if scoping["loose_conditions"]
+                    else ""
+                )
+                access["unrestricted"].append(
+                    "policy '{}': it allows {} on {}{}, so every model available in "
+                    "the account can be invoked".format(
+                        policy.get("name"),
+                        action,
+                        ", ".join(scoping["unscoped_resources"]),
+                        loose,
+                    )
+                )
+
+    if not denied(MANTLE_INFERENCE_ACTION):
+        for _, policy, statements in documents:
+            for statement in statements:
+                scoping = _mantle_statement_scoping(statement)
+                if scoping is None:
+                    continue
+                access["grants"] = True
+                if scoping["models"]:
+                    access["scoped"].update(
+                        f"{MANTLE_MODEL_CONDITION_KEY} {model}"
+                        for model in scoping["models"]
+                    )
+                    continue
+                access["mantle"].append(
+                    "policy '{}' allows bedrock-mantle:CreateInference on {} with no "
+                    "{} condition naming models".format(
+                        policy.get("name"),
+                        ", ".join(scoping["resources"]) or "no resource",
+                        MANTLE_MODEL_CONDITION_KEY,
+                    )
+                )
+
+    if training_buckets and not denied(TRAINING_DATA_READ_ACTION):
+        boundary = _boundary_document(permissions)
+        boundary_statements = (
+            _policy_statements(boundary) if boundary is not None else None
+        )
+        for bucket in sorted(training_buckets):
+            if boundary_statements is not None:
+                limit = _training_data_reach(boundary_statements, bucket)
+                if not limit["open"]:
+                    continue
+            for _, policy, statements in documents:
+                if any(
+                    _identity_denies_everywhere(statement, TRAINING_DATA_READ_ACTION)
+                    for statement in statements
+                ):
+                    continue
+                reach = _training_data_reach(statements, bucket)
+                if reach["open"]:
+                    access["training"].append(
+                        "policy '{}' allows s3:GetObject on {}, which reaches "
+                        "bucket '{}' ({}) without naming it".format(
+                            policy.get("name"),
+                            ", ".join(sorted(set(reach["open"]))),
+                            bucket,
+                            "; ".join(training_buckets[bucket][:2]),
+                        )
+                    )
+    return access
 
 
 def check_bedrock_model_allow_list(
-    permission_cache, region: str = ""
+    permission_cache, region: str = "", training_data: Optional[Dict[str, Any]] = None
 ) -> Dict[str, Any]:
     """
-    BR-42: Verify identity policies restrict Bedrock model invocation to named
-    model or inference-profile ARNs instead of every model in the account.
+    BR-42: Verify identity policies restrict Bedrock model invocation, including
+    the bedrock-mantle endpoint, to named models, and reach model customization
+    training data only through grants that name the bucket.
+
+    Roles, users and the groups of each user are read, with NotAction and
+    NotResource, identity Deny statements and permissions boundaries. A
+    positive condition on a bedrock: key the action does not define never
+    matches, so that Allow grants nothing and is reported as a policy defect.
     """
     logger.debug("Starting check for Bedrock model invocation allow-list scoping")
     check_name = "Foundation Model Invocation Allow-List"
@@ -12291,6 +12697,10 @@ def check_bedrock_model_allow_list(
             "details": "",
             "csv_data": [],
         }
+
+        if training_data is None:
+            training_data = _training_data_buckets()
+        training_buckets = training_data.get("buckets") or {}
 
         unrestricted = []
         scoped = []
@@ -12304,48 +12714,38 @@ def check_bedrock_model_allow_list(
         ]
 
         for identity_type, identity_name, permissions in identities:
-            grants_invocation = False
-            deficiencies = []
-            scoped_resources = set()
-
-            for policy in (
-                permissions["attached_policies"] + permissions["inline_policies"]
-            ):
-                try:
-                    statements = _policy_statements(policy["document"])
-                except Exception as error:
-                    logger.warning(
-                        f"Unable to parse policy {policy['name']} on "
-                        f"{identity_type} {identity_name}: {error}"
-                    )
-                    continue
-
-                for statement in statements:
-                    scoping = _statement_model_invocation_scoping(statement)
-                    if scoping is None:
-                        continue
-                    grants_invocation = True
-                    scoped_resources.update(scoping["named_resources"])
-                    deficiency = _model_invocation_statement_deficiency(scoping)
-                    if deficiency:
-                        deficiencies.append(f"policy '{policy['name']}': {deficiency}")
-
-            if not grants_invocation:
-                continue
-            if deficiencies:
-                unrestricted.append(
-                    {
-                        "type": identity_type,
-                        "name": identity_name,
-                        "reasons": deficiencies,
-                    }
+            access = _identity_model_access(permissions, training_buckets)
+            reasons = []
+            if access["unrestricted"]:
+                reasons.append(
+                    "can invoke any foundation model because "
+                    + "; ".join(access["unrestricted"][:3])
                 )
-            else:
+            if access["mantle"]:
+                reasons.append(
+                    "can run any model on the bedrock-mantle endpoint because "
+                    + "; ".join(access["mantle"][:3])
+                )
+            if access["training"]:
+                reasons.append(
+                    "can read model customization training data because "
+                    + "; ".join(access["training"][:3])
+                )
+            if access["inert"]:
+                reasons.append(
+                    "tests a condition key the action does not define: "
+                    + "; ".join(access["inert"][:3])
+                )
+            if reasons:
+                unrestricted.append(
+                    {"type": identity_type, "name": identity_name, "reasons": reasons}
+                )
+            elif access["grants"]:
                 scoped.append(
                     "{} '{}' scoped to {}".format(
                         identity_type,
                         identity_name,
-                        ", ".join(sorted(scoped_resources)) or "no resource",
+                        ", ".join(sorted(access["scoped"])) or "no resource",
                     )
                 )
 
@@ -12355,26 +12755,65 @@ def check_bedrock_model_allow_list(
                 create_finding(
                     check_id="BR-42",
                     finding_name=check_name,
-                    finding_details=(
-                        "{} '{}' can invoke any foundation model because {}.".format(
-                            identity["type"].capitalize(),
-                            identity["name"],
-                            "; ".join(identity["reasons"][:3]),
-                        )
+                    finding_details="{} '{}' {}. {}".format(
+                        identity["type"].capitalize(),
+                        identity["name"],
+                        "; it also ".join(identity["reasons"]),
+                        SCP_NOT_EVALUATED_NOTE,
                     ),
                     resolution=(
                         "Scope bedrock:InvokeModel and "
                         "bedrock:InvokeModelWithResponseStream to the approved "
                         "foundation-model and inference-profile ARNs in the Resource "
-                        "element. The streaming operation does not support the "
-                        "bedrock:ModelArn condition key, so a condition alone does "
-                        "not restrict it."
+                        "element, scope bedrock-mantle:CreateInference with a "
+                        "bedrock-mantle:Model condition, and name the training data "
+                        "buckets in s3:GetObject grants. The streaming operation does "
+                        "not support the bedrock:ModelArn condition key, so a "
+                        "condition on it does not restrict that call."
                     ),
                     reference=MODEL_ALLOW_LIST_REFERENCE,
                     severity="High",
                     status="Failed",
                     region=region,
                 )
+            )
+
+        training_note = ""
+        if training_data.get("errors") or training_data.get("truncated"):
+            findings["csv_data"].append(
+                create_finding(
+                    check_id="BR-42",
+                    finding_name=check_name,
+                    finding_details=(
+                        "Access to model customization training data was not fully "
+                        "assessed because the customization jobs could not all be "
+                        "read: {}.".format(
+                            "; ".join(
+                                (training_data.get("errors") or [])
+                                + (training_data.get("truncated") or [])
+                            )[:1500]
+                        )
+                    ),
+                    resolution=COULD_NOT_ASSESS_RESOLUTION,
+                    reference=MODEL_ALLOW_LIST_REFERENCE,
+                    severity="Informational",
+                    status="N/A",
+                    region=region,
+                )
+            )
+        elif training_buckets:
+            training_note = (
+                " s3:GetObject grants were tested against {} training data "
+                "bucket(s) of model customization jobs in {} assessed Region(s); "
+                "statement conditions on those grants are not evaluated.".format(
+                    len(training_buckets), len(training_data.get("regions") or [])
+                )
+            )
+        else:
+            training_note = (
+                " No model customization job in the {} assessed Region(s) reads "
+                "training data from S3, so there was no training data grant to "
+                "test.".format(len(training_data.get("regions") or []))
             )
 
         if scoped:
@@ -12386,7 +12825,9 @@ def check_bedrock_model_allow_list(
                         "{} identity policy grant(s) restrict model invocation to "
                         "named ARNs: {}. The assessment does not know which models "
                         "your workload approved, so confirm these ARNs are the "
-                        "approved list.".format(len(scoped), "; ".join(scoped[:10]))
+                        "approved list.{}".format(
+                            len(scoped), "; ".join(scoped[:10]), training_note
+                        )
                     ),
                     resolution="No action required. Review the named ARNs whenever the approved model list changes.",
                     reference=MODEL_ALLOW_LIST_REFERENCE,
@@ -12403,10 +12844,11 @@ def check_bedrock_model_allow_list(
                     check_id="BR-42",
                     finding_name=check_name,
                     finding_details=(
-                        "No role or user in the IAM permissions cache allows "
-                        "bedrock:InvokeModel or "
-                        "bedrock:InvokeModelWithResponseStream, so there is no "
-                        "model invocation grant to restrict."
+                        "No role, user or group in the IAM permissions cache allows "
+                        "bedrock:InvokeModel, "
+                        "bedrock:InvokeModelWithResponseStream or "
+                        "bedrock-mantle:CreateInference, so there is no model "
+                        "invocation grant to restrict.{}".format(training_note)
                     ),
                     resolution="No action required",
                     reference=MODEL_ALLOW_LIST_REFERENCE,
@@ -12416,7 +12858,14 @@ def check_bedrock_model_allow_list(
                 )
             )
 
-        return findings
+        return _apply_cache_population_gaps(
+            findings,
+            permission_cache,
+            "BR-42",
+            check_name,
+            MODEL_ALLOW_LIST_REFERENCE,
+            region,
+        )
 
     except Exception as e:
         logger.error(
@@ -12488,6 +12937,7 @@ def _inference_profile_routing(api_region: str = "") -> Dict[str, Any]:
         "profiles": 0,
         "unbounded": [],
         "bounded_regions": set(),
+        "destinations": {},
         "unparsed_arns": 0,
         "error": None,
     }
@@ -12501,15 +12951,20 @@ def _inference_profile_routing(api_region: str = "") -> Dict[str, Any]:
         for page in paginator.paginate():
             for profile in page.get("inferenceProfileSummaries", []):
                 routing["profiles"] += 1
+                profile_id = (
+                    profile.get("inferenceProfileId")
+                    or profile.get("inferenceProfileName")
+                    or "unnamed profile"
+                )
                 destinations = [
                     _model_arn_region(model.get("modelArn"))
                     for model in profile.get("models") or []
                 ]
                 if any(destination == "" for destination in destinations):
-                    routing["unbounded"].append(
-                        profile.get("inferenceProfileId")
-                        or profile.get("inferenceProfileName")
-                        or "unnamed profile"
+                    routing["unbounded"].append(profile_id)
+                else:
+                    routing["destinations"][profile_id] = sorted(
+                        {destination for destination in destinations if destination}
                     )
                 routing["bounded_regions"].update(
                     destination for destination in destinations if destination
@@ -12556,14 +13011,41 @@ def _describe_inference_profile_routing(
     return text
 
 
-def _scp_region_controls(document: Any) -> List[Dict[str, Any]]:
-    """
-    Describe every statement that conditions Bedrock invocation on the request
-    Region.
+# A value no Region name can match, used to tell a Region pattern that matches
+# every Region ("*", "?*") from one that matches a family ("eu-*").
+UNLISTED_REGION_PROBE = "zz-unlisted-9"
 
-    A Deny with a negated Region test is an allow-list of Regions; a Deny with a
-    positive test is a deny-list. Both control routing, and both are reported
-    with the Region values observed so the reader can see which form is in use.
+# aws:PrincipalArn tested with a negated operator exempts named principals, such
+# as the Control Tower execution role, from a Region deny. It is credited, and
+# the exemption is named in the finding.
+REGION_DENY_EXEMPTION_KEYS = ("aws:principalarn",)
+
+GLOBAL_PROFILE_CONDITION_KEY = "bedrock:inferenceprofilearn"
+
+# A global inference profile ARN no pattern names literally, used to tell a
+# bedrock:InferenceProfileArn pattern that matches every global profile from one
+# that matches a few.
+ANY_GLOBAL_PROFILE_ARN = (
+    "arn:aws:bedrock:" + UNLISTED_REGION_PROBE + ":000000000000:"
+    "inference-profile/global." + ANY_MODEL_ID_CHARACTER
+)
+
+
+def _scp_region_controls(
+    document: Any, actions: tuple = REGION_CONTROL_ACTIONS
+) -> List[Dict[str, Any]]:
+    """
+    Describe every Deny statement that conditions some of ``actions`` on the
+    request Region.
+
+    ``kind`` is "allow_list" for a negated Region test on Resource '*' that
+    denies every Region outside a named set; "global_deny" for a positive test
+    on the literal 'unspecified', which closes Global inference routing;
+    "deny_list" for any other positive test, which leaves every Region it does
+    not name open; and "gap" for a negated test that a ForAnyValue prefix, an
+    extra condition key, a narrowed Resource or an every-Region value keeps from
+    denying all other Regions. A Deny written with NotAction covers every action
+    it does not name, which is the form of the Control Tower Region deny.
     """
     controls = []
     for statement in _policy_statements(document):
@@ -12571,28 +13053,189 @@ def _scp_region_controls(document: Any) -> List[Dict[str, Any]]:
             continue
         covered = [
             action_name
-            for action_name in REGION_CONTROL_ACTIONS
-            if any(
-                _action_pattern_covers(action, action_name)
-                for action in _as_list(statement.get("Action"))
-            )
+            for action_name in actions
+            if _statement_matches_action(statement, action_name)
         ]
         if not covered:
             continue
-        for operator, key, values in _condition_keys_by_operator(statement):
-            if REGION_CONDITION_KEY not in key:
+        conditions = _condition_keys_by_operator(statement)
+        region_tests = [c for c in conditions if c[1] == REGION_CONDITION_KEY]
+        if not region_tests:
+            continue
+        exemptions = []
+        gaps = []
+        profile_scope = []
+        for operator, key, values in conditions:
+            if key == REGION_CONDITION_KEY:
                 continue
-            regions = [str(value).lower() for value in values]
-            controls.append(
-                {
-                    "actions": covered,
-                    "operator": operator,
-                    "regions": regions,
-                    "negated": "not" in operator,
-                    "allows_global": GLOBAL_INFERENCE_REGION_VALUE in regions,
-                }
+            base = _strip_condition_set_operator(operator)
+            if key in REGION_DENY_EXEMPTION_KEYS and "not" in base:
+                exemptions.append(
+                    "{} {} {}".format(operator, key, ", ".join(map(str, values)))
+                )
+            elif key == GLOBAL_PROFILE_CONDITION_KEY and "not" not in base:
+                profile_scope.extend(str(value) for value in values)
+            else:
+                gaps.append(
+                    f"it also requires {operator} on {key}, so it denies only when "
+                    "that test holds too"
+                )
+        if "NotResource" in statement or any(
+            str(resource).strip() != "*"
+            for resource in _as_list(statement.get("Resource", "*"))
+        ):
+            gaps.append(
+                "it applies only to {}, not to every resource".format(
+                    ", ".join(
+                        map(
+                            str,
+                            _as_list(
+                                statement.get("NotResource")
+                                or statement.get("Resource")
+                            ),
+                        )
+                    )
+                )
             )
+        for operator, _, values in region_tests:
+            base = _strip_condition_set_operator(operator)
+            regions = [str(value).lower() for value in values]
+            negated = "not" in base
+            allows_global = any(
+                _wildcard_matches(value, GLOBAL_INFERENCE_REGION_VALUE)
+                for value in regions
+            )
+            control = {
+                "actions": covered,
+                "operator": operator,
+                "regions": regions,
+                "negated": negated,
+                "allows_global": allows_global,
+                "exemptions": exemptions,
+                "gaps": list(gaps),
+                "profile_scope": profile_scope,
+            }
+            if negated:
+                if str(operator).lower().startswith("foranyvalue:"):
+                    control["gaps"].append(
+                        f"{operator} is true when any one value differs, which is "
+                        "not an allow-list test"
+                    )
+                every = [
+                    value
+                    for value in regions
+                    if _wildcard_matches(value, GLOBAL_INFERENCE_REGION_VALUE)
+                    and _wildcard_matches(value, UNLISTED_REGION_PROBE)
+                ]
+                if every:
+                    control["gaps"].append(
+                        "its allowed value {} matches every Region".format(
+                            ", ".join(every)
+                        )
+                    )
+                if profile_scope:
+                    control["gaps"].append(
+                        "it also requires {} {}, so it denies only calls through "
+                        "those profiles".format(
+                            GLOBAL_PROFILE_CONDITION_KEY, ", ".join(profile_scope)
+                        )
+                    )
+                control["kind"] = "gap" if control["gaps"] else "allow_list"
+            elif (
+                allows_global
+                and not gaps
+                and all(
+                    _wildcard_matches(value.lower(), ANY_GLOBAL_PROFILE_ARN)
+                    for value in profile_scope
+                )
+            ):
+                control["kind"] = "global_deny"
+            else:
+                control["kind"] = "deny_list"
+            controls.append(control)
     return controls
+
+
+def _region_is_allowed(region_name: str, allow_lists: List[List[str]]) -> bool:
+    """Return True when every credited allow-list lets a Region through."""
+    return all(
+        any(_wildcard_matches(value, region_name.lower()) for value in values)
+        for values in allow_lists
+    )
+
+
+def _describe_region_control(policy_name: str, control: Dict[str, Any]) -> str:
+    """State one Region control statement in one report-ready clause."""
+    text = "policy '{}' denies {} when {} {} {}".format(
+        policy_name,
+        ", ".join(control["actions"]),
+        REGION_CONDITION_KEY,
+        control["operator"],
+        ", ".join(control["regions"]) or "no Region value",
+    )
+    if control["kind"] == "allow_list":
+        text += (
+            ", and the allowed Region list includes the literal "
+            f"'{GLOBAL_INFERENCE_REGION_VALUE}'"
+            if control["allows_global"]
+            else ", and the allowed Region list omits the literal "
+            f"'{GLOBAL_INFERENCE_REGION_VALUE}', so every global inference profile "
+            "call is denied"
+        )
+    elif control["kind"] == "global_deny":
+        text += ", which closes Global inference routing"
+    elif control["kind"] == "deny_list":
+        text += ", a deny-list that leaves every Region it does not name open"
+    if control["gaps"]:
+        text += ", but it is not credited because " + " and ".join(control["gaps"])
+    if control["exemptions"]:
+        text += "; it exempts principals matching " + "; ".join(control["exemptions"])
+    return text
+
+
+def _region_control_summary(
+    inventory: Dict[str, Any], actions: tuple = REGION_CONTROL_ACTIONS
+) -> Dict[str, Any]:
+    """
+    Read the Region controls of every attached service control policy.
+
+    ``allow_lists`` holds the value list of each credited allow-list statement
+    that covers every one of MODEL_INVOKE_ACTIONS it names; a Region is allowed
+    only when every list lets it through, because each Deny applies on its own.
+    """
+    summary = {
+        "controls": [],
+        "described": [],
+        "covered": set(),
+        "allow_lists": [],
+        "global_closed": set(),
+        "errors": list(inventory.get("errors") or []),
+    }
+    if inventory.get("list_error"):
+        summary["errors"].append(
+            f"SERVICE_CONTROL_POLICY listing: {inventory['list_error']}"
+        )
+    for item in inventory.get("items") or []:
+        try:
+            controls = _scp_region_controls(item["content"] or "{}", actions)
+        except Exception as error:
+            logger.warning(
+                f"Unable to parse service control policy {item['name']}: {error}"
+            )
+            summary["errors"].append(f"policy '{item['name']}': {str(error)}")
+            continue
+        for control in controls:
+            summary["controls"].append(control)
+            summary["described"].append(_describe_region_control(item["name"], control))
+            if control["kind"] == "allow_list":
+                summary["covered"].update(control["actions"])
+                if any(action in MODEL_INVOKE_ACTIONS for action in control["actions"]):
+                    summary["allow_lists"].append(control["regions"])
+                if not control["allows_global"]:
+                    summary["global_closed"].update(control["actions"])
+            elif control["kind"] == "global_deny":
+                summary["global_closed"].update(control["actions"])
+    return summary
 
 
 def check_bedrock_region_invocation_control(
@@ -12603,14 +13246,15 @@ def check_bedrock_region_invocation_control(
     """
     BR-43: Verify cross-Region model invocation is an explicit decision rather
     than the inference profiles' default routing, by reading both the service
-    control policies that condition invocation on aws:RequestedRegion and the
-    profiles the account can actually route through.
+    control policies attached in the account's path that condition invocation on
+    aws:RequestedRegion and the profiles the account can route through in every
+    assessed Region.
 
-    The two legs answer different halves of the question. aws:RequestedRegion is
-    the Region the request is sent to, so an SCP built on it bounds a direct
-    invocation but says nothing about where a global profile's inference is then
-    served. A global profile is only bounded when the Region allow-list excludes
-    the literal 'unspecified', which is the value a global profile call presents.
+    aws:RequestedRegion is the Region the request is sent to, so an SCP built on
+    it bounds a direct invocation but says nothing about where a global profile's
+    inference is then served. A global profile is only bounded when the Region
+    allow-list excludes the literal 'unspecified', which is the value a global
+    profile call presents, or a separate Deny names that literal.
     """
     logger.debug("Starting check for Bedrock Region invocation control")
     check_name = "Bedrock Region Invocation Control"
@@ -12622,25 +13266,42 @@ def check_bedrock_region_invocation_control(
             "csv_data": [],
         }
 
-        routing = _inference_profile_routing(api_region)
-        routing_text = _describe_inference_profile_routing(routing, api_region)
+        routing_regions = _assessed_regions(api_region)
+        routings = {name: _inference_profile_routing(name) for name in routing_regions}
+        routing_text = "; ".join(
+            _describe_inference_profile_routing(routings[name], name)
+            for name in routing_regions
+        )
+        unbounded_profiles = sorted(
+            {
+                profile
+                for routing in routings.values()
+                for profile in routing["unbounded"]
+            }
+        )
+
+        def row(details, resolution, severity, status):
+            return create_finding(
+                check_id="BR-43",
+                finding_name=check_name,
+                finding_details=details,
+                resolution=resolution,
+                reference=REGION_CONTROL_REFERENCE,
+                severity=severity,
+                status=status,
+                region=region,
+            )
 
         context = _organization_policy_context()
         if not context["readable"]:
             findings["csv_data"].append(
-                create_finding(
-                    check_id="BR-43",
-                    finding_name=check_name,
-                    finding_details=(
-                        "Region control over Bedrock model invocation was not "
-                        f"assessed because {context['detail']}. Observed routing: "
-                        f"{routing_text}."
-                    ),
-                    resolution=context["resolution"],
-                    reference=REGION_CONTROL_REFERENCE,
-                    severity="Informational",
-                    status="N/A",
-                    region=region,
+                row(
+                    "Region control over Bedrock model invocation was not "
+                    f"assessed because {context['detail']}. Observed routing: "
+                    f"{routing_text}.",
+                    context["resolution"],
+                    "Informational",
+                    "N/A",
                 )
             )
             return findings
@@ -12650,152 +13311,170 @@ def check_bedrock_region_invocation_control(
             if scp_inventory is not None
             else get_service_control_policy_inventory()
         )
-
-        enforcing = []
-        observed_controls = []
-        for item in inventory["items"]:
-            try:
-                controls = _scp_region_controls(item["content"] or "{}")
-            except Exception as error:
-                logger.warning(
-                    f"Unable to parse service control policy {item['name']}: {error}"
-                )
-                inventory["errors"].append(f"policy '{item['name']}': {str(error)}")
-                continue
-            for control in controls:
-                observed_controls.append(control)
-                enforcing.append(
-                    "policy '{}' denies {} when {} {} {}{}".format(
-                        item["name"],
-                        ", ".join(control["actions"]),
-                        REGION_CONDITION_KEY,
-                        control["operator"],
-                        ", ".join(control["regions"]) or "no Region value",
-                        ""
-                        if not control["negated"]
-                        else (
-                            ", and the allowed Region list includes the literal "
-                            f"'{GLOBAL_INFERENCE_REGION_VALUE}'"
-                            if control["allows_global"]
-                            else ", and the allowed Region list omits the literal "
-                            f"'{GLOBAL_INFERENCE_REGION_VALUE}', so every global "
-                            "inference profile call is denied"
-                        ),
-                    )
-                )
-
-        read_errors = list(inventory["errors"])
-        if inventory["list_error"]:
-            read_errors.append(
-                f"SERVICE_CONTROL_POLICY listing: {inventory['list_error']}"
-            )
-
-        # A negated Region test that omits 'unspecified' denies the value a global
-        # profile call presents, so it is the only observed control that bounds
-        # where a global profile's inference is served.
-        global_routing_denied = any(
-            control["negated"] and not control["allows_global"]
-            for control in observed_controls
+        summary = _region_control_summary(inventory)
+        described = summary["described"]
+        allow_listed = any(
+            control["kind"] == "allow_list" for control in summary["controls"]
         )
-        global_routing_open = bool(routing["unbounded"]) and not global_routing_denied
+        uncovered = [
+            action
+            for action in REGION_CONTROL_ACTIONS
+            if action not in summary["covered"]
+        ]
+        global_open = bool(unbounded_profiles) and not all(
+            action in summary["global_closed"] for action in MODEL_INVOKE_ACTIONS
+        )
 
-        if enforcing and not global_routing_open:
+        outside_profiles = 0
+        outside_regions = set()
+        if summary["allow_lists"]:
+            for routing in routings.values():
+                for destinations in routing["destinations"].values():
+                    blocked = [
+                        name
+                        for name in destinations
+                        if not _region_is_allowed(name, summary["allow_lists"])
+                    ]
+                    if blocked:
+                        outside_profiles += 1
+                        outside_regions.update(blocked)
+        destination_text = (
+            " {} geographic profile(s) route to a Region the allow-list does not "
+            "name ({}); a request routed to a blocked destination Region fails, so "
+            "extend the allow-list to every destination of a profile in use or "
+            "stop using it.".format(
+                outside_profiles, ", ".join(sorted(outside_regions))
+            )
+            if outside_profiles
+            else ""
+        )
+        notes = (
+            " {} IAM scoping of inference-profile ARNs is assessed by BR-42.".format(
+                _scp_scope_note(inventory)
+            )
+        )
+
+        if allow_listed and not uncovered and not global_open:
             findings["details"] = "Bedrock invocation is constrained by Region"
             findings["csv_data"].append(
-                create_finding(
-                    check_id="BR-43",
-                    finding_name=check_name,
-                    finding_details=(
-                        "{} service control policy statement(s) condition Bedrock "
-                        "invocation on the request Region: {}. Observed routing: {}. "
-                        "The approved Region list is workload-specific, so confirm it "
-                        "matches the data residency your use case requires.".format(
-                            len(enforcing), "; ".join(enforcing[:5]), routing_text
-                        )
+                row(
+                    "{} service control policy statement(s) condition Bedrock "
+                    "invocation on the request Region: {}. Observed routing: {}."
+                    "{} The approved Region list is workload-specific, so confirm it "
+                    "matches the data residency your use case requires.{}".format(
+                        len(described),
+                        "; ".join(described[:5]),
+                        routing_text,
+                        destination_text,
+                        notes,
                     ),
-                    resolution="No action required. A Region allow-list must include the literal 'unspecified' to keep global inference profiles usable, and excluding it is what denies them.",
-                    reference=REGION_CONTROL_REFERENCE,
-                    severity="Medium",
-                    status="Passed",
-                    region=region,
+                    "No action required. A Region allow-list must include the literal 'unspecified' to keep global inference profiles usable, and excluding it is what denies them.",
+                    "Medium",
+                    "Passed",
                 )
             )
-        elif enforcing:
+        elif allow_listed and uncovered:
+            findings["status"] = "WARN"
+            findings["details"] = "The Region allow-list leaves an action open"
+            findings["csv_data"].append(
+                row(
+                    "{} service control policy statement(s) condition Bedrock "
+                    "invocation on the request Region ({}), but no credited "
+                    "allow-list covers {}, so those calls are not bound to the "
+                    "approved Regions. Observed routing: {}.{}{}".format(
+                        len(described),
+                        "; ".join(described[:5]),
+                        ", ".join(uncovered),
+                        routing_text,
+                        destination_text,
+                        notes,
+                    ),
+                    "Extend the Region allow-list Deny to bedrock:InvokeModel, "
+                    "bedrock:InvokeModelWithResponseStream and "
+                    "bedrock:CreateModelInvocationJob.",
+                    "Medium",
+                    "Failed",
+                )
+            )
+        elif allow_listed:
             findings["status"] = "WARN"
             findings["details"] = "Global inference profiles bypass the Region control"
             findings["csv_data"].append(
-                create_finding(
-                    check_id="BR-43",
-                    finding_name=check_name,
-                    finding_details=(
-                        "{} service control policy statement(s) condition Bedrock "
-                        "invocation on the request Region ({}), but none of them "
-                        "denies aws:RequestedRegion '{}', which is the value a global "
-                        "inference profile call presents. Observed routing: {}. The "
-                        "Region control therefore bounds direct invocation only.".format(
-                            len(enforcing),
-                            "; ".join(enforcing[:5]),
-                            GLOBAL_INFERENCE_REGION_VALUE,
-                            routing_text,
-                        )
+                row(
+                    "{} service control policy statement(s) condition Bedrock "
+                    "invocation on the request Region ({}), but none of them "
+                    "denies aws:RequestedRegion '{}', which is the value a global "
+                    "inference profile call presents. Observed routing: {}. The "
+                    "Region control therefore bounds direct invocation only.{}{}".format(
+                        len(described),
+                        "; ".join(described[:5]),
+                        GLOBAL_INFERENCE_REGION_VALUE,
+                        routing_text,
+                        destination_text,
+                        notes,
                     ),
-                    resolution=(
-                        "Decide whether inference may be served outside the approved "
-                        "Regions. To stop it, remove the literal 'unspecified' from "
-                        "the Region allow-list, which denies every global inference "
-                        "profile call; to keep it, record the global profiles as an "
-                        "accepted data-residency exception."
-                    ),
-                    reference=REGION_CONTROL_REFERENCE,
-                    severity="Medium",
-                    status="Failed",
-                    region=region,
+                    "Decide whether inference may be served outside the approved "
+                    "Regions. To stop it, remove the literal 'unspecified' from "
+                    "the Region allow-list, which denies every global inference "
+                    "profile call; to keep it, record the global profiles as an "
+                    "accepted data-residency exception.",
+                    "Medium",
+                    "Failed",
                 )
             )
-        elif read_errors:
+        elif described:
+            findings["status"] = "WARN"
+            findings["details"] = "No Region allow-list on Bedrock invocation"
             findings["csv_data"].append(
-                create_finding(
-                    check_id="BR-43",
-                    finding_name=check_name,
-                    finding_details=(
-                        "Region control over Bedrock model invocation is "
-                        "undetermined because organization policies could not be "
-                        f"read: {'; '.join(read_errors[:5])}. Observed routing: "
-                        f"{routing_text}."
+                row(
+                    "{} service control policy statement(s) condition Bedrock "
+                    "invocation on the request Region ({}), but none is an "
+                    "allow-list that denies every Region outside a named set. A "
+                    "positive Region test is a deny-list, so the Region control "
+                    "bounds direct invocation only in the Regions it names. "
+                    "Observed routing: {}.{}".format(
+                        len(described), "; ".join(described[:5]), routing_text, notes
                     ),
-                    resolution="Grant organizations:ListPolicies and organizations:DescribePolicy and retry before concluding that no Region control exists.",
-                    reference=REGION_CONTROL_REFERENCE,
-                    severity="Informational",
-                    status="N/A",
-                    region=region,
+                    "Replace the deny-list with a Deny that uses StringNotEquals on "
+                    "aws:RequestedRegion with the approved Regions, on Resource "
+                    "'*' and with no other condition key besides an "
+                    "aws:PrincipalArn exemption.",
+                    "Medium",
+                    "Failed",
+                )
+            )
+        elif summary["errors"]:
+            findings["csv_data"].append(
+                row(
+                    "Region control over Bedrock model invocation is "
+                    "undetermined because organization policies could not be "
+                    f"read: {'; '.join(summary['errors'][:5])}. Observed routing: "
+                    f"{routing_text}.",
+                    "Grant organizations:ListPolicies and organizations:DescribePolicy and retry before concluding that no Region control exists.",
+                    "Informational",
+                    "N/A",
                 )
             )
         else:
             findings["status"] = "WARN"
             findings["details"] = "No Region control on Bedrock model invocation"
             findings["csv_data"].append(
-                create_finding(
-                    check_id="BR-43",
-                    finding_name=check_name,
-                    finding_details=(
-                        "None of the {} service control policy document(s) read "
-                        "denies bedrock:InvokeModel, "
-                        "bedrock:InvokeModelWithResponseStream or "
-                        "bedrock:CreateModelInvocationJob on aws:RequestedRegion, so "
-                        "cross-region routing follows the default inference-profile "
-                        "behavior: {}.".format(len(inventory["items"]), routing_text)
+                row(
+                    "None of the {} service control policy document(s) read "
+                    "denies bedrock:InvokeModel, "
+                    "bedrock:InvokeModelWithResponseStream or "
+                    "bedrock:CreateModelInvocationJob on aws:RequestedRegion, so "
+                    "cross-region routing follows the default inference-profile "
+                    "behavior: {}.{}".format(
+                        len(inventory["items"]), routing_text, notes
                     ),
-                    resolution=(
-                        "Add a service control policy denying Bedrock invocation "
-                        "outside the approved Regions with StringNotEquals on "
-                        "aws:RequestedRegion, and include the literal 'unspecified' "
-                        "in the allowed values so global inference profiles keep "
-                        "working."
-                    ),
-                    reference=REGION_CONTROL_REFERENCE,
-                    severity="Medium",
-                    status="Failed",
-                    region=region,
+                    "Add a service control policy denying Bedrock invocation "
+                    "outside the approved Regions with StringNotEquals on "
+                    "aws:RequestedRegion, and include the literal 'unspecified' "
+                    "in the allowed values so global inference profiles keep "
+                    "working.",
+                    "Medium",
+                    "Failed",
                 )
             )
 
@@ -12816,6 +13495,573 @@ def check_bedrock_region_invocation_control(
                     finding_details=build_could_not_assess_detail(e, region),
                     resolution=COULD_NOT_ASSESS_RESOLUTION,
                     reference=REGION_CONTROL_REFERENCE,
+                    severity="Informational",
+                    status="N/A",
+                    region=region,
+                )
+            ],
+        }
+
+
+INFERENCE_REGION_FINDING = "Bedrock Inference Region Evidence"
+
+# The CloudTrail events whose additionalEventData.inferenceRegion records where a
+# model call was served.
+INFERENCE_REGION_EVENTS = (
+    "InvokeModel",
+    "InvokeModelWithResponseStream",
+    "Converse",
+    "ConverseStream",
+)
+
+INFERENCE_REGION_REFERENCE = (
+    "https://docs.aws.amazon.com/bedrock/latest/userguide/cross-region-inference.html"
+)
+
+
+def _event_inference_region(event: Dict[str, Any]) -> str:
+    """Return additionalEventData.inferenceRegion from a LookupEvents record, or ''."""
+    try:
+        record = json.loads(event.get("CloudTrailEvent") or "{}")
+    except (TypeError, ValueError):
+        return ""
+    additional = record.get("additionalEventData") or {}
+    if not isinstance(additional, dict):
+        return ""
+    return str(additional.get("inferenceRegion") or "").lower()
+
+
+def check_bedrock_inference_region_evidence(
+    region: str = "",
+    api_region: str = "",
+    scp_inventory: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """
+    BR-43: compare the Region each recent model call was served in, from
+    CloudTrail's additionalEventData.inferenceRegion, with the Region allow-list
+    in the attached service control policies.
+
+    aws:RequestedRegion is the Region the call is sent to, so an allow-list says
+    nothing on its own about where a cross-Region profile served the prompt. The
+    inferenceRegion field is the outcome, logged in the source Region.
+    """
+    logger.debug("Starting check for Bedrock inference Region evidence")
+    check_name = INFERENCE_REGION_FINDING
+    try:
+        findings = {
+            "check_name": check_name,
+            "status": "PASS",
+            "details": "",
+            "csv_data": [],
+        }
+
+        def row(details, resolution, severity, status):
+            return create_finding(
+                check_id="BR-43",
+                finding_name=check_name,
+                finding_details=details,
+                resolution=resolution,
+                reference=INFERENCE_REGION_REFERENCE,
+                severity=severity,
+                status=status,
+                region=region,
+            )
+
+        lookback_hours = int(LLM_JACKING_LOOKBACK.total_seconds() // 3600)
+        start_time = datetime.now(timezone.utc) - LLM_JACKING_LOOKBACK
+        served = {}
+        unrecorded = 0
+        read_gaps = []
+        for source_region in _assessed_regions(api_region):
+            cloudtrail_client = boto3.client(
+                "cloudtrail", config=boto3_config, region_name=source_region
+            )
+            for event_name in INFERENCE_REGION_EVENTS:
+                try:
+                    result = _llm_jacking_lookup(
+                        cloudtrail_client, event_name, start_time
+                    )
+                except Exception as error:
+                    read_gaps.append(
+                        f"{event_name} in {source_region} could not be read "
+                        f"({get_assessment_error_label(error)})"
+                    )
+                    continue
+                if result["truncated"]:
+                    read_gaps.append(
+                        f"{event_name} in {source_region} was read to the "
+                        f"{LLM_JACKING_MAX_PAGES_PER_ACTION}-page cap only"
+                    )
+                for event in result["events"]:
+                    inference_region = _event_inference_region(event)
+                    if not inference_region:
+                        unrecorded += 1
+                        continue
+                    served.setdefault(inference_region, 0)
+                    served[inference_region] += 1
+
+        observed_text = (
+            ", ".join(f"{name} ({count})" for name, count in sorted(served.items()))
+            or "no Region"
+        )
+        gap_text = (
+            " Not read: {}.".format("; ".join(read_gaps[:8])) if read_gaps else ""
+        )
+        unrecorded_text = (
+            f" {unrecorded} event(s) carried no inferenceRegion and were not counted."
+            if unrecorded
+            else ""
+        )
+
+        allow_lists = []
+        allow_error = ""
+        if scp_inventory is None:
+            context = _organization_policy_context()
+            if not context["readable"]:
+                allow_error = context["detail"]
+            else:
+                scp_inventory = get_service_control_policy_inventory()
+        if scp_inventory is not None:
+            summary = _region_control_summary(scp_inventory)
+            allow_lists = summary["allow_lists"]
+            if not allow_lists and summary["errors"]:
+                allow_error = "organization policies could not be read: " + "; ".join(
+                    summary["errors"][:5]
+                )
+
+        outside = {
+            name: count
+            for name, count in served.items()
+            if allow_lists and not _region_is_allowed(name, allow_lists)
+        }
+        if outside:
+            findings["status"] = "WARN"
+            findings["details"] = (
+                "Model calls were served outside the Region allow-list"
+            )
+            findings["csv_data"].append(
+                row(
+                    "In the last {} hours CloudTrail recorded model calls served in "
+                    "{}, which the attached Region allow-list does not name. All "
+                    "Regions served: {}.{}{}".format(
+                        lookback_hours,
+                        ", ".join(
+                            f"{name} ({count})"
+                            for name, count in sorted(outside.items())
+                        ),
+                        observed_text,
+                        unrecorded_text,
+                        gap_text,
+                    ),
+                    "Find the inference profiles that routed there and replace them "
+                    "with geographic profiles whose destinations are all approved, or "
+                    "record the destination Regions as an accepted data-residency "
+                    "exception.",
+                    "Medium",
+                    "Failed",
+                )
+            )
+        elif not served:
+            findings["csv_data"].append(
+                row(
+                    "No model call with an inferenceRegion was found in the last {} "
+                    "hours of CloudTrail event history in {}, so where inference is "
+                    "served was not observed.{}{}".format(
+                        lookback_hours,
+                        ", ".join(_assessed_regions(api_region)),
+                        unrecorded_text,
+                        gap_text,
+                    ),
+                    "Re-run after model traffic, or query the CloudTrail trail for "
+                    "additionalEventData.inferenceRegion over a longer window.",
+                    "Informational",
+                    "N/A",
+                )
+            )
+        elif not allow_lists:
+            findings["csv_data"].append(
+                row(
+                    "Model calls in the last {} hours were served in {}. No attached "
+                    "Region allow-list was {} to compare them with, so whether they "
+                    "left an approved Region was not assessed.{}{}".format(
+                        lookback_hours,
+                        observed_text,
+                        f"readable ({allow_error})" if allow_error else "found",
+                        unrecorded_text,
+                        gap_text,
+                    ),
+                    "Attach a Region allow-list service control policy (BR-43 "
+                    "Region Invocation Control) so the served Regions have an "
+                    "approved set to meet.",
+                    "Informational",
+                    "N/A",
+                )
+            )
+        elif read_gaps:
+            findings["csv_data"].append(
+                row(
+                    "Every model call read from the last {} hours was served in an "
+                    "allowed Region ({}), but the event history was not read in "
+                    "full, so a call served elsewhere may be among the events not "
+                    "read.{}{}".format(
+                        lookback_hours, observed_text, unrecorded_text, gap_text
+                    ),
+                    "Grant cloudtrail:LookupEvents in every assessed Region, or query "
+                    "the CloudTrail trail for the full window.",
+                    "Informational",
+                    "N/A",
+                )
+            )
+        else:
+            findings["details"] = "Model calls were served inside the Region allow-list"
+            findings["csv_data"].append(
+                row(
+                    "Every model call in the last {} hours of CloudTrail event "
+                    "history was served in a Region the attached allow-list names: "
+                    "{}.{}".format(lookback_hours, observed_text, unrecorded_text),
+                    "No action required.",
+                    "Medium",
+                    "Passed",
+                )
+            )
+        return findings
+
+    except Exception as e:
+        logger.error(
+            f"Error in check_bedrock_inference_region_evidence: {str(e)}", exc_info=True
+        )
+        return {
+            "check_name": check_name,
+            "status": "ERROR",
+            "details": f"Error during check: {str(e)}",
+            "csv_data": [
+                create_finding(
+                    check_id="BR-43",
+                    finding_name=check_name,
+                    finding_details=build_could_not_assess_detail(e, region),
+                    resolution=COULD_NOT_ASSESS_RESOLUTION,
+                    reference=INFERENCE_REGION_REFERENCE,
+                    severity="Informational",
+                    status="N/A",
+                    region=region,
+                )
+            ],
+        }
+
+
+AI_SERVICE_REGION_FINDING = "AI Service Region Control"
+
+# The SageMaker and storage actions a Region allow-list must also deny, so data
+# and endpoints stay in the approved Regions and not only Bedrock inference.
+AI_SERVICE_REGION_ACTIONS = (
+    "sagemaker:createendpoint",
+    "sagemaker:createtrainingjob",
+    "sagemaker:invokeendpoint",
+    "s3:createbucket",
+)
+
+AI_SERVICE_REGION_REFERENCE = (
+    "https://docs.aws.amazon.com/controltower/latest/controlreference/"
+    "ou-region-deny.html"
+)
+
+
+def check_ai_service_region_control(
+    region: str = "", scp_inventory: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
+    """
+    BR-43: verify the attached Region allow-list also denies SageMaker endpoints,
+    training and invocation, and S3 bucket creation outside the approved Regions.
+
+    A Control Tower Region deny is a Deny with NotAction and a negated
+    aws:RequestedRegion test, and it is read like any other statement.
+    """
+    logger.debug("Starting check for AI service Region control")
+    check_name = AI_SERVICE_REGION_FINDING
+    try:
+        findings = {
+            "check_name": check_name,
+            "status": "PASS",
+            "details": "",
+            "csv_data": [],
+        }
+
+        def row(details, resolution, severity, status):
+            return create_finding(
+                check_id="BR-43",
+                finding_name=check_name,
+                finding_details=details,
+                resolution=resolution,
+                reference=AI_SERVICE_REGION_REFERENCE,
+                severity=severity,
+                status=status,
+                region=region,
+            )
+
+        if scp_inventory is None:
+            context = _organization_policy_context()
+            if not context["readable"]:
+                findings["csv_data"].append(
+                    row(
+                        "Region control over SageMaker and S3 was not assessed "
+                        f"because {context['detail']}.",
+                        context["resolution"],
+                        "Informational",
+                        "N/A",
+                    )
+                )
+                return findings
+            scp_inventory = get_service_control_policy_inventory()
+
+        summary = _region_control_summary(scp_inventory, AI_SERVICE_REGION_ACTIONS)
+        uncovered = [
+            action
+            for action in AI_SERVICE_REGION_ACTIONS
+            if action not in summary["covered"]
+        ]
+        described = "; ".join(summary["described"][:5])
+        note = " " + _scp_scope_note(scp_inventory)
+
+        if not uncovered:
+            findings["details"] = "AI services are constrained by Region"
+            findings["csv_data"].append(
+                row(
+                    "A credited Region allow-list in the attached service control "
+                    "policies denies {} outside the approved Regions: {}.{}".format(
+                        ", ".join(AI_SERVICE_REGION_ACTIONS), described, note
+                    ),
+                    "No action required. Confirm the approved Regions match the "
+                    "data residency your workloads require.",
+                    "Medium",
+                    "Passed",
+                )
+            )
+        elif summary["errors"] and not summary["covered"]:
+            findings["csv_data"].append(
+                row(
+                    "Region control over SageMaker and S3 is undetermined because "
+                    "organization policies could not be read: {}.".format(
+                        "; ".join(summary["errors"][:5])
+                    ),
+                    "Grant organizations:ListPolicies and organizations:DescribePolicy and retry before concluding that no Region control exists.",
+                    "Informational",
+                    "N/A",
+                )
+            )
+        else:
+            findings["status"] = "WARN"
+            findings["details"] = "AI services are not constrained by Region"
+            findings["csv_data"].append(
+                row(
+                    "No credited Region allow-list in the attached service control "
+                    "policies denies {} outside the approved Regions, so those calls "
+                    "can create endpoints, training jobs or buckets in any Region.{}{}".format(
+                        ", ".join(uncovered),
+                        f" Statements read: {described}." if described else "",
+                        note,
+                    ),
+                    "Extend the Region deny to SageMaker and S3, through AWS Control "
+                    "Tower (CT.MULTISERVICE.PV.1) if Control Tower manages it, or "
+                    "with a Deny using StringNotEquals on aws:RequestedRegion.",
+                    "Medium",
+                    "Failed",
+                )
+            )
+        return findings
+
+    except Exception as e:
+        logger.error(
+            f"Error in check_ai_service_region_control: {str(e)}", exc_info=True
+        )
+        return {
+            "check_name": check_name,
+            "status": "ERROR",
+            "details": f"Error during check: {str(e)}",
+            "csv_data": [
+                create_finding(
+                    check_id="BR-43",
+                    finding_name=check_name,
+                    finding_details=build_could_not_assess_detail(e, region),
+                    resolution=COULD_NOT_ASSESS_RESOLUTION,
+                    reference=AI_SERVICE_REGION_REFERENCE,
+                    severity="Informational",
+                    status="N/A",
+                    region=region,
+                )
+            ],
+        }
+
+
+CUSTOM_MODEL_SHARING_FINDING = "Bedrock Custom Model Cross-Account Access"
+
+CUSTOM_MODEL_SHARING_REFERENCE = (
+    "https://docs.aws.amazon.com/bedrock/latest/APIReference/API_GetResourcePolicy.html"
+)
+
+# The resource policies read per Region. A Region with more owned models than
+# this is reported as not read in full.
+MAX_CUSTOM_MODEL_POLICY_READS = 100
+
+
+def check_bedrock_custom_model_sharing(region: str = "") -> Dict[str, Any]:
+    """
+    BR-43: read the resource policy of every custom model the account owns and
+    report which ones another account can reach.
+
+    A model shared into this account is listed with another ownerAccountId; its
+    policy belongs to the owner and is skipped.
+    """
+    logger.debug("Starting check for Bedrock custom model cross-account access")
+    check_name = CUSTOM_MODEL_SHARING_FINDING
+    try:
+        findings = {
+            "check_name": check_name,
+            "status": "PASS",
+            "details": "",
+            "csv_data": [],
+        }
+
+        def row(details, resolution, severity, status):
+            return create_finding(
+                check_id="BR-43",
+                finding_name=check_name,
+                finding_details=details,
+                resolution=resolution,
+                reference=CUSTOM_MODEL_SHARING_REFERENCE,
+                severity=severity,
+                status=status,
+                region=region,
+            )
+
+        account_id = boto3.client("sts", config=boto3_config).get_caller_identity()[
+            "Account"
+        ]
+        bedrock_client = boto3.client(
+            "bedrock", config=boto3_config, region_name=region or None
+        )
+        owned = []
+        for page in bedrock_client.get_paginator("list_custom_models").paginate():
+            for model in page.get("modelSummaries", []):
+                owner = str(model.get("ownerAccountId") or account_id)
+                if owner == account_id:
+                    owned.append(model)
+
+        unbounded = []
+        unbounded_models = set()
+        shared = []
+        unread = []
+        for model in owned[:MAX_CUSTOM_MODEL_POLICY_READS]:
+            name = model.get("modelName") or model.get("modelArn")
+            try:
+                response = bedrock_client.get_resource_policy(
+                    resourceArn=model["modelArn"]
+                )
+            except ClientError as error:
+                if error.response.get("Error", {}).get("Code") == (
+                    "ResourceNotFoundException"
+                ):
+                    continue
+                unread.append(f"{name} ({get_assessment_error_label(error)})")
+                continue
+            observed = _guardrail_share_grants(
+                response.get("resourcePolicy") or "{}",
+                account_id,
+                action=None,
+                action_label="access",
+            )
+            if observed["unbounded"]:
+                unbounded_models.add(name)
+            unbounded.extend(f"{name}: {text}" for text in observed["unbounded"])
+            shared.extend(f"{name}: {text}" for text in observed["shared"])
+        if len(owned) > MAX_CUSTOM_MODEL_POLICY_READS:
+            unread.append(
+                "{} model(s) past the {}-policy cap".format(
+                    len(owned) - MAX_CUSTOM_MODEL_POLICY_READS,
+                    MAX_CUSTOM_MODEL_POLICY_READS,
+                )
+            )
+        unread_text = (
+            " Resource policies not read: {}.".format("; ".join(unread[:5]))
+            if unread
+            else ""
+        )
+
+        if unbounded:
+            findings["status"] = "WARN"
+            findings["details"] = "A custom model is open to every AWS account"
+            findings["csv_data"].append(
+                row(
+                    "{} of {} owned custom model(s) have a resource policy that "
+                    "grants every principal with no organization condition: {}.{}{}".format(
+                        len(unbounded_models),
+                        len(owned),
+                        "; ".join(unbounded[:5]),
+                        " Also shared: {}.".format("; ".join(shared[:5]))
+                        if shared
+                        else "",
+                        unread_text,
+                    ),
+                    "Scope the model resource policy to named accounts, or add an "
+                    "aws:PrincipalOrgID condition.",
+                    "High",
+                    "Failed",
+                )
+            )
+        elif unread:
+            findings["csv_data"].append(
+                row(
+                    "Cross-account access to {} owned custom model(s) was not read "
+                    "in full.{}{}".format(
+                        len(owned),
+                        unread_text,
+                        " Shared: {}.".format("; ".join(shared[:5])) if shared else "",
+                    ),
+                    "Grant bedrock:GetResourcePolicy on the custom models and retry.",
+                    "Informational",
+                    "N/A",
+                )
+            )
+        elif shared:
+            findings["details"] = "Custom models are shared with named principals"
+            findings["csv_data"].append(
+                row(
+                    "{} owned custom model(s) read. Cross-account access is granted "
+                    "explicitly: {}. Confirm each grant is an approved decision.".format(
+                        len(owned), "; ".join(shared[:5])
+                    ),
+                    "No action required if each grant is approved.",
+                    "Medium",
+                    "Passed",
+                )
+            )
+        else:
+            findings["details"] = "No custom model is shared with another account"
+            findings["csv_data"].append(
+                row(
+                    "{} owned custom model(s) read and none has a resource policy "
+                    "that grants another account.".format(len(owned)),
+                    "No action required.",
+                    "Medium",
+                    "Passed",
+                )
+            )
+        return findings
+
+    except Exception as e:
+        logger.error(
+            f"Error in check_bedrock_custom_model_sharing: {str(e)}", exc_info=True
+        )
+        return {
+            "check_name": check_name,
+            "status": "ERROR",
+            "details": f"Error during check: {str(e)}",
+            "csv_data": [
+                create_finding(
+                    check_id="BR-43",
+                    finding_name=check_name,
+                    finding_details=build_could_not_assess_detail(e, region),
+                    resolution=COULD_NOT_ASSESS_RESOLUTION,
+                    reference=CUSTOM_MODEL_SHARING_REFERENCE,
                     severity="Informational",
                     status="N/A",
                     region=region,
@@ -12896,13 +14142,48 @@ def _scp_model_list_controls(document: Any) -> List[Dict[str, Any]]:
     return controls
 
 
+def _approved_model_control_row(
+    check_id: str,
+    region: str,
+    details: str,
+    resolution: str,
+    severity: str,
+    status: str,
+) -> Dict[str, Any]:
+    """Build one approved-model-control row under BR-42 or BR-43."""
+    if check_id == "BR-42":
+        return create_finding(
+            check_id="BR-42",
+            finding_name=APPROVED_MODEL_CONTROL_FINDING,
+            finding_details=details,
+            resolution=resolution,
+            reference=APPROVED_MODEL_CONTROL_REFERENCE,
+            severity=severity,
+            status=status,
+            region=region,
+        )
+    return create_finding(
+        check_id="BR-43",
+        finding_name=APPROVED_MODEL_CONTROL_FINDING,
+        finding_details=details,
+        resolution=resolution,
+        reference=APPROVED_MODEL_CONTROL_REFERENCE,
+        severity=severity,
+        status=status,
+        region=region,
+    )
+
+
 def check_bedrock_approved_model_control(
-    region: str = "", scp_inventory: Optional[Dict[str, Any]] = None
+    region: str = "",
+    scp_inventory: Optional[Dict[str, Any]] = None,
+    check_id: str = "BR-43",
 ) -> Dict[str, Any]:
     """
-    BR-43 model leg: verify a service control policy denies invoking any model
-    outside a named list. Only the existence of the list is asserted; which
-    models belong on it is the customer's decision.
+    BR-43 model leg, and the organization leg of BR-42: verify a service control
+    policy attached in the account's path denies invoking any model outside a
+    named list. Only the existence of the list is asserted; which models belong
+    on it is the customer's decision.
     """
     logger.debug("Starting check for Bedrock approved model control")
     check_name = APPROVED_MODEL_CONTROL_FINDING
@@ -12915,15 +14196,8 @@ def check_bedrock_approved_model_control(
         }
 
         def row(details, resolution, severity, status):
-            return create_finding(
-                check_id="BR-43",
-                finding_name=check_name,
-                finding_details=details,
-                resolution=resolution,
-                reference=APPROVED_MODEL_CONTROL_REFERENCE,
-                severity=severity,
-                status=status,
-                region=region,
+            return _approved_model_control_row(
+                check_id, region, details, resolution, severity, status
             )
 
         context = _organization_policy_context()
@@ -12980,7 +14254,9 @@ def check_bedrock_approved_model_control(
         ]
         scope_note = (
             "The approved model list is the customer's decision and is not judged "
-            "here; batch inference jobs are not read by this leg."
+            "here; batch inference jobs are not read by this leg. {}".format(
+                _scp_scope_note(inventory)
+            )
         )
         if enforcing and not uncovered:
             findings["details"] = "Bedrock invocation is limited to a model list"
@@ -13058,15 +14334,13 @@ def check_bedrock_approved_model_control(
             "status": "ERROR",
             "details": f"Error during check: {str(e)}",
             "csv_data": [
-                create_finding(
-                    check_id="BR-43",
-                    finding_name=check_name,
-                    finding_details=build_could_not_assess_detail(e, region),
-                    resolution=COULD_NOT_ASSESS_RESOLUTION,
-                    reference=APPROVED_MODEL_CONTROL_REFERENCE,
-                    severity="Informational",
-                    status="N/A",
-                    region=region,
+                _approved_model_control_row(
+                    check_id,
+                    region,
+                    build_could_not_assess_detail(e, region),
+                    COULD_NOT_ASSESS_RESOLUTION,
+                    "Informational",
+                    "N/A",
                 )
             ],
         }
@@ -18165,6 +19439,30 @@ def lambda_handler(event, context):
                 )
             )
 
+            logger.info("Running inference Region evidence check (BR-43)")
+            all_findings.append(
+                check_bedrock_inference_region_evidence(
+                    region=GLOBAL_REGION_LABEL,
+                    api_region=region,
+                    scp_inventory=scp_inventory,
+                )
+            )
+            logger.info("Running AI service Region control check (BR-43)")
+            all_findings.append(
+                check_ai_service_region_control(
+                    region=GLOBAL_REGION_LABEL, scp_inventory=scp_inventory
+                )
+            )
+
+            logger.info("Running organization model allow-list check (BR-42)")
+            all_findings.append(
+                check_bedrock_approved_model_control(
+                    region=GLOBAL_REGION_LABEL,
+                    scp_inventory=scp_inventory,
+                    check_id="BR-42",
+                )
+            )
+
             logger.info("Running Bedrock API key governance check (BR-45)")
             all_findings.append(
                 _permission_cache_unavailable_result(
@@ -18197,6 +19495,9 @@ def lambda_handler(event, context):
             )
 
         # Regional checks (BR-16 through BR-25)
+        logger.info("Running custom model cross-account access check (BR-43)")
+        all_findings.append(check_bedrock_custom_model_sharing(region=region))
+
         logger.info("Running guardrail tier validation check (BR-16)")
         guardrail_tier_findings = check_bedrock_guardrail_tier(region=region)
         all_findings.append(guardrail_tier_findings)

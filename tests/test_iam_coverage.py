@@ -601,6 +601,15 @@ _VERIFIED_REMEDIATION_IAM_ACTIONS = {
 # AWS Knowledge like the block above.
 _VERIFIED_REMEDIATION_IAM_ACTIONS |= {"s3vectors:PutVectorBucketPolicy"}
 
+# Verified on 2026-09-27 against the Service Authorization Reference JSON
+# (servicereference.us-east-1.amazonaws.com/v1/<service>/<service>.json): the
+# bedrock-mantle file lists CreateInference with the bedrock-mantle:Model action
+# condition key, and the s3 file lists GetObject.
+_VERIFIED_REMEDIATION_IAM_ACTIONS |= {
+    "bedrock-mantle:CreateInference",
+    "s3:GetObject",
+}
+
 # Verified on 2026-09-25 by submitting a policy naming each action to
 # iam-access-analyzer ValidatePolicy (a read-only call that creates nothing):
 # an action the service does not define comes back as INVALID_ACTION, and every
@@ -786,6 +795,9 @@ _VERIFIED_REMEDIATION_CONDITION_KEYS |= {
     "iam:ServiceSpecificCredentialAgeDays",
     "iam:ServiceSpecificCredentialServiceName",
 }
+
+# Verified with the bedrock-mantle:CreateInference entry above.
+_VERIFIED_REMEDIATION_CONDITION_KEYS |= {"bedrock-mantle:Model"}
 
 # Verified the same way on 2026-09-25 for the SageMaker phase-3 checks. The
 # condition key was submitted in its qualified aws:ResourceTag/<key> form, which

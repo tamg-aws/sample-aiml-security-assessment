@@ -1588,9 +1588,20 @@ INCUMBENT_NAMES = {
     "BR-37": "Bedrock Account Data Retention",
     "BR-39": "Marketplace Model Endpoint VPC Configuration",
     "BR-41": "Central Guardrail Enforcement Policy Check",
-    "BR-42": "Foundation Model Invocation Allow-List",
-    # The Region leg and the model leg.
-    "BR-43": ("Bedrock Region Invocation Control", "Bedrock Approved Model Control"),
+    # The identity leg and the organization leg.
+    "BR-42": (
+        "Foundation Model Invocation Allow-List",
+        "Bedrock Approved Model Control",
+    ),
+    # The Region leg, the model leg, the served-Region evidence, the SageMaker
+    # and S3 Region leg, and the cross-account leg.
+    "BR-43": (
+        "Bedrock Region Invocation Control",
+        "Bedrock Approved Model Control",
+        "Bedrock Inference Region Evidence",
+        "AI Service Region Control",
+        "Bedrock Custom Model Cross-Account Access",
+    ),
     "BR-44": "Marketplace Model Subscription Control",
     # An inventory line and a prevention line, by design.
     "BR-45": (

@@ -4517,9 +4517,20 @@ class TestBR42ModelAllowList:
         "arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-3-5-sonnet-v1:0"
     )
 
-    def _run(self, cache):
+    NO_TRAINING_DATA = {
+        "buckets": {},
+        "errors": [],
+        "truncated": [],
+        "regions": ["us-east-1"],
+    }
+
+    def _run(self, cache, training_data=None):
         return extract_csv_data(
-            bedrock_app.check_bedrock_model_allow_list(cache, region="Global")
+            bedrock_app.check_bedrock_model_allow_list(
+                cache,
+                region="Global",
+                training_data=training_data or self.NO_TRAINING_DATA,
+            )
         )
 
     def test_br42_named_arn_passes_while_wildcard_fails(self):
@@ -4690,6 +4701,545 @@ class TestBR42ModelAllowList:
         for finding in findings:
             assert_finding_schema(finding)
 
+    PROFILE_ARN = (
+        "arn:aws:bedrock:us-east-1:123456789012:inference-profile/"
+        "us.anthropic.claude-3-5-sonnet-v1:0"
+    )
+
+    @staticmethod
+    def _statuses(findings):
+        return [f["Status"] for f in findings]
+
+    @staticmethod
+    def _failed_text(findings):
+        return " ".join(
+            f["Finding_Details"] for f in findings if f["Status"] == "Failed"
+        )
+
+    def test_br42_group_policy_grant_on_every_model_fails_the_user(self):
+        cache = _identity_cache(users={"AnalystUser": [], "ScopedUser": []})
+        cache["user_permissions"]["AnalystUser"]["group_policies"] = [
+            {
+                "name": "OpenGroupInvoke",
+                "group": "Analysts",
+                "arn": "arn:aws:iam::123456789012:policy/OpenGroupInvoke",
+                "document": _allow("bedrock:InvokeModel", "*"),
+            }
+        ]
+        cache["user_permissions"]["ScopedUser"]["group_policies"] = [
+            {
+                "name": "ScopedGroupInvoke",
+                "group": "Scoped",
+                "document": _allow("bedrock:InvokeModel", self.MODEL_ARN),
+            }
+        ]
+        findings = self._run(cache)
+
+        failed = [f for f in findings if f["Status"] == "Failed"]
+        assert len(failed) == 1
+        assert "User 'AnalystUser'" in failed[0]["Finding_Details"]
+        assert "policy 'OpenGroupInvoke'" in failed[0]["Finding_Details"]
+        passed = [f for f in findings if f["Status"] == "Passed"]
+        assert len(passed) == 1 and "ScopedUser" in passed[0]["Finding_Details"]
+
+    def test_br42_not_resource_allow_is_not_an_allow_list(self):
+        statement = {
+            "Effect": "Allow",
+            "Action": "bedrock:InvokeModel",
+            "NotResource": [self.MODEL_ARN],
+        }
+        findings = self._run(
+            _identity_cache(
+                roles={
+                    "NotResourceRole": [
+                        (
+                            "AllButOne",
+                            {"Version": "2012-10-17", "Statement": [statement]},
+                        )
+                    ],
+                    "ScopedRole": [
+                        ("ScopedInvoke", _allow("bedrock:InvokeModel", self.MODEL_ARN))
+                    ],
+                }
+            )
+        )
+
+        failed = [f for f in findings if f["Status"] == "Failed"]
+        assert len(failed) == 1
+        assert "Role 'NotResourceRole'" in failed[0]["Finding_Details"]
+        assert "NotResource" in failed[0]["Finding_Details"]
+        assert "NotResourceRole" not in " ".join(
+            f["Finding_Details"] for f in findings if f["Status"] == "Passed"
+        )
+
+    def test_br42_not_action_allow_grants_invocation_on_every_model(self):
+        statement = {"Effect": "Allow", "NotAction": "iam:*", "Resource": "*"}
+        findings = self._run(
+            _identity_cache(
+                roles={
+                    "NotActionRole": [
+                        (
+                            "EverythingButIam",
+                            {"Version": "2012-10-17", "Statement": [statement]},
+                        )
+                    ],
+                    "NotActionBedrockRole": [
+                        (
+                            "EverythingButBedrock",
+                            {
+                                "Version": "2012-10-17",
+                                "Statement": [
+                                    {
+                                        "Effect": "Allow",
+                                        "NotAction": ["bedrock:*", "bedrock-mantle:*"],
+                                        "Resource": "*",
+                                    }
+                                ],
+                            },
+                        )
+                    ],
+                }
+            )
+        )
+
+        failed = [f for f in findings if f["Status"] == "Failed"]
+        assert len(failed) == 1
+        assert "Role 'NotActionRole'" in failed[0]["Finding_Details"]
+        assert "every model available in the account" in failed[0]["Finding_Details"]
+        assert "NotActionBedrockRole" not in self._failed_text(findings)
+
+    def test_br42_wildcard_account_or_model_prefix_is_unbounded(self):
+        findings = self._run(
+            _identity_cache(
+                roles={
+                    "AnyAccountRole": [
+                        (
+                            "AnyAccount",
+                            _allow(
+                                "bedrock:InvokeModel",
+                                "arn:aws:bedrock:us-east-1:*:inference-profile/"
+                                "us.anthropic.claude-3-5-sonnet-v1:0",
+                            ),
+                        )
+                    ],
+                    "FamilyRole": [
+                        (
+                            "Family",
+                            _allow(
+                                "bedrock:InvokeModel",
+                                "arn:aws:bedrock:*::foundation-model/anthropic.*",
+                            ),
+                        )
+                    ],
+                    "AnyRegionRole": [
+                        (
+                            "AnyRegion",
+                            _allow(
+                                "bedrock:InvokeModel",
+                                "arn:aws:bedrock:*::foundation-model/"
+                                "amazon.nova-lite-v1:0",
+                            ),
+                        )
+                    ],
+                    "ProfileRole": [
+                        ("Profile", _allow("bedrock:InvokeModel", self.PROFILE_ARN))
+                    ],
+                }
+            )
+        )
+
+        failed_text = self._failed_text(findings)
+        assert "Role 'AnyAccountRole'" in failed_text
+        assert "Role 'FamilyRole'" in failed_text
+        assert len([f for f in findings if f["Status"] == "Failed"]) == 2
+        passed = " ".join(
+            f["Finding_Details"] for f in findings if f["Status"] == "Passed"
+        )
+        assert "AnyRegionRole" in passed and "ProfileRole" in passed
+
+    def test_br42_condition_on_a_key_the_action_does_not_define_is_reported(self):
+        findings = self._run(
+            _identity_cache(
+                roles={
+                    "ModelIdRole": [
+                        (
+                            "ModelIdCondition",
+                            _allow(
+                                "bedrock:InvokeModel",
+                                "*",
+                                {"StringEquals": {"bedrock:ModelId": "amazon.nova"}},
+                            ),
+                        )
+                    ],
+                    "NegatedModelIdRole": [
+                        (
+                            "NegatedModelId",
+                            _allow(
+                                "bedrock:InvokeModel",
+                                "*",
+                                {"StringNotEquals": {"bedrock:ModelId": "amazon.nova"}},
+                            ),
+                        )
+                    ],
+                }
+            )
+        )
+
+        failed = {
+            f["Finding_Details"].split("'")[1]: f["Finding_Details"]
+            for f in findings
+            if f["Status"] == "Failed"
+        }
+        assert set(failed) == {"ModelIdRole", "NegatedModelIdRole"}
+        assert "bedrock:modelid" in failed["ModelIdRole"]
+        assert "never matches" in failed["ModelIdRole"]
+        assert "can invoke any foundation model" not in failed["ModelIdRole"]
+        assert "every model available in the account" in failed["NegatedModelIdRole"]
+
+    def test_br42_model_arn_condition_with_a_wildcard_value_is_not_scoping(self):
+        findings = self._run(
+            _identity_cache(
+                roles={
+                    "LooseConditionRole": [
+                        (
+                            "LooseCondition",
+                            _allow(
+                                "bedrock:InvokeModel",
+                                "*",
+                                {
+                                    "StringLike": {
+                                        "bedrock:ModelArn": (
+                                            "arn:aws:bedrock:*::foundation-model/*"
+                                        )
+                                    }
+                                },
+                            ),
+                        )
+                    ],
+                    "IfExistsRole": [
+                        (
+                            "IfExists",
+                            _allow(
+                                "bedrock:InvokeModel",
+                                "*",
+                                {
+                                    "StringEqualsIfExists": {
+                                        "bedrock:ModelArn": self.MODEL_ARN
+                                    }
+                                },
+                            ),
+                        )
+                    ],
+                    "ExactConditionRole": [
+                        (
+                            "ExactCondition",
+                            _allow(
+                                "bedrock:InvokeModel",
+                                "*",
+                                {"StringEquals": {"bedrock:ModelArn": self.MODEL_ARN}},
+                            ),
+                        )
+                    ],
+                }
+            )
+        )
+
+        failed_text = self._failed_text(findings)
+        assert "Role 'LooseConditionRole'" in failed_text
+        assert "Role 'IfExistsRole'" in failed_text
+        assert "names no bounded model list" in failed_text
+        assert "ExactConditionRole" not in failed_text
+        passed = [f for f in findings if f["Status"] == "Passed"]
+        assert len(passed) == 1 and "ExactConditionRole" in passed[0]["Finding_Details"]
+
+    def test_br42_permissions_boundary_is_intersected(self):
+        cache = _identity_cache(
+            roles={
+                "BoundaryDeniesRole": [("Open", _allow("bedrock:InvokeModel", "*"))],
+                "BoundaryScopesRole": [("Open", _allow("bedrock:InvokeModel", "*"))],
+                "BoundaryOpenRole": [("Open", _allow("bedrock:InvokeModel", "*"))],
+            }
+        )
+        roles = cache["role_permissions"]
+        roles["BoundaryDeniesRole"]["permissions_boundary"] = {
+            "arn": "arn:aws:iam::123456789012:policy/S3Only",
+            "document": _allow("s3:GetObject", "*"),
+        }
+        roles["BoundaryScopesRole"]["permissions_boundary"] = {
+            "arn": "arn:aws:iam::123456789012:policy/OneModel",
+            "document": _allow("bedrock:InvokeModel", self.MODEL_ARN),
+        }
+        roles["BoundaryOpenRole"]["permissions_boundary"] = {
+            "arn": "arn:aws:iam::123456789012:policy/AllBedrock",
+            "document": _allow("bedrock:*", "*"),
+        }
+        findings = self._run(cache)
+
+        failed = [f for f in findings if f["Status"] == "Failed"]
+        assert len(failed) == 1
+        assert "Role 'BoundaryOpenRole'" in failed[0]["Finding_Details"]
+        passed = [f for f in findings if f["Status"] == "Passed"]
+        assert len(passed) == 1
+        assert "BoundaryScopesRole" in passed[0]["Finding_Details"]
+        assert self.MODEL_ARN in passed[0]["Finding_Details"]
+        assert "BoundaryDeniesRole" not in " ".join(
+            f["Finding_Details"] for f in findings
+        )
+
+    def test_br42_identity_deny_outside_a_named_list_scopes_the_grant(self):
+        document = {
+            "Version": "2012-10-17",
+            "Statement": [
+                {"Effect": "Allow", "Action": "bedrock:*", "Resource": "*"},
+                {
+                    "Effect": "Deny",
+                    "Action": [
+                        "bedrock:InvokeModel",
+                        "bedrock:InvokeModelWithResponseStream",
+                    ],
+                    "NotResource": [self.MODEL_ARN],
+                },
+            ],
+        }
+        findings = self._run(
+            _identity_cache(
+                roles={
+                    "DenyListRole": [("AllowWithDenyList", document)],
+                    "OpenRole": [("OpenInvoke", _allow("bedrock:InvokeModel", "*"))],
+                }
+            )
+        )
+
+        failed = [f for f in findings if f["Status"] == "Failed"]
+        assert len(failed) == 1
+        assert "Role 'OpenRole'" in failed[0]["Finding_Details"]
+        assert "DenyListRole" in " ".join(
+            f["Finding_Details"] for f in findings if f["Status"] == "Passed"
+        )
+
+    def test_br42_bedrock_mantle_inference_needs_a_model_condition(self):
+        project = "arn:aws:bedrock-mantle:us-east-1:123456789012:project/*"
+        findings = self._run(
+            _identity_cache(
+                roles={
+                    "MantleOpenRole": [
+                        (
+                            "MantleOpen",
+                            _allow("bedrock-mantle:CreateInference", project),
+                        )
+                    ],
+                    "MantleWildcardModelRole": [
+                        (
+                            "MantleWildcard",
+                            _allow(
+                                "bedrock-mantle:CreateInference",
+                                project,
+                                {"StringLike": {"bedrock-mantle:Model": "*"}},
+                            ),
+                        )
+                    ],
+                    "MantleScopedRole": [
+                        (
+                            "MantleScoped",
+                            _allow(
+                                "bedrock-mantle:CreateInference",
+                                project,
+                                {"StringEquals": {"bedrock-mantle:Model": "gpt-oss"}},
+                            ),
+                        )
+                    ],
+                }
+            )
+        )
+
+        failed_text = self._failed_text(findings)
+        assert len([f for f in findings if f["Status"] == "Failed"]) == 2
+        assert "Role 'MantleOpenRole'" in failed_text
+        assert "Role 'MantleWildcardModelRole'" in failed_text
+        assert "bedrock-mantle endpoint" in failed_text
+        passed = [f for f in findings if f["Status"] == "Passed"]
+        assert len(passed) == 1
+        assert "MantleScopedRole" in passed[0]["Finding_Details"]
+
+    def test_br42_training_data_reached_through_a_bucket_wildcard_fails(self):
+        training = {
+            "buckets": {
+                "train-a": ["the training data of customization job 'j1' in us-east-1"],
+                "train-b": [
+                    "the validation data of customization job 'j2' in us-west-2"
+                ],
+            },
+            "errors": [],
+            "truncated": [],
+            "regions": ["us-east-1", "us-west-2"],
+        }
+        cache = _identity_cache(
+            roles={
+                "ScopedRole": [
+                    ("ScopedInvoke", _allow("bedrock:InvokeModel", self.MODEL_ARN))
+                ],
+                "AllBucketsRole": [
+                    ("AllBuckets", _allow("s3:GetObject", "arn:aws:s3:::*/*"))
+                ],
+                "PrefixRole": [
+                    ("TrainPrefix", _allow("s3:GetObject", "arn:aws:s3:::train-*/*"))
+                ],
+                "NamedBucketRole": [
+                    (
+                        "NamedBucket",
+                        _allow(
+                            "s3:GetObject",
+                            ["arn:aws:s3:::train-a/*", "arn:aws:s3:::train-b/*"],
+                        ),
+                    )
+                ],
+                "BoundedRole": [("Star", _allow("s3:GetObject", "*"))],
+            }
+        )
+        cache["role_permissions"]["BoundedRole"]["permissions_boundary"] = {
+            "document": _allow("s3:GetObject", "arn:aws:s3:::train-a/*")
+        }
+        findings = self._run(cache, training_data=training)
+
+        failed = {
+            f["Finding_Details"].split("'")[1]: f["Finding_Details"]
+            for f in findings
+            if f["Status"] == "Failed"
+        }
+        assert set(failed) == {"AllBucketsRole", "PrefixRole"}
+        assert "bucket 'train-a'" in failed["PrefixRole"]
+        assert "bucket 'train-b'" in failed["PrefixRole"]
+        assert "training data" in failed["AllBucketsRole"]
+        passed = [f for f in findings if f["Status"] == "Passed"]
+        assert "2 training data bucket(s)" in passed[0]["Finding_Details"]
+
+    def test_br42_unread_customization_jobs_are_na_not_a_clean_result(self):
+        training = {
+            "buckets": {},
+            "errors": ["us-west-2 model customization jobs: AccessDeniedException"],
+            "truncated": [],
+            "regions": ["us-east-1", "us-west-2"],
+        }
+        findings = self._run(
+            _identity_cache(
+                roles={"StarRole": [("Star", _allow("s3:GetObject", "*"))]}
+            ),
+            training_data=training,
+        )
+
+        na = [f for f in findings if f["Status"] == "N/A"]
+        assert any(
+            "us-west-2 model customization jobs" in f["Finding_Details"] for f in na
+        )
+        assert not [f for f in findings if f["Status"] == "Passed"]
+
+    def test_br42_principal_error_turns_the_passed_row_into_na(self):
+        cache = _identity_cache(
+            roles={
+                "ScopedRole": [
+                    ("ScopedInvoke", _allow("bedrock:InvokeModel", self.MODEL_ARN))
+                ]
+            }
+        )
+        cache["cache_schema_version"] = 2
+        cache["principal_errors"] = [
+            {
+                "type": "role",
+                "name": "UnreadRole",
+                "stage": "list_attached_role_policies",
+                "error": "AccessDenied",
+            }
+        ]
+        findings = self._run(cache)
+
+        assert "Passed" not in self._statuses(findings)
+        assert any("role 'UnreadRole'" in f["Finding_Details"] for f in findings)
+
+    def test_br42_training_bucket_read_covers_every_region_and_keeps_only_inputs(
+        self,
+    ):
+        per_region = {
+            "us-east-1": {
+                "buckets": {
+                    "train-a": ["the training data of customization job 'j1'"],
+                    "kb-src": ["knowledge base 'kb1' data source 'ds1'"],
+                    "out": ["the output of customization job 'j1'"],
+                },
+                "errors": ["knowledge base data sources: AccessDeniedException"],
+                "truncated": [],
+            },
+            "us-west-2": {
+                "buckets": {
+                    "train-b": ["the invocation log source of customization job 'd1'"]
+                },
+                "errors": ["customization job 'd2': ThrottlingException"],
+                "truncated": [],
+            },
+        }
+        with (
+            patch.object(
+                bedrock_app,
+                "_assessed_regions",
+                return_value=["us-east-1", "us-west-2"],
+            ),
+            patch.object(
+                bedrock_app,
+                "_ai_data_path_buckets",
+                side_effect=lambda region: per_region[region],
+            ),
+        ):
+            result = bedrock_app._training_data_buckets()
+
+        assert set(result["buckets"]) == {"train-a", "train-b"}
+        assert result["errors"] == [
+            "us-west-2 customization job 'd2': ThrottlingException"
+        ]
+        assert result["regions"] == ["us-east-1", "us-west-2"]
+
+    def test_br42_organization_row_carries_the_br42_check_id(self):
+        inventory = {
+            "items": [
+                {
+                    "name": "ApprovedModels",
+                    "id": "p-1",
+                    "content": json.dumps(
+                        {
+                            "Statement": [
+                                {
+                                    "Effect": "Deny",
+                                    "Action": [
+                                        "bedrock:InvokeModel",
+                                        "bedrock:InvokeModelWithResponseStream",
+                                    ],
+                                    "NotResource": [self.MODEL_ARN],
+                                }
+                            ]
+                        }
+                    ),
+                    "attached_to": ["root r-1"],
+                }
+            ],
+            "errors": [],
+            "list_error": None,
+            "detached": ["Elsewhere"],
+            "account": "123456789012",
+            "path": [],
+            "management_account": False,
+        }
+        with patch.object(
+            bedrock_app,
+            "_organization_policy_context",
+            return_value={"readable": True},
+        ):
+            findings = extract_csv_data(
+                bedrock_app.check_bedrock_approved_model_control(
+                    region="Global", scp_inventory=inventory, check_id="BR-42"
+                )
+            )
+
+        assert [(f["Check_ID"], f["Status"]) for f in findings] == [("BR-42", "Passed")]
+        assert "1 attached elsewhere was not counted" in findings[0]["Finding_Details"]
+
 
 # ===================================================================
 # BR-43: check_bedrock_region_invocation_control
@@ -4697,8 +5247,15 @@ class TestBR42ModelAllowList:
 class TestBR43RegionInvocationControl:
     """BR-43: A Region condition on Bedrock invocation, read from the SCPs."""
 
+    # Every action BR-43 requires the allow-list to cover.
+    ALL_REGION_ACTIONS = [
+        "bedrock:InvokeModel",
+        "bedrock:InvokeModelWithResponseStream",
+        "bedrock:CreateModelInvocationJob",
+    ]
+
     @staticmethod
-    def _region_scp(operator, regions, action="bedrock:InvokeModel"):
+    def _region_scp(operator, regions, action=ALL_REGION_ACTIONS):
         return {
             "Version": "2012-10-17",
             "Statement": [
@@ -4894,8 +5451,13 @@ class TestBR43RegionInvocationControl:
             )
         )
 
-        assert [f["Status"] for f in findings] == ["Passed"]
+        # A batch-only allow-list leaves direct invocation in any Region open.
+        assert [f["Status"] for f in findings] == ["Failed"]
         assert "bedrock:createmodelinvocationjob" in findings[0]["Finding_Details"]
+        assert (
+            "no credited allow-list covers bedrock:invokemodel, "
+            "bedrock:invokemodelwithresponsestream" in findings[0]["Finding_Details"]
+        )
 
     def test_br43_unreadable_policies_are_not_absence(self):
         inventory = {
@@ -5135,10 +5697,723 @@ class TestBR43RegionInvocationControl:
             for finding in findings:
                 assert_finding_schema(finding)
 
+    # ===================================================================
+    # BR-44: check_bedrock_marketplace_model_control
+    # ===================================================================
 
-# ===================================================================
-# BR-44: check_bedrock_marketplace_model_control
-# ===================================================================
+    # --- Region leg: which Deny statements count as a Region allow-list ---
+
+    @staticmethod
+    def _statement(**fields):
+        statement = {"Effect": "Deny", "Resource": "*"}
+        statement.update(fields)
+        return {"Version": "2012-10-17", "Statement": [statement]}
+
+    def test_br43_control_tower_not_action_region_deny_is_credited(self):
+        # Control Tower writes its Region deny with NotAction, which covers every
+        # action it does not list, and exempts its own role by aws:PrincipalArn.
+        findings = self._run(
+            self._inventory(
+                [
+                    (
+                        "aws-guardrails-RegionDeny",
+                        self._statement(
+                            NotAction=["iam:*", "organizations:*", "sts:*"],
+                            Condition={
+                                "StringNotEquals": {
+                                    "aws:RequestedRegion": ["us-east-1", "unspecified"]
+                                },
+                                "ArnNotLike": {
+                                    "aws:PrincipalARN": [
+                                        "arn:aws:iam::*:role/AWSControlTowerExecution"
+                                    ]
+                                },
+                            },
+                        ),
+                    )
+                ]
+            )
+        )
+
+        assert [f["Status"] for f in findings] == ["Passed"]
+        detail = findings[0]["Finding_Details"]
+        assert "exempts principals matching arnnotlike aws:principalarn" in detail
+        assert "AWSControlTowerExecution" in detail
+
+    def test_br43_for_any_value_negated_region_test_is_not_an_allow_list(self):
+        findings = self._run(
+            self._inventory(
+                [
+                    (
+                        "AnyValue",
+                        self._region_scp(
+                            "ForAnyValue:StringNotEquals", ["us-east-1", "unspecified"]
+                        ),
+                    )
+                ]
+            )
+        )
+
+        assert [f["Status"] for f in findings] == ["Failed"]
+        detail = findings[0]["Finding_Details"]
+        assert "not credited" in detail
+        assert "is not an allow-list test" in detail
+
+    def test_br43_extra_condition_key_keeps_the_deny_from_counting(self):
+        findings = self._run(
+            self._inventory(
+                [
+                    (
+                        "TaggedOnly",
+                        self._statement(
+                            Action=self.ALL_REGION_ACTIONS,
+                            Condition={
+                                "StringNotEquals": {
+                                    "aws:RequestedRegion": ["us-east-1", "unspecified"]
+                                },
+                                "StringEquals": {"aws:PrincipalTag/team": "ml"},
+                            },
+                        ),
+                    )
+                ]
+            )
+        )
+
+        assert [f["Status"] for f in findings] == ["Failed"]
+        assert "aws:principaltag/team" in findings[0]["Finding_Details"]
+
+    def test_br43_region_value_matching_every_region_is_not_an_allow_list(self):
+        findings = self._run(
+            self._inventory(
+                [("Everything", self._region_scp("StringNotLike", ["us-east-1", "*"]))]
+            )
+        )
+
+        assert [f["Status"] for f in findings] == ["Failed"]
+        assert "matches every Region" in findings[0]["Finding_Details"]
+
+    def test_br43_region_family_pattern_is_an_allow_list(self):
+        # The direction the every-Region test would hide: eu-* names a family,
+        # not every Region, so it is credited.
+        findings = self._run(
+            self._inventory(
+                [("Europe", self._region_scp("StringNotLike", ["eu-*", "us-east-1"]))]
+            )
+        )
+
+        assert [f["Status"] for f in findings] == ["Passed"]
+
+    def test_br43_narrowed_resource_is_not_an_allow_list(self):
+        findings = self._run(
+            self._inventory(
+                [
+                    (
+                        "OneModel",
+                        self._statement(
+                            Action=self.ALL_REGION_ACTIONS,
+                            Resource="arn:aws:bedrock:*::foundation-model/amazon.*",
+                            Condition={
+                                "StringNotEquals": {
+                                    "aws:RequestedRegion": ["us-east-1", "unspecified"]
+                                }
+                            },
+                        ),
+                    )
+                ]
+            )
+        )
+
+        assert [f["Status"] for f in findings] == ["Failed"]
+        assert "not to every resource" in findings[0]["Finding_Details"]
+
+    def test_br43_allow_lists_in_two_policies_cover_the_actions_together(self):
+        findings = self._run(
+            self._inventory(
+                [
+                    (
+                        "Invoke",
+                        self._region_scp(
+                            "StringNotEquals",
+                            ["us-east-1", "unspecified"],
+                            action=[
+                                "bedrock:InvokeModel",
+                                "bedrock:InvokeModelWithResponseStream",
+                            ],
+                        ),
+                    ),
+                    (
+                        "Batch",
+                        self._region_scp(
+                            "StringNotEquals",
+                            ["us-east-1"],
+                            action="bedrock:CreateModelInvocationJob",
+                        ),
+                    ),
+                ]
+            )
+        )
+
+        assert [f["Status"] for f in findings] == ["Passed"]
+
+    def test_br43_streaming_left_out_of_the_allow_list_fails(self):
+        findings = self._run(
+            self._inventory(
+                [
+                    (
+                        "NoStreaming",
+                        self._region_scp(
+                            "StringNotEquals",
+                            ["us-east-1", "unspecified"],
+                            action=[
+                                "bedrock:InvokeModel",
+                                "bedrock:CreateModelInvocationJob",
+                            ],
+                        ),
+                    )
+                ]
+            )
+        )
+
+        assert [f["Status"] for f in findings] == ["Failed"]
+        assert (
+            "no credited allow-list covers bedrock:invokemodelwithresponsestream"
+            in findings[0]["Finding_Details"]
+        )
+
+    def test_br43_deny_list_alone_fails(self):
+        findings = self._run(
+            self._inventory(
+                [("Blocked", self._region_scp("StringEquals", ["ap-east-1"]))]
+            )
+        )
+
+        assert [f["Status"] for f in findings] == ["Failed"]
+        detail = findings[0]["Finding_Details"]
+        assert "deny-list" in detail
+        assert "bounds direct invocation only" in detail
+
+    def _global_deny(self, profile_pattern):
+        return self._statement(
+            Action="bedrock:*",
+            Condition={
+                "StringEquals": {"aws:RequestedRegion": "unspecified"},
+                "ArnLike": {"bedrock:InferenceProfileArn": profile_pattern},
+            },
+        )
+
+    def test_br43_catalog_global_disable_closes_global_routing(self):
+        findings = self._run(
+            self._inventory(
+                [
+                    (
+                        "ApprovedRegions",
+                        self._region_scp(
+                            "StringNotEquals", ["us-east-1", "us-west-2", "unspecified"]
+                        ),
+                    ),
+                    (
+                        "NoGlobal",
+                        self._global_deny(
+                            "arn:aws:bedrock:*:*:inference-profile/global.*"
+                        ),
+                    ),
+                ]
+            ),
+            profiles=[self.BOUNDED_PROFILE, self.UNBOUNDED_PROFILE],
+        )
+
+        assert [f["Status"] for f in findings] == ["Passed"]
+        assert "closes Global inference routing" in findings[0]["Finding_Details"]
+
+    def test_br43_global_disable_scoped_to_one_model_leaves_global_open(self):
+        findings = self._run(
+            self._inventory(
+                [
+                    (
+                        "ApprovedRegions",
+                        self._region_scp(
+                            "StringNotEquals", ["us-east-1", "us-west-2", "unspecified"]
+                        ),
+                    ),
+                    (
+                        "NoGlobalClaude",
+                        self._global_deny(
+                            "arn:aws:bedrock:*:*:inference-profile/global.anthropic.*"
+                        ),
+                    ),
+                ]
+            ),
+            profiles=[self.BOUNDED_PROFILE, self.UNBOUNDED_PROFILE],
+        )
+
+        assert [f["Status"] for f in findings] == ["Failed"]
+        assert "bounds direct invocation only" in findings[0]["Finding_Details"]
+
+    def test_br43_geographic_destination_outside_the_allow_list_is_named(self):
+        findings = self._run(
+            self._inventory(
+                [
+                    (
+                        "EastOnly",
+                        self._region_scp(
+                            "StringNotEquals", ["us-east-1", "unspecified"]
+                        ),
+                    )
+                ]
+            ),
+            profiles=[self.BOUNDED_PROFILE],
+        )
+
+        detail = findings[0]["Finding_Details"]
+        assert (
+            "1 geographic profile(s) route to a Region the allow-list does not name (us-west-2)"
+            in detail
+        )
+        assert "a request routed to a blocked destination Region fails" in detail
+
+    def test_br43_geographic_destinations_inside_the_allow_list_are_not_named(self):
+        findings = self._run(
+            self._inventory(
+                [
+                    (
+                        "BothUs",
+                        self._region_scp(
+                            "StringNotEquals", ["us-east-1", "us-west-2", "unspecified"]
+                        ),
+                    )
+                ]
+            ),
+            profiles=[self.BOUNDED_PROFILE],
+        )
+
+        assert "geographic profile(s) route to" not in findings[0]["Finding_Details"]
+
+    def test_br43_routing_is_read_in_every_assessed_region(self):
+        with patch.dict(os.environ, {"TARGET_REGIONS": "us-east-1,eu-west-1"}):
+            findings = self._run(
+                self._inventory(
+                    [
+                        (
+                            "ApprovedRegions",
+                            self._region_scp(
+                                "StringNotEquals", ["us-east-1", "unspecified"]
+                            ),
+                        )
+                    ]
+                )
+            )
+
+        detail = findings[0]["Finding_Details"]
+        assert "available in us-east-1" in detail
+        assert "available in eu-west-1" in detail
+
+    def test_br43_finding_states_the_scp_scope(self):
+        findings = self._run(
+            self._inventory(
+                [
+                    (
+                        "ApprovedRegions",
+                        self._region_scp(
+                            "StringNotEquals", ["us-east-1", "unspecified"]
+                        ),
+                    )
+                ]
+            )
+        )
+
+        detail = findings[0]["Finding_Details"]
+        assert "Only service control policies attached to the root" in detail
+        assert "assessed by BR-42" in detail
+
+
+def _cloudtrail_event(inference_region, event_name="InvokeModel"):
+    return {
+        "EventName": event_name,
+        "CloudTrailEvent": json.dumps(
+            {"additionalEventData": {"inferenceRegion": inference_region}}
+            if inference_region
+            else {}
+        ),
+    }
+
+
+class TestBR43InferenceRegionEvidence:
+    """BR-43: CloudTrail inferenceRegion measured against the Region allow-list."""
+
+    ALLOW_US = TestBR43RegionInvocationControl._region_scp(
+        "StringNotEquals", ["us-east-1", "us-west-2", "unspecified"]
+    )
+
+    def _run(self, events_by_region, inventory=None, errors=None, truncated=()):
+        """events_by_region maps a source Region to {event name: [events]}."""
+        errors = errors or {}
+
+        def client_for(service, **kwargs):
+            assert service == "cloudtrail"
+            source = kwargs["region_name"]
+            client = MagicMock()
+
+            def lookup_events(**request):
+                name = request["LookupAttributes"][0]["AttributeValue"]
+                if (source, name) in errors:
+                    raise errors[(source, name)]
+                response = {"Events": events_by_region.get(source, {}).get(name, [])}
+                if (source, name) in truncated:
+                    response["NextToken"] = "more"
+                return response
+
+            client.lookup_events.side_effect = lookup_events
+            return client
+
+        if inventory is None:
+            inventory = TestBR43RegionInvocationControl._inventory(
+                [("ApprovedRegions", self.ALLOW_US)]
+            )
+        with patch("bedrock_app.boto3.client", side_effect=client_for):
+            return extract_csv_data(
+                bedrock_app.check_bedrock_inference_region_evidence(
+                    region="Global", api_region="us-east-1", scp_inventory=inventory
+                )
+            )
+
+    def test_call_served_outside_the_allow_list_fails(self):
+        findings = self._run(
+            {
+                "us-east-1": {
+                    "InvokeModel": [
+                        _cloudtrail_event("us-east-1"),
+                        _cloudtrail_event("ap-southeast-2"),
+                    ],
+                    "Converse": [_cloudtrail_event("us-west-2", "Converse")],
+                }
+            }
+        )
+
+        assert [f["Status"] for f in findings] == ["Failed"]
+        detail = findings[0]["Finding_Details"]
+        assert "served in ap-southeast-2 (1)" in detail
+        assert "us-east-1 (1)" in detail and "us-west-2 (1)" in detail
+
+    def test_calls_served_inside_the_allow_list_pass(self):
+        findings = self._run(
+            {
+                "us-east-1": {
+                    "InvokeModel": [_cloudtrail_event("us-east-1")],
+                    "ConverseStream": [_cloudtrail_event("us-west-2")],
+                }
+            }
+        )
+
+        assert [f["Status"] for f in findings] == ["Passed"]
+
+    def test_every_assessed_region_and_event_name_is_read(self):
+        with patch.dict(os.environ, {"TARGET_REGIONS": "us-east-1,eu-west-1"}):
+            findings = self._run(
+                {
+                    "us-east-1": {"InvokeModel": [_cloudtrail_event("us-east-1")]},
+                    "eu-west-1": {
+                        "InvokeModelWithResponseStream": [
+                            _cloudtrail_event("eu-central-1")
+                        ]
+                    },
+                }
+            )
+
+        assert [f["Status"] for f in findings] == ["Failed"]
+        assert "eu-central-1 (1)" in findings[0]["Finding_Details"]
+
+    def test_unread_event_history_is_not_a_clean_result(self):
+        findings = self._run(
+            {"us-east-1": {"InvokeModel": [_cloudtrail_event("us-east-1")]}},
+            errors={
+                ("us-east-1", "Converse"): _client_error(
+                    "AccessDeniedException", operation="LookupEvents"
+                )
+            },
+        )
+
+        assert [f["Status"] for f in findings] == ["N/A"]
+        assert (
+            "Converse in us-east-1 could not be read" in findings[0]["Finding_Details"]
+        )
+
+    def test_truncated_event_history_is_not_a_clean_result(self):
+        findings = self._run(
+            {"us-east-1": {"InvokeModel": [_cloudtrail_event("us-east-1")]}},
+            truncated={("us-east-1", "InvokeModel")},
+        )
+
+        assert [f["Status"] for f in findings] == ["N/A"]
+        assert "page cap only" in findings[0]["Finding_Details"]
+
+    def test_truncated_history_still_fails_on_a_call_outside(self):
+        findings = self._run(
+            {"us-east-1": {"InvokeModel": [_cloudtrail_event("sa-east-1")]}},
+            truncated={("us-east-1", "InvokeModel")},
+        )
+
+        assert [f["Status"] for f in findings] == ["Failed"]
+
+    def test_no_allow_list_reports_the_served_regions_as_na(self):
+        findings = self._run(
+            {"us-east-1": {"InvokeModel": [_cloudtrail_event("eu-west-3")]}},
+            inventory=TestBR43RegionInvocationControl._inventory([]),
+        )
+
+        assert [f["Status"] for f in findings] == ["N/A"]
+        assert "eu-west-3 (1)" in findings[0]["Finding_Details"]
+
+    def test_no_model_calls_is_na(self):
+        findings = self._run({"us-east-1": {"InvokeModel": [_cloudtrail_event("")]}})
+
+        assert [f["Status"] for f in findings] == ["N/A"]
+        detail = findings[0]["Finding_Details"]
+        assert "was not observed" in detail
+        assert "1 event(s) carried no inferenceRegion" in detail
+
+
+class TestBR43AIServiceRegionControl:
+    """BR-43: the Region allow-list must also cover SageMaker and S3."""
+
+    def _run(self, policies):
+        return extract_csv_data(
+            bedrock_app.check_ai_service_region_control(
+                region="Global",
+                scp_inventory=TestBR43RegionInvocationControl._inventory(policies),
+            )
+        )
+
+    def test_control_tower_region_deny_covers_sagemaker_and_s3(self):
+        findings = self._run(
+            [
+                (
+                    "aws-guardrails-RegionDeny",
+                    {
+                        "Statement": [
+                            {
+                                "Effect": "Deny",
+                                "NotAction": ["iam:*", "sts:*", "cloudfront:*"],
+                                "Resource": "*",
+                                "Condition": {
+                                    "StringNotEquals": {
+                                        "aws:RequestedRegion": ["us-east-1"]
+                                    }
+                                },
+                            }
+                        ]
+                    },
+                )
+            ]
+        )
+
+        assert [f["Status"] for f in findings] == ["Passed"]
+
+    def test_bedrock_only_allow_list_leaves_sagemaker_open(self):
+        findings = self._run(
+            [
+                (
+                    "BedrockRegions",
+                    TestBR43RegionInvocationControl._region_scp(
+                        "StringNotEquals", ["us-east-1"]
+                    ),
+                ),
+                (
+                    "SageMakerTraining",
+                    TestBR43RegionInvocationControl._region_scp(
+                        "StringNotEquals",
+                        ["us-east-1"],
+                        action="sagemaker:CreateTrainingJob",
+                    ),
+                ),
+            ]
+        )
+
+        assert [f["Status"] for f in findings] == ["Failed"]
+        detail = findings[0]["Finding_Details"]
+        assert (
+            "denies sagemaker:createendpoint, sagemaker:invokeendpoint, s3:createbucket"
+            in detail
+        )
+        assert "sagemaker:createtrainingjob outside" not in detail
+
+    def test_unreadable_policies_are_na(self):
+        findings = extract_csv_data(
+            bedrock_app.check_ai_service_region_control(
+                region="Global",
+                scp_inventory={
+                    "items": [],
+                    "errors": ["policy 'Hidden': AccessDenied"],
+                    "list_error": None,
+                },
+            )
+        )
+
+        assert [f["Status"] for f in findings] == ["N/A"]
+        assert "policy 'Hidden'" in findings[0]["Finding_Details"]
+
+
+class TestBR43CustomModelSharing:
+    """BR-43: resource policies on owned custom models."""
+
+    ACCOUNT = "123456789012"
+
+    @staticmethod
+    def _model(name, owner="123456789012"):
+        return {
+            "modelArn": f"arn:aws:bedrock:us-east-1:{owner}:custom-model/{name}",
+            "modelName": name,
+            "ownerAccountId": owner,
+        }
+
+    def _run(self, models, policies):
+        """policies maps a model ARN to a document, or to an exception to raise."""
+        bedrock_client = MagicMock()
+        bedrock_client.get_paginator.return_value.paginate.return_value = [
+            {"modelSummaries": models}
+        ]
+
+        def get_resource_policy(resourceArn):
+            value = policies.get(
+                resourceArn,
+                _client_error(
+                    "ResourceNotFoundException", operation="GetResourcePolicy"
+                ),
+            )
+            if isinstance(value, Exception):
+                raise value
+            return {"resourcePolicy": json.dumps(value)}
+
+        bedrock_client.get_resource_policy.side_effect = get_resource_policy
+        sts_client = MagicMock()
+        sts_client.get_caller_identity.return_value = {"Account": self.ACCOUNT}
+        with patch(
+            "bedrock_app.boto3.client",
+            side_effect=lambda service, **kwargs: {
+                "bedrock": bedrock_client,
+                "sts": sts_client,
+            }[service],
+        ):
+            findings = extract_csv_data(
+                bedrock_app.check_bedrock_custom_model_sharing(region="us-east-1")
+            )
+        return findings, bedrock_client
+
+    @staticmethod
+    def _allow(principal, condition=None):
+        statement = {
+            "Effect": "Allow",
+            "Principal": principal,
+            "Action": "bedrock:CreateModelCopyJob",
+            "Resource": "*",
+        }
+        if condition:
+            statement["Condition"] = condition
+        return {"Statement": [statement]}
+
+    def test_model_open_to_every_principal_fails_among_many(self):
+        a, b = self._model("tuned-a"), self._model("tuned-b")
+        findings, _ = self._run(
+            [a, b],
+            {
+                a["modelArn"]: self._allow(
+                    {"AWS": "111122223333"},
+                ),
+                b["modelArn"]: self._allow("*"),
+            },
+        )
+
+        assert [f["Status"] for f in findings] == ["Failed"]
+        detail = findings[0]["Finding_Details"]
+        assert "1 of 2 owned custom model(s)" in detail
+        assert "tuned-b" in detail
+        assert "Also shared: tuned-a" in detail
+
+    def test_wildcard_account_principal_is_unbounded(self):
+        a = self._model("tuned-a")
+        findings, _ = self._run(
+            [a], {a["modelArn"]: self._allow({"AWS": "arn:aws:iam::*:root"})}
+        )
+
+        assert [f["Status"] for f in findings] == ["Failed"]
+        assert "arn:aws:iam::*:root" in findings[0]["Finding_Details"]
+
+    def test_org_scoped_share_is_named_not_failed(self):
+        a = self._model("tuned-a")
+        findings, _ = self._run(
+            [a],
+            {
+                a["modelArn"]: self._allow(
+                    "*", {"StringEquals": {"aws:PrincipalOrgID": "o-abc123"}}
+                )
+            },
+        )
+
+        assert [f["Status"] for f in findings] == ["Passed"]
+        assert "aws:PrincipalOrgID o-abc123" in findings[0]["Finding_Details"]
+
+    def test_model_shared_into_the_account_is_not_read(self):
+        foreign = self._model("theirs", owner="999999999999")
+        mine = self._model("mine")
+        findings, client = self._run([foreign, mine], {})
+
+        assert [f["Status"] for f in findings] == ["Passed"]
+        assert "1 owned custom model(s) read" in findings[0]["Finding_Details"]
+        client.get_resource_policy.assert_called_once_with(resourceArn=mine["modelArn"])
+
+    def test_unreadable_policy_is_na(self):
+        a, b = self._model("tuned-a"), self._model("tuned-b")
+        findings, _ = self._run(
+            [a, b],
+            {
+                a["modelArn"]: _client_error(
+                    "AccessDeniedException", operation="GetResourcePolicy"
+                )
+            },
+        )
+
+        assert [f["Status"] for f in findings] == ["N/A"]
+        assert "tuned-a" in findings[0]["Finding_Details"]
+
+    def test_share_helper_reads_an_account_wildcard_as_every_account(self):
+        # BR-41 reads guardrail policies through the same helper; a named
+        # account with a wildcard role path is still a named share.
+        observed = bedrock_app._guardrail_share_grants(
+            {
+                "Statement": [
+                    {
+                        "Effect": "Allow",
+                        "Principal": {"AWS": "arn:aws:iam::*:root"},
+                        "Action": "bedrock:ApplyGuardrail",
+                    },
+                    {
+                        "Effect": "Allow",
+                        "Principal": {"AWS": "arn:aws:iam::111122223333:role/*"},
+                        "Action": "bedrock:ApplyGuardrail",
+                    },
+                ]
+            },
+            self.ACCOUNT,
+        )
+
+        assert observed["unbounded"] == [
+            "an Allow of bedrock:ApplyGuardrail to arn:aws:iam::*:root with no "
+            "aws:PrincipalOrgID or aws:PrincipalOrgPaths condition"
+        ]
+        assert observed["shared"] == [
+            "an Allow of bedrock:ApplyGuardrail to arn:aws:iam::111122223333:role/*"
+        ]
+
+    def test_models_past_the_cap_are_not_a_clean_result(self):
+        models = [
+            self._model(f"m{index}")
+            for index in range(bedrock_app.MAX_CUSTOM_MODEL_POLICY_READS + 1)
+        ]
+        findings, _ = self._run(models, {})
+
+        assert [f["Status"] for f in findings] == ["N/A"]
+        assert "1 model(s) past the" in findings[0]["Finding_Details"]
+
+
 class TestBR44MarketplaceModelControl:
     """BR-44: Marketplace subscription must be scoped by product."""
 
