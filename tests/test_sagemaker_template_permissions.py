@@ -43,6 +43,8 @@ def test_sagemaker_lambda_templates_include_required_actions():
 # statement must name. A resource-typed action granted on '*' fails here.
 SCOPED_SAGEMAKER_GRANTS = {
     "sagemaker:DescribeEndpointConfig": ":endpoint-config/*'",
+    "organizations:ListTargetsForPolicy": ":policy/o-*/service_control_policy/p-*'",
+    "organizations:ListParents": ":account/o-*/${AWS::AccountId}'",
 }
 
 

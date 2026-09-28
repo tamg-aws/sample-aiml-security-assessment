@@ -804,6 +804,14 @@ _VERIFIED_REMEDIATION_CONDITION_KEYS |= {"aws:ResourceTag"}
 # it in the training network isolation resolution.
 _VERIFIED_REMEDIATION_CONDITION_KEYS |= {"sagemaker:NetworkIsolation"}
 
+# Confirmed the same way on 2026-09-27: both keys are ActionConditionKeys of
+# CreateTrainingJob, and the short names sagemaker:VolumeKmsKey and
+# sagemaker:OutputKmsKey are defined by no action. SM-34 names the ARN keys.
+_VERIFIED_REMEDIATION_CONDITION_KEYS |= {
+    "sagemaker:OutputKmsKeyArn",
+    "sagemaker:VolumeKmsKeyArn",
+}
+
 # Verified the same way on 2026-09-25 for BR-46's per-bucket Macie leg. The
 # knowledge-base data-source operations live on the bedrock-agent client but are
 # authorized under the bedrock: action prefix, so the three near-misses

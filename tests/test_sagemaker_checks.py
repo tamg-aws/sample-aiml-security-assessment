@@ -3753,8 +3753,148 @@ class TestSM33TrainingJobNetworkBoundary:
         assert_could_not_assess_finding(findings[0])
 
 
+def _scp_deny(action, operator, key, value, resource="*"):
+    return {
+        "Effect": "Deny",
+        "Action": action,
+        "Resource": resource,
+        "Condition": {operator: {key: value}},
+    }
+
+
+APPROVED_KEY = "arn:aws:kms:us-east-1:123456789012:key/approved"
+SCP_ENCRYPTION_DENIES = [
+    _scp_deny(
+        "sagemaker:CreateTrainingJob", "Null", "sagemaker:VolumeKmsKeyArn", "true"
+    ),
+    _scp_deny(
+        ["sagemaker:CreateTrainingJob"], "Null", "sagemaker:OutputKmsKeyArn", "true"
+    ),
+    _scp_deny(
+        "sagemaker:CreateTrainingJob",
+        "BoolIfExists",
+        "sagemaker:InterContainerTrafficEncryption",
+        "false",
+    ),
+    _scp_deny(
+        ["sagemaker:CreateEndpointConfig", "sagemaker:CreateNotebookInstance"],
+        "ArnNotEqualsIfExists",
+        "sagemaker:VolumeKmsKeyArn",
+        [APPROVED_KEY],
+    ),
+]
+SCP_NETWORK_DENIES = [
+    _scp_deny("sagemaker:Create*", "Null", "sagemaker:VpcSubnets", "true"),
+]
+SCP_INTERNET_DENIES = [
+    _scp_deny(
+        ["sagemaker:CreateTrainingJob", "sagemaker:CreateEndpointConfig"],
+        "BoolIfExists",
+        "sagemaker:NetworkIsolation",
+        "false",
+    ),
+    _scp_deny(
+        "sagemaker:CreateNotebookInstance",
+        "StringNotEquals",
+        "sagemaker:DirectInternetAccess",
+        "Disabled",
+    ),
+]
+OPEN_SAGEMAKER_ALLOW = {"Effect": "Allow", "Action": "sagemaker:*", "Resource": "*"}
+GUARDED_CREATE_ALLOWS = [
+    {
+        "Effect": "Allow",
+        "Action": "sagemaker:CreateTrainingJob",
+        "Resource": "*",
+        "Condition": {
+            "ArnEquals": {
+                "sagemaker:VolumeKmsKeyArn": APPROVED_KEY,
+                "sagemaker:OutputKmsKeyArn": APPROVED_KEY,
+            },
+            "Bool": {
+                "sagemaker:InterContainerTrafficEncryption": "true",
+                "sagemaker:NetworkIsolation": "true",
+            },
+            "Null": {"sagemaker:VpcSubnets": "false"},
+        },
+    },
+    {
+        "Effect": "Allow",
+        "Action": "sagemaker:CreateEndpointConfig",
+        "Resource": "*",
+        "Condition": {
+            "ArnEquals": {"sagemaker:VolumeKmsKeyArn": APPROVED_KEY},
+            "Bool": {"sagemaker:NetworkIsolation": "true"},
+            "ForAnyValue:StringEquals": {"sagemaker:VpcSecurityGroupIds": ["sg-1"]},
+        },
+    },
+    {
+        "Effect": "Allow",
+        "Action": "sagemaker:CreateNotebookInstance",
+        "Resource": "*",
+        "Condition": {
+            "ArnEquals": {"sagemaker:VolumeKmsKeyArn": APPROVED_KEY},
+            "StringEquals": {"sagemaker:DirectInternetAccess": "Disabled"},
+            "Null": {"sagemaker:VpcSubnets": "false"},
+        },
+    },
+]
+ORG_PATH = {
+    "123456789012": [{"Id": "ou-workloads", "Type": "ORGANIZATIONAL_UNIT"}],
+    "ou-workloads": [{"Id": "r-root", "Type": "ROOT"}],
+}
+
+
+def _creation_cache(roles, boundaries=None, principal_errors=None, version=2):
+    """A v2 IAM cache from {role: [statements]}; version=1 drops the error list."""
+    cache = _role_cache(
+        {
+            name: [(f"{name}-policy", {"Version": "2012-10-17", "Statement": stmts})]
+            for name, stmts in roles.items()
+        }
+    )
+    for name, boundary in (boundaries or {}).items():
+        cache["role_permissions"][name]["permissions_boundary"] = {
+            "Version": "2012-10-17",
+            "Statement": boundary,
+        }
+    if version >= 2:
+        cache["cache_schema_version"] = 2
+        cache["principal_errors"] = principal_errors or []
+    return cache
+
+
+OPEN_CACHE = _creation_cache({"Admin": [OPEN_SAGEMAKER_ALLOW]})
+
+
+def _orgs_path_client(master="999999999999", parents=None, parents_error=None):
+    orgs = MagicMock()
+    orgs.describe_organization.return_value = {
+        "Organization": {"MasterAccountId": master}
+    }
+    tree = ORG_PATH if parents is None else parents
+
+    def get_paginator(operation_name):
+        if operation_name != "list_parents":
+            raise AssertionError(
+                f"unexpected organizations paginator: {operation_name}"
+            )
+        paginator = MagicMock()
+
+        def paginate(**kwargs):
+            if parents_error is not None:
+                raise parents_error
+            return [{"Parents": tree.get(kwargs["ChildId"], [])}]
+
+        paginator.paginate.side_effect = paginate
+        return paginator
+
+    orgs.get_paginator.side_effect = get_paginator
+    return orgs
+
+
 class TestSM34CreationGuardrails:
-    """AIR-SGM-TRN-08: SM-34 asserts an SCP blocks non-compliant creation."""
+    """AIR-SGM-TRN-08: SM-34 asserts creation of non-compliant resources is denied."""
 
     @staticmethod
     def _management_account_clients():
@@ -3766,59 +3906,78 @@ class TestSM34CreationGuardrails:
         sts.get_caller_identity.return_value = {"Account": "123456789012"}
         return _sm_client_factory(organizations=orgs, sts=sts)
 
-    def _run(self, inventory):
-        with patch(
-            "sagemaker_app.boto3.client",
-            side_effect=self._management_account_clients(),
-        ):
+    @staticmethod
+    def _member_account_clients(**kwargs):
+        sts = MagicMock()
+        sts.get_caller_identity.return_value = {"Account": "123456789012"}
+        return _sm_client_factory(organizations=_orgs_path_client(**kwargs), sts=sts)
+
+    def _run(self, inventory, cache=OPEN_CACHE, management=False, **org_kwargs):
+        clients = (
+            self._management_account_clients()
+            if management
+            else self._member_account_clients(**org_kwargs)
+        )
+        with patch("sagemaker_app.boto3.client", side_effect=clients):
             return extract_csv_data(
                 sagemaker_app.check_sagemaker_creation_guardrails(
-                    region="Global", scp_inventory=inventory
+                    region="Global", scp_inventory=inventory, permission_cache=cache
                 )
             )
 
     @staticmethod
-    def _inventory(*documents):
+    def _inventory(*documents, targets=None):
+        attached = (
+            [{"TargetId": "r-root", "Type": "ROOT", "Name": "Root"}]
+            if targets is None
+            else targets
+        )
         return {
             "items": [
-                {"name": name, "id": f"p-{index}", "content": json.dumps(document)}
+                {
+                    "name": name,
+                    "id": f"p-{index}",
+                    "content": json.dumps(document),
+                    "targets": attached,
+                }
                 for index, (name, document) in enumerate(documents)
             ],
             "errors": [],
             "list_error": None,
         }
 
+    @staticmethod
+    def _scp(name, statements):
+        return (name, {"Version": "2012-10-17", "Statement": statements})
+
+    @staticmethod
+    def _by_category(findings):
+        rows = {}
+        for f in findings:
+            for category in (
+                "encryption",
+                "approved network",
+                "no direct internet access",
+            ):
+                if f" {category} requirements" in f["Finding_Details"]:
+                    rows[category] = f
+        return rows
+
     def test_encryption_guard_passes_while_network_and_internet_fail(self):
         findings = self._run(
-            self._inventory(
-                (
-                    "RequireTrainingVolumeKey",
-                    {
-                        "Version": "2012-10-17",
-                        "Statement": [
-                            {
-                                "Effect": "Deny",
-                                "Action": "sagemaker:CreateTrainingJob",
-                                "Resource": "*",
-                                "Condition": {
-                                    "Null": {"sagemaker:VolumeKmsKey": "true"}
-                                },
-                            }
-                        ],
-                    },
-                )
-            )
+            self._inventory(self._scp("RequireTrainingKeys", SCP_ENCRYPTION_DENIES))
         )
         by_status = {}
         for f in findings:
             by_status.setdefault(f["Status"], []).append(f["Finding_Details"])
         assert len(by_status["Passed"]) == 1
         assert "encryption" in by_status["Passed"][0]
-        assert "RequireTrainingVolumeKey" in by_status["Passed"][0]
+        assert "RequireTrainingKeys" in by_status["Passed"][0]
         assert len(by_status["Failed"]) == 2
         failed = " | ".join(by_status["Failed"])
         assert "approved network" in failed
         assert "no direct internet access" in failed
+        assert "Role 'Admin'" in failed
         for f in findings:
             assert f["Check_ID"] == "SM-34"
             assert_finding_schema(f)
@@ -3826,27 +3985,9 @@ class TestSM34CreationGuardrails:
     def test_all_three_guardrails_can_pass(self):
         findings = self._run(
             self._inventory(
-                (
+                self._scp(
                     "SageMakerCreationGuardrails",
-                    {
-                        "Version": "2012-10-17",
-                        "Statement": [
-                            {
-                                "Effect": "Deny",
-                                "Action": "sagemaker:Create*",
-                                "Resource": "*",
-                                "Condition": {
-                                    "Null": {
-                                        "sagemaker:VolumeKmsKey": "true",
-                                        "sagemaker:VpcSubnets": "true",
-                                    },
-                                    "StringNotEquals": {
-                                        "sagemaker:DirectInternetAccess": "Disabled"
-                                    },
-                                },
-                            }
-                        ],
-                    },
+                    SCP_ENCRYPTION_DENIES + SCP_NETWORK_DENIES + SCP_INTERNET_DENIES,
                 )
             )
         )
@@ -3855,51 +3996,43 @@ class TestSM34CreationGuardrails:
     def test_positive_value_deny_is_reported_as_indeterminate(self):
         findings = self._run(
             self._inventory(
-                (
-                    "DenyOneKey",
-                    {
-                        "Version": "2012-10-17",
-                        "Statement": [
-                            {
-                                "Effect": "Deny",
-                                "Action": "sagemaker:CreateTrainingJob",
-                                "Resource": "*",
-                                "Condition": {
-                                    "StringEquals": {
-                                        "sagemaker:VolumeKmsKey": (
-                                            "arn:aws:kms:::key/legacy"
-                                        )
-                                    }
-                                },
-                            }
-                        ],
-                    },
+                self._scp(
+                    "DenyOneSubnet",
+                    [
+                        _scp_deny(
+                            [
+                                "sagemaker:CreateTrainingJob",
+                                "sagemaker:CreateEndpointConfig",
+                                "sagemaker:CreateNotebookInstance",
+                            ],
+                            "StringEquals",
+                            "sagemaker:VpcSubnets",
+                            "subnet-legacy",
+                        )
+                    ],
                 )
             )
         )
         indeterminate = [f for f in findings if f["Status"] == "N/A"]
         assert len(indeterminate) == 1
         assert "depends on that value" in indeterminate[0]["Finding_Details"]
-        assert "DenyOneKey" in indeterminate[0]["Finding_Details"]
+        assert "DenyOneSubnet" in indeterminate[0]["Finding_Details"]
 
     def test_allow_statement_does_not_count_as_a_guardrail(self):
         findings = self._run(
             self._inventory(
-                (
+                self._scp(
                     "AllowWithCondition",
-                    {
-                        "Version": "2012-10-17",
-                        "Statement": [
-                            {
-                                "Effect": "Allow",
-                                "Action": "sagemaker:CreateTrainingJob",
-                                "Resource": "*",
-                                "Condition": {
-                                    "Null": {"sagemaker:VolumeKmsKey": "true"}
-                                },
-                            }
-                        ],
-                    },
+                    [
+                        {
+                            "Effect": "Allow",
+                            "Action": "sagemaker:CreateTrainingJob",
+                            "Resource": "*",
+                            "Condition": {
+                                "Null": {"sagemaker:VolumeKmsKeyArn": "true"}
+                            },
+                        }
+                    ],
                 )
             )
         )
@@ -3908,42 +4041,28 @@ class TestSM34CreationGuardrails:
     def test_deny_on_an_unrelated_service_does_not_count(self):
         findings = self._run(
             self._inventory(
-                (
+                self._scp(
                     "DenyBedrock",
-                    {
-                        "Version": "2012-10-17",
-                        "Statement": [
-                            {
-                                "Effect": "Deny",
-                                "Action": "bedrock:InvokeModel",
-                                "Resource": "*",
-                                "Condition": {
-                                    "Null": {"sagemaker:VolumeKmsKey": "true"}
-                                },
-                            }
-                        ],
-                    },
+                    [
+                        _scp_deny(
+                            "bedrock:InvokeModel",
+                            "Null",
+                            "sagemaker:VolumeKmsKeyArn",
+                            "true",
+                        )
+                    ],
                 )
             )
         )
         assert [f["Status"] for f in findings] == ["Failed", "Failed", "Failed"]
 
     def test_member_account_run_reports_unassessed(self):
-        orgs = MagicMock()
-        orgs.describe_organization.return_value = {
-            "Organization": {"MasterAccountId": "999999999999"}
-        }
-        sts = MagicMock()
-        sts.get_caller_identity.return_value = {"Account": "123456789012"}
-        with patch(
-            "sagemaker_app.boto3.client",
-            side_effect=_sm_client_factory(organizations=orgs, sts=sts),
-        ):
-            findings = extract_csv_data(
-                sagemaker_app.check_sagemaker_creation_guardrails(region="Global")
-            )
+        findings = self._run(
+            {"items": [], "errors": [], "list_error": "AccessDenied"}, cache=None
+        )
         assert [f["Status"] for f in findings] == ["N/A"]
         assert "management account" in findings[0]["Finding_Details"]
+        assert "delegated administrator" in findings[0]["Finding_Details"]
 
     def test_organizations_not_in_use_reports_unassessed(self):
         orgs = MagicMock()
@@ -3962,10 +4081,312 @@ class TestSM34CreationGuardrails:
 
     def test_list_failure_reports_unassessed(self):
         findings = self._run(
-            {"items": [], "errors": [], "list_error": "AccessDeniedException"}
+            {"items": [], "errors": [], "list_error": "AccessDeniedException"},
+            cache=None,
+            management=True,
         )
         assert [f["Status"] for f in findings] == ["N/A"]
         assert "could not be listed" in findings[0]["Finding_Details"]
+
+    def test_short_key_names_enforce_nothing(self):
+        findings = self._run(
+            self._inventory(
+                self._scp(
+                    "ShortNames",
+                    [
+                        _scp_deny(
+                            "sagemaker:Create*",
+                            "Null",
+                            "sagemaker:VolumeKmsKey",
+                            "true",
+                        ),
+                        _scp_deny(
+                            "sagemaker:Create*",
+                            "Null",
+                            "sagemaker:OutputKmsKey",
+                            "true",
+                        ),
+                    ],
+                )
+            )
+        )
+        row = self._by_category(findings)["encryption"]
+        assert row["Status"] == "Failed"
+        assert "5 of 5 encryption requirements" in row["Finding_Details"]
+
+    def test_a_key_guards_only_the_actions_it_is_paired_with(self):
+        findings = self._run(
+            self._inventory(
+                self._scp(
+                    "NotebookKeyOnly",
+                    [
+                        _scp_deny(
+                            "sagemaker:CreateNotebookInstance",
+                            "Null",
+                            "sagemaker:VolumeKmsKeyArn",
+                            "true",
+                        )
+                    ],
+                )
+            )
+        )
+        row = self._by_category(findings)["encryption"]
+        assert row["Status"] == "Failed"
+        assert "4 of 5 encryption requirements" in row["Finding_Details"]
+        assert (
+            "CreateTrainingJob on sagemaker:VolumeKmsKeyArn" in row["Finding_Details"]
+        )
+        assert "CreateNotebookInstance" not in row["Finding_Details"]
+
+    def test_an_unattached_scp_does_not_guard_the_account(self):
+        findings = self._run(
+            self._inventory(
+                self._scp("SageMakerNetwork", SCP_NETWORK_DENIES),
+                targets=[{"TargetId": "ou-sandbox", "Type": "ORGANIZATIONAL_UNIT"}],
+            )
+        )
+        row = self._by_category(findings)["approved network"]
+        assert row["Status"] == "Failed"
+        assert "not attached to this account" in row["Finding_Details"]
+
+    def test_an_scp_attached_to_an_ou_above_the_account_guards_it(self):
+        findings = self._run(
+            self._inventory(
+                self._scp("SageMakerNetwork", SCP_NETWORK_DENIES),
+                targets=[{"TargetId": "ou-workloads", "Type": "ORGANIZATIONAL_UNIT"}],
+            )
+        )
+        row = self._by_category(findings)["approved network"]
+        assert row["Status"] == "Passed"
+        assert "SageMakerNetwork" in row["Finding_Details"]
+
+    def test_an_unread_account_path_is_not_read_not_failed(self):
+        findings = self._run(
+            self._inventory(self._scp("SageMakerNetwork", SCP_NETWORK_DENIES)),
+            parents_error=_make_client_error("AccessDeniedException"),
+        )
+        assert [f["Status"] for f in findings] == ["N/A", "N/A", "N/A"]
+        assert "organizations:ListParents" in findings[1]["Finding_Details"]
+
+    def test_an_unread_attachment_is_not_read(self):
+        inventory = self._inventory(self._scp("SageMakerNetwork", SCP_NETWORK_DENIES))
+        del inventory["items"][0]["targets"]
+        inventory["items"][0]["targets_error"] = "AccessDeniedException"
+        row = self._by_category(self._run(inventory))["approved network"]
+        assert row["Status"] == "N/A"
+        assert "attachment of service control policy" in row["Finding_Details"]
+
+    def test_an_unread_policy_document_blocks_the_failed_and_passed(self):
+        inventory = self._inventory()
+        inventory["errors"] = ["policy 'Hidden': AccessDenied"]
+        findings = self._run(inventory)
+        assert [f["Status"] for f in findings] == ["N/A", "N/A", "N/A"]
+        assert "policy 'Hidden'" in findings[0]["Finding_Details"]
+
+    def test_bool_false_without_ifexists_leaves_an_omitted_key_open(self):
+        findings = self._run(
+            self._inventory(
+                self._scp(
+                    "IsolationBool",
+                    [
+                        _scp_deny(
+                            "sagemaker:Create*",
+                            "Bool",
+                            "sagemaker:NetworkIsolation",
+                            "false",
+                        )
+                    ],
+                )
+            )
+        )
+        row = self._by_category(findings)["no direct internet access"]
+        assert row["Status"] == "Failed"
+        assert "does not deny a request that omits the key" in row["Finding_Details"]
+
+    def test_forallvalues_negated_enforces_and_foranyvalue_does_not(self):
+        def network_row(operator):
+            return self._by_category(
+                self._run(
+                    self._inventory(
+                        self._scp(
+                            "SubnetAllowList",
+                            [
+                                _scp_deny(
+                                    "sagemaker:Create*",
+                                    operator,
+                                    "sagemaker:VpcSubnets",
+                                    ["subnet-1"],
+                                )
+                            ],
+                        )
+                    )
+                )
+            )["approved network"]
+
+        assert network_row("ForAllValues:StringNotEquals")["Status"] == "Passed"
+        assert network_row("ForAnyValue:StringNotEquals")["Status"] == "Failed"
+
+    def test_a_deny_with_a_second_condition_or_narrow_resource_is_not_enforcing(self):
+        conjunctive = _scp_deny(
+            "sagemaker:Create*", "Null", "sagemaker:VpcSubnets", "true"
+        )
+        conjunctive["Condition"]["ArnNotLike"] = {
+            "aws:PrincipalArn": "arn:aws:iam::*:role/BreakGlass"
+        }
+        narrow = _scp_deny(
+            "sagemaker:Create*",
+            "Null",
+            "sagemaker:VpcSubnets",
+            "true",
+            resource="arn:aws:sagemaker:*:*:training-job/team-a-*",
+        )
+        for statement in (conjunctive, narrow):
+            row = self._by_category(
+                self._run(self._inventory(self._scp("Scoped", [statement])))
+            )["approved network"]
+            assert row["Status"] == "N/A"
+            assert "alongside other conditions" in row["Finding_Details"]
+
+    def test_identity_conditions_pass_when_every_principal_is_guarded(self):
+        cache = _creation_cache({"Builder": GUARDED_CREATE_ALLOWS})
+        findings = self._run(self._inventory(), cache=cache)
+        assert [f["Status"] for f in findings] == ["Passed", "Passed", "Passed"]
+        assert "identity policies of every principal" in findings[0]["Finding_Details"]
+        assert "not evaluated per principal" in findings[0]["Finding_Details"]
+
+    def test_one_open_principal_among_two_fails_and_is_named(self):
+        cache = _creation_cache(
+            {"Builder": GUARDED_CREATE_ALLOWS, "Admin": [OPEN_SAGEMAKER_ALLOW]}
+        )
+        findings = self._run(self._inventory(), cache=cache)
+        assert [f["Status"] for f in findings] == ["Failed", "Failed", "Failed"]
+        assert "Role 'Admin'" in findings[0]["Finding_Details"]
+        assert "Role 'Builder'" not in findings[0]["Finding_Details"]
+
+    def test_an_ifexists_allow_condition_does_not_guard(self):
+        allow = {
+            "Effect": "Allow",
+            "Action": "sagemaker:CreateNotebookInstance",
+            "Resource": "*",
+            "Condition": {
+                "StringEqualsIfExists": {"sagemaker:DirectInternetAccess": "Disabled"}
+            },
+        }
+        cache = _creation_cache({"Builder": GUARDED_CREATE_ALLOWS[:2] + [allow]})
+        row = self._by_category(self._run(self._inventory(), cache=cache))[
+            "no direct internet access"
+        ]
+        assert row["Status"] == "Failed"
+        assert "CreateNotebookInstance" in row["Finding_Details"]
+
+    def test_a_guarding_permissions_boundary_intersects_an_open_policy(self):
+        cache = _creation_cache(
+            {"Admin": [OPEN_SAGEMAKER_ALLOW]},
+            boundaries={"Admin": GUARDED_CREATE_ALLOWS},
+        )
+        findings = self._run(self._inventory(), cache=cache)
+        assert [f["Status"] for f in findings] == ["Passed", "Passed", "Passed"]
+
+    def test_an_open_boundary_does_not_hide_an_open_policy(self):
+        cache = _creation_cache(
+            {"Admin": [OPEN_SAGEMAKER_ALLOW]},
+            boundaries={"Admin": [OPEN_SAGEMAKER_ALLOW]},
+        )
+        findings = self._run(self._inventory(), cache=cache)
+        assert [f["Status"] for f in findings] == ["Failed", "Failed", "Failed"]
+
+    def test_unread_principals_block_the_identity_pass_and_are_named(self):
+        cache = _creation_cache(
+            {"Builder": GUARDED_CREATE_ALLOWS},
+            principal_errors=[
+                {
+                    "type": "role",
+                    "name": "Hidden",
+                    "stage": "list_attached_role_policies",
+                    "error": "AccessDenied",
+                }
+            ],
+        )
+        findings = self._run(self._inventory(), cache=cache)
+        assert [f["Status"] for f in findings] == ["N/A", "N/A", "N/A"]
+        assert "Role 'Hidden'" in findings[0]["Finding_Details"]
+
+    def test_a_v1_cache_passes_and_says_errors_were_not_recorded(self):
+        cache = _creation_cache({"Builder": GUARDED_CREATE_ALLOWS}, version=1)
+        findings = self._run(self._inventory(), cache=cache)
+        assert [f["Status"] for f in findings] == ["Passed", "Passed", "Passed"]
+        assert "schema version 1" in findings[0]["Finding_Details"]
+
+    def test_management_account_is_not_guarded_by_any_scp(self):
+        inventory = self._inventory(
+            self._scp(
+                "SageMakerCreationGuardrails",
+                SCP_ENCRYPTION_DENIES + SCP_NETWORK_DENIES + SCP_INTERNET_DENIES,
+            )
+        )
+        findings = self._run(inventory, management=True)
+        assert [f["Status"] for f in findings] == ["Failed", "Failed", "Failed"]
+        assert (
+            "do not apply to the organization management account"
+            in (findings[0]["Finding_Details"])
+        )
+        guarded = self._run(
+            inventory,
+            cache=_creation_cache({"Builder": GUARDED_CREATE_ALLOWS}),
+            management=True,
+        )
+        assert [f["Status"] for f in guarded] == ["Passed", "Passed", "Passed"]
+
+    def test_inventory_reads_attachment_targets_for_every_policy(self):
+        orgs = MagicMock()
+        calls = []
+
+        def get_paginator(operation_name):
+            paginator = MagicMock()
+
+            def paginate(**kwargs):
+                calls.append((operation_name, kwargs))
+                if operation_name == "list_policies":
+                    return [
+                        {"Policies": [{"Id": "p-1", "Name": "One"}]},
+                        {"Policies": [{"Id": "p-2", "Name": "Two"}]},
+                    ]
+                if kwargs["PolicyId"] == "p-2":
+                    raise _make_client_error("AccessDeniedException")
+                return [
+                    {"Targets": [{"TargetId": "ou-a", "Type": "ORGANIZATIONAL_UNIT"}]},
+                    {"Targets": [{"TargetId": "r-root", "Type": "ROOT"}]},
+                ]
+
+            paginator.paginate.side_effect = paginate
+            return paginator
+
+        orgs.get_paginator.side_effect = get_paginator
+        orgs.describe_policy.return_value = {"Policy": {"Content": "{}"}}
+        with patch(
+            "sagemaker_app.boto3.client",
+            side_effect=_sm_client_factory(organizations=orgs),
+        ):
+            inventory = sagemaker_app.get_sagemaker_scp_inventory()
+        first, second = inventory["items"]
+        assert [t["TargetId"] for t in first["targets"]] == ["ou-a", "r-root"]
+        assert second["targets_error"] == "AccessDeniedException"
+        assert ("list_targets_for_policy", {"PolicyId": "p-2"}) in calls
+
+    def test_account_path_walks_every_ou_to_the_root(self):
+        tree = {
+            "123456789012": [{"Id": "ou-inner", "Type": "ORGANIZATIONAL_UNIT"}],
+            "ou-inner": [{"Id": "ou-outer", "Type": "ORGANIZATIONAL_UNIT"}],
+            "ou-outer": [{"Id": "r-root", "Type": "ROOT"}],
+        }
+        with patch(
+            "sagemaker_app.boto3.client",
+            side_effect=_sm_client_factory(
+                organizations=_orgs_path_client(parents=tree)
+            ),
+        ):
+            path = sagemaker_app._sm_account_policy_path("123456789012")
+        assert path == ["123456789012", "ou-inner", "ou-outer", "r-root"]
 
 
 # ===================================================================

@@ -7608,60 +7608,85 @@ CREATION_GUARDRAIL_REFERENCE = (
     "https://docs.aws.amazon.com/sagemaker/latest/dg/security_iam_service-with-iam.html"
 )
 
-SAGEMAKER_CREATION_ACTIONS = (
-    "sagemaker:createtrainingjob",
-    "sagemaker:createmodel",
-    "sagemaker:createendpoint",
-    "sagemaker:createendpointconfig",
-    "sagemaker:createnotebookinstance",
-    "sagemaker:createprocessingjob",
-    "sagemaker:createtransformjob",
-    "sagemaker:createhyperparametertuningjob",
-    "sagemaker:createautomljob",
-    "sagemaker:createautomljobv2",
+# The creation actions this control names, with the resource type each creates.
+SAGEMAKER_GUARDED_CREATE_ACTIONS = (
+    ("sagemaker:CreateTrainingJob", "training-job"),
+    ("sagemaker:CreateEndpointConfig", "endpoint-config"),
+    ("sagemaker:CreateNotebookInstance", "notebook-instance"),
 )
 
-# Each guardrail category and the SageMaker condition keys that enforce it at
-# creation time. Every key was confirmed to exist in the sagemaker service
-# authorization vocabulary before being listed here.
+# Each guardrail category as (action, key group) requirements. Every requirement
+# must be enforced, and any one key of its group enforces it. Each key is listed
+# as an ActionConditionKey of its action in the sagemaker service-reference JSON
+# (read 2026-09-27). sagemaker:VolumeKmsKey and sagemaker:OutputKmsKey are listed
+# service-wide but no action defines them, so a condition on either enforces
+# nothing and neither is accepted.
 SAGEMAKER_CREATION_GUARDRAILS = (
     (
         "encryption",
         (
-            "sagemaker:volumekmskey",
-            "sagemaker:outputkmskey",
-            "sagemaker:intercontainertrafficencryption",
+            ("sagemaker:CreateTrainingJob", ("sagemaker:VolumeKmsKeyArn",)),
+            ("sagemaker:CreateTrainingJob", ("sagemaker:OutputKmsKeyArn",)),
+            (
+                "sagemaker:CreateTrainingJob",
+                ("sagemaker:InterContainerTrafficEncryption",),
+            ),
+            ("sagemaker:CreateEndpointConfig", ("sagemaker:VolumeKmsKeyArn",)),
+            ("sagemaker:CreateNotebookInstance", ("sagemaker:VolumeKmsKeyArn",)),
         ),
-        "sagemaker:VolumeKmsKey, sagemaker:OutputKmsKey or "
-        "sagemaker:InterContainerTrafficEncryption",
     ),
     (
         "approved network",
-        (
-            "sagemaker:vpcsubnets",
-            "sagemaker:vpcsecuritygroupids",
-            "sagemaker:networkisolation",
+        tuple(
+            (action, ("sagemaker:VpcSubnets", "sagemaker:VpcSecurityGroupIds"))
+            for action, _ in SAGEMAKER_GUARDED_CREATE_ACTIONS
         ),
-        "sagemaker:VpcSubnets, sagemaker:VpcSecurityGroupIds or "
-        "sagemaker:NetworkIsolation",
     ),
     (
         "no direct internet access",
-        ("sagemaker:directinternetaccess",),
-        "sagemaker:DirectInternetAccess",
+        (
+            ("sagemaker:CreateTrainingJob", ("sagemaker:NetworkIsolation",)),
+            ("sagemaker:CreateEndpointConfig", ("sagemaker:NetworkIsolation",)),
+            ("sagemaker:CreateNotebookInstance", ("sagemaker:DirectInternetAccess",)),
+        ),
     ),
+)
+
+# Keys whose compliant request value is fixed. The other keys take the
+# customer's approved KMS keys, subnets or security groups, so any value list is
+# accepted for them.
+CREATION_KEY_COMPLIANT_VALUES = {
+    "sagemaker:intercontainertrafficencryption": "true",
+    "sagemaker:networkisolation": "true",
+    "sagemaker:directinternetaccess": "disabled",
+}
+CREATION_KEY_NONCOMPLIANT_VALUES = {
+    "sagemaker:intercontainertrafficencryption": "false",
+    "sagemaker:networkisolation": "false",
+    "sagemaker:directinternetaccess": "enabled",
+}
+CREATION_PROBE_PARTITIONS = ("aws", "aws-cn", "aws-us-gov")
+MANAGEMENT_ACCOUNT_SCP_NOTE = (
+    "Service control policies do not apply to the organization management "
+    "account, so none guards SageMaker creation in this account."
 )
 
 
 def _sm_organization_policy_context() -> Dict[str, Any]:
     """
-    Resolve whether organization policy documents can be read from this account.
+    Resolve the organization, this account and whether it is the management account.
 
-    ListPolicies and DescribePolicy answer only in the management account or a
-    delegated administrator, so a member-account run has to report the control as
-    unassessed instead of reporting the policy as absent.
+    A member account can read policy documents and attachments only when it is a
+    delegated administrator for Organizations policy management, so the reads are
+    attempted and their failure is reported, instead of assuming either way.
     """
-    context = {"readable": False, "detail": "", "resolution": "", "account": ""}
+    context = {
+        "state": "read",
+        "detail": "",
+        "resolution": "",
+        "account": "",
+        "management": False,
+    }
 
     orgs_client = boto3.client("organizations", config=boto3_config)
     try:
@@ -7673,6 +7698,7 @@ def _sm_organization_policy_context() -> Dict[str, Any]:
     except ClientError as error:
         error_code = error.response.get("Error", {}).get("Code", "")
         if error_code == "AWSOrganizationsNotInUseException":
+            context["state"] = "none"
             context["detail"] = (
                 "AWS Organizations is not in use for this account, so no service "
                 "control policy can exist to enforce this control"
@@ -7683,6 +7709,7 @@ def _sm_organization_policy_context() -> Dict[str, Any]:
             )
             return context
         if error_code in ACCESS_DENIED_ERROR_CODES:
+            context["state"] = "unread"
             context["detail"] = (
                 "the organization could not be read "
                 f"({get_assessment_error_label(error)}), so service control "
@@ -7696,24 +7723,12 @@ def _sm_organization_policy_context() -> Dict[str, Any]:
             return context
         raise
 
-    if context["account"] != master_account_id:
-        context["detail"] = (
-            "service control policy documents are readable only from the "
-            "organization management account or a delegated administrator, and "
-            f"this assessment ran in account {context['account']}"
-        )
-        context["resolution"] = (
-            "Run the assessment from the organization management account to "
-            "assess this preventive control."
-        )
-        return context
-
-    context["readable"] = True
+    context["management"] = context["account"] == master_account_id
     return context
 
 
 def get_sagemaker_scp_inventory() -> Dict[str, Any]:
-    """Read every service control policy document once."""
+    """Read every service control policy document and its attachment targets once."""
     inventory = {"items": [], "errors": [], "list_error": None}
     orgs_client = boto3.client("organizations", config=boto3_config)
 
@@ -7723,7 +7738,7 @@ def get_sagemaker_scp_inventory() -> Dict[str, Any]:
         for page in paginator.paginate(Filter="SERVICE_CONTROL_POLICY"):
             policies.extend(page.get("Policies", []))
     except Exception as error:
-        inventory["list_error"] = str(error)
+        inventory["list_error"] = get_assessment_error_label(error)
         return inventory
 
     for policy in policies:
@@ -7741,84 +7756,524 @@ def get_sagemaker_scp_inventory() -> Dict[str, Any]:
         except Exception as error:
             inventory["errors"].append(f"policy '{policy_name}': {str(error)}")
             continue
-        inventory["items"].append(
-            {"name": policy_name, "id": policy_id, "content": content}
-        )
+        item = {"name": policy_name, "id": policy_id, "content": content}
+        try:
+            targets = []
+            target_paginator = orgs_client.get_paginator("list_targets_for_policy")
+            for page in target_paginator.paginate(PolicyId=policy_id):
+                targets.extend(page.get("Targets", []))
+            item["targets"] = targets
+        except ClientError as error:
+            item["targets_error"] = get_assessment_error_label(error)
+        inventory["items"].append(item)
 
     return inventory
 
 
-def _statement_denies_sagemaker_creation(statement: Dict[str, Any]) -> bool:
-    """Return whether a Deny statement reaches a SageMaker creation action."""
-    if str(statement.get("Effect", "")).upper() != "DENY":
+def _sm_account_policy_path(account_id: str) -> List[str]:
+    """
+    Return this account, every OU above it and the root, from ListParents.
+
+    An SCP governs the account when it is attached to any of these.
+    """
+    orgs_client = boto3.client("organizations", config=boto3_config)
+    path = [account_id]
+    child = account_id
+    # Organizations nests OUs at most five deep under the root.
+    for _ in range(8):
+        parents = []
+        for page in orgs_client.get_paginator("list_parents").paginate(ChildId=child):
+            parents.extend(page.get("Parents", []))
+        if not parents or not parents[0].get("Id"):
+            break
+        path.append(parents[0]["Id"])
+        if parents[0].get("Type") == "ROOT":
+            break
+        child = parents[0]["Id"]
+    return path
+
+
+def _condition_operator_parts(operator: str) -> tuple:
+    """Split a condition operator into (set prefix, base operator, IfExists)."""
+    name = str(operator).strip().lower()
+    prefix = ""
+    for candidate in ("forallvalues:", "foranyvalue:"):
+        if name.startswith(candidate):
+            prefix = candidate[:-1]
+            name = name[len(candidate) :]
+    if_exists = name.endswith("ifexists")
+    if if_exists:
+        name = name[: -len("ifexists")]
+    return prefix, name, if_exists
+
+
+def _condition_entries(statement: Dict[str, Any]) -> List[tuple]:
+    """Return (operator, lowercased key, lowercased values) for each condition."""
+    condition = statement.get("Condition")
+    if not isinstance(condition, dict):
+        return []
+    entries = []
+    for operator, block in condition.items():
+        if not isinstance(block, dict):
+            continue
+        for key, value in block.items():
+            entries.append(
+                (
+                    str(operator),
+                    str(key).lower(),
+                    [str(item).lower() for item in _policy_values(value)],
+                )
+            )
+    return entries
+
+
+def _statement_names_action(statement: Dict[str, Any], action: str) -> bool:
+    """Return whether a statement's Action or NotAction reaches action."""
+    if "Action" in statement:
+        return any(
+            _iam_action_matches(p, action) for p in _policy_values(statement["Action"])
+        )
+    if "NotAction" in statement:
+        return not any(
+            _iam_action_matches(p, action)
+            for p in _policy_values(statement["NotAction"])
+        )
+    return False
+
+
+def _deny_covers_every_resource(statement: Dict[str, Any], resource_type: str) -> bool:
+    """Return whether a Deny's Resource matches every resource of that type."""
+    if "NotResource" in statement:
         return False
-    for action in _policy_values(statement.get("Action")) + _policy_values(
-        statement.get("NotAction")
-    ):
-        normalized = action.lower()
-        if normalized in SAGEMAKER_CREATION_ACTIONS:
-            return True
-        if normalized in ("*", "sagemaker:*", "sagemaker:create*"):
+    for pattern in _policy_values(statement.get("Resource")):
+        for partition in CREATION_PROBE_PARTITIONS:
+            probe = (
+                f"arn:{partition}:sagemaker:zz-probe-1:000000000000:"
+                f"{resource_type}/zz-probe"
+            )
+            if _iam_action_matches(pattern, probe):
+                return True
+    return False
+
+
+def _deny_guard_strength(statement: Dict[str, Any], keys: tuple) -> Optional[str]:
+    """
+    Classify how a Deny statement holds one key group.
+
+    "enforced": it fires when the key is absent or holds a non-compliant value.
+    "value": it fires only for one named value whose compliance this check does
+    not judge. "absent-open": it does not fire when the request omits the key.
+    "conjunctive": the key shares the statement with other conditions, so the
+    deny fires only when all of them hold. None: the key is not named.
+    """
+    entries = _condition_entries(statement)
+    matched = [entry for entry in entries if entry[1] in keys]
+    if not matched:
+        return None
+    if len(entries) > 1:
+        return "conjunctive"
+    operator, key, values = matched[0]
+    prefix, base, if_exists = _condition_operator_parts(operator)
+    if base == "null":
+        return "enforced" if "true" in values else "value"
+    if "not" in base:
+        # A negated operator is true for an absent key, except under
+        # ForAnyValue, which is false over an empty set.
+        return "absent-open" if prefix == "foranyvalue" else "enforced"
+    noncompliant = CREATION_KEY_NONCOMPLIANT_VALUES.get(key)
+    if noncompliant is not None and noncompliant in values:
+        if if_exists or prefix == "forallvalues":
+            return "enforced"
+        return "absent-open"
+    return "value"
+
+
+def _allow_enforces_key(statement: Dict[str, Any], keys: tuple) -> bool:
+    """
+    Return whether an Allow grants only requests that carry a compliant key.
+
+    IfExists, ForAllValues and negated operators all match a request that omits
+    the key, so none of them enforces it.
+    """
+    for operator, key, values in _condition_entries(statement):
+        if key not in keys:
+            continue
+        prefix, base, if_exists = _condition_operator_parts(operator)
+        if if_exists or prefix == "forallvalues" or "not" in base:
+            continue
+        compliant = CREATION_KEY_COMPLIANT_VALUES.get(key)
+        if base == "null":
+            if compliant is None and values == ["false"]:
+                return True
+            continue
+        if compliant is None or (values and all(v == compliant for v in values)):
             return True
     return False
 
 
-def _creation_guard_strength(statement: Dict[str, Any], keys: tuple) -> Optional[str]:
-    """
-    Classify how one Deny statement constrains a creation parameter.
+def _statements_leave_creation_open(
+    allow_statements: List[Dict[str, Any]], action: str, keys: tuple
+) -> bool:
+    """Return whether an Allow reaches action with no condition enforcing keys."""
+    return any(
+        _statement_allows_action(statement, action)
+        and not _allow_enforces_key(statement, keys)
+        for statement in allow_statements
+    )
 
-    Returns "enforced" for a Deny that fires when the parameter is absent or
-    holds a value other than the approved one, "ambiguous" for a Deny that names
-    one specific value (whether that value is the non-compliant one depends on
-    the value, which this check does not interpret), and None when the statement
-    does not mention the parameter at all.
+
+def _denies_enforce(
+    statements: List[Dict[str, Any]], action: str, resource_type: str, keys: tuple
+) -> bool:
+    return any(
+        str(statement.get("Effect", "")).upper() == "DENY"
+        and _statement_names_action(statement, action)
+        and _deny_covers_every_resource(statement, resource_type)
+        and _deny_guard_strength(statement, keys) == "enforced"
+        for statement in statements
+    )
+
+
+def _creation_identity_leg(
+    permission_cache: Optional[Dict[str, Any]], action: str, keys: tuple
+) -> Dict[str, Any]:
     """
-    condition = statement.get("Condition", {})
-    if not isinstance(condition, dict):
-        return None
-    strength = None
-    for operator, condition_keys in condition.items():
-        if not isinstance(condition_keys, dict):
-            continue
-        operator_name = str(operator).lower()
-        for key, value in condition_keys.items():
-            if str(key).lower() not in keys:
+    Report which cached principals can call action without the key enforced.
+
+    A permissions boundary is an intersection: a principal is open only when
+    both its identity policies and its boundary allow the call without the key.
+    """
+    if permission_cache is None:
+        return {"state": "unread", "principals": [], "v1": False}
+    resource_type = dict(SAGEMAKER_GUARDED_CREATE_ACTIONS)[action]
+    open_principals = []
+    for identity_type, cache_key in (
+        ("Role", "role_permissions"),
+        ("User", "user_permissions"),
+    ):
+        for name, permissions in (permission_cache.get(cache_key) or {}).items():
+            statements = []
+            for policy in (permissions.get("attached_policies") or []) + (
+                permissions.get("inline_policies") or []
+            ):
+                statements.extend(_sm_policy_statements(policy.get("document")))
+            boundary = permissions.get("permissions_boundary")
+            boundary_statements = (
+                _sm_policy_statements(boundary) if boundary is not None else []
+            )
+            if _denies_enforce(
+                statements + boundary_statements, action, resource_type, keys
+            ):
                 continue
-            values = [str(item).lower() for item in _policy_values(value)]
-            if operator_name.endswith("null") and "true" in values:
-                return "enforced"
-            if "not" in operator_name:
-                return "enforced"
-            if operator_name.endswith("bool") and "false" in values:
-                return "enforced"
-            strength = "ambiguous"
-    return strength
+            if not _statements_leave_creation_open(statements, action, keys):
+                continue
+            if boundary is not None and not _statements_leave_creation_open(
+                boundary_statements, action, keys
+            ):
+                continue
+            open_principals.append(f"{identity_type} '{name}'")
+    unread = _cache_unread_principals(permission_cache)
+    if open_principals:
+        return {"state": "open", "principals": open_principals, "v1": unread is None}
+    if unread:
+        return {"state": "incomplete", "principals": unread, "v1": False}
+    return {"state": "guarded", "principals": [], "v1": unread is None}
+
+
+def _creation_scp_leg(scp: Dict[str, Any], action: str, keys: tuple) -> Dict[str, Any]:
+    """
+    Report whether an SCP governing this account enforces keys on action.
+
+    Returns a state of "enforced", "unattached", "value", "absent-open",
+    "conjunctive", "attachment-unread", "missing" or the leg-wide state
+    ("none", "unread", "exempt"), with the policy names behind it.
+    """
+    if scp["state"] != "read":
+        return {"state": scp["state"], "policies": []}
+    resource_type = dict(SAGEMAKER_GUARDED_CREATE_ACTIONS)[action]
+    found = {}
+    for item in scp["items"]:
+        for statement in _sm_policy_statements(item.get("content")):
+            if str(statement.get("Effect", "")).upper() != "DENY":
+                continue
+            if not _statement_names_action(statement, action):
+                continue
+            strength = _deny_guard_strength(statement, keys)
+            if strength is None:
+                continue
+            if strength == "enforced" and not _deny_covers_every_resource(
+                statement, resource_type
+            ):
+                strength = "conjunctive"
+            if strength == "enforced":
+                if "targets_error" in item:
+                    strength = "attachment-unread"
+                elif not {
+                    target.get("TargetId") for target in item.get("targets") or []
+                } & set(scp["path"]):
+                    strength = "unattached"
+            found.setdefault(strength, [])
+            if item["name"] not in found[strength]:
+                found[strength].append(item["name"])
+    if "enforced" not in found and scp.get("unread_policies"):
+        return {"state": "documents-unread", "policies": scp["unread_policies"]}
+    for state in (
+        "enforced",
+        "attachment-unread",
+        "conjunctive",
+        "value",
+        "absent-open",
+        "unattached",
+    ):
+        if state in found:
+            return {"state": state, "policies": found[state]}
+    return {"state": "missing", "policies": []}
+
+
+def _creation_requirement_label(action: str, keys: tuple) -> str:
+    return f"{action.split(':', 1)[1]} on {' or '.join(keys)}"
+
+
+def _creation_scp_reason(scp_leg: Dict[str, Any], scp: Dict[str, Any]) -> str:
+    names = ", ".join(f"'{name}'" for name in scp_leg["policies"][:3])
+    state = scp_leg["state"]
+    if state in ("none", "unread", "exempt"):
+        return scp["detail"]
+    if state == "documents-unread":
+        return (
+            f"{len(scp_leg['policies'])} service control policy document(s) could "
+            f"not be read ({'; '.join(scp_leg['policies'][:5])})"
+        )
+    if state == "attachment-unread":
+        return f"the attachment of service control policy {names} could not be read"
+    if state == "unattached":
+        return (
+            f"service control policy {names} enforces it but is not attached to "
+            "this account, an OU above it or the root"
+        )
+    if state == "conjunctive":
+        return (
+            f"service control policy {names} names the key alongside other "
+            "conditions or on named resources only, so it denies only when all of "
+            "them hold"
+        )
+    if state == "value":
+        return (
+            f"service control policy {names} denies one named value, so whether "
+            "the guardrail holds depends on that value"
+        )
+    if state == "absent-open":
+        return (
+            f"service control policy {names} does not deny a request that omits the key"
+        )
+    return "no service control policy Deny on this action names the key"
+
+
+def _creation_category_finding(
+    category: str,
+    requirements: tuple,
+    scp: Dict[str, Any],
+    permission_cache: Optional[Dict[str, Any]],
+    region: str,
+) -> Dict[str, Any]:
+    met = []
+    failed = []
+    unresolved = []
+    v1 = False
+    used_identity = False
+    for action, keys in requirements:
+        label = _creation_requirement_label(action, keys)
+        scp_leg = _creation_scp_leg(scp, action, tuple(k.lower() for k in keys))
+        if scp_leg["state"] == "enforced":
+            met.append(
+                f"{label} by service control policy "
+                f"{', '.join(repr(n) for n in scp_leg['policies'][:3])}"
+            )
+            continue
+        identity = _creation_identity_leg(
+            permission_cache, action, tuple(k.lower() for k in keys)
+        )
+        v1 = v1 or identity["v1"]
+        scp_reason = _creation_scp_reason(scp_leg, scp)
+        if identity["state"] == "guarded":
+            used_identity = True
+            met.append(
+                f"{label} by the identity policies of every principal that can call it"
+            )
+        elif identity["state"] == "open" and scp_leg["state"] in (
+            "missing",
+            "absent-open",
+            "unattached",
+            "none",
+            "exempt",
+        ):
+            shown = ", ".join(identity["principals"][:5])
+            if len(identity["principals"]) > 5:
+                shown += f" and {len(identity['principals']) - 5} more"
+            failed.append(
+                f"{label}: {scp_reason}, and {shown} can call it with no condition "
+                "on that key"
+            )
+        elif identity["state"] == "open":
+            unresolved.append(
+                f"{label}: {scp_reason}, and {', '.join(identity['principals'][:5])} "
+                "can call it with no condition on that key"
+            )
+        elif identity["state"] == "incomplete":
+            unresolved.append(
+                f"{label}: {scp_reason}, and the IAM cache recorded read errors for "
+                f"{', '.join(identity['principals'][:10])}"
+            )
+        else:
+            unresolved.append(
+                f"{label}: {scp_reason}, and identity policies were not read "
+                "because the IAM permissions cache was not available"
+            )
+
+    total = len(requirements)
+    identity_notes = (
+        f" {MANAGEMENT_ACCOUNT_SCP_NOTE}"
+        if scp["state"] == "exempt"
+        else f" {SCP_NOT_EVALUATED_NOTE}"
+    )
+    if v1:
+        identity_notes += f" {IAM_CACHE_V1_NOTE}"
+    if failed:
+        return create_finding(
+            check_id="SM-34",
+            finding_name=CREATION_GUARDRAIL_FINDING,
+            finding_details=(
+                f"{len(failed)} of {total} {category} requirements are not "
+                f"enforced at SageMaker creation time: {'; '.join(failed[:3])}. "
+                "A non-compliant resource can be created and is only detected "
+                f"afterwards.{identity_notes}"
+            ),
+            resolution=(
+                "Deny the named create action in a service control policy "
+                "attached above this account when the key is absent (Null true) or "
+                "outside the approved values (ArnNotEquals or StringNotEquals), or "
+                "add an Allow condition on the key to every policy that grants the "
+                "action. Use sagemaker:VolumeKmsKeyArn and "
+                "sagemaker:OutputKmsKeyArn: the short key names are defined by no "
+                "action and enforce nothing."
+            ),
+            reference=CREATION_GUARDRAIL_REFERENCE,
+            severity="Medium",
+            status="Failed",
+            region=region,
+        )
+    if unresolved:
+        return create_finding(
+            check_id="SM-34",
+            finding_name=f"{CREATION_GUARDRAIL_FINDING} Incomplete",
+            finding_details=(
+                f"{len(unresolved)} of {total} {category} requirements could not be "
+                f"established: {'; '.join(unresolved[:3])}. This check recognises "
+                "a Deny that fires when the key is absent (Null true, a negated "
+                "operator or an IfExists form) as the only condition of its "
+                f"statement.{identity_notes}"
+            ),
+            resolution=(
+                "Restate the deny so it fires when the key is absent, using Null "
+                "with value true or a negated operator naming the approved values, "
+                "and resolve the unread reads named above."
+            ),
+            reference=CREATION_GUARDRAIL_REFERENCE,
+            severity="Informational",
+            status="N/A",
+            region=region,
+        )
+    return create_finding(
+        check_id="SM-34",
+        finding_name=CREATION_GUARDRAIL_FINDING,
+        finding_details=(
+            f"All {total} {category} requirements are enforced at SageMaker "
+            f"creation time for account {scp['account'] or 'unknown'}: "
+            f"{'; '.join(met)}.{identity_notes if used_identity else ''}"
+        ),
+        resolution="No action required",
+        reference=CREATION_GUARDRAIL_REFERENCE,
+        severity="Medium",
+        status="Passed",
+        region=region,
+    )
 
 
 def check_sagemaker_creation_guardrails(
-    region: str = "", scp_inventory: Dict[str, Any] = None
+    region: str = "",
+    scp_inventory: Dict[str, Any] = None,
+    permission_cache: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
-    SM-34: Verify a service control policy blocks creation of unencrypted,
-    internet-exposed or non-VPC SageMaker resources (AIR-SGM-TRN-08).
+    SM-34: Verify creation of unencrypted, internet-exposed or non-VPC SageMaker
+    resources is denied at creation time (AIR-SGM-TRN-08).
 
-    One verdict per guardrail category, because an organization commonly enforces
-    encryption at creation and leaves the network parameters unguarded.
+    One verdict per guardrail category. Each (action, key) requirement is met by
+    a Deny in a service control policy attached on this account's path to the
+    root, or by a condition on the key in every identity policy that grants the
+    action.
     """
     logger.debug("Starting check for SageMaker creation guardrails")
     findings = {"csv_data": []}
     try:
-        context = _sm_organization_policy_context()
-        if not context["readable"]:
+        scp = _sm_organization_policy_context()
+        scp["items"] = []
+        scp["path"] = []
+        scp["unread_policies"] = []
+        if scp["state"] == "read":
+            inventory = (
+                scp_inventory
+                if scp_inventory is not None
+                else get_sagemaker_scp_inventory()
+            )
+            if inventory.get("list_error"):
+                scp["state"] = "unread"
+                scp["detail"] = (
+                    "service control policies could not be listed from account "
+                    f"{scp['account']} ({inventory['list_error']}). A member account "
+                    "reads them only as a delegated administrator for "
+                    "Organizations policy management; otherwise run the "
+                    "assessment from the management account"
+                )
+                scp["resolution"] = (
+                    "Grant organizations:ListPolicies, organizations:DescribePolicy, "
+                    "organizations:ListTargetsForPolicy and organizations:ListParents "
+                    "to the assessment role."
+                )
+            elif scp["management"]:
+                scp["state"] = "exempt"
+                scp["detail"] = (
+                    f"this assessment ran in the management account "
+                    f"{scp['account']}, which service control policies do not govern"
+                )
+            else:
+                scp["items"] = inventory.get("items", [])
+                try:
+                    scp["path"] = _sm_account_policy_path(scp["account"])
+                except ClientError as error:
+                    scp["state"] = "unread"
+                    scp["detail"] = (
+                        "the account's path to the organization root could not be "
+                        f"read with organizations:ListParents "
+                        f"({get_assessment_error_label(error)}), so which service "
+                        "control policies govern it is unknown"
+                    )
+            scp["unread_policies"] = [
+                entry.split(":")[0] for entry in inventory.get("errors", [])
+            ]
+
+        if scp["state"] != "read" and permission_cache is None:
             findings["csv_data"].append(
                 create_finding(
                     check_id="SM-34",
                     finding_name=CREATION_GUARDRAIL_FINDING,
                     finding_details=(
                         "Creation guardrails for SageMaker were not assessed: "
-                        f"{context['detail']}."
+                        f"{scp['detail']}. The IAM permissions cache was not "
+                        "available, so identity-policy conditions were not read "
+                        "either."
                     ),
-                    resolution=context["resolution"] or COULD_NOT_ASSESS_RESOLUTION,
+                    resolution=scp["resolution"] or COULD_NOT_ASSESS_RESOLUTION,
                     reference=CREATION_GUARDRAIL_REFERENCE,
                     severity="Informational",
                     status="N/A",
@@ -7827,143 +8282,12 @@ def check_sagemaker_creation_guardrails(
             )
             return findings
 
-        inventory = (
-            scp_inventory
-            if scp_inventory is not None
-            else get_sagemaker_scp_inventory()
-        )
-        if inventory.get("list_error"):
+        for category, requirements in SAGEMAKER_CREATION_GUARDRAILS:
             findings["csv_data"].append(
-                create_finding(
-                    check_id="SM-34",
-                    finding_name=CREATION_GUARDRAIL_FINDING,
-                    finding_details=(
-                        "Service control policies could not be listed, so SageMaker "
-                        "creation guardrails were not assessed."
-                    ),
-                    resolution=(
-                        "Grant organizations:ListPolicies and "
-                        "organizations:DescribePolicy to the assessment role."
-                    ),
-                    reference=CREATION_GUARDRAIL_REFERENCE,
-                    severity="Informational",
-                    status="N/A",
-                    region=region,
+                _creation_category_finding(
+                    category, requirements, scp, permission_cache, region
                 )
             )
-            return findings
-
-        # Collect, per category, which policies enforce it and which only name a
-        # specific value for it.
-        enforcing = {name: [] for name, _, _ in SAGEMAKER_CREATION_GUARDRAILS}
-        ambiguous = {name: [] for name, _, _ in SAGEMAKER_CREATION_GUARDRAILS}
-
-        for item in inventory.get("items", []):
-            statements = _sm_policy_statements(item.get("content"))
-            for statement in statements:
-                if not _statement_denies_sagemaker_creation(statement):
-                    continue
-                for category, keys, _ in SAGEMAKER_CREATION_GUARDRAILS:
-                    strength = _creation_guard_strength(statement, keys)
-                    if strength == "enforced":
-                        if item["name"] not in enforcing[category]:
-                            enforcing[category].append(item["name"])
-                    elif strength == "ambiguous":
-                        if item["name"] not in ambiguous[category]:
-                            ambiguous[category].append(item["name"])
-
-        for category, _, key_names in SAGEMAKER_CREATION_GUARDRAILS:
-            if enforcing[category]:
-                findings["csv_data"].append(
-                    create_finding(
-                        check_id="SM-34",
-                        finding_name=CREATION_GUARDRAIL_FINDING,
-                        finding_details=(
-                            f"Service control policy {', '.join(sorted(enforcing[category])[:3])} "
-                            f"denies SageMaker resource creation unless the "
-                            f"{category} parameter is set, using {key_names}. "
-                            "Which organizational units that policy is attached to "
-                            "is not read by this check."
-                        ),
-                        resolution=(
-                            "No action required on the policy. Confirm it is "
-                            "attached to every organizational unit that runs "
-                            "SageMaker workloads."
-                        ),
-                        reference=CREATION_GUARDRAIL_REFERENCE,
-                        severity="Medium",
-                        status="Passed",
-                        region=region,
-                    )
-                )
-            elif ambiguous[category]:
-                findings["csv_data"].append(
-                    create_finding(
-                        check_id="SM-34",
-                        finding_name=CREATION_GUARDRAIL_FINDING,
-                        finding_details=(
-                            f"Service control policy {', '.join(sorted(ambiguous[category])[:3])} "
-                            f"denies SageMaker resource creation for one named "
-                            f"value of {key_names}, so whether the {category} "
-                            "guardrail holds depends on that value. This check "
-                            "recognises the deny-when-absent form (Null true), a "
-                            "negated operator, or Bool false."
-                        ),
-                        resolution=(
-                            "Restate the deny so it fires when the parameter is "
-                            "absent, using Null with value true or a negated "
-                            "operator naming the approved values."
-                        ),
-                        reference=CREATION_GUARDRAIL_REFERENCE,
-                        severity="Informational",
-                        status="N/A",
-                        region=region,
-                    )
-                )
-            else:
-                findings["csv_data"].append(
-                    create_finding(
-                        check_id="SM-34",
-                        finding_name=CREATION_GUARDRAIL_FINDING,
-                        finding_details=(
-                            f"None of the {len(inventory.get('items', []))} service "
-                            "control policies read denies SageMaker resource "
-                            f"creation on the {category} parameter: no Deny "
-                            f"statement on a SageMaker create action carries "
-                            f"{key_names}. A non-compliant resource can be created "
-                            "and is only detected afterwards."
-                        ),
-                        resolution=(
-                            "Add a service control policy that denies the SageMaker "
-                            f"create actions when {key_names} is absent, using Null "
-                            "with value true, and attach it to the organizational "
-                            "units that run SageMaker workloads."
-                        ),
-                        reference=CREATION_GUARDRAIL_REFERENCE,
-                        severity="Medium",
-                        status="Failed",
-                        region=region,
-                    )
-                )
-
-        for error_detail in inventory.get("errors", [])[:5]:
-            findings["csv_data"].append(
-                create_finding(
-                    check_id="SM-34",
-                    finding_name=CREATION_GUARDRAIL_FINDING,
-                    finding_details=(
-                        f"A service control policy document could not be read, so "
-                        f"it was not searched for SageMaker creation guardrails: "
-                        f"{error_detail.split(':')[0]}."
-                    ),
-                    resolution="Grant organizations:DescribePolicy and retry.",
-                    reference=CREATION_GUARDRAIL_REFERENCE,
-                    severity="Informational",
-                    status="N/A",
-                    region=region,
-                )
-            )
-
         return findings
 
     except Exception as error:
@@ -9268,7 +9592,9 @@ def lambda_handler(event, context):
             # control is assessed once and not once per scanned region.
             logger.info("Running SageMaker creation guardrail check (SM-34)")
             all_findings.append(
-                check_sagemaker_creation_guardrails(region=GLOBAL_REGION_LABEL)
+                check_sagemaker_creation_guardrails(
+                    region=GLOBAL_REGION_LABEL, permission_cache=permission_cache
+                )
             )
 
             # Delegated administration is an organization-level setting, so it is

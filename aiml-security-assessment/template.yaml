@@ -748,6 +748,21 @@ Resources:
               Resource:
                 - !Sub 'arn:${AWS::Partition}:organizations::*:policy/*/*/*'
                 - !Sub 'arn:${AWS::Partition}:organizations::aws:policy/*/*'
+            - Sid: OrganizationsPolicyAttachmentRead
+              # SM-34 counts a service control policy only where it is attached on
+              # this account's path to the root.
+              Effect: Allow
+              Action:
+                - organizations:ListTargetsForPolicy # SM-34
+              Resource: !Sub 'arn:${AWS::Partition}:organizations::*:policy/o-*/service_control_policy/p-*'
+            - Sid: OrganizationsAccountPathRead
+              # SM-34 walks from this account through each parent OU to the root.
+              Effect: Allow
+              Action:
+                - organizations:ListParents # SM-34
+              Resource:
+                - !Sub 'arn:${AWS::Partition}:organizations::*:account/o-*/${AWS::AccountId}'
+                - !Sub 'arn:${AWS::Partition}:organizations::*:ou/o-*/ou-*'
             - Sid: SecurityHubStandardsRead
               Effect: Allow
               Action:
