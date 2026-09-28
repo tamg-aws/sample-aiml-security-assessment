@@ -7241,6 +7241,257 @@ def check_model_approval_workflow(region: str = "") -> Dict[str, Any]:
         }
 
 
+MONITOR_REPORT_FINDING = "Model Monitor Recent Report"
+MONITOR_ALARM_FINDING = "Model Monitor Violation Alarm"
+MODEL_MONITOR_REFERENCE = (
+    "https://docs.aws.amazon.com/sagemaker/latest/dg/model-monitor.html"
+)
+MONITOR_CLOUDWATCH_REFERENCE = (
+    "https://docs.aws.amazon.com/sagemaker/latest/dg/"
+    "model-monitor-interpreting-cloudwatch.html"
+)
+# Namespaces Model Monitor publishes schedule metrics to, one per monitoring type.
+MODEL_MONITOR_METRIC_NAMESPACES = (
+    "aws/sagemaker/Endpoints/data-metrics",
+    "aws/sagemaker/Endpoints/model-metrics",
+    "aws/sagemaker/Endpoints/bias-metrics",
+    "aws/sagemaker/Endpoints/explainability-metrics",
+)
+MONITOR_REPORT_STATUSES = ("Completed", "CompletedWithViolations")
+MONITOR_RUNNING_STATUSES = ("Pending", "InProgress")
+CAPTURE_DISK_ALARM_FINDING = "Data Capture Disk Utilization Alarm"
+CAPTURE_DISK_ALARM_REFERENCE = (
+    "https://docs.aws.amazon.com/sagemaker/latest/dg/"
+    "model-monitor-data-capture-endpoint.html"
+)
+# Data Capture stops capturing at high disk usage; AWS recommends keeping
+# utilization below 75%, so an alarm must fire at or below that level.
+CAPTURE_DISK_ALARM_MAX_THRESHOLD = 75.0
+ENDPOINT_METRIC_NAMESPACE = "/aws/sagemaker/Endpoints"
+RISING_COMPARISONS = ("GreaterThanThreshold", "GreaterThanOrEqualToThreshold")
+
+
+def _actionable_metric_alarms(region: str) -> List[Dict[str, Any]]:
+    """Every metric alarm in the region that is enabled and has an alarm action."""
+    cloudwatch_client = boto3.client(
+        "cloudwatch", config=boto3_config, region_name=region
+    )
+    alarms = []
+    for page in cloudwatch_client.get_paginator("describe_alarms").paginate(
+        AlarmTypes=["MetricAlarm"]
+    ):
+        for alarm in page.get("MetricAlarms", []):
+            if alarm.get("ActionsEnabled") and alarm.get("AlarmActions"):
+                alarms.append(alarm)
+    return alarms
+
+
+def _alarm_metric_dimensions(alarm: Dict[str, Any]) -> List[tuple]:
+    """Every (namespace, metric name, dimensions) a metric alarm evaluates."""
+    metrics = []
+    if alarm.get("MetricName"):
+        metrics.append(
+            (
+                alarm.get("Namespace"),
+                alarm.get("MetricName"),
+                {d.get("Name"): d.get("Value") for d in alarm.get("Dimensions") or []},
+            )
+        )
+    for query in alarm.get("Metrics") or []:
+        metric = (query.get("MetricStat") or {}).get("Metric") or {}
+        if metric.get("MetricName"):
+            metrics.append(
+                (
+                    metric.get("Namespace"),
+                    metric.get("MetricName"),
+                    {
+                        d.get("Name"): d.get("Value")
+                        for d in metric.get("Dimensions") or []
+                    },
+                )
+            )
+    return metrics
+
+
+def _schedule_cadence(expression: str) -> timedelta:
+    """The interval a Model Monitor cron expression runs at."""
+    match = re.match(r"cron\((\S+) (\S+) ", expression or "")
+    if not match:
+        return timedelta(days=7)
+    hours = match.group(2)
+    if hours == "*":
+        return timedelta(hours=1)
+    step = re.fullmatch(r"(?:\*|\d+)/(\d+)", hours)
+    if step:
+        return timedelta(hours=int(step.group(1)))
+    return timedelta(days=1)
+
+
+def _monitor_report_and_alarm_findings(
+    sagemaker_client: Any, schedules: List[Dict[str, Any]], region: str
+) -> List[Dict[str, Any]]:
+    """
+    For each monitoring schedule on an InService endpoint, require a report
+    produced within two cadences and an alarm with an action on its metrics.
+    """
+    rows = []
+    now = datetime.now(timezone.utc)
+    stale = []
+    fresh = []
+    unread = []
+    for schedule in schedules:
+        name = schedule["name"]
+        try:
+            detail = sagemaker_client.describe_monitoring_schedule(
+                MonitoringScheduleName=name
+            )
+        except Exception as error:
+            unread.append(
+                f"sagemaker:DescribeMonitoringSchedule {name} "
+                f"({get_assessment_error_label(error)})"
+            )
+            continue
+        expression = (
+            (detail.get("MonitoringScheduleConfig") or {}).get("ScheduleConfig") or {}
+        ).get("ScheduleExpression") or ""
+        max_age = 2 * _schedule_cadence(expression) + timedelta(hours=1)
+        last = detail.get("LastMonitoringExecutionSummary") or {}
+        status = last.get("MonitoringExecutionStatus")
+        scheduled = last.get("ScheduledTime")
+        if isinstance(scheduled, datetime) and scheduled.tzinfo is None:
+            scheduled = scheduled.replace(tzinfo=timezone.utc)
+        if not last:
+            stale.append(f"schedule '{name}' has never run")
+        elif status in MONITOR_RUNNING_STATUSES:
+            unread.append(
+                f"schedule '{name}': its latest execution is {status}, and the "
+                "report before it is not returned by DescribeMonitoringSchedule"
+            )
+        elif status not in MONITOR_REPORT_STATUSES:
+            reason = last.get("FailureReason")
+            stale.append(
+                f"schedule '{name}': its latest execution is {status or 'without a status'}"
+                + (f" ({reason[:120]})" if reason else "")
+            )
+        elif not isinstance(scheduled, datetime) or now - scheduled > max_age:
+            stale.append(
+                f"schedule '{name}': its latest report was scheduled "
+                f"{scheduled.isoformat() if isinstance(scheduled, datetime) else 'at an unreported time'}, "
+                f"older than twice its cadence ({expression or 'no expression'})"
+            )
+        else:
+            fresh.append(f"{name} ({status} at {scheduled.isoformat()})")
+    for problem in stale[:20]:
+        rows.append(
+            create_finding(
+                check_id="SM-23",
+                finding_name=MONITOR_REPORT_FINDING,
+                finding_details=f"Monitoring {problem}, so no current drift report exists.",
+                resolution=(
+                    "Fix the failing monitoring job (baseline, role, capture input) "
+                    "so each schedule produces a report every cycle."
+                ),
+                reference=MODEL_MONITOR_REFERENCE,
+                severity="Medium",
+                status="Failed",
+                region=region,
+            )
+        )
+    if fresh and not stale and not unread:
+        rows.append(
+            create_finding(
+                check_id="SM-23",
+                finding_name=MONITOR_REPORT_FINDING,
+                finding_details=(
+                    f"All {len(fresh)} monitoring schedule(s) produced a report "
+                    f"within twice their cadence: {', '.join(fresh[:5])}."
+                ),
+                resolution="No action required",
+                reference=MODEL_MONITOR_REFERENCE,
+                severity="Medium",
+                status="Passed",
+                region=region,
+            )
+        )
+    if unread:
+        rows.append(
+            _unread_resources_finding(
+                "SM-23",
+                MONITOR_REPORT_FINDING,
+                unread,
+                f"{len(fresh) + len(stale)} of {len(schedules)} schedule(s) were read.",
+                MODEL_MONITOR_REFERENCE,
+                region,
+            )
+        )
+
+    try:
+        alarms = _actionable_metric_alarms(region)
+    except Exception as error:
+        rows.append(
+            _unread_resources_finding(
+                "SM-23",
+                MONITOR_ALARM_FINDING,
+                [f"cloudwatch:DescribeAlarms ({get_assessment_error_label(error)})"],
+                f"{len(schedules)} monitoring schedule(s) were found.",
+                MONITOR_CLOUDWATCH_REFERENCE,
+                region,
+            )
+        )
+        return rows
+    alarmed = set()
+    for alarm in alarms:
+        for namespace, _, dimensions in _alarm_metric_dimensions(alarm):
+            if namespace in MODEL_MONITOR_METRIC_NAMESPACES:
+                alarmed.add(("schedule", dimensions.get("MonitoringSchedule")))
+                alarmed.add(("endpoint", dimensions.get("Endpoint")))
+    unalarmed = [
+        schedule
+        for schedule in schedules
+        if ("schedule", schedule["name"]) not in alarmed
+        and ("endpoint", schedule["endpoint"]) not in alarmed
+    ]
+    for schedule in unalarmed[:20]:
+        rows.append(
+            create_finding(
+                check_id="SM-23",
+                finding_name=MONITOR_ALARM_FINDING,
+                finding_details=(
+                    f"No enabled CloudWatch alarm with an action evaluates a Model "
+                    f"Monitor metric of schedule '{schedule['name']}' on endpoint "
+                    f"'{schedule['endpoint']}', so a violation in its report "
+                    "notifies no one."
+                ),
+                resolution=(
+                    "Publish the schedule's metrics to CloudWatch and alarm on the "
+                    "drift metrics in the aws/sagemaker/Endpoints/*-metrics "
+                    "namespaces with an action that notifies the model owner."
+                ),
+                reference=MONITOR_CLOUDWATCH_REFERENCE,
+                severity="Medium",
+                status="Failed",
+                region=region,
+            )
+        )
+    if schedules and not unalarmed:
+        rows.append(
+            create_finding(
+                check_id="SM-23",
+                finding_name=MONITOR_ALARM_FINDING,
+                finding_details=(
+                    f"All {len(schedules)} monitoring schedule(s) have an enabled "
+                    "alarm with an action on their Model Monitor metrics."
+                ),
+                resolution="No action required",
+                reference=MONITOR_CLOUDWATCH_REFERENCE,
+                severity="Medium",
+                status="Passed",
+                region=region,
+            )
+        )
+    return rows
+
+
 def check_model_drift_detection(region: str = "") -> Dict[str, Any]:
     """
     Check if Model Monitor is configured for drift detection with proper baselines.
@@ -7262,6 +7513,8 @@ def check_model_drift_detection(region: str = "") -> Dict[str, Any]:
         endpoints_without_monitoring = []
         endpoints_with_monitoring = []
         monitoring_issues = []
+        monitored_schedules = []
+        read_error = None
 
         try:
             # Get all InService endpoints
@@ -7300,6 +7553,11 @@ def check_model_drift_detection(region: str = "") -> Dict[str, Any]:
                 else:
                     schedules = monitoring_schedules[endpoint_name]
                     endpoints_with_monitoring.append(endpoint_name)
+                    monitored_schedules.extend(
+                        {"name": s["name"], "endpoint": endpoint_name}
+                        for s in schedules
+                        if s["status"] == "Scheduled"
+                    )
 
                     # Check for comprehensive monitoring
                     monitoring_types = [s["type"] for s in schedules]
@@ -7337,6 +7595,23 @@ def check_model_drift_detection(region: str = "") -> Dict[str, Any]:
 
         except Exception as e:
             logger.error(f"Error checking model drift detection: {str(e)}")
+            read_error = get_assessment_error_label(e)
+
+        if read_error:
+            findings["csv_data"].append(
+                _unread_resources_finding(
+                    "SM-23",
+                    "Model Drift Detection Check",
+                    [
+                        "sagemaker:ListEndpoints or ListMonitoringSchedules "
+                        f"({read_error})"
+                    ],
+                    "the endpoint and schedule lists were not read in full.",
+                    MODEL_MONITOR_REFERENCE,
+                    region,
+                )
+            )
+            return findings
 
         # Generate findings
         if endpoints_without_monitoring:
@@ -7345,7 +7620,14 @@ def check_model_drift_detection(region: str = "") -> Dict[str, Any]:
                     create_finding(
                         check_id="SM-23",
                         finding_name="Model Drift Detection Not Configured",
-                        finding_details=f"Endpoint '{endpoint}' has no Model Monitor schedules configured. Model drift and data quality issues will not be detected.",
+                        finding_details=(
+                            f"Endpoint '{endpoint}' has no Model Monitor schedules "
+                            "configured. Model drift and data quality issues will not "
+                            "be detected by SageMaker. An open-source SageMaker AI "
+                            "MLflow App with Evidently AI reports is not linked to an "
+                            "endpoint by any SageMaker API, so that replacement path "
+                            "is not read."
+                        ),
                         resolution="Configure Model Monitor with data quality, model quality, bias, and feature attribution drift monitoring for production endpoints.",
                         reference="https://docs.aws.amazon.com/sagemaker/latest/dg/model-monitor.html",
                         severity="Medium",
@@ -7410,6 +7692,13 @@ def check_model_drift_detection(region: str = "") -> Dict[str, Any]:
                         region=region,
                     )
                 )
+
+        if monitored_schedules:
+            findings["csv_data"].extend(
+                _monitor_report_and_alarm_findings(
+                    sagemaker_client, monitored_schedules, region
+                )
+            )
 
         return findings
 
@@ -8525,6 +8814,117 @@ ENDPOINT_DATA_CAPTURE_RESOLUTION = (
 )
 
 
+def _capture_disk_alarm_findings(
+    capturing: List[Dict[str, Any]], region: str
+) -> List[Dict[str, Any]]:
+    """
+    Require, for each instance-backed variant of a capturing endpoint, an enabled
+    alarm with an action on DiskUtilization that fires at or below 75%.
+    """
+    try:
+        alarms = _actionable_metric_alarms(region)
+    except Exception as error:
+        return [
+            _unread_resources_finding(
+                "SM-31",
+                CAPTURE_DISK_ALARM_FINDING,
+                [f"cloudwatch:DescribeAlarms ({get_assessment_error_label(error)})"],
+                f"{len(capturing)} capturing endpoint(s) were found.",
+                CAPTURE_DISK_ALARM_REFERENCE,
+                region,
+            )
+        ]
+    covered = set()
+    for alarm in alarms:
+        if alarm.get("ComparisonOperator") not in RISING_COMPARISONS:
+            continue
+        threshold = alarm.get("Threshold")
+        if not isinstance(threshold, (int, float)) or (
+            threshold > CAPTURE_DISK_ALARM_MAX_THRESHOLD
+        ):
+            continue
+        if alarm.get("Namespace") != ENDPOINT_METRIC_NAMESPACE:
+            continue
+        if alarm.get("MetricName") != "DiskUtilization":
+            continue
+        dimensions = {
+            d.get("Name"): d.get("Value") for d in alarm.get("Dimensions") or []
+        }
+        covered.add((dimensions.get("EndpointName"), dimensions.get("VariantName")))
+
+    uncovered = []
+    no_variants = []
+    checked = 0
+    for entry in capturing:
+        variants = [
+            v.get("VariantName")
+            for v in entry["variants"]
+            if not v.get("CurrentServerlessConfig")
+        ]
+        if not entry["variants"]:
+            no_variants.append(
+                f"endpoint {entry['name']} reported no ProductionVariants"
+            )
+            continue
+        for variant in variants:
+            checked += 1
+            if (entry["name"], variant) not in covered:
+                uncovered.append(f"{entry['name']}/{variant}")
+    rows = []
+    for label in uncovered[:20]:
+        rows.append(
+            create_finding(
+                check_id="SM-31",
+                finding_name=CAPTURE_DISK_ALARM_FINDING,
+                finding_details=(
+                    f"Capturing variant '{label}' has no enabled alarm with an "
+                    "action on /aws/sagemaker/Endpoints DiskUtilization at a "
+                    f"threshold of {CAPTURE_DISK_ALARM_MAX_THRESHOLD:g}% or lower, so "
+                    "Data Capture can stop at high disk usage without notice."
+                ),
+                resolution=(
+                    "Create a CloudWatch alarm on DiskUtilization for each variant "
+                    "(EndpointName and VariantName dimensions) at 75% or lower with "
+                    "an alarm action."
+                ),
+                reference=CAPTURE_DISK_ALARM_REFERENCE,
+                severity="Medium",
+                status="Failed",
+                region=region,
+            )
+        )
+    if no_variants:
+        rows.append(
+            _unread_resources_finding(
+                "SM-31",
+                CAPTURE_DISK_ALARM_FINDING,
+                no_variants,
+                f"{checked} capturing variant(s) were read.",
+                CAPTURE_DISK_ALARM_REFERENCE,
+                region,
+            )
+        )
+    elif not uncovered and checked:
+        rows.append(
+            create_finding(
+                check_id="SM-31",
+                finding_name=CAPTURE_DISK_ALARM_FINDING,
+                finding_details=(
+                    f"All {checked} instance-backed capturing variant(s) have an "
+                    "enabled DiskUtilization alarm with an action at "
+                    f"{CAPTURE_DISK_ALARM_MAX_THRESHOLD:g}% or lower. Serverless "
+                    "variants report no disk metric and are not counted."
+                ),
+                resolution="No action required",
+                reference=CAPTURE_DISK_ALARM_REFERENCE,
+                severity="Medium",
+                status="Passed",
+                region=region,
+            )
+        )
+    return rows
+
+
 def check_sagemaker_endpoint_data_capture(region: str = "") -> Dict[str, Any]:
     """
     SM-31: Verify each SageMaker endpoint captures inference requests and
@@ -8578,6 +8978,7 @@ def check_sagemaker_endpoint_data_capture(region: str = "") -> Dict[str, Any]:
                             "name": endpoint_name,
                             "destination": capture_config.get("DestinationS3Uri") or "",
                             "sampling": capture_config.get("CurrentSamplingPercentage"),
+                            "variants": detail.get("ProductionVariants") or [],
                         }
                     )
                 elif not capture_config:
@@ -8682,6 +9083,9 @@ def check_sagemaker_endpoint_data_capture(region: str = "") -> Dict[str, Any]:
                     region=region,
                 )
             )
+
+        if capturing:
+            findings["csv_data"].extend(_capture_disk_alarm_findings(capturing, region))
 
         for entry in describe_errors[:5]:
             findings["csv_data"].append(

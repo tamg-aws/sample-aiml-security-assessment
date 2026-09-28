@@ -803,7 +803,7 @@ Resources:
             - Sid: FlowLogAlarmRead
               Effect: Allow
               Action:
-                - cloudwatch:DescribeAlarms # SM-37
+                - cloudwatch:DescribeAlarms # SM-23, SM-31, SM-37
               Resource: !Sub 'arn:${AWS::Partition}:cloudwatch:*:${AWS::AccountId}:alarm:*'
             - Sid: GuardDutyAlertRuleTargetRead
               Effect: Allow

@@ -13,6 +13,7 @@ import sys
 import os
 import importlib.util
 import json
+from datetime import datetime, timedelta, timezone
 from unittest.mock import call, patch, MagicMock
 
 from botocore.exceptions import EndpointConnectionError, ClientError
@@ -3714,14 +3715,46 @@ class TestSM31EndpointDataCapture:
     """AIR-SGM-EP-06: SM-31 asserts inference data capture per endpoint."""
 
     @staticmethod
-    def _endpoints(mock_client, endpoints):
+    def _disk_alarm(endpoint, variant="AllTraffic", **overrides):
+        alarm = {
+            "AlarmName": f"{endpoint}-disk",
+            "ActionsEnabled": True,
+            "AlarmActions": ["arn:aws:sns:us-east-1:123456789012:ops"],
+            "Namespace": "/aws/sagemaker/Endpoints",
+            "MetricName": "DiskUtilization",
+            "Dimensions": [
+                {"Name": "EndpointName", "Value": endpoint},
+                {"Name": "VariantName", "Value": variant},
+            ],
+            "ComparisonOperator": "GreaterThanThreshold",
+            "Threshold": 75.0,
+        }
+        alarm.update(overrides)
+        return alarm
+
+    @classmethod
+    def _endpoints(cls, mock_client, endpoints, alarms=None, alarm_error=None):
         mock_sm = MagicMock()
         mock_client.return_value = mock_sm
+        for detail in endpoints.values():
+            detail.setdefault("ProductionVariants", [{"VariantName": "AllTraffic"}])
+        if alarms is None:
+            alarms = [cls._disk_alarm(name) for name in endpoints]
         paginator = MagicMock()
-        mock_sm.get_paginator.return_value = paginator
         paginator.paginate.return_value = [
             {"Endpoints": [{"EndpointName": name} for name in endpoints]}
         ]
+        alarm_pager = MagicMock()
+
+        def alarm_pages(**kwargs):
+            if alarm_error:
+                raise _make_client_error(alarm_error, "DescribeAlarms")
+            return [{"MetricAlarms": alarms}]
+
+        alarm_pager.paginate.side_effect = alarm_pages
+        mock_sm.get_paginator.side_effect = lambda name: (
+            alarm_pager if name == "describe_alarms" else paginator
+        )
         mock_sm.describe_endpoint.side_effect = lambda EndpointName: endpoints[
             EndpointName
         ]
@@ -3760,6 +3793,17 @@ class TestSM31EndpointDataCapture:
         findings = extract_csv_data(
             sagemaker_app.check_sagemaker_endpoint_data_capture(region="us-east-1")
         )
+        disk = [
+            f
+            for f in findings
+            if f["Finding"] == sagemaker_app.CAPTURE_DISK_ALARM_FINDING
+        ]
+        assert [f["Status"] for f in disk] == ["Passed"]
+        findings = [
+            f
+            for f in findings
+            if f["Finding"] == sagemaker_app.ENDPOINT_DATA_CAPTURE_FINDING
+        ]
         failed = [f for f in findings if f["Status"] == "Failed"]
         passed = [f for f in findings if f["Status"] == "Passed"]
         details = " | ".join(f["Finding_Details"] for f in failed)
@@ -3804,7 +3848,8 @@ class TestSM31EndpointDataCapture:
                     "EnableCapture": True,
                     "CaptureStatus": "Started",
                     "DestinationS3Uri": "s3://audit/capture",
-                }
+                },
+                "ProductionVariants": [{"VariantName": "AllTraffic"}],
             }
             if EndpointName == "capturing"
             else _raise(_make_client_error("AccessDeniedException"))
@@ -3825,6 +3870,364 @@ class TestSM31EndpointDataCapture:
         )
         assert len(findings) == 1
         assert_could_not_assess_finding(findings[0])
+
+
+class TestSM31CaptureDiskAlarm:
+    """AIR-SGM-EP-06: a capturing variant needs a DiskUtilization alarm at 75%
+    or lower, because Data Capture stops at high disk usage."""
+
+    CAPTURE = {"EnableCapture": True, "CaptureStatus": "Started"}
+
+    def _rows(self, mock_client, endpoints, **kwargs):
+        TestSM31EndpointDataCapture._endpoints(mock_client, endpoints, **kwargs)
+        rows = extract_csv_data(
+            sagemaker_app.check_sagemaker_endpoint_data_capture(region="us-east-1")
+        )
+        for row in rows:
+            assert_finding_schema(row)
+        return [
+            r
+            for r in rows
+            if r["Finding"].startswith(sagemaker_app.CAPTURE_DISK_ALARM_FINDING)
+        ]
+
+    def _two_variant_endpoint(self):
+        return {
+            "ep": {
+                "DataCaptureConfig": dict(self.CAPTURE),
+                "ProductionVariants": [{"VariantName": "a"}, {"VariantName": "b"}],
+            }
+        }
+
+    @patch("sagemaker_app.boto3.client")
+    def test_every_variant_alarmed_passes(self, mock_client):
+        alarm = TestSM31EndpointDataCapture._disk_alarm
+        rows = self._rows(
+            mock_client,
+            self._two_variant_endpoint(),
+            alarms=[alarm("ep", "a"), alarm("ep", "b", Threshold=70.0)],
+        )
+        assert [r["Status"] for r in rows] == ["Passed"]
+        assert "All 2" in rows[0]["Finding_Details"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_one_unalarmed_variant_among_alarmed_fails(self, mock_client):
+        alarm = TestSM31EndpointDataCapture._disk_alarm
+        rows = self._rows(
+            mock_client, self._two_variant_endpoint(), alarms=[alarm("ep", "a")]
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "'ep/b'" in rows[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "override",
+        [
+            {"Threshold": 90.0},
+            {"ActionsEnabled": False},
+            {"AlarmActions": []},
+            {"ComparisonOperator": "LessThanThreshold"},
+            {"MetricName": "CPUUtilization"},
+            {"Namespace": "AWS/SageMaker"},
+            {"Dimensions": [{"Name": "EndpointName", "Value": "ep"}]},
+        ],
+    )
+    @patch("sagemaker_app.boto3.client")
+    def test_alarm_that_cannot_fire_in_time_does_not_count(self, mock_client, override):
+        alarm = TestSM31EndpointDataCapture._disk_alarm
+        rows = self._rows(
+            mock_client,
+            self._two_variant_endpoint(),
+            alarms=[alarm("ep", "a"), alarm("ep", "b", **override)],
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "'ep/b'" in rows[0]["Finding_Details"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_alarm_read_denied_is_not_read(self, mock_client):
+        rows = self._rows(
+            mock_client,
+            self._two_variant_endpoint(),
+            alarm_error="AccessDenied",
+        )
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert "DescribeAlarms" in rows[0]["Finding_Details"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_serverless_variant_is_not_counted(self, mock_client):
+        alarm = TestSM31EndpointDataCapture._disk_alarm
+        endpoints = {
+            "ep": {
+                "DataCaptureConfig": dict(self.CAPTURE),
+                "ProductionVariants": [
+                    {"VariantName": "a"},
+                    {
+                        "VariantName": "sl",
+                        "CurrentServerlessConfig": {"MemorySizeInMB": 2048},
+                    },
+                ],
+            }
+        }
+        rows = self._rows(mock_client, endpoints, alarms=[alarm("ep", "a")])
+        assert [r["Status"] for r in rows] == ["Passed"]
+        assert "All 1" in rows[0]["Finding_Details"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_non_capturing_endpoint_needs_no_disk_alarm(self, mock_client):
+        rows = self._rows(
+            mock_client,
+            {"ep": {"DataCaptureConfig": {"EnableCapture": False}}},
+            alarms=[],
+        )
+        assert rows == []
+
+
+class TestSM23MonitorReportAndAlarm:
+    """AIR-SGM-EP-06: each Model Monitor schedule needs a current report and an
+    alarm with an action on its metrics; an unread list is never a pass."""
+
+    @staticmethod
+    def _client(
+        mock_client, schedules, details, alarms=(), errors=None, endpoints=("ep",)
+    ):
+        errors = errors or {}
+        mock_sm = MagicMock()
+        mock_client.return_value = mock_sm
+
+        def pager(name):
+            p = MagicMock()
+
+            def paginate(**kwargs):
+                if name in errors:
+                    raise _make_client_error(errors[name], name)
+                if name == "list_endpoints":
+                    return [
+                        {
+                            "Endpoints": [
+                                {"EndpointName": e, "EndpointStatus": "InService"}
+                                for e in endpoints
+                            ]
+                        }
+                    ]
+                if name == "list_monitoring_schedules":
+                    return [{"MonitoringScheduleSummaries": schedules}]
+                return [{"MetricAlarms": list(alarms)}]
+
+            p.paginate.side_effect = paginate
+            return p
+
+        mock_sm.get_paginator.side_effect = pager
+
+        def describe(MonitoringScheduleName):
+            if "describe_monitoring_schedule" in errors:
+                raise _make_client_error(errors["describe_monitoring_schedule"], "x")
+            return details[MonitoringScheduleName]
+
+        mock_sm.describe_monitoring_schedule.side_effect = describe
+        return mock_sm
+
+    @staticmethod
+    def _schedule(name, kind, endpoint="ep"):
+        return {
+            "MonitoringScheduleName": name,
+            "MonitoringType": kind,
+            "MonitoringScheduleStatus": "Scheduled",
+            "EndpointName": endpoint,
+        }
+
+    @staticmethod
+    def _detail(age_hours, status="Completed", expression="cron(0 * ? * * *)"):
+        return {
+            "MonitoringScheduleConfig": {
+                "ScheduleConfig": {"ScheduleExpression": expression}
+            },
+            "LastMonitoringExecutionSummary": {
+                "MonitoringExecutionStatus": status,
+                "ScheduledTime": datetime.now(timezone.utc)
+                - timedelta(hours=age_hours),
+            },
+        }
+
+    @staticmethod
+    def _alarm(schedule, namespace="aws/sagemaker/Endpoints/data-metrics"):
+        return {
+            "ActionsEnabled": True,
+            "AlarmActions": ["arn:aws:sns:us-east-1:123456789012:ops"],
+            "Namespace": namespace,
+            "MetricName": "feature_baseline_drift_age",
+            "Dimensions": [
+                {"Name": "Endpoint", "Value": "ep"},
+                {"Name": "MonitoringSchedule", "Value": schedule},
+            ],
+        }
+
+    def _rows(self, mock_client, finding, **kwargs):
+        self._client(mock_client, **kwargs)
+        rows = extract_csv_data(
+            sagemaker_app.check_model_drift_detection(region="us-east-1")
+        )
+        for row in rows:
+            assert_finding_schema(row)
+        return [r for r in rows if r["Finding"].startswith(finding)]
+
+    def _two(self):
+        return [
+            self._schedule("dq", "DataQuality"),
+            self._schedule("mq", "ModelQuality"),
+        ]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_fresh_reports_pass(self, mock_client):
+        rows = self._rows(
+            mock_client,
+            sagemaker_app.MONITOR_REPORT_FINDING,
+            schedules=self._two(),
+            details={
+                "dq": self._detail(1),
+                "mq": self._detail(2, "CompletedWithViolations"),
+            },
+        )
+        assert [r["Status"] for r in rows] == ["Passed"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_one_stale_report_among_fresh_fails(self, mock_client):
+        rows = self._rows(
+            mock_client,
+            sagemaker_app.MONITOR_REPORT_FINDING,
+            schedules=self._two(),
+            details={"dq": self._detail(1), "mq": self._detail(5)},
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "'mq'" in rows[0]["Finding_Details"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_daily_cadence_allows_a_day_old_report(self, mock_client):
+        rows = self._rows(
+            mock_client,
+            sagemaker_app.MONITOR_REPORT_FINDING,
+            schedules=self._two(),
+            details={
+                "dq": self._detail(30, expression="cron(0 0 ? * * *)"),
+                "mq": self._detail(60, expression="cron(0 0 ? * * *)"),
+            },
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "'mq'" in rows[0]["Finding_Details"]
+
+    @pytest.mark.parametrize("status", ["Failed", "Stopped"])
+    @patch("sagemaker_app.boto3.client")
+    def test_failed_latest_execution_fails(self, mock_client, status):
+        rows = self._rows(
+            mock_client,
+            sagemaker_app.MONITOR_REPORT_FINDING,
+            schedules=self._two(),
+            details={"dq": self._detail(1), "mq": self._detail(1, status)},
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert status in rows[0]["Finding_Details"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_never_run_schedule_fails(self, mock_client):
+        rows = self._rows(
+            mock_client,
+            sagemaker_app.MONITOR_REPORT_FINDING,
+            schedules=self._two(),
+            details={"dq": self._detail(1), "mq": {}},
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "never run" in rows[0]["Finding_Details"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_running_execution_withholds_the_pass(self, mock_client):
+        rows = self._rows(
+            mock_client,
+            sagemaker_app.MONITOR_REPORT_FINDING,
+            schedules=self._two(),
+            details={"dq": self._detail(1), "mq": self._detail(0, "InProgress")},
+        )
+        assert [r["Status"] for r in rows] == ["N/A"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_describe_denied_is_not_read(self, mock_client):
+        rows = self._rows(
+            mock_client,
+            sagemaker_app.MONITOR_REPORT_FINDING,
+            schedules=self._two(),
+            details={},
+            errors={"describe_monitoring_schedule": "AccessDeniedException"},
+        )
+        assert [r["Status"] for r in rows] == ["N/A"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_every_schedule_alarmed_passes(self, mock_client):
+        rows = self._rows(
+            mock_client,
+            sagemaker_app.MONITOR_ALARM_FINDING,
+            schedules=self._two(),
+            details={"dq": self._detail(1), "mq": self._detail(1)},
+            alarms=[
+                self._alarm("dq"),
+                self._alarm("mq", "aws/sagemaker/Endpoints/model-metrics"),
+            ],
+        )
+        assert [r["Status"] for r in rows] == ["Passed"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_one_unalarmed_schedule_among_alarmed_fails(self, mock_client):
+        other = self._alarm("mq", "AWS/SageMaker")
+        other["Dimensions"] = [{"Name": "MonitoringSchedule", "Value": "mq"}]
+        rows = self._rows(
+            mock_client,
+            sagemaker_app.MONITOR_ALARM_FINDING,
+            schedules=[
+                self._schedule("dq", "DataQuality"),
+                self._schedule("mq", "ModelQuality", endpoint="ep2"),
+            ],
+            endpoints=("ep", "ep2"),
+            details={"dq": self._detail(1), "mq": self._detail(1)},
+            alarms=[self._alarm("dq"), other],
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "'mq'" in rows[0]["Finding_Details"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_alarm_without_action_does_not_count(self, mock_client):
+        silent = self._alarm("mq")
+        silent["AlarmActions"] = []
+        rows = self._rows(
+            mock_client,
+            sagemaker_app.MONITOR_ALARM_FINDING,
+            schedules=[self._schedule("mq", "ModelQuality", endpoint="ep2")],
+            endpoints=("ep2",),
+            details={"mq": self._detail(1)},
+            alarms=[silent],
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_alarm_read_denied_is_not_read(self, mock_client):
+        rows = self._rows(
+            mock_client,
+            sagemaker_app.MONITOR_ALARM_FINDING,
+            schedules=self._two(),
+            details={"dq": self._detail(1), "mq": self._detail(1)},
+            errors={"describe_alarms": "AccessDenied"},
+        )
+        assert [r["Status"] for r in rows] == ["N/A"]
+
+    @pytest.mark.parametrize("failing", ["list_endpoints", "list_monitoring_schedules"])
+    @patch("sagemaker_app.boto3.client")
+    def test_list_denied_is_not_a_pass(self, mock_client, failing):
+        self._client(
+            mock_client,
+            schedules=[],
+            details={},
+            errors={failing: "AccessDeniedException"},
+        )
+        rows = extract_csv_data(
+            sagemaker_app.check_model_drift_detection(region="us-east-1")
+        )
+        assert "Passed" not in [r["Status"] for r in rows]
+        assert [r["Status"] for r in rows] == ["N/A"]
 
 
 def _raise(error):
