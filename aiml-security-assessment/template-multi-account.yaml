@@ -523,6 +523,15 @@ Resources:
               Action:
                 - iam:GetRole # BR-51
               Resource: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/*'
+            - Sid: EC2InstanceProfileRoleRead
+              # BR-02 resolves the role of each EC2 instance to the Bedrock
+              # surfaces it is granted. ec2:DescribeInstances needs Resource
+              # '*' and is not granted, so BR-02 reports the EC2 leg as not read
+              # until it is.
+              Effect: Allow
+              Action:
+                - iam:GetInstanceProfile # BR-02
+              Resource: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:instance-profile/*'
             - Sid: BedrockInvocationLogInspection
               # BR-04 reads the retention period of the invocation log group and
               # BR-32 reads the metric filters defined on it.

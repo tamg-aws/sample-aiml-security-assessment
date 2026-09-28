@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 import time
 from typing import Dict, List, Any, Optional
 from io import StringIO
+import botocore.session
 from botocore.config import Config
 from botocore.exceptions import BotoCoreError, ClientError, EndpointConnectionError
 import fnmatch
@@ -1318,73 +1319,424 @@ def check_bedrock_full_access_roles(
     return findings
 
 
-def check_bedrock_vpc_endpoints(region: str = "") -> Dict[str, bool]:
+# The Bedrock API surfaces that each take their own interface endpoint. A
+# bedrock-runtime endpoint does not carry bedrock-mantle traffic, so every
+# surface a workload calls needs its own endpoint.
+BEDROCK_ENDPOINT_SURFACES = (
+    "bedrock",
+    "bedrock-runtime",
+    "bedrock-agent",
+    "bedrock-agent-runtime",
+    "bedrock-mantle",
+)
+
+
+def check_bedrock_vpc_endpoints(region: str = "") -> Dict[str, Any]:
     """
-    Check if any VPC has Bedrock VPC endpoints
+    List every VPC and every Bedrock interface endpoint in the region.
+
+    A read failure raises, so a caller never reads a failed listing as an
+    account with no endpoints.
     """
     logger.debug("Checking for Bedrock VPC endpoints")
+    ec2_client = boto3.client("ec2", config=boto3_config, region_name=region)
+
+    bedrock_endpoints = [
+        f"com.amazonaws.{region}.{surface}" for surface in BEDROCK_ENDPOINT_SURFACES
+    ]
+
+    vpc_ids = []
+    for page in ec2_client.get_paginator("describe_vpcs").paginate():
+        vpc_ids.extend(vpc["VpcId"] for vpc in page.get("Vpcs", []))
+    logger.debug(f"Found VPCs: {vpc_ids}")
+
+    found_endpoints = []
+    for page in ec2_client.get_paginator("describe_vpc_endpoints").paginate():
+        for endpoint in page["VpcEndpoints"]:
+            service_name = endpoint["ServiceName"]
+            vpc_id = endpoint["VpcId"]
+            if service_name not in bedrock_endpoints:
+                continue
+            logger.info(
+                f"Found matching Bedrock endpoint: {service_name} in VPC: {vpc_id}"
+            )
+            found_endpoints.append(
+                {
+                    "vpc_id": vpc_id,
+                    "service": service_name,
+                    "endpoint_id": endpoint.get("VpcEndpointId"),
+                    # Absent rather than False when the API did not
+                    # report it, so a missing field is never read as
+                    # a disabled setting or an absent policy.
+                    "private_dns": endpoint.get("PrivateDnsEnabled"),
+                    "policy": endpoint.get("PolicyDocument"),
+                }
+            )
+
+    return {
+        "has_endpoints": len(found_endpoints) > 0,
+        "found_endpoints": found_endpoints,
+        "all_vpcs": vpc_ids,
+    }
+
+
+# bedrock-mantle has no botocore model, so its actions are listed from the
+# service authorization reference.
+BEDROCK_MANTLE_ACTIONS = tuple(
+    "bedrock-mantle:" + name.lower()
+    for name in (
+        "ArchiveProject",
+        "AssociateCustomizedModel",
+        "CallWithBearerToken",
+        "CancelFineTuningJob",
+        "CancelInference",
+        "CountTokens",
+        "CreateCustomizedModel",
+        "CreateFile",
+        "CreateFineTuningJob",
+        "CreateInference",
+        "CreateProject",
+        "CreateReservation",
+        "DeleteCustomizedModel",
+        "DeleteFile",
+        "DeleteInference",
+        "DeleteReservation",
+        "DisassociateCustomizedModel",
+        "GetAccountDataRetention",
+        "GetCustomizedModel",
+        "GetFile",
+        "GetFineTuningJob",
+        "GetInference",
+        "GetModel",
+        "GetProject",
+        "GetReservation",
+        "ListCustomizedModelAssociations",
+        "ListCustomizedModels",
+        "ListFiles",
+        "ListFineTuningJobs",
+        "ListModels",
+        "ListProjects",
+        "ListReservations",
+        "ListTagsForResource",
+        "PutAccountDataRetention",
+        "TagResource",
+        "UntagResource",
+        "UpdateProject",
+        "UpdateReservation",
+    )
+)
+
+_BEDROCK_SURFACE_ACTIONS: Dict[str, tuple] = {}
+
+
+def _bedrock_surface_actions() -> Dict[str, tuple]:
+    """
+    Map each Bedrock endpoint surface to the lowercase IAM actions it serves.
+
+    The bedrock IAM prefix covers four botocore services, so an action is placed
+    on every surface whose model defines an operation of that name. Converse and
+    ConverseStream authorize as InvokeModel and InvokeModelWithResponseStream,
+    which are already bedrock-runtime operations.
+    """
+    if not _BEDROCK_SURFACE_ACTIONS:
+        session = botocore.session.get_session()
+        for surface in BEDROCK_ENDPOINT_SURFACES:
+            if surface == "bedrock-mantle":
+                _BEDROCK_SURFACE_ACTIONS[surface] = BEDROCK_MANTLE_ACTIONS
+                continue
+            _BEDROCK_SURFACE_ACTIONS[surface] = tuple(
+                "bedrock:" + name.lower()
+                for name in session.get_service_model(surface).operation_names
+            )
+    return _BEDROCK_SURFACE_ACTIONS
+
+
+def _granted_bedrock_surfaces(permissions: Dict[str, Any]) -> set:
+    """
+    Return the Bedrock surfaces a cached identity's Allow statements reach.
+
+    Attached, inline and group policies are read and NotAction is honoured. A
+    permissions boundary that denies an action removes it. Identity Deny
+    statements and service control policies are not evaluated. An unreadable
+    policy raises ValueError.
+    """
+    surfaces = set()
+    surface_actions = _bedrock_surface_actions()
+    for _, policy in _cached_identity_policies(permissions):
+        for statement in _policy_statements(policy.get("document") or {}):
+            if str(statement.get("Effect", "")).upper() != "ALLOW":
+                continue
+            for surface, actions in surface_actions.items():
+                if surface in surfaces:
+                    continue
+                if any(
+                    _statement_matches_action(statement, action)
+                    and _boundary_allowance(permissions, action) != "denied"
+                    for action in actions
+                ):
+                    surfaces.add(surface)
+    return surfaces
+
+
+WORKLOAD_CONNECTIVITY_FINDING = "Bedrock Workload Private Connectivity"
+
+WORKLOAD_CONNECTIVITY_CEILING = (
+    "ECS tasks, EKS pods, SageMaker notebooks and endpoints are not read, and "
+    "AgentCore runtimes are judged by AC-08. Endpoints reached from another VPC "
+    "through a shared private hosted zone are not read."
+)
+
+
+def get_bedrock_vpc_workload_inventory(region: str = "") -> Dict[str, Any]:
+    """
+    List Lambda functions and EC2 instances with the VPC and role each runs as.
+
+    A listing that fails is named in ``errors`` so the population is never
+    reported complete without it.
+    """
+    inventory = {"workloads": [], "errors": []}
+    try:
+        lambda_client = boto3.client("lambda", config=boto3_config, region_name=region)
+        functions = []
+        for page in lambda_client.get_paginator("list_functions").paginate():
+            functions.extend(page.get("Functions", []))
+        for function in functions:
+            role_arn = str(function.get("Role") or "")
+            inventory["workloads"].append(
+                {
+                    "kind": "Lambda function",
+                    "name": function.get("FunctionName") or "unnamed",
+                    "vpc_id": (function.get("VpcConfig") or {}).get("VpcId") or None,
+                    "role": role_arn.rsplit("/", 1)[-1] if role_arn else None,
+                }
+            )
+    except Exception as error:
+        inventory["errors"].append(
+            "Lambda functions were not read with lambda:ListFunctions "
+            f"({get_assessment_error_label(error)})"
+        )
+
     try:
         ec2_client = boto3.client("ec2", config=boto3_config, region_name=region)
+        instances = []
+        for page in ec2_client.get_paginator("describe_instances").paginate():
+            for reservation in page.get("Reservations", []):
+                instances.extend(reservation.get("Instances", []))
+    except Exception as error:
+        inventory["errors"].append(
+            "EC2 instances were not read with ec2:DescribeInstances "
+            f"({get_assessment_error_label(error)})"
+        )
+        return inventory
 
-        bedrock_endpoints = [
-            "com.amazonaws.region.bedrock",
-            "com.amazonaws.region.bedrock-runtime",
-            "com.amazonaws.region.bedrock-agent",
-            "com.amazonaws.region.bedrock-agent-runtime",
-        ]
+    iam_client = boto3.client("iam", config=boto3_config)
+    profile_roles: Dict[str, Optional[str]] = {}
+    for instance in instances:
+        if (instance.get("State") or {}).get("Name") == "terminated":
+            continue
+        name = instance.get("InstanceId") or "unnamed"
+        profile_arn = str((instance.get("IamInstanceProfile") or {}).get("Arn") or "")
+        role = None
+        if profile_arn:
+            profile_name = profile_arn.rsplit("/", 1)[-1]
+            if profile_name not in profile_roles:
+                try:
+                    roles = iam_client.get_instance_profile(
+                        InstanceProfileName=profile_name
+                    )["InstanceProfile"].get("Roles", [])
+                    profile_roles[profile_name] = (
+                        roles[0].get("RoleName") if roles else None
+                    )
+                except Exception as error:
+                    profile_roles[profile_name] = None
+                    inventory["errors"].append(
+                        f"instance profile '{profile_name}' of EC2 instance {name} "
+                        "was not read with iam:GetInstanceProfile "
+                        f"({get_assessment_error_label(error)})"
+                    )
+            role = profile_roles[profile_name]
+        inventory["workloads"].append(
+            {
+                "kind": "EC2 instance",
+                "name": name,
+                "vpc_id": instance.get("VpcId") or None,
+                "role": role,
+            }
+        )
+    return inventory
 
-        # Get current region
-        current_region = region
-        logger.debug(f"Current region: {current_region}")
 
-        # Get list of all VPCs
-        vpcs = ec2_client.describe_vpcs()
-        vpc_ids = [vpc["VpcId"] for vpc in vpcs["Vpcs"]]
-        logger.debug(f"Found VPCs: {vpc_ids}")
+def _workload_connectivity_findings(
+    permission_cache: Dict[str, Any],
+    found_endpoints: List[Dict[str, Any]],
+    workload_inventory: Dict[str, Any],
+    region: str,
+) -> List[Dict[str, Any]]:
+    """
+    Judge, per workload, whether each Bedrock surface its role is granted has an
+    interface endpoint with private DNS in the workload's own VPC.
 
-        # Replace 'region' with actual region in endpoint names
-        bedrock_endpoints = [
-            endpoint.replace("region", current_region) for endpoint in bedrock_endpoints
-        ]
-        found_endpoints = []
+    An endpoint without private DNS does not count, because an unmodified SDK
+    client still resolves the public hostname. A workload outside any VPC cannot
+    use an interface endpoint at all.
+    """
+    rows = []
+    covered_by_vpc: Dict[str, set] = {}
+    no_dns_by_vpc: Dict[str, set] = {}
+    prefix = f"com.amazonaws.{region}."
+    for endpoint in found_endpoints:
+        surface = str(endpoint.get("service", ""))
+        if not surface.startswith(prefix):
+            continue
+        surface = surface[len(prefix) :]
+        target = (
+            covered_by_vpc if endpoint.get("private_dns") is True else no_dns_by_vpc
+        )
+        target.setdefault(endpoint.get("vpc_id"), set()).add(surface)
 
-        # Get all VPC endpoints
-        paginator = ec2_client.get_paginator("describe_vpc_endpoints")
-
-        for page in paginator.paginate():
-            for endpoint in page["VpcEndpoints"]:
-                service_name = endpoint["ServiceName"]
-                vpc_id = endpoint["VpcId"]
-                logger.debug(f"Found VPC endpoint: {service_name} in VPC: {vpc_id}")
-
-                # Check if this endpoint matches any of our Bedrock endpoints
-                for bedrock_endpoint in bedrock_endpoints:
-                    if service_name == bedrock_endpoint:
-                        logger.info(
-                            f"Found matching Bedrock endpoint: {service_name} in VPC: {vpc_id}"
+    roles = permission_cache.get("role_permissions") or {}
+    gaps = []
+    covered = []
+    unread = list(workload_inventory.get("errors") or [])
+    for workload in workload_inventory.get("workloads") or []:
+        label = "{} '{}'".format(workload["kind"], workload["name"])
+        role = workload.get("role")
+        if not role:
+            continue
+        if role not in roles:
+            unread.append(
+                f"{label} runs as role '{role}', which the IAM cache does not hold"
+            )
+            continue
+        try:
+            surfaces = _granted_bedrock_surfaces(roles[role])
+        except (ValueError, TypeError, AttributeError):
+            unread.append(
+                f"{label} runs as role '{role}', whose policies could not be parsed"
+            )
+            continue
+        if not surfaces:
+            continue
+        vpc_id = workload.get("vpc_id")
+        if not vpc_id:
+            gaps.append(
+                "{} (role '{}') is not attached to a VPC, so its calls to {} use "
+                "the public service endpoint".format(
+                    label, role, ", ".join(sorted(surfaces))
+                )
+            )
+            continue
+        missing = sorted(surfaces - covered_by_vpc.get(vpc_id, set()))
+        if missing:
+            no_dns = sorted(set(missing) & no_dns_by_vpc.get(vpc_id, set()))
+            gaps.append(
+                "{} in {} (role '{}') is granted {} with no private-DNS endpoint "
+                "in that VPC{}".format(
+                    label,
+                    vpc_id,
+                    role,
+                    ", ".join(missing),
+                    (
+                        "; the endpoint for {} has private DNS off".format(
+                            ", ".join(no_dns)
                         )
-                        found_endpoints.append(
-                            {
-                                "vpc_id": vpc_id,
-                                "service": service_name,
-                                "endpoint_id": endpoint.get("VpcEndpointId"),
-                                # Absent rather than False when the API did not
-                                # report it, so a missing field is never read as
-                                # a disabled setting or an absent policy.
-                                "private_dns": endpoint.get("PrivateDnsEnabled"),
-                                "policy": endpoint.get("PolicyDocument"),
-                            }
-                        )
+                        if no_dns
+                        else ""
+                    ),
+                )
+            )
+        else:
+            covered.append(
+                "{} in {} ({})".format(label, vpc_id, ", ".join(sorted(surfaces)))
+            )
 
-        return {
-            "has_endpoints": len(found_endpoints) > 0,
-            "found_endpoints": found_endpoints,
-            "all_vpcs": vpc_ids,
-        }
-
-    except Exception as e:
-        logger.error(f"Error checking VPC endpoints: {str(e)}", exc_info=True)
-        return {"has_endpoints": False, "found_endpoints": [], "all_vpcs": []}
+    scope = (
+        "Surfaces are taken from the grants of each workload's role, including a "
+        "permissions boundary that removes an action. "
+        f"{SCP_NOT_EVALUATED_NOTE} {WORKLOAD_CONNECTIVITY_CEILING}"
+    )
+    if gaps:
+        rows.append(
+            create_finding(
+                check_id="BR-02",
+                finding_name=WORKLOAD_CONNECTIVITY_FINDING,
+                finding_details="{} workload(s) can call a Bedrock surface outside "
+                "PrivateLink: {}. {}".format(len(gaps), "; ".join(gaps[:10]), scope),
+                resolution=(
+                    "Create one interface endpoint with private DNS for each "
+                    "Bedrock surface (com.amazonaws.{0}.bedrock, bedrock-runtime, "
+                    "bedrock-agent, bedrock-agent-runtime or bedrock-mantle) in "
+                    "each VPC whose workloads call it, and attach Lambda functions "
+                    "that call Bedrock to a VPC.".format(region)
+                ),
+                reference=VPC_ENDPOINT_REFERENCE,
+                severity="Medium",
+                status="Failed",
+                region=region,
+            )
+        )
+    if covered:
+        rows.append(
+            create_finding(
+                check_id="BR-02",
+                finding_name=WORKLOAD_CONNECTIVITY_FINDING,
+                finding_details="{} workload(s) have a private-DNS endpoint in "
+                "their VPC for every Bedrock surface their role is granted: {}. "
+                "{}{}".format(
+                    len(covered),
+                    "; ".join(covered[:10]),
+                    scope,
+                    (
+                        " This is not reported as Passed because part of the "
+                        "workload population was not read."
+                        if unread
+                        else ""
+                    ),
+                ),
+                resolution="No action required",
+                reference=VPC_ENDPOINT_REFERENCE,
+                severity="Medium",
+                status="N/A" if unread else "Passed",
+                region=region,
+            )
+        )
+    if unread:
+        rows.append(
+            create_finding(
+                check_id="BR-02",
+                finding_name=WORKLOAD_CONNECTIVITY_FINDING,
+                finding_details="{} part(s) of the workload population were not "
+                "read, so the Bedrock surfaces they call were not judged: {}.".format(
+                    len(unread), "; ".join(unread[:10])
+                ),
+                resolution=(
+                    "Grant lambda:ListFunctions, ec2:DescribeInstances and "
+                    "iam:GetInstanceProfile, refresh the IAM permissions cache and "
+                    "retry."
+                ),
+                reference=VPC_ENDPOINT_REFERENCE,
+                severity="Informational",
+                status="N/A",
+                region=region,
+            )
+        )
+    if not rows:
+        rows.append(
+            create_finding(
+                check_id="BR-02",
+                finding_name=WORKLOAD_CONNECTIVITY_FINDING,
+                finding_details=(
+                    "No Lambda function or EC2 instance runs as a role granted a "
+                    f"Bedrock surface. {scope}"
+                ),
+                resolution="No action required",
+                reference=VPC_ENDPOINT_REFERENCE,
+                severity="Informational",
+                status="N/A",
+                region=region,
+            )
+        )
+    return rows
 
 
 def has_bedrock_permissions_in_cache(permissions: Dict) -> bool:
@@ -1845,6 +2197,13 @@ def _vpc_endpoint_hardening_findings(
 def check_bedrock_access_and_vpc_endpoints(
     permission_cache, region: str = ""
 ) -> Dict[str, Any]:
+    """
+    BR-02: Judge private connectivity to Bedrock per workload and per endpoint.
+
+    The endpoint inventory, the workload leg and the endpoint hardening legs run
+    whatever the IAM cache or the regional resource footprint shows, because an
+    account that only invokes on-demand models has no Bedrock resources to find.
+    """
     logger.debug("Starting check for Bedrock access and VPC endpoints")
     try:
         findings = {
@@ -1855,48 +2214,22 @@ def check_bedrock_access_and_vpc_endpoints(
         }
 
         bedrock_access_found = False
-
-        # Check roles and users for Bedrock access
-        for role_name, permissions in permission_cache["role_permissions"].items():
-            if has_bedrock_permissions_in_cache(permissions):
-                bedrock_access_found = True
-                break
-
-        if not bedrock_access_found:
-            for user_name, permissions in permission_cache["user_permissions"].items():
-                if has_bedrock_permissions_in_cache(permissions):
+        for permissions in list(
+            (permission_cache.get("role_permissions") or {}).values()
+        ) + list((permission_cache.get("user_permissions") or {}).values()):
+            try:
+                if _granted_bedrock_surfaces(permissions):
                     bedrock_access_found = True
                     break
+            except (ValueError, TypeError, AttributeError):
+                continue
 
-        if bedrock_access_found:
-            bedrock_footprint_found = detect_bedrock_regional_footprint(region=region)
+        vpc_endpoint_check = check_bedrock_vpc_endpoints(region=region)
+        workload_inventory = get_bedrock_vpc_workload_inventory(region=region)
 
-            if bedrock_footprint_found is not True:
-                findings["details"] = bedrock_footprint_na_detail(
-                    bedrock_footprint_found
-                )
-                findings["csv_data"].append(
-                    create_finding(
-                        check_id="BR-02",
-                        finding_name="Amazon Bedrock private connectivity check",
-                        finding_details=bedrock_footprint_na_detail(
-                            bedrock_footprint_found,
-                            "to assess private connectivity",
-                        ),
-                        resolution="No action required",
-                        reference="https://docs.aws.amazon.com/bedrock/latest/userguide/vpc-interface-endpoints.html",
-                        severity="Informational",
-                        status="N/A",
-                        region=region,
-                    )
-                )
-                return findings
-
-            vpc_endpoint_check = check_bedrock_vpc_endpoints(region=region)
-
-            if not vpc_endpoint_check["has_endpoints"]:
+        if not vpc_endpoint_check["has_endpoints"]:
+            if bedrock_access_found:
                 findings["status"] = "WARN"
-
                 if vpc_endpoint_check["all_vpcs"]:
                     vpc_list = ", ".join(vpc_endpoint_check["all_vpcs"])
                     finding_detail = (
@@ -1910,44 +2243,68 @@ def check_bedrock_access_and_vpc_endpoints(
                         check_id="BR-02",
                         finding_name="Amazon Bedrock private connectivity not used",
                         finding_details=finding_detail,
-                        resolution="Create a VPC endpoint in your VPC with any of the following Bedrock service endpoints that your application may be using:\n- com.amazonaws.region.bedrock\n- com.amazonaws.region.bedrock-runtime\n- com.amazonaws.region.bedrock-agent\n- com.amazonaws.region.bedrock-agent-runtime",
+                        resolution="Create a VPC endpoint in your VPC for each of the following Bedrock service endpoints that your application calls:\n- com.amazonaws.region.bedrock\n- com.amazonaws.region.bedrock-runtime\n- com.amazonaws.region.bedrock-agent\n- com.amazonaws.region.bedrock-agent-runtime\n- com.amazonaws.region.bedrock-mantle",
                         reference="https://docs.aws.amazon.com/bedrock/latest/userguide/vpc-interface-endpoints.html",
                         severity="Medium",
                         status="Failed",
                         region=region,
                     )
                 )
-            else:
-                endpoint_details = []
-                for endpoint in vpc_endpoint_check["found_endpoints"]:
-                    endpoint_details.append(
-                        f"VPC {endpoint['vpc_id']} has endpoint {endpoint['service']}"
-                    )
-                findings["details"] = "Bedrock VPC endpoints found: " + "; ".join(
-                    endpoint_details
-                )
-                findings["csv_data"].append(
-                    create_finding(
-                        check_id="BR-02",
-                        finding_name="Amazon Bedrock private connectivity",
-                        finding_details=f"Bedrock VPC endpoints found: {'; '.join(endpoint_details)}",
-                        resolution="No action required",
-                        reference="https://docs.aws.amazon.com/bedrock/latest/userguide/vpc-interface-endpoints.html",
-                        severity="High",
-                        status="Passed",
-                        region=region,
-                    )
-                )
-                # An endpoint existing is not private connectivity being used,
-                # which is what AIR-FND-NET-02 asks for, so the two settings that
-                # decide it are judged per endpoint.
-                hardening = _vpc_endpoint_hardening_findings(
-                    vpc_endpoint_check["found_endpoints"], region
-                )
-                if any(row["Status"] == "Failed" for row in hardening):
-                    findings["status"] = "WARN"
-                findings["csv_data"].extend(hardening)
         else:
+            endpoint_details = []
+            for endpoint in vpc_endpoint_check["found_endpoints"]:
+                endpoint_details.append(
+                    f"VPC {endpoint['vpc_id']} has endpoint {endpoint['service']}"
+                )
+            findings["details"] = "Bedrock VPC endpoints found: " + "; ".join(
+                endpoint_details
+            )
+            # An endpoint existing proves nothing about the calls a workload
+            # makes, so this row is inventory and the workload leg decides.
+            findings["csv_data"].append(
+                create_finding(
+                    check_id="BR-02",
+                    finding_name="Amazon Bedrock private connectivity",
+                    finding_details=(
+                        f"Bedrock VPC endpoints found: {'; '.join(endpoint_details)}. "
+                        f"Whether each workload's VPC has an endpoint for every "
+                        f"surface it calls is judged in the "
+                        f"{WORKLOAD_CONNECTIVITY_FINDING} row."
+                    ),
+                    resolution="No action required",
+                    reference="https://docs.aws.amazon.com/bedrock/latest/userguide/vpc-interface-endpoints.html",
+                    severity="Informational",
+                    status="N/A",
+                    region=region,
+                )
+            )
+            hardening = _vpc_endpoint_hardening_findings(
+                vpc_endpoint_check["found_endpoints"], region
+            )
+            if any(row["Status"] == "Failed" for row in hardening):
+                findings["status"] = "WARN"
+            findings["csv_data"].extend(hardening)
+
+        workload_rows = _apply_cache_population_gaps(
+            {
+                "csv_data": _workload_connectivity_findings(
+                    permission_cache,
+                    vpc_endpoint_check["found_endpoints"],
+                    workload_inventory,
+                    region,
+                )
+            },
+            permission_cache,
+            "BR-02",
+            WORKLOAD_CONNECTIVITY_FINDING,
+            VPC_ENDPOINT_REFERENCE,
+            region,
+            principal_types=("role",),
+        )["csv_data"]
+        if any(row["Status"] == "Failed" for row in workload_rows):
+            findings["status"] = "WARN"
+        findings["csv_data"].extend(workload_rows)
+        if not bedrock_access_found:
             findings["details"] = "No Bedrock access found in roles or users"
 
         return findings

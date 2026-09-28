@@ -165,6 +165,7 @@ _EXPECTED_ACTIONS = {
         "ec2:DescribeVpcEndpoints",
         "ec2:DescribeVpcs",
         "iam:GenerateServiceLastAccessedDetails",
+        "iam:GetInstanceProfile",
         "iam:GetLoginProfile",
         "iam:GetRole",
         "iam:GetServiceLastAccessedDetails",
@@ -1033,6 +1034,10 @@ def test_aisf_phase5_reads_wildcard_only_where_iam_has_no_resource_type(template
         ("BedrockSecurityAssessmentFunction", "AIRoleTrustPolicyRead"): (
             "iam:GetRole",
             "iam::${AWS::AccountId}:role/*",
+        ),
+        ("BedrockSecurityAssessmentFunction", "EC2InstanceProfileRoleRead"): (
+            "iam:GetInstanceProfile",
+            "iam::${AWS::AccountId}:instance-profile/*",
         ),
         ("BedrockSecurityAssessmentFunction", "OrganizationsEffectivePolicyRead"): (
             "organizations:DescribeEffectivePolicy",

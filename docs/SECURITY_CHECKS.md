@@ -347,7 +347,7 @@ investigation and remediation.
 ### BR-02: Amazon VPC Endpoint Configuration
 
 - **Severity:** High
-- **Description:** Validates Bedrock Amazon VPC endpoints exist for private connectivity.
+- **Description:** Lists interface endpoints for the five Bedrock surfaces (`bedrock`, `bedrock-runtime`, `bedrock-agent`, `bedrock-agent-runtime` and `bedrock-mantle`) across every VPC page, then reads each Lambda function and each EC2 instance in the Region, resolves its execution or instance-profile role, and computes from the IAM cache which surfaces that role is granted (attached, inline and group policies, with a permissions boundary that denies an action removing it). The `Bedrock Workload Private Connectivity` finding fails a workload outside a VPC, and a workload whose VPC has no private-DNS endpoint for a surface its role is granted. Endpoint presence alone is reported as `N/A` and no longer passes. An endpoint listing that fails is reported as not read. The EC2 leg needs `ec2:DescribeInstances` on `*`, which the scan role does not hold, so it reports the instances as not read. ECS tasks, EKS pods, SageMaker notebooks and private hosted zones shared from another VPC are not read. A workload whose role the cache does not hold, a collector error, or cache `principal_errors` downgrade the `Passed` row to `N/A`. Service control policies are not evaluated per principal.
 
 ### BR-03: Marketplace Subscription Access
 

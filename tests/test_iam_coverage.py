@@ -619,6 +619,9 @@ _VERIFIED_REMEDIATION_IAM_ACTIONS |= {
     "aws-marketplace:Unsubscribe",
     "bedrock:CallWithBearerToken",
     "bedrock-mantle:CallWithBearerToken",
+    # BR-02's EC2 workload leg: same method, 2026-09-27.
+    "ec2:DescribeInstances",
+    "iam:GetInstanceProfile",
     # The two PutAccountDataRetention actions: same method, 2026-09-27.
     "bedrock-mantle:PutAccountDataRetention",
     "bedrock:PutAccountDataRetention",

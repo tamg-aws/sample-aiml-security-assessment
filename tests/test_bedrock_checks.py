@@ -135,7 +135,21 @@ class TestBR01FullAccessRoles:
 class TestBR02VPCEndpoints:
     """BR-02: Check Bedrock access and VPC endpoints."""
 
-    def test_br02_no_bedrock_access_returns_no_findings(self, empty_permission_cache):
+    @pytest.fixture(autouse=True)
+    def _no_workloads(self):
+        with patch(
+            "bedrock_app.get_bedrock_vpc_workload_inventory",
+            return_value={"workloads": [], "errors": []},
+        ):
+            yield
+
+    @patch(
+        "bedrock_app.check_bedrock_vpc_endpoints",
+        return_value={"has_endpoints": False, "found_endpoints": [], "all_vpcs": []},
+    )
+    def test_br02_no_bedrock_access_returns_no_findings(
+        self, mock_vpc, empty_permission_cache
+    ):
         check = bedrock_app.check_bedrock_access_and_vpc_endpoints
         result = check(empty_permission_cache)
         # When no bedrock access found, csv_data may be empty or have info finding
@@ -143,7 +157,7 @@ class TestBR02VPCEndpoints:
 
     @patch("bedrock_app.check_bedrock_vpc_endpoints")
     @patch("bedrock_app.detect_bedrock_regional_footprint", return_value=True)
-    def test_br02_bedrock_access_with_endpoints_returns_passed(
+    def test_br02_endpoint_presence_alone_does_not_pass(
         self, mock_footprint, mock_vpc, permission_cache_compliant
     ):
         check = bedrock_app.check_bedrock_access_and_vpc_endpoints
@@ -160,8 +174,9 @@ class TestBR02VPCEndpoints:
         result = check(permission_cache_compliant)
         findings = extract_csv_data(result)
         assert len(findings) >= 1
-        assert findings[0]["Status"] == "Passed"
+        assert findings[0]["Status"] == "N/A"
         assert findings[0]["Check_ID"] == "BR-02"
+        assert "Passed" not in [finding["Status"] for finding in findings]
 
     @patch("bedrock_app.check_bedrock_vpc_endpoints")
     @patch("bedrock_app.detect_bedrock_regional_footprint", return_value=True)
@@ -182,18 +197,22 @@ class TestBR02VPCEndpoints:
 
     @patch("bedrock_app.check_bedrock_vpc_endpoints")
     @patch("bedrock_app.detect_bedrock_regional_footprint", return_value=False)
-    def test_br02_no_regional_footprint_returns_na(
+    def test_br02_no_regional_footprint_still_judges_connectivity(
         self, mock_footprint, mock_vpc, permission_cache_compliant
     ):
+        """An account that only invokes on-demand models has no resources to
+        find, so the footprint no longer decides whether BR-02 runs."""
         check = bedrock_app.check_bedrock_access_and_vpc_endpoints
+        mock_vpc.return_value = {
+            "has_endpoints": False,
+            "found_endpoints": [],
+            "all_vpcs": ["vpc-123"],
+        }
         result = check(permission_cache_compliant, region="eu-west-3")
         findings = extract_csv_data(result)
         assert len(findings) >= 1
-        assert findings[0]["Status"] == "N/A"
-        assert findings[0]["Finding_Details"] == (
-            "No regional Bedrock resources found to assess private connectivity"
-        )
-        mock_vpc.assert_not_called()
+        assert findings[0]["Status"] == "Failed"
+        mock_vpc.assert_called_once_with(region="eu-west-3")
 
     @patch("bedrock_app.check_bedrock_vpc_endpoints")
     @patch("bedrock_app.detect_bedrock_regional_footprint", return_value=True)
@@ -281,6 +300,10 @@ class TestBR02VPCEndpointHardening:
     def _run(self, endpoints, permission_cache):
         with (
             patch("bedrock_app.detect_bedrock_regional_footprint", return_value=True),
+            patch(
+                "bedrock_app.get_bedrock_vpc_workload_inventory",
+                return_value={"workloads": [], "errors": []},
+            ),
             patch(
                 "bedrock_app.check_bedrock_vpc_endpoints",
                 return_value={
@@ -738,6 +761,390 @@ class TestBR02VPCEndpointHardening:
         assert endpoint["endpoint_id"] == "vpce-1"
         assert endpoint["private_dns"] is False
         assert endpoint["policy"] == self._OPEN_POLICY
+
+
+class TestBR02WorkloadConnectivity:
+    """
+    BR-02 workload leg: each Bedrock surface a workload's role is granted needs
+    a private-DNS interface endpoint in that workload's VPC.
+    """
+
+    REGION = "us-east-1"
+
+    @staticmethod
+    def _role(actions, not_action=False, boundary=None):
+        statement = {"Effect": "Allow", "Resource": "*"}
+        statement["NotAction" if not_action else "Action"] = actions
+        permissions = {
+            "attached_policies": [
+                {
+                    "name": "Workload",
+                    "arn": "arn:aws:iam::123456789012:policy/Workload",
+                    "document": {"Version": "2012-10-17", "Statement": [statement]},
+                }
+            ],
+            "inline_policies": [],
+        }
+        if boundary is not None:
+            permissions["permissions_boundary"] = {"document": boundary}
+        return permissions
+
+    @classmethod
+    def _cache(cls, roles, errors=None):
+        return {
+            "cache_schema_version": 2,
+            "principal_errors": errors or [],
+            "role_permissions": roles,
+            "user_permissions": {},
+        }
+
+    @classmethod
+    def _endpoint(cls, surface, vpc_id="vpc-1", private_dns=True, endpoint_id="vpce-1"):
+        return {
+            "vpc_id": vpc_id,
+            "service": f"com.amazonaws.{cls.REGION}.{surface}",
+            "endpoint_id": endpoint_id,
+            "private_dns": private_dns,
+            "policy": None,
+        }
+
+    @staticmethod
+    def _function(name, role, vpc_id="vpc-1"):
+        return {"kind": "Lambda function", "name": name, "vpc_id": vpc_id, "role": role}
+
+    def _run(self, cache, endpoints, workloads, errors=None):
+        with (
+            patch(
+                "bedrock_app.check_bedrock_vpc_endpoints",
+                return_value={
+                    "has_endpoints": bool(endpoints),
+                    "found_endpoints": list(endpoints),
+                    "all_vpcs": ["vpc-1", "vpc-2"],
+                },
+            ),
+            patch(
+                "bedrock_app.get_bedrock_vpc_workload_inventory",
+                return_value={"workloads": list(workloads), "errors": errors or []},
+            ),
+        ):
+            findings = extract_csv_data(
+                bedrock_app.check_bedrock_access_and_vpc_endpoints(
+                    cache, region=self.REGION
+                )
+            )
+        return [
+            finding
+            for finding in findings
+            if finding["Finding"] == bedrock_app.WORKLOAD_CONNECTIVITY_FINDING
+        ]
+
+    def test_br02_workload_with_an_endpoint_per_granted_surface_passes(self):
+        rows = self._run(
+            self._cache({"InvokeRole": self._role(["bedrock:InvokeModel"])}),
+            [self._endpoint("bedrock-runtime")],
+            [self._function("summarize", "InvokeRole")],
+        )
+
+        assert [row["Status"] for row in rows] == ["Passed"]
+        assert (
+            "Lambda function 'summarize' in vpc-1 (bedrock-runtime)"
+            in rows[0]["Finding_Details"]
+        )
+
+    def test_br02_two_workloads_in_two_vpcs_reach_both_verdicts(self):
+        rows = self._run(
+            self._cache({"InvokeRole": self._role(["bedrock:InvokeModel"])}),
+            [self._endpoint("bedrock-runtime", vpc_id="vpc-1")],
+            [
+                self._function("covered", "InvokeRole", vpc_id="vpc-1"),
+                self._function("exposed", "InvokeRole", vpc_id="vpc-2"),
+            ],
+        )
+
+        assert [row["Status"] for row in rows] == ["Failed", "Passed"]
+        assert "Lambda function 'exposed' in vpc-2" in rows[0]["Finding_Details"]
+        assert "'covered'" not in rows[0]["Finding_Details"]
+
+    def test_br02_mantle_grant_is_not_carried_by_a_runtime_endpoint(self):
+        rows = self._run(
+            self._cache(
+                {
+                    "MixedRole": self._role(
+                        ["bedrock:InvokeModel", "bedrock-mantle:CreateInference"]
+                    )
+                }
+            ),
+            [self._endpoint("bedrock-runtime")],
+            [self._function("chat", "MixedRole")],
+        )
+
+        assert [row["Status"] for row in rows] == ["Failed"]
+        assert (
+            "is granted bedrock-mantle with no private-DNS endpoint"
+            in rows[0]["Finding_Details"]
+        )
+
+    def test_br02_agent_runtime_grant_needs_its_own_endpoint(self):
+        rows = self._run(
+            self._cache({"AgentRole": self._role(["bedrock:InvokeAgent"])}),
+            [self._endpoint("bedrock-runtime"), self._endpoint("bedrock-agent")],
+            [self._function("agent", "AgentRole")],
+        )
+
+        assert [row["Status"] for row in rows] == ["Failed"]
+        assert "is granted bedrock-agent-runtime" in rows[0]["Finding_Details"]
+
+    def test_br02_endpoint_with_private_dns_off_does_not_cover_the_workload(self):
+        rows = self._run(
+            self._cache({"InvokeRole": self._role(["bedrock:InvokeModel"])}),
+            [self._endpoint("bedrock-runtime", private_dns=False)],
+            [self._function("summarize", "InvokeRole")],
+        )
+
+        assert [row["Status"] for row in rows] == ["Failed"]
+        assert (
+            "the endpoint for bedrock-runtime has private DNS off"
+            in rows[0]["Finding_Details"]
+        )
+
+    def test_br02_lambda_outside_a_vpc_fails(self):
+        rows = self._run(
+            self._cache({"InvokeRole": self._role(["bedrock:InvokeModel"])}),
+            [self._endpoint("bedrock-runtime")],
+            [self._function("public", "InvokeRole", vpc_id=None)],
+        )
+
+        assert [row["Status"] for row in rows] == ["Failed"]
+        assert "is not attached to a VPC" in rows[0]["Finding_Details"]
+
+    def test_br02_not_action_allow_reaches_every_surface(self):
+        rows = self._run(
+            self._cache({"WideRole": self._role(["s3:*"], not_action=True)}),
+            [self._endpoint("bedrock-runtime")],
+            [self._function("wide", "WideRole")],
+        )
+
+        assert [row["Status"] for row in rows] == ["Failed"]
+        detail = rows[0]["Finding_Details"]
+        for surface in ("bedrock, ", "bedrock-agent, ", "bedrock-mantle"):
+            assert surface in detail
+
+    def test_br02_boundary_that_denies_bedrock_removes_the_surface(self):
+        boundary = {
+            "Version": "2012-10-17",
+            "Statement": [{"Effect": "Allow", "Action": "s3:*", "Resource": "*"}],
+        }
+        rows = self._run(
+            self._cache({"Bounded": self._role(["bedrock:*"], boundary=boundary)}),
+            [],
+            [self._function("bounded", "Bounded", vpc_id=None)],
+        )
+
+        assert [row["Status"] for row in rows] == ["N/A"]
+        assert "No Lambda function or EC2 instance" in rows[0]["Finding_Details"]
+
+    def test_br02_unread_population_blocks_a_clean_pass(self):
+        rows = self._run(
+            self._cache({"InvokeRole": self._role(["bedrock:InvokeModel"])}),
+            [self._endpoint("bedrock-runtime")],
+            [
+                self._function("summarize", "InvokeRole"),
+                self._function("orphan", "UncachedRole"),
+            ],
+            errors=[
+                "EC2 instances were not read with ec2:DescribeInstances (AccessDenied)"
+            ],
+        )
+
+        assert [row["Status"] for row in rows] == ["N/A", "N/A"]
+        assert "This is not reported as Passed" in rows[0]["Finding_Details"]
+        assert "ec2:DescribeInstances" in rows[1]["Finding_Details"]
+        assert (
+            "role 'UncachedRole', which the IAM cache does not hold"
+            in rows[1]["Finding_Details"]
+        )
+
+    def test_br02_cache_principal_errors_block_a_clean_pass(self):
+        rows = self._run(
+            self._cache(
+                {"InvokeRole": self._role(["bedrock:InvokeModel"])},
+                errors=[
+                    {
+                        "type": "role",
+                        "name": "Hidden",
+                        "stage": "policies",
+                        "error": "x",
+                    }
+                ],
+            ),
+            [self._endpoint("bedrock-runtime")],
+            [self._function("summarize", "InvokeRole")],
+        )
+
+        assert "Passed" not in [row["Status"] for row in rows]
+        assert any("Hidden" in row["Finding_Details"] for row in rows)
+
+    def test_br02_workload_inventory_reads_every_page_and_names_the_ec2_gap(self):
+        lambda_client = MagicMock()
+        lambda_client.get_paginator.return_value.paginate.return_value = [
+            {
+                "Functions": [
+                    {
+                        "FunctionName": "one",
+                        "Role": "arn:aws:iam::123456789012:role/service-role/RoleOne",
+                        "VpcConfig": {"VpcId": "vpc-1"},
+                    }
+                ]
+            },
+            {
+                "Functions": [
+                    {
+                        "FunctionName": "two",
+                        "Role": "arn:aws:iam::123456789012:role/RoleTwo",
+                    }
+                ]
+            },
+        ]
+        ec2_client = MagicMock()
+        ec2_client.get_paginator.return_value.paginate.side_effect = ClientError(
+            {"Error": {"Code": "UnauthorizedOperation", "Message": "denied"}},
+            "DescribeInstances",
+        )
+
+        def client(service, **_):
+            return {"lambda": lambda_client, "ec2": ec2_client}.get(
+                service, MagicMock()
+            )
+
+        with patch("bedrock_app.boto3.client", side_effect=client):
+            inventory = bedrock_app.get_bedrock_vpc_workload_inventory(self.REGION)
+
+        assert inventory["workloads"] == [
+            {
+                "kind": "Lambda function",
+                "name": "one",
+                "vpc_id": "vpc-1",
+                "role": "RoleOne",
+            },
+            {
+                "kind": "Lambda function",
+                "name": "two",
+                "vpc_id": None,
+                "role": "RoleTwo",
+            },
+        ]
+        assert len(inventory["errors"]) == 1
+        assert "ec2:DescribeInstances" in inventory["errors"][0]
+
+    def test_br02_workload_inventory_resolves_instance_profile_roles(self):
+        lambda_client = MagicMock()
+        lambda_client.get_paginator.return_value.paginate.return_value = [
+            {"Functions": []}
+        ]
+        ec2_client = MagicMock()
+        ec2_client.get_paginator.return_value.paginate.return_value = [
+            {
+                "Reservations": [
+                    {
+                        "Instances": [
+                            {
+                                "InstanceId": "i-1",
+                                "VpcId": "vpc-1",
+                                "State": {"Name": "running"},
+                                "IamInstanceProfile": {
+                                    "Arn": "arn:aws:iam::123456789012:instance-profile/app"
+                                },
+                            },
+                            {
+                                "InstanceId": "i-2",
+                                "VpcId": "vpc-2",
+                                "State": {"Name": "stopped"},
+                                "IamInstanceProfile": {
+                                    "Arn": "arn:aws:iam::123456789012:instance-profile/app"
+                                },
+                            },
+                            {"InstanceId": "i-3", "State": {"Name": "terminated"}},
+                        ]
+                    }
+                ]
+            }
+        ]
+        iam_client = MagicMock()
+        iam_client.get_instance_profile.return_value = {
+            "InstanceProfile": {"Roles": [{"RoleName": "AppRole"}]}
+        }
+
+        def client(service, **_):
+            return {"lambda": lambda_client, "ec2": ec2_client, "iam": iam_client}[
+                service
+            ]
+
+        with patch("bedrock_app.boto3.client", side_effect=client):
+            inventory = bedrock_app.get_bedrock_vpc_workload_inventory(self.REGION)
+
+        assert inventory["errors"] == []
+        assert [
+            (workload["name"], workload["vpc_id"], workload["role"])
+            for workload in inventory["workloads"]
+        ] == [("i-1", "vpc-1", "AppRole"), ("i-2", "vpc-2", "AppRole")]
+        iam_client.get_instance_profile.assert_called_once_with(
+            InstanceProfileName="app"
+        )
+
+    def test_br02_endpoint_listing_failure_is_not_read_as_no_endpoints(
+        self, permission_cache_compliant
+    ):
+        ec2_client = MagicMock()
+        ec2_client.get_paginator.return_value.paginate.side_effect = ClientError(
+            {"Error": {"Code": "UnauthorizedOperation", "Message": "denied"}},
+            "DescribeVpcEndpoints",
+        )
+        with (
+            patch("bedrock_app.boto3.client", return_value=ec2_client),
+            patch(
+                "bedrock_app.get_bedrock_vpc_workload_inventory",
+                return_value={"workloads": [], "errors": []},
+            ),
+        ):
+            findings = extract_csv_data(
+                bedrock_app.check_bedrock_access_and_vpc_endpoints(
+                    permission_cache_compliant, region=self.REGION
+                )
+            )
+
+        assert [finding["Status"] for finding in findings] == ["N/A"]
+        assert_could_not_assess_finding(findings[0])
+
+    def test_br02_collector_keeps_mantle_endpoints_across_vpc_pages(self):
+        ec2_client = MagicMock()
+        pages = {
+            "describe_vpcs": [
+                {"Vpcs": [{"VpcId": "vpc-1"}]},
+                {"Vpcs": [{"VpcId": "vpc-2"}]},
+            ],
+            "describe_vpc_endpoints": [
+                {
+                    "VpcEndpoints": [
+                        {
+                            "VpcEndpointId": "vpce-m",
+                            "VpcId": "vpc-2",
+                            "ServiceName": "com.amazonaws.us-east-1.bedrock-mantle",
+                            "PrivateDnsEnabled": True,
+                        }
+                    ]
+                }
+            ],
+        }
+        ec2_client.get_paginator.side_effect = lambda name: MagicMock(
+            paginate=MagicMock(return_value=pages[name])
+        )
+        with patch("bedrock_app.boto3.client", return_value=ec2_client):
+            result = bedrock_app.check_bedrock_vpc_endpoints(region=self.REGION)
+
+        assert result["all_vpcs"] == ["vpc-1", "vpc-2"]
+        assert [endpoint["endpoint_id"] for endpoint in result["found_endpoints"]] == [
+            "vpce-m"
+        ]
 
 
 # ===================================================================

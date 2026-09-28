@@ -1548,9 +1548,9 @@ INCUMBENT_NAMES = {
     ),
     "BR-02": (
         "Amazon Bedrock private connectivity",
-        "Amazon Bedrock private connectivity check",
         "Amazon Bedrock private connectivity not used",
         "Bedrock VPC Endpoint Check",
+        "Bedrock Workload Private Connectivity",
     ),
     # The second name is published by the outer `except` alone, where every other
     # path publishes the first. An operator filtering the report on the name the
