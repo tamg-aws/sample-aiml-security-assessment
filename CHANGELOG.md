@@ -208,6 +208,9 @@ section.
 
 ### Fixed
 
+- `AC-45` judges each AgentCore runtime's own execution role by the rules it
+  applies to a tool role. No check read a runtime role outside the AgentCore
+  namespace, so one granting `s3:*` or every foundation model passed.
 - `AC-51` requires a rate-based rule whose action is `Block` beside the
   Anti-DDoS managed rule group, and keeps the gateways it judged when a
   gateway or web ACL read fails below the API. A web ACL with the group and no

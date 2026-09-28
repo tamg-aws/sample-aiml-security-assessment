@@ -31843,6 +31843,280 @@ class TestAC45WholePopulation:
         assert keywords == {"assess_shell": "is_primary_region"}
 
 
+def _wire_runtime_roles(mock_ac, runtimes):
+    """Stub ListAgentRuntimes and GetAgentRuntime.
+
+    runtimes maps a runtime id to its GetAgentRuntime detail or the error the
+    call raises.
+    """
+    mock_ac.list_agent_runtimes.return_value = {
+        "agentRuntimes": [
+            {"agentRuntimeId": runtime_id, "agentRuntimeName": f"name-{runtime_id}"}
+            for runtime_id in runtimes
+        ]
+    }
+
+    def get_agent_runtime(agentRuntimeId):
+        answer = runtimes[agentRuntimeId]
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+    mock_ac.get_agent_runtime.side_effect = get_agent_runtime
+
+
+class TestAC45RuntimeExecutionRole:
+    """AC-45 judges each runtime's own roleArn in every namespace."""
+
+    _ACCOUNT = "123456789012"
+
+    def _runtime(self, runtime_id, role_name="RuntimeRole", **extra):
+        detail = {
+            "agentRuntimeId": runtime_id,
+            "agentRuntimeArn": (
+                f"arn:aws:bedrock-agentcore:us-east-1:{self._ACCOUNT}:"
+                f"runtime/{runtime_id}"
+            ),
+        }
+        if role_name:
+            detail["roleArn"] = f"arn:aws:iam::{self._ACCOUNT}:role/{role_name}"
+        detail.update(extra)
+        return detail
+
+    def _cache(self, roles):
+        return {
+            "role_permissions": {
+                name: {
+                    "attached_policies": [
+                        _tool_policy(f"{name}Policy", {"Statement": statements})
+                    ],
+                    "inline_policies": [],
+                }
+                for name, statements in roles.items()
+            }
+        }
+
+    @staticmethod
+    def _allow(action, resource):
+        return {"Effect": "Allow", "Action": action, "Resource": resource}
+
+    @pytest.mark.parametrize(
+        "statement",
+        [
+            {"Effect": "Allow", "Action": "s3:GetObject", "Resource": "*"},
+            {"Effect": "Allow", "Action": "s3:*", "Resource": "arn:aws:s3:::b/*"},
+            {
+                "Effect": "Allow",
+                "Action": "bedrock:InvokeModel",
+                "Resource": "arn:aws:bedrock:us-east-1::foundation-model/*",
+            },
+            {
+                "Effect": "Allow",
+                "Action": "dynamodb:GetItem",
+                "NotResource": "arn:aws:dynamodb:us-east-1:123456789012:table/x",
+            },
+        ],
+        ids=["every-resource", "service-wildcard", "every-model", "not-resource"],
+    )
+    @patch("agentcore_app.agentcore_client")
+    def test_a_runtime_role_unscoped_outside_agentcore_fails(self, mock_ac, statement):
+        _wire_tools(mock_ac)
+        _wire_runtime_roles(mock_ac, {"rt-1": self._runtime("rt-1")})
+
+        findings = agentcore_app.check_agentcore_tool_execution_role_scope(
+            self._cache({"RuntimeRole": [statement]})
+        )
+
+        runtime_rows = [f for f in findings if "(rt-1)" in f["Finding_Details"]]
+        assert [f["Status"] for f in runtime_rows] == ["Failed"]
+        assert runtime_rows[0]["Finding"] == "AgentCore Runtime Execution Role Unscoped"
+        assert runtime_rows[0]["Severity"] == "High"
+        assert "so the runtime reaches everything" in runtime_rows[0]["Finding_Details"]
+        assert "this runtime" in runtime_rows[0]["Resolution"]
+        assert runtime_rows[0]["Check_ID"] == "AC-45"
+
+    @patch("agentcore_app.agentcore_client")
+    def test_each_runtime_is_judged_on_its_own_role(self, mock_ac):
+        _wire_tools(mock_ac)
+        _wire_runtime_roles(
+            mock_ac,
+            {
+                "rt-1": self._runtime("rt-1", "ScopedRole"),
+                "rt-2": self._runtime("rt-2", "WideRole"),
+            },
+        )
+        cache = self._cache(
+            {
+                "ScopedRole": [self._allow("s3:GetObject", "arn:aws:s3:::app/*")],
+                "WideRole": [self._allow("s3:GetObject", "*")],
+            }
+        )
+
+        findings = agentcore_app.check_agentcore_tool_execution_role_scope(cache)
+
+        assert [f["Status"] for f in findings] == ["N/A", "Passed", "Failed"]
+        assert "no tool execution role was assessed" in findings[0]["Finding_Details"]
+        assert "(rt-1)" in findings[1]["Finding_Details"]
+        assert findings[1]["Finding"] == "AgentCore Runtime Execution Role Scope"
+        assert "(rt-2)" in findings[2]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_tools_and_runtimes_are_both_judged(self, mock_ac):
+        _wire_tools(
+            mock_ac,
+            interpreters=[
+                _code_interpreter(
+                    executionRoleArn=f"arn:aws:iam::{self._ACCOUNT}:role/ToolRole"
+                )
+            ],
+        )
+        _wire_runtime_roles(mock_ac, {"rt-1": self._runtime("rt-1")})
+        cache = self._cache(
+            {
+                "ToolRole": [self._allow("s3:GetObject", "arn:aws:s3:::app/*")],
+                "RuntimeRole": [self._allow("s3:GetObject", "*")],
+            }
+        )
+
+        findings = agentcore_app.check_agentcore_tool_execution_role_scope(cache)
+
+        assert [f["Finding"] for f in findings] == [
+            "AgentCore Tool Execution Role Scope",
+            "AgentCore Runtime Execution Role Unscoped",
+        ]
+        assert "so the sandbox reaches" not in findings[1]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_runtime_reporting_no_role_is_not_passed(self, mock_ac):
+        _wire_tools(mock_ac)
+        _wire_runtime_roles(mock_ac, {"rt-1": self._runtime("rt-1", role_name=None)})
+
+        findings = agentcore_app.check_agentcore_tool_execution_role_scope({})
+
+        runtime_rows = [f for f in findings if "(rt-1)" in f["Finding_Details"]]
+        assert [f["Status"] for f in runtime_rows] == ["N/A"]
+        assert "reports no roleArn" in runtime_rows[0]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_unread_runtime_roles_are_na(self, mock_ac):
+        _wire_tools(mock_ac)
+        _wire_runtime_roles(
+            mock_ac,
+            {
+                "rt-1": self._runtime("rt-1", "MissingRole"),
+                "rt-2": self._runtime(
+                    "rt-2",
+                    role_name=None,
+                    roleArn="arn:aws:iam::210987654321:role/RuntimeRole",
+                ),
+            },
+        )
+        cache = self._cache({"RuntimeRole": [self._allow("s3:GetObject", "*")]})
+
+        findings = agentcore_app.check_agentcore_tool_execution_role_scope(cache)
+
+        runtime_rows = findings[1:]
+        assert [f["Status"] for f in runtime_rows] == ["N/A", "N/A"]
+        assert "not in the IAM permissions cache" in runtime_rows[0]["Finding_Details"]
+        assert "the runtime could reach" in runtime_rows[0]["Finding_Details"]
+        assert "210987654321" in runtime_rows[1]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_runtime_read_errors_name_the_action(self, mock_ac):
+        _wire_tools(mock_ac)
+        _wire_runtime_roles(
+            mock_ac,
+            {
+                "rt-1": _make_client_error("AccessDeniedException", "no"),
+                "rt-2": self._runtime("rt-2"),
+            },
+        )
+        cache = self._cache({"RuntimeRole": [self._allow("s3:GetObject", "*")]})
+
+        findings = agentcore_app.check_agentcore_tool_execution_role_scope(cache)
+
+        assert [f["Status"] for f in findings] == ["N/A", "N/A", "Failed"]
+        assert "bedrock-agentcore:GetAgentRuntime" in findings[0]["Resolution"]
+        assert "(rt-2)" in findings[2]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_denied_runtime_list_is_na_naming_the_action(self, mock_ac):
+        _wire_tools(mock_ac)
+        mock_ac.list_agent_runtimes.side_effect = _make_client_error(
+            "AccessDeniedException", "no"
+        )
+
+        findings = agentcore_app.check_agentcore_tool_execution_role_scope({})
+
+        assert [f["Status"] for f in findings] == ["N/A", "N/A"]
+        assert "bedrock-agentcore:ListAgentRuntimes" in findings[0]["Resolution"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_resourceless_actions_on_star_do_not_fail_a_runtime(self, mock_ac):
+        _wire_tools(mock_ac)
+        _wire_runtime_roles(
+            mock_ac,
+            {
+                "rt-1": self._runtime("rt-1", "TemplateRole"),
+                "rt-2": self._runtime("rt-2", "MixedRole"),
+            },
+        )
+        resourceless = [
+            "ecr:GetAuthorizationToken",
+            "xray:PutTraceSegments",
+            "xray:PutTelemetryRecords",
+            "xray:GetSamplingRules",
+            "xray:GetSamplingTargets",
+            "logs:DescribeLogGroups",
+        ]
+        cache = self._cache(
+            {
+                "TemplateRole": [self._allow(resourceless, "*")],
+                # One action that takes a resource keeps the statement a grant
+                # of every resource.
+                "MixedRole": [
+                    self._allow(resourceless + ["cloudwatch:PutMetricData"], "*")
+                ],
+            }
+        )
+
+        findings = agentcore_app.check_agentcore_tool_execution_role_scope(cache)
+
+        assert [f["Status"] for f in findings] == ["N/A", "Passed", "Failed"]
+        assert "(rt-2)" in findings[2]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_the_resourceless_exemption_does_not_reach_tool_roles(self, mock_ac):
+        _wire_tools(
+            mock_ac,
+            interpreters=[
+                _code_interpreter(
+                    executionRoleArn=f"arn:aws:iam::{self._ACCOUNT}:role/ToolRole"
+                )
+            ],
+        )
+        _wire_runtime_roles(mock_ac, {})
+        cache = self._cache(
+            {"ToolRole": [self._allow("ecr:GetAuthorizationToken", "*")]}
+        )
+
+        findings = agentcore_app.check_agentcore_tool_execution_role_scope(cache)
+
+        assert [f["Status"] for f in findings] == ["Failed"]
+
+    def test_the_resourceless_actions_take_no_resource_type(self):
+        # Each literal is an IAM action and its service reference lists no
+        # resource for it, read 2026-09-28. The set is lowercase for matching.
+        assert agentcore_app.AGENTCORE_RUNTIME_RESOURCELESS_ACTIONS == {
+            "ecr:getauthorizationtoken",
+            "logs:describeloggroups",
+            "xray:getsamplingrules",
+            "xray:getsamplingtargets",
+            "xray:puttelemetryrecords",
+            "xray:puttracesegments",
+        }
+
+
 class TestAC45CommandShellAlarm:
     """AC-45 requires an acting alarm on shell connections when anyone holds one."""
 

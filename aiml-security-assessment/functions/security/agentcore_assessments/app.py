@@ -21283,8 +21283,26 @@ def _tool_resource_is_unbounded(resource: str) -> bool:
     return bool(name) and ("*" in name or "?" in name)
 
 
+# Actions AgentCore's runtime execution role needs that the service reference
+# lists with no resource type, so Resource "*" is the only form a grant of one
+# can take and it reaches no resource. Read from the ecr, xray and logs service
+# reference JSON on 2026-09-28; cloudwatch:PutMetricData is left out because it
+# now takes the dataset resource.
+AGENTCORE_RUNTIME_RESOURCELESS_ACTIONS = frozenset(
+    {
+        "ecr:getauthorizationtoken",
+        "logs:describeloggroups",
+        "xray:getsamplingrules",
+        "xray:getsamplingtargets",
+        "xray:puttelemetryrecords",
+        "xray:puttracesegments",
+    }
+)
+
+
 def _tool_execution_role_problems(
     permissions: Dict[str, Any],
+    resourceless_actions: frozenset = frozenset(),
 ) -> Tuple[List[str], int]:
     """Return one tool execution role's unscoped grants and unreadable count.
 
@@ -21296,7 +21314,8 @@ def _tool_execution_role_problems(
     AC-02 reads the same documents for the AgentCore namespace only, so a tool
     role granting s3:* on every bucket passes it. A statement whose every action
     the role's own unconditioned Deny or permissions boundary removes is not a
-    grant, and group policies are read with the rest.
+    grant, and group policies are read with the rest. A statement whose every
+    action is in resourceless_actions is not read as granting every resource.
     """
     problems: List[str] = []
     unreadable = 0
@@ -21322,6 +21341,12 @@ def _tool_execution_role_problems(
                 resource
                 for resource in resources
                 if _tool_resource_is_unbounded(resource)
+                and not (
+                    actions
+                    and all(
+                        action.lower() in resourceless_actions for action in actions
+                    )
+                )
             ]
             if unbounded:
                 problems.append(
@@ -21612,12 +21637,48 @@ def _command_shell_findings(permission_cache: Dict[str, Any]) -> List[Dict[str, 
     return findings
 
 
+def _agentcore_runtime_role_details() -> Tuple[
+    List[Tuple[str, Dict[str, Any]]], List[Tuple[str, Exception, str]]
+]:
+    """Return each runtime's GetAgentRuntime detail, labelled for reports.
+
+    A list or detail failure is returned with the IAM action that answers it,
+    so one unreadable runtime does not hide the rest.
+    """
+    details: List[Tuple[str, Dict[str, Any]]] = []
+    errors: List[Tuple[str, Exception, str]] = []
+    try:
+        runtimes = _agentcore_list_all("list_agent_runtimes", ["agentRuntimes"])
+    except (AttributeError, BotoCoreError, ClientError) as error:
+        logger.warning(f"Could not list AgentCore runtimes: {error}")
+        return details, [
+            (
+                "The list of AgentCore runtimes",
+                error,
+                "bedrock-agentcore:ListAgentRuntimes",
+            )
+        ]
+    for runtime in runtimes:
+        runtime_id = runtime.get("agentRuntimeId") or "unknown"
+        label = (
+            f"Runtime '{runtime.get('agentRuntimeName') or runtime_id}' ({runtime_id})"
+        )
+        try:
+            detail = agentcore_client.get_agent_runtime(agentRuntimeId=runtime_id)
+        except (BotoCoreError, ClientError) as error:
+            logger.warning(f"Could not read runtime {runtime_id}: {error}")
+            errors.append((label, error, "bedrock-agentcore:GetAgentRuntime"))
+            continue
+        details.append((label, detail if isinstance(detail, dict) else {}))
+    return details, errors
+
+
 def check_agentcore_tool_execution_role_scope(
     permission_cache: Dict[str, Any],
     browser_inventory: Dict[str, Any] = None,
     assess_shell: bool = False,
 ) -> List[Dict[str, Any]]:
-    """AC-45: Judge the execution role a code interpreter or browser can use.
+    """AC-45: Judge the execution role a code interpreter, browser or runtime uses.
 
     Code the model writes runs in the sandbox with the tool's execution role, and
     a browser session follows the pages it is pointed at with the same role, so
@@ -21632,6 +21693,12 @@ def check_agentcore_tool_execution_role_scope(
     primary region only, the check also reads who can run a command or open a
     shell inside a runtime session, which reaches the runtime's own role. The
     trust policy and the reuse of a tool role across resources are AC-48's.
+
+    Each runtime's own roleArn is judged by the same rules, because the agent's
+    code runs with it and the model steers what that code calls. AC-02 reads the
+    AgentCore namespace only, so a runtime role granting s3:* on every bucket
+    passed every check. CreateAgentRuntime requires roleArn, so a runtime whose
+    detail reports none is not judged instead of passing.
     """
     shell_rows = _command_shell_findings(permission_cache) if assess_shell else []
     if agentcore_client is None:
@@ -21652,11 +21719,21 @@ def check_agentcore_tool_execution_role_scope(
     # interpreter list is denied. So there is no whole-check failure to catch
     # here, and each unreadable tool is reported on its own line below.
     details, errors = _agentcore_tool_details(browser_inventory)
-    findings = shell_rows + _agentcore_tool_read_findings(
-        "AC-45",
-        "AgentCore Tool Execution Role Scope",
-        errors,
-        AGENTCORE_TOOL_EXECUTION_ROLE_REFERENCE_URL,
+    runtime_details, runtime_errors = _agentcore_runtime_role_details()
+    findings = (
+        shell_rows
+        + _agentcore_tool_read_findings(
+            "AC-45",
+            "AgentCore Tool Execution Role Scope",
+            errors,
+            AGENTCORE_TOOL_EXECUTION_ROLE_REFERENCE_URL,
+        )
+        + _agentcore_tool_read_findings(
+            "AC-45",
+            "AgentCore Runtime Execution Role Scope",
+            runtime_errors,
+            AGENTCORE_RUNTIME_PERMISSIONS_REFERENCE_URL,
+        )
     )
 
     if not details:
@@ -21674,7 +21751,8 @@ def check_agentcore_tool_execution_role_scope(
                 status=StatusEnum.NA,
             )
         )
-        return findings
+        if not runtime_details:
+            return findings
 
     role_permissions = (permission_cache or {}).get("role_permissions") or {}
     cache = permission_cache if isinstance(permission_cache, dict) else {}
@@ -21686,8 +21764,43 @@ def check_agentcore_tool_execution_role_scope(
     }
     v1_note = "" if recorded else " " + IAM_CACHE_V1_NOTE
 
-    for label, detail in details:
-        role_arn = detail.get("executionRoleArn")
+    judged = [(label, detail, False) for label, detail in details] + [
+        (label, detail, True) for label, detail in runtime_details
+    ]
+    for label, detail, is_runtime in judged:
+        if is_runtime:
+            role_arn = detail.get("roleArn")
+            scope_name = "AgentCore Runtime Execution Role Scope"
+            where = "the runtime"
+            runs_with = "The agent's code, which the model steers,"
+            subject = "this runtime"
+            role_reference = AGENTCORE_RUNTIME_PERMISSIONS_REFERENCE_URL
+        else:
+            role_arn = detail.get("executionRoleArn")
+            scope_name = "AgentCore Tool Execution Role Scope"
+            where = "the sandbox"
+            runs_with = "Code the model writes"
+            subject = "this tool"
+            role_reference = AGENTCORE_TOOL_EXECUTION_ROLE_REFERENCE_URL
+        if not role_arn and is_runtime:
+            findings.append(
+                create_finding(
+                    check_id="AC-45",
+                    finding_name=f"{scope_name} Incomplete",
+                    finding_details=(
+                        f"{label} reports no roleArn, which CreateAgentRuntime "
+                        "requires, so the role its code runs with was not judged."
+                    ),
+                    resolution=(
+                        "No action is required on the assessed workload based on "
+                        "this result. Rerun the assessment."
+                    ),
+                    reference=role_reference,
+                    severity=SeverityEnum.INFORMATIONAL,
+                    status=StatusEnum.NA,
+                )
+            )
+            continue
         if not role_arn:
             findings.append(
                 create_finding(
@@ -21710,17 +21823,20 @@ def check_agentcore_tool_execution_role_scope(
             continue
 
         foreign_account = _role_outside_cached_account(
-            role_arn, detail.get("codeInterpreterArn") or detail.get("browserArn")
+            role_arn,
+            detail.get("codeInterpreterArn")
+            or detail.get("browserArn")
+            or detail.get("agentRuntimeArn"),
         )
         if foreign_account:
             findings.append(
                 create_finding(
                     check_id="AC-45",
-                    finding_name="AgentCore Tool Execution Role Scope Incomplete",
+                    finding_name=f"{scope_name} Incomplete",
                     finding_details=(
                         f"{label} uses execution role {role_arn} from account "
                         f"{foreign_account}, and the IAM permission cache reads only "
-                        "the account that owns the tool, so the role's "
+                        f"the account that owns {subject}, so the role's "
                         "policies were not judged."
                     ),
                     resolution=(
@@ -21728,7 +21844,7 @@ def check_agentcore_tool_execution_role_scope(
                         "this result. Review the role's policies in the account "
                         "that owns it."
                     ),
-                    reference=AGENTCORE_TOOL_EXECUTION_ROLE_REFERENCE_URL,
+                    reference=role_reference,
                     severity=SeverityEnum.INFORMATIONAL,
                     status=StatusEnum.NA,
                 )
@@ -21740,11 +21856,11 @@ def check_agentcore_tool_execution_role_scope(
             findings.append(
                 create_finding(
                     check_id="AC-45",
-                    finding_name="AgentCore Tool Execution Role Scope Incomplete",
+                    finding_name=f"{scope_name} Incomplete",
                     finding_details=(
                         f"{label} uses execution role {role_name}, whose policies "
                         "the IAM permission cache could not read, so what code in "
-                        "the sandbox could reach was not judged: "
+                        f"{where} could reach was not judged: "
                         + ", ".join(
                             gap
                             for gap in gap_labels
@@ -21757,7 +21873,7 @@ def check_agentcore_tool_execution_role_scope(
                         "this result. Grant the cache producer read access to the "
                         "role's policies and rerun the assessment."
                     ),
-                    reference=AGENTCORE_TOOL_EXECUTION_ROLE_REFERENCE_URL,
+                    reference=role_reference,
                     severity=SeverityEnum.INFORMATIONAL,
                     status=StatusEnum.NA,
                 )
@@ -21767,31 +21883,34 @@ def check_agentcore_tool_execution_role_scope(
             findings.append(
                 create_finding(
                     check_id="AC-45",
-                    finding_name="AgentCore Tool Execution Role Scope",
+                    finding_name=scope_name,
                     finding_details=(
                         f"{label} uses execution role {role_name}, which is not in "
-                        "the IAM permissions cache, so what code in the sandbox "
-                        "could reach was not judged."
+                        "the IAM permissions cache, so what code in "
+                        f"{where} could reach was not judged."
                     ),
                     resolution=(
                         "No action is required on the assessed workload based on "
                         "this result. Confirm the role exists in this account and "
                         "rerun the assessment."
                     ),
-                    reference=AGENTCORE_TOOL_EXECUTION_ROLE_REFERENCE_URL,
+                    reference=role_reference,
                     severity=SeverityEnum.INFORMATIONAL,
                     status=StatusEnum.NA,
                 )
             )
             continue
 
-        problems, unreadable = _tool_execution_role_problems(permissions)
+        problems, unreadable = _tool_execution_role_problems(
+            permissions,
+            AGENTCORE_RUNTIME_RESOURCELESS_ACTIONS if is_runtime else frozenset(),
+        )
 
         if unreadable:
             findings.append(
                 create_finding(
                     check_id="AC-45",
-                    finding_name="AgentCore Tool Execution Role Scope Incomplete",
+                    finding_name=f"{scope_name} Incomplete",
                     finding_details=(
                         f"{unreadable} cached policy document(s) on execution role "
                         f"{role_name} could not be parsed, so a grant inside one of "
@@ -21802,7 +21921,7 @@ def check_agentcore_tool_execution_role_scope(
                         "this result. Repair the unreadable policy documents in the "
                         "IAM permission cache and rerun the assessment."
                     ),
-                    reference=AGENTCORE_TOOL_EXECUTION_ROLE_REFERENCE_URL,
+                    reference=role_reference,
                     severity=SeverityEnum.INFORMATIONAL,
                     status=StatusEnum.NA,
                 )
@@ -21812,18 +21931,18 @@ def check_agentcore_tool_execution_role_scope(
             findings.append(
                 create_finding(
                     check_id="AC-45",
-                    finding_name="AgentCore Tool Execution Role Unscoped",
+                    finding_name=scope_name.replace(" Scope", " Unscoped"),
                     finding_details=(
                         f"{label} uses execution role {role_name}, which "
-                        f"{'; '.join(problems)}. Code the model writes runs with "
-                        "this role, so the sandbox reaches everything the role "
-                        f"reaches. {IAM_CACHE_SCP_NOTE}"
+                        f"{'; '.join(problems)}. {runs_with} runs with this "
+                        f"role, so {where} reaches everything the role reaches. "
+                        f"{IAM_CACHE_SCP_NOTE}"
                     ),
                     resolution=(
-                        "Rewrite the role's policies to name the ARNs this tool "
+                        f"Rewrite the role's policies to name the ARNs {subject} "
                         "reads and writes, and the actions it performs on each."
                     ),
-                    reference=AGENTCORE_TOOL_EXECUTION_ROLE_REFERENCE_URL,
+                    reference=role_reference,
                     severity=SeverityEnum.HIGH,
                     status=StatusEnum.FAILED,
                 )
@@ -21832,7 +21951,7 @@ def check_agentcore_tool_execution_role_scope(
             findings.append(
                 create_finding(
                     check_id="AC-45",
-                    finding_name="AgentCore Tool Execution Role Scope",
+                    finding_name=scope_name,
                     finding_details=(
                         f"{label} uses execution role {role_name}, whose Allow "
                         "statements name their resources and actions instead of "
@@ -21841,10 +21960,10 @@ def check_agentcore_tool_execution_role_scope(
                     ),
                     resolution=(
                         "No action required for this check. Confirm the named "
-                        "resources are the ones this tool needs, which is a "
+                        f"resources are the ones {subject} needs, which is a "
                         "decision this check does not make."
                     ),
-                    reference=AGENTCORE_TOOL_EXECUTION_ROLE_REFERENCE_URL,
+                    reference=role_reference,
                     severity=SeverityEnum.HIGH,
                     status=StatusEnum.PASSED,
                 )
