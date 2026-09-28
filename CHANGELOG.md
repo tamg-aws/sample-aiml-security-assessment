@@ -248,9 +248,9 @@ section.
 - `SM-37` endpoint network alerting names, for each alarm a passing endpoint
   relies on, when the metric alarm last entered `ALARM`, read from its
   `StateUpdate` history with `cloudwatch:DescribeAlarmHistory`. A denied or
-  empty history is named and does not change the status. A composite alarm's
-  own history is returned only to that action on `*`, which is not granted,
-  so a composite route names its metric alarm's history.
+  empty history is named and does not change the status. A composite route
+  also names when the composite alarm that carries the action last entered
+  `ALARM`, read with the `CompositeAlarm` alarm type.
 - `SM-03` reads the encryption of an EFS or FSx for Lustre file system a
   training job reads through `FileSystemDataSource`. An unencrypted file
   system fails, an AWS managed key or the Amazon FSx service key of a
@@ -267,7 +267,15 @@ section.
   joined only by `OR`, including through a nested composite. A rule holding
   `AND`, `NOT`, `OK()`, `INSUFFICIENT_DATA()`, `TRUE` or `FALSE` credits
   nothing. Each passing endpoint names the alarm and its current
-  `StateValue`. No IAM grant changes.
+  `StateValue`. CloudWatch returns composite alarms only to
+  `cloudwatch:DescribeAlarms` on `*`, so this credit takes effect once the
+  grant change under Deployment impact is deployed; before that no composite
+  is returned and a composite route reads as unactioned.
+- `SM-43` judges every specification of an inference component created with
+  several (`Specifications`), where `DescribeInferenceComponent` returns no
+  `Specification`. It judges only `InService` components hosted on the
+  endpoint, and a component that returns no model name, image or artifact URL
+  holds back `Passed` and is named.
 - `SM-34` and `SM-42` no longer say a principal "can call it with no
   condition on that key" when its Allow or Deny names the key without
   enforcing it, for example a Null-only Deny or a bare negated operator on a
@@ -807,20 +815,24 @@ AgentCore role already holds on this account's keys in the
 `PolicyEngineKeyStateRead` Sid. A memory whose key lives in another account
 reads `N/A`.
 
-The SageMaker assessment role gains six read-only actions in both SAM
+The SageMaker assessment role gains seven read-only actions in both SAM
 templates: `ecr:DescribeRepositories` and `ecr:DescribeImageSigningStatus` on
 the account's repositories (`ModelImageRepositoryRead`, for `SM-43`),
-`cloudwatch:DescribeAlarmHistory` on the account's alarms
-(`FlowLogAlarmHistoryRead`, for `SM-37`), `elasticfilesystem:DescribeFileSystems`
-on the account's file systems (`TrainingFileSystemRead`, for `SM-03`), and
-`ecr:GetSigningConfiguration` and `fsx:DescribeFileSystems` on `*` in
-`ApprovedInventoryWithoutResourceType`, because neither has a resource type
-in the service authorization reference. Until the stack is redeployed,
-`SM-43` reads each tag-pinned image as `N/A` and `SM-03` names each training
-file system as not read. `SM-43` reads artifact bucket encryption through the
-existing `s3:GetEncryptionConfiguration` grant. Inference component
-endpoints read `N/A` under `SM-43`, because
-`sagemaker:ListInferenceComponents` is not granted.
+`elasticfilesystem:DescribeFileSystems` on the account's file systems
+(`TrainingFileSystemRead`, for `SM-03`), `ecr:GetSigningConfiguration`,
+`fsx:DescribeFileSystems` and `sagemaker:ListInferenceComponents` (for
+`SM-43` and `SM-03`) on `*` in `ApprovedInventoryWithoutResourceType`,
+because none has a resource type in the service authorization reference, and
+`cloudwatch:DescribeAlarmHistory` (for `SM-37`) on `*` in the new
+`CompositeAlarmRead` Sid. The role's `cloudwatch:DescribeAlarms` grant (for
+`SM-23`, `SM-31` and `SM-37`) moves from the account's alarms to `*` in the
+same Sid, which replaces `FlowLogAlarmRead`. The CloudWatch API reference for
+both actions says composite alarm information is returned only when the
+permission is scoped to `*`. Until the stack is redeployed, `SM-43` reads
+each tag-pinned image and each inference component endpoint as `N/A`, `SM-03`
+names each training file system as not read, and `SM-37` receives no
+composite alarms. `SM-43` reads artifact bucket encryption through the
+existing `s3:GetEncryptionConfiguration` grant.
 
 The IAM permissions cache role gains `iam:GetRole` on the account's roles and
 `iam:GetUser` on its users in both SAM templates, because only those calls

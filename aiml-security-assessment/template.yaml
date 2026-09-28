@@ -891,17 +891,17 @@ Resources:
               Action:
                 - logs:DescribeMetricFilters # SM-37
               Resource: !Sub 'arn:${AWS::Partition}:logs:*:${AWS::AccountId}:log-group:*'
-            - Sid: FlowLogAlarmRead
+            - Sid: CompositeAlarmRead
+              # SM-37 credits an alarm actioned through a composite alarm and reads
+              # whether a crediting alarm has entered ALARM. The CloudWatch API
+              # reference pages API_DescribeAlarms and API_DescribeAlarmHistory
+              # both say composite alarm information is returned only when the
+              # permission is scoped to '*'.
               Effect: Allow
               Action:
                 - cloudwatch:DescribeAlarms # SM-23, SM-31, SM-37
-              Resource: !Sub 'arn:${AWS::Partition}:cloudwatch:*:${AWS::AccountId}:alarm:*'
-            - Sid: FlowLogAlarmHistoryRead
-              # SM-37 reads whether a crediting alarm has entered ALARM.
-              Effect: Allow
-              Action:
                 - cloudwatch:DescribeAlarmHistory # SM-37
-              Resource: !Sub 'arn:${AWS::Partition}:cloudwatch:*:${AWS::AccountId}:alarm:*'
+              Resource: '*'
             - Sid: ModelImageRepositoryRead
               # SM-43 reads tag mutability and image signing status of the ECR
               # repositories endpoint containers run from.
@@ -935,7 +935,7 @@ Resources:
               Resource: '*'
             - Sid: ApprovedInventoryWithoutResourceType
               # Read-only inventory approved for the SageMaker legs. None of these
-              # twelve actions has a resource type in the service authorization
+              # thirteen actions has a resource type in the service authorization
               # reference, so each needs Resource '*'.
               Effect: Allow
               Action:
@@ -951,6 +951,7 @@ Resources:
                 - iot:ListScheduledAudits # SM-41
                 - ecr:GetSigningConfiguration # SM-43
                 - fsx:DescribeFileSystems # SM-03
+                - sagemaker:ListInferenceComponents # SM-43
               Resource: '*'
             - Sid: EC2NetworkPostureInventory
               # SM-02, SM-11, SM-18 and SM-33 read interface VPC endpoints, SM-37
