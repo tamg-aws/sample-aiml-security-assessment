@@ -891,11 +891,31 @@ Resources:
               Action:
                 - logs:DescribeMetricFilters # SM-37
               Resource: !Sub 'arn:${AWS::Partition}:logs:*:${AWS::AccountId}:log-group:*'
-            - Sid: FlowLogAlarmRead
+            - Sid: CompositeAlarmRead
+              # SM-37 credits an alarm actioned through a composite alarm and reads
+              # whether a crediting alarm has entered ALARM. The CloudWatch API
+              # reference pages API_DescribeAlarms and API_DescribeAlarmHistory
+              # both say composite alarm information is returned only when the
+              # permission is scoped to '*'.
               Effect: Allow
               Action:
                 - cloudwatch:DescribeAlarms # SM-23, SM-31, SM-37
-              Resource: !Sub 'arn:${AWS::Partition}:cloudwatch:*:${AWS::AccountId}:alarm:*'
+                - cloudwatch:DescribeAlarmHistory # SM-37
+              Resource: '*'
+            - Sid: ModelImageRepositoryRead
+              # SM-43 reads tag mutability and image signing status of the ECR
+              # repositories endpoint containers run from.
+              Effect: Allow
+              Action:
+                - ecr:DescribeRepositories # SM-43
+                - ecr:DescribeImageSigningStatus # SM-43
+              Resource: !Sub 'arn:${AWS::Partition}:ecr:*:${AWS::AccountId}:repository/*'
+            - Sid: TrainingFileSystemRead
+              # SM-03 reads the encryption of EFS file systems training jobs read.
+              Effect: Allow
+              Action:
+                - elasticfilesystem:DescribeFileSystems # SM-03
+              Resource: !Sub 'arn:${AWS::Partition}:elasticfilesystem:*:${AWS::AccountId}:file-system/*'
             - Sid: GuardDutyAlertRuleTargetRead
               Effect: Allow
               Action:
@@ -912,6 +932,26 @@ Resources:
                 - secretsmanager:ListSecrets # SM-40
                 - iot:ListPolicies # SM-41
                 - cloudtrail:LookupEvents # SM-40
+              Resource: '*'
+            - Sid: ApprovedInventoryWithoutResourceType
+              # Read-only inventory approved for the SageMaker legs. None of these
+              # thirteen actions has a resource type in the service authorization
+              # reference, so each needs Resource '*'.
+              Effect: Allow
+              Action:
+                - events:ListRules # SM-04, SM-40
+                - cloudtrail:DescribeTrails # SM-09
+                - ram:ListResources # SM-22
+                - config:ListConfigurationRecorders # SM-32
+                - securityhub:GetConfigurationPolicyAssociation # SM-36
+                - inspector2:ListCoverage # SM-38
+                - ecs:ListClusters # SM-38, SM-39, SM-40
+                - ecs:ListServices # SM-39, SM-40
+                - ecs:DescribeTaskDefinition # SM-40
+                - iot:ListScheduledAudits # SM-41
+                - ecr:GetSigningConfiguration # SM-43
+                - fsx:DescribeFileSystems # SM-03
+                - sagemaker:ListInferenceComponents # SM-43
               Resource: '*'
             - Sid: EC2NetworkPostureInventory
               # SM-02, SM-11, SM-18 and SM-33 read interface VPC endpoints, SM-37
@@ -978,16 +1018,17 @@ Resources:
               Resource: !Sub 'arn:${AWS::Partition}:iot:*:${AWS::AccountId}:scheduledaudit/*'
             - Sid: JobDataBucketProtectionRead
               # SM-03 and SM-18 read the default encryption and bucket policy of the
-              # buckets training and transform jobs read from and write to.
+              # buckets training and transform jobs read from and write to; SM-43 reads
+              # the default encryption of the model artifact buckets endpoints load.
               Effect: Allow
               Action:
-                - s3:GetEncryptionConfiguration # SM-03, SM-18
+                - s3:GetEncryptionConfiguration # SM-03, SM-18, SM-43
                 - s3:GetBucketPolicy # SM-03, SM-18
               Resource: !Sub 'arn:${AWS::Partition}:s3:::*'
             - Sid: JobKeyManagerRead
               Effect: Allow
               Action:
-                - kms:DescribeKey # SM-03, SM-18
+                - kms:DescribeKey # SM-03, SM-11, SM-18, SM-27
               Resource: !Sub 'arn:${AWS::Partition}:kms:*:${AWS::AccountId}:key/*'
 
   AgentCoreSecurityAssessmentFunction:

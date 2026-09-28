@@ -1,16 +1,18 @@
 # Live fixtures for the AISF live-verifiability gate
 
 `aisf-parity/probe_live.py` measures whether each shipped `AISF-` row actually
-reaches both a Passed and a Failed verdict against a real account. Two rows could
-not reach both from the account's standing resources, so two fixtures exist
+reaches both a Passed and a Failed verdict against a real account. Three rows could
+not reach both from the account's standing resources, so three fixtures exist
 purely to exercise the missing branch.
 
 Account **ACCOUNT_ID**, region **us-east-1**. The id is redacted because this file
 ships in a public fork; the profile in the commands below resolves it. Every resource
-is named with the `aisflive` prefix. Four of the seven that can carry tags also carry
+of the AISF-01 and AISF-05 fixtures is named with the `aisflive` prefix. Four of the seven that can carry tags also carry
 `purpose=aisf-live-verifiability-fixture` and `temporary=true`: the KMS key, the
 knowledge base and both IAM roles. The gateway, the vector bucket and the vector index
-carry no tags at all.
+carry no tags at all. The AISF-03 fixture came later and follows a different
+scheme: both resources are named `aisf-fixture-br10-*` and carry the single tag
+`Purpose=aisf-parity-fixture`. Its section below lists both by identifier.
 
 Neither tag is a teardown selector. Measured on 2026-09-25,
 `resourcegroupstaggingapi get-resources --tag-filters
@@ -144,10 +146,29 @@ and its detail prints the maps' own count beside the observed one.
 |---|---|---|---|
 | AISF-01 | AG-24 | `elif authorizer_type == "AUTHENTICATE_ONLY"` → Failed (`agentcore_assessments/app.py:3617-3619`) | ONE_ONLY. All 15 standing gateways are `AWS_IAM` or `CUSTOM_JWT`, so only Passed fires. |
 | AISF-05 | BR-20 | the S3 Vectors Passed path: `aws:kms` + `kmsKeyArn` **and** an attached bucket policy | ONE_ONLY. All 9 standing knowledge bases sit on `AES256` vector buckets with no bucket policy, so only Failed fires. |
+| AISF-03 | BR-10 | the per-identity Passed at `bedrock_assessments/app.py:6094`: an identity whose invoke grant is bound to one named guardrail | ONE_ONLY. 45 of 45 standing identities that can invoke a model carry no `bedrock:GuardrailIdentifier` condition, so only Failed fires. |
 
 Measured at `f65f948` with both fixtures in place: BOTH=4, ONE_ONLY=4, NONE=0,
 VACUOUS=0, exit 0, over 19 legs. The four remaining ONE_ONLY rows are excused by
 construction and not by a waiver. The last section says why for each one.
+
+Measured at `7fa0a41` with all three fixtures in place: BOTH=5, ONE_ONLY=3, NONE=0,
+VACUOUS=0, exit 0, over 19 legs. BR-10 moved from `ELSE_GUARDED` to `REACHABLE` in the
+bedrock team's round-1 changes, which is what made the AISF-03 fixture both possible
+and necessary.
+
+Measured on 2026-09-28 with all three fixtures in place, after SM-42 joined AISF-07
+and the producer table began running each source's account-wide producer as well as
+its regional one: BOTH=6, ONE_ONLY=2, NONE=0, VACUOUS=0, exit 0, over 22 legs (one
+source read, 13 producers, 8 rows). The two account-wide producers are BR-37's
+`check_bedrock_data_retention_scp` and SM-09's
+`check_sagemaker_notebook_access_guardrails`, which the report labels Global and folds
+into every regional verdict. AISF-06 moved from ONE_ONLY to BOTH, and its two verdicts
+come from different producers: the regional retention setting reached Passed and the
+service control policy check reached Failed. The folded AISF-06 verdict for this
+account is therefore Failed, so BOTH here says that each producer's assertion fired,
+and not that AISF-06 can read Passed in this account. AISF-07 reached 7 findings from
+SM-18 and SM-42, all Failed.
 
 ## AISF-01: an AUTHENTICATE_ONLY gateway
 
@@ -202,6 +223,23 @@ ten knowledge bases Failed; the bucket policy is what moves it to BOTH.
 **Cost: about $1/month** for the CMK. Vector storage with zero vectors is
 negligible. The CMK is the only recurring charge in either fixture.
 
+## AISF-03: an invoke grant bound to one guardrail version
+
+- Guardrail `aisf-fixture-br10-guardrail` (`9mls97oibka9`), version `1`, one content
+  filter (`HATE` at `HIGH` on input and output). It is referenced and never invoked.
+- `aisf-fixture-br10-bound`, trust for `bedrock.amazonaws.com` under an
+  `aws:SourceAccount` condition. One inline policy, `br10-guardrail-bound`, allows
+  `bedrock:InvokeModel` and `bedrock:InvokeModelWithResponseStream` on the single
+  foundation model `anthropic.claude-3-haiku-20240307-v1:0` in us-east-1, conditioned
+  `StringEquals bedrock:GuardrailIdentifier` on
+  `arn:aws:bedrock:us-east-1:ACCOUNT_ID:guardrail/9mls97oibka9:1`. BR-10 credits a
+  binding only under a positive operator with no `IfExists` or `ForAllValues:` form
+  and a value with no wildcard (`_guardrail_allow_binding`), so this is the narrowest
+  shape it reads as bound.
+
+**Cost: $0.** Guardrails bill per text unit evaluated, and nothing calls this one. The
+role has no attached caller and is never assumed.
+
 ## Teardown
 
 The KMS key has a **7-day minimum** deletion window, so it outlives the other
@@ -223,10 +261,15 @@ aws iam delete-role-policy --role-name aisflive-kb-cmk-role --policy-name aisfli
 aws iam delete-role --role-name aisflive-kb-cmk-role
 aws kms delete-alias --alias-name alias/aisflive-vectors-cmk
 aws kms schedule-key-deletion --key-id alias/aisflive-vectors-cmk --pending-window-in-days 7
+
+# AISF-03
+aws iam delete-role-policy --role-name aisf-fixture-br10-bound --policy-name br10-guardrail-bound
+aws iam delete-role --role-name aisf-fixture-br10-bound
+aws bedrock delete-guardrail --guardrail-identifier 9mls97oibka9
 ```
 
-Tearing these down returns AISF-01 and AISF-05 to ONE_ONLY, which fails the gate
-for both. That is the intended behaviour: the gate reports what the account can
+Tearing these down returns AISF-01, AISF-03 and AISF-05 to ONE_ONLY, which fails
+the gate for all three. That is the intended behaviour: the gate reports what the account can
 actually prove, so removing a fixture must remove the proof.
 
 ## Also standing: the stack deployed to read the rows in a real report
@@ -332,7 +375,7 @@ aws cloudformation wait stack-delete-complete --stack-name aiml-security-aisf-pa
 
 Removing these stacks does not change any gate. `probe_live.py` reads the account
 through the checks' own source and never through a deployed assessment, so the
-BOTH/ONE_ONLY figures above survive the teardown. The two fixtures in the sections
+BOTH/ONE_ONLY figures above survive the teardown. The three fixtures in the sections
 above are the ones that must stay for the gate to stay green.
 
 ## What is NOT a fixture
@@ -340,15 +383,21 @@ above are the ones that must stay for the gate to stay green.
 The 36 `prowlerlive*` resources in this account belong to the Prowler check
 pipeline and are not ours. Five of them bill hourly. Scan them, never modify them.
 
-Four rows stay at ONE_ONLY by construction and are recorded rather than failed:
+Two rows stay at ONE_ONLY by construction and are recorded rather than failed
+(measured on 2026-09-28):
 
-- **AISF-03 / AISF-07 / AISF-08** (`BR-10`, `SM-18`, `SM-09`+`SM-01`+`SM-03`) are
-  `ELSE_GUARDED`: the only Passed emit sits in the `else` of the guard that emits
-  the Failed findings, so one non-compliant resource suppresses Passed for the
-  whole account. No fixture can fix this, and for transform jobs nothing can —
-  SageMaker has no `DeleteTransformJob`, so `prowlerlive-xf-noenc` is permanent.
-- **AISF-06** (`BR-37`) is `SINGLETON`: account-level data retention yields one
-  verdict per region by construction.
+- **AISF-02 / AISF-07** (`AC-06`; `SM-18` and `SM-42`) are `ELSE_GUARDED`: the only
+  Passed emit of `AC-06` and of `SM-18` sits in the `else` of the guard that emits
+  the Failed findings, so one non-compliant resource suppresses Passed for the whole
+  account. A row is only as reachable as its least reachable source, so SM-42 being
+  `REACHABLE` does not lift AISF-07. AISF-08's regional sources are `ELSE_GUARDED` as
+  well, but between them they reached BOTH. No fixture can fix an `ELSE_GUARDED` row,
+  and for transform jobs nothing can: SageMaker has no `DeleteTransformJob`, so
+  `prowlerlive-xf-noenc` is permanent.
+- **AISF-06** (`BR-37`) is `SINGLETON`: both of its producers, the regional data
+  retention setting and the account-wide service control policy check, yield one
+  verdict each by construction. It measured BOTH on 2026-09-28 only because the two
+  disagreed; see the measurement above.
 
 `probe_live.py` computes these classifications from each check's own source on
 every run, so none of them can go stale against an edited check. The excuse is

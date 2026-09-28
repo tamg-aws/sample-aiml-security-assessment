@@ -430,6 +430,22 @@ def _boundary_unread(permission_cache: Dict[str, Any]) -> set:
     }
 
 
+def _resource_unbounded(statement: Dict[str, Any]) -> bool:
+    """Whether an Allow's resource scope is left open: every resource, a
+    wildcard in any segment of a Resource ARN, or a NotResource.
+
+    A registry id is service-generated, twelve to sixteen letters and digits,
+    so a wildcard in it cannot select registries by name, and one in the
+    Region or account segment reaches every registry there.
+    """
+    if "NotResource" in statement:
+        return True
+    return any(
+        "*" in resource or "?" in resource
+        for resource in _as_list(statement.get("Resource", []))
+    )
+
+
 def _has_registry_access(permissions: Dict[str, Any], wildcard_only: bool) -> bool:
     if not _granted_actions(
         permissions,
@@ -441,8 +457,7 @@ def _has_registry_access(permissions: Dict[str, Any], wildcard_only: bool) -> bo
             if statement.get("Effect") != "Allow":
                 continue
             actions = _as_list(statement.get("Action", []))
-            resources = _as_list(statement.get("Resource", []))
-            if wildcard_only and "*" not in resources:
+            if wildcard_only and not _resource_unbounded(statement):
                 continue
             for action in actions:
                 service, _, pattern = action.partition(":")
@@ -728,7 +743,7 @@ def check_agent_registry_full_access(
             create_finding(
                 "AR-01",
                 "AWS Agent Registry IAM Wildcard Permissions",
-                "The following principals have wildcard or allow-except AWS Agent Registry permissions on all resources: "
+                "The following principals have wildcard or allow-except AWS Agent Registry permissions on every resource, on a resource ARN with a wildcard in any segment, or on a NotResource: "
                 + ", ".join(sorted(wildcard))
                 + ". "
                 + SCP_NOT_EVALUATED_NOTE,
@@ -751,8 +766,9 @@ def check_agent_registry_full_access(
                 finding,
                 f"None of the {len(identities)} cached roles and users has an "
                 "AWS Agent Registry full-access policy, a wildcard or allow-except "
-                "Registry grant on all resources, or a grant that merges Registry "
-                "read and write actions on one resource type.",
+                "Registry grant on every resource, on a resource ARN with a "
+                "wildcard in any segment or on a NotResource, or a grant that "
+                "merges Registry read and write actions on one resource type.",
                 "No action required",
                 IAM_FULL_ACCESS_REFERENCE_URL,
                 SeverityEnum.HIGH,
@@ -1820,18 +1836,116 @@ def check_agent_registry_record_provenance(
     return findings
 
 
-def _event_pattern_literals(pattern: Dict[str, Any], key: str) -> Optional[List[str]]:
-    """The literal values an event pattern requires for one top-level field.
+def _wildcard_matches(pattern: str, value: str) -> bool:
+    """EventBridge `wildcard`: `*` matches any run of characters, `\\*` is a
+    literal asterisk, and the comparison is case-sensitive.
 
-    None means the field is absent, which in EventBridge matches every value. An
-    empty list means the field is present but carries a content matcher, such as
-    `prefix` or `anything-but`, whose reach this check cannot decide.
+    Segments are matched left to right with str.find, so a pattern with many
+    asterisks costs one pass over the value and cannot backtrack.
+    """
+    segments = [""]
+    index = 0
+    while index < len(pattern):
+        if pattern[index] == "\\" and index + 1 < len(pattern):
+            segments[-1] += pattern[index + 1]
+            index += 2
+            continue
+        if pattern[index] == "*":
+            segments.append("")
+        else:
+            segments[-1] += pattern[index]
+        index += 1
+    if len(segments) == 1:
+        return value == segments[0]
+    head, middle, tail = segments[0], segments[1:-1], segments[-1]
+    if len(value) < len(head) + len(tail) or not value.startswith(head):
+        return False
+    position, end = len(head), len(value) - len(tail)
+    for segment in middle:
+        found = value.find(segment, position, end)
+        if found < 0:
+            return False
+        position = found + len(segment)
+    return value.endswith(tail)
+
+
+def _matcher_matches(matcher: Any, value: str) -> Optional[bool]:
+    """Whether one element of an event pattern's value list matches a string.
+
+    None means the element has a shape this check does not evaluate, so its
+    reach is undecided, neither a match nor a miss.
+    """
+    if isinstance(matcher, str):
+        return matcher == value
+    if not isinstance(matcher, dict):
+        # A number, boolean or null matches only a value of its own type.
+        return False
+    if len(matcher) != 1:
+        return None
+    operator, operand = next(iter(matcher.items()))
+    if operator in ("prefix", "suffix"):
+        compare = str.startswith if operator == "prefix" else str.endswith
+        if isinstance(operand, str):
+            return compare(value, operand)
+        if (
+            isinstance(operand, dict)
+            and list(operand) == ["equals-ignore-case"]
+            and isinstance(operand["equals-ignore-case"], str)
+        ):
+            return compare(value.lower(), operand["equals-ignore-case"].lower())
+        return None
+    if operator == "equals-ignore-case":
+        return value.lower() == operand.lower() if isinstance(operand, str) else None
+    if operator == "wildcard":
+        return _wildcard_matches(operand, value) if isinstance(operand, str) else None
+    if operator == "exists":
+        return operand if isinstance(operand, bool) else None
+    if operator in ("numeric", "cidr"):
+        # Neither matches a string value.
+        return False
+    if operator != "anything-but":
+        return None
+    if isinstance(operand, dict):
+        if len(operand) != 1:
+            return None
+        inner, inner_operand = next(iter(operand.items()))
+        if inner not in ("prefix", "suffix", "equals-ignore-case", "wildcard"):
+            return None
+        items = inner_operand if isinstance(inner_operand, list) else [inner_operand]
+        results = [_matcher_matches({inner: item}, value) for item in items]
+    else:
+        items = operand if isinstance(operand, list) else [operand]
+        if any(isinstance(item, (dict, list)) for item in items):
+            return None
+        results = [item == value for item in items]
+    if not results or None in results:
+        return None
+    return not any(results)
+
+
+def _event_pattern_reach(
+    pattern: Dict[str, Any], key: str, candidates: Iterable[str]
+) -> Optional[tuple]:
+    """Which candidate values one top-level event pattern field matches.
+
+    None means the field is absent, which in EventBridge matches every value.
+    Otherwise returns (matched, undecided): the candidates a literal or a content
+    matcher in the field's list matches, and those no element matches but an
+    element this check does not evaluate might. An empty list leaves every
+    candidate undecided.
     """
     if key not in pattern:
         return None
     value = pattern[key]
-    values = value if isinstance(value, list) else [value]
-    return [item for item in values if isinstance(item, str)]
+    elements = value if isinstance(value, list) else [value]
+    matched, undecided = set(), set()
+    for candidate in candidates:
+        results = [_matcher_matches(element, candidate) for element in elements]
+        if True in results:
+            matched.add(candidate)
+        elif None in results or not results:
+            undecided.add(candidate)
+    return matched, undecided
 
 
 def _classify_event_pattern(rule: Dict[str, Any]) -> Dict[str, Any]:
@@ -1840,7 +1954,10 @@ def _classify_event_pattern(rule: Dict[str, Any]) -> Dict[str, Any]:
     `kind` is `other` when the rule cannot receive Registry events, `registry`
     when it matches the GA source, `preview` when it matches only the
     discontinued public-preview source, and `unreadable` when the pattern is not
-    JSON or a content matcher decides the source or the detail type.
+    a JSON object, uses `$or`, or carries a matcher this check does not evaluate
+    on the source or the detail type. Prefix, suffix, wildcard, equals-ignore-case
+    and anything-but matchers are evaluated against the known source and detail
+    type values.
     """
     raw_pattern = rule.get("EventPattern")
     if not raw_pattern:
@@ -1854,22 +1971,38 @@ def _classify_event_pattern(rule: Dict[str, Any]) -> Dict[str, Any]:
             "kind": "unreadable",
             "reason": "its event pattern is not a JSON object",
         }
-    sources = _event_pattern_literals(pattern, "source")
-    if sources is not None and not sources:
+    if "$or" in pattern:
+        return {
+            "kind": "unreadable",
+            "reason": "its event pattern combines alternatives with $or",
+        }
+    sources = _event_pattern_reach(
+        pattern, "source", (REGISTRY_EVENT_SOURCE, REGISTRY_PREVIEW_EVENT_SOURCE)
+    )
+    matched_sources, undecided_sources = sources or (set(), set())
+    matches_ga = sources is None or REGISTRY_EVENT_SOURCE in matched_sources
+    matches_preview = REGISTRY_PREVIEW_EVENT_SOURCE in matched_sources
+    # The preview source only decides the kind when the GA source is not matched.
+    if REGISTRY_EVENT_SOURCE in undecided_sources or (
+        not matches_ga and undecided_sources
+    ):
         return {
             "kind": "unreadable",
             "reason": "a content filter decides which event sources it matches",
         }
-    matches_ga = sources is None or REGISTRY_EVENT_SOURCE in sources
-    matches_preview = sources is not None and REGISTRY_PREVIEW_EVENT_SOURCE in sources
     if not matches_ga and not matches_preview:
         return {"kind": "other"}
-    detail_types = _event_pattern_literals(pattern, "detail-type")
-    if detail_types is not None and not detail_types:
+    reach = _event_pattern_reach(
+        pattern, "detail-type", REGISTRY_LIFECYCLE_DETAIL_TYPES
+    )
+    # Only the approval transitions enter the verdict, so an undecided match on
+    # another lifecycle type is left out of the set without blocking it.
+    if reach is not None and reach[1] & set(REGISTRY_APPROVAL_DETAIL_TYPES):
         return {
             "kind": "unreadable",
             "reason": "a content filter decides which detail types it matches",
         }
+    detail_types = None if reach is None else reach[0]
     if (
         not matches_ga
         and detail_types is not None
@@ -1977,6 +2110,16 @@ def _registry_rule_entries(bus_name: str, inventory: Dict[str, Any]) -> tuple:
                 ) = _rule_targets(rule, bus_name)
             entries.append(entry)
     return entries, examined
+
+
+def _could_credit(entry: Dict[str, Any]) -> bool:
+    """Whether a rule whose targets could not be read would be credited if they
+    reached a review pipeline: an enabled GA-source rule with no narrowing."""
+    return (
+        entry["classification"]["kind"] == "registry"
+        and not entry["classification"]["narrowed_by"]
+        and entry["rule"].get("State") != "DISABLED"
+    )
 
 
 def _forwards_only(entry: Dict[str, Any]) -> bool:
@@ -2105,7 +2248,9 @@ def _forwarded_routing(
     bus sees Registry events only through a forwarding rule like this one. A bus
     in this account and Region was read one hop deep by the inventory; a bus in
     another account or Region cannot be read, so the detail types forwarded there
-    are returned as `unseen` rather than as covered or missing.
+    are returned as `unseen` rather than as covered or missing. So are those
+    forwarded to a local bus whose rules, or a rule's pattern or targets, could
+    not be read.
     """
     result = {"findings": [], "labels": [], "covered": set(), "unseen": set()}
     name = entry["rule"].get("Name", "unknown")
@@ -2127,6 +2272,7 @@ def _forwarded_routing(
             bus["name"], {"items": [], "list_error": None}
         )
         if forwarded["list_error"] is not None:
+            result["unseen"].update(detail_types)
             result["findings"].append(
                 _na(
                     "AR-10",
@@ -2139,16 +2285,20 @@ def _forwarded_routing(
             continue
         credited = False
         undecided = []
+        unread = set()
         target_error = None
         for hop in forwarded["items"]:
             hop_name = hop["rule"].get("Name", "unknown")
             classification = hop["classification"]
             if classification["kind"] == "unreadable":
                 undecided.append(hop_name)
+                unread.update(detail_types)
                 continue
             if hop["target_error"] is not None:
                 target_error = target_error or hop["target_error"]
                 undecided.append(hop_name)
+                if _could_credit(hop):
+                    unread.update(detail_types & classification["detail_types"])
                 continue
             # Bus targets on this bus are not followed: the sweep stops at one hop.
             delivering = len(hop.get("pipeline_targets", []))
@@ -2169,6 +2319,7 @@ def _forwarded_routing(
         if credited:
             continue
         if undecided:
+            result["unseen"].update(unread)
             result["findings"].append(
                 _na(
                     "AR-10",
@@ -2232,6 +2383,8 @@ def check_agent_registry_lifecycle_event_routing(
         name = rule.get("Name", "unknown")
         classification = entry["classification"]
         if classification["kind"] == "unreadable":
+            # The rule may route any approval transition, so none is missing.
+            unseen.update(REGISTRY_APPROVAL_DETAIL_TYPES)
             findings.append(
                 _na(
                     "AR-10",
@@ -2243,6 +2396,8 @@ def check_agent_registry_lifecycle_event_routing(
             )
             continue
         if entry["target_error"] is not None:
+            if _could_credit(entry):
+                unseen.update(classification["detail_types"])
             findings.append(
                 _na(
                     "AR-10",

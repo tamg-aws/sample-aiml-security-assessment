@@ -41,6 +41,10 @@ AISF_SERVICE_SLUG = "aisf"
 # Reserved for the coverage marker row (the `OW-00` analogue). Never a control.
 AISF_COVERAGE_CHECK_ID = "AISF-00"
 
+# The Region value the assessment modules put on once-per-account findings.
+# Must match `GLOBAL_REGION_LABEL` in the module Lambdas and in `app.py`.
+AISF_GLOBAL_REGION = "Global"
+
 # Severity comes from the AISF control's own `risk` field, NOT from the source
 # check's severity. This deviates from OWASP, which inherits the source row's
 # severity (AGENTS.md:132). The deviation is deliberate: an `AISF-` row is a
@@ -156,8 +160,8 @@ AISF_DERIVED_MAP: List[Dict[str, Any]] = [
     {
         "check_id": "AISF-07",
         "control": "AIR-SGM-EP-08",
-        # ledger verdict: covered. incumbents: SM-18
-        "sources": ["SM-18"],
+        # ledger verdict: covered. incumbents: SM-18, SM-42
+        "sources": ["SM-18", "SM-42"],
         "finding": "AISF AIR-SGM-EP-08: Batch Inference Network and Encryption Parity",
         "risk": "high",
         "severity": "High",
@@ -292,8 +296,13 @@ def _row(
 def derive_aisf_findings(source_rows: List[Dict[str, Any]]) -> List[Dict[str, str]]:
     """Restate incumbent verdicts as `AISF-` rows, one per control per join key.
 
-    The join key is `(Account_ID, Region)`. All ten source checks are regional
-    (none is tagged with the `Global` sentinel), so a control's legs share a key.
+    The join key is `(Account_ID, Region)`. A source check can also emit rows
+    under the `Global` sentinel, from a once-per-account leg on the primary
+    Region. An account-wide verdict holds in every Region, so each `Global` row
+    is folded into every regional key of the same account and aggregated there
+    with the regional rows. The `Global` key itself
+    is emitted only for an account that has no regional key: beside a regional
+    verdict it would repeat the same evidence as a half-populated `N/A`.
 
     A control whose legs are not all present for a key that has at least one leg
     is emitted as `Status=N/A` naming the missing `Check_ID`s, never dropped: a
@@ -325,8 +334,30 @@ def derive_aisf_findings(source_rows: List[Dict[str, Any]]) -> List[Dict[str, st
             logger.warning(f"AISF: skipping unreadable source row: {e}")
             continue
 
+    # Kept apart from the regional keys, so a regional Passed cannot publish while
+    # the same check's Global row for that account is Failed.
+    global_legs = {
+        account_id: present
+        for (account_id, region), present in legs.items()
+        if region == AISF_GLOBAL_REGION
+    }
+    regional_accounts = {
+        account_id for (account_id, region) in legs if region != AISF_GLOBAL_REGION
+    }
+    # (account_id, region) -> source check ids that carry folded Global rows
+    folded: Dict[tuple, List[str]] = {}
+    for (account_id, region), present in list(legs.items()):
+        if region == AISF_GLOBAL_REGION:
+            if account_id in regional_accounts:
+                del legs[(account_id, region)]
+            continue
+        for cid, statuses in global_legs.get(account_id, {}).items():
+            present.setdefault(cid, []).extend(statuses)
+            folded.setdefault((account_id, region), []).append(cid)
+
     findings: List[Dict[str, str]] = []
     for (account_id, region), present in sorted(legs.items()):
+        folded_here = folded.get((account_id, region), [])
         absent_controls: List[str] = []
         for mapping in AISF_DERIVED_MAP:
             try:
@@ -360,6 +391,13 @@ def derive_aisf_findings(source_rows: List[Dict[str, Any]]) -> List[Dict[str, st
                         f"AISF control {mapping['control']}. Derived from "
                         f"{legs_txt}. This row restates existing check verdicts "
                         "under an AISF control id; it is not an additional check."
+                    )
+                folded_legs = [cid for cid in have if cid in folded_here]
+                if folded_legs:
+                    details = (
+                        f"{details} The findings for {', '.join(folded_legs)} "
+                        "include the account-wide findings reported under "
+                        f"{AISF_GLOBAL_REGION}, which apply in every Region."
                     )
                 note = _collapse_note(mapping["risk"], status)
                 if note:

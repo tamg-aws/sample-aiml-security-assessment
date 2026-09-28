@@ -57,39 +57,125 @@ ELSE_GUARDED = "ELSE_GUARDED"
 SINGLETON = "SINGLETON"
 NO_VERDICT_PATH = "NO_VERDICT_PATH"
 
+# A source id with more than one producer takes its most reachable producer's
+# class: if one producer can reach both verdicts, the id can. Taking the least
+# reachable would let an account-wide SINGLETON producer excuse a ONE_ONLY that
+# the regional producer alone is held to.
+REACH_ORDER = (REACHABLE, ELSE_GUARDED, SINGLETON, NO_VERDICT_PATH)
+
 # Where each incumbent lives and how to call it. The row list is NOT duplicated
 # here: it comes from aisf_mappings.AISF_DERIVED_MAP, and leg 1 fails if this
 # table does not cover every source id that map names.
+#
+# A source id maps to every function that emits it, because the report joins
+# them all: a module can emit one id from a regional check and again from an
+# account-wide check it labels Region="Global", and derive_aisf_findings folds
+# the Global rows into each regional verdict. Each producer is
+# (module_dir, function to call, call mode, function whose source is
+# classified). The last differs from the second only for a wrapper whose
+# Passed and Failed emits all sit in a shared helper.
+# tests/test_probe_live_incumbents.py fails when a function that names a
+# shipped source id is not reachable from one of its producers here.
 INCUMBENTS = {
     "BR-10": (
-        "bedrock_assessments",
-        "check_bedrock_guardrail_iam_enforcement",
-        "cache+region",
+        (
+            "bedrock_assessments",
+            "check_bedrock_guardrail_iam_enforcement",
+            "cache+region",
+            "check_bedrock_guardrail_iam_enforcement",
+        ),
     ),
     "BR-20": (
-        "bedrock_assessments",
-        "check_bedrock_knowledge_base_kms_encryption",
-        "region",
+        (
+            "bedrock_assessments",
+            "check_bedrock_knowledge_base_kms_encryption",
+            "region",
+            "check_bedrock_knowledge_base_kms_encryption",
+        ),
     ),
-    "BR-26": ("bedrock_assessments", "check_bedrock_guardrail_pii_filters", "region"),
-    "BR-37": ("bedrock_assessments", "check_bedrock_account_data_retention", "region"),
-    "AC-06": ("agentcore_assessments", "check_browser_tool_recording", "noargs"),
+    "BR-26": (
+        (
+            "bedrock_assessments",
+            "check_bedrock_guardrail_pii_filters",
+            "region",
+            "check_bedrock_guardrail_pii_filters",
+        ),
+    ),
+    "BR-37": (
+        (
+            "bedrock_assessments",
+            "check_bedrock_account_data_retention",
+            "region",
+            "check_bedrock_account_data_retention",
+        ),
+        (
+            "bedrock_assessments",
+            "check_bedrock_data_retention_scp",
+            "scp+global",
+            "check_bedrock_data_retention_scp",
+        ),
+    ),
+    "AC-06": (
+        (
+            "agentcore_assessments",
+            "check_browser_tool_recording",
+            "noargs",
+            "check_browser_tool_recording",
+        ),
+    ),
     "AG-24": (
-        "agentcore_assessments",
-        "check_agentcore_gateway_agentic_security",
-        "noargs",
+        (
+            "agentcore_assessments",
+            "check_agentcore_gateway_agentic_security",
+            "noargs",
+            "check_agentcore_gateway_agentic_security",
+        ),
     ),
-    "SM-01": ("sagemaker_assessments", "check_sagemaker_internet_access", "region"),
-    "SM-03": ("sagemaker_assessments", "check_sagemaker_data_protection", "region"),
+    "SM-01": (
+        (
+            "sagemaker_assessments",
+            "check_sagemaker_internet_access",
+            "region",
+            "check_sagemaker_internet_access",
+        ),
+    ),
+    "SM-03": (
+        (
+            "sagemaker_assessments",
+            "check_sagemaker_data_protection",
+            "region",
+            "check_sagemaker_data_protection",
+        ),
+    ),
     "SM-09": (
-        "sagemaker_assessments",
-        "check_sagemaker_notebook_root_access",
-        "region",
+        (
+            "sagemaker_assessments",
+            "check_sagemaker_notebook_root_access",
+            "region",
+            "check_sagemaker_notebook_root_access",
+        ),
+        (
+            "sagemaker_assessments",
+            "check_sagemaker_notebook_access_guardrails",
+            "cache+global",
+            "_creation_category_finding",
+        ),
     ),
     "SM-18": (
-        "sagemaker_assessments",
-        "check_sagemaker_transform_job_encryption",
-        "region",
+        (
+            "sagemaker_assessments",
+            "check_sagemaker_transform_job_encryption",
+            "region",
+            "check_sagemaker_transform_job_encryption",
+        ),
+    ),
+    "SM-42": (
+        (
+            "sagemaker_assessments",
+            "check_sagemaker_batch_creation_guardrails",
+            "cache+region",
+            "_creation_category_finding",
+        ),
     ),
 }
 
@@ -543,6 +629,24 @@ def instrument(mod, sink):
     return original
 
 
+def call_producer(mod, fn, how, region, permission_cache):
+    """Call one producer the way the module's lambda_handler calls it."""
+    if how == "region":
+        return fn(region=region)
+    if how == "noargs":
+        return fn()
+    if how == "cache+region":
+        return fn(permission_cache=permission_cache, region=region)
+    if how == "cache+global":
+        return fn(region=mod.GLOBAL_REGION_LABEL, permission_cache=permission_cache)
+    if how == "scp+global":
+        return fn(
+            region=mod.GLOBAL_REGION_LABEL,
+            scp_inventory=mod.get_service_control_policy_inventory(),
+        )
+    raise ValueError(f"unknown call mode {how!r}")
+
+
 def norm(status):
     s = status.strip().lower()
     if s in {"n/a", "na", "statusenum.na"} or s.endswith(".na"):
@@ -631,17 +735,24 @@ def main():
         print("[FAIL] gate ran nothing. Refusing to report success.")
         return 1
 
-    # Leg 2: reachability, recomputed from each incumbent's source.
+    # Leg 2: reachability, recomputed from each incumbent's source. Ids leg 1
+    # reported as uncovered have no producer to read, so they are skipped here
+    # and leg 1's failure is what the run prints.
+    covered = sorted(needed & set(INCUMBENTS))
     reach = {}
+    producer_reach = {}
     missing_fn = []
-    for cid in sorted({c for s in rows_map.values() for c in s}):
-        module_dir, fn_name, _ = INCUMBENTS[cid]
-        fn = function_ast(module_dir, fn_name)
-        legs += 1
-        if fn is None:
-            missing_fn.append(f"{cid}: {fn_name} not found in {module_dir}/app.py")
-            continue
-        reach[cid] = classify_reachability(fn)
+    for cid in covered:
+        for module_dir, fn_name, _, ast_name in INCUMBENTS[cid]:
+            fn = function_ast(module_dir, ast_name)
+            legs += 1
+            if fn is None:
+                missing_fn.append(f"{cid}: {ast_name} not found in {module_dir}/app.py")
+                continue
+            producer_reach[(cid, fn_name)] = classify_reachability(fn)
+        got = [v for (c, _), v in producer_reach.items() if c == cid]
+        if got:
+            reach[cid] = min(got, key=lambda v: REACH_ORDER.index(v[0]))
     if missing_fn:
         failures.extend(missing_fn)
     tally_reach = defaultdict(int)
@@ -649,13 +760,12 @@ def main():
         tally_reach[verdict] += 1
     print(
         f"[{'FAIL' if missing_fn else 'PASS'}] reachability computed from source: "
-        f"{len(reach)} of {len(rows_map and {c for s in rows_map.values() for c in s})} "
-        f"incumbents read, "
+        f"{len(reach)} of {len(needed)} incumbents read, "
+        f"{len(producer_reach)} producer(s), "
         + ", ".join(f"{k}={v}" for k, v in sorted(tally_reach.items()))
     )
-    for cid in sorted(reach):
-        verdict, why = reach[cid]
-        print(f"         {cid:6s} {verdict:15s} {why}")
+    for (cid, fn_name), (verdict, why) in sorted(producer_reach.items()):
+        print(f"         {cid:6s} {verdict:15s} {fn_name}: {why}")
     for cid, (verdict, why) in sorted(reach.items()):
         if verdict == NO_VERDICT_PATH:
             failures.append(f"{cid} has no two-sided verdict path in source: {why}")
@@ -681,45 +791,44 @@ def main():
         permission_cache = None
         setup["permission_cache"] = f"FAILED {type(exc).__name__}: {exc}"
 
-    # Run each incumbent once.
+    # Run each producer once.
     by_check = defaultdict(list)
     errors = {}
     loaded = {}
-    for cid in sorted({c for s in rows_map.values() for c in s}):
-        module_dir, fn_name, how = INCUMBENTS[cid]
-        if module_dir not in loaded:
-            try:
-                loaded[module_dir] = load_module(module_dir)
-            except Exception as exc:
-                errors[module_dir] = f"{type(exc).__name__}: {exc}"
-                continue
-            if module_dir == "agentcore_assessments":
+    for cid in covered:
+        for module_dir, fn_name, how, _ in INCUMBENTS[cid]:
+            if module_dir not in loaded:
                 try:
-                    prime_agentcore_client(loaded[module_dir], args.region)
-                    setup["agentcore_client"] = "primed, list_agent_runtimes answered"
+                    loaded[module_dir] = load_module(module_dir)
                 except Exception as exc:
-                    setup["agentcore_client"] = f"FAILED {type(exc).__name__}: {exc}"
-        mod = loaded.get(module_dir)
-        if mod is None:
-            continue
-        sink = []
-        original = instrument(mod, sink)
-        fn = getattr(mod, fn_name, None)
-        if fn is None:
-            errors[cid] = f"{fn_name} not found at runtime"
-        else:
-            try:
-                if how == "region":
-                    fn(region=args.region)
-                elif how == "noargs":
-                    fn()
-                elif how == "cache+region":
-                    fn(permission_cache, region=args.region)
-            except Exception as exc:
-                errors[cid] = f"{type(exc).__name__}: {exc}"
-        mod.create_finding = original
-        for rec in sink:
-            by_check[rec["check_id"]].append(rec)
+                    errors[module_dir] = f"{type(exc).__name__}: {exc}"
+                    continue
+                if module_dir == "agentcore_assessments":
+                    try:
+                        prime_agentcore_client(loaded[module_dir], args.region)
+                        setup["agentcore_client"] = (
+                            "primed, list_agent_runtimes answered"
+                        )
+                    except Exception as exc:
+                        setup["agentcore_client"] = (
+                            f"FAILED {type(exc).__name__}: {exc}"
+                        )
+            mod = loaded.get(module_dir)
+            if mod is None:
+                continue
+            sink = []
+            original = instrument(mod, sink)
+            fn = getattr(mod, fn_name, None)
+            if fn is None:
+                errors[f"{cid} {fn_name}"] = f"{fn_name} not found at runtime"
+            else:
+                try:
+                    call_producer(mod, fn, how, args.region, permission_cache)
+                except Exception as exc:
+                    errors[f"{cid} {fn_name}"] = f"{type(exc).__name__}: {exc}"
+            mod.create_finding = original
+            for rec in sink:
+                by_check[rec["check_id"]].append(rec)
 
     print()
     print(
@@ -802,6 +911,9 @@ def main():
                     "region": args.region,
                     "setup": setup,
                     "reachability": {k: list(v) for k, v in reach.items()},
+                    "producer_reachability": {
+                        f"{c} {f}": list(v) for (c, f), v in producer_reach.items()
+                    },
                     "rows": rows,
                     "errors": errors,
                 },

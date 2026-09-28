@@ -48,7 +48,6 @@ SCOPED_SAGEMAKER_GRANTS = {
     "securityhub:DescribeOrganizationConfiguration": ":hub/default'",
     "securityhub:ListEnabledProductsForImport": ":hub/default'",
     "logs:DescribeMetricFilters": ":log-group:*'",
-    "cloudwatch:DescribeAlarms": ":alarm:*'",
     "events:ListTargetsByRule": ":rule/*'",
     "iot:ListPrincipalThings": ":cert/*'",
     "iot:DescribeScheduledAudit": ":scheduledaudit/*'",
@@ -61,6 +60,11 @@ SCOPED_SAGEMAKER_GRANTS = {
     "cloudtrail:GetEventSelectors": ":cloudtrail:*:*:trail/*'",
     "config:DescribeConfigurationRecorderStatus": ":configuration-recorder/*/*'",
     "config:DescribeConformancePackCompliance": ":conformance-pack/*/*'",
+    "ecr:DescribeRepositories": ":ecr:*:${AWS::AccountId}:repository/*'",
+    "ecr:DescribeImageSigningStatus": ":ecr:*:${AWS::AccountId}:repository/*'",
+    "elasticfilesystem:DescribeFileSystems": (
+        ":elasticfilesystem:*:${AWS::AccountId}:file-system/*'"
+    ),
 }
 
 
@@ -97,6 +101,23 @@ APPROVED_WILDCARD_SAGEMAKER_GRANTS = {
     "iot:ListAuditFindings": "IoTDeviceDefenderAuditRead",
     "inspector2:BatchGetAccountStatus": "InspectorAccountStatusRead",
     "lambda:ListFunctions": "LambdaFunctionInventory",
+    "cloudtrail:DescribeTrails": "ApprovedInventoryWithoutResourceType",
+    "config:ListConfigurationRecorders": "ApprovedInventoryWithoutResourceType",
+    "ecs:DescribeTaskDefinition": "ApprovedInventoryWithoutResourceType",
+    "ecs:ListClusters": "ApprovedInventoryWithoutResourceType",
+    "ecs:ListServices": "ApprovedInventoryWithoutResourceType",
+    "events:ListRules": "ApprovedInventoryWithoutResourceType",
+    "inspector2:ListCoverage": "ApprovedInventoryWithoutResourceType",
+    "iot:ListScheduledAudits": "ApprovedInventoryWithoutResourceType",
+    "ram:ListResources": "ApprovedInventoryWithoutResourceType",
+    "securityhub:GetConfigurationPolicyAssociation": "ApprovedInventoryWithoutResourceType",
+    "ecr:GetSigningConfiguration": "ApprovedInventoryWithoutResourceType",
+    "fsx:DescribeFileSystems": "ApprovedInventoryWithoutResourceType",
+    "sagemaker:ListInferenceComponents": "ApprovedInventoryWithoutResourceType",
+    # API_DescribeAlarms and API_DescribeAlarmHistory return composite alarms
+    # only when the permission is scoped to '*'.
+    "cloudwatch:DescribeAlarms": "CompositeAlarmRead",
+    "cloudwatch:DescribeAlarmHistory": "CompositeAlarmRead",
 }
 
 # Reads the SageMaker legs call that are not approved. Each leg reports "not
@@ -104,21 +125,10 @@ APPROVED_WILDCARD_SAGEMAKER_GRANTS = {
 UNAPPROVED_SAGEMAKER_READS = [
     "ec2:DescribeVpcs",
     "ec2:DescribeDhcpOptions",
-    "sagemaker:ListInferenceComponents",
     "sagemaker:ListUserProfiles",
     "sagemaker:ListMonitoringExecutions",
     "guardduty:ListMembers",
-    "config:ListConfigurationRecorders",
-    "iot:ListScheduledAudits",
-    "inspector2:ListCoverage",
     "organizations:ListAccounts",
-    "events:ListRules",
-    "securityhub:GetConfigurationPolicyAssociation",
-    "cloudtrail:DescribeTrails",
-    "ram:ListResources",
-    "ecs:ListClusters",
-    "ecs:ListServices",
-    "ecs:DescribeTaskDefinition",
     "s3:GetObjectAttributes",
 ]
 

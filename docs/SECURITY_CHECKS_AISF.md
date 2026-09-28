@@ -16,19 +16,19 @@ and the shipped BR/SM/AC/AG check every row is derived from.
   machine-checkable AISF control, including the foundation controls, which assert
   over the account or runtime an AI workload sits on, and the ledger marks each
   foundation row. A row is a narrower claim than
-  coverage, so read this figure with the ledger census below it: 101 of the 105 are
-  `covered`, all 8 rows sit on `covered` controls, and the other 93 `covered`
+  coverage, so read this figure with the ledger census below it: 103 of the 105 are
+  `covered`, all 8 rows sit on `covered` controls, and the other 95 `covered`
   controls are named by the `Compliance_Frameworks` tag column until each is
   walked through [Adding a control](#adding-a-control), which allocates an id and
-  writes a per-control section. The 97 without a row are 93 `covered`, 0
-  `tighten`, 0 `new` and 4 `not_implementable`, with no control left
+  writes a per-control section. The 97 without a row are 95 `covered`, 0
+  `tighten`, 0 `new` and 2 `not_implementable`, with no control left
   `unassessed`. Each `not_implementable` control asks about evidence no AWS
   API returns, and the ledger names the reason for each. The parity analysis behind those figures is in
   [`aisf-parity/AISF-WORK-LEDGER.md`](../aisf-parity/AISF-WORK-LEDGER.md).
 - **Traceability:** 0 controls are `tighten`. A `tighten` control is covered
   too partly to earn an `AISF-` row at all, and its ledger row names the
   incumbent extension or the new check that closes it. The `Compliance_Frameworks` CSV
-  column names all 101 taggable controls on the producer rows themselves, the 101
+  column names all 103 taggable controls on the producer rows themselves, the 103
   `covered` and the 0 `tighten`, and is described under
   [Traceability column on producer rows](#traceability-column-on-producer-rows).
   A tag carries no verdict.
@@ -62,7 +62,7 @@ map, gate 12 fails if the control text baked into the map drifts from the
 AISF control definition, and gate 13 fails if an id does not carry the
 registered `AISF-` prefix or is missing from this catalogue.
 
-**`AISF-` rows are not counted in the framework's 275-check total.** They carry
+**`AISF-` rows are not counted in the framework's 277-check total.** They carry
 no new assertion, so counting them would double-count the incumbent check. They
 are excluded from the report's pass-rate denominator and from Open Action Items
 for the same reason, which is how OWASP-mapped rows already behave.
@@ -101,6 +101,13 @@ Passed)`), so a failing resource cannot be hidden behind a later `Passed` row
 from the same check. BR-20 emits its summary `Passed` row after its per-resource
 rows, which is the order that made this concrete.
 
+A source check that runs once per account, on the primary Region, reports under
+the `Global` Region. An account-wide verdict holds in every Region, so each `Global` row is aggregated into every
+regional key of the same account, and `Finding_Details` says so. The `Global`
+key gets its own `AISF-` rows only for an account with no regional key.
+Otherwise a `Global` `Failed` would sit beside a regional `Passed` for the same
+control.
+
 `AISF-00` is a report-completeness marker, not an AISF control. It lists every
 derived control that had no source check for that account and region, so an
 incomplete scan reads as unassessed instead of silently omitting rows.
@@ -131,7 +138,7 @@ itself. A row with `Status=N/A` always reports `Informational`.
 | AISF-04 | AIR-BDR-GRD-03 | High | `BR-26` |
 | AISF-05 | AIR-BDR-KB-03 | High | `BR-20` |
 | AISF-06 | AIR-BDR-MDL-10 | High | `BR-37` |
-| AISF-07 | AIR-SGM-EP-08 | High | `SM-18` |
+| AISF-07 | AIR-SGM-EP-08 | High | `SM-18`, `SM-42` |
 | AISF-08 | AIR-SGM-TRN-05 | Medium | `SM-09`, `SM-01`, `SM-03` |
 
 ### AISF-01 AIR-ACR-GW-01 Gateway Inbound Authorization
@@ -210,6 +217,7 @@ private-network and encryption standard as real-time inference?
 | Source | Signal |
 | -------- | -------- |
 | SM-18 | SageMaker Transform Job Encryption Check (model VPC/isolation config plus job KMS configuration) |
+| SM-42 | SageMaker Batch Transform Creation Guardrail (SCP and identity guardrails on `CreateModel` and `CreateTransformJob` for encryption, approved network and no direct internet access) |
 
 Reference: <https://docs.aws.amazon.com/sagemaker/latest/dg/batch-vpc.html>
 
@@ -240,8 +248,8 @@ contributes to, so a reader of `bedrock_security_report_*.csv` can trace a row
 back to the framework. The `Status` column still carries the verdict.
 
 Measured by `check_ledger.py` gate 14, which prints each of these figures on
-every run: 155 check-control pairs over 108 tagged checks in 4 modules, naming 101
-distinct controls. Tagged checks per module are bedrock 33, sagemaker 22,
+every run: 166 check-control pairs over 112 tagged checks in 4 modules, naming 103
+distinct controls. Tagged checks per module are bedrock 33, sagemaker 26,
 agentcore 49, agent_registry 4.
 
 ### The qualifier is what makes a `tighten` control safe to name
@@ -258,8 +266,8 @@ trusting the literal in the file:
 | `AISF AIR-SGM-TRN-05 (1 of 3 checks)` | the control is covered, but jointly, so no single leg asserts it |
 | `AISF <control> (partial)` | the check asserts less than the control requires, and the gap is open in the ledger |
 
-Census at the current head, also printed by gate 14: 66 bare, 0 `(partial)`, 89
-joint. The 66 bare tags plus the 35 jointly covered controls account for the 101
+Census at the current head, also printed by gate 14: 61 bare, 0 `(partial)`, 105
+joint. The 61 bare tags plus the 42 jointly covered controls account for the 103
 `covered` controls. A `(partial)` tag sits on a `tighten` control, one per
 incumbent, and with 0 `tighten` controls open none is emitted. A bare tag on a `tighten` row, a `(partial)` on a `covered` row, or a
 dropped `(1 of N)`, fails gate 14 with the row's verdict and incumbent count
@@ -267,13 +275,13 @@ named.
 
 A check that contributes to several controls carries them pipe-joined, with the
 `AISF ` prefix repeated on each element so a consumer that splits on `|` gets a
-complete token. 31 checks name more than one control. `AC-02` names five: bare
+complete token. 34 checks name more than one control. `AC-02` names five: bare
 on `AIR-ACR-EVAL-01` and on `AIR-ACR-PAY-01`, and joint on
-`AIR-ACR-RT-03 (1 of 2 checks)`, `AIR-FND-IAM-05 (1 of 4 checks)` and
+`AIR-ACR-RT-03 (1 of 3 checks)`, `AIR-FND-IAM-05 (1 of 4 checks)` and
 `AIR-FND-IAM-09 (1 of 4 checks)`.
 
 Mixing a `(partial)` with a tag of another form inside one value is no longer the
-common case, 0 of those 31, because no `tighten` control is left to carry a
+common case, 0 of those 34, because no `tighten` control is left to carry a
 `(partial)`. A foundational control such as `AIR-FND-NET-01` is asserted jointly by
 checks whose own service control they fully assert, so the same check carries a
 bare tag and a `(1 of N checks)` one. Nothing in the vocabulary forbids a mix,
@@ -459,16 +467,16 @@ timestamp and `--csv-dir` says it cannot.
    if it ever succeeds.
 7. Run `.venv/bin/python aisf-parity/mutate.py`. Before it mutates anything it
    validates every entry's find-string against its file and prints
-   `entries 32/32 find-strings validated`, aborting and naming each entry whose
+   `entries 33/33 find-strings validated`, aborting and naming each entry whose
    string no longer occurs exactly once, so a battery that lost entries to a
    refactor cannot report a clean run on the entries it still reached. It then
-   breaks the code 32 ways and requires a ledger gate or a test to go red for
+   breaks the code 33 ways and requires a ledger gate or a test to go red for
    each one, naming the catcher it observed: 5 defects in the derived mapping, 6
    in `BR-20`'s S3 Vectors legs, 5 in the tag column, 2 in the API field names
    the checks read, 3 in the incumbent-name map, 1 in the ledger's markdown
    renderer, 1 in the census anchor, 1 in the published battery figures, 2 in the
-   coverage bullets, 1 in the multi-control figures, 1 in the foundation scope
-   and 4 in the live tag probe. Gate
+   coverage bullets, 1 in the multi-control figures, 1 in the report section's
+   coverage figures, 1 in the foundation scope and 4 in the live tag probe. Gate
    20 derives every figure in this step from `mutate.py`'s own entry list and
    fails if this paragraph disagrees with it, because the earlier copy of this
    sentence went stale at 17 while the battery grew to 22 and nothing read the
