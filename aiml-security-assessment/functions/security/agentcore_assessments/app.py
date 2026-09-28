@@ -708,6 +708,20 @@ AGENTCORE_DATA_EVENT_FAMILIES = (
             "AWS::BedrockAgentCore::Policy": (("list_policies", ("policies",), {}),),
         },
     },
+    {
+        "key": "evaluator",
+        "label": "Evaluator",
+        "resource_types": ("AWS::BedrockAgentCore::Evaluator",),
+        # ListEvaluators also returns the AWS-provided Builtin evaluators, which
+        # every account sees, so only the account's own evaluators put the type
+        # in scope.
+        "inventory": {
+            "AWS::BedrockAgentCore::Evaluator": (
+                ("list_evaluators", ("evaluators",), {}),
+            ),
+        },
+        "exclude": {"evaluatorType": "Builtin"},
+    },
 )
 
 # Advanced event selector fields that decide which events of a selected type are
@@ -3112,6 +3126,9 @@ PAYMENT_MANAGER_WRITE_ACTIONS = (
 )
 AGENTCORE_SERVICE_PRINCIPAL = "bedrock-agentcore.amazonaws.com"
 PAYMENT_PASS_ROLE_WIDE_RESOURCE_LEG = "its Resource reaches every role"
+PAYMENT_PASS_ROLE_PATTERN_LEG = (
+    "its Resource names roles by a wildcard pattern and not by one role's ARN"
+)
 PAYMENT_PASS_ROLE_SERVICE_LEG = (
     f"it does not pin iam:PassedToService to {AGENTCORE_SERVICE_PRINCIPAL}"
 )
@@ -3208,8 +3225,11 @@ def _writer_pass_role_gaps(
     role, and holds an iam:PassRole Allow whose Resource is unbounded, or that
     does not pin iam:PassedToService to the AgentCore service principal, can
     hand any role it reaches to that resource, or hand the role to another
-    service. iam:PassedToService is always in a PassRole request, so its
-    IfExists form is read as the plain one.
+    service. A Resource with a wildcard anywhere, such as `role/payments-*`,
+    names a set of roles and not the one role the resource needs, so it is a
+    gap too. Whether the literal ARN is the resource's own role is not compared
+    here: the cache carries no resource. iam:PassedToService is always in a
+    PassRole request, so its IfExists form is read as the plain one.
     """
     labels: List[str] = []
     for principal_name, permissions in permissions_by_name.items():
@@ -3236,6 +3256,12 @@ def _writer_pass_role_gaps(
                     continue
                 if _statement_resource_is_unbounded(statement):
                     missing.add(PAYMENT_PASS_ROLE_WIDE_RESOURCE_LEG)
+                elif any(
+                    wildcard in str(resource)
+                    for resource in _statement_resources(statement)
+                    for wildcard in ("*", "?")
+                ):
+                    missing.add(PAYMENT_PASS_ROLE_PATTERN_LEG)
                 if not _condition_pins_value(
                     statement,
                     IAM_PASSED_TO_SERVICE_CONDITION_KEY,
@@ -4173,8 +4199,10 @@ def check_agentcore_full_access_roles(
                         f"{'; '.join(pass_role_gaps)}. The payment manager "
                         "retrieves payment credentials as the role passed in its "
                         "roleArn, so an unscoped PassRole lets setup hand it any "
-                        "role the principal reaches, or hand the retrieval role to "
-                        f"another service. {IAM_CACHE_SCP_NOTE}"
+                        "role the grant matches, or hand the retrieval role to "
+                        "another service. A grant naming one role's ARN is not "
+                        "compared to the payment manager's own roleArn. "
+                        f"{IAM_CACHE_SCP_NOTE}"
                     ),
                     resolution=(
                         "Scope the ControlPlaneRole's iam:PassRole to the "
@@ -9744,9 +9772,16 @@ def _agentcore_family_inventory(family: Dict[str, Any]) -> Tuple[Dict[str, int],
                     )
                 ]
             else:
-                listed[key] = _agentcore_list_all(
-                    operation_name, list(result_keys), **list_kwargs
-                )
+                listed[key] = [
+                    item
+                    for item in _agentcore_list_all(
+                        operation_name, list(result_keys), **list_kwargs
+                    )
+                    if not any(
+                        item.get(field) == value
+                        for field, value in family.get("exclude", {}).items()
+                    )
+                ]
         return listed[key]
 
     type_counts = {
@@ -10285,6 +10320,85 @@ def _masking_data_identifiers(policy_document: Any) -> List[str]:
     return identifiers
 
 
+# CloudWatch Logs managed data identifiers by the categories OBS-04 names:
+# credentials, and personal or health data. Financial identifiers are neither.
+# A country-scoped identifier carries a suffix such as -US, which is stripped.
+LOGS_CREDENTIAL_DATA_IDENTIFIERS = frozenset(
+    {
+        "AwsSecretKey",
+        "OpenSshPrivateKey",
+        "PgpPrivateKey",
+        "PkcsPrivateKey",
+        "PuttyPrivateKey",
+    }
+)
+LOGS_PERSONAL_OR_HEALTH_DATA_IDENTIFIERS = frozenset(
+    {
+        "Address",
+        "EmailAddress",
+        "IpAddress",
+        "LatLong",
+        "Name",
+        "VehicleIdentificationNumber",
+        "CepCode",
+        "Cnpj",
+        "CpfCode",
+        "DriversLicense",
+        "DrugEnforcementAgencyNumber",
+        "ElectoralRollNumber",
+        "HealthInsuranceCardNumber",
+        "HealthInsuranceClaimNumber",
+        "HealthInsuranceNumber",
+        "HealthcareProcedureCode",
+        "IndividualTaxIdentificationNumber",
+        "InseeCode",
+        "MedicareBeneficiaryNumber",
+        "NationalDrugCode",
+        "NationalIdentificationNumber",
+        "NationalInsuranceNumber",
+        "NationalProviderId",
+        "NhsNumber",
+        "NieNumber",
+        "NifNumber",
+        "PassportNumber",
+        "PermanentResidenceNumber",
+        "PersonalHealthNumber",
+        "PhoneNumber",
+        "PostalCode",
+        "RgNumber",
+        "SocialInsuranceNumber",
+        "Ssn",
+        "TaxId",
+        "ZipCode",
+    }
+)
+
+
+def _masking_category_gaps(identifiers: List[str]) -> List[str]:
+    """Name the OBS-04 identifier categories no masked identifier falls in.
+
+    Only an AWS managed identifier ARN is classified. A custom identifier's
+    pattern is not read, so it falls in neither category.
+    """
+    managed = set()
+    for identifier in identifiers:
+        parts = str(identifier).split(":", 5)
+        if (
+            len(parts) == 6
+            and parts[0] == "arn"
+            and parts[2] == "dataprotection"
+            and parts[4] == "aws"
+            and parts[5].startswith("data-identifier/")
+        ):
+            managed.add(parts[5][len("data-identifier/") :].split("-", 1)[0])
+    gaps = []
+    if not managed & LOGS_CREDENTIAL_DATA_IDENTIFIERS:
+        gaps.append("credentials")
+    if not managed & LOGS_PERSONAL_OR_HEALTH_DATA_IDENTIFIERS:
+        gaps.append("personal or health")
+    return gaps
+
+
 def _account_masking_data_identifiers() -> List[str]:
     """Data identifiers masked by an account-wide data-protection policy."""
     policies = _paginate_aws_list(
@@ -10397,15 +10511,23 @@ def check_agentcore_log_group_data_protection() -> List[Dict[str, Any]]:
         identifiers = list(account_identifiers)
         masking_scope = "account-wide"
 
-        if not identifiers and log_group.get("dataProtectionStatus") == "ACTIVATED":
+        if (
+            _masking_category_gaps(identifiers)
+            and log_group.get("dataProtectionStatus") == "ACTIVATED"
+        ):
             # describe_log_groups reports that a policy is attached but not what
             # it masks, so the document is read only for groups that have one.
+            # The account and group policies are cumulative.
             try:
                 document = logs_client.get_data_protection_policy(
                     logGroupIdentifier=log_group_name
                 ).get("policyDocument")
-                identifiers = _masking_data_identifiers(document)
-                masking_scope = "log-group"
+                identifiers += _masking_data_identifiers(document)
+                masking_scope = (
+                    "account-wide and a log-group"
+                    if account_identifiers
+                    else "log-group"
+                )
             except Exception as error:
                 findings.append(
                     create_finding(
@@ -10424,15 +10546,18 @@ def check_agentcore_log_group_data_protection() -> List[Dict[str, Any]]:
                 )
                 continue
 
-        if identifiers and has_cmk:
+        category_gaps = _masking_category_gaps(identifiers)
+        if identifiers and not category_gaps and has_cmk:
             findings.append(
                 create_finding(
                     check_id="AC-20",
                     finding_name="AgentCore Log Data Protection",
                     finding_details=(
                         f"Log group '{log_group_name}' masks "
-                        f"{len(set(identifiers))} data identifier(s) through a "
-                        f"{masking_scope} data-protection policy and is encrypted "
+                        f"{len(set(identifiers))} data identifier(s), among them "
+                        "a credentials and a personal or health managed "
+                        f"identifier, through a {masking_scope} data-protection "
+                        "policy and is encrypted "
                         "with a customer managed key. AC-26 judges that key's "
                         "policy. Log groups outside the AgentCore prefixes that a "
                         "delivery writes to are not read."
@@ -10451,6 +10576,11 @@ def check_agentcore_log_group_data_protection() -> List[Dict[str, Any]]:
         missing = []
         if not identifiers:
             missing.append("no data-protection policy that de-identifies log events")
+        elif category_gaps:
+            missing.append(
+                "a data-protection policy that de-identifies no "
+                f"{' and no '.join(category_gaps)} managed data identifier"
+            )
         if not has_cmk:
             missing.append("no customer managed encryption key")
 
@@ -10464,7 +10594,10 @@ def check_agentcore_log_group_data_protection() -> List[Dict[str, Any]]:
                 resolution=(
                     "Attach a data-protection policy with a Deidentify operation "
                     "covering the sensitive data identifiers this workload logs, "
-                    "and set a customer managed KMS key on the log group."
+                    "among them a credentials managed identifier such as "
+                    "AwsSecretKey and a personal or health one such as "
+                    "EmailAddress, and set a customer managed KMS key on the log "
+                    "group."
                 ),
                 reference=LOGS_DATA_PROTECTION_REFERENCE_URL,
                 severity=SeverityEnum.MEDIUM,
@@ -10479,13 +10612,16 @@ LOGS_UNMASK_ACTION = "logs:unmask"
 
 
 def _logs_resource_is_unbounded(resource: str) -> bool:
-    """Return whether one logs Resource pattern reaches every log group.
+    """Return whether one logs Resource pattern reaches every AgentCore log group.
 
     A log group name may contain `/`, so the generic ARN rule would read the
     prefix `log-group:/aws/bedrock-agentcore/*` as a whole resource type. Here
-    the name after `log-group:` is one component: it is unbounded only when it
-    is made of wildcards alone. A wildcard in the partition, service, region or
-    account segment, or in the resource type, is unbounded as it is elsewhere.
+    the name after `log-group:` is one component: it is unbounded when it is
+    made of wildcards alone, or when it is a literal head that every name under
+    an AgentCore prefix starts with followed by wildcards alone, so
+    `/aws/bedrock-agentcore/*` and `/aws/*` count as `*` does. A wildcard in
+    the partition, service, region or account segment, or in the resource
+    type, is unbounded as it is elsewhere.
     """
     resource = str(resource).strip()
     parts = resource.split(":", 5)
@@ -10504,7 +10640,20 @@ def _logs_resource_is_unbounded(resource: str) -> bool:
     if resource_type != "log-group":
         return False
     name = name.split(":log-stream", 1)[0]
-    return not name or set(name) <= {"*", "?"}
+    if name.endswith(":*"):
+        name = name[:-2]
+    wildcard_at = min(
+        (index for index in (name.find("*"), name.find("?")) if index >= 0),
+        default=-1,
+    )
+    if wildcard_at < 0:
+        return not name
+    head, tail = name[:wildcard_at], name[wildcard_at:]
+    return (
+        "*" in tail
+        and set(tail) <= {"*", "?"}
+        and any(prefix.startswith(head) for prefix in AGENTCORE_LOG_GROUP_PREFIXES)
+    )
 
 
 def _principals_granting_logs_unmask(
@@ -10644,8 +10793,10 @@ def check_agentcore_log_unmask_restriction(
                     check_id="AC-21",
                     finding_name="AgentCore Log Unmask Restriction",
                     finding_details=(
-                        "The following principals can unmask any log group's "
-                        f"masked values: {', '.join(unscoped)}. "
+                        "The following principals can unmask the masked values of "
+                        "every AgentCore log group, through a resource of wildcards "
+                        "alone or a wildcard after an AgentCore log group prefix: "
+                        f"{', '.join(unscoped)}. "
                         f"{IAM_CACHE_SCP_NOTE}"
                     ),
                     resolution=(
@@ -10760,36 +10911,79 @@ def _sink_org_condition_binds(operator: str, key: str, raw: Any) -> bool:
     return True
 
 
-def _sink_statement_is_scoped(statement: Dict[str, Any]) -> bool:
-    """Return whether one sink-policy statement binds the sink to known callers.
+def _sink_principal_account(principal: str) -> str:
+    """Return the account a sink-policy principal names, or "" for a service."""
+    principal = principal.strip()
+    if re.fullmatch(r"\d{12}", principal):
+        return principal
+    return _arn_account(principal)
 
-    Named principals bind it only when no value carries `*`: `*` alone and an
-    ARN such as an account-wildcard root both admit every account. A NotPrincipal
-    Allow admits everyone outside its list, so only a condition can bind it.
+
+def _sink_statement_scope(
+    statement: Dict[str, Any],
+    sink_account: str,
+    read_organization_id: Callable[[], str],
+) -> str:
+    """Classify who one sink-policy statement lets link to the sink.
+
+    Returns "scoped" when the statement admits only the sink's own account, or
+    only callers in this account's organization; "foreign_org" when its only
+    binding organization conditions name another organization;
+    "foreign_accounts" when it names accounts outside the sink's account and
+    no organization condition bounds them; "org_unread" when an organization
+    condition binds it but this account's organization could not be read; and
+    "unscoped" otherwise. Named principals bind only when no value carries `*`,
+    and a NotPrincipal Allow admits everyone outside its list, so only a
+    condition can bind it.
     """
     principals = _sink_statement_principals(statement)
-    if (
+    named = (
         "NotPrincipal" not in statement
         and principals
         and not any("*" in principal for principal in principals)
+    )
+    if named and all(
+        _sink_principal_account(principal) in ("", sink_account)
+        for principal in principals
     ):
-        return True
+        return "scoped"
 
+    org_value_sets: List[List[str]] = []
     conditions = statement.get("Condition")
-    if not isinstance(conditions, dict):
-        return False
+    if isinstance(conditions, dict):
+        for operator, condition_values in conditions.items():
+            if not isinstance(condition_values, dict):
+                continue
+            for condition_key, raw in condition_values.items():
+                key = str(condition_key).strip().lower()
+                if (
+                    key in SINK_PRINCIPAL_SCOPE_CONDITION_KEYS
+                    and _sink_org_condition_binds(operator, key, raw)
+                ):
+                    org_value_sets.append(
+                        [
+                            value.strip().split("/", 1)[0]
+                            if key == "aws:principalorgpaths"
+                            else value.strip()
+                            for value in _condition_values(raw)
+                        ]
+                    )
 
-    for operator, condition_values in conditions.items():
-        if not isinstance(condition_values, dict):
-            continue
-        for condition_key, raw in condition_values.items():
-            key = str(condition_key).strip().lower()
-            if key in SINK_PRINCIPAL_SCOPE_CONDITION_KEYS and _sink_org_condition_binds(
-                operator, key, raw
-            ):
-                return True
-
-    return False
+    if org_value_sets:
+        organization_id = read_organization_id()
+        if not organization_id:
+            return "org_unread"
+        # Conditions AND together, so one entry naming only this organization
+        # bounds the statement to it.
+        if any(
+            all(value.lower() == organization_id.lower() for value in values)
+            for values in org_value_sets
+        ):
+            return "scoped"
+        return "foreign_org"
+    if named:
+        return "foreign_accounts"
+    return "unscoped"
 
 
 def check_agentcore_telemetry_sink_scope() -> List[Dict[str, Any]]:
@@ -10859,12 +11053,33 @@ def check_agentcore_telemetry_sink_scope() -> List[Dict[str, Any]]:
             )
         ]
 
+    organization: Dict[str, str] = {}
+
+    def read_organization_id() -> str:
+        if "id" not in organization:
+            organization["id"] = ""
+            if organizations_client is None:
+                organization["error"] = "no Organizations client"
+            else:
+                try:
+                    organization["id"] = (
+                        organizations_client.describe_organization()
+                        .get("Organization", {})
+                        .get("Id", "")
+                    )
+                except Exception as error:
+                    organization["error"] = type(error).__name__
+                if not organization["id"] and "error" not in organization:
+                    organization["error"] = "no organization id returned"
+        return organization["id"]
+
     findings = []
     for sink in sinks:
         sink_arn = sink.get("Arn")
         if not sink_arn:
             continue
         sink_name = sink.get("Name", sink_arn)
+        sink_account = _arn_account(sink_arn)
 
         try:
             policy_text = oam_client.get_sink_policy(SinkIdentifier=sink_arn).get(
@@ -10961,11 +11176,75 @@ def check_agentcore_telemetry_sink_scope() -> List[Dict[str, Any]]:
             for statement in statements
             if isinstance(statement, dict) and statement.get("Effect") == "Allow"
         ]
-        unscoped_count = sum(
-            1
+        scopes = [
+            _sink_statement_scope(statement, sink_account, read_organization_id)
             for statement in allow_statements
-            if not _sink_statement_is_scoped(statement)
-        )
+        ]
+        unscoped_count = scopes.count("unscoped")
+        foreign_org_count = scopes.count("foreign_org")
+
+        if foreign_org_count and not unscoped_count:
+            findings.append(
+                create_finding(
+                    check_id="AC-22",
+                    finding_name="AgentCore Telemetry Sink Scope",
+                    finding_details=(
+                        f"Sink '{sink_name}' has {foreign_org_count} Allow "
+                        "statement(s) whose organization condition names only an "
+                        f"organization other than this account's, "
+                        f"{organization['id']}, so accounts of that organization "
+                        "can link telemetry into it."
+                    ),
+                    resolution=(
+                        "Set the aws:PrincipalOrgID or aws:PrincipalOrgPaths "
+                        "condition of each Allow statement to this account's "
+                        "organization."
+                    ),
+                    reference=OAM_CROSS_ACCOUNT_REFERENCE_URL,
+                    severity=SeverityEnum.MEDIUM,
+                    status=StatusEnum.FAILED,
+                )
+            )
+            continue
+
+        if not unscoped_count and (
+            "org_unread" in scopes or "foreign_accounts" in scopes
+        ):
+            gaps = []
+            if "org_unread" in scopes:
+                gaps.append(
+                    f"{scopes.count('org_unread')} Allow statement(s) are bound by "
+                    "an organization condition, but this account's organization "
+                    "could not be read to compare it "
+                    f"({organization.get('error', '')})"
+                )
+            if "foreign_accounts" in scopes:
+                gaps.append(
+                    f"{scopes.count('foreign_accounts')} Allow statement(s) name "
+                    "accounts other than the sink's own with no organization "
+                    "condition, and whether they belong to this organization is "
+                    "not read"
+                )
+            findings.append(
+                create_finding(
+                    check_id="AC-22",
+                    finding_name="AgentCore Telemetry Sink Scope Unverified",
+                    finding_details=(
+                        f"Sink '{sink_name}' is not shown to admit only this "
+                        f"organization: {'; '.join(gaps)}."
+                    ),
+                    resolution=(
+                        "Grant organizations:DescribeOrganization so the "
+                        "organization condition is compared to this account's "
+                        "organization, and add an aws:PrincipalOrgID condition to "
+                        "each Allow statement that names other accounts."
+                    ),
+                    reference=OAM_CROSS_ACCOUNT_REFERENCE_URL,
+                    severity=SeverityEnum.INFORMATIONAL,
+                    status=StatusEnum.NA,
+                )
+            )
+            continue
 
         if allow_statements and not unscoped_count:
             findings.append(
@@ -10974,9 +11253,10 @@ def check_agentcore_telemetry_sink_scope() -> List[Dict[str, Any]]:
                     finding_name="AgentCore Telemetry Sink Scope",
                     finding_details=(
                         f"Sink '{sink_name}' restricts every Allow statement to "
-                        "principals named with no wildcard, or to an organization "
-                        "condition that names its organization under a positive "
-                        "string operator."
+                        "principals of the sink's own account named with no "
+                        "wildcard, or to an organization condition that names "
+                        "this account's organization under a positive string "
+                        "operator."
                     ),
                     resolution=(
                         "No action required. Confirm the organization or account "
@@ -16981,19 +17261,67 @@ def _cedar_scope_operators(part: str) -> List[str]:
     return re.sub(r'"(?:[^"\\]|\\.)*"', '""', part).split()
 
 
+def _cedar_condition_blocks(conditions: str) -> List[Tuple[str, str]]:
+    """Return (keyword, body) for every when/unless block of a policy.
+
+    The body is the text between the block's braces, found outside string
+    literals, so a brace inside an entity id does not end the block.
+    """
+    blocks: List[Tuple[str, str]] = []
+    pattern = re.compile(
+        r"\b(" + "|".join(CEDAR_CONDITION_KEYWORDS) + r")\b(?:\s+\w+)?\s*\{"
+    )
+    position = 0
+    while True:
+        match = pattern.search(conditions, position)
+        if not match:
+            return blocks
+        depth = 1
+        in_string = False
+        escaped = False
+        index = match.end()
+        while index < len(conditions) and depth:
+            character = conditions[index]
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif character == "\\":
+                    escaped = True
+                elif character == '"':
+                    in_string = False
+            elif character == '"':
+                in_string = True
+            elif character == "{":
+                depth += 1
+            elif character == "}":
+                depth -= 1
+            index += 1
+        blocks.append((match.group(1), conditions[match.end() : index - 1]))
+        position = index
+
+
 def _cedar_principal_is_bounded(scope: List[str], conditions: str) -> bool:
     """Return whether a permit names the callers it admits.
 
     `principal is AgentCore::OAuthUser`, `principal == ...` and `principal in
-    ...` name a type or an entity. A bare `principal` admits every caller the
-    gateway's authorizer lets through, unless a condition reads the principal,
-    as the attribute-based pattern `principal.getTag(...)` does. The condition
-    body is not evaluated: a condition that reads the principal is taken as the
-    bound it was written to be.
+    ...` name a type or an entity; the recommendation asks for a principal type.
+    A bare `principal` admits every caller the gateway's authorizer lets
+    through, unless a `when` block reads the principal, as the attribute-based
+    pattern `principal.getTag(...)` does. An `unless` block only removes callers
+    from a permit that otherwise admits all of them, a word inside a string
+    literal is not a read, and `context.principal` is a context attribute. The
+    condition body is not evaluated: a `when` block that reads the principal is
+    taken as the bound it was written to be.
     """
     if len(scope[0].split()) > 1:
         return True
-    return re.search(r"\bprincipal\b", conditions) is not None
+    return any(
+        keyword == "when"
+        and re.search(
+            r"(?<![.\w])principal\b", re.sub(r'"(?:[^"\\]|\\.)*"', '""', body)
+        )
+        for keyword, body in _cedar_condition_blocks(conditions)
+    )
 
 
 def _cedar_resource_is_bounded(scope: List[str]) -> bool:
@@ -17282,14 +17610,15 @@ def check_agentcore_policy_tool_scope() -> List[Dict[str, Any]]:
                         f"{label} enforces policy engine {policy_engine_id}, whose "
                         f"policy {', '.join(sorted(set(caller_wide)))} permits "
                         "named tools to a bare principal and no condition reads "
-                        "the principal, so every caller the gateway authorizer "
-                        "accepts may call them."
+                        "the principal in a when block, so every caller the "
+                        "gateway authorizer accepts may call them."
                     ),
                     resolution=(
                         "Name the caller population in the permit head, for "
                         "example principal is AgentCore::OAuthUser or principal "
-                        "== an entity, or bound it with a condition on the "
-                        "principal's tags."
+                        "== an entity, or bound it with a when condition on the "
+                        "principal's tags. An unless condition on the principal "
+                        "removes callers and does not name the ones admitted."
                     ),
                     reference=AGENTCORE_POLICY_CORE_CONCEPTS_REFERENCE_URL,
                     severity=SeverityEnum.MEDIUM,
@@ -19559,7 +19888,7 @@ def check_agentcore_evaluation_pass_role_scope(
                 finding_details=(
                     "The following principals can create or update an online "
                     "evaluation configuration and hold an iam:PassRole grant that "
-                    "would let them name any role they reach as its execution "
+                    "would let them name any role it matches as its execution "
                     "role, whether or not a configuration exists today: "
                     f"{'; '.join(sorted(writer_gaps))}. {IAM_CACHE_SCP_NOTE}"
                 ),

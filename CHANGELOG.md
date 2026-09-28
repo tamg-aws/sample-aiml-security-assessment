@@ -208,6 +208,27 @@ section.
 
 ### Fixed
 
+- `AC-35` no longer reads a bare `principal` as bounded because the word
+  `principal` appears somewhere in the conditions. Only a `when` block that
+  reads the principal outside string literals now counts: an `unless` block,
+  a string literal such as `"principal"` and `context.principal` each passed
+  before and now fail as `Caller Scope Unbounded`.
+- `AC-02` and `AC-42` fail a payment manager or evaluation writer whose
+  `iam:PassRole` names roles by a wildcard pattern such as `role/pay-*`. Only a
+  Resource reaching every role failed, so a pattern passed as scoped to the one
+  role the resource needs.
+- `AC-18` inventories the account's own evaluators and requires the
+  `AWS::BedrockAgentCore::Evaluator` data-event type for them. Built-in
+  evaluators are not counted.
+- `AC-20` requires a managed credentials identifier and a managed personal or
+  health identifier among the masked ones. Any single identifier passed, and an
+  account policy hid the log-group policy it is cumulative with.
+- `AC-21` fails `logs:Unmask` on a wildcard after an AgentCore log group
+  prefix. `/aws/bedrock-agentcore/*` reached every AgentCore group and passed
+  as scoped.
+- `AC-22` compares a sink's organization condition to this account's
+  organization and no longer passes a statement naming other accounts. Any
+  organization id and any foreign account passed.
 - `AC-18` no longer reads a selector field that keeps every AgentCore event
   as narrowing. `readOnly` listing both values, and a `resources.ARN` prefix
   covering every AgentCore resource of the region, failed a type they log

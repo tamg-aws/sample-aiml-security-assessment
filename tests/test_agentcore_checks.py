@@ -2330,6 +2330,61 @@ class TestAC02WholePopulation:
         assert "Scoped" not in finding["Finding_Details"]
         assert_finding_schema(finding)
 
+    @pytest.mark.parametrize(
+        "resource",
+        [
+            "arn:aws:iam::123456789012:role/Resource*",
+            "arn:aws:iam::123456789012:role/ResourceRetrievalRol?",
+            "arn:aws:iam::123456789012:role/Retrieval*Role",
+            [
+                "arn:aws:iam::123456789012:role/ResourceRetrievalRole",
+                "arn:aws:iam::123456789012:role/pay-*",
+            ],
+        ],
+        ids=["prefix", "single-char", "infix", "one-literal-one-pattern"],
+    )
+    def test_a_role_name_pattern_is_not_one_retrieval_role(self, resource):
+        pattern = dict(self._scoped_pass_role(), Resource=resource)
+        cache = {
+            "role_permissions": {
+                "Scoped": self._control_plane(self._scoped_pass_role()),
+                "Pattern": self._control_plane(pattern),
+            },
+            "user_permissions": {},
+        }
+
+        findings = agentcore_app.check_agentcore_full_access_roles(cache)
+
+        finding = self._finding(findings, self._PASS_ROLE)
+        assert finding["Status"] == "Failed"
+        assert (
+            "role Pattern, where its Resource names roles by a wildcard pattern"
+            in finding["Finding_Details"]
+        )
+        assert "reaches every role" not in finding["Finding_Details"]
+        assert "Scoped" not in finding["Finding_Details"]
+        assert (
+            "is not compared to the payment manager's own roleArn"
+            in (finding["Finding_Details"])
+        )
+
+    def test_two_literal_role_arns_are_not_a_pattern(self):
+        literal = dict(
+            self._scoped_pass_role(),
+            Resource=[
+                self._RETRIEVAL_ROLE_ARN,
+                "arn:aws:iam::123456789012:role/SecondRetrievalRole",
+            ],
+        )
+        cache = {
+            "role_permissions": {"ControlPlane": self._control_plane(literal)},
+            "user_permissions": {},
+        }
+
+        findings = agentcore_app.check_agentcore_full_access_roles(cache)
+
+        assert self._PASS_ROLE not in self._names(findings)
+
     def test_pass_role_without_a_payment_manager_write_is_not_this_leg(self):
         cache = {
             "role_permissions": {
@@ -6735,6 +6790,7 @@ def _empty_agentcore_inventory(mock_ac):
     mock_ac.list_oauth2_credential_providers.return_value = {"credentialProviders": []}
     mock_ac.list_api_key_credential_providers.return_value = {"credentialProviders": []}
     mock_ac.list_policy_engines.return_value = {"policyEngines": []}
+    mock_ac.list_evaluators.return_value = {"evaluators": []}
 
 
 def _logging_trail(mock_ct, multi_region=True, home_region="us-east-1", logging=True):
@@ -7494,6 +7550,115 @@ class TestAC18WholePopulation:
 # ===================================================================
 # AC-19: check_agentcore_log_delivery_configuration
 # ===================================================================
+class TestAC18EvaluatorFamily:
+    """AC-18: the account's own evaluators need the Evaluator data-event type."""
+
+    @staticmethod
+    def _evaluators(mock_ac, *types):
+        mock_ac.list_evaluators.return_value = {
+            "evaluators": [
+                {"evaluatorId": f"ev-{index}", "evaluatorType": evaluator_type}
+                for index, evaluator_type in enumerate(types)
+            ]
+        }
+
+    @patch("agentcore_app.agentcore_client")
+    @patch("agentcore_app.cloudtrail_client")
+    def test_a_custom_evaluator_without_the_type_fails(self, mock_ct, mock_ac):
+        TestAC18WholePopulation._selectors_per_trail(
+            mock_ct, {"t1": [_data_event_selector("AWS::BedrockAgentCore::Memory")]}
+        )
+        _logging_trail(mock_ct)
+        _empty_agentcore_inventory(mock_ac)
+        self._evaluators(mock_ac, "Custom")
+
+        evaluator = _family_finding(
+            agentcore_app.check_agentcore_cloudtrail_data_events(), "Evaluator"
+        )
+
+        assert evaluator["Status"] == "Failed"
+        assert evaluator["Finding_Details"].startswith(
+            "1 AgentCore Evaluator resource(s) found"
+        )
+        assert "AWS::BedrockAgentCore::Evaluator whole" in evaluator["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    @patch("agentcore_app.cloudtrail_client")
+    def test_a_custom_evaluator_with_the_type_passes(self, mock_ct, mock_ac):
+        TestAC18WholePopulation._selectors_per_trail(
+            mock_ct,
+            {"t1": [_data_event_selector("AWS::BedrockAgentCore::Evaluator")]},
+        )
+        _logging_trail(mock_ct)
+        _empty_agentcore_inventory(mock_ac)
+        self._evaluators(mock_ac, "CustomCode")
+
+        evaluator = _family_finding(
+            agentcore_app.check_agentcore_cloudtrail_data_events(), "Evaluator"
+        )
+
+        assert evaluator["Status"] == "Passed"
+
+    @patch("agentcore_app.agentcore_client")
+    @patch("agentcore_app.cloudtrail_client")
+    def test_builtin_evaluators_alone_read_na(self, mock_ct, mock_ac):
+        TestAC18WholePopulation._selectors_per_trail(
+            mock_ct, {"t1": [_data_event_selector("AWS::BedrockAgentCore::Memory")]}
+        )
+        _logging_trail(mock_ct)
+        _empty_agentcore_inventory(mock_ac)
+        self._evaluators(mock_ac, "Builtin", "Builtin")
+
+        evaluator = _family_finding(
+            agentcore_app.check_agentcore_cloudtrail_data_events(), "Evaluator"
+        )
+
+        assert evaluator["Status"] == "N/A"
+        assert evaluator["Finding_Details"].startswith(
+            "No AgentCore Evaluator resources found"
+        )
+
+    @patch("agentcore_app.agentcore_client")
+    @patch("agentcore_app.cloudtrail_client")
+    def test_only_the_accounts_own_evaluators_are_counted(self, mock_ct, mock_ac):
+        TestAC18WholePopulation._selectors_per_trail(
+            mock_ct, {"t1": [_data_event_selector("AWS::BedrockAgentCore::Memory")]}
+        )
+        _logging_trail(mock_ct)
+        _empty_agentcore_inventory(mock_ac)
+        self._evaluators(
+            mock_ac, "Builtin", "Custom", "Builtin", "ThirdParty", "CustomDerived"
+        )
+
+        evaluator = _family_finding(
+            agentcore_app.check_agentcore_cloudtrail_data_events(), "Evaluator"
+        )
+
+        assert evaluator["Status"] == "Failed"
+        assert evaluator["Finding_Details"].startswith(
+            "3 AgentCore Evaluator resource(s) found"
+        )
+
+    @patch("agentcore_app.agentcore_client")
+    @patch("agentcore_app.cloudtrail_client")
+    def test_the_evaluator_type_does_not_cover_the_other_families(
+        self, mock_ct, mock_ac
+    ):
+        TestAC18WholePopulation._selectors_per_trail(
+            mock_ct,
+            {"t1": [_data_event_selector("AWS::BedrockAgentCore::Evaluator")]},
+        )
+        _logging_trail(mock_ct)
+        _empty_agentcore_inventory(mock_ac)
+        self._evaluators(mock_ac, "Custom")
+        mock_ac.list_memories.return_value = {"memories": [{"id": "mem-1"}]}
+
+        findings = agentcore_app.check_agentcore_cloudtrail_data_events()
+
+        assert _family_finding(findings, "Evaluator")["Status"] == "Passed"
+        assert _family_finding(findings, "Memory")["Status"] == "Failed"
+
+
 class TestAC19LogDeliveryConfiguration:
     """AC-19: Application-log delivery per gateway and memory resource."""
 
@@ -7964,7 +8129,8 @@ class TestAC20LogDataProtection:
 
     _MASKING_POLICY = (
         '{"Name": "p", "Statement": [{"Sid": "mask", '
-        '"DataIdentifier": ["arn:aws:dataprotection::aws:data-identifier/EmailAddress"], '
+        '"DataIdentifier": ["arn:aws:dataprotection::aws:data-identifier/EmailAddress", '
+        '"arn:aws:dataprotection::aws:data-identifier/AwsSecretKey"], '
         '"Operation": {"Deidentify": {"MaskConfig": {}}}}]}'
     )
     _AUDIT_ONLY_POLICY = (
@@ -8261,7 +8427,7 @@ class TestAC21LogUnmaskRestriction:
                 ["logs:Unmask"],
                 resource=(
                     "arn:aws:logs:us-east-1:123456789012:"
-                    "log-group:/aws/bedrock-agentcore/*"
+                    "log-group:/aws/bedrock-agentcore/runtimes/rt-1-DEFAULT"
                 ),
             )
         )
@@ -8374,8 +8540,10 @@ class TestAC22TelemetrySinkScope:
         "Name": "central-sink",
     }
 
+    @patch("agentcore_app.organizations_client")
     @patch("agentcore_app.oam_client")
-    def test_org_id_condition_passes(self, mock_oam):
+    def test_org_id_condition_passes(self, mock_oam, mock_orgs):
+        mock_orgs.describe_organization.return_value = {"Organization": {"Id": "o-1"}}
         mock_oam.list_sinks.return_value = {"Items": [self._SINK]}
         mock_oam.get_sink_policy.return_value = {
             "Policy": (
@@ -8391,8 +8559,10 @@ class TestAC22TelemetrySinkScope:
         assert findings[0]["Status"] == "Passed"
         assert_finding_schema(findings[0])
 
+    @patch("agentcore_app.organizations_client")
     @patch("agentcore_app.oam_client")
-    def test_prefixed_condition_operator_passes(self, mock_oam):
+    def test_prefixed_condition_operator_passes(self, mock_oam, mock_orgs):
+        mock_orgs.describe_organization.return_value = {"Organization": {"Id": "o-1"}}
         mock_oam.list_sinks.return_value = {"Items": [self._SINK]}
         mock_oam.get_sink_policy.return_value = {
             "Policy": (
@@ -8413,7 +8583,7 @@ class TestAC22TelemetrySinkScope:
         mock_oam.get_sink_policy.return_value = {
             "Policy": (
                 '{"Statement": [{"Effect": "Allow", '
-                '"Principal": {"AWS": ["arn:aws:iam::111122223333:root"]}, '
+                '"Principal": {"AWS": ["arn:aws:iam::123456789012:root"]}, '
                 '"Action": "oam:CreateLink", "Resource": "*"}]}'
             )
         }
@@ -8648,8 +8818,14 @@ class TestAC22SinkScopeValues:
             ),
         ],
     )
+    @patch("agentcore_app.organizations_client")
     @patch("agentcore_app.oam_client")
-    def test_a_named_organization_still_passes(self, mock_oam, operator, key, value):
+    def test_a_named_organization_still_passes(
+        self, mock_oam, mock_orgs, operator, key, value
+    ):
+        mock_orgs.describe_organization.return_value = {
+            "Organization": {"Id": "o-a1b2c3d4e5"}
+        }
         mock_oam.list_sinks.return_value = {"Items": [self._SINK]}
         mock_oam.get_sink_policy.return_value = self._policy(
             self._open({operator: {key: value}})
@@ -8659,8 +8835,12 @@ class TestAC22SinkScopeValues:
 
         assert findings[0]["Status"] == "Passed"
 
+    @patch("agentcore_app.organizations_client")
     @patch("agentcore_app.oam_client")
-    def test_a_binding_key_beside_a_non_binding_one_passes(self, mock_oam):
+    def test_a_binding_key_beside_a_non_binding_one_passes(self, mock_oam, mock_orgs):
+        mock_orgs.describe_organization.return_value = {
+            "Organization": {"Id": "o-a1b2c3d4e5"}
+        }
         mock_oam.list_sinks.return_value = {"Items": [self._SINK]}
         mock_oam.get_sink_policy.return_value = self._policy(
             self._open(
@@ -8675,8 +8855,12 @@ class TestAC22SinkScopeValues:
 
         assert findings[0]["Status"] == "Passed"
 
+    @patch("agentcore_app.organizations_client")
     @patch("agentcore_app.oam_client")
-    def test_one_wildcard_sink_among_scoped_ones_fails_alone(self, mock_oam):
+    def test_one_wildcard_sink_among_scoped_ones_fails_alone(self, mock_oam, mock_orgs):
+        mock_orgs.describe_organization.return_value = {
+            "Organization": {"Id": "o-a1b2c3d4e5"}
+        }
         second = dict(
             self._SINK,
             Arn="arn:aws:oam:us-east-1:123456789012:sink/s-2",
@@ -8730,6 +8914,185 @@ class TestAC22SinkScopeValues:
         assert findings[0]["Status"] == "N/A"
         assert "oam:ListLinks" in findings[0]["Finding_Details"]
         mock_oam.list_links.assert_not_called()
+
+
+class TestAC22OwnOrganization:
+    """AC-22: the organization a sink admits must be this account's own."""
+
+    _SINK = TestAC22TelemetrySinkScope._SINK
+    _OWN = "o-a1b2c3d4e5"
+
+    @staticmethod
+    def _statement(principal="*", condition=None):
+        statement = {
+            "Effect": "Allow",
+            "Principal": principal,
+            "Action": "oam:CreateLink",
+            "Resource": "*",
+        }
+        if condition is not None:
+            statement["Condition"] = condition
+        return statement
+
+    @classmethod
+    def _run(cls, mock_oam, mock_orgs, *statements, sinks=None):
+        mock_oam.list_sinks.return_value = {"Items": sinks or [cls._SINK]}
+        mock_oam.get_sink_policy.return_value = {
+            "Policy": json.dumps({"Statement": list(statements)})
+        }
+        if mock_orgs is not None:
+            mock_orgs.describe_organization.return_value = {
+                "Organization": {"Id": cls._OWN}
+            }
+        return agentcore_app.check_agentcore_telemetry_sink_scope()
+
+    @pytest.mark.parametrize(
+        "condition",
+        [
+            {"StringEquals": {"aws:PrincipalOrgID": "o-z9y8x7w6v5"}},
+            {"StringEquals": {"aws:PrincipalOrgID": ["o-a1b2c3d4e5", "o-z9y8x7w6v5"]}},
+            {"ForAnyValue:StringLike": {"aws:PrincipalOrgPaths": "o-z9y8x7w6v5/*"}},
+        ],
+    )
+    @patch("agentcore_app.organizations_client")
+    @patch("agentcore_app.oam_client")
+    def test_another_organization_fails(self, mock_oam, mock_orgs, condition):
+        findings = self._run(mock_oam, mock_orgs, self._statement(condition=condition))
+
+        assert [f["Status"] for f in findings] == ["Failed"]
+        assert (
+            "other than this account's, o-a1b2c3d4e5" in findings[0]["Finding_Details"]
+        )
+
+    @patch("agentcore_app.organizations_client")
+    @patch("agentcore_app.oam_client")
+    def test_an_unreadable_organization_is_na_and_names_the_action(
+        self, mock_oam, mock_orgs
+    ):
+        mock_oam.list_sinks.return_value = {"Items": [self._SINK]}
+        mock_oam.get_sink_policy.return_value = {
+            "Policy": json.dumps(
+                {
+                    "Statement": [
+                        self._statement(
+                            condition={
+                                "StringEquals": {"aws:PrincipalOrgID": self._OWN}
+                            }
+                        )
+                    ]
+                }
+            )
+        }
+        mock_orgs.describe_organization.side_effect = _make_client_error(
+            "AccessDeniedException", "denied"
+        )
+
+        findings = agentcore_app.check_agentcore_telemetry_sink_scope()
+
+        assert [f["Status"] for f in findings] == ["N/A"]
+        assert "(ClientError)" in findings[0]["Finding_Details"]
+        assert "organizations:DescribeOrganization" in findings[0]["Resolution"]
+
+    @patch("agentcore_app.oam_client")
+    def test_no_organizations_client_is_na(self, mock_oam):
+        with patch("agentcore_app.organizations_client", None):
+            findings = self._run(
+                mock_oam,
+                None,
+                self._statement(
+                    condition={"StringEquals": {"aws:PrincipalOrgID": self._OWN}}
+                ),
+            )
+
+        assert [f["Status"] for f in findings] == ["N/A"]
+        assert "no Organizations client" in findings[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "principal",
+        [
+            {"AWS": "arn:aws:iam::111122223333:root"},
+            {"AWS": "111122223333"},
+            {"AWS": ["arn:aws:iam::123456789012:root", "444455556666"]},
+        ],
+    )
+    @patch("agentcore_app.organizations_client")
+    @patch("agentcore_app.oam_client")
+    def test_a_named_foreign_account_alone_is_unverified(
+        self, mock_oam, mock_orgs, principal
+    ):
+        findings = self._run(mock_oam, mock_orgs, self._statement(principal))
+
+        assert [f["Status"] for f in findings] == ["N/A"]
+        assert (
+            "name accounts other than the sink's own" in findings[0]["Finding_Details"]
+        )
+        mock_orgs.describe_organization.assert_not_called()
+
+    @patch("agentcore_app.organizations_client")
+    @patch("agentcore_app.oam_client")
+    def test_a_named_foreign_account_bound_to_this_organization_passes(
+        self, mock_oam, mock_orgs
+    ):
+        findings = self._run(
+            mock_oam,
+            mock_orgs,
+            self._statement(
+                {"AWS": "111122223333"},
+                {"StringEquals": {"aws:PrincipalOrgID": self._OWN}},
+            ),
+        )
+
+        assert [f["Status"] for f in findings] == ["Passed"]
+
+    @pytest.mark.parametrize(
+        "principal",
+        [{"AWS": "123456789012"}, {"AWS": "arn:aws:iam::123456789012:root"}],
+    )
+    @patch("agentcore_app.oam_client")
+    def test_the_sinks_own_account_passes_without_reading_the_organization(
+        self, mock_oam, principal
+    ):
+        with patch("agentcore_app.organizations_client", None):
+            findings = self._run(mock_oam, None, self._statement(principal))
+
+        assert [f["Status"] for f in findings] == ["Passed"]
+
+    @patch("agentcore_app.organizations_client")
+    @patch("agentcore_app.oam_client")
+    def test_each_sink_is_judged_and_the_organization_is_read_once(
+        self, mock_oam, mock_orgs
+    ):
+        foreign = dict(
+            self._SINK,
+            Arn="arn:aws:oam:us-east-1:123456789012:sink/s-2",
+            Name="foreign-sink",
+        )
+        mock_oam.list_sinks.return_value = {"Items": [self._SINK, foreign]}
+        policies = {
+            self._SINK["Arn"]: self._statement(
+                condition={"StringEquals": {"aws:PrincipalOrgID": self._OWN}}
+            ),
+            foreign["Arn"]: self._statement(
+                condition={"StringEquals": {"aws:PrincipalOrgID": "o-z9y8x7w6v5"}}
+            ),
+        }
+        mock_oam.get_sink_policy.side_effect = lambda SinkIdentifier: {
+            "Policy": json.dumps({"Statement": [policies[SinkIdentifier]]})
+        }
+        mock_orgs.describe_organization.return_value = {
+            "Organization": {"Id": self._OWN}
+        }
+
+        findings = agentcore_app.check_agentcore_telemetry_sink_scope()
+
+        by_sink = {
+            ("foreign" if "foreign-sink" in f["Finding_Details"] else "own"): f[
+                "Status"
+            ]
+            for f in findings
+        }
+        assert by_sink == {"own": "Passed", "foreign": "Failed"}
+        mock_orgs.describe_organization.assert_called_once_with()
 
 
 # ===================================================================
@@ -9069,7 +9432,15 @@ class TestObservabilityCheckRegistration:
 
     def test_data_event_families_cover_runtime_memory_and_tools(self):
         keys = {family["key"] for family in agentcore_app.AGENTCORE_DATA_EVENT_FAMILIES}
-        assert keys == {"runtime", "memory", "tools", "gateway", "identity", "policy"}
+        assert keys == {
+            "runtime",
+            "memory",
+            "tools",
+            "gateway",
+            "identity",
+            "policy",
+            "evaluator",
+        }
         memory = next(
             family
             for family in agentcore_app.AGENTCORE_DATA_EVENT_FAMILIES
@@ -27918,7 +28289,8 @@ class TestAC21WholePopulation:
                     {
                         "Effect": "Allow",
                         "Action": "logs:Unmask",
-                        "Resource": self._LG + "/aws/bedrock-agentcore/*",
+                        "Resource": self._LG
+                        + "/aws/bedrock-agentcore/runtimes/rt-1-DEFAULT",
                     }
                 ]
             ),
@@ -28060,6 +28432,262 @@ class TestAC21WholePopulation:
         )
         assert [f["Status"] for f in findings] == ["Passed"]
         assert findings[0]["Finding_Details"].endswith(agentcore_app.IAM_CACHE_V1_NOTE)
+
+
+class TestAC20IdentifierCategories:
+    """AC-20: masking must name a credentials and a personal or health identifier."""
+
+    _KMS_KEY = "arn:aws:kms:us-east-1:123456789012:key/k1"
+    _DI = "arn:aws:dataprotection::aws:data-identifier/"
+
+    @classmethod
+    def _policy(cls, *names):
+        return json.dumps(
+            {
+                "Name": "p",
+                "Statement": [
+                    {
+                        "Sid": "mask",
+                        "DataIdentifier": [
+                            name if name.startswith("arn:") else cls._DI + name
+                            for name in names
+                        ],
+                        "Operation": {"Deidentify": {"MaskConfig": {}}},
+                    }
+                ],
+            }
+        )
+
+    @classmethod
+    def _run(cls, mock_logs, group_policies, account_names=()):
+        mock_logs.describe_account_policies.return_value = {
+            "accountPolicies": (
+                [{"policyName": "acct", "policyDocument": cls._policy(*account_names)}]
+                if account_names
+                else []
+            )
+        }
+        mock_logs.describe_log_groups.side_effect = _log_group_side_effect(
+            {
+                "/aws/bedrock-agentcore/": [
+                    {
+                        "logGroupName": name,
+                        "kmsKeyId": cls._KMS_KEY,
+                        "dataProtectionStatus": "ACTIVATED",
+                    }
+                    for name in group_policies
+                ]
+            }
+        )
+        mock_logs.get_data_protection_policy.side_effect = lambda **kwargs: {
+            "policyDocument": cls._policy(*group_policies[kwargs["logGroupIdentifier"]])
+        }
+        findings = agentcore_app.check_agentcore_log_group_data_protection()
+        return {
+            name: next(f for f in findings if f"'{name}'" in f["Finding_Details"])
+            for name in group_policies
+        }
+
+    @patch("agentcore_app.logs_client")
+    def test_one_personal_identifier_alone_fails(self, mock_logs):
+        by_group = self._run(mock_logs, {"/aws/bedrock-agentcore/a": ["EmailAddress"]})
+
+        finding = by_group["/aws/bedrock-agentcore/a"]
+        assert finding["Status"] == "Failed"
+        assert (
+            "de-identifies no credentials managed data identifier"
+            in finding["Finding_Details"]
+        )
+        assert "personal or health" not in finding["Finding_Details"]
+
+    @patch("agentcore_app.logs_client")
+    def test_one_credentials_identifier_alone_fails(self, mock_logs):
+        by_group = self._run(mock_logs, {"/aws/bedrock-agentcore/a": ["AwsSecretKey"]})
+
+        finding = by_group["/aws/bedrock-agentcore/a"]
+        assert finding["Status"] == "Failed"
+        assert (
+            "de-identifies no personal or health managed data identifier"
+            in finding["Finding_Details"]
+        )
+
+    @patch("agentcore_app.logs_client")
+    def test_financial_and_custom_identifiers_fall_in_neither(self, mock_logs):
+        by_group = self._run(
+            mock_logs,
+            {
+                "/aws/bedrock-agentcore/a": [
+                    "CreditCardNumber",
+                    "BankAccountNumber-US",
+                    "EmployeeId",
+                ]
+            },
+        )
+
+        finding = by_group["/aws/bedrock-agentcore/a"]
+        assert finding["Status"] == "Failed"
+        assert (
+            "no credentials and no personal or health managed data identifier"
+            in finding["Finding_Details"]
+        )
+
+    @patch("agentcore_app.logs_client")
+    def test_a_customer_arn_named_like_a_managed_one_is_not_managed(self, mock_logs):
+        by_group = self._run(
+            mock_logs,
+            {
+                "/aws/bedrock-agentcore/a": [
+                    "arn:aws:dataprotection::123456789012:data-identifier/AwsSecretKey",
+                    "EmailAddress",
+                ]
+            },
+        )
+
+        assert by_group["/aws/bedrock-agentcore/a"]["Status"] == "Failed"
+
+    @patch("agentcore_app.logs_client")
+    def test_country_coded_identifiers_are_classified(self, mock_logs):
+        by_group = self._run(
+            mock_logs,
+            {"/aws/bedrock-agentcore/a": ["DriversLicense-US", "PkcsPrivateKey"]},
+        )
+
+        finding = by_group["/aws/bedrock-agentcore/a"]
+        assert finding["Status"] == "Passed"
+        assert (
+            "among them a credentials and a personal or health"
+            in (finding["Finding_Details"])
+        )
+
+    @patch("agentcore_app.logs_client")
+    def test_each_group_is_judged_on_its_own_identifiers(self, mock_logs):
+        by_group = self._run(
+            mock_logs,
+            {
+                "/aws/bedrock-agentcore/a": ["EmailAddress", "AwsSecretKey"],
+                "/aws/bedrock-agentcore/b": ["EmailAddress"],
+                "/aws/bedrock-agentcore/c": ["Ssn-US", "OpenSshPrivateKey"],
+            },
+        )
+
+        assert {name: f["Status"] for name, f in by_group.items()} == {
+            "/aws/bedrock-agentcore/a": "Passed",
+            "/aws/bedrock-agentcore/b": "Failed",
+            "/aws/bedrock-agentcore/c": "Passed",
+        }
+
+    @patch("agentcore_app.logs_client")
+    def test_the_account_and_group_policies_are_cumulative(self, mock_logs):
+        by_group = self._run(
+            mock_logs,
+            {"/aws/bedrock-agentcore/a": ["AwsSecretKey"]},
+            account_names=("EmailAddress",),
+        )
+
+        finding = by_group["/aws/bedrock-agentcore/a"]
+        assert finding["Status"] == "Passed"
+        assert (
+            "account-wide and a log-group data-protection policy"
+            in (finding["Finding_Details"])
+        )
+        mock_logs.get_data_protection_policy.assert_called_once_with(
+            logGroupIdentifier="/aws/bedrock-agentcore/a"
+        )
+
+    @patch("agentcore_app.logs_client")
+    def test_an_account_policy_missing_a_category_is_not_rescued(self, mock_logs):
+        by_group = self._run(
+            mock_logs,
+            {"/aws/bedrock-agentcore/a": ["Name"]},
+            account_names=("EmailAddress",),
+        )
+
+        finding = by_group["/aws/bedrock-agentcore/a"]
+        assert finding["Status"] == "Failed"
+        assert "no credentials managed data identifier" in finding["Finding_Details"]
+
+
+class TestAC21PrefixWideUnmask:
+    """AC-21: a wildcard after an AgentCore prefix reaches every AgentCore group."""
+
+    _LG = "arn:aws:logs:us-east-1:123456789012:log-group:"
+
+    @classmethod
+    def _run(cls, **resources):
+        return agentcore_app.check_agentcore_log_unmask_restriction(
+            {
+                "cache_schema_version": 2,
+                "principal_errors": [],
+                "role_permissions": {
+                    name: {
+                        "attached_policies": [
+                            {
+                                "name": "p",
+                                "document": {
+                                    "Statement": [
+                                        {
+                                            "Effect": "Allow",
+                                            "Action": "logs:Unmask",
+                                            "Resource": cls._LG + resource,
+                                        }
+                                    ]
+                                },
+                            }
+                        ],
+                        "inline_policies": [],
+                    }
+                    for name, resource in resources.items()
+                },
+                "user_permissions": {},
+            }
+        )
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "/aws/bedrock-agentcore/*",
+            "/aws/bedrock-agentcore/*:*",
+            "/aws/vendedlogs/bedrock-agentcore/*",
+            "/aws/vendedlogs/*",
+            "/aws/*",
+            "/aws/bedrock-agentcore*",
+            "/aws/bedrock-agentcore/?*",
+        ],
+    )
+    def test_a_prefix_wide_grant_fails(self, name):
+        findings = self._run(wide=name)
+
+        assert [f["Status"] for f in findings] == ["Failed"]
+        assert "role wide" in findings[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "/aws/bedrock-agentcore/runtimes/rt-1-DEFAULT",
+            "/aws/bedrock-agentcore/runtimes/rt-1-DEFAULT:*",
+            "/aws/bedrock-agentcore/*/rt-1-DEFAULT",
+            "/aws/bedrock-agentcore/runtimes/*",
+            "/aws/lambda/*",
+        ],
+    )
+    def test_a_grant_short_of_a_whole_prefix_passes(self, name):
+        findings = self._run(narrow=name)
+
+        assert [f["Status"] for f in findings] == ["Passed"]
+        assert "role narrow" in findings[0]["Finding_Details"]
+
+    def test_only_the_prefix_wide_role_fails(self):
+        findings = self._run(
+            wide="/aws/bedrock-agentcore/*",
+            narrow="/aws/bedrock-agentcore/runtimes/rt-1-DEFAULT",
+            vended="/aws/vendedlogs/*",
+        )
+
+        by_status = {f["Status"]: f["Finding_Details"] for f in findings}
+        assert set(by_status) == {"Failed", "Passed"}
+        assert "role vended, role wide" in by_status["Failed"]
+        assert "role narrow" not in by_status["Failed"]
+        assert "role narrow" in by_status["Passed"]
 
 
 class TestAC23WholePopulation:
@@ -28982,6 +29610,39 @@ class TestAC42WholePopulation:
         assert "role writer" in writer_rows[0]["Finding_Details"]
         assert "scoped-writer" not in writer_rows[0]["Finding_Details"]
         assert writer_rows[0]["Region"] == agentcore_app.GLOBAL_REGION_LABEL
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_writer_passing_a_role_name_pattern_fails(self, mock_ac):
+        _online_evaluation_client(mock_ac)
+        cache = _v2_cache(
+            roles={
+                "pattern-writer": _principal_with(
+                    [
+                        self._WRITE,
+                        self._pass(resource="arn:aws:iam::123456789012:role/eval-*"),
+                    ]
+                ),
+                "scoped-writer": _principal_with(
+                    [self._WRITE, self._pass(resource=_EVALUATION_ROLE_ARN)]
+                ),
+            }
+        )
+
+        findings = agentcore_app.check_agentcore_evaluation_pass_role_scope(
+            cache, assess_writers=True
+        )
+
+        writer_rows = [
+            f
+            for f in findings
+            if f["Finding"] == "AgentCore Evaluation Writer Pass Role Unbounded"
+        ]
+        assert [f["Status"] for f in writer_rows] == ["Failed"]
+        assert (
+            "role pattern-writer, where its Resource names roles"
+            in (writer_rows[0]["Finding_Details"])
+        )
+        assert "scoped-writer" not in writer_rows[0]["Finding_Details"]
 
     @patch("agentcore_app.agentcore_client")
     def test_the_writer_leg_runs_only_when_asked(self, mock_ac):
@@ -30998,6 +31659,79 @@ class TestAC35CallerAndGatewayScope:
         assert [f["Finding"] for f in findings] == [
             "AgentCore Policy Caller Scope Unbounded"
         ]
+
+    _NAMED_GATEWAY_HEAD = (
+        "permit(\n"
+        "  principal,\n"
+        '  action == AgentCore::Action::"a___b",\n'
+        '  resource == AgentCore::Gateway::"arn:aws:bedrock-agentcore:'
+        'us-east-1:123456789012:gateway/gw-1"\n'
+        ") "
+    )
+
+    @pytest.mark.parametrize(
+        "conditions",
+        [
+            'unless { principal.hasTag("blocked") };',
+            'when { context.input.owner == "principal" };',
+            'when { context.principal == "admin" };',
+            'when { context.input.amount < 100 } unless { principal.hasTag("x") };',
+            'when { context.input.id == "a } principal.x" };',
+        ],
+        ids=[
+            "unless",
+            "string-literal",
+            "context-attribute",
+            "when-on-input-unless-on-principal",
+            "brace-in-string",
+        ],
+    )
+    @patch("agentcore_app.agentcore_client")
+    def test_a_principal_word_that_is_not_a_when_read_does_not_bound(
+        self, mock_ac, conditions
+    ):
+        findings = self._run(mock_ac, {"gw-1": [self._NAMED_GATEWAY_HEAD + conditions]})
+
+        assert [f["Finding"] for f in findings] == [
+            "AgentCore Policy Caller Scope Unbounded"
+        ]
+        assert findings[0]["Status"] == "Failed"
+        assert "in a when block" in findings[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "conditions",
+        [
+            'when { principal.getTag("team") == "pay" };',
+            'when { context.input.amount < 100 } when { principal in Team::"pay" };',
+            'unless { context.input.amount > 100 } when { principal.hasTag("t") };',
+        ],
+        ids=["when", "second-when", "when-after-unless"],
+    )
+    @patch("agentcore_app.agentcore_client")
+    def test_a_when_block_that_reads_the_principal_bounds_it(self, mock_ac, conditions):
+        findings = self._run(mock_ac, {"gw-1": [self._NAMED_GATEWAY_HEAD + conditions]})
+
+        assert [f["Status"] for f in findings] == ["Passed"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_an_unless_permit_among_when_permits_fails_alone(self, mock_ac):
+        findings = self._run(
+            mock_ac,
+            {
+                "gw-1": [
+                    self._NAMED_GATEWAY_HEAD + 'when { principal.hasTag("a") };',
+                    self._NAMED_GATEWAY_HEAD + 'unless { principal.hasTag("b") };',
+                    self._NAMED_GATEWAY_HEAD + 'when { principal.hasTag("c") };',
+                ]
+            },
+        )
+
+        assert [f["Finding"] for f in findings] == [
+            "AgentCore Policy Caller Scope Unbounded"
+        ]
+        assert "policy p1 permits" in findings[0]["Finding_Details"]
+        assert "p0" not in findings[0]["Finding_Details"]
+        assert "p2" not in findings[0]["Finding_Details"]
 
     @patch("agentcore_app.agentcore_client")
     def test_an_event_resource_reference_does_not_name_a_gateway(self, mock_ac):
