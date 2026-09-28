@@ -19765,6 +19765,162 @@ def _score_alarm(
     return alarm
 
 
+def _published(*metrics):
+    """A ListMetrics page of evaluation score metrics, each (namespace, name, dims)."""
+    return {
+        "Metrics": [
+            {
+                "Namespace": namespace,
+                "MetricName": name,
+                "Dimensions": [{"Name": k, "Value": v} for k, v in dims.items()],
+            }
+            for namespace, name, dims in metrics
+        ]
+    }
+
+
+class TestAC40PublishedScoreMetrics:
+    """AC-40 counts a score alarm only on a metric ListMetrics lists."""
+
+    _NS = "Bedrock-AgentCore/Evaluations"
+    _DIMS = {"EvaluatorName": "Builtin.Harmfulness"}
+
+    def _run(self, mock_ac, alarms, list_metrics):
+        _online_evaluation_client(mock_ac)
+        with patch("agentcore_app.cloudwatch_client") as mock_cw:
+            mock_cw.describe_alarms.return_value = {"MetricAlarms": alarms}
+            if isinstance(list_metrics, Exception):
+                mock_cw.list_metrics.side_effect = list_metrics
+            else:
+                mock_cw.list_metrics.side_effect = lambda Namespace, **_: (
+                    list_metrics.get(Namespace, {"Metrics": []})
+                )
+            return agentcore_app.check_agentcore_evaluation_safety_coverage()
+
+    @patch("agentcore_app.agentcore_client")
+    def test_an_alarm_on_an_unpublished_dimension_set_fails(self, mock_ac):
+        # The alarm names no dimensions, while the service publishes the score
+        # per evaluator, so the alarm reads a metric that never has data.
+        findings = self._run(
+            mock_ac,
+            [_score_alarm()],
+            {self._NS: _published((self._NS, "Builtin.Harmfulness", self._DIMS))},
+        )
+
+        assert findings[0]["Status"] == "Failed"
+        assert (
+            "Alarm(s) eval-score-drop read a metric name or dimension set"
+            in (findings[0]["Finding_Details"])
+        )
+
+    @patch("agentcore_app.agentcore_client")
+    def test_an_alarm_on_the_other_namespace_spelling_fails(self, mock_ac):
+        other = "Bedrock AgentCore/Evaluations"
+        findings = self._run(
+            mock_ac,
+            [_score_alarm(namespace=other)],
+            {self._NS: _published((self._NS, "Builtin.Harmfulness", {}))},
+        )
+
+        assert findings[0]["Status"] == "Failed"
+        assert "no CloudWatch alarm with actions" in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_an_alarm_on_a_published_metric_passes(self, mock_ac):
+        alarm = _score_alarm(
+            Dimensions=[{"Name": "EvaluatorName", "Value": "Builtin.Harmfulness"}]
+        )
+        findings = self._run(
+            mock_ac,
+            [alarm, _score_alarm(name="stale", MetricName="Harmfulnes")],
+            {self._NS: _published((self._NS, "Builtin.Harmfulness", self._DIMS))},
+        )
+
+        assert findings[0]["Status"] == "Passed"
+        assert (
+            "alarm(s) eval-score-drop with actions" in (findings[0]["Finding_Details"])
+        )
+        assert "Alarm(s) stale read a metric name" in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_metric_math_alarm_on_a_published_metric_passes(self, mock_ac):
+        alarm = _score_alarm(
+            Namespace=None,
+            MetricName=None,
+            Metrics=[
+                {
+                    "Id": "m1",
+                    "MetricStat": {
+                        "Metric": {
+                            "Namespace": self._NS,
+                            "MetricName": "Builtin.Harmfulness",
+                            "Dimensions": [
+                                {
+                                    "Name": "EvaluatorName",
+                                    "Value": "Builtin.Harmfulness",
+                                }
+                            ],
+                        }
+                    },
+                }
+            ],
+        )
+        findings = self._run(
+            mock_ac,
+            [alarm],
+            {self._NS: _published((self._NS, "Builtin.Harmfulness", self._DIMS))},
+        )
+
+        assert findings[0]["Status"] == "Passed"
+
+    @patch("agentcore_app.agentcore_client")
+    def test_no_listed_metric_keeps_the_namespace_match_and_says_so(self, mock_ac):
+        findings = self._run(mock_ac, [_score_alarm()], {})
+
+        assert findings[0]["Status"] == "Passed"
+        assert "ListMetrics lists no metric in" in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_denied_metric_listing_withholds_the_pass(self, mock_ac):
+        findings = self._run(
+            mock_ac,
+            [_score_alarm()],
+            _make_client_error("AccessDeniedException", "no"),
+        )
+
+        assert findings[0]["Status"] == "N/A"
+        assert (
+            "ListMetrics on Bedrock-AgentCore/Evaluations failed with "
+            in (findings[0]["Finding_Details"])
+        )
+        assert findings[0]["Resolution"].startswith(
+            "Grant cloudwatch:ListMetrics and retry."
+        )
+        assert (
+            "ListMetrics on Bedrock AgentCore/Evaluations failed with "
+            in (findings[0]["Finding_Details"])
+        )
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_denied_metric_listing_does_not_clear_a_missing_evaluator(self, mock_ac):
+        _online_evaluation_client(
+            mock_ac,
+            [
+                _online_evaluation_detail(
+                    evaluators=[{"evaluatorId": "Builtin.Harmfulness"}]
+                )
+            ],
+        )
+        with patch("agentcore_app.cloudwatch_client") as mock_cw:
+            mock_cw.describe_alarms.return_value = {"MetricAlarms": [_score_alarm()]}
+            mock_cw.list_metrics.side_effect = _make_client_error(
+                "AccessDeniedException", "no"
+            )
+            findings = agentcore_app.check_agentcore_evaluation_safety_coverage()
+
+        assert findings[0]["Status"] == "Failed"
+
+
 class TestAC40EvaluationSafetyCoverage:
     """AC-40: what the attached evaluators score, read from the catalogue."""
 

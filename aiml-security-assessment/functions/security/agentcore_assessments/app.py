@@ -20449,6 +20449,32 @@ def _alarm_reads_namespace(alarm: Dict[str, Any], namespaces: Tuple[str, ...]) -
     )
 
 
+def _metric_key(metric: Dict[str, Any]) -> Tuple[Any, Any, frozenset]:
+    """Key one CloudWatch metric by namespace, name and dimension set."""
+    return (
+        metric.get("Namespace"),
+        metric.get("MetricName"),
+        frozenset(
+            (dimension.get("Name"), dimension.get("Value"))
+            for dimension in metric.get("Dimensions") or []
+            if isinstance(dimension, dict)
+        ),
+    )
+
+
+def _alarm_metric_keys(alarm: Dict[str, Any]) -> List[Tuple[Any, Any, frozenset]]:
+    """Return the key of every metric one alarm reads, single or metric math."""
+    keys = []
+    if alarm.get("Namespace"):
+        keys.append(_metric_key(alarm))
+    for query in alarm.get("Metrics") or []:
+        if isinstance(query, dict):
+            metric = (query.get("MetricStat") or {}).get("Metric") or {}
+            if metric.get("Namespace"):
+                keys.append(_metric_key(metric))
+    return keys
+
+
 def check_agentcore_evaluation_safety_coverage() -> List[Dict[str, Any]]:
     """AC-40: Judge whether an online evaluation scores safety and tool choice.
 
@@ -20459,7 +20485,10 @@ def check_agentcore_evaluation_safety_coverage() -> List[Dict[str, Any]]:
     configuration passes only when it attaches a safety evaluator and one of
     EVALUATOR_TOOL_CHOICE_IDS, and a CloudWatch alarm with actions reads a metric
     in the namespace its scores are published to. A score no alarm reads notifies
-    nobody when it falls.
+    nobody when it falls. When ListMetrics lists metrics in that namespace, an
+    alarm counts only when a metric it reads matches a listed one by name and
+    dimension set, because an alarm on a metric that is never published stays in
+    INSUFFICIENT_DATA and never fires.
     """
     if agentcore_client is None:
         return [
@@ -20591,6 +20620,7 @@ def check_agentcore_evaluation_safety_coverage() -> List[Dict[str, Any]]:
         except Exception as error:
             alarm_error = _assessment_error_label(error)
 
+    published_by_namespace: Dict[str, Any] = {}
     for label, detail in details:
         output = (detail.get("outputConfig") or {}).get("cloudWatchConfig") or {}
         custom_namespace = output.get("metricsNamespace")
@@ -20600,13 +20630,74 @@ def check_agentcore_evaluation_safety_coverage() -> List[Dict[str, Any]]:
             else EVALUATION_DEFAULT_METRICS_NAMESPACES
         )
         namespace_text = " or ".join(namespaces)
-        watching = sorted(
-            str(alarm.get("AlarmName"))
+        watching_alarms = [
+            alarm
             for alarm in alarms
             if _alarm_reads_namespace(alarm, namespaces)
             and alarm.get("ActionsEnabled") is True
             and alarm.get("AlarmActions")
-        )
+        ]
+        metric_failures: List[str] = []
+        published: set = set()
+        if watching_alarms:
+            for namespace in namespaces:
+                if namespace not in published_by_namespace:
+                    try:
+                        published_by_namespace[namespace] = {
+                            _metric_key(metric)
+                            for metric in _paginate_aws_list(
+                                cloudwatch_client,
+                                "list_metrics",
+                                "Metrics",
+                                token_request_key="NextToken",
+                                token_response_key="NextToken",
+                                Namespace=namespace,
+                            )
+                            if isinstance(metric, dict)
+                        }
+                    except (BotoCoreError, ClientError) as error:
+                        published_by_namespace[namespace] = error
+                listed = published_by_namespace[namespace]
+                if isinstance(listed, Exception):
+                    metric_failures.append(
+                        f"ListMetrics on {namespace} failed with "
+                        f"{_assessment_error_label(listed)}"
+                    )
+                else:
+                    published |= listed
+        metric_error = "; ".join(metric_failures)
+        if published and not metric_error:
+            unpublished = sorted(
+                str(alarm.get("AlarmName"))
+                for alarm in watching_alarms
+                if not any(key in published for key in _alarm_metric_keys(alarm))
+            )
+            watching_alarms = [
+                alarm
+                for alarm in watching_alarms
+                if str(alarm.get("AlarmName")) not in unpublished
+            ]
+            metric_note = (
+                f" Alarm(s) {', '.join(unpublished)} read a metric name or "
+                "dimension set that ListMetrics does not list in "
+                f"{namespace_text}, so they never fire and are not counted."
+                if unpublished
+                else ""
+            )
+        elif metric_error:
+            metric_note = (
+                f" {metric_error}, so whether each alarm reads a metric that is "
+                "published is unknown."
+            )
+        elif watching_alarms:
+            metric_note = (
+                f" ListMetrics lists no metric in {namespace_text}, so the metric "
+                "name and dimensions each alarm reads are not compared to a "
+                "published one."
+            )
+        else:
+            metric_note = ""
+        watching = sorted(str(alarm.get("AlarmName")) for alarm in watching_alarms)
         attached = [
             str(reference.get("evaluatorId"))
             for reference in detail.get("evaluators") or []
@@ -20657,6 +20748,7 @@ def check_agentcore_evaluation_safety_coverage() -> List[Dict[str, Any]]:
                     finding_details=(
                         f"{label} attaches {len(attached)} evaluator(s) and "
                         f"{'; and '.join(missing)}.{owner_note}{alarm_note}"
+                        f"{metric_note}"
                     ),
                     resolution=(
                         "Attach a safety evaluator and a tool-choice evaluator from "
@@ -20689,6 +20781,26 @@ def check_agentcore_evaluation_safety_coverage() -> List[Dict[str, Any]]:
                     status=StatusEnum.NA,
                 )
             )
+        elif metric_error:
+            findings.append(
+                create_finding(
+                    check_id="AC-40",
+                    finding_name="AgentCore Evaluation Safety Coverage",
+                    finding_details=(
+                        f"{label} scores safety with {', '.join(safety_attached)} and "
+                        f"tool choice with {', '.join(tool_call_attached)}, and "
+                        f"alarm(s) {', '.join(watching)} with actions read "
+                        f"{namespace_text}.{owner_note}{metric_note}"
+                    ),
+                    resolution=(
+                        "Grant cloudwatch:ListMetrics and retry. "
+                        f"{EVALUATION_SCORE_ALARM_NOTE}"
+                    ),
+                    reference=AGENTCORE_EVALUATORS_REFERENCE_URL,
+                    severity=SeverityEnum.INFORMATIONAL,
+                    status=StatusEnum.NA,
+                )
+            )
         else:
             findings.append(
                 create_finding(
@@ -20698,7 +20810,7 @@ def check_agentcore_evaluation_safety_coverage() -> List[Dict[str, Any]]:
                         f"{label} scores safety with {', '.join(safety_attached)} and "
                         f"tool choice with {', '.join(tool_call_attached)}, and "
                         f"alarm(s) {', '.join(watching)} with actions read its "
-                        f"scores in {namespace_text}.{owner_note}"
+                        f"scores in {namespace_text}.{owner_note}{metric_note}"
                     ),
                     resolution=(
                         "No action required for this check. "

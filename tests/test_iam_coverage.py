@@ -1158,6 +1158,11 @@ _VERIFIED_REMEDIATION_IAM_ACTIONS |= {
     "bedrock-agentcore:ListBatchEvaluations",
     "bedrock-agentcore:GetBatchEvaluation",
 }
+# Verified on 2026-09-28 against the cloudwatch service reference JSON, which
+# lists ListMetrics as a list action, and botocore's cloudwatch model, which
+# defines the operation with a Namespace filter. AC-40 names it when the score
+# metrics an alarm reads cannot be listed.
+_VERIFIED_REMEDIATION_IAM_ACTIONS |= {"cloudwatch:ListMetrics"}
 
 _NON_IAM_REMEDIATION_TOKENS = {
     # SM-41 names the AWS IoT Core policy variables

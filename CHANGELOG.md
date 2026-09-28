@@ -262,6 +262,12 @@ section.
   `bedrock-agentcore:GetEvaluator`, `ListBatchEvaluations` or
   `GetBatchEvaluation` grant, so those legs are `N/A` naming the action until
   it is added.
+- `AC-40` counts a score alarm only when `cloudwatch:ListMetrics` lists the
+  metric it reads, by name and dimension set, in the configuration's
+  namespace. An alarm on a misspelled metric name, or on a dimension set the
+  service does not publish, passed on its namespace alone and never fires.
+  The assessment roles hold no `cloudwatch:ListMetrics` grant, so a
+  configuration that would pass is `N/A` naming it until it is added.
 - `AC-45` judges each AgentCore runtime's own execution role by the rules it
   applies to a tool role. No check read a runtime role outside the AgentCore
   namespace, so one granting `s3:*` or every foundation model passed.
