@@ -208,6 +208,19 @@ section.
 
 ### Fixed
 
+- `AC-18` no longer reads a selector field that keeps every AgentCore event
+  as narrowing. `readOnly` listing both values, and a `resources.ARN` prefix
+  covering every AgentCore resource of the region, failed a type they log
+  whole.
+- `AC-33` ties a named workload identity to the principal's own agent. It
+  passed any grant naming one identity, whichever agent owned it. A runtime
+  or gateway role naming another agent's identity now fails, and a principal
+  no runtime or gateway runs as is `N/A` as unattributed.
+- `AC-14` reads the token vault key's policy. It passed any vault whose key
+  was customer managed and enabled, whoever the key policy let decrypt. A
+  policy with no statement limiting `kms:Decrypt` to AgentCore Identity and
+  the vault's encryption context, or one open to every principal, now fails,
+  and an unreadable key policy is `N/A` naming `kms:GetKeyPolicy`.
 - `AC-12` describes each gateway's key and reads its key policy. It passed
   any gateway that named a key ARN, AWS managed or disabled keys included,
   and dropped a gateway whose `GetGateway` call failed without a trace. A key

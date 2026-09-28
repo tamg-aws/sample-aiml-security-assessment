@@ -5872,6 +5872,53 @@ def _provider(name, vault="default", kind="oauth2credentialprovider"):
     }
 
 
+def _ac14_key_policy(
+    context="arn:aws:bedrock-agentcore:*:*:token-vault/default",
+    via="bedrock-agentcore-identity.*.amazonaws.com",
+    via_operator="StringLike",
+    account_held=True,
+    context_operator="ArnLike",
+):
+    """Return the AgentCore Identity guide's example vault key policy."""
+    condition = {
+        via_operator: {"kms:ViaService": via},
+        context_operator: {
+            "kms:EncryptionContext:aws-crypto-ec:aws:bedrock-agentcore-identity:"
+            "token-vault-arn": context
+        },
+    }
+    if account_held:
+        condition.setdefault("StringEquals", {})["aws:ResourceAccount"] = (
+            "${aws:PrincipalAccount}"
+        )
+    return json.dumps(
+        {
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Sid": "EnableRoot",
+                    "Effect": "Allow",
+                    "Principal": {"AWS": "arn:aws:iam::123456789012:root"},
+                    "Action": "kms:*",
+                    "Resource": "*",
+                },
+                {
+                    "Sid": "BedrockAgentCoreIdentityKMSAccess",
+                    "Effect": "Allow",
+                    "Principal": {"AWS": "arn:aws:iam::123456789012:root"},
+                    "Action": [
+                        "kms:Encrypt",
+                        "kms:Decrypt",
+                        "kms:GenerateDataKeyWithoutPlaintext",
+                    ],
+                    "Resource": "*",
+                    "Condition": condition,
+                },
+            ],
+        }
+    )
+
+
 class TestAC14TokenVaultPopulation:
     """AC-14 reads every vault a credential provider names, and the key's state."""
 
@@ -5893,6 +5940,11 @@ class TestAC14TokenVaultPopulation:
     def _enabled(mock_kms, state="Enabled", manager="CUSTOMER"):
         mock_kms.describe_key.return_value = {
             "KeyMetadata": {"KeyState": state, "KeyManager": manager}
+        }
+        mock_kms.get_key_policy.return_value = {
+            "Policy": _ac14_key_policy(
+                context="arn:aws:bedrock-agentcore:us-east-1:123456789012:token-vault/*"
+            )
         }
 
     def _vaults(self, mock_ac, configs):
@@ -6110,6 +6162,217 @@ class TestAC14TokenVaultPopulation:
         assert mock_kms.describe_key.call_count == 1
 
 
+class TestAC14VaultKeyPolicy:
+    """AC-14 reads the vault key's policy before crediting the CMK."""
+
+    _KEYS = {
+        "default": "arn:aws:kms:us-east-1:123456789012:key/key-default",
+        "team-vault": "arn:aws:kms:us-east-1:123456789012:key/key-team",
+    }
+
+    def _wire(self, mock_ac, mock_kms, policies, vaults=("default",)):
+        mock_ac.list_oauth2_credential_providers.return_value = {
+            "credentialProviders": [
+                _provider(f"okta-{vault}", vault)
+                for vault in vaults
+                if vault != "default"
+            ]
+        }
+        mock_ac.list_api_key_credential_providers.return_value = {
+            "credentialProviders": []
+        }
+        mock_ac.list_payment_credential_providers.return_value = {
+            "credentialProviders": []
+        }
+        mock_ac.get_token_vault.side_effect = lambda tokenVaultId: {
+            "tokenVaultId": tokenVaultId,
+            "kmsConfiguration": {
+                "keyType": "CustomerManagedKey",
+                "kmsKeyArn": self._KEYS[tokenVaultId],
+            },
+        }
+        mock_kms.describe_key.return_value = {
+            "KeyMetadata": {"KeyState": "Enabled", "KeyManager": "CUSTOMER"}
+        }
+
+        def get_key_policy(KeyId):
+            policy = policies[KeyId]
+            if isinstance(policy, Exception):
+                raise policy
+            return {"Policy": policy}
+
+        mock_kms.get_key_policy.side_effect = get_key_policy
+
+    @staticmethod
+    def _by_vault(findings):
+        return {
+            f["Finding_Details"].split("token vault '")[1].split("'")[0]: f
+            for f in findings
+            if "token vault '" in f["Finding_Details"]
+        }
+
+    @patch("agentcore_app.kms_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_the_documented_policy_passes_for_its_vault_only(self, mock_ac, mock_kms):
+        documented = _ac14_key_policy()
+        self._wire(
+            mock_ac,
+            mock_kms,
+            {self._KEYS["default"]: documented, self._KEYS["team-vault"]: documented},
+            vaults=("default", "team-vault"),
+        )
+
+        by_vault = self._by_vault(
+            agentcore_app.check_agentcore_token_vault_encryption()
+        )
+
+        assert by_vault["default"]["Status"] == "Passed"
+        assert "account-root kms:*" in by_vault["default"]["Finding_Details"]
+        assert by_vault["team-vault"]["Status"] == "Failed"
+        assert by_vault["team-vault"]["Finding"] == (
+            "AgentCore Identity Token Vault Key Policy Unscoped"
+        )
+        assert "token-vault/team-vault" in by_vault["team-vault"]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "policy",
+        [
+            _ac14_key_policy(account_held=False),
+            _ac14_key_policy(via="*"),
+            _ac14_key_policy(via="bedrock-agentcore.us-east-1.amazonaws.com"),
+            _ac14_key_policy(via_operator="StringLikeIfExists"),
+            _ac14_key_policy(context_operator="ArnLikeIfExists"),
+            _ac14_key_policy(context_operator="ForAllValues:ArnLike"),
+            _ac14_key_policy(context="arn:aws:*:*:*:token-vault/default"),
+            _ac14_key_policy(context="arn:aws:bedrock-agentcore:*:*:*"),
+            _ac14_key_policy(context="*"),
+            json.dumps(
+                {
+                    "Statement": [
+                        {
+                            "Effect": "Allow",
+                            "Principal": {"AWS": "arn:aws:iam::123456789012:root"},
+                            "Action": "kms:*",
+                            "Resource": "*",
+                        }
+                    ]
+                }
+            ),
+        ],
+        ids=[
+            "account-open",
+            "via-any-service",
+            "via-gateway-service",
+            "via-ifexists",
+            "context-ifexists",
+            "context-forallvalues",
+            "context-any-service",
+            "context-any-resource",
+            "context-any",
+            "root-only",
+        ],
+    )
+    @patch("agentcore_app.kms_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_policy_that_does_not_bind_decrypt_to_the_vault_fails(
+        self, mock_ac, mock_kms, policy
+    ):
+        self._wire(mock_ac, mock_kms, {self._KEYS["default"]: policy})
+
+        findings = agentcore_app.check_agentcore_token_vault_encryption()
+
+        assert [f["Status"] for f in findings] == ["Failed"]
+        assert findings[0]["Finding"] == (
+            "AgentCore Identity Token Vault Key Policy Unscoped"
+        )
+        assert "kms:Decrypt only with kms:ViaService" in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.kms_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_literal_account_and_region_bind_without_the_account_condition(
+        self, mock_ac, mock_kms
+    ):
+        policy = _ac14_key_policy(
+            context="arn:aws:bedrock-agentcore:us-east-1:123456789012:token-vault/default",
+            via="bedrock-agentcore-identity.us-east-1.amazonaws.com",
+            via_operator="StringEquals",
+            account_held=False,
+        )
+        self._wire(mock_ac, mock_kms, {self._KEYS["default"]: policy})
+
+        findings = agentcore_app.check_agentcore_token_vault_encryption()
+
+        assert [f["Status"] for f in findings] == ["Passed"]
+
+    @patch("agentcore_app.kms_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_open_decrypt_fails_beside_the_documented_statement(
+        self, mock_ac, mock_kms
+    ):
+        policy = json.loads(_ac14_key_policy())
+        policy["Statement"].append(
+            {
+                "Effect": "Allow",
+                "Principal": "*",
+                "Action": "kms:Decrypt",
+                "Resource": "*",
+            }
+        )
+        self._wire(mock_ac, mock_kms, {self._KEYS["default"]: json.dumps(policy)})
+
+        findings = agentcore_app.check_agentcore_token_vault_encryption()
+
+        assert [f["Status"] for f in findings] == ["Failed"]
+        assert "lets every principal decrypt" in findings[0]["Finding_Details"]
+        assert "only with kms:ViaService" not in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.kms_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_an_unreadable_key_policy_is_na_naming_the_action(self, mock_ac, mock_kms):
+        self._wire(
+            mock_ac,
+            mock_kms,
+            {
+                self._KEYS["default"]: _ac14_key_policy(),
+                self._KEYS["team-vault"]: _make_client_error(
+                    "AccessDeniedException", "denied"
+                ),
+            },
+            vaults=("default", "team-vault"),
+        )
+
+        by_vault = self._by_vault(
+            agentcore_app.check_agentcore_token_vault_encryption()
+        )
+
+        assert by_vault["default"]["Status"] == "Passed"
+        assert by_vault["team-vault"]["Status"] == "N/A"
+        assert "kms:GetKeyPolicy" in by_vault["team-vault"]["Finding_Details"]
+        assert "kms:GetKeyPolicy" in by_vault["team-vault"]["Resolution"]
+
+    @patch("agentcore_app.kms_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_shared_key_policy_is_read_once_and_judged_per_vault(
+        self, mock_ac, mock_kms
+    ):
+        self._KEYS = {"default": "arn:aws:kms:us-east-1:123456789012:key/shared"}
+        self._KEYS["team-vault"] = self._KEYS["default"]
+        self._wire(
+            mock_ac,
+            mock_kms,
+            {self._KEYS["default"]: _ac14_key_policy()},
+            vaults=("default", "team-vault"),
+        )
+
+        by_vault = self._by_vault(
+            agentcore_app.check_agentcore_token_vault_encryption()
+        )
+
+        assert mock_kms.get_key_policy.call_count == 1
+        assert by_vault["default"]["Status"] == "Passed"
+        assert by_vault["team-vault"]["Status"] == "Failed"
+
+
 class TestProposedAgentCoreChecks:
     """AC-14 through AC-17 and the AC-06 correction."""
 
@@ -6118,6 +6381,11 @@ class TestProposedAgentCoreChecks:
     def test_ac14_customer_managed_token_vault_passes(self, mock_ac, mock_kms):
         mock_kms.describe_key.return_value = {
             "KeyMetadata": {"KeyState": "Enabled", "KeyManager": "CUSTOMER"}
+        }
+        mock_kms.get_key_policy.return_value = {
+            "Policy": _ac14_key_policy(
+                context="arn:aws:bedrock-agentcore:us-east-1:123456789012:token-vault/*"
+            )
         }
         mock_ac.get_token_vault.return_value = {
             "tokenVaultId": "default",
@@ -6140,6 +6408,11 @@ class TestProposedAgentCoreChecks:
     def test_ac14_uses_configured_non_default_token_vault(self, mock_ac, mock_kms):
         mock_kms.describe_key.return_value = {
             "KeyMetadata": {"KeyState": "Enabled", "KeyManager": "CUSTOMER"}
+        }
+        mock_kms.get_key_policy.return_value = {
+            "Policy": _ac14_key_policy(
+                context="arn:aws:bedrock-agentcore:us-east-1:123456789012:token-vault/*"
+            )
         }
         mock_ac.get_token_vault.return_value = {
             "tokenVaultId": "team-security-vault",
@@ -6704,6 +6977,138 @@ def _trail(name, region="us-east-1"):
         "Name": name,
         "TrailARN": f"arn:aws:cloudtrail:{region}:123456789012:trail/{name}",
     }
+
+
+class TestAC18FieldsThatKeepEveryEvent:
+    """AC-18 reads an extra field as narrowing only when it drops an event."""
+
+    @staticmethod
+    def _run(mock_ct, mock_ac, extra):
+        selector = _data_event_selector("AWS::BedrockAgentCore::Memory")
+        selector["FieldSelectors"].extend(extra)
+        mock_ct.list_trails.return_value = {"Trails": [_trail("t1")]}
+        mock_ct.get_event_selectors.return_value = {
+            "AdvancedEventSelectors": [selector]
+        }
+        _logging_trail(mock_ct)
+        _empty_agentcore_inventory(mock_ac)
+        mock_ac.list_memories.return_value = {
+            "memories": [{"id": "mem-1"}, {"id": "mem-2"}]
+        }
+        return _family_finding(
+            agentcore_app.check_agentcore_cloudtrail_data_events(), "Memory"
+        )
+
+    @pytest.mark.parametrize(
+        "extra",
+        [
+            [{"Field": "readOnly", "Equals": ["true", "false"]}],
+            [{"Field": "resources.ARN", "StartsWith": ["arn:aws:bedrock-agentcore:"]}],
+            [
+                {
+                    "Field": "resources.ARN",
+                    "StartsWith": ["arn:aws:bedrock-agentcore:us-east-1:"],
+                }
+            ],
+            [{"Field": "resources.ARN", "NotStartsWith": ["arn:aws:s3:::"]}],
+            [{"Field": "resources.ARN", "NotEquals": ["arn:aws:s3:::bucket/key"]}],
+            [
+                {"Field": "readOnly", "Equals": ["false", "true"]},
+                {"Field": "resources.ARN", "StartsWith": ["arn:aws:"]},
+            ],
+        ],
+        ids=[
+            "readonly-both",
+            "arn-service-prefix",
+            "arn-region-prefix",
+            "arn-not-another-service",
+            "arn-not-equals-another-service",
+            "two-fields-both-whole",
+        ],
+    )
+    @patch("agentcore_app.agentcore_client")
+    @patch("agentcore_app.cloudtrail_client")
+    def test_a_field_that_keeps_every_event_does_not_narrow(
+        self, mock_ct, mock_ac, extra
+    ):
+        memory = self._run(mock_ct, mock_ac, extra)
+
+        assert memory["Status"] == "Passed"
+
+    @pytest.mark.parametrize(
+        "extra, field",
+        [
+            ([{"Field": "readOnly", "Equals": ["true"]}], "readOnly"),
+            (
+                [
+                    {
+                        "Field": "resources.ARN",
+                        "StartsWith": [
+                            "arn:aws:bedrock-agentcore:us-east-1:123456789012:memory/mem-1"
+                        ],
+                    }
+                ],
+                "resources.ARN",
+            ),
+            (
+                [
+                    {
+                        "Field": "resources.ARN",
+                        "StartsWith": ["arn:aws:bedrock-agentcore:eu-west-1:"],
+                    }
+                ],
+                "resources.ARN",
+            ),
+            (
+                [
+                    {
+                        "Field": "resources.ARN",
+                        "NotStartsWith": ["arn:aws:bedrock-agentcore:us-east-1:1"],
+                    }
+                ],
+                "resources.ARN",
+            ),
+            (
+                [{"Field": "resources.ARN", "NotStartsWith": ["arn:aws:"]}],
+                "resources.ARN",
+            ),
+            (
+                [
+                    {
+                        "Field": "resources.ARN",
+                        "StartsWith": ["arn:aws:bedrock-agentcore:"],
+                        "NotEndsWith": ["/mem-2"],
+                    }
+                ],
+                "resources.ARN",
+            ),
+            (
+                [
+                    {"Field": "readOnly", "Equals": ["true", "false"]},
+                    {"Field": "eventName", "Equals": ["RetrieveMemoryRecords"]},
+                ],
+                "eventName",
+            ),
+        ],
+        ids=[
+            "readonly-one",
+            "arn-one-memory",
+            "arn-other-region",
+            "arn-not-some-accounts",
+            "arn-not-every-arn",
+            "arn-mixed-operators",
+            "whole-field-beside-narrowing-field",
+        ],
+    )
+    @patch("agentcore_app.agentcore_client")
+    @patch("agentcore_app.cloudtrail_client")
+    def test_a_field_that_drops_an_event_still_narrows(
+        self, mock_ct, mock_ac, extra, field
+    ):
+        memory = self._run(mock_ct, mock_ac, extra)
+
+        assert memory["Status"] == "Failed"
+        assert f"only where {field} match" in memory["Finding_Details"]
 
 
 class TestAC18WholePopulation:
@@ -13519,6 +13924,35 @@ _VAULT_ARN = "arn:aws:bedrock-agentcore:us-east-1:123456789012:token-vault/defau
 _PROVIDER_ARN = f"{_VAULT_ARN}/oauth2-credential-provider/my-provider"
 
 
+def _ac33_runs_as(mock_ac, runtimes=None, gateways=None):
+    """Wire runtimes and gateways as {role name: workload identity ARN}."""
+    mock_ac.meta.region_name = "us-east-1"
+
+    def detail(runs, key):
+        return {
+            f"{key}-{index}": {
+                "roleArn": f"arn:aws:iam::123456789012:role/service/{role}",
+                "workloadIdentityDetails": {"workloadIdentityArn": identity},
+            }
+            for index, (role, identity) in enumerate((runs or {}).items())
+        }
+
+    runtime_details = detail(runtimes, "rt")
+    gateway_details = detail(gateways, "gw")
+    mock_ac.list_agent_runtimes.return_value = {
+        "agentRuntimes": [{"agentRuntimeId": rid} for rid in runtime_details]
+    }
+    mock_ac.get_agent_runtime.side_effect = lambda agentRuntimeId: runtime_details[
+        agentRuntimeId
+    ]
+    mock_ac.list_gateways.return_value = {
+        "items": [{"gatewayId": gid} for gid in gateway_details]
+    }
+    mock_ac.get_gateway.side_effect = lambda gatewayIdentifier: gateway_details[
+        gatewayIdentifier
+    ]
+
+
 class TestAC33TokenIssuanceScope:
     """AC-33: which resources a principal may mint an agent token against."""
 
@@ -13558,7 +13992,9 @@ class TestAC33TokenIssuanceScope:
         for finding in findings:
             assert_finding_schema(finding)
 
-    def test_the_published_scoped_policy_passes(self):
+    @patch("agentcore_app.agentcore_client")
+    def test_the_published_scoped_policy_passes(self, mock_ac):
+        _ac33_runs_as(mock_ac, runtimes={"agent-role": _IDENTITY_ARN})
         # The four ARNs AWS's own scoped example lists in one Resource array. A
         # rule demanding that every element name a workload identity would fail
         # the policy the service's own documentation tells a customer to write.
@@ -13728,7 +14164,11 @@ class TestAC33TokenIssuanceScope:
         assert [f["Status"] for f in findings] == ["Failed"]
         assert findings[0]["Severity"] == "High"
 
-    def test_the_directory_arn_and_the_identity_arn_may_sit_in_two_statements(self):
+    @patch("agentcore_app.agentcore_client")
+    def test_the_directory_arn_and_the_identity_arn_may_sit_in_two_statements(
+        self, mock_ac
+    ):
+        _ac33_runs_as(mock_ac, runtimes={"agent-role": _IDENTITY_ARN})
         # The same grant as the published example, split in two. Ranking the
         # undecidable leg above the scoped one would fail this.
         cache = self._cache(
@@ -13763,7 +14203,9 @@ class TestAC33TokenIssuanceScope:
         assert [f["Status"] for f in findings] == ["Failed"]
         assert "user agent-role" in findings[0]["Finding_Details"]
 
-    def test_all_three_groups_are_reported_separately(self):
+    @patch("agentcore_app.agentcore_client")
+    def test_all_three_groups_are_reported_separately(self, mock_ac):
+        _ac33_runs_as(mock_ac, runtimes={"scoped-role": _IDENTITY_ARN})
         cache = self._cache(["bedrock-agentcore:GetWorkloadAccessToken"])
         for principal, resource in (
             ("directory-role", [_DIRECTORY_ARN]),
@@ -28069,6 +28511,120 @@ class TestAC32WholePopulation:
         assert findings[0]["Finding_Details"].endswith(agentcore_app.IAM_CACHE_V1_NOTE)
 
 
+class TestAC33OwnAgentIdentity:
+    """AC-33 credits a named identity only when it is the principal's own agent's."""
+
+    _OTHER = _IDENTITY_ARN.replace("agent-1", "agent-2")
+
+    @staticmethod
+    def _cache(roles=None, users=None):
+        def principal(resources):
+            return _principal_with(
+                [
+                    {
+                        "Effect": "Allow",
+                        "Action": "bedrock-agentcore:GetWorkloadAccessToken",
+                        "Resource": [_DIRECTORY_ARN, *resources],
+                    }
+                ]
+            )
+
+        return _v2_cache(
+            roles={name: principal(res) for name, res in (roles or {}).items()},
+            users={name: principal(res) for name, res in (users or {}).items()},
+        )
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_role_naming_another_agents_identity_fails(self, mock_ac):
+        _ac33_runs_as(
+            mock_ac,
+            runtimes={"agent-1-role": _IDENTITY_ARN, "agent-2-role": self._OTHER},
+        )
+
+        findings = agentcore_app.check_agentcore_token_issuance_scope(
+            self._cache(
+                roles={
+                    "agent-1-role": [_IDENTITY_ARN, self._OTHER],
+                    "agent-2-role": [self._OTHER],
+                }
+            )
+        )
+
+        failed = [f for f in findings if f["Status"] == "Failed"]
+        assert len(failed) == 1
+        assert failed[0]["Severity"] == "High"
+        assert "role agent-1-role" in failed[0]["Finding_Details"]
+        assert "workload-identity/agent-2" in failed[0]["Finding_Details"]
+        assert "role agent-2-role" not in failed[0]["Finding_Details"]
+        passed = [f for f in findings if f["Status"] == "Passed"]
+        assert len(passed) == 1
+        assert "role agent-2-role" in passed[0]["Finding_Details"]
+        assert "role agent-1-role" not in passed[0]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_gateway_role_is_tied_to_the_gateway_identity(self, mock_ac):
+        _ac33_runs_as(mock_ac, gateways={"gateway-role": self._OTHER})
+
+        findings = agentcore_app.check_agentcore_token_issuance_scope(
+            self._cache(roles={"gateway-role": [self._OTHER]})
+        )
+
+        assert [f["Status"] for f in findings] == ["Passed"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_principal_no_resource_runs_as_is_unattributed(self, mock_ac):
+        _ac33_runs_as(mock_ac, runtimes={"agent-1-role": _IDENTITY_ARN})
+
+        findings = agentcore_app.check_agentcore_token_issuance_scope(
+            self._cache(
+                roles={"backend-role": [_IDENTITY_ARN]},
+                users={"operator": [_IDENTITY_ARN]},
+            )
+        )
+
+        assert [f["Status"] for f in findings] == ["N/A"]
+        assert findings[0]["Finding"] == "AgentCore Token Issuance Scope Unattributed"
+        assert "role backend-role" in findings[0]["Finding_Details"]
+        assert "user operator" in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_an_identity_in_another_region_is_unattributed_not_failed(self, mock_ac):
+        _ac33_runs_as(mock_ac, runtimes={"agent-1-role": _IDENTITY_ARN})
+        elsewhere = self._OTHER.replace("us-east-1", "eu-west-1")
+
+        findings = agentcore_app.check_agentcore_token_issuance_scope(
+            self._cache(roles={"agent-1-role": [_IDENTITY_ARN, elsewhere]})
+        )
+
+        assert [f["Status"] for f in findings] == ["N/A"]
+        assert "eu-west-1" in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_an_unread_runtime_list_is_named_and_fails_nothing(self, mock_ac):
+        _ac33_runs_as(mock_ac, gateways={"agent-1-role": _IDENTITY_ARN})
+        mock_ac.list_agent_runtimes.side_effect = _make_client_error(
+            "AccessDeniedException", "denied"
+        )
+
+        findings = agentcore_app.check_agentcore_token_issuance_scope(
+            self._cache(roles={"agent-1-role": [_IDENTITY_ARN, self._OTHER]})
+        )
+
+        assert "Failed" not in [f["Status"] for f in findings]
+        na = [f for f in findings if f["Status"] == "N/A"]
+        assert len(na) == 1
+        assert "bedrock-agentcore:ListAgentRuntimes" in na[0]["Finding_Details"]
+        assert "role agent-1-role" in na[0]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client", None)
+    def test_no_agentcore_client_leaves_every_named_identity_unattributed(self):
+        findings = agentcore_app.check_agentcore_token_issuance_scope(
+            self._cache(roles={"agent-1-role": [_IDENTITY_ARN]})
+        )
+
+        assert [f["Status"] for f in findings] == ["N/A"]
+
+
 class TestAC33WholePopulation:
     """AC-33 reads every principal's token issuance grants by resource value."""
 
@@ -28088,7 +28644,9 @@ class TestAC33WholePopulation:
         ],
         ids=["account", "region", "trailing-question-mark", "partition"],
     )
-    def test_a_widening_wildcard_fails_only_that_role(self, resource):
+    @patch("agentcore_app.agentcore_client")
+    def test_a_widening_wildcard_fails_only_that_role(self, mock_ac, resource):
+        _ac33_runs_as(mock_ac, runtimes={"narrow": _IDENTITY_ARN})
         findings = agentcore_app.check_agentcore_token_issuance_scope(
             _v2_cache(
                 roles={

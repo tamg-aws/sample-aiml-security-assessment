@@ -111,6 +111,10 @@ AGENTCORE_POLICY_ENGINE_REFERENCE_URL = (
     "https://docs.aws.amazon.com/bedrock-agentcore-control/latest/APIReference/"
     "API_GatewayPolicyEngineConfiguration.html"
 )
+TOKEN_VAULT_KEY_POLICY_REFERENCE_URL = (
+    "https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/"
+    "kms-key-policy-configuration.html"
+)
 AGENTCORE_IDENTITY_REFERENCE_URL = (
     "https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/"
     "identity-data-encryption.html"
@@ -708,7 +712,8 @@ AGENTCORE_DATA_EVENT_FAMILIES = (
 
 # Advanced event selector fields that decide which events of a selected type are
 # kept. Any other field (eventName, readOnly, resources.ARN, userIdentity.arn and
-# so on) drops some of the type's events.
+# so on) drops some of the type's events, unless its values keep every AgentCore
+# event of the region, which _field_selector_keeps_every_agentcore_event reads.
 DATA_EVENT_SELECTOR_SCOPE_FIELDS = ("eventCategory", "resources.type")
 
 # Log groups AgentCore writes to: the service-managed prefix and the vended-log
@@ -6112,6 +6117,135 @@ TOKEN_VAULT_PROVIDER_LISTS = (
 )
 TOKEN_VAULT_ID_PATTERN = re.compile(r":token-vault/([A-Za-z0-9_-]+)/")
 
+# kms-key-policy-configuration.html: the example vault key policy allows
+# kms:Decrypt only through bedrock-agentcore-identity and only for the vault's
+# encryption context, and binds the account with aws:ResourceAccount equal to
+# ${aws:PrincipalAccount} where the context value leaves the account open.
+TOKEN_VAULT_ENCRYPTION_CONTEXT_KEY = (
+    "kms:encryptioncontext:aws-crypto-ec:aws:bedrock-agentcore-identity:token-vault-arn"
+)
+TOKEN_VAULT_CONTEXT_OPERATORS = (
+    "arnequals",
+    "arnlike",
+    "stringequals",
+    "stringequalsignorecase",
+    "stringlike",
+)
+
+
+def _positive_condition_values(statement: Dict[str, Any], key: str) -> List[List[str]]:
+    """Return the lowercased value lists of each binding condition on `key`.
+
+    IfExists and ForAllValues forms are true when the key is absent, so they
+    bind nothing and are left out.
+    """
+    condition = statement.get("Condition")
+    if not isinstance(condition, dict):
+        return []
+    found = []
+    for operator, entries in condition.items():
+        if not isinstance(entries, dict):
+            continue
+        name = str(operator).strip().lower()
+        if name.startswith("forallvalues:") or name.endswith("ifexists"):
+            continue
+        if _normalized_condition_operator(name) not in TOKEN_VAULT_CONTEXT_OPERATORS:
+            continue
+        for entry_key, raw in entries.items():
+            if str(entry_key).strip().lower() == key:
+                values = [value.strip().lower() for value in _condition_values(raw)]
+                if values:
+                    found.append(values)
+    return found
+
+
+def _statement_binds_token_vault(
+    statement: Dict[str, Any], vault_id: str, region: str
+) -> bool:
+    """Return whether one statement limits key use to this vault via Identity.
+
+    kms:ViaService has to name bedrock-agentcore-identity in the key's region;
+    the documented `bedrock-agentcore-identity.*.amazonaws.com` is accepted
+    because a key policy governs only its own key, which lives in one region.
+    The vault context has to name the bedrock-agentcore service and a
+    `token-vault/` resource matching this vault, and an account that is either
+    literal or held to the caller's own account by aws:ResourceAccount equal to
+    ${aws:PrincipalAccount} in the same statement.
+    """
+    via_service = f"bedrock-agentcore-identity.{region}.amazonaws.com"
+    if not any(
+        all(
+            value in (via_service, "bedrock-agentcore-identity.*.amazonaws.com")
+            for value in values
+        )
+        for values in _positive_condition_values(statement, "kms:viaservice")
+    ):
+        return False
+    account_held = _condition_pins_value(
+        statement,
+        "aws:resourceaccount",
+        "${aws:PrincipalAccount}",
+        if_exists_counts=False,
+    )
+    target = f"token-vault/{vault_id}".lower()
+    for values in _positive_condition_values(
+        statement, TOKEN_VAULT_ENCRYPTION_CONTEXT_KEY
+    ):
+        bound = True
+        for value in values:
+            parts = value.split(":", 5)
+            if len(parts) != 6:
+                bound = False
+                break
+            partition, service, account, resource = (
+                parts[1],
+                parts[2],
+                parts[4],
+                parts[5],
+            )
+            if (
+                parts[0] != "arn"
+                or any(wildcard in partition for wildcard in "*?")
+                or service != "bedrock-agentcore"
+                or not resource.startswith("token-vault/")
+                or not fnmatchcase(target, resource)
+                or not (account.isdigit() and len(account) == 12 or account_held)
+            ):
+                bound = False
+                break
+        if bound:
+            return True
+    return False
+
+
+def _token_vault_key_policy_gaps(
+    policy_document: Any, vault_id: str, key_arn: str
+) -> List[str]:
+    """Return the Identity scoping a vault key's policy is missing.
+
+    A statement granting kms:Decrypt with no condition, such as the
+    account-root kms:* statement, is not subtracted.
+    """
+    region = _arn_region(key_arn)
+    gaps: List[str] = []
+    if not any(
+        _statement_matches_action(statement, "kms:decrypt")
+        and _statement_binds_token_vault(statement, vault_id, region)
+        for statement in _document_statements(policy_document, effect="Allow")
+    ):
+        gaps.append(
+            "has no statement allowing kms:Decrypt only with kms:ViaService "
+            f"bedrock-agentcore-identity.{region}.amazonaws.com and "
+            "kms:EncryptionContext:aws-crypto-ec:aws:bedrock-agentcore-identity:"
+            f"token-vault-arn naming token-vault/{vault_id} in one account"
+        )
+    if _kms_key_policy_allows_open_decrypt(policy_document):
+        gaps.append(
+            "lets every principal decrypt with no condition binding the caller's "
+            "account, organization, principal ARN or source"
+        )
+    return gaps
+
 
 def check_agentcore_token_vault_encryption() -> List[Dict[str, Any]]:
     """AC-14: Require every Identity token vault in use to use a usable CMK.
@@ -6120,7 +6254,9 @@ def check_agentcore_token_vault_encryption() -> List[Dict[str, Any]]:
     (AGENTCORE_TOKEN_VAULT_ID, default "default") and every vault an OAuth2, API
     key or payment credential provider ARN names. A vault's key must be customer
     managed and Enabled by kms:DescribeKey: a disabled key leaves the stored
-    credentials undecryptable. A vault that could not be read, and a provider
+    credentials undecryptable. The key policy, read by kms:GetKeyPolicy, has to
+    let kms:Decrypt through only via AgentCore Identity for that vault. A vault
+    that could not be read, a key policy that could not be read, and a provider
     list that could not be read, are N/A and never Passed. Whether agent code
     or configuration also embeds a credential is AC-34's leg.
     """
@@ -6180,6 +6316,7 @@ def check_agentcore_token_vault_encryption() -> List[Dict[str, Any]]:
         )
 
     key_metadata_cache: Dict[str, Any] = {}
+    key_policy_cache: Dict[str, Any] = {}
     for vault_id in sorted(providers_by_vault):
         provider_names = providers_by_vault[vault_id]
         label = f"AgentCore token vault '{vault_id}'"
@@ -6306,13 +6443,61 @@ def check_agentcore_token_vault_encryption() -> List[Dict[str, Any]]:
                 )
             )
             continue
+        if key_arn not in key_policy_cache:
+            try:
+                key_policy_cache[key_arn] = kms_client.get_key_policy(KeyId=key_arn)[
+                    "Policy"
+                ]
+            except Exception as error:
+                logger.warning(f"Could not read key policy for {key_arn}: {error}")
+                key_policy_cache[key_arn] = error
+        key_policy = key_policy_cache[key_arn]
+        if isinstance(key_policy, Exception):
+            findings.append(
+                incomplete(
+                    f"{label} names customer managed key {key_arn}, whose key "
+                    "policy could not be read by kms:GetKeyPolicy: "
+                    f"{_assessment_error_label(key_policy)}, so who may decrypt "
+                    "the stored credentials is unknown.",
+                    "Grant kms:GetKeyPolicy on the key and retry.",
+                )
+            )
+            continue
+        gaps = _token_vault_key_policy_gaps(key_policy, vault_id, key_arn)
+        if gaps:
+            findings.append(
+                create_finding(
+                    check_id="AC-14",
+                    finding_name="AgentCore Identity Token Vault Key Policy Unscoped",
+                    finding_details=(
+                        f"{label} uses customer managed key {key_arn}, whose key "
+                        f"policy {' and '.join(gaps)}."
+                    ),
+                    resolution=(
+                        "Allow kms:Decrypt on the key only with kms:ViaService "
+                        "set to the bedrock-agentcore-identity endpoint and "
+                        "kms:EncryptionContext:aws-crypto-ec:aws:"
+                        "bedrock-agentcore-identity:token-vault-arn set to the "
+                        "vault ARN, as the example key policy in the "
+                        "AgentCore Identity guide does."
+                    ),
+                    reference=TOKEN_VAULT_KEY_POLICY_REFERENCE_URL,
+                    severity=SeverityEnum.MEDIUM,
+                    status=StatusEnum.FAILED,
+                )
+            )
+            continue
         findings.append(
             create_finding(
                 check_id="AC-14",
                 finding_name=finding_name,
                 finding_details=(
                     f"{label} uses customer-managed KMS key {key_arn}, which "
-                    "kms:DescribeKey reports as Enabled."
+                    "kms:DescribeKey reports as Enabled and whose key policy "
+                    "allows kms:Decrypt through AgentCore Identity for this "
+                    "vault. A statement granting kms:Decrypt with no condition, "
+                    "such as the account-root kms:* statement, is not "
+                    "subtracted."
                 ),
                 resolution="No action required",
                 reference=AGENTCORE_IDENTITY_REFERENCE_URL,
@@ -9337,14 +9522,59 @@ def check_agentcore_gateway_configuration() -> List[Dict[str, Any]]:
     return findings
 
 
+def _field_selector_keeps_every_agentcore_event(
+    field_selector: Dict[str, Any], region: str
+) -> bool:
+    """Return whether one extra field selector drops no AgentCore event here.
+
+    readOnly accepts only Equals, so listing both "true" and "false" keeps every
+    event. On resources.ARN a single StartsWith keeps every AgentCore resource of
+    this region when one value is a prefix of `arn:<partition>:bedrock-agentcore:
+    <region>:`, and a single NotStartsWith or NotEquals drops none when no value
+    can match that prefix. A selector mixing operators, and every other field,
+    is read as narrowing.
+    """
+    operators = {
+        name: [str(value) for value in values]
+        for name, values in field_selector.items()
+        if name != "Field" and isinstance(values, list) and values
+    }
+    field = field_selector.get("Field")
+    if field == "readOnly":
+        return set(operators) == {"Equals"} and {"true", "false"} <= {
+            value.lower() for value in operators["Equals"]
+        }
+    if field != "resources.ARN" or len(operators) != 1 or not region:
+        return False
+    partition = (
+        "aws-cn"
+        if region.startswith("cn-")
+        else "aws-us-gov"
+        if region.startswith("us-gov-")
+        else "aws"
+    )
+    prefix = f"arn:{partition}:bedrock-agentcore:{region}:"
+    operator, values = next(iter(operators.items()))
+    if operator == "StartsWith":
+        return any(prefix.startswith(value) for value in values)
+    if operator == "NotStartsWith":
+        return not any(
+            prefix.startswith(value) or value.startswith(prefix) for value in values
+        )
+    if operator == "NotEquals":
+        return not any(value.startswith(prefix) for value in values)
+    return False
+
+
 def _advanced_selector_data_resource_types(
-    selector: Dict[str, Any],
+    selector: Dict[str, Any], region: str = ""
 ) -> Tuple[Set[str], List[str]]:
     """Read resources.type values from a Data-category advanced event selector.
 
     Returns the selected types and the fields beyond eventCategory and
     resources.type that narrow the selector, so a selector that keeps only some
-    of a type's events is not read as covering the type. Management-category
+    of a type's events is not read as covering the type. A field whose values
+    keep every AgentCore event of `region` does not narrow. Management-category
     selectors carry no resources.type, and a selector that omits eventCategory
     Data does not log data events, so its resource types are not evidence of
     data-event coverage.
@@ -9362,7 +9592,8 @@ def _advanced_selector_data_resource_types(
             continue
         field = field_selector.get("Field")
         if field not in DATA_EVENT_SELECTOR_SCOPE_FIELDS:
-            narrowing.append(str(field))
+            if not _field_selector_keeps_every_agentcore_event(field_selector, region):
+                narrowing.append(str(field))
             continue
         equals = field_selector.get("Equals")
         if not isinstance(equals, list):
@@ -9433,7 +9664,7 @@ def _cloudtrail_data_event_resource_types() -> Dict[str, Any]:
         for selector in advanced_selectors:
             if not isinstance(selector, dict):
                 continue
-            types, narrowing = _advanced_selector_data_resource_types(selector)
+            types, narrowing = _advanced_selector_data_resource_types(selector, region)
             for resource_type in types:
                 if not resource_type.startswith("AWS::BedrockAgentCore::"):
                     continue
@@ -15481,7 +15712,7 @@ def _token_issuance_scope_verdict(statement: Dict[str, Any]) -> str:
 def _principals_issuing_agent_tokens(
     permissions_by_name: Dict[str, Any],
     principal_kind: str,
-) -> Tuple[List[str], List[str], List[str]]:
+) -> Tuple[List[str], List[str], List[str], List[str], Dict[str, Set[str]]]:
     """Group principals holding token-issuance actions by how narrow the grant is.
 
     A principal is judged on the union of its resource elements, so `scoped`
@@ -15490,12 +15721,14 @@ def _principals_issuing_agent_tokens(
     statements is the same grant. Any action pattern reaching an issuance
     action counts, a bare `Action: "*"` included, and only if it survives the
     principal's own unconditioned Deny statements and permissions boundary.
-    The fourth list names principals with a policy that could not be parsed.
+    The fourth list names principals with a policy that could not be parsed,
+    and the map gives each principal the workload identity ARNs it names.
     """
     unbounded: List[str] = []
     directory_only: List[str] = []
     scoped: List[str] = []
     unreadable: List[str] = []
+    named_identities: Dict[str, Set[str]] = {}
 
     for principal_name, permissions in permissions_by_name.items():
         if not isinstance(permissions, dict):
@@ -15518,6 +15751,11 @@ def _principals_issuing_agent_tokens(
                     )
                 ):
                     verdicts.add(_token_issuance_scope_verdict(statement))
+                    named_identities.setdefault(label, set()).update(
+                        resource
+                        for resource in _statement_resources(statement)
+                        if _resource_names_one_workload_identity(resource)
+                    )
 
         if "unbounded" in verdicts:
             unbounded.append(label)
@@ -15526,7 +15764,73 @@ def _principals_issuing_agent_tokens(
         elif "directory_only" in verdicts:
             directory_only.append(label)
 
-    return unbounded, directory_only, scoped, unreadable
+    return unbounded, directory_only, scoped, unreadable, named_identities
+
+
+def _workload_identities_by_role() -> Tuple[Dict[str, Set[str]], List[str]]:
+    """Map each runtime or gateway role name to the workload identities it runs as.
+
+    GetAgentRuntime and GetGateway return the resource's roleArn beside its
+    workloadIdentityDetails, which is the only record of which identity is a
+    role's own agent. The second list names each read that failed, by action.
+    """
+    own: Dict[str, Set[str]] = {}
+    unread: List[str] = []
+    families = (
+        (
+            "list_agent_runtimes",
+            ["agentRuntimes"],
+            "ListAgentRuntimes",
+            "agentRuntimeId",
+            "get_agent_runtime",
+            "agentRuntimeId",
+            "GetAgentRuntime",
+        ),
+        (
+            "list_gateways",
+            ["items", "gateways"],
+            "ListGateways",
+            "gatewayId",
+            "get_gateway",
+            "gatewayIdentifier",
+            "GetGateway",
+        ),
+    )
+    for (
+        list_method,
+        list_keys,
+        list_action,
+        id_key,
+        get_method,
+        get_param,
+        get_action,
+    ) in families:
+        try:
+            items = _agentcore_list_all(list_method, list_keys)
+        except Exception as error:
+            logger.warning(f"Could not call {list_action}: {error}")
+            unread.append(
+                f"bedrock-agentcore:{list_action} ({_assessment_error_label(error)})"
+            )
+            continue
+        for item in items:
+            item_id = item.get(id_key) or "unknown"
+            try:
+                detail = getattr(agentcore_client, get_method)(**{get_param: item_id})
+            except Exception as error:
+                logger.warning(f"Could not call {get_action} on {item_id}: {error}")
+                unread.append(
+                    f"bedrock-agentcore:{get_action} on {item_id} "
+                    f"({_assessment_error_label(error)})"
+                )
+                continue
+            role_name = str(detail.get("roleArn") or "").rsplit("/", 1)[-1].lower()
+            identity = (detail.get("workloadIdentityDetails") or {}).get(
+                "workloadIdentityArn"
+            )
+            if role_name and identity:
+                own.setdefault(role_name, set()).add(str(identity).lower())
+    return own, unread
 
 
 def check_agentcore_token_issuance_scope(
@@ -15576,7 +15880,97 @@ def check_agentcore_token_issuance_scope(
         directory_only = sorted(role_groups[1] + user_groups[1])
         scoped = sorted(role_groups[2] + user_groups[2])
         unreadable = sorted(role_groups[3] + user_groups[3])
+        named_identities = {**role_groups[4], **user_groups[4]}
         findings.extend(gap_rows)
+
+        # A role holding named identities is credited only for its own agent's.
+        foreign: List[str] = []
+        unattributed: List[str] = []
+        attributed: List[str] = []
+        if scoped:
+            if agentcore_client is None:
+                own_by_role: Dict[str, Set[str]] = {}
+                unread = ["the AgentCore client is not available in this region"]
+                assessed_region = ""
+            else:
+                own_by_role, unread = _workload_identities_by_role()
+                assessed_region = agentcore_client.meta.region_name
+            for label in scoped:
+                kind, _, name = label.partition(" ")
+                own = own_by_role.get(name.lower(), set()) if kind == "role" else set()
+                others = sorted(
+                    identity
+                    for identity in named_identities.get(label, set())
+                    if identity.lower() not in own
+                )
+                if not others:
+                    attributed.append(label)
+                    continue
+                crossing = [
+                    identity
+                    for identity in others
+                    if own
+                    and not unread
+                    and _arn_region(identity).lower() == assessed_region.lower()
+                ]
+                if crossing:
+                    foreign.append(f"{label} ({', '.join(crossing)})")
+                else:
+                    unattributed.append(f"{label} ({', '.join(others)})")
+            scoped = attributed
+            if unattributed:
+                reason = f" These reads failed: {', '.join(unread)}." if unread else ""
+                findings.append(
+                    create_finding(
+                        check_id="AC-33",
+                        finding_name="AgentCore Token Issuance Scope Unattributed",
+                        finding_details=(
+                            "The following principals hold agent token-issuance "
+                            "actions only against named workload identities, but no "
+                            f"runtime or gateway read in {assessed_region or 'this region'} "
+                            "runs as that principal with that identity, so whether "
+                            "each identity is the principal's own agent's was not "
+                            f"established: {', '.join(unattributed)}.{reason}"
+                        ),
+                        resolution=(
+                            "No action is required on the assessed workload based on "
+                            "this result. Confirm each named workload identity is the "
+                            "one that principal's own agent runs as; for an agent in "
+                            "another region, assess that region. Grant "
+                            "bedrock-agentcore:ListAgentRuntimes, "
+                            "bedrock-agentcore:GetAgentRuntime, "
+                            "bedrock-agentcore:ListGateways and "
+                            "bedrock-agentcore:GetGateway where a read failed."
+                        ),
+                        reference=AGENTCORE_WORKLOAD_IDENTITY_SCOPE_REFERENCE_URL,
+                        severity=SeverityEnum.INFORMATIONAL,
+                        status=StatusEnum.NA,
+                        region=GLOBAL_REGION_LABEL,
+                    )
+                )
+            if foreign:
+                findings.append(
+                    create_finding(
+                        check_id="AC-33",
+                        finding_name="AgentCore Token Issuance Scope",
+                        finding_details=(
+                            "The following runtime or gateway roles can mint agent "
+                            "access tokens for a workload identity that belongs to "
+                            "no resource running as that role, so one compromised "
+                            "agent acts as another: "
+                            f"{', '.join(foreign)}. {IAM_CACHE_SCP_NOTE}"
+                        ),
+                        resolution=(
+                            "Limit each role's token-issuance statements to the "
+                            "workload identity its own runtime or gateway reports "
+                            "in workloadIdentityDetails."
+                        ),
+                        reference=AGENTCORE_WORKLOAD_IDENTITY_SCOPE_REFERENCE_URL,
+                        severity=SeverityEnum.HIGH,
+                        status=StatusEnum.FAILED,
+                        region=GLOBAL_REGION_LABEL,
+                    )
+                )
         if unreadable:
             findings.append(
                 create_finding(
@@ -15663,12 +16057,13 @@ def check_agentcore_token_issuance_scope(
                     finding_name="AgentCore Token Issuance Scope",
                     finding_details=(
                         "The following principals hold agent token-issuance actions "
-                        "only against named workload identities: "
-                        f"{', '.join(scoped)}."
+                        "only against the workload identities of the runtimes or "
+                        "gateways that run as them, by the roleArn and "
+                        "workloadIdentityDetails GetAgentRuntime and GetGateway "
+                        f"return: {', '.join(scoped)}."
                     ),
                     resolution=(
-                        "No action required. Confirm each named workload identity is "
-                        "the one that principal's own agent runs as, and Deny "
+                        "No action required. Deny "
                         "GetWorkloadAccessTokenForUserId and "
                         "InvokeAgentRuntimeForUser where a JWT is always available."
                     ),
@@ -15683,6 +16078,8 @@ def check_agentcore_token_issuance_scope(
             not unbounded
             and not directory_only
             and not scoped
+            and not foreign
+            and not unattributed
             and not gap_rows
             and not unreadable
         ):
