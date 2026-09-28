@@ -822,6 +822,19 @@ Resources:
               Action:
                 - iot:DescribeScheduledAudit # SM-41
               Resource: !Sub 'arn:${AWS::Partition}:iot:*:${AWS::AccountId}:scheduledaudit/*'
+            - Sid: JobDataBucketProtectionRead
+              # SM-18 reads the default encryption and bucket policy of the
+              # buckets transform jobs read from and write to.
+              Effect: Allow
+              Action:
+                - s3:GetEncryptionConfiguration # SM-18
+                - s3:GetBucketPolicy # SM-18
+              Resource: !Sub 'arn:${AWS::Partition}:s3:::*'
+            - Sid: JobKeyManagerRead
+              Effect: Allow
+              Action:
+                - kms:DescribeKey # SM-18
+              Resource: !Sub 'arn:${AWS::Partition}:kms:*:${AWS::AccountId}:key/*'
 
   AgentCoreSecurityAssessmentFunction:
     Type: AWS::Serverless::Function

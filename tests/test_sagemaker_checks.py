@@ -8276,3 +8276,545 @@ class TestSM33VpcEndpointCoverage:
         rows = _by_finding(rows, sagemaker_app.TRAINING_VPC_ENDPOINTS_FINDING)
         assert [r["Status"] for r in rows] == ["N/A"]
         assert "subnet-deleted" in rows[0]["Finding_Details"]
+
+
+# ===================================================================
+# AIR-SGM-EP-08: SM-18 transform job output key, model boundary, buckets
+# ===================================================================
+_CMK = "arn:aws:kms:us-east-1:123456789012:key/1111"
+_AWS_KEY = "arn:aws:kms:us-east-1:123456789012:key/2222"
+_ISOLATED_MODEL = {
+    "VpcConfig": {"Subnets": ["subnet-a"], "SecurityGroupIds": ["sg-1"]},
+    "EnableNetworkIsolation": True,
+}
+_KMS_BUCKET = {
+    "ServerSideEncryptionConfiguration": {
+        "Rules": [
+            {
+                "ApplyServerSideEncryptionByDefault": {
+                    "SSEAlgorithm": "aws:kms",
+                    "KMSMasterKeyID": _CMK,
+                }
+            }
+        ]
+    }
+}
+
+
+def _transform_job(model="m", volume=_CMK, output=_CMK, bucket="data"):
+    return {
+        "ModelName": model,
+        "TransformResources": {"InstanceType": "ml.m5.large", "VolumeKmsKeyId": volume},
+        "TransformInput": {
+            "DataSource": {"S3DataSource": {"S3Uri": f"s3://{bucket}/in/"}}
+        },
+        "TransformOutput": {"S3OutputPath": f"s3://{bucket}/out/", "KmsKeyId": output},
+    }
+
+
+def _tls_statement(bucket="data", **overrides):
+    statement = {
+        "Sid": "TLSOnly",
+        "Effect": "Deny",
+        "Principal": "*",
+        "Action": "s3:*",
+        "Resource": [f"arn:aws:s3:::{bucket}", f"arn:aws:s3:::{bucket}/*"],
+        "Condition": {"Bool": {"aws:SecureTransport": "false"}},
+    }
+    statement.update(overrides)
+    return statement
+
+
+def _tls_policy(bucket="data", **overrides):
+    return json.dumps(
+        {"Version": "2012-10-17", "Statement": [_tls_statement(bucket, **overrides)]}
+    )
+
+
+def _sm18_rows(
+    jobs,
+    models=None,
+    keys=None,
+    buckets=None,
+    vpces=None,
+    job_pages=None,
+    calls=None,
+):
+    """Run SM-18 over jobs {name: DescribeTransformJob or exception}."""
+    models = models if models is not None else {"m": _ISOLATED_MODEL}
+    keys = keys or {}
+    buckets = buckets or {}
+    calls = calls if calls is not None else {}
+
+    def lookup(table, name):
+        value = table[name]
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+    def describe_model(ModelName):
+        if ModelName not in models:
+            raise _make_client_error(
+                "ValidationException", f'Could not find model "{ModelName}".'
+            )
+        return lookup(models, ModelName)
+
+    def describe_key(KeyId):
+        calls.setdefault("describe_key", []).append(KeyId)
+        value = keys.get(KeyId, "CUSTOMER")
+        if isinstance(value, Exception):
+            raise value
+        return {"KeyMetadata": {"KeyId": KeyId, "KeyManager": value}}
+
+    def bucket_part(part, Bucket):
+        value = buckets.get(Bucket, {}).get(part)
+        if value is None:
+            value = (
+                _KMS_BUCKET if part == "encryption" else {"Policy": _tls_policy(Bucket)}
+            )
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+    sm = _pages_client(
+        {
+            "list_transform_jobs": job_pages
+            or [{"TransformJobSummaries": [{"TransformJobName": n} for n in jobs]}]
+        },
+        describe_transform_job=MagicMock(
+            side_effect=lambda TransformJobName: lookup(jobs, TransformJobName)
+        ),
+        describe_model=MagicMock(side_effect=describe_model),
+    )
+    ec2 = _pages_client(
+        {
+            "describe_subnets": [{"Subnets": [_subnet("subnet-a", "vpc-1")]}],
+            "describe_route_tables": [
+                {
+                    "RouteTables": [
+                        _route_table("rtb-a", [LOCAL_ROUTE], _explicit("subnet-a"))
+                    ]
+                }
+            ],
+            "describe_vpc_endpoints": [
+                {
+                    "VpcEndpoints": vpces
+                    if vpces is not None
+                    else [_vpce("vpc-1", "s3", endpoint_type="Gateway", dns=None)]
+                }
+            ],
+        }
+    )
+    kms = MagicMock()
+    kms.describe_key.side_effect = describe_key
+    s3 = MagicMock()
+    s3.get_bucket_encryption.side_effect = lambda Bucket: bucket_part(
+        "encryption", Bucket
+    )
+    s3.get_bucket_policy.side_effect = lambda Bucket: bucket_part("policy", Bucket)
+    with patch("sagemaker_app.boto3.client") as mock_client:
+        mock_client.side_effect = _sm_client_factory(
+            sagemaker=sm, ec2=ec2, kms=kms, s3=s3
+        )
+        return _rows(
+            sagemaker_app.check_sagemaker_transform_job_encryption(region="us-east-1")
+        )
+
+
+def _statuses(rows, name):
+    return [r["Status"] for r in rows if r["Finding"].startswith(name)]
+
+
+class TestSM18TransformJobBoundary:
+    """AIR-SGM-EP-08: output key, customer managed keys, model network, buckets."""
+
+    def test_clean_job_passes_every_leg(self):
+        rows = _sm18_rows({"good": _transform_job()})
+        assert _statuses(rows, "SageMaker Transform Job Encryption Check") == ["Passed"]
+        for name in (
+            sagemaker_app.TRANSFORM_JOB_BOUNDARY_FINDING,
+            sagemaker_app.TRANSFORM_SUBNET_EXPOSURE_FINDING,
+            sagemaker_app.TRANSFORM_S3_ENDPOINT_FINDING,
+            sagemaker_app.TRANSFORM_BUCKET_FINDING,
+        ):
+            assert _statuses(rows, name) == ["Passed"], name
+        assert all(r["Check_ID"] == "SM-18" for r in rows)
+
+    @pytest.mark.parametrize(
+        "job,models,text",
+        [
+            (_transform_job(output=None), None, "TransformOutput.KmsKeyId is not set"),
+            (
+                _transform_job(model="open"),
+                {"open": {"EnableNetworkIsolation": True}},
+                "model 'open' has no VpcConfig",
+            ),
+            (
+                _transform_job(model="leaky"),
+                {"leaky": dict(_ISOLATED_MODEL, EnableNetworkIsolation=False)},
+                "model 'leaky' does not set EnableNetworkIsolation",
+            ),
+            (
+                _transform_job(output="alias/aws/sagemaker"),
+                None,
+                "TransformOutput.KmsKeyId alias/aws/sagemaker is an AWS managed key",
+            ),
+            (
+                _transform_job(volume=_AWS_KEY),
+                None,
+                f"TransformResources.VolumeKmsKeyId {_AWS_KEY} is an AWS managed key",
+            ),
+        ],
+    )
+    def test_one_bad_job_among_good_ones_fails_alone(self, job, models, text):
+        all_models = {"m": _ISOLATED_MODEL, **(models or {})}
+        rows = _sm18_rows(
+            {"good-1": _transform_job(), "bad": job, "good-2": _transform_job()},
+            models=all_models,
+            keys={_AWS_KEY: "AWS"},
+        )
+        boundary = _by_finding(rows, sagemaker_app.TRANSFORM_JOB_BOUNDARY_FINDING)
+        assert [r["Status"] for r in boundary] == ["Failed"]
+        assert text in boundary[0]["Finding_Details"]
+        assert "'bad'" in boundary[0]["Finding_Details"]
+        assert "good-" not in boundary[0]["Finding_Details"]
+
+    def test_aws_managed_alias_is_judged_without_a_describe_call(self):
+        calls = {}
+        rows = _sm18_rows(
+            {"j": _transform_job(output="alias/aws/sagemaker")}, calls=calls
+        )
+        assert _statuses(rows, sagemaker_app.TRANSFORM_JOB_BOUNDARY_FINDING) == [
+            "Failed"
+        ]
+        assert "alias/aws/sagemaker" not in calls["describe_key"]
+        assert set(calls["describe_key"]) == {_CMK}
+
+    @pytest.mark.parametrize(
+        "jobs,models,keys,text",
+        [
+            (
+                {"j": _transform_job()},
+                None,
+                {_CMK: _make_client_error("AccessDeniedException")},
+                f"kms:DescribeKey {_CMK} (AccessDeniedException)",
+            ),
+            (
+                {"j": _transform_job(model="gone")},
+                {},
+                None,
+                "model 'gone' no longer exists",
+            ),
+            (
+                {"j": _transform_job()},
+                {"m": _make_client_error("AccessDeniedException")},
+                None,
+                "sagemaker:DescribeModel m (AccessDeniedException)",
+            ),
+        ],
+    )
+    def test_unread_leg_is_incomplete_not_passed(self, jobs, models, keys, text):
+        rows = _sm18_rows(jobs, models=models, keys=keys)
+        boundary = _by_finding(rows, sagemaker_app.TRANSFORM_JOB_BOUNDARY_FINDING)
+        assert [r["Status"] for r in boundary] == ["N/A"]
+        assert text in boundary[0]["Finding_Details"]
+
+    def test_describe_job_error_leaves_no_pass_on_either_leg(self):
+        rows = _sm18_rows(
+            {"good": _transform_job(), "denied": _make_client_error("AccessDenied")}
+        )
+        assert _statuses(rows, "SageMaker Transform Job Encryption Check") == ["N/A"]
+        boundary = _by_finding(rows, sagemaker_app.TRANSFORM_JOB_BOUNDARY_FINDING)
+        assert [r["Status"] for r in boundary] == ["N/A"]
+        assert "denied" in boundary[0]["Finding_Details"]
+        assert not any(
+            r["Status"] == "Passed"
+            and r["Finding"]
+            in (
+                "SageMaker Transform Job Encryption Check",
+                sagemaker_app.TRANSFORM_JOB_BOUNDARY_FINDING,
+            )
+            for r in rows
+        )
+
+    def test_known_failure_stands_beside_an_unread_job(self):
+        rows = _sm18_rows(
+            {
+                "bad": _transform_job(output=None),
+                "unread": _transform_job(model="gone"),
+            }
+        )
+        assert _statuses(rows, sagemaker_app.TRANSFORM_JOB_BOUNDARY_FINDING) == [
+            "Failed",
+            "N/A",
+        ]
+
+    def test_list_error_is_not_reported_as_no_jobs(self):
+        with patch("sagemaker_app.boto3.client") as mock_client:
+            sm = _pages_client(
+                {"list_transform_jobs": _make_client_error("AccessDeniedException")}
+            )
+            mock_client.return_value = sm
+            rows = extract_csv_data(
+                sagemaker_app.check_sagemaker_transform_job_encryption("us-east-1")
+            )
+        assert len(rows) == 1
+        assert_could_not_assess_finding(rows[0])
+        assert "No transform jobs found" not in rows[0]["Finding_Details"]
+
+    def test_job_on_a_later_page_is_read(self):
+        jobs = {f"j{i}": _transform_job() for i in range(3)}
+        jobs["j2"] = _transform_job(output=None)
+        rows = _sm18_rows(
+            jobs,
+            job_pages=[
+                {"TransformJobSummaries": [{"TransformJobName": "j0"}]},
+                {"TransformJobSummaries": [{"TransformJobName": "j1"}]},
+                {"TransformJobSummaries": [{"TransformJobName": "j2"}]},
+            ],
+        )
+        boundary = _by_finding(rows, sagemaker_app.TRANSFORM_JOB_BOUNDARY_FINDING)
+        assert [r["Status"] for r in boundary] == ["Failed"]
+        assert "'j2'" in boundary[0]["Finding_Details"]
+
+    def test_vpc_without_s3_endpoint_fails(self):
+        rows = _sm18_rows({"j": _transform_job()}, vpces=[_vpce("vpc-1", "logs")])
+        row = _by_finding(rows, sagemaker_app.TRANSFORM_S3_ENDPOINT_FINDING)
+        assert [r["Status"] for r in row] == ["Failed"]
+        assert "com.amazonaws.us-east-1.s3" in row[0]["Finding_Details"]
+        assert "transform job(s) j" in row[0]["Finding_Details"]
+
+    def test_model_outside_a_vpc_gets_no_endpoint_or_subnet_pass(self):
+        rows = _sm18_rows(
+            {"j": _transform_job(model="open")},
+            models={"open": {"EnableNetworkIsolation": True}},
+        )
+        assert _statuses(rows, sagemaker_app.TRANSFORM_S3_ENDPOINT_FINDING) == []
+        assert _statuses(rows, sagemaker_app.TRANSFORM_SUBNET_EXPOSURE_FINDING) == []
+
+
+class TestSM18BucketProtection:
+    """The source and output buckets: SSE-KMS with a CMK and a TLS-only Deny."""
+
+    def _bucket_rows(self, bucket_reads, keys=None):
+        rows = _sm18_rows(
+            {
+                "clean": _transform_job(bucket="clean"),
+                "target": _transform_job(bucket="target"),
+            },
+            buckets={"target": bucket_reads},
+            keys=keys,
+        )
+        return _by_finding(rows, sagemaker_app.TRANSFORM_BUCKET_FINDING)
+
+    @pytest.mark.parametrize(
+        "reads,text",
+        [
+            (
+                {
+                    "encryption": {
+                        "ServerSideEncryptionConfiguration": {
+                            "Rules": [
+                                {
+                                    "ApplyServerSideEncryptionByDefault": {
+                                        "SSEAlgorithm": "AES256"
+                                    }
+                                }
+                            ]
+                        }
+                    }
+                },
+                "default encryption is not SSE-KMS (AES256)",
+            ),
+            (
+                {
+                    "encryption": {
+                        "ServerSideEncryptionConfiguration": {
+                            "Rules": [
+                                {
+                                    "ApplyServerSideEncryptionByDefault": {
+                                        "SSEAlgorithm": "aws:kms"
+                                    }
+                                }
+                            ]
+                        }
+                    }
+                },
+                "uses the AWS managed key aws/s3",
+            ),
+            (
+                {
+                    "encryption": _make_client_error(
+                        "ServerSideEncryptionConfigurationNotFoundError"
+                    )
+                },
+                "no default encryption configuration",
+            ),
+            (
+                {"policy": _make_client_error("NoSuchBucketPolicy")},
+                "has no bucket policy",
+            ),
+            (
+                {
+                    "policy": {
+                        "Policy": _tls_policy(
+                            "target",
+                            Condition={"Bool": {"aws:SecureTransport": "true"}},
+                        )
+                    }
+                },
+                "has no Deny on aws:SecureTransport false",
+            ),
+            (
+                {
+                    "policy": {
+                        "Policy": _tls_policy(
+                            "target",
+                            Principal={"AWS": "arn:aws:iam::123456789012:root"},
+                        )
+                    }
+                },
+                "it does not apply to every principal",
+            ),
+            (
+                {
+                    "policy": {
+                        "Policy": _tls_policy("target", Resource="arn:aws:s3:::target")
+                    }
+                },
+                "its Resource does not cover every object",
+            ),
+            (
+                {
+                    "policy": {
+                        "Policy": _tls_policy(
+                            "target", Resource="arn:aws:s3:::target/public/*"
+                        )
+                    }
+                },
+                "its Resource does not cover the bucket",
+            ),
+            (
+                {"policy": {"Policy": _tls_policy("target", Action="s3:GetObject")}},
+                "its Action does not cover s3:*",
+            ),
+            (
+                {
+                    "policy": {
+                        "Policy": _tls_policy(
+                            "target",
+                            Condition={
+                                "Bool": {"aws:SecureTransport": "false"},
+                                "StringEquals": {"aws:PrincipalAccount": "111"},
+                            },
+                        )
+                    }
+                },
+                "its Condition also tests StringEquals aws:principalaccount",
+            ),
+            (
+                {"policy": {"Policy": _tls_policy("target", Effect="Allow")}},
+                "has no Deny on aws:SecureTransport false",
+            ),
+        ],
+    )
+    def test_one_unprotected_bucket_fails_alone(self, reads, text):
+        rows = self._bucket_rows(reads)
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "Bucket 'target', used by target" in rows[0]["Finding_Details"]
+        assert text in rows[0]["Finding_Details"]
+        assert "'clean'" not in rows[0]["Finding_Details"]
+
+    def test_bucket_default_key_that_aws_manages_fails(self):
+        rows = self._bucket_rows(
+            {
+                "encryption": {
+                    "ServerSideEncryptionConfiguration": {
+                        "Rules": [
+                            {
+                                "ApplyServerSideEncryptionByDefault": {
+                                    "SSEAlgorithm": "aws:kms",
+                                    "KMSMasterKeyID": _AWS_KEY,
+                                }
+                            }
+                        ]
+                    }
+                }
+            },
+            keys={_AWS_KEY: "AWS"},
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert (
+            f"default encryption key {_AWS_KEY} is an AWS managed key"
+            in (rows[0]["Finding_Details"])
+        )
+
+    @pytest.mark.parametrize(
+        "overrides",
+        [
+            {"Resource": "*"},
+            {"Resource": ["arn:aws:s3:::tar*"]},
+            {"Resource": ["arn:aws:s3:::target", "arn:aws:s3:::target*"]},
+            {"Principal": {"AWS": "*"}},
+            {"Action": "*"},
+            {"Condition": {"BoolIfExists": {"aws:SecureTransport": ["false"]}}},
+        ],
+    )
+    def test_equivalent_tls_deny_passes(self, overrides):
+        rows = self._bucket_rows(
+            {"policy": {"Policy": _tls_policy("target", **overrides)}}
+        )
+        assert [r["Status"] for r in rows] == ["Passed"]
+        assert "2 bucket(s)" in rows[0]["Finding_Details"]
+
+    def test_second_statement_can_carry_the_deny(self):
+        document = json.dumps(
+            {
+                "Version": "2012-10-17",
+                "Statement": [
+                    _tls_statement("target", Sid="Partial", Action="s3:GetObject"),
+                    _tls_statement("target", Sid="Full"),
+                ],
+            }
+        )
+        rows = self._bucket_rows({"policy": {"Policy": document}})
+        assert [r["Status"] for r in rows] == ["Passed"]
+
+    @pytest.mark.parametrize(
+        "reads,text",
+        [
+            (
+                {"encryption": _make_client_error("AccessDenied")},
+                "bucket target: s3:GetEncryptionConfiguration (AccessDenied)",
+            ),
+            (
+                {"policy": _make_client_error("AccessDenied")},
+                "bucket target: s3:GetBucketPolicy (AccessDenied)",
+            ),
+        ],
+    )
+    def test_unread_bucket_is_incomplete(self, reads, text):
+        rows = self._bucket_rows(reads)
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert text in rows[0]["Finding_Details"]
+        assert "1 bucket(s)" in rows[0]["Finding_Details"]
+
+    def test_unread_bucket_key_is_incomplete(self):
+        rows = self._bucket_rows(
+            {},
+            keys={_CMK: _make_client_error("AccessDeniedException")},
+        )
+        assert [r["Status"] for r in rows] == ["N/A"]
+
+    def test_covers_objects_needs_a_trailing_wildcard_over_the_bucket(self):
+        arn = "arn:aws:s3:::target"
+        assert sagemaker_app._s3_resource_covers_objects("arn:aws:s3:::target/*", arn)
+        assert sagemaker_app._s3_resource_covers_objects("arn:aws:s3:::*", arn)
+        assert sagemaker_app._s3_resource_covers_objects("arn:aws:s3:::t?rget/*", arn)
+        assert not sagemaker_app._s3_resource_covers_objects(
+            "arn:aws:s3:::target/a*", arn
+        )
+        assert not sagemaker_app._s3_resource_covers_objects(
+            "arn:aws:s3:::other/*", arn
+        )
+        assert not sagemaker_app._s3_resource_covers_objects("arn:aws:s3:::target", arn)

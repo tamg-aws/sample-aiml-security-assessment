@@ -277,6 +277,9 @@ _EXPECTED_ACTIONS = {
         "events:ListTargetsByRule",
         "iot:ListPrincipalThings",
         "iot:DescribeScheduledAudit",
+        "s3:GetEncryptionConfiguration",
+        "s3:GetBucketPolicy",
+        "kms:DescribeKey",
     },
     "AgentCoreSecurityAssessmentFunction": {
         "bedrock-agentcore:GetAgentRuntime",

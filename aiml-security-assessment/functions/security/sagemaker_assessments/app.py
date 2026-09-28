@@ -1950,6 +1950,343 @@ def has_sagemaker_permissions(policy_doc: Dict) -> bool:
         return False
 
 
+# A key named by an alias under alias/aws/ is an AWS managed key; any other key
+# id or ARN is resolved with kms:DescribeKey, because an AWS managed key can
+# also be named by its key ARN and the ARN alone does not say who manages it.
+AWS_MANAGED_ALIAS_PREFIX = "alias/aws/"
+S3_ENCRYPTION_KMS_ALGORITHMS = ("aws:kms", "aws:kms:dsse")
+BUCKET_PROTECTION_REFERENCE = (
+    "https://docs.aws.amazon.com/AmazonS3/latest/userguide/security-best-practices.html"
+)
+MAX_BUCKET_PROTECTION_FINDINGS = 20
+
+
+def _kms_key_alias(key_id: str) -> Optional[str]:
+    if key_id.startswith("alias/"):
+        return key_id
+    if ":alias/" in key_id:
+        return "alias/" + key_id.split(":alias/", 1)[1]
+    return None
+
+
+def _kms_key_managers(key_ids: List[str], region: str) -> Dict[str, Dict[str, Any]]:
+    """
+    Return {key id: {"manager": "AWS" | "CUSTOMER" | None, "error": label}}.
+
+    A key ARN is described in the Region the ARN names, since kms:DescribeKey
+    answers only for keys in the Region it is called in.
+    """
+    results: Dict[str, Dict[str, Any]] = {}
+    clients: Dict[str, Any] = {}
+    for key_id in sorted({str(k) for k in key_ids if k}):
+        alias = _kms_key_alias(key_id)
+        if alias and alias.startswith(AWS_MANAGED_ALIAS_PREFIX):
+            results[key_id] = {"manager": "AWS", "error": None}
+            continue
+        key_region = region
+        if key_id.startswith("arn:"):
+            key_region = key_id.split(":")[3] or region
+        try:
+            if key_region not in clients:
+                clients[key_region] = boto3.client(
+                    "kms", config=boto3_config, region_name=key_region
+                )
+            metadata = (
+                clients[key_region].describe_key(KeyId=key_id).get("KeyMetadata") or {}
+            )
+            manager = metadata.get("KeyManager")
+            results[key_id] = {
+                "manager": manager if manager in ("AWS", "CUSTOMER") else None,
+                "error": None if manager in ("AWS", "CUSTOMER") else "no KeyManager",
+            }
+        except Exception as error:
+            results[key_id] = {
+                "manager": None,
+                "error": get_assessment_error_label(error),
+            }
+    return results
+
+
+def _s3_uri_bucket(uri: Any) -> Optional[str]:
+    """Return the bucket of an s3://bucket/prefix URI, or None for anything else."""
+    if not isinstance(uri, str) or not uri.startswith("s3://"):
+        return None
+    return uri[len("s3://") :].split("/", 1)[0] or None
+
+
+def _s3_resource_covers_objects(pattern: str, bucket_arn: str) -> bool:
+    """
+    True when a Resource pattern matches every object key in the bucket.
+
+    IAM wildcards match across "/", so the pattern covers every key when it
+    ends in "*" and the text before that "*" matches some prefix of
+    "<bucket arn>/".
+    """
+    if not pattern.endswith("*"):
+        return False
+    head = pattern[:-1]
+    target = bucket_arn + "/"
+    return any(
+        fnmatch.fnmatchcase(target[:length], head) for length in range(len(target) + 1)
+    )
+
+
+def _plaintext_deny_gaps(statement: Dict[str, Any], bucket: str) -> Optional[List[str]]:
+    """
+    Return None when the statement is not a Deny on aws:SecureTransport false,
+    otherwise the reasons it leaves plaintext requests to the bucket allowed.
+    """
+    if str(statement.get("Effect", "")).upper() != "DENY":
+        return None
+    entries = _condition_entries(statement)
+    tests_plaintext = any(
+        _condition_operator_parts(operator)[1] == "bool"
+        and key == "aws:securetransport"
+        and values
+        and all(value == "false" for value in values)
+        for operator, key, values in entries
+    )
+    if not tests_plaintext:
+        return None
+    gaps = []
+    principal = statement.get("Principal")
+    if "NotPrincipal" in statement or "*" not in _policy_values(
+        principal if isinstance(principal, (dict, list)) else [principal or ""]
+    ):
+        gaps.append("it does not apply to every principal")
+    bucket_arn = f"arn:aws:s3:::{bucket}"
+    if "NotResource" in statement:
+        gaps.append("it uses NotResource")
+    else:
+        # The partition segment is dropped so a GovCloud or China ARN compares
+        # the same way as the aws partition.
+        resources = [
+            re.sub(r"^arn:aws(-[a-z-]+)?:", "arn:aws:", str(r))
+            for r in _policy_values(statement.get("Resource"))
+        ]
+        if not any(r == "*" or fnmatch.fnmatchcase(bucket_arn, r) for r in resources):
+            gaps.append("its Resource does not cover the bucket")
+        if not any(
+            r == "*" or _s3_resource_covers_objects(r, bucket_arn) for r in resources
+        ):
+            gaps.append("its Resource does not cover every object")
+    if "NotAction" in statement or not any(
+        _iam_action_matches(pattern, "s3:*")
+        for pattern in _policy_values(statement.get("Action"))
+    ):
+        gaps.append("its Action does not cover s3:*")
+    narrowing = sorted(
+        {
+            f"{operator} {key}"
+            for operator, key, _ in entries
+            if key != "aws:securetransport"
+        }
+    )
+    if narrowing:
+        gaps.append(f"its Condition also tests {', '.join(narrowing)}")
+    return gaps
+
+
+def _bucket_policy_tls_problem(bucket: str, document: Any) -> Optional[str]:
+    reasons = []
+    for index, statement in enumerate(_sm_policy_statements(document), start=1):
+        gaps = _plaintext_deny_gaps(statement, bucket)
+        if gaps is None:
+            continue
+        if not gaps:
+            return None
+        label = statement.get("Sid") or f"statement {index}"
+        reasons.append(f"'{label}': {'; '.join(gaps)}")
+    if reasons:
+        return (
+            "no bucket policy Deny on aws:SecureTransport false closes the bucket ("
+            + " | ".join(reasons[:3])
+            + ")"
+        )
+    return "the bucket policy has no Deny on aws:SecureTransport false"
+
+
+def _bucket_protection_findings(
+    check_id: str,
+    finding_name: str,
+    bucket_users: Dict[str, List[str]],
+    region: str,
+) -> List[Dict[str, Any]]:
+    """
+    Read each bucket's default encryption and bucket policy: SSE-KMS with a
+    customer managed key, and a Deny on aws:SecureTransport false that reaches
+    every principal, the bucket, every object and s3:*.
+    """
+    if not bucket_users:
+        return []
+    s3_client = boto3.client("s3", config=boto3_config, region_name=region)
+    reads = {}
+    for bucket in sorted(bucket_users):
+        problems: List[str] = []
+        unread: List[str] = []
+        key_id = None
+        try:
+            rules = (
+                s3_client.get_bucket_encryption(Bucket=bucket)
+                .get("ServerSideEncryptionConfiguration", {})
+                .get("Rules", [])
+            )
+            defaults = [
+                r.get("ApplyServerSideEncryptionByDefault") or {} for r in rules
+            ]
+            kms_defaults = [
+                d
+                for d in defaults
+                if d.get("SSEAlgorithm") in S3_ENCRYPTION_KMS_ALGORITHMS
+            ]
+            if not kms_defaults:
+                algorithms = sorted({str(d.get("SSEAlgorithm")) for d in defaults})
+                problems.append(
+                    "default encryption is not SSE-KMS "
+                    f"({', '.join(algorithms) or 'no default rule'})"
+                )
+            elif not kms_defaults[0].get("KMSMasterKeyID"):
+                problems.append(
+                    "default encryption is SSE-KMS with no KMSMasterKeyID, so it "
+                    "uses the AWS managed key aws/s3"
+                )
+            else:
+                key_id = kms_defaults[0]["KMSMasterKeyID"]
+        except ClientError as error:
+            if get_assessment_error_label(error) == (
+                "ServerSideEncryptionConfigurationNotFoundError"
+            ):
+                problems.append("the bucket has no default encryption configuration")
+            else:
+                unread.append(
+                    f"s3:GetEncryptionConfiguration ({get_assessment_error_label(error)})"
+                )
+        except Exception as error:
+            unread.append(
+                f"s3:GetEncryptionConfiguration ({get_assessment_error_label(error)})"
+            )
+        try:
+            document = s3_client.get_bucket_policy(Bucket=bucket).get("Policy")
+            problem = _bucket_policy_tls_problem(bucket, document)
+            if problem:
+                problems.append(problem)
+        except ClientError as error:
+            if get_assessment_error_label(error) == "NoSuchBucketPolicy":
+                problems.append(
+                    "the bucket has no bucket policy, so no Deny on "
+                    "aws:SecureTransport false"
+                )
+            else:
+                unread.append(
+                    f"s3:GetBucketPolicy ({get_assessment_error_label(error)})"
+                )
+        except Exception as error:
+            unread.append(f"s3:GetBucketPolicy ({get_assessment_error_label(error)})")
+        reads[bucket] = {"problems": problems, "unread": unread, "key": key_id}
+
+    managers = _kms_key_managers(
+        [read["key"] for read in reads.values() if read["key"]], region
+    )
+    for read in reads.values():
+        if not read["key"]:
+            continue
+        manager = managers[read["key"]]
+        if manager["manager"] == "AWS":
+            read["problems"].append(
+                f"default encryption key {read['key']} is an AWS managed key"
+            )
+        elif manager["manager"] is None:
+            read["unread"].append(f"kms:DescribeKey {read['key']} ({manager['error']})")
+
+    emitted = []
+    clean = []
+    unread = []
+    failed = [bucket for bucket in sorted(reads) if reads[bucket]["problems"]]
+    for bucket in failed[:MAX_BUCKET_PROTECTION_FINDINGS]:
+        users = bucket_users[bucket]
+        emitted.append(
+            create_finding(
+                check_id=check_id,
+                finding_name=finding_name,
+                finding_details=(
+                    f"Bucket '{bucket}', used by {', '.join(users[:5])}"
+                    f"{' and more' if len(users) > 5 else ''}: "
+                    f"{'; '.join(reads[bucket]['problems'])}."
+                    + (
+                        f" Not read: {', '.join(reads[bucket]['unread'])}."
+                        if reads[bucket]["unread"]
+                        else ""
+                    )
+                ),
+                resolution=(
+                    "Set the bucket's default encryption to SSE-KMS with a customer "
+                    "managed key, and add a bucket policy statement that denies "
+                    "s3:* on the bucket and bucket/* to every principal when "
+                    "aws:SecureTransport is false."
+                ),
+                reference=BUCKET_PROTECTION_REFERENCE,
+                severity="Medium",
+                status="Failed",
+                region=region,
+            )
+        )
+    if len(failed) > MAX_BUCKET_PROTECTION_FINDINGS:
+        emitted.append(
+            create_finding(
+                check_id=check_id,
+                finding_name=finding_name,
+                finding_details=(
+                    f"{len(failed)} buckets fail (the first "
+                    f"{MAX_BUCKET_PROTECTION_FINDINGS} are reported above): "
+                    f"{', '.join(failed[MAX_BUCKET_PROTECTION_FINDINGS:])}."
+                ),
+                resolution="Apply the same fix to each bucket listed.",
+                reference=BUCKET_PROTECTION_REFERENCE,
+                severity="Medium",
+                status="Failed",
+                region=region,
+            )
+        )
+    for bucket in sorted(reads):
+        if reads[bucket]["problems"]:
+            continue
+        if reads[bucket]["unread"]:
+            unread.extend(
+                f"bucket {bucket}: {item}" for item in reads[bucket]["unread"]
+            )
+        else:
+            clean.append(bucket)
+    read_details = (
+        f"{len(clean)} bucket(s) use SSE-KMS with a customer managed key and deny "
+        f"plaintext requests: {', '.join(clean[:10]) or 'none'}."
+    )
+    if unread:
+        emitted.append(
+            _unread_resources_finding(
+                check_id,
+                finding_name,
+                unread,
+                read_details,
+                BUCKET_PROTECTION_REFERENCE,
+                region,
+            )
+        )
+    elif clean and not failed:
+        emitted.append(
+            create_finding(
+                check_id=check_id,
+                finding_name=finding_name,
+                finding_details=read_details,
+                resolution="No action required",
+                reference=BUCKET_PROTECTION_REFERENCE,
+                severity="Medium",
+                status="Passed",
+                region=region,
+            )
+        )
+    return emitted
+
+
 TRAINING_VOLUME_ENCRYPTION_FINDING = "Training Job Volume Encryption"
 TRAINING_VOLUME_ENCRYPTION_REFERENCE = (
     "https://docs.aws.amazon.com/sagemaker/latest/dg/train-encrypt.html"
@@ -4633,10 +4970,266 @@ def check_sagemaker_processing_job_encryption(region: str = "") -> Dict[str, Any
         }
 
 
+TRANSFORM_JOB_REFERENCE = (
+    "https://docs.aws.amazon.com/sagemaker/latest/APIReference/"
+    "API_CreateTransformJob.html"
+)
+TRANSFORM_JOB_BOUNDARY_FINDING = "SageMaker Transform Job Output Key and Model Boundary"
+TRANSFORM_SUBNET_EXPOSURE_FINDING = "SageMaker Transform Job Model Subnet Exposure"
+TRANSFORM_S3_ENDPOINT_FINDING = "SageMaker Transform Job S3 VPC Endpoint"
+TRANSFORM_BUCKET_FINDING = "SageMaker Transform Job Bucket Protection"
+MAX_TRANSFORM_JOB_FINDINGS = 20
+
+
+def _transform_model_network(sagemaker_client, model_name: str) -> Dict[str, Any]:
+    """Return {"subnets", "security_groups", "isolated", "error"} for a model."""
+    try:
+        model = sagemaker_client.describe_model(ModelName=model_name)
+    except ClientError as error:
+        message = str(error.response.get("Error", {}).get("Message", ""))
+        if "Could not find model" in message:
+            return {
+                "error": (
+                    f"model '{model_name}' no longer exists, so the VpcConfig and "
+                    "EnableNetworkIsolation the job ran with are not readable "
+                    "(DescribeTransformJob does not record them)"
+                )
+            }
+        return {
+            "error": (
+                f"sagemaker:DescribeModel {model_name} "
+                f"({get_assessment_error_label(error)})"
+            )
+        }
+    except Exception as error:
+        return {
+            "error": (
+                f"sagemaker:DescribeModel {model_name} "
+                f"({get_assessment_error_label(error)})"
+            )
+        }
+    vpc_config = model.get("VpcConfig") or {}
+    return {
+        "subnets": [s for s in vpc_config.get("Subnets") or [] if s],
+        "security_groups": [g for g in vpc_config.get("SecurityGroupIds") or [] if g],
+        "isolated": model.get("EnableNetworkIsolation") is True,
+        "error": None,
+    }
+
+
+def _transform_job_boundary_findings(
+    jobs: List[Dict[str, Any]],
+    sagemaker_client,
+    unread: List[str],
+    region: str,
+) -> List[Dict[str, Any]]:
+    """
+    AIR-SGM-EP-08: a transform job takes its network posture from the model it
+    names, so each job's ModelName is resolved to that model's VpcConfig and
+    EnableNetworkIsolation. TransformOutput.KmsKeyId encrypts the results in S3,
+    and both job keys must be customer managed.
+    """
+    models: Dict[str, Dict[str, Any]] = {}
+    for job in jobs:
+        model_name = job["detail"].get("ModelName")
+        if model_name and model_name not in models:
+            models[model_name] = _transform_model_network(sagemaker_client, model_name)
+    managers = _kms_key_managers(
+        [
+            key
+            for job in jobs
+            for key in (
+                (job["detail"].get("TransformResources") or {}).get("VolumeKmsKeyId"),
+                (job["detail"].get("TransformOutput") or {}).get("KmsKeyId"),
+            )
+            if key
+        ],
+        region,
+    )
+
+    failed = []
+    clean = []
+    jobs_in_vpc = []
+    bucket_users: Dict[str, List[str]] = {}
+    for job in jobs:
+        name = job["name"]
+        detail = job["detail"]
+        problems = []
+        job_unread = []
+        output = detail.get("TransformOutput") or {}
+        output_key = output.get("KmsKeyId")
+        if not output_key:
+            problems.append(
+                "TransformOutput.KmsKeyId is not set, so the results in S3 are not "
+                "encrypted with a customer managed key"
+            )
+        for field, key in (
+            (
+                "TransformResources.VolumeKmsKeyId",
+                (detail.get("TransformResources") or {}).get("VolumeKmsKeyId"),
+            ),
+            ("TransformOutput.KmsKeyId", output_key),
+        ):
+            if not key:
+                continue
+            manager = managers[str(key)]
+            if manager["manager"] == "AWS":
+                problems.append(f"{field} {key} is an AWS managed key")
+            elif manager["manager"] is None:
+                job_unread.append(f"kms:DescribeKey {key} ({manager['error']})")
+        model_name = detail.get("ModelName")
+        network = models.get(model_name) if model_name else None
+        if network is None:
+            job_unread.append("the job names no ModelName")
+        elif network["error"]:
+            job_unread.append(network["error"])
+        else:
+            if not network["subnets"] or not network["security_groups"]:
+                problems.append(
+                    f"model '{model_name}' has no VpcConfig with subnets and "
+                    "security groups, so the job ran in the SageMaker-managed network"
+                )
+            else:
+                jobs_in_vpc.append({"name": name, "subnets": network["subnets"]})
+            if not network["isolated"]:
+                problems.append(
+                    f"model '{model_name}' does not set EnableNetworkIsolation, so "
+                    "the container can make outbound network calls"
+                )
+        for uri in (
+            ((detail.get("TransformInput") or {}).get("DataSource") or {})
+            .get("S3DataSource", {})
+            .get("S3Uri"),
+            output.get("S3OutputPath"),
+        ):
+            bucket = _s3_uri_bucket(uri)
+            if bucket:
+                bucket_users.setdefault(bucket, [])
+                if name not in bucket_users[bucket]:
+                    bucket_users[bucket].append(name)
+        if problems:
+            failed.append((name, problems, job_unread))
+        elif job_unread:
+            unread.extend(f"transform job {name}: {item}" for item in job_unread)
+        else:
+            clean.append(name)
+
+    emitted = []
+    for name, problems, job_unread in failed[:MAX_TRANSFORM_JOB_FINDINGS]:
+        emitted.append(
+            create_finding(
+                check_id="SM-18",
+                finding_name=TRANSFORM_JOB_BOUNDARY_FINDING,
+                finding_details=(
+                    f"Transform job '{name}': {'; '.join(problems)}."
+                    + (f" Not read: {'; '.join(job_unread)}." if job_unread else "")
+                ),
+                resolution=(
+                    "Recreate the model with VpcConfig (private subnets and security "
+                    "groups) and EnableNetworkIsolation true, and run transform jobs "
+                    "against it with TransformResources.VolumeKmsKeyId and "
+                    "TransformOutput.KmsKeyId set to customer managed keys."
+                ),
+                reference=TRANSFORM_JOB_REFERENCE,
+                severity="Medium",
+                status="Failed",
+                region=region,
+            )
+        )
+    if len(failed) > MAX_TRANSFORM_JOB_FINDINGS:
+        emitted.append(
+            create_finding(
+                check_id="SM-18",
+                finding_name=TRANSFORM_JOB_BOUNDARY_FINDING,
+                finding_details=(
+                    f"{len(failed)} transform jobs fail (the first "
+                    f"{MAX_TRANSFORM_JOB_FINDINGS} are reported above): "
+                    f"{', '.join(n for n, _, _ in failed[MAX_TRANSFORM_JOB_FINDINGS:])}."
+                ),
+                resolution="Apply the same fix to each transform job listed.",
+                reference=TRANSFORM_JOB_REFERENCE,
+                severity="Medium",
+                status="Failed",
+                region=region,
+            )
+        )
+    read_details = (
+        f"{len(clean)} transform job(s) use customer managed keys for the volume "
+        "and the output and name a model that is VPC-attached and network "
+        f"isolated: {', '.join(clean[:10]) or 'none'}."
+    )
+    if unread:
+        emitted.append(
+            _unread_resources_finding(
+                "SM-18",
+                TRANSFORM_JOB_BOUNDARY_FINDING,
+                unread,
+                read_details,
+                TRANSFORM_JOB_REFERENCE,
+                region,
+            )
+        )
+    elif clean and not failed:
+        emitted.append(
+            create_finding(
+                check_id="SM-18",
+                finding_name=TRANSFORM_JOB_BOUNDARY_FINDING,
+                finding_details=read_details,
+                resolution="No action required",
+                reference=TRANSFORM_JOB_REFERENCE,
+                severity="Medium",
+                status="Passed",
+                region=region,
+            )
+        )
+
+    emitted.extend(
+        _subnet_exposure_findings(
+            check_id="SM-18",
+            finding_name=TRANSFORM_SUBNET_EXPOSURE_FINDING,
+            resources=[
+                {"name": f"Transform job '{job['name']}'", "subnets": job["subnets"]}
+                for job in jobs_in_vpc
+            ],
+            region=region,
+            reference=TRANSFORM_JOB_REFERENCE,
+            resolution=(
+                "Recreate the model with VpcConfig naming subnets whose route "
+                "tables have no internet gateway route."
+            ),
+            severity="Medium",
+        )
+    )
+    emitted.extend(
+        _training_vpc_endpoint_findings(
+            jobs_in_vpc,
+            region,
+            check_id="SM-18",
+            finding_name=TRANSFORM_S3_ENDPOINT_FINDING,
+            services=("s3",),
+            subject="transform job",
+            resolution=(
+                "Create an S3 gateway endpoint in the VPC. Network isolation "
+                "removes the container's interface but not the one SageMaker uses "
+                "to move the input and output through S3."
+            ),
+        )
+    )
+    emitted.extend(
+        _bucket_protection_findings(
+            "SM-18", TRANSFORM_BUCKET_FINDING, bucket_users, region
+        )
+    )
+    return emitted
+
+
 def check_sagemaker_transform_job_encryption(region: str = "") -> Dict[str, Any]:
     """
     Check if SageMaker transform jobs have volume encryption enabled.
     Aligns with AWS Security Hub control SageMaker.11
+
+    AIR-SGM-EP-08 also needs the output key, the model's network posture and
+    the buckets, which _transform_job_boundary_findings reports.
     """
     logger.debug("Starting check for SageMaker transform job encryption")
     try:
@@ -4648,39 +5241,42 @@ def check_sagemaker_transform_job_encryption(region: str = "") -> Dict[str, Any]
 
         jobs_without_encryption = []
         jobs_with_encryption = []
+        described = []
+        unread = []
 
-        try:
-            paginator = sagemaker_client.get_paginator("list_transform_jobs")
-            for page in paginator.paginate():
-                for job in page.get("TransformJobSummaries", []):
-                    job_name = job.get("TransformJobName")
-                    job_status = job.get("TransformJobStatus")
+        # A ListTransformJobs failure reaches the outer handler, so it is
+        # reported as not assessed instead of "No transform jobs found".
+        paginator = sagemaker_client.get_paginator("list_transform_jobs")
+        for page in paginator.paginate():
+            for job in page.get("TransformJobSummaries", []):
+                job_name = job.get("TransformJobName")
+                job_status = job.get("TransformJobStatus")
 
-                    if job_name:
-                        try:
-                            job_details = sagemaker_client.describe_transform_job(
-                                TransformJobName=job_name
-                            )
+                if job_name:
+                    try:
+                        job_details = sagemaker_client.describe_transform_job(
+                            TransformJobName=job_name
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            f"Error describing transform job {job_name}: {str(e)}"
+                        )
+                        unread.append(
+                            f"sagemaker:DescribeTransformJob {job_name} "
+                            f"({get_assessment_error_label(e)})"
+                        )
+                        continue
+                    described.append({"name": job_name, "detail": job_details})
 
-                            transform_resources = job_details.get(
-                                "TransformResources", {}
-                            )
-                            volume_kms_key = transform_resources.get("VolumeKmsKeyId")
+                    transform_resources = job_details.get("TransformResources", {})
+                    volume_kms_key = transform_resources.get("VolumeKmsKeyId")
 
-                            if not volume_kms_key:
-                                jobs_without_encryption.append(
-                                    {"name": job_name, "status": job_status}
-                                )
-                            else:
-                                jobs_with_encryption.append(job_name)
-
-                        except Exception as e:
-                            logger.warning(
-                                f"Error describing transform job {job_name}: {str(e)}"
-                            )
-
-        except Exception as e:
-            logger.error(f"Error listing transform jobs: {str(e)}")
+                    if not volume_kms_key:
+                        jobs_without_encryption.append(
+                            {"name": job_name, "status": job_status}
+                        )
+                    else:
+                        jobs_with_encryption.append(job_name)
 
         if jobs_without_encryption:
             for job in jobs_without_encryption[:15]:
@@ -4710,6 +5306,18 @@ def check_sagemaker_transform_job_encryption(region: str = "") -> Dict[str, Any]
                         region=region,
                     )
                 )
+        elif unread:
+            findings["csv_data"].append(
+                _unread_resources_finding(
+                    "SM-18",
+                    "SageMaker Transform Job Encryption Check",
+                    unread,
+                    f"{len(jobs_with_encryption)} transform job(s) have volume "
+                    "encryption configured.",
+                    "https://docs.aws.amazon.com/sagemaker/latest/dg/batch-transform.html",
+                    region,
+                )
+            )
         else:
             if jobs_with_encryption:
                 # Transform jobs exist and all have encryption - Passed
@@ -4739,6 +5347,13 @@ def check_sagemaker_transform_job_encryption(region: str = "") -> Dict[str, Any]
                         region=region,
                     )
                 )
+
+        if described or unread:
+            findings["csv_data"].extend(
+                _transform_job_boundary_findings(
+                    described, sagemaker_client, list(unread), region
+                )
+            )
 
         return findings
 
@@ -7387,13 +8002,24 @@ TRAINING_REQUIRED_ENDPOINT_SERVICES = (
 
 
 def _training_vpc_endpoint_findings(
-    jobs_in_vpc: List[Dict[str, Any]], region: str
+    jobs_in_vpc: List[Dict[str, Any]],
+    region: str,
+    check_id: str = "SM-33",
+    finding_name: str = TRAINING_VPC_ENDPOINTS_FINDING,
+    services: tuple = TRAINING_REQUIRED_ENDPOINT_SERVICES,
+    subject: str = "training job",
+    resolution: str = (
+        "Create the missing VPC endpoints: a gateway endpoint for "
+        "S3 and interface endpoints with private DNS for "
+        "CloudWatch Logs, the SageMaker API, ecr.api and ecr.dkr."
+    ),
 ) -> List[Dict[str, Any]]:
     """
     AIR-SGM-TRN-01: every VPC a training job ran in needs an available endpoint
     for each service in TRAINING_REQUIRED_ENDPOINT_SERVICES. An interface
     endpoint counts only with private DNS on, since the job resolves the
     service's default hostname; S3 counts as a gateway or interface endpoint.
+    AIR-SGM-EP-08 calls it for transform job models with S3 only.
     """
     subnets = sorted({s for job in jobs_in_vpc for s in job["subnets"] if s})
     if not subnets:
@@ -7436,11 +8062,11 @@ def _training_vpc_endpoint_findings(
         logger.warning(f"Error reading training VPC endpoints: {str(error)}")
         return [
             create_finding(
-                check_id="SM-33",
-                finding_name=f"{TRAINING_VPC_ENDPOINTS_FINDING} Incomplete",
+                check_id=check_id,
+                finding_name=f"{finding_name} Incomplete",
                 finding_details=(
                     f"The VPC endpoints of the {len(jobs_in_vpc)} VPC-attached "
-                    "training job(s) were not read (ec2:DescribeSubnets, "
+                    f"{subject}(s) were not read (ec2:DescribeSubnets, "
                     "ec2:DescribeVpcEndpoints: "
                     f"{get_assessment_error_label(error)})."
                 ),
@@ -7455,11 +8081,7 @@ def _training_vpc_endpoint_findings(
     emitted = []
     complete = []
     for vpc_id in sorted(present):
-        missing = [
-            service
-            for service in TRAINING_REQUIRED_ENDPOINT_SERVICES
-            if service not in present[vpc_id]
-        ]
+        missing = [service for service in services if service not in present[vpc_id]]
         jobs = sorted(
             {
                 job["name"]
@@ -7470,20 +8092,16 @@ def _training_vpc_endpoint_findings(
         if missing:
             emitted.append(
                 create_finding(
-                    check_id="SM-33",
-                    finding_name=TRAINING_VPC_ENDPOINTS_FINDING,
+                    check_id=check_id,
+                    finding_name=finding_name,
                     finding_details=(
-                        f"VPC {vpc_id}, used by training job(s) "
+                        f"VPC {vpc_id}, used by {subject}(s) "
                         f"{', '.join(jobs[:5])}, has no available endpoint (with "
                         "private DNS for interface endpoints) for "
                         f"{', '.join(prefix + m for m in missing)}, so that "
                         "traffic leaves the VPC or fails."
                     ),
-                    resolution=(
-                        "Create the missing VPC endpoints: a gateway endpoint for "
-                        "S3 and interface endpoints with private DNS for "
-                        "CloudWatch Logs, the SageMaker API, ecr.api and ecr.dkr."
-                    ),
+                    resolution=resolution,
                     reference=TRAINING_NETWORK_BOUNDARY_REFERENCE,
                     severity="Medium",
                     status="Failed",
@@ -7494,14 +8112,14 @@ def _training_vpc_endpoint_findings(
             complete.append(vpc_id)
     unresolved = [s for s in subnets if s not in subnet_vpcs]
     read_details = (
-        f"{len(complete)} VPC(s) used by training jobs have an endpoint for every "
+        f"{len(complete)} VPC(s) used by {subject}s have an endpoint for every "
         f"required service: {', '.join(complete) or 'none'}."
     )
     if unresolved:
         emitted.append(
             _unread_resources_finding(
-                "SM-33",
-                TRAINING_VPC_ENDPOINTS_FINDING,
+                check_id,
+                finding_name,
                 [f"subnet {s} (not found by ec2:DescribeSubnets)" for s in unresolved],
                 read_details,
                 TRAINING_NETWORK_BOUNDARY_REFERENCE,
@@ -7511,8 +8129,8 @@ def _training_vpc_endpoint_findings(
     elif complete and not emitted:
         emitted.append(
             create_finding(
-                check_id="SM-33",
-                finding_name=TRAINING_VPC_ENDPOINTS_FINDING,
+                check_id=check_id,
+                finding_name=finding_name,
                 finding_details=read_details,
                 resolution="No action required",
                 reference=TRAINING_NETWORK_BOUNDARY_REFERENCE,

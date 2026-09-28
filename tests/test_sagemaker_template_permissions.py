@@ -52,6 +52,9 @@ SCOPED_SAGEMAKER_GRANTS = {
     "events:ListTargetsByRule": ":rule/*'",
     "iot:ListPrincipalThings": ":cert/*'",
     "iot:DescribeScheduledAudit": ":scheduledaudit/*'",
+    "s3:GetEncryptionConfiguration": ":s3:::*'",
+    "s3:GetBucketPolicy": ":s3:::*'",
+    "kms:DescribeKey": ":key/*'",
 }
 
 
