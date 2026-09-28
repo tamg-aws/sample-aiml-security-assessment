@@ -9592,6 +9592,68 @@ class TestSM02CacheContractOtherLegs:
         )
         assert failed == ["Denied", "Open"]
 
+    @pytest.mark.parametrize("separate_policy", [False, True])
+    def test_partial_account_wide_deny_leaves_not_every_action(self, separate_policy):
+        # Deny sagemaker:Delete* on "*" removes every delete, so the role no
+        # longer holds every SageMaker action, whichever policy carries it.
+        if separate_policy:
+            policies = [
+                ("All", _identity_policy("sagemaker:*", "*")),
+                (
+                    "NoDelete",
+                    {
+                        "Statement": [
+                            {
+                                "Effect": "Deny",
+                                "Action": "sagemaker:Delete*",
+                                "Resource": "*",
+                            }
+                        ]
+                    },
+                ),
+            ]
+        else:
+            policies = [("All", self._allow_all_with_deny("sagemaker:Delete*"))]
+        cache = _v2_cache(
+            {
+                "Denied": policies,
+                "Open": [("All", _identity_policy("sagemaker:*", "*"))],
+            }
+        )
+        rows = _by_finding(_sm02_rows(cache), sagemaker_app.SERVICE_WIDE_GRANT_FINDING)
+        failed = [r for r in rows if r["Status"] == "Failed"]
+        assert len(failed) == 1
+        assert "Role 'Open'" in failed[0]["Finding_Details"]
+        assert all("Denied" not in r["Finding_Details"] for r in rows)
+
+    def test_deny_scoped_to_one_resource_leaves_the_grant_failed(self):
+        # A Deny on one endpoint ARN removes the deletes on that endpoint only.
+        # On every other SageMaker resource the sagemaker:* statement still
+        # grants read and delete together, so the role stays Failed.
+        scoped = {
+            "Statement": [
+                {"Effect": "Allow", "Action": "sagemaker:*", "Resource": "*"},
+                {
+                    "Effect": "Deny",
+                    "Action": "sagemaker:Delete*",
+                    "Resource": (
+                        "arn:aws:sagemaker:us-east-1:123456789012:endpoint/prod"
+                    ),
+                },
+            ]
+        }
+        cache = _v2_cache(
+            {
+                "Scoped": [("All", scoped)],
+                "Open": [("All", _identity_policy("sagemaker:*", "*"))],
+            }
+        )
+        rows = _by_finding(_sm02_rows(cache), sagemaker_app.SERVICE_WIDE_GRANT_FINDING)
+        failed = sorted(
+            r["Finding_Details"].split("'")[1] for r in rows if r["Status"] == "Failed"
+        )
+        assert failed == ["Open", "Scoped"]
+
     def test_boundary_with_notaction_listing_sagemaker_narrows(self):
         boundary = {
             "Statement": [

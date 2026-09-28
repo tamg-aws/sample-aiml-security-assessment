@@ -1849,8 +1849,9 @@ def _service_wide_grant_findings(
     Report the AIR-FND-IAM-09 leg of SM-02 over customer-managed, inline and
     group policies. AWS managed policies are excluded because the full-access
     leg already reports AmazonSageMakerFullAccess by name, and the merged read
-    and write leg reads them. An identity whose permissions boundary allows no
-    SageMaker action is not reported.
+    and write leg reads them. A statement is reported only when, with the
+    identity's permissions boundary and account-wide Denies applied, it still
+    grants every action in IAM_ACCESS_LEVEL_ACTIONS.
     """
     violations = []
     unreadable = []
@@ -1873,14 +1874,22 @@ def _service_wide_grant_findings(
                 ]
                 if ":iam::aws:policy/" not in (policy.get("arn") or "")
             ] + list(permissions.get("inline_policies") or [])
-            # A boundary that does not allow every SageMaker action leaves the
-            # identity without a service-wide grant, whatever its policies say,
-            # and so does an account-wide Deny that leaves it no SageMaker action.
-            if not _boundary_allows_every_sagemaker_action(
-                permissions.get("permissions_boundary")
-            ) or not _boundary_leaves_sagemaker(permissions):
-                policies_read += len(policies)
-                continue
+            # Denies from every policy, AWS managed included. A customer policy
+            # that cannot be parsed is reported as unread in the loop below.
+            denies = []
+            for policy in [
+                *(permissions.get("attached_policies") or []),
+                *(permissions.get("group_policies") or []),
+                *(permissions.get("inline_policies") or []),
+            ]:
+                try:
+                    denies.extend(
+                        statement
+                        for statement in _merged_statements(policy.get("document"))
+                        if str(statement.get("Effect", "")).upper() == "DENY"
+                    )
+                except (ValueError, TypeError):
+                    continue
             for policy in policies:
                 try:
                     statements = _merged_statements(policy.get("document"))
@@ -1893,7 +1902,15 @@ def _service_wide_grant_findings(
                 policies_read += 1
                 for statement in statements:
                     reason = _service_wide_sagemaker_grant(statement)
-                    if reason:
+                    # The boundary and account-wide Denies can remove any one
+                    # action, so the grant counts only if every action survives.
+                    if (
+                        reason
+                        and _granted_actions(
+                            permissions, [statement, *denies], IAM_ACCESS_LEVEL_ACTIONS
+                        )
+                        >= IAM_ACCESS_LEVEL_ACTIONS
+                    ):
                         violations.append(
                             {
                                 "label": f"{identity_type} '{name}'",
@@ -1913,8 +1930,11 @@ def _service_wide_grant_findings(
                     f"{entry['label']} holds every SageMaker action through "
                     f"customer policy '{entry['policy']}': an Allow statement "
                     f"with {entry['reason']} makes read and delete permissions "
-                    "on the same resource inseparable, and no permissions "
-                    f"boundary narrows it. {SCP_NOT_EVALUATED_NOTE}"
+                    "on the same resource inseparable, and neither its "
+                    "permissions boundary nor an account-wide Deny removes any "
+                    f"of the {len(IAM_ACCESS_LEVEL_ACTIONS)} SageMaker read and "
+                    "write actions the service authorization reference lists "
+                    f"for SageMaker resources. {SCP_NOT_EVALUATED_NOTE}"
                 ),
                 resolution=SERVICE_WIDE_GRANT_RESOLUTION,
                 reference=SERVICE_WIDE_GRANT_REFERENCE,
@@ -1967,10 +1987,11 @@ def _service_wide_grant_findings(
                 finding_name=SERVICE_WIDE_GRANT_FINDING,
                 finding_details=(
                     f"None of the {policies_read} customer-managed, inline or "
-                    'group policies read grants sagemaker:* or "*" or reaches '
-                    "SageMaker through a NotAction Allow that the identity's "
-                    "permissions boundary and account-wide Denies leave in "
-                    "force. Whether each identity's action "
+                    'group policies read grants, through sagemaker:*, "*" or a '
+                    "NotAction Allow, all of the "
+                    f"{len(IAM_ACCESS_LEVEL_ACTIONS)} SageMaker read and write "
+                    "actions once the identity's permissions boundary and "
+                    "account-wide Denies apply. Whether each identity's action "
                     "list matches its role is a workload decision this check "
                     "does not make."
                 ),
@@ -1982,20 +2003,6 @@ def _service_wide_grant_findings(
             )
         )
     return emitted
-
-
-def _boundary_leaves_sagemaker(permissions: Dict[str, Any]) -> bool:
-    """Whether the identity is granted any SageMaker action once its boundary
-    and account-wide Denies apply. A policy that cannot be parsed keeps the
-    grant."""
-    try:
-        return bool(
-            _granted_actions(
-                permissions, _identity_statements(permissions), IAM_ACCESS_LEVEL_ACTIONS
-            )
-        )
-    except (ValueError, TypeError, AttributeError):
-        return True
 
 
 MERGED_READ_WRITE_FINDING = "SageMaker Read and Write Merged in One Grant"
