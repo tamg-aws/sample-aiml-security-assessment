@@ -122,14 +122,18 @@ _EXPECTED_ACTIONS = {
         "s3:PutObject",
     },
     "BedrockSecurityAssessmentFunction": {
+        "backup:DescribeBackupVault",
         "backup:ListBackupVaults",
+        "bedrock-agentcore:GetAgentRuntime",
         "bedrock:GetAccountDataRetention",
         "bedrock:GetAgent",
         "bedrock:GetAgentActionGroup",
+        "bedrock:GetAgentVersion",
         "bedrock:GetAutomatedReasoningPolicy",
         "bedrock:GetCustomModel",
         "bedrock:GetDataSource",
         "bedrock:GetFlow",
+        "bedrock:GetFlowVersion",
         "bedrock:GetGuardrail",
         "bedrock:GetImportedModel",
         "bedrock:GetKnowledgeBase",
@@ -137,13 +141,18 @@ _EXPECTED_ACTIONS = {
         "bedrock:GetModelCustomizationJob",
         "bedrock:GetModelInvocationLoggingConfiguration",
         "bedrock:GetPrompt",
+        "bedrock:GetResourcePolicy",
         "bedrock:ListAgentActionGroups",
+        "bedrock:ListAgentAliases",
+        "bedrock:ListAgentCollaborators",
+        "bedrock:ListAgentKnowledgeBases",
         "bedrock:ListAgents",
         "bedrock:ListAutomatedReasoningPolicies",
         "bedrock:ListCustomModels",
         "bedrock:ListDataSources",
         "bedrock:ListEnforcedGuardrailsConfiguration",
         "bedrock:ListEvaluationJobs",
+        "bedrock:ListFlowAliases",
         "bedrock:ListFlows",
         "bedrock:ListGuardrails",
         "bedrock:ListImportedModels",
@@ -165,8 +174,11 @@ _EXPECTED_ACTIONS = {
         "ec2:DescribeSubnets",
         "ec2:DescribeVpcEndpoints",
         "ec2:DescribeVpcs",
+        "es:DescribeDomain",
         "iam:GenerateServiceLastAccessedDetails",
+        "iam:GetInstanceProfile",
         "iam:GetLoginProfile",
+        "iam:GetRole",
         "iam:GetServiceLastAccessedDetails",
         "iam:ListAccessKeys",
         "iam:ListMFADevices",
@@ -174,33 +186,43 @@ _EXPECTED_ACTIONS = {
         "inspector2:BatchGetAccountStatus",
         "kms:DescribeKey",
         "kms:GetKeyPolicy",
+        "kms:ListGrants",
         "kms:ListKeys",
         "lambda:GetFunction",
         "lambda:GetPolicy",
+        "lambda:ListAliases",
         "lambda:ListFunctionUrlConfigs",
         "lambda:ListFunctions",
+        "lambda:ListVersionsByFunction",
         "logs:DescribeLogGroups",
         "logs:DescribeMetricFilters",
+        "logs:DescribeSubscriptionFilters",
         "macie2:DescribeBuckets",
+        "macie2:DescribeClassificationJob",
         "macie2:GetAutomatedDiscoveryConfiguration",
         "macie2:GetMacieSession",
         "macie2:ListClassificationJobs",
+        "neptune-graph:GetGraph",
         "organizations:DescribeEffectivePolicy",
         "organizations:DescribeOrganization",
         "organizations:DescribePolicy",
+        "organizations:ListParents",
         "organizations:ListPolicies",
         "organizations:ListRoots",
         "organizations:ListTargetsForPolicy",
+        "rds:DescribeDBClusters",
         "s3:GetBucketObjectLockConfiguration",
         "s3:GetBucketPolicy",
         "s3:GetBucketVersioning",
         "s3:GetEncryptionConfiguration",
         "s3:GetLifecycleConfiguration",
         "s3:GetObject",
+        "s3:GetReplicationConfiguration",
         "s3:PutObject",
         "s3vectors:GetIndex",
         "s3vectors:GetVectorBucket",
         "s3vectors:GetVectorBucketPolicy",
+        "secretsmanager:DescribeSecret",
         "servicequotas:GetAWSDefaultServiceQuota",
         "servicequotas:GetServiceQuota",
         "servicequotas:ListServiceQuotas",
@@ -306,12 +328,15 @@ _EXPECTED_ACTIONS = {
         "bedrock-agentcore:GetCodeInterpreter",
         "bedrock-agentcore:GetGateway",
         "bedrock-agentcore:GetGatewayTarget",
+        "bedrock-agentcore:GetHarness",
         "bedrock-agentcore:GetMemory",
         "bedrock-agentcore:GetOnlineEvaluationConfig",
+        "bedrock-agentcore:GetPaymentManager",
         "bedrock-agentcore:GetPolicyEngine",
         "bedrock-agentcore:GetResourcePolicy",
         "bedrock-agentcore:GetTokenVault",
         "bedrock-agentcore:ListAgentRuntimes",
+        "bedrock-agentcore:ListApiKeyCredentialProviders",
         "bedrock-agentcore:ListBrowsers",
         "bedrock-agentcore:ListCodeInterpreters",
         "bedrock-agentcore:ListEvaluators",
@@ -319,11 +344,17 @@ _EXPECTED_ACTIONS = {
         "bedrock-agentcore:ListGatewayTargets",
         "bedrock-agentcore:ListGateways",
         "bedrock-agentcore:ListMemories",
+        "bedrock-agentcore:ListOauth2CredentialProviders",
+        "bedrock-agentcore:ListPaymentCredentialProviders",
         "bedrock-agentcore:ListOnlineEvaluationConfigs",
         "bedrock-agentcore:ListPolicies",
         "bedrock-agentcore:ListPolicyEngines",
+        "bedrock-agentcore:ListWorkloadIdentities",
         "cloudtrail:GetEventSelectors",
+        "cloudtrail:GetTrail",
+        "cloudtrail:GetTrailStatus",
         "cloudtrail:ListTrails",
+        "cloudwatch:DescribeAlarms",
         "cloudwatch:PutMetricData",
         "cognito-idp:DescribeUserPool",
         "cognito-idp:DescribeUserPoolClient",
@@ -339,7 +370,9 @@ _EXPECTED_ACTIONS = {
         "iam:GetRole",
         "iam:GetServiceLastAccessedDetails",
         "kms:Decrypt",
+        "kms:DescribeKey",
         "kms:GetKeyPolicy",
+        "kms:ListGrants",
         "logs:DescribeAccountPolicies",
         "logs:DescribeDeliveries",
         "logs:DescribeDeliverySources",
@@ -349,11 +382,18 @@ _EXPECTED_ACTIONS = {
         "oam:ListSinks",
         "organizations:DescribePolicy",
         "organizations:ListPolicies",
+        "organizations:ListParents",
+        "organizations:ListTargetsForPolicy",
         "route53resolver:GetFirewallConfig",
         "route53resolver:ListFirewallDomainLists",
         "route53resolver:ListFirewallDomains",
         "route53resolver:ListFirewallRuleGroupAssociations",
         "route53resolver:ListFirewallRules",
+        "s3:GetBucketPolicy",
+        "s3:GetBucketPublicAccessBlock",
+        "s3:GetBucketVersioning",
+        "s3:GetEncryptionConfiguration",
+        "s3:GetLifecycleConfiguration",
         "s3:GetObject",
         "s3:PutObject",
         "wafv2:GetWebACL",
@@ -646,6 +686,10 @@ def test_bedrock_resource_level_actions_are_arn_scoped(template):
         "bedrock:GetPrompt",
         "bedrock:GetCustomModel",
         "bedrock:GetFlow",
+        "bedrock:ListAgentAliases",
+        "bedrock:GetAgentVersion",
+        "bedrock:ListFlowAliases",
+        "bedrock:GetFlowVersion",
     ):
         assert action not in inventory
 
@@ -702,6 +746,16 @@ def test_bedrock_organizations_policy_target_read_is_arn_scoped(template):
     assert "organizations::*:policy/*/*/*" in policy_targets
     assert "organizations::aws:policy/*/*" in policy_targets
     assert not re.search(r"Resource:\s+['\"]\*['\"]", policy_targets)
+
+    account_path = _statement_block(
+        template,
+        "BedrockSecurityAssessmentFunction",
+        "OrganizationsAccountPathRead",
+    )
+    assert "organizations:ListParents" in account_path
+    assert "organizations::*:account/o-*/${AWS::AccountId}" in account_path
+    assert "organizations::*:ou/o-*/ou-*" in account_path
+    assert not re.search(r"Resource:\s+['\"]\*['\"]", account_path)
 
 
 @pytest.mark.parametrize("template", _SAM_TEMPLATES, ids=os.path.basename)
@@ -965,6 +1019,10 @@ def test_agentcore_observability_and_governance_reads_are_scoped_where_iam_allow
             "cloudtrail:GetEventSelectors",
             "cloudtrail:*:${AWS::AccountId}:trail/*",
         ),
+        "AgentCoreIdentityInventory": (
+            "bedrock-agentcore:ListWorkloadIdentities",
+            "bedrock-agentcore:*:${AWS::AccountId}:workload-identity-directory/*",
+        ),
         "LogsDataProtectionPolicyRead": (
             "logs:GetDataProtectionPolicy",
             "logs:*:${AWS::AccountId}:log-group:*",
@@ -975,6 +1033,10 @@ def test_agentcore_observability_and_governance_reads_are_scoped_where_iam_allow
         ),
         "LogEncryptionKeyPolicyRead": (
             "kms:GetKeyPolicy",
+            "kms:*:${AWS::AccountId}:key/*",
+        ),
+        "PolicyEngineKeyStateRead": (
+            "kms:ListGrants",
             "kms:*:${AWS::AccountId}:key/*",
         ),
         "OrganizationsPolicyRead": (
@@ -989,6 +1051,19 @@ def test_agentcore_observability_and_governance_reads_are_scoped_where_iam_allow
         assert action in statement
         assert resource in statement
         assert not re.search(r"Resource:\s+['\"]\*['\"]", statement)
+
+    # AC-18 reads each trail's logging state beside its selectors, on the same
+    # trail ARN, and lists the credential providers in the token vault.
+    trail_read = _statement_block(
+        template, "AgentCoreSecurityAssessmentFunction", "CloudTrailEventSelectorRead"
+    )
+    assert "cloudtrail:GetTrailStatus" in trail_read
+    identity = _statement_block(
+        template, "AgentCoreSecurityAssessmentFunction", "AgentCoreIdentityInventory"
+    )
+    assert "bedrock-agentcore:ListOauth2CredentialProviders" in identity
+    assert "bedrock-agentcore:ListApiKeyCredentialProviders" in identity
+    assert "bedrock-agentcore:*:${AWS::AccountId}:token-vault/*" in identity
 
     # DescribeSecurityGroups has no resource-level authorization either, so it
     # joins the existing EC2 enumeration statement instead of getting a wildcard
@@ -1008,6 +1083,23 @@ def test_agentcore_observability_and_governance_reads_are_scoped_where_iam_allow
     assert "iam::${AWS::AccountId}:role/*" in gateway_role
     assert "iam::*:role/" not in gateway_role
     assert not re.search(r"Resource:\s+['\"]\*['\"]", gateway_role)
+
+    # AC-06 reads each recording bucket, whose name the customer chose, so the
+    # grant covers bucket ARNs and nothing wider.
+    recording = _statement_block(
+        template, "AgentCoreSecurityAssessmentFunction", "BrowserRecordingBucketRead"
+    )
+    for action in (
+        "s3:GetEncryptionConfiguration",
+        "s3:GetBucketPublicAccessBlock",
+        "s3:GetBucketPolicy",
+        "s3:GetLifecycleConfiguration",
+        "s3:GetBucketVersioning",
+    ):
+        assert action in recording
+    assert "Resource: !Sub 'arn:${AWS::Partition}:s3:::*'" in recording
+    assert "s3:GetAccountPublicAccessBlock" not in recording
+    assert not re.search(r"Resource:\s+['\"]\*['\"]", recording)
 
 
 @pytest.mark.parametrize("template", _SAM_TEMPLATES, ids=os.path.basename)
@@ -1076,6 +1168,18 @@ def test_aisf_phase5_reads_wildcard_only_where_iam_has_no_resource_type(template
         ("BedrockSecurityAssessmentFunction", "BedrockApiKeyInventoryRead"): (
             "iam:ListMFADevices",
             "iam::${AWS::AccountId}:user/*",
+        ),
+        ("BedrockSecurityAssessmentFunction", "AIRoleTrustPolicyRead"): (
+            "iam:GetRole",
+            "iam::${AWS::AccountId}:role/*",
+        ),
+        ("BedrockSecurityAssessmentFunction", "EC2InstanceProfileRoleRead"): (
+            "iam:GetInstanceProfile",
+            "iam::${AWS::AccountId}:instance-profile/*",
+        ),
+        ("BedrockSecurityAssessmentFunction", "BedrockInvocationLogInspection"): (
+            "logs:DescribeSubscriptionFilters",
+            "logs:*:${AWS::AccountId}:log-group:*",
         ),
         ("BedrockSecurityAssessmentFunction", "OrganizationsEffectivePolicyRead"): (
             "organizations:DescribeEffectivePolicy",
