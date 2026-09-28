@@ -915,6 +915,19 @@ NETWORK_PATH_CONDITION_KEYS = {
     "aws:sourceip",
 }
 
+# Every action that invokes a runtime, from the bedrock-agentcore service
+# reference, where each takes the runtime and runtime-endpoint resource types. A
+# restriction on InvokeAgentRuntime alone leaves the command, shell, WebSocket and
+# per-user paths open to the same caller.
+AGENTCORE_RUNTIME_INVOKE_ACTIONS = (
+    "bedrock-agentcore:InvokeAgentRuntime",
+    "bedrock-agentcore:InvokeAgentRuntimeForUser",
+    "bedrock-agentcore:InvokeAgentRuntimeCommand",
+    "bedrock-agentcore:InvokeAgentRuntimeCommandShell",
+    "bedrock-agentcore:InvokeAgentRuntimeWithWebSocketStream",
+    "bedrock-agentcore:InvokeAgentRuntimeWithWebSocketStreamForUser",
+)
+
 # KMS actions that read log data under a customer managed key. A key policy that
 # allows one of these to every principal with no condition hands the plaintext to
 # anyone the account trusts, which defeats the point of the CMK.
@@ -13034,6 +13047,7 @@ def _restricting_deny(
     resource_arn: str,
     keys: Set[str],
     bounded: Callable[[str, List[str]], bool],
+    exempt_aws_service: bool = False,
 ) -> Tuple[List[str], str]:
     """Judge one resource-policy statement as a Deny that restricts `action`.
 
@@ -13042,7 +13056,10 @@ def _restricting_deny(
     values named under `keys`, and otherwise the reason it does not. The reason
     is empty for a statement that names none of `keys`. Every condition entry
     must be one of `keys` under a negated operator: any other entry is ANDed in,
-    so a request that fails it is not denied.
+    so a request that fails it is not denied. With `exempt_aws_service`, a
+    Bool aws:ViaAWSService false entry is the one ANDed entry accepted: it
+    exempts only a call an AWS service makes on the caller's behalf, the form
+    the AgentCore network-path Deny is written in.
     """
     named = sorted(key for key in _statement_condition_keys(statement) if key in keys)
     if not named:
@@ -13078,6 +13095,14 @@ def _restricting_deny(
             return [], f"a Deny on {listed} carries an unreadable {operator} entry"
         for key, raw in entries.items():
             key = str(key).strip().lower()
+            if (
+                exempt_aws_service
+                and key == "aws:viaawsservice"
+                and name == "bool"
+                and [value.strip().lower() for value in _condition_values(raw)]
+                == ["false"]
+            ):
+                continue
             if key not in keys:
                 return [], (
                     f"a Deny on {listed} also requires {key}, so a request "
@@ -13103,6 +13128,7 @@ def _resource_policy_restriction(
     resource_arn: str,
     keys: Set[str],
     bounded: Callable[[str, List[str]], bool],
+    exempt_aws_service: bool = False,
 ) -> Tuple[List[str], List[str]]:
     """Return (restricting keys, reasons) over every statement of one policy.
 
@@ -13115,7 +13141,7 @@ def _resource_policy_restriction(
     reasons: List[str] = []
     for statement in statements:
         named, reason = _restricting_deny(
-            statement, action, resource_arn, keys, bounded
+            statement, action, resource_arn, keys, bounded, exempt_aws_service
         )
         restricting.update(named)
         if reason:
@@ -13490,6 +13516,7 @@ def _gateway_resource_policy_findings(
         str(gateway_arn),
         NETWORK_PATH_CONDITION_KEYS,
         _network_values_are_bounded,
+        exempt_aws_service=True,
     )
     if network_keys:
         findings.append(
@@ -13502,6 +13529,17 @@ def _gateway_resource_policy_findings(
                     "request from outside the network path named by "
                     f"{', '.join(network_keys)}, and every value it names is "
                     "bounded."
+                    + (
+                        " A Deny exempts calls an AWS service makes on the "
+                        "caller's behalf (Bool aws:ViaAWSService false)."
+                        if any(
+                            statement.get("Effect") == "Deny"
+                            and "aws:viaawsservice"
+                            in _statement_condition_keys(statement)
+                            for statement in _document_statements(policy)
+                        )
+                        else ""
+                    )
                 ),
                 resolution=(
                     "No action required. Confirm the VPC, VPC endpoint or address "
@@ -22067,6 +22105,48 @@ def check_agentcore_runtime_session_limits() -> List[Dict[str, Any]]:
     return findings
 
 
+def _runtime_invoke_restriction(
+    statements: List[Dict[str, Any]],
+    runtime_arn: str,
+    keys: Set[str],
+    bounded: Callable[[str, List[str]], bool],
+    exempt_aws_service: bool = False,
+) -> Tuple[List[str], List[str], List[str]]:
+    """Return (restricting keys, reasons, unrestricted actions) for a runtime.
+
+    The keys are credited only when a Deny restricts every runtime invoke
+    action, since a caller refused InvokeAgentRuntime can still reach the agent
+    through InvokeAgentRuntimeCommandShell. The reasons are de-duplicated across
+    actions, and the actions list names each invoke action no Deny restricts.
+    """
+    restricting: Set[str] = set()
+    reasons: List[str] = []
+    open_actions: List[str] = []
+    for action in AGENTCORE_RUNTIME_INVOKE_ACTIONS:
+        named, action_reasons = _resource_policy_restriction(
+            statements, action, runtime_arn, keys, bounded, exempt_aws_service
+        )
+        if named:
+            restricting.update(named)
+        else:
+            open_actions.append(action)
+            reasons.extend(action_reasons)
+    reasons = list(dict.fromkeys(reasons))
+    if open_actions:
+        return [], reasons, open_actions
+    return sorted(restricting), reasons, []
+
+
+def _open_actions_text(open_actions: List[str]) -> str:
+    """Name the runtime invoke actions a restriction leaves open, if only some."""
+    if len(open_actions) == len(AGENTCORE_RUNTIME_INVOKE_ACTIONS):
+        return ""
+    return (
+        " A Deny restricts some runtime invoke actions but not "
+        f"{', '.join(open_actions)}, which reach the agent without it."
+    )
+
+
 def check_agentcore_runtime_invocation_path() -> List[Dict[str, Any]]:
     """AC-47: Judge the network path and the caller allowed to invoke a runtime.
 
@@ -22197,24 +22277,35 @@ def check_agentcore_runtime_invocation_path() -> List[Dict[str, Any]]:
         # endpoint" is the form AWS documents, and a resource-policy Allow does
         # not bind a same-account caller whose identity policy grants the call.
         statements = list(_document_statements(policy))
-        network_keys, network_gaps = _resource_policy_restriction(
+        invoke_actions = ", ".join(AGENTCORE_RUNTIME_INVOKE_ACTIONS)
+        network_keys, network_gaps, network_open = _runtime_invoke_restriction(
             statements,
-            "bedrock-agentcore:InvokeAgentRuntime",
             str(runtime_arn or ""),
             NETWORK_PATH_CONDITION_KEYS,
             _network_values_are_bounded,
+            exempt_aws_service=True,
         )
         if network_keys:
+            exemption_text = (
+                " A Deny exempts calls an AWS service makes on the caller's "
+                "behalf (Bool aws:ViaAWSService false)."
+                if any(
+                    statement.get("Effect") == "Deny"
+                    and "aws:viaawsservice" in _statement_condition_keys(statement)
+                    for statement in statements
+                )
+                else ""
+            )
             findings.append(
                 create_finding(
                     check_id="AC-47",
                     finding_name="AgentCore Runtime Network Path Scope",
                     finding_details=(
-                        f"{label} has a resource policy that denies "
-                        "bedrock-agentcore:InvokeAgentRuntime to every principal "
-                        "on a request from outside the network path named by "
+                        f"{label} has a resource policy that denies every runtime "
+                        f"invoke action ({invoke_actions}) to every principal on a "
+                        "request from outside the network path named by "
                         f"{', '.join(network_keys)}, and every value it names is "
-                        "bounded."
+                        f"bounded.{exemption_text}"
                     ),
                     resolution=(
                         "No action required. Confirm the VPC, VPC endpoint or "
@@ -22237,19 +22328,21 @@ def check_agentcore_runtime_invocation_path() -> List[Dict[str, Any]]:
                     check_id="AC-47",
                     finding_name="AgentCore Runtime Network Path Unrestricted",
                     finding_details=(
-                        f"{label} has no resource policy Deny that refuses "
-                        "bedrock-agentcore:InvokeAgentRuntime to every principal "
-                        "outside a bounded aws:SourceVpc, aws:SourceVpce, "
-                        "aws:VpcSourceIp or aws:SourceIp value, so a caller that "
-                        "satisfies its inbound authentication reaches it over any "
-                        "network path, including the public internet."
-                        f"{gap_text}"
+                        f"{label} has no resource policy Deny that refuses every "
+                        "runtime invoke action to every principal outside a "
+                        "bounded aws:SourceVpc, aws:SourceVpce, aws:VpcSourceIp or "
+                        "aws:SourceIp value, so a caller that satisfies its inbound "
+                        "authentication reaches it over any network path, "
+                        "including the public internet."
+                        f"{_open_actions_text(network_open)}{gap_text}"
                     ),
                     resolution=(
-                        "Attach a runtime resource policy that denies invocation "
-                        "whose aws:SourceVpce is not the approved interface "
-                        "endpoint, or express the same restriction in a service "
-                        "control policy."
+                        "Attach a runtime resource policy that denies "
+                        f"{invoke_actions} whose aws:SourceVpce is not the "
+                        "approved interface endpoint, adding Bool "
+                        "aws:ViaAWSService false if AWS service calls must pass, "
+                        "or express the same restriction in a service control "
+                        "policy."
                     ),
                     reference=AGENTCORE_VPC_INTERFACE_ENDPOINT_REFERENCE_URL,
                     severity=SeverityEnum.MEDIUM,
@@ -22271,9 +22364,8 @@ def check_agentcore_runtime_invocation_path() -> List[Dict[str, Any]]:
                 f"{len(workload_identities)} workload identity(ies)"
             )
 
-        caller_keys, caller_gaps = _resource_policy_restriction(
+        caller_keys, caller_gaps, caller_open = _runtime_invoke_restriction(
             statements,
-            "bedrock-agentcore:InvokeAgentRuntime",
             str(runtime_arn or ""),
             {"aws:principalarn"},
             lambda _key, values: (
@@ -22283,8 +22375,8 @@ def check_agentcore_runtime_invocation_path() -> List[Dict[str, Any]]:
         )
         if caller_keys:
             restrictions.append(
-                "a resource policy Deny refusing every principal outside a "
-                "bounded aws:PrincipalArn list"
+                "a resource policy Deny refusing every runtime invoke action to "
+                "every principal outside a bounded aws:PrincipalArn list"
             )
 
         if restrictions:
@@ -22334,20 +22426,19 @@ def check_agentcore_runtime_invocation_path() -> List[Dict[str, Any]]:
                     finding_details=(
                         f"{label} carries neither an allowedWorkloadConfiguration "
                         "on its JWT authorizer nor a resource policy Deny that "
-                        "refuses every principal outside a bounded "
-                        "aws:PrincipalArn list, so a caller that satisfies its "
-                        "inbound authentication reaches the agent directly and "
-                        "the tool policy, rate limits and audit trail of the "
-                        "gateway in front of it do not apply."
-                        f"{allow_text}{gap_text}"
+                        "refuses every runtime invoke action to every principal "
+                        "outside a bounded aws:PrincipalArn list, so a caller that "
+                        "satisfies its inbound authentication reaches the agent "
+                        "directly and the tool policy, rate limits and audit "
+                        "trail of the gateway in front of it do not apply."
+                        f"{_open_actions_text(caller_open)}{allow_text}{gap_text}"
                     ),
                     resolution=(
                         "Set allowedWorkloadConfiguration on the runtime's JWT "
                         "authorizer to the gateways allowed to invoke it, or for "
                         "SigV4 callers attach a resource policy that denies "
-                        "bedrock-agentcore:InvokeAgentRuntime to every principal "
-                        "whose aws:PrincipalArn is not the gateway's execution "
-                        "role."
+                        f"{invoke_actions} to every principal whose "
+                        "aws:PrincipalArn is not the gateway's execution role."
                     ),
                     reference=AGENTCORE_ALLOWED_WORKLOAD_REFERENCE_URL,
                     severity=SeverityEnum.HIGH,

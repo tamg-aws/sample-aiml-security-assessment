@@ -22640,7 +22640,7 @@ class TestAC47RuntimeInvocationPath:
                     {
                         "Effect": "Deny",
                         "Principal": "*",
-                        "Action": "bedrock-agentcore:InvokeAgentRuntime",
+                        "Action": _RUNTIME_INVOKE_ACTIONS,
                         "Resource": "*",
                         "Condition": {
                             "StringNotEquals": {condition_key: value},
@@ -22896,12 +22896,26 @@ class TestAC47RuntimeInvocationPath:
         assert "GetResourcePolicy" in model.operation_names
 
 
-def _deny_invoke(condition, action="bedrock-agentcore:InvokeAgentRuntime", **extra):
+# The runtime invoke actions, written out from the bedrock-agentcore service
+# reference and not read from the module, so a shortened constant fails here.
+_RUNTIME_INVOKE_ACTIONS = [
+    "bedrock-agentcore:InvokeAgentRuntime",
+    "bedrock-agentcore:InvokeAgentRuntimeForUser",
+    "bedrock-agentcore:InvokeAgentRuntimeCommand",
+    "bedrock-agentcore:InvokeAgentRuntimeCommandShell",
+    "bedrock-agentcore:InvokeAgentRuntimeWithWebSocketStream",
+    "bedrock-agentcore:InvokeAgentRuntimeWithWebSocketStreamForUser",
+]
+
+
+# Stricter since round 2: the default Deny names every runtime invoke action, as
+# AC-47 now requires, where it named InvokeAgentRuntime alone.
+def _deny_invoke(condition, action=tuple(_RUNTIME_INVOKE_ACTIONS), **extra):
     """Return one Deny statement on every principal under `condition`."""
     return {
         "Effect": "Deny",
         "Principal": "*",
-        "Action": action,
+        "Action": list(action) if isinstance(action, tuple) else action,
         "Resource": "*",
         "Condition": condition,
         **extra,
@@ -23254,6 +23268,242 @@ class TestAC47DenyForm:
         assert "admits every path" in network["gw-wild"]["Finding_Details"]
         assert network["gw-allow"]["Status"] == "Failed"
         assert "an Allow statement" in network["gw-allow"]["Finding_Details"]
+
+
+_VPCE_DENY = {"StringNotEquals": {"aws:SourceVpce": "vpce-1"}}
+_GATEWAY_ROLE_DENY = {
+    "ArnNotEquals": {"aws:PrincipalArn": "arn:aws:iam::123456789012:role/gw"}
+}
+_VIA_AWS_SERVICE_FALSE = {"Bool": {"aws:ViaAWSService": "false"}}
+
+
+class TestAC47EveryInvokeAction:
+    """AC-47 credits a Deny only when it restricts every runtime invoke action."""
+
+    def _judge(self, mock_ac, statements_by_runtime):
+        _wire_runtimes(
+            mock_ac, [_vpc_runtime(runtime_id) for runtime_id in statements_by_runtime]
+        )
+        mock_ac.get_resource_policy.side_effect = lambda resourceArn: {
+            "policy": json.dumps(
+                {"Statement": statements_by_runtime[resourceArn.rsplit("/", 1)[-1]]}
+            )
+        }
+        return agentcore_app.check_agentcore_runtime_invocation_path()
+
+    def _leg(self, findings, runtime_id, leg):
+        matches = [
+            finding
+            for finding in findings
+            if leg in finding["Finding"]
+            and f"({runtime_id})" in finding["Finding_Details"]
+        ]
+        assert len(matches) == 1
+        return matches[0]
+
+    def test_the_action_list_is_the_service_reference_list(self):
+        assert list(agentcore_app.AGENTCORE_RUNTIME_INVOKE_ACTIONS) == (
+            _RUNTIME_INVOKE_ACTIONS
+        )
+
+    @pytest.mark.parametrize("omitted", _RUNTIME_INVOKE_ACTIONS)
+    @patch("agentcore_app.agentcore_client")
+    def test_a_network_deny_missing_one_action_fails_and_names_it(
+        self, mock_ac, omitted
+    ):
+        actions = [action for action in _RUNTIME_INVOKE_ACTIONS if action != omitted]
+        findings = self._judge(
+            mock_ac, {"rt-1": [_deny_invoke(_VPCE_DENY, action=actions)]}
+        )
+
+        leg = self._leg(findings, "rt-1", "Network Path")
+        assert leg["Status"] == "Failed"
+        assert f"but not {omitted}, which reach" in leg["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_network_deny_on_invoke_agent_runtime_alone_fails(self, mock_ac):
+        # Before round 2 this passed: the shell, command and WebSocket paths stayed
+        # open to a caller on any network.
+        findings = self._judge(
+            mock_ac,
+            {
+                "rt-1": [
+                    _deny_invoke(
+                        _VPCE_DENY, action="bedrock-agentcore:InvokeAgentRuntime"
+                    )
+                ]
+            },
+        )
+
+        leg = self._leg(findings, "rt-1", "Network Path")
+        assert leg["Status"] == "Failed"
+        for action in _RUNTIME_INVOKE_ACTIONS[1:]:
+            assert action in leg["Finding_Details"]
+        for action in _RUNTIME_INVOKE_ACTIONS:
+            assert action in leg["Resolution"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_caller_deny_on_invoke_agent_runtime_alone_fails(self, mock_ac):
+        findings = self._judge(
+            mock_ac,
+            {
+                "rt-1": [
+                    _deny_invoke(
+                        _GATEWAY_ROLE_DENY,
+                        action="bedrock-agentcore:InvokeAgentRuntime",
+                    )
+                ]
+            },
+        )
+
+        leg = self._leg(findings, "rt-1", "Caller")
+        assert leg["Status"] == "Failed"
+        assert (
+            "bedrock-agentcore:InvokeAgentRuntimeCommandShell"
+            in (leg["Finding_Details"])
+        )
+        for action in _RUNTIME_INVOKE_ACTIONS:
+            assert action in leg["Resolution"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_denies_split_across_statements_cover_every_action(self, mock_ac):
+        findings = self._judge(
+            mock_ac,
+            {
+                "rt-1": [
+                    _deny_invoke(_VPCE_DENY, action=_RUNTIME_INVOKE_ACTIONS[:3]),
+                    _deny_invoke(_VPCE_DENY, action=_RUNTIME_INVOKE_ACTIONS[3:]),
+                ]
+            },
+        )
+
+        assert self._leg(findings, "rt-1", "Network Path")["Status"] == "Passed"
+
+    @patch("agentcore_app.agentcore_client")
+    def test_every_runtime_is_judged_on_its_own_action_coverage(self, mock_ac):
+        findings = self._judge(
+            mock_ac,
+            {
+                "rt-full": [
+                    _deny_invoke(_VPCE_DENY),
+                    _deny_invoke(_GATEWAY_ROLE_DENY),
+                ],
+                "rt-one": [
+                    _deny_invoke(
+                        _VPCE_DENY, action="bedrock-agentcore:InvokeAgentRuntime"
+                    ),
+                    _deny_invoke(
+                        _GATEWAY_ROLE_DENY,
+                        action="bedrock-agentcore:InvokeAgentRuntime",
+                    ),
+                ],
+            },
+        )
+
+        assert self._leg(findings, "rt-full", "Network Path")["Status"] == "Passed"
+        assert self._leg(findings, "rt-full", "Caller")["Status"] == "Passed"
+        assert self._leg(findings, "rt-one", "Network Path")["Status"] == "Failed"
+        assert self._leg(findings, "rt-one", "Caller")["Status"] == "Failed"
+
+    @patch("agentcore_app.agentcore_client")
+    def test_the_via_aws_service_form_passes_and_is_named(self, mock_ac):
+        # The RT-13 recommendation writes the network Deny with Bool
+        # aws:ViaAWSService false. Before round 2 that ANDed entry failed it.
+        findings = self._judge(
+            mock_ac,
+            {"rt-1": [_deny_invoke({**_VPCE_DENY, **_VIA_AWS_SERVICE_FALSE})]},
+        )
+
+        leg = self._leg(findings, "rt-1", "Network Path")
+        assert leg["Status"] == "Passed"
+        assert "Bool aws:ViaAWSService false" in leg["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_network_deny_without_the_exemption_does_not_claim_one(self, mock_ac):
+        findings = self._judge(mock_ac, {"rt-1": [_deny_invoke(_VPCE_DENY)]})
+
+        leg = self._leg(findings, "rt-1", "Network Path")
+        assert leg["Status"] == "Passed"
+        assert "ViaAWSService" not in leg["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "exemption",
+        [
+            {"Bool": {"aws:ViaAWSService": "true"}},
+            {"Bool": {"aws:ViaAWSService": ["false", "true"]}},
+            {"StringEquals": {"aws:ViaAWSService": "false"}},
+        ],
+        ids=["true", "both-values", "string-operator"],
+    )
+    @patch("agentcore_app.agentcore_client")
+    def test_another_via_aws_service_entry_still_fails(self, mock_ac, exemption):
+        findings = self._judge(
+            mock_ac, {"rt-1": [_deny_invoke({**_VPCE_DENY, **exemption})]}
+        )
+
+        leg = self._leg(findings, "rt-1", "Network Path")
+        assert leg["Status"] == "Failed"
+        assert "also requires aws:viaawsservice" in leg["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_the_exemption_is_not_accepted_on_the_caller_deny(self, mock_ac):
+        # The recommendation places the exemption on the network Deny only. On
+        # the caller Deny it would let any principal through an AWS service.
+        findings = self._judge(
+            mock_ac,
+            {"rt-1": [_deny_invoke({**_GATEWAY_ROLE_DENY, **_VIA_AWS_SERVICE_FALSE})]},
+        )
+
+        leg = self._leg(findings, "rt-1", "Caller")
+        assert leg["Status"] == "Failed"
+        assert "also requires aws:viaawsservice" in leg["Finding_Details"]
+
+    @patch("agentcore_app.iam_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_the_gateway_network_leg_accepts_the_via_aws_service_form(
+        self, mock_ac, mock_iam
+    ):
+        policies = {
+            "gw-exempt": [
+                _deny_invoke(
+                    {**_VPCE_DENY, **_VIA_AWS_SERVICE_FALSE},
+                    action="bedrock-agentcore:InvokeGateway",
+                )
+            ],
+            "gw-plain": [
+                _deny_invoke(_VPCE_DENY, action="bedrock-agentcore:InvokeGateway")
+            ],
+        }
+        mock_ac.list_gateways.return_value = {
+            "items": [{"gatewayId": name, "name": name} for name in policies]
+        }
+        mock_ac.get_gateway.side_effect = lambda gatewayIdentifier: {
+            "gatewayArn": (
+                "arn:aws:bedrock-agentcore:us-east-1:123456789012:gateway/"
+                f"{gatewayIdentifier}"
+            ),
+            "roleArn": "arn:aws:iam::123456789012:role/GuardedRole",
+        }
+        mock_ac.get_resource_policy.side_effect = lambda resourceArn: {
+            "policy": json.dumps(
+                {"Statement": policies[resourceArn.rsplit("/", 1)[-1]]}
+            )
+        }
+        mock_iam.get_role.return_value = {
+            "Role": {"AssumeRolePolicyDocument": _GUARDED_TRUST}
+        }
+
+        findings = agentcore_app.check_agentcore_gateway_policy_conditions()
+        network = {
+            finding["Finding_Details"].split("'")[1]: finding
+            for finding in findings
+            if "Network Path" in finding["Finding"]
+        }
+
+        assert network["gw-exempt"]["Status"] == "Passed"
+        assert "Bool aws:ViaAWSService false" in network["gw-exempt"]["Finding_Details"]
+        assert network["gw-plain"]["Status"] == "Passed"
+        assert "ViaAWSService" not in network["gw-plain"]["Finding_Details"]
 
 
 class TestRuntimeIsolationCheckRegistration:

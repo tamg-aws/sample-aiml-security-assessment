@@ -1104,6 +1104,20 @@ _VERIFIED_REMEDIATION_IAM_ACTIONS |= {"ec2:DescribeVpcs"}
 # name it when a security group rule references a prefix list whose entries
 # could not be read.
 _VERIFIED_REMEDIATION_IAM_ACTIONS |= {"ec2:GetManagedPrefixListEntries"}
+# Verified on 2026-09-28 with one IDENTITY_POLICY validate-policy run for the
+# AC-47 runtime invoke actions, one statement per name on a runtime ARN.
+# aws:ViaAWSService at index 0 and bedrock-agentcore:InvokeAgentRuntimeForUser,
+# InvokeAgentRuntimeWithWebSocketStream and
+# InvokeAgentRuntimeWithWebSocketStreamForUser at indexes 2 to 4 were not
+# reported. The negative controls aws:ViaAWSServiceNotReal (index 1),
+# InvokeAgentRuntimeForUsers and InvokeAgentRuntimeWithWebSocketStreams
+# (indexes 5 and 6) came back INVALID_GLOBAL_CONDITION_KEY and INVALID_ACTION.
+_VERIFIED_REMEDIATION_IAM_ACTIONS |= {
+    "bedrock-agentcore:InvokeAgentRuntimeForUser",
+    "bedrock-agentcore:InvokeAgentRuntimeWithWebSocketStream",
+    "bedrock-agentcore:InvokeAgentRuntimeWithWebSocketStreamForUser",
+}
+_VERIFIED_REMEDIATION_CONDITION_KEYS |= {"aws:ViaAWSService"}
 # Verified on 2026-09-28 against the kms service reference JSON, which lists the
 # condition key kms:EncryptionContext:${EncryptionContextKey}. AC-12 names it
 # with the gateway context key aws:bedrock-agentcore-gateway:arn from the

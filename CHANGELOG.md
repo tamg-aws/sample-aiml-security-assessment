@@ -208,6 +208,12 @@ section.
 
 ### Fixed
 
+- `AC-47` credits a runtime network or caller `Deny` only when it reaches all
+  six runtime invoke actions, and names the ones it misses. A `Deny` on
+  `InvokeAgentRuntime` alone passed, leaving the command shell, command,
+  WebSocket and per-user paths open. The network `Deny` of `AC-47` and
+  `AC-27` now accepts `Bool` `aws:ViaAWSService` `false`, the
+  form AISF `AIR-ACR-RT-13` gives, which failed as an ANDed key.
 - `AC-01` egress and `AC-08` endpoint inbound scope read the entries of each
   prefix list a security group rule names, so a prefix list holding
   `0.0.0.0/0` or the VPC CIDR fails, and an unread prefix list reports
