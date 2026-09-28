@@ -3702,7 +3702,7 @@ class TestSM33TrainingJobNetworkBoundary:
         assert "Network isolation is off as well" in failed[0]["Finding_Details"]
         assert len(passed) == 1
         assert "subnet-a" in passed[0]["Finding_Details"]
-        assert "2 most recent" in passed[0]["Finding_Details"]
+        assert "of the 2 training jobs" in passed[0]["Finding_Details"]
         for f in findings:
             assert f["Check_ID"] == "SM-33"
             assert_finding_schema(f)
@@ -3722,14 +3722,14 @@ class TestSM33TrainingJobNetworkBoundary:
         assert "Network isolation is on" in findings[0]["Finding_Details"]
 
     @patch("sagemaker_app.boto3.client")
-    def test_sample_is_bounded_to_the_most_recent_jobs(self, mock_client):
+    def test_every_training_job_is_read_not_a_sample(self, mock_client):
+        # AIR-SGM-TRN-01 full grade: the 50-job sample hid every older job.
         _, paginator = self._jobs(mock_client, {})
         sagemaker_app.check_sagemaker_training_job_network_boundary(region="us-east-1")
         paginator.paginate.assert_called_once_with(
-            SortBy="CreationTime",
-            SortOrder="Descending",
-            PaginationConfig={"MaxItems": sagemaker_app.MAX_TRAINING_JOBS_SAMPLED},
+            SortBy="CreationTime", SortOrder="Descending"
         )
+        assert not hasattr(sagemaker_app, "MAX_TRAINING_JOBS_SAMPLED")
 
     @patch("sagemaker_app.boto3.client")
     def test_no_training_jobs_returns_na(self, mock_client):
@@ -6242,3 +6242,689 @@ class TestSM02CacheContractOtherLegs:
         summary = _by_finding(rows, "SageMaker IAM Permissions Check")
         assert [r["Status"] for r in summary] == ["N/A"]
         assert "bob" in summary[0]["Finding_Details"]
+
+
+# ===================================================================
+# SM-11 full grade: AIR-SGM-EP-01 and AIR-SGM-EP-03
+# ===================================================================
+def _pages_client(pages, calls=None, **methods):
+    """A client whose paginators return pages[operation] and whose methods are given."""
+    client = MagicMock()
+
+    def get_paginator(operation_name):
+        paginator = MagicMock()
+
+        def paginate(**kwargs):
+            if calls is not None:
+                calls.setdefault(operation_name, []).append(kwargs)
+            value = pages.get(operation_name, [])
+            if isinstance(value, Exception):
+                raise value
+            limit = (kwargs.get("PaginationConfig") or {}).get("MaxItems")
+            if limit is None:
+                return value
+            # Honour MaxItems the way botocore does, so a capped sweep is visible.
+            capped = []
+            for page in value:
+                page = dict(page)
+                for key, items in page.items():
+                    if isinstance(items, list):
+                        page[key] = items[:limit]
+                        limit -= len(page[key])
+                capped.append(page)
+            return capped
+
+        paginator.paginate.side_effect = paginate
+        return paginator
+
+    client.get_paginator.side_effect = get_paginator
+    for name, value in methods.items():
+        setattr(client, name, value)
+    return client
+
+
+_ISOLATED_VPC_MODEL = {
+    "EnableNetworkIsolation": True,
+    "VpcConfig": {"Subnets": ["subnet-private"], "SecurityGroupIds": ["sg-1"]},
+}
+_PRIVATE_RUNTIME_VPCE = {
+    "VpcEndpointId": "vpce-good",
+    "VpcId": "vpc-1",
+    "VpcEndpointType": "Interface",
+    "State": "available",
+    "PrivateDnsEnabled": True,
+}
+
+
+def _sm11_rows(models, endpoints=None, configs=None, vpces=None, extra_pages=None):
+    """Run SM-11 against models {name: DescribeModel}, endpoints {name: config}."""
+    endpoints = endpoints or {}
+    configs = configs or {}
+    pages = {
+        "list_models": [{"Models": [{"ModelName": n} for n in models]}],
+        "list_endpoints": [
+            {
+                "Endpoints": [
+                    {"EndpointName": n, "EndpointStatus": "InService"}
+                    for n in endpoints
+                ]
+            }
+        ],
+    }
+    pages.update(extra_pages or {})
+
+    def describe_model(ModelName):
+        value = models[ModelName]
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+    def describe_endpoint(EndpointName):
+        value = endpoints[EndpointName]
+        if isinstance(value, Exception):
+            raise value
+        return {"EndpointName": EndpointName, "EndpointConfigName": value}
+
+    def describe_endpoint_config(EndpointConfigName):
+        return configs[EndpointConfigName]
+
+    sm = _pages_client(
+        pages,
+        describe_model=MagicMock(side_effect=describe_model),
+        describe_endpoint=MagicMock(side_effect=describe_endpoint),
+        describe_endpoint_config=MagicMock(side_effect=describe_endpoint_config),
+    )
+    ec2_pages = {
+        "describe_subnets": [{"Subnets": PRIVATE_SUBNET_FIXTURE[0]}],
+        "describe_route_tables": [{"RouteTables": PRIVATE_SUBNET_FIXTURE[1]}],
+        "describe_vpc_endpoints": vpces
+        if isinstance(vpces, Exception)
+        else [{"VpcEndpoints": vpces or []}],
+    }
+    ec2_calls = {}
+    ec2 = _pages_client(ec2_pages, calls=ec2_calls)
+    with patch("sagemaker_app.boto3.client") as mock_client:
+        mock_client.side_effect = _sm_client_factory(sagemaker=sm, ec2=ec2)
+        rows = _rows(
+            sagemaker_app.check_sagemaker_model_network_isolation(region="us-east-1")
+        )
+    return rows, ec2_calls
+
+
+def _config(model_names, kms=None, instance_type="ml.m5.large", **extra):
+    config = {
+        "ProductionVariants": [
+            {"VariantName": f"v{i}", "ModelName": name, "InstanceType": instance_type}
+            for i, name in enumerate(model_names)
+        ]
+    }
+    if kms:
+        config["KmsKeyId"] = kms
+    config.update(extra)
+    return config
+
+
+class TestSM11ModelInventoryReadErrors:
+    """EP-01: a failed model read never yields a clean result."""
+
+    def test_list_models_error_is_could_not_assess_not_no_models(self):
+        pages = {"list_models": _make_client_error("AccessDeniedException")}
+        rows, _ = _sm11_rows({}, extra_pages=pages)
+        isolation = _by_finding(rows, "SageMaker Model Network Isolation Check")
+        assert [r["Status"] for r in isolation] == ["N/A"]
+        assert "No models found" not in isolation[0]["Finding_Details"]
+        assert "AccessDeniedException" in isolation[0]["Finding_Details"]
+
+    def test_describe_error_on_one_model_blocks_both_passes(self):
+        rows, _ = _sm11_rows(
+            {
+                "good": _ISOLATED_VPC_MODEL,
+                "unread": _make_client_error("ThrottlingException"),
+            }
+        )
+        assert not [
+            r
+            for r in rows
+            if r["Status"] == "Passed"
+            and r["Finding"]
+            in (
+                "SageMaker Model Network Isolation Check",
+                sagemaker_app.MODEL_VPC_ATTACHMENT_FINDING,
+            )
+        ]
+        incomplete = _by_finding(
+            rows, "SageMaker Model Network Isolation Check Incomplete"
+        )
+        assert len(incomplete) == 1
+        assert "unread" in incomplete[0]["Finding_Details"]
+        vpc_incomplete = _by_finding(
+            rows, f"{sagemaker_app.MODEL_VPC_ATTACHMENT_FINDING} Incomplete"
+        )
+        assert len(vpc_incomplete) == 1
+
+    def test_vpc_pass_names_the_runtime_leg_instead_of_disclaiming_it(self):
+        rows, _ = _sm11_rows({"good": _ISOLATED_VPC_MODEL})
+        passed = _by_finding(rows, sagemaker_app.MODEL_VPC_ATTACHMENT_FINDING)
+        assert [r["Status"] for r in passed] == ["Passed"]
+        assert "does not record" not in passed[0]["Finding_Details"]
+        assert (
+            sagemaker_app.RUNTIME_PRIVATE_PATH_FINDING in passed[0]["Finding_Details"]
+        )
+
+
+class TestSM11EndpointModelNetworkPath:
+    """EP-01: the population is the models behind endpoints."""
+
+    def test_one_bad_endpoint_among_two_is_failed_and_blocks_the_pass(self):
+        rows, _ = _sm11_rows(
+            {
+                "good": _ISOLATED_VPC_MODEL,
+                "open": {"EnableNetworkIsolation": False},
+            },
+            endpoints={"ep-good": "cfg-good", "ep-open": "cfg-open"},
+            configs={"cfg-good": _config(["good"]), "cfg-open": _config(["open"])},
+        )
+        rows = _by_finding(rows, sagemaker_app.ENDPOINT_MODEL_NETWORK_FINDING)
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "ep-open" in rows[0]["Finding_Details"]
+        assert "EnableNetworkIsolation off" in rows[0]["Finding_Details"]
+        assert "no VpcConfig" in rows[0]["Finding_Details"]
+
+    def test_shadow_variant_model_is_in_the_population(self):
+        config = _config(["good"])
+        config["ShadowProductionVariants"] = [
+            {"VariantName": "shadow", "ModelName": "open", "InstanceType": "ml.m5"}
+        ]
+        rows, _ = _sm11_rows(
+            {"good": _ISOLATED_VPC_MODEL, "open": {"EnableNetworkIsolation": True}},
+            endpoints={"ep": "cfg"},
+            configs={"cfg": config},
+        )
+        rows = _by_finding(rows, sagemaker_app.ENDPOINT_MODEL_NETWORK_FINDING)
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "'open' has no VpcConfig" in rows[0]["Finding_Details"]
+
+    def test_every_endpoint_compliant_is_passed(self):
+        rows, _ = _sm11_rows(
+            {"a": _ISOLATED_VPC_MODEL, "b": _ISOLATED_VPC_MODEL},
+            endpoints={"ep-a": "cfg-a", "ep-b": "cfg-b"},
+            configs={"cfg-a": _config(["a"]), "cfg-b": _config(["b"])},
+        )
+        rows = _by_finding(rows, sagemaker_app.ENDPOINT_MODEL_NETWORK_FINDING)
+        assert [r["Status"] for r in rows] == ["Passed"]
+        assert "2 endpoint(s)" in rows[0]["Finding_Details"]
+
+    def test_model_missing_from_inventory_leaves_endpoint_unread(self):
+        rows, _ = _sm11_rows(
+            {"a": _ISOLATED_VPC_MODEL},
+            endpoints={"ep-a": "cfg-a", "ep-gone": "cfg-gone"},
+            configs={"cfg-a": _config(["a"]), "cfg-gone": _config(["deleted"])},
+        )
+        rows = _by_finding(
+            rows, f"{sagemaker_app.ENDPOINT_MODEL_NETWORK_FINDING} Incomplete"
+        )
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert "deleted" in rows[0]["Finding_Details"]
+
+    def test_describe_endpoint_error_blocks_the_pass(self):
+        rows, _ = _sm11_rows(
+            {"a": _ISOLATED_VPC_MODEL},
+            endpoints={
+                "ep-a": "cfg-a",
+                "ep-denied": _make_client_error("AccessDeniedException"),
+            },
+            configs={"cfg-a": _config(["a"], kms="key")},
+        )
+        for name in (
+            sagemaker_app.ENDPOINT_MODEL_NETWORK_FINDING,
+            sagemaker_app.ENDPOINT_CONFIG_KMS_FINDING,
+        ):
+            assert not [r for r in _by_finding(rows, name) if r["Status"] == "Passed"]
+            incomplete = _by_finding(rows, f"{name} Incomplete")
+            assert len(incomplete) == 1
+            assert "ep-denied" in incomplete[0]["Finding_Details"]
+
+    def test_inference_component_variant_reads_the_endpoint_config(self):
+        config = {
+            "ProductionVariants": [{"VariantName": "ic", "InstanceType": "ml.g5"}],
+            "EnableNetworkIsolation": False,
+        }
+        rows, _ = _sm11_rows(
+            {}, endpoints={"ep-ic": "cfg-ic"}, configs={"cfg-ic": config}
+        )
+        rows = _by_finding(rows, sagemaker_app.ENDPOINT_MODEL_NETWORK_FINDING)
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "inference-component" in rows[0]["Finding_Details"]
+
+    def test_list_endpoints_error_is_not_no_endpoints(self):
+        pages = {"list_endpoints": _make_client_error("AccessDeniedException")}
+        rows, _ = _sm11_rows({"a": _ISOLATED_VPC_MODEL}, extra_pages=pages)
+        rows = _by_finding(rows, sagemaker_app.ENDPOINT_MODEL_NETWORK_FINDING)
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert "AccessDeniedException" in rows[0]["Finding_Details"]
+
+    def test_second_page_of_endpoints_is_read(self):
+        pages = {
+            "list_endpoints": [
+                {"Endpoints": [{"EndpointName": "ep-a"}]},
+                {"Endpoints": [{"EndpointName": "ep-open"}]},
+            ]
+        }
+        rows, _ = _sm11_rows(
+            {"a": _ISOLATED_VPC_MODEL, "open": {"EnableNetworkIsolation": False}},
+            endpoints={"ep-a": "cfg-a", "ep-open": "cfg-open"},
+            configs={"cfg-a": _config(["a"]), "cfg-open": _config(["open"])},
+            extra_pages=pages,
+        )
+        rows = _by_finding(rows, sagemaker_app.ENDPOINT_MODEL_NETWORK_FINDING)
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "ep-open" in rows[0]["Finding_Details"]
+
+
+class TestSM11EndpointConfigKms:
+    """EP-03: the endpoint config KmsKeyId leg, with the inter-container ceiling."""
+
+    def test_one_unkeyed_config_among_two_is_failed(self):
+        rows, _ = _sm11_rows(
+            {"a": _ISOLATED_VPC_MODEL},
+            endpoints={"ep-keyed": "cfg-keyed", "ep-bare": "cfg-bare"},
+            configs={
+                "cfg-keyed": _config(["a"], kms="arn:aws:kms:us-east-1:1:key/k"),
+                "cfg-bare": _config(["a"]),
+            },
+        )
+        rows = _by_finding(rows, sagemaker_app.ENDPOINT_CONFIG_KMS_FINDING)
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "ep-bare" in rows[0]["Finding_Details"]
+        assert "inter-container" in rows[0]["Finding_Details"]
+
+    def test_all_keyed_is_passed_and_names_the_unread_hop(self):
+        rows, _ = _sm11_rows(
+            {"a": _ISOLATED_VPC_MODEL},
+            endpoints={"ep-1": "cfg-1", "ep-2": "cfg-2"},
+            configs={
+                "cfg-1": _config(["a"], kms="k1"),
+                "cfg-2": _config(["a"], kms="k2"),
+            },
+        )
+        rows = _by_finding(rows, sagemaker_app.ENDPOINT_CONFIG_KMS_FINDING)
+        assert [r["Status"] for r in rows] == ["Passed"]
+        assert "inter-container traffic encryption" in rows[0]["Finding_Details"]
+
+    def test_serverless_only_config_is_not_judged(self):
+        config = {
+            "ProductionVariants": [
+                {"VariantName": "s", "ModelName": "a", "ServerlessConfig": {}}
+            ]
+        }
+        rows, _ = _sm11_rows(
+            {"a": _ISOLATED_VPC_MODEL},
+            endpoints={"ep-sl": "cfg-sl"},
+            configs={"cfg-sl": config},
+        )
+        assert _by_finding(rows, sagemaker_app.ENDPOINT_CONFIG_KMS_FINDING) == []
+
+
+class TestSM11RuntimePrivatePath:
+    """EP-01: an available sagemaker.runtime interface endpoint with private DNS."""
+
+    _ENDPOINTS = {"ep-a": "cfg-a"}
+    _CONFIGS = {"cfg-a": _config(["a"], kms="k")}
+
+    def _run(self, vpces):
+        return _sm11_rows(
+            {"a": _ISOLATED_VPC_MODEL},
+            endpoints=self._ENDPOINTS,
+            configs=self._CONFIGS,
+            vpces=vpces,
+        )
+
+    def test_no_runtime_endpoint_is_failed(self):
+        rows, calls = self._run([])
+        rows = _by_finding(rows, sagemaker_app.RUNTIME_PRIVATE_PATH_FINDING)
+        assert [r["Status"] for r in rows] == ["Failed"]
+        filters = calls["describe_vpc_endpoints"][0]["Filters"]
+        assert "com.amazonaws.us-east-1.sagemaker.runtime" in filters[0]["Values"]
+
+    def test_endpoints_without_private_dns_or_not_available_are_failed(self):
+        rows, _ = self._run(
+            [
+                dict(
+                    _PRIVATE_RUNTIME_VPCE,
+                    VpcEndpointId="vpce-nodns",
+                    PrivateDnsEnabled=False,
+                ),
+                dict(
+                    _PRIVATE_RUNTIME_VPCE, VpcEndpointId="vpce-pending", State="pending"
+                ),
+            ]
+        )
+        rows = _by_finding(rows, sagemaker_app.RUNTIME_PRIVATE_PATH_FINDING)
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "vpce-nodns" in rows[0]["Finding_Details"]
+        assert "vpce-pending" in rows[0]["Finding_Details"]
+
+    def test_one_good_endpoint_is_passed(self):
+        rows, _ = self._run(
+            [
+                dict(
+                    _PRIVATE_RUNTIME_VPCE,
+                    VpcEndpointId="vpce-nodns",
+                    PrivateDnsEnabled=False,
+                ),
+                _PRIVATE_RUNTIME_VPCE,
+            ]
+        )
+        rows = _by_finding(rows, sagemaker_app.RUNTIME_PRIVATE_PATH_FINDING)
+        assert [r["Status"] for r in rows] == ["Passed"]
+        assert "vpce-good" in rows[0]["Finding_Details"]
+        assert "public" in rows[0]["Finding_Details"]
+
+    def test_access_denied_is_not_read_not_failed_or_passed(self):
+        rows, _ = self._run(_make_client_error("UnauthorizedOperation"))
+        rows = _by_finding(rows, sagemaker_app.RUNTIME_PRIVATE_PATH_FINDING)
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert "ec2:DescribeVpcEndpoints" in rows[0]["Finding_Details"]
+
+    def test_no_endpoints_asks_nothing(self):
+        rows, calls = _sm11_rows({"a": _ISOLATED_VPC_MODEL}, vpces=[])
+        assert _by_finding(rows, sagemaker_app.RUNTIME_PRIVATE_PATH_FINDING) == []
+        assert "describe_vpc_endpoints" not in calls
+
+
+class TestSM02RuntimeVpcEndpointPolicy:
+    """EP-02: the sagemaker.runtime VPC endpoint policy layer."""
+
+    _SCOPED = json.dumps(
+        {
+            "Statement": [
+                {
+                    "Effect": "Allow",
+                    "Principal": "*",
+                    "Action": "sagemaker:InvokeEndpoint",
+                    "Resource": "arn:aws:sagemaker:us-east-1:111122223333:endpoint/prod",
+                }
+            ]
+        }
+    )
+    _DEFAULT = json.dumps(
+        {
+            "Statement": [
+                {"Effect": "Allow", "Principal": "*", "Action": "*", "Resource": "*"}
+            ]
+        }
+    )
+
+    def _run(self, vpces):
+        ec2 = _pages_client(
+            {
+                "describe_vpc_endpoints": vpces
+                if isinstance(vpces, Exception)
+                else [{"VpcEndpoints": vpces}]
+            }
+        )
+        with patch("sagemaker_app.boto3.client") as mock_client:
+            mock_client.side_effect = _sm_client_factory(ec2=ec2)
+            return _rows(
+                sagemaker_app.check_sagemaker_runtime_endpoint_policy("us-east-1")
+            )
+
+    def test_default_policy_among_two_is_failed(self):
+        rows = self._run(
+            [
+                dict(
+                    _PRIVATE_RUNTIME_VPCE,
+                    VpcEndpointId="vpce-scoped",
+                    PolicyDocument=self._SCOPED,
+                ),
+                dict(
+                    _PRIVATE_RUNTIME_VPCE,
+                    VpcEndpointId="vpce-open",
+                    PolicyDocument=self._DEFAULT,
+                ),
+            ]
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert rows[0]["Check_ID"] == "SM-02"
+        assert "vpce-open" in rows[0]["Finding_Details"]
+
+    def test_account_wide_resource_is_failed(self):
+        policy = json.dumps(
+            {
+                "Statement": [
+                    {
+                        "Effect": "Allow",
+                        "Principal": "*",
+                        "Action": "sagemaker:Invoke*",
+                        "Resource": "arn:aws:sagemaker:us-east-1:111122223333:*",
+                    }
+                ]
+            }
+        )
+        rows = self._run([dict(_PRIVATE_RUNTIME_VPCE, PolicyDocument=policy)])
+        assert [r["Status"] for r in rows] == ["Failed"]
+
+    def test_all_scoped_is_passed(self):
+        rows = self._run(
+            [
+                dict(
+                    _PRIVATE_RUNTIME_VPCE,
+                    VpcEndpointId="vpce-1",
+                    PolicyDocument=self._SCOPED,
+                ),
+                dict(
+                    _PRIVATE_RUNTIME_VPCE,
+                    VpcEndpointId="vpce-2",
+                    PolicyDocument=self._SCOPED,
+                ),
+            ]
+        )
+        assert [r["Status"] for r in rows] == ["Passed"]
+        assert "vpce-1" in rows[0]["Finding_Details"]
+
+    def test_unparsable_policy_blocks_the_pass(self):
+        rows = self._run(
+            [
+                dict(
+                    _PRIVATE_RUNTIME_VPCE,
+                    VpcEndpointId="vpce-1",
+                    PolicyDocument=self._SCOPED,
+                ),
+                dict(
+                    _PRIVATE_RUNTIME_VPCE,
+                    VpcEndpointId="vpce-bad",
+                    PolicyDocument="{not json",
+                ),
+            ]
+        )
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert "vpce-bad" in rows[0]["Finding_Details"]
+
+    def test_read_error_is_not_read(self):
+        rows = self._run(_make_client_error("UnauthorizedOperation"))
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert "UnauthorizedOperation" in rows[0]["Finding_Details"]
+
+    def test_handler_calls_the_policy_leg_per_region(self):
+        source = open(os.path.join(_sm_dir, "app.py"), encoding="utf-8").read()
+        handler = source[source.index("def lambda_handler") :]
+        assert "check_sagemaker_runtime_endpoint_policy(region=region)" in handler
+
+
+# ===================================================================
+# SM-33 full grade: AIR-SGM-TRN-01
+# ===================================================================
+def _vpce(vpc_id, service, endpoint_type="Interface", state="available", dns=True):
+    return {
+        "VpcEndpointId": f"vpce-{vpc_id}-{service}",
+        "VpcId": vpc_id,
+        "ServiceName": f"com.amazonaws.us-east-1.{service}",
+        "VpcEndpointType": endpoint_type,
+        "State": state,
+        "PrivateDnsEnabled": dns,
+    }
+
+
+def _full_training_vpces(vpc_id):
+    return [_vpce(vpc_id, "s3", endpoint_type="Gateway", dns=None)] + [
+        _vpce(vpc_id, service)
+        for service in ("logs", "sagemaker.api", "ecr.api", "ecr.dkr")
+    ]
+
+
+def _in_vpc_job(subnet, isolated=True):
+    return {
+        "VpcConfig": {"Subnets": [subnet], "SecurityGroupIds": ["sg-1"]},
+        "EnableNetworkIsolation": isolated,
+    }
+
+
+def _sm33_rows(jobs, subnets=None, vpces=None, job_pages=None):
+    """Run SM-33 over jobs {name: DescribeTrainingJob or exception}."""
+    subnets = subnets or [_subnet("subnet-a", "vpc-1"), _subnet("subnet-b", "vpc-2")]
+    tables = [
+        _route_table(
+            f"rtb-{s['SubnetId']}",
+            [LOCAL_ROUTE],
+            _explicit(s["SubnetId"]),
+            vpc_id=s["VpcId"],
+        )
+        for s in subnets
+    ]
+
+    def describe_training_job(TrainingJobName):
+        value = jobs[TrainingJobName]
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+    sm = _pages_client(
+        {
+            "list_training_jobs": job_pages
+            or [{"TrainingJobSummaries": [{"TrainingJobName": n} for n in jobs]}]
+        },
+        describe_training_job=MagicMock(side_effect=describe_training_job),
+    )
+    ec2 = _pages_client(
+        {
+            "describe_subnets": [{"Subnets": subnets}],
+            "describe_route_tables": [{"RouteTables": tables}],
+            "describe_vpc_endpoints": vpces
+            if isinstance(vpces, Exception)
+            else [{"VpcEndpoints": vpces or []}],
+        }
+    )
+    with patch("sagemaker_app.boto3.client") as mock_client:
+        mock_client.side_effect = _sm_client_factory(sagemaker=sm, ec2=ec2)
+        return _rows(
+            sagemaker_app.check_sagemaker_training_job_network_boundary(
+                region="us-east-1"
+            )
+        )
+
+
+class TestSM33WholePopulation:
+    def test_a_job_on_the_second_page_past_fifty_is_read(self):
+        names = [f"job-{i}" for i in range(60)]
+        jobs = {n: _in_vpc_job("subnet-a") for n in names}
+        jobs["job-55"] = {"EnableNetworkIsolation": True}
+        pages = [
+            {"TrainingJobSummaries": [{"TrainingJobName": n} for n in names[:50]]},
+            {"TrainingJobSummaries": [{"TrainingJobName": n} for n in names[50:]]},
+        ]
+        rows = _sm33_rows(jobs, vpces=_full_training_vpces("vpc-1"), job_pages=pages)
+        failed = [
+            r
+            for r in rows
+            if r["Finding"] == sagemaker_app.TRAINING_NETWORK_BOUNDARY_FINDING
+            and r["Status"] == "Failed"
+        ]
+        assert len(failed) == 1
+        assert "job-55" in failed[0]["Finding_Details"]
+
+    def test_describe_error_replaces_the_pass_with_incomplete(self):
+        rows = _sm33_rows(
+            {
+                "good": _in_vpc_job("subnet-a"),
+                "denied": _make_client_error("AccessDeniedException"),
+            },
+            vpces=_full_training_vpces("vpc-1"),
+        )
+        boundary = _by_finding(rows, sagemaker_app.TRAINING_NETWORK_BOUNDARY_FINDING)
+        assert [r["Status"] for r in boundary] == ["N/A"]
+        assert "denied" in boundary[0]["Finding_Details"]
+
+
+class TestSM33NetworkIsolation:
+    def test_in_vpc_job_with_isolation_off_is_failed_and_isolated_one_is_not(self):
+        rows = _sm33_rows(
+            {
+                "isolated": _in_vpc_job("subnet-a"),
+                "open": _in_vpc_job("subnet-a", isolated=False),
+            },
+            vpces=_full_training_vpces("vpc-1"),
+        )
+        rows = _by_finding(rows, sagemaker_app.TRAINING_NETWORK_ISOLATION_FINDING)
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "'open'" in rows[0]["Finding_Details"]
+
+
+class TestSM33VpcEndpointCoverage:
+    def test_one_vpc_missing_an_endpoint_among_two_is_failed(self):
+        vpces = _full_training_vpces("vpc-1") + [
+            v
+            for v in _full_training_vpces("vpc-2")
+            if "ecr.dkr" not in v["ServiceName"]
+        ]
+        rows = _sm33_rows(
+            {"a": _in_vpc_job("subnet-a"), "b": _in_vpc_job("subnet-b")}, vpces=vpces
+        )
+        rows = _by_finding(rows, sagemaker_app.TRAINING_VPC_ENDPOINTS_FINDING)
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "vpc-2" in rows[0]["Finding_Details"]
+        assert "ecr.dkr" in rows[0]["Finding_Details"]
+        assert "ecr.api" not in rows[0]["Finding_Details"]
+
+    def test_interface_without_private_dns_or_pending_does_not_count(self):
+        vpces = [
+            v
+            for v in _full_training_vpces("vpc-1")
+            if "logs" not in v["ServiceName"]
+            and "sagemaker.api" not in v["ServiceName"]
+        ] + [
+            _vpce("vpc-1", "logs", dns=False),
+            _vpce("vpc-1", "sagemaker.api", state="pending"),
+        ]
+        rows = _sm33_rows({"a": _in_vpc_job("subnet-a")}, vpces=vpces)
+        rows = _by_finding(rows, sagemaker_app.TRAINING_VPC_ENDPOINTS_FINDING)
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "logs" in rows[0]["Finding_Details"]
+        assert "sagemaker.api" in rows[0]["Finding_Details"]
+
+    def test_every_vpc_complete_is_passed(self):
+        rows = _sm33_rows(
+            {"a": _in_vpc_job("subnet-a"), "b": _in_vpc_job("subnet-b")},
+            vpces=_full_training_vpces("vpc-1") + _full_training_vpces("vpc-2"),
+        )
+        rows = _by_finding(rows, sagemaker_app.TRAINING_VPC_ENDPOINTS_FINDING)
+        assert [r["Status"] for r in rows] == ["Passed"]
+        assert "vpc-1" in rows[0]["Finding_Details"]
+        assert "vpc-2" in rows[0]["Finding_Details"]
+
+    def test_endpoint_read_denied_is_incomplete(self):
+        rows = _sm33_rows(
+            {"a": _in_vpc_job("subnet-a")},
+            vpces=_make_client_error("UnauthorizedOperation"),
+        )
+        rows = _by_finding(rows, sagemaker_app.TRAINING_VPC_ENDPOINTS_FINDING)
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert "UnauthorizedOperation" in rows[0]["Finding_Details"]
+
+    def test_subnet_not_found_blocks_the_pass(self):
+        rows = _sm33_rows(
+            {"a": _in_vpc_job("subnet-a"), "gone": _in_vpc_job("subnet-deleted")},
+            vpces=_full_training_vpces("vpc-1"),
+        )
+        rows = _by_finding(rows, sagemaker_app.TRAINING_VPC_ENDPOINTS_FINDING)
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert "subnet-deleted" in rows[0]["Finding_Details"]

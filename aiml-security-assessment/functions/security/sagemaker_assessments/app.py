@@ -91,6 +91,38 @@ def build_could_not_assess_detail(error: Exception, region: str = "") -> str:
     )
 
 
+def _unread_resources_finding(
+    check_id: str,
+    finding_name: str,
+    unread: List[str],
+    read_details: str,
+    reference: str,
+    region: str,
+) -> Dict[str, Any]:
+    """
+    Report a population claim as N/A because some of its members were not read.
+
+    A Passed row over a partly read population would hide exactly the members
+    the scan could not see, so the row names them instead.
+    """
+    shown = "; ".join(unread[:10])
+    if len(unread) > 10:
+        shown += f"; and {len(unread) - 10} more"
+    return create_finding(
+        check_id=check_id,
+        finding_name=f"{finding_name} Incomplete",
+        finding_details=(
+            f"{len(unread)} read(s) failed, so this result was not established "
+            f"for them: {shown}. For what was read: {read_details}"
+        ),
+        resolution=COULD_NOT_ASSESS_RESOLUTION,
+        reference=reference,
+        severity="Informational",
+        status="N/A",
+        region=region,
+    )
+
+
 # DescribeSubnets and DescribeRouteTables accept up to 200 filter values; 100
 # keeps each request well inside that bound while still batching.
 SUBNET_LOOKUP_BATCH_SIZE = 100
@@ -2809,6 +2841,9 @@ def check_sagemaker_notebook_vpc_deployment(region: str = "") -> Dict[str, Any]:
 
 
 MODEL_VPC_ATTACHMENT_FINDING = "SageMaker Model VPC Attachment"
+RUNTIME_PRIVATE_PATH_FINDING = "SageMaker Runtime Private Invoke Path"
+ENDPOINT_MODEL_NETWORK_FINDING = "SageMaker Endpoint Model Network Path"
+ENDPOINT_CONFIG_KMS_FINDING = "SageMaker Endpoint Config Storage Encryption"
 MODEL_SUBNET_EXPOSURE_FINDING = "SageMaker Model Subnet Internet Exposure"
 MODEL_VPC_ATTACHMENT_REFERENCE = (
     "https://docs.aws.amazon.com/sagemaker/latest/dg/host-vpc.html"
@@ -2883,9 +2918,9 @@ def _model_vpc_attachment_findings(
                     f"{len(models_in_vpc)} model(s) are attached to customer "
                     f"subnets: {described}. Whether those subnets have a route to "
                     "an internet gateway is reported under "
-                    f"'{MODEL_SUBNET_EXPOSURE_FINDING}'. Callers still reach the "
-                    "public runtime endpoint unless an interface VPC endpoint is "
-                    "in place, which the model configuration does not record."
+                    f"'{MODEL_SUBNET_EXPOSURE_FINDING}', and whether callers reach "
+                    "the runtime through an interface VPC endpoint is reported "
+                    f"under '{RUNTIME_PRIVATE_PATH_FINDING}'."
                 ),
                 resolution=(
                     "No action required on the model. Reach it through a "
@@ -2924,6 +2959,486 @@ def _model_vpc_attachment_findings(
     return emitted
 
 
+RUNTIME_PRIVATE_PATH_REFERENCE = (
+    "https://docs.aws.amazon.com/sagemaker/latest/dg/interface-vpc-endpoint.html"
+)
+ENDPOINT_CONFIG_KMS_REFERENCE = (
+    "https://docs.aws.amazon.com/sagemaker/latest/APIReference/"
+    "API_CreateEndpointConfig.html"
+)
+
+
+def _endpoint_hosting_inventory(sagemaker_client) -> Dict[str, Any]:
+    """
+    Resolve every endpoint in the region to its endpoint config and models.
+
+    Returns {"endpoints": [...], "unread": [...]}. Each endpoint carries its
+    name, status, the DescribeEndpointConfig output and the model names its
+    production and shadow variants serve. A variant with no ModelName hosts
+    inference components, and the endpoint config's own VpcConfig and
+    EnableNetworkIsolation are the settings the scan can read for it. The
+    list call is not caught: a failed inventory is the caller's to report.
+    """
+    endpoints = []
+    unread = []
+    for page in sagemaker_client.get_paginator("list_endpoints").paginate():
+        for summary in page.get("Endpoints", []):
+            name = summary.get("EndpointName")
+            if not name:
+                continue
+            try:
+                endpoint = sagemaker_client.describe_endpoint(EndpointName=name)
+                config_name = endpoint.get("EndpointConfigName")
+                config = sagemaker_client.describe_endpoint_config(
+                    EndpointConfigName=config_name
+                )
+            except Exception as e:
+                unread.append(f"endpoint '{name}' ({get_assessment_error_label(e)})")
+                continue
+            variants = list(config.get("ProductionVariants") or []) + list(
+                config.get("ShadowProductionVariants") or []
+            )
+            endpoints.append(
+                {
+                    "name": name,
+                    "status": summary.get("EndpointStatus")
+                    or endpoint.get("EndpointStatus"),
+                    "config_name": config_name,
+                    "config": config,
+                    "variants": variants,
+                    "models": sorted(
+                        {v["ModelName"] for v in variants if v.get("ModelName")}
+                    ),
+                    "component_variants": [
+                        v.get("VariantName") for v in variants if not v.get("ModelName")
+                    ],
+                }
+            )
+    return {"endpoints": endpoints, "unread": unread}
+
+
+def _endpoint_model_network_findings(
+    inventory: Dict[str, Any],
+    model_settings: Dict[str, Dict[str, Any]],
+    unread_models: Dict[str, str],
+    region: str,
+) -> List[Dict[str, Any]]:
+    """
+    AIR-SGM-EP-01 and EP-03: judge network isolation and VpcConfig on the
+    models an endpoint actually serves, not on the model inventory at large.
+
+    A model the endpoint names but the scan could not describe, or one deleted
+    after the endpoint was created, leaves that endpoint unread.
+    """
+    emitted = []
+    unread = list(inventory["unread"])
+    compliant = []
+    for endpoint in inventory["endpoints"]:
+        gaps = []
+        endpoint_unread = False
+        for model_name in endpoint["models"]:
+            settings = model_settings.get(model_name)
+            if settings is None:
+                reason = unread_models.get(model_name, "not in the model inventory")
+                unread.append(
+                    f"model '{model_name}' behind endpoint '{endpoint['name']}' "
+                    f"({reason})"
+                )
+                endpoint_unread = True
+                continue
+            if not settings["isolation"]:
+                gaps.append(f"model '{model_name}' has EnableNetworkIsolation off")
+            if not settings["subnets"]:
+                gaps.append(f"model '{model_name}' has no VpcConfig")
+        if endpoint["component_variants"]:
+            config = endpoint["config"]
+            vpc_config = config.get("VpcConfig")
+            subnets = (
+                vpc_config.get("Subnets") if isinstance(vpc_config, dict) else None
+            )
+            if not config.get("EnableNetworkIsolation"):
+                gaps.append(
+                    "endpoint config "
+                    f"'{endpoint['config_name']}' (inference-component variants "
+                    f"{', '.join(str(v) for v in endpoint['component_variants'])}) "
+                    "has EnableNetworkIsolation off"
+                )
+            if not subnets:
+                gaps.append(
+                    f"endpoint config '{endpoint['config_name']}' "
+                    "(inference-component variants) has no VpcConfig"
+                )
+        if gaps:
+            emitted.append(
+                create_finding(
+                    check_id="SM-11",
+                    finding_name=ENDPOINT_MODEL_NETWORK_FINDING,
+                    finding_details=(
+                        f"Endpoint '{endpoint['name']}' serves containers with an "
+                        f"internet or unmanaged network path: {'; '.join(gaps)}."
+                    ),
+                    resolution=MODEL_VPC_ATTACHMENT_RESOLUTION
+                    + " Set EnableNetworkIsolation=True on the model.",
+                    reference=MODEL_VPC_ATTACHMENT_REFERENCE,
+                    severity="High",
+                    status="Failed",
+                    region=region,
+                )
+            )
+        elif not endpoint_unread:
+            compliant.append(endpoint["name"])
+
+    read_details = (
+        f"{len(compliant)} endpoint(s) serve only models with network isolation "
+        f"on and a VpcConfig: {', '.join(compliant[:10]) or 'none'}."
+    )
+    if unread:
+        emitted.append(
+            _unread_resources_finding(
+                "SM-11",
+                ENDPOINT_MODEL_NETWORK_FINDING,
+                unread,
+                read_details,
+                MODEL_VPC_ATTACHMENT_REFERENCE,
+                region,
+            )
+        )
+    elif compliant and not emitted:
+        emitted.append(
+            create_finding(
+                check_id="SM-11",
+                finding_name=ENDPOINT_MODEL_NETWORK_FINDING,
+                finding_details=read_details,
+                resolution="No action required",
+                reference=MODEL_VPC_ATTACHMENT_REFERENCE,
+                severity="High",
+                status="Passed",
+                region=region,
+            )
+        )
+    elif not inventory["endpoints"]:
+        emitted.append(
+            create_finding(
+                check_id="SM-11",
+                finding_name=ENDPOINT_MODEL_NETWORK_FINDING,
+                finding_details="No endpoints found",
+                resolution="No action required",
+                reference=MODEL_VPC_ATTACHMENT_REFERENCE,
+                severity="Informational",
+                status="N/A",
+                region=region,
+            )
+        )
+    return emitted
+
+
+def _endpoint_config_kms_findings(
+    inventory: Dict[str, Any], region: str
+) -> List[Dict[str, Any]]:
+    """
+    AIR-SGM-EP-03: read the endpoint config KmsKeyId, the at-rest leg the
+    recommendation names for the co-located inference hop.
+
+    No endpoint API field turns on inter-container traffic encryption:
+    EnableInterContainerTrafficEncryption exists only on training, tuning and
+    processing jobs. The rows say so rather than implying the hop was read.
+    """
+    emitted = []
+    keyed = []
+    for endpoint in inventory["endpoints"]:
+        config = endpoint["config"]
+        instance_types = sorted(
+            {
+                str(v.get("InstanceType"))
+                for v in endpoint["variants"]
+                if v.get("InstanceType")
+            }
+        )
+        if not instance_types:
+            # Serverless variants have no instance storage volume for the key.
+            continue
+        if config.get("KmsKeyId"):
+            keyed.append(endpoint["name"])
+            continue
+        emitted.append(
+            create_finding(
+                check_id="SM-11",
+                finding_name=ENDPOINT_CONFIG_KMS_FINDING,
+                finding_details=(
+                    f"Endpoint '{endpoint['name']}' uses endpoint config "
+                    f"'{endpoint['config_name']}' with no KmsKeyId, so the storage "
+                    "volume on its instances "
+                    f"({', '.join(instance_types)}) is not encrypted with a "
+                    "customer managed key. No endpoint API field enables "
+                    "inter-container traffic encryption, so that hop was not read."
+                ),
+                resolution=(
+                    "Create a new endpoint config with KmsKeyId set to a customer "
+                    "managed key and update the endpoint to use it."
+                ),
+                reference=ENDPOINT_CONFIG_KMS_REFERENCE,
+                severity="Medium",
+                status="Failed",
+                region=region,
+            )
+        )
+    read_details = (
+        f"{len(keyed)} instance-backed endpoint(s) name a KmsKeyId in their "
+        f"endpoint config: {', '.join(keyed[:10]) or 'none'}. The key covers the "
+        "attached storage volume; Nitro local instance storage is encrypted by the "
+        "instance hardware module, which the field does not record. No endpoint "
+        "API field enables inter-container traffic encryption, so that hop was "
+        "not read."
+    )
+    if inventory["unread"]:
+        emitted.append(
+            _unread_resources_finding(
+                "SM-11",
+                ENDPOINT_CONFIG_KMS_FINDING,
+                inventory["unread"],
+                read_details,
+                ENDPOINT_CONFIG_KMS_REFERENCE,
+                region,
+            )
+        )
+    elif keyed and not emitted:
+        emitted.append(
+            create_finding(
+                check_id="SM-11",
+                finding_name=ENDPOINT_CONFIG_KMS_FINDING,
+                finding_details=read_details,
+                resolution="No action required",
+                reference=ENDPOINT_CONFIG_KMS_REFERENCE,
+                severity="Medium",
+                status="Passed",
+                region=region,
+            )
+        )
+    return emitted
+
+
+def _read_runtime_vpc_endpoints(region: str) -> List[Dict[str, Any]]:
+    """Every VPC endpoint for the region's sagemaker.runtime service, paginated."""
+    service_names = [
+        f"com.amazonaws.{region}.sagemaker.runtime",
+        f"com.amazonaws.{region}.sagemaker.runtime-fips",
+    ]
+    ec2_client = boto3.client("ec2", config=boto3_config, region_name=region)
+    paginator = ec2_client.get_paginator("describe_vpc_endpoints")
+    vpces = []
+    for page in paginator.paginate(
+        Filters=[{"Name": "service-name", "Values": service_names}]
+    ):
+        vpces.extend(page.get("VpcEndpoints", []))
+    return vpces
+
+
+RUNTIME_ENDPOINT_POLICY_FINDING = "SageMaker Runtime VPC Endpoint Policy Scoping"
+
+
+def check_sagemaker_runtime_endpoint_policy(region: str = "") -> Dict[str, Any]:
+    """
+    AIR-SGM-EP-02: read the endpoint policy on each sagemaker.runtime interface
+    VPC endpoint, the layer the recommendation puts in front of the identity
+    grants SM-02 reads from the IAM cache.
+
+    A policy fails when an Allow reaches sagemaker:InvokeEndpoint on every
+    endpoint, which is what the default full-access policy does. Deny statements
+    are not evaluated, which can only overstate what the policy allows. A region
+    with no runtime VPC endpoint emits nothing here; SM-11 reports the missing
+    private path.
+    """
+    reference = RUNTIME_PRIVATE_PATH_REFERENCE
+    try:
+        vpces = _read_runtime_vpc_endpoints(region)
+    except Exception as e:
+        logger.error(f"Error reading sagemaker.runtime VPC endpoints: {str(e)}")
+        return {
+            "csv_data": [
+                create_finding(
+                    check_id="SM-02",
+                    finding_name=RUNTIME_ENDPOINT_POLICY_FINDING,
+                    finding_details=(
+                        "The sagemaker.runtime VPC endpoint policies were not read "
+                        f"(ec2:DescribeVpcEndpoints: {get_assessment_error_label(e)})."
+                    ),
+                    resolution=COULD_NOT_ASSESS_RESOLUTION,
+                    reference=reference,
+                    severity="Informational",
+                    status="N/A",
+                    region=region,
+                )
+            ]
+        }
+    rows = []
+    scoped = []
+    unread = []
+    for vpce in vpces:
+        vpce_id = vpce.get("VpcEndpointId")
+        document = vpce.get("PolicyDocument")
+        try:
+            policy = json.loads(document) if isinstance(document, str) else document
+            statements = _sm_policy_statements(policy)
+        except (TypeError, ValueError) as e:
+            unread.append(f"{vpce_id} (policy document not parsed: {type(e).__name__})")
+            continue
+        if not isinstance(policy, dict):
+            unread.append(f"{vpce_id} (no policy document returned)")
+            continue
+        wildcards = [
+            element
+            for statement in statements
+            if str(statement.get("Effect", "")).lower() == "allow"
+            for element in [_unscoped_endpoint_invocation_statement(statement)]
+            if element
+        ]
+        if wildcards:
+            rows.append(
+                create_finding(
+                    check_id="SM-02",
+                    finding_name=RUNTIME_ENDPOINT_POLICY_FINDING,
+                    finding_details=(
+                        f"VPC endpoint {vpce_id} in {vpce.get('VpcId')} has an "
+                        "endpoint policy that allows sagemaker:InvokeEndpoint on "
+                        f"every endpoint ({', '.join(wildcards[:3])}). Deny "
+                        "statements were not evaluated, so a Deny could narrow it."
+                    ),
+                    resolution=(
+                        "Replace the endpoint policy with one that allows "
+                        "sagemaker:InvokeEndpoint only on the named endpoint ARNs "
+                        "(arn:aws:sagemaker:<region>:<account>:endpoint/<name>)."
+                    ),
+                    reference=reference,
+                    severity="Medium",
+                    status="Failed",
+                    region=region,
+                )
+            )
+        else:
+            scoped.append(vpce_id)
+    read_details = (
+        f"{len(scoped)} sagemaker.runtime VPC endpoint(s) have a policy that "
+        f"names the endpoints it allows invoking: {', '.join(scoped[:10]) or 'none'}."
+    )
+    if unread:
+        rows.append(
+            _unread_resources_finding(
+                "SM-02",
+                RUNTIME_ENDPOINT_POLICY_FINDING,
+                unread,
+                read_details,
+                reference,
+                region,
+            )
+        )
+    elif scoped and not rows:
+        rows.append(
+            create_finding(
+                check_id="SM-02",
+                finding_name=RUNTIME_ENDPOINT_POLICY_FINDING,
+                finding_details=read_details,
+                resolution="No action required",
+                reference=reference,
+                severity="Medium",
+                status="Passed",
+                region=region,
+            )
+        )
+    return {"csv_data": rows}
+
+
+def _runtime_private_path_findings(
+    inventory: Dict[str, Any], region: str
+) -> List[Dict[str, Any]]:
+    """
+    AIR-SGM-EP-01: require an available sagemaker.runtime interface endpoint
+    with private DNS, the path the recommendation names for InvokeEndpoint.
+
+    Only asked when the region hosts an endpoint. The scan cannot see where
+    callers run, so a Passed row states which VPCs have the path and no more.
+    """
+    if not inventory["endpoints"]:
+        return []
+    private = []
+    other = []
+    try:
+        for vpce in _read_runtime_vpc_endpoints(region):
+            label = f"{vpce.get('VpcEndpointId')} in {vpce.get('VpcId')}"
+            if (
+                vpce.get("VpcEndpointType") == "Interface"
+                and str(vpce.get("State", "")).lower() == "available"
+                and vpce.get("PrivateDnsEnabled") is True
+            ):
+                private.append(label)
+            else:
+                other.append(
+                    f"{label} (type {vpce.get('VpcEndpointType')}, state "
+                    f"{vpce.get('State')}, private DNS "
+                    f"{vpce.get('PrivateDnsEnabled')})"
+                )
+    except Exception as e:
+        return [
+            create_finding(
+                check_id="SM-11",
+                finding_name=RUNTIME_PRIVATE_PATH_FINDING,
+                finding_details=(
+                    "The sagemaker.runtime interface VPC endpoints were not read "
+                    f"(ec2:DescribeVpcEndpoints: {get_assessment_error_label(e)}), "
+                    "so whether callers have a private invoke path is unknown."
+                ),
+                resolution=COULD_NOT_ASSESS_RESOLUTION,
+                reference=RUNTIME_PRIVATE_PATH_REFERENCE,
+                severity="Informational",
+                status="N/A",
+                region=region,
+            )
+        ]
+    endpoint_names = ", ".join(e["name"] for e in inventory["endpoints"][:10])
+    if not private:
+        seen = f" Endpoints found: {'; '.join(other[:5])}." if other else ""
+        return [
+            create_finding(
+                check_id="SM-11",
+                finding_name=RUNTIME_PRIVATE_PATH_FINDING,
+                finding_details=(
+                    f"The region hosts endpoint(s) {endpoint_names}, and no "
+                    "available com.amazonaws."
+                    f"{region}.sagemaker.runtime interface VPC endpoint has "
+                    "private DNS enabled, so InvokeEndpoint calls resolve to the "
+                    f"public runtime endpoint.{seen}"
+                ),
+                resolution=(
+                    "Create an interface VPC endpoint for "
+                    f"com.amazonaws.{region}.sagemaker.runtime with private DNS "
+                    "enabled in each VPC that invokes the endpoints, and attach an "
+                    "endpoint policy."
+                ),
+                reference=RUNTIME_PRIVATE_PATH_REFERENCE,
+                severity="Medium",
+                status="Failed",
+                region=region,
+            )
+        ]
+    return [
+        create_finding(
+            check_id="SM-11",
+            finding_name=RUNTIME_PRIVATE_PATH_FINDING,
+            finding_details=(
+                "An available sagemaker.runtime interface VPC endpoint with private "
+                f"DNS exists: {'; '.join(private[:5])}. Calls from those VPCs "
+                "resolve the runtime hostname to it. The scan does not record where "
+                "callers run, so calls from other networks can still use the public "
+                "runtime endpoint."
+            ),
+            resolution="No action required",
+            reference=RUNTIME_PRIVATE_PATH_REFERENCE,
+            severity="Medium",
+            status="Passed",
+            region=region,
+        )
+    ]
+
+
 def check_sagemaker_model_network_isolation(region: str = "") -> Dict[str, Any]:
     """
     Check if SageMaker hosted models have network isolation enabled.
@@ -2942,6 +3457,9 @@ def check_sagemaker_model_network_isolation(region: str = "") -> Dict[str, Any]:
         models_with_isolation = []
         models_in_vpc = []
         models_without_vpc = []
+        model_settings = {}
+        unread_models = {}
+        list_error = None
 
         try:
             paginator = sagemaker_client.get_paginator("list_models")
@@ -2966,6 +3484,10 @@ def check_sagemaker_model_network_isolation(region: str = "") -> Dict[str, Any]:
                                 if isinstance(vpc_config, dict)
                                 else None
                             )
+                            model_settings[model_name] = {
+                                "isolation": bool(enable_network_isolation),
+                                "subnets": list(subnets or []),
+                            }
                             if subnets:
                                 models_in_vpc.append(
                                     {"name": model_name, "subnets": list(subnets)}
@@ -2989,11 +3511,26 @@ def check_sagemaker_model_network_isolation(region: str = "") -> Dict[str, Any]:
                             logger.warning(
                                 f"Error describing model {model_name}: {str(e)}"
                             )
+                            unread_models[model_name] = get_assessment_error_label(e)
 
         except Exception as e:
             logger.error(f"Error listing models: {str(e)}")
+            list_error = e
 
-        if models_without_isolation:
+        if list_error is not None:
+            findings["csv_data"].append(
+                create_finding(
+                    check_id="SM-11",
+                    finding_name="SageMaker Model Network Isolation Check",
+                    finding_details=build_could_not_assess_detail(list_error, region),
+                    resolution=COULD_NOT_ASSESS_RESOLUTION,
+                    reference="https://docs.aws.amazon.com/sagemaker/latest/dg/mkt-algo-model-internet-free.html",
+                    severity="Informational",
+                    status="N/A",
+                    region=region,
+                )
+            )
+        elif models_without_isolation:
             # Limit findings to avoid overwhelming output
             for model in models_without_isolation[:20]:
                 findings["csv_data"].append(
@@ -3022,6 +3559,21 @@ def check_sagemaker_model_network_isolation(region: str = "") -> Dict[str, Any]:
                         region=region,
                     )
                 )
+        elif unread_models:
+            findings["csv_data"].append(
+                _unread_resources_finding(
+                    "SM-11",
+                    "SageMaker Model Network Isolation Check",
+                    [
+                        f"model '{name}' ({label})"
+                        for name, label in unread_models.items()
+                    ],
+                    f"{len(models_with_isolation)} models have network isolation "
+                    "enabled.",
+                    "https://docs.aws.amazon.com/sagemaker/latest/dg/mkt-algo-model-internet-free.html",
+                    region,
+                )
+            )
         else:
             if models_with_isolation:
                 # Models exist and all have network isolation - Passed
@@ -3052,9 +3604,62 @@ def check_sagemaker_model_network_isolation(region: str = "") -> Dict[str, Any]:
                     )
                 )
 
-        findings["csv_data"].extend(
-            _model_vpc_attachment_findings(models_in_vpc, models_without_vpc, region)
+        attachment_rows = _model_vpc_attachment_findings(
+            models_in_vpc, models_without_vpc, region
         )
+        if list_error is not None or unread_models:
+            # The Passed attachment row speaks for the whole inventory, which was
+            # not read in full; Failed rows and the subnet legs still stand.
+            unread = (
+                [build_could_not_assess_detail(list_error, region)]
+                if list_error is not None
+                else [f"model '{n}' ({label})" for n, label in unread_models.items()]
+            )
+            attachment_rows = [
+                _unread_resources_finding(
+                    "SM-11",
+                    MODEL_VPC_ATTACHMENT_FINDING,
+                    unread,
+                    row["Finding_Details"],
+                    MODEL_VPC_ATTACHMENT_REFERENCE,
+                    region,
+                )
+                if row["Finding"] == MODEL_VPC_ATTACHMENT_FINDING
+                and row["Status"] == "Passed"
+                else row
+                for row in attachment_rows
+            ]
+        findings["csv_data"].extend(attachment_rows)
+
+        try:
+            inventory = _endpoint_hosting_inventory(sagemaker_client)
+        except Exception as e:
+            logger.error(f"Error listing endpoints: {str(e)}")
+            for finding_name in (
+                ENDPOINT_MODEL_NETWORK_FINDING,
+                ENDPOINT_CONFIG_KMS_FINDING,
+            ):
+                findings["csv_data"].append(
+                    create_finding(
+                        check_id="SM-11",
+                        finding_name=finding_name,
+                        finding_details=build_could_not_assess_detail(e, region),
+                        resolution=COULD_NOT_ASSESS_RESOLUTION,
+                        reference=MODEL_VPC_ATTACHMENT_REFERENCE,
+                        severity="Informational",
+                        status="N/A",
+                        region=region,
+                    )
+                )
+            return findings
+
+        findings["csv_data"].extend(
+            _endpoint_model_network_findings(
+                inventory, model_settings, unread_models, region
+            )
+        )
+        findings["csv_data"].extend(_endpoint_config_kms_findings(inventory, region))
+        findings["csv_data"].extend(_runtime_private_path_findings(inventory, region))
 
         return findings
 
@@ -6608,9 +7213,155 @@ TRAINING_NETWORK_BOUNDARY_RESOLUTION = (
     "a compromised training script from exfiltrating the training data."
 )
 
-# Training jobs are never deleted, so an account accumulates them indefinitely.
-# The check samples the most recent jobs and the finding says how many it read.
-MAX_TRAINING_JOBS_SAMPLED = 50
+TRAINING_NETWORK_ISOLATION_FINDING = "Training Job Network Isolation"
+TRAINING_VPC_ENDPOINTS_FINDING = "Training Job VPC Endpoint Coverage"
+# The services a VPC-attached training job reaches, per AIR-SGM-TRN-01: S3,
+# CloudWatch Logs, the SageMaker API and ECR (API and image layers).
+TRAINING_REQUIRED_ENDPOINT_SERVICES = (
+    "s3",
+    "logs",
+    "sagemaker.api",
+    "ecr.api",
+    "ecr.dkr",
+)
+
+
+def _training_vpc_endpoint_findings(
+    jobs_in_vpc: List[Dict[str, Any]], region: str
+) -> List[Dict[str, Any]]:
+    """
+    AIR-SGM-TRN-01: every VPC a training job ran in needs an available endpoint
+    for each service in TRAINING_REQUIRED_ENDPOINT_SERVICES. An interface
+    endpoint counts only with private DNS on, since the job resolves the
+    service's default hostname; S3 counts as a gateway or interface endpoint.
+    """
+    subnets = sorted({s for job in jobs_in_vpc for s in job["subnets"] if s})
+    if not subnets:
+        return []
+    prefix = f"com.amazonaws.{region}."
+    subnet_vpcs = {}
+    try:
+        ec2_client = boto3.client("ec2", config=boto3_config, region_name=region)
+        subnet_paginator = ec2_client.get_paginator("describe_subnets")
+        for chunk in _chunked(subnets, SUBNET_LOOKUP_BATCH_SIZE):
+            for page in subnet_paginator.paginate(
+                Filters=[{"Name": "subnet-id", "Values": chunk}]
+            ):
+                for subnet in page.get("Subnets", []):
+                    if subnet.get("SubnetId") in subnets and subnet.get("VpcId"):
+                        subnet_vpcs[subnet["SubnetId"]] = subnet["VpcId"]
+        present = {vpc_id: set() for vpc_id in subnet_vpcs.values()}
+        vpce_paginator = ec2_client.get_paginator("describe_vpc_endpoints")
+        for chunk in _chunked(sorted(present), SUBNET_LOOKUP_BATCH_SIZE):
+            for page in vpce_paginator.paginate(
+                Filters=[{"Name": "vpc-id", "Values": chunk}]
+            ):
+                for vpce in page.get("VpcEndpoints", []):
+                    service = str(vpce.get("ServiceName", ""))
+                    if (
+                        vpce.get("VpcId") not in present
+                        or str(vpce.get("State", "")).lower() != "available"
+                        or not service.startswith(prefix)
+                    ):
+                        continue
+                    short = service[len(prefix) :]
+                    if (
+                        vpce.get("VpcEndpointType") == "Interface"
+                        and vpce.get("PrivateDnsEnabled") is not True
+                        and short != "s3"
+                    ):
+                        continue
+                    present[vpce["VpcId"]].add(short)
+    except Exception as error:
+        logger.warning(f"Error reading training VPC endpoints: {str(error)}")
+        return [
+            create_finding(
+                check_id="SM-33",
+                finding_name=f"{TRAINING_VPC_ENDPOINTS_FINDING} Incomplete",
+                finding_details=(
+                    f"The VPC endpoints of the {len(jobs_in_vpc)} VPC-attached "
+                    "training job(s) were not read (ec2:DescribeSubnets, "
+                    "ec2:DescribeVpcEndpoints: "
+                    f"{get_assessment_error_label(error)})."
+                ),
+                resolution=COULD_NOT_ASSESS_RESOLUTION,
+                reference=TRAINING_NETWORK_BOUNDARY_REFERENCE,
+                severity="Informational",
+                status="N/A",
+                region=region,
+            )
+        ]
+
+    emitted = []
+    complete = []
+    for vpc_id in sorted(present):
+        missing = [
+            service
+            for service in TRAINING_REQUIRED_ENDPOINT_SERVICES
+            if service not in present[vpc_id]
+        ]
+        jobs = sorted(
+            {
+                job["name"]
+                for job in jobs_in_vpc
+                if any(subnet_vpcs.get(s) == vpc_id for s in job["subnets"])
+            }
+        )
+        if missing:
+            emitted.append(
+                create_finding(
+                    check_id="SM-33",
+                    finding_name=TRAINING_VPC_ENDPOINTS_FINDING,
+                    finding_details=(
+                        f"VPC {vpc_id}, used by training job(s) "
+                        f"{', '.join(jobs[:5])}, has no available endpoint (with "
+                        "private DNS for interface endpoints) for "
+                        f"{', '.join(prefix + m for m in missing)}, so that "
+                        "traffic leaves the VPC or fails."
+                    ),
+                    resolution=(
+                        "Create the missing VPC endpoints: a gateway endpoint for "
+                        "S3 and interface endpoints with private DNS for "
+                        "CloudWatch Logs, the SageMaker API, ecr.api and ecr.dkr."
+                    ),
+                    reference=TRAINING_NETWORK_BOUNDARY_REFERENCE,
+                    severity="Medium",
+                    status="Failed",
+                    region=region,
+                )
+            )
+        else:
+            complete.append(vpc_id)
+    unresolved = [s for s in subnets if s not in subnet_vpcs]
+    read_details = (
+        f"{len(complete)} VPC(s) used by training jobs have an endpoint for every "
+        f"required service: {', '.join(complete) or 'none'}."
+    )
+    if unresolved:
+        emitted.append(
+            _unread_resources_finding(
+                "SM-33",
+                TRAINING_VPC_ENDPOINTS_FINDING,
+                [f"subnet {s} (not found by ec2:DescribeSubnets)" for s in unresolved],
+                read_details,
+                TRAINING_NETWORK_BOUNDARY_REFERENCE,
+                region,
+            )
+        )
+    elif complete and not emitted:
+        emitted.append(
+            create_finding(
+                check_id="SM-33",
+                finding_name=TRAINING_VPC_ENDPOINTS_FINDING,
+                finding_details=read_details,
+                resolution="No action required",
+                reference=TRAINING_NETWORK_BOUNDARY_REFERENCE,
+                severity="Medium",
+                status="Passed",
+                region=region,
+            )
+        )
+    return emitted
 
 
 def check_sagemaker_training_job_network_boundary(region: str = "") -> Dict[str, Any]:
@@ -6634,11 +7385,8 @@ def check_sagemaker_training_job_network_boundary(region: str = "") -> Dict[str,
         describe_errors = []
 
         paginator = sagemaker_client.get_paginator("list_training_jobs")
-        for page in paginator.paginate(
-            SortBy="CreationTime",
-            SortOrder="Descending",
-            PaginationConfig={"MaxItems": MAX_TRAINING_JOBS_SAMPLED},
-        ):
+        # AIR-SGM-TRN-01 is a population claim, so every job is read.
+        for page in paginator.paginate(SortBy="CreationTime", SortOrder="Descending"):
             for summary in page.get("TrainingJobSummaries", []):
                 job_name = summary.get("TrainingJobName")
                 if not job_name:
@@ -6721,8 +7469,8 @@ def check_sagemaker_training_job_network_boundary(region: str = "") -> Dict[str,
                     check_id="SM-33",
                     finding_name=TRAINING_NETWORK_BOUNDARY_FINDING,
                     finding_details=(
-                        f"{len(jobs_without_vpc)} of the {jobs_sampled} most recent "
-                        "training jobs ran with no VpcConfig (the first 20 are "
+                        f"{len(jobs_without_vpc)} of the {jobs_sampled} training "
+                        "jobs ran with no VpcConfig (the first 20 are "
                         "reported individually above)."
                     ),
                     resolution=TRAINING_NETWORK_BOUNDARY_RESOLUTION,
@@ -6733,18 +7481,61 @@ def check_sagemaker_training_job_network_boundary(region: str = "") -> Dict[str,
                 )
             )
 
-        if jobs_in_vpc:
-            described = "; ".join(
-                "{} in {}".format(entry["name"], ", ".join(entry["subnets"][:3]))
-                for entry in jobs_in_vpc[:3]
+        for entry in [job for job in jobs_in_vpc if not job["isolated"]][:20]:
+            findings["csv_data"].append(
+                create_finding(
+                    check_id="SM-33",
+                    finding_name=TRAINING_NETWORK_ISOLATION_FINDING,
+                    finding_details=(
+                        f"Training job '{entry['name']}' ran in customer subnets "
+                        "with EnableNetworkIsolation off, so its container can "
+                        "reach any destination its subnets route to. No API "
+                        "records whether the job was an approved exception."
+                    ),
+                    resolution=(
+                        "Set EnableNetworkIsolation=true on training jobs whose "
+                        "algorithm does not need to call out, and require it with "
+                        "the sagemaker:NetworkIsolation condition key."
+                    ),
+                    reference=TRAINING_NETWORK_BOUNDARY_REFERENCE,
+                    severity="Medium",
+                    status="Failed",
+                    region=region,
+                )
             )
+
+        described = "; ".join(
+            "{} in {}".format(entry["name"], ", ".join(entry["subnets"][:3]))
+            for entry in jobs_in_vpc[:3]
+        )
+        vpc_pass_details = (
+            f"{len(jobs_in_vpc)} of the {jobs_sampled} training jobs ran in "
+            f"customer subnets: {described}. "
+            "Whether those subnets have a route to an internet gateway "
+            f"is reported under '{TRAINING_SUBNET_EXPOSURE_FINDING}'."
+        )
+        if describe_errors:
+            findings["csv_data"].append(
+                _unread_resources_finding(
+                    "SM-33",
+                    TRAINING_NETWORK_BOUNDARY_FINDING,
+                    [
+                        f"training job '{entry['name']}' ({entry['label']})"
+                        for entry in describe_errors
+                    ],
+                    vpc_pass_details,
+                    TRAINING_NETWORK_BOUNDARY_REFERENCE,
+                    region,
+                )
+            )
+        elif jobs_in_vpc:
             findings["csv_data"].append(
                 create_finding(
                     check_id="SM-33",
                     finding_name=TRAINING_NETWORK_BOUNDARY_FINDING,
                     finding_details=(
-                        f"{len(jobs_in_vpc)} of the {jobs_sampled} most recent "
-                        f"training jobs ran in customer subnets: {described}. "
+                        f"{len(jobs_in_vpc)} of the {jobs_sampled} training jobs "
+                        f"ran in customer subnets: {described}. "
                         "Whether those subnets have a route to an internet gateway "
                         f"is reported under '{TRAINING_SUBNET_EXPOSURE_FINDING}'. "
                         "Whether the job needed outbound access at all is a "
@@ -6761,22 +7552,9 @@ def check_sagemaker_training_job_network_boundary(region: str = "") -> Dict[str,
                 )
             )
 
-        for entry in describe_errors[:5]:
-            findings["csv_data"].append(
-                create_finding(
-                    check_id="SM-33",
-                    finding_name=TRAINING_NETWORK_BOUNDARY_FINDING,
-                    finding_details=(
-                        f"Training job '{entry['name']}' could not be assessed for "
-                        f"network configuration. Assessment error: {entry['label']}."
-                    ),
-                    resolution="Grant sagemaker:DescribeTrainingJob and retry.",
-                    reference=TRAINING_NETWORK_BOUNDARY_REFERENCE,
-                    severity="Informational",
-                    status="N/A",
-                    region=region,
-                )
-            )
+        findings["csv_data"].extend(
+            _training_vpc_endpoint_findings(jobs_in_vpc, region)
+        )
 
         # AIR-FND-NET-01: a job's VpcConfig subnets decide nothing about egress
         # until their route tables are read.
@@ -8801,6 +9579,9 @@ def lambda_handler(event, context):
 
         logger.info("Running AWS IoT device-scoped policy check (SM-41)")
         all_findings.append(check_iot_device_scoped_policies(region=region))
+
+        logger.info("Running sagemaker.runtime VPC endpoint policy check (SM-02)")
+        all_findings.append(check_sagemaker_runtime_endpoint_policy(region=region))
 
         # Generate and upload report
         logger.info("Generating reports")

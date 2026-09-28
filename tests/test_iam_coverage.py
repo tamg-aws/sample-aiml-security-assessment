@@ -799,6 +799,11 @@ _VERIFIED_REMEDIATION_IAM_ACTIONS |= {
 
 _VERIFIED_REMEDIATION_CONDITION_KEYS |= {"aws:ResourceTag"}
 
+# Confirmed on 2026-09-27 from the sagemaker service-reference JSON: the key is
+# listed as Bool and is an ActionConditionKey of CreateTrainingJob. SM-33 names
+# it in the training network isolation resolution.
+_VERIFIED_REMEDIATION_CONDITION_KEYS |= {"sagemaker:NetworkIsolation"}
+
 # Verified the same way on 2026-09-25 for BR-46's per-bucket Macie leg. The
 # knowledge-base data-source operations live on the bedrock-agent client but are
 # authorized under the bedrock: action prefix, so the three near-misses

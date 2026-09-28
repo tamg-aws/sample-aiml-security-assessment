@@ -1,3 +1,4 @@
+import re
 from pathlib import Path
 
 
@@ -36,3 +37,32 @@ def test_sagemaker_lambda_templates_include_required_actions():
             f"{template_path.name} is missing SageMaker Lambda permissions: "
             f"{', '.join(missing_actions)}"
         )
+
+
+# Actions the full-grade SageMaker legs added, each with the resource ARN its
+# statement must name. A resource-typed action granted on '*' fails here.
+SCOPED_SAGEMAKER_GRANTS = {
+    "sagemaker:DescribeEndpointConfig": ":endpoint-config/*'",
+}
+
+
+def _sagemaker_function_statements(template_text):
+    start = re.search(
+        r"^  SagemakerSecurityAssessmentFunction:\n", template_text, re.MULTILINE
+    )
+    rest = template_text[start.end() :]
+    match = re.search(r"\n  [A-Za-z0-9]+:\n", rest)
+    block = rest[: match.start()] if match else rest
+    return block.split("- Sid:")[1:]
+
+
+def test_new_sagemaker_grants_are_resource_scoped_on_the_sagemaker_function():
+    for template_path in TEMPLATE_PATHS:
+        statements = _sagemaker_function_statements(
+            template_path.read_text(encoding="utf-8")
+        )
+        for action, resource in SCOPED_SAGEMAKER_GRANTS.items():
+            holding = [s for s in statements if re.search(rf"- {action}\b", s)]
+            assert len(holding) == 1, f"{template_path.name}: {action} not granted once"
+            assert resource in holding[0], f"{template_path.name}: {action} scope"
+            assert "Resource: '*'" not in holding[0], f"{template_path.name}: {action}"

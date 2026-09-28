@@ -677,6 +677,7 @@ Resources:
                 - sagemaker:DescribeMonitoringSchedule
                 - sagemaker:DescribeModel
                 - sagemaker:DescribeEndpoint
+                - sagemaker:DescribeEndpointConfig # SM-11
                 - sagemaker:DescribeDataQualityJobDefinition
                 - sagemaker:DescribeTransformJob
                 - sagemaker:DescribeHyperParameterTuningJob
@@ -696,6 +697,7 @@ Resources:
                 - !Sub 'arn:${AWS::Partition}:sagemaker:*:${AWS::AccountId}:monitoring-schedule/*'
                 - !Sub 'arn:${AWS::Partition}:sagemaker:*:${AWS::AccountId}:model/*'
                 - !Sub 'arn:${AWS::Partition}:sagemaker:*:${AWS::AccountId}:endpoint/*'
+                - !Sub 'arn:${AWS::Partition}:sagemaker:*:${AWS::AccountId}:endpoint-config/*'
                 - !Sub 'arn:${AWS::Partition}:sagemaker:*:${AWS::AccountId}:data-quality-job-definition/*'
                 - !Sub 'arn:${AWS::Partition}:sagemaker:*:${AWS::AccountId}:transform-job/*'
                 - !Sub 'arn:${AWS::Partition}:sagemaker:*:${AWS::AccountId}:hyper-parameter-tuning-job/*'

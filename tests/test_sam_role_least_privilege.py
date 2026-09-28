@@ -233,6 +233,7 @@ _EXPECTED_ACTIONS = {
         "sagemaker:DescribeDataQualityJobDefinition",
         "sagemaker:DescribeDomain",
         "sagemaker:DescribeEndpoint",
+        "sagemaker:DescribeEndpointConfig",
         "sagemaker:DescribeFeatureGroup",
         "sagemaker:DescribeHyperParameterTuningJob",
         "sagemaker:DescribeModel",
