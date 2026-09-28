@@ -12,6 +12,7 @@ from botocore.config import Config
 from botocore.exceptions import ClientError, EndpointConnectionError
 import random
 import json
+from functools import lru_cache
 import re
 
 # TO DO PYDANTIC SUPPORT
@@ -590,115 +591,6 @@ def _permission_cache_unavailable_result(region: str) -> Dict[str, Any]:
             )
         ],
     }
-
-
-IAM_CACHE_V1_NOTE = (
-    "The IAM permissions cache is schema version 1, which does not record "
-    "per-principal read errors, so a principal whose policies failed to read "
-    "cannot be told apart from one with no grant."
-)
-SCP_NOT_EVALUATED_NOTE = (
-    "Service control policies were not evaluated per principal. An SCP can only "
-    "remove a permission, so this result can overstate the grant but not miss one."
-)
-IAM_CACHE_INCOMPLETE_RESOLUTION = (
-    "Resolve the read errors the IAM Permission Caching task recorded for the "
-    "named principals, then rerun the assessment."
-)
-
-
-def _cache_unread_principals(permission_cache: Dict[str, Any]) -> Optional[List[str]]:
-    """
-    Return the principals the IAM cache recorded read errors for.
-
-    None means a version-1 cache, which did not record them at all.
-    """
-    version = permission_cache.get("cache_schema_version")
-    if not isinstance(version, int) or version < 2:
-        return None
-    labels = []
-    for error in permission_cache.get("principal_errors") or []:
-        if not isinstance(error, dict):
-            continue
-        principal_type = str(error.get("type", "")).lower()
-        if principal_type not in ("role", "user"):
-            continue
-        label = (
-            f"{principal_type.capitalize()} '{error.get('name')}' "
-            f"({error.get('stage')})"
-        )
-        if label not in labels:
-            labels.append(label)
-    return labels
-
-
-def _cache_boundary_unread(
-    permission_cache: Dict[str, Any], identity_type: str, name: str
-) -> bool:
-    """
-    Return whether the cache failed to read this principal's permissions boundary.
-
-    The cache stores a null boundary both when none is set and when the read
-    failed, so only the permissions_boundary error entry tells them apart.
-    """
-    return any(
-        isinstance(error, dict)
-        and str(error.get("type", "")).lower() == identity_type.lower()
-        and error.get("name") == name
-        and error.get("stage") == "permissions_boundary"
-        for error in permission_cache.get("principal_errors") or []
-    )
-
-
-def _cache_population_finding(
-    permission_cache: Dict[str, Any],
-    check_id: str,
-    finding_name: str,
-    passed_details: str,
-    reference: str,
-    severity: str,
-    region: str,
-    extra_unread: Optional[List[str]] = None,
-) -> Dict[str, Any]:
-    """
-    Emit a population-wide IAM claim as Passed only when every principal was read.
-
-    A principal the cache could not read, or one this check could not read
-    itself (extra_unread), makes the claim incomplete, and the row names them.
-    """
-    unread = _cache_unread_principals(permission_cache)
-    missing = list(unread or []) + list(extra_unread or [])
-    if missing:
-        shown = ", ".join(missing[:10])
-        if len(missing) > 10:
-            shown += f" and {len(missing) - 10} more"
-        return create_finding(
-            check_id=check_id,
-            finding_name=f"{finding_name} Incomplete",
-            finding_details=(
-                f"{len(missing)} principal read(s) failed, so this claim was not "
-                f"established for them: {shown}. For the principals that were "
-                f"read: {passed_details}"
-            ),
-            resolution=IAM_CACHE_INCOMPLETE_RESOLUTION,
-            reference=reference,
-            severity="Informational",
-            status="N/A",
-            region=region,
-        )
-    details = passed_details
-    if unread is None:
-        details = f"{passed_details} {IAM_CACHE_V1_NOTE}"
-    return create_finding(
-        check_id=check_id,
-        finding_name=finding_name,
-        finding_details=details,
-        resolution="No action required",
-        reference=reference,
-        severity=severity,
-        status="Passed",
-        region=region,
-    )
 
 
 def _iam_action_matches(pattern: str, action: str) -> bool:
@@ -1493,8 +1385,8 @@ def _endpoint_invocation_scoping_findings(
             continue
         if wildcard is None:
             scoped.append(f"{identity_type} '{name}'")
-        elif boundary is None and _cache_boundary_unread(
-            permission_cache, identity_type, name
+        elif boundary is None and (identity_type.lower(), name) in _boundary_unread(
+            permission_cache
         ):
             boundary_unknown.append(
                 f"{identity_type} '{name}' (policy '{wildcard_policy}' allows "
@@ -1592,7 +1484,7 @@ def _endpoint_invocation_scoping_findings(
 
     # With no invocation grant at all the leg emits nothing, unless a principal
     # could not be read and might hold one.
-    if not unscoped and (scoped or _cache_unread_principals(permission_cache)):
+    if not unscoped and (scoped or _principal_read_errors(permission_cache)):
         if scoped:
             passed_details = scoped_details
         else:
@@ -1601,18 +1493,316 @@ def _endpoint_invocation_scoping_findings(
                 "grant to invoke a SageMaker endpoint."
             )
         emitted.append(
-            _cache_population_finding(
-                permission_cache,
+            create_finding(
                 check_id="SM-02",
                 finding_name=ENDPOINT_INVOCATION_SCOPING_FINDING,
-                passed_details=passed_details,
+                finding_details=passed_details,
+                resolution="No action required",
                 reference=ENDPOINT_INVOCATION_SCOPING_REFERENCE,
                 severity="High",
+                status="Passed",
                 region=region,
             )
         )
 
     return emitted
+
+
+# Per resource type, the actions that read it and the actions that write it, as
+# the service authorization reference publishes them, generated by
+# generate_iam_access_levels.py.
+with open(
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "iam_access_levels.json"),
+    encoding="utf-8",
+) as _levels:
+    IAM_ACCESS_LEVELS: Dict[str, Dict[str, Dict[str, List[str]]]] = json.load(_levels)[
+        "services"
+    ]
+IAM_ACCESS_LEVEL_ACTIONS = frozenset(
+    f"{namespace}:{action}".lower()
+    for namespace, types in IAM_ACCESS_LEVELS.items()
+    for levels in types.values()
+    for action in levels["read"] + levels["write"]
+)
+UNRECORDED_PRINCIPAL_ERRORS_NOTE = (
+    "The IAM permissions cache predates schema version 2 and did not record "
+    "per-principal read errors, so a principal whose policies could not be read "
+    "looks the same as one with no policies."
+)
+SCP_NOT_EVALUATED_NOTE = (
+    "Service control policies were not evaluated per principal. They only remove "
+    "permissions, so an SCP can make this finding a false Failed but cannot hide "
+    "a grant it reports."
+)
+
+
+def _merged_patterns(value: Any) -> List[str]:
+    if isinstance(value, str):
+        return [value.strip().lower()]
+    if isinstance(value, list):
+        return [str(item).strip().lower() for item in value]
+    return []
+
+
+def _merged_statements(document: Any) -> List[Dict[str, Any]]:
+    """Statements of one policy document. A document that is not JSON raises
+    ValueError, so the caller reports it as unread instead of as no grant."""
+    if isinstance(document, str):
+        document = json.loads(document)
+    if document is None:
+        return []
+    if not isinstance(document, dict):
+        raise ValueError("policy document is not a JSON object")
+    statements = document.get("Statement", [])
+    if isinstance(statements, dict):
+        statements = [statements]
+    return [statement for statement in statements if isinstance(statement, dict)]
+
+
+def _identity_statements(permissions: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Attached, inline and group policy statements of one cached identity."""
+    return [
+        statement
+        for policy in [
+            *(permissions.get("attached_policies") or []),
+            *(permissions.get("inline_policies") or []),
+            *(permissions.get("group_policies") or []),
+        ]
+        for statement in _merged_statements(policy.get("document"))
+    ]
+
+
+def _merged_statement_matches(statement: Dict[str, Any], action: str) -> bool:
+    """Whether one statement's Action or NotAction covers a lowercase action."""
+    if "Action" in statement:
+        return any(
+            fnmatch.fnmatchcase(action, pattern)
+            for pattern in _merged_patterns(statement.get("Action"))
+        )
+    return "NotAction" in statement and not any(
+        fnmatch.fnmatchcase(action, pattern)
+        for pattern in _merged_patterns(statement.get("NotAction"))
+    )
+
+
+def _merged_account_wide_deny(statement: Dict[str, Any], action: str) -> bool:
+    """Whether a Deny removes the action everywhere: no condition, Resource "*".
+
+    A narrower Deny is read as removing nothing, which can only over-report.
+    """
+    return (
+        str(statement.get("Effect", "")).upper() == "DENY"
+        and not statement.get("Condition")
+        and "*" in _merged_patterns(statement.get("Resource"))
+        and _merged_statement_matches(statement, action)
+    )
+
+
+def _granted_actions(
+    permissions: Dict[str, Any], statements: List[Dict[str, Any]], actions: Any
+) -> set:
+    """Return the lowercase ``actions`` one identity is granted.
+
+    An action counts when an identity-policy Allow covers it, no account-wide
+    Deny removes it, and the permissions boundary, when there is one, allows it
+    too: the effective grant is the intersection of the two. A conditioned or
+    resource-scoped boundary Allow still counts as allowing, so an uncertain
+    case keeps the grant and can only over-report.
+    """
+    boundary = permissions.get("permissions_boundary")
+    boundary_statements = None if boundary is None else _merged_statements(boundary)
+    allows = [s for s in statements if str(s.get("Effect", "")).upper() == "ALLOW"]
+    granted = set()
+    for action in actions:
+        if not any(_merged_statement_matches(s, action) for s in allows):
+            continue
+        if any(_merged_account_wide_deny(s, action) for s in statements):
+            continue
+        if boundary_statements is not None and (
+            any(_merged_account_wide_deny(s, action) for s in boundary_statements)
+            or not any(
+                str(s.get("Effect", "")).upper() == "ALLOW"
+                and _merged_statement_matches(s, action)
+                for s in boundary_statements
+            )
+        ):
+            continue
+        granted.add(action)
+    return granted
+
+
+def _boundary_unread(permission_cache: Dict[str, Any]) -> set:
+    """Return (type, name) for each principal whose permissions boundary the
+    cache failed to read. The cache stores a null boundary both when none is
+    set and when the read failed, so only the error entry tells them apart,
+    and such a principal is left unassessed: a boundary could remove the grant.
+    """
+    return {
+        (str(error.get("type", "")).lower(), error["name"])
+        for error in permission_cache.get("principal_errors") or []
+        if isinstance(error, dict)
+        and error.get("name")
+        and error.get("stage") == "permissions_boundary"
+    }
+
+
+def _merged_resources(statement: Dict[str, Any]) -> List[str]:
+    """Lowercase Resource patterns of one statement. A NotResource statement
+    reads as "*", which can only over-report."""
+    if "Resource" not in statement:
+        return ["*"]
+    return [
+        str(item).strip().lower()
+        for item in _merged_patterns_any(statement["Resource"])
+    ]
+
+
+def _merged_patterns_any(value: Any) -> List[Any]:
+    if isinstance(value, list):
+        return value
+    return [value] if value is not None else []
+
+
+@lru_cache(maxsize=None)
+def _globs_overlap(left: str, right: str) -> bool:
+    """Whether some string matches both IAM glob patterns ("*" and "?")."""
+
+    @lru_cache(maxsize=None)
+    def overlap(i: int, j: int) -> bool:
+        if i == len(left):
+            return all(char == "*" for char in right[j:])
+        if j == len(right):
+            return all(char == "*" for char in left[i:])
+        if left[i] == "*":
+            return overlap(i + 1, j) or overlap(i, j + 1)
+        if right[j] == "*":
+            return overlap(i, j + 1) or overlap(i + 1, j)
+        if "?" in (left[i], right[j]) or left[i] == right[j]:
+            return overlap(i + 1, j + 1)
+        return False
+
+    return overlap(0, 0)
+
+
+def _merged_reaches_type(resources: List[str], arns: List[str]) -> bool:
+    """Whether a Resource entry can name an ARN of the resource type. A
+    variable such as ${aws:username} reads as "*"."""
+    return any(
+        _globs_overlap(re.sub(r"\$\{[^}]*\}", "*", resource), arn.lower())
+        for resource in resources
+        for arn in arns
+    )
+
+
+def _merged_read_write_grants(permissions: Dict[str, Any]) -> List[str]:
+    """Describe each wildcard or NotAction Allow that grants both a read and a
+    write action on one resource type.
+
+    An explicit action list separates read from write however long it is; a
+    pattern or a NotAction cannot, because it grants whatever it matches, a
+    bare "*" and a partial pattern among them. Only actions the identity is
+    granted after Denies and its permissions boundary count. A condition on the Allow applies to the read and the write alike, so
+    it is not read. The Resource entries are read only to drop the resource
+    types none of them can name.
+    """
+    statements = _identity_statements(permissions)
+    triggers = []
+    for statement in statements:
+        if str(statement.get("Effect", "")).upper() != "ALLOW":
+            continue
+        if "Action" in statement:
+            triggers += [
+                (
+                    f"Action '{pattern}'",
+                    {"Action": pattern},
+                    _merged_resources(statement),
+                )
+                for pattern in _merged_patterns(statement.get("Action"))
+                if "*" in pattern or "?" in pattern
+            ]
+        elif "NotAction" in statement:
+            triggers.append(
+                (
+                    f"NotAction {_merged_patterns(statement.get('NotAction'))}",
+                    {"NotAction": statement.get("NotAction")},
+                    _merged_resources(statement),
+                )
+            )
+    if not triggers:
+        return []
+    effective = _granted_actions(
+        permissions,
+        statements,
+        {
+            action
+            for action in IAM_ACCESS_LEVEL_ACTIONS
+            if any(_merged_statement_matches(t, action) for _, t, _ in triggers)
+        },
+    )
+    grants = []
+    for label, trigger, resources in triggers:
+        for namespace, types in IAM_ACCESS_LEVELS.items():
+            merged = []
+            for resource_type, levels in types.items():
+                if not _merged_reaches_type(resources, levels["arns"]):
+                    continue
+                reads, writes = (
+                    [
+                        f"{namespace}:{action}"
+                        for action in levels[level]
+                        if f"{namespace}:{action}".lower() in effective
+                        and _merged_statement_matches(
+                            trigger, f"{namespace}:{action}".lower()
+                        )
+                    ]
+                    for level in ("read", "write")
+                )
+                if reads and writes:
+                    merged.append((resource_type, reads, writes))
+            if not merged:
+                continue
+            resource_type, reads, writes = max(
+                merged,
+                key=lambda item: any(
+                    w.split(":", 1)[1].startswith("Delete") for w in item[2]
+                ),
+            )
+            write = next(
+                (w for w in writes if w.split(":", 1)[1].startswith("Delete")),
+                writes[0],
+            )
+            grants.append(
+                f"{label} grants read and write on {len(merged)} {namespace} "
+                f"resource type(s), for example {reads[0]} and {write} on "
+                f"{resource_type}"
+            )
+    return grants
+
+
+def _principal_read_errors(permission_cache: Dict[str, Any]) -> Optional[List[str]]:
+    """Label each principal whose cache read failed, or None for a cache that
+    predates ``principal_errors``."""
+    errors = permission_cache.get("principal_errors")
+    if not isinstance(errors, list):
+        return None
+    failed: Dict[str, List[str]] = {}
+    for error in errors:
+        if isinstance(error, dict) and error.get("name"):
+            label = f"{error.get('type', 'principal')} '{error['name']}'"
+            failed.setdefault(label, []).append(str(error.get("stage", "unknown")))
+    return [
+        f"{label} ({', '.join(stages)})" for label, stages in sorted(failed.items())
+    ]
+
+
+def _unread_principals_detail(unread: List[str]) -> str:
+    shown = ", ".join(unread[:10])
+    if len(unread) > 10:
+        shown += f" and {len(unread) - 10} more"
+    return (
+        f"{len(unread)} principal(s) could not be fully read into the IAM "
+        f"permissions cache, so their grants are unknown: {shown}."
+    )
 
 
 SERVICE_WIDE_GRANT_FINDING = "SageMaker Service-Wide Grant in Customer Policy"
@@ -1636,15 +1826,14 @@ def _service_wide_sagemaker_grant(statement: Dict[str, Any]) -> Optional[str]:
     """
     Return why an Allow statement grants every SageMaker action, or None.
 
-    A bare "*" is an administrator grant, not a SageMaker-specific one, and is
-    left to the administrator-access checks. A NotAction Allow grants every
+    A bare "*" grants every SageMaker action too. A NotAction Allow grants every
     action it does not list, so it reaches all of SageMaker unless one of its
     patterns covers the whole sagemaker: prefix.
     """
     if str(statement.get("Effect", "")).upper() != "ALLOW":
         return None
     for action in _policy_values(statement.get("Action")):
-        if action.strip() != "*" and _pattern_covers_all_sagemaker_actions(action):
+        if _pattern_covers_all_sagemaker_actions(action.strip()):
             return f"Action '{action}'"
     if "NotAction" in statement:
         excluded = _policy_values(statement.get("NotAction"))
@@ -1657,32 +1846,51 @@ def _service_wide_grant_findings(
     permission_cache: Dict[str, Any], region: str
 ) -> List[Dict[str, Any]]:
     """
-    Report the AIR-FND-IAM-09 leg of SM-02 over customer-managed and inline
-    policies. AWS managed policies are excluded because the full-access leg
-    already reports AmazonSageMakerFullAccess by name.
+    Report the AIR-FND-IAM-09 leg of SM-02 over customer-managed, inline and
+    group policies. AWS managed policies are excluded because the full-access
+    leg already reports AmazonSageMakerFullAccess by name, and the merged read
+    and write leg reads them. An identity whose permissions boundary allows no
+    SageMaker action is not reported.
     """
     violations = []
+    unreadable = []
     policies_read = 0
+    boundary_unread = _boundary_unread(permission_cache)
     for identity_type, cache_key in (
         ("Role", "role_permissions"),
         ("User", "user_permissions"),
     ):
         for name, permissions in (permission_cache.get(cache_key) or {}).items():
+            if (identity_type.lower(), name) in boundary_unread and (
+                permissions.get("permissions_boundary") is None
+            ):
+                continue
             policies = [
                 policy
-                for policy in permissions.get("attached_policies") or []
+                for policy in [
+                    *(permissions.get("attached_policies") or []),
+                    *(permissions.get("group_policies") or []),
+                ]
                 if ":iam::aws:policy/" not in (policy.get("arn") or "")
             ] + list(permissions.get("inline_policies") or [])
             # A boundary that does not allow every SageMaker action leaves the
             # identity without a service-wide grant, whatever its policies say.
-            bounded = not _boundary_allows_every_sagemaker_action(
+            if not _boundary_allows_every_sagemaker_action(
                 permissions.get("permissions_boundary")
-            )
+            ):
+                policies_read += len(policies)
+                continue
             for policy in policies:
-                policies_read += 1
-                if bounded:
+                try:
+                    statements = _merged_statements(policy.get("document"))
+                except (ValueError, TypeError):
+                    unreadable.append(
+                        f"{identity_type.lower()} '{name}' policy "
+                        f"'{policy.get('name') or 'inline policy'}'"
+                    )
                     continue
-                for statement in _sm_policy_statements(policy.get("document")):
+                policies_read += 1
+                for statement in statements:
                     reason = _service_wide_sagemaker_grant(statement)
                     if reason:
                         violations.append(
@@ -1731,26 +1939,202 @@ def _service_wide_grant_findings(
                 region=region,
             )
         )
-    if not violations:
+    if unreadable:
         emitted.append(
-            _cache_population_finding(
-                permission_cache,
+            create_finding(
                 check_id="SM-02",
-                finding_name=SERVICE_WIDE_GRANT_FINDING,
-                passed_details=(
-                    f"None of the {policies_read} customer-managed or inline "
-                    "policies read grants sagemaker:* or reaches SageMaker "
-                    "through a NotAction Allow that a permissions boundary "
-                    "leaves in force. Whether each identity's action list "
-                    "matches its role is a workload decision this check does "
-                    "not make."
+                finding_name=f"{SERVICE_WIDE_GRANT_FINDING} Incomplete",
+                finding_details=(
+                    f"{len(unreadable)} cached policy document(s) could not be "
+                    f"parsed, so whether they grant every SageMaker action was not "
+                    f"assessed: {', '.join(unreadable[:10])}."
+                ),
+                resolution=(
+                    "Review the IAM Permission Caching task output, then rerun "
+                    "the assessment."
                 ),
                 reference=SERVICE_WIDE_GRANT_REFERENCE,
+                severity="Informational",
+                status="N/A",
+                region=region,
+            )
+        )
+    elif not violations:
+        emitted.append(
+            create_finding(
+                check_id="SM-02",
+                finding_name=SERVICE_WIDE_GRANT_FINDING,
+                finding_details=(
+                    f"None of the {policies_read} customer-managed, inline or "
+                    'group policies read grants sagemaker:* or "*" or reaches '
+                    "SageMaker through a NotAction Allow that a permissions "
+                    "boundary leaves in force. Whether each identity's action "
+                    "list matches its role is a workload decision this check "
+                    "does not make."
+                ),
+                resolution="No action required",
+                reference=SERVICE_WIDE_GRANT_REFERENCE,
                 severity="High",
+                status="Passed",
                 region=region,
             )
         )
     return emitted
+
+
+MERGED_READ_WRITE_FINDING = "SageMaker Read and Write Merged in One Grant"
+MERGED_READ_WRITE_REFERENCE = (
+    f"{SERVICE_WIDE_GRANT_REFERENCE}\n"
+    "https://docs.aws.amazon.com/IAM/latest/UserGuide/best-practices.html"
+)
+
+
+def _merged_read_write_findings(
+    permission_cache: Dict[str, Any], region: str
+) -> List[Dict[str, Any]]:
+    """AIR-FND-IAM-09 leg of SM-02: a grant that cannot tell read from write,
+    read over every policy of every cached role and user, AWS managed included."""
+    boundary_unread = _boundary_unread(permission_cache)
+    identities = [
+        (identity_type, name, permissions)
+        for identity_type, cache_key in (
+            ("Role", "role_permissions"),
+            ("User", "user_permissions"),
+        )
+        for name, permissions in (permission_cache.get(cache_key) or {}).items()
+        if (identity_type.lower(), name) not in boundary_unread
+        or permissions.get("permissions_boundary") is not None
+    ]
+    flagged, unreadable = [], []
+    for identity_type, name, permissions in identities:
+        try:
+            grants = _merged_read_write_grants(permissions)
+        except (ValueError, TypeError, AttributeError):
+            unreadable.append(f"{identity_type.lower()} '{name}'")
+            continue
+        if grants:
+            flagged.append((identity_type, name, grants))
+    resolution = (
+        "Replace the wildcard or NotAction grant with the specific SageMaker read "
+        "actions the identity needs, and grant create, update and delete actions "
+        "separately to the principals that make those changes."
+    )
+    rows = [
+        create_finding(
+            check_id="SM-02",
+            finding_name=MERGED_READ_WRITE_FINDING,
+            finding_details=(
+                f"{identity_type} '{name}': {'; '.join(grants[:5])}. An explicit "
+                "action list is the only form that grants the read without the "
+                "write; a condition or resource scope applies to both alike. "
+                + SCP_NOT_EVALUATED_NOTE
+            ),
+            resolution=resolution,
+            reference=MERGED_READ_WRITE_REFERENCE,
+            severity="High",
+            status="Failed",
+            region=region,
+        )
+        for identity_type, name, grants in flagged[:20]
+    ]
+    if len(flagged) > 20:
+        rows.append(
+            create_finding(
+                check_id="SM-02",
+                finding_name=MERGED_READ_WRITE_FINDING,
+                finding_details=(
+                    f"{len(flagged)} principals hold a grant that merges SageMaker "
+                    "read and write (the first 20 are reported individually)."
+                ),
+                resolution=resolution,
+                reference=MERGED_READ_WRITE_REFERENCE,
+                severity="High",
+                status="Failed",
+                region=region,
+            )
+        )
+    if unreadable:
+        rows.append(
+            create_finding(
+                check_id="SM-02",
+                finding_name=MERGED_READ_WRITE_FINDING,
+                finding_details=(
+                    "The cached policies of "
+                    f"{', '.join(unreadable)} could not be parsed, so whether a "
+                    "grant merges read and write was not assessed."
+                ),
+                resolution=(
+                    "Review the IAM Permission Caching task output, then rerun "
+                    "the assessment."
+                ),
+                reference="https://docs.aws.amazon.com/IAM/latest/UserGuide/access_policies.html",
+                severity="Informational",
+                status="N/A",
+                region=region,
+            )
+        )
+    if not flagged and not unreadable and identities:
+        rows.append(
+            create_finding(
+                check_id="SM-02",
+                finding_name=MERGED_READ_WRITE_FINDING,
+                finding_details=(
+                    f"None of the {len(identities)} cached role(s) and user(s) "
+                    "holds a wildcard or NotAction grant that allows both a read "
+                    "and a write action on one SageMaker resource type."
+                ),
+                resolution="No action required",
+                reference=MERGED_READ_WRITE_REFERENCE,
+                severity="High",
+                status="Passed",
+                region=region,
+            )
+        )
+    return rows
+
+
+def _hold_passed_for_unread_principals(
+    permission_cache: Dict[str, Any], rows: List[Dict[str, Any]], region: str
+) -> List[Dict[str, Any]]:
+    """Hold back a Passed SM-02 row while the cache names an unread principal.
+
+    Each Passed row becomes N/A naming the principals; a failing row is kept.
+    A cache without ``principal_errors`` keeps its verdict and says the errors
+    were not recorded.
+    """
+    unread = _principal_read_errors(permission_cache)
+    if unread is None:
+        for row in rows:
+            if row["Status"] == "Passed":
+                row["Finding_Details"] += " " + UNRECORDED_PRINCIPAL_ERRORS_NOTE
+        return rows
+    if not unread:
+        return rows
+    detail = _unread_principals_detail(unread)
+
+    def incomplete(name: str, details: str) -> Dict[str, Any]:
+        return create_finding(
+            check_id="SM-02",
+            finding_name=f"{name} Incomplete",
+            finding_details=details,
+            resolution=(
+                "Grant the IAM Permission Caching task read access to the listed "
+                "principals, then re-run the assessment."
+            ),
+            reference="https://docs.aws.amazon.com/IAM/latest/UserGuide/access_policies.html",
+            severity="Informational",
+            status="N/A",
+            region=region,
+        )
+
+    kept = [row for row in rows if row["Status"] != "Passed"]
+    passed = [row for row in rows if row["Status"] == "Passed"]
+    if passed:
+        return kept + [
+            incomplete(row["Finding"], f"{row['Finding_Details']} {detail}")
+            for row in passed
+        ]
+    return kept + [incomplete("SageMaker IAM Permissions Check", detail)]
 
 
 def check_sagemaker_iam_permissions(
@@ -1771,6 +2155,8 @@ def check_sagemaker_iam_permissions(
 
         # Check for roles with SageMaker full access
         roles_with_full_access = []
+        full_access_boundary_unread = []
+        boundary_unread = _boundary_unread(permission_cache)
         for role_name, permissions in permission_cache["role_permissions"].items():
             if not _boundary_allows_every_sagemaker_action(
                 permissions.get("permissions_boundary")
@@ -1778,7 +2164,12 @@ def check_sagemaker_iam_permissions(
                 continue
             for policy in permissions["attached_policies"]:
                 if policy["name"] == "AmazonSageMakerFullAccess":
-                    roles_with_full_access.append(role_name)
+                    if permissions.get("permissions_boundary") is None and (
+                        ("role", role_name) in boundary_unread
+                    ):
+                        full_access_boundary_unread.append(role_name)
+                    else:
+                        roles_with_full_access.append(role_name)
                     break
 
         # Check for stale access. IAM is a global service, so the client is not
@@ -1869,6 +2260,25 @@ def check_sagemaker_iam_permissions(
                             region=region,
                         )
                     )
+                # A null boundary that was not read may narrow the grant, so
+                # the role is named as not read, never Failed. With no Failed
+                # row, the population row below names it instead.
+                if full_access_boundary_unread:
+                    findings["csv_data"].append(
+                        _unread_resources_finding(
+                            "SM-02",
+                            "SageMaker Full Access Policy Used",
+                            [
+                                f"Role '{name}' (AmazonSageMakerFullAccess is "
+                                "attached; its permissions boundary was not read)"
+                                for name in full_access_boundary_unread
+                            ],
+                            f"{len(roles_with_full_access)} role(s) are reported "
+                            "above.",
+                            "https://docs.aws.amazon.com/sagemaker-unified-studio/latest/adminguide/security-iam.html",
+                            region,
+                        )
+                    )
 
             # Findings for stale users
             if stale_users:
@@ -1886,20 +2296,31 @@ def check_sagemaker_iam_permissions(
                         )
                     )
         else:
+            passed_details = (
+                "No role holds AmazonSageMakerFullAccess outside a narrowing "
+                "permissions boundary, and no user with a SageMaker grant is "
+                "stale by 60 days."
+            )
+            reference = "https://docs.aws.amazon.com/sagemaker-unified-studio/latest/adminguide/security-iam.html"
             findings["csv_data"].append(
-                _cache_population_finding(
-                    permission_cache,
+                _unread_resources_finding(
+                    "SM-02",
+                    "SageMaker IAM Permissions Check",
+                    unread_users,
+                    passed_details,
+                    reference,
+                    region,
+                )
+                if unread_users
+                else create_finding(
                     check_id="SM-02",
                     finding_name="SageMaker IAM Permissions Check",
-                    passed_details=(
-                        "No role holds AmazonSageMakerFullAccess outside a "
-                        "narrowing permissions boundary, and no user with a "
-                        "SageMaker grant is stale by 60 days."
-                    ),
-                    reference="https://docs.aws.amazon.com/sagemaker-unified-studio/latest/adminguide/security-iam.html",
+                    finding_details=passed_details,
+                    resolution="No action required",
+                    reference=reference,
                     severity="High",
+                    status="Passed",
                     region=region,
-                    extra_unread=unread_users,
                 )
             )
 
@@ -1911,6 +2332,12 @@ def check_sagemaker_iam_permissions(
         )
         findings["csv_data"].extend(
             _service_wide_grant_findings(permission_cache, region)
+        )
+        findings["csv_data"].extend(
+            _merged_read_write_findings(permission_cache, region)
+        )
+        findings["csv_data"] = _hold_passed_for_unread_principals(
+            permission_cache, findings["csv_data"], region
         )
 
         return findings
@@ -3379,7 +3806,7 @@ def _environment_role_findings(
         ]
     else:
         cached = permission_cache.get("role_permissions") or {}
-        unread_principals = set(_cache_unread_principals(permission_cache) or [])
+        unread_principals = set(_principal_read_errors(permission_cache) or [])
         for label, role_arn in environment_roles:
             name = _role_name_from_arn(role_arn)
             if name not in cached:
@@ -3389,7 +3816,7 @@ def _environment_role_findings(
             if (
                 reason
                 and cached[name].get("permissions_boundary") is None
-                and _cache_boundary_unread(permission_cache, "Role", name)
+                and ("role", name) in _boundary_unread(permission_cache)
             ):
                 unread.append(
                     f"{label} role {role_arn} ({reason}; its permissions boundary "
@@ -3397,7 +3824,7 @@ def _environment_role_findings(
                 )
             elif reason:
                 broad.append(f"{label} runs as role '{name}', which holds {reason}")
-            elif any(p.startswith(f"Role '{name}' ") for p in unread_principals):
+            elif any(p.startswith(f"role '{name}' ") for p in unread_principals):
                 unread.append(f"{label} role {role_arn} (IAM cache read error)")
     rows = []
     for entry in broad[:20]:
@@ -3965,11 +4392,149 @@ def check_sagemaker_notebook_root_access(
         }
 
 
+STUDIO_DOMAIN_NETWORK_FINDING = "SageMaker Studio Domain Network Boundary"
+STUDIO_DOMAIN_SUBNET_EXPOSURE_FINDING = (
+    "SageMaker Studio Domain Subnet Internet Exposure"
+)
+STUDIO_DOMAIN_NETWORK_REFERENCE = "https://docs.aws.amazon.com/sagemaker/latest/dg/studio-notebooks-and-internet-access.html"
+
+
+def _studio_domain_network_findings(
+    sagemaker_client: Any, region: str
+) -> List[Dict[str, Any]]:
+    """SM-10 Studio domain leg of AIR-FND-NET-01.
+
+    DescribeDomain reports AppNetworkAccessType. PublicInternetOnly, the default,
+    sends non-EFS traffic through a SageMaker-managed VPC that allows direct
+    internet access. VpcOnly sends all traffic through the domain's SubnetIds,
+    whose route tables then decide whether the domain is private. No domain
+    yields no row.
+    """
+    rows: List[Dict[str, Any]] = []
+    in_vpc: List[Dict[str, Any]] = []
+    public: List[str] = []
+    try:
+        paginator = sagemaker_client.get_paginator("list_domains")
+        domains = [
+            domain
+            for page in paginator.paginate()
+            for domain in page.get("Domains", [])
+            if domain.get("DomainId")
+        ]
+    except Exception as error:
+        logger.warning(f"Could not list SageMaker domains: {str(error)}")
+        return [
+            create_finding(
+                check_id="SM-10",
+                finding_name=STUDIO_DOMAIN_NETWORK_FINDING,
+                finding_details=(
+                    "SageMaker Studio domains could not be listed, so their network "
+                    "access type was not read. Assessment error: "
+                    f"{get_assessment_error_label(error)}."
+                ),
+                resolution="Grant sagemaker:ListDomains and retry.",
+                reference=STUDIO_DOMAIN_NETWORK_REFERENCE,
+                severity="Informational",
+                status="N/A",
+                region=region,
+            )
+        ]
+
+    for summary in domains:
+        domain_id = summary["DomainId"]
+        label = (
+            f"Studio domain '{summary.get('DomainName') or domain_id}' ({domain_id})"
+        )
+        try:
+            detail = sagemaker_client.describe_domain(DomainId=domain_id)
+        except Exception as error:
+            rows.append(
+                create_finding(
+                    check_id="SM-10",
+                    finding_name=STUDIO_DOMAIN_NETWORK_FINDING,
+                    finding_details=(
+                        f"{label} could not be described, so its network access "
+                        "type was not read. Assessment error: "
+                        f"{get_assessment_error_label(error)}."
+                    ),
+                    resolution="Grant sagemaker:DescribeDomain and retry.",
+                    reference=STUDIO_DOMAIN_NETWORK_REFERENCE,
+                    severity="Informational",
+                    status="N/A",
+                    region=region,
+                )
+            )
+            continue
+        access_type = detail.get("AppNetworkAccessType") or "PublicInternetOnly"
+        subnets = [subnet for subnet in detail.get("SubnetIds") or [] if subnet]
+        if access_type != "VpcOnly":
+            public.append(label)
+        elif not subnets:
+            rows.append(
+                create_finding(
+                    check_id="SM-10",
+                    finding_name=STUDIO_DOMAIN_NETWORK_FINDING,
+                    finding_details=(
+                        f"{label} reports AppNetworkAccessType VpcOnly with no "
+                        "SubnetIds, so whether it reaches an internet gateway was "
+                        "not judged."
+                    ),
+                    resolution="Grant sagemaker:DescribeDomain and retry.",
+                    reference=STUDIO_DOMAIN_NETWORK_REFERENCE,
+                    severity="Informational",
+                    status="N/A",
+                    region=region,
+                )
+            )
+        else:
+            in_vpc.append({"name": label, "subnets": subnets})
+
+    for label in public:
+        rows.append(
+            create_finding(
+                check_id="SM-10",
+                finding_name=STUDIO_DOMAIN_NETWORK_FINDING,
+                finding_details=(
+                    f"{label} uses AppNetworkAccessType PublicInternetOnly, so its "
+                    "non-EFS traffic goes through a SageMaker-managed VPC that "
+                    "allows direct internet access."
+                ),
+                resolution=(
+                    "Set AppNetworkAccessType to VpcOnly with private SubnetIds, "
+                    "and add the VPC endpoints Studio needs."
+                ),
+                reference=STUDIO_DOMAIN_NETWORK_REFERENCE,
+                severity="High",
+                status="Failed",
+                region=region,
+            )
+        )
+    rows.extend(
+        _subnet_exposure_findings(
+            check_id="SM-10",
+            finding_name=STUDIO_DOMAIN_SUBNET_EXPOSURE_FINDING,
+            resources=in_vpc,
+            region=region,
+            reference=STUDIO_DOMAIN_NETWORK_REFERENCE,
+            resolution=(
+                "Point the domain at subnets whose route tables have no internet "
+                "gateway route, or remove that route from the subnets' route "
+                "tables."
+            ),
+            severity="High",
+        )
+    )
+    return rows
+
+
 def check_sagemaker_notebook_vpc_deployment(region: str = "") -> Dict[str, Any]:
     """
     Check if SageMaker notebook instances are deployed within a custom VPC.
     Notebooks outside VPC use shared infrastructure with less isolation.
     Aligns with AWS Security Hub control SageMaker.2
+
+    Studio domains are read in the same check: a domain's AppNetworkAccessType
+    and SubnetIds decide where its notebooks' traffic goes.
     """
     logger.debug("Starting check for SageMaker notebook VPC deployment")
     try:
@@ -3981,6 +4546,7 @@ def check_sagemaker_notebook_vpc_deployment(region: str = "") -> Dict[str, Any]:
 
         notebooks_without_vpc = []
         notebooks_with_vpc = []
+        notebook_error = None
 
         try:
             paginator = sagemaker_client.get_paginator("list_notebook_instances")
@@ -4014,6 +4580,31 @@ def check_sagemaker_notebook_vpc_deployment(region: str = "") -> Dict[str, Any]:
 
         except Exception as e:
             logger.error(f"Error checking notebook instances VPC: {str(e)}")
+            notebook_error = e
+
+        if notebook_error is not None:
+            # A failed read never yields the all-in-VPC Passed or the
+            # none-found N/A, which would both claim a population not read.
+            findings["csv_data"].append(
+                create_finding(
+                    check_id="SM-10",
+                    finding_name="SageMaker Notebook VPC Deployment Check",
+                    finding_details=(
+                        "Notebook instances could not all be read, so "
+                        f"{len(notebooks_with_vpc) + len(notebooks_without_vpc)} "
+                        "read so far are reported and the rest were not assessed. "
+                        f"Assessment error: {get_assessment_error_label(notebook_error)}."
+                    ),
+                    resolution=(
+                        "Grant sagemaker:ListNotebookInstances and "
+                        "sagemaker:DescribeNotebookInstance and retry."
+                    ),
+                    reference="https://docs.aws.amazon.com/sagemaker/latest/dg/appendix-notebook-and-internet-access.html",
+                    severity="Informational",
+                    status="N/A",
+                    region=region,
+                )
+            )
 
         if notebooks_without_vpc:
             for notebook in notebooks_without_vpc:
@@ -4029,7 +4620,7 @@ def check_sagemaker_notebook_vpc_deployment(region: str = "") -> Dict[str, Any]:
                         region=region,
                     )
                 )
-        else:
+        elif notebook_error is None:
             if notebooks_with_vpc:
                 # Notebooks exist and all are in VPCs - Passed
                 findings["csv_data"].append(
@@ -4082,6 +4673,9 @@ def check_sagemaker_notebook_vpc_deployment(region: str = "") -> Dict[str, Any]:
                 ),
                 severity="High",
             )
+        )
+        findings["csv_data"].extend(
+            _studio_domain_network_findings(sagemaker_client, region)
         )
 
         return findings
@@ -10025,13 +10619,207 @@ def _training_vpc_endpoint_findings(
     return emitted
 
 
+PROCESSING_NETWORK_BOUNDARY_FINDING = "Processing Job Network Boundary"
+PROCESSING_SUBNET_EXPOSURE_FINDING = "SageMaker Processing Job Subnet Internet Exposure"
+PROCESSING_NETWORK_BOUNDARY_REFERENCE = (
+    "https://docs.aws.amazon.com/sagemaker/latest/APIReference/API_NetworkConfig.html"
+)
+PROCESSING_NETWORK_BOUNDARY_RESOLUTION = (
+    "Create processing jobs with NetworkConfig.VpcConfig naming private subnets "
+    "and security groups, and set NetworkConfig.EnableNetworkIsolation true "
+    "unless the job has to reach an approved external source."
+)
+
+
+def _processing_job_network_findings(
+    sagemaker_client: Any, region: str
+) -> Tuple[List[Dict[str, Any]], int]:
+    """SM-33 processing-job leg of AIR-FND-NET-01.
+
+    Returns the rows and the number of processing jobs listed. Every job is
+    listed and described. A processing job reports its network placement under
+    NetworkConfig, not at the top level as a training job does.
+    """
+    rows: List[Dict[str, Any]] = []
+    in_vpc: List[Dict[str, Any]] = []
+    without_vpc: List[Dict[str, Any]] = []
+    describe_errors: List[Dict[str, str]] = []
+    jobs_read = 0
+
+    try:
+        paginator = sagemaker_client.get_paginator("list_processing_jobs")
+        for page in paginator.paginate():
+            for summary in page.get("ProcessingJobSummaries", []):
+                job_name = summary.get("ProcessingJobName")
+                if not job_name:
+                    continue
+                jobs_read += 1
+                try:
+                    detail = sagemaker_client.describe_processing_job(
+                        ProcessingJobName=job_name
+                    )
+                except Exception as error:
+                    describe_errors.append(
+                        {"name": job_name, "label": get_assessment_error_label(error)}
+                    )
+                    continue
+                network = detail.get("NetworkConfig")
+                network = network if isinstance(network, dict) else {}
+                vpc_config = network.get("VpcConfig")
+                subnets = (
+                    vpc_config.get("Subnets") if isinstance(vpc_config, dict) else None
+                )
+                isolated = network.get("EnableNetworkIsolation") is True
+                if subnets:
+                    in_vpc.append({"name": job_name, "subnets": list(subnets)})
+                else:
+                    without_vpc.append({"name": job_name, "isolated": isolated})
+    except Exception as error:
+        logger.warning(f"Could not list SageMaker processing jobs: {str(error)}")
+        return [
+            create_finding(
+                check_id="SM-33",
+                finding_name=PROCESSING_NETWORK_BOUNDARY_FINDING,
+                finding_details=(
+                    "SageMaker processing jobs could not be listed, so their "
+                    "network placement was not read. Assessment error: "
+                    f"{get_assessment_error_label(error)}."
+                ),
+                resolution="Grant sagemaker:ListProcessingJobs and retry.",
+                reference=PROCESSING_NETWORK_BOUNDARY_REFERENCE,
+                severity="Informational",
+                status="N/A",
+                region=region,
+            )
+        ], jobs_read
+
+    for entry in without_vpc[:20]:
+        isolation_note = (
+            " Network isolation is on, which blocks the container's own egress "
+            "but leaves it outside the customer VPC."
+            if entry["isolated"]
+            else " Network isolation is off as well."
+        )
+        rows.append(
+            create_finding(
+                check_id="SM-33",
+                finding_name=PROCESSING_NETWORK_BOUNDARY_FINDING,
+                finding_details=(
+                    f"Processing job '{entry['name']}' ran with no "
+                    "NetworkConfig.VpcConfig, so it ran in the SageMaker-managed "
+                    f"network.{isolation_note}"
+                ),
+                resolution=PROCESSING_NETWORK_BOUNDARY_RESOLUTION,
+                reference=PROCESSING_NETWORK_BOUNDARY_REFERENCE,
+                severity="Medium",
+                status="Failed",
+                region=region,
+            )
+        )
+    if len(without_vpc) > 20:
+        rows.append(
+            create_finding(
+                check_id="SM-33",
+                finding_name=PROCESSING_NETWORK_BOUNDARY_FINDING,
+                finding_details=(
+                    f"{len(without_vpc)} of the {jobs_read} processing jobs ran "
+                    "with no NetworkConfig.VpcConfig (the first 20 are reported "
+                    "individually above)."
+                ),
+                resolution=PROCESSING_NETWORK_BOUNDARY_RESOLUTION,
+                reference=PROCESSING_NETWORK_BOUNDARY_REFERENCE,
+                severity="Medium",
+                status="Failed",
+                region=region,
+            )
+        )
+    if in_vpc:
+        described = "; ".join(
+            "{} in {}".format(entry["name"], ", ".join(entry["subnets"][:3]))
+            for entry in in_vpc[:3]
+        )
+        rows.append(
+            create_finding(
+                check_id="SM-33",
+                finding_name=PROCESSING_NETWORK_BOUNDARY_FINDING,
+                finding_details=(
+                    f"{len(in_vpc)} of the {jobs_read} processing jobs ran in "
+                    f"customer subnets: {described}. Whether those subnets have "
+                    "a route to an internet gateway is reported under "
+                    f"'{PROCESSING_SUBNET_EXPOSURE_FINDING}'."
+                ),
+                resolution="No action required on the VPC attachment.",
+                reference=PROCESSING_NETWORK_BOUNDARY_REFERENCE,
+                severity="Medium",
+                status="Passed",
+                region=region,
+            )
+        )
+    for entry in describe_errors[:5]:
+        rows.append(
+            create_finding(
+                check_id="SM-33",
+                finding_name=PROCESSING_NETWORK_BOUNDARY_FINDING,
+                finding_details=(
+                    f"Processing job '{entry['name']}' could not be assessed for "
+                    f"network configuration. Assessment error: {entry['label']}."
+                ),
+                resolution="Grant sagemaker:DescribeProcessingJob and retry.",
+                reference=PROCESSING_NETWORK_BOUNDARY_REFERENCE,
+                severity="Informational",
+                status="N/A",
+                region=region,
+            )
+        )
+    if len(describe_errors) > 5:
+        rows.append(
+            create_finding(
+                check_id="SM-33",
+                finding_name=PROCESSING_NETWORK_BOUNDARY_FINDING,
+                finding_details=(
+                    f"{len(describe_errors)} of the {jobs_read} processing jobs "
+                    "could not be described (the first 5 are reported "
+                    "individually above)."
+                ),
+                resolution="Grant sagemaker:DescribeProcessingJob and retry.",
+                reference=PROCESSING_NETWORK_BOUNDARY_REFERENCE,
+                severity="Informational",
+                status="N/A",
+                region=region,
+            )
+        )
+    rows.extend(
+        _subnet_exposure_findings(
+            check_id="SM-33",
+            finding_name=PROCESSING_SUBNET_EXPOSURE_FINDING,
+            resources=[
+                {
+                    "name": f"Processing job '{entry['name']}'",
+                    "subnets": entry["subnets"],
+                }
+                for entry in in_vpc
+            ],
+            region=region,
+            reference=PROCESSING_NETWORK_BOUNDARY_REFERENCE,
+            resolution=(
+                "Run processing jobs with NetworkConfig.VpcConfig naming subnets "
+                "whose route tables have no internet gateway route, or remove that "
+                "route from the subnets' route tables."
+            ),
+            severity="Medium",
+        )
+    )
+    return rows, jobs_read
+
+
 def check_sagemaker_training_job_network_boundary(region: str = "") -> Dict[str, Any]:
     """
     SM-33: Verify training jobs run inside a customer VPC (AIR-SGM-TRN-01).
 
     SM-21 asserts this for AutoML jobs only. Network isolation and VpcConfig are
     reported separately because a job can be isolated with no VPC attachment, and
-    an isolated job still has no private path to S3 or ECR without one.
+    an isolated job still has no private path to S3 or ECR without one. Every
+    training job and every processing job is listed and described.
     """
     logger.debug("Starting check for SageMaker training job network boundary")
     findings = {"csv_data": []}
@@ -10082,13 +10870,17 @@ def check_sagemaker_training_job_network_boundary(region: str = "") -> Dict[str,
                 else:
                     jobs_without_vpc.append({"name": job_name, "isolated": isolated})
 
-        if jobs_sampled == 0:
+        processing_rows, processing_jobs = _processing_job_network_findings(
+            sagemaker_client, region
+        )
+
+        if jobs_sampled == 0 and processing_jobs == 0 and not processing_rows:
             findings["csv_data"].append(
                 create_finding(
                     check_id="SM-33",
                     finding_name=TRAINING_NETWORK_BOUNDARY_FINDING,
                     finding_details=(
-                        "No SageMaker training jobs found in "
+                        "No SageMaker training or processing jobs found in "
                         f"{region or 'this region'}."
                     ),
                     resolution="No action required",
@@ -10240,6 +11032,7 @@ def check_sagemaker_training_job_network_boundary(region: str = "") -> Dict[str,
                 severity="Medium",
             )
         )
+        findings["csv_data"].extend(processing_rows)
 
         return findings
 
@@ -10667,12 +11460,13 @@ def _creation_identity_leg(
                 continue
             # An unread boundary may close the call; the principal is already
             # named among the cache's unread principals.
-            if boundary is None and _cache_boundary_unread(
-                permission_cache, identity_type, name
-            ):
+            if boundary is None and (
+                identity_type.lower(),
+                name,
+            ) in _boundary_unread(permission_cache):
                 continue
             open_principals.append(f"{identity_type} '{name}'")
-    unread = _cache_unread_principals(permission_cache)
+    unread = _principal_read_errors(permission_cache)
     if open_principals:
         return {"state": "open", "principals": open_principals, "v1": unread is None}
     if unread:
@@ -10856,7 +11650,7 @@ def _creation_category_finding(
         else f" {SCP_NOT_EVALUATED_NOTE}"
     )
     if v1:
-        identity_notes += f" {IAM_CACHE_V1_NOTE}"
+        identity_notes += f" {UNRECORDED_PRINCIPAL_ERRORS_NOTE}"
     if failed:
         return create_finding(
             check_id=check_id,

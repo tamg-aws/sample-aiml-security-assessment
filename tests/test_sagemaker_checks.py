@@ -4786,6 +4786,7 @@ class TestSM33TrainingJobNetworkBoundary:
         assert len(passed) == 1
         assert "subnet-a" in passed[0]["Finding_Details"]
         assert "of the 2 training jobs" in passed[0]["Finding_Details"]
+        assert "most recent" not in passed[0]["Finding_Details"]
         for f in findings:
             assert f["Check_ID"] == "SM-33"
             assert_finding_schema(f)
@@ -4807,12 +4808,50 @@ class TestSM33TrainingJobNetworkBoundary:
     @patch("sagemaker_app.boto3.client")
     def test_every_training_job_is_read_not_a_sample(self, mock_client):
         # AIR-SGM-TRN-01 full grade: the 50-job sample hid every older job.
-        _, paginator = self._jobs(mock_client, {})
+        mock_sm, paginator = self._jobs(mock_client, {})
         sagemaker_app.check_sagemaker_training_job_network_boundary(region="us-east-1")
-        paginator.paginate.assert_called_once_with(
-            SortBy="CreationTime", SortOrder="Descending"
-        )
+        # The processing-job leg shares this mock paginator, so the training
+        # list is picked out by its operation name and its sort arguments.
+        operations = [c.args[0] for c in mock_sm.get_paginator.call_args_list]
+        assert operations.count("list_training_jobs") == 1
+        training_call = paginator.paginate.call_args_list[
+            operations.index("list_training_jobs")
+        ]
+        assert training_call == call(SortBy="CreationTime", SortOrder="Descending")
         assert not hasattr(sagemaker_app, "MAX_TRAINING_JOBS_SAMPLED")
+
+    @patch("sagemaker_app.boto3.client")
+    def test_every_training_job_is_listed_with_no_item_cap(self, mock_client):
+        """The list used to stop at the 50 most recent jobs, so an older job
+        with no VpcConfig was never read."""
+        mock_sm, paginator = self._jobs(mock_client, {})
+        ok = {"VpcConfig": {"Subnets": ["subnet-a"]}}
+        paginator.paginate.return_value = [
+            {
+                "TrainingJobSummaries": [
+                    {"TrainingJobName": f"job-{i:02d}"} for i in range(50)
+                ]
+            },
+            {"TrainingJobSummaries": [{"TrainingJobName": "old-open-job"}]},
+        ]
+        mock_sm.describe_training_job.side_effect = lambda TrainingJobName: (
+            {} if TrainingJobName == "old-open-job" else ok
+        )
+        findings = extract_csv_data(
+            sagemaker_app.check_sagemaker_training_job_network_boundary(
+                region="us-east-1"
+            )
+        )
+        for paginate_call in paginator.paginate.call_args_list:
+            assert "PaginationConfig" not in paginate_call.kwargs
+        failed = [
+            f
+            for f in findings
+            if f["Finding"] == sagemaker_app.TRAINING_NETWORK_BOUNDARY_FINDING
+            and f["Status"] == "Failed"
+        ]
+        assert [f["Finding_Details"].split("'")[1] for f in failed] == ["old-open-job"]
+        assert mock_sm.describe_training_job.call_count == 51
 
     @patch("sagemaker_app.boto3.client")
     def test_no_training_jobs_returns_na(self, mock_client):
@@ -5392,13 +5431,16 @@ class TestSM34CreationGuardrails:
         )
         findings = self._run(self._inventory(), cache=cache)
         assert [f["Status"] for f in findings] == ["N/A", "N/A", "N/A"]
-        assert "Role 'Hidden'" in findings[0]["Finding_Details"]
+        assert "role 'Hidden'" in findings[0]["Finding_Details"]
 
     def test_a_v1_cache_passes_and_says_errors_were_not_recorded(self):
         cache = _creation_cache({"Builder": GUARDED_CREATE_ALLOWS}, version=1)
         findings = self._run(self._inventory(), cache=cache)
         assert [f["Status"] for f in findings] == ["Passed", "Passed", "Passed"]
-        assert "schema version 1" in findings[0]["Finding_Details"]
+        assert (
+            sagemaker_app.UNRECORDED_PRINCIPAL_ERRORS_NOTE
+            in findings[0]["Finding_Details"]
+        )
 
     def test_management_account_is_not_guarded_by_any_scp(self):
         inventory = self._inventory(
@@ -6286,7 +6328,10 @@ class TestSM02ServiceWideGrant:
         )
         rows = self._grant_rows(cache)
         assert [f["Status"] for f in rows] == ["Passed"]
-        assert "None of the 2 customer-managed or inline" in rows[0]["Finding_Details"]
+        assert (
+            "None of the 2 customer-managed, inline or group"
+            in rows[0]["Finding_Details"]
+        )
 
     def test_notaction_allow_reaches_sagemaker_and_fails(self):
         document = {
@@ -6307,11 +6352,13 @@ class TestSM02ServiceWideGrant:
         rows = self._grant_rows(_role_cache({"ExcludesRole": [("EX", document)]}))
         assert [f["Status"] for f in rows] == ["Passed"]
 
-    def test_bare_star_is_left_to_the_administrator_checks(self):
+    def test_bare_star_grants_every_sagemaker_action(self):
         rows = self._grant_rows(
             _role_cache({"AdminRole": [("Admin", _identity_policy("*", "*"))]})
         )
-        assert [f["Status"] for f in rows] == ["Passed"]
+        assert [f["Status"] for f in rows] == ["Failed"]
+        assert "Role 'AdminRole'" in rows[0]["Finding_Details"]
+        assert "Action '*'" in rows[0]["Finding_Details"]
 
     def test_aws_managed_policy_is_excluded(self):
         cache = {
@@ -9450,7 +9497,9 @@ class TestSM02EndpointInvocationScopingFullGrade:
             _sm02_rows(cache), sagemaker_app.ENDPOINT_INVOCATION_SCOPING_FINDING
         )
         assert [r["Status"] for r in rows] == ["Passed"]
-        assert "schema version 1" in rows[0]["Finding_Details"]
+        assert (
+            sagemaker_app.UNRECORDED_PRINCIPAL_ERRORS_NOTE in rows[0]["Finding_Details"]
+        )
 
     def test_version_two_cache_without_errors_omits_the_version_note(self):
         cache = _v2_cache(
@@ -9470,7 +9519,10 @@ class TestSM02EndpointInvocationScopingFullGrade:
             _sm02_rows(cache), sagemaker_app.ENDPOINT_INVOCATION_SCOPING_FINDING
         )
         assert [r["Status"] for r in rows] == ["Passed"]
-        assert "schema version 1" not in rows[0]["Finding_Details"]
+        assert (
+            sagemaker_app.UNRECORDED_PRINCIPAL_ERRORS_NOTE
+            not in rows[0]["Finding_Details"]
+        )
 
 
 class TestSM02CacheContractOtherLegs:
@@ -12098,7 +12150,7 @@ class TestCacheV2BoundaryUnread:
         rows = self._sm02_scoping(cache)
         assert [r["Status"] for r in rows] == ["N/A"]
         assert rows[0]["Finding"].endswith("Incomplete")
-        assert "Role 'Hidden'" in rows[0]["Finding_Details"]
+        assert "role 'Hidden'" in rows[0]["Finding_Details"]
 
     def test_sm02_one_read_and_one_unknown_boundary(self):
         cache = _v2_cache(
@@ -12192,7 +12244,7 @@ class TestCacheV2BoundaryUnread:
         )
         findings = self._sm34(cache)
         assert [f["Status"] for f in findings] == ["N/A", "N/A", "N/A"]
-        assert "Role 'Admin'" in findings[0]["Finding_Details"]
+        assert "role 'Admin'" in findings[0]["Finding_Details"]
 
     def test_sm34_one_read_and_one_unknown_boundary(self):
         cache = _creation_cache(
@@ -12212,3 +12264,356 @@ class TestCacheV2BoundaryUnread:
         findings = self._sm34(cache)
         assert [f["Status"] for f in findings] == ["Failed", "Failed", "Failed"]
         assert "Role 'Admin'" in findings[0]["Finding_Details"]
+
+    _FULL_ACCESS_FINDING = "SageMaker Full Access Policy Used"
+    _FULL_ACCESS_DOC = [("AmazonSageMakerFullAccess", {"Statement": []})]
+
+    def test_full_access_unread_boundary_is_not_read_not_failed(self):
+        cache = _v2_cache(
+            {"Hidden": self._FULL_ACCESS_DOC},
+            principal_errors=[_boundary_error("Hidden")],
+        )
+        rows = _sm02_rows(cache)
+        assert _by_finding(rows, self._FULL_ACCESS_FINDING) == []
+        check = _by_finding(rows, "SageMaker IAM Permissions Check")
+        assert [r["Status"] for r in check] == ["N/A"]
+        assert "Hidden" in check[0]["Finding_Details"]
+
+    def test_full_access_one_read_and_one_unknown_boundary(self):
+        cache = _v2_cache(
+            {"Open": self._FULL_ACCESS_DOC, "Hidden": self._FULL_ACCESS_DOC},
+            principal_errors=[_boundary_error("Hidden")],
+        )
+        rows = _by_finding(_sm02_rows(cache), self._FULL_ACCESS_FINDING)
+        failed = [r for r in rows if r["Status"] == "Failed"]
+        unread = [r for r in rows if r["Status"] == "N/A"]
+        assert len(failed) == 1
+        assert "Role 'Open'" in failed[0]["Finding_Details"]
+        assert len(unread) == 1
+        assert unread[0]["Finding"].endswith("Incomplete")
+        assert "Role 'Hidden'" in unread[0]["Finding_Details"]
+        assert "Open" not in unread[0]["Finding_Details"].split("For what")[0]
+        assert "permissions boundary was not read" in unread[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            _boundary_error("Hidden", stage="inline_policy"),
+            _boundary_error("SomeoneElse"),
+            _boundary_error("Hidden", identity_type="user"),
+        ],
+    )
+    def test_full_access_error_elsewhere_does_not_hide_a_read_boundary(self, error):
+        cache = _v2_cache({"Hidden": self._FULL_ACCESS_DOC}, principal_errors=[error])
+        rows = _by_finding(_sm02_rows(cache), self._FULL_ACCESS_FINDING)
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "Role 'Hidden'" in rows[0]["Finding_Details"]
+
+
+MIXED_SUBNET_FIXTURE = (
+    [_subnet("subnet-public"), _subnet("subnet-private")],
+    [
+        _route_table(
+            "rtb-public", [LOCAL_ROUTE, IGW_ROUTE], _explicit("subnet-public", "a-1")
+        ),
+        _route_table(
+            "rtb-private", [LOCAL_ROUTE, NAT_ROUTE], _explicit("subnet-private", "a-2")
+        ),
+    ],
+)
+
+
+def _sagemaker_pages(pages, **describes):
+    """A SageMaker client whose paginators are keyed by operation name and
+    whose describe calls read from ``describes``."""
+    sm = MagicMock()
+
+    def get_paginator(operation_name):
+        paginator = MagicMock()
+        outcome = pages.get(operation_name, [{}])
+        if isinstance(outcome, Exception):
+            paginator.paginate.side_effect = outcome
+        else:
+            paginator.paginate.return_value = outcome
+        return paginator
+
+    sm.get_paginator.side_effect = get_paginator
+    for operation, table in describes.items():
+
+        def describe(_table=table, **kwargs):
+            (key,) = kwargs.values()
+            outcome = _table[key]
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+
+        setattr(sm, operation, MagicMock(side_effect=describe))
+    return sm
+
+
+_ACCESS_DENIED = ClientError(
+    {"Error": {"Code": "AccessDeniedException", "Message": "denied"}}, "Describe"
+)
+
+
+class TestNet01ProcessingJobs:
+    """AIR-FND-NET-01: SM-33 reads every processing job's NetworkConfig and the
+    route tables of the subnets it names."""
+
+    @staticmethod
+    def _run(mock_client, processing, ec2=None, pages=None):
+        sm = _sagemaker_pages(
+            pages
+            or {
+                "list_training_jobs": [{"TrainingJobSummaries": []}],
+                "list_processing_jobs": [
+                    {
+                        "ProcessingJobSummaries": [
+                            {"ProcessingJobName": name} for name in processing
+                        ]
+                    }
+                ],
+            },
+            describe_processing_job=processing,
+        )
+        mock_client.side_effect = _sm_client_factory(
+            sagemaker=sm, ec2=ec2 or _ec2_exposure_client(*MIXED_SUBNET_FIXTURE)
+        )
+        rows = extract_csv_data(
+            sagemaker_app.check_sagemaker_training_job_network_boundary(
+                region="us-east-1"
+            )
+        )
+        for row in rows:
+            assert row["Check_ID"] == "SM-33"
+            assert_finding_schema(row)
+        return rows
+
+    @patch("sagemaker_app.boto3.client")
+    def test_one_processing_job_without_a_vpc_among_vpc_jobs_is_failed(
+        self, mock_client
+    ):
+        vpc = {"NetworkConfig": {"VpcConfig": {"Subnets": ["subnet-private"]}}}
+        rows = self._run(
+            mock_client,
+            {
+                "p-vpc-1": vpc,
+                "p-vpc-2": vpc,
+                "p-open": {"NetworkConfig": {"EnableNetworkIsolation": True}},
+            },
+        )
+        boundary = [
+            r
+            for r in rows
+            if r["Finding"] == sagemaker_app.PROCESSING_NETWORK_BOUNDARY_FINDING
+        ]
+        assert [r["Status"] for r in boundary] == ["Failed", "Passed"]
+        assert "'p-open'" in boundary[0]["Finding_Details"]
+        assert "Network isolation is on" in boundary[0]["Finding_Details"]
+        assert boundary[1]["Finding_Details"].startswith(
+            "2 of the 3 processing jobs ran in customer subnets"
+        )
+        exposure = [
+            r
+            for r in rows
+            if r["Finding"] == sagemaker_app.PROCESSING_SUBNET_EXPOSURE_FINDING
+        ]
+        assert [r["Status"] for r in exposure] == ["Passed"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_a_processing_job_in_a_public_subnet_is_failed(self, mock_client):
+        rows = self._run(
+            mock_client,
+            {
+                "p-private": {
+                    "NetworkConfig": {"VpcConfig": {"Subnets": ["subnet-private"]}}
+                },
+                "p-public": {
+                    "NetworkConfig": {"VpcConfig": {"Subnets": ["subnet-public"]}}
+                },
+            },
+        )
+        exposure = [
+            r
+            for r in rows
+            if r["Finding"] == sagemaker_app.PROCESSING_SUBNET_EXPOSURE_FINDING
+        ]
+        assert [r["Status"] for r in exposure] == ["Failed", "Passed"]
+        assert "Processing job 'p-public'" in exposure[0]["Finding_Details"]
+        assert "igw-public1" in exposure[0]["Finding_Details"]
+        assert "p-private" not in exposure[0]["Finding_Details"]
+        assert "p-public" not in exposure[1]["Finding_Details"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_a_processing_list_error_is_na_and_never_the_none_found_row(
+        self, mock_client
+    ):
+        rows = self._run(
+            mock_client,
+            {},
+            pages={
+                "list_training_jobs": [{"TrainingJobSummaries": []}],
+                "list_processing_jobs": _ACCESS_DENIED,
+            },
+        )
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert rows[0]["Finding"] == sagemaker_app.PROCESSING_NETWORK_BOUNDARY_FINDING
+        assert "could not be listed" in rows[0]["Finding_Details"]
+        assert "No SageMaker training" not in rows[0]["Finding_Details"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_a_processing_describe_error_is_na_beside_the_passed(self, mock_client):
+        rows = self._run(
+            mock_client,
+            {
+                "p-private": {
+                    "NetworkConfig": {"VpcConfig": {"Subnets": ["subnet-private"]}}
+                },
+                "p-unread": _ACCESS_DENIED,
+            },
+        )
+        unread = [r for r in rows if "'p-unread'" in r["Finding_Details"]]
+        assert [r["Status"] for r in unread] == ["N/A"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_processing_jobs_alone_suppress_the_none_found_row(self, mock_client):
+        rows = self._run(
+            mock_client,
+            {"p-open": {}},
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "no NetworkConfig.VpcConfig" in rows[0]["Finding_Details"]
+
+
+class TestNet01StudioDomains:
+    """AIR-FND-NET-01: SM-10 reads each Studio domain's AppNetworkAccessType and
+    the route tables of its SubnetIds."""
+
+    @staticmethod
+    def _run(mock_client, domains, notebook_pages=None, domain_pages=None):
+        sm = _sagemaker_pages(
+            {
+                "list_notebook_instances": notebook_pages
+                or [{"NotebookInstances": []}],
+                "list_domains": domain_pages
+                or [
+                    {
+                        "Domains": [
+                            {"DomainId": domain_id, "DomainName": domain_id}
+                            for domain_id in domains
+                        ]
+                    }
+                ],
+            },
+            describe_domain=domains,
+        )
+        mock_client.side_effect = _sm_client_factory(
+            sagemaker=sm, ec2=_ec2_exposure_client(*MIXED_SUBNET_FIXTURE)
+        )
+        rows = extract_csv_data(
+            sagemaker_app.check_sagemaker_notebook_vpc_deployment(region="us-east-1")
+        )
+        for row in rows:
+            assert row["Check_ID"] == "SM-10"
+            assert_finding_schema(row)
+        return rows
+
+    @staticmethod
+    def _domain_rows(rows):
+        return [
+            r
+            for r in rows
+            if r["Finding"]
+            in (
+                sagemaker_app.STUDIO_DOMAIN_NETWORK_FINDING,
+                sagemaker_app.STUDIO_DOMAIN_SUBNET_EXPOSURE_FINDING,
+            )
+        ]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_a_public_internet_domain_among_vpc_only_domains_is_failed(
+        self, mock_client
+    ):
+        private = {"AppNetworkAccessType": "VpcOnly", "SubnetIds": ["subnet-private"]}
+        rows = self._domain_rows(
+            self._run(
+                mock_client,
+                {
+                    "d-ok1": private,
+                    "d-open": {"AppNetworkAccessType": "PublicInternetOnly"},
+                    "d-ok2": private,
+                },
+            )
+        )
+        failed = [r for r in rows if r["Status"] == "Failed"]
+        assert len(failed) == 1
+        assert "'d-open'" in failed[0]["Finding_Details"]
+        assert "PublicInternetOnly" in failed[0]["Finding_Details"]
+        exposure = [
+            r
+            for r in rows
+            if r["Finding"] == sagemaker_app.STUDIO_DOMAIN_SUBNET_EXPOSURE_FINDING
+        ]
+        assert [r["Status"] for r in exposure] == ["Passed"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_a_domain_that_omits_the_access_type_reads_as_the_public_default(
+        self, mock_client
+    ):
+        rows = self._domain_rows(self._run(mock_client, {"d-default": {}}))
+        assert [r["Status"] for r in rows] == ["Failed"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_a_vpc_only_domain_in_a_public_subnet_is_failed(self, mock_client):
+        rows = self._domain_rows(
+            self._run(
+                mock_client,
+                {
+                    "d-public": {
+                        "AppNetworkAccessType": "VpcOnly",
+                        "SubnetIds": ["subnet-public"],
+                    },
+                    "d-private": {
+                        "AppNetworkAccessType": "VpcOnly",
+                        "SubnetIds": ["subnet-private"],
+                    },
+                },
+            )
+        )
+        failed = [r for r in rows if r["Status"] == "Failed"]
+        assert len(failed) == 1
+        assert "'d-public'" in failed[0]["Finding_Details"]
+        assert "igw-public1" in failed[0]["Finding_Details"]
+        assert "d-private" not in failed[0]["Finding_Details"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_a_vpc_only_domain_with_no_subnets_is_na(self, mock_client):
+        rows = self._domain_rows(
+            self._run(mock_client, {"d-empty": {"AppNetworkAccessType": "VpcOnly"}})
+        )
+        assert [r["Status"] for r in rows] == ["N/A"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_domain_list_and_describe_errors_are_na(self, mock_client):
+        listed = self._domain_rows(
+            self._run(mock_client, {}, domain_pages=_ACCESS_DENIED)
+        )
+        assert [r["Status"] for r in listed] == ["N/A"]
+        assert "could not be listed" in listed[0]["Finding_Details"]
+        described = self._domain_rows(
+            self._run(mock_client, {"d-unread": _ACCESS_DENIED})
+        )
+        assert [r["Status"] for r in described] == ["N/A"]
+        assert "'d-unread'" in described[0]["Finding_Details"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_a_notebook_list_error_never_yields_the_all_in_vpc_passed(
+        self, mock_client
+    ):
+        rows = self._run(mock_client, {}, notebook_pages=_ACCESS_DENIED)
+        notebook = [
+            r for r in rows if r["Finding"] == "SageMaker Notebook VPC Deployment Check"
+        ]
+        assert [r["Status"] for r in notebook] == ["N/A"]
+        assert "could not all be read" in notebook[0]["Finding_Details"]
+        assert "Passed" not in [r["Status"] for r in rows]
