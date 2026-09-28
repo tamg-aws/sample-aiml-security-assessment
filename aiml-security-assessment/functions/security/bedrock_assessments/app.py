@@ -13235,6 +13235,90 @@ def check_bedrock_guardrail_prompt_attack_filter(
     return findings
 
 
+def check_guardrail_intervention_logging(region: str = "") -> Dict[str, Any]:
+    """
+    BR-34 logging leg (AIR-FND-DET-04): a guardrail intervention is a
+    reviewable event only when model invocation logging delivers the text
+    output body, which carries the intervention (Converse stopReason
+    guardrail_intervened).
+    """
+    finding_name = "Guardrail Intervention Logging"
+    reference = "https://docs.aws.amazon.com/bedrock/latest/userguide/model-invocation-logging.html"
+    resolution = (
+        "Enable model invocation logging with textDataDeliveryEnabled=true to an "
+        "S3 bucket or CloudWatch Logs log group, so each guardrail intervention "
+        "is recorded with the invocation that triggered it."
+    )
+
+    def row(details: str, status: str, action: str) -> Dict[str, Any]:
+        return create_finding(
+            check_id="BR-34",
+            finding_name=finding_name,
+            finding_details=details,
+            resolution=action,
+            reference=reference,
+            severity="Informational" if status == "N/A" else "Medium",
+            status=status,
+            region=region,
+        )
+
+    try:
+        config = (
+            boto3.client("bedrock", config=boto3_config, region_name=region)
+            .get_model_invocation_logging_configuration()
+            .get("loggingConfig")
+            or {}
+        )
+    except (ClientError, BotoCoreError) as error:
+        return {
+            "csv_data": [
+                row(
+                    "Whether guardrail interventions are logged could not be assessed: "
+                    "bedrock:GetModelInvocationLoggingConfiguration was not read "
+                    f"({get_assessment_error_label(error)}).",
+                    "N/A",
+                    COULD_NOT_ASSESS_RESOLUTION,
+                )
+            ]
+        }
+    destinations = []
+    bucket_name = _extract_s3_bucket_name(config.get("s3Config"))
+    if bucket_name:
+        destinations.append(f"S3 bucket '{bucket_name}'")
+    log_group_name = (config.get("cloudWatchConfig") or {}).get("logGroupName")
+    if log_group_name:
+        destinations.append(f"log group '{log_group_name}'")
+    if not destinations:
+        details = (
+            "Model invocation logging is off in this region, so no guardrail "
+            "intervention is recorded as an event."
+        )
+        return {"csv_data": [row(details, "Failed", resolution)]}
+    if "textDataDeliveryEnabled" not in config:
+        details = (
+            "Model invocation logging delivers to "
+            f"{' and '.join(destinations)}, but GetModelInvocationLoggingConfiguration "
+            "did not return textDataDeliveryEnabled, so whether text output bodies, "
+            "which carry a guardrail intervention, are delivered is not shown."
+        )
+        return {"csv_data": [row(details, "N/A", COULD_NOT_ASSESS_RESOLUTION)]}
+    if config["textDataDeliveryEnabled"] is not True:
+        details = (
+            "Model invocation logging delivers to "
+            f"{' and '.join(destinations)} with textDataDeliveryEnabled not true, so "
+            "text output bodies, which carry a guardrail intervention, are not "
+            "recorded."
+        )
+        return {"csv_data": [row(details, "Failed", resolution)]}
+    details = (
+        "Model invocation logging delivers text output bodies, which carry a "
+        f"guardrail intervention, to {' and '.join(destinations)}. Only calls through "
+        "the bedrock-runtime endpoint are logged, and whether a guardrail is applied "
+        "to each call is judged by BR-41 and BR-49, not here."
+    )
+    return {"csv_data": [row(details, "Passed", "No action required.")]}
+
+
 def check_bedrock_guardrail_image_content_filters(
     region: str = "", guardrail_inventory: Dict[str, Any] = None
 ) -> Dict[str, Any]:
@@ -28240,6 +28324,7 @@ def lambda_handler(event, context):
                 knowledge_base_inventory=knowledge_base_screening,
             )
         )
+        all_findings.append(check_guardrail_intervention_logging(region=region))
 
         logger.info("Running guardrail image content filter advisory (BR-35)")
         all_findings.append(

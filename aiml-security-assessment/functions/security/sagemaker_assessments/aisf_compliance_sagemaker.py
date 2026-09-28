@@ -31,7 +31,7 @@ AISF_COMPLIANCE_MAP = {
     "SM-11": "AISF AIR-FND-NET-01 (1 of 6 checks) | AISF AIR-SGM-EP-01",
     "SM-18": "AISF AIR-SGM-EP-08",
     "SM-22": "AISF AIR-SGM-GOV-01",
-    "SM-26": "AISF AIR-FND-DET-02 (1 of 3 checks)",
+    "SM-26": "AISF AIR-FND-DET-02 (1 of 3 checks) | AISF AIR-FND-DET-04 (1 of 4 checks)",
     "SM-28": "AISF AIR-FND-NET-01 (1 of 6 checks)",
     "SM-31": "AISF AIR-SGM-EP-06",
     "SM-32": "AISF AIR-SGM-GOV-10",

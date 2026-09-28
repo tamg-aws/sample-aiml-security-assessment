@@ -1041,11 +1041,17 @@ AI_SUBJECT_ROWS = [
         "AIR-FND-DET-04",
         COVERED,
         None,
-        "bedrock_assessments",
-        ["BR-34", "BR-41", "BR-49"],
-        "three checks, one per enforcement surface. BR-34 asserts a guardrail carries a "
+        ["bedrock_assessments", "sagemaker_assessments"],
+        ["BR-34", "BR-41", "BR-49", "SM-26"],
+        "three Bedrock checks, one per enforcement surface, and one detection check. "
+        "BR-34 asserts a guardrail carries a "
         "PROMPT_ATTACK filter with inputEnabled true, inputAction BLOCK and inputStrength "
-        "HIGH. BR-41 reads ListEnforcedGuardrailsConfiguration, including "
+        "HIGH on the STANDARD content-filter tier, and fails a CLASSIC tier, which has no "
+        "prompt-leakage detection. BR-34 also fails a Region whose model invocation "
+        "logging is off or has textDataDeliveryEnabled not true, since the text output "
+        "body is the record of a guardrail intervention, and reports an unread or absent "
+        "flag as Not Applicable. SM-26 reads each GuardDuty detector's AI_PROTECTION "
+        "feature, which raises the prompt-injection finding. BR-41 reads ListEnforcedGuardrailsConfiguration, including "
         "modelEnforcement.includedModels and excludedModels, where ALL with an empty "
         "excludedModels is every model and a non-empty excludedModels leaves holes, and "
         "selectiveContentGuarding, where SELECTIVE on either the system or the messages "
@@ -1059,7 +1065,9 @@ AI_SUBJECT_ROWS = [
         "model is denied bedrock:InvokeModel and bedrock:InvokeModelWithResponseStream "
         "without an approved bedrock:GuardrailIdentifier. Those two actions authorize "
         "Converse and ConverseStream as well; the Converse operations have no IAM action of"
-        " their own",
+        " their own. Ceiling: whether an application runs ApplyGuardrail over retrieved "
+        "and tool-returned content is runtime behaviour that no configuration API "
+        "reports",
         [],
         5,
     ),

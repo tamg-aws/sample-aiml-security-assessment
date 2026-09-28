@@ -242,6 +242,9 @@ section.
   name each unread leg. `BR-52` no longer credits a recovery point created
   before its vault's lock date whose own lifecycle deletes it before the
   vault's minimum retention.
+- `BR-34` fails a Region whose model invocation logging is off or does not
+  deliver text, so a guardrail intervention leaves no record. `AIR-FND-DET-04`
+  now also counts `SM-26`, which reads GuardDuty AI Protection.
 - Bedrock checks judge values that they used to credit on presence. `BR-07`,
   `BR-17`, `BR-20` (S3 Vectors), `BR-30` and `BR-38` describe each named KMS
   key and pass only an enabled customer managed key. `BR-07` also fails inline

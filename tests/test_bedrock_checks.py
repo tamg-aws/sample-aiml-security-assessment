@@ -15595,6 +15595,74 @@ class TestDeployedGuardrailVersions:
         assert "bedrock:ListEnforcedGuardrailsConfiguration" in inventory["errors"][0]
 
 
+class TestGuardrailInterventionLogging:
+    """AIR-FND-DET-04: an intervention is an event only if invocation logging records it."""
+
+    REGION = "us-east-1"
+
+    def _run(self, config=None, error=None):
+        client = MagicMock()
+        if error is not None:
+            client.get_model_invocation_logging_configuration.side_effect = error
+        else:
+            client.get_model_invocation_logging_configuration.return_value = {
+                "loggingConfig": config
+            }
+        with patch.object(bedrock_app.boto3, "client", return_value=client):
+            result = bedrock_app.check_guardrail_intervention_logging(
+                region=self.REGION
+            )
+        rows = extract_csv_data(result)
+        for row in rows:
+            assert_finding_schema(row)
+            assert row["Check_ID"] == "BR-34"
+            assert row["Finding"] == "Guardrail Intervention Logging"
+        return rows
+
+    def test_logging_off_fails(self):
+        rows = self._run(config=None)
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "Model invocation logging is off" in rows[0]["Finding_Details"]
+
+    def test_both_destinations_without_text_delivery_fail(self):
+        rows = self._run(
+            config={
+                "s3Config": {"bucketName": "logs-a"},
+                "cloudWatchConfig": {"logGroupName": "lg-b"},
+                "textDataDeliveryEnabled": False,
+                "imageDataDeliveryEnabled": True,
+            }
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "S3 bucket 'logs-a' and log group 'lg-b'" in rows[0]["Finding_Details"]
+        assert "textDataDeliveryEnabled not true" in rows[0]["Finding_Details"]
+
+    def test_a_destination_without_the_text_flag_is_not_credited(self):
+        rows = self._run(config={"cloudWatchConfig": {"logGroupName": "lg-b"}})
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert "did not return textDataDeliveryEnabled" in rows[0]["Finding_Details"]
+
+    def test_text_delivery_to_a_destination_passes_and_names_it(self):
+        rows = self._run(
+            config={
+                "s3Config": {"bucketName": "logs-a"},
+                "textDataDeliveryEnabled": True,
+            }
+        )
+        assert [r["Status"] for r in rows] == ["Passed"]
+        details = rows[0]["Finding_Details"]
+        assert "S3 bucket 'logs-a'" in details
+        assert "judged by BR-41 and BR-49, not here" in details
+
+    def test_unread_configuration_is_na_naming_the_action(self):
+        rows = self._run(error=_make_client_error("AccessDeniedException"))
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert (
+            "bedrock:GetModelInvocationLoggingConfiguration was not read"
+            in rows[0]["Finding_Details"]
+        )
+
+
 class TestGuardrailConditionPins:
     """The deployed-guardrail population includes guardrails callers are made to name."""
 
@@ -25070,6 +25138,35 @@ class TestBR55EnclaveKeyBinding:
             "arn:k/b-unread: its key policy binds attestation, but its grants"
             in (rows[2]["Finding_Details"])
         )
+
+
+def test_handler_emits_the_guardrail_intervention_logging_row():
+    test_client = MagicMock()
+    test_client.get_model_invocation_logging_configuration.side_effect = (
+        _make_client_error("AccessDeniedException")
+    )
+    captured = {}
+
+    def fake_csv(findings):
+        captured["findings"] = findings
+        return "csv"
+
+    with (
+        patch.object(bedrock_app.boto3, "client", return_value=test_client),
+        patch.object(bedrock_app, "get_permissions_cache", return_value=None),
+        patch.object(bedrock_app, "generate_csv_report", side_effect=fake_csv),
+        patch.object(bedrock_app, "write_to_s3", return_value="s3://b/r.csv"),
+    ):
+        bedrock_app.lambda_handler(
+            _bedrock_event(region="us-east-1", region_index=0), None
+        )
+    rows = [
+        r
+        for f in captured["findings"]
+        for r in f.get("csv_data", [])
+        if r["Finding"] == "Guardrail Intervention Logging"
+    ]
+    assert [(r["Check_ID"], r["Status"]) for r in rows] == [("BR-34", "N/A")]
 
 
 def test_handler_reports_br50_and_br51_unassessed_without_a_cache():
