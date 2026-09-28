@@ -13807,7 +13807,10 @@ MODEL_ARTIFACT_INTEGRITY_RESOLUTION = (
     "ModelDataSource with its S3 ETag or ManifestEtag recorded, or from a model "
     "package container that records ModelDataETag, in place of a bare "
     "ModelDataUrl or a hub model id read at startup, and encrypt the artifact "
-    "bucket with SSE-KMS under a named key."
+    "bucket with SSE-KMS under a named key. An inference component whose "
+    "container names an S3 ArtifactUrl has no ETag field to record one, so "
+    "create the component from a model (ModelName) whose container loads its "
+    "data through ModelDataSource with the ETag recorded."
 )
 MODEL_ARTIFACT_INTEGRITY_SCOPE_NOTE = (
     "A recorded ETag, ManifestEtag or ModelDataETag means an expected value is "
