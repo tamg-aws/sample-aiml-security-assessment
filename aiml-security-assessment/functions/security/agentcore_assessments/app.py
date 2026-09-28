@@ -9404,6 +9404,10 @@ def _statement_condition_denies_value(
             if name.startswith(prefix):
                 name = name[len(prefix) :]
                 break
+        # The authorizer type is always present on the write, so an IfExists
+        # operator reads the same as its plain form.
+        if name.endswith("ifexists"):
+            name = name[: -len("ifexists")]
         for entry_key, raw in entries.items():
             if str(entry_key).strip().lower() != key:
                 continue
@@ -9440,6 +9444,236 @@ def _scp_authorizer_deny_coverage(
     return covered, names_key
 
 
+# Organizations nests organizational units at most five levels under the root,
+# so an account's parent chain has at most six hops. The walk stops at the root
+# and fails loudly past this bound instead of looping on a malformed answer.
+ORGANIZATION_PARENT_CHAIN_LIMIT = 6
+
+
+ORGANIZATIONS_TARGET_TYPE_LABELS = {
+    "ACCOUNT": "account",
+    "ORGANIZATIONAL_UNIT": "organizational unit",
+    "ROOT": "root",
+}
+
+
+def _assessed_account_parent_chain(account_id: str) -> List[Tuple[str, str]]:
+    """Return the account and every parent up to the root, as (id, type) pairs.
+
+    An SCP binds an account when it is attached to the account itself, to any
+    organizational unit above it, or to the root.
+    """
+    chain = [(account_id, "ACCOUNT")]
+    child = account_id
+    for _ in range(ORGANIZATION_PARENT_CHAIN_LIMIT):
+        parents = _paginate_aws_list(
+            organizations_client,
+            "list_parents",
+            "Parents",
+            token_request_key="NextToken",
+            token_response_key="NextToken",
+            ChildId=child,
+        )
+        if len(parents) != 1 or not parents[0].get("Id"):
+            raise ValueError(
+                f"ListParents returned {len(parents)} parent(s) for {child}"
+            )
+        child = str(parents[0]["Id"])
+        parent_type = str(parents[0].get("Type", ""))
+        chain.append((child, parent_type))
+        if parent_type == "ROOT":
+            return chain
+    raise ValueError(
+        f"no root within {ORGANIZATION_PARENT_CHAIN_LIMIT} parents of {account_id}"
+    )
+
+
+def _scp_attachment(
+    policies: List[Dict[str, Any]], candidate_ids: Set[str]
+) -> Dict[str, Any]:
+    """Read where each candidate SCP is attached relative to the assessed account.
+
+    Returns the account id, whether it is the management account (which no SCP
+    restricts), the candidates attached to the account or an ancestor with the
+    target that binds them, the candidates attached elsewhere, the candidates
+    whose targets could not be read, and the error that stopped the parent walk.
+    Nothing is read when there is no candidate.
+    """
+    result: Dict[str, Any] = {
+        "account": "",
+        "management": False,
+        "attached": {},
+        "unattached": set(),
+        "unread": {},
+        "chain_error": None,
+    }
+    if not candidate_ids:
+        return result
+    try:
+        account_id = boto3.client("sts", config=boto3_config).get_caller_identity()[
+            "Account"
+        ]
+        result["account"] = account_id
+        # A customer managed SCP's ARN carries the management account in its
+        # account segment, so no DescribeOrganization call is needed.
+        if account_id in {_arn_account(policy.get("Arn")) for policy in policies}:
+            result["management"] = True
+            return result
+        chain = dict(_assessed_account_parent_chain(account_id))
+    except Exception as error:
+        result["chain_error"] = error
+        return result
+
+    for policy_id in sorted(candidate_ids):
+        try:
+            targets = _paginate_aws_list(
+                organizations_client,
+                "list_targets_for_policy",
+                "Targets",
+                token_request_key="NextToken",
+                token_response_key="NextToken",
+                PolicyId=policy_id,
+            )
+        except Exception as error:
+            result["unread"][policy_id] = error
+            continue
+        binding = [
+            target for target in targets if str(target.get("TargetId", "")) in chain
+        ]
+        if binding:
+            target = binding[0]
+            target_type = str(target.get("Type") or chain[target["TargetId"]])
+            result["attached"][policy_id] = (
+                f"{ORGANIZATIONS_TARGET_TYPE_LABELS.get(target_type, target_type)} "
+                f"{target['TargetId']}"
+            )
+        else:
+            result["unattached"].add(policy_id)
+    return result
+
+
+def _attached_scp_coverage(
+    check_id: str,
+    finding_name: str,
+    reference: str,
+    attachment: Dict[str, Any],
+    coverage: Dict[str, Tuple[str, Set[str]]],
+    actions: Dict[str, str],
+) -> Tuple[Set[str], List[Tuple[str, str]], List[str], List[Dict[str, Any]]]:
+    """Keep only the SCP coverage that binds the assessed account.
+
+    `coverage` maps a policy id to its name and the actions its content denies.
+    Returns the actions denied by attached policies, each attached policy's name
+    with the target that binds it,
+    the names of guarding policies attached elsewhere, and the findings that
+    end the check because attachment could not be judged. A policy whose
+    targets were not read is never counted as attached, and a verdict that
+    would change if it were is reported incomplete.
+    """
+    action_label = " and ".join(sorted(actions.values()))
+    account = attachment["account"] or "this account"
+    if not coverage:
+        return set(), [], [], []
+    if attachment["chain_error"] is not None:
+        names = ", ".join(sorted(name for name, _ in coverage.values()))
+        return (
+            set(),
+            [],
+            [],
+            [
+                create_finding(
+                    check_id=check_id,
+                    finding_name=f"{finding_name} Incomplete",
+                    finding_details=(
+                        f"Service control policy {names} would deny {action_label}, "
+                        "but the organizational units and root above "
+                        f"{account} could not be read: "
+                        f"{_assessment_error_label(attachment['chain_error'])}. "
+                        "Whether the policy binds this account was not confirmed, "
+                        "so no Passed is reported."
+                    ),
+                    resolution=(
+                        "Grant organizations:ListParents and "
+                        "organizations:ListTargetsForPolicy and rerun the assessment."
+                    ),
+                    reference=reference,
+                    severity=SeverityEnum.INFORMATIONAL,
+                    status=StatusEnum.NA,
+                )
+            ],
+        )
+    if attachment["management"]:
+        return (
+            set(),
+            [],
+            [],
+            [
+                create_finding(
+                    check_id=check_id,
+                    finding_name=f"{finding_name} Not Enforced",
+                    finding_details=(
+                        f"{account} is the organization's management account, and "
+                        "service control policies do not restrict users or roles in "
+                        f"the management account, so no SCP denies {action_label} "
+                        "here whatever its content."
+                    ),
+                    resolution=(
+                        "Keep AgentCore workloads out of the management account, and "
+                        "run this assessment in each member account that hosts them."
+                    ),
+                    reference=reference,
+                    severity=SeverityEnum.HIGH,
+                    status=StatusEnum.FAILED,
+                )
+            ],
+        )
+
+    covered: Set[str] = set()
+    guarding: List[Tuple[str, str]] = []
+    for policy_id, target in attachment["attached"].items():
+        name, denied = coverage[policy_id]
+        covered |= denied
+        guarding.append((name, target))
+    unattached = sorted(
+        coverage[policy_id][0] for policy_id in attachment["unattached"]
+    )
+
+    unread_would_cover: Set[str] = set()
+    for policy_id in attachment["unread"]:
+        unread_would_cover |= coverage[policy_id][1]
+    if unread_would_cover - covered:
+        unread = ", ".join(
+            f"{coverage[policy_id][0]} ({_assessment_error_label(error)})"
+            for policy_id, error in sorted(attachment["unread"].items())
+        )
+        return (
+            covered,
+            sorted(guarding),
+            unattached,
+            [
+                create_finding(
+                    check_id=check_id,
+                    finding_name=f"{finding_name} Incomplete",
+                    finding_details=(
+                        f"The attachment targets of service control policy {unread} "
+                        f"could not be read, and that policy would deny "
+                        f"{action_label} where the attached ones do not. Whether it "
+                        f"binds {account} was not confirmed, so no verdict is "
+                        "reported."
+                    ),
+                    resolution=(
+                        "Grant organizations:ListTargetsForPolicy and rerun the "
+                        "assessment."
+                    ),
+                    reference=reference,
+                    severity=SeverityEnum.INFORMATIONAL,
+                    status=StatusEnum.NA,
+                )
+            ],
+        )
+    return covered, sorted(guarding), unattached, []
+
+
 def check_agentcore_gateway_authorizer_scp() -> List[Dict[str, Any]]:
     """AC-28: Require an SCP that denies creating a gateway with no authorizer.
 
@@ -9450,10 +9684,11 @@ def check_agentcore_gateway_authorizer_scp() -> List[Dict[str, Any]]:
     create: a Deny on create alone leaves an authenticated gateway one
     UpdateGateway call away from being open.
 
-    The check reads policy content only. Whether a policy is attached to the
-    root, to one organizational unit, or to nothing needs
-    organizations:ListTargetsForPolicy, which this function is not granted, so
-    every finding says that attachment is still the reader's to confirm.
+    A policy counts only when it binds the assessed account: attached to the
+    account, to an organizational unit above it, or to the root, read with
+    organizations:ListParents and organizations:ListTargetsForPolicy. No SCP
+    restricts the management account, so there the guardrail is reported as
+    not enforced.
     """
     if organizations_client is None:
         return [
@@ -9507,8 +9742,7 @@ def check_agentcore_gateway_authorizer_scp() -> List[Dict[str, Any]]:
             )
         ]
 
-    covered_actions: Set[str] = set()
-    guarding_policies: List[str] = []
+    coverage: Dict[str, Tuple[str, Set[str]]] = {}
     attempting_policies: List[str] = []
     read_errors: List[Tuple[str, Exception]] = []
 
@@ -9528,8 +9762,7 @@ def check_agentcore_gateway_authorizer_scp() -> List[Dict[str, Any]]:
             GATEWAY_AUTHORIZER_UNAUTHENTICATED_VALUE,
         )
         if covered:
-            covered_actions |= covered
-            guarding_policies.append(policy_name)
+            coverage[policy["Id"]] = (policy_name, covered)
         elif names_key:
             attempting_policies.append(policy_name)
 
@@ -9550,12 +9783,34 @@ def check_agentcore_gateway_authorizer_scp() -> List[Dict[str, Any]]:
             )
         )
 
+    covered_actions, guarding_policies, unattached, stop = _attached_scp_coverage(
+        "AC-28",
+        "AgentCore Gateway Authorizer Guardrail",
+        AGENTCORE_GATEWAY_CONDITION_KEY_REFERENCE_URL,
+        _scp_attachment(policies, set(coverage)),
+        coverage,
+        GATEWAY_WRITE_ACTIONS,
+    )
+    if stop:
+        findings.extend(stop)
+        return findings
+
     missing = [
         name
         for action, name in GATEWAY_WRITE_ACTIONS.items()
         if action not in covered_actions
     ]
-    guarding_label = ", ".join(sorted(guarding_policies))
+    guarding_label = ", ".join(name for name, _ in guarding_policies)
+    attached_label = "; ".join(
+        f"{name} is attached to {target}" for name, target in guarding_policies
+    )
+    unattached_note = (
+        f" Service control policy {', '.join(unattached)} would deny the write "
+        "too, but is attached to neither this account nor an organizational "
+        "unit or root above it."
+        if unattached
+        else ""
+    )
 
     if not missing:
         findings.append(
@@ -9565,12 +9820,13 @@ def check_agentcore_gateway_authorizer_scp() -> List[Dict[str, Any]]:
                 finding_details=(
                     "CreateGateway and UpdateGateway are both denied when "
                     "bedrock-agentcore:GatewayAuthorizerType is NONE, by service "
-                    f"control policy: {guarding_label}."
+                    f"control policy: {guarding_label}. {attached_label}, which "
+                    "binds this account."
                 ),
                 resolution=(
-                    "No action required. Confirm the policy is attached to the root "
-                    "or to every organizational unit that hosts gateways, because "
-                    "this check reads policy content and not attachment targets."
+                    "No action required. The policy binds this account through the "
+                    "attachment named; other accounts are judged by their own "
+                    "assessment."
                 ),
                 reference=AGENTCORE_GATEWAY_CONDITION_KEY_REFERENCE_URL,
                 severity=SeverityEnum.HIGH,
@@ -9591,11 +9847,34 @@ def check_agentcore_gateway_authorizer_scp() -> List[Dict[str, Any]]:
                     f"Authorizer type NONE is denied on {covered_label} but not on "
                     f"{', '.join(missing)}, by service control policy: "
                     f"{guarding_label}. An existing gateway can still be moved to "
-                    "authorizer type NONE."
+                    f"authorizer type NONE.{unattached_note}"
                 ),
                 resolution=(
                     "Add the uncovered action to the same Deny statement, keeping "
                     "the bedrock-agentcore:GatewayAuthorizerType condition."
+                ),
+                reference=AGENTCORE_GATEWAY_CONDITION_KEY_REFERENCE_URL,
+                severity=SeverityEnum.HIGH,
+                status=StatusEnum.FAILED,
+            )
+        )
+        return findings
+
+    if unattached:
+        findings.append(
+            create_finding(
+                check_id="AC-28",
+                finding_name="AgentCore Gateway Authorizer Guardrail Unattached",
+                finding_details=(
+                    f"Service control policy {', '.join(unattached)} denies "
+                    "gateway writes when bedrock-agentcore:GatewayAuthorizerType "
+                    "is NONE, but is attached to neither this account nor an "
+                    "organizational unit or root above it, so it binds nothing "
+                    "here."
+                ),
+                resolution=(
+                    "Attach the policy to the root, or to the organizational unit "
+                    "that holds this account."
                 ),
                 reference=AGENTCORE_GATEWAY_CONDITION_KEY_REFERENCE_URL,
                 severity=SeverityEnum.HIGH,
@@ -9670,8 +9949,8 @@ def check_agentcore_runtime_authorizer_scp() -> List[Dict[str, Any]]:
     SigV4, is reported separately: it is a guardrail pointed at the wrong value
     and reads as configured to anyone counting policies.
 
-    The check reads policy content only, so every finding says that attachment
-    is still the reader's to confirm.
+    As with AC-28, a policy counts only when it is attached to the assessed
+    account or a parent of it, and the management account is never bound.
     """
     if organizations_client is None:
         return [
@@ -9725,10 +10004,8 @@ def check_agentcore_runtime_authorizer_scp() -> List[Dict[str, Any]]:
             )
         ]
 
-    covered_actions: Set[str] = set()
-    inverted_actions: Set[str] = set()
-    guarding_policies: List[str] = []
-    inverted_policies: List[str] = []
+    coverage: Dict[str, Tuple[str, Set[str]]] = {}
+    inverted_coverage: Dict[str, Tuple[str, Set[str]]] = {}
     attempting_policies: List[str] = []
     read_errors: List[Tuple[str, Exception]] = []
 
@@ -9754,11 +10031,9 @@ def check_agentcore_runtime_authorizer_scp() -> List[Dict[str, Any]]:
             RUNTIME_AUTHORIZER_VERIFIED_USER_VALUE,
         )
         if covered:
-            covered_actions |= covered
-            guarding_policies.append(policy_name)
+            coverage[policy["Id"]] = (policy_name, covered)
         elif inverted:
-            inverted_actions |= inverted
-            inverted_policies.append(policy_name)
+            inverted_coverage[policy["Id"]] = (policy_name, inverted)
         elif names_key:
             attempting_policies.append(policy_name)
 
@@ -9779,12 +10054,42 @@ def check_agentcore_runtime_authorizer_scp() -> List[Dict[str, Any]]:
             )
         )
 
+    attachment = _scp_attachment(policies, set(coverage) | set(inverted_coverage))
+    covered_actions, guarding_policies, unattached, stop = _attached_scp_coverage(
+        "AC-29",
+        "AgentCore Runtime Authorizer Guardrail",
+        AGENTCORE_RUNTIME_INBOUND_AUTH_REFERENCE_URL,
+        attachment,
+        coverage,
+        RUNTIME_WRITE_ACTIONS,
+    )
+    if stop:
+        findings.extend(stop)
+        return findings
+    # An inverted policy that binds nothing here forbids nothing here either.
+    inverted_actions: Set[str] = set()
+    inverted_policies: List[str] = []
+    for policy_id, (policy_name, inverted) in inverted_coverage.items():
+        if policy_id in attachment["attached"]:
+            inverted_actions |= inverted
+            inverted_policies.append(policy_name)
+
     missing = [
         name
         for action, name in RUNTIME_WRITE_ACTIONS.items()
         if action not in covered_actions
     ]
-    guarding_label = ", ".join(sorted(guarding_policies))
+    guarding_label = ", ".join(name for name, _ in guarding_policies)
+    attached_label = "; ".join(
+        f"{name} is attached to {target}" for name, target in guarding_policies
+    )
+    unattached_note = (
+        f" Service control policy {', '.join(unattached)} would deny the write "
+        "too, but is attached to neither this account nor an organizational "
+        "unit or root above it."
+        if unattached
+        else ""
+    )
 
     if not missing:
         findings.append(
@@ -9796,13 +10101,12 @@ def check_agentcore_runtime_authorizer_scp() -> List[Dict[str, Any]]:
                     "when bedrock-agentcore:RuntimeAuthorizerType is AWS_IAM, by "
                     f"service control policy: {guarding_label}, so a new runtime "
                     "has to carry a JWT authorizer that validates the end user's "
-                    "token."
+                    f"token. {attached_label}, which binds this account."
                 ),
                 resolution=(
-                    "No action required. Confirm the policy is attached to the "
-                    "root or to every organizational unit that hosts runtimes, "
-                    "because this check reads policy content and not attachment "
-                    "targets."
+                    "No action required. The policy binds this account through "
+                    "the attachment named; other accounts are judged by their "
+                    "own assessment."
                 ),
                 reference=AGENTCORE_RUNTIME_INBOUND_AUTH_REFERENCE_URL,
                 severity=SeverityEnum.HIGH,
@@ -9823,11 +10127,34 @@ def check_agentcore_runtime_authorizer_scp() -> List[Dict[str, Any]]:
                     f"Authorizer type AWS_IAM is denied on {covered_label} but "
                     f"not on {', '.join(missing)}, by service control policy: "
                     f"{guarding_label}. An existing runtime can still be moved "
-                    "to SigV4-only inbound auth."
+                    f"to SigV4-only inbound auth.{unattached_note}"
                 ),
                 resolution=(
                     "Add the uncovered action to the same Deny statement, keeping "
                     "the bedrock-agentcore:RuntimeAuthorizerType condition."
+                ),
+                reference=AGENTCORE_RUNTIME_INBOUND_AUTH_REFERENCE_URL,
+                severity=SeverityEnum.HIGH,
+                status=StatusEnum.FAILED,
+            )
+        )
+        return findings
+
+    if unattached:
+        findings.append(
+            create_finding(
+                check_id="AC-29",
+                finding_name="AgentCore Runtime Authorizer Guardrail Unattached",
+                finding_details=(
+                    f"Service control policy {', '.join(unattached)} denies "
+                    "runtime writes when bedrock-agentcore:RuntimeAuthorizerType "
+                    "is AWS_IAM, but is attached to neither this account nor an "
+                    "organizational unit or root above it, so it binds nothing "
+                    "here."
+                ),
+                resolution=(
+                    "Attach the policy to the root, or to the organizational unit "
+                    "that holds this account."
                 ),
                 reference=AGENTCORE_RUNTIME_INBOUND_AUTH_REFERENCE_URL,
                 severity=SeverityEnum.HIGH,

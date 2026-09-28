@@ -1057,6 +1057,21 @@ Resources:
               Resource:
                 - !Sub 'arn:${AWS::Partition}:organizations::*:policy/*/*/*'
                 - !Sub 'arn:${AWS::Partition}:organizations::aws:policy/*/*'
+            # AC-28 and AC-29 count an SCP only when it binds this account, so
+            # they walk this account's parents up to the root and read where
+            # each guarding policy is attached.
+            - Sid: OrganizationsPolicyAttachmentRead
+              Effect: Allow
+              Action:
+                - organizations:ListTargetsForPolicy # AC-28, AC-29
+              Resource: !Sub 'arn:${AWS::Partition}:organizations::*:policy/o-*/service_control_policy/p-*'
+            - Sid: OrganizationsParentRead
+              Effect: Allow
+              Action:
+                - organizations:ListParents # AC-28, AC-29
+              Resource:
+                - !Sub 'arn:${AWS::Partition}:organizations::*:account/o-*/${AWS::AccountId}'
+                - !Sub 'arn:${AWS::Partition}:organizations::*:ou/o-*/ou-*'
             - Sid: CloudWatchPermissions
               Effect: Allow
               Action:

@@ -6656,12 +6656,51 @@ def _scp(statements):
 
 _GATEWAY_WRITE = ["bedrock-agentcore:CreateGateway", "bedrock-agentcore:UpdateGateway"]
 
+_MEMBER_ACCOUNT = "111122223333"
+_SCP_ROOT = "r-a1b2"
+_SCP_OU = "ou-a1b2-11111111"
+_OTHER_OU = "ou-a1b2-22222222"
 
+
+def _attach(mock_orgs, targets=None):
+    """Place the member account in one OU under the root, and serve each SCP's
+    attachment targets: the root unless `targets` names the policy id. A target
+    value that is an exception is raised instead."""
+    parents = {
+        _MEMBER_ACCOUNT: {"Id": _SCP_OU, "Type": "ORGANIZATIONAL_UNIT"},
+        _SCP_OU: {"Id": _SCP_ROOT, "Type": "ROOT"},
+    }
+    mock_orgs.list_parents.side_effect = lambda ChildId: {"Parents": [parents[ChildId]]}
+
+    def list_targets_for_policy(PolicyId, **_):
+        value = (targets or {}).get(
+            PolicyId, [{"TargetId": _SCP_ROOT, "Type": "ROOT", "Name": "Root"}]
+        )
+        if isinstance(value, Exception):
+            raise value
+        return {"Targets": value}
+
+    mock_orgs.list_targets_for_policy.side_effect = list_targets_for_policy
+
+
+@pytest.fixture
+def _member_account():
+    """Answer the STS caller-identity read with a member account."""
+    with patch("agentcore_app.boto3.client") as client:
+        client.return_value.get_caller_identity.return_value = {
+            "Account": _MEMBER_ACCOUNT
+        }
+        yield client
+
+
+@pytest.mark.usefixtures("_member_account")
 class TestAC28GatewayAuthorizerSCP:
     """AC-28: an SCP has to deny gateway writes when the authorizer type is NONE."""
 
-    def _wire(self, mock_orgs, documents):
-        """Serve one named SCP per entry in `documents`."""
+    def _wire(self, mock_orgs, documents, targets=None):
+        """Serve one named SCP per entry in `documents`, attached as `targets`
+        says and to the root otherwise."""
+        _attach(mock_orgs, targets)
         mock_orgs.list_policies.return_value = {
             "Policies": [
                 {"Id": f"p-{index}", "Name": name}
@@ -6704,7 +6743,15 @@ class TestAC28GatewayAuthorizerSCP:
         assert findings[0]["Check_ID"] == "AC-28"
         assert findings[0]["Status"] == "Passed"
         assert "DenyOpenGateway" in findings[0]["Finding_Details"]
-        assert "attachment targets" in findings[0]["Resolution"]
+        # Stricter since attachment is read: the Passed row names the target
+        # that binds this account instead of asking the reader to confirm it.
+        assert (
+            f"DenyOpenGateway is attached to root {_SCP_ROOT}"
+            in (findings[0]["Finding_Details"])
+        )
+        assert (
+            "binds this account through the attachment" in (findings[0]["Resolution"])
+        )
         assert_finding_schema(findings[0])
 
     @patch("agentcore_app.organizations_client")
@@ -7063,6 +7110,7 @@ class TestAC28GatewayAuthorizerSCP:
 
     @patch("agentcore_app.organizations_client")
     def test_policies_are_read_from_every_page(self, mock_orgs):
+        _attach(mock_orgs)
         mock_orgs.list_policies.side_effect = [
             {"Policies": [{"Id": "p-1", "Name": "First"}], "NextToken": "page-2"},
             {"Policies": [{"Id": "p-2", "Name": "Second"}]},
@@ -7128,6 +7176,7 @@ class TestAC28GatewayAuthorizerSCP:
     def test_one_unreadable_policy_does_not_hide_the_population_verdict(
         self, mock_orgs
     ):
+        _attach(mock_orgs)
         mock_orgs.list_policies.return_value = {
             "Policies": [
                 {"Id": "p-1", "Name": "Unreadable"},
@@ -7345,11 +7394,14 @@ _RUNTIME_WRITE = [
 _RUNTIME_KEY = "bedrock-agentcore:RuntimeAuthorizerType"
 
 
+@pytest.mark.usefixtures("_member_account")
 class TestAC29RuntimeAuthorizerSCP:
     """AC-29: an SCP has to deny runtime writes when the authorizer is AWS_IAM."""
 
-    def _wire(self, mock_orgs, documents):
-        """Serve one named SCP per entry in `documents`."""
+    def _wire(self, mock_orgs, documents, targets=None):
+        """Serve one named SCP per entry in `documents`, attached as `targets`
+        says and to the root otherwise."""
+        _attach(mock_orgs, targets)
         mock_orgs.list_policies.return_value = {
             "Policies": [
                 {"Id": f"p-{index}", "Name": name}
@@ -7645,6 +7697,7 @@ class TestAC29RuntimeAuthorizerSCP:
 
     @patch("agentcore_app.organizations_client")
     def test_policies_are_read_from_every_page(self, mock_orgs):
+        _attach(mock_orgs)
         # The guardrail sits on the second page, so an unpaginated read reports
         # the organization as unguarded.
         mock_orgs.list_policies.side_effect = [
@@ -7707,6 +7760,7 @@ class TestAC29RuntimeAuthorizerSCP:
     def test_an_unreadable_single_policy_is_reported_and_the_rest_judged(
         self, mock_orgs
     ):
+        _attach(mock_orgs)
         mock_orgs.list_policies.return_value = {
             "Policies": [
                 {"Id": "p-broken", "Name": "Unreadable"},
@@ -7737,6 +7791,352 @@ class TestAC29RuntimeAuthorizerSCP:
 
         assert [finding["Status"] for finding in findings] == ["N/A", "Passed"]
         assert "Unreadable" in findings[0]["Finding_Details"]
+
+
+def _gateway_guard(operator="StringEquals", value="NONE", action=None):
+    return [
+        {
+            "Effect": "Deny",
+            "Action": action or _GATEWAY_WRITE,
+            "Resource": "*",
+            "Condition": {operator: {"bedrock-agentcore:GatewayAuthorizerType": value}},
+        }
+    ]
+
+
+def _runtime_guard(operator="StringEquals", value="AWS_IAM", action=None):
+    return [
+        {
+            "Effect": "Deny",
+            "Action": action or _RUNTIME_WRITE,
+            "Resource": "*",
+            "Condition": {operator: {_RUNTIME_KEY: value}},
+        }
+    ]
+
+
+_SCP_CHECKS = [
+    pytest.param("check_agentcore_gateway_authorizer_scp", _gateway_guard, id="AC-28"),
+    pytest.param("check_agentcore_runtime_authorizer_scp", _runtime_guard, id="AC-29"),
+]
+
+
+@pytest.mark.usefixtures("_member_account")
+class TestSCPAttachment:
+    """AC-28 and AC-29 count a guarding SCP only when it binds this account."""
+
+    def _run(self, mock_orgs, check, documents, targets=None, arns=None):
+        _attach(mock_orgs, targets)
+        mock_orgs.list_policies.return_value = {
+            "Policies": [
+                {
+                    "Id": f"p-{index}",
+                    "Name": name,
+                    **({"Arn": arns[name]} if arns and name in arns else {}),
+                }
+                for index, name in enumerate(documents)
+            ]
+        }
+        by_id = {
+            f"p-{index}": statements
+            for index, statements in enumerate(documents.values())
+        }
+        mock_orgs.describe_policy.side_effect = lambda PolicyId: _scp(by_id[PolicyId])
+        findings = getattr(agentcore_app, check)()
+        for finding in findings:
+            assert_finding_schema(finding)
+        return findings
+
+    @pytest.mark.parametrize("check, guard", _SCP_CHECKS)
+    @patch("agentcore_app.organizations_client")
+    def test_a_guard_attached_to_another_ou_fails_unattached(
+        self, mock_orgs, check, guard
+    ):
+        findings = self._run(
+            mock_orgs,
+            check,
+            {"GuardElsewhere": guard()},
+            targets={"p-0": [{"TargetId": _OTHER_OU, "Type": "ORGANIZATIONAL_UNIT"}]},
+        )
+
+        assert [f["Status"] for f in findings] == ["Failed"]
+        assert findings[0]["Finding"].endswith("Unattached")
+        assert "GuardElsewhere" in findings[0]["Finding_Details"]
+
+    @pytest.mark.parametrize("check, guard", _SCP_CHECKS)
+    @patch("agentcore_app.organizations_client")
+    def test_a_guard_attached_nowhere_fails_unattached(self, mock_orgs, check, guard):
+        findings = self._run(
+            mock_orgs, check, {"Detached": guard()}, targets={"p-0": []}
+        )
+
+        assert findings[0]["Status"] == "Failed"
+        assert findings[0]["Finding"].endswith("Unattached")
+
+    @pytest.mark.parametrize(
+        "target",
+        [
+            {"TargetId": _SCP_ROOT, "Type": "ROOT"},
+            {"TargetId": _SCP_OU, "Type": "ORGANIZATIONAL_UNIT"},
+            {"TargetId": _MEMBER_ACCOUNT, "Type": "ACCOUNT"},
+        ],
+        ids=["root", "parent-ou", "account"],
+    )
+    @pytest.mark.parametrize("check, guard", _SCP_CHECKS)
+    @patch("agentcore_app.organizations_client")
+    def test_every_level_of_the_parent_chain_binds(
+        self, mock_orgs, check, guard, target
+    ):
+        findings = self._run(
+            mock_orgs,
+            check,
+            {"Guard": guard()},
+            targets={
+                "p-0": [{"TargetId": _OTHER_OU, "Type": "ORGANIZATIONAL_UNIT"}, target]
+            },
+        )
+
+        assert findings[0]["Status"] == "Passed"
+        assert target["TargetId"] in findings[0]["Finding_Details"]
+
+    @pytest.mark.parametrize("check, guard", _SCP_CHECKS)
+    @patch("agentcore_app.organizations_client")
+    def test_an_attached_create_guard_and_an_unattached_update_guard_is_partial(
+        self, mock_orgs, check, guard
+    ):
+        create, update = (
+            (_GATEWAY_WRITE[0], _GATEWAY_WRITE[1])
+            if guard is _gateway_guard
+            else (_RUNTIME_WRITE[0], _RUNTIME_WRITE[1])
+        )
+        findings = self._run(
+            mock_orgs,
+            check,
+            {"CreateGuard": guard(action=create), "UpdateGuard": guard(action=update)},
+            targets={"p-1": [{"TargetId": _OTHER_OU, "Type": "ORGANIZATIONAL_UNIT"}]},
+        )
+
+        assert findings[0]["Status"] == "Failed"
+        assert findings[0]["Finding"].endswith("Partial")
+        assert "UpdateGuard would deny the write too" in findings[0]["Finding_Details"]
+
+    @pytest.mark.parametrize("check, guard", _SCP_CHECKS)
+    @patch("agentcore_app.organizations_client")
+    def test_one_attached_guard_passes_beside_an_unattached_copy(
+        self, mock_orgs, check, guard
+    ):
+        findings = self._run(
+            mock_orgs,
+            check,
+            {"Attached": guard(), "Detached": guard()},
+            targets={"p-1": []},
+        )
+
+        assert findings[0]["Status"] == "Passed"
+        assert "Attached" in findings[0]["Finding_Details"]
+        assert "Detached" not in findings[0]["Finding_Details"]
+
+    @pytest.mark.parametrize("check, guard", _SCP_CHECKS)
+    @patch("agentcore_app.organizations_client")
+    def test_unreadable_targets_of_the_only_guard_are_incomplete(
+        self, mock_orgs, check, guard
+    ):
+        findings = self._run(
+            mock_orgs,
+            check,
+            {"Guard": guard()},
+            targets={
+                "p-0": ClientError(
+                    {"Error": {"Code": "AccessDeniedException", "Message": "no"}},
+                    "ListTargetsForPolicy",
+                )
+            },
+        )
+
+        assert [f["Status"] for f in findings] == ["N/A"]
+        assert findings[0]["Finding"].endswith("Incomplete")
+        assert "AccessDeniedException" in findings[0]["Finding_Details"]
+
+    @pytest.mark.parametrize("check, guard", _SCP_CHECKS)
+    @patch("agentcore_app.organizations_client")
+    def test_unreadable_targets_of_a_redundant_guard_do_not_block_a_pass(
+        self, mock_orgs, check, guard
+    ):
+        findings = self._run(
+            mock_orgs,
+            check,
+            {"Attached": guard(), "Unknown": guard()},
+            targets={
+                "p-1": ClientError(
+                    {"Error": {"Code": "TooManyRequestsException", "Message": "no"}},
+                    "ListTargetsForPolicy",
+                )
+            },
+        )
+
+        assert findings[0]["Status"] == "Passed"
+
+    @pytest.mark.parametrize("check, guard", _SCP_CHECKS)
+    @patch("agentcore_app.organizations_client")
+    def test_an_unreadable_parent_chain_is_incomplete(self, mock_orgs, check, guard):
+        _attach(mock_orgs)
+        mock_orgs.list_parents.side_effect = ClientError(
+            {"Error": {"Code": "AccessDeniedException", "Message": "no"}},
+            "ListParents",
+        )
+        mock_orgs.list_policies.return_value = {
+            "Policies": [{"Id": "p-0", "Name": "Guard"}]
+        }
+        mock_orgs.describe_policy.return_value = _scp(guard())
+
+        findings = getattr(agentcore_app, check)()
+
+        assert [f["Status"] for f in findings] == ["N/A"]
+        assert "ListParents" in findings[0]["Resolution"]
+
+    @pytest.mark.parametrize("check, guard", _SCP_CHECKS)
+    @patch("agentcore_app.organizations_client")
+    def test_a_parent_chain_with_no_root_is_incomplete(self, mock_orgs, check, guard):
+        _attach(mock_orgs)
+        mock_orgs.list_parents.side_effect = lambda ChildId: {
+            "Parents": [{"Id": _SCP_OU, "Type": "ORGANIZATIONAL_UNIT"}]
+        }
+        mock_orgs.list_policies.return_value = {
+            "Policies": [{"Id": "p-0", "Name": "Guard"}]
+        }
+        mock_orgs.describe_policy.return_value = _scp(guard())
+
+        findings = getattr(agentcore_app, check)()
+
+        assert findings[0]["Status"] == "N/A"
+        assert findings[0]["Finding"].endswith("Incomplete")
+
+    @pytest.mark.parametrize("check, guard", _SCP_CHECKS)
+    @patch("agentcore_app.organizations_client")
+    def test_attachment_targets_are_read_from_every_page(self, mock_orgs, check, guard):
+        _attach(mock_orgs)
+        mock_orgs.list_targets_for_policy.side_effect = [
+            {
+                "Targets": [{"TargetId": _OTHER_OU, "Type": "ORGANIZATIONAL_UNIT"}],
+                "NextToken": "page-2",
+            },
+            {"Targets": [{"TargetId": _SCP_OU, "Type": "ORGANIZATIONAL_UNIT"}]},
+        ]
+        mock_orgs.list_policies.return_value = {
+            "Policies": [{"Id": "p-0", "Name": "Guard"}]
+        }
+        mock_orgs.describe_policy.return_value = _scp(guard())
+
+        findings = getattr(agentcore_app, check)()
+
+        assert findings[0]["Status"] == "Passed"
+        assert mock_orgs.list_targets_for_policy.call_count == 2
+
+    @pytest.mark.parametrize("check, guard", _SCP_CHECKS)
+    @patch("agentcore_app.organizations_client")
+    def test_the_management_account_is_not_bound_by_any_scp(
+        self, mock_orgs, check, guard
+    ):
+        findings = self._run(
+            mock_orgs,
+            check,
+            {"Guard": guard()},
+            arns={
+                "Guard": (
+                    f"arn:aws:organizations::{_MEMBER_ACCOUNT}:policy/"
+                    "o-a1b2c3d4e5/service_control_policy/p-0"
+                )
+            },
+        )
+
+        assert [f["Status"] for f in findings] == ["Failed"]
+        assert findings[0]["Finding"].endswith("Not Enforced")
+        assert "management account" in findings[0]["Finding_Details"]
+        mock_orgs.list_targets_for_policy.assert_not_called()
+
+    @pytest.mark.parametrize("check, guard", _SCP_CHECKS)
+    @patch("agentcore_app.organizations_client")
+    def test_a_guard_owned_by_another_management_account_is_judged(
+        self, mock_orgs, check, guard
+    ):
+        findings = self._run(
+            mock_orgs,
+            check,
+            {"Guard": guard()},
+            arns={
+                "Guard": (
+                    "arn:aws:organizations::444455556666:policy/"
+                    "o-a1b2c3d4e5/service_control_policy/p-0"
+                )
+            },
+        )
+
+        assert findings[0]["Status"] == "Passed"
+
+    @pytest.mark.parametrize(
+        "operator, value, status",
+        [
+            ("StringEqualsIfExists", "NONE", "Passed"),
+            ("StringNotEqualsIfExists", ["AWS_IAM", "CUSTOM_JWT"], "Passed"),
+            ("StringNotEqualsIfExists", "NONE", "Failed"),
+            ("ForAnyValue:StringEqualsIfExists", "NONE", "Passed"),
+        ],
+    )
+    @patch("agentcore_app.organizations_client")
+    def test_ifexists_gateway_operators_read_as_their_plain_form(
+        self, mock_orgs, operator, value, status
+    ):
+        findings = self._run(
+            mock_orgs,
+            "check_agentcore_gateway_authorizer_scp",
+            {"Guard": _gateway_guard(operator, value)},
+        )
+
+        assert findings[0]["Status"] == status
+
+    @pytest.mark.parametrize(
+        "operator, value, status",
+        [
+            ("StringEqualsIfExists", "AWS_IAM", "Passed"),
+            ("StringNotEqualsIfExists", "CUSTOM_JWT", "Passed"),
+            ("StringNotEqualsIfExists", "AWS_IAM", "Failed"),
+        ],
+    )
+    @patch("agentcore_app.organizations_client")
+    def test_ifexists_runtime_operators_read_as_their_plain_form(
+        self, mock_orgs, operator, value, status
+    ):
+        findings = self._run(
+            mock_orgs,
+            "check_agentcore_runtime_authorizer_scp",
+            {"Guard": _runtime_guard(operator, value)},
+        )
+
+        assert findings[0]["Status"] == status
+
+    @patch("agentcore_app.organizations_client")
+    def test_an_unattached_inverted_runtime_policy_is_not_reported_inverted(
+        self, mock_orgs
+    ):
+        findings = self._run(
+            mock_orgs,
+            "check_agentcore_runtime_authorizer_scp",
+            {"DenyJwt": _runtime_guard(value="CUSTOM_JWT")},
+            targets={"p-0": []},
+        )
+
+        assert findings[0]["Status"] == "Failed"
+        assert findings[0]["Finding"].endswith("Missing")
+
+    @patch("agentcore_app.organizations_client")
+    def test_an_attached_inverted_runtime_policy_is_reported_inverted(self, mock_orgs):
+        findings = self._run(
+            mock_orgs,
+            "check_agentcore_runtime_authorizer_scp",
+            {"DenyJwt": _runtime_guard(value="CUSTOM_JWT")},
+        )
+
+        assert findings[0]["Finding"].endswith("Inverted")
 
 
 class TestAC29CheckRegistration:

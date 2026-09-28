@@ -288,6 +288,15 @@ section.
     principals, account root included, because an Allow does not stop a
     same-account caller. It passes on `allowedWorkloadConfiguration` or a
     Deny refusing every principal outside a bounded `aws:PrincipalArn` list.
+  - `AC-28` and `AC-29` count a guarding service control policy only when it
+    is attached to the assessed account, to an organizational unit above it,
+    or to the root, read with `organizations:ListParents` and
+    `organizations:ListTargetsForPolicy`. A guard attached elsewhere fails as
+    `Unattached`, the management account fails as `Not Enforced` because no
+    SCP restricts it, and an unreadable parent chain or attachment list is
+    `N/A` and never `Passed`. `IfExists` operators now read as their plain
+    form, so `StringEqualsIfExists` on the denied value counts. An inverted
+    `AC-29` policy is reported only when it is attached.
 
 ### Deployment impact
 
@@ -340,6 +349,13 @@ CodeBuild run applies them. `bedrock-agentcore:ListPaymentManagers` and
 `bedrock-agentcore:ListHarnesses` have no resource type and are not granted;
 until they are, the payment manager and harness legs of `AC-02` and `AC-48`
 report `N/A` naming the missing action.
+
+The AgentCore assessment role gains `organizations:ListTargetsForPolicy`,
+scoped to `service_control_policy` ARNs, and `organizations:ListParents`,
+scoped to this account's own `account` ARN and to `ou` ARNs, in both SAM
+templates, so `AC-28` and `AC-29` can read attachment. Both are read-only, and
+the same CodeBuild run applies them. A member account that cannot list the
+organization's policies still reports `N/A`, as before.
 
 ## 2.0.0 - 2026-09-18
 

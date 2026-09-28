@@ -319,6 +319,8 @@ _EXPECTED_ACTIONS = {
         "oam:ListSinks",
         "organizations:DescribePolicy",
         "organizations:ListPolicies",
+        "organizations:ListParents",
+        "organizations:ListTargetsForPolicy",
         "route53resolver:GetFirewallConfig",
         "route53resolver:ListFirewallDomainLists",
         "route53resolver:ListFirewallDomains",
