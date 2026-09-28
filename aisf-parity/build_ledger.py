@@ -731,12 +731,15 @@ AI_SUBJECT_ROWS = [
             "sagemaker_assessments",
         ],
         ["BR-20", "BR-11", "BR-17", "SM-03"],
-        "four checks cover the stores this control names: BR-20 the customer-managed key "
-        "of a managed or S3 Vectors store, reporting any other vector store as needing a "
-        "storage-layer review, and the default encryption of each data source bucket, which is where "
-        "the ingested objects sit before any index exists; BR-11 the customization job "
-        "output, read from outputModelKmsKeyArn, the field GetModelCustomizationJob "
-        "returns; BR-17 the custom model's own modelKmsKeyArn; SM-03 the training output "
+        "four checks cover the stores this control names: BR-20 the key of a managed "
+        "store, an S3 Vectors store, and the OpenSearch Serverless, Aurora, OpenSearch "
+        "domain and Neptune Analytics store each knowledge base names, each judged by "
+        "DescribeKey as customer managed and Enabled, plus the default encryption of each "
+        "data source bucket, which is where the ingested objects sit before any index "
+        "exists, and each data source's transient data key; BR-11 the custom model's "
+        "modelKmsKeyArn, else the customization job's outputModelKmsKeyArn, judged by "
+        "DescribeKey, and the default encryption of every training, validation, "
+        "invocation log source and output bucket the model names; BR-17 the custom model's own modelKmsKeyArn; SM-03 the training output "
         "and volume keys. BR-11 used to read outputDataConfig.kmsKeyId, which the API never"
         " returns, so every custom model read as needing review until the documented field "
         "was read. FS-65 is not an incumbent: its finding is about S3 event notifications "
@@ -1572,6 +1575,7 @@ INCUMBENT_NAMES = {
     "BR-11": (
         "Bedrock Custom Model Encryption Check",
         "Bedrock Custom Model Encryption Review",
+        "Bedrock Customization Data Bucket Encryption",
     ),
     "BR-12": (
         "Bedrock Invocation Log Encryption",
@@ -1580,7 +1584,14 @@ INCUMBENT_NAMES = {
     ),
     "BR-15": "Cross-Account Guardrails Enforcement Check",
     "BR-17": "Custom Model Customer-Managed KMS Encryption Check",
-    "BR-20": "Knowledge Base Customer-Managed KMS Encryption Check",
+    # The data source bucket and transient data key legs publish their own
+    # names, and a knowledge base that could not be judged publishes Review.
+    "BR-20": (
+        "Knowledge Base Customer-Managed KMS Encryption Check",
+        "Knowledge Base Customer-Managed KMS Encryption Review",
+        "Knowledge Base Data Source Bucket Encryption",
+        "Knowledge Base Data Source Transient Data Key",
+    ),
     "BR-26": (
         "Guardrail Sensitive Information Filter Check",
         "Deployed Guardrail Sensitive Information Filter",

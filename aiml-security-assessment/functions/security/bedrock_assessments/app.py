@@ -5579,6 +5579,126 @@ def check_bedrock_guardrail_iam_enforcement(
         }
 
 
+CUSTOMIZATION_DATA_ENCRYPTION_FINDING = "Bedrock Customization Data Bucket Encryption"
+
+
+def _customization_data_bucket_findings(
+    buckets: Dict[str, List[str]], region: str
+) -> List[Dict[str, Any]]:
+    """
+    Judge default encryption on every bucket a custom model was trained from,
+    validated against or written to (AIR-FND-DAT-01).
+
+    GetCustomModel carries the training, validation and output S3 URIs, so each
+    bucket is read once, whichever models name it. SSE-KMS passes only when
+    DescribeKey reports a customer managed key in state Enabled.
+    """
+    passed: List[str] = []
+    rows: List[Dict[str, Any]] = []
+
+    def row(status: str, detail: str) -> Dict[str, Any]:
+        return create_finding(
+            check_id="BR-11",
+            finding_name=CUSTOMIZATION_DATA_ENCRYPTION_FINDING,
+            finding_details=detail,
+            resolution=(
+                "Set default encryption on the bucket to SSE-KMS with a customer "
+                "managed key (PutBucketEncryption with SSEAlgorithm aws:kms and "
+                "KMSMasterKeyID set to your own key), and grant the model "
+                "customization service role kms:Decrypt on that key."
+                if status == "Failed"
+                else COULD_NOT_ASSESS_RESOLUTION
+            ),
+            reference="https://docs.aws.amazon.com/bedrock/latest/userguide/encryption-custom-job.html",
+            severity="High" if status == "Failed" else "Informational",
+            status=status,
+            region=region,
+        )
+
+    for bucket, labels in buckets.items():
+        served = "; ".join(labels)
+        try:
+            encryption = _bucket_default_encryption(bucket, region)
+        except (ClientError, BotoCoreError) as error:
+            code = (
+                error.response.get("Error", {}).get("Code", "")
+                if isinstance(error, ClientError)
+                else ""
+            )
+            if code == "ServerSideEncryptionConfigurationNotFoundError":
+                rows.append(
+                    row(
+                        "Failed",
+                        f"S3 bucket '{bucket}' has no default encryption "
+                        f"configuration, and it holds {served}.",
+                    )
+                )
+            else:
+                rows.append(
+                    row(
+                        "N/A",
+                        f"Encryption of S3 bucket '{bucket}' ({served}) could not be "
+                        "read: "
+                        f"{describe_api_error(error, 's3:GetEncryptionConfiguration', region)}",
+                    )
+                )
+            continue
+        algorithm = encryption["algorithm"]
+        if algorithm not in KMS_SSE_ALGORITHMS:
+            rows.append(
+                row(
+                    "Failed" if algorithm else "N/A",
+                    f"S3 bucket '{bucket}' uses {algorithm} instead of SSE-KMS with "
+                    f"a customer managed key, and it holds {served}."
+                    if algorithm
+                    else f"S3 bucket '{bucket}' ({served}): GetBucketEncryption "
+                    "returned no default encryption rule.",
+                )
+            )
+            continue
+        if not encryption["key"]:
+            rows.append(
+                row(
+                    "Failed",
+                    f"S3 bucket '{bucket}' uses {algorithm} with the AWS managed key "
+                    f"aws/s3, and it holds {served}.",
+                )
+            )
+            continue
+        key_status, observed = _kms_key_verdict(encryption["key"], region)
+        if key_status == "Passed":
+            passed.append(f"S3 bucket '{bucket}' uses {algorithm} ({observed})")
+        elif key_status == "Failed":
+            rows.append(
+                row(
+                    "Failed",
+                    f"S3 bucket '{bucket}' uses {algorithm}, and {observed}. It "
+                    f"holds {served}.",
+                )
+            )
+        else:
+            rows.append(row("N/A", f"S3 bucket '{bucket}' ({served}): {observed}."))
+
+    if passed:
+        rows.append(
+            create_finding(
+                check_id="BR-11",
+                finding_name=CUSTOMIZATION_DATA_ENCRYPTION_FINDING,
+                finding_details=(
+                    f"{len(passed)} of {len(buckets)} custom model data bucket(s) "
+                    f"encrypt objects with a customer managed, Enabled key: "
+                    f"{'; '.join(passed)}."
+                ),
+                resolution="No action required",
+                reference="https://docs.aws.amazon.com/bedrock/latest/userguide/encryption-custom-job.html",
+                severity="Medium",
+                status="Passed",
+                region=region,
+            )
+        )
+    return rows
+
+
 def check_bedrock_custom_model_encryption(region: str = "") -> Dict[str, Any]:
     """
     Check if custom/fine-tuned Bedrock models have proper encryption configured
@@ -5621,59 +5741,116 @@ def check_bedrock_custom_model_encryption(region: str = "") -> Dict[str, Any]:
 
             models_without_cmk = []
             models_with_cmk = []
+            models_unread = []
+            data_buckets: Dict[str, List[str]] = {}
 
             for model in custom_models:
                 model_arn = model.get("modelArn")
                 model_name = model.get("modelName", model_arn)
 
                 try:
-                    # Get detailed model info
                     model_details = bedrock_client.get_custom_model(
                         modelIdentifier=model_arn
                     )
-
-                    # Check for customer-managed KMS key via the customization job
-                    has_cmk = False
-                    job_arn = model_details.get("jobArn")
-                    if job_arn:
-                        try:
-                            job_details = bedrock_client.get_model_customization_job(
-                                jobIdentifier=job_arn
-                            )
-                            # GetModelCustomizationJob reports the output key as a
-                            # top-level outputModelKmsKeyArn. Its outputDataConfig
-                            # carries s3Uri and nothing else, so the kmsKeyId read
-                            # this replaces could never be true and no model could
-                            # reach the passing branch below.
-                            if job_details.get("outputModelKmsKeyArn"):
-                                has_cmk = True
-                        except Exception as job_err:
-                            logger.warning(
-                                f"Could not retrieve customization job for {model_name}: {str(job_err)}"
-                            )
-
-                    if not has_cmk:
-                        models_without_cmk.append(
-                            {
-                                "name": model_name,
-                                "arn": model_arn,
-                                "base_model": model_details.get(
-                                    "baseModelArn", "Unknown"
-                                ),
-                            }
-                        )
-                    else:
-                        models_with_cmk.append(model_name)
-
                 except Exception as e:
+                    # A model whose record cannot be read keeps a row, so a
+                    # Passed summary never covers a model nobody read.
                     logger.warning(
                         f"Error checking custom model {model_name}: {str(e)}"
                     )
+                    models_unread.append(
+                        f"custom model '{model_name}': "
+                        f"{describe_api_error(e, 'bedrock:GetCustomModel', region)}"
+                    )
+                    continue
+
+                # GetCustomModel names the key the model is encrypted at rest
+                # with. The customization job's outputModelKmsKeyArn is read only
+                # when the model record carries none.
+                key = str(model_details.get("modelKmsKeyArn") or "")
+                job_arn = model_details.get("jobArn")
+                if not key and job_arn:
+                    try:
+                        job_details = bedrock_client.get_model_customization_job(
+                            jobIdentifier=job_arn
+                        )
+                        # GetModelCustomizationJob reports the output key as a
+                        # top-level outputModelKmsKeyArn. Its outputDataConfig
+                        # carries s3Uri and nothing else, so the kmsKeyId read
+                        # this replaces could never be true and no model could
+                        # reach the passing branch below.
+                        if job_details.get("outputModelKmsKeyArn"):
+                            key = str(job_details["outputModelKmsKeyArn"])
+                    except Exception as job_err:
+                        logger.warning(
+                            f"Could not retrieve customization job for {model_name}: {str(job_err)}"
+                        )
+                        models_unread.append(
+                            f"custom model '{model_name}' names no modelKmsKeyArn, "
+                            "and its customization job could not be read: "
+                            f"{describe_api_error(job_err, 'bedrock:GetModelCustomizationJob', region)}"
+                        )
+                        continue
+
+                training = model_details.get("trainingDataConfig") or {}
+                locations = [
+                    ("training data", training.get("s3Uri")),
+                    (
+                        "invocation log source",
+                        (
+                            (training.get("invocationLogsConfig") or {}).get(
+                                "invocationLogSource"
+                            )
+                            or {}
+                        ).get("s3Uri"),
+                    ),
+                    (
+                        "output",
+                        (model_details.get("outputDataConfig") or {}).get("s3Uri"),
+                    ),
+                ] + [
+                    ("validation data", validator.get("s3Uri"))
+                    for validator in (
+                        model_details.get("validationDataConfig") or {}
+                    ).get("validators")
+                    or []
+                ]
+                for role, uri in locations:
+                    bucket = _s3_uri_bucket(uri)
+                    if bucket:
+                        data_buckets.setdefault(bucket, []).append(
+                            f"the {role} of custom model '{model_name}'"
+                        )
+
+                if not key:
+                    models_without_cmk.append(
+                        {
+                            "name": model_name,
+                            "reason": "names no customer managed KMS key "
+                            "(neither modelKmsKeyArn nor the customization job's "
+                            "outputModelKmsKeyArn), so it is encrypted with an AWS "
+                            "owned key",
+                        }
+                    )
+                    continue
+                key_status, observed = _kms_key_verdict(key, region)
+                if key_status == "Passed":
+                    models_with_cmk.append(f"'{model_name}' ({observed})")
+                elif key_status == "Failed":
+                    models_without_cmk.append(
+                        {
+                            "name": model_name,
+                            "reason": f"names a key that fails: {observed}",
+                        }
+                    )
+                else:
+                    models_unread.append(f"custom model '{model_name}': {observed}")
 
             if models_without_cmk:
                 findings["status"] = "WARN"
                 findings["details"] = (
-                    f"Found {len(models_without_cmk)} custom models to review for CMK encryption"
+                    f"Found {len(models_without_cmk)} custom models without a "
+                    "customer managed, Enabled KMS key"
                 )
 
                 for model in models_without_cmk:
@@ -5681,7 +5858,7 @@ def check_bedrock_custom_model_encryption(region: str = "") -> Dict[str, Any]:
                         create_finding(
                             check_id="BR-11",
                             finding_name="Bedrock Custom Model Encryption Review",
-                            finding_details=f"Custom model '{model['name']}' should be reviewed for customer-managed KMS encryption. Model artifacts and training data should use CMK.",
+                            finding_details=f"Custom model '{model['name']}' {model['reason']}.",
                             resolution="1. Use customer-managed KMS keys for training job output\n2. Ensure S3 buckets with training data use CMK encryption\n3. For future models, specify KMS key in customization job configuration",
                             reference="https://docs.aws.amazon.com/bedrock/latest/userguide/encryption-custom-job.html",
                             severity="Medium",
@@ -5689,12 +5866,16 @@ def check_bedrock_custom_model_encryption(region: str = "") -> Dict[str, Any]:
                             region=region,
                         )
                     )
-            else:
+            if models_with_cmk:
                 findings["csv_data"].append(
                     create_finding(
                         check_id="BR-11",
                         finding_name="Bedrock Custom Model Encryption Check",
-                        finding_details=f"All {len(custom_models)} custom models reviewed",
+                        finding_details=(
+                            f"{len(models_with_cmk)} of {len(custom_models)} custom "
+                            "model(s) are encrypted with a customer managed, Enabled "
+                            f"KMS key: {'; '.join(models_with_cmk)}."
+                        ),
                         resolution="No action required",
                         reference="https://docs.aws.amazon.com/bedrock/latest/userguide/encryption-custom-job.html",
                         severity="High",
@@ -5702,6 +5883,28 @@ def check_bedrock_custom_model_encryption(region: str = "") -> Dict[str, Any]:
                         region=region,
                     )
                 )
+            if models_unread and findings["status"] == "PASS":
+                findings["status"] = "WARN"
+            for gap in models_unread:
+                findings["csv_data"].append(
+                    create_finding(
+                        check_id="BR-11",
+                        finding_name="Bedrock Custom Model Encryption Review",
+                        finding_details=(
+                            f"Encryption of a custom model could not be assessed: {gap}"
+                        ),
+                        resolution=COULD_NOT_ASSESS_RESOLUTION,
+                        reference="https://docs.aws.amazon.com/bedrock/latest/userguide/encryption-custom-job.html",
+                        severity="Informational",
+                        status="N/A",
+                        region=region,
+                    )
+                )
+
+            data_rows = _customization_data_bucket_findings(data_buckets, region)
+            if any(row["Status"] == "Failed" for row in data_rows):
+                findings["status"] = "WARN"
+            findings["csv_data"].extend(data_rows)
 
         except Exception as e:
             logger.warning(f"Error listing custom models: {str(e)}")
@@ -5893,7 +6096,7 @@ def _kms_key_verdict(key_id: str, region: str) -> Tuple[str, str]:
     if key["state"] != "Enabled":
         return (
             "Failed",
-            f"customer managed KMS key '{key['arn']}' is in state {key['state'] or 'absent'}, so it cannot encrypt new log data",
+            f"customer managed KMS key '{key['arn']}' is in state {key['state'] or 'absent'}, so it cannot encrypt new data",
         )
     return "Passed", f"customer managed KMS key '{key['arn']}' is Enabled"
 
@@ -8739,6 +8942,178 @@ def _vector_bucket_region(vector_bucket_arn: str) -> str:
     return parts[3]
 
 
+# The vector reads that return a knowledge base's embeddings, all on the Index
+# resource type in the IAM service authorization reference.
+VECTOR_READ_ACTIONS = (
+    "s3vectors:queryvectors",
+    "s3vectors:getvectors",
+    "s3vectors:listvectors",
+)
+
+# Condition keys that name who is calling, so a test on them decides which
+# principals a statement reaches.
+PRINCIPAL_CONDITION_KEYS = (
+    "aws:principalarn",
+    "aws:principalaccount",
+    "aws:principalorgid",
+    "aws:principalorgpaths",
+    "aws:sourceaccount",
+    "aws:sourcearn",
+    "aws:sourceorgid",
+)
+
+
+def _condition_values_are_exact(values: List[Any]) -> bool:
+    """True when every condition value is a string with no IAM wildcard."""
+    return bool(values) and all(
+        isinstance(value, str) and "*" not in value and "?" not in value
+        for value in values
+    )
+
+
+def _principal_entries(principal: Any) -> List[str]:
+    """Flatten a Principal element into its string entries."""
+    values: List[str] = []
+    if isinstance(principal, dict):
+        for entry in principal.values():
+            values.extend(str(item).strip() for item in _as_list(entry))
+    else:
+        values = [str(item).strip() for item in _as_list(principal)]
+    return [value for value in values if value]
+
+
+def _allow_principal_is_unbounded(statement: Dict[str, Any]) -> bool:
+    """
+    True when an Allow statement admits principals it does not name.
+
+    NotPrincipal on an Allow admits everyone it does not list. A Principal entry
+    with a wildcard in any segment is unbounded unless a condition on a
+    principal key pins the caller to exact values with a positive operator.
+    """
+    if "NotPrincipal" in statement:
+        return True
+    entries = _principal_entries(statement.get("Principal"))
+    if all("*" not in entry and "?" not in entry for entry in entries):
+        return False
+    for operator, key, values in _condition_keys_by_operator(statement):
+        base = _strip_condition_set_operator(operator)
+        if (
+            key in PRINCIPAL_CONDITION_KEYS
+            and not operator.startswith("forallvalues:")
+            and base in ("stringequals", "stringlike", "arnequals", "arnlike")
+            and _condition_values_are_exact(values)
+        ):
+            return False
+    return True
+
+
+def _deny_restricts_reads(statement: Dict[str, Any], index_resource: str) -> bool:
+    """
+    True when a Deny statement blocks every vector read on the index for every
+    principal outside an exact exception list.
+
+    The Deny must reach every principal (Principal "*" or NotPrincipal), cover
+    every read in VECTOR_READ_ACTIONS, and name the index. Its conditions may
+    only carve out named principals with a negated operator and exact values: a
+    condition on any other key, such as aws:SecureTransport or aws:SourceVpce,
+    denies only one path and leaves the rest open.
+    """
+    if str(statement.get("Effect", "")).upper() != "DENY":
+        return False
+    if "NotPrincipal" not in statement and "*" not in _principal_entries(
+        statement.get("Principal")
+    ):
+        return False
+    if not all(
+        _statement_matches_action(statement, action) for action in VECTOR_READ_ACTIONS
+    ):
+        return False
+    if "NotResource" in statement or not any(
+        isinstance(resource, str)
+        and _wildcard_matches(resource.strip().lower(), index_resource.lower())
+        for resource in _as_list(statement.get("Resource"))
+    ):
+        return False
+    for operator, key, values in _condition_keys_by_operator(statement):
+        base = _strip_condition_set_operator(operator)
+        if (
+            key not in PRINCIPAL_CONDITION_KEYS
+            or base.endswith("ifexists")
+            or base
+            not in ("stringnotequals", "stringnotlike", "arnnotequals", "arnnotlike")
+            or not _condition_values_are_exact(values)
+        ):
+            return False
+    return True
+
+
+def _vector_bucket_policy_scope(policy: Any, index_resource: str) -> Dict[str, Any]:
+    """
+    Judge a vector bucket policy by its statements for BR-20.
+
+    Returns {"ok": True | False | None, "detail": str}. None means the document
+    could not be parsed. The policy restricts the store only when no Allow
+    admits an unbounded principal and some Deny blocks every vector read on the
+    index for every principal outside a named exception list. An empty
+    statement list restricts nothing, the same as no policy.
+    """
+    try:
+        statements = _policy_statements(policy)
+    except (TypeError, ValueError):
+        return {
+            "ok": None,
+            "detail": "the vector bucket policy is not a readable JSON policy "
+            "document, so its statements could not be evaluated",
+        }
+
+    def label(position: int, statement: Dict[str, Any]) -> str:
+        sid = statement.get("Sid")
+        return f"'{sid}'" if sid else f"#{position}"
+
+    unbounded = [
+        label(position, statement)
+        for position, statement in enumerate(statements, 1)
+        if str(statement.get("Effect", "")).upper() == "ALLOW"
+        and _allow_principal_is_unbounded(statement)
+    ]
+    restricting = [
+        label(position, statement)
+        for position, statement in enumerate(statements, 1)
+        if _deny_restricts_reads(statement, index_resource)
+    ]
+    counted = f"the vector bucket policy has {len(statements)} statement(s)"
+    if unbounded:
+        return {
+            "ok": False,
+            "detail": (
+                f"{counted}, and Allow statement(s) {', '.join(unbounded)} admit "
+                "a principal with a wildcard or NotPrincipal that no exact "
+                "principal condition bounds"
+            ),
+        }
+    if not restricting:
+        return {
+            "ok": False,
+            "detail": (
+                f"{counted}, and none is a Deny that blocks "
+                "s3vectors:QueryVectors, GetVectors and ListVectors on "
+                f"'{index_resource}' for every principal outside an exact "
+                "exception list, so the policy does not restrict who can read "
+                "the embeddings"
+            ),
+        }
+    return {
+        "ok": True,
+        "detail": (
+            f"{counted}: no Allow admits an unbounded principal, and Deny "
+            f"statement(s) {', '.join(restricting)} block s3vectors:QueryVectors, "
+            f"GetVectors and ListVectors on '{index_resource}' for every principal "
+            "outside an exact exception list (which principals that list names "
+            "is not judged by this check)"
+        ),
+    }
+
+
 def _assess_s3_vectors_store(
     storage_config: Dict[str, Any], region: str
 ) -> Dict[str, str]:
@@ -8757,7 +9132,8 @@ def _assess_s3_vectors_store(
         embeddings are actually encrypted with, and an aws:kms bucket holding an
         AES256 index reads as compliant without this leg. Same comparison as the
         bucket, on identically named members.
-      - access restriction: GetVectorBucketPolicy. NotFoundException means no
+      - access restriction: GetVectorBucketPolicy, judged statement by
+        statement in _vector_bucket_policy_scope. NotFoundException means no
         policy is attached, which is a Failed for this leg and explicitly NOT an
         N/A. Abstaining here is what made this control read as unassessed while
         every knowledge base in the account used S3 Vectors.
@@ -8929,20 +9305,30 @@ def _assess_s3_vectors_store(
                     "encryptionConfiguration overrides the bucket's"
                 )
 
+    # The resource a Deny must name to reach this knowledge base's embeddings.
+    if index_arn:
+        index_resource = index_arn
+    elif index_name:
+        index_resource = f"{vector_bucket_arn}/index/{index_name}"
+    else:
+        index_resource = f"{vector_bucket_arn}/index/*"
     policy_unreadable = ""
     policy_ok = False
     try:
         policy = s3_vectors_client.get_vector_bucket_policy(
             vectorBucketArn=vector_bucket_arn
         ).get("policy")
-        policy_ok = bool(policy)
-        policy_detail = (
-            "a vector bucket policy is attached (its statements are not evaluated "
-            "by this check)"
-            if policy_ok
-            else "GetVectorBucketPolicy returned an empty policy, so access to the "
-            "vector store is not restricted by a resource policy"
-        )
+        if not policy:
+            policy_detail = (
+                "GetVectorBucketPolicy returned an empty policy, so access to the "
+                "vector store is not restricted by a resource policy"
+            )
+        else:
+            scope = _vector_bucket_policy_scope(policy, index_resource)
+            policy_ok = scope["ok"] is True
+            if scope["ok"] is None:
+                policy_unreadable = "unparseable policy"
+            policy_detail = scope["detail"]
     except ClientError as e:
         error_code = e.response.get("Error", {}).get("Code", "")
         if error_code == "NotFoundException":
@@ -9005,6 +9391,302 @@ def _assess_s3_vectors_store(
     }
 
 
+# The key of a third-party vector store is held by the provider, and no AWS API
+# returns it, so BR-20 judges the AWS side only: the Secrets Manager secret that
+# holds the store's credentials.
+THIRD_PARTY_VECTOR_STORES = {
+    "PINECONE": "pineconeConfiguration",
+    "REDIS_ENTERPRISE_CLOUD": "redisEnterpriseCloudConfiguration",
+    "MONGO_DB_ATLAS": "mongoDbAtlasConfiguration",
+}
+
+
+def _arn_region(arn: str) -> str:
+    """Return the Region segment of an ARN, or "" when it has none."""
+    parts = str(arn or "").split(":")
+    return parts[3] if len(parts) > 5 and parts[0] == "arn" else ""
+
+
+def _store_verdict(status: str, detail: str) -> Dict[str, str]:
+    """Shape a storage-layer verdict the way _assess_s3_vectors_store does."""
+    if status == "Passed":
+        return {
+            "status": "Passed",
+            "severity": "Medium",
+            "detail": detail,
+            "resolution": "No action required on this vector store.",
+        }
+    if status == "Failed":
+        return {
+            "status": "Failed",
+            "severity": "High",
+            "detail": detail,
+            "resolution": (
+                "Encrypt the vector store with a customer managed, Enabled KMS "
+                "key. OpenSearch Serverless sets the key at collection creation "
+                "(an encryption policy with AWSOwnedKey false and a KmsARN), so "
+                "move the knowledge base to a new collection. Aurora sets it at "
+                "cluster creation, so restore a snapshot into an encrypted "
+                "cluster. OpenSearch Service and Neptune Analytics set it at "
+                "creation too. Then re-ingest the data sources."
+            ),
+        }
+    return {
+        "status": "N/A",
+        "severity": "Informational",
+        "detail": detail,
+        "resolution": COULD_NOT_ASSESS_RESOLUTION,
+    }
+
+
+def _store_read_error(error: Exception, action: str, region: str) -> str:
+    """Describe a failed storage-layer read, naming the permission it needs."""
+    if isinstance(error, ClientError) and _is_access_denied_client_error(error):
+        return (
+            f"{get_assessment_error_label(error)} on {action}; grant the assessment "
+            f"role {action} to read it"
+        )
+    return describe_api_error(error, action, region)
+
+
+def _assess_storage_layer_encryption(
+    storage_config: Dict[str, Any], storage_type: str, region: str
+) -> Dict[str, str]:
+    """
+    Judge the key on a bring-your-own vector store for BR-20.
+
+    OpenSearch Serverless reads the collection's kmsKeyArn (BatchGetCollection),
+    Aurora the cluster's StorageEncrypted and KmsKeyId (DescribeDBClusters),
+    OpenSearch Service the domain's EncryptionAtRestOptions (DescribeDomain) and
+    Neptune Analytics the graph's kmsKeyIdentifier (GetGraph). Each key is then
+    read with DescribeKey, so an AWS managed or disabled key fails. A
+    third-party store is judged on its credentials secret only, and never
+    passes, because the vectors' own key is held by the provider.
+    """
+    if storage_type == "OPENSEARCH_SERVERLESS":
+        arn = (storage_config.get("opensearchServerlessConfiguration") or {}).get(
+            "collectionArn"
+        ) or ""
+        store_region = _arn_region(arn) or region
+        collection_id = arn.split("collection/", 1)[1] if "collection/" in arn else ""
+        if not collection_id:
+            return _store_verdict(
+                "N/A",
+                "uses OpenSearch Serverless storage, but the knowledge base reports "
+                "no readable collectionArn, so the collection key could not be read.",
+            )
+        located = f"OpenSearch Serverless collection '{arn}'"
+        try:
+            response = boto3.client(
+                "opensearchserverless", config=boto3_config, region_name=store_region
+            ).batch_get_collection(ids=[collection_id])
+        except (ClientError, BotoCoreError) as error:
+            return _store_verdict(
+                "N/A",
+                f"uses {located}. Its encryption key could not be read: "
+                f"{_store_read_error(error, 'aoss:BatchGetCollection', store_region)}. "
+                "The deployed assessment role does not carry this grant, because "
+                "the action has no resource type and needs Resource '*'.",
+            )
+        details = response.get("collectionDetails") or []
+        if not details:
+            errors = response.get("collectionErrorDetails") or []
+            reason = (
+                errors[0].get("errorCode") or errors[0].get("errorMessage")
+                if errors
+                else "no collection detail returned"
+            )
+            return _store_verdict(
+                "N/A",
+                f"uses {located}. BatchGetCollection returned no detail for it "
+                f"({reason}), so its encryption key could not be read.",
+            )
+        key = str(details[0].get("kmsKeyArn") or "")
+        if not key.startswith("arn:"):
+            return _store_verdict(
+                "Failed",
+                f"uses {located}, whose kmsKeyArn is '{key or 'absent'}', not a "
+                "customer managed KMS key ARN.",
+            )
+        status, observed = _kms_key_verdict(key, store_region)
+        return _store_verdict(status, f"uses {located}, encrypted with {observed}.")
+
+    if storage_type == "RDS":
+        arn = (storage_config.get("rdsConfiguration") or {}).get("resourceArn") or ""
+        store_region = _arn_region(arn) or region
+        if not arn:
+            return _store_verdict(
+                "N/A",
+                "uses Amazon Aurora storage, but the knowledge base reports no "
+                "rdsConfiguration.resourceArn, so the cluster key could not be read.",
+            )
+        located = f"Aurora cluster '{arn}'"
+        try:
+            clusters = (
+                boto3.client("rds", config=boto3_config, region_name=store_region)
+                .describe_db_clusters(DBClusterIdentifier=arn)
+                .get("DBClusters")
+                or []
+            )
+        except (ClientError, BotoCoreError) as error:
+            return _store_verdict(
+                "N/A",
+                f"uses {located}. Its storage encryption could not be read: "
+                f"{_store_read_error(error, 'rds:DescribeDBClusters', store_region)}.",
+            )
+        if not clusters:
+            return _store_verdict(
+                "N/A",
+                f"uses {located}, but DescribeDBClusters returned no cluster for "
+                "it, so its storage encryption could not be read.",
+            )
+        cluster = clusters[0]
+        if cluster.get("StorageEncrypted") is not True:
+            return _store_verdict(
+                "Failed",
+                f"uses {located}, whose StorageEncrypted is "
+                f"{cluster.get('StorageEncrypted')}, so the vectors are not "
+                "encrypted at rest.",
+            )
+        key = str(cluster.get("KmsKeyId") or "")
+        if not key:
+            return _store_verdict(
+                "N/A",
+                f"uses {located}, which is encrypted, but DescribeDBClusters "
+                "returned no KmsKeyId, so whose key it is could not be read.",
+            )
+        status, observed = _kms_key_verdict(key, store_region)
+        return _store_verdict(status, f"uses {located}, encrypted with {observed}.")
+
+    if storage_type == "OPENSEARCH_MANAGED_CLUSTER":
+        arn = (storage_config.get("opensearchManagedClusterConfiguration") or {}).get(
+            "domainArn"
+        ) or ""
+        store_region = _arn_region(arn) or region
+        domain = arn.split("domain/", 1)[1] if "domain/" in arn else ""
+        if not domain:
+            return _store_verdict(
+                "N/A",
+                "uses OpenSearch Service storage, but the knowledge base reports no "
+                "readable domainArn, so the domain key could not be read.",
+            )
+        located = f"OpenSearch Service domain '{arn}'"
+        try:
+            status_block = (
+                boto3.client(
+                    "opensearch", config=boto3_config, region_name=store_region
+                )
+                .describe_domain(DomainName=domain)
+                .get("DomainStatus")
+                or {}
+            )
+        except (ClientError, BotoCoreError) as error:
+            return _store_verdict(
+                "N/A",
+                f"uses {located}. Its encryption at rest could not be read: "
+                f"{_store_read_error(error, 'es:DescribeDomain', store_region)}.",
+            )
+        at_rest = status_block.get("EncryptionAtRestOptions") or {}
+        if at_rest.get("Enabled") is not True:
+            return _store_verdict(
+                "Failed",
+                f"uses {located}, whose EncryptionAtRestOptions.Enabled is "
+                f"{at_rest.get('Enabled')}, so the vectors are not encrypted at rest.",
+            )
+        key = str(at_rest.get("KmsKeyId") or "")
+        if not key:
+            return _store_verdict(
+                "N/A",
+                f"uses {located}, which encrypts at rest, but DescribeDomain "
+                "returned no KmsKeyId, so whose key it is could not be read.",
+            )
+        status, observed = _kms_key_verdict(key, store_region)
+        return _store_verdict(status, f"uses {located}, encrypted with {observed}.")
+
+    if storage_type == "NEPTUNE_ANALYTICS":
+        arn = (storage_config.get("neptuneAnalyticsConfiguration") or {}).get(
+            "graphArn"
+        ) or ""
+        store_region = _arn_region(arn) or region
+        graph = arn.split("graph/", 1)[1] if "graph/" in arn else ""
+        if not graph:
+            return _store_verdict(
+                "N/A",
+                "uses Neptune Analytics storage, but the knowledge base reports no "
+                "readable graphArn, so the graph key could not be read.",
+            )
+        located = f"Neptune Analytics graph '{arn}'"
+        try:
+            response = boto3.client(
+                "neptune-graph", config=boto3_config, region_name=store_region
+            ).get_graph(graphIdentifier=graph)
+        except (ClientError, BotoCoreError) as error:
+            return _store_verdict(
+                "N/A",
+                f"uses {located}. Its encryption key could not be read: "
+                f"{_store_read_error(error, 'neptune-graph:GetGraph', store_region)}.",
+            )
+        key = str(response.get("kmsKeyIdentifier") or "")
+        if not key.startswith("arn:"):
+            return _store_verdict(
+                "Failed",
+                f"uses {located}, whose kmsKeyIdentifier is '{key or 'absent'}', "
+                "not a customer managed KMS key ARN.",
+            )
+        status, observed = _kms_key_verdict(key, store_region)
+        return _store_verdict(status, f"uses {located}, encrypted with {observed}.")
+
+    if storage_type in THIRD_PARTY_VECTOR_STORES:
+        config = storage_config.get(THIRD_PARTY_VECTOR_STORES[storage_type]) or {}
+        secret = str(config.get("credentialsSecretArn") or "")
+        ceiling = (
+            f"uses the third-party store {storage_type}, whose encryption key is "
+            "held by the provider and is not returned by any AWS API"
+        )
+        if not secret:
+            return _store_verdict(
+                "N/A",
+                f"{ceiling}, and the knowledge base reports no "
+                "credentialsSecretArn, so the AWS side could not be read either.",
+            )
+        secret_region = _arn_region(secret) or region
+        try:
+            described = boto3.client(
+                "secretsmanager", config=boto3_config, region_name=secret_region
+            ).describe_secret(SecretId=secret)
+        except (ClientError, BotoCoreError) as error:
+            return _store_verdict(
+                "N/A",
+                f"{ceiling}. Its credentials secret '{secret}' could not be read: "
+                f"{_store_read_error(error, 'secretsmanager:DescribeSecret', secret_region)}.",
+            )
+        key = str(described.get("KmsKeyId") or "")
+        if not key:
+            return _store_verdict(
+                "Failed",
+                f"{ceiling}, and its credentials secret '{secret}' reports no "
+                "KmsKeyId, so it is encrypted with the AWS managed key "
+                "aws/secretsmanager.",
+            )
+        status, observed = _kms_key_verdict(key, secret_region)
+        if status == "Failed":
+            return _store_verdict(
+                "Failed", f"{ceiling}, and its credentials secret uses {observed}."
+            )
+        return _store_verdict(
+            "N/A",
+            f"{ceiling}. Its credentials secret '{secret}' uses {observed}; the "
+            "vectors themselves could not be judged.",
+        )
+
+    return _store_verdict(
+        "N/A",
+        f"uses '{storage_type}' storage. The vector-store encryption key is "
+        "managed at the storage layer and this check has no read for it. Verify "
+        "customer-managed KMS encryption on the underlying store.",
+    )
+
+
 KB_DATA_SOURCE_ENCRYPTION_FINDING = "Knowledge Base Data Source Bucket Encryption"
 
 KB_DATA_SOURCE_ENCRYPTION_RESOLUTION = (
@@ -9056,6 +9738,77 @@ def _bucket_default_encryption(bucket: str, region: str) -> Dict[str, Any]:
     return {"algorithm": "", "key": "", "customer_managed": False}
 
 
+KB_TRANSIENT_KEY_FINDING = "Knowledge Base Data Source Transient Data Key"
+
+
+def _knowledge_base_transient_key_findings(
+    transient_keys: List[Dict[str, str]], region: str
+) -> List[Dict[str, Any]]:
+    """
+    Judge the key each data source names for its transient ingestion data.
+
+    CreateDataSource takes serverSideEncryptionConfiguration.kmsKeyArn, and a
+    data source without one leaves the data Bedrock stages during ingestion off
+    a customer managed key. A named key is read with DescribeKey, once per key.
+    """
+    verdicts: Dict[str, Tuple[str, str]] = {}
+    passed: List[str] = []
+    rows: List[Dict[str, Any]] = []
+    for source in transient_keys:
+        key = source["key"]
+        if not key:
+            status, observed = (
+                "Failed",
+                "names no serverSideEncryptionConfiguration.kmsKeyArn, so its "
+                "transient ingestion data is not encrypted with a customer "
+                "managed key",
+            )
+        else:
+            if key not in verdicts:
+                verdicts[key] = _kms_key_verdict(key, region)
+            status, observed = verdicts[key]
+            observed = f"encrypts transient ingestion data with {observed}"
+        if status == "Passed":
+            passed.append(f"{source['label']} {observed}")
+            continue
+        rows.append(
+            create_finding(
+                check_id="BR-20",
+                finding_name=KB_TRANSIENT_KEY_FINDING,
+                finding_details=f"The {source['label']} {observed}.",
+                resolution=(
+                    "Set serverSideEncryptionConfiguration.kmsKeyArn on the data "
+                    "source (UpdateDataSource) to a customer managed, Enabled KMS "
+                    "key."
+                    if status == "Failed"
+                    else COULD_NOT_ASSESS_RESOLUTION
+                ),
+                reference=KB_ENCRYPTION_REFERENCE,
+                severity="High" if status == "Failed" else "Informational",
+                status=status,
+                region=region,
+            )
+        )
+    if passed:
+        rows.append(
+            create_finding(
+                check_id="BR-20",
+                finding_name=KB_TRANSIENT_KEY_FINDING,
+                finding_details=(
+                    f"{len(passed)} of {len(transient_keys)} knowledge base data "
+                    f"source(s) name a customer managed, Enabled key: "
+                    f"{'; '.join(passed)}."
+                ),
+                resolution="No action required",
+                reference=KB_ENCRYPTION_REFERENCE,
+                severity="Medium",
+                status="Passed",
+                region=region,
+            )
+        )
+    return rows
+
+
 def _knowledge_base_source_encryption_findings(region: str) -> List[Dict[str, Any]]:
     """Assess encryption at rest on every S3 bucket a knowledge base ingests from.
 
@@ -9065,9 +9818,10 @@ def _knowledge_base_source_encryption_findings(region: str) -> List[Dict[str, An
     sources, so each bucket is read once and every data source that names it is
     listed on the row.
 
-    Returns no rows at all when the account has no S3 data source, so a
+    Returns no bucket rows when the account has no S3 data source, so a
     knowledge base on a non-S3 connector is not judged on a bucket it has not
-    got.
+    got. Every data source, whatever its connector, is judged on the key it
+    names for transient ingestion data.
     """
     try:
         inventory = _knowledge_base_s3_sources(region)
@@ -9136,10 +9890,24 @@ def _knowledge_base_source_encryption_findings(region: str) -> List[Dict[str, An
             continue
 
         if encryption["customer_managed"]:
-            encrypted.append(
-                f"S3 bucket '{bucket}' uses {encryption['algorithm']} with "
-                f"{encryption['key']}"
-            )
+            # The alias test rules out aws/s3 by name only; DescribeKey says who
+            # manages the key and whether it is Enabled.
+            key_status, observed = _kms_key_verdict(encryption["key"], region)
+            if key_status == "Passed":
+                encrypted.append(
+                    f"S3 bucket '{bucket}' uses {encryption['algorithm']} with "
+                    f"{observed}"
+                )
+            elif key_status == "Failed":
+                plaintext.append(
+                    {
+                        "bucket": bucket,
+                        "served": served,
+                        "reason": f"uses {encryption['algorithm']} with {observed}",
+                    }
+                )
+            else:
+                unreadable.append(f"S3 bucket '{bucket}' ({served}): {observed}")
         elif encryption["algorithm"] in KMS_SSE_ALGORITHMS:
             plaintext.append(
                 {
@@ -9209,6 +9977,10 @@ def _knowledge_base_source_encryption_findings(region: str) -> List[Dict[str, An
                 region=region,
             )
         )
+
+    source_findings.extend(
+        _knowledge_base_transient_key_findings(inventory["transient_keys"], region)
+    )
 
     for gap in unreadable + inventory["errors"]:
         source_findings.append(
@@ -9301,9 +10073,9 @@ def check_bedrock_knowledge_base_kms_encryption(region: str = "") -> Dict[str, A
 
             kbs_with_aws_keys = []
             kbs_with_customer_keys = []
-            kbs_storage_layer_review = []
             kbs_indeterminate = []
-            kbs_s3_vectors = []
+            kbs_store_assessments = []
+            kbs_unread = []
 
             for kb_summary in knowledge_bases:
                 kb_id = kb_summary.get("knowledgeBaseId")
@@ -9352,9 +10124,7 @@ def check_bedrock_knowledge_base_kms_encryption(region: str = "") -> Dict[str, A
                         )
                         kms_key_arn = sse_config.get("kmsKeyArn")
 
-                        if kms_key_arn and kms_key_arn.startswith("arn:aws:kms"):
-                            kbs_with_customer_keys.append(kb_name)
-                        else:
+                        if not kms_key_arn:
                             kbs_with_aws_keys.append(
                                 {
                                     "name": kb_name,
@@ -9362,6 +10132,26 @@ def check_bedrock_knowledge_base_kms_encryption(region: str = "") -> Dict[str, A
                                     "storage_type": "Managed (Amazon Bedrock)",
                                 }
                             )
+                        else:
+                            # The ARN alone says nothing about who manages the
+                            # key or whether it is Enabled, so it is read.
+                            key_status, observed = _kms_key_verdict(kms_key_arn, region)
+                            if key_status == "Passed":
+                                kbs_with_customer_keys.append(
+                                    f"'{kb_name}' ({observed})"
+                                )
+                            else:
+                                kbs_store_assessments.append(
+                                    {
+                                        "name": kb_name,
+                                        "id": kb_id,
+                                        **_store_verdict(
+                                            key_status,
+                                            "is a MANAGED knowledge base encrypted "
+                                            f"with {observed}.",
+                                        ),
+                                    }
+                                )
                     elif storage_type == "S3_VECTORS":
                         # S3 Vectors is the one custom store whose encryption and
                         # access policy ARE readable, one ARN hop away, so this
@@ -9391,25 +10181,32 @@ def check_bedrock_knowledge_base_kms_encryption(region: str = "") -> Dict[str, A
                                 "resolution": COULD_NOT_ASSESS_RESOLUTION,
                             }
                         assessment.update({"name": kb_name, "id": kb_id})
-                        kbs_s3_vectors.append(assessment)
+                        kbs_store_assessments.append(assessment)
                     else:
-                        # Custom vector store (VECTOR / SQL / KENDRA): encryption is
-                        # managed at the storage layer and cannot be validated from
-                        # the KB API.
-                        kbs_storage_layer_review.append(
-                            {
-                                "name": kb_name,
-                                "id": kb_id,
-                                "storage_type": storage_type,
-                            }
+                        # A bring-your-own store keeps its key on the store
+                        # itself, one read away from the knowledge base.
+                        assessment = _assess_storage_layer_encryption(
+                            storage_config, storage_type, region
                         )
+                        assessment.update({"name": kb_name, "id": kb_id})
+                        kbs_store_assessments.append(assessment)
 
                 except ClientError as detail_error:
-                    error_code = detail_error.response.get("Error", {}).get("Code", "")
-                    if error_code not in ACCESS_DENIED_ERROR_CODES:
-                        logger.warning(
-                            f"Could not get details for KB {kb_name}: {error_code}"
-                        )
+                    # A knowledge base whose detail cannot be read keeps a row,
+                    # so the population a verdict covers is never quietly short.
+                    logger.warning(
+                        f"Could not get details for KB {kb_name}: "
+                        f"{get_assessment_error_label(detail_error)}"
+                    )
+                    kbs_unread.append(
+                        {
+                            "name": kb_name,
+                            "id": kb_id,
+                            "detail": describe_api_error(
+                                detail_error, "bedrock:GetKnowledgeBase", region
+                            ),
+                        }
+                    )
 
             if kbs_with_aws_keys:
                 findings["status"] = "WARN"
@@ -9431,25 +10228,25 @@ def check_bedrock_knowledge_base_kms_encryption(region: str = "") -> Dict[str, A
                         )
                     )
 
-            if kbs_s3_vectors:
-                failed_s3_vectors = [
-                    kb for kb in kbs_s3_vectors if kb["status"] == "Failed"
+            if kbs_store_assessments:
+                failed_stores = [
+                    kb for kb in kbs_store_assessments if kb["status"] == "Failed"
                 ]
-                if failed_s3_vectors:
+                if failed_stores:
                     findings["status"] = "WARN"
                     findings["details"] = (
-                        f"{len(failed_s3_vectors)} knowledge bases on S3 Vectors do "
-                        "not meet customer-managed encryption or access restriction"
+                        f"{len(failed_stores)} knowledge base vector stores do not "
+                        "meet customer-managed encryption or access restriction"
                     )
                 elif findings["status"] == "PASS" and any(
-                    kb["status"] == "N/A" for kb in kbs_s3_vectors
+                    kb["status"] == "N/A" for kb in kbs_store_assessments
                 ):
                     findings["status"] = "WARN"
 
                 # One finding per knowledge base, in list order. An all-or-nothing
                 # summary row would make either Passed or Failed unreachable for the
                 # whole region as soon as one knowledge base disagreed.
-                for kb in kbs_s3_vectors:
+                for kb in kbs_store_assessments:
                     findings["csv_data"].append(
                         create_finding(
                             check_id="BR-20",
@@ -9470,17 +10267,21 @@ def check_bedrock_knowledge_base_kms_encryption(region: str = "") -> Dict[str, A
                         )
                     )
 
-            if kbs_storage_layer_review:
+            if kbs_unread:
                 if findings["status"] == "PASS":
                     findings["status"] = "WARN"
-                for kb in kbs_storage_layer_review:
+                for kb in kbs_unread:
                     findings["csv_data"].append(
                         create_finding(
                             check_id="BR-20",
                             finding_name="Knowledge Base Customer-Managed KMS Encryption Review",
-                            finding_details=f"Knowledge base '{kb['name']}' (ID: {kb['id']}) uses '{kb['storage_type']}' storage. The vector-store encryption key is managed at the storage layer and cannot be validated from the Knowledge Base API. Verify customer-managed KMS encryption on the underlying store.",
-                            resolution="1. For OpenSearch Serverless: verify the collection uses a customer-managed KMS key\n2. For Amazon RDS/Aurora: verify KMS encryption on the database\n3. For third-party stores (Pinecone, Redis, MongoDB): verify the provider's encryption configuration\n4. Verify the customer-managed KMS key used for transient data during ingestion",
-                            reference="https://docs.aws.amazon.com/bedrock/latest/userguide/encryption-kb.html",
+                            finding_details=(
+                                f"Knowledge base '{kb['name']}' (ID: {kb['id']}) "
+                                "could not be read, so neither its vector store "
+                                f"key nor its access policy was assessed: {kb['detail']}"
+                            ),
+                            resolution=COULD_NOT_ASSESS_RESOLUTION,
+                            reference=KB_ENCRYPTION_REFERENCE,
                             severity="Informational",
                             status="N/A",
                             region=region,
@@ -9509,7 +10310,11 @@ def check_bedrock_knowledge_base_kms_encryption(region: str = "") -> Dict[str, A
                     create_finding(
                         check_id="BR-20",
                         finding_name="Knowledge Base Customer-Managed KMS Encryption Check",
-                        finding_details=f"{len(kbs_with_customer_keys)} managed knowledge bases are using customer-managed KMS keys",
+                        finding_details=(
+                            f"{len(kbs_with_customer_keys)} managed knowledge base(s) "
+                            "are encrypted with a customer managed, Enabled KMS key: "
+                            f"{'; '.join(kbs_with_customer_keys)}."
+                        ),
                         resolution="No action required. Continue using customer-managed keys for new knowledge bases.",
                         reference="https://docs.aws.amazon.com/bedrock/latest/userguide/encryption-kb.html",
                         severity="Medium",
@@ -18654,6 +19459,7 @@ def _knowledge_base_s3_sources(region: str = "") -> Dict[str, Any]:
 
     s3_sources = []
     other_sources = []
+    transient_keys = []
     errors = []
     described = 0
     truncated = False
@@ -18705,6 +19511,17 @@ def _knowledge_base_s3_sources(region: str = "") -> Dict[str, Any]:
             label = "data source '{}' in knowledge base '{}'".format(
                 data_source.get("name") or data_source_id, kb_label
             )
+            transient_keys.append(
+                {
+                    "label": label,
+                    "key": str(
+                        (
+                            data_source.get("serverSideEncryptionConfiguration") or {}
+                        ).get("kmsKeyArn")
+                        or ""
+                    ),
+                }
+            )
 
             if source_type != "S3":
                 other_sources.append(f"{label} ingests from {source_type}")
@@ -18730,6 +19547,7 @@ def _knowledge_base_s3_sources(region: str = "") -> Dict[str, Any]:
         "knowledge_base_count": len(knowledge_bases),
         "s3_sources": s3_sources,
         "other_sources": other_sources,
+        "transient_keys": transient_keys,
         "errors": errors,
         "truncated": truncated,
     }

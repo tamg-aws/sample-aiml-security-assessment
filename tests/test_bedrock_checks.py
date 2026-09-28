@@ -3831,6 +3831,11 @@ class TestBR11CustomModelEncryption:
                 "11111111-2222-3333-4444-555555555555"
             ),
         }
+        # A named key passes only once DescribeKey reports it customer managed
+        # and Enabled.
+        mock_bedrock.describe_key.return_value = {
+            "KeyMetadata": {"KeyManager": "CUSTOMER", "KeyState": "Enabled"}
+        }
         result = check()
         findings = extract_csv_data(result)
         assert len(findings) >= 1
@@ -10539,6 +10544,14 @@ class TestBR20KnowledgeBaseKMS:
             }
         }
         mock_client.return_value = agent_client
+        # The key is read, and only a CUSTOMER key in state Enabled passes.
+        agent_client.describe_key.return_value = {
+            "KeyMetadata": {
+                "Arn": "arn:aws:kms:us-east-1:123:key/abc",
+                "KeyManager": "CUSTOMER",
+                "KeyState": "Enabled",
+            }
+        }
 
         result = check(region="us-east-1")
         findings = extract_csv_data(result)
@@ -10621,7 +10634,9 @@ class TestBR20KnowledgeBaseKMS:
         na = [f for f in findings if f["Status"] == "N/A"]
         assert len(na) >= 1
         assert na[0]["Check_ID"] == "BR-20"
-        assert "storage layer" in na[0]["Finding_Details"]
+        # No collectionArn is reported, so the collection key has no read.
+        assert "reports no readable collectionArn" in na[0]["Finding_Details"]
+        assert all(f["Status"] != "Failed" for f in findings)
 
     @patch("bedrock_app.boto3.client")
     def test_br20_region_unsupported_returns_na(self, mock_client):
@@ -10673,6 +10688,29 @@ class TestBR20KnowledgeBaseKMS:
 # previous version of this header described one account's vector
 # buckets in the present tense, and a case below now contradicts it.
 # ===================================================================
+# A vector bucket policy that restricts the store: a Deny on every principal
+# outside one named role, over every vector read. An empty statement list
+# restricts nothing and fails the access leg, so the passing fixtures use this.
+RESTRICTING_VECTOR_POLICY = json.dumps(
+    {
+        "Statement": [
+            {
+                "Sid": "OnlyTheKnowledgeBaseRole",
+                "Effect": "Deny",
+                "Principal": "*",
+                "Action": "s3vectors:*",
+                "Resource": "*",
+                "Condition": {
+                    "ArnNotEquals": {
+                        "aws:PrincipalArn": "arn:aws:iam::123456789012:role/kb-role"
+                    }
+                },
+            }
+        ]
+    }
+)
+
+
 class TestBR20S3VectorsStore:
     """BR-20: assess the S3 Vectors bucket holding a knowledge base."""
 
@@ -10733,6 +10771,14 @@ class TestBR20S3VectorsStore:
         agent_client.list_data_sources.return_value = {"dataSourceSummaries": []}
         agent_client.get_knowledge_base.side_effect = lambda **kwargs: {
             "knowledgeBase": bodies[kwargs["knowledgeBaseId"]]
+        }
+        # Only a MANAGED knowledge base reads its key through DescribeKey here.
+        agent_client.describe_key.side_effect = lambda KeyId: {
+            "KeyMetadata": {
+                "Arn": KeyId,
+                "KeyManager": "CUSTOMER",
+                "KeyState": "Enabled",
+            }
         }
         return agent_client
 
@@ -10910,7 +10956,7 @@ class TestBR20S3VectorsStore:
     @patch("bedrock_app.boto3.client")
     def test_br20_s3_vectors_cmk_with_a_policy_returns_passed(self, mock_client):
         findings, _ = self._run_one(
-            mock_client, encryption=self._CMK, policy='{"Statement": []}'
+            mock_client, encryption=self._CMK, policy=RESTRICTING_VECTOR_POLICY
         )
         assert [f["Status"] for f in findings] == ["Passed"]
         assert findings[0]["Severity"] == "Medium"
@@ -11005,7 +11051,7 @@ class TestBR20S3VectorsStore:
         findings, _ = self._run_one(
             mock_client,
             encryption=self._CMK,
-            policy='{"Statement": []}',
+            policy=RESTRICTING_VECTOR_POLICY,
             index_encryption={"sseType": "AES256"},
         )
         assert [f["Status"] for f in findings] == ["Failed"]
@@ -11073,7 +11119,7 @@ class TestBR20S3VectorsStore:
         }
         vectors_client.get_index.side_effect = get_index
         vectors_client.get_vector_bucket_policy.return_value = {
-            "policy": '{"Statement": []}'
+            "policy": RESTRICTING_VECTOR_POLICY
         }
         mock_client.side_effect = self._by_service(
             self._agent_client_for({kb: body(arn) for kb, arn in indexes.items()}),
@@ -11103,7 +11149,7 @@ class TestBR20S3VectorsStore:
         findings, _ = self._run_one(
             mock_client,
             encryption=self._CMK,
-            policy='{"Statement": []}',
+            policy=RESTRICTING_VECTOR_POLICY,
             index_encryption={},
         )
         assert [f["Status"] for f in findings] == ["Passed"]
@@ -11121,7 +11167,7 @@ class TestBR20S3VectorsStore:
         findings, _ = self._run_one(
             mock_client,
             encryption=self._CMK,
-            policy='{"Statement": []}',
+            policy=RESTRICTING_VECTOR_POLICY,
             index_error=self._client_error("AccessDeniedException", "GetIndex"),
         )
         assert [f["Status"] for f in findings] == ["N/A"]
@@ -11138,7 +11184,7 @@ class TestBR20S3VectorsStore:
         findings, _ = self._run_one(
             mock_client,
             encryption=self._CMK,
-            policy='{"Statement": []}',
+            policy=RESTRICTING_VECTOR_POLICY,
             index_error=self._client_error("NotFoundException", "GetIndex"),
         )
         assert [f["Status"] for f in findings] == ["N/A"]
@@ -11151,7 +11197,7 @@ class TestBR20S3VectorsStore:
         findings, _ = self._run_one(
             mock_client,
             encryption={"sseType": "AES256"},
-            policy='{"Statement": []}',
+            policy=RESTRICTING_VECTOR_POLICY,
             index_error=self._client_error("AccessDeniedException", "GetIndex"),
         )
         assert [f["Status"] for f in findings] == ["Failed"]
@@ -11176,7 +11222,7 @@ class TestBR20S3VectorsStore:
         self._run_one(
             mock_client,
             encryption=self._CMK,
-            policy='{"Statement": []}',
+            policy=RESTRICTING_VECTOR_POLICY,
             index_calls=index_calls,
         )
         assert index_calls == [{"indexArn": self._index_arn(self._BUCKET_ARN)}]
@@ -11194,7 +11240,7 @@ class TestBR20S3VectorsStore:
             mock_client,
             index="name",
             encryption=self._CMK,
-            policy='{"Statement": []}',
+            policy=RESTRICTING_VECTOR_POLICY,
             index_calls=index_calls,
         )
         assert index_calls == [
@@ -11213,7 +11259,7 @@ class TestBR20S3VectorsStore:
             mock_client,
             index=None,
             encryption=self._CMK,
-            policy='{"Statement": []}',
+            policy=RESTRICTING_VECTOR_POLICY,
             index_calls=index_calls,
         )
         assert [f["Status"] for f in findings] == ["N/A"]
@@ -11230,7 +11276,7 @@ class TestBR20S3VectorsStore:
             bucket_arn="arn:aws:s3vectors:eu-west-1:123456789012:bucket/kb-vectors",
             scan_region="us-east-1",
             encryption=self._CMK,
-            policy='{"Statement": []}',
+            policy=RESTRICTING_VECTOR_POLICY,
         )
         assert ("s3vectors", "eu-west-1") in clients_built
         assert ("s3vectors", "us-east-1") not in clients_built
@@ -11284,7 +11330,7 @@ class TestBR20S3VectorsStore:
             arns["kb1"]: self._client_error(
                 "NotFoundException", "GetVectorBucketPolicy"
             ),
-            arns["kb2"]: {"policy": '{"Statement": []}'},
+            arns["kb2"]: {"policy": RESTRICTING_VECTOR_POLICY},
             arns["kb3"]: self._client_error(
                 "AccessDeniedException", "GetVectorBucketPolicy"
             ),
@@ -11349,7 +11395,7 @@ class TestBR20S3VectorsStore:
                 "kb10",
                 "arn:aws:s3vectors:us-east-1:123456789012:bucket/b10",
                 self._CMK,
-                {"policy": '{"Statement": []}'},
+                {"policy": RESTRICTING_VECTOR_POLICY},
             )
         )
 
@@ -17074,7 +17120,7 @@ class TestBR20KnowledgeBaseDataSourceEncryption:
             }
         }
 
-    def _run(self, sources, encryption=None, list_error=None):
+    def _run(self, sources, encryption=None, list_error=None, key_metadata=None):
         """Run BR-20 over one MANAGED knowledge base with the given data sources.
 
         The knowledge base itself holds a customer-managed key, so the vector
@@ -17122,6 +17168,9 @@ class TestBR20KnowledgeBaseDataSourceEncryption:
                 "dataSource": {
                     "name": source["name"],
                     "dataSourceConfiguration": configuration,
+                    "serverSideEncryptionConfiguration": {
+                        "kmsKeyArn": source.get("transient_key", self._CMK_ARN)
+                    },
                 }
             }
 
@@ -17139,7 +17188,24 @@ class TestBR20KnowledgeBaseDataSourceEncryption:
         s3_client.get_bucket_encryption.side_effect = get_bucket_encryption
         self.s3_client = s3_client
 
-        clients = {"bedrock-agent": agent_client, "s3": s3_client}
+        # Every key is read with DescribeKey. The account's own key answers as
+        # a CUSTOMER key in state Enabled; `key_metadata` overrides per key.
+        kms_client = MagicMock()
+        key_answers = {
+            self._CMK_ARN: {"KeyManager": "CUSTOMER", "KeyState": "Enabled"},
+            **(key_metadata or {}),
+        }
+
+        def describe_key(KeyId):
+            answer = key_answers[KeyId]
+            if isinstance(answer, Exception):
+                raise answer
+            return {"KeyMetadata": {"Arn": KeyId, **answer}}
+
+        kms_client.describe_key.side_effect = describe_key
+        self.kms_client = kms_client
+
+        clients = {"bedrock-agent": agent_client, "s3": s3_client, "kms": kms_client}
         with patch(
             "bedrock_app.boto3.client",
             side_effect=lambda service, **kwargs: clients[service],
@@ -17300,7 +17366,12 @@ class TestBR20KnowledgeBaseDataSourceEncryption:
         source = self._run([{"id": "ds1", "name": "site", "type": "WEB"}])
 
         assert source == []
-        assert [f["Status"] for f in self.all_findings] == ["Passed"]
+        # The vector store row and the data source's transient-key row; no
+        # bucket row.
+        assert [(f["Finding"], f["Status"]) for f in self.all_findings] == [
+            ("Knowledge Base Customer-Managed KMS Encryption Check", "Passed"),
+            (bedrock_app.KB_TRANSIENT_KEY_FINDING, "Passed"),
+        ]
         self.s3_client.get_bucket_encryption.assert_not_called()
 
     def test_br20_data_source_walk_error_keeps_the_vector_store_verdict(self):
@@ -20768,3 +20839,904 @@ class TestBR04RetentionDepth:
         )
         assert [r["Status"] for r in rows] == ["N/A"]
         assert "s3:GetBucketObjectLockConfiguration" in rows[0]["Finding_Details"]
+
+
+# ===================================================================
+# BR-20 value depth: the vector bucket policy is judged by its
+# statements, every bring-your-own store is followed to its key, every
+# key is read with DescribeKey, a knowledge base whose detail read
+# fails keeps a row, and every data source is judged on its transient
+# ingestion key.
+# ===================================================================
+class TestBR20ValueDepth:
+    ACCOUNT = "123456789012"
+    CMK = f"arn:aws:kms:us-east-1:{ACCOUNT}:key/cmk"
+    AWS_KEY = f"arn:aws:kms:us-east-1:{ACCOUNT}:key/aws-managed"
+    OFF_KEY = f"arn:aws:kms:us-east-1:{ACCOUNT}:key/disabled"
+    BUCKET = f"arn:aws:s3vectors:us-east-1:{ACCOUNT}:bucket/vec"
+    INDEX = f"arn:aws:s3vectors:us-east-1:{ACCOUNT}:bucket/vec/index/kb-index"
+    ROLE = f"arn:aws:iam::{ACCOUNT}:role/kb-role"
+
+    KEYS = {
+        CMK: {"KeyManager": "CUSTOMER", "KeyState": "Enabled"},
+        AWS_KEY: {"KeyManager": "AWS", "KeyState": "Enabled"},
+        OFF_KEY: {"KeyManager": "CUSTOMER", "KeyState": "Disabled"},
+    }
+
+    @classmethod
+    def _deny(cls, **overrides):
+        statement = {
+            "Sid": "OnlyKbRole",
+            "Effect": "Deny",
+            "Principal": "*",
+            "Action": "s3vectors:*",
+            "Resource": "*",
+            "Condition": {"ArnNotEquals": {"aws:PrincipalArn": cls.ROLE}},
+        }
+        statement.update(overrides)
+        return {k: v for k, v in statement.items() if v is not None}
+
+    @staticmethod
+    def _policy(*statements):
+        return json.dumps({"Statement": list(statements)})
+
+    @classmethod
+    def _s3v_body(cls, bucket=None, index=None):
+        bucket = bucket or cls.BUCKET
+        return {
+            "knowledgeBaseConfiguration": {"type": "VECTOR"},
+            "storageConfiguration": {
+                "type": "S3_VECTORS",
+                "s3VectorsConfiguration": {
+                    "vectorBucketArn": bucket,
+                    "indexArn": index or f"{bucket}/index/kb-index",
+                },
+            },
+        }
+
+    @staticmethod
+    def _store_body(storage_type, member, config):
+        return {
+            "knowledgeBaseConfiguration": {"type": "VECTOR"},
+            "storageConfiguration": {"type": storage_type, member: config},
+        }
+
+    @classmethod
+    def _managed_body(cls, key):
+        return {
+            "knowledgeBaseConfiguration": {
+                "type": "MANAGED",
+                "managedKnowledgeBaseConfiguration": {
+                    "serverSideEncryptionConfiguration": {"kmsKeyArn": key}
+                },
+            }
+        }
+
+    def _run(
+        self,
+        bodies,
+        *,
+        policies=None,
+        detail_errors=None,
+        clients=None,
+        keys=None,
+        sources=None,
+        bucket_encryption=None,
+    ):
+        """Run BR-20 over `bodies` ({kb_id: body}) with a client per service.
+
+        `policies` answers GetVectorBucketPolicy per bucket ARN (an Exception is
+        raised). `sources` is {kb_id: [(ds_id, bucket or None, transient key)]}.
+        """
+        agent = MagicMock()
+        agent.list_knowledge_bases.return_value = {
+            "knowledgeBaseSummaries": [
+                {"knowledgeBaseId": kb, "name": f"KB-{kb}"} for kb in bodies
+            ]
+        }
+
+        def get_kb(knowledgeBaseId):
+            error = (detail_errors or {}).get(knowledgeBaseId)
+            if error is not None:
+                raise error
+            return {"knowledgeBase": bodies[knowledgeBaseId]}
+
+        agent.get_knowledge_base.side_effect = get_kb
+        source_map = sources or {}
+        agent.list_data_sources.side_effect = lambda knowledgeBaseId, **_: {
+            "dataSourceSummaries": [
+                {"dataSourceId": ds, "name": ds}
+                for ds, _, _ in source_map.get(knowledgeBaseId, [])
+            ]
+        }
+
+        def get_ds(knowledgeBaseId, dataSourceId):
+            for ds, bucket, key in source_map[knowledgeBaseId]:
+                if ds == dataSourceId:
+                    configuration = {"type": "S3" if bucket else "WEB"}
+                    if bucket:
+                        configuration["s3Configuration"] = {
+                            "bucketArn": f"arn:aws:s3:::{bucket}"
+                        }
+                    data_source = {"name": ds, "dataSourceConfiguration": configuration}
+                    if key:
+                        data_source["serverSideEncryptionConfiguration"] = {
+                            "kmsKeyArn": key
+                        }
+                    return {"dataSource": data_source}
+            raise AssertionError(dataSourceId)
+
+        agent.get_data_source.side_effect = get_ds
+
+        vectors = MagicMock()
+        vectors.get_vector_bucket.side_effect = lambda vectorBucketArn: {
+            "vectorBucket": {
+                "encryptionConfiguration": {"sseType": "aws:kms", "kmsKeyArn": self.CMK}
+            }
+        }
+        vectors.get_index.side_effect = lambda **_: {"index": {}}
+
+        def get_policy(vectorBucketArn):
+            answer = (policies or {})[vectorBucketArn]
+            if isinstance(answer, Exception):
+                raise answer
+            return {"policy": answer}
+
+        vectors.get_vector_bucket_policy.side_effect = get_policy
+
+        key_table = {**self.KEYS, **(keys or {})}
+        kms = MagicMock()
+
+        def describe_key(KeyId):
+            answer = key_table[KeyId]
+            if isinstance(answer, Exception):
+                raise answer
+            return {"KeyMetadata": {"Arn": KeyId, **answer}}
+
+        kms.describe_key.side_effect = describe_key
+        self.kms = kms
+
+        s3 = MagicMock()
+        s3.get_bucket_encryption.side_effect = lambda Bucket: (bucket_encryption or {})[
+            Bucket
+        ]
+
+        table = {"bedrock-agent": agent, "s3vectors": vectors, "kms": kms, "s3": s3}
+        table.update(clients or {})
+        self.built = []
+
+        def factory(service, **kwargs):
+            self.built.append((service, kwargs.get("region_name")))
+            return table[service]
+
+        with patch("bedrock_app.boto3.client", side_effect=factory):
+            return extract_csv_data(
+                bedrock_app.check_bedrock_knowledge_base_kms_encryption(
+                    region="us-east-1"
+                )
+            )
+
+    @staticmethod
+    def _rows_for(findings, kb_id):
+        return [f for f in findings if f"(ID: {kb_id})" in f["Finding_Details"]]
+
+    # --- vector bucket policy statements --------------------------------
+
+    def test_an_empty_statement_list_restricts_nothing(self):
+        rows = self._run(
+            {"kb1": self._s3v_body()}, policies={self.BUCKET: self._policy()}
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "has 0 statement(s)" in rows[0]["Finding_Details"]
+
+    def test_a_restricting_deny_passes(self):
+        rows = self._run(
+            {"kb1": self._s3v_body()},
+            policies={self.BUCKET: self._policy(self._deny())},
+        )
+        assert [r["Status"] for r in rows] == ["Passed"]
+        assert "Deny statement(s) 'OnlyKbRole'" in rows[0]["Finding_Details"]
+        assert "not judged by this check" in rows[0]["Finding_Details"]
+
+    def test_an_allow_to_everyone_fails_beside_a_restricting_deny(self):
+        allow = {
+            "Sid": "Open",
+            "Effect": "Allow",
+            "Principal": "*",
+            "Action": "s3vectors:QueryVectors",
+            "Resource": "*",
+        }
+        rows = self._run(
+            {"kb1": self._s3v_body()},
+            policies={self.BUCKET: self._policy(self._deny(), allow)},
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "Allow statement(s) 'Open'" in rows[0]["Finding_Details"]
+
+    def test_a_wildcard_in_one_principal_segment_is_unbounded(self):
+        allow = {
+            "Effect": "Allow",
+            "Principal": {"AWS": f"arn:aws:iam::{self.ACCOUNT}:role/*"},
+            "Action": "s3vectors:GetVectors",
+            "Resource": "*",
+        }
+        rows = self._run(
+            {"kb1": self._s3v_body()},
+            policies={self.BUCKET: self._policy(self._deny(), allow)},
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "Allow statement(s) #2" in rows[0]["Finding_Details"]
+
+    def test_an_allow_not_principal_is_unbounded(self):
+        allow = {
+            "Effect": "Allow",
+            "NotPrincipal": {"AWS": self.ROLE},
+            "Action": "s3vectors:GetVectors",
+            "Resource": "*",
+        }
+        rows = self._run(
+            {"kb1": self._s3v_body()},
+            policies={self.BUCKET: self._policy(self._deny(), allow)},
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+
+    def test_an_exact_principal_account_condition_bounds_a_star_allow(self):
+        allow = {
+            "Effect": "Allow",
+            "Principal": "*",
+            "Action": "s3vectors:QueryVectors",
+            "Resource": "*",
+            "Condition": {"StringEquals": {"aws:PrincipalAccount": self.ACCOUNT}},
+        }
+        rows = self._run(
+            {"kb1": self._s3v_body()},
+            policies={self.BUCKET: self._policy(self._deny(), allow)},
+        )
+        assert [r["Status"] for r in rows] == ["Passed"]
+
+    def test_a_wildcard_condition_value_does_not_bound_a_star_allow(self):
+        allow = {
+            "Effect": "Allow",
+            "Principal": "*",
+            "Action": "s3vectors:QueryVectors",
+            "Resource": "*",
+            "Condition": {"StringLike": {"aws:PrincipalAccount": "12345*"}},
+        }
+        rows = self._run(
+            {"kb1": self._s3v_body()},
+            policies={self.BUCKET: self._policy(self._deny(), allow)},
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+
+    def test_a_transport_deny_is_not_an_access_restriction(self):
+        deny = self._deny(Condition={"Bool": {"aws:SecureTransport": "false"}})
+        rows = self._run(
+            {"kb1": self._s3v_body()}, policies={self.BUCKET: self._policy(deny)}
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "none is a Deny" in rows[0]["Finding_Details"]
+
+    def test_a_wildcard_exception_list_is_not_credited(self):
+        deny = self._deny(
+            Condition={
+                "ArnNotLike": {
+                    "aws:PrincipalArn": f"arn:aws:iam::{self.ACCOUNT}:role/*"
+                }
+            }
+        )
+        rows = self._run(
+            {"kb1": self._s3v_body()}, policies={self.BUCKET: self._policy(deny)}
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+
+    def test_a_deny_on_writes_only_leaves_reads_open(self):
+        deny = self._deny(Action=["s3vectors:PutVectors", "s3vectors:DeleteVectors"])
+        rows = self._run(
+            {"kb1": self._s3v_body()}, policies={self.BUCKET: self._policy(deny)}
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+
+    def test_a_deny_on_another_index_does_not_reach_this_one(self):
+        other = self._deny(Resource=f"{self.BUCKET}/index/other")
+        mine = self._deny(Sid="Mine", Resource=self.INDEX)
+        rows = self._run(
+            {
+                "kb1": self._s3v_body(),
+                "kb2": self._s3v_body(index=f"{self.BUCKET}/index/other"),
+            },
+            policies={self.BUCKET: self._policy(other, mine)},
+        )
+        # kb1's index is covered by 'Mine'; kb2's index by the first statement.
+        assert [r["Status"] for r in rows] == ["Passed", "Passed"]
+        only_other = self._run(
+            {"kb1": self._s3v_body()}, policies={self.BUCKET: self._policy(other)}
+        )
+        assert [r["Status"] for r in only_other] == ["Failed"]
+
+    def test_an_unparseable_policy_is_not_judged(self):
+        rows = self._run({"kb1": self._s3v_body()}, policies={self.BUCKET: "{not json"})
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert "not a readable JSON policy" in rows[0]["Finding_Details"]
+
+    def test_two_buckets_reach_both_policy_verdicts(self):
+        second = f"arn:aws:s3vectors:us-east-1:{self.ACCOUNT}:bucket/open"
+        rows = self._run(
+            {"kb1": self._s3v_body(), "kb2": self._s3v_body(bucket=second)},
+            policies={
+                self.BUCKET: self._policy(self._deny()),
+                second: self._policy(),
+            },
+        )
+        assert [(r["Status"], "(ID: kb1)" in r["Finding_Details"]) for r in rows] == [
+            ("Passed", True),
+            ("Failed", False),
+        ]
+
+    # --- bring-your-own stores --------------------------------------------
+
+    @staticmethod
+    def _aoss(key=None, error=None, details=True):
+        client = MagicMock()
+        if error is not None:
+            client.batch_get_collection.side_effect = error
+        else:
+            client.batch_get_collection.side_effect = lambda ids: {
+                "collectionDetails": (
+                    [{"id": ids[0], "kmsKeyArn": key}] if details else []
+                ),
+                "collectionErrorDetails": (
+                    [] if details else [{"id": ids[0], "errorCode": "NOT_FOUND"}]
+                ),
+            }
+        return client
+
+    def _aoss_body(self):
+        return self._store_body(
+            "OPENSEARCH_SERVERLESS",
+            "opensearchServerlessConfiguration",
+            {"collectionArn": f"arn:aws:aoss:us-west-2:{self.ACCOUNT}:collection/c1"},
+        )
+
+    def test_opensearch_serverless_on_a_customer_key_passes(self):
+        rows = self._run(
+            {"kb1": self._aoss_body()},
+            clients={"opensearchserverless": self._aoss(self.CMK)},
+        )
+        assert [r["Status"] for r in rows] == ["Passed"]
+        assert ("opensearchserverless", "us-west-2") in self.built
+        assert (
+            f"customer managed KMS key '{self.CMK}' is Enabled"
+            in rows[0]["Finding_Details"]
+        )
+
+    def test_opensearch_serverless_without_a_key_arn_fails(self):
+        rows = self._run(
+            {"kb1": self._aoss_body()},
+            clients={"opensearchserverless": self._aoss("auto")},
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "kmsKeyArn is 'auto'" in rows[0]["Finding_Details"]
+
+    def test_opensearch_serverless_on_an_aws_managed_key_fails(self):
+        rows = self._run(
+            {"kb1": self._aoss_body()},
+            clients={"opensearchserverless": self._aoss(self.AWS_KEY)},
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "managed by AWS" in rows[0]["Finding_Details"]
+
+    def test_opensearch_serverless_unread_is_na_naming_the_action(self):
+        rows = self._run(
+            {"kb1": self._aoss_body()},
+            clients={
+                "opensearchserverless": self._aoss(
+                    error=_client_error(
+                        "AccessDeniedException", "denied", "BatchGetCollection"
+                    )
+                )
+            },
+        )
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert "aoss:BatchGetCollection" in rows[0]["Finding_Details"]
+
+    def test_opensearch_serverless_missing_collection_is_na(self):
+        rows = self._run(
+            {"kb1": self._aoss_body()},
+            clients={"opensearchserverless": self._aoss(details=False)},
+        )
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert "NOT_FOUND" in rows[0]["Finding_Details"]
+
+    def _rds(self, clusters=None, error=None):
+        client = MagicMock()
+        if error is not None:
+            client.describe_db_clusters.side_effect = error
+        else:
+            client.describe_db_clusters.return_value = {"DBClusters": clusters or []}
+        return client
+
+    def _rds_body(self):
+        return self._store_body(
+            "RDS",
+            "rdsConfiguration",
+            {"resourceArn": f"arn:aws:rds:us-east-1:{self.ACCOUNT}:cluster:kb-db"},
+        )
+
+    def test_aurora_unencrypted_fails(self):
+        rows = self._run(
+            {"kb1": self._rds_body()},
+            clients={"rds": self._rds([{"StorageEncrypted": False}])},
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "StorageEncrypted is False" in rows[0]["Finding_Details"]
+
+    def test_aurora_on_a_disabled_customer_key_fails(self):
+        rows = self._run(
+            {"kb1": self._rds_body()},
+            clients={
+                "rds": self._rds([{"StorageEncrypted": True, "KmsKeyId": self.OFF_KEY}])
+            },
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "state Disabled" in rows[0]["Finding_Details"]
+
+    def test_aurora_with_no_cluster_returned_is_na(self):
+        rows = self._run({"kb1": self._rds_body()}, clients={"rds": self._rds([])})
+        assert [r["Status"] for r in rows] == ["N/A"]
+
+    def test_opensearch_domain_off_and_neptune_on_reach_both_verdicts(self):
+        domain = MagicMock()
+        domain.describe_domain.return_value = {
+            "DomainStatus": {"EncryptionAtRestOptions": {"Enabled": False}}
+        }
+        graph = MagicMock()
+        graph.get_graph.return_value = {"kmsKeyIdentifier": self.CMK}
+        rows = self._run(
+            {
+                "kb1": self._store_body(
+                    "OPENSEARCH_MANAGED_CLUSTER",
+                    "opensearchManagedClusterConfiguration",
+                    {"domainArn": f"arn:aws:es:us-east-1:{self.ACCOUNT}:domain/d1"},
+                ),
+                "kb2": self._store_body(
+                    "NEPTUNE_ANALYTICS",
+                    "neptuneAnalyticsConfiguration",
+                    {
+                        "graphArn": f"arn:aws:neptune-graph:us-east-1:{self.ACCOUNT}:graph/g-1"
+                    },
+                ),
+            },
+            clients={"opensearch": domain, "neptune-graph": graph},
+        )
+        assert [r["Status"] for r in rows] == ["Failed", "Passed"]
+        domain.describe_domain.assert_called_once_with(DomainName="d1")
+        graph.get_graph.assert_called_once_with(graphIdentifier="g-1")
+
+    def test_neptune_without_a_key_fails(self):
+        graph = MagicMock()
+        graph.get_graph.return_value = {}
+        rows = self._run(
+            {
+                "kb1": self._store_body(
+                    "NEPTUNE_ANALYTICS",
+                    "neptuneAnalyticsConfiguration",
+                    {
+                        "graphArn": f"arn:aws:neptune-graph:us-east-1:{self.ACCOUNT}:graph/g-1"
+                    },
+                )
+            },
+            clients={"neptune-graph": graph},
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+
+    def _pinecone_body(self):
+        return self._store_body(
+            "PINECONE",
+            "pineconeConfiguration",
+            {
+                "credentialsSecretArn": f"arn:aws:secretsmanager:us-east-1:{self.ACCOUNT}:secret:pc"
+            },
+        )
+
+    def test_a_third_party_secret_on_the_default_key_fails(self):
+        secrets = MagicMock()
+        secrets.describe_secret.return_value = {"Name": "pc"}
+        rows = self._run(
+            {"kb1": self._pinecone_body()}, clients={"secretsmanager": secrets}
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "aws/secretsmanager" in rows[0]["Finding_Details"]
+
+    def test_a_third_party_store_never_passes(self):
+        secrets = MagicMock()
+        secrets.describe_secret.return_value = {"KmsKeyId": self.CMK}
+        rows = self._run(
+            {"kb1": self._pinecone_body()}, clients={"secretsmanager": secrets}
+        )
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert "held by the provider" in rows[0]["Finding_Details"]
+        assert "could not be judged" in rows[0]["Finding_Details"]
+
+    # --- knowledge base population --------------------------------------
+
+    def test_an_unreadable_knowledge_base_keeps_a_row(self):
+        rows = self._run(
+            {"kb1": self._managed_body(self.CMK), "kb2": self._managed_body(self.CMK)},
+            detail_errors={
+                "kb2": _client_error(
+                    "AccessDeniedException", "denied", "GetKnowledgeBase"
+                )
+            },
+        )
+        assert [r["Status"] for r in rows] == ["N/A", "Passed"]
+        assert "(ID: kb2) could not be read" in rows[0]["Finding_Details"]
+        assert "1 managed knowledge base(s)" in rows[1]["Finding_Details"]
+
+    def test_a_throttled_knowledge_base_is_not_dropped(self):
+        rows = self._run(
+            {"kb1": self._managed_body(self.CMK)},
+            detail_errors={
+                "kb1": _client_error("ThrottlingException", "slow", "GetKnowledgeBase")
+            },
+        )
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert "ThrottlingException" in rows[0]["Finding_Details"]
+
+    # --- managed knowledge base key -------------------------------------
+
+    def test_a_managed_kb_on_an_aws_managed_key_fails(self):
+        rows = self._run({"kb1": self._managed_body(self.AWS_KEY)})
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "managed by AWS" in rows[0]["Finding_Details"]
+
+    def test_a_managed_kb_key_in_another_partition_is_read_not_failed(self):
+        gov = f"arn:aws-us-gov:kms:us-gov-west-1:{self.ACCOUNT}:key/cmk"
+        rows = self._run(
+            {"kb1": self._managed_body(gov)},
+            keys={gov: {"KeyManager": "CUSTOMER", "KeyState": "Enabled"}},
+        )
+        assert [r["Status"] for r in rows] == ["Passed"]
+        assert ("kms", "us-gov-west-1") in self.built
+
+    def test_managed_kbs_on_good_and_disabled_keys_reach_both_verdicts(self):
+        rows = self._run(
+            {
+                "kb1": self._managed_body(self.CMK),
+                "kb2": self._managed_body(self.OFF_KEY),
+            },
+        )
+        assert sorted(r["Status"] for r in rows) == ["Failed", "Passed"]
+        failed = [r for r in rows if r["Status"] == "Failed"][0]
+        assert "(ID: kb2)" in failed["Finding_Details"]
+
+    def test_an_unread_managed_key_is_na(self):
+        rows = self._run(
+            {"kb1": self._managed_body(self.CMK)},
+            keys={
+                self.CMK: _client_error(
+                    "AccessDeniedException", "denied", "DescribeKey"
+                )
+            },
+        )
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert "kms:DescribeKey" in rows[0]["Finding_Details"]
+
+    # --- data source bucket key and transient key -----------------------
+
+    @staticmethod
+    def _sse(key):
+        return {
+            "ServerSideEncryptionConfiguration": {
+                "Rules": [
+                    {
+                        "ApplyServerSideEncryptionByDefault": {
+                            "SSEAlgorithm": "aws:kms",
+                            "KMSMasterKeyID": key,
+                        }
+                    }
+                ]
+            }
+        }
+
+    def _source_rows(self, findings, name):
+        return [f for f in findings if f["Finding"] == name]
+
+    def test_a_source_bucket_key_managed_by_aws_fails(self):
+        findings = self._run(
+            {"kb1": self._managed_body(self.CMK)},
+            sources={"kb1": [("ds1", "corpus", self.CMK)]},
+            bucket_encryption={"corpus": self._sse(self.AWS_KEY)},
+        )
+        rows = self._source_rows(
+            findings, bedrock_app.KB_DATA_SOURCE_ENCRYPTION_FINDING
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "managed by AWS" in rows[0]["Finding_Details"]
+
+    def test_source_buckets_on_good_and_unread_keys(self):
+        denied = f"arn:aws:kms:us-east-1:{self.ACCOUNT}:key/denied"
+        findings = self._run(
+            {"kb1": self._managed_body(self.CMK)},
+            sources={"kb1": [("ds1", "good", self.CMK), ("ds2", "closed", self.CMK)]},
+            bucket_encryption={
+                "good": self._sse(self.CMK),
+                "closed": self._sse(denied),
+            },
+            keys={
+                denied: _client_error("AccessDeniedException", "denied", "DescribeKey")
+            },
+        )
+        rows = self._source_rows(
+            findings, bedrock_app.KB_DATA_SOURCE_ENCRYPTION_FINDING
+        )
+        assert [r["Status"] for r in rows] == ["Passed", "N/A"]
+        assert "1 of 2" in rows[0]["Finding_Details"]
+        assert "closed" in rows[1]["Finding_Details"]
+
+    def test_a_data_source_without_a_transient_key_fails(self):
+        findings = self._run(
+            {"kb1": self._managed_body(self.CMK)},
+            sources={"kb1": [("web", None, None), ("docs", None, self.CMK)]},
+        )
+        rows = self._source_rows(findings, bedrock_app.KB_TRANSIENT_KEY_FINDING)
+        assert [r["Status"] for r in rows] == ["Failed", "Passed"]
+        assert "data source 'web'" in rows[0]["Finding_Details"]
+        assert "1 of 2" in rows[1]["Finding_Details"]
+
+    def test_a_shared_transient_key_is_read_once(self):
+        findings = self._run(
+            {"kb1": self._managed_body(self.AWS_KEY)},
+            sources={"kb1": [("a", None, self.OFF_KEY), ("b", None, self.OFF_KEY)]},
+        )
+        rows = self._source_rows(findings, bedrock_app.KB_TRANSIENT_KEY_FINDING)
+        assert [r["Status"] for r in rows] == ["Failed", "Failed"]
+        key_reads = [
+            c
+            for c in self.kms.describe_key.call_args_list
+            if c.kwargs["KeyId"] == self.OFF_KEY
+        ]
+        assert len(key_reads) == 1
+
+
+class TestBR11ValueDepth:
+    """BR-11 judges each model's key and each customization data bucket by value.
+
+    The check read only whether the job named outputModelKmsKeyArn. A model
+    whose record failed to read was dropped, so "reviewed" could stand over a
+    model nobody read, a job read failure became Failed, and no training,
+    validation or output bucket was read at all.
+    """
+
+    ACCOUNT = "123456789012"
+    CMK = f"arn:aws:kms:us-east-1:{ACCOUNT}:key/cmk"
+    AWS_KEY = f"arn:aws:kms:us-east-1:{ACCOUNT}:key/aws-managed"
+    OFF_KEY = f"arn:aws:kms:us-east-1:{ACCOUNT}:key/disabled"
+    KEYS = {
+        CMK: {"KeyManager": "CUSTOMER", "KeyState": "Enabled"},
+        AWS_KEY: {"KeyManager": "AWS", "KeyState": "Enabled"},
+        OFF_KEY: {"KeyManager": "CUSTOMER", "KeyState": "Disabled"},
+    }
+    DENIED = ClientError(
+        {"Error": {"Code": "AccessDeniedException", "Message": "denied"}}, "Op"
+    )
+
+    def _run(self, models, *, jobs=None, buckets=None):
+        """`models` is {name: GetCustomModel body or Exception}; `jobs` is
+        {jobArn: body or Exception}; `buckets` is {bucket: rule dict, None for
+        no configuration, or Exception}."""
+        jobs = jobs or {}
+        buckets = buckets or {}
+        bedrock = MagicMock()
+        paginator = MagicMock()
+        bedrock.get_paginator.return_value = paginator
+        paginator.paginate.return_value = [
+            {
+                "modelSummaries": [
+                    {"modelArn": f"arn:model:{name}", "modelName": name}
+                    for name in models
+                ]
+            }
+        ]
+
+        def get_model(modelIdentifier):
+            body = models[modelIdentifier.split(":")[-1]]
+            if isinstance(body, Exception):
+                raise body
+            return body
+
+        def get_job(jobIdentifier):
+            body = jobs[jobIdentifier]
+            if isinstance(body, Exception):
+                raise body
+            return body
+
+        bedrock.get_custom_model.side_effect = get_model
+        bedrock.get_model_customization_job.side_effect = get_job
+
+        kms = MagicMock()
+
+        def describe_key(KeyId):
+            if KeyId not in self.KEYS:
+                raise self.DENIED
+            return {"KeyMetadata": self.KEYS[KeyId]}
+
+        kms.describe_key.side_effect = describe_key
+
+        s3 = MagicMock()
+        self.bucket_reads = []
+
+        def get_bucket_encryption(Bucket):
+            self.bucket_reads.append(Bucket)
+            rule = buckets[Bucket]
+            if isinstance(rule, Exception):
+                raise rule
+            if rule is None:
+                raise ClientError(
+                    {
+                        "Error": {
+                            "Code": "ServerSideEncryptionConfigurationNotFoundError"
+                        }
+                    },
+                    "GetBucketEncryption",
+                )
+            return {
+                "ServerSideEncryptionConfiguration": {
+                    "Rules": [{"ApplyServerSideEncryptionByDefault": rule}]
+                }
+            }
+
+        s3.get_bucket_encryption.side_effect = get_bucket_encryption
+        clients = {"bedrock": bedrock, "kms": kms, "s3": s3}
+        with patch(
+            "boto3.client", side_effect=lambda service, **kwargs: clients[service]
+        ):
+            result = bedrock_app.check_bedrock_custom_model_encryption(
+                region="us-east-1"
+            )
+        return result, extract_csv_data(result)
+
+    @staticmethod
+    def _rows(findings, name, status=None):
+        return [
+            f
+            for f in findings
+            if f["Finding"] == name and (status is None or f["Status"] == status)
+        ]
+
+    MODEL_ROW = "Bedrock Custom Model Encryption Review"
+    MODEL_PASS = "Bedrock Custom Model Encryption Check"
+    DATA_ROW = "Bedrock Customization Data Bucket Encryption"
+
+    def test_model_record_read_failure_is_na_not_dropped(self):
+        result, findings = self._run(
+            {"good": {"modelKmsKeyArn": self.CMK}, "hidden": self.DENIED}
+        )
+        na = self._rows(findings, self.MODEL_ROW, "N/A")
+        assert len(na) == 1
+        assert "'hidden'" in na[0]["Finding_Details"]
+        assert "bedrock:GetCustomModel" in na[0]["Finding_Details"]
+        passed = self._rows(findings, self.MODEL_PASS, "Passed")
+        assert "1 of 2 custom model(s)" in passed[0]["Finding_Details"]
+        assert result["status"] == "WARN"
+
+    def test_job_read_failure_is_na_not_failed(self):
+        _, findings = self._run(
+            {"m": {"jobArn": "arn:job:m"}}, jobs={"arn:job:m": self.DENIED}
+        )
+        assert not [f for f in findings if f["Status"] == "Failed"]
+        na = self._rows(findings, self.MODEL_ROW, "N/A")
+        assert "bedrock:GetModelCustomizationJob" in na[0]["Finding_Details"]
+
+    def test_model_key_is_read_from_get_custom_model_without_the_job(self):
+        _, findings = self._run(
+            {"m": {"modelKmsKeyArn": self.CMK, "jobArn": "arn:job:m"}},
+            jobs={"arn:job:m": self.DENIED},
+        )
+        assert self._rows(findings, self.MODEL_PASS, "Passed")
+        assert not [f for f in findings if f["Status"] in ("Failed", "N/A")]
+
+    def test_named_key_is_judged_by_describe_key_across_models(self):
+        _, findings = self._run(
+            {
+                "cmk": {"modelKmsKeyArn": self.CMK},
+                "aws": {"modelKmsKeyArn": self.AWS_KEY},
+                "off": {"jobArn": "arn:job:off"},
+                "unread": {
+                    "modelKmsKeyArn": f"arn:aws:kms:us-east-1:{self.ACCOUNT}:key/x"
+                },
+            },
+            jobs={"arn:job:off": {"outputModelKmsKeyArn": self.OFF_KEY}},
+        )
+        failed = {
+            f["Finding_Details"].split("'")[1]: f
+            for f in self._rows(findings, self.MODEL_ROW, "Failed")
+        }
+        assert set(failed) == {"aws", "off"}
+        assert "managed by AWS" in failed["aws"]["Finding_Details"]
+        assert "Disabled" in failed["off"]["Finding_Details"]
+        assert all(f["Severity"] == "Medium" for f in failed.values())
+        na = self._rows(findings, self.MODEL_ROW, "N/A")
+        assert len(na) == 1 and "'unread'" in na[0]["Finding_Details"]
+        passed = self._rows(findings, self.MODEL_PASS, "Passed")
+        assert "1 of 4 custom model(s)" in passed[0]["Finding_Details"]
+
+    def test_model_with_no_key_anywhere_fails(self):
+        _, findings = self._run(
+            {"m": {"jobArn": "arn:job:m"}}, jobs={"arn:job:m": {"outputDataConfig": {}}}
+        )
+        failed = self._rows(findings, self.MODEL_ROW, "Failed")
+        assert "AWS owned key" in failed[0]["Finding_Details"]
+        assert not self._rows(findings, self.MODEL_PASS)
+
+    def _data_model(self, name, training, validation=(), output=None, logs=None):
+        body = {
+            "modelKmsKeyArn": self.CMK,
+            "trainingDataConfig": {"s3Uri": f"s3://{training}/train.jsonl"},
+            "validationDataConfig": {
+                "validators": [{"s3Uri": f"s3://{v}/val.jsonl"} for v in validation]
+            },
+            "outputDataConfig": {"s3Uri": f"s3://{output or training}/out/"},
+        }
+        if logs:
+            body["trainingDataConfig"]["invocationLogsConfig"] = {
+                "invocationLogSource": {"s3Uri": f"s3://{logs}/logs/"}
+            }
+        return body
+
+    def test_every_data_bucket_is_read_once_and_judged_by_value(self):
+        _, findings = self._run(
+            {
+                "a": self._data_model("a", "train", ["val"], "out", logs="logs"),
+                "b": self._data_model("b", "train", ["val-b"], "out-b"),
+            },
+            buckets={
+                "train": {"SSEAlgorithm": "aws:kms", "KMSMasterKeyID": self.CMK},
+                "val": {"SSEAlgorithm": "AES256"},
+                "out": {"SSEAlgorithm": "aws:kms"},
+                "logs": {"SSEAlgorithm": "aws:kms", "KMSMasterKeyID": self.OFF_KEY},
+                "val-b": None,
+                "out-b": self.DENIED,
+            },
+        )
+        assert sorted(self.bucket_reads) == sorted(
+            ["train", "val", "out", "logs", "val-b", "out-b"]
+        )
+        failed = {
+            f["Finding_Details"].split("'")[1]: f["Finding_Details"]
+            for f in self._rows(findings, self.DATA_ROW, "Failed")
+        }
+        assert set(failed) == {"val", "out", "logs", "val-b"}
+        assert "AES256" in failed["val"]
+        assert "aws/s3" in failed["out"]
+        assert "Disabled" in failed["logs"]
+        assert "no default encryption" in failed["val-b"]
+        assert "validation data of custom model 'b'" in failed["val-b"]
+        na = self._rows(findings, self.DATA_ROW, "N/A")
+        assert len(na) == 1 and "'out-b'" in na[0]["Finding_Details"]
+        passed = self._rows(findings, self.DATA_ROW, "Passed")
+        assert "1 of 6 custom model data bucket(s)" in passed[0]["Finding_Details"]
+        assert "'train'" in passed[0]["Finding_Details"]
+
+    def test_data_bucket_failure_is_reported_when_model_key_passes(self):
+        """The hiding direction: a CMK on the model must not clear its data."""
+        result, findings = self._run(
+            {"a": self._data_model("a", "plain")},
+            buckets={"plain": {"SSEAlgorithm": "AES256"}},
+        )
+        assert self._rows(findings, self.MODEL_PASS, "Passed")
+        assert self._rows(findings, self.DATA_ROW, "Failed")
+        assert result["status"] == "WARN"
+
+    def test_unread_data_bucket_key_is_na(self):
+        _, findings = self._run(
+            {"a": self._data_model("a", "b1")},
+            buckets={
+                "b1": {
+                    "SSEAlgorithm": "aws:kms",
+                    "KMSMasterKeyID": f"arn:aws:kms:us-east-1:{self.ACCOUNT}:key/x",
+                }
+            },
+        )
+        na = self._rows(findings, self.DATA_ROW, "N/A")
+        assert len(na) == 1 and "kms:DescribeKey" in na[0]["Finding_Details"]
+        assert not self._rows(findings, self.DATA_ROW, "Passed")
