@@ -13009,17 +13009,26 @@ class TestSCPAttachment:
         assert findings[0]["Finding"].endswith("Inverted")
 
 
+# Stricter since round 2: logs:DeleteLogStream joins the four writes, and the
+# resources carry each group's :log-stream:* ARN that DeleteLogStream is
+# authorized on.
 _LOG_TAMPER_ACTIONS = [
     "logs:DeleteLogGroup",
+    "logs:DeleteLogStream",
     "logs:PutRetentionPolicy",
     "logs:PutLogGroupDeletionProtection",
     "logs:DeleteSubscriptionFilter",
 ]
-_AGENTCORE_LOG_RESOURCES = [
+_AGENTCORE_LOG_GROUP_RESOURCES = [
     "arn:aws:logs:*:*:log-group:/aws/bedrock-agentcore/*",
     "arn:aws:logs:*:*:log-group:/aws/vendedlogs/bedrock-agentcore/*",
     "arn:aws:logs:*:*:log-group:aws/spans",
     "arn:aws:logs:*:*:log-group:aws/spans:*",
+]
+_AGENTCORE_LOG_RESOURCES = _AGENTCORE_LOG_GROUP_RESOURCES + [
+    "arn:aws:logs:*:*:log-group:/aws/bedrock-agentcore/*:log-stream:*",
+    "arn:aws:logs:*:*:log-group:/aws/vendedlogs/bedrock-agentcore/*:log-stream:*",
+    "arn:aws:logs:*:*:log-group:aws/spans:log-stream:*",
 ]
 _VPC_PLACEMENT_ACTIONS = [
     "bedrock-agentcore:CreateAgentRuntime",
@@ -13075,9 +13084,15 @@ def _vpc_pin_guard(operator="ForAnyValue:StringNotEquals", values=None, action=N
 
 @pytest.mark.usefixtures("_member_account")
 class TestAC26LogTamperSCP:
-    """AC-26: an attached SCP denies the four log tamper writes on AgentCore logs."""
+    """AC-26: an attached SCP denies the five log tamper writes on AgentCore logs."""
 
     _run = TestSCPAttachment._run
+
+    @pytest.fixture(autouse=True)
+    def _no_invocation_log_group(self):
+        with patch("agentcore_app.bedrock_client") as bedrock:
+            bedrock.get_model_invocation_logging_configuration.return_value = {}
+            yield bedrock
 
     def _findings(self, mock_orgs, documents, targets=None):
         return self._run(
@@ -13094,7 +13109,14 @@ class TestAC26LogTamperSCP:
 
     @pytest.mark.parametrize(
         "resource",
-        [["*"], ["arn:aws:logs:*:*:log-group:*"], ["arn:aws:logs:*:111122223333:*"]],
+        [
+            ["*"],
+            [
+                "arn:aws:logs:*:*:log-group:*",
+                "arn:aws:logs:*:*:log-group:*:log-stream:*",
+            ],
+            ["arn:aws:logs:*:111122223333:*"],
+        ],
         ids=["star", "every-log-group", "this-account"],
     )
     @patch("agentcore_app.organizations_client")
@@ -13245,6 +13267,273 @@ class TestAC26LogTamperSCP:
         assert [f["Status"] for f in findings] == ["Failed"]
         assert findings[0]["Finding"] == "Log Tamper Guardrail Not Enforced"
         assert mock_orgs.list_targets_for_policy.call_count == 0
+
+
+_INVOCATION_GROUP = "bedrock-invocations"
+_INVOCATION_RESOURCES = [
+    f"arn:aws:logs:us-east-1:*:log-group:{_INVOCATION_GROUP}",
+    f"arn:aws:logs:us-east-1:*:log-group:{_INVOCATION_GROUP}:*",
+    f"arn:aws:logs:us-east-1:*:log-group:{_INVOCATION_GROUP}:log-stream:*",
+]
+
+
+@pytest.mark.usefixtures("_member_account")
+class TestAC26LogTamperStreamsAndInvocationGroup:
+    """AC-26 SCP leg: DeleteLogStream, and the Bedrock invocation log group."""
+
+    _run = TestSCPAttachment._run
+
+    @pytest.fixture(autouse=True)
+    def bedrock(self):
+        with patch("agentcore_app.bedrock_client") as bedrock:
+            bedrock.meta.region_name = "us-east-1"
+            bedrock.get_model_invocation_logging_configuration.return_value = {
+                "loggingConfig": {
+                    "cloudWatchConfig": {"logGroupName": _INVOCATION_GROUP}
+                }
+            }
+            yield bedrock
+
+    def _findings(self, mock_orgs, documents):
+        return self._run(mock_orgs, "check_agentcore_log_tamper_scp", documents)
+
+    @patch("agentcore_app.organizations_client")
+    def test_every_group_and_stream_denied_passes_and_names_the_group(self, mock_orgs):
+        findings = self._findings(
+            mock_orgs,
+            {
+                "DenyLogTamper": _log_tamper_guard(
+                    resource=_AGENTCORE_LOG_RESOURCES + _INVOCATION_RESOURCES
+                )
+            },
+        )
+
+        assert [f["Status"] for f in findings] == ["Passed"]
+        assert "logs:DeleteLogStream" in findings[0]["Finding_Details"]
+        assert "Bedrock model invocation log group" in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.organizations_client")
+    def test_a_deny_without_delete_log_stream_is_partial(self, mock_orgs, bedrock):
+        bedrock.get_model_invocation_logging_configuration.return_value = {}
+        findings = self._findings(
+            mock_orgs,
+            {
+                "DenyLogTamper": _log_tamper_guard(
+                    action=[
+                        a for a in _LOG_TAMPER_ACTIONS if a != "logs:DeleteLogStream"
+                    ]
+                )
+            },
+        )
+
+        assert [f["Status"] for f in findings] == ["Failed"]
+        assert findings[0]["Finding"] == "Log Tamper Guardrail Partial"
+        assert "but not logs:DeleteLogStream" in findings[0]["Finding_Details"]
+        assert "logs:DeleteLogStream" in findings[0]["Resolution"]
+
+    @pytest.mark.parametrize(
+        ("resource", "finding"),
+        [
+            (_AGENTCORE_LOG_GROUP_RESOURCES, "Log Tamper Guardrail Partial"),
+            (["arn:aws:logs:*:*:log-group:*"], "Log Tamper Guardrail Partial"),
+            (["arn:aws:logs:*:*:log-group:/aws/*"], "Log Tamper Guardrail Missing"),
+        ],
+        ids=["group-arns-only", "every-log-group", "slash-prefix"],
+    )
+    @patch("agentcore_app.organizations_client")
+    def test_a_log_group_arn_without_log_stream_misses_delete_log_stream(
+        self, mock_orgs, bedrock, resource, finding
+    ):
+        # A * that would have to span the :log-stream: part does not count, per
+        # the DET-09 recommendation.
+        bedrock.get_model_invocation_logging_configuration.return_value = {}
+        findings = self._findings(
+            mock_orgs, {"DenyLogTamper": _log_tamper_guard(resource=resource)}
+        )
+
+        assert [f["Status"] for f in findings] == ["Failed"]
+        assert findings[0]["Finding"] == finding
+
+    @patch("agentcore_app.organizations_client")
+    def test_the_group_arns_only_form_is_partial_on_delete_log_stream(
+        self, mock_orgs, bedrock
+    ):
+        bedrock.get_model_invocation_logging_configuration.return_value = {}
+        findings = self._findings(
+            mock_orgs,
+            {
+                "DenyLogTamper": _log_tamper_guard(
+                    resource=_AGENTCORE_LOG_GROUP_RESOURCES
+                )
+            },
+        )
+
+        assert findings[0]["Finding"] == "Log Tamper Guardrail Partial"
+        assert findings[0]["Finding_Details"].endswith("but not logs:DeleteLogStream.")
+
+    @patch("agentcore_app.organizations_client")
+    def test_a_deny_missing_the_invocation_group_fails(self, mock_orgs):
+        findings = self._findings(mock_orgs, {"DenyLogTamper": _log_tamper_guard()})
+
+        assert [f["Status"] for f in findings] == ["Failed"]
+        assert findings[0]["Finding"] == "Log Tamper Guardrail Missing"
+
+    @patch("agentcore_app.organizations_client")
+    def test_the_invocation_group_is_probed_in_its_own_region(self, mock_orgs, bedrock):
+        bedrock.meta.region_name = "us-west-2"
+        findings = self._findings(
+            mock_orgs,
+            {
+                "DenyLogTamper": _log_tamper_guard(
+                    resource=_AGENTCORE_LOG_RESOURCES + _INVOCATION_RESOURCES
+                )
+            },
+        )
+
+        assert [f["Status"] for f in findings] == ["Failed"]
+
+    @patch("agentcore_app.organizations_client")
+    def test_the_configuration_is_read_once(self, mock_orgs, bedrock):
+        self._findings(
+            mock_orgs,
+            {
+                "DenyA": _log_tamper_guard(
+                    resource=_AGENTCORE_LOG_RESOURCES + _INVOCATION_RESOURCES
+                ),
+                "DenyB": _log_tamper_guard(),
+            },
+        )
+
+        assert bedrock.get_model_invocation_logging_configuration.call_count == 1
+
+    @patch("agentcore_app.organizations_client")
+    def test_an_unread_configuration_turns_a_pass_into_na(self, mock_orgs, bedrock):
+        bedrock.get_model_invocation_logging_configuration.side_effect = (
+            _make_client_error("AccessDeniedException", "denied")
+        )
+        findings = self._findings(
+            mock_orgs,
+            {
+                "DenyLogTamper": _log_tamper_guard(
+                    resource=_AGENTCORE_LOG_RESOURCES + _INVOCATION_RESOURCES
+                )
+            },
+        )
+
+        assert [f["Status"] for f in findings] == ["N/A"]
+        assert findings[0]["Finding"] == "Log Tamper Guardrail Incomplete"
+        assert "AccessDeniedException" in findings[0]["Finding_Details"]
+        assert (
+            "bedrock:GetModelInvocationLoggingConfiguration"
+            in findings[0]["Resolution"]
+        )
+
+    @patch("agentcore_app.organizations_client")
+    def test_an_unread_configuration_leaves_a_failure_failed(self, mock_orgs, bedrock):
+        bedrock.get_model_invocation_logging_configuration.side_effect = (
+            _make_client_error("AccessDeniedException", "denied")
+        )
+        findings = self._findings(
+            mock_orgs,
+            {
+                "DenyLogTamper": _log_tamper_guard(
+                    action=["logs:DeleteLogGroup"],
+                    resource=_AGENTCORE_LOG_RESOURCES + _INVOCATION_RESOURCES,
+                )
+            },
+        )
+
+        assert [f["Status"] for f in findings] == ["Failed"]
+        assert findings[0]["Finding"] == "Log Tamper Guardrail Partial"
+
+    @patch("agentcore_app.organizations_client")
+    def test_no_bedrock_client_is_na(self, mock_orgs):
+        with patch("agentcore_app.bedrock_client", None):
+            findings = self._findings(
+                mock_orgs,
+                {
+                    "DenyLogTamper": _log_tamper_guard(
+                        resource=_AGENTCORE_LOG_RESOURCES + _INVOCATION_RESOURCES
+                    )
+                },
+            )
+
+        assert [f["Status"] for f in findings] == ["N/A"]
+        assert "no Bedrock client" in findings[0]["Finding_Details"]
+
+    def test_the_log_stream_cover_rule_discriminates(self):
+        covers = agentcore_app._log_stream_resource_covers
+        probe = [
+            "arn:aws:logs:*:111122223333:log-group:/aws/bedrock-agentcore/*"
+            ":log-stream:*"
+        ]
+        assert covers({"Resource": "*"}, probe)
+        assert covers({"Resource": "arn:aws:logs:*:*:*"}, probe)
+        assert covers({"Resource": "arn:aws:logs:*:*:log-group:*:log-stream:*"}, probe)
+        assert not covers({"Resource": "arn:aws:logs:*:*:log-group:*"}, probe)
+        assert not covers(
+            {"Resource": "arn:aws:logs:*:*:log-group:/aws/bedrock-agentcore/*"}, probe
+        )
+        assert not covers({"Resource": "arn:aws:logs:*:444455556666:*"}, probe)
+        assert not covers(
+            {"NotResource": "arn:aws:logs:*:*:log-group:/aws/bedrock-agentcore/*"},
+            probe,
+        )
+
+    def test_the_handler_creates_the_bedrock_client(self):
+        source = inspect.getsource(agentcore_app.lambda_handler)
+        call = source[source.index("bedrock_client = boto3.client(") :]
+        assert call.split(",", 1)[0].split("(", 1)[1].strip() == '"bedrock"'
+
+
+class TestAC26VendedLogDeletionProtection:
+    """AC-26: vended-log groups are held to deletion protection."""
+
+    @patch("agentcore_app.kms_client")
+    @patch("agentcore_app.logs_client")
+    def test_each_vended_group_is_judged(self, mock_logs, mock_kms):
+        mock_logs.describe_log_groups.side_effect = _log_group_side_effect(
+            {
+                "/aws/vendedlogs/bedrock-agentcore/": [
+                    {
+                        "logGroupName": "/aws/vendedlogs/bedrock-agentcore/memory/m1",
+                        "retentionInDays": 30,
+                        "deletionProtectionEnabled": True,
+                    },
+                    {
+                        "logGroupName": "/aws/vendedlogs/bedrock-agentcore/gateway/g1",
+                        "retentionInDays": 30,
+                    },
+                ]
+            }
+        )
+
+        findings = agentcore_app.check_agentcore_log_retention_and_key_scope()
+
+        assert [finding["Status"] for finding in findings] == ["Passed", "Failed"]
+        assert "deletion protection enabled" in findings[0]["Finding_Details"]
+        assert "gateway/g1" in findings[1]["Finding_Details"]
+        assert "deletion protection off" in findings[1]["Finding_Details"]
+        assert "vended-log" in findings[1]["Resolution"]
+
+    @patch("agentcore_app.kms_client")
+    @patch("agentcore_app.logs_client")
+    def test_a_vended_group_with_protection_off_fails(self, mock_logs, mock_kms):
+        mock_logs.describe_log_groups.side_effect = _log_group_side_effect(
+            {
+                "/aws/vendedlogs/bedrock-agentcore/": [
+                    {
+                        "logGroupName": "/aws/vendedlogs/bedrock-agentcore/memory/m1",
+                        "retentionInDays": 30,
+                        "deletionProtectionEnabled": False,
+                    }
+                ]
+            }
+        )
+
+        findings = agentcore_app.check_agentcore_log_retention_and_key_scope()
+
+        assert [finding["Status"] for finding in findings] == ["Failed"]
 
 
 @pytest.mark.usefixtures("_member_account")
@@ -26570,11 +26859,13 @@ class TestAC26LogDeletionProtection:
     def test_a_non_runtime_group_is_not_judged_for_deletion_protection(
         self, mock_logs, mock_kms
     ):
+        # Round 2 holds the vended-log groups to deletion protection, so this
+        # case now reads a group outside both the runtime and vended-log prefixes.
         mock_logs.describe_log_groups.side_effect = _log_group_side_effect(
             {
-                "/aws/vendedlogs/bedrock-agentcore/": [
+                "/aws/bedrock-agentcore/": [
                     {
-                        "logGroupName": "/aws/vendedlogs/bedrock-agentcore/memory/m1",
+                        "logGroupName": "/aws/bedrock-agentcore/evaluations/e1",
                         "retentionInDays": 30,
                     }
                 ]

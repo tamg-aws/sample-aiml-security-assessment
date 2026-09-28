@@ -49,6 +49,7 @@ wafv2_client = None
 route53resolver_client = None
 cognito_client = None
 events_client = None
+bedrock_client = None
 
 # Environment variables
 BUCKET_NAME = os.environ.get("AIML_ASSESSMENT_BUCKET_NAME")
@@ -743,6 +744,13 @@ AGENTCORE_LOG_GROUP_PREFIXES = (
 # CloudWatch Transaction Search writes AgentCore trace spans to. aws/spans is
 # shared with every other traced application, so it is matched by exact name.
 AGENTCORE_RUNTIME_LOG_GROUP_PREFIX = "/aws/bedrock-agentcore/runtimes/"
+# The vended-log groups carry memory and gateway log delivery, including the
+# memory data-plane events AISF DET-09 counts as audit records, so they are held
+# to deletion protection with the runtime groups.
+AGENTCORE_DELETION_PROTECTED_LOG_GROUP_PREFIXES = (
+    AGENTCORE_RUNTIME_LOG_GROUP_PREFIX,
+    "/aws/vendedlogs/bedrock-agentcore/",
+)
 TRANSACTION_SEARCH_SPANS_LOG_GROUP = "aws/spans"
 
 # AgentCore does not configure log destinations automatically. Memory and gateway
@@ -12684,13 +12692,13 @@ def check_agentcore_log_retention_and_key_scope() -> List[Dict[str, Any]]:
                 "and memory record is kept indefinitely"
             )
 
-        if log_group_name.startswith(AGENTCORE_RUNTIME_LOG_GROUP_PREFIX):
+        if log_group_name.startswith(AGENTCORE_DELETION_PROTECTED_LOG_GROUP_PREFIXES):
             if log_group.get("deletionProtectionEnabled") is True:
                 confirmations.append("has deletion protection enabled")
             else:
                 problems.append(
                     "has deletion protection off, so a principal allowed to "
-                    "delete log groups can erase the runtime's log record"
+                    "delete log groups can erase the agent's log record"
                 )
 
         if key_id:
@@ -12756,7 +12764,7 @@ def check_agentcore_log_retention_and_key_scope() -> List[Dict[str, Any]]:
                         "every wildcard-principal decrypt grant in the encryption "
                         "key's policy with kms:CallerAccount, aws:PrincipalOrgID "
                         "or aws:PrincipalArn, and turn on deletion "
-                        "protection for each runtime log group."
+                        "protection for each runtime and vended-log group."
                     ),
                     reference=LOGS_RETENTION_REFERENCE_URL,
                     severity=SeverityEnum.MEDIUM,
@@ -15074,6 +15082,7 @@ def _deny_binds_every_caller(statement: Dict[str, Any]) -> bool:
 
 AGENTCORE_LOG_TAMPER_ACTIONS = {
     "logs:deleteloggroup": "logs:DeleteLogGroup",
+    "logs:deletelogstream": "logs:DeleteLogStream",
     "logs:putretentionpolicy": "logs:PutRetentionPolicy",
     "logs:putloggroupdeletionprotection": "logs:PutLogGroupDeletionProtection",
     "logs:deletesubscriptionfilter": "logs:DeleteSubscriptionFilter",
@@ -15088,58 +15097,163 @@ AGENTCORE_LOG_GROUP_PROBE_NAMES = (
 )
 
 
-def _agentcore_log_group_probes(context: Dict[str, str]) -> List[str]:
-    """Return the log-group ARNs, in every Region, a tamper guardrail must reach.
+def _agentcore_log_group_probes(
+    context: Dict[str, str], action: str, invocation_log_group_arn: str = ""
+) -> List[str]:
+    """Return the ARNs, in every Region, a tamper guardrail must reach for `action`.
 
-    Each name is probed with and without the trailing `:*` because the service
-    authorization reference does not say which form each action is evaluated
-    against.
+    Each log-group name is probed with and without the trailing `:*` because the
+    service authorization reference does not say which form each action is
+    evaluated against. DeleteLogStream is authorized on the log-stream resource
+    type, so it is probed on `log-group:<name>:log-stream:*`. The Bedrock model
+    invocation log group is probed in the Region its configuration came from.
     """
-    return [
-        f"arn:{context['partition']}:logs:*:{context['account']}:log-group:{name}{suffix}"
+    groups = [
+        f"arn:{context['partition']}:logs:*:{context['account']}:log-group:{name}"
         for name in AGENTCORE_LOG_GROUP_PROBE_NAMES
-        for suffix in ("", ":*")
     ]
+    if invocation_log_group_arn:
+        groups.append(invocation_log_group_arn)
+    if action == "logs:deletelogstream":
+        return [f"{group}:log-stream:*" for group in groups]
+    return [f"{group}{suffix}" for group in groups for suffix in ("", ":*")]
+
+
+def _log_stream_resource_covers(statement: Dict[str, Any], arns: List[str]) -> bool:
+    """Return whether a Deny reaches every log-stream probe in `arns`.
+
+    AISF DET-09 states a DeleteLogStream Deny needs the log-group ARN plus a
+    trailing `:log-stream:*`, and the service reference's log-stream ARN carries
+    both parts. A pattern is credited when its resource part is `*` or it names
+    as many colon-separated parts as the probe with each part matching, so
+    `log-group:/aws/bedrock-agentcore/*` alone, whose `*` would have to span
+    the `:log-stream:` part, is not.
+    """
+    if "NotResource" in statement:
+        return _statement_resource_covers(statement, arns)
+    patterns = [str(pattern) for pattern in _statement_resources(statement)]
+
+    def covers(arn: str, pattern: str) -> bool:
+        if pattern == "*":
+            return True
+        arn_parts, pattern_parts = arn.split(":"), pattern.split(":")
+        if len(pattern_parts) == 6 and pattern_parts[5] == "*":
+            return all(
+                fnmatchcase(part, wanted)
+                for part, wanted in zip(arn_parts[:5], pattern_parts[:5])
+            )
+        return len(arn_parts) == len(pattern_parts) and all(
+            fnmatchcase(part, wanted) for part, wanted in zip(arn_parts, pattern_parts)
+        )
+
+    return all(any(covers(arn, pattern) for pattern in patterns) for arn in arns)
+
+
+def _bedrock_invocation_log_group_arn(context: Dict[str, str]) -> Tuple[str, str]:
+    """Return (log-group ARN, unread reason) for Bedrock model invocation logging.
+
+    The ARN is empty when this Region's configuration names no CloudWatch log
+    group. The reason is empty when the configuration was read.
+    """
+    if bedrock_client is None:
+        return "", "no Bedrock client is available"
+    try:
+        config = bedrock_client.get_model_invocation_logging_configuration()
+    except Exception as error:
+        return "", _assessment_error_label(error)
+    name = ((config.get("loggingConfig") or {}).get("cloudWatchConfig") or {}).get(
+        "logGroupName"
+    ) or ""
+    if not name:
+        return "", ""
+    region = bedrock_client.meta.region_name
+    return (
+        f"arn:{context['partition']}:logs:{region}:{context['account']}:"
+        f"log-group:{name}",
+        "",
+    )
 
 
 def check_agentcore_log_tamper_scp() -> List[Dict[str, Any]]:
     """AC-26 preventive leg: an attached SCP denies tampering with AgentCore logs.
 
     Deletion protection on a log group stops a delete but not a caller who can
-    turn it off, shorten retention or drop the subscription that forwards the
-    events. This leg reads whether a service control policy that binds this
-    account denies all four of those writes on every AgentCore log group in
-    every Region, to every caller but principals named by ARN.
+    turn it off, shorten retention, delete a stream or drop the subscription
+    that forwards the events. This leg reads whether a service control policy
+    that binds this account denies all five of those writes on every AgentCore
+    log group in every Region, and on the Bedrock model invocation log group of
+    the Region it runs in, to every caller but principals named by ARN. An
+    unread invocation logging configuration keeps the leg from passing.
     """
-    return _scp_guardrail_findings(
+    invocation_arns: Dict[str, Tuple[str, str]] = {}
+
+    def invocation_log_group(context: Dict[str, str]) -> Tuple[str, str]:
+        key = f"{context['partition']}:{context['account']}"
+        if key not in invocation_arns:
+            invocation_arns[key] = _bedrock_invocation_log_group_arn(context)
+        return invocation_arns[key]
+
+    def denies(statement: Dict[str, Any], action: str, context: Dict[str, str]):
+        if not _deny_binds_every_caller(statement):
+            return False
+        probes = _agentcore_log_group_probes(
+            context, action, invocation_log_group(context)[0]
+        )
+        if action == "logs:deletelogstream":
+            return _log_stream_resource_covers(statement, probes)
+        return _statement_resource_covers(statement, probes)
+
+    findings = _scp_guardrail_findings(
         "AC-26",
         SERVICE_CONTROL_POLICY_REFERENCE_URL,
         [
             {
                 "finding_name": "Log Tamper Guardrail",
                 "actions": AGENTCORE_LOG_TAMPER_ACTIONS,
-                "denies": lambda statement, action, context: (
-                    _deny_binds_every_caller(statement)
-                    and _statement_resource_covers(
-                        statement, _agentcore_log_group_probes(context)
-                    )
-                ),
+                "denies": denies,
                 "guard_text": (
-                    "on the AgentCore log groups and aws/spans in every Region"
+                    "on the AgentCore log groups and aws/spans in every Region, "
+                    "and on the Bedrock model invocation log group this Region's "
+                    "logging configuration names, if any"
                 ),
                 "remediation": (
                     "Attach a service control policy that denies "
-                    "logs:DeleteLogGroup, logs:PutRetentionPolicy, "
-                    "logs:PutLogGroupDeletionProtection and "
-                    "logs:DeleteSubscriptionFilter on "
+                    "logs:DeleteLogGroup, logs:DeleteLogStream, "
+                    "logs:PutRetentionPolicy, logs:PutLogGroupDeletionProtection "
+                    "and logs:DeleteSubscriptionFilter on "
                     "arn:aws:logs:*:*:log-group:/aws/bedrock-agentcore/*, the "
-                    "/aws/vendedlogs/bedrock-agentcore/* groups and aws/spans, "
-                    "exempting only the log administration role by "
-                    "aws:PrincipalArn."
+                    "/aws/vendedlogs/bedrock-agentcore/* groups, aws/spans and the "
+                    "Bedrock model invocation log group, with each group's "
+                    ":log-stream:* ARN for logs:DeleteLogStream, exempting only "
+                    "the log administration role by aws:PrincipalArn."
                 ),
             }
         ],
     )
+    unread = [reason for _arn, reason in invocation_arns.values() if reason]
+    if not unread:
+        return findings
+    return [
+        create_finding(
+            check_id="AC-26",
+            finding_name="Log Tamper Guardrail Incomplete",
+            finding_details=(
+                f"{finding['Finding_Details']} The Bedrock model invocation "
+                f"logging configuration could not be read ({unread[0]}), so "
+                "whether the guardrail reaches the invocation log group was not "
+                "judged."
+            ),
+            resolution=(
+                "Grant bedrock:GetModelInvocationLoggingConfiguration and retry."
+            ),
+            reference=SERVICE_CONTROL_POLICY_REFERENCE_URL,
+            severity=SeverityEnum.INFORMATIONAL,
+            status=StatusEnum.NA,
+        )
+        if finding["Status"] == StatusEnum.PASSED
+        else finding
+        for finding in findings
+    ]
 
 
 AGENTCORE_VPC_PLACEMENT_ACTIONS = {
@@ -21299,10 +21413,9 @@ def _command_shell_holders(
     return unbounded, named, unreadable
 
 
-# The runtime log group prefix and the CloudTrail event a shell connection is
-# correlated through. The service never logs what is typed in the shell, so
-# the AIR-ACR-RT-03 recommendation compensates with a metric filter and alarm.
-AGENTCORE_RUNTIME_LOG_GROUP_PREFIX = "/aws/bedrock-agentcore/runtimes/"
+# The CloudTrail event a shell connection is correlated through. The service
+# never logs what is typed in the shell, so the AIR-ACR-RT-03 recommendation
+# compensates with a metric filter and alarm.
 AGENTCORE_COMMAND_SHELL_EVENT = "InvokeAgentRuntimeCommandShell"
 
 
@@ -25426,6 +25539,7 @@ def lambda_handler(event, context):
     global cloudwatch_client, cloudtrail_client, oam_client, agentcore_client
     global kms_client, organizations_client
     global wafv2_client, route53resolver_client, cognito_client, events_client
+    global bedrock_client
     start_time = time.time()
 
     try:
@@ -25467,6 +25581,10 @@ def lambda_handler(event, context):
         # AC-36 reads the default bus, which receives the region's CloudTrail
         # management events.
         events_client = boto3.client("events", config=boto3_config, region_name=region)
+        # AC-26 reads the log group this region's model invocation logging names.
+        bedrock_client = boto3.client(
+            "bedrock", config=boto3_config, region_name=region
+        )
 
         # Collect all findings
         all_findings = []

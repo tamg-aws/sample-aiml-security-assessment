@@ -208,6 +208,13 @@ section.
 
 ### Fixed
 
+- `AC-26` requires the log tamper SCP to deny `logs:DeleteLogStream` on each
+  group's `:log-stream:*` ARN, and to reach the Bedrock model invocation log
+  group, reporting `N/A` naming `bedrock:GetModelInvocationLoggingConfiguration`
+  when that configuration cannot be read. It also holds the
+  `/aws/vendedlogs/bedrock-agentcore/` groups to deletion protection. The SCP
+  leg passed with streams deletable and the invocation log group unguarded,
+  and the vended-log groups were never judged for deletion protection.
 - `AC-47` credits a runtime network or caller `Deny` only when it reaches all
   six runtime invoke actions, and names the ones it misses. A `Deny` on
   `InvokeAgentRuntime` alone passed, leaving the command shell, command,
