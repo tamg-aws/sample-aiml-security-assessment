@@ -152,6 +152,15 @@ REQUIRED_SAGEMAKER_ACTIONS = {
     "iot:ListPolicies",
     "iot:GetPolicy",
     "iot:ListTargetsForPolicy",
+    # Approved '*' reads for actions with no IAM resource type.
+    "ec2:DescribeVpcEndpoints",  # SM-02, SM-11, SM-18, SM-33
+    "ec2:DescribeFlowLogs",  # SM-37
+    "ec2:DescribeSecurityGroups",  # SM-39
+    "config:DescribeConformancePacks",  # SM-32
+    "iot:DescribeAccountAuditConfiguration",  # SM-41
+    "iot:ListAuditFindings",  # SM-41
+    "inspector2:BatchGetAccountStatus",  # SM-38
+    "lambda:ListFunctions",  # SM-38, SM-39, SM-40
 }
 
 REQUIRED_AGENTCORE_ACTIONS = {
@@ -799,6 +808,19 @@ _VERIFIED_REMEDIATION_IAM_ACTIONS |= {
 
 _VERIFIED_REMEDIATION_CONDITION_KEYS |= {"aws:ResourceTag"}
 
+# Confirmed on 2026-09-27 from the sagemaker service-reference JSON: the key is
+# listed as Bool and is an ActionConditionKey of CreateTrainingJob. SM-33 names
+# it in the training network isolation resolution.
+_VERIFIED_REMEDIATION_CONDITION_KEYS |= {"sagemaker:NetworkIsolation"}
+
+# Confirmed the same way on 2026-09-27: both keys are ActionConditionKeys of
+# CreateTrainingJob, and the short names sagemaker:VolumeKmsKey and
+# sagemaker:OutputKmsKey are defined by no action. SM-34 names the ARN keys.
+_VERIFIED_REMEDIATION_CONDITION_KEYS |= {
+    "sagemaker:OutputKmsKeyArn",
+    "sagemaker:VolumeKmsKeyArn",
+}
+
 # Verified the same way on 2026-09-25 for BR-46's per-bucket Macie leg. The
 # knowledge-base data-source operations live on the bedrock-agent client but are
 # authorized under the bedrock: action prefix, so the three near-misses
@@ -897,6 +919,17 @@ _VERIFIED_REMEDIATION_CONDITION_KEYS |= {
     "aws:SecureTransport",
 }
 
+# Verified on 2026-09-27 with one IDENTITY_POLICY validate-policy run for
+# SM-09's notebook access leg, one statement per name. The negative controls
+# sagemaker:CreateNotebookInstances and aws:SourceIpAddress came back
+# INVALID_ACTION and INVALID_GLOBAL_CONDITION_KEY at statement indexes 1 and 2,
+# and index 0, which names both entries below, drew only PRIVATE_IP_ADDRESS.
+_VERIFIED_REMEDIATION_IAM_ACTIONS |= {"sagemaker:CreateNotebookInstance"}
+_VERIFIED_REMEDIATION_CONDITION_KEYS |= {"aws:SourceIp"}
+# Verified on 2026-09-27 with one IDENTITY_POLICY validate-policy run for
+# SM-32's recorder leg. The negative control config:ListConfigurationRecorder
+# came back INVALID_ACTION at statement index 1, and index 0 drew nothing.
+_VERIFIED_REMEDIATION_IAM_ACTIONS |= {"config:ListConfigurationRecorders"}
 # Verified on 2026-09-27 with one IDENTITY_POLICY validate-policy run for the
 # NET-01 processing-job and Studio domain legs of SM-33 and SM-10, one
 # statement per name. The three negative controls sagemaker:ListProcessingJob,

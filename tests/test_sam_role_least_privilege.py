@@ -207,16 +207,19 @@ _EXPECTED_ACTIONS = {
         "tag:GetResources",
     },
     "SagemakerSecurityAssessmentFunction": {
+        "cloudtrail:LookupEvents",
         "config:DescribeComplianceByConfigRule",
         "config:DescribeConfigRules",
         "config:DescribeConfigurationRecorders",
         "ec2:DescribeRouteTables",
         "ec2:DescribeSubnets",
+        "ecs:DescribeServices",
         "eks:DescribeAddon",
         "eks:DescribeCluster",
         "eks:ListAddons",
         "eks:ListClusters",
         "guardduty:GetDetector",
+        "guardduty:ListCoverage",
         "guardduty:ListDetectors",
         "iam:GenerateServiceLastAccessedDetails",
         "iam:GetServiceLastAccessedDetails",
@@ -226,7 +229,9 @@ _EXPECTED_ACTIONS = {
         "organizations:DescribeOrganization",
         "organizations:DescribePolicy",
         "organizations:ListDelegatedAdministrators",
+        "organizations:ListParents",
         "organizations:ListPolicies",
+        "organizations:ListTargetsForPolicy",
         "s3:GetObject",
         "s3:PutObject",
         "sagemaker:DescribeAutoMLJob",
@@ -235,6 +240,7 @@ _EXPECTED_ACTIONS = {
         "sagemaker:DescribeDataQualityJobDefinition",
         "sagemaker:DescribeDomain",
         "sagemaker:DescribeEndpoint",
+        "sagemaker:DescribeEndpointConfig",
         "sagemaker:DescribeFeatureGroup",
         "sagemaker:DescribeHyperParameterTuningJob",
         "sagemaker:DescribeModel",
@@ -268,7 +274,31 @@ _EXPECTED_ACTIONS = {
         "sagemaker:ListTransformJobs",
         "sagemaker:ListTrials",
         "secretsmanager:ListSecrets",
+        "securityhub:DescribeOrganizationConfiguration",
         "securityhub:GetEnabledStandards",
+        "securityhub:ListEnabledProductsForImport",
+        "cloudwatch:DescribeAlarms",
+        "logs:DescribeMetricFilters",
+        "events:ListTargetsByRule",
+        "iot:ListPrincipalThings",
+        "iot:DescribeScheduledAudit",
+        "s3:GetEncryptionConfiguration",
+        "s3:GetBucketPolicy",
+        "kms:DescribeKey",
+        "sagemaker:DescribeUserProfile",
+        "cloudtrail:GetTrailStatus",
+        "cloudtrail:GetEventSelectors",
+        "config:DescribeConfigurationRecorderStatus",
+        "config:DescribeConformancePackCompliance",
+        "sagemaker:DescribeInferenceComponent",
+        "ec2:DescribeVpcEndpoints",
+        "ec2:DescribeFlowLogs",
+        "ec2:DescribeSecurityGroups",
+        "config:DescribeConformancePacks",
+        "iot:DescribeAccountAuditConfiguration",
+        "iot:ListAuditFindings",
+        "inspector2:BatchGetAccountStatus",
+        "lambda:ListFunctions",
     },
     "AgentCoreSecurityAssessmentFunction": {
         "bedrock-agentcore:GetAgentRuntime",
@@ -736,8 +766,16 @@ def test_sagemaker_and_guardduty_resource_reads_are_arn_scoped(template):
         template, "SagemakerSecurityAssessmentFunction", "GuardDutyDetectorRead"
     )
     assert "guardduty:GetDetector" in detector
+    assert "guardduty:ListCoverage" in detector
     assert "guardduty:*:${AWS::AccountId}:detector/*" in detector
     assert not re.search(r"Resource:\s+['\"]\*['\"]", detector)
+
+    ecs_services = _statement_block(
+        template, "SagemakerSecurityAssessmentFunction", "EcsServiceRead"
+    )
+    assert "ecs:DescribeServices" in ecs_services
+    assert "ecs:*:${AWS::AccountId}:service/*" in ecs_services
+    assert not re.search(r"Resource:\s+['\"]\*['\"]", ecs_services)
 
 
 @pytest.mark.parametrize("template", _SAM_TEMPLATES, ids=os.path.basename)
@@ -758,8 +796,28 @@ def test_sagemaker_scope27_reads_wildcard_only_where_iam_has_no_resource_type(
         ),
         (
             "AccountInventoryWithoutResourceType",
-            ("eks:ListClusters", "secretsmanager:ListSecrets", "iot:ListPolicies"),
+            (
+                "eks:ListClusters",
+                "secretsmanager:ListSecrets",
+                "iot:ListPolicies",
+                "cloudtrail:LookupEvents",
+            ),
         ),
+        (
+            "EC2NetworkPostureInventory",
+            (
+                "ec2:DescribeVpcEndpoints",
+                "ec2:DescribeFlowLogs",
+                "ec2:DescribeSecurityGroups",
+            ),
+        ),
+        ("ConformancePackInventory", ("config:DescribeConformancePacks",)),
+        (
+            "IoTDeviceDefenderAuditRead",
+            ("iot:DescribeAccountAuditConfiguration", "iot:ListAuditFindings"),
+        ),
+        ("InspectorAccountStatusRead", ("inspector2:BatchGetAccountStatus",)),
+        ("LambdaFunctionInventory", ("lambda:ListFunctions",)),
     ):
         statement = _statement_block(
             template, "SagemakerSecurityAssessmentFunction", sid
