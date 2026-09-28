@@ -71,40 +71,42 @@ AI_SUBJECT_ROWS = [
     ("AIR-BDR-MDL-09", COVERED, None, "bedrock_assessments", ["BR-45"], "", [], 3),
     (
         "AIR-BDR-KB-05",
-        NOT_IMPL,
+        COVERED,
         None,
-        None,
+        "bedrock_assessments",
+        ["BR-34"],
+        "partial, ceiling reached. BR-34 reads every data source with GetDataSource "
+        "for a POST_CHUNKING transformation Lambda, and every agent version and flow "
+        "node that retrieves from the knowledge base, at DRAFT and at each "
+        "alias-routed version, with ListAgentKnowledgeBases and the flow definition. "
+        "It fails a knowledge base that ingests a source with no transformation step "
+        "and is reached through no guardrail whose PROMPT_ATTACK input filter blocks "
+        "at HIGH strength, or through an agent or node with no such guardrail, and it "
+        "never passes one. The ceiling: a transformation Lambda's logic is opaque, "
+        "KnowledgeBase has no guardrailConfiguration member, and a direct "
+        "RetrieveAndGenerate caller supplies guardrailId per request, so no read can "
+        "show that retrieved chunks are screened",
         [],
-        "the screening step is readable configuration and reading it proves nothing: "
-        "GetDataSource returns vectorIngestionConfiguration.customTransformationConfiguration"
-        ".transformations[].transformationFunction.transformationLambdaConfiguration.lambdaArn "
-        "with stepToApply POST_CHUNKING, so a check can see that a customer Lambda rewrites "
-        "each chunk, and no API says whether it looks for instruction-like patterns. The "
-        "guardrail leg is readable and unattributable: GetGuardrail exposes the PROMPT_ATTACK "
-        "content filter, but KnowledgeBase has no guardrailConfiguration member, only Agent "
-        "and KnowledgeBaseFlowNodeConfiguration do, and a direct RetrieveAndGenerate caller "
-        "supplies guardrailId per request, so a read cannot bind the filter to this knowledge "
-        "base",
-        [],
-        None,
+        3,
     ),
     (
         "AIR-BDR-KB-08",
-        NOT_IMPL,
+        COVERED,
         None,
-        None,
+        "bedrock_assessments",
+        ["BR-26"],
+        "partial, ceiling reached. BR-26 fails a knowledge base that ingests a source "
+        "with no POST_CHUNKING transformation step and no completed Comprehend "
+        "ONLY_REDACTION job whose output location holds everything the source "
+        "ingests, and that is reached through no agent version or flow node whose "
+        "guardrail sets a PII entity type to BLOCK or ANONYMIZE, or through one that "
+        "sets none. It never passes one. comprehend:ListPiiEntitiesDetectionJobs has "
+        "no resource type and is not granted, so an S3 source reads as not judged "
+        "until it is. The ceiling: a transformation Lambda's logic and a Glue job's "
+        "effect are not recorded, and a direct RetrieveAndGenerate caller supplies "
+        "guardrailId per request",
         [],
-        "every nearby surface is readable and none of them is evidence of redaction: a "
-        "pre-ingestion Comprehend or Glue job is not an attribute of the knowledge base, "
-        "macie2 GetAutomatedDiscoveryConfiguration reports that discovery is enabled and "
-        "where sensitive data was found, never that it was removed, and a guardrail "
-        "sensitiveInformationPolicy with piiEntities action ANONYMIZE or BLOCK is readable on "
-        "GetGuardrail but recorded on an Agent or a flow node and not on the knowledge base, "
-        "with a direct RetrieveAndGenerate caller supplying guardrailId per request. The "
-        "strongest assertable statement is that some guardrail in the account masks PII, "
-        "which is not evidence that this knowledge base's content reaches a model redacted",
-        [],
-        None,
+        3,
     ),
     (
         "AIR-BDR-MDL-08",
@@ -115,12 +117,16 @@ AI_SUBJECT_ROWS = [
         "BR-07 holds the catalog leg (ListPrompts non-empty is its Passed row, zero prompts"
         " is Not Applicable) and now the production-version leg as well. For each prompt it"
         " calls ListPrompts(promptIdentifier=...) for the numbered versions, fails a prompt"
-        " that has only its DRAFT, and reads GetPrompt(promptVersion=N) on the highest "
+        " that has only its DRAFT, and reads GetPrompt(promptVersion=N) on every "
         "numbered version for customerEncryptionKeyArn, which PromptSummary does not carry. For flows it reads "
-        "the prompt node's resource.promptArn and fails a node that pins no version suffix,"
+        "the prompt node's resource.promptArn in the working draft and in every flow "
+        "version an alias routes to (ListFlowAliases, GetFlowVersion), and fails a node that pins no version suffix,"
         " since an unversioned ARN resolves to the working draft. A version != DRAFT test "
         "on bare ListPrompts or on a GetPrompt with no promptVersion would have failed "
-        "every prompt in every account, because both return the draft",
+        "every prompt in every account, because both return the draft. Partial, ceiling "
+        "reached: a prompt held in application code has no AWS record, and no AWS field "
+        "names the role approved to release a version, so the IAM split between release "
+        "and RenderPrompt roles is not judged",
         [],
         4,
     ),
@@ -918,12 +924,15 @@ AI_SUBJECT_ROWS = [
             "sagemaker_assessments",
         ],
         ["BR-20", "BR-11", "BR-17", "SM-03"],
-        "four checks cover the stores this control names: BR-20 the customer-managed key "
-        "of a managed or S3 Vectors store, reporting any other vector store as needing a "
-        "storage-layer review, and the default encryption of each data source bucket, which is where "
-        "the ingested objects sit before any index exists; BR-11 the customization job "
-        "output, read from outputModelKmsKeyArn, the field GetModelCustomizationJob "
-        "returns; BR-17 the custom model's own modelKmsKeyArn; SM-03 the training output "
+        "four checks cover the stores this control names: BR-20 the key of a managed "
+        "store, an S3 Vectors store, and the OpenSearch Serverless, Aurora, OpenSearch "
+        "domain and Neptune Analytics store each knowledge base names, each judged by "
+        "DescribeKey as customer managed and Enabled, plus the default encryption of each "
+        "data source bucket, which is where the ingested objects sit before any index "
+        "exists, and each data source's transient data key; BR-11 the custom model's "
+        "modelKmsKeyArn, else the customization job's outputModelKmsKeyArn, judged by "
+        "DescribeKey, and the default encryption of every training, validation, "
+        "invocation log source and output bucket the model names; BR-17 the custom model's own modelKmsKeyArn; SM-03 the training output "
         "and volume keys. BR-11 used to read outputDataConfig.kmsKeyId, which the API never"
         " returns, so every custom model read as needing review until the documented field "
         "was read. FS-65 is not an incumbent: its finding is about S3 event notifications "
@@ -940,14 +949,17 @@ AI_SUBJECT_ROWS = [
         "BR-47 reads the bucket policy of each S3 bucket on the Bedrock data path "
         "(knowledge base S3 sources, the invocation log S3 destination and its CloudWatch "
         "large-data bucket, and the training, validation, output and distillation "
-        "invocation-log source buckets of the newest 50 customization jobs). It passes a "
+        "invocation-log source buckets of every customization job). It passes a "
         "bucket only when one Deny, conditioned by Bool or BoolIfExists on "
         "aws:SecureTransport false, reaches every principal, covers s3:*, and names both "
         "the bucket and its objects. A bucket with no policy fails, because S3 then "
         "accepts plaintext requests. For each Deny that falls short, the finding names the "
         "principals, resources or actions it misses, since a Deny scoped to some "
-        "principals leaves the rest able to use HTTP. A data source or job cap, or a failed "
-        "read, withholds the Passed row, since an unread bucket may accept plaintext",
+        "principals leaves the rest able to use HTTP. The aws:PrincipalIsAWSService "
+        "false exception of the S3 example policy is credited, since the Deny still "
+        "reaches every identity. Every data source and job is read "
+        "with no cap, and a failed read withholds the Passed row, since an unread bucket "
+        "may accept plaintext",
         [],
         5,
     ),
@@ -957,17 +969,18 @@ AI_SUBJECT_ROWS = [
         None,
         "bedrock_assessments",
         ["BR-46"],
-        "BR-46 holds both legs. It reads automatedDiscoveryMonitoringStatus for each "
-        "knowledge base source bucket, which is the sampling leg, and, for a bucket "
-        "automated discovery does not monitor, whether a SCHEDULED classification job that "
-        "is RUNNING or IDLE and whose last run did not error names the bucket, which is the "
-        "per-object leg the control keeps separate because automated discovery samples. A "
-        "job that selects buckets by criteria is reported, not credited, and neither leg "
-        "is read unless the Macie session and automated discovery are enabled. A ListClassificationJobs item carries "
-        "bucketDefinitions, bucketCriteria, jobType and jobStatus, so "
-        "DescribeClassificationJob is not needed. The pre-ingest Comprehend detection the "
-        "control also recommends is a call the application makes, which no account "
-        "configuration records",
+        "BR-46 judges the per-object leg by value on every AI source bucket: each "
+        "knowledge base S3 source with its inclusion prefixes, and the training, "
+        "validation and invocation-log source buckets of every customization job. "
+        "DescribeClassificationJob is read for each job that names the bucket or is its "
+        "jobDetails.lastJobId, and a job clears the source only when it is SCHEDULED, "
+        "RUNNING or IDLE, has run at least once with no ERROR, ran over existing "
+        "objects, samples 100 percent, has data identifiers, and scopes in the source "
+        "prefix. Automated discovery samples, so a MONITORED bucket with no such job "
+        "fails. Exclude conditions on extension, size, date or tag are counted and not "
+        "judged, and a failed read is N/A. The order of classification and ingestion "
+        "per object, and the pre-ingest Comprehend detection the control also "
+        "recommends, are not recorded by any account configuration",
         [],
         5,
     ),
@@ -980,11 +993,12 @@ AI_SUBJECT_ROWS = [
         "BR-48 reads both surfaces. DescribeEffectivePolicy on AISERVICES_OPT_OUT_POLICY "
         "answers what resolves for the account, and an absent effective policy fails "
         "because the account is then opted in. The effective document has the inheritance "
-        "operators stripped, so from the management account BR-48 also reads every AI "
-        "services opt-out policy in the organization through ListPolicies and "
-        "DescribePolicy, and names any whose opt_out_policy value is open to child "
-        "policies: an unset @@operators_allowed_for_child_policies defaults to @@all, "
-        'and only ["@@none"] locks the value',
+        "operators stripped, so an optOut default passes only when an opt-out policy "
+        "attached to the root, an OU in the account's path or the account assigns "
+        'optOut and sets ["@@none"] at services, services.default and '
+        "services.default.opt_out_policy. A lock on the value alone lets a child add a "
+        "service section that opts back in, so it fails, and an unread path or policy "
+        "is N/A",
         [],
         5,
     ),
@@ -1445,8 +1459,11 @@ FOUNDATION_ROWS = [
         "s3:BypassGovernanceRetention can delete the objects, and so do no Object "
         "Lock configuration and a lock with no default retention. A bucket whose "
         "configuration the role cannot read, such as one in another account, is "
-        "Not Applicable. AWS Backup Vault Lock state is printed beside the verdict "
-        "and does not decide it",
+        "Not Applicable. A bucket without that lock can pass through AWS Backup: its "
+        "newest completed recovery point must sit in a vault whose Vault Lock is in "
+        "compliance mode past its LockDate grace period with a minimum retention. "
+        "Governance mode, a grace period and an unread recovery point list do not "
+        "clear a bucket",
         [],
         6,
     ),
@@ -1471,8 +1488,14 @@ FOUNDATION_ROWS = [
         "statement that grants the account root is such a bypass unless it "
         "carries an attestation pin or that Deny is present. A Null Deny alone "
         "refuses a missing attestation but admits any image, so a key with no "
-        "exact pin still fails. Which workloads must be enclave-bound is the "
-        "customer's decision, so a key without the condition is never failed",
+        "exact pin still fails. A Nitro Enclave image pin alone fails too: every "
+        "releasing statement also needs an exact PCR3, PCR4 or PCR8 value, in "
+        "itself or through a single-test Deny, because the image file is not "
+        "secret. A Deny narrowed by another condition key is not credited. Every "
+        "grant is read, and a grant of the four operations fails the key unless a "
+        "Deny covers it; unread grants are N/A. Which workloads must be "
+        "enclave-bound is the customer's decision, and no API records it, so a key "
+        "without the condition is never failed",
         [],
         6,
     ),
@@ -1483,9 +1506,15 @@ FOUNDATION_ROWS = [
         "bedrock_assessments",
         ["BR-53"],
         "BR-53 passes the ARNs the module inventories from the Bedrock list APIs "
-        "(agents, knowledge bases, guardrails, custom and imported models, "
-        "provisioned throughput) to GetResources in batches of 100 and fails each "
-        "resource with no tag key containing owner, case-insensitive. The "
+        "(agents, knowledge bases, flows, prompts, guardrails, custom and imported "
+        "models, provisioned throughput, application inference profiles) to "
+        "GetResources in batches of 100 and fails each resource with no owner tag "
+        "whose value names someone. The key must be owner after any namespace, "
+        "alone or with a closed list of qualifiers, so previous_owner is not "
+        "credited, and a placeholder value such as TBD is not credited. Whether a "
+        "value resolves to a person is not verified, and no API marks a resource "
+        "as production. SageMaker and AgentCore resources belong to their own "
+        "modules. The "
         "population is the inventory, never a ResourceTypeFilters sweep, because "
         "GetResources returns only resources that are or were tagged, so a sweep "
         "omits the resources that most need an owner",
@@ -1578,18 +1607,53 @@ FOUNDATION_ROWS = [
         None,
         "bedrock_assessments",
         ["BR-54"],
-        "BR-54 reads the function URL's AuthType and the resource policy of every "
-        "Lambda function. It fails a function URL with AuthType NONE, and says "
-        "the URL accepts no requests yet when no statement grants public invoke. "
-        'It fails an Allow to Principal "*" on lambda:InvokeFunction* or lambda:* '
-        "with no aws:SourceArn, aws:SourceAccount or aws:PrincipalOrgID "
-        "condition. lambda:FunctionUrlAuthType and lambda:InvokedViaFunctionUrl "
-        "do not clear it, because they describe how the function is called. It "
-        "reports configuration and does not claim the function is reachable",
+        "BR-54 reads the function URL's AuthType and CORS AllowOrigins and the "
+        "resource policy of every Lambda function, alias and published version. "
+        "It fails a function URL with AuthType NONE, and says the URL accepts no "
+        "requests yet when the policy of the URL's own qualifier grants no public "
+        "invoke. It fails a URL whose CORS origins hold a wildcard. It fails an "
+        'Allow to Principal "*" on lambda:InvokeFunction* or lambda:* unless a '
+        "positive, non-IfExists aws:SourceAccount, aws:PrincipalOrgID or "
+        "aws:SourceArn test names one account, organization or source ARN in "
+        "every value. lambda:FunctionUrlAuthType and lambda:InvokedViaFunctionUrl "
+        "do not clear it, because they describe how the function is called. On "
+        "the primary Region it judges the attached service control policies for a "
+        "Deny on lambda:CreateFunctionUrlConfig and lambda:UpdateFunctionUrlConfig "
+        "when lambda:FunctionUrlAuthType is NONE. Partial, ceiling reached: it "
+        "reports configuration and does not claim the function is reachable, and "
+        "a CloudFront or WAF front for a public URL is not read",
         [],
         6,
     ),
-    # ---------------- not_implementable: 4 controls ----------------
+    (
+        "AIR-SLF-AGT-05",
+        COVERED,
+        None,
+        "bedrock_assessments",
+        ["BR-57"],
+        "BR-57 takes the agent roles to be the roles Bedrock agents run as, from "
+        "GetAgent and from GetAgentVersion for every version an alias routes to, "
+        "and the roles AgentCore runtimes run as, from GetAgentRuntime for the "
+        "latest version and each endpoint's live and target version. A Bedrock "
+        "collaborator, read with ListAgentCollaborators on every supervisor "
+        "version and resolved through its alias routing, fails when it runs as "
+        "its supervisor's own role. Every cached role's trust policy is read with "
+        "iam:GetRole. An Allow on sts:AssumeRole is an edge from an agent role "
+        "when it names that role, or names its account or * and the agent role's "
+        "own identity policy allows sts:AssumeRole on the target, and a boundary "
+        "that allows sts:AssumeRole nowhere removes it. An edge passes only on a "
+        "positive string test of sts:SourceIdentity with no wildcard value, no "
+        "IfExists form and no ForAllValues: prefix. An unread agent, runtime, "
+        "collaborator alias, trust policy or cached principal reports N/A, never "
+        "Passed. Partial, ceiling reached: no AWS API marks which ECS task or "
+        "Lambda execution roles host an agent, GetAgentRuntime returns no field "
+        "for a runtime session's token scope, and the runtime list needs "
+        "bedrock-agentcore:ListAgentRuntimes and ListAgentRuntimeEndpoints on *, "
+        "which are not granted",
+        [],
+        6,
+    ),
+    # ---------------- not_implementable: 3 controls ----------------
     (
         "AIR-FND-DET-10",
         NOT_IMPL,
@@ -1611,19 +1675,6 @@ FOUNDATION_ROWS = [
         "The review queue and its backlog metrics are customer-built and "
         "customer-named, and no AWS API identifies which queue holds agent "
         "decisions awaiting review.",
-        [],
-        None,
-    ),
-    (
-        "AIR-SLF-AGT-05",
-        NOT_IMPL,
-        None,
-        None,
-        [],
-        "Trust policies are readable, but no AWS API marks which roles belong to "
-        "agents or which agent-to-agent handoffs are expected, so a missing "
-        "sts:SourceIdentity condition cannot be told apart from a role that never "
-        "takes part in a handoff.",
         [],
         None,
     ),
@@ -1704,6 +1755,7 @@ INCUMBENT_NAMES = {
     "BR-53": "Bedrock Resource Owner Tag",
     "BR-54": "Lambda Function Public Invoke Configuration",
     "BR-55": "KMS Key Enclave Attestation Binding",
+    "BR-57": "Agent Handoff Source Identity",
     # Five names: the Passed and N/A rows carry "AgentCore VPC Configuration
     # Check", and the Failed rows one of the other four, by resource and leg.
     "AC-01": (
@@ -1789,9 +1841,9 @@ INCUMBENT_NAMES = {
     ),
     "BR-02": (
         "Amazon Bedrock private connectivity",
-        "Amazon Bedrock private connectivity check",
         "Amazon Bedrock private connectivity not used",
         "Bedrock VPC Endpoint Check",
+        "Bedrock Workload Private Connectivity",
     ),
     # The second name is published by the outer `except` alone, where every other
     # path publishes the first. An operator filtering the report on the name the
@@ -1813,25 +1865,54 @@ INCUMBENT_NAMES = {
     "BR-11": (
         "Bedrock Custom Model Encryption Check",
         "Bedrock Custom Model Encryption Review",
+        "Bedrock Customization Data Bucket Encryption",
     ),
     "BR-12": (
         "Bedrock Invocation Log Encryption",
+        "Bedrock Invocation Log Group Encryption",
         "Bedrock Invocation Log Group Deletion Protection",
     ),
     "BR-15": "Cross-Account Guardrails Enforcement Check",
     "BR-17": "Custom Model Customer-Managed KMS Encryption Check",
-    "BR-20": "Knowledge Base Customer-Managed KMS Encryption Check",
-    "BR-26": "Guardrail Sensitive Information Filter Check",
-    "BR-27": "Guardrail Contextual Grounding Check",
+    # The data source bucket and transient data key legs publish their own
+    # names, and a knowledge base that could not be judged publishes Review.
+    "BR-20": (
+        "Knowledge Base Customer-Managed KMS Encryption Check",
+        "Knowledge Base Customer-Managed KMS Encryption Review",
+        "Knowledge Base Data Source Bucket Encryption",
+        "Knowledge Base Data Source Transient Data Key",
+    ),
+    "BR-26": (
+        "Guardrail Sensitive Information Filter Check",
+        "Deployed Guardrail Sensitive Information Filter",
+    ),
+    "BR-27": (
+        "Guardrail Contextual Grounding Check",
+        "Deployed Guardrail Contextual Grounding",
+    ),
     "BR-32": "Bedrock CloudWatch Alarm Check",
     "BR-33": "Amazon Inspector Lambda Code Scanning Check",
-    "BR-34": "Guardrail Prompt Attack Filter",
+    "BR-34": (
+        "Guardrail Prompt Attack Filter",
+        "Deployed Guardrail Prompt Attack Filter",
+    ),
     "BR-37": "Bedrock Account Data Retention",
     "BR-39": "Marketplace Model Endpoint VPC Configuration",
     "BR-41": "Central Guardrail Enforcement Policy Check",
-    "BR-42": "Foundation Model Invocation Allow-List",
-    # The Region leg and the model leg.
-    "BR-43": ("Bedrock Region Invocation Control", "Bedrock Approved Model Control"),
+    # The identity leg and the organization leg.
+    "BR-42": (
+        "Foundation Model Invocation Allow-List",
+        "Bedrock Approved Model Control",
+    ),
+    # The Region leg, the model leg, the served-Region evidence, the SageMaker
+    # and S3 Region leg, and the cross-account leg.
+    "BR-43": (
+        "Bedrock Region Invocation Control",
+        "Bedrock Approved Model Control",
+        "Bedrock Inference Region Evidence",
+        "AI Service Region Control",
+        "Bedrock Custom Model Cross-Account Access",
+    ),
     "BR-44": "Marketplace Model Subscription Control",
     # An inventory line and a prevention line, by design.
     "BR-45": (
