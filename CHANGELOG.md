@@ -380,6 +380,15 @@ section.
     same rules, and an unreadable key policy is `N/A` and never `Passed`.
     Retention length is reported and not judged: no API field states the
     workload's schedule.
+  - `AC-19` adds runtimes to its population and requires a `TRACES`
+    delivery for every runtime, gateway and memory, beside the
+    `APPLICATION_LOGS` delivery it already required for gateways and
+    memories. A delivery source reporting `INACTIVE` no longer counts, and an
+    unlistable runtime inventory is `N/A`. A gateway or memory that passed on
+    application logs alone now fails.
+  - `AC-20` states in its `Passed` text that `AC-26` judges the key policy
+    and that delivery destination log groups outside the AgentCore prefixes
+    are not read.
 
 ### Deployment impact
 
@@ -458,6 +467,9 @@ them. Until it runs, the `AC-18` identity family reports `N/A`.
 `AC-22`, `AC-26`, `AC-36` and `AC-41` change no IAM grant: `kms:GetKeyPolicy`
 is already scoped to `key/*` in both SAM templates. Rows of these checks that
 passed before can now fail after the same CodeBuild run.
+
+`AC-19` changes no IAM grant: it reads runtimes with
+`bedrock-agentcore:ListAgentRuntimes`, which the role already holds.
 
 ## 2.0.0 - 2026-09-18
 

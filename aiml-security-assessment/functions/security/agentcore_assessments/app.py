@@ -715,6 +715,20 @@ TRANSACTION_SEARCH_SPANS_LOG_GROUP = "aws/spans"
 # with this service and log type, plus a delivery to a destination.
 AGENTCORE_VENDED_LOG_SERVICE = "bedrock-agentcore"
 AGENTCORE_VENDED_LOG_TYPE = "APPLICATION_LOGS"
+AGENTCORE_VENDED_TRACE_TYPE = "TRACES"
+# The vended deliveries AC-19 requires per resource family. A runtime writes its
+# service-provided logs to a log group AgentCore creates for it, so only its
+# traces need a delivery; a memory or gateway has no log destination until one
+# is configured.
+AGENTCORE_RUNTIME_DELIVERY_TYPES = (AGENTCORE_VENDED_TRACE_TYPE,)
+AGENTCORE_RESOURCE_DELIVERY_TYPES = (
+    AGENTCORE_VENDED_LOG_TYPE,
+    AGENTCORE_VENDED_TRACE_TYPE,
+)
+AGENTCORE_DELIVERY_TYPE_LABELS = {
+    AGENTCORE_VENDED_LOG_TYPE: "application logs",
+    AGENTCORE_VENDED_TRACE_TYPE: "traces",
+}
 
 # Condition keys that bind a cross-account observability sink policy to a known
 # set of principals, and the operators under which they bind. ForAllValues and
@@ -6993,22 +7007,29 @@ def check_agentcore_cloudtrail_data_events() -> List[Dict[str, Any]]:
     return findings
 
 
-def _agentcore_delivery_configuration() -> Tuple[Dict[str, List[str]], Set[str]]:
-    """Map AgentCore resource ARNs to their application-log delivery sources.
+def _agentcore_delivery_configuration() -> Tuple[
+    Dict[str, Dict[str, List[str]]], Set[str]
+]:
+    """Map AgentCore resource ARNs to their delivery sources per log type.
 
-    A delivery source names the resource whose logs it collects; a delivery
-    connects that source to a destination. A source with no delivery produces no
-    logs, so both halves are needed to answer whether logging is configured.
+    A delivery source names the resource whose logs or traces it collects; a
+    delivery connects that source to a destination. A source with no delivery
+    produces nothing, so both halves are needed to answer whether delivery is
+    configured. A source reporting status INACTIVE, which is what a source
+    whose resource was deleted reports, is not counted.
     """
     sources = _paginate_aws_list(
         logs_client, "describe_delivery_sources", "deliverySources"
     )
 
-    arn_sources: Dict[str, List[str]] = {}
+    arn_sources: Dict[str, Dict[str, List[str]]] = {}
     for source in sources:
         if source.get("service") != AGENTCORE_VENDED_LOG_SERVICE:
             continue
-        if source.get("logType") != AGENTCORE_VENDED_LOG_TYPE:
+        log_type = source.get("logType")
+        if log_type not in AGENTCORE_DELIVERY_TYPE_LABELS:
+            continue
+        if source.get("status") == "INACTIVE":
             continue
         source_name = source.get("name")
         resource_arns = source.get("resourceArns")
@@ -7016,7 +7037,9 @@ def _agentcore_delivery_configuration() -> Tuple[Dict[str, List[str]], Set[str]]
             continue
         for resource_arn in resource_arns:
             if isinstance(resource_arn, str):
-                arn_sources.setdefault(resource_arn, []).append(source_name)
+                arn_sources.setdefault(resource_arn, {}).setdefault(
+                    log_type, []
+                ).append(source_name)
 
     deliveries = _paginate_aws_list(logs_client, "describe_deliveries", "deliveries")
     delivered_source_names = {
@@ -7029,37 +7052,63 @@ def _agentcore_delivery_configuration() -> Tuple[Dict[str, List[str]], Set[str]]
 
 
 def _delivery_source_names_for(
-    arn_match: str, arn_sources: Dict[str, List[str]]
+    arn_match: str, arn_sources: Dict[str, Dict[str, List[str]]], log_type: str
 ) -> List[str]:
-    """Find the delivery sources naming one resource.
+    """Find the delivery sources of one log type naming one resource.
 
-    GatewaySummary carries no ARN, so a gateway is matched on the ARN tail built
-    from its id; a memory is matched on the exact ARN the list API returns.
+    GatewaySummary carries no ARN, so a gateway or runtime is matched on the ARN
+    tail built from its id; a memory is matched on the exact ARN the list API
+    returns.
     """
     names: List[str] = []
-    for resource_arn, source_names in arn_sources.items():
+    for resource_arn, sources_by_type in arn_sources.items():
         if resource_arn == arn_match or resource_arn.endswith(arn_match):
-            names.extend(source_names)
+            names.extend(sources_by_type.get(log_type, []))
     return names
 
 
 def _log_delivery_finding(
     resource_label: str,
     arn_match: str,
-    arn_sources: Dict[str, List[str]],
+    arn_sources: Dict[str, Dict[str, List[str]]],
     delivered_source_names: Set[str],
+    required_log_types: Tuple[str, ...],
 ) -> Dict[str, Any]:
-    """Build one AC-19 finding for a gateway or memory resource."""
-    source_names = _delivery_source_names_for(arn_match, arn_sources)
-    delivered = sorted(name for name in source_names if name in delivered_source_names)
+    """Build one AC-19 finding for a runtime, gateway or memory resource.
 
-    if delivered:
+    Every required log type is judged on its own, so a resource that delivers
+    application logs and no traces fails on the traces.
+    """
+    delivered_notes: List[str] = []
+    problems: List[str] = []
+    for log_type in required_log_types:
+        label = AGENTCORE_DELIVERY_TYPE_LABELS[log_type]
+        source_names = _delivery_source_names_for(arn_match, arn_sources, log_type)
+        delivered = sorted(
+            name for name in source_names if name in delivered_source_names
+        )
+        if delivered:
+            delivered_notes.append(
+                f"{label} through delivery source {', '.join(delivered)}"
+            )
+        elif source_names:
+            problems.append(
+                f"has {log_type} delivery source "
+                f"{', '.join(sorted(source_names))} but no delivery to a "
+                f"destination, so its {label} are not stored anywhere"
+            )
+        else:
+            problems.append(
+                f"has no bedrock-agentcore {log_type} delivery source, so its "
+                f"{label} are not collected"
+            )
+
+    if not problems:
         return create_finding(
             check_id="AC-19",
             finding_name="AgentCore Log Delivery Configuration",
             finding_details=(
-                f"{resource_label} delivers application logs through delivery "
-                f"source {', '.join(delivered)}."
+                f"{resource_label} delivers {' and '.join(delivered_notes)}."
             ),
             resolution=(
                 "No action required. Confirm the delivery destination retention "
@@ -7070,35 +7119,18 @@ def _log_delivery_finding(
             status=StatusEnum.PASSED,
         )
 
-    if source_names:
-        return create_finding(
-            check_id="AC-19",
-            finding_name="AgentCore Log Delivery Configuration",
-            finding_details=(
-                f"{resource_label} has delivery source "
-                f"{', '.join(sorted(source_names))} but no delivery to a "
-                "destination, so its application logs are not stored anywhere."
-            ),
-            resolution=(
-                "Create a CloudWatch Logs delivery joining this delivery source "
-                "to a log group, S3 bucket, or Firehose destination."
-            ),
-            reference=AGENTCORE_OBSERVABILITY_CONFIGURE_REFERENCE_URL,
-            severity=SeverityEnum.MEDIUM,
-            status=StatusEnum.FAILED,
-        )
-
+    delivered_text = (
+        f" It delivers {' and '.join(delivered_notes)}." if delivered_notes else ""
+    )
     return create_finding(
         check_id="AC-19",
         finding_name="AgentCore Log Delivery Configuration",
-        finding_details=(
-            f"{resource_label} has no bedrock-agentcore "
-            f"{AGENTCORE_VENDED_LOG_TYPE} delivery source, so its application "
-            "logs are not collected."
-        ),
+        finding_details=(f"{resource_label} {'; it '.join(problems)}.{delivered_text}"),
         resolution=(
-            "Enable observability for this resource and configure a delivery "
-            "source and delivery for its application logs."
+            "Enable observability for this resource: create a delivery source "
+            "and a delivery for each log type named, APPLICATION_LOGS to a log "
+            "group, S3 bucket or Firehose stream and TRACES to X-Ray. Tracing "
+            "needs CloudWatch Transaction Search on in the account."
         ),
         reference=AGENTCORE_OBSERVABILITY_CONFIGURE_REFERENCE_URL,
         severity=SeverityEnum.MEDIUM,
@@ -7107,10 +7139,13 @@ def _log_delivery_finding(
 
 
 def check_agentcore_log_delivery_configuration() -> List[Dict[str, Any]]:
-    """AC-19: Report application-log delivery per gateway and memory resource.
+    """AC-19: Report log and trace delivery per runtime, gateway and memory.
 
-    Runtime logging is service-managed and needs no delivery configuration, so
-    runtimes are out of scope here; AC-04 covers runtime tracing.
+    A gateway or memory needs an APPLICATION_LOGS and a TRACES delivery, because
+    AgentCore configures no destination for either. A runtime needs a TRACES
+    delivery only: AgentCore creates a log group for its service-provided logs.
+    Whether CloudWatch Transaction Search is on, which tracing needs, is not
+    read, because xray:GetTraceSegmentDestination is not granted.
     """
     if logs_client is None:
         return [
@@ -7149,6 +7184,39 @@ def check_agentcore_log_delivery_configuration() -> List[Dict[str, Any]]:
     findings = []
 
     try:
+        runtimes = _agentcore_list_all("list_agent_runtimes", ["agentRuntimes"])
+    except Exception as error:
+        runtimes = []
+        findings.append(
+            create_finding(
+                check_id="AC-19",
+                finding_name="AgentCore Log Delivery Configuration",
+                finding_details=(
+                    f"Runtimes could not be listed: {type(error).__name__}."
+                ),
+                resolution="Grant bedrock-agentcore:ListAgentRuntimes and retry.",
+                reference=AGENTCORE_OBSERVABILITY_CONFIGURE_REFERENCE_URL,
+                severity=SeverityEnum.INFORMATIONAL,
+                status=StatusEnum.NA,
+            )
+        )
+
+    for runtime in runtimes:
+        runtime_id = runtime.get("agentRuntimeId")
+        if not runtime_id:
+            continue
+        runtime_name = runtime.get("agentRuntimeName", runtime_id)
+        findings.append(
+            _log_delivery_finding(
+                f"Runtime '{runtime_name}' ({runtime_id})",
+                f":runtime/{runtime_id}",
+                arn_sources,
+                delivered_source_names,
+                AGENTCORE_RUNTIME_DELIVERY_TYPES,
+            )
+        )
+
+    try:
         gateways = _agentcore_list_all("list_gateways", ["items", "gateways"])
     except Exception as error:
         gateways = []
@@ -7177,6 +7245,7 @@ def check_agentcore_log_delivery_configuration() -> List[Dict[str, Any]]:
                 f":gateway/{gateway_id}",
                 arn_sources,
                 delivered_source_names,
+                AGENTCORE_RESOURCE_DELIVERY_TYPES,
             )
         )
 
@@ -7209,6 +7278,7 @@ def check_agentcore_log_delivery_configuration() -> List[Dict[str, Any]]:
                 memory_arn,
                 arn_sources,
                 delivered_source_names,
+                AGENTCORE_RESOURCE_DELIVERY_TYPES,
             )
         )
 
@@ -7218,7 +7288,8 @@ def check_agentcore_log_delivery_configuration() -> List[Dict[str, Any]]:
                 check_id="AC-19",
                 finding_name="AgentCore Log Delivery Configuration",
                 finding_details=(
-                    "No AgentCore gateway or memory resources found in this region."
+                    "No AgentCore runtime, gateway or memory resources found in "
+                    "this region."
                 ),
                 resolution="No action required.",
                 reference=AGENTCORE_OBSERVABILITY_CONFIGURE_REFERENCE_URL,
@@ -7328,7 +7399,12 @@ def check_agentcore_log_group_data_protection() -> List[Dict[str, Any]]:
     """AC-20: Report masking and CMK encryption on AgentCore log groups.
 
     Agent prompts, tool arguments and memory records reach these log groups
-    verbatim, so a guardrail at the model boundary does not cover them.
+    verbatim, so a guardrail at the model boundary does not cover them. An
+    account data-protection policy takes no selectionCriteria and its scope can
+    only be ALL, so it covers every group. AC-26 reads the policy of the key
+    named here for the same groups. A delivery destination log group named
+    outside the AgentCore prefixes is not read: finding it needs
+    logs:DescribeDeliveryDestinations, which is not granted.
     """
     if logs_client is None:
         return [
@@ -7437,7 +7513,9 @@ def check_agentcore_log_group_data_protection() -> List[Dict[str, Any]]:
                         f"Log group '{log_group_name}' masks "
                         f"{len(set(identifiers))} data identifier(s) through a "
                         f"{masking_scope} data-protection policy and is encrypted "
-                        "with a customer managed key."
+                        "with a customer managed key. AC-26 judges that key's "
+                        "policy. Log groups outside the AgentCore prefixes that a "
+                        "delivery writes to are not read."
                     ),
                     resolution=(
                         "No action required. Confirm the data identifiers cover "

@@ -5079,10 +5079,14 @@ class TestAC19LogDeliveryConfiguration:
     @patch("agentcore_app.logs_client")
     def test_gateway_with_source_and_delivery_passes(self, mock_logs, mock_ac):
         mock_logs.describe_delivery_sources.return_value = self._sources(
-            self._gateway_source()
+            self._gateway_source(),
+            self._gateway_source(name="gw-traces-source", log_type="TRACES"),
         )
         mock_logs.describe_deliveries.return_value = {
-            "deliveries": [{"deliverySourceName": "gw-logs-source"}]
+            "deliveries": [
+                {"deliverySourceName": "gw-logs-source"},
+                {"deliverySourceName": "gw-traces-source"},
+            ]
         }
         _empty_agentcore_inventory(mock_ac)
         mock_ac.list_gateways.return_value = {
@@ -5141,10 +5145,19 @@ class TestAC19LogDeliveryConfiguration:
                 "service": "bedrock-agentcore",
                 "logType": "APPLICATION_LOGS",
                 "resourceArns": [memory_arn],
-            }
+            },
+            {
+                "name": "mem-traces-source",
+                "service": "bedrock-agentcore",
+                "logType": "TRACES",
+                "resourceArns": [memory_arn],
+            },
         )
         mock_logs.describe_deliveries.return_value = {
-            "deliveries": [{"deliverySourceName": "mem-logs-source"}]
+            "deliveries": [
+                {"deliverySourceName": "mem-logs-source"},
+                {"deliverySourceName": "mem-traces-source"},
+            ]
         }
         _empty_agentcore_inventory(mock_ac)
         mock_ac.list_memories.return_value = {
@@ -5242,13 +5255,18 @@ class TestAC19LogDeliveryConfiguration:
     def test_every_delivery_source_page_is_read(self, mock_logs, mock_ac):
         mock_logs.describe_delivery_sources.side_effect = [
             {
-                "deliverySources": [self._gateway_source(name="page-1-source")],
+                "deliverySources": [
+                    self._gateway_source(name="page-1-source", log_type="TRACES")
+                ],
                 "nextToken": "page-2",
             },
             {"deliverySources": [self._gateway_source()]},
         ]
         mock_logs.describe_deliveries.return_value = {
-            "deliveries": [{"deliverySourceName": "gw-logs-source"}]
+            "deliveries": [
+                {"deliverySourceName": "gw-logs-source"},
+                {"deliverySourceName": "page-1-source"},
+            ]
         }
         _empty_agentcore_inventory(mock_ac)
         mock_ac.list_gateways.return_value = {
@@ -5263,6 +5281,225 @@ class TestAC19LogDeliveryConfiguration:
         }
         gateway = [f for f in findings if "gateway-1" in f["Finding_Details"]]
         assert gateway[0]["Status"] == "Passed"
+
+
+def _delivery_source(name, resource_arn, log_type, status=None):
+    source = {
+        "name": name,
+        "service": "bedrock-agentcore",
+        "logType": log_type,
+        "resourceArns": [resource_arn],
+    }
+    if status is not None:
+        source["status"] = status
+    return source
+
+
+def _delivered(*names):
+    return {"deliveries": [{"deliverySourceName": name} for name in names]}
+
+
+_AC19_ARN = "arn:aws:bedrock-agentcore:us-east-1:123456789012"
+
+
+class TestAC19TracesAndRuntimes:
+    """AC-19: traces for every resource, and runtimes in the population."""
+
+    @staticmethod
+    def _row(findings, needle):
+        rows = [f for f in findings if needle in f["Finding_Details"]]
+        assert len(rows) == 1, findings
+        return rows[0]
+
+    @patch("agentcore_app.agentcore_client")
+    @patch("agentcore_app.logs_client")
+    def test_a_gateway_without_traces_fails_beside_one_with_them(
+        self, mock_logs, mock_ac
+    ):
+        mock_logs.describe_delivery_sources.return_value = {
+            "deliverySources": [
+                _delivery_source(
+                    "gw1-logs", f"{_AC19_ARN}:gateway/gw-1", "APPLICATION_LOGS"
+                ),
+                _delivery_source("gw1-traces", f"{_AC19_ARN}:gateway/gw-1", "TRACES"),
+                _delivery_source(
+                    "gw2-logs", f"{_AC19_ARN}:gateway/gw-2", "APPLICATION_LOGS"
+                ),
+            ]
+        }
+        mock_logs.describe_deliveries.return_value = _delivered(
+            "gw1-logs", "gw1-traces", "gw2-logs"
+        )
+        _empty_agentcore_inventory(mock_ac)
+        mock_ac.list_gateways.return_value = {
+            "items": [
+                {"gatewayId": "gw-1", "name": "gateway-1"},
+                {"gatewayId": "gw-2", "name": "gateway-2"},
+            ]
+        }
+
+        findings = agentcore_app.check_agentcore_log_delivery_configuration()
+
+        assert self._row(findings, "gateway-1")["Status"] == "Passed"
+        bad = self._row(findings, "gateway-2")
+        assert bad["Status"] == "Failed"
+        assert "no bedrock-agentcore TRACES delivery source" in bad["Finding_Details"]
+        assert (
+            "It delivers application logs through delivery source gw2-logs"
+            in (bad["Finding_Details"])
+        )
+        assert "TRACES to X-Ray" in bad["Resolution"]
+
+    @patch("agentcore_app.agentcore_client")
+    @patch("agentcore_app.logs_client")
+    def test_a_memory_trace_source_with_no_delivery_fails(self, mock_logs, mock_ac):
+        memory_arn = f"{_AC19_ARN}:memory/mem-1"
+        mock_logs.describe_delivery_sources.return_value = {
+            "deliverySources": [
+                _delivery_source("mem-logs", memory_arn, "APPLICATION_LOGS"),
+                _delivery_source("mem-traces", memory_arn, "TRACES"),
+            ]
+        }
+        mock_logs.describe_deliveries.return_value = _delivered("mem-logs")
+        _empty_agentcore_inventory(mock_ac)
+        mock_ac.list_memories.return_value = {
+            "memories": [{"id": "mem-1", "arn": memory_arn}]
+        }
+
+        memory = self._row(
+            agentcore_app.check_agentcore_log_delivery_configuration(), "mem-1"
+        )
+
+        assert memory["Status"] == "Failed"
+        assert (
+            "has TRACES delivery source mem-traces but no delivery to a destination, "
+            "so its traces are not stored anywhere"
+        ) in memory["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    @patch("agentcore_app.logs_client")
+    def test_every_runtime_is_judged_on_its_traces(self, mock_logs, mock_ac):
+        mock_logs.describe_delivery_sources.return_value = {
+            "deliverySources": [
+                _delivery_source("rt1-traces", f"{_AC19_ARN}:runtime/rt-1", "TRACES"),
+                _delivery_source(
+                    "rt2-logs", f"{_AC19_ARN}:runtime/rt-2", "APPLICATION_LOGS"
+                ),
+            ]
+        }
+        mock_logs.describe_deliveries.return_value = _delivered(
+            "rt1-traces", "rt2-logs"
+        )
+        _empty_agentcore_inventory(mock_ac)
+        mock_ac.list_agent_runtimes.return_value = {
+            "agentRuntimes": [
+                {"agentRuntimeId": "rt-1", "agentRuntimeName": "agent_one"},
+                {"agentRuntimeId": "rt-2", "agentRuntimeName": "agent_two"},
+            ]
+        }
+
+        findings = agentcore_app.check_agentcore_log_delivery_configuration()
+
+        good = self._row(findings, "agent_one")
+        assert good["Status"] == "Passed"
+        assert (
+            "delivers traces through delivery source rt1-traces"
+            in (good["Finding_Details"])
+        )
+        bad = self._row(findings, "agent_two")
+        assert bad["Status"] == "Failed"
+        assert "no bedrock-agentcore TRACES delivery source" in bad["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    @patch("agentcore_app.logs_client")
+    def test_another_runtime_ids_source_does_not_count(self, mock_logs, mock_ac):
+        mock_logs.describe_delivery_sources.return_value = {
+            "deliverySources": [
+                _delivery_source("rt10-traces", f"{_AC19_ARN}:runtime/rt-10", "TRACES"),
+                _delivery_source("xrt1-traces", f"{_AC19_ARN}:runtime/xrt-1", "TRACES"),
+            ]
+        }
+        mock_logs.describe_deliveries.return_value = _delivered(
+            "rt10-traces", "xrt1-traces"
+        )
+        _empty_agentcore_inventory(mock_ac)
+        mock_ac.list_agent_runtimes.return_value = {
+            "agentRuntimes": [{"agentRuntimeId": "rt-1", "agentRuntimeName": "one"}]
+        }
+
+        runtime = self._row(
+            agentcore_app.check_agentcore_log_delivery_configuration(), "'one'"
+        )
+
+        assert runtime["Status"] == "Failed"
+
+    @patch("agentcore_app.agentcore_client")
+    @patch("agentcore_app.logs_client")
+    def test_an_inactive_source_does_not_count(self, mock_logs, mock_ac):
+        gateway_arn = f"{_AC19_ARN}:gateway/gw-1"
+        mock_logs.describe_delivery_sources.return_value = {
+            "deliverySources": [
+                _delivery_source(
+                    "gw-logs", gateway_arn, "APPLICATION_LOGS", status="ACTIVE"
+                ),
+                _delivery_source("gw-traces", gateway_arn, "TRACES", status="INACTIVE"),
+            ]
+        }
+        mock_logs.describe_deliveries.return_value = _delivered("gw-logs", "gw-traces")
+        _empty_agentcore_inventory(mock_ac)
+        mock_ac.list_gateways.return_value = {
+            "items": [{"gatewayId": "gw-1", "name": "gateway-1"}]
+        }
+
+        gateway = self._row(
+            agentcore_app.check_agentcore_log_delivery_configuration(), "gateway-1"
+        )
+
+        assert gateway["Status"] == "Failed"
+        assert (
+            "no bedrock-agentcore TRACES delivery source"
+            in (gateway["Finding_Details"])
+        )
+
+    @patch("agentcore_app.agentcore_client")
+    @patch("agentcore_app.logs_client")
+    def test_every_runtime_page_is_read(self, mock_logs, mock_ac):
+        mock_logs.describe_delivery_sources.return_value = {"deliverySources": []}
+        mock_logs.describe_deliveries.return_value = {"deliveries": []}
+        _empty_agentcore_inventory(mock_ac)
+        mock_ac.list_agent_runtimes.side_effect = [
+            {
+                "agentRuntimes": [{"agentRuntimeId": "rt-1", "agentRuntimeName": "a"}],
+                "nextToken": "page-2",
+            },
+            {"agentRuntimes": [{"agentRuntimeId": "rt-2", "agentRuntimeName": "b"}]},
+        ]
+
+        findings = agentcore_app.check_agentcore_log_delivery_configuration()
+
+        assert self._row(findings, "'b' (rt-2)")["Status"] == "Failed"
+        assert mock_ac.list_agent_runtimes.call_args_list[1].kwargs == {
+            "nextToken": "page-2"
+        }
+
+    @patch("agentcore_app.agentcore_client")
+    @patch("agentcore_app.logs_client")
+    def test_an_unlistable_runtime_inventory_is_na_and_never_passed(
+        self, mock_logs, mock_ac
+    ):
+        mock_logs.describe_delivery_sources.return_value = {"deliverySources": []}
+        mock_logs.describe_deliveries.return_value = {"deliveries": []}
+        _empty_agentcore_inventory(mock_ac)
+        mock_ac.list_agent_runtimes.side_effect = _make_client_error(
+            "AccessDeniedException", "denied"
+        )
+
+        findings = agentcore_app.check_agentcore_log_delivery_configuration()
+
+        unread = self._row(findings, "Runtimes could not be listed")
+        assert unread["Status"] == "N/A"
+        assert "bedrock-agentcore:ListAgentRuntimes" in unread["Resolution"]
+        assert not [f for f in findings if f["Status"] == "Passed"]
 
 
 # ===================================================================
@@ -5322,6 +5559,46 @@ class TestAC20LogDataProtection:
         assert findings[0]["Check_ID"] == "AC-20"
         assert findings[0]["Status"] == "Passed"
         assert_finding_schema(findings[0])
+
+    @patch("agentcore_app.logs_client")
+    def test_an_account_policy_covers_every_group_and_the_pass_names_its_limits(
+        self, mock_logs
+    ):
+        mock_logs.describe_account_policies.return_value = {
+            "accountPolicies": [
+                {"policyName": "acct", "policyDocument": self._MASKING_POLICY}
+            ]
+        }
+        mock_logs.describe_log_groups.side_effect = _log_group_side_effect(
+            {
+                "/aws/bedrock-agentcore/": [
+                    {
+                        "logGroupName": "/aws/bedrock-agentcore/runtimes/rt-1",
+                        "kmsKeyId": self._KMS_KEY,
+                    }
+                ],
+                "/aws/vendedlogs/bedrock-agentcore/": [
+                    {
+                        "logGroupName": "/aws/vendedlogs/bedrock-agentcore/gateway/g",
+                        "kmsKeyId": self._KMS_KEY,
+                    },
+                    {"logGroupName": "/aws/vendedlogs/bedrock-agentcore/memory/m"},
+                ],
+            }
+        )
+
+        findings = agentcore_app.check_agentcore_log_group_data_protection()
+
+        by_group = {f["Finding_Details"].split("'")[1]: f for f in findings}
+        assert by_group["/aws/bedrock-agentcore/runtimes/rt-1"]["Status"] == "Passed"
+        passed = by_group["/aws/vendedlogs/bedrock-agentcore/gateway/g"]
+        assert passed["Status"] == "Passed"
+        assert "AC-26 judges that key's policy" in passed["Finding_Details"]
+        assert "outside the AgentCore prefixes" in passed["Finding_Details"]
+        assert by_group["/aws/vendedlogs/bedrock-agentcore/memory/m"]["Status"] == (
+            "Failed"
+        )
+        mock_logs.get_data_protection_policy.assert_not_called()
 
     @patch("agentcore_app.logs_client")
     def test_missing_cmk_fails_and_names_only_that_leg(self, mock_logs):
