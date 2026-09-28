@@ -102,8 +102,7 @@ from the same check. BR-20 emits its summary `Passed` row after its per-resource
 rows, which is the order that made this concrete.
 
 A source check that runs once per account, on the primary Region, reports under
-the `Global` Region. `SM-09` and `BR-37` each have such a leg. An account-wide
-verdict holds in every Region, so each `Global` row is aggregated into every
+the `Global` Region. An account-wide verdict holds in every Region, so each `Global` row is aggregated into every
 regional key of the same account, and `Finding_Details` says so. The `Global`
 key gets its own `AISF-` rows only for an account with no regional key.
 Otherwise a `Global` `Failed` would sit beside a regional `Passed` for the same
