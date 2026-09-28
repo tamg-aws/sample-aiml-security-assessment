@@ -493,27 +493,28 @@ Resources:
             - Sid: OrganizationsPolicyTargetRead
               Effect: Allow
               Action:
-                - organizations:ListTargetsForPolicy # BR-15, BR-41, BR-43, BR-45
+                - organizations:ListTargetsForPolicy # BR-15, BR-41, BR-43, BR-45, BR-48
               Resource:
                 - !Sub 'arn:${AWS::Partition}:organizations::*:policy/*/*/*'
                 - !Sub 'arn:${AWS::Partition}:organizations::aws:policy/*/*'
             - Sid: OrganizationsAccountPathRead
-              # BR-41, BR-43 and BR-45 credit a service control policy only when
-              # it is attached to this account, an OU above it or the root, and
-              # ListParents walks that path. The account and OU ARNs carry the
+              # BR-41, BR-43 and BR-45 credit a service control policy, and BR-48
+              # an AI opt-out policy lock, only when it is attached to this
+              # account, an OU above it or the root, and ListParents walks that
+              # path. The account and OU ARNs carry the
               # management account's ID, so only that segment is left open.
               Effect: Allow
               Action:
-                - organizations:ListParents # BR-41, BR-43, BR-45
+                - organizations:ListParents # BR-41, BR-43, BR-45, BR-48
               Resource:
                 - !Sub 'arn:${AWS::Partition}:organizations::*:account/o-*/${AWS::AccountId}'
                 - !Sub 'arn:${AWS::Partition}:organizations::*:ou/o-*/ou-*'
             - Sid: OrganizationsPolicyDocumentRead
-              # BR-41, BR-43 and BR-45 read the policy document itself, which
-              # only DescribePolicy returns.
+              # BR-41, BR-43, BR-45 and BR-48 read the policy document itself,
+              # which only DescribePolicy returns.
               Effect: Allow
               Action:
-                - organizations:DescribePolicy # BR-41, BR-43, BR-45
+                - organizations:DescribePolicy # BR-41, BR-43, BR-45, BR-48
               Resource:
                 - !Sub 'arn:${AWS::Partition}:organizations::*:policy/*/*/*'
                 - !Sub 'arn:${AWS::Partition}:organizations::aws:policy/*/*'

@@ -800,11 +800,12 @@ AI_SUBJECT_ROWS = [
         "BR-48 reads both surfaces. DescribeEffectivePolicy on AISERVICES_OPT_OUT_POLICY "
         "answers what resolves for the account, and an absent effective policy fails "
         "because the account is then opted in. The effective document has the inheritance "
-        "operators stripped, so from the management account BR-48 also reads every AI "
-        "services opt-out policy in the organization through ListPolicies and "
-        "DescribePolicy, and names any whose opt_out_policy value is open to child "
-        "policies: an unset @@operators_allowed_for_child_policies defaults to @@all, "
-        'and only ["@@none"] locks the value',
+        "operators stripped, so an optOut default passes only when an opt-out policy "
+        "attached to the root, an OU in the account's path or the account assigns "
+        'optOut and sets ["@@none"] at services, services.default and '
+        "services.default.opt_out_policy. A lock on the value alone lets a child add a "
+        "service section that opts back in, so it fails, and an unread path or policy "
+        "is N/A",
         [],
         5,
     ),

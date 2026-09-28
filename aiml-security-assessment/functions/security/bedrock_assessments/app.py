@@ -22491,24 +22491,87 @@ def _ai_services_opt_out_scope(policy_content: Any) -> Dict[str, Any]:
     return scope
 
 
+# AWS Example 1 locks the organization default with ["@@none"] at three
+# placements, each closing a different change: under services a child cannot
+# add a service section, under default it cannot add keys, and under
+# opt_out_policy it cannot change the value. Example 2 omits the first, and a
+# child policy then opts Amazon Lex back in.
+AI_OPT_OUT_LOCK_PLACEMENTS = (
+    ("services",),
+    ("services", "default"),
+    ("services", "default", "opt_out_policy"),
+)
+
+
+def _ai_opt_out_lock_gaps(document: Any) -> List[str]:
+    """
+    Name each placement at which a source opt-out policy leaves the default open.
+
+    An empty list means the policy assigns optOut to the default and sets
+    @@operators_allowed_for_child_policies to ["@@none"] at every placement in
+    AI_OPT_OUT_LOCK_PLACEMENTS. An unset operator allows @@all.
+    """
+    gaps = []
+    node = document
+    for placement in AI_OPT_OUT_LOCK_PLACEMENTS:
+        node = node.get(placement[-1]) if isinstance(node, dict) else None
+        label = ".".join(placement)
+        if not isinstance(node, dict):
+            gaps.append(f"{label} is absent")
+            break
+        operators = [
+            str(operator)
+            for operator in _as_list(node.get(AI_OPT_OUT_CHILD_OPERATORS_KEY))
+            if operator
+        ]
+        if operators != ["@@none"]:
+            gaps.append(f"{label} allows {', '.join(operators) or '@@all'}")
+    else:
+        if _ai_services_opt_out_value(node)["value"] != AI_OPT_OUT_VALUE:
+            gaps.append("services.default.opt_out_policy does not assign optOut")
+    return gaps
+
+
 def _ai_services_opt_out_child_overrides() -> Dict[str, Any]:
     """
-    Report which source opt-out policies let a child policy change the value.
+    Report which source opt-out policies that apply to this account lock the
+    default against child policies.
 
     The source document is read only for @@operators_allowed_for_child_policies:
     the effective document is the merged result and has no operators left in it,
     so it cannot answer whether an OU below the attachment point may opt a
-    service back in. ListPolicies and DescribePolicy answer only in the
-    management account, so a member-account run reports the leg as unassessed
-    instead of reporting no delegation.
+    service back in. Only a policy attached to the root, an OU in the account's
+    path or the account itself is read. ListPolicies and DescribePolicy answer
+    only in the management account or a delegated administrator, so a
+    member-account run reports the leg as unassessed instead of reporting no
+    delegation. ``locking`` names each policy that locks the default at every
+    placement, and ``open`` names what each other policy leaves open.
     """
-    result = {"readable": False, "delegating": [], "errors": []}
+    result = {
+        "readable": False,
+        "delegating": [],
+        "errors": [],
+        "locking": [],
+        "open": [],
+        "account": "",
+    }
     context = _organization_policy_context()
     if not context["readable"]:
         result["detail"] = context["detail"]
         return result
+    result["account"] = context["account"]
 
     orgs_client = boto3.client("organizations", config=boto3_config)
+    try:
+        path = _organization_account_path(orgs_client, context["account"])
+    except Exception as error:
+        result["errors"].append(
+            "the account's position in the organization could not be read "
+            f"(organizations:ListParents: {get_assessment_error_label(error)})"
+        )
+        return result
+    path_ids = {target["Id"] for target in path}
+
     try:
         policies = _list_all_items(
             orgs_client,
@@ -22534,6 +22597,32 @@ def _ai_services_opt_out_child_overrides() -> Dict[str, Any]:
             continue
         policy_name = policy.get("Name") or policy_id
         try:
+            targets = _list_all_items(
+                orgs_client,
+                "list_targets_for_policy",
+                "Targets",
+                max_results_param="MaxResults",
+                token_param="NextToken",
+                token_response_keys=("NextToken",),
+                max_results=20,
+                PolicyId=policy_id,
+            )
+        except Exception as error:
+            result["errors"].append(
+                f"policy '{policy_name}' targets: {get_assessment_error_label(error)}"
+            )
+            continue
+        attached_to = [
+            "{} {}".format(
+                str(target.get("Type", "target")).lower().replace("_", " "),
+                target.get("TargetId"),
+            )
+            for target in targets
+            if target.get("TargetId") in path_ids
+        ]
+        if not attached_to:
+            continue
+        try:
             detail = orgs_client.describe_policy(PolicyId=policy_id)
         except Exception as error:
             result["errors"].append(
@@ -22556,6 +22645,12 @@ def _ai_services_opt_out_child_overrides() -> Dict[str, Any]:
             result["delegating"].append(
                 f"'{policy_name}' delegates {', '.join(delegated)} to child policies"
             )
+        gaps = _ai_opt_out_lock_gaps(document)
+        described = f"'{policy_name}' (attached to {', '.join(attached_to)})"
+        if gaps:
+            result["open"].append(f"{described}: {'; '.join(gaps)}")
+        else:
+            result["locking"].append(described)
 
     return result
 
@@ -22739,6 +22834,9 @@ def check_bedrock_ai_services_opt_out(region: str = "") -> Dict[str, Any]:
                     "the source opt-out policy documents could not be read: "
                     f"{get_assessment_error_label(error)}"
                 ],
+                "locking": [],
+                "open": [],
+                "account": "",
             }
 
         child_clause = (
@@ -22755,17 +22853,86 @@ def check_bedrock_ai_services_opt_out(region: str = "") -> Dict[str, Any]:
 
         default_opts_out = scope["default"] == AI_OPT_OUT_VALUE
 
-        if default_opts_out and not scope["opted_in"]:
+        effective_clause = (
+            "The effective AI services opt-out policy for target {} sets "
+            "services.default.opt_out_policy to optOut and no service section opts "
+            "back in".format(policy.get("TargetId") or "this account")
+        )
+        lock_placements = ", ".join(
+            ".".join(placement) for placement in AI_OPT_OUT_LOCK_PLACEMENTS
+        )
+        if default_opts_out and not scope["opted_in"] and not overrides["locking"]:
+            findings["status"] = "WARN"
+            if overrides["readable"] and not overrides["errors"]:
+                lock_status = "Failed"
+                lock_detail = (
+                    "{}, but no opt-out policy attached to the root, an OU in the "
+                    "path of account {} or the account itself sets "
+                    '["@@none"] at all of {}, so a child policy can add a service '
+                    "section that opts back in, as AWS Example 2 shows for Amazon "
+                    "Lex. {} policy(ies) apply{}.{}".format(
+                        effective_clause,
+                        overrides["account"] or "unknown",
+                        lock_placements,
+                        len(overrides["open"]),
+                        ": " + " | ".join(overrides["open"][:5])
+                        if overrides["open"]
+                        else "",
+                        child_clause if overrides["delegating"] else "",
+                    )
+                )
+                lock_resolution = (
+                    "In the opt-out policy attached highest in the organization, set "
+                    '"@@operators_allowed_for_child_policies": ["@@none"] under '
+                    "services, under services.default and under "
+                    "services.default.opt_out_policy, as in AWS Example 1."
+                )
+                lock_severity = "Medium"
+            else:
+                lock_status = "N/A"
+                lock_detail = (
+                    "{}, but whether a child policy can opt a service back in was "
+                    "not established, and no readable policy was found that locks "
+                    "the default at all of {}: {}.".format(
+                        effective_clause,
+                        lock_placements,
+                        "; ".join(overrides["errors"][:5])
+                        or overrides.get("detail")
+                        or "the source policy documents were not readable",
+                    )
+                )
+                lock_resolution = (
+                    "Run the assessment from the organization management account or "
+                    "a delegated administrator with organizations:ListPolicies, "
+                    "organizations:ListTargetsForPolicy, organizations:ListParents "
+                    "and organizations:DescribePolicy, then retry."
+                )
+                lock_severity = "Informational"
+            findings["csv_data"].append(
+                create_finding(
+                    check_id="BR-48",
+                    finding_name=check_name,
+                    finding_details=lock_detail,
+                    resolution=lock_resolution,
+                    reference=AI_SERVICES_OPT_OUT_REFERENCE,
+                    severity=lock_severity,
+                    status=lock_status,
+                    region=region,
+                )
+            )
+        elif default_opts_out and not scope["opted_in"]:
             findings["csv_data"].append(
                 create_finding(
                     check_id="BR-48",
                     finding_name=check_name,
                     finding_details=(
-                        "The effective AI services opt-out policy for target {} sets "
-                        "services.default.opt_out_policy to optOut and no service "
-                        "section opts back in, so Amazon Bedrock content is not "
-                        "stored or used for service improvement.{}".format(
-                            policy.get("TargetId") or "this account", child_clause
+                        "{}, so Amazon Bedrock content is not stored or used for "
+                        "service improvement. {} sets "
+                        '["@@none"] at {}, so no policy attached below it can opt a '
+                        "service back in.".format(
+                            effective_clause,
+                            " and ".join(overrides["locking"][:3]),
+                            lock_placements,
                         )
                     ),
                     resolution=(

@@ -16083,6 +16083,34 @@ class TestBR48AIServicesOptOut:
     """BR-48: an AI services opt-out policy must resolve for the account."""
 
     ACCOUNT = "123456789012"
+    ROOT = "r-root"
+    OU = "ou-root-ai"
+
+    # AWS Example 1: ["@@none"] at all three placements.
+    LOCKED = {
+        "services": {
+            "@@operators_allowed_for_child_policies": ["@@none"],
+            "default": {
+                "@@operators_allowed_for_child_policies": ["@@none"],
+                "opt_out_policy": {
+                    "@@operators_allowed_for_child_policies": ["@@none"],
+                    "@@assign": "optOut",
+                },
+            },
+        }
+    }
+    # AWS Example 2: the services level is open, so a child can add lex: optIn.
+    TWO_OF_THREE = {
+        "services": {
+            "default": {
+                "@@operators_allowed_for_child_policies": ["@@none"],
+                "opt_out_policy": {
+                    "@@operators_allowed_for_child_policies": ["@@none"],
+                    "@@assign": "optOut",
+                },
+            },
+        }
+    }
 
     def _run(
         self,
@@ -16095,6 +16123,9 @@ class TestBR48AIServicesOptOut:
         list_policies_error=None,
         describe_policy_error=None,
         describe_organization_error=None,
+        policy_targets=None,
+        targets_error=None,
+        list_parents_error=None,
     ):
         orgs_client = MagicMock()
         if effective_error:
@@ -16140,6 +16171,33 @@ class TestBR48AIServicesOptOut:
 
         orgs_client.describe_policy.side_effect = describe_policy
 
+        parents = {
+            caller_account or self.ACCOUNT: {
+                "Id": self.OU,
+                "Type": "ORGANIZATIONAL_UNIT",
+            },
+            self.OU: {"Id": self.ROOT, "Type": "ROOT"},
+        }
+
+        def list_parents(ChildId, **kwargs):
+            if list_parents_error:
+                raise list_parents_error
+            return {"Parents": [parents[ChildId]]}
+
+        orgs_client.list_parents.side_effect = list_parents
+        targets = policy_targets or {}
+
+        def list_targets_for_policy(PolicyId, **kwargs):
+            if targets_error and PolicyId in targets_error:
+                raise targets_error[PolicyId]
+            return {
+                "Targets": targets.get(
+                    PolicyId, [{"TargetId": self.ROOT, "Type": "ROOT"}]
+                )
+            }
+
+        orgs_client.list_targets_for_policy.side_effect = list_targets_for_policy
+
         sts_client = MagicMock()
         sts_client.get_caller_identity.return_value = {
             "Account": caller_account or self.ACCOUNT
@@ -16158,7 +16216,9 @@ class TestBR48AIServicesOptOut:
 
     def test_br48_default_optout_passes(self):
         findings = self._run(
-            effective_content={"services": {"default": {"opt_out_policy": "optOut"}}}
+            effective_content={"services": {"default": {"opt_out_policy": "optOut"}}},
+            source_policies=[{"Id": "p-lock", "Name": "ai-lock"}],
+            source_documents={"p-lock": self.LOCKED},
         )
 
         assert [f["Status"] for f in findings] == ["Passed"]
@@ -16170,10 +16230,127 @@ class TestBR48AIServicesOptOut:
         )
         assert "o-a1b2c3d4e5" in findings[0]["Finding_Details"]
         assert (
-            "No source policy delegates the value to a child policy"
+            "'ai-lock' (attached to root r-root) sets [\"@@none\"] at services, "
+            "services.default, services.default.opt_out_policy, so no policy "
+            "attached below it can opt a service back in"
             in findings[0]["Finding_Details"]
         )
         assert_finding_schema(findings[0])
+
+    def test_br48_no_source_policy_to_lock_the_default_fails(self):
+        """The default read optOut, but nothing stops a child adding lex: optIn."""
+        findings = self._run(
+            effective_content={"services": {"default": {"opt_out_policy": "optOut"}}}
+        )
+
+        assert [f["Status"] for f in findings] == ["Failed"]
+        assert findings[0]["Severity"] == "Medium"
+        details = findings[0]["Finding_Details"]
+        assert "a child policy can add a service section that opts back in" in details
+        assert "0 policy(ies) apply." in details
+        assert "No source policy delegates the value" not in details
+
+    def test_br48_one_locking_policy_among_open_ones_passes_and_names_it(self):
+        findings = self._run(
+            effective_content={"services": {"default": {"opt_out_policy": "optOut"}}},
+            source_policies=[
+                {"Id": "p-open", "Name": "ai-open"},
+                {"Id": "p-lock", "Name": "ai-lock"},
+            ],
+            source_documents={"p-open": self.TWO_OF_THREE, "p-lock": self.LOCKED},
+            policy_targets={
+                "p-open": [{"TargetId": self.ROOT, "Type": "ROOT"}],
+                "p-lock": [{"TargetId": self.OU, "Type": "ORGANIZATIONAL_UNIT"}],
+            },
+        )
+
+        assert [f["Status"] for f in findings] == ["Passed"]
+        details = findings[0]["Finding_Details"]
+        assert f"'ai-lock' (attached to organizational unit {self.OU})" in details
+        assert "ai-open" not in details
+
+    def test_br48_two_of_three_placements_locked_fails_as_aws_example_2(self):
+        findings = self._run(
+            effective_content={"services": {"default": {"opt_out_policy": "optOut"}}},
+            source_policies=[
+                {"Id": "p-a", "Name": "ai-a"},
+                {"Id": "p-b", "Name": "ai-b"},
+            ],
+            source_documents={"p-a": self.TWO_OF_THREE, "p-b": self.TWO_OF_THREE},
+        )
+
+        assert [f["Status"] for f in findings] == ["Failed"]
+        details = findings[0]["Finding_Details"]
+        assert "2 policy(ies) apply" in details
+        assert "'ai-a' (attached to root r-root): services allows @@all" in details
+        assert "'ai-b' (attached to root r-root): services allows @@all" in details
+
+    def test_br48_locking_policy_attached_outside_the_path_is_not_credited(self):
+        findings = self._run(
+            effective_content={"services": {"default": {"opt_out_policy": "optOut"}}},
+            source_policies=[{"Id": "p-lock", "Name": "ai-lock"}],
+            source_documents={"p-lock": self.LOCKED},
+            policy_targets={
+                "p-lock": [{"TargetId": "ou-root-other", "Type": "ORGANIZATIONAL_UNIT"}]
+            },
+        )
+
+        assert [f["Status"] for f in findings] == ["Failed"]
+        assert "0 policy(ies) apply." in findings[0]["Finding_Details"]
+        assert "ai-lock" not in findings[0]["Finding_Details"]
+
+    def test_br48_locking_policy_that_assigns_opt_in_is_not_credited(self):
+        document = json.loads(json.dumps(self.LOCKED))
+        document["services"]["default"]["opt_out_policy"]["@@assign"] = "optIn"
+        findings = self._run(
+            effective_content={"services": {"default": {"opt_out_policy": "optOut"}}},
+            source_policies=[{"Id": "p-lock", "Name": "ai-lock"}],
+            source_documents={"p-lock": document},
+        )
+
+        assert [f["Status"] for f in findings] == ["Failed"]
+        assert (
+            "services.default.opt_out_policy does not assign optOut"
+            in findings[0]["Finding_Details"]
+        )
+
+    def test_br48_policy_targets_read_error_is_na(self):
+        findings = self._run(
+            effective_content={"services": {"default": {"opt_out_policy": "optOut"}}},
+            source_policies=[
+                {"Id": "p-open", "Name": "ai-open"},
+                {"Id": "p-unread", "Name": "ai-unread"},
+            ],
+            source_documents={"p-open": self.TWO_OF_THREE},
+            targets_error={
+                "p-unread": _client_error(
+                    "AccessDeniedException", operation="ListTargetsForPolicy"
+                )
+            },
+        )
+
+        assert [f["Status"] for f in findings] == ["N/A", "N/A"]
+        assert (
+            "whether a child policy can opt a service back in was not established"
+            in findings[0]["Finding_Details"]
+        )
+        assert "policy 'ai-unread' targets" in findings[0]["Finding_Details"]
+
+    def test_br48_account_path_read_error_is_na(self):
+        findings = self._run(
+            effective_content={"services": {"default": {"opt_out_policy": "optOut"}}},
+            source_policies=[{"Id": "p-lock", "Name": "ai-lock"}],
+            source_documents={"p-lock": self.LOCKED},
+            list_parents_error=_client_error(
+                "AccessDeniedException", operation="ListParents"
+            ),
+        )
+
+        assert [f["Status"] for f in findings] == ["N/A", "N/A"]
+        assert (
+            "the account's position in the organization could not be read"
+            in findings[0]["Finding_Details"]
+        )
 
     def test_br48_service_section_opting_back_in_fails_and_names_it(self):
         """AIR-FND-DAT-09: an optIn section re-enables content use for that service."""
@@ -16263,7 +16440,7 @@ class TestBR48AIServicesOptOut:
             },
         )
 
-        assert [f["Status"] for f in findings] == ["Passed"]
+        assert [f["Status"] for f in findings] == ["Failed"]
         assert (
             "'ai-opt-out' delegates @@assign to child policies"
             in findings[0]["Finding_Details"]
@@ -16286,12 +16463,16 @@ class TestBR48AIServicesOptOut:
             },
         )
 
-        assert [f["Status"] for f in findings] == ["Passed"]
+        assert [f["Status"] for f in findings] == ["Failed"]
         details = findings[0]["Finding_Details"]
         assert "No source policy delegates the value" not in details
         assert "'ai-opt-out' delegates @@all to child policies" in details
 
-    def test_br48_none_child_operator_locks_the_value(self):
+    def test_br48_none_child_operator_on_the_value_alone_does_not_lock(self):
+        """A lock on opt_out_policy alone still lets a child add a service section.
+
+        This used to pass and claim no source policy delegates the value.
+        """
         findings = self._run(
             effective_content={"services": {"default": {"opt_out_policy": "optOut"}}},
             source_policies=[{"Id": "p-1", "Name": "ai-opt-out"}],
@@ -16309,10 +16490,13 @@ class TestBR48AIServicesOptOut:
             },
         )
 
-        assert [f["Status"] for f in findings] == ["Passed"]
+        assert [f["Status"] for f in findings] == ["Failed"]
         details = findings[0]["Finding_Details"]
         assert "delegates @@none" not in details
-        assert "No source policy delegates the value to a child policy" in details
+        assert (
+            "'ai-opt-out' (attached to root r-root): services allows @@all; "
+            "services.default allows @@all" in details
+        )
 
     def test_br48_member_account_says_the_child_leg_was_not_assessed(self):
         findings = self._run(
@@ -16323,11 +16507,13 @@ class TestBR48AIServicesOptOut:
             ),
         )
 
-        assert [f["Status"] for f in findings] == ["Passed"]
+        assert [f["Status"] for f in findings] == ["N/A"]
+        details = findings[0]["Finding_Details"]
         assert (
-            "Whether a child policy may change the value was not assessed"
-            in findings[0]["Finding_Details"]
+            "whether a child policy can opt a service back in was not established"
+            in details
         )
+        assert "this assessment ran in account 111122223333" in details
 
     def test_br48_source_policy_read_error_keeps_the_effective_verdict(self):
         findings = self._run(
@@ -16340,7 +16526,8 @@ class TestBR48AIServicesOptOut:
             },
         )
 
-        assert [f["Status"] for f in findings] == ["Passed", "N/A"]
+        assert [f["Status"] for f in findings] == ["N/A", "N/A"]
+        assert "policy 'ai-opt-out'" in findings[0]["Finding_Details"]
         assert "policy 'ai-opt-out'" in findings[1]["Finding_Details"]
         assert "organizations:DescribePolicy" in findings[1]["Resolution"]
 
@@ -16351,7 +16538,9 @@ class TestBR48AIServicesOptOut:
                     "default": {"opt_out_policy": "optOut"},
                     "comprehend": {"opt_out_policy": 42},
                 }
-            }
+            },
+            source_policies=[{"Id": "p-lock", "Name": "ai-lock"}],
+            source_documents={"p-lock": self.LOCKED},
         )
 
         assert [f["Status"] for f in findings] == ["Passed", "N/A"]
