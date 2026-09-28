@@ -915,6 +915,23 @@ Resources:
                 - iot:ListPolicies # SM-41
                 - cloudtrail:LookupEvents # SM-40
               Resource: '*'
+            - Sid: ApprovedInventoryWithoutResourceType
+              # Read-only inventory approved for the SageMaker legs. None of these
+              # ten actions has a resource type in the service authorization
+              # reference, so each needs Resource '*'.
+              Effect: Allow
+              Action:
+                - events:ListRules # SM-04, SM-40
+                - cloudtrail:DescribeTrails # SM-09
+                - ram:ListResources # SM-22
+                - config:ListConfigurationRecorders # SM-32
+                - securityhub:GetConfigurationPolicyAssociation # SM-36
+                - inspector2:ListCoverage # SM-38
+                - ecs:ListClusters # SM-38, SM-39, SM-40
+                - ecs:ListServices # SM-39, SM-40
+                - ecs:DescribeTaskDefinition # SM-40
+                - iot:ListScheduledAudits # SM-41
+              Resource: '*'
             - Sid: EC2NetworkPostureInventory
               # SM-02, SM-11, SM-18 and SM-33 read interface VPC endpoints, SM-37
               # reads flow logs and SM-39 reads workload security groups. None of
@@ -989,7 +1006,7 @@ Resources:
             - Sid: JobKeyManagerRead
               Effect: Allow
               Action:
-                - kms:DescribeKey # SM-03, SM-18
+                - kms:DescribeKey # SM-03, SM-11, SM-18, SM-27
               Resource: !Sub 'arn:${AWS::Partition}:kms:*:${AWS::AccountId}:key/*'
 
   AgentCoreSecurityAssessmentFunction:

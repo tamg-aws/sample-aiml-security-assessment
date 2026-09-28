@@ -572,6 +572,10 @@ class TestProposedSageMakerChecks:
     # patched here to keep this unit test off the network.
     @patch("sagemaker_app.boto3.client")
     def test_sm27_and_sm28_share_hyperpod_inventory(self, mock_client):
+        # SM-27 credits a key only when kms:DescribeKey reports CUSTOMER.
+        mock_client.return_value.describe_key.return_value = {
+            "KeyMetadata": {"KeyManager": "CUSTOMER"}
+        }
         inventory = {
             "items": [
                 {
@@ -589,13 +593,13 @@ class TestProposedSageMakerChecks:
                                     {
                                         "EbsVolumeConfig": {
                                             "RootVolume": True,
-                                            "VolumeKmsKeyId": "arn:kms:key-1",
+                                            "VolumeKmsKeyId": "arn:aws:kms:us-east-1:123456789012:key/key-1",
                                         }
                                     },
                                     {
                                         "EbsVolumeConfig": {
                                             "RootVolume": False,
-                                            "VolumeKmsKeyId": "arn:kms:key-2",
+                                            "VolumeKmsKeyId": "arn:aws:kms:us-east-1:123456789012:key/key-2",
                                         }
                                     },
                                 ],
@@ -4887,10 +4891,16 @@ def _scp_deny(action, operator, key, value, resource="*"):
 APPROVED_KEY = "arn:aws:kms:us-east-1:123456789012:key/approved"
 SCP_ENCRYPTION_DENIES = [
     _scp_deny(
-        "sagemaker:CreateTrainingJob", "Null", "sagemaker:VolumeKmsKeyArn", "true"
+        ["sagemaker:CreateTrainingJob", "sagemaker:CreateTransformJob"],
+        "ArnNotEquals",
+        "sagemaker:VolumeKmsKeyArn",
+        [APPROVED_KEY],
     ),
     _scp_deny(
-        ["sagemaker:CreateTrainingJob"], "Null", "sagemaker:OutputKmsKeyArn", "true"
+        ["sagemaker:CreateTrainingJob", "sagemaker:CreateTransformJob"],
+        "ArnNotEquals",
+        "sagemaker:OutputKmsKeyArn",
+        [APPROVED_KEY],
     ),
     _scp_deny(
         "sagemaker:CreateTrainingJob",
@@ -4907,10 +4917,20 @@ SCP_ENCRYPTION_DENIES = [
 ]
 SCP_NETWORK_DENIES = [
     _scp_deny("sagemaker:Create*", "Null", "sagemaker:VpcSubnets", "true"),
+    _scp_deny(
+        "sagemaker:Create*",
+        "ForAnyValue:StringNotEquals",
+        "sagemaker:VpcSubnets",
+        ["subnet-1"],
+    ),
 ]
 SCP_INTERNET_DENIES = [
     _scp_deny(
-        ["sagemaker:CreateTrainingJob", "sagemaker:CreateEndpointConfig"],
+        [
+            "sagemaker:CreateTrainingJob",
+            "sagemaker:CreateEndpointConfig",
+            "sagemaker:CreateModel",
+        ],
         "BoolIfExists",
         "sagemaker:NetworkIsolation",
         "false",
@@ -4937,6 +4957,7 @@ GUARDED_CREATE_ALLOWS = [
                 "sagemaker:InterContainerTrafficEncryption": "true",
                 "sagemaker:NetworkIsolation": "true",
             },
+            "ForAllValues:StringEquals": {"sagemaker:VpcSubnets": ["subnet-1"]},
             "Null": {"sagemaker:VpcSubnets": "false"},
         },
     },
@@ -4947,7 +4968,8 @@ GUARDED_CREATE_ALLOWS = [
         "Condition": {
             "ArnEquals": {"sagemaker:VolumeKmsKeyArn": APPROVED_KEY},
             "Bool": {"sagemaker:NetworkIsolation": "true"},
-            "ForAnyValue:StringEquals": {"sagemaker:VpcSecurityGroupIds": ["sg-1"]},
+            "ForAllValues:StringEquals": {"sagemaker:VpcSecurityGroupIds": ["sg-1"]},
+            "Null": {"sagemaker:VpcSecurityGroupIds": "false"},
         },
     },
     {
@@ -4957,7 +4979,29 @@ GUARDED_CREATE_ALLOWS = [
         "Condition": {
             "ArnEquals": {"sagemaker:VolumeKmsKeyArn": APPROVED_KEY},
             "StringEquals": {"sagemaker:DirectInternetAccess": "Disabled"},
+            "ForAllValues:StringEquals": {"sagemaker:VpcSubnets": ["subnet-1"]},
             "Null": {"sagemaker:VpcSubnets": "false"},
+        },
+    },
+    {
+        "Effect": "Allow",
+        "Action": "sagemaker:CreateModel",
+        "Resource": "*",
+        "Condition": {
+            "Bool": {"sagemaker:NetworkIsolation": "true"},
+            "ForAllValues:StringEquals": {"sagemaker:VpcSubnets": ["subnet-1"]},
+            "Null": {"sagemaker:VpcSubnets": "false"},
+        },
+    },
+    {
+        "Effect": "Allow",
+        "Action": "sagemaker:CreateTransformJob",
+        "Resource": "*",
+        "Condition": {
+            "ArnEquals": {
+                "sagemaker:VolumeKmsKeyArn": APPROVED_KEY,
+                "sagemaker:OutputKmsKeyArn": APPROVED_KEY,
+            },
         },
     },
 ]
@@ -5126,6 +5170,7 @@ class TestSM34CreationGuardrails:
                                 "sagemaker:CreateTrainingJob",
                                 "sagemaker:CreateEndpointConfig",
                                 "sagemaker:CreateNotebookInstance",
+                                "sagemaker:CreateModel",
                             ],
                             "StringEquals",
                             "sagemaker:VpcSubnets",
@@ -5234,7 +5279,7 @@ class TestSM34CreationGuardrails:
         )
         row = self._by_category(findings)["encryption"]
         assert row["Status"] == "Failed"
-        assert "5 of 5 encryption requirements" in row["Finding_Details"]
+        assert "7 of 7 encryption requirements" in row["Finding_Details"]
 
     def test_a_key_guards_only_the_actions_it_is_paired_with(self):
         findings = self._run(
@@ -5254,7 +5299,7 @@ class TestSM34CreationGuardrails:
         )
         row = self._by_category(findings)["encryption"]
         assert row["Status"] == "Failed"
-        assert "4 of 5 encryption requirements" in row["Finding_Details"]
+        assert "7 of 7 encryption requirements" in row["Finding_Details"]
         assert (
             "CreateTrainingJob on sagemaker:VolumeKmsKeyArn" in row["Finding_Details"]
         )
@@ -5325,8 +5370,10 @@ class TestSM34CreationGuardrails:
         assert row["Status"] == "Failed"
         assert "does not deny a request that omits the key" in row["Finding_Details"]
 
-    def test_forallvalues_negated_enforces_and_foranyvalue_does_not(self):
-        def network_row(operator):
+    def test_neither_set_operator_alone_enforces_a_subnet_list(self):
+        # ForAllValues admits a request that mixes subnet-1 with another
+        # subnet, and ForAnyValue does not fire when the key is omitted.
+        def network_row(*operators):
             return self._by_category(
                 self._run(
                     self._inventory(
@@ -5337,16 +5384,23 @@ class TestSM34CreationGuardrails:
                                     "sagemaker:Create*",
                                     operator,
                                     "sagemaker:VpcSubnets",
-                                    ["subnet-1"],
+                                    ["subnet-1"] if operator != "Null" else "true",
                                 )
+                                for operator in operators
                             ],
                         )
                     )
                 )
             )["approved network"]
 
-        assert network_row("ForAllValues:StringNotEquals")["Status"] == "Passed"
+        mixed = network_row("ForAllValues:StringNotEquals")
+        assert mixed["Status"] == "Failed"
+        assert "admits any value" in mixed["Finding_Details"]
         assert network_row("ForAnyValue:StringNotEquals")["Status"] == "Failed"
+        assert network_row("Null")["Status"] == "Failed"
+        paired = network_row("Null", "ForAnyValue:StringNotEquals")
+        assert paired["Status"] == "Passed"
+        assert "SubnetAllowList" in paired["Finding_Details"]
 
     def test_a_deny_with_a_second_condition_or_narrow_resource_is_not_enforcing(self):
         conjunctive = _scp_deny(
@@ -5357,9 +5411,9 @@ class TestSM34CreationGuardrails:
         }
         narrow = _scp_deny(
             "sagemaker:Create*",
-            "Null",
+            "StringNotEquals",
             "sagemaker:VpcSubnets",
-            "true",
+            ["subnet-1"],
             resource="arn:aws:sagemaker:*:*:training-job/team-a-*",
         )
         for statement in (conjunctive, narrow):
@@ -6476,6 +6530,16 @@ class TestSM35SecurityServiceDelegatedAdmin:
                     {"DelegatedAdministrators": [active]},
                 ],
                 "cloudtrail.amazonaws.com": [{"DelegatedAdministrators": [active]}],
+                "detective.amazonaws.com": [{"DelegatedAdministrators": [active]}],
+                "securitylake.amazonaws.com": [{"DelegatedAdministrators": []}],
+                "fms.amazonaws.com": [{"DelegatedAdministrators": [active]}],
+                "auditmanager.amazonaws.com": [
+                    {
+                        "DelegatedAdministrators": [
+                            {"Id": self.MANAGEMENT, "Status": "ACTIVE"}
+                        ]
+                    }
+                ],
             }
         )
         rows = _rows(
@@ -6489,6 +6553,10 @@ class TestSM35SecurityServiceDelegatedAdmin:
             "Failed",
             "Passed",
             "Passed",
+            "Passed",
+            "Failed",
+            "Passed",
+            "Failed",
             "Failed",
         ]
         assert all(r["Check_ID"] == "SM-35" for r in rows)
@@ -6520,7 +6588,7 @@ class TestSM35SecurityServiceDelegatedAdmin:
             }
         )
         rows = _rows(sagemaker_app.check_security_service_delegated_admin())
-        assert [r["Status"] for r in rows] == ["Passed"] * 8
+        assert [r["Status"] for r in rows] == ["Passed"] * 12
         assert self.MANAGEMENT not in rows[0]["Finding_Details"].split(".")[0]
         assert (
             f"one non-management account {self.SECURITY}"
@@ -6538,7 +6606,7 @@ class TestSM35SecurityServiceDelegatedAdmin:
         pages["guardduty.amazonaws.com"] = _make_client_error("TooManyRequests")
         mock_client.return_value = self._client(pages)
         rows = _rows(sagemaker_app.check_security_service_delegated_admin())
-        assert len(rows) == 8
+        assert len(rows) == 12
         assert_could_not_assess_finding(rows[0])
         assert "readable only from" not in rows[0]["Finding_Details"]
         assert rows[1]["Status"] == "Failed"
@@ -6593,11 +6661,42 @@ class TestSM35DelegatedAdminConsolidation:
             sagemaker_app.SECURITY_SERVICE_PRINCIPALS
         )
 
+    @pytest.mark.parametrize(
+        "service",
+        [
+            ("Amazon Detective", "detective.amazonaws.com"),
+            ("Amazon Security Lake", "securitylake.amazonaws.com"),
+            ("AWS Firewall Manager", "fms.amazonaws.com"),
+            ("AWS Audit Manager", "auditmanager.amazonaws.com"),
+        ],
+    )
+    def test_acc09_services_are_checked(self, service):
+        assert service in sagemaker_app.SECURITY_SERVICE_PRINCIPALS
+
+    @patch("sagemaker_app.boto3.client")
+    def test_a_management_administered_audit_manager_fails(self, mock_client):
+        rows = self._rows(
+            mock_client,
+            {
+                "auditmanager.amazonaws.com": [
+                    {
+                        "DelegatedAdministrators": [
+                            {"Id": self.MANAGEMENT, "Status": "ACTIVE"}
+                        ]
+                    }
+                ]
+            },
+        )
+        audit = [r for r in rows if "AWS Audit Manager (" in r["Finding_Details"]]
+        assert [r["Status"] for r in audit] == ["Failed"]
+        assert rows[-1]["Status"] == "Failed"
+        assert "AWS Audit Manager" in rows[-1]["Finding_Details"].split(".")[0]
+
     @patch("sagemaker_app.boto3.client")
     def test_one_shared_administrator_passes(self, mock_client):
         rows = self._rows(mock_client)
         assert rows[-1]["Status"] == "Passed"
-        assert "7 security services" in rows[-1]["Finding_Details"]
+        assert "11 security services" in rows[-1]["Finding_Details"]
         assert "not recorded by any Organizations API" in rows[-1]["Finding_Details"]
 
     @patch("sagemaker_app.boto3.client")
@@ -6615,7 +6714,7 @@ class TestSM35DelegatedAdminConsolidation:
             },
         )
         # Every per-service row passes; only the cross-service row sees the split.
-        assert [r["Status"] for r in rows[:-1]] == ["Passed"] * 7
+        assert [r["Status"] for r in rows[:-1]] == ["Passed"] * 11
         assert rows[-1]["Status"] == "Failed"
         assert f"account {self.OTHER}: Amazon Inspector" in rows[-1]["Finding_Details"]
 
@@ -6676,8 +6775,16 @@ class TestSM36SecurityHubAIStandard:
         "aws-foundational-security-best-practices/v/1.0.0"
     )
 
-    def _run(self, mock_client, pages=None, error=None, configuration=None):
+    def _run(
+        self, mock_client, pages=None, error=None, configuration=None, association=None
+    ):
         client = MagicMock()
+        if association is not None:
+            client.get_caller_identity.return_value = {"Account": "123456789012"}
+            if isinstance(association, Exception):
+                client.get_configuration_policy_association.side_effect = association
+            else:
+                client.get_configuration_policy_association.return_value = association
         if error is not None:
             client.get_paginator.side_effect = error
         else:
@@ -6692,7 +6799,7 @@ class TestSM36SecurityHubAIStandard:
         mock_client.return_value = client
         return _rows(sagemaker_app.check_security_hub_ai_standard(region="us-east-1"))
 
-    def _central(self, mock_client, configuration):
+    def _central(self, mock_client, configuration, association=None):
         rows = self._run(
             mock_client,
             [
@@ -6703,6 +6810,7 @@ class TestSM36SecurityHubAIStandard:
                 }
             ],
             configuration=configuration,
+            association=association,
         )
         assert rows[0]["Status"] == "Passed"
         assert len(rows) == 2
@@ -6728,6 +6836,71 @@ class TestSM36SecurityHubAIStandard:
         assert row["Status"] == "N/A"
         assert row["Finding"].endswith("Incomplete")
         assert "GetConfigurationPolicyAssociation" in row["Finding_Details"]
+
+    def _association(self, mock_client, association):
+        row = self._central(
+            mock_client,
+            {"ConfigurationType": "CENTRAL", "Status": "ENABLED"},
+            association=association,
+        )
+        call = mock_client.return_value.get_configuration_policy_association
+        assert call.call_args.kwargs == {"Target": {"AccountId": "123456789012"}}
+        return row
+
+    @pytest.mark.parametrize("how", ["APPLIED", "INHERITED"])
+    @patch("sagemaker_app.boto3.client")
+    def test_self_managed_association_fails(self, mock_client, how):
+        row = self._association(
+            mock_client,
+            {
+                "ConfigurationPolicyId": "SELF_MANAGED_SECURITY_HUB",
+                "AssociationType": how,
+                "AssociationStatus": "SUCCESS",
+            },
+        )
+        assert row["Status"] == "Failed"
+        assert "self-managed" in row["Finding_Details"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_failed_association_fails(self, mock_client):
+        row = self._association(
+            mock_client,
+            {
+                "ConfigurationPolicyId": "a1b2",
+                "AssociationType": "APPLIED",
+                "AssociationStatus": "FAILED",
+                "AssociationStatusMessage": "boom",
+            },
+        )
+        assert row["Status"] == "Failed"
+        assert "AssociationStatus FAILED" in row["Finding_Details"]
+        assert "boom" in row["Finding_Details"]
+
+    @pytest.mark.parametrize("status", ["SUCCESS", "PENDING"])
+    @patch("sagemaker_app.boto3.client")
+    def test_policy_association_names_the_unread_policy(self, mock_client, status):
+        row = self._association(
+            mock_client,
+            {
+                "ConfigurationPolicyId": "a1b2",
+                "AssociationType": "INHERITED",
+                "AssociationStatus": status,
+            },
+        )
+        assert row["Status"] == "N/A"
+        assert row["Finding"].endswith("Incomplete")
+        assert "configuration policy a1b2" in row["Finding_Details"]
+        assert "securityhub:GetConfigurationPolicy," in row["Finding_Details"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_association_access_denied_is_incomplete(self, mock_client):
+        row = self._association(
+            mock_client, _make_client_error("AccessDeniedException")
+        )
+        assert row["Status"] == "N/A"
+        assert row["Finding"].endswith("Incomplete")
+        assert "GetConfigurationPolicyAssociation failed" in row["Finding_Details"]
+        assert "AccessDeniedException" in row["Finding_Details"]
 
     @patch("sagemaker_app.boto3.client")
     def test_central_not_enabled_fails(self, mock_client):
@@ -7095,6 +7268,89 @@ class TestSM37EndpointFlowLogAlerting:
         ]
         rows = self._run(mock_client, alarms=[self._alarm(MetricName="Other"), band])
         assert [r["Status"] for r in rows] == ["Passed"]
+
+    def _filters(self, *patterns, **extra):
+        return {
+            "/flow/a": [
+                {
+                    "logGroupName": "/flow/a",
+                    "filterName": f"f{i}",
+                    "filterPattern": pattern,
+                    "metricTransformations": [
+                        {"metricNamespace": "Flow", "metricName": "Egress"}
+                    ],
+                    **extra,
+                }
+                for i, pattern in enumerate(patterns)
+            ]
+        }
+
+    @pytest.mark.parametrize(
+        "pattern",
+        [
+            "",
+            "[version, account, eni, source, destination != 10.*, srcport, "
+            "destport, protocol, packets, bytes, start, end, action, status]",
+            "REJECT",
+            '"ACCEPT" 443',
+            "?REJECT ?ERROR",
+            "-ERROR",
+        ],
+    )
+    @patch("sagemaker_app.boto3.client")
+    def test_pattern_that_matches_flow_log_records_passes(self, mock_client, pattern):
+        rows = self._run(mock_client, filters=self._filters(pattern))
+        assert [r["Status"] for r in rows] == ["Passed"]
+
+    @pytest.mark.parametrize(
+        "pattern",
+        ["ERROR", '{ $.action = "REJECT" }', "REJECT Exception", "?ERROR ?Timeout"],
+    )
+    @patch("sagemaker_app.boto3.client")
+    def test_pattern_that_matches_no_flow_log_record_fails(self, mock_client, pattern):
+        rows = self._run(mock_client, filters=self._filters(pattern))
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "pattern matches no flow-log record" in rows[0]["Finding_Details"]
+        assert "'f0'" in rows[0]["Finding_Details"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_json_pattern_on_transformed_logs_passes(self, mock_client):
+        rows = self._run(
+            mock_client,
+            filters=self._filters(
+                '{ $.action = "REJECT" }', applyOnTransformedLogs=True
+            ),
+        )
+        assert [r["Status"] for r in rows] == ["Passed"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_one_matching_filter_beside_a_dead_one_passes(self, mock_client):
+        rows = self._run(mock_client, filters=self._filters("ERROR", "REJECT"))
+        assert [r["Status"] for r in rows] == ["Passed"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_each_subnet_needs_an_alarmed_flow_log(self, mock_client):
+        # subnet-1's VPC log group is alarmed; subnet-2's is not. Before the
+        # per-subnet join the alarmed group on subnet-1 passed the endpoint.
+        rows = self._run(
+            mock_client,
+            endpoints={"ep-1": {"models": ["m-1"]}},
+            models={"m-1": ["subnet-1", "subnet-2"]},
+            flow_logs=[
+                self._flow_log("vpc-1"),
+                self._flow_log("vpc-2", group="/flow/b"),
+            ],
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "/flow/b covering subnet-2" in rows[0]["Finding_Details"]
+        assert "/flow/a" not in rows[0]["Finding_Details"].split("SageMaker")[0]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_text_names_the_alarm_history_grant(self, mock_client):
+        rows = self._run(mock_client)
+        details = rows[0]["Finding_Details"]
+        assert "cloudwatch:DescribeAlarmHistory" in details
+        assert "not recorded by any CloudWatch API and was not assessed" not in details
 
     @patch("sagemaker_app.boto3.client")
     def test_filter_on_another_log_group_does_not_count(self, mock_client):
@@ -9693,6 +9949,7 @@ class TestSM02CacheContractOtherLegs:
                         {"name": "SM", "document": _identity_policy("sagemaker:*", "*")}
                     ],
                     "inline_policies": [],
+                    "group_policies": [],
                     "permissions_boundary": None,
                 }
             },
@@ -9761,9 +10018,21 @@ _PRIVATE_RUNTIME_VPCE = {
 }
 
 
-def _sm11_rows(models, endpoints=None, configs=None, vpces=None, extra_pages=None):
-    """Run SM-11 against models {name: DescribeModel}, endpoints {name: config}."""
+def _sm11_rows(
+    models,
+    endpoints=None,
+    configs=None,
+    vpces=None,
+    extra_pages=None,
+    permission_cache=None,
+    key_managers=None,
+):
+    """Run SM-11 against models {name: DescribeModel}, endpoints {name: config}.
+
+    kms:DescribeKey reports CUSTOMER for any key not in key_managers.
+    """
     endpoints = endpoints or {}
+    key_managers = key_managers or {}
     configs = configs or {}
     pages = {
         "list_models": [{"Models": [{"ModelName": n} for n in models]}],
@@ -9808,10 +10077,21 @@ def _sm11_rows(models, endpoints=None, configs=None, vpces=None, extra_pages=Non
     }
     ec2_calls = {}
     ec2 = _pages_client(ec2_pages, calls=ec2_calls)
+
+    def describe_key(KeyId):
+        value = key_managers.get(KeyId, "CUSTOMER")
+        if isinstance(value, Exception):
+            raise value
+        return {"KeyMetadata": {"KeyId": KeyId, "KeyManager": value}}
+
+    kms = MagicMock()
+    kms.describe_key.side_effect = describe_key
     with patch("sagemaker_app.boto3.client") as mock_client:
-        mock_client.side_effect = _sm_client_factory(sagemaker=sm, ec2=ec2)
+        mock_client.side_effect = _sm_client_factory(sagemaker=sm, ec2=ec2, kms=kms)
         rows = _rows(
-            sagemaker_app.check_sagemaker_model_network_isolation(region="us-east-1")
+            sagemaker_app.check_sagemaker_model_network_isolation(
+                region="us-east-1", permission_cache=permission_cache
+            )
         )
     return rows, ec2_calls
 
@@ -10016,6 +10296,38 @@ class TestSM11EndpointConfigKms:
         assert [r["Status"] for r in rows] == ["Passed"]
         assert "inter-container traffic encryption" in rows[0]["Finding_Details"]
 
+    @pytest.mark.parametrize("aws_key", ["k-aws", "alias/aws/sagemaker"])
+    def test_aws_managed_key_beside_a_customer_key_is_failed(self, aws_key):
+        rows, _ = _sm11_rows(
+            {"a": _ISOLATED_VPC_MODEL},
+            endpoints={"ep-cmk": "cfg-cmk", "ep-aws": "cfg-aws"},
+            configs={
+                "cfg-cmk": _config(["a"], kms="k-cmk"),
+                "cfg-aws": _config(["a"], kms=aws_key),
+            },
+            key_managers={"k-aws": "AWS"},
+        )
+        rows = _by_finding(rows, sagemaker_app.ENDPOINT_CONFIG_KMS_FINDING)
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "ep-aws" in rows[0]["Finding_Details"]
+        assert "AWS managed key" in rows[0]["Finding_Details"]
+        assert "ep-cmk" not in rows[0]["Finding_Details"]
+
+    def test_describe_key_error_holds_back_passed(self):
+        rows, _ = _sm11_rows(
+            {"a": _ISOLATED_VPC_MODEL},
+            endpoints={"ep-1": "cfg-1", "ep-2": "cfg-2"},
+            configs={
+                "cfg-1": _config(["a"], kms="k1"),
+                "cfg-2": _config(["a"], kms="k2"),
+            },
+            key_managers={"k2": _make_client_error("AccessDeniedException")},
+        )
+        rows = _by_finding(rows, sagemaker_app.ENDPOINT_CONFIG_KMS_FINDING)
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert "kms:DescribeKey k2" in rows[0]["Finding_Details"]
+        assert "1 instance-backed endpoint(s)" in rows[0]["Finding_Details"]
+
     def test_serverless_only_config_is_not_judged(self):
         config = {
             "ProductionVariants": [
@@ -10214,6 +10526,210 @@ class TestSM02RuntimeVpcEndpointPolicy:
         source = open(os.path.join(_sm_dir, "app.py"), encoding="utf-8").read()
         handler = source[source.index("def lambda_handler") :]
         assert "check_sagemaker_runtime_endpoint_policy(region=region)" in handler
+
+
+def _invoke_allow(condition=None, resource="*"):
+    return _identity_policy("sagemaker:InvokeEndpoint", resource, condition)
+
+
+def _invoke_deny(operator, key="aws:SourceVpce", value="vpce-1", **extra):
+    statement = {
+        "Effect": "Deny",
+        "Action": "sagemaker:InvokeEndpoint",
+        "Resource": extra.pop("resource", "*"),
+        "Condition": {operator: {key: value}, **extra.pop("more", {})},
+    }
+    if "not_resource" in extra:
+        del statement["Resource"]
+        statement["NotResource"] = extra.pop("not_resource")
+    return statement
+
+
+class TestSM11InvokeSourceNetwork:
+    """AIR-SGM-EP-01: invoke grants held to aws:SourceVpce or aws:SourceVpc."""
+
+    INVENTORY = {"endpoints": [{"name": "ep-1"}]}
+    PINNED = {"StringEquals": {"aws:SourceVpce": "vpce-1"}}
+
+    def _rows(self, cache, inventory=None):
+        return _rows(
+            {
+                "csv_data": sagemaker_app._invoke_source_network_findings(
+                    cache, inventory or self.INVENTORY, "us-east-1"
+                )
+            }
+        )
+
+    def test_open_role_fails_beside_a_pinned_one(self):
+        rows = self._rows(
+            _v2_cache(
+                {
+                    "Pinned": [("PinnedInvoke", _invoke_allow(self.PINNED))],
+                    "Open": [("OpenInvoke", _invoke_allow())],
+                }
+            )
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert rows[0]["Check_ID"] == "SM-11"
+        assert "Role 'Open' (policy 'OpenInvoke')" in rows[0]["Finding_Details"]
+        assert "Pinned" not in rows[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "condition",
+        [
+            {"StringEquals": {"aws:SourceVpce": "vpce-1"}},
+            {"StringEquals": {"aws:SourceVpc": ["vpc-1", "vpc-2"]}},
+            {"StringLike": {"aws:SourceVpce": "vpce-1"}},
+            {"ForAnyValue:StringEquals": {"aws:SourceVpce": "vpce-1"}},
+        ],
+    )
+    def test_pinned_allow_passes(self, condition):
+        rows = self._rows(_v2_cache({"R": [("P", _invoke_allow(condition))]}))
+        assert [r["Status"] for r in rows] == ["Passed"]
+        assert "Role 'R'" in rows[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "condition",
+        [
+            {"StringEqualsIfExists": {"aws:SourceVpce": "vpce-1"}},
+            {"StringNotEquals": {"aws:SourceVpce": "vpce-1"}},
+            {"Null": {"aws:SourceVpce": "false"}},
+            {"StringLike": {"aws:SourceVpce": "vpce-*"}},
+            {"ForAllValues:StringEquals": {"aws:SourceVpce": "vpce-1"}},
+            {"StringEquals": {"aws:SourceAccount": "123456789012"}},
+        ],
+    )
+    def test_allow_that_admits_a_public_call_fails(self, condition):
+        rows = self._rows(_v2_cache({"R": [("P", _invoke_allow(condition))]}))
+        assert [r["Status"] for r in rows] == ["Failed"]
+
+    def test_second_unpinned_statement_fails_the_principal(self):
+        rows = self._rows(
+            _v2_cache(
+                {
+                    "R": [
+                        ("Pinned", _invoke_allow(self.PINNED)),
+                        ("Async", _identity_policy("sagemaker:Invoke*", "*")),
+                    ]
+                }
+            )
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "policy 'Async'" in rows[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "deny",
+        [
+            _invoke_deny("StringNotEquals"),
+            _invoke_deny("StringNotEqualsIfExists", key="aws:SourceVpc", value="v"),
+            _invoke_deny(
+                "StringNotEquals",
+                resource="arn:aws:sagemaker:*:*:endpoint/*",
+            ),
+        ],
+    )
+    def test_identity_deny_outside_the_vpce_passes(self, deny):
+        policy = _invoke_allow()
+        policy["Statement"].append(deny)
+        rows = self._rows(_v2_cache({"R": [("P", policy)]}))
+        assert [r["Status"] for r in rows] == ["Passed"]
+
+    @pytest.mark.parametrize(
+        "deny",
+        [
+            _invoke_deny("ForAnyValue:StringNotEquals"),
+            _invoke_deny("StringNotLike", value="vpce-*"),
+            _invoke_deny(
+                "StringNotEquals", more={"Bool": {"aws:ViaAWSService": "false"}}
+            ),
+            _invoke_deny(
+                "StringNotEquals",
+                resource="arn:aws:sagemaker:us-east-1:123456789012:endpoint/a",
+            ),
+            _invoke_deny("StringNotEquals", not_resource="arn:aws:s3:::b"),
+            _invoke_deny("StringEquals"),
+        ],
+    )
+    def test_deny_that_misses_a_public_call_fails(self, deny):
+        policy = _invoke_allow()
+        policy["Statement"].append(deny)
+        rows = self._rows(_v2_cache({"R": [("P", policy)]}))
+        assert [r["Status"] for r in rows] == ["Failed"]
+
+    def test_group_grant_is_read(self):
+        rows = self._rows(
+            _v2_cache({}, users={"G": _group_user("GroupInvoke", _invoke_allow())})
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "User 'G' (policy 'GroupInvoke')" in rows[0]["Finding_Details"]
+
+    def test_pinning_boundary_passes_and_a_boundary_without_invoke_is_skipped(self):
+        cache = _v2_cache(
+            {"Bounded": [("P", _invoke_allow())], "NoInvoke": [("P", _invoke_allow())]},
+            boundaries={
+                "Bounded": _invoke_allow(self.PINNED),
+                "NoInvoke": _identity_policy("s3:GetObject", "*"),
+            },
+        )
+        rows = self._rows(cache)
+        assert [r["Status"] for r in rows] == ["Passed"]
+        assert "1 principal(s)" in rows[0]["Finding_Details"]
+        assert "NoInvoke" not in rows[0]["Finding_Details"]
+
+    def test_unread_principal_holds_back_passed(self):
+        cache = _v2_cache(
+            {"R": [("P", _invoke_allow(self.PINNED))]},
+            principal_errors=[
+                {"type": "Role", "name": "Hidden", "stage": "attached_policies"}
+            ],
+        )
+        rows = self._rows(cache)
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert rows[0]["Finding"].endswith("Incomplete")
+        assert "Role 'Hidden'" in rows[0]["Finding_Details"]
+
+    def test_unread_boundary_is_incomplete_not_failed(self):
+        cache = _v2_cache(
+            {"R": [("P", _invoke_allow())]},
+            principal_errors=[
+                {"type": "Role", "name": "R", "stage": "permissions_boundary"}
+            ],
+        )
+        rows = self._rows(cache)
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert "permissions boundary not read" in rows[0]["Finding_Details"]
+
+    def test_no_endpoints_emits_nothing(self):
+        cache = _v2_cache({"R": [("P", _invoke_allow())]})
+        assert self._rows(cache, inventory={"endpoints": []}) == []
+
+    def test_missing_cache_is_incomplete(self):
+        rows = self._rows(None)
+        assert [r["Status"] for r in rows] == ["N/A"]
+
+    def test_check_reads_the_cache_it_is_given(self):
+        rows, _ = _sm11_rows(
+            {"m": _ISOLATED_VPC_MODEL},
+            endpoints={"ep-1": "cfg"},
+            configs={"cfg": _config(["m"])},
+            vpces=[_PRIVATE_RUNTIME_VPCE],
+            permission_cache=_v2_cache({"Open": [("OpenInvoke", _invoke_allow())]}),
+        )
+        source = [
+            r
+            for r in rows
+            if r["Finding"] == sagemaker_app.INVOKE_SOURCE_NETWORK_FINDING
+        ]
+        assert [r["Status"] for r in source] == ["Failed"]
+        assert "Role 'Open'" in source[0]["Finding_Details"]
+
+    def test_handler_passes_the_cache(self):
+        source = open(os.path.join(_sm_dir, "app.py"), encoding="utf-8").read()
+        handler = source[source.index("def lambda_handler") :]
+        assert (
+            "check_sagemaker_model_network_isolation(\n"
+            "            region=region, permission_cache=permission_cache"
+        ) in handler
 
 
 # ===================================================================
@@ -10448,6 +10964,28 @@ def _tls_policy(bucket="data", **overrides):
     )
 
 
+def _s3_endpoint_policy(resource, principal="*", condition=None, sid="Data"):
+    statement = {
+        "Sid": sid,
+        "Effect": "Allow",
+        "Principal": principal,
+        "Action": ["s3:GetObject", "s3:PutObject"],
+        "Resource": resource,
+    }
+    if condition:
+        statement["Condition"] = condition
+    return json.dumps({"Version": "2012-10-17", "Statement": [statement]})
+
+
+def _scoped_s3_gateway(vpc_id, policy=None, suffix=""):
+    vpce = _vpce(vpc_id, "s3", endpoint_type="Gateway", dns=None)
+    vpce["VpcEndpointId"] += suffix
+    vpce["PolicyDocument"] = (
+        policy if policy is not None else _s3_endpoint_policy("arn:aws:s3:::data/*")
+    )
+    return vpce
+
+
 def _sm18_rows(
     jobs,
     models=None,
@@ -10517,7 +11055,7 @@ def _sm18_rows(
                 {
                     "VpcEndpoints": vpces
                     if vpces is not None
-                    else [_vpce("vpc-1", "s3", endpoint_type="Gateway", dns=None)]
+                    else [_scoped_s3_gateway("vpc-1")]
                 }
             ],
         }
@@ -10700,6 +11238,111 @@ class TestSM18TransformJobBoundary:
         assert [r["Status"] for r in row] == ["Failed"]
         assert "com.amazonaws.us-east-1.s3" in row[0]["Finding_Details"]
         assert "transform job(s) j" in row[0]["Finding_Details"]
+
+    DEFAULT_ENDPOINT_POLICY = json.dumps(
+        {
+            "Statement": [
+                {"Effect": "Allow", "Principal": "*", "Action": "*", "Resource": "*"}
+            ]
+        }
+    )
+
+    @pytest.mark.parametrize(
+        "policy",
+        [
+            DEFAULT_ENDPOINT_POLICY,
+            _s3_endpoint_policy("arn:aws:s3:::*/*"),
+            _s3_endpoint_policy("*", principal={"AWS": "123456789012"}),
+            _s3_endpoint_policy(
+                "*", principal={"AWS": "arn:aws:iam::123456789012:root"}
+            ),
+            _s3_endpoint_policy(
+                "*", principal={"AWS": "arn:aws:iam::123456789012:role/*"}
+            ),
+            _s3_endpoint_policy(
+                "*",
+                condition={
+                    "StringLike": {
+                        "aws:PrincipalArn": "arn:aws:iam::123456789012:role/*"
+                    }
+                },
+            ),
+            _s3_endpoint_policy(
+                "*",
+                condition={
+                    "StringNotEquals": {
+                        "aws:PrincipalArn": "arn:aws:iam::123456789012:role/x"
+                    }
+                },
+            ),
+            json.dumps(
+                {
+                    "Statement": [
+                        {
+                            "Effect": "Allow",
+                            "Principal": "*",
+                            "Action": "s3:*",
+                            "NotResource": "arn:aws:s3:::secret/*",
+                        }
+                    ]
+                }
+            ),
+        ],
+    )
+    def test_s3_endpoint_policy_open_to_every_bucket_fails(self, policy):
+        rows = _sm18_rows(
+            {"j": _transform_job()}, vpces=[_scoped_s3_gateway("vpc-1", policy)]
+        )
+        row = _by_finding(rows, sagemaker_app.TRANSFORM_S3_ENDPOINT_FINDING)
+        assert [r["Status"] for r in row] == ["Failed"]
+        assert "on every bucket to any principal" in row[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "policy",
+        [
+            _s3_endpoint_policy(["arn:aws:s3:::data", "arn:aws:s3:::data/*"]),
+            _s3_endpoint_policy(
+                "*", principal={"AWS": "arn:aws:iam::123456789012:role/exec"}
+            ),
+            _s3_endpoint_policy(
+                "*",
+                condition={
+                    "ArnEquals": {
+                        "aws:PrincipalArn": "arn:aws:iam::123456789012:role/exec"
+                    }
+                },
+            ),
+        ],
+    )
+    def test_s3_endpoint_policy_scoped_by_bucket_or_role_passes(self, policy):
+        rows = _sm18_rows(
+            {"j": _transform_job()}, vpces=[_scoped_s3_gateway("vpc-1", policy)]
+        )
+        row = _by_finding(rows, sagemaker_app.TRANSFORM_S3_ENDPOINT_FINDING)
+        assert [r["Status"] for r in row] == ["Passed"]
+        assert "workload decision" in row[0]["Finding_Details"]
+
+    def test_one_open_s3_endpoint_beside_a_scoped_one_fails(self):
+        rows = _sm18_rows(
+            {"j": _transform_job()},
+            vpces=[
+                _scoped_s3_gateway("vpc-1"),
+                _scoped_s3_gateway("vpc-1", self.DEFAULT_ENDPOINT_POLICY, "-open"),
+            ],
+        )
+        row = _by_finding(rows, sagemaker_app.TRANSFORM_S3_ENDPOINT_FINDING)
+        assert [r["Status"] for r in row] == ["Failed"]
+        assert "-open" in row[0]["Finding_Details"]
+
+    @pytest.mark.parametrize("policy", ["", "{not json"])
+    def test_unread_s3_endpoint_policy_is_incomplete(self, policy):
+        vpce = _scoped_s3_gateway("vpc-1", policy)
+        if not policy:
+            del vpce["PolicyDocument"]
+        rows = _sm18_rows({"j": _transform_job()}, vpces=[vpce])
+        row = _by_finding(rows, sagemaker_app.TRANSFORM_S3_ENDPOINT_FINDING)
+        assert [r["Status"] for r in row] == ["N/A"]
+        assert "policy of S3 endpoint" in row[0]["Finding_Details"]
 
     def test_model_outside_a_vpc_gets_no_endpoint_or_subnet_pass(self):
         rows = _sm18_rows(
@@ -11015,6 +11658,94 @@ def _sm03_rows(jobs, keys=None, buckets=None, pages=None, notebooks=None):
         return extract_csv_data(
             sagemaker_app.check_sagemaker_data_protection(region="us-east-1")
         )
+
+
+def _plain_job(**resource_config):
+    job = _training_job()
+    job["EnableInterContainerTrafficEncryption"] = False
+    job["ResourceConfig"].update(resource_config)
+    return job
+
+
+class TestSM03InterContainerAndSources:
+    """AIR-SGM-TRN-02: distributed jobs only, and every input source read."""
+
+    @pytest.mark.parametrize(
+        "config",
+        [
+            {"InstanceCount": 1},
+            {"InstanceGroups": [{"InstanceGroupName": "g", "InstanceCount": 1}]},
+        ],
+    )
+    def test_single_instance_job_without_ice_passes(self, config):
+        rows = _sm03_rows({"solo": _plain_job(**config)})
+        assert not _by_finding(rows, "Missing VPC Encryption")
+        assert [r["Status"] for r in _by_finding(rows, "Data Protection Check")] == [
+            "Passed"
+        ]
+
+    @pytest.mark.parametrize(
+        "config",
+        [
+            {"InstanceCount": 2},
+            {
+                "InstanceGroups": [
+                    {"InstanceGroupName": "a", "InstanceCount": 1},
+                    {"InstanceGroupName": "b", "InstanceCount": 1},
+                ]
+            },
+            {},
+        ],
+    )
+    def test_distributed_or_unrecorded_job_without_ice_fails(self, config):
+        rows = _sm03_rows(
+            {"solo": _plain_job(InstanceCount=1), "multi": _plain_job(**config)}
+        )
+        missing = _by_finding(rows, "Missing VPC Encryption")
+        assert [r["Status"] for r in missing] == ["Failed"]
+        assert "'multi'" in missing[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "source,text",
+        [
+            (
+                {
+                    "FileSystemDataSource": {
+                        "FileSystemId": "fs-1",
+                        "FileSystemType": "EFS",
+                        "FileSystemAccessMode": "ro",
+                        "DirectoryPath": "/d",
+                    }
+                },
+                "EFS file system fs-1",
+            ),
+            (
+                {
+                    "FileSystemDataSource": {
+                        "FileSystemId": "fs-2",
+                        "FileSystemType": "FSxLustre",
+                        "FileSystemAccessMode": "ro",
+                        "DirectoryPath": "/d",
+                    }
+                },
+                "fsx:DescribeFileSystems is not granted",
+            ),
+            (
+                {"DatasetSource": {"DatasetArn": "arn:aws:x:::dataset/d"}},
+                "dataset arn:aws:x:::dataset/d",
+            ),
+        ],
+    )
+    def test_non_s3_source_holds_back_passed(self, source, text):
+        job = _training_job()
+        job["InputDataConfig"].append({"ChannelName": "extra", "DataSource": source})
+        rows = _sm03_rows({"clean": _training_job(), "fs": job})
+        assert not _by_finding(rows, "Data Protection Check")
+        unread = [r for r in rows if r["Finding"].endswith("Incomplete")]
+        assert len(unread) == 1
+        assert "training job 'fs' channel 'extra'" in unread[0]["Finding_Details"]
+        assert text in unread[0]["Finding_Details"]
+        assert "'clean'" not in unread[0]["Finding_Details"]
 
 
 class TestSM03KeyManagerAndUnreadLegs:
@@ -11798,13 +12529,19 @@ SCP_NOTEBOOK_ACCESS_DENIES = [
         "Disabled",
     ),
     _scp_deny(
+        "sagemaker:CreateNotebookInstance",
+        "ForAnyValue:StringNotEquals",
+        "sagemaker:VpcSubnets",
+        ["subnet-1"],
+    ),
+    _scp_deny(
         "sagemaker:CreateNotebookInstance", "Null", "sagemaker:VpcSubnets", "true"
     ),
     _scp_deny(
         "sagemaker:CreateNotebookInstance",
-        "Null",
+        "ArnNotEquals",
         "sagemaker:VolumeKmsKeyArn",
-        "true",
+        [APPROVED_KEY],
     ),
     _scp_deny(
         [
@@ -11839,7 +12576,7 @@ class TestSM09NotebookAccessGuardrails:
         assert "All 6 notebook access requirements" in rows[0]["Finding_Details"]
         assert rows[0]["Check_ID"] == "SM-09"
 
-    @pytest.mark.parametrize("dropped", range(5))
+    @pytest.mark.parametrize("dropped", range(6))
     def test_each_missing_deny_fails_with_an_open_principal(self, dropped):
         statements = [
             s for i, s in enumerate(SCP_NOTEBOOK_ACCESS_DENIES) if i != dropped
@@ -11908,6 +12645,9 @@ class TestSM09NotebookAccessGuardrails:
                                 "sagemaker:DirectInternetAccess": "Disabled",
                             },
                             "ArnEquals": {"sagemaker:VolumeKmsKeyArn": APPROVED_KEY},
+                            "ForAllValues:StringEquals": {
+                                "sagemaker:VpcSubnets": ["subnet-1"]
+                            },
                             "Null": {"sagemaker:VpcSubnets": "false"},
                         },
                     },
@@ -12714,3 +13454,532 @@ class TestNet01StudioDomains:
         assert [r["Status"] for r in notebook] == ["N/A"]
         assert "could not all be read" in notebook[0]["Finding_Details"]
         assert "Passed" not in [r["Status"] for r in rows]
+
+
+def _group_user(policy_name, document, group="DataScience"):
+    """A cached user whose only grant comes from one group policy."""
+    return {
+        "attached_policies": [],
+        "inline_policies": [],
+        "group_policies": [
+            {
+                "name": policy_name,
+                "arn": f"arn:aws:iam::123456789012:policy/{policy_name}",
+                "group": group,
+                "document": document,
+            }
+        ],
+        "permissions_boundary": None,
+    }
+
+
+class TestSageMakerGroupPolicies:
+    """A user granted through an IAM group is read like any other user."""
+
+    def test_endpoint_invocation_through_a_group_is_read(self):
+        users = {
+            "GroupWide": _group_user(
+                "InvokeAll", _identity_policy("sagemaker:InvokeEndpoint", "*")
+            ),
+            "GroupNamed": _group_user(
+                "InvokeOne",
+                _identity_policy(
+                    "sagemaker:InvokeEndpoint",
+                    "arn:aws:sagemaker:us-east-1:123456789012:endpoint/a",
+                ),
+            ),
+        }
+        rows = _by_finding(
+            _sm02_rows(_v2_cache({}, users=users)),
+            sagemaker_app.ENDPOINT_INVOCATION_SCOPING_FINDING,
+        )
+        failed = [r for r in rows if r["Status"] == "Failed"]
+        assert len(failed) == 1
+        assert "User 'GroupWide'" in failed[0]["Finding_Details"]
+        assert "InvokeAll" in failed[0]["Finding_Details"]
+        assert "GroupNamed" not in failed[0]["Finding_Details"]
+
+    def test_creation_open_through_a_group_is_open(self):
+        users = {
+            "GroupOpen": _group_user(
+                "AllSageMaker", {"Statement": [OPEN_SAGEMAKER_ALLOW]}
+            ),
+            "GroupGuarded": _group_user(
+                "Guarded", {"Statement": GUARDED_CREATE_ALLOWS}
+            ),
+        }
+        leg = sagemaker_app._creation_identity_leg(
+            _v2_cache({}, users=users),
+            "sagemaker:CreateTrainingJob",
+            ("sagemaker:networkisolation",),
+        )
+        assert leg["state"] == "open"
+        assert leg["principals"] == ["User 'GroupOpen'"]
+
+    def test_group_deny_closes_the_creation_call(self):
+        deny = _scp_deny(
+            "sagemaker:CreateTrainingJob",
+            "BoolIfExists",
+            "sagemaker:NetworkIsolation",
+            "false",
+        )
+        user = _group_user("AllSageMaker", {"Statement": [OPEN_SAGEMAKER_ALLOW]})
+        user["group_policies"].append(
+            {
+                "name": "DenyOpen",
+                "group": "DataScience",
+                "document": {"Statement": [deny]},
+            }
+        )
+        leg = sagemaker_app._creation_identity_leg(
+            _v2_cache({}, users={"Denied": user}),
+            "sagemaker:CreateTrainingJob",
+            ("sagemaker:networkisolation",),
+        )
+        assert leg["state"] == "guarded"
+
+    def test_stale_access_through_a_group_is_reported(self):
+        users = {
+            "GroupStale": _group_user(
+                "Train", _identity_policy("sagemaker:CreateTrainingJob", "*")
+            ),
+            "NoSageMaker": _group_user("S3", _identity_policy("s3:GetObject", "*")),
+        }
+        old = datetime.now(timezone.utc) - timedelta(days=120)
+        with patch("sagemaker_app.boto3.client") as mock_client:
+            client = mock_client.return_value
+            client.get_caller_identity.return_value = {
+                "Account": "123456789012",
+                "Arn": "arn:aws:sts::123456789012:assumed-role/a/b",
+            }
+            client.generate_service_last_accessed_details.return_value = {
+                "JobId": "job-1"
+            }
+            client.get_service_last_accessed_details.return_value = {
+                "JobStatus": "COMPLETED",
+                "ServicesLastAccessed": [
+                    {"ServiceName": "Amazon SageMaker", "LastAuthenticated": old}
+                ],
+            }
+            rows = _rows(
+                sagemaker_app.check_sagemaker_iam_permissions(
+                    _v2_cache({}, users=users), region="Global"
+                )
+            )
+        stale = [r for r in rows if r["Finding"] == "Stale SageMaker Access"]
+        assert [r["Status"] for r in stale] == ["Failed"]
+        assert "User 'GroupStale'" in stale[0]["Finding_Details"]
+        assert client.generate_service_last_accessed_details.call_count == 1
+
+
+class TestSM34ValuePinning:
+    """AIR-SGM-TRN-08: a guard must hold the key to approved values, not only
+    require it, and CreateModel and CreateTransformJob are guarded too."""
+
+    _sm34 = TestSM34CreationGuardrails()
+
+    def _rows(self, statements, cache=OPEN_CACHE, **inventory_kwargs):
+        inventory = self._sm34._inventory(
+            self._sm34._scp("Guard", statements), **inventory_kwargs
+        )
+        return self._sm34._by_category(self._sm34._run(inventory, cache=cache))
+
+    def test_a_null_deny_on_a_fixed_value_key_admits_enabled(self):
+        statements = (
+            SCP_ENCRYPTION_DENIES
+            + SCP_NETWORK_DENIES
+            + [
+                SCP_INTERNET_DENIES[0],
+                _scp_deny(
+                    "sagemaker:CreateNotebookInstance",
+                    "Null",
+                    "sagemaker:DirectInternetAccess",
+                    "true",
+                ),
+            ]
+        )
+        rows = self._rows(statements)
+        assert rows["encryption"]["Status"] == "Passed"
+        assert rows["approved network"]["Status"] == "Passed"
+        internet = rows["no direct internet access"]
+        assert internet["Status"] == "Failed"
+        assert "1 of 4 no direct internet access" in internet["Finding_Details"]
+        assert "admits any value" in internet["Finding_Details"]
+        assert "CreateNotebookInstance" in internet["Finding_Details"]
+
+    def test_a_null_or_wildcard_deny_on_a_kms_key_does_not_pin_it(self):
+        for weak in (
+            _scp_deny(
+                ["sagemaker:CreateTrainingJob", "sagemaker:CreateTransformJob"],
+                "Null",
+                "sagemaker:VolumeKmsKeyArn",
+                "true",
+            ),
+            _scp_deny(
+                ["sagemaker:CreateTrainingJob", "sagemaker:CreateTransformJob"],
+                "ArnNotLike",
+                "sagemaker:VolumeKmsKeyArn",
+                ["arn:aws:kms:*:123456789012:key/*"],
+            ),
+        ):
+            row = self._rows([weak] + SCP_ENCRYPTION_DENIES[1:])["encryption"]
+            assert row["Status"] == "Failed"
+            assert "2 of 7 encryption requirements" in row["Finding_Details"]
+            assert (
+                "CreateTrainingJob on sagemaker:VolumeKmsKeyArn"
+                in (row["Finding_Details"])
+            )
+
+    def test_the_model_and_transform_job_actions_are_guarded(self):
+        three_actions = [
+            "sagemaker:CreateTrainingJob",
+            "sagemaker:CreateEndpointConfig",
+            "sagemaker:CreateNotebookInstance",
+        ]
+        statements = [
+            _scp_deny(
+                three_actions,
+                "ArnNotEquals",
+                "sagemaker:VolumeKmsKeyArn",
+                [APPROVED_KEY],
+            ),
+            _scp_deny(
+                "sagemaker:CreateTrainingJob",
+                "ArnNotEquals",
+                "sagemaker:OutputKmsKeyArn",
+                [APPROVED_KEY],
+            ),
+            SCP_ENCRYPTION_DENIES[2],
+            _scp_deny(three_actions, "Null", "sagemaker:VpcSubnets", "true"),
+            _scp_deny(
+                three_actions,
+                "ForAnyValue:StringNotEquals",
+                "sagemaker:VpcSubnets",
+                ["subnet-1"],
+            ),
+            _scp_deny(
+                ["sagemaker:CreateTrainingJob", "sagemaker:CreateEndpointConfig"],
+                "BoolIfExists",
+                "sagemaker:NetworkIsolation",
+                "false",
+            ),
+            SCP_INTERNET_DENIES[1],
+        ]
+        rows = self._rows(statements)
+        encryption = rows["encryption"]["Finding_Details"]
+        assert rows["encryption"]["Status"] == "Failed"
+        assert "2 of 7 encryption requirements" in encryption
+        assert "CreateTransformJob on sagemaker:VolumeKmsKeyArn" in encryption
+        assert "CreateTransformJob on sagemaker:OutputKmsKeyArn" in encryption
+        network = rows["approved network"]["Finding_Details"]
+        assert rows["approved network"]["Status"] == "Failed"
+        assert "1 of 4 approved network requirements" in network
+        assert "CreateModel on sagemaker:VpcSubnets" in network
+        internet = rows["no direct internet access"]["Finding_Details"]
+        assert rows["no direct internet access"]["Status"] == "Failed"
+        assert "CreateModel on sagemaker:NetworkIsolation" in internet
+
+    def test_transform_job_is_not_required_to_carry_network_keys(self):
+        network = dict(sagemaker_app.SAGEMAKER_CREATION_GUARDRAILS)["approved network"]
+        assert "sagemaker:CreateTransformJob" not in [a for a, _ in network]
+        assert "sagemaker:CreateModel" in [a for a, _ in network]
+
+    def test_a_pair_is_only_as_attached_as_its_less_attached_half(self):
+        inventory = self._sm34._inventory(
+            self._sm34._scp("Presence", SCP_NETWORK_DENIES[:1]),
+            self._sm34._scp("Values", SCP_NETWORK_DENIES[1:]),
+        )
+        inventory["items"][1]["targets"] = [
+            {"TargetId": "ou-sandbox", "Type": "ORGANIZATIONAL_UNIT"}
+        ]
+        row = self._sm34._by_category(self._sm34._run(inventory))["approved network"]
+        assert row["Status"] == "Failed"
+        assert "not attached to this account" in row["Finding_Details"]
+        inventory["items"][1]["targets"] = [{"TargetId": "r-root", "Type": "ROOT"}]
+        row = self._sm34._by_category(self._sm34._run(inventory))["approved network"]
+        assert row["Status"] == "Passed"
+        assert "'Presence'" in row["Finding_Details"]
+        assert "'Values'" in row["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "condition",
+        [
+            {"Null": {"sagemaker:VpcSubnets": "false"}},
+            {"ForAnyValue:StringEquals": {"sagemaker:VpcSecurityGroupIds": ["sg-1"]}},
+            {"ForAllValues:StringEquals": {"sagemaker:VpcSubnets": ["subnet-1"]}},
+            {"StringLike": {"sagemaker:VpcSubnets": "subnet-*"}},
+        ],
+    )
+    def test_an_allow_that_does_not_pin_the_subnets_is_open(self, condition):
+        pinned = {
+            "Effect": "Allow",
+            "Action": "sagemaker:CreateModel",
+            "Resource": "*",
+            "Condition": {
+                "ForAllValues:StringEquals": {"sagemaker:VpcSubnets": ["subnet-1"]},
+                "Null": {"sagemaker:VpcSubnets": "false"},
+            },
+        }
+        weak = {
+            "Effect": "Allow",
+            "Action": "sagemaker:CreateModel",
+            "Resource": "*",
+            "Condition": condition,
+        }
+        keys = ("sagemaker:vpcsubnets", "sagemaker:vpcsecuritygroupids")
+        leg = sagemaker_app._creation_identity_leg(
+            _creation_cache({"Pinned": [pinned], "Weak": [weak]}),
+            "sagemaker:CreateModel",
+            keys,
+        )
+        assert leg["state"] == "open"
+        assert leg["principals"] == ["Role 'Weak'"]
+
+    def test_an_identity_deny_pair_guards_the_call(self):
+        cache = _creation_cache(
+            {"Admin": [OPEN_SAGEMAKER_ALLOW] + SCP_NETWORK_DENIES},
+        )
+        leg = sagemaker_app._creation_identity_leg(
+            cache,
+            "sagemaker:CreateModel",
+            ("sagemaker:vpcsubnets", "sagemaker:vpcsecuritygroupids"),
+        )
+        assert leg["state"] == "guarded"
+        half = _creation_cache(
+            {"Admin": [OPEN_SAGEMAKER_ALLOW] + SCP_NETWORK_DENIES[:1]}
+        )
+        assert (
+            sagemaker_app._creation_identity_leg(
+                half,
+                "sagemaker:CreateModel",
+                ("sagemaker:vpcsubnets", "sagemaker:vpcsecuritygroupids"),
+            )["state"]
+            == "open"
+        )
+
+
+def _hyperpod_inventory(groups):
+    return {
+        "items": [
+            {
+                "summary": {"ClusterName": "cluster-1"},
+                "detail": {
+                    "ClusterName": "cluster-1",
+                    "InstanceGroups": [
+                        {
+                            "InstanceGroupName": name,
+                            "InstanceStorageConfigs": [
+                                {
+                                    "EbsVolumeConfig": {
+                                        "RootVolume": root,
+                                        "VolumeKmsKeyId": key,
+                                    }
+                                }
+                                for root, key in volumes
+                            ],
+                        }
+                        for name, volumes in groups
+                    ],
+                },
+            }
+        ],
+        "errors": [],
+        "list_error": None,
+    }
+
+
+_HP_CMK = "arn:aws:kms:us-east-1:123456789012:key/cmk-1"
+_HP_AWS = "arn:aws:kms:us-east-1:123456789012:key/aws-1"
+
+
+class TestSM27KeyManager:
+    """SM-27 resolves each VolumeKmsKeyId with kms:DescribeKey."""
+
+    def _run(self, inventory, managers):
+        kms = MagicMock()
+
+        def describe_key(KeyId):
+            value = managers[KeyId]
+            if isinstance(value, Exception):
+                raise value
+            return {"KeyMetadata": {"KeyId": KeyId, "KeyManager": value}}
+
+        kms.describe_key.side_effect = describe_key
+        with patch("sagemaker_app.boto3.client", return_value=kms):
+            rows = extract_csv_data(
+                sagemaker_app.check_hyperpod_ebs_cmk_encryption("us-east-1", inventory)
+            )
+        return {row["Finding_Details"].split("'")[3]: row for row in rows}
+
+    @pytest.mark.parametrize("key", [_HP_AWS, "alias/aws/sagemaker"])
+    def test_aws_managed_secondary_volume_fails(self, key):
+        rows = self._run(
+            _hyperpod_inventory([("workers", [(True, _HP_CMK), (False, key)])]),
+            {_HP_CMK: "CUSTOMER", _HP_AWS: "AWS"},
+        )
+        assert rows["workers"]["Status"] == "Failed"
+        assert "AWS managed key: secondary volume" in rows["workers"]["Finding_Details"]
+
+    def test_aws_managed_group_beside_customer_group(self):
+        rows = self._run(
+            _hyperpod_inventory(
+                [
+                    ("good", [(True, _HP_CMK)]),
+                    ("bad", [(True, _HP_AWS)]),
+                ]
+            ),
+            {_HP_CMK: "CUSTOMER", _HP_AWS: "AWS"},
+        )
+        assert rows["good"]["Status"] == "Passed"
+        assert rows["bad"]["Status"] == "Failed"
+        assert "root volume" in rows["bad"]["Finding_Details"]
+
+    def test_describe_key_error_holds_back_passed(self):
+        rows = self._run(
+            _hyperpod_inventory([("workers", [(True, _HP_CMK), (False, _HP_AWS)])]),
+            {_HP_CMK: "CUSTOMER", _HP_AWS: _make_client_error("AccessDeniedException")},
+        )
+        assert rows["workers"]["Status"] == "N/A"
+        assert f"kms:DescribeKey {_HP_AWS}" in rows["workers"]["Finding_Details"]
+        assert "customer-managed" not in rows["workers"]["Finding_Details"]
+
+    def test_unread_key_does_not_hide_a_missing_key(self):
+        rows = self._run(
+            _hyperpod_inventory([("workers", [(True, _HP_CMK), (False, None)])]),
+            {_HP_CMK: _make_client_error("AccessDeniedException")},
+        )
+        assert rows["workers"]["Status"] == "Failed"
+        assert "secondary volume" in rows["workers"]["Finding_Details"]
+        assert (
+            f"Not read: kms:DescribeKey {_HP_CMK}" in rows["workers"]["Finding_Details"]
+        )
+
+    def test_customer_keys_pass(self):
+        rows = self._run(
+            _hyperpod_inventory([("workers", [(True, _HP_CMK), (False, _HP_CMK)])]),
+            {_HP_CMK: "CUSTOMER"},
+        )
+        assert rows["workers"]["Status"] == "Passed"
+        assert "kms:DescribeKey" in rows["workers"]["Finding_Details"]
+
+
+def _user_without_group_policies(document, error=True):
+    """A cached user whose group policies were not read."""
+    user = {
+        "attached_policies": [
+            {
+                "name": "Scoped",
+                "arn": "arn:aws:iam::123456789012:policy/Scoped",
+                "document": document,
+            }
+        ],
+        "inline_policies": [],
+        "permissions_boundary": None,
+    }
+    if error:
+        user["group_policies_error"] = "AccessDenied"
+    return user
+
+
+class TestGroupPoliciesContract:
+    """A user with no group_policies list is unread, never a pass."""
+
+    SCOPED_INVOKE = _identity_policy(
+        "sagemaker:InvokeEndpoint",
+        "arn:aws:sagemaker:us-east-1:123456789012:endpoint/a",
+    )
+
+    @pytest.mark.parametrize("recorded", [True, False])
+    def test_principal_read_errors_names_the_user(self, recorded):
+        errors = (
+            [{"type": "user", "name": "u", "stage": "group_policies"}]
+            if recorded
+            else []
+        )
+        cache = _v2_cache(
+            {},
+            principal_errors=errors,
+            users={"u": _user_without_group_policies(self.SCOPED_INVOKE, recorded)},
+        )
+        assert sagemaker_app._principal_read_errors(cache) == [
+            "user 'u' (group_policies)"
+        ]
+
+    def test_a_cache_without_principal_errors_still_names_the_user(self):
+        cache = _v2_cache(
+            {}, users={"u": _user_without_group_policies(self.SCOPED_INVOKE)}
+        )
+        del cache["principal_errors"]
+        assert sagemaker_app._principal_read_errors(cache) == [
+            "user 'u' (group_policies)"
+        ]
+
+    def test_an_empty_group_list_is_read(self):
+        user = _user_without_group_policies(self.SCOPED_INVOKE, error=False)
+        user["group_policies"] = []
+        assert (
+            sagemaker_app._principal_read_errors(_v2_cache({}, users={"u": user})) == []
+        )
+
+    @pytest.mark.parametrize("recorded", [True, False])
+    def test_endpoint_scoping_does_not_pass(self, recorded):
+        users = {
+            "read": _group_user("InvokeOne", self.SCOPED_INVOKE),
+            "unread": _user_without_group_policies(self.SCOPED_INVOKE, recorded),
+        }
+        rows = _by_finding(
+            _sm02_rows(_v2_cache({}, users=users)),
+            sagemaker_app.ENDPOINT_INVOCATION_SCOPING_FINDING,
+        )
+        assert "Passed" not in [r["Status"] for r in rows]
+        assert any(
+            r["Status"] == "N/A" and "user 'unread'" in r["Finding_Details"]
+            for r in rows
+        )
+
+    def test_invoke_source_network_does_not_pass(self):
+        pinned = _invoke_allow({"StringEquals": {"aws:SourceVpce": "vpce-1"}})
+        cache = _v2_cache(
+            {"R": [("P", pinned)]},
+            users={"unread": _user_without_group_policies(pinned, error=False)},
+        )
+        rows = _rows(
+            {
+                "csv_data": sagemaker_app._invoke_source_network_findings(
+                    cache, {"endpoints": [{"name": "ep-1"}]}, "us-east-1"
+                )
+            }
+        )
+        assert "Passed" not in [r["Status"] for r in rows]
+        assert any("user 'unread'" in r["Finding_Details"] for r in rows)
+
+    def test_creation_leg_is_incomplete(self):
+        users = {
+            "guarded": _group_user("Guarded", {"Statement": GUARDED_CREATE_ALLOWS}),
+            "unread": _user_without_group_policies(
+                {"Statement": GUARDED_CREATE_ALLOWS}, error=False
+            ),
+        }
+        leg = sagemaker_app._creation_identity_leg(
+            _v2_cache({}, users=users),
+            "sagemaker:CreateTrainingJob",
+            ("sagemaker:networkisolation",),
+        )
+        assert leg["state"] == "incomplete"
+        assert leg["principals"] == ["user 'unread' (group_policies)"]
+
+    def test_an_open_grant_still_fails_beside_the_unread_groups(self):
+        leg = sagemaker_app._creation_identity_leg(
+            _v2_cache(
+                {},
+                users={
+                    "open": _user_without_group_policies(
+                        {"Statement": [OPEN_SAGEMAKER_ALLOW]}
+                    )
+                },
+            ),
+            "sagemaker:CreateTrainingJob",
+            ("sagemaker:networkisolation",),
+        )
+        assert leg["state"] == "open"
+        assert leg["principals"] == ["User 'open'"]
