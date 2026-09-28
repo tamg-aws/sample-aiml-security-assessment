@@ -11871,7 +11871,9 @@ def _deny_guard_strength(statement: Dict[str, Any], keys: tuple) -> Optional[str
     non-compliant value but not when the request omits the key. A "presence"
     and an "absent-open" Deny together enforce the key. "conjunctive": the key
     shares the statement with other conditions, so the deny fires only when all
-    of them hold. None: the key is not named.
+    of them hold. "undefined-operator": a negated operator on a multivalued
+    key with no ForAllValues or ForAnyValue prefix, which IAM does not define,
+    so it earns no credit. None: the key is not named.
     """
     entries = _condition_entries(statement)
     matched = [entry for entry in entries if entry[1] in keys]
@@ -11884,6 +11886,8 @@ def _deny_guard_strength(statement: Dict[str, Any], keys: tuple) -> Optional[str
     if base == "null":
         return "presence" if "true" in values else "value"
     if "not" in base:
+        if not prefix and key in MULTIVALUED_CREATION_KEYS:
+            return "undefined-operator"
         # A negated operator is true for an absent key, except under
         # ForAnyValue, which is false over an empty set.
         if _like_values_unbounded(base, values):
@@ -11921,7 +11925,8 @@ def _allow_enforces_key(statement: Dict[str, Any], keys: tuple) -> bool:
     neither enforces it. ForAllValues does too, unless the statement also holds
     a Null false test on the same key. A Null test and a Like on a wildcard value
     require only that the key is present. ForAnyValue on a multivalued key
-    admits a request that mixes an approved value with an unapproved one.
+    admits a request that mixes an approved value with an unapproved one, and
+    IAM does not define a multivalued key under no set operator.
     """
     entries = _condition_entries(statement)
     required = {
@@ -11939,7 +11944,7 @@ def _allow_enforces_key(statement: Dict[str, Any], keys: tuple) -> bool:
             continue
         if prefix == "forallvalues" and key not in required:
             continue
-        if prefix == "foranyvalue" and key in MULTIVALUED_CREATION_KEYS:
+        if key in MULTIVALUED_CREATION_KEYS and prefix != "forallvalues":
             continue
         compliant = CREATION_KEY_COMPLIANT_VALUES.get(key)
         if compliant is None or (values and all(v == compliant for v in values)):
@@ -12032,7 +12037,8 @@ def _creation_scp_leg(scp: Dict[str, Any], action: str, keys: tuple) -> Dict[str
     Report whether an SCP governing this account enforces keys on action.
 
     Returns a state of "enforced", "unattached", "value", "presence",
-    "absent-open", "conjunctive", "attachment-unread", "missing" or the
+    "absent-open", "conjunctive", "undefined-operator", "attachment-unread",
+    "missing" or the
     leg-wide state ("none", "unread", "exempt"), with the policy names behind
     it. An attached "presence" Deny and an attached "absent-open" Deny that
     both cover every resource are "enforced" together.
@@ -12051,9 +12057,10 @@ def _creation_scp_leg(scp: Dict[str, Any], action: str, keys: tuple) -> Dict[str
             strength = _deny_guard_strength(statement, keys)
             if strength is None:
                 continue
-            if strength == "enforced" and not _deny_covers_every_resource(
-                statement, resource_type
-            ):
+            if strength in (
+                "enforced",
+                "undefined-operator",
+            ) and not _deny_covers_every_resource(statement, resource_type):
                 strength = "conjunctive"
             if "targets_error" in item:
                 attachment = "attachment-unread"
@@ -12100,6 +12107,7 @@ def _creation_scp_leg(scp: Dict[str, Any], action: str, keys: tuple) -> Dict[str
         "enforced",
         "attachment-unread",
         "conjunctive",
+        "undefined-operator",
         "value",
         "presence",
         "absent-open",
@@ -12136,6 +12144,11 @@ def _creation_scp_reason(scp_leg: Dict[str, Any], scp: Dict[str, Any]) -> str:
             f"service control policy {names} names the key alongside other "
             "conditions or on named resources only, so it denies only when all of "
             "them hold"
+        )
+    if state == "undefined-operator":
+        return (
+            f"service control policy {names} denies with an operator IAM does not "
+            "define for a multivalued key, so it earns no credit"
         )
     if state == "value":
         return (

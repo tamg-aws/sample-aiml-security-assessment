@@ -5402,6 +5402,58 @@ class TestSM34CreationGuardrails:
         assert paired["Status"] == "Passed"
         assert "SubnetAllowList" in paired["Finding_Details"]
 
+    @pytest.mark.parametrize(
+        "operator,values",
+        [
+            ("StringNotEquals", ["subnet-1"]),
+            ("StringNotLike", ["subnet-1"]),
+            ("StringNotLike", ["subnet-*"]),
+        ],
+    )
+    @pytest.mark.parametrize(
+        "key", ["sagemaker:VpcSubnets", "sagemaker:VpcSecurityGroupIds"]
+    )
+    def test_a_bare_negated_operator_on_a_multivalued_key_earns_no_credit(
+        self, operator, values, key
+    ):
+        # IAM defines a multivalued key only under ForAllValues or ForAnyValue.
+        for statements in (
+            [_scp_deny("sagemaker:Create*", operator, key, values)],
+            [
+                _scp_deny("sagemaker:Create*", "Null", key, "true"),
+                _scp_deny("sagemaker:Create*", operator, key, values),
+            ],
+        ):
+            row = self._by_category(
+                self._run(self._inventory(self._scp("BareNegated", statements)))
+            )["approved network"]
+            assert row["Status"] == "N/A"
+            assert (
+                "operator IAM does not define for a multivalued key"
+                in (row["Finding_Details"])
+            )
+            assert "BareNegated" in row["Finding_Details"]
+
+    def test_the_documented_set_operator_pair_beside_a_bare_one_still_passes(self):
+        documented = self._scp("Documented", SCP_NETWORK_DENIES)
+        bare = self._scp(
+            "BareNegated",
+            [
+                _scp_deny(
+                    "sagemaker:Create*",
+                    "StringNotEquals",
+                    "sagemaker:VpcSubnets",
+                    ["subnet-1"],
+                )
+            ],
+        )
+        for order in ((documented, bare), (bare, documented)):
+            row = self._by_category(self._run(self._inventory(*order)))[
+                "approved network"
+            ]
+            assert row["Status"] == "Passed"
+            assert "'Documented'" in row["Finding_Details"]
+
     def test_a_deny_with_a_second_condition_or_narrow_resource_is_not_enforcing(self):
         conjunctive = _scp_deny(
             "sagemaker:Create*", "Null", "sagemaker:VpcSubnets", "true"
@@ -13756,6 +13808,50 @@ class TestSM34ValuePinning:
             )["state"]
             == "open"
         )
+
+    def test_an_identity_deny_with_a_bare_negated_operator_does_not_guard(self):
+        keys = ("sagemaker:vpcsubnets", "sagemaker:vpcsecuritygroupids")
+        bare = _scp_deny(
+            "sagemaker:Create*", "StringNotEquals", "sagemaker:VpcSubnets", ["subnet-1"]
+        )
+        cache = _creation_cache(
+            {
+                "Guarded": [OPEN_SAGEMAKER_ALLOW] + SCP_NETWORK_DENIES,
+                "Bare": [OPEN_SAGEMAKER_ALLOW, bare],
+            }
+        )
+        leg = sagemaker_app._creation_identity_leg(cache, "sagemaker:CreateModel", keys)
+        assert leg["state"] == "open"
+        assert leg["principals"] == ["Role 'Bare'"]
+
+    @pytest.mark.parametrize("operator", ["StringEquals", "StringNotEquals"])
+    def test_an_allow_with_no_set_operator_on_the_subnets_is_open(self, operator):
+        keys = ("sagemaker:vpcsubnets", "sagemaker:vpcsecuritygroupids")
+        pinned = {
+            "Effect": "Allow",
+            "Action": "sagemaker:CreateModel",
+            "Resource": "*",
+            "Condition": {
+                "ForAllValues:StringEquals": {"sagemaker:VpcSubnets": ["subnet-1"]},
+                "Null": {"sagemaker:VpcSubnets": "false"},
+            },
+        }
+        bare = {
+            "Effect": "Allow",
+            "Action": "sagemaker:CreateModel",
+            "Resource": "*",
+            "Condition": {
+                operator: {"sagemaker:VpcSubnets": ["subnet-1"]},
+                "Null": {"sagemaker:VpcSubnets": "false"},
+            },
+        }
+        leg = sagemaker_app._creation_identity_leg(
+            _creation_cache({"Pinned": [pinned], "Bare": [bare]}),
+            "sagemaker:CreateModel",
+            keys,
+        )
+        assert leg["state"] == "open"
+        assert leg["principals"] == ["Role 'Bare'"]
 
 
 def _hyperpod_inventory(groups):
