@@ -8354,6 +8354,384 @@ def _scoped_iot_document():
     )
 
 
+class TestSM40RotationHistoryAndPropagation:
+    """AIR-SLF-RT-06: rotation outcomes, propagation to ECS, plaintext credentials."""
+
+    check = staticmethod(sagemaker_app.check_secret_rotation_history_and_propagation)
+    ARN = "arn:aws:secretsmanager:us-east-1:111122223333:secret:db-AbCdEf"
+    NOW = datetime.now(timezone.utc)
+
+    def _secret(self, name="db", arn=None, rotating=True, last_days=2):
+        secret = {"Name": name, "ARN": arn or self.ARN, "RotationEnabled": rotating}
+        if last_days is not None:
+            secret["LastRotatedDate"] = self.NOW - timedelta(days=last_days)
+        return secret
+
+    def _event(self, name, days_ago, secret=None):
+        return {
+            "EventName": name,
+            "EventTime": self.NOW - timedelta(days=days_ago),
+            "CloudTrailEvent": json.dumps(
+                {"additionalEventData": {"SecretId": secret or self.ARN}}
+            ),
+        }
+
+    @staticmethod
+    def _task(containers):
+        return {"containerDefinitions": containers}
+
+    def _run(
+        self,
+        secrets=None,
+        events=None,
+        services=None,
+        task_defs=None,
+        functions=None,
+        rules=None,
+        errors=None,
+    ):
+        """services: [(cluster, name, task def arn)]; rules: [(pattern, targets)]."""
+        errors = errors or {}
+        secrets = secrets if secrets is not None else [self._secret()]
+        events = events or []
+        services = services or []
+        task_defs = task_defs or {}
+        functions = functions or []
+        rules = rules or []
+        # describe_services receives its own services kwarg.
+        service_rows = services
+
+        def source(key, pages):
+            def paginate(**kwargs):
+                if key in errors:
+                    raise errors[key]
+                return pages(**kwargs) if callable(pages) else pages
+
+            return paginate
+
+        def factory(service, **kwargs):
+            client = MagicMock()
+            if service == "secretsmanager":
+                client.get_paginator.side_effect = _pager(
+                    {"list_secrets": source("sm", [{"SecretList": secrets}])}
+                )
+            elif service == "cloudtrail":
+                client.get_paginator.side_effect = _pager(
+                    {
+                        "lookup_events": source(
+                            "ct",
+                            lambda LookupAttributes: [
+                                {
+                                    "Events": [
+                                        e
+                                        for e in events
+                                        if e["EventName"]
+                                        == LookupAttributes[0]["AttributeValue"]
+                                    ]
+                                }
+                            ],
+                        )
+                    }
+                )
+            elif service == "ecs":
+                clusters = sorted({c for c, _, _ in services})
+                client.get_paginator.side_effect = _pager(
+                    {
+                        "list_clusters": source(
+                            "ecs",
+                            [{"clusterArns": [f"arn:c/cluster/{c}" for c in clusters]}],
+                        ),
+                        "list_services": lambda cluster: [
+                            {
+                                "serviceArns": [
+                                    n
+                                    for c, n, _ in services
+                                    if c == cluster.rsplit("/", 1)[-1]
+                                ]
+                            }
+                        ],
+                    }
+                )
+                client.describe_services.side_effect = lambda cluster, services: {
+                    "services": [
+                        {"serviceName": n, "status": "ACTIVE", "taskDefinition": t}
+                        for c, n, t in service_rows
+                        if n in services
+                    ]
+                }
+
+                def describe_task_definition(taskDefinition):
+                    if "td" in errors:
+                        raise errors["td"]
+                    return {"taskDefinition": task_defs[taskDefinition]}
+
+                client.describe_task_definition.side_effect = describe_task_definition
+            elif service == "lambda":
+                client.get_paginator.side_effect = _pager(
+                    {"list_functions": source("lambda", [{"Functions": functions}])}
+                )
+            elif service == "events":
+                client.get_paginator.side_effect = _pager(
+                    {
+                        "list_rules": source(
+                            "events",
+                            [
+                                {
+                                    "Rules": [
+                                        {
+                                            "Name": f"r{i}",
+                                            "State": "ENABLED",
+                                            "EventPattern": json.dumps(p),
+                                        }
+                                        for i, (p, _) in enumerate(rules)
+                                    ]
+                                }
+                            ],
+                        ),
+                        "list_targets_by_rule": lambda Rule: [
+                            {"Targets": rules[int(Rule[1:])][1]}
+                        ],
+                    }
+                )
+            return client
+
+        with patch("sagemaker_app.boto3.client", side_effect=factory):
+            return _rows(self.check(region="us-east-1"))
+
+    @staticmethod
+    def _named(rows, name):
+        return [r for r in rows if r["Finding"].startswith(name)]
+
+    def _history(self, rows):
+        return self._named(rows, sagemaker_app.SECRET_HISTORY_FINDING)
+
+    def _propagation(self, rows):
+        return self._named(rows, sagemaker_app.SECRET_PROPAGATION_FINDING)
+
+    def _plaintext(self, rows):
+        return self._named(rows, sagemaker_app.PLAINTEXT_CREDENTIAL_FINDING)
+
+    def test_completed_rotation_passes_history(self):
+        rows = self._run(events=[self._event("RotationStarted", 2.01)])
+        history = self._history(rows)
+        assert [r["Status"] for r in history] == ["Passed"]
+        assert "1 recorded a RotationStarted event" in history[0]["Finding_Details"]
+
+    def test_failure_after_last_rotation_fails_among_healthy_secrets(self):
+        other = "arn:aws:secretsmanager:us-east-1:111122223333:secret:api-XyZ123"
+        rows = self._run(
+            secrets=[self._secret(), self._secret("api", other)],
+            events=[
+                self._event("RotationFailed", 1),
+                # A failure before the last rotation was recovered from.
+                self._event("RotationFailed", 3, other),
+            ],
+        )
+        history = self._history(rows)
+        assert [r["Status"] for r in history] == ["Failed"]
+        assert (
+            "Secret 'db' recorded a rotation failure" in history[0]["Finding_Details"]
+        )
+
+    def test_started_rotation_that_never_completed_fails(self):
+        # RotationEnabled and a recent-enough LastRotatedDate hide the stall.
+        history = self._history(self._run(events=[self._event("RotationStarted", 1.5)]))
+        assert [r["Status"] for r in history] == ["Failed"]
+        assert "has not completed" in history[0]["Finding_Details"]
+
+    def test_rotation_started_within_a_day_is_incomplete(self):
+        history = self._history(self._run(events=[self._event("RotationStarted", 0.1)]))
+        assert [r["Status"] for r in history] == ["N/A"]
+
+    def test_event_history_denied_is_incomplete_not_passed(self):
+        history = self._history(
+            self._run(errors={"ct": _make_client_error("AccessDeniedException")})
+        )
+        assert [r["Status"] for r in history] == ["N/A"]
+        assert "cloudtrail:LookupEvents" in history[0]["Finding_Details"]
+
+    def test_non_rotating_secrets_get_no_history_row(self):
+        rows = self._run(secrets=[self._secret(rotating=False)])
+        assert self._history(rows) == []
+
+    def _ecs_injecting(self, value_from):
+        return {
+            "services": [("agents", "planner", "td:1"), ("agents", "tools", "td:2")],
+            "task_defs": {
+                "td:1": self._task([{"name": "app", "secrets": []}]),
+                "td:2": self._task(
+                    [
+                        {
+                            "name": "app",
+                            "secrets": [{"name": "DB", "valueFrom": value_from}],
+                        }
+                    ]
+                ),
+            },
+        }
+
+    def test_injected_rotating_secret_without_redeploy_rule_fails(self):
+        prop = self._propagation(
+            self._run(**self._ecs_injecting(self.ARN + ":password::"))
+        )
+        assert [r["Status"] for r in prop] == ["Failed"]
+        assert (
+            "ECS service tools in agents, container app injects rotating secret 'db'"
+            in prop[0]["Finding_Details"]
+        )
+
+    def test_rotation_rule_with_a_target_covers_injection(self):
+        prop = self._propagation(
+            self._run(
+                rules=[
+                    ({"source": ["aws.guardduty"]}, [{"Id": "t"}]),
+                    (
+                        {
+                            "source": ["aws.secretsmanager"],
+                            "detail": {"eventName": ["RotationSucceeded"]},
+                        },
+                        [{"Id": "t"}],
+                    ),
+                ],
+                **self._ecs_injecting(self.ARN),
+            )
+        )
+        assert [r["Status"] for r in prop] == ["Passed"]
+        assert "1 injection(s) of a rotating secret" in prop[0]["Finding_Details"]
+
+    def test_rotation_rule_without_targets_or_on_other_events_does_not_cover(self):
+        prop = self._propagation(
+            self._run(
+                rules=[
+                    ({"source": ["aws.secretsmanager"]}, []),
+                    (
+                        {
+                            "source": ["aws.secretsmanager"],
+                            "detail": {"eventName": ["DeleteSecret"]},
+                        },
+                        [{"Id": "t"}],
+                    ),
+                ],
+                **self._ecs_injecting(self.ARN),
+            )
+        )
+        assert [r["Status"] for r in prop] == ["Failed"]
+
+    def test_parameter_store_injection_fails(self):
+        prop = self._propagation(
+            self._run(
+                **self._ecs_injecting(
+                    "arn:aws:ssm:us-east-1:111122223333:parameter/db-password"
+                )
+            )
+        )
+        assert [r["Status"] for r in prop] == ["Failed"]
+        assert "from Parameter Store" in prop[0]["Finding_Details"]
+
+    def test_rule_read_denied_is_incomplete_not_passed(self):
+        prop = self._propagation(
+            self._run(
+                errors={"events": _make_client_error("AccessDeniedException")},
+                **self._ecs_injecting(self.ARN),
+            )
+        )
+        assert [r["Status"] for r in prop] == ["N/A"]
+        assert "events:ListRules" in prop[0]["Finding_Details"]
+
+    def test_task_definition_denied_is_incomplete_not_passed(self):
+        prop = self._propagation(
+            self._run(
+                errors={"td": _make_client_error("AccessDeniedException")},
+                **self._ecs_injecting(self.ARN),
+            )
+        )
+        assert [r["Status"] for r in prop] == ["N/A"]
+        assert "task definition td:1" in prop[0]["Finding_Details"]
+
+    def test_function_list_denied_is_incomplete_not_passed(self):
+        prop = self._propagation(
+            self._run(errors={"lambda": _make_client_error("AccessDeniedException")})
+        )
+        assert [r["Status"] for r in prop] == ["N/A"]
+        assert "lambda:ListFunctions" in prop[0]["Finding_Details"]
+
+    def test_no_injection_passes_and_counts_extension_users(self):
+        prop = self._propagation(
+            self._run(
+                functions=[
+                    {
+                        "FunctionName": "a",
+                        "Layers": [
+                            {
+                                "Arn": "arn:aws:lambda:us-east-1:177933569100:layer:"
+                                "AWS-Parameters-and-Secrets-Lambda-Extension:12"
+                            }
+                        ],
+                    },
+                    {"FunctionName": "b"},
+                ]
+            )
+        )
+        assert [r["Status"] for r in prop] == ["Passed"]
+        assert (
+            "1 of 2 use the Parameters and Secrets extension"
+            in prop[0]["Finding_Details"]
+        )
+
+    def test_one_plaintext_credential_among_references_fails(self):
+        rows = self._run(
+            functions=[
+                {
+                    "FunctionName": "tool",
+                    "Environment": {
+                        "Variables": {
+                            "DB_PASSWORD": "hunter2",
+                            "API_SECRET_ARN": self.ARN,
+                            "CLIENT_SECRET": self.ARN,
+                            "SECRET_NAME": "db",
+                            "PASSWORD_LENGTH": "32",
+                            "TOKEN_ENDPOINT": "https://idp/token",
+                            "SECRETS_MANAGER_TTL": "300",
+                        }
+                    },
+                }
+            ]
+        )
+        plaintext = self._plaintext(rows)
+        assert [r["Status"] for r in plaintext] == ["Failed"]
+        assert (
+            "Lambda function tool sets DB_PASSWORD" in plaintext[0]["Finding_Details"]
+        )
+        assert "hunter2" not in plaintext[0]["Finding_Details"]
+
+    def test_ecs_plaintext_credential_fails(self):
+        plaintext = self._plaintext(
+            self._run(
+                services=[("agents", "planner", "td:1")],
+                task_defs={
+                    "td:1": self._task(
+                        [
+                            {
+                                "name": "app",
+                                "environment": [
+                                    {"name": "OPENAI_API_KEY", "value": "sk-x"},
+                                    {"name": "LOG_LEVEL", "value": "info"},
+                                ],
+                            }
+                        ]
+                    )
+                },
+            )
+        )
+        assert [r["Status"] for r in plaintext] == ["Failed"]
+        assert "container app sets OPENAI_API_KEY" in plaintext[0]["Finding_Details"]
+
+    def test_list_secrets_denied_is_incomplete(self):
+        rows = self._run(errors={"sm": _make_client_error("AccessDeniedException")})
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert "secretsmanager:ListSecrets" in rows[0]["Finding_Details"]
+
+
 class TestSM41IoTDeviceScopedPolicies:
     """AIR-PHY-EDG-01: thing-name scoping plus an attached-thing condition."""
 

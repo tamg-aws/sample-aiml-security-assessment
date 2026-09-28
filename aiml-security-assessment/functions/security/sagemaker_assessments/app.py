@@ -12760,67 +12760,83 @@ def _eks_policy_mode_findings(region: str) -> List[Dict[str, Any]]:
     return rows
 
 
-def _segmentation_workloads(region: str) -> Tuple[List[Dict[str, Any]], List[str]]:
-    """ECS services and Lambda functions with the security groups they run in."""
-    workloads, unread = [], []
+def _ecs_services(region: str) -> Tuple[List[Tuple[str, Dict[str, Any]]], List[str]]:
+    """Every ECS service in the region with its cluster name."""
+    services, unread = [], []
     try:
         ecs_client = boto3.client("ecs", config=boto3_config, region_name=region)
         clusters = []
         for page in ecs_client.get_paginator("list_clusters").paginate():
             clusters.extend(page.get("clusterArns", []))
-        for cluster in clusters:
-            try:
-                arns = []
-                for page in ecs_client.get_paginator("list_services").paginate(
-                    cluster=cluster
-                ):
-                    arns.extend(page.get("serviceArns", []))
-                for start in range(0, len(arns), 10):
-                    response = ecs_client.describe_services(
-                        cluster=cluster, services=arns[start : start + 10]
-                    )
-                    for failure in response.get("failures") or []:
-                        unread.append(
-                            f"ECS service {failure.get('arn')} "
-                            f"({failure.get('reason')})"
-                        )
-                    for service in response.get("services") or []:
-                        awsvpc = (service.get("networkConfiguration") or {}).get(
-                            "awsvpcConfiguration"
-                        ) or {}
-                        workloads.append(
-                            {
-                                "label": (
-                                    f"ECS service {service.get('serviceName')} in "
-                                    f"{str(cluster).rsplit('/', 1)[-1]}"
-                                ),
-                                "groups": awsvpc.get("securityGroups") or [],
-                                "awsvpc": bool(awsvpc),
-                                "ingress": True,
-                            }
-                        )
-            except Exception as error:
-                unread.append(
-                    f"ECS cluster {str(cluster).rsplit('/', 1)[-1]} services "
-                    f"({get_assessment_error_label(error)})"
-                )
     except Exception as error:
-        unread.append(f"ecs:ListClusters ({get_assessment_error_label(error)})")
+        return [], [f"ecs:ListClusters ({get_assessment_error_label(error)})"]
+    for cluster in clusters:
+        cluster_name = str(cluster).rsplit("/", 1)[-1]
+        try:
+            arns = []
+            for page in ecs_client.get_paginator("list_services").paginate(
+                cluster=cluster
+            ):
+                arns.extend(page.get("serviceArns", []))
+            for start in range(0, len(arns), 10):
+                response = ecs_client.describe_services(
+                    cluster=cluster, services=arns[start : start + 10]
+                )
+                for failure in response.get("failures") or []:
+                    unread.append(
+                        f"ECS service {failure.get('arn')} ({failure.get('reason')})"
+                    )
+                for service in response.get("services") or []:
+                    services.append((cluster_name, service))
+        except Exception as error:
+            unread.append(
+                f"ECS cluster {cluster_name} services "
+                f"({get_assessment_error_label(error)})"
+            )
+    return services, unread
+
+
+def _lambda_functions(region: str) -> Tuple[List[Dict[str, Any]], List[str]]:
     try:
         lambda_client = boto3.client("lambda", config=boto3_config, region_name=region)
+        functions = []
         for page in lambda_client.get_paginator("list_functions").paginate():
-            for function in page.get("Functions", []):
-                groups = (function.get("VpcConfig") or {}).get("SecurityGroupIds") or []
-                workloads.append(
-                    {
-                        "label": f"Lambda function {function.get('FunctionName')}",
-                        "groups": groups,
-                        "awsvpc": bool(groups),
-                        "ingress": False,
-                    }
-                )
+            functions.extend(page.get("Functions", []))
+        return functions, []
     except Exception as error:
-        unread.append(f"lambda:ListFunctions ({get_assessment_error_label(error)})")
+        return [], [f"lambda:ListFunctions ({get_assessment_error_label(error)})"]
+
+
+def _segmentation_workloads(region: str) -> Tuple[List[Dict[str, Any]], List[str]]:
+    """ECS services and Lambda functions with the security groups they run in."""
+    workloads = []
+    services, unread = _ecs_services(region)
+    for cluster_name, service in services:
+        awsvpc = (service.get("networkConfiguration") or {}).get(
+            "awsvpcConfiguration"
+        ) or {}
+        workloads.append(
+            {
+                "label": (
+                    f"ECS service {service.get('serviceName')} in {cluster_name}"
+                ),
+                "groups": awsvpc.get("securityGroups") or [],
+                "awsvpc": bool(awsvpc),
+                "ingress": True,
+            }
+        )
+    functions, lambda_unread = _lambda_functions(region)
+    unread.extend(lambda_unread)
+    for function in functions:
+        groups = (function.get("VpcConfig") or {}).get("SecurityGroupIds") or []
+        workloads.append(
+            {
+                "label": f"Lambda function {function.get('FunctionName')}",
+                "groups": groups,
+                "awsvpc": bool(groups),
+                "ingress": False,
+            }
+        )
     return workloads, unread
 
 
@@ -13247,6 +13263,421 @@ def check_secrets_manager_rotation(region: str = "") -> Dict[str, Any]:
                 "N/A",
             )
         )
+    return findings
+
+
+SECRET_HISTORY_FINDING = "Secrets Manager Rotation History"
+SECRET_HISTORY_REFERENCE = (
+    "https://docs.aws.amazon.com/secretsmanager/latest/userguide/"
+    "monitoring-cloudtrail.html"
+)
+SECRET_PROPAGATION_FINDING = "Rotated Secret Propagation"
+SECRET_PROPAGATION_REFERENCE = (
+    "https://docs.aws.amazon.com/AmazonECS/latest/developerguide/"
+    "secrets-envvar-secrets-manager.html"
+)
+PLAINTEXT_CREDENTIAL_FINDING = "Credential Held Outside Secrets Manager"
+ROTATION_FAILURE_EVENTS = ("RotationFailed", "RotationAbandoned")
+ROTATION_STALL_HOURS = 24
+SECRETS_EXTENSION_LAYER = "AWS-Parameters-and-Secrets-Lambda-Extension"
+# Anchored at the end so SECRET_NAME, TOKEN_ENDPOINT and PASSWORD_LENGTH,
+# which name a reference or a setting, do not match.
+_CREDENTIAL_NAME = re.compile(
+    r"(PASSWORD|PASSWD|SECRET|SECRET_?KEY|TOKEN|API_?KEY|ACCESS_?KEY|PRIVATE_?KEY"
+    r"|CREDENTIALS?)$",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_plaintext_credential(name: str, value: Any) -> bool:
+    """A credential-named variable whose value is not a reference to a store."""
+    if not _CREDENTIAL_NAME.search(name):
+        return False
+    text = str(value or "").strip()
+    return bool(text) and not text.startswith("arn:")
+
+
+def _secret_arn_prefix(value_from: str) -> Optional[str]:
+    """The secret ARN inside an ECS valueFrom, without a JSON key suffix."""
+    parts = str(value_from).split(":")
+    if len(parts) >= 7 and parts[2] == "secretsmanager" and parts[5] == "secret":
+        return ":".join(parts[:7])
+    return None
+
+
+def _capped_problem_rows(
+    check_id, name, problems, resolution, reference, severity, region, noun
+):
+    rows = [
+        create_finding(
+            check_id=check_id,
+            finding_name=name,
+            finding_details=problem,
+            resolution=resolution,
+            reference=reference,
+            severity=severity,
+            status="Failed",
+            region=region,
+        )
+        for problem in problems[:20]
+    ]
+    if len(problems) > 20:
+        rows.append(
+            create_finding(
+                check_id=check_id,
+                finding_name=name,
+                finding_details=(
+                    f"{len(problems)} {noun} were found (the first 20 are reported "
+                    "individually above)."
+                ),
+                resolution=resolution,
+                reference=reference,
+                severity=severity,
+                status="Failed",
+                region=region,
+            )
+        )
+    return rows
+
+
+def _rotation_events(region: str) -> Dict[str, List[Tuple[str, datetime]]]:
+    """Secret ARN or name to (event name, time) for the last 90 days."""
+    client = boto3.client("cloudtrail", config=boto3_config, region_name=region)
+    events = {}
+    for event_name in ("RotationStarted",) + ROTATION_FAILURE_EVENTS:
+        for page in client.get_paginator("lookup_events").paginate(
+            LookupAttributes=[
+                {"AttributeKey": "EventName", "AttributeValue": event_name}
+            ]
+        ):
+            for event in page.get("Events", []):
+                try:
+                    record = json.loads(event.get("CloudTrailEvent") or "{}")
+                except ValueError:
+                    record = {}
+                secret = (record.get("additionalEventData") or {}).get("SecretId") or (
+                    record.get("requestParameters") or {}
+                ).get("secretId")
+                when = event.get("EventTime")
+                if secret and isinstance(when, datetime):
+                    if when.tzinfo is None:
+                        when = when.replace(tzinfo=timezone.utc)
+                    events.setdefault(secret, []).append((event_name, when))
+    return events
+
+
+def _rotation_history_findings(
+    region: str, secrets: List[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+    rotating = [s for s in secrets if s.get("RotationEnabled") is True]
+    if not rotating:
+        return []
+    try:
+        events = _rotation_events(region)
+    except Exception as error:
+        return [
+            _unread_resources_finding(
+                "SM-40",
+                SECRET_HISTORY_FINDING,
+                [f"cloudtrail:LookupEvents ({get_assessment_error_label(error)})"],
+                f"{len(rotating)} rotating secret(s) have no history read.",
+                SECRET_HISTORY_REFERENCE,
+                region,
+            )
+        ]
+    now = datetime.now(timezone.utc)
+    problems, in_progress, clean, started = [], [], [], 0
+    for secret in rotating:
+        name = secret.get("Name") or secret.get("ARN")
+        history = events.get(secret.get("ARN"), []) + events.get(secret.get("Name"), [])
+        last = secret.get("LastRotatedDate")
+        if isinstance(last, datetime) and last.tzinfo is None:
+            last = last.replace(tzinfo=timezone.utc)
+        after = [
+            (event, when)
+            for event, when in history
+            if not isinstance(last, datetime) or when > last
+        ]
+        failure = max(
+            (w for e, w in after if e in ROTATION_FAILURE_EVENTS), default=None
+        )
+        start = max((w for e, w in after if e == "RotationStarted"), default=None)
+        if any(e == "RotationStarted" for e, _ in history):
+            started += 1
+        if failure:
+            problems.append(
+                f"Secret '{name}' recorded a rotation failure at "
+                f"{failure.isoformat()} and has not rotated since."
+            )
+        elif start and now - start > timedelta(hours=ROTATION_STALL_HOURS):
+            problems.append(
+                f"Secret '{name}' started a rotation at {start.isoformat()} that "
+                "has not completed: LastRotatedDate is older than the start."
+            )
+        elif start:
+            in_progress.append(f"secret {name} (rotation started {start.isoformat()})")
+        else:
+            clean.append(name)
+    rows = _capped_problem_rows(
+        "SM-40",
+        SECRET_HISTORY_FINDING,
+        problems,
+        "Read the rotation function's logs, fix the failing step, and rotate the "
+        "secret again.",
+        SECRET_HISTORY_REFERENCE,
+        "Medium",
+        region,
+        "secrets with a failed or stalled rotation",
+    )
+    if in_progress:
+        rows.append(
+            _unread_resources_finding(
+                "SM-40",
+                SECRET_HISTORY_FINDING,
+                in_progress,
+                "a rotation in progress has no outcome yet.",
+                SECRET_HISTORY_REFERENCE,
+                region,
+            )
+        )
+    if clean and not problems and not in_progress:
+        rows.append(
+            create_finding(
+                check_id="SM-40",
+                finding_name=SECRET_HISTORY_FINDING,
+                finding_details=(
+                    f"None of the {len(clean)} rotating secret(s) recorded a "
+                    "failed, abandoned or stalled rotation in the 90 days of "
+                    f"CloudTrail event history; {started} recorded a "
+                    "RotationStarted event in that window."
+                ),
+                resolution="No action required",
+                reference=SECRET_HISTORY_REFERENCE,
+                severity="Medium",
+                status="Passed",
+                region=region,
+            )
+        )
+    return rows
+
+
+def _rotation_redeploy_rules(region: str) -> List[str]:
+    """ENABLED default-bus rules on aws.secretsmanager that have a target."""
+    client = boto3.client("events", config=boto3_config, region_name=region)
+    rules = []
+    for page in client.get_paginator("list_rules").paginate():
+        for rule in page.get("Rules", []):
+            if rule.get("State") != "ENABLED":
+                continue
+            try:
+                pattern = json.loads(rule.get("EventPattern") or "{}")
+            except ValueError:
+                continue
+            sources = pattern.get("source") if isinstance(pattern, dict) else None
+            if isinstance(sources, str):
+                sources = [sources]
+            if not isinstance(sources, list) or "aws.secretsmanager" not in sources:
+                continue
+            names = (pattern.get("detail") or {}).get("eventName")
+            if isinstance(names, list) and not any(
+                str(n).startswith("Rotation") for n in names
+            ):
+                continue
+            targets = []
+            for target_page in client.get_paginator("list_targets_by_rule").paginate(
+                Rule=rule.get("Name")
+            ):
+                targets.extend(target_page.get("Targets", []))
+            if targets:
+                rules.append(rule.get("Name"))
+    return rules
+
+
+def _propagation_and_plaintext_findings(
+    region: str, secrets: List[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+    rotating = {
+        s.get("ARN"): s.get("Name") for s in secrets if s.get("RotationEnabled") is True
+    }
+    services, unread = _ecs_services(region)
+    functions, lambda_unread = _lambda_functions(region)
+    unread.extend(lambda_unread)
+    injected, parameters, plaintext = [], [], []
+    ecs_client = boto3.client("ecs", config=boto3_config, region_name=region)
+    task_definitions = {}
+    for cluster_name, service in services:
+        if service.get("status") != "ACTIVE":
+            continue
+        arn = service.get("taskDefinition")
+        label = f"ECS service {service.get('serviceName')} in {cluster_name}"
+        if arn not in task_definitions:
+            try:
+                task_definitions[arn] = ecs_client.describe_task_definition(
+                    taskDefinition=arn
+                ).get("taskDefinition", {})
+            except Exception as error:
+                task_definitions[arn] = None
+                unread.append(
+                    f"task definition {arn} ({get_assessment_error_label(error)})"
+                )
+        definition = task_definitions[arn]
+        if definition is None:
+            continue
+        for container in definition.get("containerDefinitions") or []:
+            where = f"{label}, container {container.get('name')}"
+            for entry in container.get("secrets") or []:
+                value_from = str(entry.get("valueFrom") or "")
+                secret_arn = _secret_arn_prefix(value_from)
+                if secret_arn in rotating:
+                    injected.append(
+                        f"{where} injects rotating secret '{rotating[secret_arn]}'"
+                    )
+                elif secret_arn is None:
+                    parameters.append(
+                        f"{where} injects {entry.get('name')} from Parameter Store "
+                        f"({value_from.rsplit(':', 1)[-1][:120]}), which has no "
+                        "automatic rotation"
+                    )
+            for entry in container.get("environment") or []:
+                if _looks_like_plaintext_credential(
+                    str(entry.get("name")), entry.get("value")
+                ):
+                    plaintext.append(
+                        f"{where} sets {entry.get('name')} as a plaintext environment "
+                        "variable"
+                    )
+    extension_users = 0
+    for function in functions:
+        if any(
+            SECRETS_EXTENSION_LAYER in str(layer.get("Arn"))
+            for layer in function.get("Layers") or []
+        ):
+            extension_users += 1
+        variables = (function.get("Environment") or {}).get("Variables") or {}
+        for name, value in variables.items():
+            if _looks_like_plaintext_credential(name, value):
+                plaintext.append(
+                    f"Lambda function {function.get('FunctionName')} sets {name} as a "
+                    "plaintext environment variable"
+                )
+
+    rows = []
+    stale = []
+    if injected:
+        try:
+            redeploy = _rotation_redeploy_rules(region)
+        except Exception as error:
+            redeploy = None
+            unread.append(f"events:ListRules ({get_assessment_error_label(error)})")
+        if redeploy == []:
+            stale = [
+                f"{entry}. ECS resolves the value at task start, and no ENABLED "
+                "EventBridge rule on aws.secretsmanager rotation events has a "
+                "target, so a rotation does not reach running tasks"
+                for entry in injected
+            ]
+    rows.extend(
+        _capped_problem_rows(
+            "SM-40",
+            SECRET_PROPAGATION_FINDING,
+            [f"{p}." for p in stale + parameters],
+            "Fetch the secret at runtime with secretsmanager:GetSecretValue under "
+            "the task role, or route the rotation event to an update-service "
+            "--force-new-deployment, and move Parameter Store credentials to a "
+            "rotating Secrets Manager secret.",
+            SECRET_PROPAGATION_REFERENCE,
+            "Medium",
+            region,
+            "secret propagation gaps",
+        )
+    )
+    rows.extend(
+        _capped_problem_rows(
+            "SM-40",
+            PLAINTEXT_CREDENTIAL_FINDING,
+            [
+                f"{p}. A credential set in configuration is outside any rotation "
+                "schedule (matched on the variable name; the value is not logged)."
+                for p in plaintext
+            ],
+            "Store the credential in Secrets Manager with automatic rotation and "
+            "read it at runtime or through the Parameters and Secrets extension.",
+            SECRET_ROTATION_REFERENCE,
+            "Medium",
+            region,
+            "plaintext credentials",
+        )
+    )
+    if unread:
+        rows.append(
+            _unread_resources_finding(
+                "SM-40",
+                SECRET_PROPAGATION_FINDING,
+                list(dict.fromkeys(unread)),
+                f"{len(services)} ECS service(s) and {len(functions)} Lambda "
+                "function(s) were read.",
+                SECRET_PROPAGATION_REFERENCE,
+                region,
+            )
+        )
+    elif not stale and not parameters:
+        wired = (
+            f" {len(injected)} injection(s) of a rotating secret are covered by an "
+            "EventBridge rotation rule with a target; whether that target "
+            "redeploys the service is not read."
+            if injected
+            else ""
+        )
+        rows.append(
+            create_finding(
+                check_id="SM-40",
+                finding_name=SECRET_PROPAGATION_FINDING,
+                finding_details=(
+                    f"No ECS task injects a rotating secret without a redeploy path, "
+                    f"and none injects from Parameter Store.{wired} Lambda functions "
+                    "are not graded: no API shows whether a function re-fetches per "
+                    "invocation or caches at init; "
+                    f"{extension_users} of {len(functions)} use the Parameters and "
+                    "Secrets extension."
+                ),
+                resolution="No action required",
+                reference=SECRET_PROPAGATION_REFERENCE,
+                severity="Medium",
+                status="Passed",
+                region=region,
+            )
+        )
+    return rows
+
+
+def check_secret_rotation_history_and_propagation(region: str = "") -> Dict[str, Any]:
+    """
+    SM-40: Read rotation outcomes from CloudTrail and whether a rotated value
+    reaches the ECS tasks that inject it, and find credentials held in plaintext
+    environment variables outside any rotation.
+    """
+    findings = {"csv_data": []}
+    try:
+        client = boto3.client("secretsmanager", config=boto3_config, region_name=region)
+        secrets = []
+        for page in client.get_paginator("list_secrets").paginate():
+            secrets.extend(
+                s for s in page.get("SecretList", []) if not s.get("OwningService")
+            )
+    except Exception as error:
+        findings["csv_data"].append(
+            _unread_resources_finding(
+                "SM-40",
+                SECRET_PROPAGATION_FINDING,
+                [f"secretsmanager:ListSecrets ({get_assessment_error_label(error)})"],
+                "no secret was read.",
+                SECRET_PROPAGATION_REFERENCE,
+                region,
+            )
+        )
+        return findings
+    findings["csv_data"].extend(_rotation_history_findings(region, secrets))
+    findings["csv_data"].extend(_propagation_and_plaintext_findings(region, secrets))
     return findings
 
 
@@ -14132,6 +14563,9 @@ def lambda_handler(event, context):
 
         logger.info("Running Secrets Manager rotation check (SM-40)")
         all_findings.append(check_secrets_manager_rotation(region=region))
+        all_findings.append(
+            check_secret_rotation_history_and_propagation(region=region)
+        )
 
         logger.info("Running AWS IoT device-scoped policy check (SM-41)")
         all_findings.append(check_iot_device_scoped_policies(region=region))

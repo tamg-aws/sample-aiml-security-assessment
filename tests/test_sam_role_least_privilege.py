@@ -205,6 +205,7 @@ _EXPECTED_ACTIONS = {
         "tag:GetResources",
     },
     "SagemakerSecurityAssessmentFunction": {
+        "cloudtrail:LookupEvents",
         "config:DescribeComplianceByConfigRule",
         "config:DescribeConfigRules",
         "config:DescribeConfigurationRecorders",
@@ -785,7 +786,12 @@ def test_sagemaker_scope27_reads_wildcard_only_where_iam_has_no_resource_type(
         ),
         (
             "AccountInventoryWithoutResourceType",
-            ("eks:ListClusters", "secretsmanager:ListSecrets", "iot:ListPolicies"),
+            (
+                "eks:ListClusters",
+                "secretsmanager:ListSecrets",
+                "iot:ListPolicies",
+                "cloudtrail:LookupEvents",
+            ),
         ),
     ):
         statement = _statement_block(

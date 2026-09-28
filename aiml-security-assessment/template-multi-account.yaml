@@ -819,14 +819,16 @@ Resources:
                 - events:ListTargetsByRule # SM-04
               Resource: !Sub 'arn:${AWS::Partition}:events:*:${AWS::AccountId}:rule/*'
             - Sid: AccountInventoryWithoutResourceType
-              # SM-39, SM-40 and SM-41 enumerate clusters, secrets and IoT policies.
-              # None of these three list actions has a resource type in IAM.
+              # SM-39, SM-40 and SM-41 enumerate clusters, secrets and IoT policies,
+              # and SM-40 reads rotation events. None of these four actions has a
+              # resource type in IAM.
               # SM-40 reads rotation metadata only, never a secret value.
               Effect: Allow
               Action:
                 - eks:ListClusters # SM-39
                 - secretsmanager:ListSecrets # SM-40
                 - iot:ListPolicies # SM-41
+                - cloudtrail:LookupEvents # SM-40
               Resource: '*'
             - Sid: EKSAddonRead
               Effect: Allow
