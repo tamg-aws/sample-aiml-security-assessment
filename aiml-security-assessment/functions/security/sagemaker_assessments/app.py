@@ -12003,6 +12003,395 @@ def check_guardduty_runtime_monitoring(
     return findings
 
 
+RUNTIME_COVERAGE_FINDING = "GuardDuty Runtime Monitoring Coverage"
+RUNTIME_COVERAGE_REFERENCE = (
+    "https://docs.aws.amazon.com/guardduty/latest/ug/"
+    "runtime-monitoring-assessing-coverage.html"
+)
+LAMBDA_RUNTIME_TIER_FINDING = "Lambda Runtime Detection Tier"
+LAMBDA_RUNTIME_TIER_REFERENCE = (
+    "https://docs.aws.amazon.com/inspector/latest/user/scanning-lambda.html"
+)
+RUNTIME_UNSUPPORTED_NOTE = (
+    "EKS on Fargate, EKS Hybrid Nodes and ECS Managed Instances are not "
+    "supported by Runtime Monitoring and fall to task- and network-level telemetry"
+)
+
+
+def _runtime_coverage_findings(
+    region: str, detector_id: str, runtime: Dict[str, Any]
+) -> List[Dict[str, Any]]:
+    """Every covered resource HEALTHY, and every EKS and ECS cluster covered."""
+    unread = []
+    try:
+        client = boto3.client("guardduty", config=boto3_config, region_name=region)
+        resources = []
+        for page in client.get_paginator("list_coverage").paginate(
+            DetectorId=detector_id
+        ):
+            resources.extend(page.get("Resources", []))
+    except Exception as error:
+        return [
+            _unread_resources_finding(
+                "SM-38",
+                RUNTIME_COVERAGE_FINDING,
+                [f"guardduty:ListCoverage ({get_assessment_error_label(error)})"],
+                "no per-resource coverage was read.",
+                RUNTIME_COVERAGE_REFERENCE,
+                region,
+            )
+        ]
+
+    eks_clusters = []
+    try:
+        eks_client = boto3.client("eks", config=boto3_config, region_name=region)
+        for page in eks_client.get_paginator("list_clusters").paginate():
+            eks_clusters.extend(page.get("clusters", []))
+    except Exception as error:
+        unread.append(f"eks:ListClusters ({get_assessment_error_label(error)})")
+    ecs_clusters = []
+    try:
+        ecs_client = boto3.client("ecs", config=boto3_config, region_name=region)
+        for page in ecs_client.get_paginator("list_clusters").paginate():
+            ecs_clusters.extend(
+                str(arn).rsplit("/", 1)[-1] for arn in page.get("clusterArns", [])
+            )
+    except Exception as error:
+        unread.append(f"ecs:ListClusters ({get_assessment_error_label(error)})")
+
+    problems = []
+    covered = {"EKS": set(), "ECS": set()}
+    healthy = []
+    for resource in resources:
+        details = resource.get("ResourceDetails") or {}
+        kind = details.get("ResourceType") or "resource"
+        eks = details.get("EksClusterDetails") or {}
+        ecs = details.get("EcsClusterDetails") or {}
+        ec2 = details.get("Ec2InstanceDetails") or {}
+        name = (
+            eks.get("ClusterName")
+            or ecs.get("ClusterName")
+            or ec2.get("InstanceId")
+            or resource.get("ResourceId")
+        )
+        if kind in covered and name:
+            covered[kind].add(name)
+        label = f"{kind} {name}"
+        if resource.get("CoverageStatus") != "HEALTHY":
+            issue = resource.get("Issue")
+            problems.append(
+                f"{label} is {resource.get('CoverageStatus') or 'without a status'}"
+                + (f" ({str(issue)[:160]})" if issue else "")
+            )
+            continue
+        compatible = eks.get("CompatibleNodes")
+        covered_nodes = eks.get("CoveredNodes")
+        if (
+            isinstance(compatible, int)
+            and isinstance(covered_nodes, int)
+            and covered_nodes < compatible
+        ):
+            problems.append(
+                f"{label} covers {covered_nodes} of {compatible} compatible nodes"
+            )
+            continue
+        healthy.append(label)
+    for cluster in eks_clusters:
+        if cluster not in covered["EKS"]:
+            problems.append(f"EKS cluster {cluster} has no Runtime Monitoring coverage")
+    for cluster in ecs_clusters:
+        if cluster not in covered["ECS"]:
+            problems.append(f"ECS cluster {cluster} has no Runtime Monitoring coverage")
+
+    states = {
+        config.get("Name"): config.get("Status")
+        for config in runtime.get("AdditionalConfiguration") or []
+    }
+    unmanaged = [
+        name
+        for name in RUNTIME_MONITORING_AGENT_CONFIGS
+        if states.get(name) != "ENABLED"
+    ]
+    rows = []
+    if not resources and not eks_clusters and not ecs_clusters and not unread:
+        if unmanaged:
+            problems.append(
+                "no host reports a Runtime Monitoring agent, and automated agent "
+                f"management is not enabled for {', '.join(unmanaged)}"
+            )
+        else:
+            rows.append(
+                create_finding(
+                    check_id="SM-38",
+                    finding_name=RUNTIME_COVERAGE_FINDING,
+                    finding_details=(
+                        "Automated agent management is enabled for EKS, ECS Fargate "
+                        "and EC2, and no host is in coverage yet. The EC2 instance "
+                        "population is not compared against coverage, so an "
+                        "instance GuardDuty has not enrolled is not counted."
+                    ),
+                    resolution="No action required",
+                    reference=RUNTIME_COVERAGE_REFERENCE,
+                    severity="Informational",
+                    status="N/A",
+                    region=region,
+                )
+            )
+    for problem in problems[:20]:
+        rows.append(
+            create_finding(
+                check_id="SM-38",
+                finding_name=RUNTIME_COVERAGE_FINDING,
+                finding_details=(
+                    f"Runtime Monitoring coverage: {problem}. {RUNTIME_UNSUPPORTED_NOTE}."
+                ),
+                resolution=(
+                    "Enable automated agent management for the host type or install "
+                    "the GuardDuty security agent, then resolve the coverage issue "
+                    "GuardDuty reports until the resource is HEALTHY."
+                ),
+                reference=RUNTIME_COVERAGE_REFERENCE,
+                severity="High",
+                status="Failed",
+                region=region,
+            )
+        )
+    if len(problems) > 20:
+        rows.append(
+            create_finding(
+                check_id="SM-38",
+                finding_name=RUNTIME_COVERAGE_FINDING,
+                finding_details=(
+                    f"{len(problems)} Runtime Monitoring coverage gaps were found "
+                    "(the first 20 are reported individually above)."
+                ),
+                resolution="Resolve each coverage gap until the resource is HEALTHY.",
+                reference=RUNTIME_COVERAGE_REFERENCE,
+                severity="High",
+                status="Failed",
+                region=region,
+            )
+        )
+    if unread:
+        rows.append(
+            _unread_resources_finding(
+                "SM-38",
+                RUNTIME_COVERAGE_FINDING,
+                unread,
+                f"{len(resources)} covered resource(s) were read.",
+                RUNTIME_COVERAGE_REFERENCE,
+                region,
+            )
+        )
+    elif healthy and not problems:
+        rows.append(
+            create_finding(
+                check_id="SM-38",
+                finding_name=RUNTIME_COVERAGE_FINDING,
+                finding_details=(
+                    f"All {len(healthy)} resource(s) in Runtime Monitoring coverage "
+                    f"are HEALTHY, including every EKS and ECS cluster listed: "
+                    f"{', '.join(healthy[:10])}. The EC2 instance population is not "
+                    "compared against coverage, so a standalone instance GuardDuty "
+                    "has not enrolled is not counted."
+                ),
+                resolution="No action required",
+                reference=RUNTIME_COVERAGE_REFERENCE,
+                severity="High",
+                status="Passed",
+                region=region,
+            )
+        )
+    return rows
+
+
+def _lambda_runtime_tier_findings(
+    region: str, detail: Dict[str, Any]
+) -> List[Dict[str, Any]]:
+    """
+    Lambda has no runtime agent, so the tier is GuardDuty Lambda Protection plus
+    Inspector Lambda standard and code scanning, read per function.
+    """
+    problems = []
+    unread = []
+    lambda_logs = _guardduty_feature(detail, "LAMBDA_NETWORK_LOGS") if detail else None
+    if detail.get("Status") != "ENABLED" or not (
+        lambda_logs and lambda_logs.get("Status") == "ENABLED"
+    ):
+        problems.append(
+            "GuardDuty Lambda Protection (LAMBDA_NETWORK_LOGS) is not enabled"
+        )
+    inspector = boto3.client("inspector2", config=boto3_config, region_name=region)
+    try:
+        accounts = inspector.batch_get_account_status().get("accounts") or []
+        state = (accounts[0].get("resourceState") or {}) if accounts else {}
+        for key, label in (("lambda", "standard"), ("lambdaCode", "code")):
+            status = (state.get(key) or {}).get("status")
+            if status != "ENABLED":
+                problems.append(
+                    f"Inspector Lambda {label} scanning is {status or 'not reported'}"
+                )
+    except Exception as error:
+        unread.append(
+            f"inspector2:BatchGetAccountStatus ({get_assessment_error_label(error)})"
+        )
+    scanned = {}
+    try:
+        for page in inspector.get_paginator("list_coverage").paginate(
+            filterCriteria={
+                "resourceType": [
+                    {"comparison": "EQUALS", "value": "AWS_LAMBDA_FUNCTION"}
+                ]
+            }
+        ):
+            for resource in page.get("coveredResources", []):
+                name = (
+                    (resource.get("resourceMetadata") or {}).get("lambdaFunction") or {}
+                ).get("functionName") or str(resource.get("resourceId"))
+                scanned.setdefault(name, []).append(resource)
+    except Exception as error:
+        unread.append(f"inspector2:ListCoverage ({get_assessment_error_label(error)})")
+        scanned = None
+    functions = []
+    try:
+        lambda_client = boto3.client("lambda", config=boto3_config, region_name=region)
+        for page in lambda_client.get_paginator("list_functions").paginate():
+            functions.extend(page.get("Functions", []))
+    except Exception as error:
+        unread.append(f"lambda:ListFunctions ({get_assessment_error_label(error)})")
+    if scanned is not None:
+        for function in functions:
+            name = function.get("FunctionName")
+            entries = scanned.get(name) or scanned.get(function.get("FunctionArn"))
+            if not entries:
+                problems.append(
+                    f"function {name} is not in Inspector coverage"
+                    + (
+                        " (a customer-managed KmsKeyArn removes Inspector scanning)"
+                        if function.get("KMSKeyArn")
+                        else ""
+                    )
+                )
+                continue
+            for entry in entries:
+                status = entry.get("scanStatus") or {}
+                if status.get("statusCode") != "ACTIVE":
+                    problems.append(
+                        f"function {name} {entry.get('scanType') or ''} scanning is "
+                        f"{status.get('statusCode') or 'not reported'} "
+                        f"({status.get('reason') or 'no reason'})".replace("  ", " ")
+                    )
+    rows = []
+    for problem in problems[:20]:
+        rows.append(
+            create_finding(
+                check_id="SM-38",
+                finding_name=LAMBDA_RUNTIME_TIER_FINDING,
+                finding_details=(
+                    f"Lambda runtime tier: {problem}. Lambda has no runtime agent, "
+                    "so this tier is the only managed detection for functions."
+                ),
+                resolution=(
+                    "Enable GuardDuty Lambda Protection and Inspector Lambda standard "
+                    "and code scanning, and keep each function eligible (no "
+                    "InspectorExclusion tag, invoked or updated within 90 days, no "
+                    "customer-managed KmsKeyArn unless the artifact is scanned in CI)."
+                ),
+                reference=LAMBDA_RUNTIME_TIER_REFERENCE,
+                severity="Medium",
+                status="Failed",
+                region=region,
+            )
+        )
+    if len(problems) > 20:
+        rows.append(
+            create_finding(
+                check_id="SM-38",
+                finding_name=LAMBDA_RUNTIME_TIER_FINDING,
+                finding_details=(
+                    f"{len(problems)} Lambda runtime tier gaps were found (the first "
+                    "20 are reported individually above)."
+                ),
+                resolution="Resolve each Lambda coverage gap.",
+                reference=LAMBDA_RUNTIME_TIER_REFERENCE,
+                severity="Medium",
+                status="Failed",
+                region=region,
+            )
+        )
+    if unread:
+        rows.append(
+            _unread_resources_finding(
+                "SM-38",
+                LAMBDA_RUNTIME_TIER_FINDING,
+                unread,
+                f"{len(functions)} function(s) were listed.",
+                LAMBDA_RUNTIME_TIER_REFERENCE,
+                region,
+            )
+        )
+    elif not problems:
+        rows.append(
+            create_finding(
+                check_id="SM-38",
+                finding_name=LAMBDA_RUNTIME_TIER_FINDING,
+                finding_details=(
+                    "GuardDuty Lambda Protection and Inspector Lambda standard and "
+                    f"code scanning are enabled, and all {len(functions)} function(s) "
+                    "are ACTIVE in Inspector coverage."
+                ),
+                resolution="No action required",
+                reference=LAMBDA_RUNTIME_TIER_REFERENCE,
+                severity="Medium",
+                status="Passed",
+                region=region,
+            )
+        )
+    return rows
+
+
+def check_guardduty_runtime_monitoring_coverage(
+    region: str = "", detector_inventory: Dict[str, Any] = None
+) -> Dict[str, Any]:
+    """
+    SM-38: Read Runtime Monitoring coverage per resource against the EKS and ECS
+    cluster population, and the Lambda tier that stands in for a runtime agent.
+    A detector with every agent-management option off and no manual agent
+    fails here, where the feature flag alone reads as enabled.
+    """
+    findings = {"csv_data": []}
+    try:
+        inventory = detector_inventory or get_guardduty_detector_inventory(region)
+        if inventory.get("error"):
+            raise inventory["error"]
+        detail = inventory.get("detail") or {}
+        runtime = _guardduty_feature(detail, "RUNTIME_MONITORING")
+        if (
+            inventory.get("detector_id")
+            and detail.get("Status") == "ENABLED"
+            and runtime
+            and runtime.get("Status") == "ENABLED"
+        ):
+            findings["csv_data"].extend(
+                _runtime_coverage_findings(region, inventory["detector_id"], runtime)
+            )
+        findings["csv_data"].extend(_lambda_runtime_tier_findings(region, detail))
+    except Exception as error:
+        findings["csv_data"].append(
+            create_finding(
+                check_id="SM-38",
+                finding_name=RUNTIME_COVERAGE_FINDING,
+                finding_details=build_could_not_assess_detail(error, region),
+                resolution=COULD_NOT_ASSESS_RESOLUTION,
+                reference=RUNTIME_COVERAGE_REFERENCE,
+                severity="Informational",
+                status="N/A",
+                region=region,
+            )
+        )
+    return findings
+
+
 EKS_NETWORK_POLICY_FINDING = "EKS VPC CNI Network Policy Enforcement"
 EKS_NETWORK_POLICY_REFERENCE = (
     "https://docs.aws.amazon.com/eks/latest/userguide/cni-network-policy-configure.html"
@@ -13331,6 +13720,13 @@ def lambda_handler(event, context):
         logger.info("Running GuardDuty Runtime Monitoring check (SM-38)")
         all_findings.append(
             check_guardduty_runtime_monitoring(
+                region=region, detector_inventory=guardduty_inventory
+            )
+        )
+
+        logger.info("Running GuardDuty Runtime Monitoring coverage check (SM-38)")
+        all_findings.append(
+            check_guardduty_runtime_monitoring_coverage(
                 region=region, detector_inventory=guardduty_inventory
             )
         )

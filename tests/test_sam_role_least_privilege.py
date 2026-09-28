@@ -215,6 +215,7 @@ _EXPECTED_ACTIONS = {
         "eks:ListAddons",
         "eks:ListClusters",
         "guardduty:GetDetector",
+        "guardduty:ListCoverage",
         "guardduty:ListDetectors",
         "iam:GenerateServiceLastAccessedDetails",
         "iam:GetServiceLastAccessedDetails",
@@ -753,6 +754,7 @@ def test_sagemaker_and_guardduty_resource_reads_are_arn_scoped(template):
         template, "SagemakerSecurityAssessmentFunction", "GuardDutyDetectorRead"
     )
     assert "guardduty:GetDetector" in detector
+    assert "guardduty:ListCoverage" in detector
     assert "guardduty:*:${AWS::AccountId}:detector/*" in detector
     assert not re.search(r"Resource:\s+['\"]\*['\"]", detector)
 

@@ -7279,6 +7279,342 @@ class TestSM38GuardDutyRuntimeMonitoring:
         assert_could_not_assess_finding(rows[0])
 
 
+class TestSM38RuntimeCoverageAndLambdaTier:
+    """AIR-SLF-RT-04: per-resource coverage and the Lambda detection tier."""
+
+    check = staticmethod(sagemaker_app.check_guardduty_runtime_monitoring_coverage)
+
+    AGENTS_ON = [
+        {"Name": name, "Status": "ENABLED"}
+        for name in sagemaker_app.RUNTIME_MONITORING_AGENT_CONFIGS
+    ]
+
+    def _detail(self, runtime="ENABLED", agents=None, lambda_logs="ENABLED"):
+        return _detector(
+            features=[
+                {
+                    "Name": "RUNTIME_MONITORING",
+                    "Status": runtime,
+                    "AdditionalConfiguration": (
+                        self.AGENTS_ON if agents is None else agents
+                    ),
+                },
+                {"Name": "LAMBDA_NETWORK_LOGS", "Status": lambda_logs},
+            ]
+        )
+
+    @staticmethod
+    def _eks(name, covered=3, compatible=3, status="HEALTHY", issue=None):
+        resource = {
+            "ResourceId": name,
+            "CoverageStatus": status,
+            "ResourceDetails": {
+                "ResourceType": "EKS",
+                "EksClusterDetails": {
+                    "ClusterName": name,
+                    "CoveredNodes": covered,
+                    "CompatibleNodes": compatible,
+                },
+            },
+        }
+        if issue:
+            resource["Issue"] = issue
+        return resource
+
+    @staticmethod
+    def _ecs(name, status="HEALTHY"):
+        return {
+            "ResourceId": name,
+            "CoverageStatus": status,
+            "ResourceDetails": {
+                "ResourceType": "ECS",
+                "EcsClusterDetails": {"ClusterName": name},
+            },
+        }
+
+    @staticmethod
+    def _fn_cov(name, scan_type="PACKAGE", code="ACTIVE", reason="SUCCESSFUL"):
+        return {
+            "resourceId": f"arn:aws:lambda:us-east-1:111122223333:function:{name}",
+            "scanType": scan_type,
+            "scanStatus": {"statusCode": code, "reason": reason},
+            "resourceMetadata": {"lambdaFunction": {"functionName": name}},
+        }
+
+    def _run(
+        self,
+        detector,
+        coverage=None,
+        eks=None,
+        ecs=None,
+        functions=None,
+        fn_coverage=None,
+        lambda_state=None,
+        errors=None,
+    ):
+        errors = errors or {}
+        coverage = coverage or []
+        functions = functions if functions is not None else [{"FunctionName": "fn"}]
+        fn_coverage = (
+            fn_coverage
+            if fn_coverage is not None
+            else [
+                self._fn_cov(f["FunctionName"], t)
+                for f in functions
+                for t in ("PACKAGE", "CODE")
+            ]
+        )
+        state = lambda_state or {
+            "lambda": {"status": "ENABLED"},
+            "lambdaCode": {"status": "ENABLED"},
+        }
+
+        def source(key, pages):
+            def paginate(**kwargs):
+                if key in errors:
+                    raise errors[key]
+                return pages
+
+            return paginate
+
+        def factory(service, **kwargs):
+            client = MagicMock()
+            if service == "guardduty":
+                client.get_paginator.side_effect = _pager(
+                    {"list_coverage": source("gd", [{"Resources": coverage}])}
+                )
+            elif service == "eks":
+                client.get_paginator.side_effect = _pager(
+                    {"list_clusters": source("eks", [{"clusters": eks or []}])}
+                )
+            elif service == "ecs":
+                arns = [
+                    f"arn:aws:ecs:us-east-1:111122223333:cluster/{n}" for n in ecs or []
+                ]
+                client.get_paginator.side_effect = _pager(
+                    {"list_clusters": source("ecs", [{"clusterArns": arns}])}
+                )
+            elif service == "inspector2":
+                if "status" in errors:
+                    client.batch_get_account_status.side_effect = errors["status"]
+                else:
+                    client.batch_get_account_status.return_value = {
+                        "accounts": [{"resourceState": state}]
+                    }
+                client.get_paginator.side_effect = _pager(
+                    {
+                        "list_coverage": source(
+                            "inspector", [{"coveredResources": fn_coverage}]
+                        )
+                    }
+                )
+            elif service == "lambda":
+                client.get_paginator.side_effect = _pager(
+                    {"list_functions": source("lambda", [{"Functions": functions}])}
+                )
+            return client
+
+        with patch("sagemaker_app.boto3.client", side_effect=factory):
+            return _rows(self.check(region="us-east-1", detector_inventory=detector))
+
+    @staticmethod
+    def _named(rows, name):
+        return [r for r in rows if r["Finding"].startswith(name)]
+
+    def test_healthy_coverage_for_every_cluster_passes(self):
+        rows = self._run(
+            self._detail(),
+            coverage=[self._eks("prod"), self._ecs("svc")],
+            eks=["prod"],
+            ecs=["svc"],
+        )
+        cov = self._named(rows, sagemaker_app.RUNTIME_COVERAGE_FINDING)
+        assert [r["Status"] for r in cov] == ["Passed"]
+        assert "All 2 resource(s)" in cov[0]["Finding_Details"]
+        tier = self._named(rows, sagemaker_app.LAMBDA_RUNTIME_TIER_FINDING)
+        assert [r["Status"] for r in tier] == ["Passed"]
+
+    def test_one_unhealthy_cluster_among_healthy_ones_fails(self):
+        rows = self._run(
+            self._detail(),
+            coverage=[
+                self._eks("a"),
+                self._eks("b", status="UNHEALTHY", issue="Agent not reporting"),
+                self._ecs("svc"),
+            ],
+            eks=["a", "b"],
+            ecs=["svc"],
+        )
+        cov = self._named(rows, sagemaker_app.RUNTIME_COVERAGE_FINDING)
+        assert [r["Status"] for r in cov] == ["Failed"]
+        assert "EKS b is UNHEALTHY (Agent not reporting)" in cov[0]["Finding_Details"]
+
+    def test_healthy_cluster_hiding_uncovered_nodes_fails(self):
+        # CoverageStatus HEALTHY with 2 of 5 nodes covered hides three hosts.
+        rows = self._run(
+            self._detail(),
+            coverage=[self._eks("prod", covered=2, compatible=5)],
+            eks=["prod"],
+        )
+        cov = self._named(rows, sagemaker_app.RUNTIME_COVERAGE_FINDING)
+        assert [r["Status"] for r in cov] == ["Failed"]
+        assert "covers 2 of 5 compatible nodes" in cov[0]["Finding_Details"]
+
+    def test_cluster_missing_from_coverage_fails(self):
+        rows = self._run(
+            self._detail(),
+            coverage=[self._eks("a")],
+            eks=["a", "fargate-only"],
+            ecs=["svc"],
+        )
+        details = [
+            r["Finding_Details"]
+            for r in self._named(rows, sagemaker_app.RUNTIME_COVERAGE_FINDING)
+            if r["Status"] == "Failed"
+        ]
+        assert len(details) == 2
+        assert any("EKS cluster fargate-only has no" in d for d in details)
+        assert any("ECS cluster svc has no" in d for d in details)
+        assert "EKS on Fargate" in details[0]
+
+    def test_feature_on_with_agent_management_off_and_no_hosts_fails(self):
+        rows = self._run(
+            self._detail(
+                agents=[{"Name": "EKS_ADDON_MANAGEMENT", "Status": "DISABLED"}]
+            )
+        )
+        cov = self._named(rows, sagemaker_app.RUNTIME_COVERAGE_FINDING)
+        assert [r["Status"] for r in cov] == ["Failed"]
+        assert "EC2_AGENT_MANAGEMENT" in cov[0]["Finding_Details"]
+
+    def test_agent_management_on_and_no_hosts_is_na(self):
+        cov = self._named(
+            self._run(self._detail()), sagemaker_app.RUNTIME_COVERAGE_FINDING
+        )
+        assert [r["Status"] for r in cov] == ["N/A"]
+
+    def test_coverage_read_denied_is_incomplete_not_passed(self):
+        cov = self._named(
+            self._run(
+                self._detail(),
+                coverage=[self._eks("a")],
+                errors={"gd": _make_client_error("AccessDeniedException")},
+            ),
+            sagemaker_app.RUNTIME_COVERAGE_FINDING,
+        )
+        assert [r["Status"] for r in cov] == ["N/A"]
+        assert "guardduty:ListCoverage" in cov[0]["Finding_Details"]
+
+    def test_cluster_population_unread_withholds_passed(self):
+        cov = self._named(
+            self._run(
+                self._detail(),
+                coverage=[self._eks("a")],
+                eks=["a"],
+                errors={"ecs": _make_client_error("AccessDeniedException")},
+            ),
+            sagemaker_app.RUNTIME_COVERAGE_FINDING,
+        )
+        assert [r["Status"] for r in cov] == ["N/A"]
+        assert "ecs:ListClusters" in cov[0]["Finding_Details"]
+
+    def test_runtime_disabled_skips_coverage_leg(self):
+        rows = self._run(self._detail(runtime="DISABLED"))
+        assert self._named(rows, sagemaker_app.RUNTIME_COVERAGE_FINDING) == []
+
+    def test_one_function_missing_from_inspector_coverage_fails(self):
+        functions = [
+            {"FunctionName": "ok"},
+            {"FunctionName": "enc", "KMSKeyArn": "arn:aws:kms:us-east-1:1:key/k"},
+        ]
+        tier = self._named(
+            self._run(
+                self._detail(),
+                functions=functions,
+                fn_coverage=[self._fn_cov("ok"), self._fn_cov("ok", "CODE")],
+            ),
+            sagemaker_app.LAMBDA_RUNTIME_TIER_FINDING,
+        )
+        assert [r["Status"] for r in tier] == ["Failed"]
+        assert "function enc is not in Inspector coverage" in tier[0]["Finding_Details"]
+        assert "KmsKeyArn" in tier[0]["Finding_Details"]
+
+    def test_inactive_code_scan_behind_active_package_scan_fails(self):
+        tier = self._named(
+            self._run(
+                self._detail(),
+                fn_coverage=[
+                    self._fn_cov("fn"),
+                    self._fn_cov("fn", "CODE", "INACTIVE", "EXCLUDED_BY_TAG"),
+                ],
+            ),
+            sagemaker_app.LAMBDA_RUNTIME_TIER_FINDING,
+        )
+        assert [r["Status"] for r in tier] == ["Failed"]
+        assert (
+            "CODE scanning is INACTIVE (EXCLUDED_BY_TAG)" in tier[0]["Finding_Details"]
+        )
+
+    def test_lambda_protection_and_code_scanning_off_fail(self):
+        tier = self._named(
+            self._run(
+                self._detail(lambda_logs="DISABLED"),
+                lambda_state={
+                    "lambda": {"status": "ENABLED"},
+                    "lambdaCode": {"status": "DISABLED"},
+                },
+            ),
+            sagemaker_app.LAMBDA_RUNTIME_TIER_FINDING,
+        )
+        details = " ".join(r["Finding_Details"] for r in tier)
+        assert {r["Status"] for r in tier} == {"Failed"}
+        assert "LAMBDA_NETWORK_LOGS" in details
+        assert "Inspector Lambda code scanning is DISABLED" in details
+
+    def test_inspector_status_denied_is_incomplete_not_passed(self):
+        tier = self._named(
+            self._run(
+                self._detail(),
+                errors={"status": _make_client_error("AccessDeniedException")},
+            ),
+            sagemaker_app.LAMBDA_RUNTIME_TIER_FINDING,
+        )
+        assert [r["Status"] for r in tier] == ["N/A"]
+        assert "inspector2:BatchGetAccountStatus" in tier[0]["Finding_Details"]
+
+    def test_function_list_denied_is_incomplete_not_passed(self):
+        tier = self._named(
+            self._run(
+                self._detail(),
+                errors={"lambda": _make_client_error("AccessDeniedException")},
+            ),
+            sagemaker_app.LAMBDA_RUNTIME_TIER_FINDING,
+        )
+        assert [r["Status"] for r in tier] == ["N/A"]
+        assert "lambda:ListFunctions" in tier[0]["Finding_Details"]
+
+    def test_failed_rows_are_capped_with_a_summary(self):
+        functions = [{"FunctionName": f"f{i}"} for i in range(25)]
+        tier = self._named(
+            self._run(self._detail(), functions=functions, fn_coverage=[]),
+            sagemaker_app.LAMBDA_RUNTIME_TIER_FINDING,
+        )
+        assert len(tier) == 21
+        assert "25 Lambda runtime tier gaps" in tier[-1]["Finding_Details"]
+
+    def test_inventory_error_is_could_not_assess(self):
+        rows = _rows(
+            self.check(
+                detector_inventory={
+                    "detector_id": None,
+                    "detail": None,
+                    "error": RuntimeError("boom"),
+                }
+            )
+        )
+        assert_could_not_assess_finding(rows[0])
+
+
 class TestSM39EksVpcCniNetworkPolicy:
     """AIR-SLF-RT-05: enableNetworkPolicy in the managed vpc-cni add-on."""
 

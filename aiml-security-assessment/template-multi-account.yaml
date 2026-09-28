@@ -718,6 +718,7 @@ Resources:
               Effect: Allow
               Action:
                 - guardduty:GetDetector
+                - guardduty:ListCoverage # SM-38
               Resource: !Sub 'arn:${AWS::Partition}:guardduty:*:${AWS::AccountId}:detector/*'
             - Sid: ConfigEvaluationRead
               # SM-32 reads the recorder scope, the rule inventory and each
