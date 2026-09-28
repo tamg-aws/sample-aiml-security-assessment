@@ -1138,6 +1138,10 @@ _VERIFIED_REMEDIATION_IAM_ACTIONS |= {"xray:GetTraceSegmentDestination"}
 # names it with DescribeDeliveries and DescribeDeliverySources when the log
 # groups behind AgentCore deliveries cannot be resolved.
 _VERIFIED_REMEDIATION_IAM_ACTIONS |= {"logs:DescribeDeliveryDestinations"}
+# Verified on 2026-09-28 against the oam service reference JSON, which lists
+# ListLinks with no resource type. AC-22 names it when an account with no sink
+# cannot list the links it shares telemetry through.
+_VERIFIED_REMEDIATION_IAM_ACTIONS |= {"oam:ListLinks"}
 
 _NON_IAM_REMEDIATION_TOKENS = {
     # SM-41 names the AWS IoT Core policy variables

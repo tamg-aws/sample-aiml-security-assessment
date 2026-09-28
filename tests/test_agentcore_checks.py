@@ -8911,12 +8911,17 @@ class TestAC22SinkScopeValues:
     @patch("agentcore_app.oam_client")
     def test_no_sink_names_the_unread_source_link_leg(self, mock_oam):
         mock_oam.list_sinks.return_value = {"Items": []}
+        # The link leg is now read, so a denied ListLinks is what leaves it
+        # unread; it was asserted uncalled while the check skipped it.
+        mock_oam.list_links.side_effect = _make_client_error(
+            "AccessDeniedException", "denied"
+        )
 
         findings = agentcore_app.check_agentcore_telemetry_sink_scope()
 
         assert findings[0]["Status"] == "N/A"
         assert "oam:ListLinks" in findings[0]["Finding_Details"]
-        mock_oam.list_links.assert_not_called()
+        mock_oam.list_links.assert_called_once()
 
 
 class TestAC22OwnOrganization:
@@ -35158,3 +35163,91 @@ class TestAC20DeliveryDestinationGroups:
         )
         findings = agentcore_app.check_agentcore_log_group_data_protection()
         assert self._by_group(findings) == {"/aws/bedrock-agentcore/x": "Failed"}
+
+
+class TestAC22TelemetryLinks:
+    """AIR-ACR-OBS-06: an account with no sink is judged on the links it uses to
+    share AgentCore telemetry with a monitoring account."""
+
+    _ALL_TYPES = ["AWS::Logs::LogGroup", "AWS::XRay::Trace", "AWS::CloudWatch::Metric"]
+
+    @staticmethod
+    def _link(label, types):
+        return {
+            "Arn": f"arn:aws:oam:us-east-1:111122223333:link/{label}",
+            "Label": label,
+            "SinkArn": "arn:aws:oam:us-east-1:444455556666:sink/s-1",
+            "ResourceTypes": types,
+        }
+
+    @staticmethod
+    def _run(mock_oam, links):
+        mock_oam.list_sinks.return_value = {"Items": []}
+        if isinstance(links, Exception):
+            mock_oam.list_links.side_effect = links
+        else:
+            mock_oam.list_links.return_value = {"Items": links}
+        findings = agentcore_app.check_agentcore_telemetry_sink_scope()
+        for finding in findings:
+            assert finding["Check_ID"] == "AC-22"
+            assert_finding_schema(finding)
+        return findings
+
+    @patch("agentcore_app.oam_client")
+    def test_a_link_sharing_every_telemetry_type_passes(self, mock_oam):
+        (finding,) = self._run(mock_oam, [self._link("src", self._ALL_TYPES)])
+        assert finding["Status"] == "Passed"
+        assert (
+            "arn:aws:oam:us-east-1:444455556666:sink/s-1" in finding["Finding_Details"]
+        )
+        assert "filters are not read" in finding["Finding_Details"]
+
+    @patch("agentcore_app.oam_client")
+    def test_each_link_is_judged_and_a_missing_type_is_named(self, mock_oam):
+        findings = self._run(
+            mock_oam,
+            [
+                self._link("full", self._ALL_TYPES),
+                self._link("metrics-only", ["AWS::CloudWatch::Metric"]),
+                self._link(
+                    "no-traces", ["AWS::Logs::LogGroup", "AWS::CloudWatch::Metric"]
+                ),
+            ],
+        )
+        assert [f["Status"] for f in findings] == ["Passed", "Failed", "Failed"]
+        assert "AWS::Logs::LogGroup, AWS::XRay::Trace" in findings[1]["Finding_Details"]
+        assert "AWS::XRay::Trace" in findings[2]["Finding_Details"]
+        assert "AWS::Logs::LogGroup" not in findings[2]["Finding_Details"]
+
+    @patch("agentcore_app.oam_client")
+    def test_a_link_reporting_no_types_fails(self, mock_oam):
+        link = self._link("bare", [])
+        del link["ResourceTypes"]
+        (finding,) = self._run(mock_oam, [link])
+        assert finding["Status"] == "Failed"
+
+    @patch("agentcore_app.oam_client")
+    def test_no_link_is_na_and_says_telemetry_is_not_shared(self, mock_oam):
+        (finding,) = self._run(mock_oam, [])
+        assert finding["Status"] == "N/A"
+        assert "returned no link" in finding["Finding_Details"]
+        assert "not granted" not in finding["Finding_Details"]
+
+    @patch("agentcore_app.oam_client")
+    def test_a_denied_link_read_is_na_naming_the_action(self, mock_oam):
+        (finding,) = self._run(
+            mock_oam, _make_client_error("AccessDeniedException", "denied")
+        )
+        assert finding["Status"] == "N/A"
+        assert "AccessDeniedException" in finding["Finding_Details"]
+        assert finding["Resolution"] == "Grant oam:ListLinks and retry."
+
+    @patch("agentcore_app.oam_client")
+    def test_links_are_read_across_pages(self, mock_oam):
+        mock_oam.list_sinks.return_value = {"Items": []}
+        mock_oam.list_links.side_effect = [
+            {"Items": [self._link("a", self._ALL_TYPES)], "NextToken": "t"},
+            {"Items": [self._link("b", ["AWS::Logs::LogGroup"])]},
+        ]
+        findings = agentcore_app.check_agentcore_telemetry_sink_scope()
+        assert [f["Status"] for f in findings] == ["Passed", "Failed"]

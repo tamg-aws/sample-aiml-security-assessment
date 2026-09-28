@@ -226,6 +226,11 @@ section.
   delivery writes to. A delivery to such a group escaped the check. The
   assessment roles hold no `logs:DescribeDeliveryDestinations` grant, so the
   check reports an `N/A` row naming it and judges the prefixed groups only.
+- `AC-22` reads the links an account with no sink shares telemetry through,
+  and fails a link that omits log groups, traces or metrics. The check said
+  source-account links were not read. The assessment roles hold no
+  `oam:ListLinks` grant, so the row is `N/A` naming that action until it is
+  added.
 - `AC-45` judges each AgentCore runtime's own execution role by the rules it
   applies to a tool role. No check read a runtime role outside the AgentCore
   namespace, so one granting `s3:*` or every foundation model passed.

@@ -11403,6 +11403,112 @@ def _sink_statement_scope(
     return "unscoped"
 
 
+# The OAM resource types that carry AgentCore telemetry: its log groups,
+# including the aws/spans group Transaction Search writes, its X-Ray traces,
+# and its CloudWatch metrics.
+AGENTCORE_OAM_TELEMETRY_TYPES = (
+    "AWS::Logs::LogGroup",
+    "AWS::XRay::Trace",
+    "AWS::CloudWatch::Metric",
+)
+
+
+def _agentcore_telemetry_link_findings() -> List[Dict[str, Any]]:
+    """Judge the links an account with no sink uses to share its telemetry.
+
+    Each link must share every AgentCore telemetry type. The sink's policy lives
+    in the account that owns it, where AC-22 judges it.
+    """
+    no_sink = "No observability sink found in this region, so no telemetry is "
+    try:
+        links = _paginate_aws_list(
+            oam_client,
+            "list_links",
+            "Items",
+            token_request_key="NextToken",
+            token_response_key="NextToken",
+        )
+    except (BotoCoreError, ClientError) as error:
+        return [
+            create_finding(
+                check_id="AC-22",
+                finding_name="AgentCore Telemetry Sink Scope",
+                finding_details=(
+                    f"{no_sink}aggregated into this account. Whether this account "
+                    "links its own telemetry to a sink elsewhere was not read: "
+                    f"oam:ListLinks failed with {_assessment_error_label(error)}."
+                ),
+                resolution="Grant oam:ListLinks and retry.",
+                reference=OAM_CROSS_ACCOUNT_REFERENCE_URL,
+                severity=SeverityEnum.INFORMATIONAL,
+                status=StatusEnum.NA,
+            )
+        ]
+    if not links:
+        return [
+            create_finding(
+                check_id="AC-22",
+                finding_name="AgentCore Telemetry Sink Scope",
+                finding_details=(
+                    f"{no_sink}aggregated into this account, and ListLinks "
+                    "returned no link, so this region's telemetry is not shared "
+                    "with a monitoring account."
+                ),
+                resolution=(
+                    "No action required for a single-account deployment. For a "
+                    "multi-account one, link this account to a sink in the "
+                    "monitoring account."
+                ),
+                reference=OAM_CROSS_ACCOUNT_REFERENCE_URL,
+                severity=SeverityEnum.INFORMATIONAL,
+                status=StatusEnum.NA,
+            )
+        ]
+    findings = []
+    for link in links:
+        label = link.get("Label") or link.get("Arn") or "unnamed link"
+        sink_arn = link.get("SinkArn") or "an unreported sink"
+        shared = set(link.get("ResourceTypes") or [])
+        missing = [t for t in AGENTCORE_OAM_TELEMETRY_TYPES if t not in shared]
+        if missing:
+            findings.append(
+                create_finding(
+                    check_id="AC-22",
+                    finding_name="AgentCore Telemetry Sink Scope",
+                    finding_details=(
+                        f"Link '{label}' to {sink_arn} does not share "
+                        f"{', '.join(missing)}, so that AgentCore telemetry stays "
+                        "in this account and the monitoring account cannot see it."
+                    ),
+                    resolution=(
+                        "Add the missing resource types to the link's list with "
+                        "UpdateLink."
+                    ),
+                    reference=OAM_CROSS_ACCOUNT_REFERENCE_URL,
+                    severity=SeverityEnum.MEDIUM,
+                    status=StatusEnum.FAILED,
+                )
+            )
+            continue
+        findings.append(
+            create_finding(
+                check_id="AC-22",
+                finding_name="AgentCore Telemetry Sink Scope",
+                finding_details=(
+                    f"Link '{label}' shares {', '.join(AGENTCORE_OAM_TELEMETRY_TYPES)} "
+                    f"with {sink_arn}. That sink's policy is judged by AC-22 in "
+                    "the account that owns it, and the link's log group and "
+                    "metric filters are not read."
+                ),
+                resolution="No action required.",
+                reference=OAM_CROSS_ACCOUNT_REFERENCE_URL,
+                severity=SeverityEnum.MEDIUM,
+                status=StatusEnum.PASSED,
+            )
+        )
+    return findings
+
+
 def check_agentcore_telemetry_sink_scope() -> List[Dict[str, Any]]:
     """AC-22: Report whether each observability sink is scoped to known callers.
 
@@ -11449,26 +11555,7 @@ def check_agentcore_telemetry_sink_scope() -> List[Dict[str, Any]]:
         ]
 
     if not sinks:
-        return [
-            create_finding(
-                check_id="AC-22",
-                finding_name="AgentCore Telemetry Sink Scope",
-                finding_details=(
-                    "No observability sink found in this region, so no telemetry "
-                    "is aggregated into this account. Whether this account links "
-                    "its own telemetry to a sink elsewhere is not read: "
-                    "oam:ListLinks has no resource type and needs Resource '*', "
-                    "which this role is not granted."
-                ),
-                resolution=(
-                    "No action required for a single-account deployment. Create a "
-                    "sink in the monitoring account for a multi-account one."
-                ),
-                reference=OAM_CROSS_ACCOUNT_REFERENCE_URL,
-                severity=SeverityEnum.INFORMATIONAL,
-                status=StatusEnum.NA,
-            )
-        ]
+        return _agentcore_telemetry_link_findings()
 
     organization: Dict[str, str] = {}
 
