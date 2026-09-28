@@ -8,6 +8,7 @@ from typing import Dict, List, Any, Optional
 from io import StringIO
 from botocore.config import Config
 from botocore.exceptions import BotoCoreError, ClientError, EndpointConnectionError
+import fnmatch
 import random
 import re
 import json
@@ -14689,71 +14690,191 @@ MARKETPLACE_PRODUCT_CONDITION_KEY = "aws-marketplace:productid"
 MARKETPLACE_MODEL_CONTROL_REFERENCE = "https://docs.aws.amazon.com/bedrock/latest/userguide/security-iam-awsmanpol.html#security-iam-awsmanpol-bedrock-marketplace"
 
 
-def _marketplace_subscription_scoping(document: Any) -> Dict[str, Any]:
-    """
-    Describe how one policy document controls Marketplace model subscription.
+# Subscribe and Unsubscribe change which Marketplace models the account can use,
+# so both must be bounded by product. ViewSubscriptions only reads.
+MARKETPLACE_CHANGE_ACTIONS = (
+    MARKETPLACE_SUBSCRIBE_ACTION,
+    "aws-marketplace:unsubscribe",
+)
 
-    A Deny that names approved products positively fails open, because a product
-    that is not named is not denied. Only an Allow carrying the product condition,
-    or a Deny with a negated test, restricts the set of subscribable models.
-    """
-    observed = {"grants": 0, "unconditioned": 0, "scoped": [], "fails_open": []}
+MARKETPLACE_READ_ACTION = "aws-marketplace:viewsubscriptions"
 
-    for statement in _policy_statements(document):
-        covers_subscribe = any(
-            _action_pattern_covers(action, MARKETPLACE_SUBSCRIBE_ACTION)
-            for action in _as_list(statement.get("Action"))
-        )
-        if not covers_subscribe:
+MARKETPLACE_POSITIVE_OPERATORS = (
+    "stringequals",
+    "stringequalsignorecase",
+    "stringlike",
+)
+
+MARKETPLACE_NEGATED_OPERATORS = (
+    "stringnotequals",
+    "stringnotequalsignorecase",
+    "stringnotlike",
+)
+
+
+def _product_values_are_named(values: List[Any]) -> bool:
+    """Return True when every product value names one product with no wildcard."""
+    return bool(values) and all(
+        isinstance(value, str) and value.strip() and not re.search(r"[*?]", value)
+        for value in values
+    )
+
+
+def _marketplace_statement_binding(statement: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Judge how one statement bounds Marketplace subscription by product.
+
+    An Allow is bound by a positive test on aws-marketplace:ProductId whose
+    values each name a product. ForAllValues: is true when the key is absent, so
+    it binds only beside a Null false test on the same key. A Deny is an
+    allow-list only with a negated test over named products and no other key; a
+    Deny naming products positively leaves every other product allowed.
+    """
+    conditions = _condition_keys_by_operator(statement)
+    product_tests = [
+        (operator, values)
+        for operator, key, values in conditions
+        if key == MARKETPLACE_PRODUCT_CONDITION_KEY
+    ]
+    key_required = any(
+        _strip_condition_set_operator(operator) == "null"
+        and values
+        and all(str(value).strip().lower() == "false" for value in values)
+        for operator, values in product_tests
+    )
+    effect = str(statement.get("Effect", "")).upper()
+    reasons = []
+    for operator, values in product_tests:
+        base = _strip_condition_set_operator(operator)
+        if base == "null":
             continue
-
-        effect = str(statement.get("Effect", "")).upper()
-        product_conditions = [
-            (operator, values)
-            for operator, key, values in _condition_keys_by_operator(statement)
-            if MARKETPLACE_PRODUCT_CONDITION_KEY in key
-        ]
-
         if effect == "ALLOW":
-            observed["grants"] += 1
-            if product_conditions:
-                for operator, values in product_conditions:
-                    observed["scoped"].append(
-                        "Allow scoped by {} {} to {}".format(
-                            operator,
-                            MARKETPLACE_PRODUCT_CONDITION_KEY,
-                            ", ".join(str(value) for value in values) or "no product",
-                        )
+            if base.endswith("ifexists"):
+                reasons.append(f"{operator} is true when the product key is absent")
+            elif base not in MARKETPLACE_POSITIVE_OPERATORS:
+                reasons.append(f"{operator} allows every product it does not name")
+            elif operator.startswith("forallvalues:") and not key_required:
+                reasons.append(
+                    f"{operator} is true when the product key is absent, and no "
+                    "Null false test requires it"
+                )
+            elif not _product_values_are_named(values):
+                reasons.append(
+                    "its product value {} carries a wildcard".format(
+                        ", ".join(str(value) for value in values) or "is empty and"
                     )
+                )
             else:
-                observed["unconditioned"] += 1
-        elif effect == "DENY":
-            for operator, values in product_conditions:
-                if "not" in operator or operator == "null":
-                    observed["scoped"].append(
-                        "Deny scoped by {} {} to {}".format(
-                            operator,
-                            MARKETPLACE_PRODUCT_CONDITION_KEY,
-                            ", ".join(str(value) for value in values) or "no product",
-                        )
+                return {
+                    "bound": True,
+                    "detail": "Allow scoped by {} {} to {}".format(
+                        operator,
+                        MARKETPLACE_PRODUCT_CONDITION_KEY,
+                        ", ".join(str(value) for value in values),
+                    ),
+                }
+        else:
+            other_keys = sorted(
+                {key for _, key, _ in conditions} - {MARKETPLACE_PRODUCT_CONDITION_KEY}
+            )
+            if base not in MARKETPLACE_NEGATED_OPERATORS:
+                reasons.append(
+                    "Deny tests {} with {}, which leaves every product that is "
+                    "not named allowed".format(
+                        MARKETPLACE_PRODUCT_CONDITION_KEY, operator
                     )
-                else:
-                    observed["fails_open"].append(
-                        "Deny tests {} with {}, which leaves every product that is "
-                        "not named allowed".format(
-                            MARKETPLACE_PRODUCT_CONDITION_KEY, operator
-                        )
+                )
+            elif operator.startswith("forallvalues:"):
+                reasons.append(
+                    f"Deny with {operator} is false when any requested product is "
+                    "approved, so a mixed request is not denied"
+                )
+            elif other_keys:
+                reasons.append(
+                    "Deny is also conditioned on {}, which narrows it to part of "
+                    "the requests".format(", ".join(other_keys))
+                )
+            elif not _product_values_are_named(values):
+                reasons.append(
+                    "Deny approved value {} carries a wildcard".format(
+                        ", ".join(str(value) for value in values) or "is empty and"
                     )
+                )
+            elif "NotResource" in statement or not any(
+                str(resource).strip() == "*"
+                for resource in _as_list(statement.get("Resource"))
+            ):
+                reasons.append('Deny does not apply to Resource "*"')
+            else:
+                return {
+                    "bound": True,
+                    "detail": "Deny scoped by {} {} to {}".format(
+                        operator,
+                        MARKETPLACE_PRODUCT_CONDITION_KEY,
+                        ", ".join(str(value) for value in values),
+                    ),
+                }
+    if not product_tests and effect == "ALLOW":
+        reasons.append(f"without an {MARKETPLACE_PRODUCT_CONDITION_KEY} condition")
+    return {"bound": False, "detail": "; ".join(reasons)}
 
+
+def _marketplace_scp_bounds(
+    scp_inventory: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """
+    Name the attached service control policies that bound each change action.
+
+    An SCP never restricts the management account, so none is credited there.
+    """
+    observed = {"bounded": {}, "unread": [], "note": ""}
+    if scp_inventory is None:
+        return observed
+    observed["note"] = _scp_scope_note(scp_inventory)
+    if scp_inventory.get("list_error"):
+        observed["unread"].append(str(scp_inventory["list_error"]))
+    observed["unread"].extend(scp_inventory.get("errors") or [])
+    if scp_inventory.get("management_account"):
+        return observed
+    for item in scp_inventory.get("items") or []:
+        try:
+            statements = _policy_statements(item.get("content") or "{}")
+        except (ValueError, TypeError) as error:
+            observed["unread"].append(
+                f"policy '{item.get('name')}': {get_assessment_error_label(error)}"
+            )
+            continue
+        for statement in statements:
+            if str(statement.get("Effect", "")).upper() != "DENY":
+                continue
+            binding = _marketplace_statement_binding(statement)
+            if not binding["bound"]:
+                continue
+            for action in MARKETPLACE_CHANGE_ACTIONS:
+                if _statement_matches_action(statement, action):
+                    observed["bounded"].setdefault(action, []).append(
+                        "policy '{}' ({})".format(item.get("name"), binding["detail"])
+                    )
     return observed
 
 
 def check_bedrock_marketplace_model_control(
-    permission_cache, region: str = ""
+    permission_cache,
+    region: str = "",
+    scp_inventory: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     BR-44: Verify Marketplace model subscription is restricted to approved
-    products by an aws-marketplace:ProductId condition on the Allow side.
+    products.
+
+    aws-marketplace:Subscribe and aws-marketplace:Unsubscribe are judged per
+    Allow statement for every role and user, through attached, inline and group
+    policies and the permissions boundary. A grant is bounded by an
+    aws-marketplace:ProductId test naming products, by a negated product Deny on
+    the identity or its boundary, or by an attached service control policy
+    carrying that Deny. Bedrock subscribes on first invocation, so the model-ARN
+    allow-list on invocation is the companion control, asserted by BR-42 and the
+    organization leg of BR-43.
     """
     logger.debug("Starting check for Marketplace model subscription control")
     check_name = "Marketplace Model Subscription Control"
@@ -14765,8 +14886,11 @@ def check_bedrock_marketplace_model_control(
             "csv_data": [],
         }
 
+        scp = _marketplace_scp_bounds(scp_inventory)
         deficient = []
         scoped = []
+        scp_bounded = []
+        viewers = []
 
         identities = [
             ("role", name, permissions)
@@ -14779,49 +14903,130 @@ def check_bedrock_marketplace_model_control(
         for identity_type, identity_name, permissions in identities:
             reasons = []
             scoped_statements = []
-            grants_subscribe = False
-
-            for policy in (
-                permissions["attached_policies"] + permissions["inline_policies"]
-            ):
-                try:
-                    observed = _marketplace_subscription_scoping(policy["document"])
-                except Exception as error:
-                    logger.warning(
-                        f"Unable to parse policy {policy['name']} on "
-                        f"{identity_type} {identity_name}: {error}"
-                    )
-                    continue
-
-                if observed["grants"]:
-                    grants_subscribe = True
-                if observed["unconditioned"]:
-                    reasons.append(
-                        "policy '{}' allows {} without an {} condition".format(
-                            policy["name"],
-                            MARKETPLACE_SUBSCRIBE_ACTION,
-                            MARKETPLACE_PRODUCT_CONDITION_KEY,
-                        )
-                    )
-                for fails_open in observed["fails_open"]:
-                    reasons.append(f"policy '{policy['name']}': {fails_open}")
-                for scoped_statement in observed["scoped"]:
-                    scoped_statements.append(
-                        f"policy '{policy['name']}': {scoped_statement}"
-                    )
-
-            if not grants_subscribe and not reasons and not scoped_statements:
+            scp_reasons = []
+            policies = _cached_identity_policies(permissions)
+            boundary = _boundary_document(permissions)
+            documents = [
+                (f"policy '{policy.get('name') or 'unnamed'}'", policy.get("document"))
+                for _, policy in policies
+            ]
+            try:
+                identity_statements = [
+                    (label, statement)
+                    for label, document in documents
+                    for statement in _policy_statements(document)
+                ]
+                boundary_statements = _policy_statements(boundary)
+            except (ValueError, TypeError) as error:
+                deficient.append(
+                    {
+                        "type": identity_type,
+                        "name": identity_name,
+                        "reasons": [
+                            "a policy document could not be parsed ({})".format(
+                                get_assessment_error_label(error)
+                            )
+                        ],
+                    }
+                )
                 continue
+
+            if any(
+                str(statement.get("Effect", "")).upper() == "ALLOW"
+                and _statement_matches_action(statement, MARKETPLACE_READ_ACTION)
+                for _, statement in identity_statements
+            ):
+                viewers.append(f"{identity_type} '{identity_name}'")
+
+            for action in MARKETPLACE_CHANGE_ACTIONS:
+                if _boundary_allowance(permissions, action) == "denied":
+                    continue
+                denies = [
+                    (label, statement)
+                    for label, statement in identity_statements
+                    + [("permissions boundary", st) for st in boundary_statements]
+                    if str(statement.get("Effect", "")).upper() == "DENY"
+                    and _statement_matches_action(statement, action)
+                    and _condition_keys_by_operator(statement)
+                ]
+                credited_deny = None
+                deny_reasons = []
+                for label, statement in denies:
+                    binding = _marketplace_statement_binding(statement)
+                    if binding["bound"]:
+                        credited_deny = f"{label}: {binding['detail']}"
+                        break
+                    if binding["detail"]:
+                        deny_reasons.append(f"{label}: {binding['detail']}")
+                if credited_deny:
+                    scoped_statements.append(credited_deny)
+                    continue
+                allowing = [
+                    (label, statement)
+                    for label, statement in identity_statements
+                    if str(statement.get("Effect", "")).upper() == "ALLOW"
+                    and _statement_matches_action(statement, action)
+                ]
+                if not allowing:
+                    continue
+                boundary_bindings = [
+                    _marketplace_statement_binding(statement)
+                    for statement in boundary_statements
+                    if str(statement.get("Effect", "")).upper() == "ALLOW"
+                    and _statement_matches_action(statement, action)
+                ]
+                if boundary_bindings and all(
+                    binding["bound"] for binding in boundary_bindings
+                ):
+                    scoped_statements.append(
+                        "permissions boundary: " + boundary_bindings[0]["detail"]
+                    )
+                    reasons.extend(deny_reasons)
+                    continue
+                action_reasons = []
+                for label, statement in allowing:
+                    binding = _marketplace_statement_binding(statement)
+                    if binding["bound"]:
+                        scoped_statements.append(f"{label}: {binding['detail']}")
+                    else:
+                        action_reasons.append(
+                            "{} allows {} {}".format(label, action, binding["detail"])
+                        )
+                # A product Deny that is not an allow-list is reported even
+                # beside a scoped Allow: it reads as control but excludes only
+                # what it names.
+                action_reasons.extend(deny_reasons)
+                if not action_reasons:
+                    continue
+                if action in scp["bounded"]:
+                    scp_reasons.extend(action_reasons)
+                else:
+                    reasons.extend(action_reasons)
+
             if reasons:
                 deficient.append(
                     {"type": identity_type, "name": identity_name, "reasons": reasons}
                 )
+            elif scp_reasons:
+                scp_bounded.append(f"{identity_type} '{identity_name}'")
             elif scoped_statements:
                 scoped.append(
                     "{} '{}' ({})".format(
                         identity_type, identity_name, "; ".join(scoped_statements[:2])
                     )
                 )
+
+        scp_note = ""
+        if scp_inventory is not None:
+            scp_note = " {}{}".format(
+                "Service control policy documents could not all be read ({}), so "
+                "an attached policy bounding subscription may be missed. ".format(
+                    "; ".join(scp["unread"][:3])
+                )
+                if scp["unread"]
+                else "",
+                scp["note"],
+            )
 
         for identity in deficient:
             findings["status"] = "WARN"
@@ -14830,22 +15035,26 @@ def check_bedrock_marketplace_model_control(
                     check_id="BR-44",
                     finding_name=check_name,
                     finding_details=(
-                        "{} '{}' can subscribe to unapproved Marketplace models "
-                        "because {}.".format(
+                        "{} '{}' can subscribe to or unsubscribe from unapproved "
+                        "Marketplace models because {}. No attached service control "
+                        "policy bounds the action by product.{}".format(
                             identity["type"].capitalize(),
                             identity["name"],
                             "; ".join(identity["reasons"][:3]),
+                            scp_note,
                         )
                     ),
                     resolution=(
                         "Put the aws-marketplace:ProductId condition on the Allow "
-                        "statement that grants aws-marketplace:Subscribe, naming the "
-                        "approved product identifiers. That key carries multiple "
-                        "values, so qualify the operator (ForAllValues:StringEquals) "
-                        "or IAM rejects the statement. A subscription restriction "
-                        "does not stop invocation of a model that is already "
-                        "subscribed, so pair it with the model-ARN allow-list "
-                        "asserted by BR-42."
+                        "statement that grants aws-marketplace:Subscribe and "
+                        "aws-marketplace:Unsubscribe, naming the approved product "
+                        "identifiers. That key carries multiple values, so qualify "
+                        "the operator with ForAnyValue:StringEquals; "
+                        "ForAllValues:StringEquals is true when the key is absent "
+                        "and needs a Null false test beside it. A subscription "
+                        "restriction does not stop invocation of a model that is "
+                        "already subscribed, so pair it with the model-ARN "
+                        "allow-list asserted by BR-42."
                     ),
                     reference=MARKETPLACE_MODEL_CONTROL_REFERENCE,
                     severity="High",
@@ -14854,19 +15063,40 @@ def check_bedrock_marketplace_model_control(
                 )
             )
 
-        if scoped:
+        if scoped or scp_bounded:
             findings["csv_data"].append(
                 create_finding(
                     check_id="BR-44",
                     finding_name=check_name,
                     finding_details=(
                         "{} identity policy grant(s) restrict Marketplace "
-                        "subscription by product: {}. The approved product list is "
-                        "workload-specific, so confirm these identifiers are the "
+                        "subscription by product: {}.{} The approved product list "
+                        "is workload-specific, so confirm these identifiers are the "
                         "models your use case approved. Subscription scoping does "
                         "not prevent invocation of an already-subscribed model, "
-                        "which BR-42 asserts.".format(
-                            len(scoped), "; ".join(scoped[:5])
+                        "which BR-42 asserts. aws-marketplace:ViewSubscriptions only "
+                        "reads and is not judged ({} identity/identities hold "
+                        "it).{}".format(
+                            len(scoped),
+                            "; ".join(scoped[:5]) or "none",
+                            " {} identity/identities with an unbounded grant are "
+                            "bounded by {}: {}.".format(
+                                len(scp_bounded),
+                                "; ".join(
+                                    sorted(
+                                        {
+                                            policy
+                                            for policies in scp["bounded"].values()
+                                            for policy in policies
+                                        }
+                                    )[:3]
+                                ),
+                                ", ".join(scp_bounded[:10]),
+                            )
+                            if scp_bounded
+                            else "",
+                            len(viewers),
+                            scp_note,
                         )
                     ),
                     resolution="No action required. Update the product identifiers whenever the approved model list changes.",
@@ -14877,7 +15107,9 @@ def check_bedrock_marketplace_model_control(
                 )
             )
 
-        if not scoped and not deficient:
+        if not scoped and not deficient and not scp_bounded:
+            version = permission_cache.get("cache_schema_version")
+            complete = isinstance(version, int) and version >= IAM_CACHE_SCHEMA_VERSION
             findings["details"] = "No cached identity grants Marketplace subscription"
             findings["csv_data"].append(
                 create_finding(
@@ -14885,18 +15117,35 @@ def check_bedrock_marketplace_model_control(
                     finding_name=check_name,
                     finding_details=(
                         "No role or user in the IAM permissions cache allows "
-                        f"{MARKETPLACE_SUBSCRIBE_ACTION}, so no identity can "
-                        "subscribe to a third-party or Marketplace model."
+                        f"{MARKETPLACE_SUBSCRIBE_ACTION} or "
+                        "aws-marketplace:unsubscribe, so no identity can subscribe "
+                        "to a third-party or Marketplace model, including the "
+                        "subscription Bedrock makes on a model's first invocation."
+                        "{}{}".format(
+                            ""
+                            if complete
+                            else " This is not reported as Passed because "
+                            + IAM_CACHE_V1_NOTE[0].lower()
+                            + IAM_CACHE_V1_NOTE[1:],
+                            scp_note,
+                        )
                     ),
                     resolution="No action required",
                     reference=MARKETPLACE_MODEL_CONTROL_REFERENCE,
                     severity="Informational",
-                    status="N/A",
+                    status="Passed" if complete else "N/A",
                     region=region,
                 )
             )
 
-        return findings
+        return _apply_cache_population_gaps(
+            findings,
+            permission_cache,
+            "BR-44",
+            check_name,
+            MARKETPLACE_MODEL_CONTROL_REFERENCE,
+            region,
+        )
 
     except Exception as e:
         logger.error(
@@ -14933,47 +15182,216 @@ BEDROCK_API_KEY_REFERENCE = (
 
 BEDROCK_CREDENTIAL_AGE_CONDITION_KEY = "iam:servicespecificcredentialagedays"
 
-BEDROCK_BEARER_TOKEN_CONDITION_KEYS = (
-    "bedrock:bearertokentype",
-    "bedrock-mantle:bearertokentype",
-)
+# The lifetime the catalog names as its example cap, in days.
+BEDROCK_API_KEY_MAX_AGE_DAYS = 90
 
-BEDROCK_CREDENTIAL_CREATE_ACTIONS = (
-    "iam:createservicespecificcredential",
-    "bedrock:callwithbearertoken",
-    "bedrock-mantle:callwithbearertoken",
-)
+BEDROCK_CREDENTIAL_CREATE_ACTION = "iam:createservicespecificcredential"
+
+BEDROCK_CREDENTIAL_SERVICE_NAME_KEY = "iam:servicespecificcredentialservicename"
+
+# Each bearer token action publishes its own token type key; a condition on the
+# other endpoint's key is absent from the request and enforces nothing.
+BEDROCK_BEARER_TOKEN_ACTIONS = {
+    "bedrock:callwithbearertoken": "bedrock:bearertokentype",
+    "bedrock-mantle:callwithbearertoken": "bedrock-mantle:bearertokentype",
+}
 
 
-def _scp_controls_bedrock_api_keys(document: Any) -> List[str]:
-    """Describe every Deny statement that caps API key age or bearer token type."""
-    controls = []
-    for statement in _policy_statements(document):
+def _deny_applies_to_every_resource(statement: Dict[str, Any]) -> bool:
+    """Return True when a Deny statement names Resource "*" and no NotResource."""
+    return "NotResource" not in statement and any(
+        str(resource).strip() == "*" for resource in _as_list(statement.get("Resource"))
+    )
+
+
+def _age_cap_test(operator: str, values: List[Any]) -> Dict[str, Any]:
+    """Judge one test on iam:ServiceSpecificCredentialAgeDays in a Deny."""
+    base = _strip_condition_set_operator(operator)
+    if_exists = base.endswith("ifexists")
+    if if_exists:
+        base = base[: -len("ifexists")]
+    limits = {"numericgreaterthan": 0, "numericgreaterthanequals": 1}
+    if base not in limits:
+        return {"capped": False, "reason": f"{operator} does not deny long lifetimes"}
+    try:
+        numbers = [float(str(value)) for value in values]
+    except ValueError:
+        return {"capped": False, "reason": f"{operator} value is not a number"}
+    if not numbers:
+        return {"capped": False, "reason": f"{operator} has no value"}
+    ceiling = max(numbers) - limits[base]
+    if ceiling > BEDROCK_API_KEY_MAX_AGE_DAYS:
+        return {
+            "capped": False,
+            "reason": "{} {} allows keys up to {:g} days, above the {}-day cap".format(
+                operator,
+                ", ".join(str(value) for value in values),
+                ceiling,
+                BEDROCK_API_KEY_MAX_AGE_DAYS,
+            ),
+        }
+    return {"capped": True, "if_exists": if_exists, "days": ceiling}
+
+
+def _bedrock_api_key_scp_controls(statements: List[tuple]) -> Dict[str, Any]:
+    """
+    Judge Deny statements of attached service control policies against the API
+    key lifetime cap and the LONG_TERM bearer token restriction.
+
+    statements are (policy_name, statement) pairs. An age test is credited on
+    iam:CreateServiceSpecificCredential when it denies lifetimes above the cap
+    and is either IfExists or paired with a Deny on a Null age key, because a key
+    created with no expiry carries no age (UNVERIFIED). The only other key it may
+    carry is the ServiceName key naming bedrock.amazonaws.com. A token test is
+    credited per bearer token action only on that action's own key.
+    """
+    result = {"age": [], "age_needs_null": [], "null_age": [], "token": {}, "gaps": []}
+    for policy_name, statement in statements:
         if str(statement.get("Effect", "")).upper() != "DENY":
             continue
-        covered = [
-            action_name
-            for action_name in BEDROCK_CREDENTIAL_CREATE_ACTIONS
-            if any(
-                _action_pattern_covers(action, action_name)
-                for action in _as_list(statement.get("Action"))
-            )
-        ]
-        if not covered:
-            continue
-        for operator, key, values in _condition_keys_by_operator(statement):
-            if BEDROCK_CREDENTIAL_AGE_CONDITION_KEY in key or any(
-                token_key in key for token_key in BEDROCK_BEARER_TOKEN_CONDITION_KEYS
-            ):
-                controls.append(
-                    "denies {} when {} {} {}".format(
-                        ", ".join(covered),
-                        key,
-                        operator,
-                        ", ".join(str(value) for value in values) or "no value",
+        label = "policy '{}' statement '{}'".format(
+            policy_name, statement.get("Sid") or "unnamed"
+        )
+        conditions = _condition_keys_by_operator(statement)
+        keys = {key for _, key, _ in conditions}
+        every_resource = _deny_applies_to_every_resource(statement)
+
+        if _statement_matches_action(statement, BEDROCK_CREDENTIAL_CREATE_ACTION):
+            service_ok = True
+            for operator, key, values in conditions:
+                if key != BEDROCK_CREDENTIAL_SERVICE_NAME_KEY:
+                    continue
+                base = _strip_condition_set_operator(operator)
+                if base not in (
+                    "stringequals",
+                    "stringequalsignorecase",
+                    "stringlike",
+                ) or not any(
+                    fnmatch.fnmatchcase(
+                        BEDROCK_CREDENTIAL_SERVICE_NAME, str(value).lower()
                     )
+                    for value in values
+                ):
+                    service_ok = False
+            extra = sorted(
+                keys
+                - {
+                    BEDROCK_CREDENTIAL_AGE_CONDITION_KEY,
+                    BEDROCK_CREDENTIAL_SERVICE_NAME_KEY,
+                }
+            )
+            age_tests = [
+                (operator, values)
+                for operator, key, values in conditions
+                if key == BEDROCK_CREDENTIAL_AGE_CONDITION_KEY
+            ]
+            if not every_resource:
+                if age_tests:
+                    result["gaps"].append(f'{label} does not apply to Resource "*"')
+            elif extra:
+                if age_tests:
+                    result["gaps"].append(
+                        "{} is also conditioned on {}, which narrows it to part of "
+                        "the requests".format(label, ", ".join(extra))
+                    )
+            elif not service_ok:
+                result["gaps"].append(
+                    f"{label} does not apply to service name {BEDROCK_CREDENTIAL_SERVICE_NAME}"
                 )
-    return controls
+            elif not conditions or keys == {BEDROCK_CREDENTIAL_SERVICE_NAME_KEY}:
+                result["age"].append(f"{label} denies creating the credential at all")
+            else:
+                for operator, values in age_tests:
+                    base = _strip_condition_set_operator(operator)
+                    if base == "null":
+                        if values and all(
+                            str(value).strip().lower() == "true" for value in values
+                        ):
+                            result["null_age"].append(label)
+                        continue
+                    judged = _age_cap_test(operator, values)
+                    if not judged["capped"]:
+                        result["gaps"].append(f"{label}: {judged['reason']}")
+                        continue
+                    text = "{} denies lifetimes above {:g} days with {}".format(
+                        label, judged["days"], operator
+                    )
+                    if judged["if_exists"]:
+                        result["age"].append(text)
+                    else:
+                        result["age_needs_null"].append(text)
+
+        for action, own_key in BEDROCK_BEARER_TOKEN_ACTIONS.items():
+            if not _statement_matches_action(statement, action):
+                continue
+            if not every_resource:
+                result["gaps"].append(
+                    f'{label} does not apply {action} to Resource "*"'
+                )
+                continue
+            if not conditions:
+                result["token"].setdefault(action, []).append(
+                    f"{label} denies every bearer token on {action}"
+                )
+                continue
+            extra = sorted(keys - {own_key})
+            if extra:
+                result["gaps"].append(
+                    "{} conditions {} on {}, which {} does not publish or which "
+                    "narrows the Deny".format(label, action, ", ".join(extra), action)
+                )
+                continue
+            for operator, key, values in conditions:
+                base = _strip_condition_set_operator(operator)
+                if operator.startswith("forallvalues:"):
+                    denied = False
+                elif base.startswith("stringnot"):
+                    denied = not any(
+                        fnmatch.fnmatchcase("long_term", str(value).lower())
+                        for value in values
+                    )
+                elif base.startswith("string"):
+                    denied = any(
+                        fnmatch.fnmatchcase("long_term", str(value).lower())
+                        for value in values
+                    )
+                else:
+                    denied = False
+                if denied:
+                    result["token"].setdefault(action, []).append(
+                        f"{label} denies LONG_TERM tokens on {action} with {operator} {key}"
+                    )
+                else:
+                    result["gaps"].append(
+                        "{}: {} {} {} does not deny LONG_TERM tokens on {}".format(
+                            label,
+                            operator,
+                            key,
+                            ", ".join(str(value) for value in values),
+                            action,
+                        )
+                    )
+    return result
+
+
+def _days_between(start: Any, end: Any) -> Optional[float]:
+    """Return the days from start to end, both datetimes or ISO strings."""
+
+    def parse(value):
+        if isinstance(value, datetime):
+            return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+        if isinstance(value, str) and value:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+        return None
+
+    try:
+        first, last = parse(start), parse(end)
+    except ValueError:
+        return None
+    if first is None or last is None:
+        return None
+    return (last - first).total_seconds() / 86400
 
 
 def check_bedrock_api_key_governance(
@@ -14999,37 +15417,91 @@ def check_bedrock_api_key_governance(
         expiring = []
         standing = []
         inventory_errors = []
+        population_note = ""
 
-        for user_name in permission_cache["user_permissions"]:
-            try:
-                credentials = _list_all_items(
-                    iam_client,
-                    "list_service_specific_credentials",
-                    "ServiceSpecificCredentials",
-                    max_results_param=None,
-                    token_param="Marker",
-                    token_response_keys=("Marker",),
-                    UserName=user_name,
-                    ServiceName=BEDROCK_CREDENTIAL_SERVICE_NAME,
+        # One AllUsers listing reads every IAM user in the account, so a user
+        # the permissions cache could not read is still inventoried.
+        try:
+            credentials = _list_all_items(
+                iam_client,
+                "list_service_specific_credentials",
+                "ServiceSpecificCredentials",
+                max_results_param=None,
+                token_param="Marker",
+                token_response_keys=("Marker",),
+                AllUsers=True,
+                ServiceName=BEDROCK_CREDENTIAL_SERVICE_NAME,
+            )
+            listed = [
+                (credential.get("UserName") or "unknown", credential)
+                for credential in credentials
+            ]
+            from_cache = False
+        except (ClientError, BotoCoreError) as error:
+            population_note = (
+                " The account-wide listing (AllUsers) was refused ({}), so the "
+                "inventory covers the {} IAM user(s) in the permissions cache "
+                "only.".format(
+                    get_assessment_error_label(error),
+                    len(permission_cache["user_permissions"]),
                 )
-            except Exception as error:
-                inventory_errors.append(f"user '{user_name}': {str(error)}")
-                continue
-
-            for credential in credentials:
-                credential_id = credential.get("ServiceSpecificCredentialId", "unknown")
-                if str(credential.get("Status", "")).lower() != "active":
+            )
+            from_cache = True
+            listed = []
+            for user_name in permission_cache["user_permissions"]:
+                try:
+                    user_credentials = _list_all_items(
+                        iam_client,
+                        "list_service_specific_credentials",
+                        "ServiceSpecificCredentials",
+                        max_results_param=None,
+                        token_param="Marker",
+                        token_response_keys=("Marker",),
+                        UserName=user_name,
+                        ServiceName=BEDROCK_CREDENTIAL_SERVICE_NAME,
+                    )
+                except Exception as user_error:
+                    inventory_errors.append(f"user '{user_name}': {str(user_error)}")
                     continue
-                if credential.get("ExpirationDate"):
-                    expiring.append(
-                        f"user '{user_name}' credential {credential_id} expires "
-                        f"{credential['ExpirationDate']}"
+                listed.extend(
+                    (user_name, credential) for credential in user_credentials
+                )
+
+        for user_name, credential in listed:
+            credential_id = credential.get("ServiceSpecificCredentialId", "unknown")
+            if str(credential.get("Status", "")).lower() != "active":
+                continue
+            if not credential.get("ExpirationDate"):
+                standing.append(
+                    f"user '{user_name}' credential {credential_id} has no "
+                    "expiration date"
+                )
+                continue
+            lifetime = _days_between(
+                credential.get("CreateDate"), credential.get("ExpirationDate")
+            )
+            if lifetime is None:
+                inventory_errors.append(
+                    f"user '{user_name}' credential {credential_id} expires "
+                    f"{credential['ExpirationDate']} but has no readable CreateDate, "
+                    "so its lifetime is unknown"
+                )
+            elif lifetime > BEDROCK_API_KEY_MAX_AGE_DAYS:
+                standing.append(
+                    "user '{}' credential {} expires {} after a lifetime of {:.0f} "
+                    "days, above the {}-day cap".format(
+                        user_name,
+                        credential_id,
+                        credential["ExpirationDate"],
+                        lifetime,
+                        BEDROCK_API_KEY_MAX_AGE_DAYS,
                     )
-                else:
-                    standing.append(
-                        f"user '{user_name}' credential {credential_id} has no "
-                        "expiration date"
-                    )
+                )
+            else:
+                expiring.append(
+                    f"user '{user_name}' credential {credential_id} expires "
+                    f"{credential['ExpirationDate']} ({lifetime:.0f}-day lifetime)"
+                )
 
         for credential_detail in standing:
             findings["status"] = "WARN"
@@ -15038,18 +15510,37 @@ def check_bedrock_api_key_governance(
                     check_id="BR-45",
                     finding_name=BEDROCK_API_KEY_INVENTORY_FINDING,
                     finding_details=(
-                        f"A long-term Bedrock API key is active with no expiry: "
+                        f"A long-term Bedrock API key is active beyond the "
+                        f"{BEDROCK_API_KEY_MAX_AGE_DAYS}-day cap: "
                         f"{credential_detail}. The key is a static credential on a "
                         "standing IAM user."
                     ),
                     resolution=(
                         "Replace the long-term key with a short-term key generated "
-                        "from the console session, or recreate it with an expiration, "
-                        "then delete the service-specific credential."
+                        "from the console session, or recreate it with an expiration "
+                        f"of at most {BEDROCK_API_KEY_MAX_AGE_DAYS} days, then delete "
+                        "the service-specific credential."
                     ),
                     reference=BEDROCK_API_KEY_REFERENCE,
                     severity="High",
                     status="Failed",
+                    region=region,
+                )
+            )
+
+        if inventory_errors and (expiring or standing):
+            findings["csv_data"].append(
+                create_finding(
+                    check_id="BR-45",
+                    finding_name=BEDROCK_API_KEY_INVENTORY_FINDING,
+                    finding_details=(
+                        "Part of the Bedrock API key inventory could not be judged: "
+                        "{}.".format("; ".join(inventory_errors[:5]))
+                    ),
+                    resolution="Grant iam:ListServiceSpecificCredentials and retry.",
+                    reference=BEDROCK_API_KEY_REFERENCE,
+                    severity="Informational",
+                    status="N/A",
                     region=region,
                 )
             )
@@ -15060,27 +15551,32 @@ def check_bedrock_api_key_governance(
                     check_id="BR-45",
                     finding_name=BEDROCK_API_KEY_INVENTORY_FINDING,
                     finding_details=(
-                        "{} active Bedrock API key(s) carry an expiration date: "
-                        "{}.".format(len(expiring), "; ".join(expiring[:5]))
+                        "{} active Bedrock API key(s) expire within the {}-day cap: "
+                        "{}.{}".format(
+                            len(expiring),
+                            BEDROCK_API_KEY_MAX_AGE_DAYS,
+                            "; ".join(expiring[:5]),
+                            population_note,
+                        )
                     ),
                     resolution="No action required. Confirm the expiration matches your credential-rotation policy.",
                     reference=BEDROCK_API_KEY_REFERENCE,
                     severity="Medium",
-                    status="Passed",
+                    status="N/A" if inventory_errors else "Passed",
                     region=region,
                 )
             )
 
         if not expiring and not standing:
             detail = (
-                "No IAM user in the permissions cache holds an active "
+                "No IAM user holds an active "
                 f"{BEDROCK_CREDENTIAL_SERVICE_NAME} service-specific credential, so "
-                "no Bedrock API key is in use."
+                f"no Bedrock API key is in use.{population_note}"
             )
             if inventory_errors:
                 detail = (
                     "Bedrock API keys could not be inventoried: "
-                    f"{'; '.join(inventory_errors[:5])}."
+                    f"{'; '.join(inventory_errors[:5])}.{population_note}"
                 )
             findings["csv_data"].append(
                 create_finding(
@@ -15097,6 +15593,17 @@ def check_bedrock_api_key_governance(
                     status="N/A",
                     region=region,
                 )
+            )
+
+        if from_cache:
+            _apply_cache_population_gaps(
+                findings,
+                permission_cache,
+                "BR-45",
+                BEDROCK_API_KEY_INVENTORY_FINDING,
+                BEDROCK_API_KEY_REFERENCE,
+                region,
+                principal_types=("user",),
             )
 
         context = _organization_policy_context()
@@ -15124,44 +15631,73 @@ def check_bedrock_api_key_governance(
             else get_service_control_policy_inventory()
         )
 
-        preventive = []
+        statements = []
         for item in inventory["items"]:
             try:
-                controls = _scp_controls_bedrock_api_keys(item["content"] or "{}")
-            except Exception as error:
+                statements.extend(
+                    (item["name"], statement)
+                    for statement in _policy_statements(item["content"] or "{}")
+                )
+            except (ValueError, TypeError) as error:
                 logger.warning(
                     f"Unable to parse service control policy {item['name']}: {error}"
                 )
                 inventory["errors"].append(f"policy '{item['name']}': {str(error)}")
-                continue
-            for control in controls:
-                preventive.append(f"policy '{item['name']}' {control}")
+        controls = _bedrock_api_key_scp_controls(statements)
+        age_controls = list(controls["age"])
+        if controls["null_age"]:
+            age_controls.extend(controls["age_needs_null"])
+        elif controls["age_needs_null"]:
+            controls["gaps"].extend(
+                "{}, but no Deny on a Null {} stops a key created with no "
+                "expiry".format(text, BEDROCK_CREDENTIAL_AGE_CONDITION_KEY)
+                for text in controls["age_needs_null"]
+            )
+        token_actions = sorted(controls["token"])
+        tokens_blocked = len(token_actions) == len(BEDROCK_BEARER_TOKEN_ACTIONS)
+        preventive = age_controls + [
+            text for action in token_actions for text in controls["token"][action]
+        ]
+        management = bool(inventory.get("management_account"))
 
         read_errors = list(inventory["errors"])
         if inventory["list_error"]:
             read_errors.append(
                 f"SERVICE_CONTROL_POLICY listing: {inventory['list_error']}"
             )
+        scope_note = _scp_scope_note(inventory)
+        gap_note = (
+            " Statements not credited: {}.".format("; ".join(controls["gaps"][:5]))
+            if controls["gaps"]
+            else ""
+        )
 
-        if preventive:
+        if (age_controls or tokens_blocked) and not management:
             findings["csv_data"].append(
                 create_finding(
                     check_id="BR-45",
                     finding_name=BEDROCK_API_KEY_PREVENTION_FINDING,
                     finding_details=(
                         "{} service control policy statement(s) restrict Bedrock API "
-                        "key creation or use: {}.".format(
-                            len(preventive), "; ".join(preventive[:5])
+                        "key creation or use: {}.{}{} {}".format(
+                            len(preventive),
+                            "; ".join(preventive[:5]),
+                            ""
+                            if age_controls
+                            else " No age cap is credited; LONG_TERM tokens are "
+                            "denied on both bearer token actions.",
+                            gap_note,
+                            scope_note,
                         )
                     ),
                     resolution="No action required",
                     reference=BEDROCK_API_KEY_REFERENCE,
                     severity="Medium",
-                    status="Passed",
+                    status="N/A" if read_errors else "Passed",
                     region=region,
                 )
             )
-        elif read_errors:
+        elif read_errors and not management:
             findings["csv_data"].append(
                 create_finding(
                     check_id="BR-45",
@@ -15169,7 +15705,7 @@ def check_bedrock_api_key_governance(
                     finding_details=(
                         "A preventive control on Bedrock API keys is undetermined "
                         "because organization policies could not be read: "
-                        f"{'; '.join(read_errors[:5])}."
+                        f"{'; '.join(read_errors[:5])}.{gap_note} {scope_note}"
                     ),
                     resolution="Grant organizations:ListPolicies and organizations:DescribePolicy and retry before concluding that no control exists.",
                     reference=BEDROCK_API_KEY_REFERENCE,
@@ -15186,21 +15722,37 @@ def check_bedrock_api_key_governance(
                     finding_name=BEDROCK_API_KEY_PREVENTION_FINDING,
                     finding_details=(
                         "None of the {} service control policy document(s) read caps "
-                        "iam:ServiceSpecificCredentialAgeDays on "
-                        "iam:CreateServiceSpecificCredential or denies "
-                        "bedrock:CallWithBearerToken for a LONG_TERM bearer token "
-                        "type, so a long-term Bedrock API key can be created with no "
-                        "expiry.".format(len(inventory["items"]))
+                        "iam:ServiceSpecificCredentialAgeDays at {} days on "
+                        "iam:CreateServiceSpecificCredential or denies the LONG_TERM "
+                        "bearer token type on both bedrock:CallWithBearerToken and "
+                        "bedrock-mantle:CallWithBearerToken{}, so a long-term Bedrock "
+                        "API key can be created with no expiry and used.{}{} "
+                        "{}".format(
+                            len(inventory["items"]),
+                            BEDROCK_API_KEY_MAX_AGE_DAYS,
+                            " (only {} is covered)".format(", ".join(token_actions))
+                            if token_actions
+                            else "",
+                            " Credited statements exist but do not restrict this "
+                            "account."
+                            if management and preventive
+                            else "",
+                            gap_note,
+                            scope_note,
+                        )
                     ),
                     resolution=(
                         "Add a service control policy denying "
                         "iam:CreateServiceSpecificCredential when "
                         "iam:ServiceSpecificCredentialServiceName is "
                         "bedrock.amazonaws.com and "
-                        "iam:ServiceSpecificCredentialAgeDays exceeds your maximum, "
-                        "and denying bedrock:CallWithBearerToken and "
-                        "bedrock-mantle:CallWithBearerToken for the LONG_TERM bearer "
-                        "token type in production accounts."
+                        "iam:ServiceSpecificCredentialAgeDays exceeds your maximum "
+                        "(NumericGreaterThanIfExists, so a key with no expiry is "
+                        "also denied), and denying bedrock:CallWithBearerToken on "
+                        "bedrock:BearerTokenType LONG_TERM and "
+                        "bedrock-mantle:CallWithBearerToken on "
+                        "bedrock-mantle:BearerTokenType LONG_TERM in production "
+                        "accounts, each action with its own key."
                     ),
                     reference=BEDROCK_API_KEY_REFERENCE,
                     severity="High",
@@ -15242,8 +15794,10 @@ AI_READ_ACTION_VERBS = ("get", "list", "describe", "search")
 
 AI_USER_SCOPE_NOTE = (
     "The population is IAM users whose attached, inline or group policies allow a "
-    "non-read Bedrock, SageMaker AI or AgentCore action; Deny statements, "
-    "permissions boundaries and service control policies are not evaluated."
+    "non-read Bedrock, SageMaker AI or AgentCore action and whose permissions "
+    "boundary, if set, allows one too. Deny statements and service control "
+    "policies are not evaluated per principal, so a user they block can still be "
+    "counted."
 )
 
 
@@ -15297,22 +15851,35 @@ def _policy_ai_write_grants(document: Any) -> List[str]:
     return grants
 
 
-def _ai_write_users(permission_cache: Dict[str, Any]) -> Dict[str, Any]:
+def _ai_write_users(
+    permission_cache: Dict[str, Any], cache_key: str = "user_permissions"
+) -> Dict[str, Any]:
     """
-    Select the cached IAM users that hold a non-read Bedrock, SageMaker AI or
-    AgentCore permission, with the grants that put each one in scope.
+    Select the cached IAM users (or, with cache_key "role_permissions", roles)
+    that hold a non-read Bedrock, SageMaker AI or AgentCore permission, with the
+    grants that put each one in scope.
 
-    ``unreadable`` lists users whose group policies or policy documents could
-    not be read and who were not otherwise found in scope, so a population
-    that looks empty is never reported as clean when part of it went unread.
+    A permissions boundary is an intersection, so an identity whose boundary
+    allows no non-read AI action is out of scope. ``unreadable`` lists
+    identities whose group policies, boundary or policy documents could not be
+    read and who were not otherwise found in scope, so a population that looks
+    empty is never reported as clean when part of it went unread.
     """
     users = {}
     unreadable = {}
-    for user_name, permissions in permission_cache["user_permissions"].items():
+    for user_name, permissions in permission_cache[cache_key].items():
         evidence = []
         gaps = []
         if permissions.get("group_policies_error"):
             gaps.append("group policies could not be read")
+        boundary = _boundary_document(permissions)
+        if boundary is not None:
+            try:
+                if not _policy_ai_write_grants(boundary):
+                    continue
+            except (ValueError, TypeError, AttributeError):
+                unreadable[user_name] = ["the permissions boundary could not be parsed"]
+                continue
         for source, policy in _cached_identity_policies(permissions):
             policy_name = policy.get("name") or "unnamed policy"
             try:
@@ -15427,7 +15994,15 @@ def check_bedrock_ai_user_access_keys(
                     "N/A",
                 )
             )
-            return findings
+            return _apply_cache_population_gaps(
+                findings,
+                permission_cache,
+                "BR-50",
+                AI_USER_ACCESS_KEY_FINDING,
+                AI_USER_ACCESS_KEY_REFERENCE,
+                region,
+                principal_types=("user",),
+            )
 
         iam_client = boto3.client("iam", config=boto3_config)
         without_keys = []
@@ -15492,7 +16067,15 @@ def check_bedrock_ai_user_access_keys(
                     "Passed",
                 )
             )
-        return findings
+        return _apply_cache_population_gaps(
+            findings,
+            permission_cache,
+            "BR-50",
+            AI_USER_ACCESS_KEY_FINDING,
+            AI_USER_ACCESS_KEY_REFERENCE,
+            region,
+            principal_types=("user",),
+        )
 
     except Exception as e:
         logger.error(
@@ -15524,17 +16107,172 @@ AI_USER_MFA_REFERENCE = (
 )
 
 AI_USER_MFA_SCOPE_NOTE = (
-    "Only IAM users are read: people who sign in through IAM Identity Center are "
-    "not covered, and this check does not read Identity Center MFA settings."
+    "IAM users and the trust policies of IAM roles are read. People who sign in "
+    "through IAM Identity Center are not covered: the sso-admin API publishes no "
+    "operation that returns the MFA mode, and the permission-set Deny keyed on "
+    'aws:PrincipalTag needs sso:ListInstances, which authorizes only on "*".'
 )
+
+MFA_PRESENT_CONDITION_KEY = "aws:multifactorauthpresent"
+
+
+def _ai_write_services(permissions: Dict[str, Any]) -> List[str]:
+    """Return the AI services in which an identity's Allow statements grant writes."""
+    services = set()
+    for _, policy in _cached_identity_policies(permissions):
+        for statement in _policy_statements(policy.get("document")):
+            if str(statement.get("Effect", "")).upper() != "ALLOW":
+                continue
+            if "NotAction" in statement:
+                excluded = [
+                    str(action).strip().lower()
+                    for action in _as_list(statement.get("NotAction"))
+                ]
+                services.update(
+                    service
+                    for service in AI_WRITE_SERVICES
+                    if not any(
+                        _wildcard_matches(action, f"{service}:\x00")
+                        for action in excluded
+                    )
+                )
+                continue
+            for action in _as_list(statement.get("Action")):
+                services.update(_action_grants_ai_write(action))
+    return sorted(services)
+
+
+def _mfa_deny_statement_services(statement: Dict[str, Any]) -> List[str]:
+    """
+    Return the AI services whose every action a Deny statement blocks when the
+    request was not signed with MFA.
+
+    Only BoolIfExists false or Null true on aws:MultiFactorAuthPresent is
+    credited: a request signed with a long-term access key carries no such key,
+    so a plain Bool false test never fires for it. A second condition key
+    narrows the Deny and is not credited.
+    """
+    if str(statement.get("Effect", "")).upper() != "DENY":
+        return []
+    if not _deny_applies_to_every_resource(statement):
+        return []
+    conditions = _condition_keys_by_operator(statement)
+    if {key for _, key, _ in conditions} != {MFA_PRESENT_CONDITION_KEY}:
+        return []
+    for operator, _, values in conditions:
+        base = _strip_condition_set_operator(operator)
+        wanted = {"boolifexists": "false", "null": "true"}.get(base)
+        if wanted is None or not values:
+            return []
+        if any(str(value).strip().lower() != wanted for value in values):
+            return []
+    if "NotAction" in statement:
+        excluded = [
+            str(action).strip().lower()
+            for action in _as_list(statement.get("NotAction"))
+        ]
+        return [
+            service
+            for service in AI_WRITE_SERVICES
+            if not any(
+                service in _action_grants_ai_write(action) for action in excluded
+            )
+        ]
+    return [
+        service
+        for service in AI_WRITE_SERVICES
+        if any(
+            _wildcard_matches(str(action).strip().lower(), f"{service}:\x00")
+            for action in _as_list(statement.get("Action"))
+        )
+    ]
+
+
+def _mfa_deny_source(permissions: Dict[str, Any]) -> str:
+    """
+    Name the Deny that requires MFA on every AI write service an identity holds,
+    from its own policies or its permissions boundary, or return "".
+    """
+    needed = set(_ai_write_services(permissions))
+    if not needed:
+        return ""
+    sources = [
+        (f"{source} '{policy.get('name') or 'unnamed'}'", policy.get("document"))
+        for source, policy in _cached_identity_policies(permissions)
+    ]
+    boundary = _boundary_document(permissions)
+    if boundary is not None:
+        sources.append(("permissions boundary", boundary))
+    covered = set()
+    names = []
+    for label, document in sources:
+        for statement in _policy_statements(document):
+            services = set(_mfa_deny_statement_services(statement)) & needed
+            if services - covered:
+                covered |= services
+                names.append(label)
+    return ", ".join(names) if covered >= needed else ""
+
+
+def _trust_statements_without_mfa(trust_policy: Any) -> List[str]:
+    """
+    Describe each Allow in a role trust policy that lets an IAM user, or any
+    principal of an account, assume the role without MFA.
+
+    A service, a federated or a role principal is not judged here: MFA for a
+    role session is that of the session that assumed it, and an identity
+    provider owns MFA for federated sign-in.
+    """
+    open_statements = []
+    for statement in _policy_statements(trust_policy):
+        if str(statement.get("Effect", "")).upper() != "ALLOW":
+            continue
+        actions = [str(action).lower() for action in _as_list(statement.get("Action"))]
+        if not any(_wildcard_matches(action, "sts:assumerole") for action in actions):
+            continue
+        principal = statement.get("Principal")
+        if principal == "*":
+            aws_principals = ["*"]
+        elif isinstance(principal, dict):
+            aws_principals = [str(value) for value in _as_list(principal.get("AWS"))]
+        else:
+            aws_principals = []
+        human = [
+            value
+            for value in aws_principals
+            if value == "*"
+            or re.fullmatch(r"\d{12}", value)
+            or value.endswith(":root")
+            or ":user/" in value
+        ]
+        if not human:
+            continue
+        requires_mfa = any(
+            _strip_condition_set_operator(operator) == "bool"
+            and key == MFA_PRESENT_CONDITION_KEY
+            and values
+            and all(str(value).strip().lower() == "true" for value in values)
+            for operator, key, values in _condition_keys_by_operator(statement)
+        )
+        if not requires_mfa:
+            open_statements.append(
+                "statement '{}' trusts {} with no Bool aws:MultiFactorAuthPresent "
+                "true condition".format(
+                    statement.get("Sid") or "unnamed", ", ".join(human[:3])
+                )
+            )
+    return open_statements
 
 
 def check_bedrock_ai_user_console_mfa(
     permission_cache, region: str = ""
 ) -> Dict[str, Any]:
     """
-    BR-51: Flag IAM users that can change Bedrock, SageMaker AI or AgentCore
-    resources, have a console password and have no MFA device.
+    BR-51: Flag identities that can change Bedrock, SageMaker AI or AgentCore
+    resources without MFA: an IAM user with a console password and no MFA
+    device, an IAM user with an active access key and no Deny requiring MFA,
+    and an IAM role whose trust policy lets a user or account assume it
+    without MFA.
     """
     logger.debug("Starting check for AI user console MFA")
     try:
@@ -15557,7 +16295,18 @@ def check_bedrock_ai_user_console_mfa(
                 region=region,
             )
 
+        def finish():
+            return _apply_cache_population_gaps(
+                findings,
+                permission_cache,
+                "BR-51",
+                AI_USER_MFA_FINDING,
+                AI_USER_MFA_REFERENCE,
+                region,
+            )
+
         population = _ai_write_users(permission_cache)
+        roles = _ai_write_users(permission_cache, "role_permissions")
         findings["csv_data"].extend(
             _ai_user_unread_findings(
                 population["unreadable"],
@@ -15567,46 +16316,91 @@ def check_bedrock_ai_user_console_mfa(
                 region,
             )
         )
-        if not population["users"]:
+        if not population["users"] and not roles["users"]:
             findings["status"] = "N/A"
             findings["csv_data"].append(
                 row(
-                    "No IAM user in the permissions cache holds a non-read "
-                    "Bedrock, SageMaker AI or AgentCore permission. "
+                    "No IAM user or role in the permissions cache holds a "
+                    "non-read Bedrock, SageMaker AI or AgentCore permission. "
                     f"{AI_USER_SCOPE_NOTE}",
                     "No action required",
                     "Informational",
                     "N/A",
                 )
             )
-            return findings
+            return finish()
 
         iam_client = boto3.client("iam", config=boto3_config)
         protected = []
         no_console = []
+        deny_protected = []
         for user_name, evidence in sorted(population["users"].items()):
-            try:
-                iam_client.get_login_profile(UserName=user_name)
-            except ClientError as error:
-                if error.response.get("Error", {}).get("Code") == "NoSuchEntity":
-                    no_console.append(user_name)
-                    continue
-                findings["csv_data"].append(
-                    row(
-                        f"Console access of IAM user '{user_name}' could not be "
-                        "read: "
-                        f"{describe_api_error(error, 'iam:GetLoginProfile', region)}.",
-                        COULD_NOT_ASSESS_RESOLUTION,
-                        "Informational",
-                        "N/A",
-                    )
-                )
+            deny_source = _mfa_deny_source(
+                permission_cache["user_permissions"][user_name]
+            )
+            if deny_source:
+                deny_protected.append(f"{user_name} ({deny_source})")
                 continue
             try:
-                devices = _list_all_items(
+                iam_client.get_login_profile(UserName=user_name)
+                console = True
+            except ClientError as error:
+                if error.response.get("Error", {}).get("Code") != "NoSuchEntity":
+                    findings["csv_data"].append(
+                        row(
+                            f"Console access of IAM user '{user_name}' could not be "
+                            "read: "
+                            f"{describe_api_error(error, 'iam:GetLoginProfile', region)}.",
+                            COULD_NOT_ASSESS_RESOLUTION,
+                            "Informational",
+                            "N/A",
+                        )
+                    )
+                    continue
+                console = False
+            has_device = False
+            if console:
+                try:
+                    devices = _list_all_items(
+                        iam_client,
+                        "list_mfa_devices",
+                        "MFADevices",
+                        max_results_param=None,
+                        token_param="Marker",
+                        token_response_keys=("Marker",),
+                        UserName=user_name,
+                    )
+                except Exception as error:
+                    findings["csv_data"].append(
+                        row(
+                            f"MFA devices of IAM user '{user_name}' could not be "
+                            "listed: "
+                            f"{describe_api_error(error, 'iam:ListMFADevices', region)}.",
+                            COULD_NOT_ASSESS_RESOLUTION,
+                            "Informational",
+                            "N/A",
+                        )
+                    )
+                    continue
+                has_device = bool(devices)
+                if not has_device:
+                    findings["status"] = "WARN"
+                    findings["csv_data"].append(
+                        row(
+                            f"IAM user '{user_name}' has a console password and no "
+                            f"MFA device. The user is in scope because {evidence[0]}. "
+                            f"{AI_USER_SCOPE_NOTE}",
+                            "Assign an MFA device to the user, or remove the console "
+                            "password and move the person to IAM Identity Center.",
+                            "High",
+                            "Failed",
+                        )
+                    )
+            try:
+                keys = _list_all_items(
                     iam_client,
-                    "list_mfa_devices",
-                    "MFADevices",
+                    "list_access_keys",
+                    "AccessKeyMetadata",
                     max_results_param=None,
                     token_param="Marker",
                     token_response_keys=("Marker",),
@@ -15615,41 +16409,109 @@ def check_bedrock_ai_user_console_mfa(
             except Exception as error:
                 findings["csv_data"].append(
                     row(
-                        f"MFA devices of IAM user '{user_name}' could not be "
-                        "listed: "
-                        f"{describe_api_error(error, 'iam:ListMFADevices', region)}.",
+                        f"Access keys of IAM user '{user_name}' could not be "
+                        "listed, so whether it can sign AI writes without MFA is "
+                        "unknown: "
+                        f"{describe_api_error(error, 'iam:ListAccessKeys', region)}.",
                         COULD_NOT_ASSESS_RESOLUTION,
                         "Informational",
                         "N/A",
                     )
                 )
                 continue
-            if devices:
-                protected.append(user_name)
-                continue
-            findings["status"] = "WARN"
-            findings["csv_data"].append(
-                row(
-                    f"IAM user '{user_name}' has a console password and no MFA "
-                    f"device. The user is in scope because {evidence[0]}. "
-                    f"{AI_USER_SCOPE_NOTE}",
-                    "Assign an MFA device to the user, or remove the console "
-                    "password and move the person to IAM Identity Center.",
-                    "High",
-                    "Failed",
+            active = [key for key in keys if key.get("Status") == "Active"]
+            if active:
+                findings["status"] = "WARN"
+                findings["csv_data"].append(
+                    row(
+                        f"IAM user '{user_name}' has {len(active)} active access "
+                        "key(s), and no Deny in its policies or permissions "
+                        "boundary requires MFA (BoolIfExists "
+                        "aws:MultiFactorAuthPresent false) on its AI write "
+                        "services, so the key signs AI changes without MFA"
+                        f"{' even though the user has an MFA device' if has_device else ''}. "
+                        f"The user is in scope because {evidence[0]}. "
+                        f"{AI_USER_SCOPE_NOTE}",
+                        "Remove the access key and use temporary credentials from "
+                        "an IAM role or IAM Identity Center, or attach a Deny on "
+                        "the AI write actions with BoolIfExists "
+                        "aws:MultiFactorAuthPresent false.",
+                        "High",
+                        "Failed",
+                    )
                 )
-            )
+            elif has_device:
+                protected.append(user_name)
+            elif not console:
+                no_console.append(user_name)
 
-        if protected or no_console:
+        trusted = []
+        for role_name, evidence in sorted(roles["users"].items()):
+            try:
+                role = iam_client.get_role(RoleName=role_name)["Role"]
+            except (ClientError, BotoCoreError) as error:
+                findings["csv_data"].append(
+                    row(
+                        f"The trust policy of IAM role '{role_name}' could not be "
+                        "read: "
+                        f"{describe_api_error(error, 'iam:GetRole', region)}.",
+                        COULD_NOT_ASSESS_RESOLUTION,
+                        "Informational",
+                        "N/A",
+                    )
+                )
+                continue
+            try:
+                open_statements = _trust_statements_without_mfa(
+                    role.get("AssumeRolePolicyDocument")
+                )
+            except (ValueError, TypeError) as error:
+                findings["csv_data"].append(
+                    row(
+                        f"The trust policy of IAM role '{role_name}' could not be "
+                        f"parsed: {get_assessment_error_label(error)}.",
+                        COULD_NOT_ASSESS_RESOLUTION,
+                        "Informational",
+                        "N/A",
+                    )
+                )
+                continue
+            if open_statements:
+                findings["status"] = "WARN"
+                findings["csv_data"].append(
+                    row(
+                        f"IAM role '{role_name}' can be assumed without MFA: "
+                        f"{'; '.join(open_statements[:3])}. The role is in scope "
+                        f"because {evidence[0]}.",
+                        "Add a Bool aws:MultiFactorAuthPresent true condition to "
+                        "each trust statement that names an IAM user or an "
+                        "account, or move the people who assume the role to IAM "
+                        "Identity Center.",
+                        "High",
+                        "Failed",
+                    )
+                )
+            else:
+                trusted.append(role_name)
+
+        if protected or no_console or deny_protected or trusted:
             findings["csv_data"].append(
                 row(
                     "{} of the {} in-scope IAM user(s) have an MFA device ({}) and "
-                    "{} have no console password ({}). {}".format(
+                    "{} have no console password ({}) and no active access key. "
+                    "{} user(s) are held to MFA by a Deny ({}). {} of the {} "
+                    "in-scope IAM role(s) cannot be assumed by a user or account "
+                    "without MFA ({}). {}".format(
                         len(protected),
                         len(population["users"]),
                         ", ".join(protected[:10]) or "none",
                         len(no_console),
                         ", ".join(no_console[:10]) or "none",
+                        len(deny_protected),
+                        "; ".join(deny_protected[:5]) or "none",
+                        len(trusted),
+                        len(roles["users"]),
+                        ", ".join(trusted[:10]) or "none",
                         AI_USER_SCOPE_NOTE,
                     ),
                     "No action required",
@@ -15657,7 +16519,7 @@ def check_bedrock_ai_user_console_mfa(
                     "Passed",
                 )
             )
-        return findings
+        return finish()
 
     except Exception as e:
         logger.error(
@@ -19594,6 +20456,7 @@ def lambda_handler(event, context):
         # violations are not reported once per scanned region. These run before the
         # regional availability gate so they are still emitted even if Bedrock is
         # not available in the primary region.
+        scp_inventory = None
         if is_primary_region:
             if permission_cache is None:
                 all_findings.extend(
@@ -19643,9 +20506,15 @@ def lambda_handler(event, context):
                 logger.info(
                     "Running Marketplace model subscription control check (BR-44)"
                 )
+                # BR-41, BR-43, BR-44 and BR-45 all read the same service
+                # control policy documents, so the organization-wide pass is
+                # made once and reused below.
+                scp_inventory = get_service_control_policy_inventory()
                 all_findings.append(
                     check_bedrock_marketplace_model_control(
-                        permission_cache, region=GLOBAL_REGION_LABEL
+                        permission_cache,
+                        region=GLOBAL_REGION_LABEL,
+                        scp_inventory=scp_inventory,
                     )
                 )
 
@@ -19806,9 +20675,8 @@ def lambda_handler(event, context):
             )
             all_findings.append(cross_account_guardrails_findings)
 
-            # BR-41, BR-43 and BR-45 all read the same service control policy
-            # documents, so the organization-wide pass is made once here.
-            scp_inventory = get_service_control_policy_inventory()
+            if scp_inventory is None:
+                scp_inventory = get_service_control_policy_inventory()
 
             logger.info("Running central guardrail enforcement check (BR-41)")
             central_guardrail_findings = check_bedrock_central_guardrail_enforcement(

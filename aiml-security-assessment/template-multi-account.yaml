@@ -507,14 +507,22 @@ Resources:
               Resource: !Sub 'arn:${AWS::Partition}:organizations::*:account/o-*/${AWS::AccountId}'
             - Sid: BedrockApiKeyInventoryRead
               # BR-45 lists the bedrock.amazonaws.com service-specific
-              # credentials of each cached IAM user.
+              # credentials of every IAM user (AllUsers), falling back to each
+              # cached IAM user when the account-wide listing is refused.
               Effect: Allow
               Action:
                 - iam:ListServiceSpecificCredentials # BR-45
-                - iam:ListAccessKeys # BR-50
+                - iam:ListAccessKeys # BR-50, BR-51
                 - iam:GetLoginProfile # BR-51
                 - iam:ListMFADevices # BR-51
               Resource: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:user/*'
+            - Sid: AIRoleTrustPolicyRead
+              # BR-51 reads the trust policy of each role holding an AI write
+              # grant, to find users or accounts that can assume it without MFA.
+              Effect: Allow
+              Action:
+                - iam:GetRole # BR-51
+              Resource: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/*'
             - Sid: BedrockInvocationLogInspection
               # BR-04 reads the retention period of the invocation log group and
               # BR-32 reads the metric filters defined on it.

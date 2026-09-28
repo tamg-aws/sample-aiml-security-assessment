@@ -616,6 +616,7 @@ _VERIFIED_REMEDIATION_IAM_ACTIONS |= {
 # action below came back clean.
 _VERIFIED_REMEDIATION_IAM_ACTIONS |= {
     "aws-marketplace:Subscribe",
+    "aws-marketplace:Unsubscribe",
     "bedrock:CallWithBearerToken",
     "bedrock-mantle:CallWithBearerToken",
     "iam:CreateServiceSpecificCredential",
@@ -791,6 +792,7 @@ _VERIFIED_REMEDIATION_CONDITION_KEYS |= {
     "aws-marketplace:ProductId",
     "aws:RequestedRegion",
     "bedrock:BearerTokenType",
+    "bedrock-mantle:BearerTokenType",
     "bedrock:ModelArn",
     "iam:ServiceSpecificCredentialAgeDays",
     "iam:ServiceSpecificCredentialServiceName",

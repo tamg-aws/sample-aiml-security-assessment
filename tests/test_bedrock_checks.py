@@ -6918,9 +6918,10 @@ class TestBR44MarketplaceModelControl:
 
     def test_br44_qualified_operator_is_the_form_iam_accepts(self):
         # aws-marketplace:ProductId is multi-valued, so IAM Access Analyzer
-        # rejects a bare StringEquals on it with MISSING_QUALIFIER. The
-        # qualified operator must therefore read as scoping, and its negated
-        # form must still read as a Deny allow-list.
+        # rejects a bare StringEquals on it with MISSING_QUALIFIER. The negated
+        # ForAnyValue form must still read as a Deny allow-list. An Allow with
+        # ForAllValues: is true when the key is absent, so without a Null false
+        # test it does not bind and the role is reported.
         findings = self._run(
             _identity_cache(
                 roles={
@@ -6964,9 +6965,12 @@ class TestBR44MarketplaceModelControl:
             )
         )
 
-        assert [f["Status"] for f in findings] == ["Passed"]
+        assert [f["Status"] for f in findings] == ["Failed", "Passed"]
+        assert "QualifiedAllowRole" in findings[0]["Finding_Details"]
         assert "forallvalues:stringequals" in findings[0]["Finding_Details"]
-        assert "foranyvalue:stringnotequals" in findings[0]["Finding_Details"]
+        assert "key is absent" in findings[0]["Finding_Details"]
+        assert "QualifiedDenyRole" in findings[1]["Finding_Details"]
+        assert "foranyvalue:stringnotequals" in findings[1]["Finding_Details"]
 
     def test_br44_resolution_names_the_multi_value_qualifier(self):
         findings = self._run(
@@ -6982,6 +6986,273 @@ class TestBR44MarketplaceModelControl:
         failed = [f for f in findings if f["Status"] == "Failed"]
         assert len(failed) == 1
         assert "ForAllValues:StringEquals" in failed[0]["Resolution"]
+
+    def _scoped(
+        self, action="aws-marketplace:Subscribe", operator="StringEquals", value=None
+    ):
+        return _allow(
+            action,
+            "*",
+            {operator: {"aws-marketplace:ProductId": value or self.PRODUCT_ID}},
+        )
+
+    def _scp(self, statement):
+        return {
+            "items": [
+                {
+                    "name": "MarketplaceGuard",
+                    "id": "p-mkt",
+                    "content": json.dumps(
+                        {"Version": "2012-10-17", "Statement": [statement]}
+                    ),
+                    "attached_to": ["r-root"],
+                }
+            ],
+            "errors": [],
+            "list_error": None,
+        }
+
+    SCP_ALLOW_LIST = {
+        "Effect": "Deny",
+        "Action": ["aws-marketplace:Subscribe", "aws-marketplace:Unsubscribe"],
+        "Resource": "*",
+        "Condition": {
+            "ForAnyValue:StringNotEquals": {
+                "aws-marketplace:ProductId": ["prod-abcdefghijklm"]
+            }
+        },
+    }
+
+    def test_br44_unscoped_unsubscribe_fails(self):
+        findings = self._run(
+            _identity_cache(
+                roles={
+                    "UnsubRole": [
+                        ("Sub", self._scoped()),
+                        ("Unsub", _allow("aws-marketplace:Unsubscribe", "*")),
+                    ]
+                }
+            )
+        )
+
+        failed = [f for f in findings if f["Status"] == "Failed"]
+        assert len(failed) == 1
+        assert "aws-marketplace:unsubscribe" in failed[0]["Finding_Details"]
+        assert not [f for f in findings if f["Status"] == "Passed"]
+
+    def test_br44_group_policy_grant_is_read(self):
+        cache = _identity_cache(users={"Dev": []})
+        cache["user_permissions"]["Dev"]["group_policies"] = [
+            {
+                "group": "Builders",
+                "name": "GroupSubscribe",
+                "arn": "arn:aws:iam::123456789012:policy/GroupSubscribe",
+                "document": _allow("aws-marketplace:Subscribe", "*"),
+            }
+        ]
+        findings = self._run(cache)
+
+        failed = [f for f in findings if f["Status"] == "Failed"]
+        assert len(failed) == 1
+        assert "User 'Dev'" in failed[0]["Finding_Details"]
+        assert "GroupSubscribe" in failed[0]["Finding_Details"]
+
+    def test_br44_not_action_grant_is_read(self):
+        document = {
+            "Version": "2012-10-17",
+            "Statement": [{"Effect": "Allow", "NotAction": "iam:*", "Resource": "*"}],
+        }
+        findings = self._run(
+            _identity_cache(roles={"BroadRole": [("Broad", document)]})
+        )
+
+        assert [f["Status"] for f in findings] == ["Failed"]
+        assert "Role 'BroadRole'" in findings[0]["Finding_Details"]
+
+    def test_br44_boundary_denying_subscription_removes_the_grant(self):
+        cache = _identity_cache(
+            roles={
+                "Bounded": [("Open", _allow("aws-marketplace:*", "*"))],
+                "Open": [("Open", _allow("aws-marketplace:Subscribe", "*"))],
+            }
+        )
+        cache["role_permissions"]["Bounded"]["permissions_boundary"] = {
+            "document": _allow("bedrock:InvokeModel", "*")
+        }
+        findings = self._run(cache)
+
+        failed = [f for f in findings if f["Status"] == "Failed"]
+        assert len(failed) == 1
+        assert "Role 'Open'" in failed[0]["Finding_Details"]
+        assert "Bounded" not in " ".join(f["Finding_Details"] for f in findings)
+
+    def test_br44_boundary_scoping_bounds_an_open_grant(self):
+        cache = _identity_cache(
+            roles={"Bounded": [("Open", _allow("aws-marketplace:*", "*"))]}
+        )
+        cache["role_permissions"]["Bounded"]["permissions_boundary"] = {
+            "document": self._scoped(
+                action=["aws-marketplace:Subscribe", "aws-marketplace:Unsubscribe"]
+            )
+        }
+        findings = self._run(cache)
+
+        assert [f["Status"] for f in findings] == ["Passed"]
+        assert "permissions boundary" in findings[0]["Finding_Details"]
+
+    def test_br44_wildcard_or_ifexists_product_value_fails(self):
+        findings = self._run(
+            _identity_cache(
+                roles={
+                    "WildRole": [("Wild", self._scoped(value="prod-*"))],
+                    "IfExistsRole": [
+                        ("IfExists", self._scoped(operator="StringEqualsIfExists"))
+                    ],
+                    "ScopedRole": [("Scoped", self._scoped())],
+                }
+            )
+        )
+
+        failed = [f for f in findings if f["Status"] == "Failed"]
+        assert len(failed) == 2
+        details = " ".join(f["Finding_Details"] for f in failed)
+        assert "Role 'WildRole'" in details and "wildcard" in details
+        assert "Role 'IfExistsRole'" in details and "key is absent" in details
+        passed = [f for f in findings if f["Status"] == "Passed"]
+        assert len(passed) == 1 and "ScopedRole" in passed[0]["Finding_Details"]
+
+    def test_br44_for_all_values_with_null_false_binds(self):
+        document = {
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Effect": "Allow",
+                    "Action": "aws-marketplace:Subscribe",
+                    "Resource": "*",
+                    "Condition": {
+                        "ForAllValues:StringEquals": {
+                            "aws-marketplace:ProductId": [self.PRODUCT_ID]
+                        },
+                        "Null": {"aws-marketplace:ProductId": "false"},
+                    },
+                }
+            ],
+        }
+        findings = self._run(_identity_cache(roles={"Guarded": [("G", document)]}))
+
+        assert [f["Status"] for f in findings] == ["Passed"]
+
+    def test_br44_deny_with_an_extra_key_is_not_credited(self):
+        document = {
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Effect": "Allow",
+                    "Action": "aws-marketplace:Subscribe",
+                    "Resource": "*",
+                },
+                {
+                    "Effect": "Deny",
+                    "Action": "aws-marketplace:Subscribe",
+                    "Resource": "*",
+                    "Condition": {
+                        "StringNotEquals": {
+                            "aws-marketplace:ProductId": self.PRODUCT_ID,
+                            "aws:RequestedRegion": "us-east-1",
+                        }
+                    },
+                },
+            ],
+        }
+        findings = self._run(_identity_cache(roles={"Narrow": [("N", document)]}))
+
+        assert [f["Status"] for f in findings] == ["Failed"]
+        assert "aws:requestedregion" in findings[0]["Finding_Details"]
+
+    def test_br44_attached_scp_allow_list_bounds_open_grants(self):
+        cache = _identity_cache(
+            roles={
+                "OpenA": [("Open", _allow("aws-marketplace:Subscribe", "*"))],
+                "OpenB": [("Open", _allow("aws-marketplace:*", "*"))],
+            }
+        )
+        findings = extract_csv_data(
+            bedrock_app.check_bedrock_marketplace_model_control(
+                cache, region="Global", scp_inventory=self._scp(self.SCP_ALLOW_LIST)
+            )
+        )
+
+        assert [f["Status"] for f in findings] == ["Passed"]
+        details = findings[0]["Finding_Details"]
+        assert "policy 'MarketplaceGuard'" in details
+        assert "role 'OpenA'" in details and "role 'OpenB'" in details
+
+    def test_br44_scp_is_not_credited_in_the_management_account(self):
+        inventory = self._scp(self.SCP_ALLOW_LIST)
+        inventory["management_account"] = True
+        findings = extract_csv_data(
+            bedrock_app.check_bedrock_marketplace_model_control(
+                _identity_cache(
+                    roles={"Open": [("Open", _allow("aws-marketplace:Subscribe", "*"))]}
+                ),
+                region="Global",
+                scp_inventory=inventory,
+            )
+        )
+
+        assert [f["Status"] for f in findings] == ["Failed"]
+
+    def test_br44_scp_deny_list_or_one_action_is_not_credited(self):
+        deny_list = dict(
+            self.SCP_ALLOW_LIST,
+            Condition={"StringEquals": {"aws-marketplace:ProductId": "prod-bad"}},
+        )
+        subscribe_only = dict(self.SCP_ALLOW_LIST, Action="aws-marketplace:Subscribe")
+        cache = _identity_cache(
+            roles={"Open": [("Open", _allow("aws-marketplace:*", "*"))]}
+        )
+        for statement in (deny_list, subscribe_only):
+            findings = extract_csv_data(
+                bedrock_app.check_bedrock_marketplace_model_control(
+                    cache, region="Global", scp_inventory=self._scp(statement)
+                )
+            )
+            assert [f["Status"] for f in findings] == ["Failed"]
+
+    def test_br44_unread_scp_is_named(self):
+        inventory = self._scp(self.SCP_ALLOW_LIST)
+        inventory["errors"] = ["policy 'Other': AccessDenied"]
+        findings = extract_csv_data(
+            bedrock_app.check_bedrock_marketplace_model_control(
+                _identity_cache(roles={"Scoped": [("S", self._scoped())]}),
+                region="Global",
+                scp_inventory=inventory,
+            )
+        )
+
+        assert "could not all be read" in findings[0]["Finding_Details"]
+        assert "AccessDenied" in findings[0]["Finding_Details"]
+
+    def test_br44_empty_population_passes_only_on_a_complete_cache(self):
+        cache = _identity_cache(
+            roles={"Reader": [("R", _allow("bedrock:ListFoundationModels", "*"))]}
+        )
+        cache["cache_schema_version"] = 2
+        cache["principal_errors"] = []
+        findings = self._run(cache)
+        assert [f["Status"] for f in findings] == ["Passed"]
+
+        cache["principal_errors"] = [
+            {
+                "type": "role",
+                "name": "Hidden",
+                "stage": "policies",
+                "error": "Throttling",
+            }
+        ]
+        findings = self._run(cache)
+        assert [f["Status"] for f in findings] == ["N/A", "N/A"]
+        assert "Hidden" in findings[1]["Finding_Details"]
 
     def test_br44_no_subscribe_grant_returns_na(self):
         findings = self._run(
@@ -7070,11 +7341,34 @@ class TestBR45ApiKeyGovernance:
             ],
         }
 
-    def _run(self, credentials, inventory=None, account="123456789012", users=None):
-        """credentials: {user_name: [credential dicts]}."""
+    def _run(
+        self,
+        credentials,
+        inventory=None,
+        account="123456789012",
+        users=None,
+        all_users=False,
+    ):
+        """credentials: {user_name: [credential dicts]}.
+
+        all_users=False refuses the account-wide AllUsers listing, so the check
+        falls back to one listing per cached user.
+        """
         iam_client = MagicMock()
 
         def list_credentials(**kwargs):
+            if kwargs.get("AllUsers"):
+                if not all_users:
+                    raise _client_error(
+                        "AccessDenied", operation="ListServiceSpecificCredentials"
+                    )
+                return {
+                    "ServiceSpecificCredentials": [
+                        dict(credential, UserName=name)
+                        for name, items in credentials.items()
+                        for credential in items
+                    ]
+                }
             return {
                 "ServiceSpecificCredentials": list(
                     credentials.get(kwargs["UserName"], [])
@@ -7134,6 +7428,7 @@ class TestBR45ApiKeyGovernance:
                     {
                         "ServiceSpecificCredentialId": "ACCA-expiring",
                         "Status": "Active",
+                        "CreateDate": "2025-12-01T00:00:00Z",
                         "ExpirationDate": "2026-01-01T00:00:00Z",
                     }
                 ],
@@ -7190,12 +7485,15 @@ class TestBR45ApiKeyGovernance:
             },
         )
 
+        # A plain NumericGreaterThan is false when the age key is absent, which
+        # is the case for a key created with no expiry, so alone it caps nothing.
         prevention = self._by_name(findings, self.PREVENTION_FINDING)
-        assert [f["Status"] for f in prevention] == ["Passed"]
+        assert [f["Status"] for f in prevention] == ["Failed"]
         assert "CapKeyAge" in prevention[0]["Finding_Details"]
         assert (
             "iam:servicespecificcredentialagedays" in prevention[0]["Finding_Details"]
         )
+        assert "no expiry" in prevention[0]["Finding_Details"]
 
     def test_br45_bearer_token_type_deny_passes_the_prevention_leg(self):
         _, findings = self._run(
@@ -7213,9 +7511,14 @@ class TestBR45ApiKeyGovernance:
             },
         )
 
+        # The Deny names bedrock:CallWithBearerToken only, so a LONG_TERM key
+        # still reaches the bedrock-mantle endpoint.
         prevention = self._by_name(findings, self.PREVENTION_FINDING)
-        assert [f["Status"] for f in prevention] == ["Passed"]
-        assert "bedrock:bearertokentype" in prevention[0]["Finding_Details"]
+        assert [f["Status"] for f in prevention] == ["Failed"]
+        assert (
+            "only bedrock:callwithbearertoken is covered"
+            in (prevention[0]["Finding_Details"])
+        )
 
     def test_br45_no_preventive_policy_returns_failed(self):
         _, findings = self._run(
@@ -7304,6 +7607,7 @@ class TestBR45ApiKeyGovernance:
     def test_br45_reads_credentials_from_all_pages(self):
         iam_client = MagicMock()
         iam_client.list_service_specific_credentials.side_effect = [
+            _client_error("AccessDenied", operation="ListServiceSpecificCredentials"),
             {
                 "ServiceSpecificCredentials": [
                     {"ServiceSpecificCredentialId": "ACCA-1", "Status": "Inactive"}
@@ -7348,6 +7652,361 @@ class TestBR45ApiKeyGovernance:
         assert [f["Status"] for f in inventory_rows] == ["Failed"]
         assert "ACCA-2" in inventory_rows[0]["Finding_Details"]
 
+    @staticmethod
+    def _scp_items(*statements, name="KeyGuard"):
+        return {
+            "items": [
+                {
+                    "name": name,
+                    "id": "p-key",
+                    "content": json.dumps(
+                        {"Version": "2012-10-17", "Statement": list(statements)}
+                    ),
+                    "attached_to": ["r-root"],
+                }
+            ],
+            "errors": [],
+            "list_error": None,
+        }
+
+    @staticmethod
+    def _deny(action, condition=None, sid="Guard"):
+        statement = {"Sid": sid, "Effect": "Deny", "Action": action, "Resource": "*"}
+        if condition:
+            statement["Condition"] = condition
+        return statement
+
+    BEDROCK_SERVICE = {
+        "StringEquals": {
+            "iam:ServiceSpecificCredentialServiceName": "bedrock.amazonaws.com"
+        }
+    }
+
+    def _prevention(self, inventory):
+        _, findings = self._run({}, inventory=inventory)
+        return self._by_name(findings, self.PREVENTION_FINDING)
+
+    def test_br45_all_users_listing_reads_users_outside_the_cache(self):
+        iam_client, findings = self._run(
+            {
+                "CachedUser": [
+                    {
+                        "ServiceSpecificCredentialId": "ACCA-cached",
+                        "Status": "Active",
+                        "CreateDate": "2026-08-01T00:00:00Z",
+                        "ExpirationDate": "2026-08-31T00:00:00Z",
+                    }
+                ],
+                "UncachedUser": [
+                    {"ServiceSpecificCredentialId": "ACCA-hidden", "Status": "Active"}
+                ],
+            },
+            users=["CachedUser"],
+            all_users=True,
+        )
+
+        iam_client.list_service_specific_credentials.assert_called_once_with(
+            AllUsers=True, ServiceName="bedrock.amazonaws.com"
+        )
+        rows = self._by_name(findings, self.INVENTORY_FINDING)
+        failed = [f for f in rows if f["Status"] == "Failed"]
+        assert len(failed) == 1
+        assert "UncachedUser" in failed[0]["Finding_Details"]
+        passed = [f for f in rows if f["Status"] == "Passed"]
+        assert len(passed) == 1 and "ACCA-cached" in passed[0]["Finding_Details"]
+
+    def test_br45_expiry_beyond_the_cap_is_a_standing_key(self):
+        # The live shape: a console key created with a 100-year expiry.
+        _, findings = self._run(
+            {
+                "CenturyUser": [
+                    {
+                        "ServiceSpecificCredentialId": "ACCA-century",
+                        "Status": "Active",
+                        "CreateDate": "2026-08-25T00:34:16+00:00",
+                        "ExpirationDate": "2126-08-01T00:34:16+00:00",
+                    }
+                ],
+                "YearUser": [
+                    {
+                        "ServiceSpecificCredentialId": "ACCA-year",
+                        "Status": "Active",
+                        "CreateDate": "2026-08-25T00:25:59+00:00",
+                        "ExpirationDate": "2027-08-25T00:25:59+00:00",
+                    }
+                ],
+                "MonthUser": [
+                    {
+                        "ServiceSpecificCredentialId": "ACCA-month",
+                        "Status": "Active",
+                        "CreateDate": "2026-08-25T00:00:00+00:00",
+                        "ExpirationDate": "2026-09-24T00:00:00+00:00",
+                    }
+                ],
+            },
+            all_users=True,
+        )
+
+        rows = self._by_name(findings, self.INVENTORY_FINDING)
+        failed = [f for f in rows if f["Status"] == "Failed"]
+        assert len(failed) == 2
+        details = " ".join(f["Finding_Details"] for f in failed)
+        assert "ACCA-century" in details and "ACCA-year" in details
+        assert "above the 90-day cap" in details
+        passed = [f for f in rows if f["Status"] == "Passed"]
+        assert len(passed) == 1 and "ACCA-month" in passed[0]["Finding_Details"]
+
+    def test_br45_expiry_without_a_create_date_is_not_passed(self):
+        _, findings = self._run(
+            {
+                "OddUser": [
+                    {
+                        "ServiceSpecificCredentialId": "ACCA-odd",
+                        "Status": "Active",
+                        "ExpirationDate": "2026-10-01T00:00:00Z",
+                    }
+                ]
+            },
+            all_users=True,
+        )
+
+        rows = self._by_name(findings, self.INVENTORY_FINDING)
+        assert [f["Status"] for f in rows] == ["N/A"]
+        assert "lifetime is unknown" in rows[0]["Finding_Details"]
+
+    def test_br45_fallback_listing_does_not_pass_over_unread_users(self):
+        iam_client = MagicMock()
+
+        def list_credentials(**kwargs):
+            if kwargs.get("AllUsers"):
+                raise _client_error(
+                    "AccessDenied", operation="ListServiceSpecificCredentials"
+                )
+            return {
+                "ServiceSpecificCredentials": [
+                    {
+                        "ServiceSpecificCredentialId": "ACCA-ok",
+                        "Status": "Active",
+                        "CreateDate": "2026-08-01T00:00:00Z",
+                        "ExpirationDate": "2026-08-31T00:00:00Z",
+                    }
+                ]
+            }
+
+        iam_client.list_service_specific_credentials.side_effect = list_credentials
+        org_client = MagicMock()
+        org_client.describe_organization.return_value = {
+            "Organization": {"MasterAccountId": "123456789012"}
+        }
+        sts_client = MagicMock()
+        sts_client.get_caller_identity.return_value = {"Account": "123456789012"}
+        cache = _identity_cache(users={"KeyUser": []})
+        cache["cache_schema_version"] = 2
+        cache["principal_errors"] = [
+            {
+                "type": "user",
+                "name": "Hidden",
+                "stage": "policies",
+                "error": "Throttling",
+            }
+        ]
+        with patch(
+            "bedrock_app.boto3.client",
+            side_effect=lambda service, **kwargs: {
+                "iam": iam_client,
+                "organizations": org_client,
+                "sts": sts_client,
+            }[service],
+        ):
+            findings = extract_csv_data(
+                bedrock_app.check_bedrock_api_key_governance(
+                    cache,
+                    region="Global",
+                    scp_inventory={"items": [], "errors": [], "list_error": None},
+                )
+            )
+
+        rows = self._by_name(findings, self.INVENTORY_FINDING)
+        assert "Passed" not in [f["Status"] for f in rows]
+        details = " ".join(f["Finding_Details"] for f in rows)
+        assert "AllUsers" in details and "Hidden" in details
+
+    def test_br45_if_exists_age_cap_passes(self):
+        prevention = self._prevention(
+            self._scp_items(
+                self._deny(
+                    "iam:CreateServiceSpecificCredential",
+                    dict(
+                        self.BEDROCK_SERVICE,
+                        NumericGreaterThanIfExists={
+                            "iam:ServiceSpecificCredentialAgeDays": "90"
+                        },
+                    ),
+                )
+            )
+        )
+
+        assert [f["Status"] for f in prevention] == ["Passed"]
+        assert "above 90 days" in prevention[0]["Finding_Details"]
+        assert "attached to the root" in prevention[0]["Finding_Details"]
+
+    def test_br45_plain_age_cap_with_a_null_deny_passes(self):
+        prevention = self._prevention(
+            self._scp_items(
+                self._deny(
+                    "iam:CreateServiceSpecificCredential",
+                    {
+                        "NumericGreaterThan": {
+                            "iam:ServiceSpecificCredentialAgeDays": "30"
+                        }
+                    },
+                    sid="Cap",
+                ),
+                self._deny(
+                    "iam:CreateServiceSpecificCredential",
+                    {"Null": {"iam:ServiceSpecificCredentialAgeDays": "true"}},
+                    sid="NoExpiry",
+                ),
+            )
+        )
+
+        assert [f["Status"] for f in prevention] == ["Passed"]
+
+    def test_br45_age_cap_value_operator_and_scope_are_judged(self):
+        cases = {
+            "above the cap": self._deny(
+                "iam:CreateServiceSpecificCredential",
+                {
+                    "NumericGreaterThanIfExists": {
+                        "iam:ServiceSpecificCredentialAgeDays": "365"
+                    }
+                },
+            ),
+            "wrong direction": self._deny(
+                "iam:CreateServiceSpecificCredential",
+                {"NumericLessThan": {"iam:ServiceSpecificCredentialAgeDays": "7"}},
+            ),
+            "extra key": self._deny(
+                "iam:CreateServiceSpecificCredential",
+                {
+                    "NumericGreaterThanIfExists": {
+                        "iam:ServiceSpecificCredentialAgeDays": "30"
+                    },
+                    "StringEquals": {"aws:PrincipalTag/team": "ml"},
+                },
+            ),
+            "other service": self._deny(
+                "iam:CreateServiceSpecificCredential",
+                {
+                    "StringEquals": {
+                        "iam:ServiceSpecificCredentialServiceName": "codecommit.amazonaws.com"
+                    },
+                    "NumericGreaterThanIfExists": {
+                        "iam:ServiceSpecificCredentialAgeDays": "30"
+                    },
+                },
+            ),
+            "wrong action": self._deny(
+                "iam:CreateUser",
+                {
+                    "NumericGreaterThanIfExists": {
+                        "iam:ServiceSpecificCredentialAgeDays": "30"
+                    }
+                },
+            ),
+        }
+        for label, statement in cases.items():
+            prevention = self._prevention(self._scp_items(statement))
+            assert [f["Status"] for f in prevention] == ["Failed"], label
+
+    def test_br45_token_deny_needs_each_endpoint_with_its_own_key(self):
+        paired = self._prevention(
+            self._scp_items(
+                self._deny(
+                    "bedrock:CallWithBearerToken",
+                    {"StringEquals": {"bedrock:BearerTokenType": "LONG_TERM"}},
+                    sid="Bedrock",
+                ),
+                self._deny(
+                    "bedrock-mantle:CallWithBearerToken",
+                    {"StringEquals": {"bedrock-mantle:BearerTokenType": "LONG_TERM"}},
+                    sid="Mantle",
+                ),
+            )
+        )
+        assert [f["Status"] for f in paired] == ["Passed"]
+        assert "No age cap is credited" in paired[0]["Finding_Details"]
+
+        shared = self._prevention(
+            self._scp_items(
+                self._deny(
+                    [
+                        "bedrock:CallWithBearerToken",
+                        "bedrock-mantle:CallWithBearerToken",
+                    ],
+                    {"StringEquals": {"bedrock:BearerTokenType": "LONG_TERM"}},
+                )
+            )
+        )
+        assert [f["Status"] for f in shared] == ["Failed"]
+        assert "bedrock-mantle:callwithbearertoken" in shared[0]["Finding_Details"]
+
+        short_only = self._prevention(
+            self._scp_items(
+                self._deny(
+                    "bedrock:CallWithBearerToken",
+                    {"StringEquals": {"bedrock:BearerTokenType": "SHORT_TERM"}},
+                    sid="Bedrock",
+                ),
+                self._deny(
+                    "bedrock-mantle:CallWithBearerToken",
+                    {"StringEquals": {"bedrock-mantle:BearerTokenType": "SHORT_TERM"}},
+                    sid="Mantle",
+                ),
+            )
+        )
+        assert [f["Status"] for f in short_only] == ["Failed"]
+
+    def test_br45_unconditioned_bearer_token_deny_passes(self):
+        prevention = self._prevention(
+            self._scp_items(self._deny("bedrock*:CallWithBearerToken"))
+        )
+
+        assert [f["Status"] for f in prevention] == ["Passed"]
+
+    def test_br45_management_account_is_not_credited(self):
+        inventory = self._scp_items(
+            self._deny(
+                "iam:CreateServiceSpecificCredential",
+                {
+                    "NumericGreaterThanIfExists": {
+                        "iam:ServiceSpecificCredentialAgeDays": "30"
+                    }
+                },
+            )
+        )
+        inventory["management_account"] = True
+        prevention = self._prevention(inventory)
+
+        assert [f["Status"] for f in prevention] == ["Failed"]
+        assert "management account" in prevention[0]["Finding_Details"]
+
+    def test_br45_credited_control_with_unread_policies_is_not_passed(self):
+        inventory = self._scp_items(
+            self._deny(
+                "iam:CreateServiceSpecificCredential",
+                {
+                    "NumericGreaterThanIfExists": {
+                        "iam:ServiceSpecificCredentialAgeDays": "30"
+                    }
+                },
+            )
+        )
+        inventory["errors"] = ["policy 'Other': AccessDenied"]
+        prevention = self._prevention(inventory)
+
+        assert [f["Status"] for f in prevention] == ["N/A"]
+
     def test_br45_schema_valid(self):
         _, findings = self._run(
             {
@@ -7358,6 +8017,7 @@ class TestBR45ApiKeyGovernance:
                     {
                         "ServiceSpecificCredentialId": "ACCA-y",
                         "Status": "Active",
+                        "CreateDate": "2026-04-05T00:00:00Z",
                         "ExpirationDate": "2026-05-05T00:00:00Z",
                     }
                 ],
@@ -15523,6 +16183,41 @@ class TestBR50AIUserAccessKeys:
             "'hidden' was not placed in or out of scope" in rows[0]["Finding_Details"]
         )
 
+    def test_br50_boundary_without_ai_writes_takes_the_user_out_of_scope(self):
+        cache = _ai_user_cache()
+        cache["user_permissions"]["bob"]["permissions_boundary"] = {
+            "document": _policy(
+                {"Effect": "Allow", "Action": "sagemaker:List*", "Resource": "*"}
+            )
+        }
+        key = {
+            "AccessKeyId": "AKIAEXAMPLEACTIVE123",  # pragma: allowlist secret - fake test key id
+            "Status": "Active",
+            "CreateDate": "2024-01-01T00:00:00Z",
+        }
+        _, rows, _ = self._run(cache, {"alice": [key], "bob": [key]})
+
+        failed = [r for r in rows if r["Status"] == "Failed"]
+        assert len(failed) == 1
+        assert "IAM user 'alice'" in failed[0]["Finding_Details"]
+        assert "bob" not in json.dumps(rows)
+
+    def test_br50_unread_principal_stops_a_passed_row(self):
+        cache = _ai_user_cache()
+        cache["cache_schema_version"] = 2
+        cache["principal_errors"] = [
+            {
+                "type": "user",
+                "name": "ghost",
+                "stage": "policies",
+                "error": "Throttling",
+            }
+        ]
+        _, rows, _ = self._run(cache, {})
+
+        assert "Passed" not in [r["Status"] for r in rows]
+        assert "ghost" in rows[-1]["Finding_Details"]
+
     def test_br50_exception_is_could_not_assess(self):
         rows = extract_csv_data(
             bedrock_app.check_bedrock_ai_user_access_keys({}, region="Global")
@@ -15542,9 +16237,12 @@ class TestBR50AIUserAccessKeys:
 class TestBR51AIUserConsoleMFA:
     """BR-51: console password without MFA on AI write users."""
 
-    def _run(self, cache, login=None, devices=None, mfa_error=None):
+    def _run(self, cache, login=None, devices=None, mfa_error=None, keys=None):
         iam = MagicMock()
         login = login or {}
+        iam.list_access_keys.side_effect = lambda UserName, **kwargs: {
+            "AccessKeyMetadata": (keys or {}).get(UserName, [])
+        }
 
         def get_login_profile(UserName):
             outcome = login.get(UserName, "none")
@@ -15621,6 +16319,164 @@ class TestBR51AIUserConsoleMFA:
     def test_br51_empty_population_is_na(self, empty_permission_cache):
         _, rows = self._run(empty_permission_cache)
         assert [r["Status"] for r in rows] == ["N/A"]
+
+    KEY = {
+        "AccessKeyId": "AKIAEXAMPLEACTIVE123",  # pragma: allowlist secret - fake test key id
+        "Status": "Active",
+        "CreateDate": "2024-01-01T00:00:00Z",
+    }
+
+    @staticmethod
+    def _mfa_deny(operator="BoolIfExists", value="false", extra=None, **statement):
+        condition = {operator: {"aws:MultiFactorAuthPresent": value}}
+        if extra:
+            condition.update(extra)
+        body = {"Effect": "Deny", "Resource": "*", "Condition": condition}
+        body.update(statement or {"Action": ["bedrock:*", "sagemaker:*"]})
+        return _customer_policy("RequireMfa", body)
+
+    def test_br51_access_key_user_without_an_mfa_deny_fails(self):
+        cache = _ai_user_cache()
+        cache["user_permissions"]["alice"]["attached_policies"].append(self._mfa_deny())
+        _, rows = self._run(cache, keys={"alice": [self.KEY], "bob": [self.KEY]})
+
+        failed = [r for r in rows if r["Status"] == "Failed"]
+        assert len(failed) == 1
+        assert (
+            "IAM user 'bob' has 1 active access key(s)"
+            in (failed[0]["Finding_Details"])
+        )
+        passed = [r for r in rows if r["Status"] == "Passed"]
+        assert "held to MFA by a Deny (alice" in passed[0]["Finding_Details"]
+
+    def test_br51_mfa_device_does_not_cover_an_access_key(self):
+        _, rows = self._run(
+            _ai_user_cache(),
+            login={"alice": "yes"},
+            devices={"alice": [{"SerialNumber": "s"}]},
+            keys={"alice": [self.KEY]},
+        )
+
+        assert [r["Status"] for r in rows] == ["Failed", "Passed"]
+        assert "IAM user 'alice'" in rows[0]["Finding_Details"]
+        assert "even though the user has an MFA device" in rows[0]["Finding_Details"]
+        assert (
+            "0 of the 2 in-scope IAM user(s) have an MFA device"
+            in (rows[1]["Finding_Details"])
+        )
+
+    def test_br51_mfa_deny_forms_that_never_fire_are_not_credited(self):
+        for policy in (
+            self._mfa_deny(operator="Bool"),
+            self._mfa_deny(
+                extra={"StringEquals": {"aws:RequestedRegion": "us-east-1"}}
+            ),
+            self._mfa_deny(Action="bedrock:*"),
+        ):
+            cache = _ai_user_cache()
+            for user in ("alice", "bob"):
+                cache["user_permissions"][user]["attached_policies"].append(policy)
+            _, rows = self._run(cache, keys={"alice": [self.KEY], "bob": [self.KEY]})
+            failed = [r for r in rows if r["Status"] == "Failed"]
+            # alice holds only bedrock writes, so a bedrock-only Deny covers her.
+            names = " ".join(r["Finding_Details"] for r in failed)
+            assert "IAM user 'bob'" in names
+            if policy["document"]["Statement"][0]["Action"] != "bedrock:*":
+                assert "IAM user 'alice'" in names
+
+    def test_br51_not_action_mfa_deny_is_credited(self):
+        cache = _ai_user_cache()
+        policy = self._mfa_deny(
+            NotAction=["iam:ChangePassword", "iam:*MFADevice", "sts:GetSessionToken"]
+        )
+        for user in ("alice", "bob"):
+            cache["user_permissions"][user]["attached_policies"].append(policy)
+        _, rows = self._run(cache, keys={"alice": [self.KEY], "bob": [self.KEY]})
+
+        assert [r["Status"] for r in rows] == ["Passed"]
+        assert "2 user(s) are held to MFA by a Deny" in rows[0]["Finding_Details"]
+
+    def test_br51_role_trust_policy_is_judged(self):
+        cache = {"role_permissions": {}, "user_permissions": {}}
+        write = [
+            _customer_policy(
+                "Write", {"Effect": "Allow", "Action": "bedrock:*", "Resource": "*"}
+            )
+        ]
+        for name in ("OpenRole", "IfExistsRole", "MfaRole", "ServiceRole", "Unread"):
+            cache["role_permissions"][name] = _identity(attached=write)
+        cache["role_permissions"]["ReaderRole"] = _identity(
+            attached=[
+                _customer_policy(
+                    "Read",
+                    {"Effect": "Allow", "Action": "bedrock:Get*", "Resource": "*"},
+                )
+            ]
+        )
+
+        def trust(principal, condition=None):
+            statement = {
+                "Effect": "Allow",
+                "Principal": principal,
+                "Action": "sts:AssumeRole",
+            }
+            if condition:
+                statement["Condition"] = condition
+            return {"Role": {"AssumeRolePolicyDocument": _policy(statement)}}
+
+        roles = {
+            "OpenRole": trust({"AWS": "arn:aws:iam::123456789012:root"}),
+            "IfExistsRole": trust(
+                {"AWS": "arn:aws:iam::123456789012:user/dev"},
+                {"BoolIfExists": {"aws:MultiFactorAuthPresent": "true"}},
+            ),
+            "MfaRole": trust(
+                {"AWS": "123456789012"},
+                {"Bool": {"aws:MultiFactorAuthPresent": "true"}},
+            ),
+            "ServiceRole": trust({"Service": "lambda.amazonaws.com"}),
+            "ReaderRole": trust({"AWS": "*"}),
+        }
+
+        iam = MagicMock()
+
+        def get_role(RoleName):
+            if RoleName == "Unread":
+                raise _make_client_error("AccessDenied")
+            return roles[RoleName]
+
+        iam.get_role.side_effect = get_role
+        with patch("boto3.client", return_value=iam):
+            rows = extract_csv_data(
+                bedrock_app.check_bedrock_ai_user_console_mfa(cache, region="Global")
+            )
+
+        failed = [r for r in rows if r["Status"] == "Failed"]
+        assert sorted(r["Finding_Details"].split("'")[1] for r in failed) == [
+            "IfExistsRole",
+            "OpenRole",
+        ]
+        unread = [r for r in rows if r["Status"] == "N/A"]
+        assert len(unread) == 1 and "'Unread'" in unread[0]["Finding_Details"]
+        passed = [r for r in rows if r["Status"] == "Passed"]
+        assert "2 of the 5 in-scope IAM role(s)" in passed[0]["Finding_Details"]
+        assert "ReaderRole" not in json.dumps(rows)
+
+    def test_br51_unread_principal_stops_a_passed_row(self):
+        cache = _ai_user_cache()
+        cache["cache_schema_version"] = 2
+        cache["principal_errors"] = [
+            {
+                "type": "role",
+                "name": "ghost",
+                "stage": "policies",
+                "error": "Throttling",
+            }
+        ]
+        _, rows = self._run(cache)
+
+        assert "Passed" not in [r["Status"] for r in rows]
+        assert "ghost" in rows[-1]["Finding_Details"]
 
     def test_br51_exception_is_could_not_assess(self):
         rows = extract_csv_data(
