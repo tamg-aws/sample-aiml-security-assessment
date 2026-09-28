@@ -208,6 +208,16 @@ section.
 
 ### Fixed
 
+- `AC-01` egress and `AC-08` endpoint inbound scope read the entries of each
+  prefix list a security group rule names, so a prefix list holding
+  `0.0.0.0/0` or the VPC CIDR fails, and an unread prefix list reports
+  `N/A` naming `ec2:GetManagedPrefixListEntries`. Both legs passed a rule
+  that named a prefix list on its IP ranges alone.
+- `AC-45` fails the runtime command shell leg when a principal can open a
+  shell and no metric filter counting shell connections feeds an alarm with
+  an action, and reports `N/A` naming `logs:DescribeMetricFilters` or
+  `cloudwatch:DescribeAlarms` when either read fails. The shell leg passed
+  on the grant alone, although the service never logs what a shell runs.
 - `AC-37` credits the gateway role's `bedrock:InvokeGuardrailChecks` grant only
   on `Resource: "*"` with no condition, since the action has no resource
   type, and fails a guardrail comparison that drops the score equal to the

@@ -9983,6 +9983,207 @@ class TestAC08EndpointInboundBreadth:
         assert "DescribeVpcs" in network["vpce-a"]["Finding_Details"]
 
 
+def _prefix_list_rule(*prefix_list_ids):
+    return {
+        "IpProtocol": "tcp",
+        "FromPort": 443,
+        "ToPort": 443,
+        "PrefixListIds": [{"PrefixListId": pl} for pl in prefix_list_ids],
+    }
+
+
+def _wire_prefix_lists(mock_ec2, entries, denied=()):
+    """Answer GetManagedPrefixListEntries from {id: [page, ...]} of CIDR lists."""
+
+    def get_entries(PrefixListId, NextToken=None, **_):
+        if PrefixListId in denied:
+            raise _make_client_error("AccessDeniedException", "denied")
+        pages = entries[PrefixListId]
+        index = int(NextToken or 0)
+        response = {"Entries": [{"Cidr": cidr} for cidr in pages[index]]}
+        if index + 1 < len(pages):
+            response["NextToken"] = str(index + 1)
+        return response
+
+    mock_ec2.get_managed_prefix_list_entries.side_effect = get_entries
+
+
+class TestAC01AC08PrefixListEntries:
+    """AC-01 and AC-08 read a rule's prefix list entries as the ranges it admits."""
+
+    @staticmethod
+    def _network(findings):
+        return TestAC08EndpointInboundBreadth._network(findings)
+
+    def _endpoints(self, mock_ac, mock_ec2, groups):
+        TestAC08SurfaceEndpoints._wire(
+            mock_ac,
+            mock_ec2,
+            [
+                _ac08_endpoint("vpce-pl", "bedrock-agentcore", groups=("sg-pl",)),
+                _ac08_endpoint("vpce-tight", "bedrock-agentcore", groups=("sg-app",)),
+            ],
+            groups=[
+                {"GroupId": "sg-pl", "IpPermissions": groups},
+                {
+                    "GroupId": "sg-app",
+                    "IpPermissions": [_ac08_https_rule("172.31.4.0/24")],
+                },
+            ],
+        )
+
+    @pytest.mark.parametrize(
+        ("entries", "rule_lists", "finding"),
+        [
+            (
+                {"pl-open": [["0.0.0.0/0"]]},
+                ["pl-open"],
+                "AgentCore VPC Endpoint Network Scope Unrestricted",
+            ),
+            (
+                {"pl-low": [["0.0.0.0/1"]], "pl-high": [["128.0.0.0/1"]]},
+                ["pl-low", "pl-high"],
+                "AgentCore VPC Endpoint Network Scope Unrestricted",
+            ),
+            (
+                {"pl-paged": [["10.9.0.0/24"], ["0.0.0.0/1", "128.0.0.0/1"]]},
+                ["pl-paged"],
+                "AgentCore VPC Endpoint Network Scope Unrestricted",
+            ),
+            (
+                {"pl-vpc": [["172.31.0.0/17", "172.31.128.0/17"]]},
+                ["pl-vpc"],
+                "AgentCore VPC Endpoint Network Scope Too Wide",
+            ),
+        ],
+        ids=["internet", "split-across-lists", "second-page", "vpc-cidr"],
+    )
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_an_endpoint_prefix_list_is_read_as_its_entries(
+        self, mock_ac, mock_ec2, entries, rule_lists, finding
+    ):
+        self._endpoints(mock_ac, mock_ec2, [_prefix_list_rule(*rule_lists)])
+        _wire_prefix_lists(mock_ec2, entries)
+
+        network = self._network(agentcore_app.check_agentcore_vpc_endpoints())
+
+        assert network["vpce-pl"]["Status"] == "Failed"
+        assert network["vpce-pl"]["Finding"] == finding
+        assert network["vpce-tight"]["Status"] == "Passed"
+
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_an_unread_endpoint_prefix_list_withholds_that_pass(
+        self, mock_ac, mock_ec2
+    ):
+        self._endpoints(mock_ac, mock_ec2, [_prefix_list_rule("pl-denied")])
+        _wire_prefix_lists(mock_ec2, {}, denied={"pl-denied"})
+
+        network = self._network(agentcore_app.check_agentcore_vpc_endpoints())
+
+        assert network["vpce-pl"]["Status"] == "N/A"
+        details = network["vpce-pl"]["Finding_Details"]
+        assert "ec2:GetManagedPrefixListEntries on pl-denied (AccessDenied" in details
+        assert "ec2:GetManagedPrefixListEntries" in network["vpce-pl"]["Resolution"]
+        assert network["vpce-tight"]["Status"] == "Passed"
+
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_narrow_prefix_list_passes_and_is_read_once(self, mock_ac, mock_ec2):
+        TestAC08SurfaceEndpoints._wire(
+            mock_ac,
+            mock_ec2,
+            [
+                _ac08_endpoint("vpce-a", "bedrock-agentcore", groups=("sg-pl",)),
+                _ac08_endpoint("vpce-b", "bedrock-agentcore", groups=("sg-pl",)),
+            ],
+            groups=[
+                {"GroupId": "sg-pl", "IpPermissions": [_prefix_list_rule("pl-app")]}
+            ],
+        )
+        _wire_prefix_lists(mock_ec2, {"pl-app": [["172.31.4.0/24"]]})
+
+        network = self._network(agentcore_app.check_agentcore_vpc_endpoints())
+
+        assert {f["Status"] for f in network.values()} == {"Passed"}
+        assert set(network) == {"vpce-a", "vpce-b"}
+        mock_ec2.get_managed_prefix_list_entries.assert_called_once()
+
+    def _egress(self, mock_ac, mock_ec2, entries, denied=()):
+        _wire_runtimes(
+            mock_ac,
+            [
+                _vpc_runtime("rt-pl", security_groups=["sg-pl"]),
+                _vpc_runtime("rt-named", security_groups=["sg-named"]),
+            ],
+        )
+        _wire_tools(mock_ac)
+        mock_ec2.describe_security_groups.return_value = {
+            "SecurityGroups": [
+                _security_group("sg-pl", [_prefix_list_rule(*entries or ["pl-x"])]),
+                _security_group("sg-named", [_NAMED_EGRESS]),
+            ]
+        }
+        _wire_prefix_lists(mock_ec2, entries, denied=denied)
+        findings = [
+            finding
+            for finding in extract_csv_data(
+                agentcore_app.check_agentcore_vpc_configuration()
+            )
+            if finding["Finding"].startswith("AgentCore Egress")
+        ]
+        return {
+            runtime: finding
+            for finding in findings
+            for runtime in ("rt-pl", "rt-named")
+            if f"{runtime}'" in finding["Finding_Details"]
+            or f"{runtime})" in finding["Finding_Details"]
+            or f"'{runtime}" in finding["Finding_Details"]
+        }
+
+    @pytest.mark.parametrize(
+        "entries",
+        [
+            {"pl-open": [["0.0.0.0/0"]]},
+            {"pl-v6": [["::/1"], ["8000::/1"]]},
+        ],
+        ids=["ipv4", "ipv6-paged"],
+    )
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_an_egress_prefix_list_to_the_internet_fails(
+        self, mock_ac, mock_ec2, entries
+    ):
+        by_runtime = self._egress(mock_ac, mock_ec2, entries)
+
+        assert by_runtime["rt-pl"]["Status"] == "Failed"
+        assert by_runtime["rt-pl"]["Finding"] == "AgentCore Egress Unrestricted"
+        assert by_runtime["rt-named"]["Status"] == "Passed"
+
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_an_unread_egress_prefix_list_withholds_that_pass(self, mock_ac, mock_ec2):
+        by_runtime = self._egress(
+            mock_ac, mock_ec2, {"pl-denied": [[]]}, denied={"pl-denied"}
+        )
+
+        assert by_runtime["rt-pl"]["Status"] == "N/A"
+        assert (
+            "ec2:GetManagedPrefixListEntries on pl-denied"
+            in by_runtime["rt-pl"]["Finding_Details"]
+        )
+        assert by_runtime["rt-named"]["Status"] == "Passed"
+
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_narrow_egress_prefix_list_passes(self, mock_ac, mock_ec2):
+        by_runtime = self._egress(mock_ac, mock_ec2, {"pl-s3": [["52.216.0.0/15"]]})
+
+        assert by_runtime["rt-pl"]["Status"] == "Passed"
+        assert "prefix list entries included" in by_runtime["rt-pl"]["Finding_Details"]
+
+
 class TestAC08RuntimeVpcEndpoint:
     """AC-08 requires a bedrock-agentcore endpoint in each VPC-mode runtime's VPC."""
 
@@ -30401,6 +30602,43 @@ class TestAC44WholePopulation:
         assert [f["Status"] for f in findings] == ["Failed"]
 
 
+_SHELL_FILTER = {
+    "filterName": "shell-connections",
+    "logGroupName": "aws-cloudtrail-logs",
+    "filterPattern": "{ $.eventName = InvokeAgentRuntimeCommandShell }",
+    "metricTransformations": [
+        {"metricNamespace": "AgentCore", "metricName": "ShellConnections"}
+    ],
+}
+_SHELL_ALARM = {
+    "AlarmName": "shell-opened",
+    "Namespace": "AgentCore",
+    "MetricName": "ShellConnections",
+    "ActionsEnabled": True,
+    "AlarmActions": ["arn:aws:sns:us-east-1:123456789012:secops"],
+}
+
+
+def _shell_alarm_clients(filters=(_SHELL_FILTER,), alarms=(_SHELL_ALARM,)):
+    logs = MagicMock()
+    logs.describe_metric_filters.return_value = {"metricFilters": list(filters)}
+    cloudwatch = MagicMock()
+    cloudwatch.describe_alarms.return_value = {"MetricAlarms": list(alarms)}
+    return logs, cloudwatch
+
+
+@pytest.fixture
+def shell_alarm():
+    """AC-45 reads an alarm on shell connections; give the shell tests one."""
+    logs, cloudwatch = _shell_alarm_clients()
+    with (
+        patch.object(agentcore_app, "logs_client", logs),
+        patch.object(agentcore_app, "cloudwatch_client", cloudwatch),
+    ):
+        yield
+
+
+@pytest.mark.usefixtures("shell_alarm")
 class TestAC45WholePopulation:
     """AC-45 reads tool roles by value and who can open a runtime shell."""
 
@@ -30852,6 +31090,165 @@ class TestAC45WholePopulation:
         assert len(calls) == 1
         keywords = {kw.arg: ast.unparse(kw.value) for kw in calls[0].keywords}
         assert keywords == {"assess_shell": "is_primary_region"}
+
+
+class TestAC45CommandShellAlarm:
+    """AC-45 requires an acting alarm on shell connections when anyone holds one."""
+
+    _RUNTIME = "arn:aws:bedrock-agentcore:us-east-1:123456789012:runtime/rt-1"
+    _SHELL = "bedrock-agentcore:InvokeAgentRuntimeCommandShell"
+
+    def _holder(self):
+        return _v2_cache(
+            roles={
+                "BreakGlass": _principal_with(
+                    [
+                        {
+                            "Effect": "Allow",
+                            "Action": self._SHELL,
+                            "Resource": self._RUNTIME,
+                        }
+                    ]
+                )
+            }
+        )
+
+    def _rows(self, cache, logs, cloudwatch):
+        with (
+            patch.object(agentcore_app, "logs_client", logs),
+            patch.object(agentcore_app, "cloudwatch_client", cloudwatch),
+            patch.object(agentcore_app, "agentcore_client", None),
+        ):
+            findings = agentcore_app.check_agentcore_tool_execution_role_scope(
+                cache, assess_shell=True
+            )
+        return [f for f in findings if "Command Shell" in f["Finding"]]
+
+    @pytest.mark.parametrize(
+        ("filters", "alarms"),
+        [
+            ((), (_SHELL_ALARM,)),
+            (
+                ({**_SHELL_FILTER, "filterPattern": "ERROR"},),
+                (_SHELL_ALARM,),
+            ),
+            (
+                (
+                    {
+                        **_SHELL_FILTER,
+                        "logGroupName": "/aws/lambda/shell-tool",
+                        "filterPattern": "shell",
+                    },
+                ),
+                (_SHELL_ALARM,),
+            ),
+            ((_SHELL_FILTER,), ({**_SHELL_ALARM, "ActionsEnabled": False},)),
+            ((_SHELL_FILTER,), ({**_SHELL_ALARM, "AlarmActions": []},)),
+            ((_SHELL_FILTER,), ({**_SHELL_ALARM, "MetricName": "Other"},)),
+            ((_SHELL_FILTER,), ()),
+        ],
+        ids=[
+            "no-filter",
+            "unrelated-pattern",
+            "shell-outside-runtime-group",
+            "actions-disabled",
+            "no-action",
+            "other-metric",
+            "no-alarm",
+        ],
+    )
+    def test_a_shell_holder_with_no_acting_alarm_fails(self, filters, alarms):
+        rows = self._rows(self._holder(), *_shell_alarm_clients(filters, alarms))
+
+        assert [f["Status"] for f in rows] == ["Failed"]
+        assert rows[0]["Finding"].endswith("Unwatched")
+        assert rows[0]["Severity"] == "Medium"
+
+    @pytest.mark.parametrize(
+        "metric_filter",
+        [
+            _SHELL_FILTER,
+            {
+                **_SHELL_FILTER,
+                "logGroupName": "/aws/bedrock-agentcore/runtimes/rt-1-DEFAULT",
+                "filterPattern": '"Shell connection"',
+            },
+        ],
+        ids=["cloudtrail-event", "runtime-log-group"],
+    )
+    def test_an_acting_alarm_on_shell_connections_passes(self, metric_filter):
+        rows = self._rows(self._holder(), *_shell_alarm_clients((metric_filter,)))
+
+        assert [f["Status"] for f in rows] == ["Passed"]
+        details = rows[0]["Finding_Details"]
+        assert "alarm shell-opened with an action" in details
+        assert "targets and the filter's source trail are not read" in details
+
+    def test_the_acting_alarm_is_found_among_many(self):
+        filters = (
+            {**_SHELL_FILTER, "filterName": "errors", "filterPattern": "ERROR"},
+            _SHELL_FILTER,
+        )
+        alarms = (
+            {**_SHELL_ALARM, "AlarmName": "muted", "ActionsEnabled": False},
+            {**_SHELL_ALARM, "AlarmName": "other", "MetricName": "Errors"},
+            _SHELL_ALARM,
+        )
+
+        rows = self._rows(self._holder(), *_shell_alarm_clients(filters, alarms))
+
+        assert [f["Status"] for f in rows] == ["Passed"]
+        assert "alarm shell-opened" in rows[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        ("broken", "action"),
+        [
+            ("filters", "logs:DescribeMetricFilters (AccessDenied"),
+            ("alarms", "cloudwatch:DescribeAlarms (AccessDenied"),
+            ("clients", "(no CloudWatch client)"),
+        ],
+    )
+    def test_an_unread_alarm_leg_withholds_the_pass(self, broken, action):
+        logs, cloudwatch = _shell_alarm_clients()
+        denied = _make_client_error("AccessDeniedException", "denied")
+        if broken == "filters":
+            logs.describe_metric_filters.side_effect = denied
+        elif broken == "alarms":
+            cloudwatch.describe_alarms.side_effect = denied
+        else:
+            logs = cloudwatch = None
+
+        rows = self._rows(self._holder(), logs, cloudwatch)
+
+        assert [f["Status"] for f in rows] == ["N/A"]
+        assert rows[0]["Finding"].endswith("Incomplete")
+        assert action in rows[0]["Finding_Details"]
+        assert "logs:DescribeMetricFilters" in rows[0]["Resolution"]
+
+    def test_no_holder_needs_no_alarm(self):
+        logs, cloudwatch = _shell_alarm_clients(filters=())
+        cache = _v2_cache(roles={"Reader": _principal_with([])})
+
+        rows = self._rows(cache, logs, cloudwatch)
+
+        assert [f["Status"] for f in rows] == ["Passed"]
+        logs.describe_metric_filters.assert_not_called()
+
+    def test_an_unscoped_holder_also_fails_the_alarm(self):
+        cache = _v2_cache(
+            roles={
+                "Admin": _principal_with(
+                    [{"Effect": "Allow", "Action": "*", "Resource": "*"}]
+                )
+            }
+        )
+
+        rows = self._rows(cache, *_shell_alarm_clients(filters=()))
+
+        assert [f["Finding"].rsplit(" ", 1)[-1] for f in rows] == [
+            "Unscoped",
+            "Unwatched",
+        ]
 
 
 def _guardrail_policy(effect, call):

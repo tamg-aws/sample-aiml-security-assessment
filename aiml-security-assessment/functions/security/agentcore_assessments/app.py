@@ -2118,6 +2118,7 @@ def _agentcore_egress_findings(
         }
     )
     security_groups: Dict[str, Dict[str, Any]] = {}
+    prefix_list_cidrs: Dict[str, Any] = {}
     describe_error = None
     if group_ids:
         try:
@@ -2225,13 +2226,16 @@ def _agentcore_egress_findings(
             for group_id in target_groups
             if str(group_id) not in security_groups
         ]
+        read_groups = [
+            security_groups[str(group_id)]
+            for group_id in target_groups
+            if str(group_id) in security_groups
+        ]
+        unread_prefix_lists = _prefix_list_cidrs(
+            read_groups, "IpPermissionsEgress", prefix_list_cidrs
+        )
         open_ranges = _security_groups_open_ranges(
-            [
-                security_groups[str(group_id)]
-                for group_id in target_groups
-                if str(group_id) in security_groups
-            ],
-            "IpPermissionsEgress",
+            read_groups, "IpPermissionsEgress", prefix_list_cidrs
         )
 
         if open_ranges:
@@ -2272,6 +2276,22 @@ def _agentcore_egress_findings(
                     status=StatusEnum.NA,
                 )
             )
+        elif unread_prefix_lists:
+            findings.append(
+                create_finding(
+                    check_id="AC-01",
+                    finding_name=AGENTCORE_EGRESS_FINDING_NAME,
+                    finding_details=(
+                        f"{label} has outbound rules naming prefix lists whose "
+                        "entries could not be read, so whether they admit the "
+                        f"whole internet is unknown: {'; '.join(unread_prefix_lists)}."
+                    ),
+                    resolution="Grant ec2:GetManagedPrefixListEntries and retry.",
+                    reference=AGENTCORE_VPC_SECURITY_GROUP_REFERENCE_URL,
+                    severity=SeverityEnum.INFORMATIONAL,
+                    status=StatusEnum.NA,
+                )
+            )
         else:
             findings.append(
                 create_finding(
@@ -2279,8 +2299,9 @@ def _agentcore_egress_findings(
                     finding_name=AGENTCORE_EGRESS_FINDING_NAME,
                     finding_details=(
                         f"The outbound ranges of {label}'s "
-                        f"{len(target_groups)} security group(s) together cover "
-                        "neither 0.0.0.0/0 nor ::/0."
+                        f"{len(target_groups)} security group(s), prefix list "
+                        "entries included, together cover neither 0.0.0.0/0 nor "
+                        "::/0."
                     ),
                     resolution=(
                         "No action required. Confirm the outbound rules name only "
@@ -7393,34 +7414,107 @@ def _vpc_endpoint_policy_is_full_access(policy_document: Any) -> bool:
     return False
 
 
+def _prefix_list_cidrs(
+    security_groups: List[Dict[str, Any]],
+    permissions_key: str,
+    cache: Dict[str, Any],
+) -> List[str]:
+    """Read the entries of each prefix list the groups' rules name, once each.
+
+    A rule that names a prefix list admits every CIDR in it, so the entries
+    are read into `cache` by prefix list id, as a list of CIDRs or the error
+    that stopped the read. Returns one line per prefix list that could not be
+    read, naming ec2:GetManagedPrefixListEntries.
+    """
+    unread = set()
+    for security_group in security_groups:
+        for permission in security_group.get(permissions_key) or []:
+            if not isinstance(permission, dict):
+                continue
+            for prefix_list in permission.get("PrefixListIds") or []:
+                prefix_list_id = (
+                    prefix_list.get("PrefixListId")
+                    if isinstance(prefix_list, dict)
+                    else None
+                )
+                if not prefix_list_id:
+                    continue
+                if prefix_list_id not in cache:
+                    if ec2_client is None:
+                        cache[prefix_list_id] = "no EC2 client"
+                    else:
+                        try:
+                            cache[prefix_list_id] = [
+                                str(entry.get("Cidr") or "")
+                                for entry in _paginate_aws_list(
+                                    ec2_client,
+                                    "get_managed_prefix_list_entries",
+                                    "Entries",
+                                    token_request_key="NextToken",
+                                    token_response_key="NextToken",
+                                    PrefixListId=prefix_list_id,
+                                )
+                                if isinstance(entry, dict)
+                            ]
+                        except Exception as error:
+                            cache[prefix_list_id] = _assessment_error_label(error)
+                if isinstance(cache[prefix_list_id], str):
+                    unread.add(
+                        f"ec2:GetManagedPrefixListEntries on {prefix_list_id} "
+                        f"({cache[prefix_list_id]})"
+                    )
+    return sorted(unread)
+
+
+def _permission_networks(
+    permission: Dict[str, Any], prefix_list_cidrs: Optional[Dict[str, Any]]
+) -> List[Any]:
+    """Return every network one security group rule names, prefix lists included.
+
+    A range that does not parse, and a prefix list whose entries were not read,
+    add nothing; the caller reports the unread prefix list itself.
+    """
+    cidrs = [
+        ip_range.get(field)
+        for ranges, field in (("IpRanges", "CidrIp"), ("Ipv6Ranges", "CidrIpv6"))
+        for ip_range in permission.get(ranges) or []
+        if isinstance(ip_range, dict)
+    ]
+    for prefix_list in permission.get("PrefixListIds") or []:
+        if not isinstance(prefix_list, dict):
+            continue
+        entries = (prefix_list_cidrs or {}).get(prefix_list.get("PrefixListId"))
+        if isinstance(entries, list):
+            cidrs.extend(entries)
+    networks = []
+    for cidr in cidrs:
+        try:
+            networks.append(ipaddress.ip_network(str(cidr or "").strip(), strict=False))
+        except ValueError:
+            continue
+    return networks
+
+
 def _security_groups_open_ranges(
-    security_groups: List[Dict[str, Any]], permissions_key: str
+    security_groups: List[Dict[str, Any]],
+    permissions_key: str,
+    prefix_list_cidrs: Optional[Dict[str, Any]] = None,
 ) -> List[str]:
     """Return 0.0.0.0/0 or ::/0 when the groups' ranges together cover it.
 
     `permissions_key` is IpPermissions for inbound rules or IpPermissionsEgress
     for outbound ones. The rules of every group on one interface add up, so
     0.0.0.0/1 on one group and 128.0.0.0/1 on another open the whole IPv4
-    internet as surely as one 0.0.0.0/0 rule does. A range that does not parse
-    is left out.
+    internet as surely as one 0.0.0.0/0 rule does. A prefix list counts as the
+    entries read into `prefix_list_cidrs`. A range that does not parse is left
+    out.
     """
     networks = []
     for security_group in security_groups:
         for permission in security_group.get(permissions_key) or []:
             if not isinstance(permission, dict):
                 continue
-            for ranges, field in (("IpRanges", "CidrIp"), ("Ipv6Ranges", "CidrIpv6")):
-                for ip_range in permission.get(ranges) or []:
-                    if not isinstance(ip_range, dict):
-                        continue
-                    try:
-                        networks.append(
-                            ipaddress.ip_network(
-                                str(ip_range.get(field) or "").strip(), strict=False
-                            )
-                        )
-                    except ValueError:
-                        continue
+            networks.extend(_permission_networks(permission, prefix_list_cidrs))
     open_ranges: List[str] = []
     for everything in (
         ipaddress.ip_network("0.0.0.0/0"),
@@ -7476,27 +7570,19 @@ def _endpoint_inbound_ports_beyond_https(
 
 
 def _endpoint_inbound_vpc_wide_ranges(
-    security_groups: List[Dict[str, Any]], vpc_networks: List[Any]
+    security_groups: List[Dict[str, Any]],
+    vpc_networks: List[Any],
+    prefix_list_cidrs: Optional[Dict[str, Any]] = None,
 ) -> List[str]:
     """Return the VPC CIDR blocks the groups' inbound ranges together cover.
 
     A rule naming the whole VPC CIDR admits every host in the VPC, and ranges
-    pieced together from narrower blocks cover it the same way.
+    pieced together from narrower blocks, or held in a prefix list, cover it
+    the same way.
     """
     networks = []
     for _, permission in _security_groups_inbound_permissions(security_groups):
-        for ranges, field in (("IpRanges", "CidrIp"), ("Ipv6Ranges", "CidrIpv6")):
-            for ip_range in permission.get(ranges) or []:
-                if not isinstance(ip_range, dict):
-                    continue
-                try:
-                    networks.append(
-                        ipaddress.ip_network(
-                            str(ip_range.get(field) or "").strip(), strict=False
-                        )
-                    )
-                except ValueError:
-                    continue
+        networks.extend(_permission_networks(permission, prefix_list_cidrs))
     covered = []
     for vpc_network in vpc_networks:
         family = [
@@ -7623,6 +7709,7 @@ def _agentcore_endpoint_scope_findings(
         }
     )
     security_groups: Dict[str, Dict[str, Any]] = {}
+    prefix_list_cidrs: Dict[str, Any] = {}
     security_group_error = None
     if group_ids:
         try:
@@ -7815,11 +7902,18 @@ def _agentcore_endpoint_scope_findings(
             for group in groups
             if group["GroupId"] in security_groups
         ]
-        open_ranges = _security_groups_open_ranges(read_groups, "IpPermissions")
+        unread_prefix_lists = _prefix_list_cidrs(
+            read_groups, "IpPermissions", prefix_list_cidrs
+        )
+        open_ranges = _security_groups_open_ranges(
+            read_groups, "IpPermissions", prefix_list_cidrs
+        )
         vpc_blocks = (vpc_networks or {}).get(entry["vpc_id"])
         breadth = []
         if vpc_blocks:
-            vpc_wide = _endpoint_inbound_vpc_wide_ranges(read_groups, vpc_blocks)
+            vpc_wide = _endpoint_inbound_vpc_wide_ranges(
+                read_groups, vpc_blocks, prefix_list_cidrs
+            )
             if vpc_wide:
                 breadth.append(
                     f"its inbound ranges cover the whole VPC CIDR {', '.join(vpc_wide)}"
@@ -7872,15 +7966,23 @@ def _agentcore_endpoint_scope_findings(
                     status=StatusEnum.FAILED,
                 )
             )
-        elif unreadable or not vpc_blocks:
-            missing = (
-                f"references security group(s) {', '.join(unreadable)} that were "
-                "not returned"
-                if unreadable
-                else "sits in a VPC whose CIDR blocks were not returned by "
-                "DescribeVpcs, so whether its inbound ranges cover the VPC could "
-                "not be judged"
-            )
+        elif unreadable or not vpc_blocks or unread_prefix_lists:
+            if unreadable:
+                missing = (
+                    f"references security group(s) {', '.join(unreadable)} that "
+                    "were not returned"
+                )
+            elif not vpc_blocks:
+                missing = (
+                    "sits in a VPC whose CIDR blocks were not returned by "
+                    "DescribeVpcs, so whether its inbound ranges cover the VPC "
+                    "could not be judged"
+                )
+            else:
+                missing = (
+                    "has inbound rules naming prefix lists whose entries could "
+                    f"not be read: {'; '.join(unread_prefix_lists)}"
+                )
             findings.append(
                 create_finding(
                     check_id="AC-08",
@@ -7890,8 +7992,8 @@ def _agentcore_endpoint_scope_findings(
                         "is unknown."
                     ),
                     resolution=(
-                        "Grant ec2:DescribeSecurityGroups and ec2:DescribeVpcs "
-                        "and retry."
+                        "Grant ec2:DescribeSecurityGroups, ec2:DescribeVpcs and "
+                        "ec2:GetManagedPrefixListEntries and retry."
                     ),
                     reference=VPC_ENDPOINT_POLICY_REFERENCE_URL,
                     severity=SeverityEnum.INFORMATIONAL,
@@ -7907,7 +8009,8 @@ def _agentcore_endpoint_scope_findings(
                         f"AgentCore VPC {label} accepts inbound traffic on TCP "
                         "443 only, and from no range covering 0.0.0.0/0, ::/0 or "
                         "the VPC CIDR, alone or pieced together from narrower "
-                        f"ranges, on its {len(groups)} security group(s)."
+                        "ranges and prefix list entries, on its "
+                        f"{len(groups)} security group(s)."
                     ),
                     resolution=(
                         "No action required. Confirm the inbound rules name only "
@@ -17959,33 +18062,53 @@ def _kms_key_loss_alarm_leg() -> Tuple[str, List[str]]:
                         f"{' and '.join(KMS_KEY_LOSS_EVENTS)} calls",
                         [],
                     )
+    alarm, alarm_unread = _metric_filter_alarm(
+        lambda metric_filter: all(
+            event_name in str(metric_filter.get("filterPattern") or "")
+            for event_name in KMS_KEY_LOSS_EVENTS
+        )
+    )
+    if alarm:
+        return (
+            f"{alarm}, whose pattern names its "
+            f"{' and '.join(KMS_KEY_LOSS_EVENTS)} calls",
+            [],
+        )
+    return "", unread + alarm_unread
+
+
+def _metric_filter_alarm(
+    filter_matches: Callable[[Dict[str, Any]], bool],
+) -> Tuple[str, List[str]]:
+    """Return which alarm with an action watches a matching metric filter in
+    this region, or "", and each read that failed.
+
+    A filter counts when filter_matches accepts it, and an alarm counts when
+    its actions are enabled, it has an alarm action, and it watches the
+    namespace and name one of the filter's transformations publishes.
+    """
     if logs_client is None or cloudwatch_client is None:
-        unread.append(
+        return "", [
             "logs:DescribeMetricFilters and cloudwatch:DescribeAlarms (no CloudWatch "
             "client)"
-        )
-        return "", unread
+        ]
     try:
         metric_filters = _paginate_aws_list(
             logs_client, "describe_metric_filters", "metricFilters"
         )
     except Exception as error:
-        unread.append(f"logs:DescribeMetricFilters ({_assessment_error_label(error)})")
-        return "", unread
+        return "", [f"logs:DescribeMetricFilters ({_assessment_error_label(error)})"]
     metrics = {
         (
             transformation.get("metricNamespace"),
             transformation.get("metricName"),
         ): metric_filter.get("filterName")
         for metric_filter in metric_filters
-        if all(
-            event_name in str(metric_filter.get("filterPattern") or "")
-            for event_name in KMS_KEY_LOSS_EVENTS
-        )
+        if filter_matches(metric_filter)
         for transformation in metric_filter.get("metricTransformations") or []
     }
     if not metrics:
-        return "", unread
+        return "", []
     try:
         alarms = _paginate_aws_list(
             cloudwatch_client,
@@ -17995,8 +18118,7 @@ def _kms_key_loss_alarm_leg() -> Tuple[str, List[str]]:
             token_response_key="NextToken",
         )
     except Exception as error:
-        unread.append(f"cloudwatch:DescribeAlarms ({_assessment_error_label(error)})")
-        return "", unread
+        return "", [f"cloudwatch:DescribeAlarms ({_assessment_error_label(error)})"]
     for alarm in alarms:
         metric = (alarm.get("Namespace"), alarm.get("MetricName"))
         if (
@@ -18006,11 +18128,10 @@ def _kms_key_loss_alarm_leg() -> Tuple[str, List[str]]:
         ):
             return (
                 f"alarm {alarm.get('AlarmName')} with an action watches the metric "
-                f"of filter {metrics[metric]}, whose pattern names its "
-                f"{' and '.join(KMS_KEY_LOSS_EVENTS)} calls",
+                f"of filter {metrics[metric]}",
                 [],
             )
-    return "", unread
+    return "", []
 
 
 def _policy_engine_grant_gap(grants: List[Dict[str, Any]], engine_arn: str) -> str:
@@ -21140,6 +21261,30 @@ def _command_shell_holders(
     return unbounded, named, unreadable
 
 
+# The runtime log group prefix and the CloudTrail event a shell connection is
+# correlated through. The service never logs what is typed in the shell, so
+# the AIR-ACR-RT-03 recommendation compensates with a metric filter and alarm.
+AGENTCORE_RUNTIME_LOG_GROUP_PREFIX = "/aws/bedrock-agentcore/runtimes/"
+AGENTCORE_COMMAND_SHELL_EVENT = "InvokeAgentRuntimeCommandShell"
+
+
+def _command_shell_filter_matches(metric_filter: Dict[str, Any]) -> bool:
+    """Return whether a metric filter counts shell connections.
+
+    A filter counts when its pattern names the InvokeAgentRuntimeCommandShell
+    event, as a filter on a CloudTrail log group would, or when it sits on an
+    AgentCore runtime log group and its pattern names a shell. The runtime log
+    line for a shell connection is not documented, so the second form is
+    matched by name and not against the line.
+    """
+    pattern = str(metric_filter.get("filterPattern") or "")
+    if AGENTCORE_COMMAND_SHELL_EVENT in pattern:
+        return True
+    return str(metric_filter.get("logGroupName") or "").startswith(
+        AGENTCORE_RUNTIME_LOG_GROUP_PREFIX
+    ) and ("shell" in pattern.lower())
+
+
 def _command_shell_findings(permission_cache: Dict[str, Any]) -> List[Dict[str, Any]]:
     """Return the account-wide AC-45 rows on runtime command and shell access."""
     finding_name = "AgentCore Runtime Command Shell Access"
@@ -21231,7 +21376,60 @@ def _command_shell_findings(permission_cache: Dict[str, Any]) -> List[Dict[str, 
                 region=GLOBAL_REGION_LABEL,
             )
         )
-    elif not findings:
+    alarm = ""
+    if unbounded or named:
+        alarm, alarm_unread = _metric_filter_alarm(_command_shell_filter_matches)
+        if alarm_unread:
+            findings.append(
+                create_finding(
+                    check_id="AC-45",
+                    finding_name=f"{finding_name} Incomplete",
+                    finding_details=(
+                        "Principals in the IAM permission cache can open a shell "
+                        "inside an agent runtime session, and whether an alarm "
+                        "counts shell connections in this region was not read: "
+                        f"{'; '.join(alarm_unread)}."
+                    ),
+                    resolution=(
+                        "No action is required on the assessed workload based on "
+                        "this result. Grant logs:DescribeMetricFilters and "
+                        "cloudwatch:DescribeAlarms and rerun the assessment."
+                    ),
+                    reference=AGENTCORE_TOOL_EXECUTION_ROLE_REFERENCE_URL,
+                    severity=SeverityEnum.INFORMATIONAL,
+                    status=StatusEnum.NA,
+                    region=GLOBAL_REGION_LABEL,
+                )
+            )
+        elif not alarm:
+            findings.append(
+                create_finding(
+                    check_id="AC-45",
+                    finding_name=f"{finding_name} Unwatched",
+                    finding_details=(
+                        "Principals in the IAM permission cache can open a shell "
+                        "inside an agent runtime session, and no metric filter in "
+                        "this region that names InvokeAgentRuntimeCommandShell, or "
+                        "names a shell on an AgentCore runtime log group, feeds an "
+                        "alarm with an action. The service does not log what is "
+                        "typed in a shell, so a connection nobody is alerted to "
+                        "leaves no record of the commands run."
+                    ),
+                    resolution=(
+                        "Add a CloudWatch Logs metric filter on shell connections, "
+                        "in the runtime log group or on the "
+                        "InvokeAgentRuntimeCommandShell CloudTrail event, and an "
+                        "alarm with an action on its metric, and treat each "
+                        "production shell connection as an incident to review."
+                    ),
+                    reference=AGENTCORE_TOOL_EXECUTION_ROLE_REFERENCE_URL,
+                    severity=SeverityEnum.MEDIUM,
+                    status=StatusEnum.FAILED,
+                    region=GLOBAL_REGION_LABEL,
+                )
+            )
+
+    if not unbounded and not findings:
         holders = (
             f"Only these principals name the action on named runtimes: "
             f"{', '.join(named)}."
@@ -21239,6 +21437,11 @@ def _command_shell_findings(permission_cache: Dict[str, Any]) -> List[Dict[str, 
             else "No principal in the IAM permission cache can run a command or "
             "open a shell inside an agent runtime session."
         )
+        if alarm:
+            holders += (
+                f" In this region {alarm}, which counts shell connections; the "
+                "alarm's targets and the filter's source trail are not read."
+            )
         findings.append(
             create_finding(
                 check_id="AC-45",

@@ -1099,6 +1099,11 @@ _VERIFIED_REMEDIATION_IAM_ACTIONS |= {
 # 1, and index 0 drew nothing. DescribeVpcs is also listed in the ec2 service
 # reference JSON.
 _VERIFIED_REMEDIATION_IAM_ACTIONS |= {"ec2:DescribeVpcs"}
+# Verified on 2026-09-28 against the ec2 service reference JSON, which lists
+# GetManagedPrefixListEntries on the prefix-list resource type. AC-01 and AC-08
+# name it when a security group rule references a prefix list whose entries
+# could not be read.
+_VERIFIED_REMEDIATION_IAM_ACTIONS |= {"ec2:GetManagedPrefixListEntries"}
 # Verified on 2026-09-28 against the kms service reference JSON, which lists the
 # condition key kms:EncryptionContext:${EncryptionContextKey}. AC-12 names it
 # with the gateway context key aws:bedrock-agentcore-gateway:arn from the
