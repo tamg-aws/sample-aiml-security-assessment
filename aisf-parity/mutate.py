@@ -107,6 +107,18 @@ DERIVED_PARTIAL_QUALIFIER_NAME = "a single tag's (partial) qualifier flipped"
 # the position of the entry is the position of the comment that explains it.
 DERIVED_PARTIAL_QUALIFIER = "derive: the (partial) qualifier entry"
 
+# The report section's scope_text, whose coverage sentence carries figures that
+# move every time the ledger does, so its entry is built at run time as well.
+TEMPLATE = f"{SECURITY}/generate_consolidated_report/report_template.py"
+
+# One name and one placeholder for the derived scope_text figure entry, for the
+# reasons DERIVED_PARTIAL_QUALIFIER_NAME and DERIVED_PARTIAL_QUALIFIER give.
+DERIVED_SCOPE_COVERED_NAME = "the report section's covered figure drifts by one"
+DERIVED_SCOPE_COVERED = "derive: the scope_text covered figure entry"
+
+# The covered figure as the template writes it, on one source line.
+SCOPE_COVERED = re.compile(r"(?<![-\w])(\d+) of the \d+ are covered by checks")
+
 # Each find-string must occur EXACTLY ONCE in its file; the run aborts otherwise.
 # That replaces the `nth` occurrence selector the prowler harness carries, whose
 # 0-based field and 1-based display have mutated the wrong arm of a duplicated
@@ -510,6 +522,11 @@ MUTATIONS = [
         "find": "checks name more than one control",
         "replace": "checks name several controls",
     },
+    # A figure edit and not a phrase edit, unlike the entries above: the defect
+    # this guards is the hand bump that was missed, and a reworded phrase would
+    # exercise the absent branch instead. Derived, so the figure moving does not
+    # cost the battery the entry.
+    DERIVED_SCOPE_COVERED,
     # ----------------------------------------------------- the live tag probe
     # The probe's positive controls in LIVE-FIXTURES.md were run once by hand
     # against a real run's CSVs, and `--selftest` hands `tag_mismatches` one row.
@@ -634,6 +651,37 @@ def partial_qualifier_mutation(repo: Path) -> dict[str, str]:
     raise AssertionError("unreachable: die() raises")
 
 
+def scope_covered_figure_mutation(repo: Path) -> dict[str, str]:
+    """Raise the scope_text's covered figure by one, whatever it reads today.
+
+    The find-string is the phrase with its current digits, read from the
+    template, so it is unique for the same reason the gate's pattern is. When
+    the phrase is gone this fails loudly: the gate would then be reading an
+    absent figure, and a skipped entry would read as a shorter clean run.
+    """
+    text = (repo / TEMPLATE).read_text(encoding="utf-8")
+    hits = SCOPE_COVERED.findall(text)
+    if len(hits) != 1:
+        die(
+            f"{TEMPLATE} carries {len(hits)} copies of the covered phrase "
+            f"{SCOPE_COVERED.pattern!r}, not 1, so the scope_text figure "
+            "mutation has nothing unique to break"
+        )
+    found = SCOPE_COVERED.search(text)
+    raised = str(int(found[1]) + 1)
+    return {
+        "name": DERIVED_SCOPE_COVERED_NAME,
+        "file": TEMPLATE,
+        "defect": (
+            f"the report publishes {raised} covered controls while the ledger "
+            f"computes {found[1]}, the missed hand bump in a copy the report "
+            "ships that no gate read before gate 12's coverage leg"
+        ),
+        "find": found[0],
+        "replace": raised + found[0][len(found[1]) :],
+    }
+
+
 # Which published figure each mutation counts toward, keyed by name because the
 # target file does not separate them: the tag-column group spans five files, and
 # build_ledger.py carries two unrelated groups. The value is the phrase the doc
@@ -705,6 +753,7 @@ GROUPS: dict[str, str] = {
     "the multi-control sentence stops publishing its count": (
         "in the multi-control figures"
     ),
+    DERIVED_SCOPE_COVERED_NAME: "in the report section's coverage figures",
     "the live tag probe reads only the first row": "in the live tag probe",
     "the live tag probe passes when any row agrees": "in the live tag probe",
     "the live tag probe's as-written verdict is discarded": "in the live tag probe",
@@ -721,6 +770,8 @@ def resolve_mutations(repo: Path) -> list[dict[str, str]]:
     resolved = [
         partial_qualifier_mutation(repo)
         if entry == DERIVED_PARTIAL_QUALIFIER
+        else scope_covered_figure_mutation(repo)
+        if entry == DERIVED_SCOPE_COVERED
         else entry
         for entry in MUTATIONS
     ]

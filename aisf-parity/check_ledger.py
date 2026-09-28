@@ -220,9 +220,10 @@ def figure_drift(source, values, found, computed):
     the whole battery passed.
 
     Used for both figure families gate 14 asserts, so the census messages cannot
-    drift in shape from the tag-column ones. Gate 12 keeps figure_problems()
-    instead: there the computed side is three separate legs printed below it, so
-    those messages have no single computed value to name.
+    drift in shape from the tag-column ones. Gate 12 keeps figure_problems() for
+    its scope figures: there the computed side is three separate legs printed
+    below it, so those messages have no single computed value to name. Its
+    coverage sentence does have one per figure, and uses this.
 
     The computing side is named as "the ledger" and not by number. These three
     strings are the only place a gate number reached the output, and once gate 14
@@ -281,6 +282,42 @@ def scope_figures(text):
         ),
     )
     return {label: agreed_figure(hits) for label, hits in found.items()}, found
+
+
+def scope_coverage_drift(text, summary, mapped_controls):
+    """The coverage sentence in the report section's scope_text, against the ledger.
+
+    Kept apart from scope_figures() because SECURITY_CHECKS_AISF.md does not
+    publish this sentence in these words: its copy of the same figures is the
+    coverage bullet, which gate 21 reads with its own patterns. Adding these
+    labels to scope_figures() would read them as absent from the doc, and gate
+    12's doc-versus-template comparison would then fail on a correct pair.
+
+    Three figures, and the middle one is not a restatement of the scope
+    sentence's in-scope total. It is a second copy, published inside the
+    coverage claim, and a copy nothing reads is free to go stale while the one
+    beside it stays gated. `covered_without_row` is counted over distinct
+    controls for the reason gate 21 records at its own copy.
+
+    Returns the published values, every copy found, the computed side, and one
+    message per figure that is absent, disagrees with itself, or with the ledger.
+    """
+    found = figure_occurrences(
+        text,
+        (
+            ("covered", r"(?<![-\w])(\d+) of the \d+ are covered by checks"),
+            ("covered_in_scope", r"\d+ of the (\d+) are covered by checks"),
+            ("covered_without_row", r"the (\d+) covered controls without a row"),
+        ),
+    )
+    values = {label: agreed_figure(hits) for label, hits in found.items()}
+    computed = {
+        "covered": summary["covered"],
+        "covered_in_scope": summary["total"],
+        "covered_without_row": summary["covered"] - len(mapped_controls),
+    }
+    problems = figure_drift("the report section's scope_text", values, found, computed)
+    return values, found, computed, problems
 
 
 README_CATALOG_PATTERNS = (
@@ -1552,6 +1589,17 @@ def main():
     # leg green and the whole battery green with exit 0 while the paragraph it
     # publishes read one control too many.
     drift += figure_problems("the report section's scope_text", figures, figure_hits)
+    # The coverage sentence two clauses later published 101 and 93 with nothing
+    # reading them: both were moved by hand when the ledger moved, and a missed
+    # bump would have shipped in the report with every gate green.
+    coverage_figures, coverage_hits, coverage_computed, coverage_drift = (
+        scope_coverage_drift(
+            (aisf_entry or {}).get("scope_text", ""),
+            summary,
+            {m["control"] for m in AISF_DERIVED_MAP},
+        )
+    )
+    drift += coverage_drift
     drift += figure_problems("SECURITY_CHECKS_AISF.md", doc_figures, doc_hits)
     drift += figure_problems("SECURITY_CHECKS.md", {"sc_total": catalog_total}, sc_hits)
     drift += figure_problems("README.md", {"readme_total": readme_total}, readme_hits)
@@ -1628,8 +1676,12 @@ def main():
         f"{len(AISF_DERIVED_MAP)} mappings x 4 baked fields + "
         f"{len(collapsed)} collapsed-band disclosures x 2 status paths + "
         f"{len(figures)} figures in the report section + "
+        f"{len(coverage_figures)} in its coverage sentence + "
         f"{len(doc_figures)} in SECURITY_CHECKS_AISF.md checked, "
-        f"figures={figures}, copies scope_text [{copies_note(figure_hits)}] "
+        f"figures={figures}, coverage={coverage_figures} vs "
+        f"computed={coverage_computed}, "
+        f"copies scope_text [{copies_note(figure_hits)}] "
+        f"coverage [{copies_note(coverage_hits)}] "
         f"SECURITY_CHECKS_AISF.md [{copies_note(doc_hits)}] "
         f"SECURITY_CHECKS.md [{copies_note(sc_hits)}] "
         f"README.md [{copies_note(readme_hits)}], "

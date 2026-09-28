@@ -70,6 +70,16 @@ section.
   The 19 foundation controls that waited on those checks and legs are
   `covered`, and the new check ids carry their AISF control in the
   `Compliance_Frameworks` column.
+- `AIR-SGM-EP-03` moves from `not_implementable` to `covered` by `SM-11` and
+  `SM-14`, bringing the ledger to 101 `covered` and 4 `not_implementable`.
+  Its one unread field, inter-container traffic encryption, is named in the
+  ledger gap: `EnableInterContainerTrafficEncryption` is on the training,
+  processing and tuning job APIs and on no endpoint API. Seven checks that
+  already asserted part of a covered control now carry it in the
+  `Compliance_Frameworks` column: `SM-23` on `AIR-SGM-EP-06`, `SM-34` on
+  `AIR-SGM-TRN-01`, `AC-48` on `AIR-ACR-RT-03`, `AC-49` on `AIR-ACR-RT-08`,
+  `AG-39` on `AIR-FND-NET-08`, `AC-18` on `AIR-ACR-GW-10` and `AC-19` on
+  `AIR-ACR-MEM-12`. No check logic or IAM grant changes.
 - Added `AC-50` and `AC-51`, and extended `AC-26`. The assessment role gains
   one read-only permission, `ecr:GetRegistryScanningConfiguration`.
   - `AC-50` fails an AgentCore image repository that Amazon Inspector enhanced
@@ -281,6 +291,22 @@ section.
   forwarded bus only when its rule has one. Before, any target passed, so a
   rule delivering only to a CloudWatch Logs group or an API destination
   passed; it now fails.
+- `AR-10` evaluates the `prefix`, `suffix`, `wildcard`, `equals-ignore-case`,
+  `anything-but`, `exists` and `numeric` matchers on `source` and
+  `detail-type`. Before, any content matcher made a rule `N/A`, so a rule on
+  `{"prefix": "aws.s3"}` was reported as undecidable, and one on
+  `{"prefix": "aws.agent-"}` that routes every approval event was not
+  credited. A rule that stays undecidable, now one using `$or` or a matcher
+  the check does not evaluate, or one whose targets cannot be read, no longer
+  leaves a `Failed` beside its `N/A` saying no rule routes the approval
+  events. The same applies on a forwarded bus whose rules cannot be listed.
+  No IAM grant changes.
+- `AR-01` fails a wildcard `agent-registry` action on a resource ARN with a
+  wildcard in any segment, such as `arn:aws:agent-registry:*:*:*` or
+  `registry/*`, and on a `NotResource`. Before, only a literal `Resource: "*"`
+  counted, so `agent-registry:Get*` on `arn:aws:agent-registry:*:*:*` passed
+  with a finding saying no principal held a wildcard grant on all resources.
+  No IAM grant changes.
 - `AC-01`, `SM-10`, `SM-33` and `BR-39` read more of the AI compute
   population for AIR-FND-NET-01. `AC-01` fails a custom Code Interpreter or
   Browser in a subnet whose route table routes to an internet gateway, fails a
