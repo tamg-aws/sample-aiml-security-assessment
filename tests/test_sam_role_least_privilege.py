@@ -337,6 +337,7 @@ _EXPECTED_ACTIONS = {
         "ecr:GetSigningConfiguration",
         "elasticfilesystem:DescribeFileSystems",
         "fsx:DescribeFileSystems",
+        "sagemaker:ListInferenceComponents",
     },
     "AgentCoreSecurityAssessmentFunction": {
         "bedrock-agentcore:GetAgentRuntime",

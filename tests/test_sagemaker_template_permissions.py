@@ -48,7 +48,6 @@ SCOPED_SAGEMAKER_GRANTS = {
     "securityhub:DescribeOrganizationConfiguration": ":hub/default'",
     "securityhub:ListEnabledProductsForImport": ":hub/default'",
     "logs:DescribeMetricFilters": ":log-group:*'",
-    "cloudwatch:DescribeAlarms": ":alarm:*'",
     "events:ListTargetsByRule": ":rule/*'",
     "iot:ListPrincipalThings": ":cert/*'",
     "iot:DescribeScheduledAudit": ":scheduledaudit/*'",
@@ -61,7 +60,6 @@ SCOPED_SAGEMAKER_GRANTS = {
     "cloudtrail:GetEventSelectors": ":cloudtrail:*:*:trail/*'",
     "config:DescribeConfigurationRecorderStatus": ":configuration-recorder/*/*'",
     "config:DescribeConformancePackCompliance": ":conformance-pack/*/*'",
-    "cloudwatch:DescribeAlarmHistory": ":cloudwatch:*:${AWS::AccountId}:alarm:*'",
     "ecr:DescribeRepositories": ":ecr:*:${AWS::AccountId}:repository/*'",
     "ecr:DescribeImageSigningStatus": ":ecr:*:${AWS::AccountId}:repository/*'",
     "elasticfilesystem:DescribeFileSystems": (
@@ -115,6 +113,11 @@ APPROVED_WILDCARD_SAGEMAKER_GRANTS = {
     "securityhub:GetConfigurationPolicyAssociation": "ApprovedInventoryWithoutResourceType",
     "ecr:GetSigningConfiguration": "ApprovedInventoryWithoutResourceType",
     "fsx:DescribeFileSystems": "ApprovedInventoryWithoutResourceType",
+    "sagemaker:ListInferenceComponents": "ApprovedInventoryWithoutResourceType",
+    # API_DescribeAlarms and API_DescribeAlarmHistory return composite alarms
+    # only when the permission is scoped to '*'.
+    "cloudwatch:DescribeAlarms": "CompositeAlarmRead",
+    "cloudwatch:DescribeAlarmHistory": "CompositeAlarmRead",
 }
 
 # Reads the SageMaker legs call that are not approved. Each leg reports "not
@@ -122,7 +125,6 @@ APPROVED_WILDCARD_SAGEMAKER_GRANTS = {
 UNAPPROVED_SAGEMAKER_READS = [
     "ec2:DescribeVpcs",
     "ec2:DescribeDhcpOptions",
-    "sagemaker:ListInferenceComponents",
     "sagemaker:ListUserProfiles",
     "sagemaker:ListMonitoringExecutions",
     "guardduty:ListMembers",

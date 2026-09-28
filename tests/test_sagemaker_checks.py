@@ -7234,9 +7234,17 @@ class TestSM37EndpointFlowLogAlerting:
                 pages[1]["CompositeAlarms"] = composites
             return pages
 
-        def describe_alarm_history(AlarmName, HistoryItemType, ScanBy):
+        composite_names = {c.get("AlarmName") for c in composites}
+        self.history_types = []
+
+        def describe_alarm_history(
+            AlarmName, HistoryItemType, ScanBy, AlarmTypes=("MetricAlarm",)
+        ):
             self.history_calls.append((AlarmName, HistoryItemType, ScanBy))
-            source = history.get(AlarmName, [])
+            self.history_types.append((AlarmName, list(AlarmTypes)))
+            # CloudWatch returns only the alarm types named, metric by default.
+            kind = "CompositeAlarm" if AlarmName in composite_names else "MetricAlarm"
+            source = history.get(AlarmName, []) if kind in AlarmTypes else []
             if isinstance(source, Exception):
                 raise source
             return [
@@ -7752,7 +7760,142 @@ class TestSM37EndpointFlowLogAlerting:
             "last entered ALARM at 2026-09-02T00:00:00+00:00"
             in (rows[0]["Finding_Details"])
         )
-        assert [call[0] for call in self.history_calls] == ["egress"]
+        assert [call[0] for call in self.history_calls] == ["egress", "page-oncall"]
+        assert (
+            "actioned through composite alarm 'page-oncall', last entered ALARM at "
+            "2026-09-02T00:00:00+00:00, composite alarm 'page-oncall' alarm history "
+            "not read (cloudwatch:DescribeAlarmHistory: AccessDenied)"
+        ) in rows[0]["Finding_Details"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_the_composite_history_is_read_as_a_composite(self, mock_client):
+        rows = self._run(
+            mock_client,
+            alarms=[self._silent_alarm()],
+            composites=[self._composite("ALARM(egress)")],
+            history={
+                "page-oncall": [
+                    self._state_update(
+                        "OK",
+                        "ALARM",
+                        datetime(2026, 9, 3, tzinfo=timezone.utc),
+                        name="page-oncall",
+                    )
+                ],
+            },
+        )
+        assert [r["Status"] for r in rows] == ["Passed"]
+        details = rows[0]["Finding_Details"]
+        assert (
+            "alarm 'egress' in state OK, actioned through composite alarm "
+            "'page-oncall', no entry into ALARM in the alarm history CloudWatch "
+            "returned, composite alarm 'page-oncall' last entered ALARM at "
+            "2026-09-03T00:00:00+00:00"
+        ) in details
+        assert self.history_types == [
+            ("egress", ["MetricAlarm"]),
+            ("page-oncall", ["CompositeAlarm"]),
+        ]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_a_nested_composite_reads_the_history_of_the_actioned_parent(
+        self, mock_client
+    ):
+        rows = self._run(
+            mock_client,
+            alarms=[self._silent_alarm()],
+            composites=[
+                self._composite("ALARM(page-oncall)", name="top"),
+                self._composite("ALARM(egress)", ActionsEnabled=False, AlarmActions=[]),
+            ],
+            history={
+                "top": [
+                    self._state_update(
+                        "OK",
+                        "ALARM",
+                        datetime(2026, 9, 4, tzinfo=timezone.utc),
+                        name="top",
+                    )
+                ],
+            },
+        )
+        assert [r["Status"] for r in rows] == ["Passed"]
+        assert (
+            "composite alarm 'top' last entered ALARM at 2026-09-04T00:00:00+00:00"
+        ) in rows[0]["Finding_Details"]
+        assert [call[0] for call in self.history_calls] == ["egress", "top"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_each_endpoint_names_the_history_of_its_own_composite(self, mock_client):
+        filter_b = {
+            "logGroupName": "/flow/b",
+            "metricTransformations": [
+                {"metricNamespace": "Flow", "metricName": "EgressB"}
+            ],
+        }
+        rows = self._run(
+            mock_client,
+            flow_logs=[self._flow_log("vpc-1"), self._flow_log("vpc-2", "/flow/b")],
+            filters={
+                "/flow/a": [
+                    {
+                        "logGroupName": "/flow/a",
+                        "metricTransformations": [
+                            {"metricNamespace": "Flow", "metricName": "Egress"}
+                        ],
+                    }
+                ],
+                "/flow/b": [filter_b],
+            },
+            alarms=[
+                self._silent_alarm(),
+                self._alarm(
+                    "EgressB",
+                    AlarmName="egress-b",
+                    ActionsEnabled=False,
+                    AlarmActions=[],
+                ),
+            ],
+            composites=[
+                self._composite("ALARM(egress)", name="page-a"),
+                self._composite("ALARM(egress-b)", name="page-b"),
+            ],
+            history={
+                "page-b": [
+                    self._state_update(
+                        "OK",
+                        "ALARM",
+                        datetime(2026, 9, 5, tzinfo=timezone.utc),
+                        name="page-b",
+                    )
+                ],
+            },
+        )
+        assert [r["Status"] for r in rows] == ["Passed"]
+        details = rows[0]["Finding_Details"]
+        assert (
+            "endpoint 'ep-1' (log group /flow/a, alarm 'egress' in state OK, "
+            "actioned through composite alarm 'page-a', no entry into ALARM in the "
+            "alarm history CloudWatch returned, composite alarm 'page-a' no entry "
+            "into ALARM in the alarm history CloudWatch returned)"
+        ) in details
+        assert (
+            "actioned through composite alarm 'page-b', no entry into ALARM in the "
+            "alarm history CloudWatch returned, composite alarm 'page-b' last "
+            "entered ALARM at 2026-09-05T00:00:00+00:00)"
+        ) in details
+
+    @patch("sagemaker_app.boto3.client")
+    def test_an_and_composite_credits_no_child_on_either_endpoint(self, mock_client):
+        rows = self._run(
+            mock_client,
+            alarms=[self._silent_alarm()],
+            composites=[self._composite("ALARM(egress) AND ALARM(other)")],
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        details = rows[0]["Finding_Details"]
+        assert "2 endpoint(s) have no network anomaly alerting" in details
+        assert self.history_calls == []
 
 
 class TestSM37GuardDutyLambdaNetworkLogs:
@@ -14830,7 +14973,13 @@ def _sm43_rows(
         found = components.get((EndpointNameEquals, VariantNameEquals), [])
         if isinstance(found, Exception):
             raise found
-        return [{"InferenceComponents": [{"InferenceComponentName": n} for n in found]}]
+        summaries = [
+            n if isinstance(n, dict) else {"InferenceComponentName": n} for n in found
+        ]
+        return [
+            {"InferenceComponents": summaries[:1]},
+            {"InferenceComponents": summaries[1:]},
+        ]
 
     sagemaker.get_paginator.side_effect = _pager(
         {
@@ -14891,6 +15040,8 @@ def _sm43_rows(
         spec = components[InferenceComponentName]
         if isinstance(spec, Exception):
             raise spec
+        if "Specifications" in spec:
+            return spec
         return {"Specification": spec}
 
     sagemaker.describe_inference_component.side_effect = describe_inference_component
@@ -15478,6 +15629,176 @@ class TestSM43ModelArtifactIntegrity:
             "inference component 'ic-1' container loads ModelDataUrl "
             "s3://artifacts/ic/model.tar.gz with no expected value recorded"
         ) in rows[0]["Finding_Details"]
+
+    def _ic_container(self, url=None, image=None):
+        container = {"DeployedImage": {"SpecifiedImage": image or _sm43_image()}}
+        if url:
+            container["ArtifactUrl"] = url
+        return {"Container": container}
+
+    def test_only_the_second_component_on_a_variant_fails(self):
+        rows = _sm43_rows(
+            endpoints={"ep-1": {"models": [], "components": ["ic-variant"]}},
+            models={},
+            components={
+                ("ep-1", "ic-variant"): ["ic-1", "ic-2"],
+                "ic-1": self._ic_container(),
+                "ic-2": self._ic_container(url="s3://artifacts/ic2/model.tar.gz"),
+            },
+        )
+        assert _sm43_statuses(rows) == ["Failed"]
+        details = rows[0]["Finding_Details"]
+        assert (
+            "inference component 'ic-2' container loads ModelDataUrl "
+            "s3://artifacts/ic2/model.tar.gz with no expected value recorded"
+        ) in details
+        assert "'ic-1'" not in details
+
+    def test_component_endpoints_are_judged_each_on_their_own(self):
+        rows = _sm43_rows(
+            endpoints={
+                "ep-1": {"models": [], "components": ["ic-variant"]},
+                "ep-2": {"models": [], "components": ["ic-variant"]},
+            },
+            models={
+                "m-good": {"PrimaryContainer": _sm43_container()},
+                "m-bad": {"PrimaryContainer": _sm43_container(etag=None)},
+            },
+            components={
+                ("ep-1", "ic-variant"): ["ic-1"],
+                ("ep-2", "ic-variant"): ["ic-2"],
+                "ic-1": {"ModelName": "m-good"},
+                "ic-2": {"ModelName": "m-bad"},
+            },
+        )
+        assert _sm43_statuses(rows) == ["Failed"]
+        assert rows[0]["Finding_Details"].startswith("Endpoint 'ep-2' serves")
+        assert "model 'm-bad' container 1" in rows[0]["Finding_Details"]
+
+    def test_passing_components_on_two_endpoints_pass(self):
+        rows = _sm43_rows(
+            endpoints={
+                "ep-1": {"models": [], "components": ["ic-variant"]},
+                "ep-2": {"models": ["m-1"], "components": ["ic-variant"]},
+            },
+            models={
+                "m-1": {"PrimaryContainer": _sm43_container()},
+                "m-ic": {"PrimaryContainer": _sm43_container()},
+            },
+            components={
+                ("ep-1", "ic-variant"): ["ic-1"],
+                ("ep-2", "ic-variant"): ["ic-2"],
+                "ic-1": {"ModelName": "m-ic"},
+                "ic-2": {"ModelName": "m-ic"},
+            },
+        )
+        assert _sm43_statuses(rows) == ["Passed"]
+        assert "2 InService endpoint(s)" in rows[0]["Finding_Details"]
+
+    def test_every_specification_of_a_multi_spec_component_is_judged(self):
+        rows = _sm43_rows(
+            endpoints={"ep-1": {"models": [], "components": ["ic-variant"]}},
+            models={
+                "m-gpu": {"PrimaryContainer": _sm43_container()},
+                "m-cpu": {"PrimaryContainer": _sm43_container(etag=None)},
+            },
+            components={
+                ("ep-1", "ic-variant"): ["ic-1"],
+                "ic-1": {
+                    "Specifications": [
+                        {"InstanceType": "ml.g5.xlarge", "ModelName": "m-gpu"},
+                        {"InstanceType": "ml.c5.xlarge", "ModelName": "m-cpu"},
+                    ]
+                },
+            },
+        )
+        assert _sm43_statuses(rows) == ["Failed"]
+        details = rows[0]["Finding_Details"]
+        assert "model 'm-cpu' container 1" in details
+        assert "m-gpu" not in details
+
+    def test_a_component_with_nothing_to_judge_is_na(self):
+        rows = _sm43_rows(
+            endpoints={"ep-1": {"models": [], "components": ["ic-variant"]}},
+            models={},
+            components={
+                ("ep-1", "ic-variant"): ["ic-1"],
+                "ic-1": {"BaseInferenceComponentName": "base"},
+            },
+        )
+        assert _sm43_statuses(rows) == ["N/A"]
+        assert (
+            "inference component 'ic-1' returned no model name, image or artifact "
+            "URL to judge"
+        ) in rows[0]["Finding_Details"]
+
+    def test_a_component_of_another_endpoint_is_not_charged_to_this_one(self):
+        rows = _sm43_rows(
+            endpoints={"ep-1": {"models": [], "components": ["ic-variant"]}},
+            models={
+                "m-good": {"PrimaryContainer": _sm43_container()},
+                "m-bad": {"PrimaryContainer": _sm43_container(etag=None)},
+            },
+            components={
+                ("ep-1", "ic-variant"): [
+                    {"InferenceComponentName": "ic-1", "EndpointName": "ep-1"},
+                    {"InferenceComponentName": "ic-x", "EndpointName": "ep-other"},
+                ],
+                "ic-1": {"ModelName": "m-good"},
+                "ic-x": {"ModelName": "m-bad"},
+            },
+        )
+        assert _sm43_statuses(rows) == ["Passed"]
+
+    @pytest.mark.parametrize("status", ["Failed", "Deleting", "Creating"])
+    def test_a_component_not_in_service_is_not_judged(self, status):
+        rows = _sm43_rows(
+            endpoints={"ep-1": {"models": [], "components": ["ic-variant"]}},
+            models={
+                "m-good": {"PrimaryContainer": _sm43_container()},
+                "m-bad": {"PrimaryContainer": _sm43_container(etag=None)},
+            },
+            components={
+                ("ep-1", "ic-variant"): [
+                    {
+                        "InferenceComponentName": "ic-1",
+                        "InferenceComponentStatus": "InService",
+                    },
+                    {
+                        "InferenceComponentName": "ic-2",
+                        "InferenceComponentStatus": status,
+                    },
+                ],
+                "ic-1": {"ModelName": "m-good"},
+                "ic-2": {"ModelName": "m-bad"},
+            },
+        )
+        assert _sm43_statuses(rows) == ["Passed"]
+
+    def test_an_in_service_component_listed_second_is_judged(self):
+        rows = _sm43_rows(
+            endpoints={"ep-1": {"models": [], "components": ["ic-variant"]}},
+            models={
+                "m-good": {"PrimaryContainer": _sm43_container()},
+                "m-bad": {"PrimaryContainer": _sm43_container(etag=None)},
+            },
+            components={
+                ("ep-1", "ic-variant"): [
+                    {
+                        "InferenceComponentName": "ic-1",
+                        "InferenceComponentStatus": "Failed",
+                    },
+                    {
+                        "InferenceComponentName": "ic-2",
+                        "InferenceComponentStatus": "InService",
+                    },
+                ],
+                "ic-1": {"ModelName": "m-good"},
+                "ic-2": {"ModelName": "m-bad"},
+            },
+        )
+        assert _sm43_statuses(rows) == ["Failed"]
+        assert "model 'm-bad' container 1" in rows[0]["Finding_Details"]
 
     def test_unread_inference_components_are_na(self):
         rows = _sm43_rows(

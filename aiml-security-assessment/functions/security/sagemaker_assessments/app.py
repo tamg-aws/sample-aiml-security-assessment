@@ -13334,10 +13334,13 @@ ENDPOINT_FLOW_LOG_SCOPE_NOTE = (
     "SageMaker endpoints, so the customer flow log is the only network telemetry "
     "for an endpoint. AgentCore Runtime is not read by this module. The state "
     "named for each alarm is its current StateValue, and its last entry into "
-    "ALARM comes from the metric alarm's own StateUpdate history. A composite "
-    "alarm's history is returned only to cloudwatch:DescribeAlarmHistory on "
-    "'*', which this role is not granted, so a composite's own firing is not "
-    "read. Neither history result changes the status. Whether a fired alarm was "
+    "ALARM comes from the metric alarm's own StateUpdate history. An alarm with "
+    "no action of its own is credited when an OR of ALARM() terms carries it to "
+    "a composite alarm with an action, and that composite's own last entry into "
+    "ALARM is read too, through cloudwatch:DescribeAlarmHistory with the "
+    "CompositeAlarm type. Neither history result changes the status: an alarm that "
+    "has never entered ALARM still passes, and a history read that fails is "
+    "named in the row without holding back Passed. Whether a fired alarm was "
     "triaged is not recorded by any CloudWatch API."
 )
 FLOW_LOG_ALERTING_TRAFFIC_TYPES = ("ALL", "ACCEPT")
@@ -13424,11 +13427,14 @@ def _actioned_alarms(
     return actioned
 
 
-def _alarm_last_fired(cloudwatch_client, alarm_name: str) -> str:
-    """When a metric alarm last entered ALARM, from its StateUpdate history."""
+def _alarm_last_fired(
+    cloudwatch_client, alarm_name: str, alarm_type: str = "MetricAlarm"
+) -> str:
+    """When an alarm last entered ALARM, from its StateUpdate history."""
     try:
         for page in cloudwatch_client.get_paginator("describe_alarm_history").paginate(
             AlarmName=alarm_name,
+            AlarmTypes=[alarm_type],
             HistoryItemType="StateUpdate",
             ScanBy="TimestampDescending",
         ):
@@ -13640,7 +13646,9 @@ def check_sagemaker_endpoint_flow_log_alerting(region: str = "") -> Dict[str, An
                 if composite:
                     label += f", actioned through composite alarm '{composite}'"
                 for metric in _alarm_metrics(alarm):
-                    alarmed_metrics.setdefault(metric, (label, alarm["AlarmName"]))
+                    alarmed_metrics.setdefault(
+                        metric, (label, alarm["AlarmName"], composite)
+                    )
         except Exception as error:
             alarm_error = get_assessment_error_label(error)
 
@@ -13728,11 +13736,22 @@ def check_sagemaker_endpoint_flow_log_alerting(region: str = "") -> Dict[str, An
         alarm: _alarm_last_fired(cloudwatch_client, alarm)
         for alarm in sorted({hit[2] for _, hits in passed for hit in hits})
     }
+    composite_history = {
+        composite: _alarm_last_fired(cloudwatch_client, composite, "CompositeAlarm")
+        for composite in sorted(
+            {hit[3] for _, hits in passed for hit in hits if hit[3]}
+        )
+    }
     passed = [
         f"endpoint '{name}' ("
         + "; ".join(
             f"log group {group}, {label}, {history[alarm]}"
-            for group, label, alarm in hits
+            + (
+                f", composite alarm '{composite}' {composite_history[composite]}"
+                if composite
+                else ""
+            )
+            for group, label, alarm, composite in hits
         )
         + ")"
         for name, hits in passed
@@ -14198,31 +14217,48 @@ def check_sagemaker_model_artifact_integrity(region: str = "") -> Dict[str, Any]
                     EndpointNameEquals=endpoint["name"], VariantNameEquals=variant
                 ):
                     for component in page.get("InferenceComponents", []):
+                        if component.get("EndpointName") not in (
+                            None,
+                            endpoint["name"],
+                        ) or component.get("InferenceComponentStatus") not in (
+                            None,
+                            "InService",
+                        ):
+                            continue
                         name = component.get("InferenceComponentName")
                         action = "sagemaker:DescribeInferenceComponent"
-                        spec = (
-                            sagemaker_client.describe_inference_component(
-                                InferenceComponentName=name
-                            ).get("Specification")
-                            or {}
+                        described = sagemaker_client.describe_inference_component(
+                            InferenceComponentName=name
                         )
-                        if spec.get("ModelName"):
-                            units.append(("model", spec["ModelName"], None))
-                            continue
-                        container = spec.get("Container") or {}
-                        deployed = container.get("DeployedImage") or {}
-                        units.append(
-                            (
-                                "container",
-                                f"inference component '{name}' container",
-                                {
-                                    "Image": deployed.get("SpecifiedImage"),
-                                    "ResolvedImage": deployed.get("ResolvedImage"),
-                                    "ModelDataUrl": container.get("ArtifactUrl"),
-                                    "Environment": container.get("Environment"),
-                                },
+                        specs = described.get("Specifications") or [
+                            described.get("Specification") or {}
+                        ]
+                        for spec in specs:
+                            if spec.get("ModelName"):
+                                units.append(("model", spec["ModelName"], None))
+                                continue
+                            container = spec.get("Container") or {}
+                            deployed = container.get("DeployedImage") or {}
+                            if not deployed.get("SpecifiedImage") and not container.get(
+                                "ArtifactUrl"
+                            ):
+                                unreads.append(
+                                    f"inference component '{name}' returned no model "
+                                    "name, image or artifact URL to judge"
+                                )
+                                continue
+                            units.append(
+                                (
+                                    "container",
+                                    f"inference component '{name}' container",
+                                    {
+                                        "Image": deployed.get("SpecifiedImage"),
+                                        "ResolvedImage": deployed.get("ResolvedImage"),
+                                        "ModelDataUrl": container.get("ArtifactUrl"),
+                                        "Environment": container.get("Environment"),
+                                    },
+                                )
                             )
-                        )
             except Exception as error:
                 unreads.append(
                     f"inference components of variant {variant} were not read "
