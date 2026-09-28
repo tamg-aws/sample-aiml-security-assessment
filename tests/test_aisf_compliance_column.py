@@ -232,6 +232,19 @@ def test_two_producers_in_one_interpreter_keep_their_own_maps(schemas):
     assert _finding(sagemaker, "BR-10")["Compliance_Frameworks"] == ""
 
 
+def test_sm43_carries_the_control_it_moved_off_not_implementable(schemas, ledger):
+    # AIR-SLF-CMP-08 was not_implementable until SM-43 shipped. The ledger row
+    # and the tag on SM-43's CSV rows have to move together.
+    row = next(r for r in ledger if r["control"] == "AIR-SLF-CMP-08")
+    assert (row["verdict"], row["incumbents"]) == ("covered", ["SM-43"])
+    sagemaker = schemas["sagemaker_assessments"]
+    text = _csv_rows("sagemaker_assessments", sagemaker, [_finding(sagemaker, "SM-43")])
+    assert (
+        next(csv.DictReader(StringIO(text)))["Compliance_Frameworks"]
+        == "AISF AIR-SLF-CMP-08"
+    )
+
+
 # ---------------------------------------------------------------------------
 # The tag reaches the CSV
 # ---------------------------------------------------------------------------

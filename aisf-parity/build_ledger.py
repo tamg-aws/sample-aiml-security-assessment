@@ -1232,7 +1232,7 @@ AI_SUBJECT_ROWS = [
 # AISF control, and ruled that they are hosted in the existing modules. Each
 # covered row names every check id whose shipped code asserts it.
 FOUNDATION_ROWS = [
-    # ---------------- covered: 23 controls ----------------
+    # ---------------- covered: 25 controls ----------------
     (
         "AIR-FND-DAT-04",
         COVERED,
@@ -1707,7 +1707,33 @@ FOUNDATION_ROWS = [
         [],
         6,
     ),
-    # ---------------- not_implementable: 3 controls ----------------
+    (
+        "AIR-SLF-CMP-08",
+        COVERED,
+        None,
+        "sagemaker_assessments",
+        ["SM-43"],
+        "SM-43 judges every serving container of each InService endpoint, "
+        "including model package containers and inference components. An image "
+        "passes when it is pinned by an @sha256 digest, or by a tag its ECR "
+        "repository holds immutable, and a mutable tag fails. When a managed "
+        "signing rule read with ecr:GetSigningConfiguration covers the repository, "
+        "a failed or absent DescribeImageSigningStatus result fails. Model data "
+        "named by ModelDataUrl fails without a ModelDataETag, which only a model "
+        "package container can record. An S3 ModelDataSource or additional model "
+        "data source fails without an ETag or ManifestEtag unless it is SageMaker "
+        "hub content. A container with an HF_MODEL_ID environment key and no model "
+        "data fails. Each artifact bucket must default to aws:kms or aws:kms:dsse "
+        "with a named key. An endpoint with an unread repository, signing status, "
+        "model or bucket reports N/A, never Passed. Partial, ceiling reached: a "
+        "recorded ETag says an expected value is recorded, and no AWS API returns "
+        "whether SageMaker or the container compared it with the object at load "
+        "time. Weights fetched by container startup code, and models loaded on "
+        "ECS, EKS or EC2, are not read",
+        [],
+        6,
+    ),
+    # ---------------- not_implementable: 2 controls ----------------
     (
         "AIR-FND-DET-10",
         NOT_IMPL,
@@ -1736,18 +1762,6 @@ FOUNDATION_ROWS = [
         "of InProgress loops can be counted, but they return no reviewer and no "
         "review-quality field. Nothing on a flow definition marks it as holding "
         "agent decisions.",
-        [],
-        None,
-    ),
-    (
-        "AIR-SLF-CMP-08",
-        NOT_IMPL,
-        None,
-        None,
-        [],
-        "The digest check runs inside the workload's own startup code, and no AWS "
-        "API records the expected digest or whether it was verified before the "
-        "weights loaded.",
         [],
         None,
     ),
@@ -2027,6 +2041,7 @@ INCUMBENT_NAMES = {
     "SM-40": "Secrets Manager Automatic Rotation",
     "SM-41": "AWS IoT Device-Scoped Policy",
     "SM-42": "SageMaker Batch Transform Creation Guardrail",
+    "SM-43": "SageMaker Model Artifact Integrity",
 }
 
 

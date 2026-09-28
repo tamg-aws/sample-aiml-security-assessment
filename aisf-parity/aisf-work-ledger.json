@@ -7,12 +7,12 @@
     "fnd_ai_subject": 11,
     "foundation": 27,
     "total": 105,
-    "covered": 101,
+    "covered": 102,
     "tighten": 0,
     "tighten_extend": 0,
     "tighten_new_id": 0,
     "new": 0,
-    "not_implementable": 4,
+    "not_implementable": 3,
     "unassessed": 0,
     "new_check_functions": 0,
     "extensions": 0,
@@ -2585,6 +2585,29 @@
       "source": "controls/ai-specific/selfhosted-agent.yaml"
     },
     {
+      "control": "AIR-SLF-CMP-08",
+      "area": "SLF",
+      "question": "For self-hosted models, are the model weights obtained from a verified source and integrity-checked before they are loaded, rather than pulled from a public hub and trusted on arrival?",
+      "assert": "Recorded expected digest for each deployed model + the load-time verification step that compares against it, plus the KMS key protecting the artifact at rest",
+      "workload_agnostic": false,
+      "verdict": "covered",
+      "disposition": null,
+      "target_modules": [
+        "sagemaker_assessments"
+      ],
+      "incumbents": [
+        "SM-43"
+      ],
+      "incumbent_names": [
+        "SageMaker Model Artifact Integrity"
+      ],
+      "gap": "SM-43 judges every serving container of each InService endpoint, including model package containers and inference components. An image passes when it is pinned by an @sha256 digest, or by a tag its ECR repository holds immutable, and a mutable tag fails. When a managed signing rule read with ecr:GetSigningConfiguration covers the repository, a failed or absent DescribeImageSigningStatus result fails. Model data named by ModelDataUrl fails without a ModelDataETag, which only a model package container can record. An S3 ModelDataSource or additional model data source fails without an ETag or ManifestEtag unless it is SageMaker hub content. A container with an HF_MODEL_ID environment key and no model data fails. Each artifact bucket must default to aws:kms or aws:kms:dsse with a named key. An endpoint with an unread repository, signing status, model or bucket reports N/A, never Passed. Partial, ceiling reached: a recorded ETag says an expected value is recorded, and no AWS API returns whether SageMaker or the container compared it with the object at load time. Weights fetched by container startup code, and models loaded on ECS, EKS or EC2, are not read",
+      "extra_iam": [],
+      "phase": 6,
+      "tier": "foundation",
+      "source": "controls/ai-specific/selfhosted-compute.yaml"
+    },
+    {
       "control": "AIR-FND-DET-10",
       "area": "FND",
       "question": "Are coordination-level metrics for multi-agent workflows \u2014 inter-agent message rates, per-agent-pair error rates, workflow execution frequency, and communication topology \u2014 baselined and alarmed on, rather than only each agent's own health and error metrics?",
@@ -2617,23 +2640,6 @@
       "phase": null,
       "tier": "foundation",
       "source": "controls/baseline/governance-compliance.yaml"
-    },
-    {
-      "control": "AIR-SLF-CMP-08",
-      "area": "SLF",
-      "question": "For self-hosted models, are the model weights obtained from a verified source and integrity-checked before they are loaded, rather than pulled from a public hub and trusted on arrival?",
-      "assert": "Recorded expected digest for each deployed model + the load-time verification step that compares against it, plus the KMS key protecting the artifact at rest",
-      "workload_agnostic": false,
-      "verdict": "not_implementable",
-      "disposition": null,
-      "target_modules": [],
-      "incumbents": [],
-      "incumbent_names": [],
-      "gap": "The digest check runs inside the workload's own startup code, and no AWS API records the expected digest or whether it was verified before the weights loaded.",
-      "extra_iam": [],
-      "phase": null,
-      "tier": "foundation",
-      "source": "controls/ai-specific/selfhosted-compute.yaml"
     }
   ]
 }

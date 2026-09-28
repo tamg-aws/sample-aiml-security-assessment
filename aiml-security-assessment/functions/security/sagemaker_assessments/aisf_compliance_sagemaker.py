@@ -47,6 +47,7 @@ AISF_COMPLIANCE_MAP = {
     "SM-40": "AISF AIR-SLF-RT-06",
     "SM-41": "AISF AIR-PHY-EDG-01",
     "SM-42": "AISF AIR-SGM-EP-08 (1 of 2 checks)",
+    "SM-43": "AISF AIR-SLF-CMP-08",
 }
 
 
