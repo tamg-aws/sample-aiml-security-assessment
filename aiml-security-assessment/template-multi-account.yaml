@@ -1057,9 +1057,9 @@ Resources:
               Action:
                 - kms:GetKeyPolicy
               Resource: !Sub 'arn:${AWS::Partition}:kms:*:${AWS::AccountId}:key/*'
-            # AC-11 and AC-14 read a policy engine or token vault key's manager
-            # and state, and AC-36 lists the key's grants to find the engine's
-            # management and evaluation grants.
+            # AC-07, AC-11 and AC-14 read a memory, policy engine or token vault
+            # key's manager and state, and AC-36 lists the key's grants to find
+            # the engine's management and evaluation grants.
             - Sid: PolicyEngineKeyStateRead
               Effect: Allow
               Action:

@@ -4112,6 +4112,149 @@ class TestAC07MemoryConfiguration:
             assert "namespaces" in wrapper.members
             assert set(wrapper.metadata.get("required") or []) == {"name"}
 
+    # --- AC-07 key leg: the named key is read by value (AIR-ACR-MEM-01) ---
+
+    _CUSTOMER_KEY = {"KeyManager": "CUSTOMER", "KeyState": "Enabled"}
+
+    @pytest.fixture(autouse=True)
+    def _customer_managed_memory_key(self):
+        # Every memory key in this class describes as customer managed and
+        # Enabled unless a test says otherwise, so a Passed encryption verdict
+        # always rests on a DescribeKey answer.
+        with patch("agentcore_app.kms_client") as mock_kms:
+            mock_kms.describe_key.return_value = {"KeyMetadata": self._CUSTOMER_KEY}
+            yield mock_kms
+
+    @staticmethod
+    def _two_memories(mock_ac, first_key, second_key):
+        mock_ac.list_memories.return_value = {
+            "memories": [
+                {"id": "mem-1", "name": "First"},
+                {"id": "mem-2", "name": "Second"},
+            ]
+        }
+        mock_ac.get_memory.side_effect = [
+            {"memory": TestAC07MemoryConfiguration._memory_detail(encryptionKeyArn=key)}
+            for key in (first_key, second_key)
+        ]
+
+    @staticmethod
+    def _encryption_rows(findings):
+        return [f for f in findings if f["Finding"] == "AgentCore Memory Encryption"]
+
+    _GOOD_KEY = "arn:aws:kms:us-east-1:123456789012:key/good"
+    _BAD_KEY = "arn:aws:kms:us-east-1:123456789012:key/bad"
+
+    @pytest.mark.parametrize(
+        "bad_metadata, expected",
+        [
+            ({"KeyManager": "AWS", "KeyState": "Enabled"}, "managed by AWS"),
+            ({"KeyState": "Enabled"}, "managed by an unknown party"),
+            ({"KeyManager": "CUSTOMER", "KeyState": "Disabled"}, "reports as Disabled"),
+            (
+                {"KeyManager": "CUSTOMER", "KeyState": "PendingDeletion"},
+                "reports as PendingDeletion",
+            ),
+            ({"KeyManager": "CUSTOMER"}, "in an unknown state"),
+        ],
+    )
+    @patch("agentcore_app.agentcore_client")
+    def test_ac07_a_named_key_that_is_not_a_usable_customer_key_fails(
+        self, mock_ac, _customer_managed_memory_key, bad_metadata, expected
+    ):
+        self._two_memories(mock_ac, self._GOOD_KEY, self._BAD_KEY)
+        metadata = {self._GOOD_KEY: self._CUSTOMER_KEY, self._BAD_KEY: bad_metadata}
+        _customer_managed_memory_key.describe_key.side_effect = lambda KeyId: {
+            "KeyMetadata": metadata[KeyId]
+        }
+
+        rows = self._encryption_rows(
+            extract_csv_data(agentcore_app.check_agentcore_memory_configuration())
+        )
+
+        assert [f["Status"] for f in rows] == ["Passed", "Failed"]
+        assert "'First' (mem-1)" in rows[0]["Finding_Details"]
+        assert "customer managed and Enabled" in rows[0]["Finding_Details"]
+        assert "'Second' (mem-2)" in rows[1]["Finding_Details"]
+        assert self._BAD_KEY in rows[1]["Finding_Details"]
+        assert expected in rows[1]["Finding_Details"]
+        assert rows[1]["Severity"] == "Medium"
+        for row in rows:
+            assert_finding_schema(row)
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            _make_client_error("AccessDeniedException", "denied"),
+            _make_client_error("ThrottlingException", "slow down"),
+            _make_client_error("NotFoundException", "no such key"),
+        ],
+    )
+    @patch("agentcore_app.agentcore_client")
+    def test_ac07_an_undescribed_key_is_na_not_passed(
+        self, mock_ac, _customer_managed_memory_key, error
+    ):
+        self._two_memories(mock_ac, self._GOOD_KEY, self._BAD_KEY)
+
+        def describe(KeyId):
+            if KeyId == self._BAD_KEY:
+                raise error
+            return {"KeyMetadata": self._CUSTOMER_KEY}
+
+        _customer_managed_memory_key.describe_key.side_effect = describe
+
+        rows = self._encryption_rows(
+            extract_csv_data(agentcore_app.check_agentcore_memory_configuration())
+        )
+
+        assert [f["Status"] for f in rows] == ["Passed", "N/A"]
+        assert error.response["Error"]["Code"] in rows[1]["Finding_Details"]
+        assert "not reported as customer managed" in rows[1]["Finding_Details"]
+        assert "kms:DescribeKey" in rows[1]["Resolution"]
+        assert "another account" in rows[1]["Resolution"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_ac07_a_missing_kms_client_is_na_not_passed(self, mock_ac):
+        self._one_memory(mock_ac)
+
+        with patch("agentcore_app.kms_client", None):
+            rows = self._encryption_rows(
+                extract_csv_data(agentcore_app.check_agentcore_memory_configuration())
+            )
+
+        assert [f["Status"] for f in rows] == ["N/A"]
+        assert "KMS client is not available" in rows[0]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_ac07_a_key_shared_by_two_memories_is_described_once(
+        self, mock_ac, _customer_managed_memory_key
+    ):
+        self._two_memories(mock_ac, self._GOOD_KEY, self._GOOD_KEY)
+
+        rows = self._encryption_rows(
+            extract_csv_data(agentcore_app.check_agentcore_memory_configuration())
+        )
+
+        assert [f["Status"] for f in rows] == ["Passed", "Passed"]
+        _customer_managed_memory_key.describe_key.assert_called_once_with(
+            KeyId=self._GOOD_KEY
+        )
+
+    @patch("agentcore_app.agentcore_client")
+    def test_ac07_a_memory_without_a_key_still_fails_without_a_describe(
+        self, mock_ac, _customer_managed_memory_key
+    ):
+        self._two_memories(mock_ac, self._GOOD_KEY, None)
+
+        rows = self._encryption_rows(
+            extract_csv_data(agentcore_app.check_agentcore_memory_configuration())
+        )
+
+        assert [f["Status"] for f in rows] == ["Passed", "Failed"]
+        _customer_managed_memory_key.describe_key.assert_called_once_with(
+            KeyId=self._GOOD_KEY
+        )
+
 
 # ===================================================================
 # AC-08: check_agentcore_vpc_endpoints

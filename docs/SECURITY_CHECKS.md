@@ -681,7 +681,7 @@ inventory is never treated as evidence of compliance.
 ### AC-07: Memory Encryption
 
 - **Severity:** Medium
-- **Description:** Checks agent memory encryption with AWS KMS. A memory that `GetMemory` cannot describe is informational `N/A`, and the resolution follows the error. `AccessDeniedException` names `bedrock-agentcore:GetMemory` on the memory and `kms:Decrypt` on its customer managed key through `bedrock-agentcore`, allowed by both the role's IAM policy and the key policy, because AgentCore decrypts the memory's strategies on the caller's behalf and a caller without the key grant is denied `GetMemory`. The assessment role carries that `kms:Decrypt` grant, conditioned on `kms:ViaService` `bedrock-agentcore.*.amazonaws.com`, so a denial that remains points at a key policy that does not allow the role. Only `ResourceNotFoundException` points at a memory deleted mid-assessment.
+- **Description:** Checks agent memory encryption with AWS KMS. A memory that `GetMemory` cannot describe is informational `N/A`, and the resolution follows the error. `AccessDeniedException` names `bedrock-agentcore:GetMemory` on the memory and `kms:Decrypt` on its customer managed key through `bedrock-agentcore`, allowed by both the role's IAM policy and the key policy, because AgentCore decrypts the memory's strategies on the caller's behalf and a caller without the key grant is denied `GetMemory`. The assessment role carries that `kms:Decrypt` grant, conditioned on `kms:ViaService` `bedrock-agentcore.*.amazonaws.com`, so a denial that remains points at a key policy that does not allow the role. Only `ResourceNotFoundException` points at a memory deleted mid-assessment. The key a memory names is read with `kms:DescribeKey` and passes only when `KeyManager` is `CUSTOMER` and `KeyState` is `Enabled`. A key that is not customer managed, is disabled or is pending deletion fails, and a key `DescribeKey` cannot read is informational `N/A`, which includes every key in another account because the role's grant names this account's keys. A second row per memory fails a strategy namespace with no `{actorId}` variable.
 
 ### AC-08: Amazon VPC Endpoints
 
@@ -696,7 +696,7 @@ inventory is never treated as evidence of compliance.
 ### AC-10: Resource-Based Policies
 
 - **Severity:** Medium
-- **Description:** Checks runtime and gateway resource policies.
+- **Description:** Fails an Allow statement on a runtime or gateway resource policy that opens it to any principal without binding the caller's account or organization. An unreadable runtime or gateway list is informational `N/A`.
 
 ### AC-11: Policy Engine Encryption
 

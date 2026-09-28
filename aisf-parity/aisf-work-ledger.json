@@ -722,7 +722,7 @@
       "incumbent_names": [
         "Agentic AI Gateway Inbound Authorization"
       ],
-      "gap": "AG-24 accepts authorizerType in {AWS_IAM, CUSTOM_JWT}, or AUTHENTICATE_ONLY with a policy engine in ENFORCE, which is GW-01's assertion exactly",
+      "gap": "AG-24 passes authorizerType AWS_IAM, AUTHENTICATE_ONLY with a policy engine in ENFORCE, and CUSTOM_JWT only when the authorizer's values bound it: an allowedAudience or allowedClients list pins the application, and a list holding a blank or * value does not count. A CUSTOM_JWT gateway with no such list fails as Unbounded, one whose discoveryUrl is not https fails as Issuer Not HTTPS, and one that reports no customJWTAuthorizer is N/A",
       "extra_iam": [],
       "phase": 4,
       "tier": "ai_subject",
@@ -768,7 +768,7 @@
       "incumbent_names": [
         "AgentCore IAM Full Access Check"
       ],
-      "gap": "AC-02 now reads wildcard action patterns at any resource scope, on cached roles and users alike, so bedrock-agentcore:* narrowed to one evaluation ARN is reported where the full-access legs saw nothing. A pattern reaching any one of the six evaluator and online-evaluation-config writes grants all six, and a principal that can delete an evaluation can stop the measurement of the agent it watches. A bare Action \"*\" stays with the existing legs as a service-agnostic administrator grant",
+      "gap": "AC-02 reads roles, users and the group policies of each user, and counts a bare Action \"*\" and a NotAction that leaves AgentCore in. A wildcard action pattern, a bare \"*\" or a NotAction reaching any one of the six evaluator and online-evaluation-config writes grants all six and fails as Evaluation Administration Wildcard, because a principal that can delete an evaluation can stop the measurement of the agent it watches. A second leg fails when cached principals can author evaluators and none holds the evaluator reads without an author action, so no identity reviews an evaluator it cannot rewrite. A permissions boundary is intersected with the grants, and a principal the IAM cache could not read withholds Passed. SCPs are not evaluated per principal, so they can produce a false Failed and never a false Passed",
       "extra_iam": [],
       "phase": 4,
       "tier": "ai_subject",
@@ -791,7 +791,7 @@
       "incumbent_names": [
         "AgentCore Token Issuance Scope"
       ],
-      "gap": "AC-33 judges the resource element on the five token issuance actions per cached role and user: a resource ending in a wildcard mints a token for every workload identity in the account, while a resource naming one identity bounds the grant to that agent. A grant that names only the workload identity directory is reported separately at medium, because the service authorization reference marks both the directory and the identity required on these actions and never says whether the directory alone authorizes the call, so that grant either reaches every identity the directory holds or authorizes nothing",
+      "gap": "AC-33 judges the resource element on the five token issuance actions per cached role and user: a resource ending in a wildcard, a wildcard in the region or account segment of the workload identity ARN, or a NotResource grant mints a token for every workload identity in the account, while a resource naming one identity bounds the grant to that agent. A bare Action \"*\" and group policies count, a grant the principal's own Deny or boundary removes does not, and a principal the IAM cache could not read is named in an N/A row that withholds Passed. A grant that names only the workload identity directory is reported separately at medium, because the service authorization reference marks both the directory and the identity required on these actions and never says whether the directory alone authorizes the call, so that grant either reaches every identity the directory holds or authorizes nothing",
       "extra_iam": [],
       "phase": 4,
       "tier": "ai_subject",
@@ -814,7 +814,7 @@
       "incumbent_names": [
         "AgentCore IAM Full Access Check"
       ],
-      "gap": "AC-02 now fails any role or user whose Allow statements reach both an AgentCore payment session or instrument write and ProcessPayment with no account-wide Deny on the latter. A payment session carries its own limits.maxSpendAmount, so that one principal sets the budget it then spends against, which is the single failure behind both legs the devguide draws: its ManagementRole denies ProcessPayment and its ProcessPaymentRole holds no session write. A Deny scoped to one payment manager or carrying a condition is read as no account-wide Deny, so a narrower Deny never excuses the collision",
+      "gap": "AC-02 fails any role or user, group policies included, whose Allow statements reach both an AgentCore payment session or instrument write and ProcessPayment with no account-wide Deny on the latter and no permissions boundary removing either. A payment session carries its own limits.maxSpendAmount, so that one principal sets the budget it then spends against, which is the single failure behind both legs the devguide draws: its ManagementRole denies ProcessPayment and its ProcessPaymentRole holds no session write. A Deny scoped to one payment manager or carrying a condition is read as no account-wide Deny, so a narrower Deny never excuses the collision. Two more legs read the payment manager: a principal that can create or update one fails when its iam:PassRole grant is wider than the retrieval role or does not pin iam:PassedToService, and each manager's retrieval role trust must name only bedrock-agentcore.amazonaws.com and pin aws:SourceArn to that manager. The trust leg reads N/A until bedrock-agentcore:ListPaymentManagers is granted",
       "extra_iam": [],
       "phase": 4,
       "tier": "ai_subject",
@@ -839,7 +839,7 @@
         "AgentCore IAM Full Access Check",
         "AgentCore Tool Execution Role Scope"
       ],
-      "gap": "AC-45 reads the execution role of every code interpreter and browser in the account and fails a role whose Allow statements reach every resource, name a NotResource, or carry a service-wide or bare action wildcard. AC-02 judges the same wildcards but only over the bedrock-agentcore namespace and only on the assessment's own roles, so a tool role granting s3:* on every bucket is a verdict it cannot reach",
+      "gap": "AC-45 reads the execution role of every code interpreter and browser in the account by value and fails a role whose Allow statements reach every resource or an unbounded one (arn:aws:s3:::*, table/*, a region or account wildcard), name a NotResource, carry a service-wide, bare or pattern action wildcard such as s3:Get*, or are written with NotAction. On the primary region a Global row names every principal that can run a command or open a shell in a runtime session through a grant that does not name bedrock-agentcore:InvokeAgentRuntimeCommandShell or InvokeAgentRuntimeCommand, or that reaches every runtime. AC-02 judges the same wildcards only over the bedrock-agentcore namespace, so a tool role granting s3:* on every bucket is a verdict it cannot reach",
       "extra_iam": [],
       "phase": 4,
       "tier": "ai_subject",
@@ -914,7 +914,7 @@
         "AgentCore Resource-Based Policies Check",
         "AgentCore Gateway Policy Conditions"
       ],
-      "gap": "AC-10 reports that a gateway resource policy is present; AC-27 judges whether its Allow statements and the gateway execution role's trust policy carry aws:SourceAccount or aws:SourceArn, and fails an unconditioned statement even when a guarded sibling sits beside it in the same document",
+      "gap": "AC-10 fails an Allow statement on a gateway or runtime resource policy that opens it to any principal without binding the caller's account or organization, and an unreadable gateway or runtime list is N/A. AC-27 judges whether the gateway's Allow statements and its execution role's trust policy carry aws:SourceAccount or aws:SourceArn naming the assessed account in every value, fails an unconditioned statement even when a guarded sibling sits beside it in the same document, and fails a gateway role that trusts a second principal. IfExists, ForAllValues and wildcard values do not count",
       "extra_iam": [],
       "phase": 4,
       "tier": "ai_subject",
@@ -941,7 +941,7 @@
         "AgentCore Resource-Based Policies Check",
         "AgentCore Runtime Invocation Path"
       ],
-      "gap": "AC-47 passes the network leg only on a resource policy Deny that refuses the invoke action outside a bounded aws:SourceVpc, aws:SourceVpce, aws:VpcSourceIp or aws:SourceIp value, and the caller leg only on an allowedWorkloadConfiguration on the JWT authorizer or a Deny outside a bounded aws:PrincipalArn list, because an Allow does not stop a same-account caller. AC-08 requires an available bedrock-agentcore endpoint when runtimes exist, fails an interface endpoint with private DNS off, and fails a security group set whose inbound ranges together cover the internet. AC-10 reports only that a policy exists",
+      "gap": "AC-47 passes the network leg only on a resource policy Deny that refuses the invoke action to every principal outside a bounded aws:SourceVpc, aws:SourceVpce, aws:VpcSourceIp or aws:SourceIp value. An Allow condition alone, a positive or ForAnyValue operator, a wildcard endpoint, an address list covering every address (0.0.0.0/1 plus 128.0.0.0/1 included) and a Deny that ANDs in another key or names specific principals fail. The caller leg passes only on an allowedWorkloadConfiguration on the JWT authorizer or a Deny outside a bounded aws:PrincipalArn list, because an Allow does not stop a same-account caller. AC-08 requires an available bedrock-agentcore endpoint when runtimes exist, fails an interface endpoint with private DNS off, and fails a security group set whose inbound ranges together cover the internet. AC-10 fails an Allow that opens the runtime to any principal without binding the caller's account or organization",
       "extra_iam": [],
       "phase": 4,
       "tier": "ai_subject",
@@ -991,7 +991,7 @@
         "Agentic AI Gateway WAF Protection",
         "AgentCore Gateway Rate Limiting"
       ],
-      "gap": "AG-27 holds the WAF leg; AC-24 requires an ACTIVE gateway rate limit carrying a requests, tokens or connections ceiling, because dimensions is the only required member of a limit entry and a limit can therefore name a dimension and bound nothing",
+      "gap": "AG-27 holds the WAF leg and reads the gateway's wafConfiguration failureMode beside the web ACL association: FAIL_OPEN fails, an unset value is N/A, and only FAIL_CLOSE passes. AC-24 requires an ACTIVE gateway rate limit carrying a requests, tokens or connections ceiling, because dimensions is the only required member of a limit entry and a limit can therefore name a dimension and bound nothing. A limit keyed on $.context.jwt.jti, iat, exp or nbf does not count, because each takes a new value with every token and a caller who mints a fresh token escapes the limit",
       "extra_iam": [],
       "phase": 4,
       "tier": "ai_subject",
@@ -1043,7 +1043,7 @@
         "AgentCore Memory Encryption",
         "AgentCore Memory Record Access Scope"
       ],
-      "gap": "AC-07 asserts a customer managed key and an {actorId} namespace per memory, AC-23 asserts that no cached role or user reads memory records without a namespace, strategy, actor or session condition",
+      "gap": "AC-07 reads the key each memory names with kms:DescribeKey and passes only a key KMS reports as customer managed and Enabled: a memory with no key, a key that is not customer managed and a key that is disabled or pending deletion fail, and a key the assessment role cannot describe, which includes every key in another account, is N/A. AC-07 also requires an {actorId} variable in every namespace of every strategy. AC-23 judges each memory read by the key that action carries: namespace for record reads, actorId or sessionId for event reads. A strategyId condition alone, an IfExists, ForAllValues or negated operator and a wildcard-only value do not bound a read. A bare Action \"*\", a NotAction and group policies count, a grant the principal's own Deny or boundary removes does not, and a principal the IAM cache could not read is N/A",
       "extra_iam": [],
       "phase": 4,
       "tier": "ai_subject",
@@ -1095,7 +1095,7 @@
         "AgentCore Log Delivery Configuration",
         "AgentCore Policy Tool Scope"
       ],
-      "gap": "AG-25 asserts mode ENFORCE plus status/enforcementMode ACTIVE, AC-19 asserts the gateway delivers APPLICATION_LOGS, which is where a policy decision record lands, and AC-35 asserts no enforcing permit leaves the action position unconstrained; default-deny and forbid-wins are engine behaviour and not a setting to read, so a permit over every tool is the only way to restore allow-all",
+      "gap": "AG-25 asserts mode ENFORCE plus status/enforcementMode ACTIVE and reads the text of each enforcing policy: a permit over every action with no condition fails as Allows All, and an enforcing policy with no readable text is N/A. AC-19 asserts the gateway delivers APPLICATION_LOGS, which is where a policy decision record is written. AC-35 asserts no enforcing permit leaves the action position unconstrained, and reads the principal and resource of every permit over named tools: a bare principal that no condition reads fails as Caller Scope Unbounded, and a resource named by type alone or not at all fails as Gateway Scope Unbounded. A policy with no readable text, or a head without three scope positions, withholds the gateway's Passed. Default-deny and forbid-wins are engine behaviour and not a setting to read",
       "extra_iam": [],
       "phase": 4,
       "tier": "ai_subject",
@@ -1120,7 +1120,7 @@
         "Agentic AI Gateway Tool Policy Enforcement",
         "AgentCore Policy Session Binding"
       ],
-      "gap": "AG-25 counts enforcing policies, AC-38 asserts a temporal policy exists and that the gateway carrying it authenticates callers with CUSTOM_JWT or AWS_IAM, the two authorizer types the devguide names as binding a session to the caller's identity; the session-id propagation path is fail-closed by the service, since a request to an engine holding a temporal policy fails validation without the header",
+      "gap": "AG-25 counts enforcing policies and reads their text. AC-38 asserts a temporal policy exists and that the gateway carrying it authenticates callers with CUSTOM_JWT or AWS_IAM, the two authorizer types the devguide names as binding a session to the caller's identity, and reads each event pattern of the temporal policy: one with no eventResource fails as Session Rule Resource Unscoped, and a temporal policy with no readable event pattern is N/A. The session-id propagation path is fail-closed by the service, since a request to an engine holding a temporal policy fails validation without the header",
       "extra_iam": [],
       "phase": 4,
       "tier": "ai_subject",
@@ -1174,7 +1174,7 @@
         "AgentCore Egress Unrestricted",
         "AgentCore Egress Filtering"
       ],
-      "gap": "AC-01 now reads the outbound rules of every security group attached to a VPC runtime, code interpreter or browser and fails a group permitting 0.0.0.0/0 or ::/0 egress. A tool in PUBLIC network mode fails without a describe call, because the service grants it open internet egress by configuration; SANDBOX passes at Medium, because the sandbox reaches no network the workload can name. A group the describe did not return and a denied ec2:DescribeSecurityGroups are both reported N/A on their own line, so an unread group is never counted as closed",
+      "gap": "AC-01 unions the outbound ranges of every security group attached to a VPC runtime, code interpreter or browser and fails a resource whose groups together permit 0.0.0.0/0 or ::/0 egress, so 0.0.0.0/1 plus 128.0.0.0/1 fails as 0.0.0.0/0 does. A tool in PUBLIC network mode fails without a describe call, because the service grants it open internet egress by configuration, and a tool in SANDBOX fails at Medium, because no customer security group names what it reaches. A group the describe did not return and a denied ec2:DescribeSecurityGroups are both reported N/A on their own line, so an unread group is never counted as closed. A Global leg requires an attached SCP that denies CreateAgentRuntime, UpdateAgentRuntime, CreateCodeInterpreter and CreateBrowser with a Null true test on bedrock-agentcore:subnets or bedrock-agentcore:securityGroups, and a second that pins both keys with ForAnyValue:StringNotEquals to IDs without wildcards",
       "extra_iam": [],
       "phase": 4,
       "tier": "ai_subject",
@@ -1197,7 +1197,7 @@
       "incumbent_names": [
         "AgentCore Evaluation Pass Role Scope"
       ],
-      "gap": "AC-42 reads iam:PassRole on every cached role and user against the execution roles the region's online evaluation configurations name, and judges the widest statement that reaches one of them: a Resource pattern wider than the role itself, or a grant carrying no iam:PassedToService condition, lets the holder run a role it could not assume by writing a configuration that names it",
+      "gap": "AC-42 reads iam:PassRole on every cached role and user, group policies included, against the execution roles the region's online evaluation configurations name, and judges the widest statement that reaches one of them: a Resource pattern wider than the role itself, a NotResource grant, which reaches every role it does not list, or a grant carrying no iam:PassedToService condition lets the holder run a role it could not assume by writing a configuration that names it. On the primary region a writer leg fails a principal able to create or update an online evaluation configuration whose PassRole grant does not name its roles or does not pin iam:PassedToService to bedrock-agentcore.amazonaws.com. A grant the principal's own Deny or boundary removes does not count, and a principal the IAM cache could not read is named in an N/A row that withholds Passed",
       "extra_iam": [],
       "phase": 4,
       "tier": "ai_subject",
@@ -1220,7 +1220,7 @@
       "incumbent_names": [
         "AgentCore Evaluation Role Trust"
       ],
-      "gap": "AC-43 reads each evaluation execution role's own trust policy and reports every Allow statement trusting an AWS service principal, or every principal, with no aws:SourceAccount and no aws:SourceArn condition. The role can read the scored traces and invoke the judge model, so a service acting for another customer's configuration reaches both. AC-27 makes the same assertion on gateway execution roles and reaches no evaluation role, because it reads the roles gateways name",
+      "gap": "AC-43 reads each evaluation execution role's own trust policy and fails every Allow statement trusting an AWS service principal, or every principal, unless an aws:SourceAccount or aws:SourceArn condition names the assessed account in every value: an IfExists or ForAllValues operator and a wildcard value do not count. The role can read the scored traces and invoke the judge model, so a service acting for another customer's configuration reaches both. AC-27 makes the same assertion on gateway execution roles and reaches no evaluation role, because it reads the roles gateways name",
       "extra_iam": [],
       "phase": 4,
       "tier": "ai_subject",
@@ -1243,7 +1243,7 @@
       "incumbent_names": [
         "AgentCore Evaluation Judge Model Scope"
       ],
-      "gap": "AC-44 reports whether each evaluation execution role's model-invocation grant names models at all: a Resource pattern ending in a bare wildcard reaches every model the account can invoke, and the judge prompt carries the agent output being scored, so every model it reaches is one attacker-influenced text can be sent to. Which models a workload's judges may use is the workload owner's decision, so the check names the patterns it found and asserts only that they are bounded",
+      "gap": "AC-44 reports whether each evaluation execution role's model-invocation grant names models at all: a Resource pattern ending in a bare wildcard, a wildcard in the service, account or resource type segment (arn:aws:bedrock:*::*), or a NotResource grant reaches every model the account can invoke, and the judge prompt carries the agent output being scored, so every model it reaches is one attacker-influenced text can be sent to. A region wildcard on a named model passes. A bare Action \"*\" counts, a grant the role's own Deny or boundary removes does not, and a role the IAM cache could not read is N/A. Which models a workload's judges may use is the workload owner's decision, so the check names the patterns it found and asserts only that they are bounded",
       "extra_iam": [],
       "phase": 4,
       "tier": "ai_subject",
@@ -1271,7 +1271,7 @@
         "AgentCore Span Log Deletion Protection",
         "AgentCore Evaluation Result Protection"
       ],
-      "gap": "AC-41 anchors on the log group each configuration's outputConfig names and asserts a retention period, a customer managed key, and membership of the AgentCore log group prefixes, so a results group whose creator chose a name outside them is reported rather than skipped. AC-20 and AC-26 judge masking and key policy on the groups under those prefixes and neither reaches a group outside them. Tag values and the configuration's own description are free-form text AC-41 discloses instead of judging",
+      "gap": "AC-41 anchors on the log group each configuration's outputConfig names and asserts a retention period, a customer managed key, and membership of the AgentCore log group prefixes, so a results group whose creator chose a name outside them is reported and not skipped. AC-41 reads that group's key policy itself: an Allow to a wildcard principal or a NotPrincipal fails unless a condition binds the caller's account, organization, principal ARN or source with a bounded value under a positive operator, kms:ViaService alone does not count, and a grant to the CloudWatch Logs service principal fails unless it binds the account or the kms:EncryptionContext:aws:logs:arn value. An unreadable key policy is N/A. A configuration writing to SOURCE_LOG_GROUP names no results group and is N/A, with AC-20 and AC-26 named as the checks that judge the input groups. Retention length is reported and not judged, because no API field states the workload's schedule. Tag values and the configuration's own description are free-form text AC-41 discloses without judging",
       "extra_iam": [],
       "phase": 4,
       "tier": "ai_subject",
@@ -1294,7 +1294,7 @@
       "incumbent_names": [
         "AgentCore Gateway Authorizer Guardrail"
       ],
-      "gap": "AC-28 requires a service control policy that denies both CreateGateway and UpdateGateway when bedrock-agentcore:GatewayAuthorizerType is NONE, either by naming NONE in an equals-family condition or by omitting it from a not-equals-family one, so no approved-authorizer list has to be invented; attachment targets are outside the grant and the finding says so. The condition key carries a documentation drift: the AgentCore devguide wires GatewayAuthorizerType to CreateGateway and UpdateGateway and shows sibling gateway keys used this way in SCPs, while the machine-readable service reference and the service authorization reference page wire it to zero actions. The devguide wins for feature availability. Access Analyzer validate-policy accepts the key name but is no oracle for the wiring: it also accepts RuntimeAuthorizerType on CreateGateway, a pairing neither surface declares",
+      "gap": "AC-28 requires a service control policy that denies both CreateGateway and UpdateGateway when bedrock-agentcore:GatewayAuthorizerType is NONE, either by naming NONE in an equals-family condition or by omitting it from a not-equals-family one, so no approved-authorizer list has to be invented. IfExists operators read as their plain form. The policy counts only when it is attached to the assessed account, to an organizational unit above it or to the root, read with organizations:ListParents and organizations:ListTargetsForPolicy: a guard attached elsewhere fails as Unattached, the management account fails as Not Enforced because no SCP restricts it, and an unreadable parent chain or attachment list is N/A. The condition key carries a documentation drift: the AgentCore devguide wires GatewayAuthorizerType to CreateGateway and UpdateGateway and shows sibling gateway keys used this way in SCPs, while the machine-readable service reference and the service authorization reference page wire it to zero actions. The devguide wins for feature availability. Access Analyzer validate-policy accepts the key name but is no oracle for the wiring: it also accepts RuntimeAuthorizerType on CreateGateway, a pairing neither surface declares",
       "extra_iam": [],
       "phase": 4,
       "tier": "ai_subject",
@@ -1317,7 +1317,7 @@
       "incumbent_names": [
         "AgentCore Gateway Target Authorization"
       ],
-      "gap": "AC-25 reads credentialProviderConfigurations per target through GetGatewayTarget, which is the only surface that carries it: the ListGatewayTargets summary omits the field. The control's second leg, a Lambda target scoped to one function ARN, is not expressible because the target ARN members reject a wildcard",
+      "gap": "AC-25 reads credentialProviderConfigurations per target through GetGatewayTarget, which is the only surface that carries it: the ListGatewayTargets summary omits the field. A Gateway Role Scope row per gateway reads the attached and inline policies of the gateway's roleArn from the IAM permission cache with the AC-45 rules, so a wildcard action, a Resource * or an unbounded ARN segment that no Deny or permissions boundary removes fails as Unscoped, and a role the cache records as unreadable, a role missing from the cache and a missing cache are N/A. SCPs are not evaluated per principal. The control's second leg, a Lambda target scoped to one function ARN, is not expressible because the target ARN members reject a wildcard",
       "extra_iam": [],
       "phase": 4,
       "tier": "ai_subject",
@@ -1345,7 +1345,7 @@
         "AgentCore Log Retention and Key Scope",
         "AgentCore Span Log Deletion Protection"
       ],
-      "gap": "AC-19 pairs each AgentCore delivery source with its delivery and AC-20 asserts masking plus a customer managed key; AC-26 adds the two legs neither held, an explicitly configured retentionInDays and a key policy that does not let every principal decrypt without a condition",
+      "gap": "AC-19 pairs each AgentCore delivery source with its delivery and AC-20 asserts masking plus a customer managed key. AC-26 adds an explicitly configured retentionInDays and reads each key policy by value: an Allow whose principal is a wildcard or a NotPrincipal fails unless a condition binds the caller's account, organization, principal ARN or source with a bounded value under a positive operator, and kms:ViaService alone, IfExists, ForAllValues and a wildcard account do not count. A grant to the CloudWatch Logs service principal fails unless it binds the account or the kms:EncryptionContext:aws:logs:arn value, because it serves log groups in any account. A Global leg requires an attached SCP denying logs:DeleteLogGroup, logs:PutRetentionPolicy, logs:PutLogGroupDeletionProtection and logs:DeleteSubscriptionFilter on the AgentCore log groups and aws/spans, and a regional leg fails a trail that records the Region with log file validation off",
       "extra_iam": [],
       "phase": 4,
       "tier": "ai_subject",
@@ -1368,7 +1368,7 @@
       "incumbent_names": [
         "AgentCore Runtime Authorizer Guardrail"
       ],
-      "gap": "AC-29 requires a service control policy that denies both CreateAgentRuntime and UpdateAgentRuntime when bedrock-agentcore:RuntimeAuthorizerType is AWS_IAM, so a runtime cannot be created on, or moved back to, the SigV4 mode that authenticates the hosting application's shared role instead of the end user; a policy written the other way round, denying CUSTOM_JWT, is reported separately because it reads as configured to anyone counting policies. organizations:ListPolicies and organizations:DescribePolicy are granted to this function for GW-02's AC-28, so ID-04 costs no further permission. Attachment targets are outside the grant and every finding says so",
+      "gap": "AC-29 requires a service control policy that denies both CreateAgentRuntime and UpdateAgentRuntime when bedrock-agentcore:RuntimeAuthorizerType is AWS_IAM, so a runtime cannot be created on, or moved back to, the SigV4 mode that authenticates the hosting application's shared role instead of the end user. IfExists operators read as their plain form. The policy counts only when it is attached to the assessed account, to an organizational unit above it or to the root, read with organizations:ListParents and organizations:ListTargetsForPolicy: a guard attached elsewhere fails as Unattached, the management account fails as Not Enforced because no SCP restricts it, and an unreadable parent chain or attachment list is N/A. A policy written the other way round, denying CUSTOM_JWT, is reported separately when it is attached, because it reads as configured to anyone counting policies. The Organizations grants are shared with GW-02's AC-28, so ID-04 costs no further permission",
       "extra_iam": [],
       "phase": 4,
       "tier": "ai_subject",
@@ -1391,7 +1391,7 @@
       "incumbent_names": [
         "AgentCore Runtime Inbound Authorization"
       ],
-      "gap": "AC-30 reads GetAgentRuntime.authorizerConfiguration per runtime: an absent configuration means every invoke is SigV4-signed, and a customJWTAuthorizer that pins neither allowedAudience nor allowedClients accepts every token its issuer minted for every application registered there, so the claims are validated but not against this agent. allowedScopes and customClaims are credited in the detail and cannot substitute, because a scope bounds what a token may ask for and not who it was minted for",
+      "gap": "AC-30 reads GetAgentRuntime.authorizerConfiguration per runtime: an absent configuration means every invoke is SigV4-signed, and a customJWTAuthorizer that pins neither allowedAudience nor allowedClients accepts every token its issuer minted for every application registered there, so the claims are validated but not against this agent. A list holding a blank or * value names no single application and does not count, and a discoveryUrl that is not https fails as Issuer Not HTTPS whatever the lists hold. allowedScopes and customClaims are credited in the detail and cannot substitute, because a scope bounds what a token may ask for and not who it was minted for. AC-30 reads the runtime version GetAgentRuntime returns by default, and its Passed text says so",
       "extra_iam": [],
       "phase": 4,
       "tier": "ai_subject",
@@ -1416,7 +1416,7 @@
         "AgentCore Gateway Inbound Allow Lists",
         "AgentCore Inbound JWT Issuer Conditions"
       ],
-      "gap": "AG-24 passed every CUSTOM_JWT gateway on the authorizer type alone. AC-31 reads the authorizer's allow-lists and fails a gateway that pins neither allowedAudience nor allowedClients, because it then honours any token its issuer minted for any application registered there; allowedScopes and customClaims bound what a token may ask for and not who minted it for whom, so they are credited but do not substitute. AC-32 covers the second door, where the token-exchange APIs take an end user's JWT without passing a gateway authorizer at all, and fails a cached principal holding GetWorkloadAccessTokenForJWT or CompleteResourceTokenAuth with no InboundJwtClaim condition",
+      "gap": "AC-31 reads each gateway JWT authorizer's allow-lists and fails a gateway that pins neither allowedAudience nor allowedClients, because it then honours any token its issuer minted for any application registered there; a list holding a blank or * value does not count, and a discoveryUrl that is not https fails. allowedScopes and customClaims bound what a token may ask for and not who minted it for whom, so they are credited but do not substitute. AC-32 covers the second door, where the token-exchange APIs take an end user's JWT without passing a gateway authorizer at all, and fails a cached principal holding GetWorkloadAccessTokenForJWT or CompleteResourceTokenAuth unless every InboundJwtClaim/iss value is a literal or a pattern narrower than *. A bare Action \"*\" and group policies count, a grant the principal's own Deny or boundary removes does not, and a principal the IAM cache could not read is N/A",
       "extra_iam": [],
       "phase": 4,
       "tier": "ai_subject",
@@ -1456,7 +1456,7 @@
       "incumbent_names": [
         "AgentCore CloudTrail Data Event Coverage"
       ],
-      "gap": "AC-18 asserts that a CloudTrail advanced event selector logs data events for AWS::BedrockAgentCore::Memory whenever the region holds a memory resource",
+      "gap": "AC-18 requires a CloudTrail advanced event selector that logs data events for AWS::BedrockAgentCore::Memory whenever the region holds a memory resource. A selector narrowed by readOnly, eventName, resources.ARN or any other field does not count, nor does a trail that is not logging or that neither spans all Regions nor is homed in the scanned one. An unreadable trail status is N/A",
       "extra_iam": [],
       "phase": 4,
       "tier": "ai_subject",
@@ -1479,7 +1479,7 @@
       "incumbent_names": [
         "AgentCore CloudTrail Data Event Coverage"
       ],
-      "gap": "AC-18 asserts data-event coverage per resource family, so a trail that logs only the runtime types still fails for memory and for the built-in tools",
+      "gap": "AC-18 requires every data-event type in use, per resource family: runtimes need RuntimeEndpoint as well as Runtime, the AWS-managed code interpreter and browser need the unsuffixed types, and memory, gateways, identity (workload identities and credential providers) and policy engines are families of their own, so a trail that logs only the runtime types fails for the rest. A selector narrowed by readOnly, eventName, resources.ARN or any other field does not count, nor does a trail that is not logging or that neither spans all Regions nor is homed in the scanned one. An unreadable trail status is N/A",
       "extra_iam": [],
       "phase": 4,
       "tier": "ai_subject",
@@ -1502,7 +1502,7 @@
       "incumbent_names": [
         "AgentCore Log Delivery Configuration"
       ],
-      "gap": "AC-04 is X-Ray tracingConfig.enabled over list_agent_runtimes only, so it cannot cover Gateway, Memory, Policy or Identity, which is OBS-03's whole subject. AC-19 asserts an APPLICATION_LOGS delivery source wired to a destination per gateway and per memory; runtime logging is service-managed, WorkloadIdentity delivery is configured on the associated runtime or gateway resource, and policy engines have no log-destination surface, so those three legs need no separate assertion",
+      "gap": "AC-19 requires a TRACES delivery wired to a destination for every runtime, gateway and memory, and an APPLICATION_LOGS delivery for every gateway and memory. A delivery source reporting INACTIVE does not count, and an unlistable runtime inventory is N/A. Runtime application logging is service-managed, WorkloadIdentity delivery is configured on the associated runtime or gateway resource, and policy engines have no log-destination surface, so those three legs need no separate assertion",
       "extra_iam": [],
       "phase": 4,
       "tier": "ai_subject",
@@ -1527,7 +1527,7 @@
         "AgentCore Log Data Protection",
         "AgentCore Log Unmask Restriction"
       ],
-      "gap": "AC-20 asserts a Deidentify data-protection policy and a customer managed key on the AgentCore log groups, AC-21 asserts that no cached role or user holds logs:Unmask on every resource",
+      "gap": "AC-20 asserts a Deidentify data-protection policy and a customer managed key on the AgentCore log groups, and its Passed text says that AC-26 judges the key policy and that delivery destination log groups outside the AgentCore prefixes are not read. AC-21 fails a cached role or user that holds logs:Unmask on an unbounded log group resource. A bare Action \"*\", any pattern or NotAction that reaches the action and group policies count, a resource is unbounded when the group name is wildcard-only or a wider ARN segment is a wildcard, a grant the principal's own Deny or boundary removes does not count, and a policy that cannot be parsed or a principal the IAM cache could not read is N/A",
       "extra_iam": [],
       "phase": 4,
       "tier": "ai_subject",
@@ -1550,7 +1550,7 @@
       "incumbent_names": [
         "AgentCore Telemetry Sink Scope"
       ],
-      "gap": "AC-22 asserts that every Allow statement on an OAM sink policy either names its principals or carries an organization condition key",
+      "gap": "AC-22 reads each Allow statement on an OAM sink policy by value. A statement naming principals passes only when no principal is a wildcard and no NotPrincipal is present; otherwise it needs aws:PrincipalOrgID or aws:PrincipalOrgPaths under StringEquals, StringEqualsIgnoreCase or StringLike with a value whose organization segment has no wildcard. A negated, IfExists or ForAllValues operator and a wildcard organization do not count",
       "extra_iam": [],
       "phase": 4,
       "tier": "ai_subject",
@@ -1573,7 +1573,7 @@
       "incumbent_names": [
         "AgentCore Policy Guardrail Wiring"
       ],
-      "gap": "AC-37 asserts the workload-independent half: a policy carrying a guardrails condition needs bedrock:InvokeGuardrailChecks on the gateway execution role, because the Policy data plane calls Bedrock Guardrails with that role's forward access session. Whether this workload's content belongs at the authorization boundary at all, and which safeguard categories and thresholds apply, is the workload owner's decision, which AC-37 reports and does not judge",
+      "gap": "AC-37 asserts the workload-independent half: a policy carrying a guardrails condition needs bedrock:InvokeGuardrailChecks on the gateway execution role, because the Policy data plane calls Bedrock Guardrails with that role's forward access session, and the grant counts after the role's own Deny and boundary. AC-37 reads each BedrockGuardrails call by value and fails a guardrail policy that no returned score (0, 0.2, 0.4, 0.6, 0.8, 1.0) can make act, or whose call names no category or data path. A suppressOutput policy in a plain when block counts, a threshold it cannot read is named in an N/A row, and a readable grant beside an unparseable policy does not pass. Whether this workload's content belongs at the authorization boundary at all, and which categories and reachable thresholds apply, is the workload owner's decision, which AC-37 reports and does not judge",
       "extra_iam": [],
       "phase": 4,
       "tier": "ai_subject",
@@ -1782,7 +1782,7 @@
         "AgentCore IAM Full Access Check",
         "AgentCore Execution Role Trust"
       ],
-      "gap": "AC-45 scopes what a tool execution role may do and AC-02 flags wildcard or allow-except AgentCore grants on all resources across every cached role. AC-43 asserts the confused-deputy guard on evaluation roles. AC-48 reads the trust policy of every runtime, gateway, browser and code interpreter execution role: it fails a service principal or * with no aws:SourceAccount or aws:SourceArn condition and an account-root or bare account-id principal with no condition, and it fails a role that more than one AgentCore resource names, since the shared role carries the union of what each needs. AC-27 also reads the gateway roles",
+      "gap": "AC-45 scopes what a tool execution role may do and AC-02 flags wildcard or allow-except AgentCore grants on all resources across every cached role and user. AC-43 asserts the confused-deputy guard on evaluation roles. AC-48 reads the trust policy of every runtime, gateway, browser, code interpreter, memory, payment manager and harness execution role: it fails a service principal or * unless an aws:SourceAccount or aws:SourceArn condition names the assessed account in every value, fails an account-root or bare account-id principal unless its condition names the calling principal, and fails a role that more than one AgentCore resource names, since the shared role carries the union of what each needs. The sharing Passed is withheld while any family could not be listed, so it reads N/A until bedrock-agentcore:ListPaymentManagers and bedrock-agentcore:ListHarnesses are granted. AC-27 also reads the gateway roles",
       "extra_iam": [],
       "phase": 5,
       "tier": "ai_subject",
@@ -1907,7 +1907,7 @@
         "AgentCore Code Interpreter Network Isolation",
         "AgentCore DNS Egress Control"
       ],
-      "gap": "AC-01 fails a runtime or built-in tool whose security groups allow egress to 0.0.0.0/0 or ::/0, and AC-15 requires each custom code interpreter to run in VPC mode with subnets and security groups. AC-49 asserts egress by destination name on each VPC that hosts an AgentCore runtime, browser or code interpreter: it walks the associated DNS Firewall rule groups in ascending association Priority and the enforcing rules in each in ascending Priority, as DNS Firewall evaluates them, and judges the first rule whose customer domain list holds \"*\", because the first match ends evaluation. It passes only when that rule is a BLOCK with no query type, which is the walled garden pattern Route 53 documents; an ALLOW or ALERT over \"*\" fails, and rules after the deciding rule are not reached. ListFirewallDomains returns that entry fully qualified as \"*.\", and AC-49 reads either spelling. Rule groups whose rules only BLOCK over an AWS managed list, over DNS threat protection, over a list without \"*\", or over \"*\" for one query type fail, because every name or query type those rules do not match is answered. A deciding BLOCK passes only when the VPC's DNS Firewall config has FirewallFailOpen DISABLED: ENABLED fails, because VPC Resolver answers every query while DNS Firewall is impaired, and any other value is Not Applicable with the value named. An IAM Deny on the bedrock-agentcore:subnets or :securityGroups keys does not substitute for this: the devguide lists those keys while the machine-readable IAM reference lists none for CreateGatewayTarget or UpdateGatewayTarget, so such a Deny can fail open",
+      "gap": "AC-01 fails a runtime or built-in tool whose security groups together allow egress to 0.0.0.0/0 or ::/0, unioning the ranges so 0.0.0.0/1 plus 128.0.0.0/1 fails, fails a tool in PUBLIC or SANDBOX network mode, and requires attached SCPs that deny creating a runtime or tool outside a VPC or outside a pinned subnet and security group list. AC-15 requires each custom code interpreter to run in VPC mode with subnets and security groups. AC-49 asserts egress by destination name on each VPC that hosts an AgentCore runtime, browser or code interpreter: it walks the associated DNS Firewall rule groups in ascending association Priority and the enforcing rules in each in ascending Priority, as DNS Firewall evaluates them, and judges the first rule whose customer domain list holds \"*\", because the first match ends evaluation. It passes only when that rule is a BLOCK with no query type, which is the walled garden pattern Route 53 documents; an ALLOW or ALERT over \"*\" fails, and rules after the deciding rule are not reached. ListFirewallDomains returns that entry fully qualified as \"*.\", and AC-49 reads either spelling. Rule groups whose rules only BLOCK over an AWS managed list, over DNS threat protection, over a list without \"*\", or over \"*\" for one query type fail, because every name or query type those rules do not match is answered. A deciding BLOCK passes only when the VPC's DNS Firewall config has FirewallFailOpen DISABLED: ENABLED fails, because VPC Resolver answers every query while DNS Firewall is impaired, and any other value is Not Applicable with the value named. An IAM Deny on the bedrock-agentcore:subnets or :securityGroups keys does not substitute for this: the devguide lists those keys while the machine-readable IAM reference lists none for CreateGatewayTarget or UpdateGatewayTarget, so such a Deny can fail open",
       "extra_iam": [],
       "phase": 5,
       "tier": "ai_subject",
@@ -2008,7 +2008,7 @@
         "AgentCore Egress Unrestricted",
         "AgentCore Egress Filtering"
       ],
-      "gap": "AC-01 fails an AgentCore runtime or built-in tool whose security groups allow egress to 0.0.0.0/0 or ::/0, and a subnet whose route table sends traffic to an internet gateway. The runtime is where AgentCore runs the customer's own agent container, so this is the self-hosted egress surface the control names",
+      "gap": "The population is the account's AgentCore runtimes, code interpreters and browsers, where AgentCore runs the customer's own agent container and tools. Agents hosted on ECS, EKS, Lambda or EC2 are outside it, because no API field marks a task, function or instance as agent code. AC-01 unions the outbound ranges of every security group on each resource and fails one whose groups together allow 0.0.0.0/0 or ::/0, fails a tool in PUBLIC or SANDBOX network mode, fails a runtime subnet whose route table sends traffic to an internet gateway, and adds a Global leg requiring attached SCPs that deny creating a runtime or tool with no subnet or security group, or with one outside a pinned list. The internet gateway route leg reads runtime subnets only",
       "extra_iam": [],
       "phase": 6,
       "tier": "foundation",
@@ -2085,7 +2085,7 @@
         "Bedrock Invocation Log Encryption",
         "Bedrock Invocation Log Group Deletion Protection"
       ],
-      "gap": "AC-26 reads deletionProtectionEnabled on each AgentCore runtime log group and on aws/spans, and BR-12 on the CloudWatch log group the Bedrock invocation logging configuration names, each from DescribeLogGroups by logGroupNamePrefix. Both fail a group where the value is false or absent, since CloudWatch Logs leaves deletion protection off by default and an administrator can otherwise delete the audit trail with the group",
+      "gap": "AC-26 reads deletionProtectionEnabled on each AgentCore runtime log group and on aws/spans, and BR-12 on the CloudWatch log group the Bedrock invocation logging configuration names, each from DescribeLogGroups by logGroupNamePrefix. Both fail a group where the value is false or absent, since CloudWatch Logs leaves deletion protection off by default and an administrator can otherwise delete the audit trail with the group. AC-26 also requires an attached SCP that denies logs:DeleteLogGroup, logs:PutRetentionPolicy, logs:PutLogGroupDeletionProtection and logs:DeleteSubscriptionFilter on those groups in every Region, exempting at most principals named by aws:PrincipalArn, and fails a trail that records the Region with log file validation off. An unreadable trail is N/A",
       "extra_iam": [],
       "phase": 6,
       "tier": "foundation",

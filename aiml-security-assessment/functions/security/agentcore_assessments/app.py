@@ -6083,12 +6083,110 @@ def _memory_namespace_scope_finding(
     )
 
 
+def _memory_key_finding(
+    memory_label: str,
+    encryption_key_arn: str,
+    key_metadata_cache: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Judge the key one memory names by what kms:DescribeKey reports for it.
+
+    A named key passes only when KMS reports it customer managed and Enabled. A
+    key the account does not manage carries a key policy the account cannot
+    write, and a disabled key or one pending deletion cannot be used to encrypt
+    or decrypt the memory's records.
+    """
+    if encryption_key_arn not in key_metadata_cache:
+        if kms_client is None:
+            key_metadata_cache[encryption_key_arn] = "the KMS client is not available"
+        else:
+            try:
+                key_metadata_cache[encryption_key_arn] = (
+                    kms_client.describe_key(KeyId=encryption_key_arn).get("KeyMetadata")
+                    or {}
+                )
+            except Exception as error:
+                logger.warning(f"Could not describe key {encryption_key_arn}: {error}")
+                key_metadata_cache[encryption_key_arn] = _assessment_error_label(error)
+    metadata = key_metadata_cache[encryption_key_arn]
+
+    if isinstance(metadata, str):
+        return create_finding(
+            check_id="AC-07",
+            finding_name="AgentCore Memory Encryption",
+            finding_details=(
+                f"Memory {memory_label} names the key {encryption_key_arn}, whose "
+                f"manager and state kms:DescribeKey could not read: {metadata}. "
+                "The key is not reported as customer managed."
+            ),
+            resolution=(
+                "Grant kms:DescribeKey on this key and retry. The assessment role "
+                "is granted kms:DescribeKey only on keys in this account, so a key "
+                "in another account is not read."
+            ),
+            reference=AGENTCORE_MEMORY_REFERENCE_URL,
+            severity=SeverityEnum.INFORMATIONAL,
+            status=StatusEnum.NA,
+        )
+
+    key_manager = metadata.get("KeyManager")
+    key_state = metadata.get("KeyState")
+    if key_manager != "CUSTOMER":
+        return create_finding(
+            check_id="AC-07",
+            finding_name="AgentCore Memory Encryption",
+            finding_details=(
+                f"Memory {memory_label} encrypts stored records with the key "
+                f"{encryption_key_arn}, which KMS reports as managed by "
+                f"{key_manager or 'an unknown party'}, so this account does not "
+                "write its key policy."
+            ),
+            resolution=(
+                "Recreate the memory with a symmetric customer managed key whose "
+                "key policy this account controls."
+            ),
+            reference=AGENTCORE_MEMORY_REFERENCE_URL,
+            severity=SeverityEnum.MEDIUM,
+            status=StatusEnum.FAILED,
+        )
+    if key_state != "Enabled":
+        return create_finding(
+            check_id="AC-07",
+            finding_name="AgentCore Memory Encryption",
+            finding_details=(
+                f"Memory {memory_label} encrypts stored records with the customer "
+                f"managed key {encryption_key_arn}, which KMS reports as "
+                f"{key_state or 'in an unknown state'}, so the key cannot be used to "
+                "encrypt or decrypt the memory's records."
+            ),
+            resolution=(
+                "Re-enable the key or cancel its scheduled deletion, then confirm "
+                "with kms:DescribeKey that its state is Enabled."
+            ),
+            reference=AGENTCORE_MEMORY_REFERENCE_URL,
+            severity=SeverityEnum.MEDIUM,
+            status=StatusEnum.FAILED,
+        )
+    return create_finding(
+        check_id="AC-07",
+        finding_name="AgentCore Memory Encryption",
+        finding_details=(
+            f"Memory {memory_label} encrypts stored records with the customer "
+            f"managed key {encryption_key_arn}, which kms:DescribeKey reports as "
+            "customer managed and Enabled."
+        ),
+        resolution="No action required.",
+        reference=AGENTCORE_MEMORY_REFERENCE_URL,
+        severity=SeverityEnum.MEDIUM,
+        status=StatusEnum.PASSED,
+    )
+
+
 def check_agentcore_memory_configuration() -> List[Dict[str, Any]]:
     """
     Check Memory resource configuration.
 
     Validates:
-    - Encryption uses a customer managed key
+    - Encryption uses a key KMS reports as customer managed and Enabled
     - Long-term records are partitioned into a per-actor namespace
 
     Returns:
@@ -6132,6 +6230,7 @@ def check_agentcore_memory_configuration() -> List[Dict[str, Any]]:
 
         logger.info(f"Found {len(memories)} Memory resources")
 
+        key_metadata_cache: Dict[str, Any] = {}
         for memory in memories:
             memory_id = memory.get("id", "unknown")
             memory_name = (
@@ -6203,18 +6302,8 @@ def check_agentcore_memory_configuration() -> List[Dict[str, Any]]:
 
             if encryption_key_arn:
                 findings.append(
-                    create_finding(
-                        check_id="AC-07",
-                        finding_name="AgentCore Memory Encryption",
-                        finding_details=(
-                            f"Memory {memory_label} encrypts stored records with "
-                            "the customer managed key "
-                            f"{encryption_key_arn}."
-                        ),
-                        resolution="No action required.",
-                        reference=AGENTCORE_MEMORY_REFERENCE_URL,
-                        severity=SeverityEnum.MEDIUM,
-                        status=StatusEnum.PASSED,
+                    _memory_key_finding(
+                        memory_label, encryption_key_arn, key_metadata_cache
                     )
                 )
             else:

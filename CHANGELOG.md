@@ -476,6 +476,12 @@ section.
     the write, fails. Bucket Block Public Access left off, a leg that could
     not be read, a role the permission cache did not read and a conditioned
     grant are `N/A`.
+  - `AC-07` reads the key each memory names with `kms:DescribeKey` and passes
+    it only when KMS reports it customer managed and `Enabled`, where any
+    named key passed. A key that is not customer managed, is disabled or is
+    pending deletion fails, and a key that could not be described, one in
+    another account included, is `N/A`, so a memory that passed before can
+    now be `Failed` or `N/A`.
 
 ### Deployment impact
 
@@ -613,6 +619,11 @@ without it every recording browser reads `N/A`. The account-level Block Public
 Access read, `s3:GetAccountPublicAccessBlock`, is not granted pending approval,
 so a bucket that leaves its own setting off reads `N/A`. Expect `AC-06` to
 fail recording browsers that passed before.
+
+`AC-07` adds no grant. It reads memory keys with `kms:DescribeKey`, which the
+AgentCore role already holds on this account's keys in the
+`PolicyEngineKeyStateRead` Sid. A memory whose key lives in another account
+reads `N/A`.
 
 ## 2.0.0 - 2026-09-18
 
