@@ -275,7 +275,9 @@ section.
   several (`Specifications`), where `DescribeInferenceComponent` returns no
   `Specification`. It judges only `InService` components hosted on the
   endpoint, and a component that returns no model name, image or artifact URL
-  holds back `Passed` and is named.
+  holds back `Passed` and is named. The resolution says a component whose
+  container names an S3 `ArtifactUrl` has no ETag field, so the component
+  should reference a model whose `ModelDataSource` records the ETag.
 - `SM-34` and `SM-42` no longer say a principal "can call it with no
   condition on that key" when its Allow or Deny names the key without
   enforcing it, for example a Null-only Deny or a bare negated operator on a

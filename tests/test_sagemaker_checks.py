@@ -15800,6 +15800,23 @@ class TestSM43ModelArtifactIntegrity:
         assert _sm43_statuses(rows) == ["Failed"]
         assert "model 'm-bad' container 1" in rows[0]["Finding_Details"]
 
+    def test_a_component_artifact_url_failure_says_to_deploy_from_a_model(self):
+        rows = _sm43_rows(
+            endpoints={"ep-1": {"models": [], "components": ["ic-variant"]}},
+            models={},
+            components={
+                ("ep-1", "ic-variant"): ["ic-1"],
+                "ic-1": self._ic_container(url="s3://artifacts/ic/model.tar.gz"),
+            },
+        )
+        assert _sm43_statuses(rows) == ["Failed"]
+        assert (
+            "An inference component whose container names an S3 ArtifactUrl has no "
+            "ETag field to record one, so create the component from a model "
+            "(ModelName) whose container loads its data through ModelDataSource "
+            "with the ETag recorded."
+        ) in rows[0]["Resolution"]
+
     def test_unread_inference_components_are_na(self):
         rows = _sm43_rows(
             endpoints={"ep-1": {"models": [], "components": ["ic-variant"]}},
