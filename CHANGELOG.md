@@ -208,6 +208,18 @@ section.
 
 ### Fixed
 
+- `AC-37` credits the gateway role's `bedrock:InvokeGuardrailChecks` grant only
+  on `Resource: "*"` with no condition, since the action has no resource
+  type, and fails a guardrail comparison that drops the score equal to the
+  safeguard's documented default, such as `greaterThan(decimal("0.2"))` on a
+  content filter. It previously matched the grant by action alone.
+- `AC-36` requires the policy engine's encryption context on the key policy's
+  `kms:CreateGrant`, `kms:Decrypt` and `kms:GenerateDataKey` statements, fails
+  a statement scoped to AgentCore that grants any action beyond the four the
+  service needs, and reads the alarm on the key's `DisableKey` and
+  `ScheduleKeyDeletion` calls through EventBridge rules or a metric filter and
+  alarm. A key policy with none of these passed; without `events:ListRules` or
+  `logs:DescribeMetricFilters` the alarm leg is now `N/A` and names them.
 - `AC-35` no longer reads a bare `principal` as bounded because the word
   `principal` appears somewhere in the conditions. Only a `when` block that
   reads the principal outside string literals now counts: an `unless` block,

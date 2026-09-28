@@ -16062,20 +16062,30 @@ def _engine_arn(engine_id, region="us-east-1", account="123456789012"):
     return f"arn:aws:bedrock-agentcore:{region}:{account}:policy-engine/{engine_id}"
 
 
+_ENGINE_CONTEXT_KEY = (
+    "kms:EncryptionContext:aws:bedrock-agentcore-policy:policy-engine-arn"
+)
+
+
 def _engine_service_use(
     region="us-east-1",
     account="123456789012",
     via_operator="StringEquals",
     via_service=None,
     source_account=None,
+    engine_context="arn:aws*:bedrock-agentcore:*:*:policy-engine/*",
 ):
     """The policy encryption guide's key policy statements for the service."""
     via = via_service or f"bedrock-agentcore.{region}.amazonaws.com"
     grant_condition = {
-        "StringEquals": {"kms:GrantConstraintType": "EncryptionContextSubset"}
+        "StringEquals": {"kms:GrantConstraintType": "EncryptionContextSubset"},
+        "StringLike": {_ENGINE_CONTEXT_KEY: engine_context},
     }
     grant_condition.setdefault(via_operator, {})["kms:ViaService"] = via
-    use_condition = {"StringEquals": {"aws:SourceAccount": source_account or account}}
+    use_condition = {
+        "StringEquals": {"aws:SourceAccount": source_account or account},
+        "StringLike": {_ENGINE_CONTEXT_KEY: engine_context},
+    }
     use_condition.setdefault(via_operator, {})["kms:ViaService"] = via
     principal = {"AWS": f"arn:aws:iam::{account}:role/PolicyAdministrator"}
     return [
@@ -16094,6 +16104,46 @@ def _engine_service_use(
             "Condition": use_condition,
         },
     ]
+
+
+_KEY_LOSS_RULE_PATTERN = {
+    "source": ["aws.kms"],
+    "detail-type": ["AWS API Call via CloudTrail"],
+    "detail": {
+        "eventSource": ["kms.amazonaws.com"],
+        "eventName": ["DisableKey", "ScheduleKeyDeletion"],
+    },
+}
+
+
+def _key_loss_events(*rules):
+    """An EventBridge client listing the given rules on the default bus."""
+    client = MagicMock()
+    client.list_rules.return_value = {"Rules": list(rules)}
+    return client
+
+
+def _key_loss_rule(name="kms-key-loss", pattern=None, state="ENABLED"):
+    return {
+        "Name": name,
+        "State": state,
+        "EventPattern": json.dumps(
+            _KEY_LOSS_RULE_PATTERN if pattern is None else pattern
+        ),
+    }
+
+
+@pytest.fixture
+def key_loss_alarm():
+    """AC-36 reads an alarm on the key; give the key-policy tests one."""
+    # create=True lets the same tests run against a module without the client.
+    with patch.object(
+        agentcore_app,
+        "events_client",
+        _key_loss_events(_key_loss_rule()),
+        create=True,
+    ):
+        yield
 
 
 def _engine_grants(*engine_ids, drop=()):
@@ -16124,6 +16174,7 @@ def _engine_grants(*engine_ids, drop=()):
     return {"Grants": grants}
 
 
+@pytest.mark.usefixtures("key_loss_alarm")
 class TestAC36PolicyEngineKeyScope:
     """AC-36: who may decrypt a policy engine's key, and who may take it away."""
 
@@ -16515,6 +16566,7 @@ def _key_grant(action="kms:Decrypt", principal="*", condition=None, **extra):
     return statement
 
 
+@pytest.mark.usefixtures("key_loss_alarm")
 class TestKmsKeyPolicyValueScope:
     """AC-26 and AC-36 read who a key grant reaches by value, not by presence."""
 
@@ -16844,6 +16896,7 @@ class TestKmsKeyPolicyValueScope:
         assert "every principal decrypt" in details
 
 
+@pytest.mark.usefixtures("key_loss_alarm")
 class TestAC36PolicyEngineServiceScope:
     """AC-36 reads the service-use statements and the engine's two grants."""
 
@@ -17136,6 +17189,468 @@ class TestAC36PolicyEngineServiceScope:
         assert [finding["Status"] for finding in findings] == ["Passed"]
 
 
+class TestAC36KeyLossAlarmAndServiceBounds:
+    """AC-36 reads the alarm on the key, the engine's encryption context on the
+    service statements, and the actions those statements grant."""
+
+    _KEY = "arn:aws:kms:us-east-1:123456789012:key/pe-key"
+    _ADMIN = {
+        "Effect": "Allow",
+        "Principal": {"AWS": "arn:aws:iam::123456789012:role/KeyAdministrator"},
+        "Action": "kms:*",
+        "Resource": "*",
+    }
+
+    def _run(
+        self,
+        mock_ac,
+        mock_kms,
+        statements=None,
+        events=None,
+        logs=None,
+        cloudwatch=None,
+        engines=("pe-1",),
+        policies=None,
+    ):
+        mock_ac.list_policy_engines.return_value = {
+            "policyEngines": [
+                {"policyEngineId": engine_id, "name": engine_id}
+                for engine_id in engines
+            ]
+        }
+        mock_ac.get_policy_engine.side_effect = lambda policyEngineId: {
+            "policyEngineArn": _engine_arn(policyEngineId),
+            "encryptionKeyArn": f"{self._KEY}-{policyEngineId}",
+        }
+        if policies is None:
+            policy = _key_policy(
+                *(
+                    statements
+                    if statements is not None
+                    else [self._ADMIN, *_engine_service_use()]
+                )
+            )
+            mock_kms.get_key_policy.return_value = {"Policy": policy}
+        else:
+            mock_kms.get_key_policy.side_effect = lambda KeyId: {
+                "Policy": _key_policy(*policies[KeyId.split("pe-key-", 1)[1]])
+            }
+        mock_kms.list_grants.return_value = _engine_grants(*engines)
+        if events == "absent":
+            events = None
+        elif events is None:
+            events = _key_loss_events(_key_loss_rule())
+        with (
+            patch.object(agentcore_app, "events_client", events, create=True),
+            patch.object(agentcore_app, "logs_client", logs),
+            patch.object(agentcore_app, "cloudwatch_client", cloudwatch),
+        ):
+            return agentcore_app.check_agentcore_policy_engine_key_scope()
+
+    @staticmethod
+    def _denied_events():
+        client = MagicMock()
+        client.list_rules.side_effect = _make_client_error(
+            "AccessDeniedException", "denied"
+        )
+        return client
+
+    @staticmethod
+    def _logs(*filters, denied=False):
+        client = MagicMock()
+        if denied:
+            client.describe_metric_filters.side_effect = _make_client_error(
+                "AccessDeniedException", "denied"
+            )
+        else:
+            client.describe_metric_filters.return_value = {
+                "metricFilters": list(filters)
+            }
+        return client
+
+    @staticmethod
+    def _cloudwatch(*alarms):
+        client = MagicMock()
+        client.describe_alarms.return_value = {"MetricAlarms": list(alarms)}
+        return client
+
+    _FILTER = {
+        "filterName": "kms-key-loss",
+        "filterPattern": (
+            "{ ($.eventSource = kms.amazonaws.com) && (($.eventName = DisableKey) "
+            "|| ($.eventName = ScheduleKeyDeletion)) }"
+        ),
+        "metricTransformations": [
+            {"metricNamespace": "CISBenchmark", "metricName": "KmsKeyLoss"}
+        ],
+    }
+    _ALARM = {
+        "AlarmName": "kms-key-loss",
+        "Namespace": "CISBenchmark",
+        "MetricName": "KmsKeyLoss",
+        "ActionsEnabled": True,
+        "AlarmActions": ["arn:aws:sns:us-east-1:123456789012:security"],
+    }
+
+    @pytest.mark.parametrize(
+        "rules",
+        [
+            [],
+            [_key_loss_rule(state="DISABLED")],
+            [
+                _key_loss_rule(
+                    pattern={
+                        "source": ["aws.kms"],
+                        "detail": {"eventName": ["DisableKey"]},
+                    }
+                )
+            ],
+            [
+                _key_loss_rule(
+                    pattern={
+                        "source": ["aws.kms"],
+                        "detail": {"eventName": [{"prefix": "Disable"}]},
+                    }
+                )
+            ],
+            [
+                _key_loss_rule(
+                    pattern={
+                        "source": ["aws.kms"],
+                        "detail": {
+                            "eventName": ["DisableKey", "ScheduleKeyDeletion"],
+                            "requestParameters": {"keyId": ["pe-key"]},
+                        },
+                    }
+                )
+            ],
+            [_key_loss_rule(pattern={"source": ["aws.ec2"]})],
+        ],
+        ids=[
+            "no-rule",
+            "disabled",
+            "one-event",
+            "content-filter",
+            "key-id-filter",
+            "other-source",
+        ],
+    )
+    @patch("agentcore_app.kms_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_no_rule_matching_both_calls_fails(self, mock_ac, mock_kms, rules):
+        findings = self._run(
+            mock_ac,
+            mock_kms,
+            events=_key_loss_events(*rules),
+            logs=self._logs(),
+            cloudwatch=self._cloudwatch(),
+        )
+
+        assert [f["Status"] for f in findings] == ["Failed"]
+        assert "is watched by no alarm in this region" in findings[0]["Finding_Details"]
+        assert "ScheduleKeyDeletion" in findings[0]["Resolution"]
+
+    @pytest.mark.parametrize(
+        "pattern",
+        [
+            _KEY_LOSS_RULE_PATTERN,
+            {"source": ["aws.kms"]},
+            {
+                "detail": {
+                    "eventName": ["ScheduleKeyDeletion", "DisableKey", "PutKeyPolicy"]
+                }
+            },
+        ],
+        ids=["guide", "every-kms-call", "no-source"],
+    )
+    @patch("agentcore_app.kms_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_rule_matching_both_calls_passes(self, mock_ac, mock_kms, pattern):
+        findings = self._run(
+            mock_ac,
+            mock_kms,
+            events=_key_loss_events(
+                _key_loss_rule(name="other", pattern={"source": ["aws.ec2"]}),
+                _key_loss_rule(pattern=pattern),
+            ),
+        )
+
+        assert [f["Status"] for f in findings] == ["Passed"]
+        assert (
+            "enabled EventBridge rule kms-key-loss matches"
+            in findings[0]["Finding_Details"]
+        )
+
+    @patch("agentcore_app.kms_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_metric_filter_alarm_passes_when_rules_are_unreadable(
+        self, mock_ac, mock_kms
+    ):
+        findings = self._run(
+            mock_ac,
+            mock_kms,
+            events=self._denied_events(),
+            logs=self._logs(
+                {"filterName": "other", "filterPattern": "x"}, self._FILTER
+            ),
+            cloudwatch=self._cloudwatch(self._ALARM),
+        )
+
+        assert [f["Status"] for f in findings] == ["Passed"]
+        assert (
+            "alarm kms-key-loss with an action watches the metric of filter "
+            in (findings[0]["Finding_Details"])
+        )
+
+    @pytest.mark.parametrize(
+        "alarm",
+        [
+            {**_ALARM, "AlarmActions": []},
+            {**_ALARM, "ActionsEnabled": False},
+            {**_ALARM, "MetricName": "Other"},
+        ],
+        ids=["no-action", "actions-disabled", "other-metric"],
+    )
+    @patch("agentcore_app.kms_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_metric_filter_without_an_acting_alarm_fails(
+        self, mock_ac, mock_kms, alarm
+    ):
+        findings = self._run(
+            mock_ac,
+            mock_kms,
+            events=_key_loss_events(),
+            logs=self._logs(self._FILTER),
+            cloudwatch=self._cloudwatch(alarm),
+        )
+
+        assert [f["Status"] for f in findings] == ["Failed"]
+        assert "is watched by no alarm" in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.kms_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_filter_naming_one_call_is_not_an_alarm_on_both(self, mock_ac, mock_kms):
+        findings = self._run(
+            mock_ac,
+            mock_kms,
+            events=_key_loss_events(),
+            logs=self._logs(
+                {**self._FILTER, "filterPattern": "{ $.eventName = DisableKey }"}
+            ),
+            cloudwatch=self._cloudwatch(self._ALARM),
+        )
+
+        assert [f["Status"] for f in findings] == ["Failed"]
+
+    @pytest.mark.parametrize(
+        "scenario",
+        ["both-denied", "rules-denied-no-filter", "no-clients"],
+    )
+    @patch("agentcore_app.kms_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_an_unread_alarm_leg_is_na_and_names_the_actions(
+        self, mock_ac, mock_kms, scenario
+    ):
+        # With the rules unreadable, an empty filter list does not show that no
+        # alarm exists, so the leg is unread and never a Passed.
+        clients = {
+            "both-denied": (self._denied_events(), self._logs(denied=True)),
+            "rules-denied-no-filter": (self._denied_events(), self._logs()),
+            "no-clients": ("absent", None),
+        }[scenario]
+        findings = self._run(
+            mock_ac,
+            mock_kms,
+            events=clients[0],
+            logs=clients[1],
+            cloudwatch=self._cloudwatch() if clients[1] else None,
+        )
+
+        assert [f["Status"] for f in findings] == ["N/A"]
+        assert (
+            "whether an alarm in this region covers the key's"
+            in findings[0]["Finding_Details"]
+        )
+        assert "events:ListRules" in findings[0]["Resolution"]
+        assert "logs:DescribeMetricFilters" in findings[0]["Resolution"]
+
+    @patch("agentcore_app.kms_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_the_alarm_is_read_once_for_every_engine(self, mock_ac, mock_kms):
+        events = _key_loss_events()
+        logs = self._logs()
+        findings = self._run(
+            mock_ac,
+            mock_kms,
+            events=events,
+            logs=logs,
+            cloudwatch=self._cloudwatch(),
+            engines=("pe-1", "pe-2", "pe-3"),
+        )
+
+        assert [f["Status"] for f in findings] == ["Failed"] * 3
+        events.list_rules.assert_called_once()
+        logs.describe_metric_filters.assert_called_once()
+
+    @pytest.mark.parametrize(
+        "context",
+        [
+            None,
+            "*",
+            "arn:aws:bedrock-agentcore:*:*:gateway/*",
+            "arn:aws:bedrock-agentcore:us-east-1:123456789012:policy-engine/pe-9",
+            "arn:aws:*:us-east-1:123456789012:policy-engine/*",
+        ],
+        ids=["absent", "wildcard", "other-type", "other-engine", "any-service"],
+    )
+    @patch("agentcore_app.kms_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_service_statement_not_bound_to_the_engine_fails(
+        self, mock_ac, mock_kms, context
+    ):
+        grant_statement, use_statement = _engine_service_use()
+        for statement in (grant_statement, use_statement):
+            del statement["Condition"]["StringLike"]
+            if context is not None:
+                statement["Condition"]["StringLike"] = {_ENGINE_CONTEXT_KEY: context}
+        findings = self._run(
+            mock_ac, mock_kms, statements=[self._ADMIN, grant_statement, use_statement]
+        )
+
+        assert [f["Status"] for f in findings] == ["Failed"]
+        details = findings[0]["Finding_Details"]
+        assert (
+            "lets kms:CreateGrant, kms:Decrypt, kms:GenerateDataKey through "
+            "AgentCore with no kms:EncryptionContext:aws:bedrock-agentcore-policy:"
+            "policy-engine-arn condition naming only policy engines, among them "
+            f"{_engine_arn('pe-1')}"
+        ) in details
+
+    @patch("agentcore_app.kms_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_an_if_exists_context_on_decrypt_alone_is_named_alone(
+        self, mock_ac, mock_kms
+    ):
+        grant_statement, use_statement = _engine_service_use()
+        use_statement["Condition"]["StringLikeIfExists"] = use_statement[
+            "Condition"
+        ].pop("StringLike")
+        findings = self._run(
+            mock_ac, mock_kms, statements=[self._ADMIN, grant_statement, use_statement]
+        )
+
+        assert [f["Status"] for f in findings] == ["Failed"]
+        details = findings[0]["Finding_Details"]
+        assert "lets kms:Decrypt, kms:GenerateDataKey through AgentCore" in details
+        assert "kms:CreateGrant through AgentCore with no" not in details
+
+    @patch("agentcore_app.kms_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_the_engine_arn_itself_binds_the_context(self, mock_ac, mock_kms):
+        findings = self._run(
+            mock_ac,
+            mock_kms,
+            statements=[
+                self._ADMIN,
+                *_engine_service_use(engine_context=_engine_arn("pe-1")),
+            ],
+        )
+
+        assert [f["Status"] for f in findings] == ["Passed"]
+
+    @pytest.mark.parametrize(
+        "actions, named",
+        [
+            (["kms:*"], "kms:*"),
+            (["kms:Decrypt", "kms:GenerateDataKey*"], "kms:generatedatakey*"),
+            (
+                ["kms:Decrypt", "kms:GenerateDataKey", "kms:ReEncrypt*"],
+                "kms:reencrypt*",
+            ),
+        ],
+        ids=["kms-star", "data-key-family", "re-encrypt"],
+    )
+    @patch("agentcore_app.kms_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_service_statement_granting_more_actions_fails(
+        self, mock_ac, mock_kms, actions, named
+    ):
+        grant_statement, use_statement = _engine_service_use()
+        use_statement["Action"] = actions
+        findings = self._run(
+            mock_ac, mock_kms, statements=[self._ADMIN, grant_statement, use_statement]
+        )
+
+        assert [f["Status"] for f in findings] == ["Failed"]
+        assert (
+            f"allows {named} through AgentCore, beyond the kms:CreateGrant, "
+            "kms:Decrypt, kms:GenerateDataKey, kms:DescribeKey the service needs"
+        ) in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.kms_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_not_action_service_statement_fails(self, mock_ac, mock_kms):
+        grant_statement, use_statement = _engine_service_use()
+        extra = {**use_statement, "NotAction": ["kms:ScheduleKeyDeletion"]}
+        del extra["Action"]
+        findings = self._run(
+            mock_ac,
+            mock_kms,
+            statements=[self._ADMIN, grant_statement, use_statement, extra],
+        )
+
+        assert [f["Status"] for f in findings] == ["Failed"]
+        assert (
+            "allows NotAction kms:schedulekeydeletion through AgentCore"
+            in (findings[0]["Finding_Details"])
+        )
+
+    @patch("agentcore_app.kms_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_the_guides_describe_key_statement_passes(self, mock_ac, mock_kms):
+        describe = {
+            "Effect": "Allow",
+            "Principal": {"AWS": "arn:aws:iam::123456789012:role/PolicyAdministrator"},
+            "Action": "kms:DescribeKey",
+            "Resource": "*",
+            "Condition": {
+                "StringEquals": {
+                    "kms:ViaService": "bedrock-agentcore.us-east-1.amazonaws.com"
+                }
+            },
+        }
+        findings = self._run(
+            mock_ac,
+            mock_kms,
+            statements=[self._ADMIN, *_engine_service_use(), describe],
+        )
+
+        assert [f["Status"] for f in findings] == ["Passed"]
+        assert "no action beyond kms:CreateGrant" in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.kms_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_one_engine_key_without_the_context_fails_alone(self, mock_ac, mock_kms):
+        grant_statement, use_statement = _engine_service_use()
+        for statement in (grant_statement, use_statement):
+            del statement["Condition"]["StringLike"]
+        policies = {
+            "pe-1": [self._ADMIN, *_engine_service_use()],
+            "pe-2": [self._ADMIN, grant_statement, use_statement],
+            "pe-3": [self._ADMIN, *_engine_service_use()],
+        }
+        findings = self._run(
+            mock_ac,
+            mock_kms,
+            engines=("pe-1", "pe-2", "pe-3"),
+            policies=policies,
+        )
+
+        assert [f["Status"] for f in findings] == ["Passed", "Failed", "Passed"]
+        assert "kms:EncryptionContext" in findings[1]["Finding_Details"]
+        assert "(pe-2)" in findings[1]["Finding_Details"]
+
+
 class TestAC36CheckRegistration:
     """AC-36 reads regional policy engines and their regional keys."""
 
@@ -17204,10 +17719,10 @@ class TestAC37PolicyGuardrailWiring:
                                 {
                                     "Effect": "Allow",
                                     "Action": ["bedrock:InvokeGuardrailChecks"],
-                                    "Resource": (
-                                        "arn:aws:bedrock:us-east-1:123456789012:"
-                                        "guardrail/gr-1"
-                                    ),
+                                    # Stricter than before, when a guardrail ARN
+                                    # was credited: the action has no resource
+                                    # type, so only "*" grants it.
+                                    "Resource": "*",
                                 }
                             ]
                         },
@@ -30617,6 +31132,203 @@ def _trail(name, multi_region=True, home="us-east-1", validation=True):
         "IsMultiRegionTrail": multi_region,
         "LogFileValidationEnabled": validation,
     }
+
+
+class TestAC37GrantResourceAndDefaultBand:
+    """AC-37 credits only an unconditioned Resource "*" grant and reads the band."""
+
+    _ROLE_ARN = "arn:aws:iam::123456789012:role/GatewayExecution"
+    _STAR = {
+        "Effect": "Allow",
+        "Action": "bedrock:InvokeGuardrailChecks",
+        "Resource": "*",
+    }
+
+    def _call(self, safeguard, category, operator, threshold):
+        return (
+            f'BedrockGuardrails::{safeguard}(["{category}"], [context.input.prompt])'
+            f'["{category}"].confidenceScore.{operator}(decimal("{threshold}"))'
+        )
+
+    def _run(self, mock_ac, policies, roles, gateways=None):
+        gateways = gateways or [("gw-1", "Support", "GatewayExecution")]
+        mock_ac.list_gateways.return_value = {
+            "items": [{"gatewayId": gid, "name": name} for gid, name, _ in gateways]
+        }
+        role_of = {gid: role for gid, _, role in gateways}
+        mock_ac.get_gateway.side_effect = lambda gatewayIdentifier: (
+            _policy_engine_gateway(
+                roleArn=f"arn:aws:iam::123456789012:role/{role_of[gatewayIdentifier]}"
+            )
+        )
+        mock_ac.list_policies.return_value = {
+            "policies": [_cedar_policy(name, statement) for name, statement in policies]
+        }
+        cache = _v2_cache(
+            roles={name: _principal_with(statements) for name, statements in roles}
+        )
+        return agentcore_app.check_agentcore_policy_guardrail_wiring(cache)
+
+    def _good(self):
+        return _guardrail_policy(
+            "forbid",
+            self._call("PromptAttack", "PROMPT_INJECTION", "greaterThanOrEqual", "0.4"),
+        )
+
+    @pytest.mark.parametrize(
+        "scope",
+        [
+            {"Resource": "arn:aws:bedrock:us-east-1:123456789012:guardrail/gr-1"},
+            {"Resource": "arn:aws:bedrock:*:*:guardrail/*"},
+            {"Resource": ["arn:aws:bedrock:*", "arn:aws:bedrock:*:*:*"]},
+            {"NotResource": "*"},
+        ],
+        ids=["guardrail-arn", "guardrail-wildcard", "service-wildcard", "not-all"],
+    )
+    @patch("agentcore_app.agentcore_client")
+    def test_a_grant_that_does_not_reach_star_fails(self, mock_ac, scope):
+        grant = {
+            "Effect": "Allow",
+            "Action": "bedrock:InvokeGuardrailChecks",
+            **scope,
+        }
+        findings = self._run(
+            mock_ac, [("good", self._good())], [("GatewayExecution", [grant])]
+        )
+
+        assert [f["Status"] for f in findings] == ["Failed"]
+        assert "has no resource type" in findings[0]["Finding_Details"]
+        assert 'Resource "*"' in findings[0]["Resolution"]
+
+    @pytest.mark.parametrize(
+        "condition",
+        [
+            {"Bool": {"aws:SecureTransport": "true"}},
+            {"Bool": {"aws:ViaAWSService": "true"}},
+            {"StringEquals": {"aws:RequestedRegion": "us-east-1"}},
+        ],
+        ids=["secure-transport", "via-service", "region"],
+    )
+    @patch("agentcore_app.agentcore_client")
+    def test_a_conditioned_grant_alone_withholds_the_pass(self, mock_ac, condition):
+        grant = {**self._STAR, "Condition": condition}
+        findings = self._run(
+            mock_ac, [("good", self._good())], [("GatewayExecution", [grant])]
+        )
+
+        assert [f["Status"] for f in findings] == ["N/A"]
+        assert "only under a condition" in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_an_unconditioned_star_grant_beside_a_scoped_one_passes(self, mock_ac):
+        scoped = {
+            **self._STAR,
+            "Resource": "arn:aws:bedrock:us-east-1:123456789012:guardrail/gr-1",
+        }
+        conditioned = {**self._STAR, "Condition": {"Bool": {"aws:X": "true"}}}
+        findings = self._run(
+            mock_ac,
+            [("good", self._good())],
+            [("GatewayExecution", [scoped, conditioned, self._STAR])],
+        )
+
+        assert [f["Status"] for f in findings] == ["Passed"]
+        assert 'on Resource "*" with no condition' in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_not_resource_that_excludes_a_guardrail_still_reaches_star(self, mock_ac):
+        grant = {
+            "Effect": "Allow",
+            "Action": "bedrock:InvokeGuardrailChecks",
+            "NotResource": "arn:aws:bedrock:us-east-1:123456789012:guardrail/gr-1",
+        }
+        findings = self._run(
+            mock_ac, [("good", self._good())], [("GatewayExecution", [grant])]
+        )
+
+        assert [f["Status"] for f in findings] == ["Passed"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_each_gateway_is_judged_by_its_own_role(self, mock_ac):
+        scoped = {
+            **self._STAR,
+            "Resource": "arn:aws:bedrock:us-east-1:123456789012:guardrail/gr-1",
+        }
+        findings = self._run(
+            mock_ac,
+            [("good", self._good())],
+            [("RoleStar", [self._STAR]), ("RoleScoped", [scoped])],
+            gateways=[
+                ("gw-a", "Alpha", "RoleStar"),
+                ("gw-b", "Beta", "RoleScoped"),
+                ("gw-c", "Gamma", "RoleStar"),
+            ],
+        )
+
+        assert [f["Status"] for f in findings] == ["Passed", "Failed", "Passed"]
+        assert "(gw-b)" in findings[1]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        ("effect", "safeguard", "category", "operator", "threshold"),
+        [
+            ("forbid", "ContentFilter", "HATE", "greaterThan", "0.2"),
+            ("forbid", "PromptAttack", "PROMPT_INJECTION", "greaterThan", "0.4"),
+            ("forbid", "SensitiveInformation", "EMAIL", "greaterThan", "0.2"),
+            ("suppressOutput", "ContentFilter", "HATE", "greaterThan", "0.2"),
+            ("permit", "PromptAttack", "PROMPT_INJECTION", "lessThanOrEqual", "0.4"),
+        ],
+        ids=[
+            "content-filter",
+            "prompt-attack",
+            "sensitive-information",
+            "suppress-output",
+            "permit",
+        ],
+    )
+    @patch("agentcore_app.agentcore_client")
+    def test_a_strict_comparison_at_the_default_fails_beside_a_good_policy(
+        self, mock_ac, effect, safeguard, category, operator, threshold
+    ):
+        banded = _guardrail_policy(
+            effect, self._call(safeguard, category, operator, threshold)
+        )
+        findings = self._run(
+            mock_ac,
+            [("good", self._good()), ("banded", banded)],
+            [("GatewayExecution", [self._STAR])],
+        )
+
+        assert [f["Status"] for f in findings] == ["Failed"]
+        assert findings[0]["Finding"] == (
+            "AgentCore Policy Guardrail Default Band Excluded"
+        )
+        assert findings[0]["Severity"] == "Medium"
+        details = findings[0]["Finding_Details"]
+        assert f"banded ({effect}: {safeguard}" in details
+        assert "good (" not in details
+
+    @pytest.mark.parametrize(
+        ("effect", "safeguard", "category", "operator", "threshold"),
+        [
+            ("forbid", "ContentFilter", "HATE", "greaterThanOrEqual", "0.2"),
+            ("forbid", "PromptAttack", "PROMPT_INJECTION", "greaterThan", "0.2"),
+            ("forbid", "PromptAttack", "PROMPT_INJECTION", "greaterThan", "0.6"),
+            ("permit", "PromptAttack", "PROMPT_INJECTION", "lessThan", "0.4"),
+        ],
+        ids=["inclusive", "below-default", "above-default", "permit-strict"],
+    )
+    @patch("agentcore_app.agentcore_client")
+    def test_a_comparison_that_keeps_the_default_band_passes(
+        self, mock_ac, effect, safeguard, category, operator, threshold
+    ):
+        policy = _guardrail_policy(
+            effect, self._call(safeguard, category, operator, threshold)
+        )
+        findings = self._run(
+            mock_ac, [("policy", policy)], [("GatewayExecution", [self._STAR])]
+        )
+
+        assert [f["Status"] for f in findings] == ["Passed"]
 
 
 class TestAC26TrailLogFileValidation:

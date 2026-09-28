@@ -48,6 +48,7 @@ organizations_client = None
 wafv2_client = None
 route53resolver_client = None
 cognito_client = None
+events_client = None
 
 # Environment variables
 BUCKET_NAME = os.environ.get("AIML_ASSESSMENT_BUCKET_NAME")
@@ -17735,6 +17736,16 @@ POLICY_ENGINE_ENCRYPTION_CONTEXT_KEY = "aws:bedrock-agentcore-policy:policy-engi
 POLICY_ENGINE_SOURCE_GUARDED_ACTIONS = ("kms:Decrypt", "kms:GenerateDataKey")
 POLICY_ENGINE_MANAGEMENT_GRANT_OPERATION = "GenerateDataKey"
 POLICY_ENGINE_EVALUATION_GRANT_OPERATIONS = ("ReEncryptFrom", "ReEncryptTo")
+# The four actions the guide says the service needs on the key.
+POLICY_ENGINE_SERVICE_ACTIONS = (
+    "kms:CreateGrant",
+    "kms:Decrypt",
+    "kms:GenerateDataKey",
+    "kms:DescribeKey",
+)
+# A disabled or deleted key denies every Cedar decision, so these two calls are
+# the ones the recommendation asks to alarm on.
+KMS_KEY_LOSS_EVENTS = ("DisableKey", "ScheduleKeyDeletion")
 
 
 def _arn_region(arn: Any) -> str:
@@ -17743,8 +17754,44 @@ def _arn_region(arn: Any) -> str:
     return parts[3] if len(parts) == 6 and parts[0] == "arn" else ""
 
 
+def _binds_policy_engine_context(statement: Dict[str, Any], engine_arn: str) -> bool:
+    """Return whether a statement binds its calls to policy engines by the
+    encryption context the service passes, one of them this engine.
+
+    Every value of the kms:EncryptionContext entry must name the
+    bedrock-agentcore service and a policy-engine resource and match this
+    engine's ARN, so `*` or a value naming another resource type binds nothing.
+    The IfExists form is not read, because a call without the context then
+    passes it.
+    """
+    condition = statement.get("Condition")
+    if not isinstance(condition, dict):
+        return False
+    key = f"kms:encryptioncontext:{POLICY_ENGINE_ENCRYPTION_CONTEXT_KEY}"
+    for operator, entries in condition.items():
+        if not isinstance(entries, dict):
+            continue
+        if str(operator).strip().lower().endswith("ifexists"):
+            continue
+        if _normalized_condition_operator(operator) not in CONDITION_EQUALS_OPERATORS:
+            continue
+        for entry_key, raw in entries.items():
+            if str(entry_key).strip().lower() != key:
+                continue
+            values = [value.strip() for value in _condition_values(raw)]
+            if values and all(
+                len(value.split(":", 5)) == 6
+                and value.split(":", 5)[2] == "bedrock-agentcore"
+                and value.split(":", 5)[5].startswith("policy-engine/")
+                and fnmatchcase(engine_arn, value)
+                for value in values
+            ):
+                return True
+    return False
+
+
 def _policy_engine_key_policy_gaps(
-    policy_document: Any, region: str, account_id: str
+    policy_document: Any, region: str, account_id: str, engine_arn: str
 ) -> List[str]:
     """Return the service-use scoping a policy engine's key policy is missing.
 
@@ -17753,8 +17800,11 @@ def _policy_engine_key_policy_gaps(
     scope nothing and are not read as scoping. aws:SourceAccount and
     aws:SourceArn are available on the grant-based calls and not on
     kms:CreateGrant, so the source guard is read on kms:Decrypt and
-    kms:GenerateDataKey only. A statement granting the same actions with no
-    condition, such as the account-root kms:* statement, is not subtracted.
+    kms:GenerateDataKey only. kms:CreateGrant, kms:Decrypt and
+    kms:GenerateDataKey must also carry the engine's encryption context, and a
+    statement scoped to AgentCore must grant only the four actions the service
+    needs. A statement granting the same actions with no condition, such as the
+    account-root kms:* statement, is not subtracted.
     """
     via_service = f"bedrock-agentcore.{region}.amazonaws.com"
     statements = _document_statements(policy_document, effect="Allow")
@@ -17765,8 +17815,10 @@ def _policy_engine_key_policy_gaps(
         )
 
     gaps: List[str] = []
-    if not any(
-        _statement_matches_action(statement, "kms:creategrant")
+    constrained_grants = [
+        statement
+        for statement in statements
+        if _statement_matches_action(statement, "kms:creategrant")
         and via_agentcore(statement)
         and _condition_pins_value(
             statement,
@@ -17774,29 +17826,191 @@ def _policy_engine_key_policy_gaps(
             "EncryptionContextSubset",
             if_exists_counts=False,
         )
-        for statement in statements
-    ):
+    ]
+    if not constrained_grants:
         gaps.append(
             "has no statement allowing kms:CreateGrant only with kms:ViaService "
             f"{via_service} and kms:GrantConstraintType EncryptionContextSubset"
         )
-    unguarded = [
-        action
-        for action in POLICY_ENGINE_SOURCE_GUARDED_ACTIONS
-        if not any(
-            _statement_matches_action(statement, action.lower())
+    guarded = {
+        action: [
+            statement
+            for statement in statements
+            if _statement_matches_action(statement, action.lower())
             and via_agentcore(statement)
             and _confused_deputy_guard_account(statement, account_id)
-            for statement in statements
-        )
-    ]
+        ]
+        for action in POLICY_ENGINE_SOURCE_GUARDED_ACTIONS
+    }
+    unguarded = [action for action, found in guarded.items() if not found]
     if unguarded:
         gaps.append(
             f"has no statement allowing {', '.join(unguarded)} only with "
             f"kms:ViaService {via_service} and an aws:SourceAccount or "
             f"aws:SourceArn condition naming account {account_id}"
         )
+    unbound = [
+        action
+        for action, found in (("kms:CreateGrant", constrained_grants), *guarded.items())
+        if found
+        and not any(_binds_policy_engine_context(item, engine_arn) for item in found)
+    ]
+    if unbound:
+        gaps.append(
+            f"lets {', '.join(unbound)} through AgentCore with no "
+            f"kms:EncryptionContext:{POLICY_ENGINE_ENCRYPTION_CONTEXT_KEY} "
+            f"condition naming only policy engines, among them {engine_arn}, "
+            "so the key serves any AgentCore resource that passes the other "
+            "conditions"
+        )
+    allowed = {action.lower() for action in POLICY_ENGINE_SERVICE_ACTIONS}
+    extra = sorted(
+        {
+            action
+            for statement in statements
+            if via_agentcore(statement)
+            for action in (
+                _statement_actions(statement)
+                if "Action" in statement
+                else [f"NotAction {', '.join(_statement_not_actions(statement))}"]
+            )
+            if action not in allowed
+        }
+    )
+    if extra:
+        gaps.append(
+            f"allows {', '.join(extra)} through AgentCore, beyond the "
+            f"{', '.join(POLICY_ENGINE_SERVICE_ACTIONS)} the service needs"
+        )
     return gaps
+
+
+def _event_pattern_matches(pattern: Dict[str, Any], event: Dict[str, Any]) -> bool:
+    """Return whether an EventBridge pattern matches one event by literal values.
+
+    A field the event lacks does not match, and neither does a content filter
+    such as `prefix` or `anything-but`, whose reach is not decided here.
+    """
+    for key, expected in pattern.items():
+        if key not in event:
+            return False
+        actual = event[key]
+        if isinstance(expected, dict):
+            if not isinstance(actual, dict) or not _event_pattern_matches(
+                expected, actual
+            ):
+                return False
+            continue
+        values = expected if isinstance(expected, list) else [expected]
+        if not any(isinstance(value, str) and value == actual for value in values):
+            return False
+    return True
+
+
+def _kms_key_loss_alarm_leg() -> Tuple[str, List[str]]:
+    """Return what alarms on a key's DisableKey and ScheduleKeyDeletion calls in
+    this region, or "", and each read that failed.
+
+    An enabled rule on the default bus counts when its pattern matches both
+    calls as CloudTrail delivers them, so a rule that also filters on the key id
+    is not credited: the id's form depends on how the caller named the key. A
+    metric filter counts when its pattern names both calls and an alarm with an
+    action watches its metric. Neither the rule's targets nor which trail feeds
+    the filter's log group is read.
+    """
+    unread: List[str] = []
+    if events_client is None:
+        unread.append("events:ListRules (no EventBridge client)")
+    else:
+        try:
+            rules = _paginate_aws_list(
+                events_client,
+                "list_rules",
+                "Rules",
+                token_request_key="NextToken",
+                token_response_key="NextToken",
+            )
+        except Exception as error:
+            unread.append(f"events:ListRules ({_assessment_error_label(error)})")
+        else:
+            for rule in rules:
+                if rule.get("State") != "ENABLED":
+                    continue
+                try:
+                    pattern = json.loads(rule.get("EventPattern") or "")
+                except (TypeError, ValueError):
+                    continue
+                if isinstance(pattern, dict) and all(
+                    _event_pattern_matches(
+                        pattern,
+                        {
+                            "source": "aws.kms",
+                            "detail-type": "AWS API Call via CloudTrail",
+                            "detail": {
+                                "eventSource": "kms.amazonaws.com",
+                                "eventName": event_name,
+                            },
+                        },
+                    )
+                    for event_name in KMS_KEY_LOSS_EVENTS
+                ):
+                    return (
+                        f"enabled EventBridge rule {rule.get('Name')} matches its "
+                        f"{' and '.join(KMS_KEY_LOSS_EVENTS)} calls",
+                        [],
+                    )
+    if logs_client is None or cloudwatch_client is None:
+        unread.append(
+            "logs:DescribeMetricFilters and cloudwatch:DescribeAlarms (no CloudWatch "
+            "client)"
+        )
+        return "", unread
+    try:
+        metric_filters = _paginate_aws_list(
+            logs_client, "describe_metric_filters", "metricFilters"
+        )
+    except Exception as error:
+        unread.append(f"logs:DescribeMetricFilters ({_assessment_error_label(error)})")
+        return "", unread
+    metrics = {
+        (
+            transformation.get("metricNamespace"),
+            transformation.get("metricName"),
+        ): metric_filter.get("filterName")
+        for metric_filter in metric_filters
+        if all(
+            event_name in str(metric_filter.get("filterPattern") or "")
+            for event_name in KMS_KEY_LOSS_EVENTS
+        )
+        for transformation in metric_filter.get("metricTransformations") or []
+    }
+    if not metrics:
+        return "", unread
+    try:
+        alarms = _paginate_aws_list(
+            cloudwatch_client,
+            "describe_alarms",
+            "MetricAlarms",
+            token_request_key="NextToken",
+            token_response_key="NextToken",
+        )
+    except Exception as error:
+        unread.append(f"cloudwatch:DescribeAlarms ({_assessment_error_label(error)})")
+        return "", unread
+    for alarm in alarms:
+        metric = (alarm.get("Namespace"), alarm.get("MetricName"))
+        if (
+            metric in metrics
+            and alarm.get("ActionsEnabled")
+            and alarm.get("AlarmActions")
+        ):
+            return (
+                f"alarm {alarm.get('AlarmName')} with an action watches the metric "
+                f"of filter {metrics[metric]}, whose pattern names its "
+                f"{' and '.join(KMS_KEY_LOSS_EVENTS)} calls",
+                [],
+            )
+    return "", unread
 
 
 def _policy_engine_grant_gap(grants: List[Dict[str, Any]], engine_arn: str) -> str:
@@ -17899,6 +18113,7 @@ def check_agentcore_policy_engine_key_scope() -> List[Dict[str, Any]]:
 
     key_policy_cache: Dict[str, Any] = {}
     grant_cache: Dict[str, Any] = {}
+    alarm_leg: Optional[Tuple[str, List[str]]] = None
     findings = []
     for engine in engines:
         engine_id = engine.get("policyEngineId", "unknown")
@@ -17987,6 +18202,7 @@ def check_agentcore_policy_engine_key_scope() -> List[Dict[str, Any]]:
 
         engine_arn = detail.get("policyEngineArn") or engine.get("policyEngineArn")
         unread: List[str] = []
+        unread_grants: List[str] = []
         if not engine_arn:
             unread.append(
                 "the engine reports no policyEngineArn, so the key policy's "
@@ -17995,7 +18211,10 @@ def check_agentcore_policy_engine_key_scope() -> List[Dict[str, Any]]:
         else:
             problems.extend(
                 _policy_engine_key_policy_gaps(
-                    key_policy, _arn_region(engine_arn), _arn_account(engine_arn)
+                    key_policy,
+                    _arn_region(engine_arn),
+                    _arn_account(engine_arn),
+                    engine_arn,
                 )
             )
             if key_arn not in grant_cache:
@@ -18019,10 +18238,32 @@ def check_agentcore_policy_engine_key_scope() -> List[Dict[str, Any]]:
                     "engine's grants are present was not read; grant kms:ListGrants "
                     "on the key"
                 )
+                unread_grants.append("kms:ListGrants on the key")
             else:
                 grant_gap = _policy_engine_grant_gap(grants, engine_arn)
                 if grant_gap:
                     problems.append(grant_gap)
+        if alarm_leg is None:
+            alarm_leg = _kms_key_loss_alarm_leg()
+        alarm, alarm_unread = alarm_leg
+        if alarm_unread and not alarm:
+            unread.append(
+                "whether an alarm in this region covers the key's "
+                f"{' and '.join(KMS_KEY_LOSS_EVENTS)} calls, because "
+                f"{'; '.join(alarm_unread)} could not be read"
+            )
+            unread_grants.append(
+                "events:ListRules, or logs:DescribeMetricFilters with "
+                "cloudwatch:DescribeAlarms"
+            )
+        elif not alarm:
+            problems.append(
+                "is watched by no alarm in this region on its "
+                f"{' or '.join(KMS_KEY_LOSS_EVENTS)} calls: no enabled EventBridge "
+                "rule matches both, and no metric filter naming both feeds an "
+                "alarm with an action, so losing the key, which denies every "
+                "Cedar decision, raises nothing"
+            )
         unread_text = f" Not read: {'; '.join(unread)}." if unread else ""
 
         if problems:
@@ -18042,9 +18283,15 @@ def check_agentcore_policy_engine_key_scope() -> List[Dict[str, Any]]:
                         "bedrock-agentcore.<region>.amazonaws.com and "
                         "kms:GrantConstraintType EncryptionContextSubset, and "
                         "kms:Decrypt and kms:GenerateDataKey with aws:SourceAccount "
-                        "or aws:SourceArn as the key policy in the policy "
-                        "encryption guide shows. If a grant was revoked, revoke the "
-                        "other one too and recreate the engine."
+                        "or aws:SourceArn, each with the "
+                        "kms:EncryptionContext:aws:bedrock-agentcore-policy:"
+                        "policy-engine-arn condition and no action beyond "
+                        "kms:CreateGrant, kms:Decrypt, kms:GenerateDataKey and "
+                        "kms:DescribeKey, as the key policy in the policy "
+                        "encryption guide shows. Alarm on the key's DisableKey and "
+                        "ScheduleKeyDeletion calls with an EventBridge rule or a "
+                        "CloudTrail metric filter and alarm. If a grant was "
+                        "revoked, revoke the other one too and recreate the engine."
                     ),
                     reference=AGENTCORE_POLICY_ENCRYPTION_REFERENCE_URL,
                     severity=SeverityEnum.HIGH,
@@ -18062,8 +18309,11 @@ def check_agentcore_policy_engine_key_scope() -> List[Dict[str, Any]]:
                         f"reported as Passed.{unread_text}"
                     ),
                     resolution=(
-                        "Grant kms:ListGrants on the key and retry so every leg "
-                        "of the key scope is read."
+                        f"Grant {' and '.join(unread_grants)} and retry so every "
+                        "leg of the key scope is read."
+                        if unread_grants
+                        else "Rerun once the engine reports its policyEngineArn "
+                        "so every leg of the key scope is read."
                     ),
                     reference=AGENTCORE_POLICY_ENCRYPTION_REFERENCE_URL,
                     severity=SeverityEnum.INFORMATIONAL,
@@ -18084,18 +18334,21 @@ def check_agentcore_policy_engine_key_scope() -> List[Dict[str, Any]]:
                         "AgentCore in this region only for grants constrained by "
                         "encryption context, and kms:Decrypt and "
                         "kms:GenerateDataKey through AgentCore only from this "
-                        "account, and the key carries a separate management and "
-                        "evaluation grant bound to the engine. A statement that "
-                        "grants the same actions with no condition, such as the "
-                        "account-root kms:* statement, is not subtracted, so IAM "
-                        "policy remains a path to the key."
+                        "account, each bound to policy engines by the "
+                        f"{POLICY_ENGINE_ENCRYPTION_CONTEXT_KEY} encryption "
+                        "context, and grants through AgentCore no action beyond "
+                        f"{', '.join(POLICY_ENGINE_SERVICE_ACTIONS)}. The key "
+                        "carries a separate management and evaluation grant bound "
+                        f"to the engine, and {alarm}. A statement that grants the "
+                        "same actions with no condition, such as the account-root "
+                        "kms:* statement, is not subtracted, so IAM policy remains "
+                        "a path to the key."
                     ),
                     resolution=(
-                        "No action required. This check reads the key policy; "
-                        "confirm separately that an alarm covers the key's "
-                        "disable and delete events and that the break-glass "
-                        "runbook has been rehearsed, neither of which is readable "
-                        "from the key."
+                        "No action required. Confirm separately that the alarm "
+                        "reaches someone, since its rule targets or alarm actions "
+                        "are not followed, and that the break-glass runbook has "
+                        "been rehearsed, which is not readable from the key."
                     ),
                     reference=KMS_KEY_POLICY_REFERENCE_URL,
                     severity=SeverityEnum.HIGH,
@@ -18121,6 +18374,46 @@ GUARDRAIL_CALL_PATTERN = re.compile(
     r"\.(confidenceScore|maxConfidenceScore\(\)|minConfidenceScore\(\)|count\(\))"
     r"(?:\.(\w+)\(decimal\(\"([^\"]*)\"\)\))?"
 )
+
+
+# The AIR-ACR-POL-06 recommendation gives the documented default threshold of
+# each safeguard and warns that a strict greaterThan at it never fires on a
+# score equal to the default, discarding the lowest band the default blocks.
+GUARDRAIL_DEFAULT_THRESHOLDS = {
+    "ContentFilter": 0.2,
+    "PromptAttack": 0.4,
+    "SensitiveInformation": 0.2,
+}
+
+
+def _guardrail_default_band_gaps(effect: str, conditions: str) -> List[str]:
+    """Name each guardrail comparison that excludes a score at its default.
+
+    A forbid or suppressOutput with greaterThan at the safeguard's default does
+    not act on a score equal to the default, and a permit with lessThanOrEqual
+    at the default still applies on that score. Calls that cannot be read are
+    left to _guardrail_policy_verdict.
+    """
+    gaps: List[str] = []
+    flat = re.sub(r"\s+", "", conditions)
+    for call in GUARDRAIL_CALL_PATTERN.finditer(flat):
+        safeguard, categories, _, aggregate, operator, threshold = call.groups()
+        default = GUARDRAIL_DEFAULT_THRESHOLDS.get(safeguard)
+        if default is None or not operator or aggregate.startswith("count"):
+            continue
+        try:
+            value = float(threshold)
+        except (TypeError, ValueError):
+            continue
+        excluding = "lessThanOrEqual" if effect == "permit" else "greaterThan"
+        if operator == excluding and value == default:
+            action = "still applies" if effect == "permit" else "does not act"
+            gaps.append(
+                f"{safeguard}({categories or 'no category'}) {operator}"
+                f"({threshold}) {action} on a score of {default:g}, the "
+                "documented default"
+            )
+    return gaps
 
 
 def _guardrail_scores_that_fire(operator: str, threshold: str) -> Optional[List[float]]:
@@ -18316,6 +18609,7 @@ def check_agentcore_policy_guardrail_wiring(
         inert_policies: List[str] = []
         unread_policies: List[str] = []
         scored_policies: List[str] = []
+        default_band_policies: List[str] = []
         for policy in policies:
             policy_name = policy.get("name") or policy.get("policyId") or "unnamed"
             for effect, _, conditions in _cedar_policies(
@@ -18330,6 +18624,11 @@ def check_agentcore_policy_guardrail_wiring(
                 guardrail_policies.append(policy_name)
                 verdict, reason = _guardrail_policy_verdict(effect, conditions)
                 entry = f"{policy_name} ({effect}: {reason})"
+                band_gaps = _guardrail_default_band_gaps(effect, conditions)
+                if verdict == "scored" and band_gaps:
+                    default_band_policies.append(
+                        f"{policy_name} ({effect}: {'; '.join(band_gaps)})"
+                    )
                 if verdict == "inert":
                     inert_policies.append(entry)
                 elif verdict == "unread":
@@ -18387,6 +18686,32 @@ def check_agentcore_policy_guardrail_wiring(
                     ),
                     reference=AGENTCORE_POLICY_GUARDRAIL_REFERENCE_URL,
                     severity=SeverityEnum.HIGH,
+                    status=StatusEnum.FAILED,
+                )
+            )
+        if default_band_policies:
+            findings.append(
+                create_finding(
+                    check_id="AC-37",
+                    finding_name="AgentCore Policy Guardrail Default Band Excluded",
+                    finding_details=(
+                        f"{label} enforces guardrail policies whose comparison "
+                        "leaves out a score equal to the safeguard's documented "
+                        "default threshold, so content scored exactly at the "
+                        "default passes the check the default is meant to "
+                        f"apply: {'; '.join(sorted(default_band_policies))}. "
+                        "Guardrails return only the scores 0, 0.2, 0.4, 0.6, "
+                        "0.8 and 1.0, so a strict comparison at a returned "
+                        "score drops that whole band."
+                    ),
+                    resolution=(
+                        "Use greaterThanOrEqual in a forbid or suppressOutput "
+                        "policy, or lessThan in a permit, when the default is "
+                        "meant to be inclusive. If excluding the band is "
+                        "intended, record the calibration that chose it."
+                    ),
+                    reference=AGENTCORE_POLICY_GUARDRAIL_REFERENCE_URL,
+                    severity=SeverityEnum.MEDIUM,
                     status=StatusEnum.FAILED,
                 )
             )
@@ -18463,14 +18788,27 @@ def check_agentcore_policy_guardrail_wiring(
 
         permissions = role_permissions[role_name]
         documents = _principal_policies(permissions)
+        # bedrock:InvokeGuardrailChecks has no resource type in the service
+        # reference, so only an Allow whose Resource reaches "*" grants it. A
+        # condition on the grant is not evaluated against the forward access
+        # session, so a conditioned grant is not credited.
         granted = False
+        conditioned = False
+        resource_scoped = False
         unreadable_documents = 0
         for document in documents:
             try:
-                granted = granted or any(
-                    _statement_matches_action(statement, GUARDRAIL_CHECK_ACTION_LOOKUP)
-                    for statement in _allow_statements(document)
-                )
+                for statement in _allow_statements(document):
+                    if not _statement_matches_action(
+                        statement, GUARDRAIL_CHECK_ACTION_LOOKUP
+                    ):
+                        continue
+                    if not _statement_resource_covers(statement, ["*"]):
+                        resource_scoped = True
+                    elif statement.get("Condition"):
+                        conditioned = True
+                    else:
+                        granted = True
             except Exception as error:
                 unreadable_documents += 1
                 logger.warning(f"Error parsing policy for role {role_name}: {error}")
@@ -18480,7 +18818,7 @@ def check_agentcore_policy_guardrail_wiring(
             and _grant_survives(permissions, GUARDRAIL_CHECK_ACTION_LOOKUP)
         )
 
-        if granted and (inert_policies or unread_policies):
+        if granted and (inert_policies or unread_policies or default_band_policies):
             continue
         if granted:
             findings.append(
@@ -18490,7 +18828,8 @@ def check_agentcore_policy_guardrail_wiring(
                     finding_details=(
                         f"{label} enforces guardrail policy {named}, and its "
                         f"execution role '{role_name}' grants "
-                        f"{GUARDRAIL_CHECK_ACTION}, so the policy engine can "
+                        f'{GUARDRAIL_CHECK_ACTION} on Resource "*" with no '
+                        "condition, so the policy engine can "
                         "score the content the policy names: "
                         f"{'; '.join(sorted(scored_policies))}. Service control "
                         "policies and conditioned Deny statements are not "
@@ -18529,6 +18868,55 @@ def check_agentcore_policy_guardrail_wiring(
                     reference=AGENTCORE_POLICY_GUARDRAIL_REFERENCE_URL,
                     severity=SeverityEnum.INFORMATIONAL,
                     status=StatusEnum.NA,
+                )
+            )
+        elif conditioned:
+            findings.append(
+                create_finding(
+                    check_id="AC-37",
+                    finding_name="AgentCore Policy Guardrail Wiring Incomplete",
+                    finding_details=(
+                        f"{label} enforces guardrail policy {named}, and its "
+                        f"execution role '{role_name}' grants "
+                        f"{GUARDRAIL_CHECK_ACTION} only under a condition this "
+                        "check does not evaluate against the Policy data "
+                        "plane's forward access session, so whether the "
+                        "guardrail call is allowed is unknown."
+                    ),
+                    resolution=(
+                        "No action is required on the assessed workload based on "
+                        "this result. Invoke the gateway once and confirm the "
+                        "decision record in the gateway's application logs shows "
+                        "the guardrail policy among its determining policies."
+                    ),
+                    reference=AGENTCORE_POLICY_GUARDRAIL_REFERENCE_URL,
+                    severity=SeverityEnum.INFORMATIONAL,
+                    status=StatusEnum.NA,
+                )
+            )
+        elif resource_scoped:
+            findings.append(
+                create_finding(
+                    check_id="AC-37",
+                    finding_name="AgentCore Policy Guardrail Wiring Incomplete",
+                    finding_details=(
+                        f"{label} enforces guardrail policy {named}, but its "
+                        f"execution role '{role_name}' grants "
+                        f"{GUARDRAIL_CHECK_ACTION} only on named resources. "
+                        "The action has no resource type, so IAM matches it "
+                        'only with Resource "*" and the guardrail call the '
+                        "Policy data plane makes with that role is denied."
+                    ),
+                    resolution=(
+                        f"Grant {GUARDRAIL_CHECK_ACTION} to the gateway execution "
+                        'role on Resource "*", then invoke the gateway once and '
+                        "confirm the decision record in the gateway's application "
+                        "logs shows the guardrail policy among its determining "
+                        "policies."
+                    ),
+                    reference=AGENTCORE_POLICY_GUARDRAIL_REFERENCE_URL,
+                    severity=SeverityEnum.HIGH,
+                    status=StatusEnum.FAILED,
                 )
             )
         else:
@@ -24743,7 +25131,7 @@ def lambda_handler(event, context):
     global start_time, iam_client, ec2_client, ecr_client, logs_client
     global cloudwatch_client, cloudtrail_client, oam_client, agentcore_client
     global kms_client, organizations_client
-    global wafv2_client, route53resolver_client, cognito_client
+    global wafv2_client, route53resolver_client, cognito_client, events_client
     start_time = time.time()
 
     try:
@@ -24782,6 +25170,9 @@ def lambda_handler(event, context):
         cognito_client = boto3.client(
             "cognito-idp", config=boto3_config, region_name=region
         )
+        # AC-36 reads the default bus, which receives the region's CloudTrail
+        # management events.
+        events_client = boto3.client("events", config=boto3_config, region_name=region)
 
         # Collect all findings
         all_findings = []
