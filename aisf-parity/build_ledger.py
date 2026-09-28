@@ -878,7 +878,14 @@ AI_SUBJECT_ROWS = [
         "notebooks, SM-11 for models, SM-28 for HyperPod clusters, SM-33 for training jobs "
         "together with EnableNetworkIsolation, and BR-39 for marketplace model endpoints. "
         "An egress-only gateway, a NAT gateway and a peering connection do not make a "
-        "subnet public. A route read that fails is reported Not Applicable and never passes",
+        "subnet public. A route read that fails is reported Not Applicable and never passes. "
+        "AC-01 also reads custom Code Interpreter and Browser subnets and fails a VPC "
+        "runtime reporting requireServiceS3Endpoint true; SM-10 also reads every Studio "
+        "domain's AppNetworkAccessType and SubnetIds; SM-33 also reads every processing "
+        "job's NetworkConfig and every training job with no item cap; BR-39 resolves "
+        "every subnet. Ceiling: Lambda GetFunctionConfiguration and ECS DescribeServices "
+        "return no field that marks a function or service as AI inference, so general "
+        "Lambda and ECS compute is not in the population",
         [],
         5,
     ),

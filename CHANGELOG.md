@@ -239,6 +239,17 @@ section.
   forwarded bus only when its rule has one. Before, any target passed, so a
   rule delivering only to a CloudWatch Logs group or an API destination
   passed; it now fails.
+- `AC-01`, `SM-10`, `SM-33` and `BR-39` read more of the AI compute
+  population for AIR-FND-NET-01. `AC-01` fails a custom Code Interpreter or
+  Browser in a subnet whose route table routes to an internet gateway, fails a
+  VPC-mode runtime reporting `requireServiceS3Endpoint` `true`, and reports a
+  runtime that omits the field, or names no subnet, as `N/A` where it passed
+  before. `SM-10` fails a Studio domain whose `AppNetworkAccessType` is
+  `PublicInternetOnly` or unset, fails a `VpcOnly` domain in a public subnet,
+  and no longer reports `Passed` or "none found" after a notebook read error.
+  `SM-33` reads every processing job's `NetworkConfig` and every training job,
+  where it read only the 50 most recent. `BR-39` describes every named subnet
+  in batches of 50, where it stopped after 50 and reported the rest `N/A`.
 - `BR-01`, `SM-02` and `AC-02` each gain a finding that fails a wildcard or
   `NotAction` Allow granting both a read and a write action on one resource
   type of the service (AIR-FND-IAM-09): `Bedrock or Data Store Read and Write

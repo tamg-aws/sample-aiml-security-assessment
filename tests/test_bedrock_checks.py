@@ -12407,11 +12407,14 @@ class TestBR39MarketplaceSubnetPrivacy:
             Filters=[{"Name": "vpc-id", "Values": ["vpc-1"]}]
         )
 
-    def test_br39_subnet_walk_is_capped_and_reports_the_remainder(self):
+    def test_br39_every_subnet_is_resolved_in_batches(self):
+        """The walk used to stop after 50 subnets and report the rest as not
+        resolved. Every subnet is now described, 50 per request, so a public
+        subnet past the fiftieth is still read."""
         subnet_ids = [f"subnet-{index:03d}" for index in range(60)]
-        cap = bedrock_app.MAX_MARKETPLACE_SUBNETS_CHECKED
+        batch = bedrock_app.MARKETPLACE_SUBNETS_PER_REQUEST
         ec2_client = self._ec2(
-            [self._subnet(subnet_id) for subnet_id in subnet_ids[:cap]],
+            [self._subnet(subnet_id) for subnet_id in subnet_ids],
             [self._table("rtb-shared", self._PRIVATE_TABLE["Routes"], main=True)],
         )
         rows = self._privacy_rows(
@@ -12421,13 +12424,44 @@ class TestBR39MarketplaceSubnetPrivacy:
             )
         )
 
-        assert [row["Status"] for row in rows] == ["N/A"]
-        assert f"{cap} of 60 subnet(s)" in rows[0]["Finding_Details"]
-        assert f"stopped after {cap} subnets" in rows[0]["Finding_Details"]
-        assert (
-            len(ec2_client.subnets_paginator.paginate.call_args.kwargs["SubnetIds"])
-            == cap
+        assert [row["Status"] for row in rows] == ["Passed"]
+        assert "All 60 subnet(s)" in rows[0]["Finding_Details"]
+        assert [
+            len(call.kwargs["SubnetIds"])
+            for call in ec2_client.subnets_paginator.paginate.call_args_list
+        ] == [batch, 60 - batch]
+
+    def test_br39_a_public_subnet_past_the_fiftieth_is_failed(self):
+        """The public subnet sits after 50 private ones, so a walk that stops at
+        50 reports it as not resolved instead of failing it."""
+        subnet_ids = [f"subnet-{index:03d}" for index in range(59)] + ["subnet-public"]
+        ec2_client = self._ec2(
+            [self._subnet(subnet_id) for subnet_id in subnet_ids],
+            [
+                self._table("rtb-shared", self._PRIVATE_TABLE["Routes"], main=True),
+                self._PUBLIC_TABLE,
+            ],
         )
+        # DescribeSubnets answers only for the ids it was asked about.
+        ec2_client.subnets_paginator.paginate.side_effect = lambda SubnetIds: [
+            {"Subnets": [self._subnet(subnet_id) for subnet_id in SubnetIds]}
+        ]
+        rows = self._privacy_rows(
+            self._run(
+                self._inventory(
+                    self._endpoint("arn:endpoint-1", subnet_ids[:30]),
+                    self._endpoint("arn:endpoint-2", subnet_ids[30:]),
+                ),
+                ec2_client,
+            )
+        )
+
+        failed = [row for row in rows if row["Status"] == "Failed"]
+        assert len(failed) == 1
+        assert "subnet-public" in failed[0]["Finding_Details"]
+        assert "arn:endpoint-2" in failed[0]["Finding_Details"]
+        assert "arn:endpoint-1" not in failed[0]["Finding_Details"]
+        assert "N/A" not in [row["Status"] for row in rows]
 
     def test_br39_privacy_rows_pass_the_finding_schema(self):
         findings = self._run(

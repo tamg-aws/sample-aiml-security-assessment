@@ -11203,9 +11203,10 @@ def get_marketplace_endpoint_inventory(region: str = "") -> Dict[str, Any]:
 
 MARKETPLACE_SUBNET_PRIVACY_FINDING = "Marketplace Model Endpoint Subnet Privacy"
 
-# One DescribeSubnets and one DescribeRouteTables call cover every endpoint, so
-# the cap only bounds the request size for an estate with many subnets.
-MAX_MARKETPLACE_SUBNETS_CHECKED = 50
+# One DescribeRouteTables walk covers every endpoint. DescribeSubnets is sent in
+# batches of this size so an estate with many subnets still has every subnet
+# resolved.
+MARKETPLACE_SUBNETS_PER_REQUEST = 50
 
 
 def _marketplace_endpoint_subnet_ids(item: Dict[str, Any]) -> List[str]:
@@ -11245,11 +11246,7 @@ def _subnet_route_privacy(
         "error": "",
     }
 
-    checked = subnet_ids[:MAX_MARKETPLACE_SUBNETS_CHECKED]
-    for subnet_id in subnet_ids[MAX_MARKETPLACE_SUBNETS_CHECKED:]:
-        result["unresolved"][subnet_id] = (
-            f"the subnet walk stopped after {MAX_MARKETPLACE_SUBNETS_CHECKED} subnets"
-        )
+    checked = list(subnet_ids)
     if not checked:
         return result
 
@@ -11264,22 +11261,24 @@ def _subnet_route_privacy(
 
     vpc_by_subnet = {}
     try:
-        try:
-            describe(checked)
-        except ClientError as error:
-            # One absent id fails the whole request, so retry per subnet and
-            # let the absent ones fall through to "not present" below.
-            if get_assessment_error_label(error) != "InvalidSubnetID.NotFound":
-                raise
-            for subnet_id in checked:
-                try:
-                    describe([subnet_id])
-                except ClientError as single_error:
-                    if (
-                        get_assessment_error_label(single_error)
-                        != "InvalidSubnetID.NotFound"
-                    ):
-                        raise
+        for start in range(0, len(checked), MARKETPLACE_SUBNETS_PER_REQUEST):
+            batch = checked[start : start + MARKETPLACE_SUBNETS_PER_REQUEST]
+            try:
+                describe(batch)
+            except ClientError as error:
+                # One absent id fails the whole request, so retry per subnet and
+                # let the absent ones fall through to "not present" below.
+                if get_assessment_error_label(error) != "InvalidSubnetID.NotFound":
+                    raise
+                for subnet_id in batch:
+                    try:
+                        describe([subnet_id])
+                    except ClientError as single_error:
+                        if (
+                            get_assessment_error_label(single_error)
+                            != "InvalidSubnetID.NotFound"
+                        ):
+                            raise
     except Exception as error:
         result["error"] = get_assessment_error_label(error)
         return result

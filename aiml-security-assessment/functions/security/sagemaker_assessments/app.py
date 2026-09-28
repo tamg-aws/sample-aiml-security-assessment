@@ -5,7 +5,7 @@ import os
 import logging
 from datetime import datetime, timedelta, timezone
 import time
-from typing import Dict, List, Any, Optional, Iterator
+from typing import Dict, List, Any, Optional, Iterator, Tuple
 from io import StringIO
 from botocore.config import Config
 from botocore.exceptions import ClientError, EndpointConnectionError
@@ -2903,11 +2903,149 @@ def check_sagemaker_notebook_root_access(region: str = "") -> Dict[str, Any]:
         }
 
 
+STUDIO_DOMAIN_NETWORK_FINDING = "SageMaker Studio Domain Network Boundary"
+STUDIO_DOMAIN_SUBNET_EXPOSURE_FINDING = (
+    "SageMaker Studio Domain Subnet Internet Exposure"
+)
+STUDIO_DOMAIN_NETWORK_REFERENCE = "https://docs.aws.amazon.com/sagemaker/latest/dg/studio-notebooks-and-internet-access.html"
+
+
+def _studio_domain_network_findings(
+    sagemaker_client: Any, region: str
+) -> List[Dict[str, Any]]:
+    """SM-10 Studio domain leg of AIR-FND-NET-01.
+
+    DescribeDomain reports AppNetworkAccessType. PublicInternetOnly, the default,
+    sends non-EFS traffic through a SageMaker-managed VPC that allows direct
+    internet access. VpcOnly sends all traffic through the domain's SubnetIds,
+    whose route tables then decide whether the domain is private. No domain
+    yields no row.
+    """
+    rows: List[Dict[str, Any]] = []
+    in_vpc: List[Dict[str, Any]] = []
+    public: List[str] = []
+    try:
+        paginator = sagemaker_client.get_paginator("list_domains")
+        domains = [
+            domain
+            for page in paginator.paginate()
+            for domain in page.get("Domains", [])
+            if domain.get("DomainId")
+        ]
+    except Exception as error:
+        logger.warning(f"Could not list SageMaker domains: {str(error)}")
+        return [
+            create_finding(
+                check_id="SM-10",
+                finding_name=STUDIO_DOMAIN_NETWORK_FINDING,
+                finding_details=(
+                    "SageMaker Studio domains could not be listed, so their network "
+                    "access type was not read. Assessment error: "
+                    f"{get_assessment_error_label(error)}."
+                ),
+                resolution="Grant sagemaker:ListDomains and retry.",
+                reference=STUDIO_DOMAIN_NETWORK_REFERENCE,
+                severity="Informational",
+                status="N/A",
+                region=region,
+            )
+        ]
+
+    for summary in domains:
+        domain_id = summary["DomainId"]
+        label = (
+            f"Studio domain '{summary.get('DomainName') or domain_id}' ({domain_id})"
+        )
+        try:
+            detail = sagemaker_client.describe_domain(DomainId=domain_id)
+        except Exception as error:
+            rows.append(
+                create_finding(
+                    check_id="SM-10",
+                    finding_name=STUDIO_DOMAIN_NETWORK_FINDING,
+                    finding_details=(
+                        f"{label} could not be described, so its network access "
+                        "type was not read. Assessment error: "
+                        f"{get_assessment_error_label(error)}."
+                    ),
+                    resolution="Grant sagemaker:DescribeDomain and retry.",
+                    reference=STUDIO_DOMAIN_NETWORK_REFERENCE,
+                    severity="Informational",
+                    status="N/A",
+                    region=region,
+                )
+            )
+            continue
+        access_type = detail.get("AppNetworkAccessType") or "PublicInternetOnly"
+        subnets = [subnet for subnet in detail.get("SubnetIds") or [] if subnet]
+        if access_type != "VpcOnly":
+            public.append(label)
+        elif not subnets:
+            rows.append(
+                create_finding(
+                    check_id="SM-10",
+                    finding_name=STUDIO_DOMAIN_NETWORK_FINDING,
+                    finding_details=(
+                        f"{label} reports AppNetworkAccessType VpcOnly with no "
+                        "SubnetIds, so whether it reaches an internet gateway was "
+                        "not judged."
+                    ),
+                    resolution="Grant sagemaker:DescribeDomain and retry.",
+                    reference=STUDIO_DOMAIN_NETWORK_REFERENCE,
+                    severity="Informational",
+                    status="N/A",
+                    region=region,
+                )
+            )
+        else:
+            in_vpc.append({"name": label, "subnets": subnets})
+
+    for label in public:
+        rows.append(
+            create_finding(
+                check_id="SM-10",
+                finding_name=STUDIO_DOMAIN_NETWORK_FINDING,
+                finding_details=(
+                    f"{label} uses AppNetworkAccessType PublicInternetOnly, so its "
+                    "non-EFS traffic goes through a SageMaker-managed VPC that "
+                    "allows direct internet access."
+                ),
+                resolution=(
+                    "Set AppNetworkAccessType to VpcOnly with private SubnetIds, "
+                    "and add the VPC endpoints Studio needs."
+                ),
+                reference=STUDIO_DOMAIN_NETWORK_REFERENCE,
+                severity="High",
+                status="Failed",
+                region=region,
+            )
+        )
+    rows.extend(
+        _subnet_exposure_findings(
+            check_id="SM-10",
+            finding_name=STUDIO_DOMAIN_SUBNET_EXPOSURE_FINDING,
+            resources=in_vpc,
+            region=region,
+            reference=STUDIO_DOMAIN_NETWORK_REFERENCE,
+            resolution=(
+                "Point the domain at subnets whose route tables have no internet "
+                "gateway route, or remove that route from the subnets' route "
+                "tables."
+            ),
+            severity="High",
+        )
+    )
+    return rows
+
+
 def check_sagemaker_notebook_vpc_deployment(region: str = "") -> Dict[str, Any]:
     """
     Check if SageMaker notebook instances are deployed within a custom VPC.
     Notebooks outside VPC use shared infrastructure with less isolation.
     Aligns with AWS Security Hub control SageMaker.2
+
+    Studio domains are read in the same check: a domain's AppNetworkAccessType
+    and SubnetIds decide where its notebooks' traffic goes.
     """
     logger.debug("Starting check for SageMaker notebook VPC deployment")
     try:
@@ -2919,6 +3057,7 @@ def check_sagemaker_notebook_vpc_deployment(region: str = "") -> Dict[str, Any]:
 
         notebooks_without_vpc = []
         notebooks_with_vpc = []
+        notebook_error = None
 
         try:
             paginator = sagemaker_client.get_paginator("list_notebook_instances")
@@ -2952,6 +3091,31 @@ def check_sagemaker_notebook_vpc_deployment(region: str = "") -> Dict[str, Any]:
 
         except Exception as e:
             logger.error(f"Error checking notebook instances VPC: {str(e)}")
+            notebook_error = e
+
+        if notebook_error is not None:
+            # A failed read never yields the all-in-VPC Passed or the
+            # none-found N/A, which would both claim a population not read.
+            findings["csv_data"].append(
+                create_finding(
+                    check_id="SM-10",
+                    finding_name="SageMaker Notebook VPC Deployment Check",
+                    finding_details=(
+                        "Notebook instances could not all be read, so "
+                        f"{len(notebooks_with_vpc) + len(notebooks_without_vpc)} "
+                        "read so far are reported and the rest were not assessed. "
+                        f"Assessment error: {get_assessment_error_label(notebook_error)}."
+                    ),
+                    resolution=(
+                        "Grant sagemaker:ListNotebookInstances and "
+                        "sagemaker:DescribeNotebookInstance and retry."
+                    ),
+                    reference="https://docs.aws.amazon.com/sagemaker/latest/dg/appendix-notebook-and-internet-access.html",
+                    severity="Informational",
+                    status="N/A",
+                    region=region,
+                )
+            )
 
         if notebooks_without_vpc:
             for notebook in notebooks_without_vpc:
@@ -2967,7 +3131,7 @@ def check_sagemaker_notebook_vpc_deployment(region: str = "") -> Dict[str, Any]:
                         region=region,
                     )
                 )
-        else:
+        elif notebook_error is None:
             if notebooks_with_vpc:
                 # Notebooks exist and all are in VPCs - Passed
                 findings["csv_data"].append(
@@ -3020,6 +3184,9 @@ def check_sagemaker_notebook_vpc_deployment(region: str = "") -> Dict[str, Any]:
                 ),
                 severity="High",
             )
+        )
+        findings["csv_data"].extend(
+            _studio_domain_network_findings(sagemaker_client, region)
         )
 
         return findings
@@ -6844,9 +7011,197 @@ TRAINING_NETWORK_BOUNDARY_RESOLUTION = (
     "a compromised training script from exfiltrating the training data."
 )
 
-# Training jobs are never deleted, so an account accumulates them indefinitely.
-# The check samples the most recent jobs and the finding says how many it read.
-MAX_TRAINING_JOBS_SAMPLED = 50
+PROCESSING_NETWORK_BOUNDARY_FINDING = "Processing Job Network Boundary"
+PROCESSING_SUBNET_EXPOSURE_FINDING = "SageMaker Processing Job Subnet Internet Exposure"
+PROCESSING_NETWORK_BOUNDARY_REFERENCE = (
+    "https://docs.aws.amazon.com/sagemaker/latest/APIReference/API_NetworkConfig.html"
+)
+PROCESSING_NETWORK_BOUNDARY_RESOLUTION = (
+    "Create processing jobs with NetworkConfig.VpcConfig naming private subnets "
+    "and security groups, and set NetworkConfig.EnableNetworkIsolation true "
+    "unless the job has to reach an approved external source."
+)
+
+
+def _processing_job_network_findings(
+    sagemaker_client: Any, region: str
+) -> Tuple[List[Dict[str, Any]], int]:
+    """SM-33 processing-job leg of AIR-FND-NET-01.
+
+    Returns the rows and the number of processing jobs listed. Every job is
+    listed and described. A processing job reports its network placement under
+    NetworkConfig, not at the top level as a training job does.
+    """
+    rows: List[Dict[str, Any]] = []
+    in_vpc: List[Dict[str, Any]] = []
+    without_vpc: List[Dict[str, Any]] = []
+    describe_errors: List[Dict[str, str]] = []
+    jobs_read = 0
+
+    try:
+        paginator = sagemaker_client.get_paginator("list_processing_jobs")
+        for page in paginator.paginate():
+            for summary in page.get("ProcessingJobSummaries", []):
+                job_name = summary.get("ProcessingJobName")
+                if not job_name:
+                    continue
+                jobs_read += 1
+                try:
+                    detail = sagemaker_client.describe_processing_job(
+                        ProcessingJobName=job_name
+                    )
+                except Exception as error:
+                    describe_errors.append(
+                        {"name": job_name, "label": get_assessment_error_label(error)}
+                    )
+                    continue
+                network = detail.get("NetworkConfig")
+                network = network if isinstance(network, dict) else {}
+                vpc_config = network.get("VpcConfig")
+                subnets = (
+                    vpc_config.get("Subnets") if isinstance(vpc_config, dict) else None
+                )
+                isolated = network.get("EnableNetworkIsolation") is True
+                if subnets:
+                    in_vpc.append({"name": job_name, "subnets": list(subnets)})
+                else:
+                    without_vpc.append({"name": job_name, "isolated": isolated})
+    except Exception as error:
+        logger.warning(f"Could not list SageMaker processing jobs: {str(error)}")
+        return [
+            create_finding(
+                check_id="SM-33",
+                finding_name=PROCESSING_NETWORK_BOUNDARY_FINDING,
+                finding_details=(
+                    "SageMaker processing jobs could not be listed, so their "
+                    "network placement was not read. Assessment error: "
+                    f"{get_assessment_error_label(error)}."
+                ),
+                resolution="Grant sagemaker:ListProcessingJobs and retry.",
+                reference=PROCESSING_NETWORK_BOUNDARY_REFERENCE,
+                severity="Informational",
+                status="N/A",
+                region=region,
+            )
+        ], jobs_read
+
+    for entry in without_vpc[:20]:
+        isolation_note = (
+            " Network isolation is on, which blocks the container's own egress "
+            "but leaves it outside the customer VPC."
+            if entry["isolated"]
+            else " Network isolation is off as well."
+        )
+        rows.append(
+            create_finding(
+                check_id="SM-33",
+                finding_name=PROCESSING_NETWORK_BOUNDARY_FINDING,
+                finding_details=(
+                    f"Processing job '{entry['name']}' ran with no "
+                    "NetworkConfig.VpcConfig, so it ran in the SageMaker-managed "
+                    f"network.{isolation_note}"
+                ),
+                resolution=PROCESSING_NETWORK_BOUNDARY_RESOLUTION,
+                reference=PROCESSING_NETWORK_BOUNDARY_REFERENCE,
+                severity="Medium",
+                status="Failed",
+                region=region,
+            )
+        )
+    if len(without_vpc) > 20:
+        rows.append(
+            create_finding(
+                check_id="SM-33",
+                finding_name=PROCESSING_NETWORK_BOUNDARY_FINDING,
+                finding_details=(
+                    f"{len(without_vpc)} of the {jobs_read} processing jobs ran "
+                    "with no NetworkConfig.VpcConfig (the first 20 are reported "
+                    "individually above)."
+                ),
+                resolution=PROCESSING_NETWORK_BOUNDARY_RESOLUTION,
+                reference=PROCESSING_NETWORK_BOUNDARY_REFERENCE,
+                severity="Medium",
+                status="Failed",
+                region=region,
+            )
+        )
+    if in_vpc:
+        described = "; ".join(
+            "{} in {}".format(entry["name"], ", ".join(entry["subnets"][:3]))
+            for entry in in_vpc[:3]
+        )
+        rows.append(
+            create_finding(
+                check_id="SM-33",
+                finding_name=PROCESSING_NETWORK_BOUNDARY_FINDING,
+                finding_details=(
+                    f"{len(in_vpc)} of the {jobs_read} processing jobs ran in "
+                    f"customer subnets: {described}. Whether those subnets have "
+                    "a route to an internet gateway is reported under "
+                    f"'{PROCESSING_SUBNET_EXPOSURE_FINDING}'."
+                ),
+                resolution="No action required on the VPC attachment.",
+                reference=PROCESSING_NETWORK_BOUNDARY_REFERENCE,
+                severity="Medium",
+                status="Passed",
+                region=region,
+            )
+        )
+    for entry in describe_errors[:5]:
+        rows.append(
+            create_finding(
+                check_id="SM-33",
+                finding_name=PROCESSING_NETWORK_BOUNDARY_FINDING,
+                finding_details=(
+                    f"Processing job '{entry['name']}' could not be assessed for "
+                    f"network configuration. Assessment error: {entry['label']}."
+                ),
+                resolution="Grant sagemaker:DescribeProcessingJob and retry.",
+                reference=PROCESSING_NETWORK_BOUNDARY_REFERENCE,
+                severity="Informational",
+                status="N/A",
+                region=region,
+            )
+        )
+    if len(describe_errors) > 5:
+        rows.append(
+            create_finding(
+                check_id="SM-33",
+                finding_name=PROCESSING_NETWORK_BOUNDARY_FINDING,
+                finding_details=(
+                    f"{len(describe_errors)} of the {jobs_read} processing jobs "
+                    "could not be described (the first 5 are reported "
+                    "individually above)."
+                ),
+                resolution="Grant sagemaker:DescribeProcessingJob and retry.",
+                reference=PROCESSING_NETWORK_BOUNDARY_REFERENCE,
+                severity="Informational",
+                status="N/A",
+                region=region,
+            )
+        )
+    rows.extend(
+        _subnet_exposure_findings(
+            check_id="SM-33",
+            finding_name=PROCESSING_SUBNET_EXPOSURE_FINDING,
+            resources=[
+                {
+                    "name": f"Processing job '{entry['name']}'",
+                    "subnets": entry["subnets"],
+                }
+                for entry in in_vpc
+            ],
+            region=region,
+            reference=PROCESSING_NETWORK_BOUNDARY_REFERENCE,
+            resolution=(
+                "Run processing jobs with NetworkConfig.VpcConfig naming subnets "
+                "whose route tables have no internet gateway route, or remove that "
+                "route from the subnets' route tables."
+            ),
+            severity="Medium",
+        )
+    )
+    return rows, jobs_read
 
 
 def check_sagemaker_training_job_network_boundary(region: str = "") -> Dict[str, Any]:
@@ -6855,7 +7210,8 @@ def check_sagemaker_training_job_network_boundary(region: str = "") -> Dict[str,
 
     SM-21 asserts this for AutoML jobs only. Network isolation and VpcConfig are
     reported separately because a job can be isolated with no VPC attachment, and
-    an isolated job still has no private path to S3 or ECR without one.
+    an isolated job still has no private path to S3 or ECR without one. Every
+    training job and every processing job is listed and described.
     """
     logger.debug("Starting check for SageMaker training job network boundary")
     findings = {"csv_data": []}
@@ -6870,11 +7226,7 @@ def check_sagemaker_training_job_network_boundary(region: str = "") -> Dict[str,
         describe_errors = []
 
         paginator = sagemaker_client.get_paginator("list_training_jobs")
-        for page in paginator.paginate(
-            SortBy="CreationTime",
-            SortOrder="Descending",
-            PaginationConfig={"MaxItems": MAX_TRAINING_JOBS_SAMPLED},
-        ):
+        for page in paginator.paginate(SortBy="CreationTime", SortOrder="Descending"):
             for summary in page.get("TrainingJobSummaries", []):
                 job_name = summary.get("TrainingJobName")
                 if not job_name:
@@ -6909,13 +7261,17 @@ def check_sagemaker_training_job_network_boundary(region: str = "") -> Dict[str,
                 else:
                     jobs_without_vpc.append({"name": job_name, "isolated": isolated})
 
-        if jobs_sampled == 0:
+        processing_rows, processing_jobs = _processing_job_network_findings(
+            sagemaker_client, region
+        )
+
+        if jobs_sampled == 0 and processing_jobs == 0 and not processing_rows:
             findings["csv_data"].append(
                 create_finding(
                     check_id="SM-33",
                     finding_name=TRAINING_NETWORK_BOUNDARY_FINDING,
                     finding_details=(
-                        "No SageMaker training jobs found in "
+                        "No SageMaker training or processing jobs found in "
                         f"{region or 'this region'}."
                     ),
                     resolution="No action required",
@@ -6957,7 +7313,7 @@ def check_sagemaker_training_job_network_boundary(region: str = "") -> Dict[str,
                     check_id="SM-33",
                     finding_name=TRAINING_NETWORK_BOUNDARY_FINDING,
                     finding_details=(
-                        f"{len(jobs_without_vpc)} of the {jobs_sampled} most recent "
+                        f"{len(jobs_without_vpc)} of the {jobs_sampled} "
                         "training jobs ran with no VpcConfig (the first 20 are "
                         "reported individually above)."
                     ),
@@ -6979,7 +7335,7 @@ def check_sagemaker_training_job_network_boundary(region: str = "") -> Dict[str,
                     check_id="SM-33",
                     finding_name=TRAINING_NETWORK_BOUNDARY_FINDING,
                     finding_details=(
-                        f"{len(jobs_in_vpc)} of the {jobs_sampled} most recent "
+                        f"{len(jobs_in_vpc)} of the {jobs_sampled} "
                         f"training jobs ran in customer subnets: {described}. "
                         "Whether those subnets have a route to an internet gateway "
                         f"is reported under '{TRAINING_SUBNET_EXPOSURE_FINDING}'. "
@@ -7013,6 +7369,23 @@ def check_sagemaker_training_job_network_boundary(region: str = "") -> Dict[str,
                     region=region,
                 )
             )
+        if len(describe_errors) > 5:
+            findings["csv_data"].append(
+                create_finding(
+                    check_id="SM-33",
+                    finding_name=TRAINING_NETWORK_BOUNDARY_FINDING,
+                    finding_details=(
+                        f"{len(describe_errors)} of the {jobs_sampled} training "
+                        "jobs could not be described (the first 5 are reported "
+                        "individually above)."
+                    ),
+                    resolution="Grant sagemaker:DescribeTrainingJob and retry.",
+                    reference=TRAINING_NETWORK_BOUNDARY_REFERENCE,
+                    severity="Informational",
+                    status="N/A",
+                    region=region,
+                )
+            )
 
         # AIR-FND-NET-01: a job's VpcConfig subnets decide nothing about egress
         # until their route tables are read.
@@ -7037,6 +7410,7 @@ def check_sagemaker_training_job_network_boundary(region: str = "") -> Dict[str,
                 severity="Medium",
             )
         )
+        findings["csv_data"].extend(processing_rows)
 
         return findings
 

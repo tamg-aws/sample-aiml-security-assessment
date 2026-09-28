@@ -183,7 +183,7 @@ investigation and remediation.
 
 - **Severity:** High
 - **AWS Security Hub Control:** SageMaker.2
-- **Description:** Ensures notebooks are deployed within an Amazon VPC.
+- **Description:** Ensures notebooks are deployed within an Amazon VPC, and fails a notebook whose subnet's route table routes to an internet gateway. A notebook list or describe error is `N/A` and withholds the all-in-VPC `Passed`. The same check reads every SageMaker Studio domain (AIR-FND-NET-01): `DescribeDomain` reporting `AppNetworkAccessType` `PublicInternetOnly`, or omitting it (the default is `PublicInternetOnly`), fails `SageMaker Studio Domain Network Boundary`, because that mode sends non-EFS traffic through a SageMaker-managed VPC that allows direct internet access. A `VpcOnly` domain's `SubnetIds` go through the same route-table read under `SageMaker Studio Domain Subnet Internet Exposure`. A domain list or describe error, or a `VpcOnly` domain with no `SubnetIds`, is `N/A`.
 
 ### SM-11: Model Network Isolation
 
@@ -297,7 +297,7 @@ investigation and remediation.
 ### SM-33: Training Job Network Boundary
 
 - **Severity:** Medium
-- **Description:** Requires training jobs to run inside a customer VPC. Network isolation and `VpcConfig` are reported separately, because a job can set `EnableNetworkIsolation` with no VPC attachment, and an isolated job without a VPC attachment still has no private path to Amazon S3 or Amazon ECR. SM-21 asserts the same VPC boundary for AutoML jobs only.
+- **Description:** Requires training jobs to run inside a customer VPC. Network isolation and `VpcConfig` are reported separately, because a job can set `EnableNetworkIsolation` with no VPC attachment, and an isolated job without a VPC attachment still has no private path to Amazon S3 or Amazon ECR. SM-21 asserts the same VPC boundary for AutoML jobs only. Every training job is listed and described, with no item cap. The same check lists and describes every processing job (AIR-FND-NET-01): a job whose `NetworkConfig` names no `VpcConfig` fails `Processing Job Network Boundary`, and the subnets of the others go through the route-table read under `SageMaker Processing Job Subnet Internet Exposure`. A list or describe error is `N/A`, and `No SageMaker training or processing jobs found` appears only when both lists read empty. In an estate with many jobs this check makes one describe call per job.
 
 ### SM-34: SageMaker Creation Guardrails
 
@@ -561,7 +561,7 @@ inventory is never treated as evidence of compliance.
 ### BR-39: Marketplace Model Endpoint VPC Configuration
 
 - **Severity:** High
-- **Description:** Requires SageMaker-backed Bedrock Marketplace endpoint configurations to include non-empty VPC subnet and security-group lists. It also resolves the effective route table of each named subnet (its explicit association, else the VPC main table) and fails a subnet whose table routes to an internet gateway. A named subnet that is not present in the Region is reported `N/A` by id, and the other subnets are still judged.
+- **Description:** Requires SageMaker-backed Bedrock Marketplace endpoint configurations to include non-empty VPC subnet and security-group lists. It also resolves the effective route table of each named subnet (its explicit association, else the VPC main table) and fails a subnet whose table routes to an internet gateway. A named subnet that is not present in the Region is reported `N/A` by id, and the other subnets are still judged. Every named subnet is described, 50 per `DescribeSubnets` request; there is no cap on how many are resolved.
 
 ### BR-40: Marketplace Model Endpoint CMK Encryption
 
@@ -655,7 +655,7 @@ inventory is never treated as evidence of compliance.
 ### AC-01: Runtime Amazon VPC Configuration
 
 - **Severity:** High
-- **Description:** Validates agent runtimes have proper Amazon VPC settings.
+- **Description:** Fails a runtime in `PUBLIC` network mode, and fails a VPC-mode runtime, custom Code Interpreter or custom Browser whose subnet's route table (its explicit association, else the VPC main table) routes to an internet gateway that is not a blackhole (AIR-FND-NET-01). Tools report their subnets as `networkConfiguration.vpcConfig.subnets`, under `AgentCore Tool Subnet Internet Exposure`; `PUBLIC` and `SANDBOX` tools attach no customer subnet and are judged by the egress leg. A VPC-mode runtime reporting `requireServiceS3Endpoint` `true` fails `AgentCore Runtime Service-Managed S3 Gateway`, because a runtime created before the 2026-05-05 rollout keeps a service-managed Amazon S3 gateway outside its VPC configuration until the field is set `false` through `UpdateAgentRuntime`; a runtime that does not report the field is `N/A`. A VPC-mode resource with no subnets, a subnet not present in the Region, and an unreadable route table are `N/A`. The `Passed` row names each runtime and states what was read. VPC endpoints are judged by AC-08. NAT gateways are not read: a NAT route gives no inbound path.
 
 ### AC-02: AWS IAM Full Access
 

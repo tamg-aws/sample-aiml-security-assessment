@@ -150,7 +150,10 @@ class TestAC01VPCConfiguration:
         mock_ac.get_agent_runtime.return_value = {
             "networkConfiguration": {
                 "networkMode": "VPC",
-                "networkModeConfig": {"subnets": ["subnet-123"]},
+                "networkModeConfig": {
+                    "subnets": ["subnet-123"],
+                    "requireServiceS3Endpoint": False,
+                },
             }
         }
         mock_ec2.describe_subnets.return_value = {
@@ -207,7 +210,10 @@ class TestAC01VPCConfiguration:
         mock_ac.get_agent_runtime.return_value = {
             "networkConfiguration": {
                 "networkMode": "VPC",
-                "networkModeConfig": {"subnets": ["subnet-main"]},
+                "networkModeConfig": {
+                    "subnets": ["subnet-main"],
+                    "requireServiceS3Endpoint": False,
+                },
             }
         }
         mock_ec2.describe_subnets.return_value = {
@@ -16908,3 +16914,229 @@ class TestCognitoUserPoolCheckRegistration:
         source = textwrap.dedent(inspect.getsource(agentcore_app.lambda_handler))
         assert source.count("check_agentcore_cognito_user_pool_authentication") == 1
         assert '"cognito-idp", config=boto3_config, region_name=region' in source
+
+
+def _net01_ec2(mock_ec2, public=("subnet-public",)):
+    """Stub DescribeSubnets and DescribeRouteTables: a subnet in ``public`` has an
+    igw- route, every other subnet routes to a NAT gateway."""
+    mock_ec2.describe_subnets.side_effect = lambda SubnetIds: {
+        "Subnets": [{"SubnetId": s, "VpcId": "vpc-1"} for s in SubnetIds]
+    }
+
+    def route_tables(Filters):
+        (subnet_id,) = Filters[0]["Values"]
+        gateway = (
+            {"GatewayId": "igw-0abc"}
+            if subnet_id in public
+            else {"NatGatewayId": "nat-0abc"}
+        )
+        return {
+            "RouteTables": [
+                {
+                    "RouteTableId": f"rtb-{subnet_id}",
+                    "Routes": [{"DestinationCidrBlock": "0.0.0.0/0", **gateway}],
+                }
+            ]
+        }
+
+    mock_ec2.describe_route_tables.side_effect = route_tables
+    mock_ec2.describe_security_groups.return_value = {"SecurityGroups": []}
+
+
+def _net01_runtime(runtime_id, subnets=("subnet-private",), **network_mode_config):
+    config = {"subnets": list(subnets), **network_mode_config}
+    return (
+        {"agentRuntimeId": runtime_id, "agentRuntimeName": runtime_id},
+        {
+            "agentRuntimeArn": _runtime_arn(runtime_id),
+            "networkConfiguration": {
+                "networkMode": "VPC",
+                "networkModeConfig": config,
+            },
+        },
+    )
+
+
+def _net01_tool(interpreter_id, subnets):
+    tool = _code_interpreter(interpreter_id)
+    tool["networkConfiguration"]["vpcConfig"]["subnets"] = list(subnets)
+    return tool
+
+
+class TestNet01AgentCorePrivateBoundary:
+    """AIR-FND-NET-01: AC-01 reads the route tables of custom tool subnets and
+    each VPC runtime's requireServiceS3Endpoint."""
+
+    @staticmethod
+    def _run(mock_ac, mock_ec2, runtimes=(), interpreters=(), browsers=()):
+        _net01_ec2(mock_ec2)
+        _wire_runtimes(mock_ac, list(runtimes))
+        _wire_tools(mock_ac, interpreters=interpreters, browsers=browsers)
+        rows = extract_csv_data(agentcore_app.check_agentcore_vpc_configuration())
+        for row in rows:
+            assert row["Check_ID"] == "AC-01"
+            assert_finding_schema(row)
+        return rows
+
+    @staticmethod
+    def _named(rows, finding):
+        return [r for r in rows if r["Finding"] == finding]
+
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_one_tool_in_a_public_subnet_among_private_tools_is_failed(
+        self, mock_ac, mock_ec2
+    ):
+        rows = self._run(
+            mock_ac,
+            mock_ec2,
+            interpreters=[
+                _net01_tool("ci-ok", ["subnet-private"]),
+                _net01_tool("ci-open", ["subnet-private", "subnet-public"]),
+            ],
+            browsers=[
+                {
+                    **_browser("br-ok"),
+                    "networkConfiguration": {
+                        "networkMode": "VPC",
+                        "vpcConfig": {
+                            "securityGroups": ["sg-tool"],
+                            "subnets": ["subnet-private"],
+                        },
+                    },
+                }
+            ],
+        )
+        tool = self._named(rows, agentcore_app.AGENTCORE_TOOL_SUBNET_FINDING)
+        assert [r["Status"] for r in tool] == ["Failed", "Passed"]
+        assert "Code Interpreter 'ci-open'" in tool[0]["Finding_Details"]
+        assert (
+            "subnet-public routes 0.0.0.0/0 to igw-0abc" in (tool[0]["Finding_Details"])
+        )
+        assert "subnet-private" not in tool[0]["Finding_Details"]
+        assert tool[1]["Finding_Details"].startswith("2 VPC-mode custom tool(s)")
+        assert "ci-open" not in tool[1]["Finding_Details"]
+
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_tools_alone_suppress_the_no_resources_row(self, mock_ac, mock_ec2):
+        rows = self._run(
+            mock_ac, mock_ec2, interpreters=[_net01_tool("ci-open", ["subnet-public"])]
+        )
+        assert not [r for r in rows if "No AgentCore" in r["Finding_Details"]]
+        tool = self._named(rows, agentcore_app.AGENTCORE_TOOL_SUBNET_FINDING)
+        assert [r["Status"] for r in tool] == ["Failed"]
+
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_sandbox_tool_attaches_no_subnet_and_adds_no_route_row(
+        self, mock_ac, mock_ec2
+    ):
+        rows = self._run(
+            mock_ac,
+            mock_ec2,
+            interpreters=[
+                _code_interpreter(
+                    "ci-sandbox", network_mode="SANDBOX", security_groups=None
+                )
+            ],
+        )
+        assert self._named(rows, agentcore_app.AGENTCORE_TOOL_SUBNET_FINDING) == []
+        assert mock_ec2.describe_route_tables.call_count == 0
+
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_vpc_tool_with_no_subnets_is_na(self, mock_ac, mock_ec2):
+        rows = self._run(mock_ac, mock_ec2, interpreters=[_net01_tool("ci-empty", [])])
+        tool = self._named(rows, agentcore_app.AGENTCORE_TOOL_SUBNET_FINDING)
+        assert [r["Status"] for r in tool] == ["N/A"]
+        assert "ci-empty" in tool[0]["Finding_Details"]
+
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_tool_route_read_error_is_na_not_a_pass(self, mock_ac, mock_ec2):
+        _net01_ec2(mock_ec2)
+        mock_ec2.describe_route_tables.side_effect = _make_client_error(
+            "UnauthorizedOperation", "denied"
+        )
+        _wire_runtimes(mock_ac, [])
+        _wire_tools(mock_ac, interpreters=[_net01_tool("ci-1", ["subnet-private"])])
+        rows = extract_csv_data(agentcore_app.check_agentcore_vpc_configuration())
+        tool = self._named(rows, agentcore_app.AGENTCORE_TOOL_SUBNET_FINDING)
+        assert [r["Status"] for r in tool] == ["N/A"]
+        assert "UnauthorizedOperation" in tool[0]["Finding_Details"]
+
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_one_runtime_with_the_service_s3_gateway_among_closed_ones_fails(
+        self, mock_ac, mock_ec2
+    ):
+        rows = self._run(
+            mock_ac,
+            mock_ec2,
+            runtimes=[
+                _net01_runtime("rt-closed", requireServiceS3Endpoint=False),
+                _net01_runtime("rt-open", requireServiceS3Endpoint=True),
+            ],
+        )
+        gateway = self._named(rows, agentcore_app.AGENTCORE_SERVICE_S3_GATEWAY_FINDING)
+        assert [r["Status"] for r in gateway] == ["Failed"]
+        assert "'rt-open'" in gateway[0]["Finding_Details"]
+        assert "Passed" not in [
+            r["Status"]
+            for r in rows
+            if r["Finding"] == "AgentCore VPC Configuration Check"
+        ]
+
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_an_absent_require_service_s3_endpoint_is_na_and_holds_the_pass(
+        self, mock_ac, mock_ec2
+    ):
+        rows = self._run(mock_ac, mock_ec2, runtimes=[_net01_runtime("rt-unset")])
+        gateway = self._named(rows, agentcore_app.AGENTCORE_SERVICE_S3_GATEWAY_FINDING)
+        assert [r["Status"] for r in gateway] == ["N/A"]
+        assert (
+            "did not report requireServiceS3Endpoint" in (gateway[0]["Finding_Details"])
+        )
+        assert "Passed" not in [
+            r["Status"]
+            for r in rows
+            if r["Finding"] == "AgentCore VPC Configuration Check"
+        ]
+
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_vpc_runtime_with_no_subnets_is_na(self, mock_ac, mock_ec2):
+        rows = self._run(
+            mock_ac,
+            mock_ec2,
+            runtimes=[_net01_runtime("rt-bare", (), requireServiceS3Endpoint=False)],
+        )
+        runtime = self._named(rows, "AgentCore Runtime VPC Configuration")
+        assert [r["Status"] for r in runtime] == ["N/A"]
+        assert "with no subnets" in runtime[0]["Finding_Details"]
+        assert "Passed" not in [
+            r["Status"]
+            for r in rows
+            if r["Finding"] == "AgentCore VPC Configuration Check"
+        ]
+
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_the_passed_names_every_runtime_and_what_it_established(
+        self, mock_ac, mock_ec2
+    ):
+        rows = self._run(
+            mock_ac,
+            mock_ec2,
+            runtimes=[
+                _net01_runtime("rt-a", requireServiceS3Endpoint=False),
+                _net01_runtime("rt-b", requireServiceS3Endpoint=False),
+            ],
+        )
+        (passed,) = self._named(rows, "AgentCore VPC Configuration Check")
+        assert passed["Status"] == "Passed"
+        assert passed["Finding_Details"].startswith("All 2 AgentCore runtime(s)")
+        assert "'rt-a' (rt-a), 'rt-b' (rt-b)" in passed["Finding_Details"]
+        assert "requireServiceS3Endpoint false" in passed["Finding_Details"]

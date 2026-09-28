@@ -207,6 +207,10 @@ IAM_PASS_ROLE_REFERENCE_URL = (
 AGENTCORE_VPC_SECURITY_GROUP_REFERENCE_URL = (
     "https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/agentcore-vpc.html"
 )
+AGENTCORE_VPC_CONFIG_API_REFERENCE_URL = (
+    "https://docs.aws.amazon.com/bedrock-agentcore-control/latest/APIReference/"
+    "API_VpcConfig.html"
+)
 AGENTCORE_CODE_INTERPRETER_NETWORK_REFERENCE_URL = (
     "https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/"
     "code-interpreter-create.html"
@@ -1371,9 +1375,168 @@ def _agentcore_tool_read_findings(
     ]
 
 
+AGENTCORE_TOOL_SUBNET_FINDING = "AgentCore Tool Subnet Internet Exposure"
+AGENTCORE_SERVICE_S3_GATEWAY_FINDING = "AgentCore Runtime Service-Managed S3 Gateway"
+
+
+def _agentcore_subnet_internet_route(
+    subnet: Dict[str, Any],
+) -> Tuple[bool, Optional[Tuple[str, Dict[str, Any]]]]:
+    """Return (route table found, (route table id, igw route) or None).
+
+    A subnet with no explicit association uses its VPC's main route table. A
+    blackhole route names a deleted gateway and carries no traffic.
+    """
+    route_tables = ec2_client.describe_route_tables(
+        Filters=[{"Name": "association.subnet-id", "Values": [subnet["SubnetId"]]}]
+    ).get("RouteTables", [])
+    if not route_tables:
+        route_tables = ec2_client.describe_route_tables(
+            Filters=[
+                {"Name": "vpc-id", "Values": [subnet.get("VpcId")]},
+                {"Name": "association.main", "Values": ["true"]},
+            ]
+        ).get("RouteTables", [])
+    for table in route_tables:
+        for route in table.get("Routes", []):
+            if route.get("State") != "blackhole" and str(
+                route.get("GatewayId") or ""
+            ).startswith("igw-"):
+                return True, (table.get("RouteTableId") or "unknown", route)
+    return bool(route_tables), None
+
+
+def _agentcore_tool_subnet_findings(
+    tool_details: List[Tuple[str, Dict[str, Any]]],
+    tool_errors: List[Tuple[str, Exception, str]],
+) -> List[Dict[str, Any]]:
+    """AC-01 route leg for custom Code Interpreters and Browsers (AIR-FND-NET-01).
+
+    A VPC-mode tool reports its subnets under networkConfiguration.vpcConfig.
+    Each subnet's route table decides whether the tool sits in a public subnet.
+    PUBLIC and SANDBOX tools attach no customer subnet; the egress leg reports
+    them.
+    """
+    findings = _agentcore_tool_read_findings(
+        "AC-01",
+        AGENTCORE_TOOL_SUBNET_FINDING,
+        tool_errors,
+        AGENTCORE_VPC_SECURITY_GROUP_REFERENCE_URL,
+    )
+    private_tools: List[str] = []
+
+    def not_judged(label: str, reason: str, resolution: str) -> Dict[str, Any]:
+        return create_finding(
+            check_id="AC-01",
+            finding_name=AGENTCORE_TOOL_SUBNET_FINDING,
+            finding_details=(
+                f"{label} {reason}, so whether it reaches an internet gateway "
+                "was not judged."
+            ),
+            resolution=resolution,
+            reference=AGENTCORE_VPC_SECURITY_GROUP_REFERENCE_URL,
+            severity=SeverityEnum.INFORMATIONAL,
+            status=StatusEnum.NA,
+        )
+
+    for label, detail in tool_details:
+        network = detail.get("networkConfiguration") or {}
+        if str(network.get("networkMode") or "") != "VPC":
+            continue
+        subnet_ids = (network.get("vpcConfig") or {}).get("subnets") or []
+        if not subnet_ids:
+            findings.append(
+                not_judged(
+                    label,
+                    "reported VPC network mode with no subnets",
+                    "Grant bedrock-agentcore:GetCodeInterpreter and "
+                    "bedrock-agentcore:GetBrowser and retry.",
+                )
+            )
+            continue
+
+        try:
+            described, missing = _describe_subnets_reporting_missing(subnet_ids)
+            exposed = []
+            unresolved = list(missing)
+            for subnet in described:
+                found, route = _agentcore_subnet_internet_route(subnet)
+                if route is not None:
+                    exposed.append((subnet["SubnetId"], route))
+                elif not found:
+                    unresolved.append(subnet["SubnetId"])
+        except ClientError as error:
+            findings.append(
+                not_judged(
+                    label,
+                    "has subnets whose route tables could not be read: "
+                    f"{_assessment_error_label(error)}",
+                    "Grant ec2:DescribeSubnets and ec2:DescribeRouteTables and retry.",
+                )
+            )
+            continue
+
+        if exposed:
+            described_routes = "; ".join(
+                f"{subnet_id} routes "
+                f"{route.get('DestinationCidrBlock') or route.get('DestinationIpv6CidrBlock') or 'a destination'} "
+                f"to {route.get('GatewayId')} through route table {table_id}"
+                for subnet_id, (table_id, route) in exposed
+            )
+            findings.append(
+                create_finding(
+                    check_id="AC-01",
+                    finding_name=AGENTCORE_TOOL_SUBNET_FINDING,
+                    finding_details=(
+                        f"{label} runs in a public subnet: {described_routes}."
+                    ),
+                    resolution=(
+                        "Move the tool to private subnets whose route tables have "
+                        "no internet gateway route."
+                    ),
+                    reference=AGENTCORE_VPC_SECURITY_GROUP_REFERENCE_URL,
+                    severity=SeverityEnum.MEDIUM,
+                    status=StatusEnum.FAILED,
+                )
+            )
+        elif unresolved:
+            findings.append(
+                not_judged(
+                    label,
+                    f"names subnet(s) {', '.join(unresolved)} that are not present "
+                    "in this account and Region or have no route table",
+                    "Update the tool's network configuration to name subnets that "
+                    "exist, then retry.",
+                )
+            )
+        else:
+            private_tools.append(label)
+
+    if private_tools:
+        findings.append(
+            create_finding(
+                check_id="AC-01",
+                finding_name=AGENTCORE_TOOL_SUBNET_FINDING,
+                finding_details=(
+                    f"{len(private_tools)} VPC-mode custom tool(s) run only in "
+                    "subnets whose route tables have no route to an internet "
+                    f"gateway: {', '.join(private_tools)}."
+                ),
+                resolution="No action required",
+                reference=AGENTCORE_VPC_SECURITY_GROUP_REFERENCE_URL,
+                severity=SeverityEnum.MEDIUM,
+                status=StatusEnum.PASSED,
+            )
+        )
+    return findings
+
+
 def _agentcore_egress_findings(
     runtime_targets: List[Tuple[str, str, List[str]]],
     browser_inventory: Dict[str, Any] = None,
+    tool_read: Optional[
+        Tuple[List[Tuple[str, Dict[str, Any]]], List[Tuple[str, Exception, str]]]
+    ] = None,
 ) -> List[Dict[str, Any]]:
     """AC-01 egress leg: judge what each agent resource may reach outbound.
 
@@ -1388,7 +1551,7 @@ def _agentcore_egress_findings(
     assertion is the workload-independent one: the outbound rules do not name
     every address on the internet.
     """
-    details, errors = _agentcore_tool_details(browser_inventory)
+    details, errors = tool_read or _agentcore_tool_details(browser_inventory)
     findings = _agentcore_tool_read_findings(
         "AC-01",
         AGENTCORE_EGRESS_FINDING_NAME,
@@ -1596,17 +1759,23 @@ def check_agentcore_vpc_configuration(
     Check VPC configuration for AgentCore Runtimes, Code Interpreters, and Browser Tools.
 
     Validates:
-    - VPC configuration exists
-    - Subnets are private (not public)
-    - Required VPC endpoints exist
-    - NAT gateway configuration
+    - Each runtime runs in VPC network mode
+    - The route table of every runtime, custom Code Interpreter and custom
+      Browser subnet has no route to an internet gateway
+    - Each VPC-mode runtime reports requireServiceS3Endpoint false, so no
+      service-managed Amazon S3 gateway sits outside its VPC configuration
     - What the security groups of each VPC-mode resource permit outbound
+
+    VPC endpoints are judged by AC-08. NAT gateways are not read: a NAT route
+    gives no inbound path, and what the workload reaches through it is the
+    security group egress leg's question.
 
     Returns:
         List of findings
     """
     findings = []
     egress_targets: List[Tuple[str, str, List[str]]] = []
+    private_runtimes: List[str] = []
 
     if agentcore_client is None:
         logger.error("AgentCore client not available")
@@ -1678,6 +1847,64 @@ def check_agentcore_vpc_configuration(
                                 )
                             )
 
+                            # AIR-FND-NET-01: a runtime created before the
+                            # 2026-05-05 rollout keeps a service-managed S3
+                            # gateway outside its VPC configuration until
+                            # requireServiceS3Endpoint is set false. An absent
+                            # field is not read as either answer.
+                            require_s3 = (
+                                network_config.get("networkModeConfig") or {}
+                            ).get("requireServiceS3Endpoint")
+                            if require_s3 is True:
+                                findings.append(
+                                    create_finding(
+                                        check_id="AC-01",
+                                        finding_name=AGENTCORE_SERVICE_S3_GATEWAY_FINDING,
+                                        finding_details=(
+                                            f"Runtime '{runtime_name}' ({runtime_id}) "
+                                            "runs in VPC mode with "
+                                            "requireServiceS3Endpoint true, so a "
+                                            "service-managed Amazon S3 gateway "
+                                            "outside its VPC configuration carries "
+                                            "its S3 traffic."
+                                        ),
+                                        resolution=(
+                                            "Confirm the VPC gives the runtime the "
+                                            "Amazon S3 access it needs at startup, "
+                                            "then set requireServiceS3Endpoint to "
+                                            "false through UpdateAgentRuntime."
+                                        ),
+                                        reference=AGENTCORE_VPC_CONFIG_API_REFERENCE_URL,
+                                        severity=SeverityEnum.MEDIUM,
+                                        status=StatusEnum.FAILED,
+                                    )
+                                )
+                            elif require_s3 is not False:
+                                findings.append(
+                                    create_finding(
+                                        check_id="AC-01",
+                                        finding_name=AGENTCORE_SERVICE_S3_GATEWAY_FINDING,
+                                        finding_details=(
+                                            f"Runtime '{runtime_name}' ({runtime_id}) "
+                                            "runs in VPC mode but GetAgentRuntime "
+                                            "did not report requireServiceS3Endpoint, "
+                                            "so whether a service-managed Amazon S3 "
+                                            "gateway sits outside its VPC "
+                                            "configuration was not established."
+                                        ),
+                                        resolution=(
+                                            "Read the runtime with GetAgentRuntime. "
+                                            "A runtime created before the rollout "
+                                            "keeps the gateway until "
+                                            "requireServiceS3Endpoint is set false "
+                                            "through UpdateAgentRuntime."
+                                        ),
+                                        reference=AGENTCORE_VPC_CONFIG_API_REFERENCE_URL,
+                                        severity=SeverityEnum.INFORMATIONAL,
+                                        status=StatusEnum.NA,
+                                    )
+                                )
+
                             # Validate VPC configuration. The runtime's subnets live
                             # in the same networkModeConfig the security groups above
                             # come from, spelled "subnets". Bedrock's VpcConfig spells
@@ -1687,7 +1914,30 @@ def check_agentcore_vpc_configuration(
                                 network_config.get("networkModeConfig") or {}
                             ).get("subnets") or []
 
-                            if subnet_ids:
+                            if not subnet_ids:
+                                findings.append(
+                                    create_finding(
+                                        check_id="AC-01",
+                                        finding_name="AgentCore Runtime VPC Configuration",
+                                        finding_details=(
+                                            f"Runtime '{runtime_name}' ({runtime_id}) "
+                                            f"reported network mode '{network_mode}' "
+                                            "with no subnets, so whether it reaches "
+                                            "an internet gateway was not judged."
+                                        ),
+                                        resolution=(
+                                            "Grant bedrock-agentcore:GetAgentRuntime "
+                                            "and retry."
+                                        ),
+                                        reference=AGENTCORE_VPC_REFERENCE_URL,
+                                        severity=SeverityEnum.INFORMATIONAL,
+                                        status=StatusEnum.NA,
+                                    )
+                                )
+                            else:
+                                private_runtimes.append(
+                                    f"'{runtime_name}' ({runtime_id})"
+                                )
                                 # Check if subnets are private
                                 try:
                                     (
@@ -1828,21 +2078,38 @@ def check_agentcore_vpc_configuration(
                 logger.error(f"Error listing runtimes: {e}")
                 raise
 
-        # Return appropriate status based on whether resources were found
+        tool_details, tool_errors = _agentcore_tool_details(browser_inventory)
+
+        # Return appropriate status based on whether resources were found. Any
+        # runtime finding above, of any status, withholds the Passed.
         if not findings:
-            if resources_found:
+            if resources_found and private_runtimes:
+                named = ", ".join(private_runtimes[:5])
+                remainder = (
+                    f" and {len(private_runtimes) - 5} more"
+                    if len(private_runtimes) > 5
+                    else ""
+                )
                 findings.append(
                     create_finding(
                         check_id="AC-01",
                         finding_name="AgentCore VPC Configuration Check",
-                        finding_details="All AgentCore resources have proper VPC configuration",
+                        finding_details=(
+                            f"All {len(private_runtimes)} AgentCore runtime(s) run "
+                            "in VPC mode on subnets whose route tables have no "
+                            "route to an internet gateway, and report "
+                            "requireServiceS3Endpoint false: "
+                            f"{named}{remainder}. Custom Code Interpreters and "
+                            "Browsers are reported under "
+                            f"'{AGENTCORE_TOOL_SUBNET_FINDING}'."
+                        ),
                         resolution="No action required",
                         reference=AGENTCORE_VPC_REFERENCE_URL,
                         severity=SeverityEnum.HIGH,
                         status=StatusEnum.PASSED,
                     )
                 )
-            else:
+            elif not resources_found and not tool_details and not tool_errors:
                 findings.append(
                     create_finding(
                         check_id="AC-01",
@@ -1855,7 +2122,12 @@ def check_agentcore_vpc_configuration(
                     )
                 )
 
-        findings.extend(_agentcore_egress_findings(egress_targets, browser_inventory))
+        findings.extend(_agentcore_tool_subnet_findings(tool_details, tool_errors))
+        findings.extend(
+            _agentcore_egress_findings(
+                egress_targets, browser_inventory, (tool_details, tool_errors)
+            )
+        )
 
     except Exception as e:
         logger.error(f"Error in VPC configuration check: {e}")
