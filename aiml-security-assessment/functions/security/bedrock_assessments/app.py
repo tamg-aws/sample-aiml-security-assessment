@@ -10004,29 +10004,6 @@ def _knowledge_base_source_encryption_findings(region: str) -> List[Dict[str, An
             )
         )
 
-    if inventory["truncated"]:
-        source_findings.append(
-            create_finding(
-                check_id="BR-20",
-                finding_name=KB_DATA_SOURCE_ENCRYPTION_FINDING,
-                finding_details=(
-                    "Encryption at rest was assessed for the first "
-                    f"{MAX_KNOWLEDGE_BASE_DATA_SOURCE_DESCRIBES} knowledge base data "
-                    "sources in this region only; the remaining data sources were "
-                    "not read."
-                ),
-                resolution=(
-                    "Assess the remaining knowledge base data source buckets "
-                    "directly, or split the knowledge bases across regions or "
-                    "accounts so the whole estate is covered."
-                ),
-                reference=KB_ENCRYPTION_REFERENCE,
-                severity="Informational",
-                status="N/A",
-                region=region,
-            )
-        )
-
     return source_findings
 
 
@@ -15697,7 +15674,6 @@ def _training_data_buckets() -> Dict[str, Any]:
     """
     buckets: Dict[str, List[str]] = {}
     errors = []
-    truncated = []
     regions = _assessed_regions()
     for region in regions:
         inventory = _ai_data_path_buckets(region)
@@ -15716,15 +15692,9 @@ def _training_data_buckets() -> Dict[str, Any]:
             for error in inventory["errors"]
             if error.startswith(("model customization jobs", "customization job "))
         )
-        truncated.extend(
-            f"{region} {note}"
-            for note in inventory["truncated"]
-            if note.startswith("model customization jobs")
-        )
     return {
         "buckets": buckets,
         "errors": errors,
-        "truncated": truncated,
         "regions": regions,
     }
 
@@ -15969,7 +15939,7 @@ def check_bedrock_model_allow_list(
             )
 
         training_note = ""
-        if training_data.get("errors") or training_data.get("truncated"):
+        if training_data.get("errors"):
             findings["csv_data"].append(
                 create_finding(
                     check_id="BR-42",
@@ -15978,10 +15948,7 @@ def check_bedrock_model_allow_list(
                         "Access to model customization training data was not fully "
                         "assessed because the customization jobs could not all be "
                         "read: {}.".format(
-                            "; ".join(
-                                (training_data.get("errors") or [])
-                                + (training_data.get("truncated") or [])
-                            )[:1500]
+                            "; ".join(training_data.get("errors") or [])[:1500]
                         )
                     ),
                     resolution=COULD_NOT_ASSESS_RESOLUTION,
@@ -19416,11 +19383,6 @@ MACIE_ACCOUNT_STATE_OWNER = (
     "governance assessment, so it is not reported as a failure twice."
 )
 
-# One GetDataSource call per data source, so a large knowledge base estate cannot
-# make the check unbounded.
-MAX_KNOWLEDGE_BASE_DATA_SOURCE_DESCRIBES = 50
-
-MAX_REPORTED_UNMONITORED_BUCKETS = 20
 
 CLASSIFICATION_JOB_FINDING = "Knowledge Base Source Classification Job Coverage"
 
@@ -19461,8 +19423,6 @@ def _knowledge_base_s3_sources(region: str = "") -> Dict[str, Any]:
     other_sources = []
     transient_keys = []
     errors = []
-    described = 0
-    truncated = False
 
     for knowledge_base in knowledge_bases:
         kb_id = knowledge_base.get("knowledgeBaseId")
@@ -19487,10 +19447,6 @@ def _knowledge_base_s3_sources(region: str = "") -> Dict[str, Any]:
             data_source_id = summary.get("dataSourceId")
             if not data_source_id:
                 continue
-            if described >= MAX_KNOWLEDGE_BASE_DATA_SOURCE_DESCRIBES:
-                truncated = True
-                continue
-            described += 1
             try:
                 detail = client.get_data_source(
                     knowledgeBaseId=kb_id, dataSourceId=data_source_id
@@ -19540,6 +19496,10 @@ def _knowledge_base_s3_sources(region: str = "") -> Dict[str, Any]:
                     "owner_account": str(
                         s3_configuration.get("bucketOwnerAccountId") or ""
                     ),
+                    "prefixes": [
+                        str(prefix)
+                        for prefix in s3_configuration.get("inclusionPrefixes") or []
+                    ],
                 }
             )
 
@@ -19549,7 +19509,6 @@ def _knowledge_base_s3_sources(region: str = "") -> Dict[str, Any]:
         "other_sources": other_sources,
         "transient_keys": transient_keys,
         "errors": errors,
-        "truncated": truncated,
     }
 
 
@@ -19559,7 +19518,8 @@ def _macie_discovery_precondition(macie_client) -> Dict[str, Any]:
 
     ``ready`` is True only when the Macie session and automated sensitive data
     discovery are both ENABLED, because a bucket's monitoring status carries no
-    meaning while discovery is off. ``permissions`` separates a missing IAM grant
+    meaning while discovery is off. ``session_enabled`` is True whenever the
+    session is ENABLED, which is all the classification job leg needs. ``permissions`` separates a missing IAM grant
     from Macie being switched off: the first must never read as a pass or a fail
     of the control.
     """
@@ -19570,11 +19530,13 @@ def _macie_discovery_precondition(macie_client) -> Dict[str, Any]:
         if any(marker in message for marker in MACIE_NOT_ENABLED_MARKERS):
             return {
                 "ready": False,
+                "session_enabled": False,
                 "permissions": False,
                 "detail": "Amazon Macie is not enabled in this Region",
             }
         return {
             "ready": False,
+            "session_enabled": False,
             "permissions": True,
             "detail": (
                 "whether Amazon Macie is enabled could not be determined "
@@ -19587,6 +19549,7 @@ def _macie_discovery_precondition(macie_client) -> Dict[str, Any]:
     if session_status.upper() != "ENABLED":
         return {
             "ready": False,
+            "session_enabled": False,
             "permissions": False,
             "detail": f"the Amazon Macie session status is {session_status or 'unknown'}",
         }
@@ -19598,6 +19561,7 @@ def _macie_discovery_precondition(macie_client) -> Dict[str, Any]:
         if any(marker in message for marker in MACIE_NOT_ENABLED_MARKERS):
             return {
                 "ready": False,
+                "session_enabled": True,
                 "permissions": False,
                 "detail": (
                     "automated sensitive data discovery has not been onboarded in "
@@ -19606,6 +19570,7 @@ def _macie_discovery_precondition(macie_client) -> Dict[str, Any]:
             }
         return {
             "ready": False,
+            "session_enabled": True,
             "permissions": True,
             "detail": (
                 "the automated sensitive data discovery configuration could not be "
@@ -19619,6 +19584,7 @@ def _macie_discovery_precondition(macie_client) -> Dict[str, Any]:
     if discovery_status.upper() != "ENABLED":
         return {
             "ready": False,
+            "session_enabled": True,
             "permissions": False,
             "detail": (
                 "automated sensitive data discovery is "
@@ -19628,6 +19594,7 @@ def _macie_discovery_precondition(macie_client) -> Dict[str, Any]:
 
     return {
         "ready": True,
+        "session_enabled": True,
         "permissions": False,
         "detail": (
             "the Macie session is ENABLED and automated sensitive data discovery is "
@@ -19643,19 +19610,14 @@ def _classification_jobs_for_buckets(
     """
     Index the Macie classification jobs that name any of ``buckets``.
 
-    ListClassificationJobs is the only job action read. DescribeClassificationJob
-    would be one call per job and carries nothing this leg needs, because
-    JobSummary already holds jobType, jobStatus, lastRunErrorStatus and the
-    bucketDefinitions that decide which bucket a job inspects.
-
-    A job that selects its buckets through ``bucketCriteria`` instead of naming
-    them in ``bucketDefinitions`` is counted separately: Macie evaluates those
-    criteria against the account's buckets when the job runs, so calling such a
-    job either coverage or not-coverage of a named bucket would be a guess.
+    JobSummary names the buckets a job inspects in ``bucketDefinitions``. A job
+    that selects its buckets through ``bucketCriteria`` is counted separately,
+    because Macie evaluates those criteria when the job runs; the bucket's own
+    ``jobDetails`` in DescribeBuckets reports whether such a job selects it.
     """
     wanted = set(buckets)
     jobs_by_bucket: Dict[str, List[Dict[str, Any]]] = {}
-    criteria_jobs: List[str] = []
+    criteria_jobs: List[Dict[str, str]] = []
 
     try:
         paginator = macie_client.get_paginator("list_classification_jobs")
@@ -19667,17 +19629,12 @@ def _classification_jobs_for_buckets(
                     for name in definition.get("buckets") or []
                 }
                 summary = {
+                    "id": str(job.get("jobId") or ""),
                     "name": job.get("name") or job.get("jobId") or "an unnamed job",
-                    "type": str(job.get("jobType") or "").upper(),
-                    "status": str(job.get("jobStatus") or "").upper(),
-                    "last_run_error": str(
-                        (job.get("lastRunErrorStatus") or {}).get("code") or ""
-                    ).upper()
-                    == "ERROR",
                 }
                 if not named:
                     if job.get("bucketCriteria"):
-                        criteria_jobs.append(summary["name"])
+                        criteria_jobs.append(summary)
                     continue
                 for name in sorted(named & wanted):
                     jobs_by_bucket.setdefault(name, []).append(summary)
@@ -19697,82 +19654,258 @@ def _classification_jobs_for_buckets(
     }
 
 
-def _classification_job_coverage(
-    bucket: str, jobs: List[Dict[str, Any]]
+def _scope_terms(block: Any) -> List[Dict[str, Any]]:
+    """Return the AND-ed conditions of a Macie JobScopingBlock."""
+    return [term for term in (block or {}).get("and") or [] if isinstance(term, dict)]
+
+
+def _is_key_prefix_term(term: Dict[str, Any]) -> bool:
+    simple = term.get("simpleScopeTerm") or {}
+    return (
+        bool(simple)
+        and str(simple.get("key") or "").upper() == "OBJECT_KEY"
+        and str(simple.get("comparator") or "").upper() == "STARTS_WITH"
+    )
+
+
+def _job_scope_gap(scoping: Any, prefixes: List[str]) -> Dict[str, Any]:
+    """
+    Decide whether a job's object scoping leaves part of a source unread.
+
+    ``prefixes`` are the key prefixes the source ingests; none means the whole
+    bucket. Include conditions are AND-ed, so an object is read only when it
+    matches every one: any include condition other than an OBJECT_KEY
+    STARTS_WITH term, or a prefix term that does not cover a source prefix,
+    leaves source objects unread. Exclude conditions are AND-ed too; when every
+    one is an OBJECT_KEY STARTS_WITH term that overlaps a source prefix, those
+    objects are skipped. Any other exclude condition (extension, size, date or
+    tag) is counted as not judged.
+    """
+    prefixes = prefixes or [""]
+    scoping = scoping or {}
+    includes = _scope_terms(scoping.get("includes"))
+    if includes:
+        if not all(_is_key_prefix_term(term) for term in includes):
+            return {
+                "gap": (
+                    f"it reads only objects matching {len(includes)} include "
+                    "condition(s) on extension, size, date, tag or key, so source "
+                    "objects outside them are not classified"
+                ),
+                "unjudged": 0,
+            }
+        for prefix in prefixes:
+            for term in includes:
+                values = [str(v) for v in term["simpleScopeTerm"].get("values") or []]
+                if not any(prefix.startswith(value) for value in values):
+                    return {
+                        "gap": (
+                            "its include condition limits it to keys starting with "
+                            f"{', '.join(values) or 'nothing'}, which does not cover "
+                            + (
+                                f"source prefix '{prefix}'"
+                                if prefix
+                                else "the whole bucket"
+                            )
+                        ),
+                        "unjudged": 0,
+                    }
+    excludes = _scope_terms(scoping.get("excludes"))
+    if excludes and all(_is_key_prefix_term(term) for term in excludes):
+        for prefix in prefixes:
+            if all(
+                any(
+                    str(value).startswith(prefix) or prefix.startswith(str(value))
+                    for value in term["simpleScopeTerm"].get("values") or []
+                )
+                for term in excludes
+            ):
+                return {
+                    "gap": (
+                        "its exclude condition skips keys starting with "
+                        + ", ".join(
+                            str(value)
+                            for term in excludes
+                            for value in term["simpleScopeTerm"].get("values") or []
+                        )
+                        + ", which overlaps "
+                        + (f"source prefix '{prefix}'" if prefix else "the source")
+                    ),
+                    "unjudged": 0,
+                }
+        return {"gap": None, "unjudged": 0}
+    return {"gap": None, "unjudged": len(excludes)}
+
+
+def _classification_job_gap(
+    detail: Dict[str, Any], prefixes: List[str]
 ) -> Dict[str, Any]:
     """
-    Decide whether the classification jobs naming one bucket keep classifying it.
+    Judge one DescribeClassificationJob response against a source it names.
 
-    Only a SCHEDULED job that is RUNNING or IDLE and whose last run did not error
-    inspects the objects a knowledge base ingests after the job was created. A
-    ONE_TIME job classified a point-in-time snapshot, so every later upload to an
-    ingestion bucket is unclassified, and that is reported as the reason the
-    bucket still fails rather than as coverage.
+    The job counts only when every value below holds: a SCHEDULED job, RUNNING
+    or IDLE, whose last run did not error, that has run at least once, whose
+    first run analyzed the objects already present (initialRun), that reads
+    every eligible object (samplingPercentage 100), that uses at least one data
+    identifier, and whose scoping reads the whole source.
     """
-    for job in jobs:
-        if (
-            job["type"] == "SCHEDULED"
-            and job["status"] in CLASSIFICATION_JOB_RECURRING_STATUSES
-            and not job["last_run_error"]
-        ):
+    job_type = str(detail.get("jobType") or "").upper()
+    status = str(detail.get("jobStatus") or "").upper()
+    if job_type != "SCHEDULED":
+        return {
+            "gap": (
+                f"it is {job_type or 'an unreported job type'}, so it inspected a "
+                "point-in-time snapshot and nothing ingested since that run is "
+                "classified"
+            ),
+            "unjudged": 0,
+        }
+    if status not in CLASSIFICATION_JOB_RECURRING_STATUSES:
+        return {
+            "gap": f"it is {status or 'in an unreported state'}, so it will not run again",
+            "unjudged": 0,
+        }
+    if (
+        str((detail.get("lastRunErrorStatus") or {}).get("code") or "").upper()
+        == "ERROR"
+    ):
+        return {
+            "gap": "its lastRunErrorStatus is ERROR, so its last run classified nothing",
+            "unjudged": 0,
+        }
+    runs = (detail.get("statistics") or {}).get("numberOfRuns")
+    if not isinstance(runs, (int, float)) or runs < 1:
+        return {"gap": "it has not run yet (numberOfRuns 0)", "unjudged": 0}
+    if detail.get("initialRun") is not True:
+        return {
+            "gap": (
+                "its initialRun is false, so objects present when the job was "
+                "created were never analyzed"
+            ),
+            "unjudged": 0,
+        }
+    sampling = detail.get("samplingPercentage")
+    if sampling is not None and sampling != 100:
+        return {
+            "gap": (
+                f"its samplingPercentage is {sampling}, so it analyzes a sample of "
+                "the eligible objects and not each one"
+            ),
+            "unjudged": 0,
+        }
+    selector = str(detail.get("managedDataIdentifierSelector") or "RECOMMENDED").upper()
+    managed = detail.get("managedDataIdentifierIds") or []
+    custom = detail.get("customDataIdentifierIds") or []
+    if not custom and (selector == "NONE" or (selector == "INCLUDE" and not managed)):
+        return {
+            "gap": (
+                f"its managedDataIdentifierSelector is {selector} and it names no "
+                "custom data identifier, so it detects nothing"
+            ),
+            "unjudged": 0,
+        }
+    return _job_scope_gap(
+        (detail.get("s3JobDefinition") or {}).get("scoping"), prefixes
+    )
+
+
+def _classification_source_verdict(
+    source: Dict[str, Any],
+    record: Dict[str, Any],
+    candidates: List[Dict[str, str]],
+    describe,
+    criteria_jobs: List[Dict[str, str]],
+) -> Dict[str, Any]:
+    """
+    Judge one source against every classification job that can reach it.
+
+    ``candidates`` are the jobs naming the bucket plus the bucket's
+    ``jobDetails.lastJobId``. ``describe`` returns a DescribeClassificationJob
+    response or raises ClientError. A bucket Macie reports as monitored by a
+    recurring job that none of the candidates is, while some job selects buckets
+    by criteria, is N/A: that job cannot be tied to the bucket. Returns
+    {"status", "detail"}, where status is Passed, Failed or N/A.
+    """
+    reasons = []
+    unread = []
+    for job in candidates:
+        try:
+            detail = describe(job["id"])
+        except (ClientError, BotoCoreError) as error:
+            unread.append(
+                f"Macie job '{job['name']}' could not be read "
+                f"({get_assessment_error_label(error)})"
+            )
+            continue
+        name = detail.get("name") or job["name"]
+        verdict = _classification_job_gap(detail, source["prefixes"])
+        if verdict["gap"] is None:
+            note = (
+                f"; {verdict['unjudged']} exclude condition(s) on extension, size, "
+                "date or tag are not judged"
+                if verdict["unjudged"]
+                else ""
+            )
             return {
-                "covered": True,
-                "job": job,
-                "reason": "{} is classified by scheduled Macie job '{}' ({})".format(
-                    bucket, job["name"], job["status"]
+                "status": "Passed",
+                "detail": (
+                    f"{source['label']} (bucket {source['bucket']}) is classified by "
+                    f"scheduled Macie job '{name}' ({detail.get('jobStatus')}, "
+                    f"{(detail.get('statistics') or {}).get('numberOfRuns')} run(s), "
+                    f"last run {detail.get('lastRunTime') or 'not recorded'}, "
+                    f"full sampling, initial run over existing objects{note})"
                 ),
             }
+        reasons.append(f"Macie job '{name}' names it, but {verdict['gap']}")
 
-    if not jobs:
+    monitored_by_job = str(
+        (record.get("jobDetails") or {}).get("isMonitoredByJob") or "UNKNOWN"
+    ).upper()
+    judged = {job["id"] for job in candidates}
+    criteria_jobs = [job["name"] for job in criteria_jobs if job["id"] not in judged]
+    if unread:
         return {
-            "covered": False,
-            "job": None,
-            "reason": (
-                f"No Macie classification job in this Region names {bucket} either."
+            "status": "N/A",
+            "detail": (
+                f"{source['label']} (bucket {source['bucket']}): "
+                + "; ".join(unread + reasons)
             ),
         }
-
-    errored = [
-        job for job in jobs if job["type"] == "SCHEDULED" and job["last_run_error"]
-    ]
-    paused = [job for job in jobs if job["type"] == "SCHEDULED"]
-    one_time = [job for job in jobs if job["type"] == "ONE_TIME"]
-
-    if errored:
-        job = errored[0]
-        detail = (
-            "scheduled Macie job '{}' names it but reports lastRunErrorStatus "
-            "ERROR, so its last run classified nothing".format(job["name"])
+    if monitored_by_job == "TRUE" and reasons and criteria_jobs:
+        return {
+            "status": "N/A",
+            "detail": (
+                f"{source['label']} (bucket {source['bucket']}): "
+                + "; ".join(reasons)
+                + f"; Macie reports isMonitoredByJob TRUE and {len(criteria_jobs)} "
+                "job(s) select buckets by criteria ("
+                + ", ".join(criteria_jobs[:5])
+                + "), so a recurring job that is not named could still cover it"
+            ),
+        }
+    if not candidates and (
+        monitored_by_job == "TRUE" or (monitored_by_job != "FALSE" and criteria_jobs)
+    ):
+        return {
+            "status": "N/A",
+            "detail": (
+                f"{source['label']} (bucket {source['bucket']}): Macie reports "
+                f"isMonitoredByJob {monitored_by_job} but no job names the bucket "
+                "and jobDetails carries no lastJobId, so the recurring job that "
+                "selects it by bucket criteria could not be read"
+            ),
+        }
+    if not reasons:
+        reasons.append(
+            "no Macie classification job names the bucket and Macie reports "
+            f"isMonitoredByJob {monitored_by_job}"
         )
-    elif paused:
-        job = paused[0]
-        detail = (
-            "the scheduled Macie job naming it, '{}', is {}, so it will not run "
-            "again".format(job["name"], job["status"] or "in an unreported state")
-        )
-    elif one_time:
-        job = one_time[0]
-        detail = (
-            "Macie job '{}' is ONE_TIME and {}, so it inspected a point-in-time "
-            "snapshot and nothing ingested since that run is classified".format(
-                job["name"], job["status"] or "in an unreported state"
-            )
-        )
-    else:
-        job = jobs[0]
-        detail = (
-            "Macie job '{}' reports jobType '{}' and jobStatus '{}', which is not a "
-            "scheduled job that will run again".format(
-                job["name"],
-                job["type"] or "unset",
-                job["status"] or "unset",
-            )
-        )
-
     return {
-        "covered": False,
-        "job": job,
-        "reason": f"{len(jobs)} Macie classification job(s) name {bucket}, but {detail}.",
+        "status": "Failed",
+        "detail": (
+            f"{source['label']} (bucket {source['bucket']}) is not classified by a "
+            f"recurring, full-depth Macie job: {'; '.join(reasons)}"
+        ),
     }
 
 
@@ -19780,25 +19913,22 @@ def check_bedrock_knowledge_base_source_classification(
     region: str = "",
 ) -> Dict[str, Any]:
     """
-    BR-46: Verify Amazon Macie is monitoring each S3 bucket a knowledge base
-    ingests from, so sensitive data in the source is classified before a
-    retrieval surfaces it.
+    BR-46: Verify every S3 source a knowledge base ingests from, and every
+    training, validation and invocation log source a model customization job
+    reads, is classified object by object by a recurring Macie job.
 
-    The assertion is per bucket. FS-44 in responsible_ai_grc_assessments already
-    asserts the two account-level Macie legs and its docstring disclaims
-    "that discovery covers the specific buckets holding training data or KB data
-    sources", which is exactly what this check reads from
-    DescribeBuckets[].automatedDiscoveryMonitoringStatus.
+    Automated sensitive data discovery selects representative objects by
+    sampling, so a MONITORED status gives estate-wide visibility and is not
+    classification of the objects about to be ingested. It is reported beside
+    each source and never passes one. A source passes only when a Macie job it
+    is named in, or the job Macie reports in the bucket's jobDetails, is a
+    SCHEDULED job that is RUNNING or IDLE, has run, ran its initial pass over
+    existing objects, samples 100 percent, uses at least one data identifier,
+    and scopes in the source's whole key prefix.
 
-    GetClassificationScope is deliberately not used: its s3 member is
-    ``excludes.bucketNames``, an exclusion list, so a check built on it would
-    pass precisely when the knowledge base buckets are excluded from discovery.
-
-    A bucket that automated discovery reports as NOT_MONITORED can still be
-    classified by a targeted classification job, so ListClassificationJobs is
-    read before any such bucket is failed. The job leg runs only where the
-    precondition above holds, because a Region with Macie switched off returns
-    early on the account-level state that FS-44 owns.
+    FS-44 in responsible_ai_grc_assessments asserts the account-level Macie
+    state, so a Region whose Macie session is not enabled is N/A here.
+    GetClassificationScope is not used: its s3 member is an exclusion list.
     """
     logger.debug("Starting check for knowledge base source data classification")
     check_name = "Knowledge Base Source Data Classification"
@@ -19810,77 +19940,91 @@ def check_bedrock_knowledge_base_source_classification(
             "csv_data": [],
         }
 
+        def na(detail: str, resolution: str, name: str = check_name) -> None:
+            findings["csv_data"].append(
+                create_finding(
+                    check_id="BR-46",
+                    finding_name=name,
+                    finding_details=detail,
+                    resolution=resolution,
+                    reference=KNOWLEDGE_BASE_CLASSIFICATION_REFERENCE,
+                    severity="Informational",
+                    status="N/A",
+                    region=region,
+                )
+            )
+
+        sources = []
+        read_errors = []
+        other_sources = []
+        knowledge_base_count = 0
         try:
             inventory = _knowledge_base_s3_sources(region)
         except Exception as error:
-            findings["csv_data"].append(
-                create_finding(
-                    check_id="BR-46",
-                    finding_name=check_name,
-                    finding_details=(
-                        "Knowledge base data sources could not be walked, so no "
-                        "source bucket could be checked for sensitive data "
-                        f"classification: {get_assessment_error_label(error)}."
-                    ),
-                    resolution="Grant bedrock:ListKnowledgeBases, bedrock:ListDataSources and bedrock:GetDataSource, then retry.",
-                    reference=KNOWLEDGE_BASE_CLASSIFICATION_REFERENCE,
-                    severity="Informational",
-                    status="N/A",
-                    region=region,
-                )
+            read_errors.append(
+                f"knowledge base data sources: {get_assessment_error_label(error)}"
             )
-            return findings
+        else:
+            knowledge_base_count = inventory["knowledge_base_count"]
+            read_errors.extend(inventory["errors"])
+            other_sources = inventory["other_sources"]
+            sources.extend(inventory["s3_sources"])
 
-        if inventory["errors"]:
-            findings["csv_data"].append(
-                create_finding(
-                    check_id="BR-46",
-                    finding_name=check_name,
-                    finding_details=(
-                        "{} knowledge base data source read(s) failed, so the source "
-                        "bucket list is incomplete: {}.".format(
-                            len(inventory["errors"]), "; ".join(inventory["errors"][:5])
-                        )
-                    ),
-                    resolution="Grant bedrock:ListDataSources and bedrock:GetDataSource, then retry before concluding which buckets feed a knowledge base.",
-                    reference=KNOWLEDGE_BASE_CLASSIFICATION_REFERENCE,
-                    severity="Informational",
-                    status="N/A",
-                    region=region,
-                )
+        try:
+            customization = _customization_job_locations(region)
+        except Exception as error:
+            read_errors.append(
+                f"model customization jobs: {get_assessment_error_label(error)}"
             )
-
-        if inventory["other_sources"]:
-            findings["csv_data"].append(
-                create_finding(
-                    check_id="BR-46",
-                    finding_name=check_name,
-                    finding_details=(
-                        "{} knowledge base data source(s) hold no S3 bucket for Macie "
-                        "to classify, so Macie cannot cover them: {}.".format(
-                            len(inventory["other_sources"]),
-                            "; ".join(inventory["other_sources"][:5]),
-                        )
-                    ),
-                    resolution="Classify non-S3 ingestion sources in the pipeline that writes them, because automated sensitive data discovery reads S3 only.",
-                    reference=KNOWLEDGE_BASE_CLASSIFICATION_REFERENCE,
-                    severity="Informational",
-                    status="N/A",
-                    region=region,
+        else:
+            read_errors.extend(customization["errors"])
+            for location in customization["locations"]:
+                if location["role"] == "output":
+                    continue
+                key = str(location["uri"]).split("://", 1)[-1].partition("/")[2]
+                sources.append(
+                    {
+                        "label": (
+                            f"the {location['role']} of customization job "
+                            f"'{location['job']}'"
+                        ),
+                        "bucket": _s3_uri_bucket(location["uri"]),
+                        "owner_account": "",
+                        "prefixes": [key] if key else [],
+                    }
                 )
+
+        if read_errors:
+            na(
+                "{} data source read(s) failed across knowledge bases and model "
+                "customization jobs, so the source list is incomplete: {}.".format(
+                    len(read_errors), "; ".join(read_errors[:5])
+                ),
+                "Grant bedrock:ListKnowledgeBases, bedrock:ListDataSources, "
+                "bedrock:GetDataSource, bedrock:ListModelCustomizationJobs and "
+                "bedrock:GetModelCustomizationJob, then retry.",
             )
 
-        if not inventory["s3_sources"]:
+        if other_sources:
+            na(
+                "{} knowledge base data source(s) hold no S3 bucket for Macie to "
+                "classify, so Macie cannot cover them: {}.".format(
+                    len(other_sources), "; ".join(other_sources[:5])
+                ),
+                "Classify non-S3 ingestion sources in the pipeline that writes them, "
+                "because Macie reads S3 only.",
+            )
+
+        if not sources:
             findings["csv_data"].append(
                 create_finding(
                     check_id="BR-46",
                     finding_name=check_name,
                     finding_details=(
                         "{} knowledge base(s) exist in {} and none of them ingests "
-                        "from an S3 bucket, so there is no source bucket to "
-                        "classify.".format(
-                            inventory["knowledge_base_count"],
-                            region or "this region",
+                        "from an S3 bucket, and no model customization job reads one, "
+                        "so there is no source bucket to classify.".format(
+                            knowledge_base_count, region or "this region"
                         )
                     ),
                     resolution="No action required",
@@ -19892,38 +20036,27 @@ def check_bedrock_knowledge_base_source_classification(
             )
             return findings
 
-        source_buckets = sorted(
-            {source["bucket"] for source in inventory["s3_sources"]}
-        )
+        source_buckets = sorted({source["bucket"] for source in sources})
         macie_client = boto3.client("macie2", config=boto3_config, region_name=region)
         precondition = _macie_discovery_precondition(macie_client)
 
-        if not precondition["ready"]:
-            findings["csv_data"].append(
-                create_finding(
-                    check_id="BR-46",
-                    finding_name=check_name,
-                    finding_details=(
-                        "{} knowledge base source bucket(s) ({}) could not be checked "
-                        "for automated sensitive data discovery because {}. {}".format(
-                            len(source_buckets),
-                            ", ".join(source_buckets[:5]),
-                            precondition["detail"],
-                            "Grant the macie2 read actions and retry."
-                            if precondition["permissions"]
-                            else MACIE_ACCOUNT_STATE_OWNER,
-                        )
-                    ),
-                    resolution=(
-                        "Grant macie2:GetMacieSession, macie2:GetAutomatedDiscoveryConfiguration and macie2:DescribeBuckets, then retry."
-                        if precondition["permissions"]
-                        else "Enable Amazon Macie and automated sensitive data discovery in this Region, then confirm each knowledge base source bucket is monitored."
-                    ),
-                    reference=KNOWLEDGE_BASE_CLASSIFICATION_REFERENCE,
-                    severity="Informational",
-                    status="N/A",
-                    region=region,
-                )
+        if not precondition["session_enabled"]:
+            na(
+                "{} AI source bucket(s) ({}) could not be checked for sensitive data "
+                "classification because {}. {}".format(
+                    len(source_buckets),
+                    ", ".join(source_buckets[:5]),
+                    precondition["detail"],
+                    "Grant the macie2 read actions and retry."
+                    if precondition["permissions"]
+                    else MACIE_ACCOUNT_STATE_OWNER,
+                ),
+                "Grant macie2:GetMacieSession, macie2:DescribeBuckets, "
+                "macie2:ListClassificationJobs and macie2:DescribeClassificationJob, "
+                "then retry."
+                if precondition["permissions"]
+                else "Enable Amazon Macie in this Region and create a scheduled "
+                "classification job over each AI source bucket.",
             )
             return findings
 
@@ -19936,33 +20069,36 @@ def check_bedrock_knowledge_base_source_classification(
                     if name:
                         macie_buckets[name] = bucket
         except ClientError as error:
-            findings["csv_data"].append(
-                create_finding(
-                    check_id="BR-46",
-                    finding_name=check_name,
-                    finding_details=(
-                        "{} knowledge base source bucket(s) ({}) could not be checked "
-                        "because the Macie bucket inventory could not be read: "
-                        "{}.".format(
-                            len(source_buckets),
-                            ", ".join(source_buckets[:5]),
-                            get_assessment_error_label(error),
-                        )
-                    ),
-                    resolution="Grant macie2:DescribeBuckets and retry.",
-                    reference=KNOWLEDGE_BASE_CLASSIFICATION_REFERENCE,
-                    severity="Informational",
-                    status="N/A",
-                    region=region,
-                )
+            na(
+                "{} AI source bucket(s) ({}) could not be checked because the Macie "
+                "bucket inventory could not be read: {}.".format(
+                    len(source_buckets),
+                    ", ".join(source_buckets[:5]),
+                    get_assessment_error_label(error),
+                ),
+                "Grant macie2:DescribeBuckets and retry.",
             )
             return findings
 
-        unmonitored = []
-        monitored = []
-        indeterminate = []
+        job_index = _classification_jobs_for_buckets(macie_client, source_buckets)
+        described: Dict[str, Any] = {}
 
-        for source in inventory["s3_sources"]:
+        def describe(job_id: str) -> Dict[str, Any]:
+            if job_id not in described:
+                try:
+                    described[job_id] = macie_client.describe_classification_job(
+                        jobId=job_id
+                    )
+                except (ClientError, BotoCoreError) as error:
+                    described[job_id] = error
+            if isinstance(described[job_id], Exception):
+                raise described[job_id]
+            return described[job_id]
+
+        passed = []
+        failed = []
+        indeterminate = []
+        for source in sources:
             bucket_name = source["bucket"]
             record = macie_buckets.get(bucket_name)
             if record is None:
@@ -19973,89 +20109,62 @@ def check_bedrock_knowledge_base_source_classification(
                 )
                 indeterminate.append(
                     f"{bucket_name} is absent from this Region's Macie bucket "
-                    f"inventory{owned_elsewhere}"
+                    f"inventory{owned_elsewhere} ({source['label']})"
                 )
                 continue
-
             error_code = record.get("errorCode")
             if error_code:
                 indeterminate.append(
-                    f"{bucket_name} reports Macie errorCode {error_code}, so its "
-                    "monitoring status could not be read"
+                    f"{bucket_name} reports Macie errorCode {error_code}, so the "
+                    f"classification of {source['label']} could not be read"
+                )
+                continue
+            if not job_index["readable"]:
+                indeterminate.append(
+                    f"{bucket_name} ({source['label']}): the Macie classification job "
+                    f"list could not be read ({job_index['error']})"
                 )
                 continue
 
-            status = str(record.get("automatedDiscoveryMonitoringStatus") or "")
-            if status.upper() == "MONITORED":
-                last_run = record.get("lastAutomatedDiscoveryTime")
-                score = record.get("sensitivityScore")
-                monitored.append(
-                    "{} is MONITORED (last discovery run {}, sensitivity score {})".format(
-                        bucket_name,
-                        last_run if last_run else "not yet recorded",
-                        score if score is not None else "not yet assigned",
-                    )
-                )
-            elif status.upper() == "NOT_MONITORED":
-                unmonitored.append({"bucket": bucket_name, "label": source["label"]})
-            else:
-                indeterminate.append(
-                    f"{bucket_name} reports automatedDiscoveryMonitoringStatus "
-                    f"'{status or 'unset'}', which is neither MONITORED nor "
-                    "NOT_MONITORED"
-                )
-
-        # Automated discovery is one classification mechanism and a targeted job
-        # is the other, so the jobs are read before any NOT_MONITORED bucket is
-        # failed: failing a bucket that a scheduled job classifies on every run
-        # would be a false positive against AIR-FND-DAT-03. The job list is only
-        # read when a bucket is failing, because that is the only verdict it can
-        # change, and an account where discovery covers every source bucket
-        # should not pay a second Macie call for it.
-        job_index = (
-            _classification_jobs_for_buckets(macie_client, source_buckets)
-            if unmonitored
-            else {
-                "readable": True,
-                "error": "",
-                "jobs_by_bucket": {},
-                "criteria_jobs": [],
-            }
-        )
-        job_covered = []
-        still_unmonitored = []
-        for source in unmonitored:
-            verdict = (
-                _classification_job_coverage(
-                    source["bucket"],
-                    job_index["jobs_by_bucket"].get(source["bucket"]) or [],
-                )
-                if job_index["readable"]
-                else {"covered": False, "reason": ""}
+            candidates = list(job_index["jobs_by_bucket"].get(bucket_name) or [])
+            last_job = str((record.get("jobDetails") or {}).get("lastJobId") or "")
+            if last_job and last_job not in {job["id"] for job in candidates}:
+                candidates.append({"id": last_job, "name": last_job})
+            verdict = _classification_source_verdict(
+                source, record, candidates, describe, job_index["criteria_jobs"]
             )
-            if verdict["covered"]:
-                job_covered.append({**source, "reason": verdict["reason"]})
+            automated = str(record.get("automatedDiscoveryMonitoringStatus") or "")
+            if precondition["ready"]:
+                sampled = (
+                    f" Automated sensitive data discovery reports {automated or 'no status'}"
+                    " for the bucket, which samples objects and does not classify each one."
+                )
             else:
-                still_unmonitored.append({**source, "job_note": verdict["reason"]})
-        unmonitored = still_unmonitored
+                sampled = f" Automated sensitive data discovery is not in effect: {precondition['detail']}."
+            if verdict["status"] == "Passed":
+                passed.append(verdict["detail"])
+            elif verdict["status"] == "Failed":
+                failed.append(verdict["detail"] + "." + sampled)
+            else:
+                indeterminate.append(verdict["detail"])
 
-        for source in unmonitored[:MAX_REPORTED_UNMONITORED_BUCKETS]:
+        for detail in failed:
             findings["status"] = "WARN"
             findings["csv_data"].append(
                 create_finding(
                     check_id="BR-46",
                     finding_name=check_name,
                     finding_details=(
-                        "Automated sensitive data discovery is enabled in this "
-                        "Region, but bucket {} is NOT_MONITORED and it is the "
-                        "ingestion source for {}, so sensitive data in it is not "
-                        "classified before a retrieval can surface it.{}".format(
-                            source["bucket"],
-                            source["label"],
-                            f" {source['job_note']}" if source["job_note"] else "",
-                        )
+                        f"{detail} Sensitive data in it is not classified before a "
+                        "knowledge base or customization job reads it."
                     ),
-                    resolution="Remove the bucket from the Macie classification scope exclusions so automated sensitive data discovery monitors it, and carry the classification result into per-document metadata so retrieval can filter on it.",
+                    resolution=(
+                        "Create a SCHEDULED Macie classification job that names the "
+                        "bucket, sets initialRun true and samplingPercentage 100, "
+                        "uses managed or custom data identifiers, and scopes in the "
+                        "source prefix. Carry the classification into per-document "
+                        "metadata so retrieval can filter on it."
+                    ),
                     reference=KNOWLEDGE_BASE_CLASSIFICATION_REFERENCE,
                     severity="High",
                     status="Failed",
@@ -20063,51 +20172,21 @@ def check_bedrock_knowledge_base_source_classification(
                 )
             )
 
-        if len(unmonitored) > MAX_REPORTED_UNMONITORED_BUCKETS:
+        if passed:
             findings["csv_data"].append(
                 create_finding(
                     check_id="BR-46",
-                    finding_name=check_name,
+                    finding_name=CLASSIFICATION_JOB_FINDING,
                     finding_details=(
-                        "{} further knowledge base source bucket(s) are "
-                        "NOT_MONITORED beyond the {} reported individually: "
-                        "{}.".format(
-                            len(unmonitored) - MAX_REPORTED_UNMONITORED_BUCKETS,
-                            MAX_REPORTED_UNMONITORED_BUCKETS,
-                            ", ".join(
-                                item["bucket"]
-                                for item in unmonitored[
-                                    MAX_REPORTED_UNMONITORED_BUCKETS:
-                                ][:20]
-                            ),
+                        "{} of {} AI data source(s) are classified by a recurring, "
+                        "full-depth Macie job: {}. Whether each object was classified "
+                        "before the ingestion or customization job that read it, and "
+                        "whether the classification is carried into per-document "
+                        "metadata, is not recorded by any API and is not judged.".format(
+                            len(passed), len(sources), "; ".join(passed)
                         )
                     ),
-                    resolution="Remove these buckets from the Macie classification scope exclusions so automated sensitive data discovery monitors them.",
-                    reference=KNOWLEDGE_BASE_CLASSIFICATION_REFERENCE,
-                    severity="High",
-                    status="Failed",
-                    region=region,
-                )
-            )
-
-        if monitored:
-            findings["csv_data"].append(
-                create_finding(
-                    check_id="BR-46",
-                    finding_name=check_name,
-                    finding_details=(
-                        "{} of {} knowledge base source bucket(s) are monitored by "
-                        "automated sensitive data discovery: {}. A monitoring status "
-                        "is not a classification result, so confirm the sensitive "
-                        "data findings for these buckets have been triaged and that "
-                        "the classification is carried into per-document "
-                        "metadata.".format(
-                            len(monitored),
-                            len(inventory["s3_sources"]),
-                            "; ".join(monitored[:5]),
-                        )
-                    ),
-                    resolution="No action required for monitoring coverage. Re-check the classification scope whenever a knowledge base data source is added.",
+                    resolution="No action required for classification coverage.",
                     reference=KNOWLEDGE_BASE_CLASSIFICATION_REFERENCE,
                     severity="Medium",
                     status="Passed",
@@ -20115,117 +20194,13 @@ def check_bedrock_knowledge_base_source_classification(
                 )
             )
 
-        if indeterminate:
-            findings["csv_data"].append(
-                create_finding(
-                    check_id="BR-46",
-                    finding_name=check_name,
-                    finding_details=(
-                        "{} knowledge base source bucket(s) have no readable "
-                        "monitoring status, so they are neither covered nor proven "
-                        "uncovered: {}.".format(
-                            len(indeterminate), "; ".join(indeterminate[:5])
-                        )
-                    ),
-                    resolution="Enable Macie in the Region holding each bucket, or run the assessment from the account that owns it, then re-check the monitoring status.",
-                    reference=KNOWLEDGE_BASE_CLASSIFICATION_REFERENCE,
-                    severity="Informational",
-                    status="N/A",
-                    region=region,
-                )
-            )
-
-        if job_covered:
-            findings["csv_data"].append(
-                create_finding(
-                    check_id="BR-46",
-                    finding_name=CLASSIFICATION_JOB_FINDING,
-                    finding_details=(
-                        "{} of {} knowledge base source bucket(s) are NOT_MONITORED by "
-                        "automated sensitive data discovery, but a recurring Macie "
-                        "classification job inspects each of them: {}. A job run is "
-                        "not a triaged finding, so confirm the sensitive data the job "
-                        "reports is reviewed and carried into per-document "
-                        "metadata.".format(
-                            len(job_covered),
-                            len(inventory["s3_sources"]),
-                            "; ".join(item["reason"] for item in job_covered[:5]),
-                        )
-                    ),
-                    resolution="No action required for classification coverage. Confirm the scheduled job keeps running and that the sensitive data it reports is triaged.",
-                    reference=KNOWLEDGE_BASE_CLASSIFICATION_REFERENCE,
-                    severity="Medium",
-                    status="Passed",
-                    region=region,
-                )
-            )
-
-        # Both rows below are emitted only while a bucket is still failing,
-        # because that is the only verdict a job list could have changed.
-        if unmonitored and not job_index["readable"]:
-            findings["csv_data"].append(
-                create_finding(
-                    check_id="BR-46",
-                    finding_name=CLASSIFICATION_JOB_FINDING,
-                    finding_details=(
-                        "The Macie classification job list could not be read ({}), so "
-                        "whether a targeted job classifies the {} NOT_MONITORED "
-                        "knowledge base source bucket(s) ({}) is unknown and the "
-                        "monitoring verdict above stands on automated discovery "
-                        "alone.".format(
-                            job_index["error"],
-                            len(unmonitored),
-                            ", ".join(item["bucket"] for item in unmonitored[:5]),
-                        )
-                    ),
-                    resolution="Grant macie2:ListClassificationJobs and retry before acting on the NOT_MONITORED buckets above.",
-                    reference=KNOWLEDGE_BASE_CLASSIFICATION_REFERENCE,
-                    severity="Informational",
-                    status="N/A",
-                    region=region,
-                )
-            )
-
-        if unmonitored and job_index["criteria_jobs"]:
-            findings["csv_data"].append(
-                create_finding(
-                    check_id="BR-46",
-                    finding_name=CLASSIFICATION_JOB_FINDING,
-                    finding_details=(
-                        "{} Macie classification job(s) ({}) select their buckets with "
-                        "bucketCriteria instead of naming them, so whether they cover "
-                        "the {} NOT_MONITORED knowledge base source bucket(s) ({}) "
-                        "cannot be read from the job list.".format(
-                            len(job_index["criteria_jobs"]),
-                            ", ".join(job_index["criteria_jobs"][:5]),
-                            len(unmonitored),
-                            ", ".join(item["bucket"] for item in unmonitored[:5]),
-                        )
-                    ),
-                    resolution="Name each knowledge base source bucket in the job's bucketDefinitions, or confirm in the Macie console that the job's bucket criteria select it.",
-                    reference=KNOWLEDGE_BASE_CLASSIFICATION_REFERENCE,
-                    severity="Informational",
-                    status="N/A",
-                    region=region,
-                )
-            )
-
-        if inventory["truncated"]:
-            findings["csv_data"].append(
-                create_finding(
-                    check_id="BR-46",
-                    finding_name=check_name,
-                    finding_details=(
-                        "The data source walk stopped after "
-                        f"{MAX_KNOWLEDGE_BASE_DATA_SOURCE_DESCRIBES} data sources, so "
-                        "any source beyond that was not resolved to a bucket."
-                    ),
-                    resolution="Re-run the assessment per knowledge base if the estate exceeds the sampled data sources.",
-                    reference=KNOWLEDGE_BASE_CLASSIFICATION_REFERENCE,
-                    severity="Informational",
-                    status="N/A",
-                    region=region,
-                )
+        for detail in indeterminate:
+            na(
+                f"An AI source bucket has no readable classification state, so it is "
+                f"neither covered nor proven uncovered: {detail}.",
+                "Grant macie2:ListClassificationJobs and macie2:DescribeClassificationJob, "
+                "enable Macie in the Region holding the bucket, or run the assessment "
+                "from the account that owns it, then retry.",
             )
 
         return findings
@@ -20272,11 +20247,6 @@ SECURE_TRANSPORT_OPERATORS = ("bool", "boolifexists")
 S3_ALL_ACTIONS = "s3:*"
 
 MAX_REPORTED_PLAINTEXT_BUCKETS = 20
-
-# Each customization job's buckets take one GetModelCustomizationJob call, and
-# the summaries ListModelCustomizationJobs returns carry no S3 location, so the
-# newest jobs are read and a longer history is reported as an incomplete list.
-MAX_CUSTOMIZATION_JOBS_READ = 50
 
 
 def _s3_uri_bucket(uri: Any) -> Optional[str]:
@@ -20477,6 +20447,74 @@ def _bucket_tls_enforcement(bucket: str, policy_document: Any) -> Dict[str, Any]
     }
 
 
+def _customization_job_locations(region: str = "") -> Dict[str, Any]:
+    """
+    Read the S3 locations of every model customization job in ``region``.
+
+    ListModelCustomizationJobs summaries carry no S3 location, so each job takes
+    one GetModelCustomizationJob call. Every page is read. Each location is
+    {"role", "uri", "job"}, where role is training data, invocation log source,
+    output or validation data.
+    """
+    locations = []
+    errors = []
+    bedrock_client = boto3.client("bedrock", config=boto3_config, region_name=region)
+    try:
+        jobs = []
+        request = {"sortBy": "CreationTime", "sortOrder": "Descending"}
+        while True:
+            page = bedrock_client.list_model_customization_jobs(**request)
+            if not isinstance(page, dict):
+                break
+            jobs.extend(page.get("modelCustomizationJobSummaries") or [])
+            token = page.get("nextToken")
+            if (
+                not isinstance(token, str)
+                or not token
+                or token == request.get("nextToken")
+            ):
+                break
+            request["nextToken"] = token
+    except Exception as error:
+        jobs = []
+        errors.append(f"model customization jobs: {get_assessment_error_label(error)}")
+    for job in jobs:
+        job_name = job.get("jobName") or job.get("jobArn") or "unnamed"
+        try:
+            detail = bedrock_client.get_model_customization_job(
+                jobIdentifier=job.get("jobArn") or job_name
+            )
+        except Exception as error:
+            errors.append(
+                f"customization job '{job_name}': {get_assessment_error_label(error)}"
+            )
+            continue
+        training = detail.get("trainingDataConfig") or {}
+        pairs = [
+            ("training data", training.get("s3Uri")),
+            (
+                "invocation log source",
+                (
+                    (training.get("invocationLogsConfig") or {}).get(
+                        "invocationLogSource"
+                    )
+                    or {}
+                ).get("s3Uri"),
+            ),
+            ("output", (detail.get("outputDataConfig") or {}).get("s3Uri")),
+        ] + [
+            ("validation data", validator.get("s3Uri"))
+            for validator in (detail.get("validationDataConfig") or {}).get(
+                "validators"
+            )
+            or []
+        ]
+        for role, uri in pairs:
+            if _s3_uri_bucket(uri):
+                locations.append({"role": role, "uri": str(uri), "job": job_name})
+    return {"locations": locations, "errors": errors}
+
+
 def _ai_data_path_buckets(region: str = "") -> Dict[str, Any]:
     """
     Resolve the S3 buckets that Bedrock reads training data from and writes
@@ -20493,13 +20531,11 @@ def _ai_data_path_buckets(region: str = "") -> Dict[str, Any]:
     read its training prompts from ``invocationLogsConfig.invocationLogSource``,
     so both are data path buckets too.
 
-    ``truncated`` names each leg that stopped at its read cap. It is kept apart
-    from ``errors`` because no grant fixes it, and either one means the bucket
-    list is not the whole data path.
+    Every data source and every customization job is read, so ``errors`` is
+    the only reason the bucket list can be short of the whole data path.
     """
     buckets: Dict[str, List[str]] = {}
     errors = []
-    truncated = []
 
     try:
         inventory = _knowledge_base_s3_sources(region)
@@ -20509,11 +20545,6 @@ def _ai_data_path_buckets(region: str = "") -> Dict[str, Any]:
         )
     else:
         errors.extend(inventory["errors"])
-        if inventory["truncated"]:
-            truncated.append(
-                "knowledge base data sources: the walk stopped after "
-                f"{MAX_KNOWLEDGE_BASE_DATA_SOURCE_DESCRIBES} data sources"
-            )
         for source in inventory["s3_sources"]:
             buckets.setdefault(source["bucket"], []).append(source["label"])
 
@@ -20545,69 +20576,14 @@ def _ai_data_path_buckets(region: str = "") -> Dict[str, Any]:
             "the large-data destination of CloudWatch model invocation logging"
         )
 
-    try:
-        jobs = []
-        request = {"sortBy": "CreationTime", "sortOrder": "Descending"}
-        while len(jobs) <= MAX_CUSTOMIZATION_JOBS_READ:
-            page = bedrock_client.list_model_customization_jobs(**request)
-            if not isinstance(page, dict):
-                break
-            jobs.extend(page.get("modelCustomizationJobSummaries") or [])
-            token = page.get("nextToken")
-            if (
-                not isinstance(token, str)
-                or not token
-                or token == request.get("nextToken")
-            ):
-                break
-            request["nextToken"] = token
-    except Exception as error:
-        jobs = []
-        errors.append(f"model customization jobs: {get_assessment_error_label(error)}")
-    if len(jobs) > MAX_CUSTOMIZATION_JOBS_READ:
-        truncated.append(
-            f"model customization jobs: only the newest {MAX_CUSTOMIZATION_JOBS_READ} "
-            "were read"
+    customization = _customization_job_locations(region)
+    errors.extend(customization["errors"])
+    for location in customization["locations"]:
+        buckets.setdefault(_s3_uri_bucket(location["uri"]), []).append(
+            f"the {location['role']} of customization job '{location['job']}'"
         )
-    for job in jobs[:MAX_CUSTOMIZATION_JOBS_READ]:
-        job_name = job.get("jobName") or job.get("jobArn") or "unnamed"
-        try:
-            detail = bedrock_client.get_model_customization_job(
-                jobIdentifier=job.get("jobArn") or job_name
-            )
-        except Exception as error:
-            errors.append(
-                f"customization job '{job_name}': {get_assessment_error_label(error)}"
-            )
-            continue
-        training = detail.get("trainingDataConfig") or {}
-        locations = [
-            ("training data", training.get("s3Uri")),
-            (
-                "invocation log source",
-                (
-                    (training.get("invocationLogsConfig") or {}).get(
-                        "invocationLogSource"
-                    )
-                    or {}
-                ).get("s3Uri"),
-            ),
-            ("output", (detail.get("outputDataConfig") or {}).get("s3Uri")),
-        ] + [
-            ("validation data", validator.get("s3Uri"))
-            for validator in (detail.get("validationDataConfig") or {}).get(
-                "validators"
-            )
-            or []
-        ]
-        for role, uri in locations:
-            bucket = _s3_uri_bucket(uri)
-            if bucket:
-                buckets.setdefault(bucket, []).append(
-                    f"the {role} of customization job '{job_name}'"
-                )
 
-    return {"buckets": buckets, "errors": errors, "truncated": truncated}
+    return {"buckets": buckets, "errors": errors}
 
 
 def check_bedrock_data_path_bucket_tls(region: str = "") -> Dict[str, Any]:
@@ -20653,30 +20629,6 @@ def check_bedrock_data_path_bucket_tls(region: str = "") -> Dict[str, Any]:
                         "bedrock:GetModelInvocationLoggingConfiguration, "
                         "bedrock:ListModelCustomizationJobs and "
                         "bedrock:GetModelCustomizationJob, then retry."
-                    ),
-                    reference=AI_DATA_PATH_TLS_REFERENCE,
-                    severity="Informational",
-                    status="N/A",
-                    region=region,
-                )
-            )
-
-        if inventory["truncated"]:
-            findings["csv_data"].append(
-                create_finding(
-                    check_id="BR-47",
-                    finding_name=check_name,
-                    finding_details=(
-                        "The data path bucket list stopped at a read cap, so buckets "
-                        "beyond it were not assessed: {}.".format(
-                            "; ".join(inventory["truncated"])
-                        )
-                    ),
-                    resolution=(
-                        "Check the bucket policy of the knowledge base data source "
-                        "and customization job buckets beyond the cap directly, or "
-                        "split the estate across Regions or accounts so each run "
-                        "reads it whole."
                     ),
                     reference=AI_DATA_PATH_TLS_REFERENCE,
                     severity="Informational",
@@ -20816,7 +20768,7 @@ def check_bedrock_data_path_bucket_tls(region: str = "") -> Dict[str, Any]:
                 )
             )
 
-        incomplete = bool(inventory["errors"] or inventory["truncated"])
+        incomplete = bool(inventory["errors"])
         if enforced and incomplete:
             findings["csv_data"].append(
                 create_finding(
@@ -21014,11 +20966,11 @@ def check_bedrock_data_path_object_lock(region: str = "") -> Dict[str, Any]:
             )
 
         inventory = _ai_data_path_buckets(region)
-        gaps = inventory["errors"] + inventory["truncated"]
+        gaps = inventory["errors"]
         if gaps:
             findings["csv_data"].append(
                 row(
-                    "{} data path read(s) failed or stopped at a cap, so the bucket "
+                    "{} data path read(s) failed, so the bucket "
                     "list is incomplete and a bucket missing from it was not "
                     "assessed: {}.".format(len(gaps), "; ".join(gaps[:5])),
                     COULD_NOT_ASSESS_RESOLUTION,

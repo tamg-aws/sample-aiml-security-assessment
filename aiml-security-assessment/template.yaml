@@ -574,6 +574,14 @@ Resources:
                 - macie2:DescribeBuckets # BR-46
                 - macie2:ListClassificationJobs # BR-46
               Resource: '*'
+            - Sid: MacieClassificationJobRead
+              # BR-46 reads each job that names an AI source bucket for its
+              # schedule, sampling depth, data identifiers and scoping.
+              # DescribeClassificationJob authorizes on the classification-job.
+              Effect: Allow
+              Action:
+                - macie2:DescribeClassificationJob # BR-46
+              Resource: !Sub 'arn:${AWS::Partition}:macie2:*:${AWS::AccountId}:classification-job/*'
             - Sid: BedrockKnowledgeBaseDataSourceRead
               # BR-46 resolves each knowledge base data source to the S3 bucket it
               # ingests from. Both operations authorize on the knowledge base.

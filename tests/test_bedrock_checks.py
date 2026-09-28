@@ -9249,7 +9249,24 @@ class TestBR45ApiKeyGovernance:
 # BR-46: check_bedrock_knowledge_base_source_classification
 # ===================================================================
 class TestBR46KnowledgeBaseSourceClassification:
-    """BR-46: every knowledge base source bucket must be monitored by Macie."""
+    """BR-46: every AI source bucket must be classified by a recurring Macie job.
+
+    Automated sensitive data discovery samples objects, so a MONITORED bucket
+    with no recurring, full-depth job fails. These cases were rewritten when the
+    job leg became the verdict: every case that used to pass on MONITORED alone
+    now fails, which is the stricter reading.
+    """
+
+    GOOD_JOB = {
+        "jobType": "SCHEDULED",
+        "jobStatus": "IDLE",
+        "initialRun": True,
+        "samplingPercentage": 100,
+        "managedDataIdentifierSelector": "RECOMMENDED",
+        "statistics": {"numberOfRuns": 3},
+        "lastRunTime": "2026-09-01T00:00:00Z",
+        "s3JobDefinition": {},
+    }
 
     def _run(
         self,
@@ -9265,6 +9282,9 @@ class TestBR46KnowledgeBaseSourceClassification:
         data_source_error=None,
         classification_jobs=(),
         classification_jobs_error=None,
+        job_details=None,
+        customization_jobs=None,
+        customization_error=None,
     ):
         agent_client = MagicMock()
         agent_client.list_knowledge_bases.return_value = {
@@ -9282,8 +9302,24 @@ class TestBR46KnowledgeBaseSourceClassification:
         agent_client.get_data_source.side_effect = lambda **kwargs: detail[
             kwargs["dataSourceId"]
         ]
-        # Exposed so the describe cap can be asserted on the call count.
         self.last_agent_client = agent_client
+
+        bedrock_client = MagicMock()
+        customization_jobs = customization_jobs or {}
+        if customization_error:
+            bedrock_client.list_model_customization_jobs.side_effect = (
+                customization_error
+            )
+        else:
+            bedrock_client.list_model_customization_jobs.return_value = {
+                "modelCustomizationJobSummaries": [
+                    {"jobName": name, "jobArn": f"arn:job/{name}"}
+                    for name in customization_jobs
+                ]
+            }
+        bedrock_client.get_model_customization_job.side_effect = lambda jobIdentifier: (
+            customization_jobs[jobIdentifier.split("/")[-1]]
+        )
 
         macie_client = MagicMock()
         if session_error:
@@ -9318,13 +9354,22 @@ class TestBR46KnowledgeBaseSourceClassification:
             "describe_buckets": buckets_paginator,
             "list_classification_jobs": jobs_paginator,
         }[operation]
-        # Exposed so a case can assert which macie2 operations were reached.
+        details = job_details or {}
+
+        def describe_job(jobId):
+            answer = details.get(jobId, self.GOOD_JOB)
+            if isinstance(answer, Exception):
+                raise answer
+            return {"jobId": jobId, **answer}
+
+        macie_client.describe_classification_job.side_effect = describe_job
         self.macie_client = macie_client
 
         with patch(
             "bedrock_app.boto3.client",
             side_effect=lambda service, **kwargs: {
                 "bedrock-agent": agent_client,
+                "bedrock": bedrock_client,
                 "macie2": macie_client,
             }[service],
         ):
@@ -9335,13 +9380,15 @@ class TestBR46KnowledgeBaseSourceClassification:
             )
 
     @staticmethod
-    def _s3_source(data_source_id, name, bucket, owner=None):
+    def _s3_source(data_source_id, name, bucket, owner=None, prefixes=None):
         configuration = {
             "type": "S3",
             "s3Configuration": {"bucketArn": f"arn:aws:s3:::{bucket}"},
         }
         if owner:
             configuration["s3Configuration"]["bucketOwnerAccountId"] = owner
+        if prefixes:
+            configuration["s3Configuration"]["inclusionPrefixes"] = list(prefixes)
         return {
             "dataSource": {
                 "dataSourceId": data_source_id,
@@ -9350,7 +9397,7 @@ class TestBR46KnowledgeBaseSourceClassification:
             }
         }
 
-    def _two_bucket_estate(self, **overrides):
+    def _two_bucket_estate(self, hr_prefixes=None, **overrides):
         """Two knowledge bases, one bucket each: the fixture that discriminates."""
         kwargs = {
             "knowledge_bases": [
@@ -9363,69 +9410,80 @@ class TestBR46KnowledgeBaseSourceClassification:
             },
             "data_source_detail": {
                 "ds-1": self._s3_source("ds-1", "support-docs", "support-bucket"),
-                "ds-2": self._s3_source("ds-2", "hr-docs", "hr-bucket"),
+                "ds-2": self._s3_source(
+                    "ds-2", "hr-docs", "hr-bucket", prefixes=hr_prefixes
+                ),
             },
         }
         kwargs.update(overrides)
         return self._run(**kwargs)
 
+    @staticmethod
+    def _bucket(name, status="MONITORED", **extra):
+        return {
+            "bucketName": name,
+            "automatedDiscoveryMonitoringStatus": status,
+            **extra,
+        }
+
+    @staticmethod
+    def _job(name, buckets=(), criteria=None):
+        job = {"jobId": f"job-{name}", "name": name}
+        if buckets:
+            job["bucketDefinitions"] = [
+                {"accountId": "123456789012", "buckets": list(buckets)}
+            ]
+        if criteria:
+            job["bucketCriteria"] = criteria
+        return job
+
+    @staticmethod
+    def _status(findings, status):
+        return [f for f in findings if f["Status"] == status]
+
     def test_br46_monitored_and_unmonitored_buckets_discriminate(self):
+        """MONITORED without a job fails; a job over a NOT_MONITORED bucket passes."""
         findings = self._two_bucket_estate(
             macie_buckets=[
-                {
-                    "bucketName": "support-bucket",
-                    "automatedDiscoveryMonitoringStatus": "MONITORED",
-                    "lastAutomatedDiscoveryTime": "2026-09-01T00:00:00Z",
-                    "sensitivityScore": 42,
-                },
-                {
-                    "bucketName": "hr-bucket",
-                    "automatedDiscoveryMonitoringStatus": "NOT_MONITORED",
-                },
-            ]
+                self._bucket("support-bucket", sensitivityScore=42),
+                self._bucket("hr-bucket", "NOT_MONITORED"),
+            ],
+            classification_jobs=[self._job("nightly-hr", ["hr-bucket"])],
         )
 
-        failed = [f for f in findings if f["Status"] == "Failed"]
-        passed = [f for f in findings if f["Status"] == "Passed"]
+        failed = self._status(findings, "Failed")
+        passed = self._status(findings, "Passed")
         assert len(failed) == 1
         assert failed[0]["Check_ID"] == "BR-46"
-        assert "hr-bucket is NOT_MONITORED" in failed[0]["Finding_Details"]
-        assert (
-            "data source 'hr-docs' in knowledge base 'hr-kb'"
-            in (failed[0]["Finding_Details"])
-        )
+        assert "(bucket support-bucket)" in failed[0]["Finding_Details"]
+        assert "reports MONITORED" in failed[0]["Finding_Details"]
+        assert "samples objects" in failed[0]["Finding_Details"]
         assert len(passed) == 1
-        assert "support-bucket is MONITORED" in passed[0]["Finding_Details"]
-        assert "sensitivity score 42" in passed[0]["Finding_Details"]
-        assert "1 of 2 knowledge base source bucket(s)" in passed[0]["Finding_Details"]
+        assert (
+            "data source 'hr-docs' in knowledge base 'hr-kb' (bucket hr-bucket) is "
+            "classified by scheduled Macie job 'nightly-hr'"
+        ) in passed[0]["Finding_Details"]
+        assert "1 of 2 AI data source(s)" in passed[0]["Finding_Details"]
 
     def test_br46_monitored_account_bucket_no_knowledge_base_uses_is_not_counted(self):
         """The Macie inventory is wider than the source set on any real account."""
         findings = self._two_bucket_estate(
             macie_buckets=[
-                {
-                    "bucketName": "support-bucket",
-                    "automatedDiscoveryMonitoringStatus": "MONITORED",
-                },
-                {
-                    "bucketName": "hr-bucket",
-                    "automatedDiscoveryMonitoringStatus": "NOT_MONITORED",
-                },
-                {
-                    "bucketName": "unrelated-bucket",
-                    "automatedDiscoveryMonitoringStatus": "MONITORED",
-                },
-            ]
+                self._bucket("support-bucket"),
+                self._bucket("hr-bucket", "NOT_MONITORED"),
+                self._bucket("unrelated-bucket"),
+            ],
+            classification_jobs=[
+                self._job("nightly-support", ["support-bucket", "unrelated-bucket"])
+            ],
         )
 
-        failed = [f for f in findings if f["Status"] == "Failed"]
-        passed = [f for f in findings if f["Status"] == "Passed"]
+        failed = self._status(findings, "Failed")
+        passed = self._status(findings, "Passed")
         assert len(failed) == 1
-        assert "hr-bucket is NOT_MONITORED" in failed[0]["Finding_Details"]
+        assert "(bucket hr-bucket)" in failed[0]["Finding_Details"]
         assert len(passed) == 1
-        # The denominator counts knowledge base source buckets, not the account's
-        # buckets, so a third monitored bucket cannot inflate it.
-        assert "1 of 2 knowledge base source bucket(s)" in passed[0]["Finding_Details"]
+        assert "1 of 2 AI data source(s)" in passed[0]["Finding_Details"]
         assert not any("unrelated-bucket" in f["Finding_Details"] for f in findings)
 
     def test_br46_unmonitored_source_fails_while_another_bucket_is_monitored(self):
@@ -9436,26 +9494,35 @@ class TestBR46KnowledgeBaseSourceClassification:
                 "ds-2": self._s3_source("ds-2", "hr-docs", "hr-bucket")
             },
             macie_buckets=[
-                {
-                    "bucketName": "unrelated-bucket",
-                    "automatedDiscoveryMonitoringStatus": "MONITORED",
-                },
-                {
-                    "bucketName": "hr-bucket",
-                    "automatedDiscoveryMonitoringStatus": "NOT_MONITORED",
-                },
+                self._bucket("unrelated-bucket"),
+                self._bucket("hr-bucket", "NOT_MONITORED"),
             ],
+            classification_jobs=[self._job("other", ["unrelated-bucket"])],
         )
 
-        # Discovery being on and some bucket being monitored is not coverage of the
-        # one bucket a knowledge base ingests from, so there is no Passed here.
         assert [f["Status"] for f in findings] == ["Failed"]
-        assert "hr-bucket is NOT_MONITORED" in findings[0]["Finding_Details"]
+        assert "reports NOT_MONITORED" in findings[0]["Finding_Details"]
         assert (
             "data source 'hr-docs' in knowledge base 'hr-kb'"
             in (findings[0]["Finding_Details"])
         )
         assert "unrelated-bucket" not in findings[0]["Finding_Details"]
+        assert "'other'" not in findings[0]["Finding_Details"]
+
+    def test_br46_every_bucket_monitored_with_no_job_fails_each(self):
+        """The hiding direction: estate-wide sampling never passes a source."""
+        findings = self._two_bucket_estate(
+            macie_buckets=[self._bucket("support-bucket"), self._bucket("hr-bucket")],
+        )
+
+        failed = self._status(findings, "Failed")
+        assert len(failed) == 2
+        assert not self._status(findings, "Passed")
+        for finding in failed:
+            assert (
+                "no Macie classification job names the bucket"
+                in (finding["Finding_Details"])
+            )
 
     def test_br46_macie_not_enabled_is_not_a_bucket_failure(self):
         findings = self._two_bucket_estate(
@@ -9481,33 +9548,37 @@ class TestBR46KnowledgeBaseSourceClassification:
         assert "FS-44" not in findings[0]["Finding_Details"]
         assert "macie2:GetMacieSession" in findings[0]["Resolution"]
 
-    def test_br46_discovery_disabled_is_not_a_bucket_failure(self):
-        findings = self._two_bucket_estate(discovery_status="DISABLED")
-
-        assert [f["Status"] for f in findings] == ["N/A"]
-        assert (
-            "automated sensitive data discovery is DISABLED"
-            in findings[0]["Finding_Details"]
+    def test_br46_discovery_disabled_still_judges_the_job_leg(self):
+        """Discovery off used to return N/A; the job leg is readable, so it fails."""
+        findings = self._two_bucket_estate(
+            discovery_status="DISABLED",
+            macie_buckets=[
+                self._bucket("support-bucket"),
+                self._bucket("hr-bucket", "NOT_MONITORED"),
+            ],
+            classification_jobs=[self._job("nightly-hr", ["hr-bucket"])],
         )
-        assert "FS-44" in findings[0]["Finding_Details"]
+
+        failed = self._status(findings, "Failed")
+        assert len(failed) == 1
+        assert "(bucket support-bucket)" in failed[0]["Finding_Details"]
+        assert (
+            "not in effect: automated sensitive data discovery is DISABLED"
+            in failed[0]["Finding_Details"]
+        )
+        assert len(self._status(findings, "Passed")) == 1
 
     def test_br46_bucket_error_code_is_indeterminate_not_failed(self):
         findings = self._two_bucket_estate(
             macie_buckets=[
-                {
-                    "bucketName": "support-bucket",
-                    "automatedDiscoveryMonitoringStatus": "MONITORED",
-                },
-                {
-                    "bucketName": "hr-bucket",
-                    "automatedDiscoveryMonitoringStatus": "NOT_MONITORED",
-                    "errorCode": "ACCESS_DENIED",
-                },
-            ]
+                self._bucket("support-bucket"),
+                self._bucket("hr-bucket", "NOT_MONITORED", errorCode="ACCESS_DENIED"),
+            ],
+            classification_jobs=[self._job("nightly", ["support-bucket"])],
         )
 
-        assert not [f for f in findings if f["Status"] == "Failed"]
-        indeterminate = [f for f in findings if f["Status"] == "N/A"]
+        assert not self._status(findings, "Failed")
+        indeterminate = self._status(findings, "N/A")
         assert len(indeterminate) == 1
         assert (
             "hr-bucket reports Macie errorCode ACCESS_DENIED"
@@ -9523,12 +9594,7 @@ class TestBR46KnowledgeBaseSourceClassification:
                     "ds-1", "support-docs", "other-account-bucket", owner="210987654321"
                 )
             },
-            macie_buckets=[
-                {
-                    "bucketName": "unrelated-bucket",
-                    "automatedDiscoveryMonitoringStatus": "MONITORED",
-                }
-            ],
+            macie_buckets=[self._bucket("unrelated-bucket")],
         )
 
         assert [f["Status"] for f in findings] == ["N/A"]
@@ -9586,30 +9652,25 @@ class TestBR46KnowledgeBaseSourceClassification:
         assert [f["Status"] for f in findings] == ["N/A"]
         assert "no source bucket to classify" in findings[0]["Finding_Details"]
 
-    def test_br46_unknown_monitoring_status_is_indeterminate(self):
+    def test_br46_unknown_monitoring_status_does_not_clear_a_bucket(self):
+        """An unset status used to be N/A; with no job the source now fails."""
         findings = self._two_bucket_estate(
-            macie_buckets=[
-                {
-                    "bucketName": "support-bucket",
-                    "automatedDiscoveryMonitoringStatus": "MONITORED",
-                },
-                {"bucketName": "hr-bucket"},
-            ]
+            macie_buckets=[self._bucket("support-bucket"), {"bucketName": "hr-bucket"}],
+            classification_jobs=[self._job("nightly", ["support-bucket"])],
         )
 
-        indeterminate = [f for f in findings if f["Status"] == "N/A"]
-        assert not [f for f in findings if f["Status"] == "Failed"]
-        assert (
-            "automatedDiscoveryMonitoringStatus 'unset'"
-            in (indeterminate[0]["Finding_Details"])
-        )
+        failed = self._status(findings, "Failed")
+        assert len(failed) == 1
+        assert "(bucket hr-bucket)" in failed[0]["Finding_Details"]
+        assert "reports no status" in failed[0]["Finding_Details"]
 
-    def test_br46_describe_cap_bounds_the_fan_out_and_still_reports(self):
-        """55 data sources across two knowledge bases, one GetDataSource each."""
-        cap = bedrock_app.MAX_KNOWLEDGE_BASE_DATA_SOURCE_DESCRIBES
+    def test_br46_every_data_source_is_read_with_no_cap(self):
+        """55 data sources across two knowledge bases: every one is resolved.
+
+        The walk used to stop at 50 and report the rest as unread; the whole
+        population is now read.
+        """
         first_kb, second_kb = 30, 25
-        assert first_kb + second_kb > cap
-
         summaries = {"kb-1": [], "kb-2": []}
         detail = {}
         for index in range(first_kb + second_kb):
@@ -9630,64 +9691,45 @@ class TestBR46KnowledgeBaseSourceClassification:
             data_sources=summaries,
             data_source_detail=detail,
             macie_buckets=[
-                {
-                    "bucketName": f"bucket-{index:03d}",
-                    "automatedDiscoveryMonitoringStatus": (
-                        "NOT_MONITORED" if index == 0 else "MONITORED"
-                    ),
-                }
+                self._bucket(f"bucket-{index:03d}")
                 for index in range(first_kb + second_kb)
+            ],
+            classification_jobs=[
+                self._job(
+                    "all",
+                    [f"bucket-{index:03d}" for index in range(1, first_kb + second_kb)],
+                )
             ],
         )
 
-        assert self.last_agent_client.get_data_source.call_count == cap
-
-        failed = [f for f in findings if f["Status"] == "Failed"]
-        passed = [f for f in findings if f["Status"] == "Passed"]
-        truncation = [
-            f
-            for f in findings
-            if f"stopped after {cap} data sources" in (f["Finding_Details"])
-        ]
-        # The cap bounds the walk without dropping the verdict for what was walked.
+        assert self.last_agent_client.get_data_source.call_count == 55
+        failed = self._status(findings, "Failed")
+        passed = self._status(findings, "Passed")
         assert len(failed) == 1
-        assert "bucket-000 is NOT_MONITORED" in failed[0]["Finding_Details"]
-        assert len(passed) == 1
-        assert (
-            f"{cap - 1} of {cap} knowledge base source bucket(s)"
-            in (passed[0]["Finding_Details"])
-        )
-        assert len(truncation) == 1
-        assert truncation[0]["Status"] == "N/A"
-        # A source past the cap was never resolved, so it appears nowhere.
-        assert not any("bucket-054" in f["Finding_Details"] for f in findings)
+        assert "(bucket bucket-000)" in failed[0]["Finding_Details"]
+        assert "54 of 55 AI data source(s)" in passed[0]["Finding_Details"]
+        assert "bucket-054" in passed[0]["Finding_Details"]
+        assert not any("stopped after" in f["Finding_Details"] for f in findings)
+        # One job describes every bucket it names, so it is read once.
+        assert self.macie_client.describe_classification_job.call_count == 1
 
     def test_br46_schema_valid(self):
         findings = self._two_bucket_estate(
             macie_buckets=[
-                {
-                    "bucketName": "support-bucket",
-                    "automatedDiscoveryMonitoringStatus": "MONITORED",
-                },
-                {
-                    "bucketName": "hr-bucket",
-                    "automatedDiscoveryMonitoringStatus": "NOT_MONITORED",
-                },
-            ]
+                self._bucket("support-bucket"),
+                self._bucket("hr-bucket", "NOT_MONITORED"),
+            ],
+            classification_jobs=[self._job("nightly-hr", ["hr-bucket"])],
         )
-        assert findings
+        assert {f["Status"] for f in findings} == {"Failed", "Passed"}
         for finding in findings:
             assert_finding_schema(finding)
 
 
 class TestBR46ClassificationJobCoverage:
     """
-    BR-46 job leg: a targeted Macie classification job is the other mechanism.
-
-    Automated sensitive data discovery reporting NOT_MONITORED is not the whole
-    answer, because a classification job can inspect the same bucket. Only a
-    scheduled job that will run again counts, so every case below fixes the
-    bucket inventory and varies the job.
+    BR-46 job leg: each value on the job decides whether it classifies the
+    source. Every case fixes the bucket inventory and varies one job value.
     """
 
     _BUCKETS = [
@@ -9701,297 +9743,424 @@ class TestBR46ClassificationJobCoverage:
         },
     ]
 
-    _BOTH_UNMONITORED = [
-        {
-            "bucketName": "support-bucket",
-            "automatedDiscoveryMonitoringStatus": "NOT_MONITORED",
-        },
-        {
-            "bucketName": "hr-bucket",
-            "automatedDiscoveryMonitoringStatus": "NOT_MONITORED",
-        },
-    ]
-
-    def _run(self, **kwargs):
-        """Reuse the two-bucket estate so only the job list varies."""
+    def _run(self, jobs=(), details=None, **kwargs):
+        """Support is always covered by a good job, so only hr's job varies."""
         estate = TestBR46KnowledgeBaseSourceClassification()
         kwargs.setdefault("macie_buckets", self._BUCKETS)
-        findings = estate._two_bucket_estate(**kwargs)
+        kwargs.setdefault(
+            "classification_jobs",
+            [
+                TestBR46KnowledgeBaseSourceClassification._job(
+                    "support", ["support-bucket"]
+                )
+            ]
+            + list(jobs),
+        )
+        findings = estate._two_bucket_estate(job_details=details, **kwargs)
         self.macie_client = estate.macie_client
         return findings
 
     @staticmethod
-    def _job(
-        name,
-        buckets=(),
-        job_type="SCHEDULED",
-        status="IDLE",
-        last_run_error=None,
-        criteria=None,
-    ):
-        job = {
-            "jobId": f"job-{name}",
-            "name": name,
-            "jobType": job_type,
-            "jobStatus": status,
-        }
-        if buckets:
-            job["bucketDefinitions"] = [
-                {"accountId": "123456789012", "buckets": list(buckets)}
-            ]
-        if criteria:
-            job["bucketCriteria"] = criteria
-        if last_run_error:
-            job["lastRunErrorStatus"] = {"code": last_run_error}
-        return job
+    def _job(name, buckets=("hr-bucket",), criteria=None):
+        return TestBR46KnowledgeBaseSourceClassification._job(name, buckets, criteria)
 
     @staticmethod
-    def _job_rows(findings):
+    def _detail(**overrides):
+        detail = dict(TestBR46KnowledgeBaseSourceClassification.GOOD_JOB)
+        detail.update(overrides)
+        return {k: v for k, v in detail.items() if v is not None}
+
+    @staticmethod
+    def _hr_rows(findings, status):
         return [
-            finding
-            for finding in findings
-            if finding["Finding"] == bedrock_app.CLASSIFICATION_JOB_FINDING
+            f
+            for f in findings
+            if f["Status"] == status and "(bucket hr-bucket)" in f["Finding_Details"]
         ]
 
+    def _hr_fails_because(self, findings, text):
+        failed = [f for f in findings if f["Status"] == "Failed"]
+        assert len(failed) == 1, [f["Finding_Details"] for f in findings]
+        assert "(bucket hr-bucket)" in failed[0]["Finding_Details"]
+        assert text in failed[0]["Finding_Details"]
+        passed = [f for f in findings if f["Status"] == "Passed"]
+        assert "1 of 2 AI data source(s)" in passed[0]["Finding_Details"]
+        assert "(bucket hr-bucket)" not in passed[0]["Finding_Details"]
+
     def test_br46_scheduled_job_clears_an_unmonitored_bucket(self):
-        findings = self._run(
-            classification_jobs=[self._job("nightly-hr", ["hr-bucket"])]
-        )
+        findings = self._run([self._job("nightly-hr")])
 
         assert not [f for f in findings if f["Status"] == "Failed"]
-        job_rows = self._job_rows(findings)
-        assert len(job_rows) == 1
-        assert job_rows[0]["Status"] == "Passed"
-        assert job_rows[0]["Check_ID"] == "BR-46"
+        passed = [f for f in findings if f["Status"] == "Passed"]
+        assert len(passed) == 1
+        assert passed[0]["Finding"] == bedrock_app.CLASSIFICATION_JOB_FINDING
         assert (
-            "hr-bucket is classified by scheduled Macie job 'nightly-hr' (IDLE)"
-            in (job_rows[0]["Finding_Details"])
+            "(bucket hr-bucket) is classified by scheduled Macie job 'nightly-hr' (IDLE"
+            in passed[0]["Finding_Details"]
         )
-        assert (
-            "1 of 2 knowledge base source bucket(s)" in job_rows[0]["Finding_Details"]
-        )
+        assert "2 of 2 AI data source(s)" in passed[0]["Finding_Details"]
+        assert "per-document metadata" in passed[0]["Finding_Details"]
+        assert "is not judged" in passed[0]["Finding_Details"]
 
     def test_br46_running_scheduled_job_also_clears_the_bucket(self):
-        """RUNNING and IDLE both mean the schedule is live, so both count."""
         findings = self._run(
-            classification_jobs=[
-                self._job("nightly-hr", ["hr-bucket"], status="RUNNING")
-            ]
+            [self._job("nightly-hr")],
+            {"job-nightly-hr": self._detail(jobStatus="RUNNING")},
         )
 
         assert not [f for f in findings if f["Status"] == "Failed"]
-        assert "(RUNNING)" in self._job_rows(findings)[0]["Finding_Details"]
+        assert "'nightly-hr' (RUNNING" in findings[0]["Finding_Details"]
 
     def test_br46_one_time_job_does_not_clear_an_unmonitored_bucket(self):
         findings = self._run(
-            classification_jobs=[
-                self._job(
-                    "one-shot", ["hr-bucket"], job_type="ONE_TIME", status="COMPLETE"
-                )
-            ]
+            [self._job("one-shot")],
+            {"job-one-shot": self._detail(jobType="ONE_TIME", jobStatus="COMPLETE")},
         )
-
-        failed = [f for f in findings if f["Status"] == "Failed"]
-        assert len(failed) == 1
-        assert "hr-bucket is NOT_MONITORED" in failed[0]["Finding_Details"]
-        assert (
-            "Macie job 'one-shot' is ONE_TIME and COMPLETE"
-            in (failed[0]["Finding_Details"])
+        self._hr_fails_because(
+            findings, "nothing ingested since that run is classified"
         )
-        assert (
-            "nothing ingested since that run is classified"
-            in (failed[0]["Finding_Details"])
-        )
-        assert not self._job_rows(findings)
 
     def test_br46_paused_scheduled_job_does_not_clear_the_bucket(self):
         findings = self._run(
-            classification_jobs=[
-                self._job("nightly-hr", ["hr-bucket"], status="USER_PAUSED")
-            ]
+            [self._job("nightly-hr")],
+            {"job-nightly-hr": self._detail(jobStatus="USER_PAUSED")},
         )
-
-        failed = [f for f in findings if f["Status"] == "Failed"]
-        assert len(failed) == 1
-        assert (
-            "the scheduled Macie job naming it, 'nightly-hr', is USER_PAUSED"
-            in (failed[0]["Finding_Details"])
-        )
-        assert not self._job_rows(findings)
+        self._hr_fails_because(findings, "is USER_PAUSED, so it will not run again")
 
     def test_br46_scheduled_job_whose_last_run_errored_does_not_clear_the_bucket(self):
-        """A live schedule whose run failed classified nothing on that run."""
         findings = self._run(
-            classification_jobs=[
-                self._job(
-                    "nightly-hr",
-                    ["hr-bucket"],
-                    status="RUNNING",
-                    last_run_error="ERROR",
+            [self._job("nightly-hr")],
+            {
+                "job-nightly-hr": self._detail(
+                    jobStatus="RUNNING", lastRunErrorStatus={"code": "ERROR"}
                 )
-            ]
+            },
         )
-
-        failed = [f for f in findings if f["Status"] == "Failed"]
-        assert len(failed) == 1
-        assert "lastRunErrorStatus ERROR" in failed[0]["Finding_Details"]
-        assert not self._job_rows(findings)
+        self._hr_fails_because(findings, "lastRunErrorStatus is ERROR")
 
     def test_br46_last_run_error_code_none_still_clears_the_bucket(self):
-        """lastRunErrorStatus is present on a healthy job with code NONE."""
         findings = self._run(
-            classification_jobs=[
-                self._job("nightly-hr", ["hr-bucket"], last_run_error="NONE")
-            ]
+            [self._job("nightly-hr")],
+            {"job-nightly-hr": self._detail(lastRunErrorStatus={"code": "NONE"})},
         )
-
         assert not [f for f in findings if f["Status"] == "Failed"]
-        assert self._job_rows(findings)[0]["Status"] == "Passed"
+
+    def test_br46_job_that_never_ran_does_not_clear_the_bucket(self):
+        findings = self._run(
+            [self._job("new")],
+            {"job-new": self._detail(statistics={"numberOfRuns": 0})},
+        )
+        self._hr_fails_because(findings, "it has not run yet")
+
+    def test_br46_job_without_initial_run_does_not_clear_the_bucket(self):
+        findings = self._run(
+            [self._job("new")], {"job-new": self._detail(initialRun=False)}
+        )
+        self._hr_fails_because(findings, "objects present when the job was created")
+
+    def test_br46_sampled_job_does_not_clear_the_bucket(self):
+        findings = self._run(
+            [self._job("sampled")], {"job-sampled": self._detail(samplingPercentage=20)}
+        )
+        self._hr_fails_because(findings, "samplingPercentage is 20")
+
+    def test_br46_job_with_no_data_identifier_does_not_clear_the_bucket(self):
+        findings = self._run(
+            [self._job("blind")],
+            {"job-blind": self._detail(managedDataIdentifierSelector="NONE")},
+        )
+        self._hr_fails_because(findings, "so it detects nothing")
+
+    def test_br46_custom_identifiers_alone_clear_the_bucket(self):
+        findings = self._run(
+            [self._job("custom")],
+            {
+                "job-custom": self._detail(
+                    managedDataIdentifierSelector="NONE",
+                    customDataIdentifierIds=["cdi-1"],
+                )
+            },
+        )
+        assert not [f for f in findings if f["Status"] == "Failed"]
+
+    def test_br46_include_scope_that_misses_the_source_prefix_fails(self):
+        scoping = {
+            "includes": {
+                "and": [
+                    {
+                        "simpleScopeTerm": {
+                            "key": "OBJECT_KEY",
+                            "comparator": "STARTS_WITH",
+                            "values": ["archive/"],
+                        }
+                    }
+                ]
+            }
+        }
+        findings = self._run(
+            [self._job("narrow")],
+            {"job-narrow": self._detail(s3JobDefinition={"scoping": scoping})},
+            hr_prefixes=["policies/"],
+        )
+        self._hr_fails_because(findings, "does not cover source prefix 'policies/'")
+
+    def test_br46_include_scope_covering_the_source_prefix_passes(self):
+        scoping = {
+            "includes": {
+                "and": [
+                    {
+                        "simpleScopeTerm": {
+                            "key": "OBJECT_KEY",
+                            "comparator": "STARTS_WITH",
+                            "values": ["archive/", "policies/"],
+                        }
+                    }
+                ]
+            }
+        }
+        findings = self._run(
+            [self._job("scoped")],
+            {"job-scoped": self._detail(s3JobDefinition={"scoping": scoping})},
+            hr_prefixes=["policies/2026/"],
+        )
+        assert not [f for f in findings if f["Status"] == "Failed"]
+
+    def test_br46_include_scope_on_a_whole_bucket_source_fails(self):
+        scoping = {
+            "includes": {
+                "and": [
+                    {
+                        "simpleScopeTerm": {
+                            "key": "OBJECT_KEY",
+                            "comparator": "STARTS_WITH",
+                            "values": ["policies/"],
+                        }
+                    }
+                ]
+            }
+        }
+        findings = self._run(
+            [self._job("narrow")],
+            {"job-narrow": self._detail(s3JobDefinition={"scoping": scoping})},
+        )
+        self._hr_fails_because(findings, "does not cover the whole bucket")
+
+    def test_br46_exclude_scope_over_the_source_prefix_fails(self):
+        scoping = {
+            "excludes": {
+                "and": [
+                    {
+                        "simpleScopeTerm": {
+                            "key": "OBJECT_KEY",
+                            "comparator": "STARTS_WITH",
+                            "values": ["policies/"],
+                        }
+                    }
+                ]
+            }
+        }
+        findings = self._run(
+            [self._job("skips")],
+            {"job-skips": self._detail(s3JobDefinition={"scoping": scoping})},
+            hr_prefixes=["policies/hr/"],
+        )
+        self._hr_fails_because(findings, "skips keys starting with policies/")
+
+    def test_br46_extension_exclude_passes_and_says_it_was_not_judged(self):
+        scoping = {
+            "excludes": {
+                "and": [
+                    {
+                        "simpleScopeTerm": {
+                            "key": "OBJECT_EXTENSION",
+                            "comparator": "EQ",
+                            "values": ["png"],
+                        }
+                    }
+                ]
+            }
+        }
+        findings = self._run(
+            [self._job("no-images")],
+            {"job-no-images": self._detail(s3JobDefinition={"scoping": scoping})},
+        )
+        assert not [f for f in findings if f["Status"] == "Failed"]
+        passed = [f for f in findings if f["Status"] == "Passed"]
+        assert "1 exclude condition(s) on extension" in passed[0]["Finding_Details"]
 
     def test_br46_job_naming_another_bucket_does_not_clear_this_one(self):
-        findings = self._run(
-            classification_jobs=[self._job("nightly-other", ["unrelated-bucket"])]
-        )
-
-        failed = [f for f in findings if f["Status"] == "Failed"]
-        assert len(failed) == 1
-        assert (
-            "No Macie classification job in this Region names hr-bucket either."
-            in (failed[0]["Finding_Details"])
-        )
-        assert "nightly-other" not in failed[0]["Finding_Details"]
-        assert not self._job_rows(findings)
-
-    def test_br46_two_unmonitored_buckets_reach_both_verdicts(self):
-        findings = self._run(
-            macie_buckets=self._BOTH_UNMONITORED,
-            classification_jobs=[self._job("nightly-support", ["support-bucket"])],
-        )
-
-        failed = [f for f in findings if f["Status"] == "Failed"]
-        job_rows = self._job_rows(findings)
-        assert len(failed) == 1
-        assert "hr-bucket is NOT_MONITORED" in failed[0]["Finding_Details"]
-        assert len(job_rows) == 1
-        assert job_rows[0]["Status"] == "Passed"
-        assert "support-bucket" in job_rows[0]["Finding_Details"]
-        # One bucket's job cannot speak for the other.
-        assert "hr-bucket" not in job_rows[0]["Finding_Details"]
+        findings = self._run([self._job("nightly-other", ["unrelated-bucket"])])
+        self._hr_fails_because(findings, "no Macie classification job names the bucket")
+        assert not any("nightly-other" in f["Finding_Details"] for f in findings)
 
     def test_br46_a_live_job_after_a_cancelled_one_still_clears_the_bucket(self):
         findings = self._run(
-            classification_jobs=[
-                self._job("old-hr", ["hr-bucket"], status="CANCELLED"),
-                self._job("nightly-hr", ["hr-bucket"]),
-            ]
+            [self._job("old-hr"), self._job("nightly-hr")],
+            {"job-old-hr": self._detail(jobStatus="CANCELLED")},
         )
-
         assert not [f for f in findings if f["Status"] == "Failed"]
-        assert "'nightly-hr'" in self._job_rows(findings)[0]["Finding_Details"]
+        assert "'nightly-hr'" in findings[0]["Finding_Details"]
 
-    def test_br46_bucket_criteria_job_is_indeterminate_not_coverage(self):
+    def test_br46_criteria_job_named_by_last_job_id_is_judged(self):
+        """DescribeBuckets jobDetails ties a criteria job to the bucket."""
+        buckets = [
+            self._BUCKETS[0],
+            {
+                **self._BUCKETS[1],
+                "jobDetails": {"isMonitoredByJob": "TRUE", "lastJobId": "job-by-tag"},
+            },
+        ]
+        criteria = {"includes": {"and": []}}
+        good = self._run([self._job("by-tag", (), criteria)], macie_buckets=buckets)
+        assert not [f for f in good if f["Status"] == "Failed"]
+        sampled = self._run(
+            [self._job("by-tag", (), criteria)],
+            {"job-by-tag": self._detail(samplingPercentage=10)},
+            macie_buckets=buckets,
+        )
+        self._hr_fails_because(sampled, "samplingPercentage is 10")
+
+    def test_br46_untied_criteria_job_is_indeterminate_not_coverage(self):
+        buckets = [
+            self._BUCKETS[0],
+            {**self._BUCKETS[1], "jobDetails": {"isMonitoredByJob": "TRUE"}},
+        ]
         findings = self._run(
-            classification_jobs=[
-                self._job(
-                    "by-tag",
-                    criteria={
-                        "includes": {
-                            "and": [
-                                {
-                                    "tagCriterion": {
-                                        "comparator": "EQ",
-                                        "tagValues": [{"key": "pii", "value": "yes"}],
-                                    }
-                                }
-                            ]
-                        }
-                    },
-                )
-            ]
+            [self._job("by-tag", (), {"includes": {"and": []}})], macie_buckets=buckets
         )
+        assert not [f for f in findings if f["Status"] == "Failed"]
+        na = self._hr_rows(findings, "N/A")
+        assert len(na) == 1
+        assert "isMonitoredByJob TRUE" in na[0]["Finding_Details"]
+        assert "could not be read" in na[0]["Finding_Details"]
 
-        failed = [f for f in findings if f["Status"] == "Failed"]
-        job_rows = self._job_rows(findings)
-        assert len(failed) == 1
-        assert len(job_rows) == 1
-        assert job_rows[0]["Status"] == "N/A"
-        assert job_rows[0]["Severity"] == "Informational"
-        assert (
-            "select their buckets with bucketCriteria instead of naming them"
-            in (job_rows[0]["Finding_Details"])
+    def test_br46_criteria_job_macie_says_does_not_monitor_fails(self):
+        buckets = [
+            self._BUCKETS[0],
+            {**self._BUCKETS[1], "jobDetails": {"isMonitoredByJob": "FALSE"}},
+        ]
+        findings = self._run(
+            [self._job("by-tag", (), {"includes": {"and": []}})], macie_buckets=buckets
         )
-        assert "by-tag" in job_rows[0]["Finding_Details"]
-        assert "hr-bucket" in job_rows[0]["Finding_Details"]
+        self._hr_fails_because(findings, "isMonitoredByJob FALSE")
+
+    def test_br46_failing_named_job_beside_a_criteria_job_is_indeterminate(self):
+        buckets = [
+            self._BUCKETS[0],
+            {**self._BUCKETS[1], "jobDetails": {"isMonitoredByJob": "TRUE"}},
+        ]
+        findings = self._run(
+            [self._job("sampled"), self._job("by-tag", (), {"includes": {"and": []}})],
+            {"job-sampled": self._detail(samplingPercentage=5)},
+            macie_buckets=buckets,
+        )
+        assert not [f for f in findings if f["Status"] == "Failed"]
+        na = self._hr_rows(findings, "N/A")
+        assert "samplingPercentage is 5" in na[0]["Finding_Details"]
+        assert "by-tag" in na[0]["Finding_Details"]
 
     def test_br46_job_list_failure_is_na_not_coverage_and_not_absence(self):
         findings = self._run(
             classification_jobs_error=_make_client_error("AccessDeniedException"),
         )
 
-        failed = [f for f in findings if f["Status"] == "Failed"]
-        job_rows = self._job_rows(findings)
-        assert len(failed) == 1
-        # The monitoring verdict stands, but the check must not claim no job
-        # names the bucket when it could not read the job list.
-        assert "No Macie classification job" not in failed[0]["Finding_Details"]
-        assert len(job_rows) == 1
-        assert job_rows[0]["Status"] == "N/A"
-        assert (
-            "The Macie classification job list could not be read"
-            in (job_rows[0]["Finding_Details"])
+        assert not [f for f in findings if f["Status"] in ("Failed", "Passed")]
+        na = [f for f in findings if f["Status"] == "N/A"]
+        assert len(na) == 2
+        assert all(
+            "classification job list could not be read" in f["Finding_Details"]
+            for f in na
         )
-        assert "hr-bucket" in job_rows[0]["Finding_Details"]
-        assert "macie2:ListClassificationJobs" in job_rows[0]["Resolution"]
+        assert "macie2:ListClassificationJobs" in na[0]["Resolution"]
 
-    def test_br46_job_list_is_not_read_when_every_bucket_is_monitored(self):
-        """Nothing is failing, so the second Macie call buys nothing."""
+    def test_br46_job_describe_failure_is_na_for_that_bucket(self):
         findings = self._run(
-            macie_buckets=[
+            [self._job("nightly-hr")],
+            {"job-nightly-hr": _make_client_error("AccessDeniedException")},
+        )
+        assert not [f for f in findings if f["Status"] == "Failed"]
+        na = self._hr_rows(findings, "N/A")
+        assert "Macie job 'nightly-hr' could not be read" in na[0]["Finding_Details"]
+        assert "macie2:DescribeClassificationJob" in na[0]["Resolution"]
+
+    def test_br46_each_job_is_described_once(self):
+        self._run(
+            [self._job("both", ["hr-bucket", "support-bucket"])],
+            classification_jobs=[self._job("both", ["hr-bucket", "support-bucket"])],
+        )
+        assert [
+            c.kwargs
+            for c in self.macie_client.describe_classification_job.call_args_list
+        ] == [{"jobId": "job-both"}]
+
+    def test_br46_customization_training_data_is_in_the_population(self):
+        """Training, validation and log sources join; the output bucket does not."""
+        findings = self._run(
+            [self._job("nightly-hr")],
+            macie_buckets=self._BUCKETS
+            + [
                 {
-                    "bucketName": "support-bucket",
+                    "bucketName": "train-bucket",
                     "automatedDiscoveryMonitoringStatus": "MONITORED",
                 },
                 {
-                    "bucketName": "hr-bucket",
+                    "bucketName": "val-bucket",
                     "automatedDiscoveryMonitoringStatus": "MONITORED",
                 },
             ],
-            classification_jobs=[self._job("nightly-hr", ["hr-bucket"])],
+            classification_jobs=[
+                self._job("support", ["support-bucket"]),
+                self._job("nightly-hr"),
+                self._job("train", ["train-bucket"]),
+            ],
+            customization_jobs={
+                "tune-1": {
+                    "trainingDataConfig": {
+                        "s3Uri": "s3://train-bucket/data/train.jsonl"
+                    },
+                    "validationDataConfig": {
+                        "validators": [{"s3Uri": "s3://val-bucket/val.jsonl"}]
+                    },
+                    "outputDataConfig": {"s3Uri": "s3://out-bucket/"},
+                }
+            },
         )
+        failed = [f for f in findings if f["Status"] == "Failed"]
+        assert len(failed) == 1
+        assert (
+            "the validation data of customization job 'tune-1' (bucket val-bucket)"
+            in failed[0]["Finding_Details"]
+        )
+        passed = [f for f in findings if f["Status"] == "Passed"]
+        assert "3 of 4 AI data source(s)" in passed[0]["Finding_Details"]
+        assert (
+            "the training data of customization job 'tune-1'"
+            in (passed[0]["Finding_Details"])
+        )
+        assert not any("out-bucket" in f["Finding_Details"] for f in findings)
 
-        assert [f["Status"] for f in findings] == ["Passed"]
-        assert not self._job_rows(findings)
-        self.macie_client.get_paginator.assert_called_once_with("describe_buckets")
-
-    def test_br46_job_coverage_reads_the_job_list_only(self):
-        """One macie2 job action: DescribeClassificationJob is never called."""
-        self._run(classification_jobs=[self._job("nightly-hr", ["hr-bucket"])])
-
-        assert [
-            call.args[0] for call in self.macie_client.get_paginator.call_args_list
-        ] == ["describe_buckets", "list_classification_jobs"]
-        assert self.macie_client.describe_classification_job.call_count == 0
-        assert self.macie_client.list_classification_jobs.call_count == 0
+    def test_br46_customization_list_failure_is_reported(self):
+        findings = self._run(
+            [self._job("nightly-hr")],
+            customization_error=_make_client_error("AccessDeniedException"),
+        )
+        na = [f for f in findings if f["Status"] == "N/A"]
+        assert len(na) == 1
+        assert "model customization jobs" in na[0]["Finding_Details"]
+        assert "bedrock:ListModelCustomizationJobs" in na[0]["Resolution"]
 
     def test_br46_job_rows_pass_the_finding_schema(self):
-        covered = self._run(
-            classification_jobs=[self._job("nightly-hr", ["hr-bucket"])]
-        )
-        criteria = self._run(
-            classification_jobs=[
-                self._job("by-tag", criteria={"includes": {"and": []}})
-            ]
-        )
-        unreadable = self._run(
-            classification_jobs_error=_make_client_error("AccessDeniedException")
-        )
-
         rows = (
-            self._job_rows(covered)
-            + self._job_rows(criteria)
-            + self._job_rows(unreadable)
+            self._run([self._job("nightly-hr")])
+            + self._run(
+                [self._job("sampled")],
+                {"job-sampled": self._detail(samplingPercentage=1)},
+            )
+            + self._run(
+                classification_jobs_error=_make_client_error("AccessDeniedException")
+            )
         )
-        assert len(rows) == 3
+        assert {f["Status"] for f in rows} == {"Passed", "Failed", "N/A"}
         for finding in rows:
             assert_finding_schema(finding)
 
@@ -15444,8 +15613,13 @@ class TestBR47DataPathBucketTLS:
         assert "train-bucket" in findings[1]["Finding_Details"]
         assert "the bucket list is incomplete" in findings[1]["Finding_Details"]
 
-    def test_br47_more_jobs_than_the_cap_is_an_incomplete_inventory(self):
-        """51 jobs over two pages: the newest 50 are read, the 51st is reported."""
+    def test_br47_every_customization_job_is_read_with_no_cap(self):
+        """51 jobs over two pages: every job is read, so the 51st bucket is judged.
+
+        The walk used to stop at 50 jobs and report the rest as unread. The
+        51st job names the only bucket without a TLS deny, so a capped read
+        would hide the failure.
+        """
         summaries = [
             {
                 "jobArn": f"arn:aws:bedrock:us-east-1:111122223333:model-customization-job/j{i}",
@@ -15457,32 +15631,37 @@ class TestBR47DataPathBucketTLS:
             {"modelCustomizationJobSummaries": summaries[:30], "nextToken": "p2"},
             {"modelCustomizationJobSummaries": summaries[30:]},
         ]
-        detail = {"trainingDataConfig": {"s3Uri": "s3://train-bucket/"}}
+        jobs = {
+            f"j{i}": {"trainingDataConfig": {"s3Uri": "s3://train-bucket/"}}
+            for i in range(50)
+        }
+        jobs["j50"] = {"trainingDataConfig": {"s3Uri": "s3://late-bucket/"}}
         findings = self._run(
-            customization_jobs={f"j{i}": detail for i in range(51)},
+            customization_jobs=jobs,
             bucket_policies={
                 "train-bucket": _bucket_policy(_tls_deny_statement(["train-bucket"]))
             },
             customization_pages=pages,
         )
 
-        assert [f["Status"] for f in findings] == ["N/A", "N/A"]
-        assert "only the newest 50 were read" in findings[0]["Finding_Details"]
-        assert "stopped at a read cap" in findings[0]["Finding_Details"]
-        assert "the bucket list is incomplete" in findings[1]["Finding_Details"]
-        assert self.bedrock_client.get_model_customization_job.call_count == 50
+        assert self.bedrock_client.get_model_customization_job.call_count == 51
         assert (
             self.bedrock_client.list_model_customization_jobs.call_args_list[1][1][
                 "nextToken"
             ]
             == "p2"
         )
+        failed = [f for f in findings if f["Status"] == "Failed"]
+        assert len(failed) == 1
+        assert "late-bucket" in failed[0]["Finding_Details"]
+        assert not any("read cap" in f["Finding_Details"] for f in findings)
+        assert not any("incomplete" in f["Finding_Details"] for f in findings)
 
-    def test_br47_data_source_cap_withholds_the_pass(self):
-        """51 data sources over two knowledge bases: 50 are read, none passes.
+    def test_br47_every_data_source_is_read_with_no_cap(self):
+        """51 data sources over two knowledge bases: all 51 buckets are read.
 
-        Every bucket read enforces TLS, so without the truncation leg the check
-        reports "50 of 50" as Passed while the 51st source went unread.
+        Every bucket enforces TLS, so the whole population passes. The walk
+        used to stop at 50 and withhold the pass.
         """
         data_sources = {
             "kb-1": [
@@ -15509,14 +15688,10 @@ class TestBR47DataPathBucketTLS:
             },
         )
 
-        assert [f["Status"] for f in findings] == ["N/A", "N/A"]
-        assert "stopped at a read cap" in findings[0]["Finding_Details"]
-        assert "stopped after 50 data sources" in findings[0]["Finding_Details"]
-        assert (
-            "50 of the 50 Bedrock data path bucket(s) read"
-            in findings[1]["Finding_Details"]
-        )
-        assert self.last_s3_client.get_bucket_policy.call_count == 50
+        assert [f["Status"] for f in findings] == ["Passed"]
+        assert "51 of 51 Bedrock data path bucket(s)" in findings[0]["Finding_Details"]
+        assert "read cap" not in findings[0]["Finding_Details"]
+        assert self.last_s3_client.get_bucket_policy.call_count == 51
         for finding in findings:
             assert_finding_schema(finding)
 

@@ -189,6 +189,7 @@ _EXPECTED_ACTIONS = {
         "logs:DescribeMetricFilters",
         "logs:DescribeSubscriptionFilters",
         "macie2:DescribeBuckets",
+        "macie2:DescribeClassificationJob",
         "macie2:GetAutomatedDiscoveryConfiguration",
         "macie2:GetMacieSession",
         "macie2:ListClassificationJobs",

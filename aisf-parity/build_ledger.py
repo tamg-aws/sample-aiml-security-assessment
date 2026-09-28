@@ -756,14 +756,15 @@ AI_SUBJECT_ROWS = [
         "BR-47 reads the bucket policy of each S3 bucket on the Bedrock data path "
         "(knowledge base S3 sources, the invocation log S3 destination and its CloudWatch "
         "large-data bucket, and the training, validation, output and distillation "
-        "invocation-log source buckets of the newest 50 customization jobs). It passes a "
+        "invocation-log source buckets of every customization job). It passes a "
         "bucket only when one Deny, conditioned by Bool or BoolIfExists on "
         "aws:SecureTransport false, reaches every principal, covers s3:*, and names both "
         "the bucket and its objects. A bucket with no policy fails, because S3 then "
         "accepts plaintext requests. For each Deny that falls short, the finding names the "
         "principals, resources or actions it misses, since a Deny scoped to some "
-        "principals leaves the rest able to use HTTP. A data source or job cap, or a failed "
-        "read, withholds the Passed row, since an unread bucket may accept plaintext",
+        "principals leaves the rest able to use HTTP. Every data source and job is read "
+        "with no cap, and a failed read withholds the Passed row, since an unread bucket "
+        "may accept plaintext",
         [],
         5,
     ),
@@ -773,17 +774,18 @@ AI_SUBJECT_ROWS = [
         None,
         "bedrock_assessments",
         ["BR-46"],
-        "BR-46 holds both legs. It reads automatedDiscoveryMonitoringStatus for each "
-        "knowledge base source bucket, which is the sampling leg, and, for a bucket "
-        "automated discovery does not monitor, whether a SCHEDULED classification job that "
-        "is RUNNING or IDLE and whose last run did not error names the bucket, which is the "
-        "per-object leg the control keeps separate because automated discovery samples. A "
-        "job that selects buckets by criteria is reported, not credited, and neither leg "
-        "is read unless the Macie session and automated discovery are enabled. A ListClassificationJobs item carries "
-        "bucketDefinitions, bucketCriteria, jobType and jobStatus, so "
-        "DescribeClassificationJob is not needed. The pre-ingest Comprehend detection the "
-        "control also recommends is a call the application makes, which no account "
-        "configuration records",
+        "BR-46 judges the per-object leg by value on every AI source bucket: each "
+        "knowledge base S3 source with its inclusion prefixes, and the training, "
+        "validation and invocation-log source buckets of every customization job. "
+        "DescribeClassificationJob is read for each job that names the bucket or is its "
+        "jobDetails.lastJobId, and a job clears the source only when it is SCHEDULED, "
+        "RUNNING or IDLE, has run at least once with no ERROR, ran over existing "
+        "objects, samples 100 percent, has data identifiers, and scopes in the source "
+        "prefix. Automated discovery samples, so a MONITORED bucket with no such job "
+        "fails. Exclude conditions on extension, size, date or tag are counted and not "
+        "judged, and a failed read is N/A. The order of classification and ingestion "
+        "per object, and the pre-ingest Comprehend detection the control also "
+        "recommends, are not recorded by any account configuration",
         [],
         5,
     ),
