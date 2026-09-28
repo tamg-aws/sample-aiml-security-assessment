@@ -826,7 +826,17 @@ AI_SUBJECT_ROWS = [
         "documents /summaries/{actorId}/{sessionId}/ for a summary strategy and "
         "/users/{actorId}/preferences/ for a user-preference strategy, so failing the "
         "absence of {sessionId} would fail a documented configuration. The log-retention "
-        "clause asks for a compliance schedule only the workload owner can name",
+        "clause is readable only as far as a period being set: AC-26 fails any log "
+        "group under the AgentCore prefixes, /aws/vendedlogs/bedrock-agentcore/ "
+        "included, that has no retentionInDays, and it is cited under other controls, "
+        "not this one. Log retention bounds how long an operator can read what the "
+        "agent logged, not what the agent can recall, so it cannot stand in for the "
+        "bound this control asks about, and whether a period meets a compliance "
+        "schedule is the workload owner's judgment. The Memory shape also carries "
+        "namespaceKeys, whose entries can restrict a namespace key to allowedValues "
+        "or a regexPattern. That narrows which namespaces records are written to, not "
+        "how many records accumulate or how long they are kept, so it is not a limit "
+        "either",
         [],
         None,
     ),
@@ -1718,7 +1728,14 @@ FOUNDATION_ROWS = [
         [],
         "The review queue and its backlog metrics are customer-built and "
         "customer-named, and no AWS API identifies which queue holds agent "
-        "decisions awaiting review.",
+        "decisions awaiting review. Amazon Augmented AI (A2I), the AWS service for "
+        "human review of model output, cannot carry the control either. A flow "
+        "definition's HumanLoopConfig names a work team, a task count and time "
+        "limits but has no priority field. ListHumanLoops and DescribeHumanLoop "
+        "return a loop's status, flow definition and output location, so a backlog "
+        "of InProgress loops can be counted, but they return no reviewer and no "
+        "review-quality field. Nothing on a flow definition marks it as holding "
+        "agent decisions.",
         [],
         None,
     ),
