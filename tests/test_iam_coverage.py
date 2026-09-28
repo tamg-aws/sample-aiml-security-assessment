@@ -910,6 +910,17 @@ _VERIFIED_REMEDIATION_CONDITION_KEYS |= {
     "aws:SecureTransport",
 }
 
+# Verified on 2026-09-28 with one IDENTITY_POLICY validate-policy run for the
+# AC-11 and AC-36 key legs, one statement per name on a key ARN.
+# kms:ListGrants at index 0, kms:DescribeKey at index 1 and
+# kms:GrantConstraintType on kms:CreateGrant at index 2 were not reported. The
+# negative controls kms:ListGrantz and kms:DescribeKeyz came back INVALID_ACTION
+# at indexes 3 and 4, and kms:GrantConstraintTypez came back
+# INVALID_SERVICE_CONDITION_KEY at index 5.
+_VERIFIED_REMEDIATION_IAM_ACTIONS |= {"kms:ListGrants", "kms:DescribeKey"}
+
+_VERIFIED_REMEDIATION_CONDITION_KEYS |= {"kms:GrantConstraintType"}
+
 # Verified on 2026-09-27 with one IDENTITY_POLICY validate-policy run for the
 # AgentCore payment manager and harness legs of AC-02 and AC-48, one statement
 # per name. The negative controls bedrock-agentcore:ListPaymentManager,

@@ -427,6 +427,21 @@ section.
     names, where only repositories named for AgentCore were judged, and
     fails `SCAN_ON_PUSH` alone, which passed. A runtime whose image could
     not be read or lives in another registry is `N/A`.
+  - `AC-11` reads each policy engine key with `kms:DescribeKey` and fails a
+    key whose `KeyManager` is not `CUSTOMER` or whose `KeyState` is not
+    `Enabled`, where any named key passed. A disabled key or one pending
+    deletion makes every decision the engine takes `DENY`. An engine whose
+    detail or key could not be read is `N/A`, where a denied
+    `GetPolicyEngine` dropped the engine from the finding.
+  - `AC-36` requires the key policy statements the policy encryption guide
+    shows: `kms:CreateGrant` only with `kms:ViaService` for the engine's
+    Region and `kms:GrantConstraintType` `EncryptionContextSubset`, and
+    `kms:Decrypt` and `kms:GenerateDataKey` through AgentCore only with an
+    `aws:SourceAccount` or `aws:SourceArn` naming the account. An `IfExists`
+    or wildcard `kms:ViaService` is not credited. It also requires the
+    key to carry a separate management and evaluation grant bound to the
+    engine ARN, read with `kms:ListGrants` across every page. A key whose
+    grants could not be listed is `N/A`, where it passed.
 
 ### Deployment impact
 
@@ -532,6 +547,13 @@ its gateways are in use.
 the AgentCore role already holds. A web ACL whose customer SQL injection or
 cross-site scripting statements use the API defaults, and a repository
 scanned at `SCAN_ON_PUSH` alone, now fail where they passed.
+
+`AC-11` and `AC-36` add `kms:DescribeKey` and `kms:ListGrants` to the AgentCore
+role in both templates, scoped to `arn:${AWS::Partition}:kms:*:${AWS::AccountId}:key/*`
+under the new Sid `PolicyEngineKeyStateRead`. Redeploy the stack before the
+next scan: without the grants every policy engine reads as `N/A` in `AC-11`
+and `AC-36`. A key policy missing the guide's service-use statements, and a
+key missing either engine grant, now fail where they passed.
 
 ## 2.0.0 - 2026-09-18
 

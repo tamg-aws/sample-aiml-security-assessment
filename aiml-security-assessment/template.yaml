@@ -1053,6 +1053,15 @@ Resources:
               Action:
                 - kms:GetKeyPolicy
               Resource: !Sub 'arn:${AWS::Partition}:kms:*:${AWS::AccountId}:key/*'
+            # AC-11 reads a policy engine key's manager and state, and AC-36
+            # lists the key's grants to find the engine's management and
+            # evaluation grants.
+            - Sid: PolicyEngineKeyStateRead
+              Effect: Allow
+              Action:
+                - kms:DescribeKey
+                - kms:ListGrants
+              Resource: !Sub 'arn:${AWS::Partition}:kms:*:${AWS::AccountId}:key/*'
             # AC-28 reads the organization's service control policies to see
             # whether one denies creating a gateway with no inbound authorizer.
             # ListPolicies takes no resource; DescribePolicy is scoped to the

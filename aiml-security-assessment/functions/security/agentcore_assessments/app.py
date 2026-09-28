@@ -2817,13 +2817,16 @@ def _normalized_condition_operator(operator: str) -> str:
     return name
 
 
-def _condition_pins_value(statement: Dict[str, Any], key: str, expected: str) -> bool:
+def _condition_pins_value(
+    statement: Dict[str, Any], key: str, expected: str, if_exists_counts: bool = True
+) -> bool:
     """Return whether an equals-family condition limits `key` to `expected` alone.
 
     Every value the condition lists has to equal `expected` as a literal; a
     wildcard value in StringLike reaches more than the one value, so it does not
     pin it. The IfExists form counts only where the key is always in the
-    request, which the caller decides by the key it passes.
+    request, which the caller decides by the key it passes or by passing
+    `if_exists_counts=False` for a key a request can omit.
     """
     condition = statement.get("Condition")
     if not isinstance(condition, dict):
@@ -2831,6 +2834,8 @@ def _condition_pins_value(statement: Dict[str, Any], key: str, expected: str) ->
     expected = expected.lower()
     for operator, entries in condition.items():
         if not isinstance(entries, dict):
+            continue
+        if not if_exists_counts and str(operator).strip().lower().endswith("ifexists"):
             continue
         if _normalized_condition_operator(operator) not in CONDITION_EQUALS_OPERATORS:
             continue
@@ -6659,6 +6664,9 @@ def check_agentcore_policy_engine_encryption() -> List[Dict[str, Any]]:
 
             engines_without_cmk = []
             engines_with_cmk = []
+            engines_key_unusable = []
+            engines_unreadable = []
+            key_metadata_cache: Dict[str, Any] = {}
 
             for engine in policy_engines:
                 engine_id = engine.get("policyEngineId", "unknown")
@@ -6668,19 +6676,56 @@ def check_agentcore_policy_engine_encryption() -> List[Dict[str, Any]]:
                     engine_details = agentcore_client.get_policy_engine(
                         policyEngineId=engine_id
                     )
-
-                    encryption_key_arn = engine_details.get("encryptionKeyArn")
-
-                    if encryption_key_arn:
-                        engines_with_cmk.append(engine_name)
-                    else:
-                        engines_without_cmk.append(
-                            {"name": engine_name, "id": engine_id}
-                        )
-
                 except ClientError as e:
-                    if e.response["Error"]["Code"] != "ResourceNotFoundException":
-                        logger.warning(f"Error getting policy engine {engine_id}: {e}")
+                    if e.response["Error"]["Code"] == "ResourceNotFoundException":
+                        continue
+                    logger.warning(f"Error getting policy engine {engine_id}: {e}")
+                    engines_unreadable.append(
+                        f"'{engine_name}' (GetPolicyEngine: "
+                        f"{_assessment_error_label(e)}; GetPolicyEngine decrypts "
+                        "before it returns, so an unusable key also fails this read)"
+                    )
+                    continue
+
+                encryption_key_arn = engine_details.get("encryptionKeyArn")
+                if not encryption_key_arn:
+                    engines_without_cmk.append({"name": engine_name, "id": engine_id})
+                    continue
+
+                if encryption_key_arn not in key_metadata_cache:
+                    try:
+                        key_metadata_cache[encryption_key_arn] = (
+                            kms_client.describe_key(KeyId=encryption_key_arn).get(
+                                "KeyMetadata"
+                            )
+                            or {}
+                        )
+                    except Exception as error:
+                        logger.warning(
+                            f"Could not describe key {encryption_key_arn}: {error}"
+                        )
+                        key_metadata_cache[encryption_key_arn] = error
+                metadata = key_metadata_cache[encryption_key_arn]
+                if isinstance(metadata, Exception):
+                    engines_unreadable.append(
+                        f"'{engine_name}' (kms:DescribeKey on {encryption_key_arn}: "
+                        f"{_assessment_error_label(metadata)})"
+                    )
+                elif metadata.get("KeyManager") != "CUSTOMER":
+                    engines_without_cmk.append(
+                        {
+                            "name": f"{engine_name} (key {encryption_key_arn} is "
+                            f"managed by {metadata.get('KeyManager') or 'an unknown party'})",
+                            "id": engine_id,
+                        }
+                    )
+                elif metadata.get("KeyState") != "Enabled":
+                    engines_key_unusable.append(
+                        f"'{engine_name}' (key {encryption_key_arn} is "
+                        f"{metadata.get('KeyState') or 'in an unknown state'})"
+                    )
+                else:
+                    engines_with_cmk.append(engine_name)
 
             if engines_without_cmk:
                 engine_list = ", ".join([f"'{e['name']}'" for e in engines_without_cmk])
@@ -6707,12 +6752,62 @@ def check_agentcore_policy_engine_encryption() -> List[Dict[str, Any]]:
                     )
                 )
 
+            if engines_key_unusable:
+                findings.append(
+                    create_finding(
+                        check_id="AC-11",
+                        finding_name="AgentCore Policy Engine Key Unusable",
+                        finding_details=(
+                            "The following Policy Engines are encrypted with a "
+                            "customer managed key that is not Enabled: "
+                            f"{', '.join(engines_key_unusable)}. The engine cannot "
+                            "decrypt its policies, so every authorization decision "
+                            "it makes is DENY and its policies cannot be read, "
+                            "updated or deleted."
+                        ),
+                        resolution=(
+                            "Re-enable the key or cancel its scheduled deletion, "
+                            "then confirm with kms:DescribeKey that its state is "
+                            "Enabled. A key whose deletion has completed cannot be "
+                            "recovered, and neither can the policies under it."
+                        ),
+                        reference="https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/policy-encryption.html",
+                        severity=SeverityEnum.HIGH,
+                        status=StatusEnum.FAILED,
+                    )
+                )
+
+            if engines_unreadable:
+                findings.append(
+                    create_finding(
+                        check_id="AC-11",
+                        finding_name="AgentCore Policy Engine Encryption Incomplete",
+                        finding_details=(
+                            "The encryption of these Policy Engines could not be "
+                            f"read: {'; '.join(engines_unreadable)}."
+                        ),
+                        resolution=(
+                            "Grant bedrock-agentcore:GetPolicyEngine and "
+                            "kms:DescribeKey on the engine's key and retry. If the "
+                            "read fails with the grants in place, check that the "
+                            "engine's key is enabled."
+                        ),
+                        reference="https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/policy-encryption.html",
+                        severity=SeverityEnum.INFORMATIONAL,
+                        status=StatusEnum.NA,
+                    )
+                )
+
             if engines_with_cmk:
                 findings.append(
                     create_finding(
                         check_id="AC-11",
                         finding_name="AgentCore Policy Engine Encryption Check",
-                        finding_details=f"Policy Engines with CMK encryption: {', '.join(engines_with_cmk)}",
+                        finding_details=(
+                            "Policy Engines encrypted with a customer managed key "
+                            "whose state kms:DescribeKey reports as Enabled: "
+                            f"{', '.join(engines_with_cmk)}"
+                        ),
                         resolution="No action required",
                         reference="https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/policy-encryption.html",
                         severity=SeverityEnum.MEDIUM,
@@ -14003,6 +14098,127 @@ def check_agentcore_policy_tool_scope() -> List[Dict[str, Any]]:
     return findings
 
 
+# policy-encryption.html: the engine's key is reached through the caller's
+# identity (a forward access session), so the key policy scopes it by the
+# AgentCore endpoint of the engine's region, grants only with an encryption
+# context constraint, and the service's decrypt and data-key calls by source.
+# The service creates two grants per engine, bound to it by this encryption
+# context key: a management grant that generates data keys and an evaluation
+# grant that re-encrypts.
+POLICY_ENGINE_ENCRYPTION_CONTEXT_KEY = "aws:bedrock-agentcore-policy:policy-engine-arn"
+POLICY_ENGINE_SOURCE_GUARDED_ACTIONS = ("kms:Decrypt", "kms:GenerateDataKey")
+POLICY_ENGINE_MANAGEMENT_GRANT_OPERATION = "GenerateDataKey"
+POLICY_ENGINE_EVALUATION_GRANT_OPERATIONS = ("ReEncryptFrom", "ReEncryptTo")
+
+
+def _arn_region(arn: Any) -> str:
+    """Return the region segment of an ARN, or an empty string."""
+    parts = str(arn or "").split(":", 5)
+    return parts[3] if len(parts) == 6 and parts[0] == "arn" else ""
+
+
+def _policy_engine_key_policy_gaps(
+    policy_document: Any, region: str, account_id: str
+) -> List[str]:
+    """Return the service-use scoping a policy engine's key policy is missing.
+
+    kms:ViaService and kms:GrantConstraintType are absent from a request made
+    outside AgentCore or for an unconstrained grant, so their IfExists forms
+    scope nothing and are not read as scoping. aws:SourceAccount and
+    aws:SourceArn are available on the grant-based calls and not on
+    kms:CreateGrant, so the source guard is read on kms:Decrypt and
+    kms:GenerateDataKey only. A statement granting the same actions with no
+    condition, such as the account-root kms:* statement, is not subtracted.
+    """
+    via_service = f"bedrock-agentcore.{region}.amazonaws.com"
+    statements = _document_statements(policy_document, effect="Allow")
+
+    def via_agentcore(statement: Dict[str, Any]) -> bool:
+        return _condition_pins_value(
+            statement, "kms:viaservice", via_service, if_exists_counts=False
+        )
+
+    gaps: List[str] = []
+    if not any(
+        _statement_matches_action(statement, "kms:creategrant")
+        and via_agentcore(statement)
+        and _condition_pins_value(
+            statement,
+            "kms:grantconstrainttype",
+            "EncryptionContextSubset",
+            if_exists_counts=False,
+        )
+        for statement in statements
+    ):
+        gaps.append(
+            "has no statement allowing kms:CreateGrant only with kms:ViaService "
+            f"{via_service} and kms:GrantConstraintType EncryptionContextSubset"
+        )
+    unguarded = [
+        action
+        for action in POLICY_ENGINE_SOURCE_GUARDED_ACTIONS
+        if not any(
+            _statement_matches_action(statement, action.lower())
+            and via_agentcore(statement)
+            and _confused_deputy_guard_account(statement, account_id)
+            for statement in statements
+        )
+    ]
+    if unguarded:
+        gaps.append(
+            f"has no statement allowing {', '.join(unguarded)} only with "
+            f"kms:ViaService {via_service} and an aws:SourceAccount or "
+            f"aws:SourceArn condition naming account {account_id}"
+        )
+    return gaps
+
+
+def _policy_engine_grant_gap(grants: List[Dict[str, Any]], engine_arn: str) -> str:
+    """Return why the two grants bound to one engine are not both present.
+
+    A grant belongs to the engine when its encryption context constraint names
+    the engine ARN. The management grant is the one allowing GenerateDataKey
+    and the evaluation grant a distinct one allowing a ReEncrypt operation.
+    """
+    bound = []
+    for grant in grants:
+        if not isinstance(grant, dict):
+            continue
+        constraints = grant.get("Constraints") or {}
+        context = {
+            **(constraints.get("EncryptionContextSubset") or {}),
+            **(constraints.get("EncryptionContextEquals") or {}),
+        }
+        if context.get(POLICY_ENGINE_ENCRYPTION_CONTEXT_KEY) == engine_arn:
+            bound.append(grant)
+    management = {
+        grant.get("GrantId")
+        for grant in bound
+        if POLICY_ENGINE_MANAGEMENT_GRANT_OPERATION in (grant.get("Operations") or [])
+    }
+    evaluation = {
+        grant.get("GrantId")
+        for grant in bound
+        if any(
+            operation in (grant.get("Operations") or [])
+            for operation in POLICY_ENGINE_EVALUATION_GRANT_OPERATIONS
+        )
+    }
+    if management and evaluation and len(management | evaluation) >= 2:
+        return ""
+    missing = [
+        name
+        for name, grant_ids in (("management", management), ("evaluation", evaluation))
+        if not grant_ids
+    ] or ["management or evaluation"]
+    return (
+        f"carries {len(bound)} grant(s) bound to the engine by "
+        f"{POLICY_ENGINE_ENCRYPTION_CONTEXT_KEY}, without a separate "
+        f"{' and '.join(missing)} grant, so the service's access to the key is "
+        "partly revoked and the engine's behaviour is inconsistent"
+    )
+
+
 def check_agentcore_policy_engine_key_scope() -> List[Dict[str, Any]]:
     """AC-36: Report who may use and who may take away a policy engine's key.
 
@@ -14011,6 +14227,11 @@ def check_agentcore_policy_engine_key_scope() -> List[Dict[str, Any]]:
     changed on an existing engine, so the key policy is the whole guard: a
     principal who can schedule the key for deletion can make every stored Cedar
     policy unreadable, and the engine cannot be repointed at a new key.
+
+    The key policy must also scope the service's use of the key, and the key must
+    carry both grants the service created for the engine. An alarm on the key's
+    disable and delete events and a break-glass runbook are not read: no API on
+    the key records either.
     """
     if agentcore_client is None:
         return [
@@ -14051,6 +14272,7 @@ def check_agentcore_policy_engine_key_scope() -> List[Dict[str, Any]]:
         ]
 
     key_policy_cache: Dict[str, Any] = {}
+    grant_cache: Dict[str, Any] = {}
     findings = []
     for engine in engines:
         engine_id = engine.get("policyEngineId", "unknown")
@@ -14137,6 +14359,46 @@ def check_agentcore_policy_engine_key_scope() -> List[Dict[str, Any]]:
                 "a new key"
             )
 
+        engine_arn = detail.get("policyEngineArn") or engine.get("policyEngineArn")
+        unread: List[str] = []
+        if not engine_arn:
+            unread.append(
+                "the engine reports no policyEngineArn, so the key policy's "
+                "service scoping and the engine's grants were not read"
+            )
+        else:
+            problems.extend(
+                _policy_engine_key_policy_gaps(
+                    key_policy, _arn_region(engine_arn), _arn_account(engine_arn)
+                )
+            )
+            if key_arn not in grant_cache:
+                try:
+                    grant_cache[key_arn] = _paginate_aws_list(
+                        kms_client,
+                        "list_grants",
+                        "Grants",
+                        token_request_key="Marker",
+                        token_response_key="NextMarker",
+                        KeyId=key_arn,
+                    )
+                except Exception as error:
+                    logger.warning(f"Could not list grants for {key_arn}: {error}")
+                    grant_cache[key_arn] = error
+            grants = grant_cache[key_arn]
+            if isinstance(grants, Exception):
+                unread.append(
+                    "the key's grants could not be listed "
+                    f"({_assessment_error_label(grants)}), so whether both of the "
+                    "engine's grants are present was not read; grant kms:ListGrants "
+                    "on the key"
+                )
+            else:
+                grant_gap = _policy_engine_grant_gap(grants, engine_arn)
+                if grant_gap:
+                    problems.append(grant_gap)
+        unread_text = f" Not read: {'; '.join(unread)}." if unread else ""
+
         if problems:
             findings.append(
                 create_finding(
@@ -14144,18 +14406,42 @@ def check_agentcore_policy_engine_key_scope() -> List[Dict[str, Any]]:
                     finding_name="AgentCore Policy Engine Key Scope Unbounded",
                     finding_details=(
                         f"{label} is encrypted with {key_arn}, whose key policy "
-                        f"{' and '.join(problems)}."
+                        f"{' and '.join(problems)}.{unread_text}"
                     ),
                     resolution=(
                         "Name the principals allowed to decrypt with this key and "
                         "the administrators allowed to disable or schedule it for "
                         "deletion, and constrain the service grants with "
                         "kms:ViaService for "
-                        "bedrock-agentcore.<region>.amazonaws.com."
+                        "bedrock-agentcore.<region>.amazonaws.com and "
+                        "kms:GrantConstraintType EncryptionContextSubset, and "
+                        "kms:Decrypt and kms:GenerateDataKey with aws:SourceAccount "
+                        "or aws:SourceArn as the key policy in the policy "
+                        "encryption guide shows. If a grant was revoked, revoke the "
+                        "other one too and recreate the engine."
                     ),
-                    reference=KMS_KEY_POLICY_REFERENCE_URL,
+                    reference=AGENTCORE_POLICY_ENCRYPTION_REFERENCE_URL,
                     severity=SeverityEnum.HIGH,
                     status=StatusEnum.FAILED,
+                )
+            )
+        elif unread:
+            findings.append(
+                create_finding(
+                    check_id="AC-36",
+                    finding_name="AgentCore Policy Engine Key Scope",
+                    finding_details=(
+                        f"{label} is encrypted with {key_arn}, whose key policy "
+                        "raises no finding on what was read, but it is not "
+                        f"reported as Passed.{unread_text}"
+                    ),
+                    resolution=(
+                        "Grant kms:ListGrants on the key and retry so every leg "
+                        "of the key scope is read."
+                    ),
+                    reference=AGENTCORE_POLICY_ENCRYPTION_REFERENCE_URL,
+                    severity=SeverityEnum.INFORMATIONAL,
+                    status=StatusEnum.NA,
                 )
             )
         else:
@@ -14168,7 +14454,15 @@ def check_agentcore_policy_engine_key_scope() -> List[Dict[str, Any]]:
                         "grants decrypt, disable, deletion, key-policy and rotation "
                         "actions to no wildcard or NotPrincipal principal unless a "
                         "condition binds the caller's account, organization, "
-                        "principal ARN or source."
+                        "principal ARN or source. It allows kms:CreateGrant through "
+                        "AgentCore in this region only for grants constrained by "
+                        "encryption context, and kms:Decrypt and "
+                        "kms:GenerateDataKey through AgentCore only from this "
+                        "account, and the key carries a separate management and "
+                        "evaluation grant bound to the engine. A statement that "
+                        "grants the same actions with no condition, such as the "
+                        "account-root kms:* statement, is not subtracted, so IAM "
+                        "policy remains a path to the key."
                     ),
                     resolution=(
                         "No action required. This check reads the key policy; "

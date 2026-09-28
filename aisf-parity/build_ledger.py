@@ -375,11 +375,15 @@ AI_SUBJECT_ROWS = [
         None,
         "agentcore_assessments",
         ["AC-11", "AC-36"],
-        "AC-11 asserts the engine names a customer managed key, AC-36 asserts the key "
-        "policy names who may decrypt with it and who may disable it or schedule it for "
-        "deletion; the key cannot be added to or changed on an existing engine, so the "
-        "key policy is the whole guard. The disable/delete alarm and the break-glass "
-        "runbook are not readable from the key, and AC-36's passing resolution says so",
+        "AC-11 asserts the engine names a customer managed key that DescribeKey reports "
+        "as customer managed and Enabled, AC-36 asserts the key policy names who may "
+        "decrypt with it and who may disable it or schedule it for deletion, scopes "
+        "CreateGrant, Decrypt and GenerateDataKey by ViaService, grant constraint and "
+        "source account as the policy encryption guide shows, and that the key carries "
+        "the engine's management and evaluation grants; the key cannot be added to or "
+        "changed on an existing engine, so the key policy is the whole guard. The "
+        "disable/delete alarm and the break-glass runbook are not readable from the "
+        "key, and AC-36's passing resolution says so",
         [],
         4,
     ),

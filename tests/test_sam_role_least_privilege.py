@@ -315,7 +315,9 @@ _EXPECTED_ACTIONS = {
         "iam:GetRole",
         "iam:GetServiceLastAccessedDetails",
         "kms:Decrypt",
+        "kms:DescribeKey",
         "kms:GetKeyPolicy",
+        "kms:ListGrants",
         "logs:DescribeAccountPolicies",
         "logs:DescribeDeliveries",
         "logs:DescribeDeliverySources",
@@ -929,6 +931,10 @@ def test_agentcore_observability_and_governance_reads_are_scoped_where_iam_allow
         ),
         "LogEncryptionKeyPolicyRead": (
             "kms:GetKeyPolicy",
+            "kms:*:${AWS::AccountId}:key/*",
+        ),
+        "PolicyEngineKeyStateRead": (
+            "kms:ListGrants",
             "kms:*:${AWS::AccountId}:key/*",
         ),
         "OrganizationsPolicyRead": (

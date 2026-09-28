@@ -3752,6 +3752,131 @@ class TestAC11PolicyEngineEncryption:
             assert_finding_schema(f)
 
 
+class TestAC11PolicyEngineKeyState:
+    """AC-11 reads the key's manager and state, not only that a key is named."""
+
+    _KEY = "arn:aws:kms:us-east-1:123456789012:key/pe-key"
+    _ENGINES = [
+        {"policyEngineId": "pe-1", "name": "Payments"},
+        {"policyEngineId": "pe-2", "name": "Support"},
+    ]
+
+    @staticmethod
+    def _key(state="Enabled", manager="CUSTOMER"):
+        return {"KeyMetadata": {"KeyState": state, "KeyManager": manager}}
+
+    @patch("agentcore_app.kms_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_an_enabled_customer_key_passes(self, mock_ac, mock_kms):
+        mock_ac.list_policy_engines.return_value = {"policyEngines": self._ENGINES[:1]}
+        mock_ac.get_policy_engine.return_value = {"encryptionKeyArn": self._KEY}
+        mock_kms.describe_key.return_value = self._key()
+
+        findings = agentcore_app.check_agentcore_policy_engine_encryption()
+
+        assert [finding["Status"] for finding in findings] == ["Passed"]
+        assert "kms:DescribeKey reports as Enabled" in findings[0]["Finding_Details"]
+        mock_kms.describe_key.assert_called_once_with(KeyId=self._KEY)
+
+    @pytest.mark.parametrize(
+        "state", ["Disabled", "PendingDeletion", "PendingImport", "Unavailable"]
+    )
+    @patch("agentcore_app.kms_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_one_unusable_key_fails_alone(self, mock_ac, mock_kms, state):
+        mock_ac.list_policy_engines.return_value = {"policyEngines": self._ENGINES}
+        mock_ac.get_policy_engine.side_effect = lambda policyEngineId: {
+            "encryptionKeyArn": f"{self._KEY}-{policyEngineId}"
+        }
+        mock_kms.describe_key.side_effect = lambda KeyId: self._key(
+            state if KeyId.endswith("pe-2") else "Enabled"
+        )
+
+        findings = agentcore_app.check_agentcore_policy_engine_encryption()
+
+        by_status = {finding["Status"]: finding for finding in findings}
+        assert sorted(by_status) == ["Failed", "Passed"]
+        failed = by_status["Failed"]
+        assert failed["Finding"] == "AgentCore Policy Engine Key Unusable"
+        assert (
+            f"'Support' (key {self._KEY}-pe-2 is {state})"
+            in (failed["Finding_Details"])
+        )
+        assert "DENY" in failed["Finding_Details"]
+        assert "Payments" not in failed["Finding_Details"]
+        assert "Support" not in by_status["Passed"]["Finding_Details"]
+
+    @patch("agentcore_app.kms_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_an_aws_managed_key_is_not_a_customer_key(self, mock_ac, mock_kms):
+        mock_ac.list_policy_engines.return_value = {"policyEngines": self._ENGINES[:1]}
+        mock_ac.get_policy_engine.return_value = {"encryptionKeyArn": self._KEY}
+        mock_kms.describe_key.return_value = self._key(manager="AWS")
+
+        findings = agentcore_app.check_agentcore_policy_engine_encryption()
+
+        assert [finding["Status"] for finding in findings] == ["Failed"]
+        assert "managed by AWS" in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.kms_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_an_undescribable_key_is_na_not_passed(self, mock_ac, mock_kms):
+        mock_ac.list_policy_engines.return_value = {"policyEngines": self._ENGINES}
+        mock_ac.get_policy_engine.side_effect = lambda policyEngineId: {
+            "encryptionKeyArn": f"{self._KEY}-{policyEngineId}"
+        }
+
+        def describe(KeyId):
+            if KeyId.endswith("pe-1"):
+                raise _make_client_error("AccessDeniedException", "denied")
+            return self._key()
+
+        mock_kms.describe_key.side_effect = describe
+
+        findings = agentcore_app.check_agentcore_policy_engine_encryption()
+
+        by_status = {finding["Status"]: finding for finding in findings}
+        assert sorted(by_status) == ["N/A", "Passed"]
+        incomplete = by_status["N/A"]
+        assert incomplete["Finding"] == "AgentCore Policy Engine Encryption Incomplete"
+        assert f"kms:DescribeKey on {self._KEY}-pe-1" in incomplete["Finding_Details"]
+        assert "Payments" not in by_status["Passed"]["Finding_Details"]
+
+    @patch("agentcore_app.kms_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_denied_engine_read_is_reported_not_dropped(self, mock_ac, mock_kms):
+        mock_ac.list_policy_engines.return_value = {"policyEngines": self._ENGINES}
+
+        def detail(policyEngineId):
+            if policyEngineId == "pe-1":
+                raise _make_client_error("AccessDeniedException", "denied")
+            return {"encryptionKeyArn": self._KEY}
+
+        mock_ac.get_policy_engine.side_effect = detail
+        mock_kms.describe_key.return_value = self._key()
+
+        findings = agentcore_app.check_agentcore_policy_engine_encryption()
+
+        by_status = {finding["Status"]: finding for finding in findings}
+        assert sorted(by_status) == ["N/A", "Passed"]
+        assert "'Payments' (GetPolicyEngine" in by_status["N/A"]["Finding_Details"]
+        assert "unusable key" in by_status["N/A"]["Finding_Details"]
+
+    @patch("agentcore_app.kms_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_shared_key_is_described_once(self, mock_ac, mock_kms):
+        mock_ac.list_policy_engines.return_value = {"policyEngines": self._ENGINES}
+        mock_ac.get_policy_engine.return_value = {"encryptionKeyArn": self._KEY}
+        mock_kms.describe_key.return_value = self._key("Disabled")
+
+        findings = agentcore_app.check_agentcore_policy_engine_encryption()
+
+        assert [finding["Status"] for finding in findings] == ["Failed"]
+        assert "'Payments'" in findings[0]["Finding_Details"]
+        assert "'Support'" in findings[0]["Finding_Details"]
+        assert mock_kms.describe_key.call_count == 1
+
+
 # ===================================================================
 # AC-12: check_agentcore_gateway_encryption
 # ===================================================================
@@ -11935,6 +12060,72 @@ class TestAC35CheckRegistration:
         )
 
 
+def _engine_arn(engine_id, region="us-east-1", account="123456789012"):
+    return f"arn:aws:bedrock-agentcore:{region}:{account}:policy-engine/{engine_id}"
+
+
+def _engine_service_use(
+    region="us-east-1",
+    account="123456789012",
+    via_operator="StringEquals",
+    via_service=None,
+    source_account=None,
+):
+    """The policy encryption guide's key policy statements for the service."""
+    via = via_service or f"bedrock-agentcore.{region}.amazonaws.com"
+    grant_condition = {
+        "StringEquals": {"kms:GrantConstraintType": "EncryptionContextSubset"}
+    }
+    grant_condition.setdefault(via_operator, {})["kms:ViaService"] = via
+    use_condition = {"StringEquals": {"aws:SourceAccount": source_account or account}}
+    use_condition.setdefault(via_operator, {})["kms:ViaService"] = via
+    principal = {"AWS": f"arn:aws:iam::{account}:role/PolicyAdministrator"}
+    return [
+        {
+            "Effect": "Allow",
+            "Principal": principal,
+            "Action": "kms:CreateGrant",
+            "Resource": "*",
+            "Condition": grant_condition,
+        },
+        {
+            "Effect": "Allow",
+            "Principal": principal,
+            "Action": ["kms:Decrypt", "kms:GenerateDataKey"],
+            "Resource": "*",
+            "Condition": use_condition,
+        },
+    ]
+
+
+def _engine_grants(*engine_ids, drop=()):
+    """A management and an evaluation grant per engine, as the service creates."""
+    grants = []
+    for engine_id in engine_ids:
+        context = {
+            "EncryptionContextSubset": {
+                "aws:bedrock-agentcore-policy:policy-engine-arn": _engine_arn(engine_id)
+            }
+        }
+        if "management" not in drop:
+            grants.append(
+                {
+                    "GrantId": f"{engine_id}-management",
+                    "Operations": ["Encrypt", "Decrypt", "GenerateDataKey"],
+                    "Constraints": context,
+                }
+            )
+        if "evaluation" not in drop:
+            grants.append(
+                {
+                    "GrantId": f"{engine_id}-evaluation",
+                    "Operations": ["Decrypt", "ReEncryptFrom", "ReEncryptTo"],
+                    "Constraints": context,
+                }
+            )
+    return {"Grants": grants}
+
+
 class TestAC36PolicyEngineKeyScope:
     """AC-36: who may decrypt a policy engine's key, and who may take it away."""
 
@@ -11946,12 +12137,7 @@ class TestAC36PolicyEngineKeyScope:
     _SCOPED = json.dumps(
         {
             "Statement": [
-                {
-                    "Effect": "Allow",
-                    "Principal": {"Service": "bedrock-agentcore.amazonaws.com"},
-                    "Action": ["kms:Decrypt", "kms:GenerateDataKey"],
-                    "Resource": "*",
-                },
+                *_engine_service_use(),
                 {
                     "Effect": "Allow",
                     "Principal": {
@@ -11988,12 +12174,20 @@ class TestAC36PolicyEngineKeyScope:
         }
     )
 
+    @classmethod
+    def _detail(cls, engine_id="pe-1", key=None):
+        return {
+            "policyEngineArn": _engine_arn(engine_id),
+            "encryptionKeyArn": key or cls._KEY,
+        }
+
     @patch("agentcore_app.kms_client")
     @patch("agentcore_app.agentcore_client")
     def test_a_scoped_key_policy_passes(self, mock_ac, mock_kms):
         mock_ac.list_policy_engines.return_value = {"policyEngines": self._ENGINES[:1]}
-        mock_ac.get_policy_engine.return_value = {"encryptionKeyArn": self._KEY}
+        mock_ac.get_policy_engine.return_value = self._detail()
         mock_kms.get_key_policy.return_value = {"Policy": self._SCOPED}
+        mock_kms.list_grants.return_value = _engine_grants("pe-1")
 
         findings = agentcore_app.check_agentcore_policy_engine_key_scope()
 
@@ -12103,11 +12297,13 @@ class TestAC36PolicyEngineKeyScope:
     @patch("agentcore_app.agentcore_client")
     def test_a_conditioned_wildcard_grant_is_not_reported(self, mock_ac, mock_kms):
         mock_ac.list_policy_engines.return_value = {"policyEngines": self._ENGINES[:1]}
-        mock_ac.get_policy_engine.return_value = {"encryptionKeyArn": self._KEY}
+        mock_ac.get_policy_engine.return_value = self._detail()
+        mock_kms.list_grants.return_value = _engine_grants("pe-1")
         mock_kms.get_key_policy.return_value = {
             "Policy": json.dumps(
                 {
                     "Statement": [
+                        *_engine_service_use(),
                         {
                             "Effect": "Allow",
                             "Principal": "*",
@@ -12116,7 +12312,7 @@ class TestAC36PolicyEngineKeyScope:
                             "Condition": {
                                 "StringEquals": {"aws:PrincipalOrgID": "o-1234567890"}
                             },
-                        }
+                        },
                     ]
                 }
             )
@@ -12132,17 +12328,19 @@ class TestAC36PolicyEngineKeyScope:
         self, mock_ac, mock_kms
     ):
         mock_ac.list_policy_engines.return_value = {"policyEngines": self._ENGINES[:1]}
-        mock_ac.get_policy_engine.return_value = {"encryptionKeyArn": self._KEY}
+        mock_ac.get_policy_engine.return_value = self._detail()
+        mock_kms.list_grants.return_value = _engine_grants("pe-1")
         mock_kms.get_key_policy.return_value = {
             "Policy": json.dumps(
                 {
                     "Statement": [
+                        *_engine_service_use(),
                         {
                             "Effect": "Allow",
                             "Principal": "*",
                             "Action": "secretsmanager:DisableKey",
                             "Resource": "*",
-                        }
+                        },
                     ]
                 }
             )
@@ -12156,17 +12354,19 @@ class TestAC36PolicyEngineKeyScope:
     @patch("agentcore_app.agentcore_client")
     def test_a_deny_statement_is_not_read_as_a_grant(self, mock_ac, mock_kms):
         mock_ac.list_policy_engines.return_value = {"policyEngines": self._ENGINES[:1]}
-        mock_ac.get_policy_engine.return_value = {"encryptionKeyArn": self._KEY}
+        mock_ac.get_policy_engine.return_value = self._detail()
+        mock_kms.list_grants.return_value = _engine_grants("pe-1")
         mock_kms.get_key_policy.return_value = {
             "Policy": json.dumps(
                 {
                     "Statement": [
+                        *_engine_service_use(),
                         {
                             "Effect": "Deny",
                             "Principal": "*",
                             "Action": "kms:ScheduleKeyDeletion",
                             "Resource": "*",
-                        }
+                        },
                     ]
                 }
             )
@@ -12208,13 +12408,14 @@ class TestAC36PolicyEngineKeyScope:
             {"policyEngines": self._ENGINES[1:]},
         ]
         mock_ac.get_policy_engine.side_effect = [
-            {"encryptionKeyArn": self._KEY},
-            {"encryptionKeyArn": f"{self._KEY}-2"},
+            self._detail("pe-1"),
+            self._detail("pe-2", key=f"{self._KEY}-2"),
         ]
         mock_kms.get_key_policy.side_effect = [
             {"Policy": self._SCOPED},
             {"Policy": self._OPEN_DELETE},
         ]
+        mock_kms.list_grants.return_value = _engine_grants("pe-1", "pe-2")
 
         findings = agentcore_app.check_agentcore_policy_engine_key_scope()
 
@@ -12610,8 +12811,10 @@ class TestKmsKeyPolicyValueScope:
             ]
         }
         mock_ac.get_policy_engine.side_effect = lambda policyEngineId: {
-            "encryptionKeyArn": bound_key if policyEngineId == "pe-1" else open_key
+            "policyEngineArn": _engine_arn(policyEngineId),
+            "encryptionKeyArn": bound_key if policyEngineId == "pe-1" else open_key,
         }
+        mock_kms.list_grants.return_value = _engine_grants("pe-1", "pe-2")
         open_statement = _key_grant(principal={"AWS": "arn:aws:iam::*:root"})
         del open_statement["Action"]
         open_statement["NotAction"] = ["kms:Decrypt", "kms:GenerateDataKey*"]
@@ -12620,7 +12823,8 @@ class TestKmsKeyPolicyValueScope:
                 _key_grant(
                     action="kms:*",
                     principal={"AWS": "arn:aws:iam::123456789012:root"},
-                )
+                ),
+                *_engine_service_use(),
             ),
             open_key: _key_policy(open_statement),
         }
@@ -12640,6 +12844,298 @@ class TestKmsKeyPolicyValueScope:
             details
         )
         assert "every principal decrypt" in details
+
+
+class TestAC36PolicyEngineServiceScope:
+    """AC-36 reads the service-use statements and the engine's two grants."""
+
+    _KEY = "arn:aws:kms:us-east-1:123456789012:key/pe-key"
+    _ENGINES = [
+        {"policyEngineId": "pe-1", "name": "Payments"},
+        {"policyEngineId": "pe-2", "name": "Support"},
+    ]
+    _ADMIN = {
+        "Effect": "Allow",
+        "Principal": {"AWS": "arn:aws:iam::123456789012:role/KeyAdministrator"},
+        "Action": "kms:*",
+        "Resource": "*",
+    }
+
+    def _setup(self, mock_ac, mock_kms, statements, grants, engines=1):
+        mock_ac.list_policy_engines.return_value = {
+            "policyEngines": self._ENGINES[:engines]
+        }
+        mock_ac.get_policy_engine.side_effect = lambda policyEngineId: {
+            "policyEngineArn": _engine_arn(policyEngineId),
+            "encryptionKeyArn": self._KEY,
+        }
+        mock_kms.get_key_policy.return_value = {"Policy": _key_policy(*statements)}
+        if isinstance(grants, Exception):
+            mock_kms.list_grants.side_effect = grants
+        else:
+            mock_kms.list_grants.return_value = grants
+
+    @patch("agentcore_app.kms_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_the_guide_policy_with_both_grants_passes(self, mock_ac, mock_kms):
+        self._setup(
+            mock_ac,
+            mock_kms,
+            [self._ADMIN, *_engine_service_use()],
+            _engine_grants("pe-1"),
+        )
+
+        findings = agentcore_app.check_agentcore_policy_engine_key_scope()
+
+        assert [finding["Status"] for finding in findings] == ["Passed"]
+        details = findings[0]["Finding_Details"]
+        assert "separate management and evaluation grant" in details
+        assert "account-root kms:* statement, is not subtracted" in details
+        mock_kms.list_grants.assert_called_once_with(KeyId=self._KEY)
+
+    @patch("agentcore_app.kms_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_key_policy_without_service_scoping_fails(self, mock_ac, mock_kms):
+        unscoped = {
+            "Effect": "Allow",
+            "Principal": {"Service": "bedrock-agentcore.amazonaws.com"},
+            "Action": ["kms:CreateGrant", "kms:Decrypt", "kms:GenerateDataKey"],
+            "Resource": "*",
+        }
+        self._setup(mock_ac, mock_kms, [self._ADMIN, unscoped], _engine_grants("pe-1"))
+
+        findings = agentcore_app.check_agentcore_policy_engine_key_scope()
+
+        assert [finding["Status"] for finding in findings] == ["Failed"]
+        details = findings[0]["Finding_Details"]
+        assert (
+            "has no statement allowing kms:CreateGrant only with kms:ViaService "
+            "bedrock-agentcore.us-east-1.amazonaws.com and kms:GrantConstraintType "
+            "EncryptionContextSubset"
+        ) in details
+        assert "kms:Decrypt, kms:GenerateDataKey only with" in details
+
+    @pytest.mark.parametrize(
+        "variant",
+        [
+            {"via_operator": "StringEqualsIfExists"},
+            {
+                "via_operator": "StringLike",
+                "via_service": "bedrock-agentcore.*.amazonaws.com",
+            },
+            {"via_service": "bedrock-agentcore.us-west-2.amazonaws.com"},
+        ],
+        ids=["if-exists", "wildcard-region", "other-region"],
+    )
+    @patch("agentcore_app.kms_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_via_service_that_scopes_nothing_here_is_not_credited(
+        self, mock_ac, mock_kms, variant
+    ):
+        self._setup(
+            mock_ac,
+            mock_kms,
+            [self._ADMIN, *_engine_service_use(**variant)],
+            _engine_grants("pe-1"),
+        )
+
+        findings = agentcore_app.check_agentcore_policy_engine_key_scope()
+
+        assert [finding["Status"] for finding in findings] == ["Failed"]
+        assert (
+            "kms:CreateGrant only with kms:ViaService"
+            in (findings[0]["Finding_Details"])
+        )
+
+    @patch("agentcore_app.kms_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_source_account_naming_another_account_fails(self, mock_ac, mock_kms):
+        self._setup(
+            mock_ac,
+            mock_kms,
+            [self._ADMIN, *_engine_service_use(source_account="444455556666")],
+            _engine_grants("pe-1"),
+        )
+
+        findings = agentcore_app.check_agentcore_policy_engine_key_scope()
+
+        assert [finding["Status"] for finding in findings] == ["Failed"]
+        details = findings[0]["Finding_Details"]
+        assert "aws:SourceAccount or aws:SourceArn condition naming account " in details
+        assert "123456789012" in details
+        assert "kms:CreateGrant only" not in details
+
+    @patch("agentcore_app.kms_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_create_grant_without_a_constraint_type_fails(self, mock_ac, mock_kms):
+        grant_statement, use_statement = _engine_service_use()
+        del grant_statement["Condition"]["StringEquals"]["kms:GrantConstraintType"]
+        self._setup(
+            mock_ac,
+            mock_kms,
+            [self._ADMIN, grant_statement, use_statement],
+            _engine_grants("pe-1"),
+        )
+
+        findings = agentcore_app.check_agentcore_policy_engine_key_scope()
+
+        assert [finding["Status"] for finding in findings] == ["Failed"]
+        assert (
+            "kms:GrantConstraintType EncryptionContextSubset"
+            in (findings[0]["Finding_Details"])
+        )
+
+    @pytest.mark.parametrize("revoked", ["management", "evaluation"])
+    @patch("agentcore_app.kms_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_one_revoked_grant_fails(self, mock_ac, mock_kms, revoked):
+        self._setup(
+            mock_ac,
+            mock_kms,
+            [self._ADMIN, *_engine_service_use()],
+            _engine_grants("pe-1", drop=(revoked,)),
+        )
+
+        findings = agentcore_app.check_agentcore_policy_engine_key_scope()
+
+        assert [finding["Status"] for finding in findings] == ["Failed"]
+        details = findings[0]["Finding_Details"]
+        assert "carries 1 grant(s) bound to the engine" in details
+        assert f"without a separate {revoked} grant" in details
+        assert "revoke the other one too" in findings[0]["Resolution"]
+
+    @patch("agentcore_app.kms_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_one_grant_carrying_both_operations_is_not_two(self, mock_ac, mock_kms):
+        merged = {
+            "Grants": [
+                {
+                    "GrantId": "pe-1-merged",
+                    "Operations": ["GenerateDataKey", "ReEncryptFrom"],
+                    "Constraints": _engine_grants("pe-1")["Grants"][0]["Constraints"],
+                }
+            ]
+        }
+        self._setup(mock_ac, mock_kms, [self._ADMIN, *_engine_service_use()], merged)
+
+        findings = agentcore_app.check_agentcore_policy_engine_key_scope()
+
+        assert [finding["Status"] for finding in findings] == ["Failed"]
+        assert (
+            "without a separate management or evaluation grant"
+            in (findings[0]["Finding_Details"])
+        )
+
+    @patch("agentcore_app.kms_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_grants_bound_to_one_engine_do_not_cover_the_other(self, mock_ac, mock_kms):
+        self._setup(
+            mock_ac,
+            mock_kms,
+            [self._ADMIN, *_engine_service_use()],
+            _engine_grants("pe-1"),
+            engines=2,
+        )
+
+        findings = agentcore_app.check_agentcore_policy_engine_key_scope()
+
+        by_engine = {
+            ("pe-1" if "(pe-1)" in f["Finding_Details"] else "pe-2"): f
+            for f in findings
+        }
+        assert by_engine["pe-1"]["Status"] == "Passed"
+        assert by_engine["pe-2"]["Status"] == "Failed"
+        assert "carries 0 grant(s)" in by_engine["pe-2"]["Finding_Details"]
+        assert mock_kms.list_grants.call_count == 1
+
+    @patch("agentcore_app.kms_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_grants_are_read_from_every_page(self, mock_ac, mock_kms):
+        management, evaluation = _engine_grants("pe-1")["Grants"]
+        self._setup(mock_ac, mock_kms, [self._ADMIN, *_engine_service_use()], None)
+        mock_kms.list_grants.side_effect = [
+            {"Grants": [management], "NextMarker": "m-2", "Truncated": True},
+            {"Grants": [evaluation], "Truncated": False},
+        ]
+
+        findings = agentcore_app.check_agentcore_policy_engine_key_scope()
+
+        assert [finding["Status"] for finding in findings] == ["Passed"]
+        assert mock_kms.list_grants.call_count == 2
+        assert mock_kms.list_grants.call_args_list[1].kwargs["Marker"] == "m-2"
+
+    @patch("agentcore_app.kms_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_unlisted_grants_are_na_not_passed(self, mock_ac, mock_kms):
+        self._setup(
+            mock_ac,
+            mock_kms,
+            [self._ADMIN, *_engine_service_use()],
+            _make_client_error("AccessDeniedException", "denied"),
+        )
+
+        findings = agentcore_app.check_agentcore_policy_engine_key_scope()
+
+        assert [finding["Status"] for finding in findings] == ["N/A"]
+        assert "not reported as Passed" in findings[0]["Finding_Details"]
+        assert "the key's grants could not be listed" in findings[0]["Finding_Details"]
+        assert "kms:ListGrants" in findings[0]["Resolution"]
+
+    @patch("agentcore_app.kms_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_unlisted_grants_do_not_hide_a_key_policy_failure(self, mock_ac, mock_kms):
+        self._setup(
+            mock_ac,
+            mock_kms,
+            [_key_grant(), *_engine_service_use()],
+            _make_client_error("AccessDeniedException", "denied"),
+        )
+
+        findings = agentcore_app.check_agentcore_policy_engine_key_scope()
+
+        assert [finding["Status"] for finding in findings] == ["Failed"]
+        details = findings[0]["Finding_Details"]
+        assert "every principal decrypt" in details
+        assert "Not read: the key's grants could not be listed" in details
+
+    @patch("agentcore_app.kms_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_an_engine_without_an_arn_is_na_not_passed(self, mock_ac, mock_kms):
+        self._setup(
+            mock_ac,
+            mock_kms,
+            [self._ADMIN, *_engine_service_use()],
+            _engine_grants("pe-1"),
+        )
+        mock_ac.get_policy_engine.side_effect = None
+        mock_ac.get_policy_engine.return_value = {"encryptionKeyArn": self._KEY}
+
+        findings = agentcore_app.check_agentcore_policy_engine_key_scope()
+
+        assert [finding["Status"] for finding in findings] == ["N/A"]
+        assert "reports no policyEngineArn" in findings[0]["Finding_Details"]
+        mock_kms.list_grants.assert_not_called()
+
+    @patch("agentcore_app.kms_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_the_summary_arn_is_used_when_the_detail_omits_it(self, mock_ac, mock_kms):
+        self._setup(
+            mock_ac,
+            mock_kms,
+            [self._ADMIN, *_engine_service_use()],
+            _engine_grants("pe-1"),
+        )
+        mock_ac.list_policy_engines.return_value = {
+            "policyEngines": [
+                {**self._ENGINES[0], "policyEngineArn": _engine_arn("pe-1")}
+            ]
+        }
+        mock_ac.get_policy_engine.side_effect = None
+        mock_ac.get_policy_engine.return_value = {"encryptionKeyArn": self._KEY}
+
+        findings = agentcore_app.check_agentcore_policy_engine_key_scope()
+
+        assert [finding["Status"] for finding in findings] == ["Passed"]
 
 
 class TestAC36CheckRegistration:

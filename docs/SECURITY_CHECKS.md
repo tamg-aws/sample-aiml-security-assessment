@@ -701,7 +701,7 @@ inventory is never treated as evidence of compliance.
 ### AC-11: Policy Engine Encryption
 
 - **Severity:** Medium
-- **Description:** Validates policy engine encryption settings.
+- **Description:** Requires every policy engine to name a customer managed key whose `kms:DescribeKey` metadata reports `KeyManager` `CUSTOMER` and `KeyState` `Enabled`. A key that is disabled, pending deletion, pending import or unavailable fails as `AgentCore Policy Engine Key Unusable`: the engine cannot decrypt its policies, so every decision it takes is `DENY`. An engine whose `GetPolicyEngine` read fails, which also happens when its key is unusable because the read decrypts first, and a key `DescribeKey` cannot read, are informational `N/A` naming the engine.
 
 ### AC-12: Gateway Encryption
 
@@ -826,7 +826,7 @@ inventory is never treated as evidence of compliance.
 ### AC-36: Policy Engine Key Scope
 
 - **Severity:** High
-- **Description:** Requires the key policy behind a policy engine's customer managed key to bind the principals allowed to decrypt with it, read by the AC-26 rules, and the administrators allowed to disable it or schedule it for deletion. The key cannot be added to or changed on an existing engine, so the key policy is the whole guard: a principal who can schedule the key for deletion makes every stored Cedar policy unreadable with no way to repoint the engine. AC-11 asserts that a key is named, which is presence only. An engine with no customer managed key is informational `N/A` and AC-11 reports it; an unreadable key policy is informational `N/A`.
+- **Description:** Requires the key policy behind a policy engine's customer managed key to bind the principals allowed to decrypt with it, read by the AC-26 rules, and the administrators allowed to disable it or schedule it for deletion. The key cannot be added to or changed on an existing engine, so the key policy is the whole guard: a principal who can schedule the key for deletion makes every stored Cedar policy unreadable with no way to repoint the engine. AC-11 asserts that a key is named, which is presence only. The key policy must also carry the service-use statements the policy encryption guide shows: `kms:CreateGrant` only with `kms:ViaService` `bedrock-agentcore.<region>.amazonaws.com` for the engine's Region and `kms:GrantConstraintType` `EncryptionContextSubset`, and `kms:Decrypt` and `kms:GenerateDataKey` with the same `kms:ViaService` and an `aws:SourceAccount` or `aws:SourceArn` naming the engine's account. An `IfExists` or wildcard `kms:ViaService` scopes nothing and is not credited. The key must carry two distinct grants whose encryption context names the engine ARN under `aws:bedrock-agentcore-policy:policy-engine-arn`, one allowing `GenerateDataKey` (management) and one allowing a `ReEncrypt` operation (evaluation); `kms:ListGrants` is read across every page. A statement that grants the same actions with no condition, such as the account-root `kms:*` statement, is not subtracted. An engine with no customer managed key is informational `N/A` and AC-11 reports it; an unreadable key policy, a key whose grants could not be listed, and an engine reporting no ARN are informational `N/A`. The disable and delete alarm and the break-glass runbook are not readable from the key and the passing resolution says so.
 
 ### AC-37: Policy Guardrail Wiring
 
