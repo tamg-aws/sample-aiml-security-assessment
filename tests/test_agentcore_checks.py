@@ -4034,6 +4034,9 @@ class TestAgenticGatewaySecurity:
                 "mode": "ENFORCE",
             },
             "webAclArn": "arn:aws:wafv2:us-east-1:123456789012:regional/webacl/test/abc",
+            # AG-27 passes only a gateway that blocks when AWS WAF cannot be
+            # evaluated, so the association alone no longer passes.
+            "wafConfiguration": {"failureMode": "FAIL_CLOSE"},
         }
         mock_ac.list_policies.return_value = {
             "policies": [
@@ -22173,3 +22176,430 @@ class TestAC26TrailLogFileValidation:
         findings = agentcore_app.check_agentcore_trail_log_file_validation()
 
         assert [f["Status"] for f in findings] == ["Failed"]
+
+
+_UNBOUNDED_ALLOW_LISTS = [["*"], [""], ["   "], ["agent-*"], ["agent-api", "*"]]
+
+
+class TestJWTAllowListValues:
+    """AC-30, AC-31, AG-24: an allow-list pins an application only by its values."""
+
+    @pytest.mark.parametrize("values", _UNBOUNDED_ALLOW_LISTS)
+    @pytest.mark.parametrize("member", ["allowedAudience", "allowedClients"])
+    @patch("agentcore_app.agentcore_client")
+    def test_a_runtime_allow_list_naming_no_application_fails(
+        self, mock_ac, member, values
+    ):
+        mock_ac.list_agent_runtimes.return_value = {
+            "agentRuntimes": [
+                {"agentRuntimeId": "rt-good", "agentRuntimeName": "Good"},
+                {"agentRuntimeId": "rt-wild", "agentRuntimeName": "Wild"},
+            ]
+        }
+
+        def details(agentRuntimeId, **kwargs):
+            pinned = ["agent-api"] if agentRuntimeId == "rt-good" else values
+            return _jwt_runtime(discoveryUrl=_ISSUER, **{member: pinned})
+
+        mock_ac.get_agent_runtime.side_effect = details
+
+        findings = agentcore_app.check_agentcore_runtime_inbound_authorization()
+
+        assert [f["Status"] for f in findings] == ["Passed", "Failed"]
+        assert "rt-good" in findings[0]["Finding_Details"]
+        assert findings[1]["Finding"].endswith("Unbounded")
+        assert f"{member} holds" in findings[1]["Finding_Details"]
+        assert "names no single application" in findings[1]["Finding_Details"]
+        for finding in findings:
+            assert_finding_schema(finding)
+
+    @pytest.mark.parametrize("values", _UNBOUNDED_ALLOW_LISTS)
+    @pytest.mark.parametrize("member", ["allowedAudience", "allowedClients"])
+    @patch("agentcore_app.agentcore_client")
+    def test_a_gateway_allow_list_naming_no_application_fails(
+        self, mock_ac, member, values
+    ):
+        mock_ac.list_gateways.return_value = {
+            "items": [
+                {"gatewayId": "gw-good", "name": "Good"},
+                {"gatewayId": "gw-wild", "name": "Wild"},
+            ]
+        }
+
+        def details(gatewayIdentifier, **kwargs):
+            pinned = ["client-a"] if gatewayIdentifier == "gw-good" else values
+            return _jwt_gateway(discoveryUrl=_ISSUER, **{member: pinned})
+
+        mock_ac.get_gateway.side_effect = details
+
+        findings = agentcore_app.check_agentcore_gateway_inbound_allow_lists()
+
+        assert [f["Status"] for f in findings] == ["Passed", "Failed"]
+        assert findings[1]["Finding"].endswith("Absent")
+        assert f"{member} holds" in findings[1]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_pinned_client_list_still_binds_beside_a_wildcard_audience(self, mock_ac):
+        mock_ac.list_agent_runtimes.return_value = {
+            "agentRuntimes": [{"agentRuntimeId": "rt-1", "agentRuntimeName": "One"}]
+        }
+        mock_ac.get_agent_runtime.return_value = _jwt_runtime(
+            discoveryUrl=_ISSUER, allowedAudience=["*"], allowedClients=["client-a"]
+        )
+
+        findings = agentcore_app.check_agentcore_runtime_inbound_authorization()
+
+        assert findings[0]["Status"] == "Passed"
+        assert "validates the client id claim(s)" in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_runtime_pass_names_the_version_it_read(self, mock_ac):
+        mock_ac.list_agent_runtimes.return_value = {
+            "agentRuntimes": [{"agentRuntimeId": "rt-1", "agentRuntimeName": "One"}]
+        }
+        mock_ac.get_agent_runtime.return_value = _jwt_runtime(
+            discoveryUrl=_ISSUER, allowedAudience=["agent-api"]
+        )
+
+        findings = agentcore_app.check_agentcore_runtime_inbound_authorization()
+
+        assert findings[0]["Status"] == "Passed"
+        assert (
+            "other versions an endpoint serves were not read"
+            in (findings[0]["Finding_Details"])
+        )
+        mock_ac.get_agent_runtime.assert_called_once_with(agentRuntimeId="rt-1")
+
+
+_PLAIN_ISSUER = "http://idp.example/.well-known/openid-configuration"
+
+
+class TestJWTIssuerTransport:
+    """AC-30, AC-31, AG-24: a pinned allow-list does not help if the keys arrive without TLS."""
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_runtime_with_a_plain_http_issuer_fails_despite_a_pinned_audience(
+        self, mock_ac
+    ):
+        mock_ac.list_agent_runtimes.return_value = {
+            "agentRuntimes": [
+                {"agentRuntimeId": "rt-tls", "agentRuntimeName": "Tls"},
+                {"agentRuntimeId": "rt-plain", "agentRuntimeName": "Plain"},
+            ]
+        }
+
+        def details(agentRuntimeId, **kwargs):
+            issuer = _ISSUER if agentRuntimeId == "rt-tls" else _PLAIN_ISSUER
+            return _jwt_runtime(discoveryUrl=issuer, allowedAudience=["agent-api"])
+
+        mock_ac.get_agent_runtime.side_effect = details
+
+        findings = agentcore_app.check_agentcore_runtime_inbound_authorization()
+
+        assert [f["Status"] for f in findings] == ["Passed", "Failed"]
+        assert findings[1]["Finding"].endswith("Issuer Not HTTPS")
+        assert findings[1]["Severity"] == "High"
+        assert _PLAIN_ISSUER in findings[1]["Finding_Details"]
+        assert "rt-plain" in findings[1]["Finding_Details"]
+        for finding in findings:
+            assert_finding_schema(finding)
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_gateway_with_a_plain_http_issuer_fails_despite_a_pinned_client(
+        self, mock_ac
+    ):
+        mock_ac.list_gateways.return_value = {
+            "items": [
+                {"gatewayId": "gw-tls", "name": "Tls"},
+                {"gatewayId": "gw-plain", "name": "Plain"},
+            ]
+        }
+
+        def details(gatewayIdentifier, **kwargs):
+            issuer = _ISSUER if gatewayIdentifier == "gw-tls" else _PLAIN_ISSUER
+            return _jwt_gateway(discoveryUrl=issuer, allowedClients=["client-a"])
+
+        mock_ac.get_gateway.side_effect = details
+
+        findings = agentcore_app.check_agentcore_gateway_inbound_allow_lists()
+
+        assert [f["Status"] for f in findings] == ["Passed", "Failed"]
+        assert findings[1]["Finding"].endswith("Issuer Not HTTPS")
+        assert "gw-plain" in findings[1]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_the_scheme_is_matched_without_case(self, mock_ac):
+        mock_ac.list_agent_runtimes.return_value = {
+            "agentRuntimes": [{"agentRuntimeId": "rt-1", "agentRuntimeName": "One"}]
+        }
+        mock_ac.get_agent_runtime.return_value = _jwt_runtime(
+            discoveryUrl="HTTPS://idp.example/.well-known/openid-configuration",
+            allowedAudience=["agent-api"],
+        )
+
+        findings = agentcore_app.check_agentcore_runtime_inbound_authorization()
+
+        assert findings[0]["Status"] == "Passed"
+
+
+class TestAG24JWTGatewayAuthorization:
+    """AG-24: a CUSTOM_JWT gateway passes on what its authorizer validates, not its type."""
+
+    @staticmethod
+    def _ag24(mock_ac, details):
+        mock_ac.list_gateways.return_value = {
+            "items": [{"gatewayId": g, "name": f"name-{g}"} for g in details]
+        }
+        mock_ac.get_gateway.side_effect = lambda gatewayIdentifier, **kwargs: details[
+            gatewayIdentifier
+        ]
+        mock_ac.list_policies.return_value = {"policies": []}
+        findings = agentcore_app.check_agentcore_gateway_agentic_security()
+        return [f for f in findings if f["Check_ID"] == "AG-24"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_each_jwt_gateway_is_judged_by_its_authorizer(self, mock_ac):
+        findings = self._ag24(
+            mock_ac,
+            {
+                "gw-pinned": _jwt_gateway(
+                    discoveryUrl=_ISSUER, allowedAudience=["gateway-api"]
+                ),
+                "gw-open": _jwt_gateway(
+                    discoveryUrl=_ISSUER, allowedScopes=["tools/read"]
+                ),
+                "gw-wild": _jwt_gateway(discoveryUrl=_ISSUER, allowedClients=["*"]),
+                "gw-plain": _jwt_gateway(
+                    discoveryUrl=_PLAIN_ISSUER, allowedAudience=["gateway-api"]
+                ),
+                "gw-iam": {"authorizerType": "AWS_IAM"},
+            },
+        )
+
+        by_gateway = {
+            gateway: finding
+            for finding in findings
+            for gateway in ["gw-pinned", "gw-open", "gw-wild", "gw-plain", "gw-iam"]
+            if f"({gateway})" in finding["Finding_Details"]
+        }
+        assert len(findings) == 5
+        assert by_gateway["gw-pinned"]["Status"] == "Passed"
+        assert "audience" in by_gateway["gw-pinned"]["Finding_Details"]
+        assert by_gateway["gw-open"]["Status"] == "Failed"
+        assert by_gateway["gw-open"]["Finding"].endswith("Unbounded")
+        assert by_gateway["gw-wild"]["Status"] == "Failed"
+        assert "allowedClients holds '*'" in by_gateway["gw-wild"]["Finding_Details"]
+        assert by_gateway["gw-plain"]["Status"] == "Failed"
+        assert by_gateway["gw-plain"]["Finding"].endswith("Issuer Not HTTPS")
+        assert by_gateway["gw-iam"]["Status"] == "Passed"
+        for finding in findings:
+            assert_finding_schema(finding)
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_jwt_gateway_with_no_readable_authorizer_is_not_passed(self, mock_ac):
+        findings = self._ag24(mock_ac, {"gw-1": {"authorizerType": "CUSTOM_JWT"}})
+
+        assert [f["Status"] for f in findings] == ["N/A"]
+        assert findings[0]["Severity"] == "Informational"
+        assert "customJWTAuthorizer" in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_the_list_entry_authorizer_type_still_reaches_the_jwt_leg(self, mock_ac):
+        mock_ac.list_gateways.return_value = {
+            "items": [
+                {"gatewayId": "gw-1", "name": "One", "authorizerType": "CUSTOM_JWT"}
+            ]
+        }
+        mock_ac.get_gateway.return_value = {
+            "authorizerConfiguration": {
+                "customJWTAuthorizer": {"discoveryUrl": _ISSUER}
+            }
+        }
+        mock_ac.list_policies.return_value = {"policies": []}
+
+        findings = [
+            f
+            for f in agentcore_app.check_agentcore_gateway_agentic_security()
+            if f["Check_ID"] == "AG-24"
+        ]
+
+        assert [f["Status"] for f in findings] == ["Failed"]
+        assert findings[0]["Finding"].endswith("Unbounded")
+
+
+def _keyed_rate_limit(rate_limit_id, *dimension_keys):
+    return {
+        "rateLimitId": rate_limit_id,
+        "status": "ACTIVE",
+        "dimensionKeys": list(dimension_keys),
+        "entries": [{"requests": [{"rate": 100, "period": "minute"}]}],
+    }
+
+
+class TestAC24RateLimitDimension:
+    """AC-24: a limit keyed on a claim that changes per token bounds nothing."""
+
+    @pytest.mark.parametrize(
+        "dimension",
+        [
+            "$.context.jwt.jti",
+            "$.context.jwt.iat",
+            "$.context.jwt.exp",
+            "$.context.jwt.nbf",
+            "$.context.jwt.JTI",
+        ],
+    )
+    @patch("agentcore_app.agentcore_client")
+    def test_a_limit_keyed_on_a_per_token_claim_is_ineffective(
+        self, mock_ac, dimension
+    ):
+        mock_ac.list_gateways.return_value = {
+            "items": [
+                {"gatewayId": "gw-caller", "name": "Caller"},
+                {"gatewayId": "gw-token", "name": "Token"},
+            ]
+        }
+
+        def rate_limits(gatewayIdentifier, **kwargs):
+            if gatewayIdentifier == "gw-caller":
+                return {
+                    "rateLimits": [_keyed_rate_limit("rl-sub", "$.context.jwt.sub")]
+                }
+            return {"rateLimits": [_keyed_rate_limit("rl-jti", dimension)]}
+
+        mock_ac.list_gateway_rate_limits.side_effect = rate_limits
+
+        findings = agentcore_app.check_agentcore_gateway_rate_limiting()
+
+        assert [f["Status"] for f in findings] == ["Passed", "Failed"]
+        assert "gw-caller" in findings[0]["Finding_Details"]
+        assert findings[1]["Finding"].endswith("Ineffective")
+        assert f"'rl-jti' is keyed on {dimension}" in findings[1]["Finding_Details"]
+        assert "fresh count" in findings[1]["Finding_Details"]
+        for finding in findings:
+            assert_finding_schema(finding)
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_per_token_key_inside_a_compound_dimension_still_resets(self, mock_ac):
+        mock_ac.list_gateways.return_value = {
+            "items": [{"gatewayId": "gw-1", "name": "One"}]
+        }
+        mock_ac.list_gateway_rate_limits.return_value = {
+            "rateLimits": [
+                _keyed_rate_limit("rl-both", "toolName", "$.context.jwt.jti")
+            ]
+        }
+
+        findings = agentcore_app.check_agentcore_gateway_rate_limiting()
+
+        assert findings[0]["Status"] == "Failed"
+
+    @patch("agentcore_app.agentcore_client")
+    def test_one_caller_keyed_limit_passes_beside_a_per_token_one(self, mock_ac):
+        mock_ac.list_gateways.return_value = {
+            "items": [{"gatewayId": "gw-1", "name": "One"}]
+        }
+        mock_ac.list_gateway_rate_limits.return_value = {
+            "rateLimits": [
+                _keyed_rate_limit("rl-jti", "$.context.jwt.jti"),
+                _keyed_rate_limit("rl-principal", "$.context.iam.principal"),
+            ]
+        }
+
+        findings = agentcore_app.check_agentcore_gateway_rate_limiting()
+
+        assert findings[0]["Status"] == "Passed"
+        assert "rl-principal" in findings[0]["Finding_Details"]
+        assert "rl-jti" not in findings[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "dimension",
+        [
+            "targetName",
+            "toolName",
+            "qualifiedModelId",
+            "$.context.iam.principal",
+            "$.context.iam.sourceIdentity",
+            "$.context.jwt.sub",
+            "$.context.jwt.client_id",
+            # A claim whose name only starts like a per-token one is not one.
+            "$.context.jwt.jtix",
+        ],
+    )
+    def test_the_caller_and_aggregate_dimensions_stay_bounded(self, dimension):
+        assert agentcore_app._gateway_rate_limit_is_bounded(
+            _keyed_rate_limit("rl", dimension)
+        )
+
+
+class TestAG27WafFailureMode:
+    """AG-27: an associated web ACL protects nothing while the gateway fails open."""
+
+    _ACL = "arn:aws:wafv2:us-east-1:123456789012:regional/webacl/test/abc"
+
+    @staticmethod
+    def _ag27(mock_ac, details):
+        mock_ac.list_gateways.return_value = {
+            "items": [{"gatewayId": g, "name": f"name-{g}"} for g in details]
+        }
+        mock_ac.get_gateway.side_effect = lambda gatewayIdentifier, **kwargs: details[
+            gatewayIdentifier
+        ]
+        mock_ac.list_policies.return_value = {"policies": []}
+        return [
+            f
+            for f in agentcore_app.check_agentcore_gateway_agentic_security()
+            if f["Check_ID"] == "AG-27"
+        ]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_each_gateway_is_judged_by_its_failure_mode(self, mock_ac):
+        def gateway(mode):
+            detail = {"authorizerType": "AWS_IAM", "webAclArn": self._ACL}
+            if mode:
+                detail["wafConfiguration"] = {"failureMode": mode}
+            return detail
+
+        findings = self._ag27(
+            mock_ac,
+            {
+                "gw-close": gateway("FAIL_CLOSE"),
+                "gw-open": gateway("FAIL_OPEN"),
+                "gw-unset": gateway(None),
+                "gw-bare": {"authorizerType": "AWS_IAM"},
+            },
+        )
+
+        by_gateway = {
+            gateway_id: finding
+            for finding in findings
+            for gateway_id in ["gw-close", "gw-open", "gw-unset", "gw-bare"]
+            if f"({gateway_id})" in finding["Finding_Details"]
+        }
+        assert len(findings) == 4
+        assert by_gateway["gw-close"]["Status"] == "Passed"
+        assert "FAIL_CLOSE" in by_gateway["gw-close"]["Finding_Details"]
+        assert by_gateway["gw-open"]["Status"] == "Failed"
+        assert by_gateway["gw-open"]["Finding"].endswith("Fails Open")
+        assert by_gateway["gw-unset"]["Status"] == "N/A"
+        assert by_gateway["gw-unset"]["Severity"] == "Informational"
+        assert "unset" in by_gateway["gw-unset"]["Finding_Details"]
+        assert by_gateway["gw-bare"]["Status"] == "Failed"
+        assert by_gateway["gw-bare"]["Finding"].endswith("Missing")
+        for finding in findings:
+            assert_finding_schema(finding)
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_fail_open_gateway_without_an_acl_is_still_missing(self, mock_ac):
+        findings = self._ag27(
+            mock_ac,
+            {
+                "gw-1": {
+                    "authorizerType": "AWS_IAM",
+                    "wafConfiguration": {"failureMode": "FAIL_CLOSE"},
+                }
+            },
+        )
+
+        assert [f["Status"] for f in findings] == ["Failed"]
+        assert findings[0]["Finding"].endswith("Missing")

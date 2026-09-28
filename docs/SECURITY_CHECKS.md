@@ -766,7 +766,7 @@ inventory is never treated as evidence of compliance.
 ### AC-24: Gateway Rate Limiting
 
 - **Severity:** Medium
-- **Description:** Requires each gateway to carry at least one `ACTIVE` rate limit with a requests, tokens, or connections ceiling. A gateway with rate limits none of which is active with a ceiling fails separately from a gateway with no rate limit at all, because a limit that bounds nothing reads as configured. The WAF association AG-27 reports filters request content and sets no throughput ceiling. An unavailable client, a region with no gateways, and unreadable rate limits are informational `N/A`.
+- **Description:** Requires each gateway to carry at least one `ACTIVE` rate limit with a requests, tokens, or connections ceiling. A limit keyed on `$.context.jwt.jti`, `iat`, `exp` or `nbf` does not count, because those claims take a new value with every token and a caller who presents a fresh token starts a fresh count. A gateway with rate limits none of which is active with a ceiling fails separately from a gateway with no rate limit at all, because a limit that bounds nothing reads as configured. The WAF association AG-27 reports filters request content and sets no throughput ceiling. An unavailable client, a region with no gateways, and unreadable rate limits are informational `N/A`.
 
 ### AC-25: Gateway Target Authorization
 
@@ -796,12 +796,12 @@ inventory is never treated as evidence of compliance.
 ### AC-30: Runtime Inbound Authorization
 
 - **Severity:** High
-- **Description:** Reports how each runtime authenticates its caller. A runtime with no inbound authorizer passes, because every invoke must then be SigV4-signed and IAM decides which principal reaches the agent. A JWT authorizer that pins neither `allowedAudience` nor `allowedClients` fails, because it accepts every token its issuer minted for every application registered with that issuer. AG-24 asks this of a gateway, and a runtime callers invoke directly never passes through one. An authorizer shape the pinned botocore model does not define is informational `N/A` and names the members it found.
+- **Description:** Reports how each runtime authenticates its caller. A runtime with no inbound authorizer passes, because every invoke must then be SigV4-signed and IAM decides which principal reaches the agent. A JWT authorizer that pins neither `allowedAudience` nor `allowedClients` fails, because it accepts every token its issuer minted for every application registered with that issuer. A list holding a blank value or a `*` does not pin, and a `discoveryUrl` that is not `https` fails whatever the lists hold. Only the version `GetAgentRuntime` returns without `agentRuntimeVersion` is read. AG-24 asks this of a gateway, and a runtime callers invoke directly never passes through one. An authorizer shape the pinned botocore model does not define is informational `N/A` and names the members it found.
 
 ### AC-31: Gateway Inbound Allow Lists
 
 - **Severity:** High
-- **Description:** Judges which issuers and applications each gateway accepts tokens from. A `CUSTOM_JWT` gateway that allow-lists neither the audience nor the client id fails, because any application registered with that issuer reaches its tools; AG-24 passes the same gateway on the authorizer type alone. A scope or custom-claim constraint bounds what a token may ask for and not who minted it for whom, so it does not satisfy the check. `authorizerType` `NONE` fails as performing no inbound authentication at all. A SigV4 gateway passes, having no bearer token to allow-list, and an unrecognized authorizer type or a missing `customJWTAuthorizer` is informational `N/A`.
+- **Description:** Judges which issuers and applications each gateway accepts tokens from. A `CUSTOM_JWT` gateway that allow-lists neither the audience nor the client id fails, because any application registered with that issuer reaches its tools. A list holding a blank value or a `*` does not pin, and a `discoveryUrl` that is not `https` fails whatever the lists hold. A scope or custom-claim constraint bounds what a token may ask for and not who minted it for whom, so it does not satisfy the check. `authorizerType` `NONE` fails as performing no inbound authentication at all. A SigV4 gateway passes, having no bearer token to allow-list, and an unrecognized authorizer type or a missing `customJWTAuthorizer` is informational `N/A`.
 
 ### AC-32: Inbound JWT Issuer Conditions
 
@@ -1165,7 +1165,7 @@ with scope limited to the Security pillar.
 - **Severity:** High
 - **Source:** AgentCore `ListGateways` and `GetGateway`
 - **Domain:** Tool Authorization
-- **Description:** Fails gateways with missing, unknown, or `NONE` authorizers. Passes `AWS_IAM` and `CUSTOM_JWT`. `AUTHENTICATE_ONLY` passes only when an AgentCore policy engine is attached in `ENFORCE` mode, because the gateway authenticates the SigV4 caller but does not make an authorization decision for that authorizer type.
+- **Description:** Fails gateways with missing, unknown, or `NONE` authorizers. Passes `AWS_IAM`. A `CUSTOM_JWT` gateway passes only when its `discoveryUrl` is `https` and an `allowedAudience` or `allowedClients` list pins the application with values that carry no `*` and are not blank; otherwise it fails, and a gateway that reports no `customJWTAuthorizer` is informational `N/A`. `AUTHENTICATE_ONLY` passes only when an AgentCore policy engine is attached in `ENFORCE` mode, because the gateway authenticates the SigV4 caller but does not make an authorization decision for that authorizer type.
 
 ### AG-25: Gateway Tool Policy Enforcement
 
@@ -1184,9 +1184,9 @@ with scope limited to the Security pillar.
 ### AG-27: Gateway WAF Protection
 
 - **Severity:** Low
-- **Source:** AgentCore `GetGateway.webAclArn`
+- **Source:** AgentCore `GetGateway.webAclArn` and `GetGateway.wafConfiguration`
 - **Domain:** Abuse & Cost Protection
-- **Description:** Fails AgentCore gateways without an associated AWS WAF web ACL.
+- **Description:** Fails AgentCore gateways without an associated AWS WAF web ACL. An associated gateway passes only with `wafConfiguration` `failureMode` `FAIL_CLOSE`; `FAIL_OPEN` fails, because the gateway then allows a request unfiltered when AWS WAF cannot be evaluated, and an unset value is informational `N/A` because the API states no default.
 
 ### AG-28: Identity Token Vault Protection
 

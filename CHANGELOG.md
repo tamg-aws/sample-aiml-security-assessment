@@ -315,6 +315,22 @@ section.
     trail with `cloudtrail:GetTrail` and fails a trail that records the
     Region with log file validation off; an unreadable trail is `N/A` and
     blocks a `Passed`.
+  - `AC-30`, `AC-31` and `AG-24` judge the values of a JWT authorizer. An
+    `allowedAudience` or `allowedClients` list holding a blank value or a `*`
+    names no single application and no longer counts, and a `discoveryUrl`
+    that is not `https` fails as `Issuer Not HTTPS` whatever the allow-lists
+    hold. `AG-24` stops passing a `CUSTOM_JWT` gateway on its authorizer type:
+    it passes only when that check would, fails as `Unbounded` when no
+    audience or client list pins the application, and is `N/A` when the
+    gateway reports no `customJWTAuthorizer`. The `AC-30` pass now states that
+    it read the version `GetAgentRuntime` returns by default.
+  - `AC-24` no longer counts a limit keyed on `$.context.jwt.jti`, `iat`,
+    `exp` or `nbf`, claims that take a new value with every token, so a
+    caller who mints a fresh token no longer escapes a limit that passed.
+  - `AG-27` reads the gateway's `wafConfiguration` `failureMode` beside the
+    web ACL association. `FAIL_OPEN` fails, an unset value is `N/A`, and only
+    `FAIL_CLOSE` passes, so an `AG-27` row that passed before can now be
+    `Failed` or `N/A`.
 
 ### Deployment impact
 

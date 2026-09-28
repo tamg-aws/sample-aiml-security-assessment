@@ -712,6 +712,14 @@ MEMORY_PARTITION_OPERATORS = {"stringequals", "stringequalsignorecase", "stringl
 # of one of these members is what makes the limit bound anything.
 GATEWAY_RATE_LIMIT_VALUE_KEYS = ("requests", "tokens", "connections")
 
+# The DimensionKey pattern admits any $.context.jwt.<claim>. These registered
+# JWT claims (RFC 7519 section 4.1) take a new value with every token the issuer
+# mints, so a limit keyed on one counts each token apart and a caller who
+# presents a fresh token starts a fresh count.
+GATEWAY_RATE_LIMIT_PER_TOKEN_DIMENSIONS = {
+    f"$.context.jwt.{claim}" for claim in ("jti", "iat", "exp", "nbf")
+}
+
 # Outbound credential provider types a gateway target can declare. The member is
 # optional on CreateGatewayTarget and the console offers "No authorization (not
 # recommended)", so a target can reach its backend with no gateway-supplied
@@ -8093,12 +8101,23 @@ def _gateway_rate_limit_is_bounded(rate_limit: Dict[str, Any]) -> bool:
     """
     if rate_limit.get("status") != "ACTIVE":
         return False
+    if _gateway_rate_limit_per_token_dimensions(rate_limit):
+        return False
     for entry in rate_limit.get("entries") or []:
         if not isinstance(entry, dict):
             continue
         if any(entry.get(key) for key in GATEWAY_RATE_LIMIT_VALUE_KEYS):
             return True
     return False
+
+
+def _gateway_rate_limit_per_token_dimensions(rate_limit: Dict[str, Any]) -> List[str]:
+    """Return the dimension keys of a limit that take a new value with every token."""
+    return [
+        str(key)
+        for key in rate_limit.get("dimensionKeys") or []
+        if str(key).lower() in GATEWAY_RATE_LIMIT_PER_TOKEN_DIMENSIONS
+    ]
 
 
 def _gateway_rate_limit_summary(rate_limit: Dict[str, Any]) -> str:
@@ -8129,7 +8148,8 @@ def check_agentcore_gateway_rate_limiting() -> List[Dict[str, Any]]:
     into tool calls and model invocations, so an unbounded gateway converts one
     abusive caller into a bill and a denial of service for every other caller.
     The WAF association AG-27 reports filters request content; it sets no
-    throughput ceiling.
+    throughput ceiling. A limit keyed on a claim that changes with every token
+    bounds nothing a caller cannot reset by minting a new token.
     """
     if agentcore_client is None:
         return [
@@ -8231,6 +8251,19 @@ def check_agentcore_gateway_rate_limiting() -> List[Dict[str, Any]]:
                 )
             )
         elif rate_limits:
+            per_token = [
+                f"'{rate_limit.get('rateLimitId', 'unknown')}' is keyed on "
+                f"{', '.join(_gateway_rate_limit_per_token_dimensions(rate_limit))}"
+                for rate_limit in rate_limits
+                if _gateway_rate_limit_per_token_dimensions(rate_limit)
+            ]
+            per_token_note = (
+                f" Limit {'; '.join(per_token)}, a claim that takes a new value "
+                "with every token, so a caller who presents a fresh token starts "
+                "a fresh count."
+                if per_token
+                else ""
+            )
             findings.append(
                 create_finding(
                     check_id="AC-24",
@@ -8238,11 +8271,15 @@ def check_agentcore_gateway_rate_limiting() -> List[Dict[str, Any]]:
                     finding_details=(
                         f"{label} has {len(rate_limits)} rate limit(s), none of "
                         "which is ACTIVE with a requests, tokens or connections "
-                        "ceiling, so no limit is in force."
+                        "ceiling on a dimension a caller cannot reset, so no "
+                        f"limit is in force.{per_token_note}"
                     ),
                     resolution=(
                         "Add a requests, tokens or connections rate to the limit's "
-                        "entries and wait for its status to reach ACTIVE."
+                        "entries, key it on a caller dimension such as "
+                        "$.context.iam.principal or a JWT claim that names the "
+                        "caller (sub or client_id), and wait for its status to "
+                        "reach ACTIVE."
                     ),
                     reference=AGENTCORE_GATEWAY_RATE_LIMIT_REFERENCE_URL,
                     severity=SeverityEnum.MEDIUM,
@@ -10945,13 +10982,85 @@ def check_agentcore_vpc_placement_scp() -> List[Dict[str, Any]]:
     )
 
 
+def _jwt_allow_list_unbounded_values(values: Any) -> List[str]:
+    """Return the values in one audience or client allow-list that name no application.
+
+    A blank value or one carrying `*` names no single application whether the
+    service matches it as a pattern or as a literal, so a list holding one does
+    not pin which application the token was minted for.
+    """
+    return [
+        str(value)
+        for value in (values if isinstance(values, list) else [values])
+        if not str(value).strip() or "*" in str(value)
+    ]
+
+
 def _jwt_authorizer_claims(
     authorizer: Dict[str, Any], members: Dict[str, str]
 ) -> List[str]:
-    """Return the claims a JWT authorizer pins out of one group."""
+    """Return the claims a JWT authorizer pins out of one group.
+
+    An audience or client list holding a value that names no application is
+    not counted as pinned.
+    """
     return [
-        label for member, label in sorted(members.items()) if authorizer.get(member)
+        label
+        for member, label in sorted(members.items())
+        if authorizer.get(member)
+        and not (
+            member in JWT_AUTHORIZER_CALLER_CLAIMS
+            and _jwt_allow_list_unbounded_values(authorizer[member])
+        )
     ]
+
+
+def _jwt_unbounded_allow_list_note(authorizer: Dict[str, Any]) -> str:
+    """Name the audience or client lists that were set but pin no application."""
+    notes = [
+        f"{member} holds {', '.join(repr(value) for value in unbounded)}"
+        for member in sorted(JWT_AUTHORIZER_CALLER_CLAIMS)
+        if authorizer.get(member)
+        for unbounded in [_jwt_allow_list_unbounded_values(authorizer[member])]
+        if unbounded
+    ]
+    if not notes:
+        return ""
+    return (
+        f" Its {'; '.join(notes)}, which names no single application, so that "
+        "list is not counted."
+    )
+
+
+def _jwt_discovery_url_is_https(authorizer: Dict[str, Any]) -> bool:
+    """Report whether the issuer's discovery document is fetched over TLS."""
+    return str(authorizer.get("discoveryUrl", "")).lower().startswith("https://")
+
+
+def _jwt_issuer_not_https_finding(
+    check_id: str,
+    finding_name: str,
+    label: str,
+    discovery_url: str,
+    reference: str,
+) -> Dict[str, Any]:
+    """Fail an authorizer whose issuer configuration and signing keys are fetched without TLS."""
+    return create_finding(
+        check_id=check_id,
+        finding_name=finding_name,
+        finding_details=(
+            f"{label} reads its token issuer's configuration and signing keys "
+            f"from {discovery_url}, which is not an https URL, so a party on "
+            "the network path can substitute the keys and mint tokens it accepts."
+        ),
+        resolution=(
+            "Set discoveryUrl to the issuer's https "
+            "/.well-known/openid-configuration URL."
+        ),
+        reference=reference,
+        severity=SeverityEnum.HIGH,
+        status=StatusEnum.FAILED,
+    )
 
 
 def check_agentcore_runtime_inbound_authorization() -> List[Dict[str, Any]]:
@@ -11081,6 +11190,19 @@ def check_agentcore_runtime_inbound_authorization() -> List[Dict[str, Any]]:
             continue
 
         discovery_url = jwt_authorizer.get("discoveryUrl", "an unnamed issuer")
+        if "discoveryUrl" in jwt_authorizer and not _jwt_discovery_url_is_https(
+            jwt_authorizer
+        ):
+            findings.append(
+                _jwt_issuer_not_https_finding(
+                    "AC-30",
+                    "AgentCore Runtime Inbound Authorization Issuer Not HTTPS",
+                    label,
+                    discovery_url,
+                    AGENTCORE_RUNTIME_INBOUND_AUTH_REFERENCE_URL,
+                )
+            )
+            continue
         caller_claims = _jwt_authorizer_claims(
             jwt_authorizer, JWT_AUTHORIZER_CALLER_CLAIMS
         )
@@ -11096,7 +11218,9 @@ def check_agentcore_runtime_inbound_authorization() -> List[Dict[str, Any]]:
                     finding_details=(
                         f"{label} accepts JWTs from {discovery_url} and validates "
                         f"the {', '.join(validated)} claim(s) before the agent's "
-                        "code runs."
+                        "code runs. This is the authorizer of the version "
+                        "GetAgentRuntime returns with no agentRuntimeVersion; "
+                        "other versions an endpoint serves were not read."
                     ),
                     resolution=(
                         "No action required. Confirm the pinned values name this "
@@ -11122,6 +11246,7 @@ def check_agentcore_runtime_inbound_authorization() -> List[Dict[str, Any]]:
                         "neither the audience nor the client id, so a token that "
                         "issuer minted for a different application invokes this "
                         "agent."
+                        f"{_jwt_unbounded_allow_list_note(jwt_authorizer)}"
                     ),
                     resolution=(
                         "Set allowedAudience or allowedClients on the runtime's "
@@ -11310,6 +11435,19 @@ def check_agentcore_gateway_inbound_allow_lists() -> List[Dict[str, Any]]:
             continue
 
         discovery_url = jwt_authorizer.get("discoveryUrl", "an unnamed issuer")
+        if "discoveryUrl" in jwt_authorizer and not _jwt_discovery_url_is_https(
+            jwt_authorizer
+        ):
+            findings.append(
+                _jwt_issuer_not_https_finding(
+                    "AC-31",
+                    "AgentCore Gateway Inbound Allow Lists Issuer Not HTTPS",
+                    label,
+                    discovery_url,
+                    AGENTCORE_GATEWAY_INBOUND_AUTH_REFERENCE_URL,
+                )
+            )
+            continue
         caller_claims = _jwt_authorizer_claims(
             jwt_authorizer, JWT_AUTHORIZER_CALLER_CLAIMS
         )
@@ -11350,6 +11488,7 @@ def check_agentcore_gateway_inbound_allow_lists() -> List[Dict[str, Any]]:
                         f"{label} accepts JWTs from {discovery_url}, {bounded} "
                         "neither the audience nor the client id, so any application "
                         "registered with that issuer can reach this gateway's tools."
+                        f"{_jwt_unbounded_allow_list_note(jwt_authorizer)}"
                     ),
                     resolution=(
                         "Set allowedAudience or allowedClients on the gateway's "
@@ -18179,6 +18318,81 @@ def check_agentcore_cognito_user_pool_authentication() -> List[Dict[str, Any]]:
     return findings
 
 
+def _gateway_jwt_authorization_finding(
+    label: str, gateway_details: Dict[str, Any]
+) -> Dict[str, Any]:
+    """AG-24: Judge a CUSTOM_JWT gateway by the issuer and claims its authorizer validates.
+
+    The authorizer type alone admits a token for any application registered
+    with the issuer, so the gateway passes only when the issuer is fetched over
+    TLS and an audience or client allow-list names this workload's application.
+    """
+    jwt_authorizer = (gateway_details.get("authorizerConfiguration") or {}).get(
+        "customJWTAuthorizer"
+    ) or {}
+    if not jwt_authorizer:
+        return create_finding(
+            check_id="AG-24",
+            finding_name="Agentic AI Gateway Inbound Authorization",
+            finding_details=(
+                f"{label} uses authorizerType CUSTOM_JWT but reported no "
+                "customJWTAuthorizer, so the issuer and the claims it validates "
+                "could not be read."
+            ),
+            resolution="Grant bedrock-agentcore:GetGateway and retry.",
+            reference=AGENTCORE_GATEWAY_INBOUND_AUTH_REFERENCE_URL,
+            severity=SeverityEnum.INFORMATIONAL,
+            status=StatusEnum.NA,
+        )
+    discovery_url = jwt_authorizer.get("discoveryUrl", "an unnamed issuer")
+    if "discoveryUrl" in jwt_authorizer and not _jwt_discovery_url_is_https(
+        jwt_authorizer
+    ):
+        return _jwt_issuer_not_https_finding(
+            "AG-24",
+            "Agentic AI Gateway JWT Issuer Not HTTPS",
+            label,
+            discovery_url,
+            AGENTCORE_GATEWAY_INBOUND_AUTH_REFERENCE_URL,
+        )
+    caller_claims = _jwt_authorizer_claims(jwt_authorizer, JWT_AUTHORIZER_CALLER_CLAIMS)
+    if not caller_claims:
+        return create_finding(
+            check_id="AG-24",
+            finding_name="Agentic AI Gateway JWT Authorization Unbounded",
+            finding_details=(
+                f"{label} uses authorizerType CUSTOM_JWT with issuer "
+                f"{discovery_url} but validates neither the audience nor the "
+                "client id, so a token that issuer minted for any application "
+                "is authorized."
+                f"{_jwt_unbounded_allow_list_note(jwt_authorizer)}"
+            ),
+            resolution=(
+                "Set allowedAudience or allowedClients on the gateway's "
+                "customJWTAuthorizer to the audience and client ids this "
+                "workload issues tokens to."
+            ),
+            reference=AGENTCORE_GATEWAY_INBOUND_AUTH_REFERENCE_URL,
+            severity=SeverityEnum.HIGH,
+            status=StatusEnum.FAILED,
+        )
+    return create_finding(
+        check_id="AG-24",
+        finding_name="Agentic AI Gateway Inbound Authorization",
+        finding_details=(
+            f"{label} uses authorizerType CUSTOM_JWT with issuer {discovery_url} "
+            f"and validates the {', '.join(caller_claims)} claim(s)."
+        ),
+        resolution=(
+            "No action required. Confirm the pinned values name this workload's "
+            "own audience and clients."
+        ),
+        reference=AGENTCORE_GATEWAY_INBOUND_AUTH_REFERENCE_URL,
+        severity=SeverityEnum.HIGH,
+        status=StatusEnum.PASSED,
+    )
+
+
 def check_agentcore_gateway_agentic_security() -> List[Dict[str, Any]]:
     """
     Check API-provable AgentCore Gateway controls for agentic tool execution.
@@ -18304,7 +18518,14 @@ def check_agentcore_gateway_agentic_security() -> List[Dict[str, Any]]:
             or (policy_engine_arn or "").rsplit("/", 1)[-1]
         )
 
-        if authorizer_type in {"AWS_IAM", "CUSTOM_JWT"}:
+        if authorizer_type == "CUSTOM_JWT":
+            findings.append(
+                _gateway_jwt_authorization_finding(
+                    f"Gateway '{gateway_name}' ({gateway_id})",
+                    gateway_details,
+                )
+            )
+        elif authorizer_type == "AWS_IAM":
             findings.append(
                 create_finding(
                     check_id="AG-24",
@@ -18481,16 +18702,43 @@ def check_agentcore_gateway_agentic_security() -> List[Dict[str, Any]]:
             )
 
         web_acl_arn = gateway_details.get("webAclArn")
-        if web_acl_arn:
+        waf_failure_mode = (gateway_details.get("wafConfiguration") or {}).get(
+            "failureMode"
+        )
+        if web_acl_arn and waf_failure_mode == "FAIL_CLOSE":
             findings.append(
                 create_finding(
                     check_id="AG-27",
                     finding_name="Agentic AI Gateway WAF Protection",
-                    finding_details=f"Gateway '{gateway_name}' ({gateway_id}) is associated with WAF web ACL {web_acl_arn}.",
+                    finding_details=f"Gateway '{gateway_name}' ({gateway_id}) is associated with WAF web ACL {web_acl_arn}, and its wafConfiguration failureMode is FAIL_CLOSE, so a request is blocked when AWS WAF cannot be evaluated.",
                     resolution="No action required",
                     reference=AGENTCORE_GATEWAY_API_REFERENCE_URL,
                     severity=SeverityEnum.LOW,
                     status=StatusEnum.PASSED,
+                )
+            )
+        elif web_acl_arn and waf_failure_mode == "FAIL_OPEN":
+            findings.append(
+                create_finding(
+                    check_id="AG-27",
+                    finding_name="Agentic AI Gateway WAF Fails Open",
+                    finding_details=f"Gateway '{gateway_name}' ({gateway_id}) is associated with WAF web ACL {web_acl_arn}, but its wafConfiguration failureMode is FAIL_OPEN, so the gateway allows a request unfiltered when AWS WAF cannot be evaluated.",
+                    resolution="Set the gateway's wafConfiguration failureMode to FAIL_CLOSE.",
+                    reference=AGENTCORE_GATEWAY_API_REFERENCE_URL,
+                    severity=SeverityEnum.LOW,
+                    status=StatusEnum.FAILED,
+                )
+            )
+        elif web_acl_arn:
+            findings.append(
+                create_finding(
+                    check_id="AG-27",
+                    finding_name="Agentic AI Gateway WAF Protection",
+                    finding_details=f"Gateway '{gateway_name}' ({gateway_id}) is associated with WAF web ACL {web_acl_arn}, but reports wafConfiguration failureMode {waf_failure_mode or 'unset'}. The AgentCore API states no default, so whether the gateway blocks or allows a request when AWS WAF cannot be evaluated was not judged.",
+                    resolution="Set the gateway's wafConfiguration failureMode to FAIL_CLOSE and rerun the assessment.",
+                    reference=AGENTCORE_GATEWAY_API_REFERENCE_URL,
+                    severity=SeverityEnum.INFORMATIONAL,
+                    status=StatusEnum.NA,
                 )
             )
         else:
