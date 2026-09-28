@@ -237,12 +237,25 @@ def test_sm43_carries_the_control_it_moved_off_not_implementable(schemas, ledger
     # and the tag on SM-43's CSV rows have to move together.
     row = next(r for r in ledger if r["control"] == "AIR-SLF-CMP-08")
     assert (row["verdict"], row["incumbents"]) == ("covered", ["SM-43"])
+    # ContainerDefinition has no ModelDataETag, so the text must name the route a
+    # plain model does have, or it reads as a failure no customer can clear.
+    assert "ModelDataSource.S3DataSource.ETag" in row["gap"]
     sagemaker = schemas["sagemaker_assessments"]
     text = _csv_rows("sagemaker_assessments", sagemaker, [_finding(sagemaker, "SM-43")])
     assert (
         next(csv.DictReader(StringIO(text)))["Compliance_Frameworks"]
         == "AISF AIR-SLF-CMP-08"
     )
+
+
+def test_mem07_names_both_memory_forms_of_event_expiry(ledger):
+    # eventExpiryDuration is required on a standalone Memory but optional, with a
+    # 30-day default, on harness-managed memory. Calling it required everywhere
+    # misstates the harness form.
+    gap = next(r for r in ledger if r["control"] == "AIR-ACR-MEM-07")["gap"]
+    assert "required on a standalone Memory" in gap
+    assert "defaults to 30 days on harness-managed memory" in gap
+    assert "bounds raw events only" in gap
 
 
 # ---------------------------------------------------------------------------

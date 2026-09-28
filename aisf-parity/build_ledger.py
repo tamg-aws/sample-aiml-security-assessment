@@ -810,8 +810,10 @@ AI_SUBJECT_ROWS = [
         None,
         None,
         [],
-        "the only retention field AgentCore Memory exposes is required, and it bounds a "
-        "different thing from the one this control asks about. eventExpiryDuration is "
+        "the only retention field AgentCore Memory exposes, eventExpiryDuration, is "
+        "required on a standalone Memory and defaults to 30 days on harness-managed "
+        "memory, and in both it bounds raw events only, a different thing from the one "
+        "this control asks about. eventExpiryDuration is "
         "Required: Yes on CreateMemory, 3 to 365 days, and comes back on the Memory shape "
         "GetMemory returns, so a presence check over it passes for every memory that "
         "exists, which is worse than no check. It also bounds the wrong subject: the "
@@ -1720,9 +1722,10 @@ FOUNDATION_ROWS = [
         "signing rule read with ecr:GetSigningConfiguration covers the repository, "
         "a failed or absent DescribeImageSigningStatus result fails. Model data "
         "named by ModelDataUrl fails without a ModelDataETag, which only a model "
-        "package container can record. An S3 ModelDataSource or additional model "
-        "data source fails without an ETag or ManifestEtag unless it is SageMaker "
-        "hub content. A container with an HF_MODEL_ID environment key and no model "
+        "package container can record, so a plain model records its expected value "
+        "through ModelDataSource.S3DataSource.ETag instead. An S3 ModelDataSource or "
+        "additional model data source fails without an ETag or ManifestEtag unless it "
+        "is SageMaker hub content. A container with an HF_MODEL_ID environment key and no model "
         "data fails. Each artifact bucket must default to aws:kms or aws:kms:dsse "
         "with a named key. An endpoint with an unread repository, signing status, "
         "model or bucket reports N/A, never Passed. Partial, ceiling reached: a "
