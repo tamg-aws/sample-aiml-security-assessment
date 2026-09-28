@@ -406,12 +406,20 @@ def _flow_node_guardrails(definition: Any) -> List[Tuple[str, Dict[str, Any]]]:
     return found
 
 
-def get_guardrail_attachment_inventory(region: str = "") -> Dict[str, Any]:
+def get_guardrail_attachment_inventory(
+    region: str = "",
+    permission_cache: Optional[Dict[str, Any]] = None,
+    scp_inventory: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     """
     Read the guardrail versions that agents, flow nodes and account-enforced
     configurations in this Region apply, and the detail of each version.
 
     Agents and flows are read at DRAFT and at every version an alias routes to.
+    With a permission cache, the guardrails that bedrock:GuardrailIdentifier
+    conditions in identity policies and attached service control policies
+    name, and the configurations of the effective Organizations Bedrock policy,
+    are read as well (_guardrail_condition_pins).
     """
     inventory = {"attachments": [], "versions": {}, "errors": []}
     attachments = inventory["attachments"]
@@ -556,11 +564,56 @@ def get_guardrail_attachment_inventory(region: str = "") -> Dict[str, Any]:
                     identifier,
                     config.get("guardrailVersion"),
                 )
+                attachments[-1]["narrowings"] = _account_enforced_guardrail_scope(
+                    config
+                )["narrowings"]
     except (ClientError, BotoCoreError, TypeError) as error:
         errors.append(
             "account-enforced guardrail configurations were not read with "
             f"bedrock:ListEnforcedGuardrailsConfiguration ({get_assessment_error_label(error)})"
         )
+
+    if permission_cache is not None:
+        pins = _guardrail_condition_pins(region, permission_cache, scp_inventory)
+        errors.extend(pins["errors"])
+        pin_client = boto3.client("bedrock", config=boto3_config, region_name=region)
+        for value, surfaces in sorted(pins["values"].items()):
+            reference = _parse_guardrail_reference(value, region)
+            versions = [reference["version"]] if reference["version"] else []
+            if not versions:
+                try:
+                    summaries = _list_all_items(
+                        pin_client,
+                        "list_guardrails",
+                        "guardrails",
+                        guardrailIdentifier=reference["identifier"],
+                    )
+                except (ClientError, BotoCoreError, TypeError) as error:
+                    errors.append(
+                        f"the versions of guardrail {value}, which "
+                        f"{', '.join(sorted(surfaces))} names with no version, were "
+                        "not read with bedrock:ListGuardrails "
+                        f"({get_assessment_error_label(error)})"
+                    )
+                    continue
+                versions = sorted(
+                    {
+                        str(summary.get("version"))
+                        for summary in summaries
+                        if isinstance(summary, dict) and summary.get("version")
+                    }
+                    | {GUARDRAIL_DRAFT_VERSION}
+                )
+                if len(versions) > MAX_GUARDRAIL_VERSION_READS:
+                    errors.append(
+                        f"guardrail {value} has {len(versions)} versions, over the "
+                        f"read cap of {MAX_GUARDRAIL_VERSION_READS}, and "
+                        f"{', '.join(sorted(surfaces))} names it with no version"
+                    )
+                    continue
+            for version in versions:
+                for surface in sorted(surfaces):
+                    attach(surface, value, version)
 
     clients = {}
     for attachment in attachments:
@@ -584,6 +637,147 @@ def get_guardrail_attachment_inventory(region: str = "") -> Dict[str, Any]:
         except (ClientError, BotoCoreError) as error:
             entry["error"] = get_assessment_error_label(error)
     return inventory
+
+
+def _guardrail_condition_pins(
+    region: str,
+    permission_cache: Dict[str, Any],
+    scp_inventory: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """
+    Collect the guardrails that callers in ``region`` can be required to apply
+    outside any workload configuration.
+
+    Values come from every bedrock:GuardrailIdentifier condition on a statement
+    covering an invoke action, in the identity policies, group policies and
+    permissions boundaries of cached roles and users and in service control
+    policies attached to this account, and from the configurations for the
+    Region in the effective Organizations Bedrock policy. A value with a
+    wildcard names no enumerable guardrail and is reported, and an ARN for
+    another Region is left to that Region. Returns {"values": {value:
+    {surface}}, "errors": [...]}.
+    """
+    pins = {"values": {}, "errors": []}
+
+    def collect(surface: str, document: Any) -> None:
+        for statement in _policy_statements(document):
+            if not any(
+                _statement_matches_action(statement, action)
+                for action in GUARDRAIL_INVOKE_ACTIONS
+            ):
+                continue
+            for _, key, values in _condition_keys_by_operator(statement):
+                if key != GUARDRAIL_CONDITION_KEY:
+                    continue
+                for raw in values:
+                    value = str(raw).strip()
+                    if not value:
+                        continue
+                    if "*" in value or "?" in value:
+                        pins["errors"].append(
+                            f"{surface} names guardrail pattern '{value}', so the "
+                            "guardrails it admits were not enumerated"
+                        )
+                        continue
+                    target = _parse_guardrail_reference(value, region)["region"]
+                    if target and target != region:
+                        continue
+                    pins["values"].setdefault(value, set()).add(surface)
+
+    for collection, kind in (
+        ("role_permissions", "role"),
+        ("user_permissions", "user"),
+    ):
+        for name, permissions in (permission_cache.get(collection) or {}).items():
+            documents = [
+                policy.get("document")
+                for _, policy in _cached_identity_policies(permissions)
+            ]
+            boundary = _boundary_document(permissions)
+            if boundary is not None:
+                documents.append(boundary)
+            try:
+                for document in documents:
+                    collect(
+                        f"a bedrock:GuardrailIdentifier condition on {kind} '{name}'",
+                        document,
+                    )
+            except (ValueError, TypeError) as error:
+                pins["errors"].append(
+                    f"the policies of {kind} '{name}' were not parsed "
+                    f"({get_assessment_error_label(error)})"
+                )
+    errored = _cache_principal_errors(permission_cache)
+    if errored is None:
+        pins["errors"].append(
+            "the IAM permissions cache is version 1, which records no principal "
+            "read errors, so a role or user whose policies failed to read would be "
+            "absent from the guardrail conditions searched"
+        )
+    elif errored:
+        pins["errors"].append(
+            f"{len(errored)} principal(s) whose policies the IAM permissions cache "
+            "could not read in full were not searched for guardrail conditions"
+        )
+
+    context = _organization_policy_context()
+    if not context.get("in_use", True):
+        return pins
+    try:
+        response = boto3.client(
+            "organizations", config=boto3_config
+        ).describe_effective_policy(PolicyType="BEDROCK_POLICY")
+        for entry in _bedrock_policy_guardrail_configs(
+            response["EffectivePolicy"]["PolicyContent"] or "{}"
+        ):
+            config = entry["config"]
+            version = config["guardrailVersion"]
+            if (
+                entry["region"] != region
+                or not config["guardrailArn"]
+                or not version
+                or version.upper() == GUARDRAIL_DRAFT_VERSION
+            ):
+                continue
+            pins["values"].setdefault(f"{config['guardrailArn']}:{version}", set()).add(
+                "the effective Organizations Bedrock policy configuration "
+                f"{config.get('configId') or 'unnamed'}"
+            )
+    except ClientError as error:
+        code = error.response.get("Error", {}).get("Code", "")
+        if code not in AI_OPT_OUT_ABSENT_CODES | {"AWSOrganizationsNotInUseException"}:
+            pins["errors"].append(
+                "the effective Bedrock policy was not read ("
+                f"{describe_api_error(error, 'organizations:DescribeEffectivePolicy', region)})"
+            )
+    except (BotoCoreError, KeyError, ValueError, TypeError) as error:
+        pins["errors"].append(
+            f"the effective Bedrock policy was not read ({get_assessment_error_label(error)})"
+        )
+
+    scps = (
+        scp_inventory
+        if scp_inventory is not None
+        else get_service_control_policy_inventory()
+    )
+    if scps.get("list_error"):
+        pins["errors"].append(
+            f"service control policies were not read ({scps['list_error']})"
+        )
+    pins["errors"].extend(scps.get("errors") or [])
+    if scps.get("management_account"):
+        return pins
+    for item in scps.get("items") or []:
+        try:
+            collect(
+                f"a bedrock:GuardrailIdentifier condition in service control policy '{item['name']}'",
+                item["content"] or "{}",
+            )
+        except (ValueError, TypeError) as error:
+            pins["errors"].append(
+                f"service control policy '{item['name']}' was not parsed ({str(error)})"
+            )
+    return pins
 
 
 def _deployed_guardrail_findings(
@@ -680,8 +874,10 @@ def _deployed_guardrail_findings(
                 check_id=check_id,
                 finding_name=finding_name,
                 finding_details=(
-                    "No agent, flow node or account-enforced configuration in this "
-                    f"Region applies a guardrail. {GUARDRAIL_DEPLOYMENT_CEILING}"
+                    "No agent, flow node, account-enforced configuration, "
+                    "Organizations Bedrock policy configuration or "
+                    "bedrock:GuardrailIdentifier condition read for this Region "
+                    f"applies a guardrail. {GUARDRAIL_DEPLOYMENT_CEILING}"
                 ),
                 resolution="No action required",
                 reference=reference,
@@ -12623,6 +12819,7 @@ def get_knowledge_base_screening_inventory(
                         "region": attachment.get("region") or region,
                         "version": attachment["version"],
                     },
+                    "narrowings": list(attachment.get("narrowings") or []),
                 }
             )
     inventory["enforced_errors"] = [
@@ -12742,9 +12939,20 @@ def _knowledge_base_screening_findings(
             return "unread"
         return "screened" if screens(entry["detail"]) else "open"
 
+    # An account-enforced configuration stands in front of every knowledge
+    # base only when it covers every model and all content; a narrowed one
+    # leaves retrieval through other models or untagged content unscreened.
     enforced = [
-        (item["surface"], judge(item)) for item in inventory.get("enforced") or []
+        (item["surface"], judge(item))
+        for item in inventory.get("enforced") or []
+        if not item.get("narrowings")
     ]
+    enforced_narrowed = [
+        f"{item['surface']} is not credited because {'; '.join(item['narrowings'])}"
+        for item in inventory.get("enforced") or []
+        if item.get("narrowings")
+    ]
+    narrowed_note = f" {'. '.join(enforced_narrowed)}." if enforced_narrowed else ""
     enforced_screen = sorted(s for s, state in enforced if state == "screened")
     enforced_unread = [
         f"the guardrail of {s} was not read with bedrock:GetGuardrail"
@@ -12813,7 +13021,8 @@ def _knowledge_base_screening_findings(
                 row(
                     f"Bedrock {entry['label']} ingests {names} with no screening "
                     f"step, and {', '.join(open_fronts)} retrieves from it with no "
-                    f"guardrail {screen_text}. {KNOWLEDGE_BASE_SCREENING_CEILING}",
+                    f"guardrail {screen_text}.{narrowed_note} "
+                    f"{KNOWLEDGE_BASE_SCREENING_CEILING}",
                     "Failed",
                     resolution,
                 )
@@ -12824,8 +13033,8 @@ def _knowledge_base_screening_findings(
                 row(
                     f"Bedrock {entry['label']} ingests {names} with no screening "
                     "step, and no agent version or flow node retrieves from it, so "
-                    f"no configured guardrail {screen_text} stands in front of it. "
-                    f"{KNOWLEDGE_BASE_SCREENING_CEILING}",
+                    f"no configured guardrail {screen_text} stands in front of it."
+                    f"{narrowed_note} {KNOWLEDGE_BASE_SCREENING_CEILING}",
                     "Failed",
                     resolution,
                 )
@@ -13717,6 +13926,10 @@ def check_bedrock_rag_evaluation_jobs(region: str = "") -> Dict[str, Any]:
 
 SENSITIVE_INFORMATION_ACTING = ("BLOCK", "ANONYMIZE")
 
+# The built-in PII entity types that name credentials. Some other entity
+# acting on a side does not stop an access key or password on that side.
+CREDENTIAL_PII_ENTITY_TYPES = ("AWS_ACCESS_KEY", "AWS_SECRET_KEY", "PASSWORD")
+
 SENSITIVE_INFORMATION_TOOL_CEILING = (
     "The filter does not evaluate toolUse input, toolResult content or a toolSpec, "
     "and no configuration API records whether a workload screens those fields itself."
@@ -13733,9 +13946,10 @@ def _sensitive_information_action(element: Dict[str, Any], side: str) -> str:
 def _sensitive_information_verdict(detail: Dict[str, Any]) -> Tuple[str, str]:
     """
     Judge one guardrail version's sensitive-information policy by the action
-    each entity and regex takes. A version passes when some entity or regex
-    blocks or masks on the input and on the output, and a custom regex blocks
-    or masks on the output for the secrets the built-in types do not name.
+    each entity and regex takes. A version passes when each credential entity
+    type (CREDENTIAL_PII_ENTITY_TYPES) blocks or masks on the input and on the
+    output, and a custom regex blocks or masks on the output for the secrets
+    the built-in types do not name.
     """
     policy = detail.get("sensitiveInformationPolicy") or {}
     entities = [e for e in policy.get("piiEntities") or [] if isinstance(e, dict)]
@@ -13766,6 +13980,22 @@ def _sensitive_information_verdict(detail: Dict[str, Any]) -> Tuple[str, str]:
     for side in ("output", "input"):
         if not acting[side]:
             gaps.append(f"no PII entity or regex blocks or masks on the {side}")
+            continue
+        missing = [
+            entity_type
+            for entity_type in CREDENTIAL_PII_ENTITY_TYPES
+            if not any(
+                entity.get("type") == entity_type
+                and _sensitive_information_action(entity, side)
+                in SENSITIVE_INFORMATION_ACTING
+                for entity in entities
+            )
+        ]
+        if missing:
+            gaps.append(
+                "the credential PII entity type(s) {} do not block or mask on "
+                "the {}".format(", ".join(missing), side)
+            )
     if not output_regexes:
         gaps.append(
             "no custom regex blocks or masks secrets, credentials or internal identifiers on the output"
@@ -13786,10 +14016,11 @@ def _sensitive_information_verdict(detail: Dict[str, Any]) -> Tuple[str, str]:
     return (
         "Passed",
         "PII entities or regexes block or mask on the input ({}) and the output ({}), "
-        "and custom regex {} acts on the output; the regex patterns themselves are "
-        "not evaluated.{}".format(
+        "including {} on both, and custom regex {} acts on the output; the regex "
+        "patterns themselves are not evaluated.{}".format(
             ", ".join(acting["input"]),
             ", ".join(acting["output"]),
+            ", ".join(CREDENTIAL_PII_ENTITY_TYPES),
             ", ".join(output_regexes),
             observed,
         ),
@@ -13797,8 +14028,8 @@ def _sensitive_information_verdict(detail: Dict[str, Any]) -> Tuple[str, str]:
 
 
 SENSITIVE_INFORMATION_RESOLUTION = (
-    "Set the required PII entity types to BLOCK or ANONYMIZE on both the input and the "
-    "output, add custom regexes for secrets, credentials and internal identifiers with "
+    "Set the required PII entity types, including AWS_ACCESS_KEY, AWS_SECRET_KEY and "
+    "PASSWORD, to BLOCK or ANONYMIZE on both the input and the output, add custom regexes for secrets, credentials and internal identifiers with "
     "BLOCK or ANONYMIZE on the output, and screen tool inputs and results in the "
     "application or through ApplyGuardrail."
 )
@@ -15162,6 +15393,55 @@ GUARDRAIL_SIGNAL_CEILING = (
     "acted on is not visible to any AWS API."
 )
 
+# InvocationsIntervened dimensions that count only a slice of the interventions
+# (monitoring-guardrails-cw-metrics). GuardrailArn and GuardrailVersion count
+# one guardrail version.
+GUARDRAIL_SLICE_DIMENSIONS = (
+    "Operation",
+    "GuardrailContentSource",
+    "GuardrailPolicyType",
+)
+
+GUARDRAIL_VERSION_DIMENSIONS = ("GuardrailArn", "GuardrailVersion")
+
+# A statistic whose value over a period is at least 1 when one intervention
+# was counted in it. Average, Minimum and percentiles can stay below 1.
+SINGLE_EVENT_STATISTICS = ("Sum", "SampleCount", "Maximum")
+
+
+def _single_event_alarm_gap(alarm: Dict[str, Any]) -> str:
+    """
+    Say why an alarm would not enter ALARM on one counted event in one
+    period, or return "" when it would.
+    """
+    name = alarm.get("AlarmName") or "unnamed"
+    if alarm.get("Metrics"):
+        return f"alarm {name} evaluates a metric math expression, whose threshold is not judged"
+    operator = alarm.get("ComparisonOperator")
+    threshold = alarm.get("Threshold")
+    if not isinstance(threshold, (int, float)) or isinstance(threshold, bool):
+        return f"alarm {name} returns no static Threshold"
+    if not (
+        (operator == "GreaterThanThreshold" and threshold < 1)
+        or (operator == "GreaterThanOrEqualToThreshold" and threshold <= 1)
+    ):
+        return f"alarm {name} ({operator or 'no operator'} {threshold:g}) does not enter ALARM on one intervention"
+    statistic = alarm.get("Statistic")
+    if statistic not in SINGLE_EVENT_STATISTICS:
+        return (
+            f"alarm {name} uses statistic "
+            f"{statistic or alarm.get('ExtendedStatistic') or 'none'}, which can "
+            "stay below 1 in a period with one intervention"
+        )
+    datapoints = alarm.get("DatapointsToAlarm") or alarm.get("EvaluationPeriods")
+    if datapoints != 1:
+        return (
+            f"alarm {name} needs {datapoints or 'an unreturned number of'} "
+            "breaching periods, so one intervention does not raise it"
+        )
+    return ""
+
+
 COMPOSITE_ALARM_REFERENCE = re.compile(r'(NOT\s+)?ALARM\(\s*"?([^")]+?)"?\s*\)')
 
 
@@ -15485,6 +15765,10 @@ def check_bedrock_cloudwatch_alarms(
                     if attachment_inventory is not None
                     else get_guardrail_attachment_inventory(region),
                     alarms_on,
+                    {
+                        alarm.get("AlarmName") or "unnamed": alarm
+                        for alarm in metric_alarms
+                    },
                 )
             )
             if findings["csv_data"][-1]["Status"] == "Failed":
@@ -15540,11 +15824,19 @@ def _guardrail_intervention_signal_finding(
     guardrail_inventory: Dict[str, Any],
     attachment_inventory: Dict[str, Any],
     alarms_on: Callable[..., Tuple[List[str], List[str]]],
+    alarm_details: Dict[str, Dict[str, Any]],
 ) -> Dict[str, Any]:
     """
     Judge whether guardrail interventions reach an acting alarm: an alarm on
     AWS/Bedrock/Guardrails InvocationsIntervened, or an alarm on the metric a
     filter over the invocation log group derives from INTERVENED.
+
+    An acting alarm counts only when one intervention in one period raises it
+    (_single_event_alarm_gap) and, on InvocationsIntervened, when it carries
+    no dimension. A slice dimension counts part of the interventions and fails;
+    an alarm scoped to one guardrail version by GuardrailArn and
+    GuardrailVersion keeps the row from Passed, because which versions callers
+    name is not read.
     """
     finding_name = "Guardrail Intervention Monitoring Signal"
     reference = "https://docs.aws.amazon.com/bedrock/latest/userguide/guardrails-enforcements.html"
@@ -15584,11 +15876,46 @@ def _guardrail_intervention_signal_finding(
         )
 
     scope_text = f"Guardrails apply here ({'; '.join(evidence)})."
-    acting_alarms, silent_alarms = alarms_on(
+    metric_alarms, silent_alarms = alarms_on(
         lambda ns, name: (
             ns == GUARDRAIL_METRIC_NAMESPACE and name == GUARDRAIL_INTERVENTION_METRIC
         )
     )
+    acting_alarms = []
+    alarm_gaps = []
+    version_scoped = []
+    unjudged = []
+    for alarm_name in metric_alarms:
+        alarm = alarm_details.get(alarm_name) or {}
+        gap = _single_event_alarm_gap(alarm)
+        dimensions = {
+            str(dimension.get("Name")): str(dimension.get("Value"))
+            for dimension in alarm.get("Dimensions") or []
+            if isinstance(dimension, dict)
+        }
+        sliced = sorted(set(dimensions) & set(GUARDRAIL_SLICE_DIMENSIONS))
+        if gap and alarm.get("Metrics"):
+            unjudged.append(gap)
+        elif gap:
+            alarm_gaps.append(gap)
+        elif sliced:
+            alarm_gaps.append(
+                "alarm {} counts only the interventions where {}".format(
+                    alarm_name,
+                    " and ".join(f"{key} is {dimensions[key]}" for key in sliced),
+                )
+            )
+        elif dimensions:
+            version_scoped.append(
+                "alarm {} counts only {}".format(
+                    alarm_name,
+                    ", ".join(
+                        f"{key} {value}" for key, value in sorted(dimensions.items())
+                    ),
+                )
+            )
+        else:
+            acting_alarms.append(alarm_name)
     other_guardrail_alarms = sorted(
         set().union(
             *alarms_on(
@@ -15619,13 +15946,18 @@ def _guardrail_intervention_signal_finding(
     for metric_filter in filters["matched"]:
         metric_set = set(metric_filter["metrics"])
         acting, _ = alarms_on(lambda ns, name: (ns, name) in metric_set)
+        for alarm_name in list(acting):
+            gap = _single_event_alarm_gap(alarm_details.get(alarm_name) or {})
+            if gap:
+                acting.remove(alarm_name)
+                (unjudged if "metric math" in gap else alarm_gaps).append(gap)
         (alarmed_filters if acting else unalarmed_filters).append(
             f"{metric_filter['name']} (alarm {', '.join(acting)})"
             if acting
             else metric_filter["name"]
         )
 
-    gaps = []
+    gaps = list(alarm_gaps)
     if silent_alarms:
         gaps.append(
             f"alarm(s) {', '.join(silent_alarms)} on {GUARDRAIL_INTERVENTION_METRIC} reach no action"
@@ -15670,6 +16002,16 @@ def _guardrail_intervention_signal_finding(
         return row(
             f"{scope_text} Interventions on the four logged inference APIs reach an acting alarm through {' and '.join(observed)}, but whether ApplyGuardrail is called here was not read (cloudtrail:LookupEvents), and its interventions reach no metric filter, so this is not reported as Passed.{gap_text}{forwarding}",
             "Grant cloudtrail:LookupEvents and retry, or alarm on InvocationsIntervened in the AWS/Bedrock/Guardrails namespace.",
+            "Informational",
+            "N/A",
+        )
+    if version_scoped or unjudged:
+        return row(
+            f"{scope_text} No acting alarm on {GUARDRAIL_METRIC_NAMESPACE} {GUARDRAIL_INTERVENTION_METRIC} counts every intervention and is judged to fire on one: "
+            + "; ".join(version_scoped + unjudged)
+            + ". Which guardrail versions callers name is not read, and a metric math result is not evaluated, so this is not reported as Passed or Failed."
+            + f"{gap_text}{forwarding}",
+            "Alarm on InvocationsIntervened with no dimension, statistic Sum, a threshold of GreaterThanOrEqualToThreshold 1 over one datapoint, and an enabled alarm action, or confirm that the per-version alarms cover every version callers name.",
             "Informational",
             "N/A",
         )
@@ -27307,7 +27649,15 @@ def lambda_handler(event, context):
         all_findings.append(service_quotas_findings)
 
         guardrail_inventory = get_guardrail_detail_inventory(region)
-        guardrail_attachments = get_guardrail_attachment_inventory(region)
+        guardrail_attachments = get_guardrail_attachment_inventory(
+            region, permission_cache=permission_cache, scp_inventory=scp_inventory
+        )
+        if permission_cache is None:
+            guardrail_attachments["errors"].append(
+                "bedrock:GuardrailIdentifier conditions in identity and service "
+                "control policies were not read, because the IAM permissions cache "
+                "was unavailable"
+            )
         knowledge_base_screening = get_knowledge_base_screening_inventory(
             region, guardrail_attachments
         )

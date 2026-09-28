@@ -13894,7 +13894,12 @@ class TestBR26GuardrailPIIFilters:
         bedrock_client.get_guardrail.return_value = {
             "guardrail": {
                 "sensitiveInformationPolicy": {
-                    "piiEntities": [{"type": "EMAIL", "action": "ANONYMIZE"}],
+                    "piiEntities": [
+                        {"type": "EMAIL", "action": "ANONYMIZE"},
+                        {"type": "AWS_ACCESS_KEY", "action": "BLOCK"},
+                        {"type": "AWS_SECRET_KEY", "action": "BLOCK"},
+                        {"type": "PASSWORD", "action": "BLOCK"},
+                    ],
                     "regexes": [
                         {
                             "name": "internal-token",
@@ -14224,6 +14229,111 @@ class TestKnowledgeBaseScreening:
         assert (
             "account-enforced guardrail configurations were not read"
             in unread[0]["Finding_Details"]
+        )
+
+    NARROWED = [
+        "includedModels does not name ALL, so the guardrail applies to only the 1 "
+        "model(s) m1 and any other model is invoked without it"
+    ]
+
+    def test_br34_a_narrowed_account_enforced_configuration_is_not_credited(self):
+        kb = self._kb(
+            "kb",
+            [self._source("raw")],
+            [self._front("agent 'a' DRAFT", guardrail=None)],
+        )
+        enforced = [
+            dict(
+                self._front("account-enforced configuration c1", guardrail="gr-e"),
+                narrowings=self.NARROWED,
+            )
+        ]
+        rows = self._br34(
+            self._inventory(
+                [kb], {("gr-e", "1"): self.PROMPT_ATTACK}, enforced=enforced
+            )
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert (
+            "account-enforced configuration c1 is not credited because "
+            "includedModels does not name ALL" in rows[0]["Finding_Details"]
+        )
+
+    def test_br34_a_full_scope_configuration_beside_a_narrowed_one_is_credited(
+        self,
+    ):
+        kb = self._kb(
+            "kb",
+            [self._source("raw")],
+            [self._front("agent 'a' DRAFT", guardrail=None)],
+        )
+        enforced = [
+            dict(
+                self._front("account-enforced configuration narrow", guardrail="gr-n"),
+                narrowings=self.NARROWED,
+            ),
+            dict(
+                self._front("account-enforced configuration full", guardrail="gr-e"),
+                narrowings=[],
+            ),
+        ]
+        rows = self._br34(
+            self._inventory(
+                [kb],
+                {("gr-e", "1"): self.PROMPT_ATTACK, ("gr-n", "1"): self.PROMPT_ATTACK},
+                enforced=enforced,
+            )
+        )
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert "account-enforced configuration full" in rows[0]["Finding_Details"]
+
+    def test_inventory_carries_enforced_narrowings_from_the_configuration(self):
+        agent_client = MagicMock()
+        agent_client.list_agents.return_value = {"agentSummaries": []}
+        agent_client.list_flows.return_value = {"flowSummaries": []}
+        agent_client.list_knowledge_bases.return_value = {"knowledgeBaseSummaries": []}
+        bedrock_client = MagicMock()
+        bedrock_client.list_enforced_guardrails_configuration.return_value = {
+            "guardrailsConfig": [
+                {
+                    "configId": "narrow",
+                    "guardrailId": "gr-n",
+                    "guardrailVersion": "1",
+                    "modelEnforcement": {"includedModels": ["m1"]},
+                },
+                {
+                    "configId": "selective",
+                    "guardrailId": "gr-s",
+                    "guardrailVersion": "1",
+                    "selectiveContentGuarding": {"messages": "SELECTIVE"},
+                },
+                {"configId": "full", "guardrailId": "gr-e", "guardrailVersion": "1"},
+            ]
+        }
+        bedrock_client.get_guardrail.return_value = {"guardrail": self.PROMPT_ATTACK}
+
+        def client(service, **_):
+            return agent_client if service == "bedrock-agent" else bedrock_client
+
+        with patch("bedrock_app.boto3.client", side_effect=client):
+            attachments = bedrock_app.get_guardrail_attachment_inventory(self.REGION)
+            inventory = bedrock_app.get_knowledge_base_screening_inventory(
+                self.REGION, attachments
+            )
+        narrowings = {
+            item["surface"]: item["narrowings"] for item in inventory["enforced"]
+        }
+        assert set(narrowings) == {
+            "account-enforced configuration narrow",
+            "account-enforced configuration selective",
+            "account-enforced configuration full",
+        }
+        assert narrowings["account-enforced configuration full"] == []
+        assert "includedModels does not name ALL" in " ".join(
+            narrowings["account-enforced configuration narrow"]
+        )
+        assert "messages content is guarded SELECTIVE" in " ".join(
+            narrowings["account-enforced configuration selective"]
         )
 
     def test_br34_list_error_and_no_knowledge_base_are_na(self):
@@ -14621,7 +14731,12 @@ class TestDeployedGuardrailVersions:
         "inputStrength": "HIGH",
     }
     GOOD_PII = {
-        "piiEntities": [{"type": "EMAIL", "action": "ANONYMIZE"}],
+        "piiEntities": [
+            {"type": "EMAIL", "action": "ANONYMIZE"},
+            {"type": "AWS_ACCESS_KEY", "action": "BLOCK"},
+            {"type": "AWS_SECRET_KEY", "action": "BLOCK"},
+            {"type": "PASSWORD", "action": "ANONYMIZE"},
+        ],
         "regexes": [
             {"name": "api-key", "pattern": "key_[0-9a-f]{40}", "action": "BLOCK"}
         ],
@@ -14831,7 +14946,9 @@ class TestDeployedGuardrailVersions:
             {
                 "InputOnly": {
                     "piiEntities": [
-                        {"type": "EMAIL", "action": "BLOCK", "outputEnabled": False}
+                        {"type": entity_type, "action": "BLOCK", "outputEnabled": False}
+                        for entity_type in ("EMAIL",)
+                        + bedrock_app.CREDENTIAL_PII_ENTITY_TYPES
                     ],
                     "regexes": [
                         {
@@ -14904,6 +15021,76 @@ class TestDeployedGuardrailVersions:
         assert (
             bedrock_app.SENSITIVE_INFORMATION_TOOL_CEILING in rows[1]["Finding_Details"]
         )
+
+    @pytest.mark.parametrize(
+        "missing",
+        ["AWS_ACCESS_KEY", "AWS_SECRET_KEY", "PASSWORD"],
+    )
+    def test_br26_a_missing_credential_entity_type_fails(self, missing):
+        weak = {
+            "piiEntities": [
+                entity
+                for entity in self.GOOD_PII["piiEntities"]
+                if entity["type"] != missing
+            ],
+            "regexes": self.GOOD_PII["regexes"],
+        }
+        result = self._pii({"Good": self.GOOD_PII, "Weak": weak})
+
+        rows = self._rows(result, "Guardrail Sensitive Information Filter Check")
+        assert [row["Status"] for row in rows] == ["Failed", "Passed"]
+        assert (
+            f"the credential PII entity type(s) {missing} do not block or mask on the output"
+            in rows[0]["Finding_Details"]
+        )
+        assert "on the input" in rows[0]["Finding_Details"]
+
+    def test_br26_a_credential_type_that_only_detects_on_the_output_fails(self):
+        weak = {
+            "piiEntities": [
+                dict(entity, outputAction="NONE")
+                if entity["type"] == "PASSWORD"
+                else entity
+                for entity in self.GOOD_PII["piiEntities"]
+            ],
+            "regexes": self.GOOD_PII["regexes"],
+        }
+        rows = self._rows(
+            self._pii({"Weak": weak}), "Guardrail Sensitive Information Filter Check"
+        )
+        assert [row["Status"] for row in rows] == ["Failed"]
+        assert (
+            "PASSWORD do not block or mask on the output" in rows[0]["Finding_Details"]
+        )
+        assert "on the input" not in rows[0]["Finding_Details"]
+
+    def test_br26_a_deployed_version_without_credential_types_fails(self):
+        result = self._pii(
+            {"Good": self.GOOD_PII},
+            self._attachments(
+                {
+                    ("gr-0", "1"): (
+                        ["agent 'a' version 1"],
+                        {
+                            "sensitiveInformationPolicy": {
+                                "piiEntities": [{"type": "EMAIL", "action": "BLOCK"}],
+                                "regexes": self.GOOD_PII["regexes"],
+                            }
+                        },
+                    ),
+                    ("gr-0", "2"): (
+                        ["agent 'a' version 2"],
+                        {"sensitiveInformationPolicy": self.GOOD_PII},
+                    ),
+                }
+            ),
+        )
+        deployed = self._rows(result, "Deployed Guardrail Sensitive Information Filter")
+        assert [row["Status"] for row in deployed] == ["Failed", "Passed"]
+        assert (
+            "AWS_ACCESS_KEY, AWS_SECRET_KEY, PASSWORD" in deployed[0]["Finding_Details"]
+        )
+        assert "version 1" in deployed[0]["Finding_Details"]
 
     def test_br26_deployed_version_is_judged_apart_from_a_passing_draft(self):
         result = self._pii(
@@ -15064,6 +15251,253 @@ class TestDeployedGuardrailVersions:
         )
         assert len(inventory["errors"]) == 1
         assert "bedrock:ListEnforcedGuardrailsConfiguration" in inventory["errors"][0]
+
+
+class TestGuardrailConditionPins:
+    """The deployed-guardrail population includes guardrails callers are made to name."""
+
+    REGION = "us-east-1"
+    PINNED = "arn:aws:bedrock:us-east-1:123456789012:guardrail/gr-9"
+
+    @staticmethod
+    def _scps(*statements, management=False):
+        return {
+            "items": [
+                {
+                    "name": "guard",
+                    "id": "p-1",
+                    "content": json.dumps(
+                        {"Version": "2012-10-17", "Statement": list(statements)}
+                    ),
+                    "attached_to": ["root r-1"],
+                }
+            ],
+            "errors": [],
+            "list_error": None,
+            "detached": [],
+            "account": "123456789012",
+            "path": [],
+            "management_account": management,
+        }
+
+    def _run(self, cache, scps=None, effective=None, versions=None, in_use=True):
+        agent_client = MagicMock()
+        agent_client.list_agents.return_value = {"agentSummaries": []}
+        agent_client.list_flows.return_value = {"flowSummaries": []}
+        bedrock_client = MagicMock()
+        bedrock_client.list_enforced_guardrails_configuration.return_value = {
+            "guardrailsConfig": []
+        }
+        bedrock_client.list_guardrails.return_value = {
+            "guardrails": [{"id": "gr-9", "version": v} for v in versions or []]
+        }
+        bedrock_client.get_guardrail.side_effect = lambda **kwargs: {
+            "guardrail": dict(kwargs)
+        }
+        orgs_client = MagicMock()
+        if effective is None:
+            orgs_client.describe_effective_policy.side_effect = ClientError(
+                {"Error": {"Code": "EffectivePolicyNotFoundException", "Message": "x"}},
+                "DescribeEffectivePolicy",
+            )
+        else:
+            orgs_client.describe_effective_policy.return_value = {
+                "EffectivePolicy": {"PolicyContent": json.dumps(effective)}
+            }
+        clients = {
+            "bedrock-agent": agent_client,
+            "bedrock": bedrock_client,
+            "organizations": orgs_client,
+        }
+        with (
+            patch(
+                "bedrock_app.boto3.client",
+                side_effect=lambda service, **_: clients[service],
+            ),
+            patch(
+                "bedrock_app._organization_policy_context",
+                return_value={"in_use": in_use},
+            ),
+        ):
+            return bedrock_app.get_guardrail_attachment_inventory(
+                self.REGION,
+                permission_cache=cache,
+                scp_inventory=scps if scps is not None else self._scps(),
+            )
+
+    def test_an_iam_condition_pin_joins_the_population(self):
+        cache = _br10_cache(
+            roles={
+                "Pinned": _br10_identity(_br10_bound(f"{self.PINNED}:3")),
+                "Open": _br10_identity(_br10_allow()),
+            },
+            errors=[],
+        )
+        inventory = self._run(cache)
+        assert list(inventory["versions"]) == [(self.PINNED, "3")]
+        assert inventory["versions"][(self.PINNED, "3")]["surfaces"] == [
+            "a bedrock:GuardrailIdentifier condition on role 'Pinned'"
+        ]
+        assert inventory["errors"] == []
+
+    def test_a_group_policy_pin_joins_the_population(self):
+        group = {
+            "group": "invokers",
+            "name": "G",
+            "arn": "arn:aws:iam::123456789012:policy/G",
+            "document": {
+                "Version": "2012-10-17",
+                "Statement": [_br10_bound(f"{self.PINNED}:4")],
+            },
+        }
+        cache = _br10_cache(
+            users={"alice": _br10_identity(_br10_allow(), groups=[group])}, errors=[]
+        )
+        inventory = self._run(cache)
+        assert (self.PINNED, "4") in inventory["versions"]
+
+    def test_an_unversioned_pin_reads_every_version(self):
+        cache = _br10_cache(
+            roles={"Pinned": _br10_identity(_br10_bound(self.PINNED))}, errors=[]
+        )
+        inventory = self._run(cache, versions=["1", "2"])
+        assert sorted(inventory["versions"]) == [
+            (self.PINNED, "1"),
+            (self.PINNED, "2"),
+            (self.PINNED, "DRAFT"),
+        ]
+
+    def test_a_wildcard_pin_is_reported_and_not_enumerated(self):
+        cache = _br10_cache(
+            roles={
+                "Pattern": _br10_identity(
+                    _br10_bound(
+                        "arn:aws:bedrock:us-east-1:123456789012:guardrail/*",
+                        "StringLike",
+                    )
+                ),
+                "Pinned": _br10_identity(_br10_bound(f"{self.PINNED}:3")),
+            },
+            errors=[],
+        )
+        inventory = self._run(cache)
+        assert list(inventory["versions"]) == [(self.PINNED, "3")]
+        assert len(inventory["errors"]) == 1
+        assert "role 'Pattern'" in inventory["errors"][0]
+        assert "were not enumerated" in inventory["errors"][0]
+
+    def test_a_pin_on_another_region_is_left_to_that_region(self):
+        cache = _br10_cache(
+            roles={
+                "West": _br10_identity(
+                    _br10_bound(
+                        "arn:aws:bedrock:us-west-2:123456789012:guardrail/gr-2:1"
+                    )
+                )
+            },
+            errors=[],
+        )
+        assert self._run(cache)["versions"] == {}
+
+    def test_a_pin_on_an_errored_cache_is_not_a_complete_population(self):
+        cache = _br10_cache(
+            roles={"Pinned": _br10_identity(_br10_bound(f"{self.PINNED}:3"))},
+            errors=[
+                {
+                    "type": "role",
+                    "name": "Other",
+                    "stage": "inline_policy",
+                    "error": "x",
+                }
+            ],
+        )
+        inventory = self._run(cache)
+        assert (self.PINNED, "3") in inventory["versions"]
+        assert any("were not searched" in error for error in inventory["errors"])
+
+    def test_a_version_one_cache_says_errors_were_not_recorded(self):
+        cache = _br10_cache(roles={})
+        inventory = self._run(cache)
+        assert any("version 1" in error for error in inventory["errors"])
+
+    def test_an_scp_pin_joins_in_a_member_account_only(self):
+        deny = {
+            "Effect": "Deny",
+            "Action": _INVOKE_BOTH,
+            "Resource": "*",
+            "Condition": {"StringNotEquals": {"bedrock:GuardrailIdentifier": "gr-7:2"}},
+        }
+        cache = _br10_cache(errors=[])
+        member = self._run(cache, scps=self._scps(deny))
+        assert member["versions"][("gr-7", "2")]["surfaces"] == [
+            "a bedrock:GuardrailIdentifier condition in service control policy 'guard'"
+        ]
+        assert (
+            self._run(cache, scps=self._scps(deny, management=True))["versions"] == {}
+        )
+
+    def test_the_effective_bedrock_policy_joins_only_its_region(self):
+        effective = {
+            "bedrock": {
+                "guardrail_inference": {
+                    region: {"baseline": {"identifier": f"{guardrail}:{version}"}}
+                    for region, guardrail, version in (
+                        ("us-east-1", self.PINNED, "5"),
+                        (
+                            "eu-west-1",
+                            "arn:aws:bedrock:eu-west-1:123456789012:guardrail/gr-3",
+                            "1",
+                        ),
+                    )
+                }
+            }
+        }
+        inventory = self._run(_br10_cache(errors=[]), effective=effective)
+        assert list(inventory["versions"]) == [(self.PINNED, "5")]
+
+    def test_an_unreadable_effective_policy_is_an_error(self):
+        cache = _br10_cache(errors=[])
+        agent_client = MagicMock()
+        with (
+            patch(
+                "bedrock_app._organization_policy_context",
+                return_value={"in_use": True},
+            ),
+            patch("bedrock_app.boto3.client") as client,
+        ):
+            client.return_value = agent_client
+            agent_client.list_agents.return_value = {"agentSummaries": []}
+            agent_client.list_flows.return_value = {"flowSummaries": []}
+            agent_client.list_enforced_guardrails_configuration.return_value = {
+                "guardrailsConfig": []
+            }
+            agent_client.describe_effective_policy.side_effect = ClientError(
+                {"Error": {"Code": "AccessDeniedException", "Message": "x"}},
+                "DescribeEffectivePolicy",
+            )
+            inventory = bedrock_app.get_guardrail_attachment_inventory(
+                self.REGION, permission_cache=cache, scp_inventory=self._scps()
+            )
+        assert any("effective Bedrock policy" in error for error in inventory["errors"])
+
+    def test_a_pinned_version_that_fails_the_judge_fails_the_check(self):
+        cache = _br10_cache(
+            roles={"Pinned": _br10_identity(_br10_bound(f"{self.PINNED}:3"))},
+            errors=[],
+        )
+        inventory = self._run(cache)
+        rows = bedrock_app._deployed_guardrail_findings(
+            "BR-26",
+            "Deployed",
+            bedrock_app.GUARDRAIL_IAM_REFERENCE,
+            self.REGION,
+            inventory,
+            lambda detail: ("Failed", "no filter"),
+            "fix",
+            "High",
+        )
+        assert [row["Status"] for row in rows] == ["Failed"]
+        assert "condition on role 'Pinned'" in rows[0]["Finding_Details"]
 
 
 # ===================================================================
@@ -15604,6 +16038,7 @@ class TestBR32CloudWatchAlarms:
                     "MetricName": "InvocationsIntervened",
                     "ActionsEnabled": True,
                     "AlarmActions": [SNS_TOPIC],
+                    **SINGLE_EVENT_THRESHOLD,
                 },
             ]
         )
@@ -15770,12 +16205,23 @@ ACTING_RUNTIME_ALARM = {
     "AlarmActions": [SNS_TOPIC],
 }
 
+# DescribeAlarms returns these fields on every static-threshold alarm.
+SINGLE_EVENT_THRESHOLD = {
+    "Statistic": "Sum",
+    "Period": 300,
+    "EvaluationPeriods": 1,
+    "DatapointsToAlarm": 1,
+    "Threshold": 1.0,
+    "ComparisonOperator": "GreaterThanOrEqualToThreshold",
+}
+
 INTERVENED_FILTER_ALARM = {
     "AlarmName": "intervened-spike",
     "Namespace": "Security",
     "MetricName": "Intervened",
     "ActionsEnabled": True,
     "AlarmActions": [SNS_TOPIC],
+    **SINGLE_EVENT_THRESHOLD,
 }
 
 INVOCATION_LOGGING = {
@@ -15787,7 +16233,7 @@ INVOCATION_LOGGING = {
 
 
 def _intervened_alarm(
-    name, actions_enabled=True, actions=True, metric="InvocationsIntervened"
+    name, actions_enabled=True, actions=True, metric="InvocationsIntervened", **fields
 ):
     return {
         "AlarmName": name,
@@ -15795,6 +16241,8 @@ def _intervened_alarm(
         "MetricName": metric,
         "ActionsEnabled": actions_enabled,
         "AlarmActions": [SNS_TOPIC] if actions else [],
+        **SINGLE_EVENT_THRESHOLD,
+        **fields,
     }
 
 
@@ -16045,6 +16493,127 @@ class TestBR32ActingIntervention:
         assert "Alarmed (alarm intervened-spike)" in signal["Finding_Details"]
         assert (
             "metric filter(s) Unalarmed match an intervention"
+            in signal["Finding_Details"]
+        )
+
+    @pytest.mark.parametrize(
+        "fields,reason",
+        [
+            (
+                {"Threshold": 10.0},
+                "(GreaterThanOrEqualToThreshold 10) does not enter ALARM",
+            ),
+            (
+                {"ComparisonOperator": "GreaterThanThreshold", "Threshold": 1.0},
+                "(GreaterThanThreshold 1) does not enter ALARM",
+            ),
+            (
+                {"ComparisonOperator": "LessThanThreshold", "Threshold": 1.0},
+                "(LessThanThreshold 1) does not enter ALARM",
+            ),
+            ({"Statistic": "Average"}, "uses statistic Average"),
+            (
+                {"DatapointsToAlarm": 3, "EvaluationPeriods": 3},
+                "needs 3 breaching periods",
+            ),
+            ({"Threshold": None}, "returns no static Threshold"),
+        ],
+    )
+    def test_an_alarm_that_one_intervention_does_not_raise_is_not_a_signal(
+        self, fields, reason
+    ):
+        _, signal = self._run([_intervened_alarm("late", **fields)])
+        assert signal["Status"] == "Failed"
+        assert f"alarm late {reason}" in signal["Finding_Details"]
+
+    def test_one_single_event_alarm_beside_a_high_threshold_one_passes(self):
+        _, signal = self._run(
+            [
+                _intervened_alarm("late", Threshold=50.0),
+                _intervened_alarm("paged"),
+            ]
+        )
+        assert signal["Status"] == "Passed"
+        assert "CloudWatch alarm(s) paged on" in signal["Finding_Details"]
+        assert (
+            "alarm late (GreaterThanOrEqualToThreshold 50)" in signal["Finding_Details"]
+        )
+
+    def test_an_alarm_on_a_slice_dimension_is_not_a_signal(self):
+        _, signal = self._run(
+            [
+                _intervened_alarm(
+                    "topics",
+                    Dimensions=[
+                        {"Name": "GuardrailPolicyType", "Value": "TopicPolicy"}
+                    ],
+                ),
+                _intervened_alarm(
+                    "inputs",
+                    Dimensions=[{"Name": "GuardrailContentSource", "Value": "Input"}],
+                ),
+            ]
+        )
+        assert signal["Status"] == "Failed"
+        assert (
+            "alarm topics counts only the interventions where GuardrailPolicyType "
+            "is TopicPolicy" in signal["Finding_Details"]
+        )
+        assert "alarm inputs counts only" in signal["Finding_Details"]
+
+    def test_an_alarm_on_one_guardrail_version_is_not_a_pass(self):
+        _, signal = self._run(
+            [
+                _intervened_alarm(
+                    "one-version",
+                    Dimensions=[
+                        {"Name": "GuardrailArn", "Value": "arn:g"},
+                        {"Name": "GuardrailVersion", "Value": "1"},
+                    ],
+                )
+            ]
+        )
+        assert signal["Status"] == "N/A"
+        assert (
+            "alarm one-version counts only GuardrailArn arn:g, GuardrailVersion 1"
+            in signal["Finding_Details"]
+        )
+
+    def test_a_metric_math_alarm_is_not_judged_either_way(self):
+        alarm = _intervened_alarm("math")
+        alarm.pop("MetricName")
+        alarm["Metrics"] = [
+            {
+                "Id": "m1",
+                "MetricStat": {
+                    "Metric": {
+                        "Namespace": "AWS/Bedrock/Guardrails",
+                        "MetricName": "InvocationsIntervened",
+                    },
+                    "Stat": "Sum",
+                    "Period": 300,
+                },
+            },
+            {"Id": "e1", "Expression": "m1 * 0", "ReturnData": True},
+        ]
+        _, signal = self._run([alarm])
+        assert signal["Status"] == "N/A"
+        assert (
+            "alarm math evaluates a metric math expression" in signal["Finding_Details"]
+        )
+
+    def test_a_filter_alarm_that_one_intervention_does_not_raise_is_not_a_signal(self):
+        _, signal = self._run(
+            [dict(INTERVENED_FILTER_ALARM, Threshold=5.0)],
+            metric_filters=[
+                _intervened_filter(
+                    "Alarmed", '{ $.["amazon-bedrock-guardrailAction"] = "INTERVENED" }'
+                ),
+            ],
+        )
+        assert signal["Status"] == "Failed"
+        assert (
+            "alarm intervened-spike (GreaterThanOrEqualToThreshold 5) does not enter ALARM"
             in signal["Finding_Details"]
         )
 
@@ -23876,6 +24445,43 @@ def test_handler_reports_br50_and_br51_unassessed_without_a_cache():
     }
     assert sorted(rows) == ["BR-50", "BR-51"]
     assert all(r["Status"] == "N/A" for r in rows.values())
+
+
+def test_handler_reports_guardrail_condition_pins_unread_without_a_cache():
+    test_client = MagicMock()
+    test_client.get_model_invocation_logging_configuration.side_effect = (
+        _make_client_error("ValidationException")
+    )
+    received = {}
+
+    def inventory(region, permission_cache=None, scp_inventory=None):
+        received["cache"] = permission_cache
+        return {"attachments": [], "versions": {}, "errors": []}
+
+    def prompt_attack(**kwargs):
+        received["errors"] = list(kwargs["attachment_inventory"]["errors"])
+        return {"check_name": "x", "status": "PASS", "details": "", "csv_data": []}
+
+    with (
+        patch.object(bedrock_app.boto3, "client", return_value=test_client),
+        patch.object(bedrock_app, "get_permissions_cache", return_value=None),
+        patch.object(
+            bedrock_app, "get_guardrail_attachment_inventory", side_effect=inventory
+        ),
+        patch.object(
+            bedrock_app,
+            "check_bedrock_guardrail_prompt_attack_filter",
+            side_effect=prompt_attack,
+        ),
+        patch.object(bedrock_app, "generate_csv_report", return_value="csv"),
+        patch.object(bedrock_app, "write_to_s3", return_value="s3://b/r.csv"),
+    ):
+        bedrock_app.lambda_handler(
+            _bedrock_event(region="us-east-1", region_index=0), None
+        )
+    assert received["cache"] is None
+    assert len(received["errors"]) == 1
+    assert "IAM permissions cache was unavailable" in received["errors"][0]
 
 
 def test_handler_reports_agentcore_memory_retention_as_unread():

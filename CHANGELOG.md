@@ -219,6 +219,17 @@ section.
   only when its Deny covers every invoke resource type, and reports `N/A`
   where a Region relies on a guardrail share it could not read. The `BR-06`
   knowledge base row needs `textDataDeliveryEnabled`.
+- `BR-26`, `BR-27` and `BR-34` judge every guardrail version that a
+  `bedrock:GuardrailIdentifier` condition pins in a role, user or group policy,
+  a permissions boundary, an attached service control policy or the effective
+  Organizations Bedrock policy for the Region, and report `N/A` for a wildcard
+  condition value, an errored principal or a version 1 IAM cache. `BR-26`
+  needs `AWS_ACCESS_KEY`, `AWS_SECRET_KEY` and `PASSWORD` to block or mask on
+  each side that sets an entity. `BR-32` credits an intervention alarm only
+  when one intervention raises it, fails a threshold or slice-dimension alarm,
+  and reports a per-version or metric-math alarm as `N/A`. The knowledge base
+  rows of `BR-26` and `BR-34` no longer credit an account-enforced
+  configuration that narrows its model or content scope.
 - Bedrock checks judge values that they used to credit on presence. `BR-07`,
   `BR-17`, `BR-20` (S3 Vectors), `BR-30` and `BR-38` describe each named KMS
   key and pass only an enabled customer managed key. `BR-07` also fails inline
