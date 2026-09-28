@@ -406,6 +406,15 @@ section.
     which names no log group and failed before. `AC-41` reports such a
     configuration as `N/A` and names `AC-20` and `AC-26` as the checks that
     judge the input log groups.
+  - `AC-08` judges a region that holds gateways and no runtime, where it
+    reported `N/A`. It requires an available
+    `com.amazonaws.<region>.bedrock-agentcore` endpoint when runtimes exist
+    and an available `com.amazonaws.<region>.bedrock-agentcore.gateway`
+    endpoint when gateways exist, where any endpoint whose service name
+    carried `agentcore`, the control-plane endpoint included, passed. The
+    inbound leg fails security groups whose ranges together cover
+    `0.0.0.0/0` or `::/0`, which passed when split across narrower ranges.
+    VPCs are read across every page.
 
 ### Deployment impact
 
@@ -499,6 +508,11 @@ account's `alarm:*` ARNs, in both SAM templates, so `AC-40` can read the
 alarms on evaluation scores. It is read-only, and the same CodeBuild run
 applies it. Until it runs, `AC-40` rows that meet the evaluator legs report
 `N/A`, and a configuration whose scores no alarm reads now fails.
+
+`AC-08` changes no IAM grant: `bedrock-agentcore:ListGateways` and
+`ec2:DescribeVpcs` are already on the AgentCore role. A region whose only
+AgentCore endpoint is the control-plane or runtime endpoint now fails where
+its gateways are in use.
 
 ## 2.0.0 - 2026-09-18
 

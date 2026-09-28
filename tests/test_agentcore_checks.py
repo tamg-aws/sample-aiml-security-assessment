@@ -6670,6 +6670,226 @@ _UNGUARDED_TRUST = {
 }
 
 
+def _ac08_endpoint(endpoint_id, service, state="available", groups=("sg-closed",)):
+    return {
+        "VpcEndpointId": endpoint_id,
+        "VpcId": "vpc-1",
+        "State": state,
+        "ServiceName": f"com.amazonaws.us-east-1.{service}",
+        "VpcEndpointType": "Interface",
+        "PrivateDnsEnabled": True,
+        "PolicyDocument": json.dumps(
+            {
+                "Statement": [
+                    {
+                        "Effect": "Allow",
+                        "Principal": {"AWS": "arn:aws:iam::123456789012:role/app"},
+                        "Action": "bedrock-agentcore:*",
+                        "Resource": "*",
+                    }
+                ]
+            }
+        ),
+        "Groups": [{"GroupId": group} for group in groups],
+    }
+
+
+class TestAC08SurfaceEndpoints:
+    """AC-08: the endpoint each surface in use is called through, over its VPCs."""
+
+    @staticmethod
+    def _wire(mock_ac, mock_ec2, endpoints, runtimes=1, gateways=0, groups=None):
+        mock_ac.list_agent_runtimes.return_value = {
+            "agentRuntimes": [{"agentRuntimeId": f"rt-{i}"} for i in range(runtimes)]
+        }
+        mock_ac.list_gateways.return_value = {
+            "items": [{"gatewayId": f"gw-{i}"} for i in range(gateways)]
+        }
+        mock_ec2.describe_vpcs.return_value = {"Vpcs": [{"VpcId": "vpc-1"}]}
+        mock_ec2.describe_vpc_endpoints.return_value = {"VpcEndpoints": endpoints}
+        mock_ec2.describe_security_groups.return_value = {
+            "SecurityGroups": groups
+            or [
+                {
+                    "GroupId": "sg-closed",
+                    "IpPermissions": [{"IpRanges": [{"CidrIp": "10.0.0.0/16"}]}],
+                }
+            ]
+        }
+
+    @staticmethod
+    def _presence(findings):
+        return next(
+            finding
+            for finding in findings
+            if finding["Finding"].startswith("AgentCore VPC Endpoints")
+        )
+
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_gateway_only_region_is_judged(self, mock_ac, mock_ec2):
+        self._wire(
+            mock_ac,
+            mock_ec2,
+            [_ac08_endpoint("vpce-rt", "bedrock-agentcore")],
+            runtimes=0,
+            gateways=2,
+        )
+
+        presence = self._presence(agentcore_app.check_agentcore_vpc_endpoints())
+
+        assert presence["Status"] == "Failed"
+        assert presence["Finding"] == "AgentCore VPC Endpoints Missing"
+        assert "2 gateway(s)" in presence["Finding_Details"]
+        assert "bedrock-agentcore.gateway" in presence["Resolution"]
+
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_gateway_endpoint_passes_a_gateway_only_region(self, mock_ac, mock_ec2):
+        self._wire(
+            mock_ac,
+            mock_ec2,
+            [_ac08_endpoint("vpce-gw", "bedrock-agentcore.gateway")],
+            runtimes=0,
+            gateways=1,
+        )
+
+        presence = self._presence(agentcore_app.check_agentcore_vpc_endpoints())
+
+        assert presence["Status"] == "Passed"
+        assert "bedrock-agentcore.gateway" in presence["Finding_Details"]
+
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_control_plane_endpoint_does_not_serve_either_surface(
+        self, mock_ac, mock_ec2
+    ):
+        self._wire(
+            mock_ac,
+            mock_ec2,
+            [_ac08_endpoint("vpce-control", "bedrock-agentcore-control")],
+            runtimes=1,
+            gateways=1,
+        )
+
+        presence = self._presence(agentcore_app.check_agentcore_vpc_endpoints())
+
+        assert presence["Status"] == "Failed"
+        assert "1 runtime(s)" in presence["Finding_Details"]
+        assert "1 gateway(s)" in presence["Finding_Details"]
+
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_runtime_endpoint_does_not_serve_the_gateways(self, mock_ac, mock_ec2):
+        self._wire(
+            mock_ac,
+            mock_ec2,
+            [
+                _ac08_endpoint("vpce-rt", "bedrock-agentcore"),
+                _ac08_endpoint("vpce-gw", "bedrock-agentcore.gateway", state="pending"),
+            ],
+            runtimes=1,
+            gateways=1,
+        )
+
+        presence = self._presence(agentcore_app.check_agentcore_vpc_endpoints())
+
+        assert presence["Status"] == "Failed"
+        assert "gateway(s)" in presence["Finding_Details"]
+        assert "runtime(s)" not in presence["Finding_Details"]
+
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_both_surface_endpoints_pass(self, mock_ac, mock_ec2):
+        self._wire(
+            mock_ac,
+            mock_ec2,
+            [
+                _ac08_endpoint("vpce-rt", "bedrock-agentcore"),
+                _ac08_endpoint("vpce-gw", "bedrock-agentcore.gateway"),
+            ],
+            runtimes=1,
+            gateways=1,
+        )
+
+        presence = self._presence(agentcore_app.check_agentcore_vpc_endpoints())
+
+        assert presence["Status"] == "Passed"
+
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_an_unlistable_gateway_inventory_is_never_passed(self, mock_ac, mock_ec2):
+        self._wire(
+            mock_ac,
+            mock_ec2,
+            [_ac08_endpoint("vpce-rt", "bedrock-agentcore")],
+        )
+        mock_ac.list_gateways.side_effect = _make_client_error(
+            "AccessDeniedException", "denied"
+        )
+
+        findings = agentcore_app.check_agentcore_vpc_endpoints()
+
+        assert [finding["Status"] for finding in findings] == ["N/A"]
+
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_split_inbound_ranges_open_the_endpoint(self, mock_ac, mock_ec2):
+        self._wire(
+            mock_ac,
+            mock_ec2,
+            [
+                _ac08_endpoint(
+                    "vpce-split", "bedrock-agentcore", groups=("sg-a", "sg-b")
+                ),
+                _ac08_endpoint("vpce-closed", "bedrock-agentcore"),
+            ],
+            groups=[
+                {
+                    "GroupId": "sg-a",
+                    "IpPermissions": [{"IpRanges": [{"CidrIp": "0.0.0.0/1"}]}],
+                },
+                {
+                    "GroupId": "sg-b",
+                    "IpPermissions": [{"IpRanges": [{"CidrIp": "128.0.0.0/1"}]}],
+                },
+                {
+                    "GroupId": "sg-closed",
+                    "IpPermissions": [{"IpRanges": [{"CidrIp": "10.0.0.0/8"}]}],
+                },
+            ],
+        )
+
+        findings = agentcore_app.check_agentcore_vpc_endpoints()
+        network = {
+            finding["Finding_Details"].split(" endpoint ")[1].split(" ")[0]: finding
+            for finding in findings
+            if "Network Scope" in finding["Finding"]
+        }
+
+        assert network["vpce-split"]["Status"] == "Failed"
+        assert "0.0.0.0/0" in network["vpce-split"]["Finding_Details"]
+        assert network["vpce-closed"]["Status"] == "Passed"
+
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_the_vpcs_are_read_from_every_page(self, mock_ac, mock_ec2):
+        self._wire(
+            mock_ac,
+            mock_ec2,
+            [_ac08_endpoint("vpce-control", "bedrock-agentcore-control")],
+        )
+        mock_ec2.describe_vpcs.side_effect = [
+            {"Vpcs": [{"VpcId": "vpc-1"}], "NextToken": "page-2"},
+            {"Vpcs": [{"VpcId": "vpc-2"}]},
+        ]
+
+        presence = self._presence(agentcore_app.check_agentcore_vpc_endpoints())
+
+        assert "2 VPC(s)" in presence["Finding_Details"]
+        mock_ec2.describe_vpcs.assert_any_call(NextToken="page-2")
+
+
 class TestAC08EndpointScope:
     """AC-08 now judges each AgentCore endpoint's policy and inbound scope."""
 

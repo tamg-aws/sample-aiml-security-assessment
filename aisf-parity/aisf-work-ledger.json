@@ -941,7 +941,7 @@
         "AgentCore Resource-Based Policies Check",
         "AgentCore Runtime Invocation Path"
       ],
-      "gap": "AC-47 fails a runtime whose resource policy restricts neither the network path nor the caller: the network leg reads aws:SourceVpc, aws:SourceVpce, aws:VpcSourceIp and aws:SourceIp on any statement, the caller leg reads a named principal or an allowedWorkloadConfiguration on the JWT authorizer. AC-08 fails an AgentCore interface endpoint with private DNS off, which is the leg that keeps the runtime's own callers off the public endpoint name. AC-10 reports only that a policy exists",
+      "gap": "AC-47 passes the network leg only on a resource policy Deny that refuses the invoke action outside a bounded aws:SourceVpc, aws:SourceVpce, aws:VpcSourceIp or aws:SourceIp value, and the caller leg only on an allowedWorkloadConfiguration on the JWT authorizer or a Deny outside a bounded aws:PrincipalArn list, because an Allow does not stop a same-account caller. AC-08 requires an available bedrock-agentcore endpoint when runtimes exist, fails an interface endpoint with private DNS off, and fails a security group set whose inbound ranges together cover the internet. AC-10 reports only that a policy exists",
       "extra_iam": [],
       "phase": 4,
       "tier": "ai_subject",
@@ -966,7 +966,7 @@
         "AgentCore VPC Endpoints Check",
         "AgentCore Gateway Policy Conditions"
       ],
-      "gap": "AC-08 now judges each AgentCore endpoint's policy against the default allow-everything document and reads its security groups for 0.0.0.0/0 and ::/0 inbound rules, alongside the existence and health legs it already held; AC-27 adds the gateway resource policy's aws:SourceVpc / aws:SourceVpce / aws:VpcSourceIp / aws:SourceIp leg",
+      "gap": "AC-08 judges a region holding gateways and no runtime, and requires an available bedrock-agentcore.gateway endpoint when gateways exist, where any endpoint whose name carried agentcore counted. It judges each endpoint's policy against the default allow-everything document and fails a security group set whose inbound ranges together cover 0.0.0.0/0 or ::/0. AC-27 passes the gateway network leg only on a resource policy Deny outside a bounded aws:SourceVpc, aws:SourceVpce, aws:VpcSourceIp or aws:SourceIp value. Which VPC a gateway's callers run in has no API field, so an endpoint in any VPC of the region counts",
       "extra_iam": [],
       "phase": 4,
       "tier": "ai_subject",

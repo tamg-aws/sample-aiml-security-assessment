@@ -2008,12 +2008,13 @@ def _agentcore_egress_findings(
             for group_id in target_groups
             if str(group_id) not in security_groups
         ]
-        open_ranges = _security_groups_open_egress(
+        open_ranges = _security_groups_open_ranges(
             [
                 security_groups[str(group_id)]
                 for group_id in target_groups
                 if str(group_id) in security_groups
-            ]
+            ],
+            "IpPermissionsEgress",
         )
 
         if open_ranges:
@@ -5371,31 +5372,20 @@ def _vpc_endpoint_policy_is_full_access(policy_document: Any) -> bool:
     return False
 
 
-def _security_group_open_ingress(security_group: Dict[str, Any]) -> List[str]:
-    """Return the internet-open inbound CIDR ranges of one security group."""
-    open_ranges: List[str] = []
-    for permission in security_group.get("IpPermissions") or []:
-        if not isinstance(permission, dict):
-            continue
-        for ip_range in permission.get("IpRanges") or []:
-            if isinstance(ip_range, dict) and ip_range.get("CidrIp") == "0.0.0.0/0":
-                open_ranges.append("0.0.0.0/0")
-        for ip_range in permission.get("Ipv6Ranges") or []:
-            if isinstance(ip_range, dict) and ip_range.get("CidrIpv6") == "::/0":
-                open_ranges.append("::/0")
-    return sorted(set(open_ranges))
+def _security_groups_open_ranges(
+    security_groups: List[Dict[str, Any]], permissions_key: str
+) -> List[str]:
+    """Return 0.0.0.0/0 or ::/0 when the groups' ranges together cover it.
 
-
-def _security_groups_open_egress(security_groups: List[Dict[str, Any]]) -> List[str]:
-    """Return 0.0.0.0/0 or ::/0 when the groups' outbound ranges together cover it.
-
-    The rules of every group on one interface add up, so 0.0.0.0/1 on one group
-    and 128.0.0.0/1 on another open the whole IPv4 internet as surely as one
-    0.0.0.0/0 rule does. A range that does not parse is left out.
+    `permissions_key` is IpPermissions for inbound rules or IpPermissionsEgress
+    for outbound ones. The rules of every group on one interface add up, so
+    0.0.0.0/1 on one group and 128.0.0.0/1 on another open the whole IPv4
+    internet as surely as one 0.0.0.0/0 rule does. A range that does not parse
+    is left out.
     """
     networks = []
     for security_group in security_groups:
-        for permission in security_group.get("IpPermissionsEgress") or []:
+        for permission in security_group.get(permissions_key) or []:
             if not isinstance(permission, dict):
                 continue
             for ranges, field in (("IpRanges", "CidrIp"), ("Ipv6Ranges", "CidrIpv6")):
@@ -5440,6 +5430,15 @@ AGENTCORE_DATA_PATH_ENDPOINT_SUFFIXES = (
     ".dynamodb",
     ".sagemaker.api",
     ".sagemaker.runtime",
+)
+
+
+# The endpoint service each AgentCore surface is called through: a runtime is
+# invoked on the data-plane service and a gateway on its own gateway service, so
+# an endpoint for one does not carry the other's traffic.
+AGENTCORE_SURFACE_ENDPOINT_SUFFIXES = (
+    ("runtime", ".bedrock-agentcore"),
+    ("gateway", ".bedrock-agentcore.gateway"),
 )
 
 
@@ -5671,14 +5670,19 @@ def _agentcore_endpoint_scope_findings(
             )
             continue
 
-        open_ranges: List[str] = []
-        unreadable: List[str] = []
-        for group in groups:
-            security_group = security_groups.get(group["GroupId"])
-            if security_group is None:
-                unreadable.append(group["GroupId"])
-                continue
-            open_ranges.extend(_security_group_open_ingress(security_group))
+        unreadable = [
+            group["GroupId"]
+            for group in groups
+            if group["GroupId"] not in security_groups
+        ]
+        open_ranges = _security_groups_open_ranges(
+            [
+                security_groups[group["GroupId"]]
+                for group in groups
+                if group["GroupId"] in security_groups
+            ],
+            "IpPermissions",
+        )
 
         if open_ranges:
             findings.append(
@@ -5687,8 +5691,9 @@ def _agentcore_endpoint_scope_findings(
                     finding_name="AgentCore VPC Endpoint Network Scope Unrestricted",
                     finding_details=(
                         f"AgentCore VPC {label} accepts inbound traffic from "
-                        f"{', '.join(sorted(set(open_ranges)))}, so any host that "
-                        "can route to the VPC reaches this endpoint."
+                        f"{', '.join(open_ranges)} across the inbound ranges of "
+                        "its security groups, so any host that can route to the "
+                        "VPC reaches this endpoint."
                     ),
                     resolution=(
                         "Restrict the endpoint security group's inbound rules to "
@@ -5723,8 +5728,8 @@ def _agentcore_endpoint_scope_findings(
                     finding_name="AgentCore VPC Endpoint Network Scope",
                     finding_details=(
                         f"AgentCore VPC {label} accepts no inbound traffic from "
-                        "0.0.0.0/0 or ::/0 on any of its "
-                        f"{len(groups)} security group(s)."
+                        "0.0.0.0/0 or ::/0, alone or pieced together from "
+                        f"narrower ranges, on its {len(groups)} security group(s)."
                     ),
                     resolution=(
                         "No action required. Confirm the inbound rules name only "
@@ -5744,7 +5749,9 @@ def check_agentcore_vpc_endpoints() -> List[Dict[str, Any]]:
     Check for AWS PrivateLink VPC endpoints for AgentCore.
 
     Validates:
-    - VPC endpoints exist for bedrock-agentcore services
+    - An available endpoint exists for the service each surface in use is called
+      through: bedrock-agentcore for runtimes, bedrock-agentcore.gateway for
+      gateways
     - Private connectivity is configured
     - Each endpoint's policy authorizes something narrower than every call
     - Each endpoint's security group admits a narrower source than the internet
@@ -5774,8 +5781,10 @@ def check_agentcore_vpc_endpoints() -> List[Dict[str, Any]]:
         logger.info("Checking for AgentCore VPC endpoints")
 
         runtimes = _agentcore_list_all("list_agent_runtimes", ["agentRuntimes"])
+        gateways = _agentcore_list_all("list_gateways", ["items", "gateways"])
+        surface_counts = {"runtime": len(runtimes), "gateway": len(gateways)}
 
-        if not runtimes:
+        if not runtimes and not gateways:
             findings.append(
                 create_finding(
                     check_id="AC-08",
@@ -5789,9 +5798,13 @@ def check_agentcore_vpc_endpoints() -> List[Dict[str, Any]]:
             )
             return findings
 
-        # Get all VPCs
-        vpcs_response = ec2_client.describe_vpcs()
-        vpcs = vpcs_response.get("Vpcs", [])
+        vpcs = _paginate_aws_list(
+            ec2_client,
+            "describe_vpcs",
+            "Vpcs",
+            token_request_key="NextToken",
+            token_response_key="NextToken",
+        )
 
         if not vpcs:
             findings.append(
@@ -5859,8 +5872,49 @@ def check_agentcore_vpc_endpoints() -> List[Dict[str, Any]]:
             unhealthy_endpoints = [
                 e for e in found_agentcore_endpoints if e["state"] != "available"
             ]
+            available_services = [
+                str(e["service"]).lower()
+                for e in found_agentcore_endpoints
+                if e["state"] == "available"
+            ]
+            missing_surfaces = [
+                (surface, suffix)
+                for surface, suffix in AGENTCORE_SURFACE_ENDPOINT_SUFFIXES
+                if surface_counts[surface]
+                and not any(name.endswith(suffix) for name in available_services)
+            ]
 
-            if unhealthy_endpoints:
+            if missing_surfaces:
+                missing_text = "; ".join(
+                    f"{surface_counts[surface]} {surface}(s) are called through "
+                    f"com.amazonaws.<region>{suffix} and no available endpoint in "
+                    f"{len(vpc_ids)} VPC(s) serves it"
+                    for surface, suffix in missing_surfaces
+                )
+                findings.append(
+                    create_finding(
+                        check_id="AC-08",
+                        finding_name="AgentCore VPC Endpoints Missing",
+                        finding_details=(
+                            f"{missing_text}, so those calls leave the VPC for the "
+                            "public service endpoint. The AgentCore endpoints found "
+                            "are for other services, and an endpoint for one "
+                            "service carries none of another's traffic."
+                        ),
+                        resolution=(
+                            "Create an interface endpoint for "
+                            + ", ".join(
+                                f"com.amazonaws.<region>{suffix}"
+                                for _, suffix in missing_surfaces
+                            )
+                            + " in the VPCs whose workloads call it."
+                        ),
+                        reference="https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/vpc.html",
+                        severity=SeverityEnum.HIGH,
+                        status=StatusEnum.FAILED,
+                    )
+                )
+            elif unhealthy_endpoints:
                 findings.append(
                     create_finding(
                         check_id="AC-08",
