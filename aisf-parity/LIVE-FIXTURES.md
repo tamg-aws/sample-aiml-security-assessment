@@ -12,7 +12,9 @@ of the AISF-01 and AISF-05 fixtures is named with the `aisflive` prefix. Four of
 knowledge base and both IAM roles. The gateway, the vector bucket and the vector index
 carry no tags at all. The AISF-03 fixture came later and follows a different
 scheme: both resources are named `aisf-fixture-br10-*` and carry the single tag
-`Purpose=aisf-parity-fixture`. Its section below lists both by identifier.
+`Purpose=aisf-parity-fixture`. Its section below lists both by identifier. The
+AISF-04 fixture follows the same scheme: one guardrail named
+`aisf-fixture-br26-guardrail` with the same single tag.
 
 Neither tag is a teardown selector. Measured on 2026-09-25,
 `resourcegroupstaggingapi get-resources --tag-filters
@@ -240,6 +242,21 @@ negligible. The CMK is the only recurring charge in either fixture.
 **Cost: $0.** Guardrails bill per text unit evaluated, and nothing calls this one. The
 role has no attached caller and is never assumed.
 
+## AISF-04: a guardrail whose sensitive-information filter passes BR-26
+
+- Guardrail `aisf-fixture-br26-guardrail` (`6qpwl7cviw2m`), working draft only. Its
+  sensitive-information policy sets `AWS_ACCESS_KEY`, `AWS_SECRET_KEY` and `PASSWORD`
+  to `BLOCK` on input and output, and one regex, `internal-account-id`
+  (`acct-[0-9]{12}`), to `ANONYMIZE` on input and output. That is the smallest
+  policy `_sensitive_information_verdict` passes: each credential entity type blocks
+  or masks on both sides, and a custom regex acts on the output.
+- It was added on 2026-09-28 after the 50ea5ef run measured AISF-04 ONE_ONLY. BR-26
+  had stopped crediting a guardrail for carrying any PII filter (8da7905, f706fe1),
+  and none of the account's other guardrails blocks the credential types on both
+  sides, so Passed never fired.
+
+**Cost: $0.** Guardrails bill per text unit evaluated, and nothing calls this one.
+
 ## Teardown
 
 The KMS key has a **7-day minimum** deletion window, so it outlives the other
@@ -266,10 +283,13 @@ aws kms schedule-key-deletion --key-id alias/aisflive-vectors-cmk --pending-wind
 aws iam delete-role-policy --role-name aisf-fixture-br10-bound --policy-name br10-guardrail-bound
 aws iam delete-role --role-name aisf-fixture-br10-bound
 aws bedrock delete-guardrail --guardrail-identifier 9mls97oibka9
+
+# AISF-04
+aws bedrock delete-guardrail --guardrail-identifier 6qpwl7cviw2m
 ```
 
-Tearing these down returns AISF-01, AISF-03 and AISF-05 to ONE_ONLY, which fails
-the gate for all three. That is the intended behaviour: the gate reports what the account can
+Tearing these down returns AISF-01, AISF-03, AISF-04 and AISF-05 to ONE_ONLY, which
+fails the gate for all four. That is the intended behaviour: the gate reports what the account can
 actually prove, so removing a fixture must remove the proof.
 
 ## Also standing: the stack deployed to read the rows in a real report
