@@ -749,8 +749,12 @@ def check_sagemaker_internet_access(region: str = "") -> Dict[str, Any]:
         findings = {"csv_data": []}
 
         instances_with_direct_access = []
+        instances_outside_vpc = []
         domains_with_direct_access = []
         total_resources_checked = 0
+        # AIR-SGM-TRN-05: a failed read is named in an Incomplete row and
+        # withholds the Passed row.
+        unread = []
 
         # Create SageMaker client
         sagemaker_client = boto3.client(
@@ -765,9 +769,23 @@ def check_sagemaker_internet_access(region: str = "") -> Dict[str, Any]:
                     instance_name = instance.get("NotebookInstanceName")
                     if instance_name:
                         # Get detailed information about the notebook instance
-                        instance_details = sagemaker_client.describe_notebook_instance(
-                            NotebookInstanceName=instance_name
-                        )
+                        try:
+                            instance_details = (
+                                sagemaker_client.describe_notebook_instance(
+                                    NotebookInstanceName=instance_name
+                                )
+                            )
+                        except Exception as e:
+                            unread.append(
+                                f"sagemaker:DescribeNotebookInstance {instance_name} "
+                                f"({get_assessment_error_label(e)})"
+                            )
+                            continue
+
+                        # The Passed text claims VPC placement, so it is read:
+                        # a notebook without SubnetId runs on SageMaker's network.
+                        if not instance_details.get("SubnetId"):
+                            instances_outside_vpc.append(instance_name)
 
                         # Check if direct internet access is enabled
                         if instance_details.get("DirectInternetAccess") == "Enabled":
@@ -783,6 +801,9 @@ def check_sagemaker_internet_access(region: str = "") -> Dict[str, Any]:
                         total_resources_checked += 1
         except Exception as e:
             logger.error(f"Error checking notebook instances: {str(e)}")
+            unread.append(
+                f"sagemaker:ListNotebookInstances ({get_assessment_error_label(e)})"
+            )
 
         # Check SageMaker Domains
         try:
@@ -792,9 +813,16 @@ def check_sagemaker_internet_access(region: str = "") -> Dict[str, Any]:
                     domain_id = domain.get("DomainId")
                     if domain_id:
                         # Get detailed information about the domain
-                        domain_details = sagemaker_client.describe_domain(
-                            DomainId=domain_id
-                        )
+                        try:
+                            domain_details = sagemaker_client.describe_domain(
+                                DomainId=domain_id
+                            )
+                        except Exception as e:
+                            unread.append(
+                                f"sagemaker:DescribeDomain {domain_id} "
+                                f"({get_assessment_error_label(e)})"
+                            )
+                            continue
 
                         vpc_id = domain_details.get("DomainSettings", {}).get(
                             "SecurityGroupIds", ["N/A"]
@@ -813,9 +841,14 @@ def check_sagemaker_internet_access(region: str = "") -> Dict[str, Any]:
                         total_resources_checked += 1
         except Exception as e:
             logger.error(f"Error checking domains: {str(e)}")
+            unread.append(f"sagemaker:ListDomains ({get_assessment_error_label(e)})")
 
         # Generate findings
-        if instances_with_direct_access or domains_with_direct_access:
+        if (
+            instances_with_direct_access
+            or domains_with_direct_access
+            or instances_outside_vpc
+        ):
             findings["status"] = "WARN"
 
             # Add findings for notebook instances
@@ -826,6 +859,25 @@ def check_sagemaker_internet_access(region: str = "") -> Dict[str, Any]:
                         finding_name="Direct Internet Access Enabled",
                         finding_details=f"SageMaker notebook instance '{instance['name']}' has direct internet access enabled",
                         resolution="Configure the notebook instance to use VPC connectivity and disable direct internet access",
+                        reference="https://docs.aws.amazon.com/sagemaker/latest/dg/infrastructure-security.html",
+                        severity="High",
+                        status="Failed",
+                        region=region,
+                    )
+                )
+
+            for instance_name in instances_outside_vpc:
+                findings["csv_data"].append(
+                    create_finding(
+                        check_id="SM-01",
+                        finding_name="Notebook Instance Outside VPC",
+                        finding_details=(
+                            f"SageMaker notebook instance '{instance_name}' has no "
+                            "SubnetId, so it runs outside a customer VPC and none "
+                            "of the VPC's security groups or endpoints governs its "
+                            "traffic"
+                        ),
+                        resolution="Recreate the notebook instance with SubnetId and SecurityGroupIds in a private subnet",
                         reference="https://docs.aws.amazon.com/sagemaker/latest/dg/infrastructure-security.html",
                         severity="High",
                         status="Failed",
@@ -847,7 +899,7 @@ def check_sagemaker_internet_access(region: str = "") -> Dict[str, Any]:
                         region=region,
                     )
                 )
-        else:
+        elif not unread:
             findings["details"] = (
                 "No SageMaker resources found with direct internet access"
             )
@@ -856,7 +908,12 @@ def check_sagemaker_internet_access(region: str = "") -> Dict[str, Any]:
                     create_finding(
                         check_id="SM-01",
                         finding_name="SageMaker Internet Access Check",
-                        finding_details="All SageMaker resources are properly configured to use VPC connectivity",
+                        finding_details=(
+                            f"All {total_resources_checked} SageMaker notebook "
+                            "instances and domains read use VPC connectivity: "
+                            "each notebook has a SubnetId and DirectInternetAccess "
+                            "Disabled, and each domain is VpcOnly"
+                        ),
                         resolution="No action required",
                         reference="https://docs.aws.amazon.com/sagemaker/latest/dg/infrastructure-security.html",
                         severity="High",
@@ -877,6 +934,19 @@ def check_sagemaker_internet_access(region: str = "") -> Dict[str, Any]:
                         region=region,
                     )
                 )
+
+        if unread:
+            findings["csv_data"].append(
+                _unread_resources_finding(
+                    "SM-01",
+                    "SageMaker Internet Access Check",
+                    unread,
+                    f"{total_resources_checked} notebook instance(s) and domain(s) "
+                    "were described.",
+                    "https://docs.aws.amazon.com/sagemaker/latest/dg/infrastructure-security.html",
+                    region,
+                )
+            )
 
         return findings
 
@@ -3179,11 +3249,426 @@ def check_sagemaker_model_monitor_usage(
         }
 
 
-def check_sagemaker_notebook_root_access(region: str = "") -> Dict[str, Any]:
+NOTEBOOK_ROOT_REFERENCE = (
+    "https://docs.aws.amazon.com/sagemaker/latest/dg/nbi-root-access.html"
+)
+NOTEBOOK_ROLE_PRIVILEGE_FINDING = "SageMaker Development Environment Execution Role"
+NOTEBOOK_ROLE_PRIVILEGE_REFERENCE = (
+    "https://docs.aws.amazon.com/sagemaker/latest/dg/sagemaker-roles.html"
+)
+# AWS managed policies that grant a development environment every SageMaker
+# action or more. The recommendation names AmazonSageMakerFullAccess.
+BROAD_MANAGED_POLICY_NAMES = (
+    "AmazonSageMakerFullAccess",
+    "AdministratorAccess",
+    "PowerUserAccess",
+)
+NOTEBOOK_TRAIL_FINDING = "SageMaker Development Environment API Logging"
+NOTEBOOK_TRAIL_REFERENCE = (
+    "https://docs.aws.amazon.com/sagemaker/latest/dg/logging-using-cloudtrail.html"
+)
+NOTEBOOK_CONFIG_RULES_FINDING = "SageMaker Notebook Config Rules"
+NOTEBOOK_CONFIG_RULES_REFERENCE = (
+    "https://docs.aws.amazon.com/config/latest/developerguide/"
+    "sagemaker-notebook-instance-kms-key-configured.html"
+)
+NOTEBOOK_CONFIG_RULE_IDENTIFIERS = (
+    "SAGEMAKER_NOTEBOOK_NO_DIRECT_INTERNET_ACCESS",
+    "SAGEMAKER_NOTEBOOK_INSTANCE_KMS_KEY_CONFIGURED",
+)
+NOTEBOOK_KMS_RULE_IDENTIFIER = "SAGEMAKER_NOTEBOOK_INSTANCE_KMS_KEY_CONFIGURED"
+SAGEMAKER_EVENT_SOURCE = "sagemaker.amazonaws.com"
+
+
+def _role_name_from_arn(role_arn: str) -> str:
+    return str(role_arn).rsplit("/", 1)[-1]
+
+
+def _broad_role_grant(permissions: Dict[str, Any]) -> Optional[str]:
+    """
+    Return why a role holds every SageMaker action or more, or None.
+
+    A permissions boundary that does not allow every SageMaker action caps the
+    role, so it is not reported.
+    """
+    if not _boundary_allows_every_sagemaker_action(
+        permissions.get("permissions_boundary")
+    ):
+        return None
+    for policy in permissions.get("attached_policies") or []:
+        arn = str(policy.get("arn") or "")
+        for name in BROAD_MANAGED_POLICY_NAMES:
+            if re.fullmatch(rf"arn:[^:]+:iam::aws:policy/(.*/)?{name}", arn):
+                return f"AWS managed policy {name}"
+    for policy in (permissions.get("attached_policies") or []) + (
+        permissions.get("inline_policies") or []
+    ):
+        if ":iam::aws:policy/" in str(policy.get("arn") or ""):
+            continue
+        for statement in _sm_policy_statements(policy.get("document")):
+            if str(statement.get("Effect", "")).upper() != "ALLOW":
+                continue
+            if any(a.strip() == "*" for a in _policy_values(statement.get("Action"))):
+                return f"policy '{policy.get('name') or 'inline'}' allows Action '*'"
+            reason = _service_wide_sagemaker_grant(statement)
+            if reason:
+                return (
+                    f"policy '{policy.get('name') or 'inline'}' allows every "
+                    f"SageMaker action through {reason}"
+                )
+    return None
+
+
+def _environment_role_findings(
+    environment_roles: List[tuple],
+    permission_cache: Optional[Dict[str, Any]],
+    region: str,
+) -> List[Dict[str, Any]]:
+    """
+    Judge each development environment's execution role from the IAM cache.
+
+    environment_roles holds (environment label, role ARN) pairs.
+    """
+    if not environment_roles:
+        return []
+    broad = []
+    unread = []
+    if permission_cache is None:
+        unread = [
+            f"{label} role {role_arn} (the IAM permissions cache was not available)"
+            for label, role_arn in environment_roles
+        ]
+    else:
+        cached = permission_cache.get("role_permissions") or {}
+        unread_principals = set(_cache_unread_principals(permission_cache) or [])
+        for label, role_arn in environment_roles:
+            name = _role_name_from_arn(role_arn)
+            if name not in cached:
+                unread.append(f"{label} role {role_arn} (not in the IAM cache)")
+                continue
+            reason = _broad_role_grant(cached[name])
+            if reason:
+                broad.append(f"{label} runs as role '{name}', which holds {reason}")
+            elif any(p.startswith(f"Role '{name}' ") for p in unread_principals):
+                unread.append(f"{label} role {role_arn} (IAM cache read error)")
+    rows = []
+    for entry in broad[:20]:
+        rows.append(
+            create_finding(
+                check_id="SM-09",
+                finding_name=NOTEBOOK_ROLE_PRIVILEGE_FINDING,
+                finding_details=(
+                    f"{entry}. A development environment with this role can act "
+                    "on every SageMaker resource, not only its experiment's. "
+                    f"{SCP_NOT_EVALUATED_NOTE}"
+                ),
+                resolution=(
+                    "Replace the broad grant with a least-privilege execution role "
+                    "scoped to the environment's buckets, keys and resources."
+                ),
+                reference=NOTEBOOK_ROLE_PRIVILEGE_REFERENCE,
+                severity="High",
+                status="Failed",
+                region=region,
+            )
+        )
+    if len(broad) > 20:
+        rows.append(
+            create_finding(
+                check_id="SM-09",
+                finding_name=NOTEBOOK_ROLE_PRIVILEGE_FINDING,
+                finding_details=(
+                    f"{len(broad) - 20} more development environment(s) run as a "
+                    "role with a service-wide or administrator grant."
+                ),
+                resolution="Review the remaining execution roles.",
+                reference=NOTEBOOK_ROLE_PRIVILEGE_REFERENCE,
+                severity="High",
+                status="Failed",
+                region=region,
+            )
+        )
+    if unread:
+        rows.append(
+            _unread_resources_finding(
+                "SM-09",
+                NOTEBOOK_ROLE_PRIVILEGE_FINDING,
+                unread,
+                f"{len(environment_roles) - len(unread)} execution role(s) were read.",
+                NOTEBOOK_ROLE_PRIVILEGE_REFERENCE,
+                region,
+            )
+        )
+    elif not broad:
+        rows.append(
+            create_finding(
+                check_id="SM-09",
+                finding_name=NOTEBOOK_ROLE_PRIVILEGE_FINDING,
+                finding_details=(
+                    f"None of the {len(environment_roles)} development environment "
+                    "execution role(s) holds AmazonSageMakerFullAccess, an "
+                    "administrator policy, Action '*' or every SageMaker action. "
+                    f"{SCP_NOT_EVALUATED_NOTE}"
+                ),
+                resolution="No action required",
+                reference=NOTEBOOK_ROLE_PRIVILEGE_REFERENCE,
+                severity="High",
+                status="Passed",
+                region=region,
+            )
+        )
+    return rows
+
+
+def _advanced_selector_management_coverage(selector: Dict[str, Any]) -> set:
+    """Return which of {"read", "write"} management events a selector records."""
+    fields = {
+        str(field.get("Field")): field for field in selector.get("FieldSelectors") or []
+    }
+    category = fields.get("eventCategory") or {}
+    if "Management" not in (category.get("Equals") or []):
+        return set()
+    for name, field in fields.items():
+        if name in ("eventCategory", "readOnly"):
+            continue
+        if name != "eventSource":
+            # Any other field narrows the selector in a way this check does
+            # not judge, so the selector is not counted.
+            return set()
+        allowed = set(field) - {"Field"}
+        if allowed - {"Equals", "NotEquals"}:
+            return set()
+        if "Equals" in field and SAGEMAKER_EVENT_SOURCE not in field["Equals"]:
+            return set()
+        if SAGEMAKER_EVENT_SOURCE in (field.get("NotEquals") or []):
+            return set()
+    read_only = fields.get("readOnly")
+    if read_only is None:
+        return {"read", "write"}
+    if set(read_only) - {"Field", "Equals"}:
+        return set()
+    values = {str(v).lower() for v in read_only.get("Equals") or []}
+    return ({"read"} if "true" in values else set()) | (
+        {"write"} if "false" in values else set()
+    )
+
+
+def _selectors_record_sagemaker_management(selectors: Dict[str, Any]) -> bool:
+    """Return whether a trail's selectors record read and write SageMaker calls."""
+    covered = set()
+    for selector in selectors.get("EventSelectors") or []:
+        if selector.get("IncludeManagementEvents") is not True:
+            continue
+        if SAGEMAKER_EVENT_SOURCE in (
+            selector.get("ExcludeManagementEventSources") or []
+        ):
+            continue
+        read_write = selector.get("ReadWriteType")
+        if read_write == "All":
+            covered |= {"read", "write"}
+        elif read_write == "ReadOnly":
+            covered.add("read")
+        elif read_write == "WriteOnly":
+            covered.add("write")
+    for selector in selectors.get("AdvancedEventSelectors") or []:
+        covered |= _advanced_selector_management_coverage(selector)
+    return covered == {"read", "write"}
+
+
+def _environment_trail_finding(region: str) -> Dict[str, Any]:
+    """
+    Report whether one logging trail sends this Region's SageMaker management
+    events, read and write, to CloudWatch Logs.
+    """
+    cloudtrail_client = boto3.client(
+        "cloudtrail", config=boto3_config, region_name=region
+    )
+    try:
+        trails = cloudtrail_client.describe_trails(includeShadowTrails=True).get(
+            "trailList", []
+        )
+    except Exception as error:
+        return _unread_resources_finding(
+            "SM-09",
+            NOTEBOOK_TRAIL_FINDING,
+            [f"cloudtrail:DescribeTrails ({get_assessment_error_label(error)})"],
+            "no trail was read.",
+            NOTEBOOK_TRAIL_REFERENCE,
+            region,
+        )
+    problems = []
+    unread = []
+    for trail in trails:
+        name = trail.get("Name") or trail.get("TrailARN")
+        trail_id = trail.get("TrailARN") or name
+        if not trail.get("IsMultiRegionTrail") and trail.get("HomeRegion") != region:
+            continue
+        if not trail.get("CloudWatchLogsLogGroupArn"):
+            problems.append(f"trail '{name}' does not deliver to CloudWatch Logs")
+            continue
+        home_client = boto3.client(
+            "cloudtrail",
+            config=boto3_config,
+            region_name=trail.get("HomeRegion") or region,
+        )
+        try:
+            status = home_client.get_trail_status(Name=trail_id)
+            selectors = home_client.get_event_selectors(TrailName=trail_id)
+        except Exception as error:
+            unread.append(f"trail '{name}' ({get_assessment_error_label(error)})")
+            continue
+        if status.get("IsLogging") is not True:
+            problems.append(f"trail '{name}' is not logging")
+            continue
+        if not _selectors_record_sagemaker_management(selectors):
+            problems.append(
+                f"trail '{name}' does not record both read and write SageMaker "
+                "management events"
+            )
+            continue
+        return create_finding(
+            check_id="SM-09",
+            finding_name=NOTEBOOK_TRAIL_FINDING,
+            finding_details=(
+                f"Trail '{name}' is logging, covers {region}, records read and "
+                "write SageMaker management events and delivers them to CloudWatch "
+                f"Logs group {trail['CloudWatchLogsLogGroupArn']}."
+            ),
+            resolution="No action required",
+            reference=NOTEBOOK_TRAIL_REFERENCE,
+            severity="Medium",
+            status="Passed",
+            region=region,
+        )
+    if unread:
+        return _unread_resources_finding(
+            "SM-09",
+            NOTEBOOK_TRAIL_FINDING,
+            unread,
+            "; ".join(problems[:5]) or "no other trail covers this Region.",
+            NOTEBOOK_TRAIL_REFERENCE,
+            region,
+        )
+    return create_finding(
+        check_id="SM-09",
+        finding_name=NOTEBOOK_TRAIL_FINDING,
+        finding_details=(
+            "No logging trail records this Region's SageMaker management events "
+            "and delivers them to CloudWatch Logs, so notebook and Studio access "
+            "(CreatePresignedNotebookInstanceUrl, CreatePresignedDomainUrl) is not "
+            f"monitored like production access. {'; '.join(problems[:5])}"
+        ).strip(),
+        resolution=(
+            "Configure a multi-Region trail that records read and write "
+            "management events, and set its CloudWatch Logs log group."
+        ),
+        reference=NOTEBOOK_TRAIL_REFERENCE,
+        severity="Medium",
+        status="Failed",
+        region=region,
+    )
+
+
+def _notebook_config_rules_finding(region: str) -> Dict[str, Any]:
+    """Report whether the two notebook Config rules are active and unnarrowed."""
+    config_client = boto3.client("config", config=boto3_config, region_name=region)
+    rules = []
+    try:
+        for page in config_client.get_paginator("describe_config_rules").paginate():
+            rules.extend(page.get("ConfigRules", []))
+    except Exception as error:
+        return _unread_resources_finding(
+            "SM-09",
+            NOTEBOOK_CONFIG_RULES_FINDING,
+            [f"config:DescribeConfigRules ({get_assessment_error_label(error)})"],
+            "no Config rule was read.",
+            NOTEBOOK_CONFIG_RULES_REFERENCE,
+            region,
+        )
+    problems = []
+    passing = []
+    for identifier in NOTEBOOK_CONFIG_RULE_IDENTIFIERS:
+        matches = [
+            rule
+            for rule in rules
+            if (rule.get("Source") or {}).get("Owner") == "AWS"
+            and (rule.get("Source") or {}).get("SourceIdentifier") == identifier
+            and rule.get("ConfigRuleState") == "ACTIVE"
+        ]
+        reasons = []
+        chosen = None
+        for rule in matches:
+            scope = rule.get("Scope") or {}
+            if scope.get("ComplianceResourceId") or scope.get("TagKey"):
+                reasons.append(
+                    f"rule '{rule.get('ConfigRuleName')}' is scoped to named or "
+                    "tagged resources"
+                )
+                continue
+            if identifier == NOTEBOOK_KMS_RULE_IDENTIFIER:
+                try:
+                    parameters = json.loads(rule.get("InputParameters") or "{}")
+                except ValueError:
+                    parameters = {}
+                if not str(parameters.get("kmsKeyArns") or "").strip():
+                    reasons.append(
+                        f"rule '{rule.get('ConfigRuleName')}' has no kmsKeyArns, so "
+                        "any key passes"
+                    )
+                    continue
+            chosen = rule
+            break
+        if chosen:
+            passing.append(f"{identifier} as '{chosen.get('ConfigRuleName')}'")
+        elif reasons:
+            problems.append(f"{identifier}: {'; '.join(reasons[:3])}")
+        else:
+            problems.append(f"{identifier}: no ACTIVE rule")
+    if problems:
+        return create_finding(
+            check_id="SM-09",
+            finding_name=NOTEBOOK_CONFIG_RULES_FINDING,
+            finding_details=(
+                f"{len(problems)} of {len(NOTEBOOK_CONFIG_RULE_IDENTIFIERS)} notebook "
+                f"Config rules are missing or narrowed in {region}: "
+                f"{'; '.join(problems)}."
+            ),
+            resolution=(
+                "Deploy sagemaker-notebook-no-direct-internet-access and "
+                "sagemaker-notebook-instance-kms-key-configured with kmsKeyArns set "
+                "to the approved keys, unscoped by resource id or tag."
+            ),
+            reference=NOTEBOOK_CONFIG_RULES_REFERENCE,
+            severity="Medium",
+            status="Failed",
+            region=region,
+        )
+    return create_finding(
+        check_id="SM-09",
+        finding_name=NOTEBOOK_CONFIG_RULES_FINDING,
+        finding_details=(
+            f"Both notebook Config rules are active in {region}: "
+            f"{'; '.join(passing)}. Both are periodic, so they detect a "
+            "non-compliant notebook after it exists."
+        ),
+        resolution="No action required",
+        reference=NOTEBOOK_CONFIG_RULES_REFERENCE,
+        severity="Medium",
+        status="Passed",
+        region=region,
+    )
+
+
+def check_sagemaker_notebook_root_access(
+    region: str = "", permission_cache: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
     """
     Check if SageMaker notebook instances have root access disabled.
     Root access enables privilege escalation and should be disabled for security.
     Aligns with AWS Security Hub control SageMaker.3
+
+    AIR-SGM-TRN-05 also reads each notebook and Studio execution role's
+    privilege, the trail that logs their access and the notebook Config rules.
     """
     logger.debug("Starting check for SageMaker notebook root access")
     try:
@@ -3195,33 +3680,116 @@ def check_sagemaker_notebook_root_access(region: str = "") -> Dict[str, Any]:
 
         notebooks_with_root = []
         notebooks_without_root = []
+        unread = []
+        environment_roles = []
+        environments_found = 0
 
-        try:
-            paginator = sagemaker_client.get_paginator("list_notebook_instances")
-            for page in paginator.paginate():
-                for instance in page.get("NotebookInstances", []):
-                    instance_name = instance.get("NotebookInstanceName")
-                    if instance_name:
-                        instance_details = sagemaker_client.describe_notebook_instance(
-                            NotebookInstanceName=instance_name
+        paginator = sagemaker_client.get_paginator("list_notebook_instances")
+        for page in paginator.paginate():
+            for instance in page.get("NotebookInstances", []):
+                instance_name = instance.get("NotebookInstanceName")
+                if not instance_name:
+                    continue
+                environments_found += 1
+                try:
+                    instance_details = sagemaker_client.describe_notebook_instance(
+                        NotebookInstanceName=instance_name
+                    )
+                except Exception as e:
+                    unread.append(
+                        f"sagemaker:DescribeNotebookInstance {instance_name} "
+                        f"({get_assessment_error_label(e)})"
+                    )
+                    continue
+
+                if instance_details.get("RoleArn"):
+                    environment_roles.append(
+                        (
+                            f"Notebook instance '{instance_name}'",
+                            instance_details["RoleArn"],
                         )
+                    )
 
-                        root_access = instance_details.get("RootAccess", "Enabled")
+                root_access = instance_details.get("RootAccess", "Enabled")
 
-                        if root_access == "Enabled":
-                            notebooks_with_root.append(
-                                {
-                                    "name": instance_name,
-                                    "status": instance_details.get(
-                                        "NotebookInstanceStatus", "Unknown"
-                                    ),
-                                }
-                            )
-                        else:
-                            notebooks_without_root.append(instance_name)
+                if root_access == "Enabled":
+                    notebooks_with_root.append(
+                        {
+                            "name": instance_name,
+                            "status": instance_details.get(
+                                "NotebookInstanceStatus", "Unknown"
+                            ),
+                        }
+                    )
+                else:
+                    notebooks_without_root.append(instance_name)
 
+        environment_unread = []
+        try:
+            domains = []
+            for page in sagemaker_client.get_paginator("list_domains").paginate():
+                domains.extend(page.get("Domains", []))
         except Exception as e:
-            logger.error(f"Error checking notebook instances: {str(e)}")
+            domains = []
+            environment_unread.append(
+                f"sagemaker:ListDomains ({get_assessment_error_label(e)})"
+            )
+        for domain in domains:
+            domain_id = domain.get("DomainId")
+            if not domain_id:
+                continue
+            environments_found += 1
+            try:
+                domain_details = sagemaker_client.describe_domain(DomainId=domain_id)
+            except Exception as e:
+                environment_unread.append(
+                    f"sagemaker:DescribeDomain {domain_id} "
+                    f"({get_assessment_error_label(e)})"
+                )
+                continue
+            default_role = (domain_details.get("DefaultUserSettings") or {}).get(
+                "ExecutionRole"
+            )
+            if default_role:
+                environment_roles.append(
+                    (f"Studio domain '{domain_id}' default", default_role)
+                )
+            try:
+                profiles = []
+                for page in sagemaker_client.get_paginator(
+                    "list_user_profiles"
+                ).paginate(DomainIdEquals=domain_id):
+                    profiles.extend(page.get("UserProfiles", []))
+            except Exception as e:
+                environment_unread.append(
+                    f"sagemaker:ListUserProfiles {domain_id} "
+                    f"({get_assessment_error_label(e)})"
+                )
+                continue
+            for profile in profiles:
+                profile_name = profile.get("UserProfileName")
+                if not profile_name:
+                    continue
+                try:
+                    profile_details = sagemaker_client.describe_user_profile(
+                        DomainId=domain_id, UserProfileName=profile_name
+                    )
+                except Exception as e:
+                    environment_unread.append(
+                        f"sagemaker:DescribeUserProfile {domain_id}/{profile_name} "
+                        f"({get_assessment_error_label(e)})"
+                    )
+                    continue
+                profile_role = (profile_details.get("UserSettings") or {}).get(
+                    "ExecutionRole"
+                )
+                if profile_role:
+                    environment_roles.append(
+                        (
+                            f"Studio user profile '{domain_id}/{profile_name}'",
+                            profile_role,
+                        )
+                    )
 
         if notebooks_with_root:
             for notebook in notebooks_with_root:
@@ -3231,12 +3799,24 @@ def check_sagemaker_notebook_root_access(region: str = "") -> Dict[str, Any]:
                         finding_name="SageMaker Notebook Root Access Enabled",
                         finding_details=f"Notebook instance '{notebook['name']}' has root access enabled. Root access allows users to install arbitrary software, modify system configurations, and potentially escalate privileges.",
                         resolution="Disable root access by updating the notebook instance with RootAccess=Disabled. Note: Lifecycle configurations will still run with root access.",
-                        reference="https://docs.aws.amazon.com/sagemaker/latest/dg/nbi-root-access.html",
+                        reference=NOTEBOOK_ROOT_REFERENCE,
                         severity="High",
                         status="Failed",
                         region=region,
                     )
                 )
+        elif unread:
+            findings["csv_data"].append(
+                _unread_resources_finding(
+                    "SM-09",
+                    "SageMaker Notebook Root Access Check",
+                    unread,
+                    f"{len(notebooks_without_root)} notebook instance(s) have root "
+                    "access disabled.",
+                    NOTEBOOK_ROOT_REFERENCE,
+                    region,
+                )
+            )
         else:
             if notebooks_without_root:
                 # Notebooks exist and all have root access disabled - Passed
@@ -3246,7 +3826,7 @@ def check_sagemaker_notebook_root_access(region: str = "") -> Dict[str, Any]:
                         finding_name="SageMaker Notebook Root Access Check",
                         finding_details=f"All {len(notebooks_without_root)} notebook instances have root access disabled",
                         resolution="No action required",
-                        reference="https://docs.aws.amazon.com/sagemaker/latest/dg/nbi-root-access.html",
+                        reference=NOTEBOOK_ROOT_REFERENCE,
                         severity="High",
                         status="Passed",
                         region=region,
@@ -3260,12 +3840,46 @@ def check_sagemaker_notebook_root_access(region: str = "") -> Dict[str, Any]:
                         finding_name="SageMaker Notebook Root Access Check",
                         finding_details="No notebook instances found",
                         resolution="No action required",
-                        reference="https://docs.aws.amazon.com/sagemaker/latest/dg/nbi-root-access.html",
+                        reference=NOTEBOOK_ROOT_REFERENCE,
                         severity="Informational",
                         status="N/A",
                         region=region,
                     )
                 )
+        if notebooks_with_root and unread:
+            findings["csv_data"].append(
+                _unread_resources_finding(
+                    "SM-09",
+                    "SageMaker Notebook Root Access Check",
+                    unread,
+                    f"{len(notebooks_with_root)} notebook instance(s) have root "
+                    "access enabled.",
+                    NOTEBOOK_ROOT_REFERENCE,
+                    region,
+                )
+            )
+
+        role_rows = _environment_role_findings(
+            environment_roles, permission_cache, region
+        )
+        if environment_unread:
+            role_rows = [row for row in role_rows if row["Status"] != "Passed"] + [
+                _unread_resources_finding(
+                    "SM-09",
+                    NOTEBOOK_ROLE_PRIVILEGE_FINDING,
+                    environment_unread,
+                    f"{len(environment_roles)} execution role(s) were found.",
+                    NOTEBOOK_ROLE_PRIVILEGE_REFERENCE,
+                    region,
+                )
+            ]
+        findings["csv_data"].extend(role_rows)
+
+        # The monitoring half of AIR-SGM-TRN-05 applies where development
+        # environments exist, or where the inventory could not rule them out.
+        if environments_found or unread or environment_unread:
+            findings["csv_data"].append(_environment_trail_finding(region))
+            findings["csv_data"].append(_notebook_config_rules_finding(region))
 
         return findings
 
@@ -8530,13 +9144,46 @@ CREATION_KEY_COMPLIANT_VALUES = {
     "sagemaker:intercontainertrafficencryption": "true",
     "sagemaker:networkisolation": "true",
     "sagemaker:directinternetaccess": "disabled",
+    "sagemaker:rootaccess": "disabled",
 }
 CREATION_KEY_NONCOMPLIANT_VALUES = {
     "sagemaker:intercontainertrafficencryption": "false",
     "sagemaker:networkisolation": "false",
     "sagemaker:directinternetaccess": "enabled",
+    "sagemaker:rootaccess": "enabled",
 }
 CREATION_PROBE_PARTITIONS = ("aws", "aws-cn", "aws-us-gov")
+
+NOTEBOOK_ACCESS_GUARDRAIL_FINDING = "SageMaker Notebook Access Guardrail"
+NOTEBOOK_ACCESS_GUARDRAIL_REFERENCE = (
+    "https://docs.aws.amazon.com/whitepapers/latest/"
+    "sagemaker-studio-admin-best-practices/permissions-management.html"
+)
+# AIR-SGM-TRN-05: each key below is an ActionConditionKey of
+# CreateNotebookInstance in the sagemaker service-reference JSON (read
+# 2026-09-27). The two presigned-URL actions define no action keys, so the
+# global aws:SourceIp and aws:SourceVpce keys restrict where they are called.
+NOTEBOOK_ACCESS_GUARDRAILS = (
+    ("sagemaker:CreateNotebookInstance", ("sagemaker:RootAccess",)),
+    ("sagemaker:CreateNotebookInstance", ("sagemaker:DirectInternetAccess",)),
+    (
+        "sagemaker:CreateNotebookInstance",
+        ("sagemaker:VpcSubnets", "sagemaker:VpcSecurityGroupIds"),
+    ),
+    ("sagemaker:CreateNotebookInstance", ("sagemaker:VolumeKmsKeyArn",)),
+    (
+        "sagemaker:CreatePresignedNotebookInstanceUrl",
+        ("aws:SourceIp", "aws:SourceVpce"),
+    ),
+    ("sagemaker:CreatePresignedDomainUrl", ("aws:SourceIp", "aws:SourceVpce")),
+)
+GUARDED_ACTION_RESOURCE_TYPES = {
+    **dict(SAGEMAKER_GUARDED_CREATE_ACTIONS),
+    "sagemaker:CreatePresignedNotebookInstanceUrl": "notebook-instance",
+    "sagemaker:CreatePresignedDomainUrl": "user-profile",
+}
+# A user profile ARN carries the domain id before the profile name.
+GUARDED_RESOURCE_PROBE_PATHS = {"user-profile": "user-profile/d-zzprobe/zz-probe"}
 MANAGEMENT_ACCOUNT_SCP_NOTE = (
     "Service control policies do not apply to the organization management "
     "account, so none guards SageMaker creation in this account."
@@ -8718,10 +9365,10 @@ def _deny_covers_every_resource(statement: Dict[str, Any], resource_type: str) -
         return False
     for pattern in _policy_values(statement.get("Resource")):
         for partition in CREATION_PROBE_PARTITIONS:
-            probe = (
-                f"arn:{partition}:sagemaker:zz-probe-1:000000000000:"
-                f"{resource_type}/zz-probe"
+            path = GUARDED_RESOURCE_PROBE_PATHS.get(
+                resource_type, f"{resource_type}/zz-probe"
             )
+            probe = f"arn:{partition}:sagemaker:zz-probe-1:000000000000:{path}"
             if _iam_action_matches(pattern, probe):
                 return True
     return False
@@ -8816,7 +9463,7 @@ def _creation_identity_leg(
     """
     if permission_cache is None:
         return {"state": "unread", "principals": [], "v1": False}
-    resource_type = dict(SAGEMAKER_GUARDED_CREATE_ACTIONS)[action]
+    resource_type = GUARDED_ACTION_RESOURCE_TYPES[action]
     open_principals = []
     for identity_type, cache_key in (
         ("Role", "role_permissions"),
@@ -8861,7 +9508,7 @@ def _creation_scp_leg(scp: Dict[str, Any], action: str, keys: tuple) -> Dict[str
     """
     if scp["state"] != "read":
         return {"state": scp["state"], "policies": []}
-    resource_type = dict(SAGEMAKER_GUARDED_CREATE_ACTIONS)[action]
+    resource_type = GUARDED_ACTION_RESOURCE_TYPES[action]
     found = {}
     for item in scp["items"]:
         for statement in _sm_policy_statements(item.get("content")):
@@ -8940,12 +9587,31 @@ def _creation_scp_reason(scp_leg: Dict[str, Any], scp: Dict[str, Any]) -> str:
     return "no service control policy Deny on this action names the key"
 
 
+CREATION_GUARDRAIL_RESOLUTION = (
+    "Deny the named create action in a service control policy "
+    "attached above this account when the key is absent (Null true) or "
+    "outside the approved values (ArnNotEquals or StringNotEquals), or "
+    "add an Allow condition on the key to every policy that grants the "
+    "action. Use sagemaker:VolumeKmsKeyArn and "
+    "sagemaker:OutputKmsKeyArn: the short key names are defined by no "
+    "action and enforce nothing."
+)
+
+
 def _creation_category_finding(
     category: str,
     requirements: tuple,
     scp: Dict[str, Any],
     permission_cache: Optional[Dict[str, Any]],
     region: str,
+    check_id: str = "SM-34",
+    finding_name: str = CREATION_GUARDRAIL_FINDING,
+    reference: str = CREATION_GUARDRAIL_REFERENCE,
+    resolution: str = CREATION_GUARDRAIL_RESOLUTION,
+    scope: str = "at SageMaker creation time",
+    consequence: str = (
+        "A non-compliant resource can be created and is only detected afterwards."
+    ),
 ) -> Dict[str, Any]:
     met = []
     failed = []
@@ -9011,32 +9677,23 @@ def _creation_category_finding(
         identity_notes += f" {IAM_CACHE_V1_NOTE}"
     if failed:
         return create_finding(
-            check_id="SM-34",
-            finding_name=CREATION_GUARDRAIL_FINDING,
+            check_id=check_id,
+            finding_name=finding_name,
             finding_details=(
                 f"{len(failed)} of {total} {category} requirements are not "
-                f"enforced at SageMaker creation time: {'; '.join(failed[:3])}. "
-                "A non-compliant resource can be created and is only detected "
-                f"afterwards.{identity_notes}"
+                f"enforced {scope}: {'; '.join(failed[:3])}. "
+                f"{consequence}{identity_notes}"
             ),
-            resolution=(
-                "Deny the named create action in a service control policy "
-                "attached above this account when the key is absent (Null true) or "
-                "outside the approved values (ArnNotEquals or StringNotEquals), or "
-                "add an Allow condition on the key to every policy that grants the "
-                "action. Use sagemaker:VolumeKmsKeyArn and "
-                "sagemaker:OutputKmsKeyArn: the short key names are defined by no "
-                "action and enforce nothing."
-            ),
-            reference=CREATION_GUARDRAIL_REFERENCE,
+            resolution=resolution,
+            reference=reference,
             severity="Medium",
             status="Failed",
             region=region,
         )
     if unresolved:
         return create_finding(
-            check_id="SM-34",
-            finding_name=f"{CREATION_GUARDRAIL_FINDING} Incomplete",
+            check_id=check_id,
+            finding_name=f"{finding_name} Incomplete",
             finding_details=(
                 f"{len(unresolved)} of {total} {category} requirements could not be "
                 f"established: {'; '.join(unresolved[:3])}. This check recognises "
@@ -9049,25 +9706,75 @@ def _creation_category_finding(
                 "with value true or a negated operator naming the approved values, "
                 "and resolve the unread reads named above."
             ),
-            reference=CREATION_GUARDRAIL_REFERENCE,
+            reference=reference,
             severity="Informational",
             status="N/A",
             region=region,
         )
     return create_finding(
-        check_id="SM-34",
-        finding_name=CREATION_GUARDRAIL_FINDING,
+        check_id=check_id,
+        finding_name=finding_name,
         finding_details=(
-            f"All {total} {category} requirements are enforced at SageMaker "
-            f"creation time for account {scp['account'] or 'unknown'}: "
+            f"All {total} {category} requirements are enforced {scope} "
+            f"for account {scp['account'] or 'unknown'}: "
             f"{'; '.join(met)}.{identity_notes if used_identity else ''}"
         ),
         resolution="No action required",
-        reference=CREATION_GUARDRAIL_REFERENCE,
+        reference=reference,
         severity="Medium",
         status="Passed",
         region=region,
     )
+
+
+def _creation_scp_state(scp_inventory: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Resolve which service control policies govern this account, or why not."""
+    scp = _sm_organization_policy_context()
+    scp["items"] = []
+    scp["path"] = []
+    scp["unread_policies"] = []
+    if scp["state"] == "read":
+        inventory = (
+            scp_inventory
+            if scp_inventory is not None
+            else get_sagemaker_scp_inventory()
+        )
+        if inventory.get("list_error"):
+            scp["state"] = "unread"
+            scp["detail"] = (
+                "service control policies could not be listed from account "
+                f"{scp['account']} ({inventory['list_error']}). A member account "
+                "reads them only as a delegated administrator for "
+                "Organizations policy management; otherwise run the "
+                "assessment from the management account"
+            )
+            scp["resolution"] = (
+                "Grant organizations:ListPolicies, organizations:DescribePolicy, "
+                "organizations:ListTargetsForPolicy and organizations:ListParents "
+                "to the assessment role."
+            )
+        elif scp["management"]:
+            scp["state"] = "exempt"
+            scp["detail"] = (
+                f"this assessment ran in the management account "
+                f"{scp['account']}, which service control policies do not govern"
+            )
+        else:
+            scp["items"] = inventory.get("items", [])
+            try:
+                scp["path"] = _sm_account_policy_path(scp["account"])
+            except ClientError as error:
+                scp["state"] = "unread"
+                scp["detail"] = (
+                    "the account's path to the organization root could not be "
+                    f"read with organizations:ListParents "
+                    f"({get_assessment_error_label(error)}), so which service "
+                    "control policies govern it is unknown"
+                )
+        scp["unread_policies"] = [
+            entry.split(":")[0] for entry in inventory.get("errors", [])
+        ]
+    return scp
 
 
 def check_sagemaker_creation_guardrails(
@@ -9087,51 +9794,7 @@ def check_sagemaker_creation_guardrails(
     logger.debug("Starting check for SageMaker creation guardrails")
     findings = {"csv_data": []}
     try:
-        scp = _sm_organization_policy_context()
-        scp["items"] = []
-        scp["path"] = []
-        scp["unread_policies"] = []
-        if scp["state"] == "read":
-            inventory = (
-                scp_inventory
-                if scp_inventory is not None
-                else get_sagemaker_scp_inventory()
-            )
-            if inventory.get("list_error"):
-                scp["state"] = "unread"
-                scp["detail"] = (
-                    "service control policies could not be listed from account "
-                    f"{scp['account']} ({inventory['list_error']}). A member account "
-                    "reads them only as a delegated administrator for "
-                    "Organizations policy management; otherwise run the "
-                    "assessment from the management account"
-                )
-                scp["resolution"] = (
-                    "Grant organizations:ListPolicies, organizations:DescribePolicy, "
-                    "organizations:ListTargetsForPolicy and organizations:ListParents "
-                    "to the assessment role."
-                )
-            elif scp["management"]:
-                scp["state"] = "exempt"
-                scp["detail"] = (
-                    f"this assessment ran in the management account "
-                    f"{scp['account']}, which service control policies do not govern"
-                )
-            else:
-                scp["items"] = inventory.get("items", [])
-                try:
-                    scp["path"] = _sm_account_policy_path(scp["account"])
-                except ClientError as error:
-                    scp["state"] = "unread"
-                    scp["detail"] = (
-                        "the account's path to the organization root could not be "
-                        f"read with organizations:ListParents "
-                        f"({get_assessment_error_label(error)}), so which service "
-                        "control policies govern it is unknown"
-                    )
-            scp["unread_policies"] = [
-                entry.split(":")[0] for entry in inventory.get("errors", [])
-            ]
+        scp = _creation_scp_state(scp_inventory)
 
         if scp["state"] != "read" and permission_cache is None:
             findings["csv_data"].append(
@@ -9174,6 +9837,92 @@ def check_sagemaker_creation_guardrails(
                     finding_details=build_could_not_assess_detail(error, region),
                     resolution=COULD_NOT_ASSESS_RESOLUTION,
                     reference=CREATION_GUARDRAIL_REFERENCE,
+                    severity="Informational",
+                    status="N/A",
+                    region=region,
+                )
+            ]
+        }
+
+
+def check_sagemaker_notebook_access_guardrails(
+    region: str = "",
+    scp_inventory: Dict[str, Any] = None,
+    permission_cache: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """
+    SM-09: Verify notebook creation and presigned-URL access are held by IAM
+    conditions (AIR-SGM-TRN-05).
+
+    Each (action, key) requirement is met by a Deny in a service control policy
+    attached on this account's path to the root, or by a condition on the key
+    in every identity policy that grants the action.
+    """
+    logger.debug("Starting check for SageMaker notebook access guardrails")
+    try:
+        scp = _creation_scp_state(scp_inventory)
+        if scp["state"] != "read" and permission_cache is None:
+            return {
+                "csv_data": [
+                    create_finding(
+                        check_id="SM-09",
+                        finding_name=NOTEBOOK_ACCESS_GUARDRAIL_FINDING,
+                        finding_details=(
+                            "Notebook access guardrails were not assessed: "
+                            f"{scp['detail']}. The IAM permissions cache was not "
+                            "available, so identity-policy conditions were not "
+                            "read either."
+                        ),
+                        resolution=scp["resolution"] or COULD_NOT_ASSESS_RESOLUTION,
+                        reference=NOTEBOOK_ACCESS_GUARDRAIL_REFERENCE,
+                        severity="Informational",
+                        status="N/A",
+                        region=region,
+                    )
+                ]
+            }
+        return {
+            "csv_data": [
+                _creation_category_finding(
+                    "notebook access",
+                    NOTEBOOK_ACCESS_GUARDRAILS,
+                    scp,
+                    permission_cache,
+                    region,
+                    check_id="SM-09",
+                    finding_name=NOTEBOOK_ACCESS_GUARDRAIL_FINDING,
+                    reference=NOTEBOOK_ACCESS_GUARDRAIL_REFERENCE,
+                    resolution=(
+                        "Deny sagemaker:CreateNotebookInstance in a service control "
+                        "policy attached above this account when RootAccess or "
+                        "DirectInternetAccess is not Disabled, or VpcSubnets or "
+                        "VolumeKmsKeyArn is absent, and deny "
+                        "CreatePresignedNotebookInstanceUrl and "
+                        "CreatePresignedDomainUrl outside the approved aws:SourceIp "
+                        "range or aws:SourceVpce. An Allow condition on the key in "
+                        "every policy that grants the action also holds it."
+                    ),
+                    scope="for SageMaker notebook and Studio access",
+                    consequence=(
+                        "A notebook can be created, or a notebook or Studio URL "
+                        "issued, outside the production access bar."
+                    ),
+                )
+            ]
+        }
+    except Exception as error:
+        logger.error(
+            f"Error in check_sagemaker_notebook_access_guardrails: {str(error)}",
+            exc_info=True,
+        )
+        return {
+            "csv_data": [
+                create_finding(
+                    check_id="SM-09",
+                    finding_name=NOTEBOOK_ACCESS_GUARDRAIL_FINDING,
+                    finding_details=build_could_not_assess_detail(error, region),
+                    resolution=COULD_NOT_ASSESS_RESOLUTION,
+                    reference=NOTEBOOK_ACCESS_GUARDRAIL_REFERENCE,
                     severity="Informational",
                     status="N/A",
                     region=region,
@@ -11146,6 +11895,13 @@ def lambda_handler(event, context):
                 )
             )
 
+            logger.info("Running SageMaker notebook access guardrail check (SM-09)")
+            all_findings.append(
+                check_sagemaker_notebook_access_guardrails(
+                    region=GLOBAL_REGION_LABEL, permission_cache=permission_cache
+                )
+            )
+
             # Delegated administration is an organization-level setting, so it is
             # assessed once and not once per scanned region.
             logger.info("Running security service delegated admin check (SM-35)")
@@ -11301,7 +12057,9 @@ def lambda_handler(event, context):
         all_findings.append(registry_findings)
 
         logger.info("Running SageMaker notebook root access check")
-        notebook_root_findings = check_sagemaker_notebook_root_access(region=region)
+        notebook_root_findings = check_sagemaker_notebook_root_access(
+            region=region, permission_cache=permission_cache
+        )
         all_findings.append(notebook_root_findings)
 
         logger.info("Running SageMaker notebook VPC deployment check")

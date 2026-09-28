@@ -131,8 +131,10 @@ class TestSM01InternetAccess:
             {"NotebookInstances": [{"NotebookInstanceName": "test-nb"}]}
         ]
         domain_paginator.paginate.return_value = [{"Domains": []}]
+        # A notebook passes only when it is placed in a VPC subnet as well.
         mock_sm.describe_notebook_instance.return_value = {
             "DirectInternetAccess": "Disabled",
+            "SubnetId": "subnet-123",
         }
         result = check()
         findings = extract_csv_data(result)
@@ -9055,3 +9057,763 @@ class TestSM03TrainingBucketProtection:
             if r["Status"] == "Failed"
         ]
         assert len(failed) == 1 and "source" in failed[0]["Finding_Details"]
+
+
+# ===================================================================
+# AIR-SGM-TRN-05: SM-01 notebook VPC placement and unread reads
+# ===================================================================
+def _sm01_rows(notebooks, domains=None, pages=None):
+    """Run SM-01 over {name: DescribeNotebookInstance or exception}."""
+    domains = domains or {}
+
+    def lookup(table, name):
+        value = table[name]
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+    listing = {
+        "list_notebook_instances": [
+            {"NotebookInstances": [{"NotebookInstanceName": n} for n in notebooks]}
+        ],
+        "list_domains": [{"Domains": [{"DomainId": d} for d in domains]}],
+    }
+    listing.update(pages or {})
+    sm = _pages_client(
+        listing,
+        describe_notebook_instance=MagicMock(
+            side_effect=lambda NotebookInstanceName: lookup(
+                notebooks, NotebookInstanceName
+            )
+        ),
+        describe_domain=MagicMock(
+            side_effect=lambda DomainId: lookup(domains, DomainId)
+        ),
+    )
+    with patch("sagemaker_app.boto3.client", return_value=sm):
+        return extract_csv_data(
+            sagemaker_app.check_sagemaker_internet_access(region="us-east-1")
+        )
+
+
+_VPC_NOTEBOOK = {"DirectInternetAccess": "Disabled", "SubnetId": "subnet-1"}
+
+
+class TestSM01NotebookVpcPlacement:
+    """The Passed text claims VPC placement, so a notebook needs a SubnetId."""
+
+    def test_notebook_without_subnet_fails_among_vpc_notebooks(self):
+        rows = _sm01_rows(
+            {
+                "in-vpc": _VPC_NOTEBOOK,
+                "no-vpc": {"DirectInternetAccess": "Disabled"},
+            }
+        )
+        outside = _by_finding(rows, "Notebook Instance Outside VPC")
+        assert len(outside) == 1
+        assert "'no-vpc'" in outside[0]["Finding_Details"]
+        assert outside[0]["Status"] == "Failed"
+        assert not _by_finding(rows, "SageMaker Internet Access Check")
+
+    def test_vpc_notebooks_and_vpc_only_domain_pass(self):
+        rows = _sm01_rows(
+            {"a": _VPC_NOTEBOOK, "b": _VPC_NOTEBOOK},
+            domains={"d-1": {"AppNetworkAccessType": "VpcOnly"}},
+        )
+        assert [r["Status"] for r in rows] == ["Passed"]
+        assert "3 SageMaker notebook" in rows[0]["Finding_Details"]
+
+    def test_describe_error_is_incomplete_and_not_passed(self):
+        rows = _sm01_rows(
+            {"a": _VPC_NOTEBOOK, "broken": _make_client_error("AccessDeniedException")}
+        )
+        incomplete = _by_finding(rows, "SageMaker Internet Access Check Incomplete")
+        assert [r["Status"] for r in incomplete] == ["N/A"]
+        assert "broken" in incomplete[0]["Finding_Details"]
+        assert [r["Status"] for r in rows] == ["N/A"]
+
+    @pytest.mark.parametrize("operation", ["list_notebook_instances", "list_domains"])
+    def test_list_error_is_incomplete(self, operation):
+        rows = _sm01_rows(
+            {"a": _VPC_NOTEBOOK},
+            pages={operation: _make_client_error("AccessDeniedException")},
+        )
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert "Incomplete" in rows[0]["Finding"]
+
+    def test_domain_describe_error_is_incomplete(self):
+        rows = _sm01_rows(
+            {"a": _VPC_NOTEBOOK},
+            domains={"d-x": _make_client_error("ThrottlingException")},
+        )
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert "sagemaker:DescribeDomain d-x" in rows[0]["Finding_Details"]
+
+
+# ===================================================================
+# AIR-SGM-TRN-05: SM-09 execution roles, API logging and Config rules
+# ===================================================================
+_NB_ROLE = "arn:aws:iam::123456789012:role/service-role/nb-role"
+_GOOD_TRAIL = {
+    "Name": "org",
+    "TrailARN": "arn:aws:cloudtrail:us-east-1:999999999999:trail/org",
+    "HomeRegion": "us-east-1",
+    "IsMultiRegionTrail": True,
+    "CloudWatchLogsLogGroupArn": "arn:aws:logs:us-east-1:999999999999:log-group:ct:*",
+}
+_ALL_MANAGEMENT = {
+    "EventSelectors": [
+        {
+            "ReadWriteType": "All",
+            "IncludeManagementEvents": True,
+            "DataResources": [],
+            "ExcludeManagementEventSources": [],
+        }
+    ]
+}
+_NOTEBOOK_RULES = [
+    {
+        "ConfigRuleName": "nb-internet",
+        "ConfigRuleState": "ACTIVE",
+        "Source": {
+            "Owner": "AWS",
+            "SourceIdentifier": "SAGEMAKER_NOTEBOOK_NO_DIRECT_INTERNET_ACCESS",
+        },
+    },
+    {
+        "ConfigRuleName": "nb-kms",
+        "ConfigRuleState": "ACTIVE",
+        "Source": {
+            "Owner": "AWS",
+            "SourceIdentifier": "SAGEMAKER_NOTEBOOK_INSTANCE_KMS_KEY_CONFIGURED",
+        },
+        "InputParameters": json.dumps({"kmsKeyArns": APPROVED_KEY}),
+    },
+]
+_LEAST_PRIVILEGE = {
+    "Effect": "Allow",
+    "Action": ["s3:GetObject"],
+    "Resource": "arn:aws:s3:::data/*",
+}
+
+
+def _environment_cache(roles):
+    """A v2 IAM cache from {role: [(policy name, arn, statements)]}."""
+    return {
+        "cache_schema_version": 2,
+        "principal_errors": [],
+        "role_permissions": {
+            name: {
+                "attached_policies": [
+                    {
+                        "name": policy,
+                        "arn": arn,
+                        "document": {"Version": "2012-10-17", "Statement": stmts},
+                    }
+                    for policy, arn, stmts in policies
+                ],
+                "inline_policies": [],
+            }
+            for name, policies in roles.items()
+        },
+        "user_permissions": {},
+    }
+
+
+_CLEAN_CACHE = _environment_cache(
+    {
+        "nb-role": [
+            ("scoped", "arn:aws:iam::123456789012:policy/scoped", [_LEAST_PRIVILEGE])
+        ]
+    }
+)
+
+
+def _sm09_rows(
+    notebooks=None,
+    domains=None,
+    profiles=None,
+    cache=_CLEAN_CACHE,
+    trails=None,
+    statuses=None,
+    selectors=None,
+    rules=None,
+    sm_pages=None,
+    trail_error=None,
+    rules_error=None,
+):
+    """Run SM-09 regionally; tables map names to responses or exceptions."""
+    notebooks = (
+        {"nb": {"RootAccess": "Disabled", "RoleArn": _NB_ROLE}}
+        if notebooks is None
+        else notebooks
+    )
+    domains = domains or {}
+    profiles = profiles or {}
+    statuses = statuses or {}
+    selectors = selectors or {}
+
+    def lookup(table, name, default=None):
+        value = table.get(name, default)
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+    listing = {
+        "list_notebook_instances": [
+            {"NotebookInstances": [{"NotebookInstanceName": n} for n in notebooks]}
+        ],
+        "list_domains": [{"Domains": [{"DomainId": d} for d in domains]}],
+    }
+    listing.update(sm_pages or {})
+    sm = _pages_client(
+        listing,
+        describe_notebook_instance=MagicMock(
+            side_effect=lambda NotebookInstanceName: lookup(
+                notebooks, NotebookInstanceName
+            )
+        ),
+        describe_domain=MagicMock(
+            side_effect=lambda DomainId: lookup(domains, DomainId)
+        ),
+        describe_user_profile=MagicMock(
+            side_effect=lambda DomainId, UserProfileName: lookup(
+                profiles, f"{DomainId}/{UserProfileName}"
+            )
+        ),
+    )
+    base_get_paginator = sm.get_paginator.side_effect
+
+    def get_paginator(operation_name):
+        if operation_name != "list_user_profiles":
+            return base_get_paginator(operation_name)
+        paginator = MagicMock()
+
+        def paginate(DomainIdEquals):
+            value = profiles.get(f"{DomainIdEquals}/*")
+            if isinstance(value, Exception):
+                raise value
+            return [
+                {
+                    "UserProfiles": [
+                        {"UserProfileName": key.split("/", 1)[1]}
+                        for key in profiles
+                        if key.startswith(f"{DomainIdEquals}/")
+                        and not key.endswith("/*")
+                    ]
+                }
+            ]
+
+        paginator.paginate.side_effect = paginate
+        return paginator
+
+    sm.get_paginator.side_effect = get_paginator
+    cloudtrail = MagicMock()
+    if trail_error is not None:
+        cloudtrail.describe_trails.side_effect = trail_error
+    else:
+        cloudtrail.describe_trails.return_value = {
+            "trailList": [_GOOD_TRAIL] if trails is None else trails
+        }
+    cloudtrail.get_trail_status.side_effect = lambda Name: lookup(
+        statuses, Name, {"IsLogging": True}
+    )
+    cloudtrail.get_event_selectors.side_effect = lambda TrailName: lookup(
+        selectors, TrailName, _ALL_MANAGEMENT
+    )
+    config = _pages_client(
+        {
+            "describe_config_rules": rules_error
+            or [{"ConfigRules": _NOTEBOOK_RULES if rules is None else rules}]
+        }
+    )
+    with patch("sagemaker_app.boto3.client") as mock_client:
+        mock_client.side_effect = _sm_client_factory(
+            sagemaker=sm, cloudtrail=cloudtrail, config=config
+        )
+        return extract_csv_data(
+            sagemaker_app.check_sagemaker_notebook_root_access(
+                region="us-east-1", permission_cache=cache
+            )
+        )
+
+
+def _statuses_of(rows, name):
+    return [r["Status"] for r in _by_finding(rows, name)]
+
+
+class TestSM09RootAccessUnreadLegs:
+    def test_clean_environment_passes_every_leg(self):
+        rows = _sm09_rows()
+        assert {r["Status"] for r in rows} == {"Passed"}
+        assert len(rows) == 4
+
+    def test_one_unreadable_notebook_withholds_root_passed(self):
+        rows = _sm09_rows(
+            notebooks={
+                "nb": {"RootAccess": "Disabled", "RoleArn": _NB_ROLE},
+                "hidden": _make_client_error("AccessDeniedException"),
+            }
+        )
+        assert _statuses_of(rows, "SageMaker Notebook Root Access Check") == ["N/A"]
+        assert (
+            "hidden"
+            in _by_finding(rows, "SageMaker Notebook Root Access Check")[0][
+                "Finding_Details"
+            ]
+        )
+
+    def test_root_enabled_with_unread_names_both(self):
+        rows = _sm09_rows(
+            notebooks={
+                "open": {"RootAccess": "Enabled", "RoleArn": _NB_ROLE},
+                "hidden": _make_client_error("ThrottlingException"),
+            }
+        )
+        assert _statuses_of(rows, "SageMaker Notebook Root Access Enabled") == [
+            "Failed"
+        ]
+        assert _statuses_of(rows, "SageMaker Notebook Root Access Check") == ["N/A"]
+
+    def test_list_error_is_could_not_assess(self):
+        rows = _sm09_rows(
+            sm_pages={
+                "list_notebook_instances": _make_client_error("AccessDeniedException")
+            }
+        )
+        assert len(rows) == 1
+        assert_could_not_assess_finding(rows[0])
+
+    def test_no_environments_skips_monitoring_legs(self):
+        rows = _sm09_rows(notebooks={})
+        assert [r["Finding"] for r in rows] == ["SageMaker Notebook Root Access Check"]
+
+
+class TestSM09ExecutionRolePrivilege:
+    ROLE = sagemaker_app.NOTEBOOK_ROLE_PRIVILEGE_FINDING
+
+    @pytest.mark.parametrize(
+        "policy,arn,statements",
+        [
+            (
+                "AmazonSageMakerFullAccess",
+                "arn:aws:iam::aws:policy/AmazonSageMakerFullAccess",
+                [],
+            ),
+            (
+                "AdministratorAccess",
+                "arn:aws:iam::aws:policy/AdministratorAccess",
+                [],
+            ),
+            (
+                "custom",
+                "arn:aws:iam::123456789012:policy/custom",
+                [{"Effect": "Allow", "Action": "sagemaker:*", "Resource": "*"}],
+            ),
+            (
+                "custom",
+                "arn:aws:iam::123456789012:policy/custom",
+                [{"Effect": "Allow", "Action": "*", "Resource": "*"}],
+            ),
+        ],
+    )
+    def test_broad_grant_on_one_of_two_notebook_roles_fails(
+        self, policy, arn, statements
+    ):
+        cache = _environment_cache(
+            {
+                "nb-role": [("scoped", "arn:aws:iam::1:policy/s", [_LEAST_PRIVILEGE])],
+                "wide-role": [(policy, arn, statements)],
+            }
+        )
+        rows = _sm09_rows(
+            notebooks={
+                "good": {"RootAccess": "Disabled", "RoleArn": _NB_ROLE},
+                "bad": {
+                    "RootAccess": "Disabled",
+                    "RoleArn": "arn:aws:iam::123456789012:role/wide-role",
+                },
+            },
+            cache=cache,
+        )
+        role_rows = _by_finding(rows, self.ROLE)
+        assert [r["Status"] for r in role_rows] == ["Failed"]
+        assert "'bad'" in role_rows[0]["Finding_Details"]
+        assert "wide-role" in role_rows[0]["Finding_Details"]
+
+    def test_boundary_that_caps_sagemaker_passes(self):
+        cache = _environment_cache(
+            {
+                "nb-role": [
+                    (
+                        "AmazonSageMakerFullAccess",
+                        "arn:aws:iam::aws:policy/AmazonSageMakerFullAccess",
+                        [],
+                    )
+                ]
+            }
+        )
+        cache["role_permissions"]["nb-role"]["permissions_boundary"] = {
+            "Version": "2012-10-17",
+            "Statement": [_LEAST_PRIVILEGE],
+        }
+        rows = _sm09_rows(cache=cache)
+        assert _statuses_of(rows, self.ROLE) == ["Passed"]
+
+    def test_studio_profile_override_is_read(self):
+        # The domain default role is clean; the profile's own role is not.
+        cache = _environment_cache(
+            {
+                "nb-role": [("scoped", "arn:aws:iam::1:policy/s", [_LEAST_PRIVILEGE])],
+                "wide-role": [
+                    (
+                        "AmazonSageMakerFullAccess",
+                        "arn:aws:iam::aws:policy/AmazonSageMakerFullAccess",
+                        [],
+                    )
+                ],
+            }
+        )
+        rows = _sm09_rows(
+            notebooks={},
+            domains={"d-1": {"DefaultUserSettings": {"ExecutionRole": _NB_ROLE}}},
+            profiles={
+                "d-1/alice": {
+                    "UserSettings": {
+                        "ExecutionRole": "arn:aws:iam::123456789012:role/wide-role"
+                    }
+                }
+            },
+            cache=cache,
+        )
+        role_rows = _by_finding(rows, self.ROLE)
+        assert [r["Status"] for r in role_rows] == ["Failed"]
+        assert "d-1/alice" in role_rows[0]["Finding_Details"]
+
+    def test_role_missing_from_cache_is_incomplete(self):
+        rows = _sm09_rows(cache=_environment_cache({}))
+        assert _statuses_of(rows, self.ROLE) == ["N/A"]
+
+    def test_no_cache_is_incomplete(self):
+        rows = _sm09_rows(cache=None)
+        assert _statuses_of(rows, self.ROLE) == ["N/A"]
+
+    @pytest.mark.parametrize(
+        "domains,profiles,text",
+        [
+            (
+                {"d-1": _make_client_error("AccessDeniedException")},
+                {},
+                "sagemaker:DescribeDomain d-1",
+            ),
+            (
+                {"d-1": {"DefaultUserSettings": {"ExecutionRole": _NB_ROLE}}},
+                {"d-1/*": _make_client_error("AccessDeniedException")},
+                "sagemaker:ListUserProfiles d-1",
+            ),
+            (
+                {"d-1": {"DefaultUserSettings": {"ExecutionRole": _NB_ROLE}}},
+                {"d-1/bob": _make_client_error("ThrottlingException")},
+                "sagemaker:DescribeUserProfile d-1/bob",
+            ),
+        ],
+    )
+    def test_studio_read_error_withholds_role_passed(self, domains, profiles, text):
+        rows = _sm09_rows(domains=domains, profiles=profiles)
+        role_rows = _by_finding(rows, self.ROLE)
+        assert [r["Status"] for r in role_rows] == ["N/A"]
+        assert text in role_rows[0]["Finding_Details"]
+
+
+class TestSM09ApiLogging:
+    TRAIL = sagemaker_app.NOTEBOOK_TRAIL_FINDING
+
+    @pytest.mark.parametrize(
+        "change,status",
+        [
+            ({"CloudWatchLogsLogGroupArn": None}, "Failed"),
+            ({"IsMultiRegionTrail": False, "HomeRegion": "eu-west-1"}, "Failed"),
+            ({"IsMultiRegionTrail": False, "HomeRegion": "us-east-1"}, "Passed"),
+        ],
+    )
+    def test_trail_shape(self, change, status):
+        rows = _sm09_rows(trails=[{**_GOOD_TRAIL, **change}])
+        assert _statuses_of(rows, self.TRAIL) == [status]
+
+    def test_stopped_trail_fails(self):
+        rows = _sm09_rows(statuses={_GOOD_TRAIL["TrailARN"]: {"IsLogging": False}})
+        assert _statuses_of(rows, self.TRAIL) == ["Failed"]
+        assert "not logging" in _by_finding(rows, self.TRAIL)[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "selector",
+        [
+            {
+                "EventSelectors": [
+                    {"ReadWriteType": "WriteOnly", "IncludeManagementEvents": True}
+                ]
+            },
+            {
+                "EventSelectors": [
+                    {"ReadWriteType": "All", "IncludeManagementEvents": False}
+                ]
+            },
+            {
+                "AdvancedEventSelectors": [
+                    {
+                        "FieldSelectors": [
+                            {"Field": "eventCategory", "Equals": ["Management"]},
+                            {
+                                "Field": "eventSource",
+                                "NotEquals": ["sagemaker.amazonaws.com"],
+                            },
+                        ]
+                    }
+                ]
+            },
+            {
+                "AdvancedEventSelectors": [
+                    {
+                        "FieldSelectors": [
+                            {"Field": "eventCategory", "Equals": ["Management"]},
+                            {"Field": "readOnly", "Equals": ["false"]},
+                        ]
+                    }
+                ]
+            },
+        ],
+    )
+    def test_selectors_that_miss_sagemaker_calls_fail(self, selector):
+        rows = _sm09_rows(selectors={_GOOD_TRAIL["TrailARN"]: selector})
+        assert _statuses_of(rows, self.TRAIL) == ["Failed"]
+
+    @pytest.mark.parametrize(
+        "selector",
+        [
+            {
+                "EventSelectors": [
+                    {"ReadWriteType": "ReadOnly", "IncludeManagementEvents": True},
+                    {"ReadWriteType": "WriteOnly", "IncludeManagementEvents": True},
+                ]
+            },
+            {
+                "AdvancedEventSelectors": [
+                    {
+                        "FieldSelectors": [
+                            {"Field": "eventCategory", "Equals": ["Management"]}
+                        ]
+                    }
+                ]
+            },
+        ],
+    )
+    def test_selectors_that_record_both_pass(self, selector):
+        rows = _sm09_rows(selectors={_GOOD_TRAIL["TrailARN"]: selector})
+        assert _statuses_of(rows, self.TRAIL) == ["Passed"]
+
+    def test_one_good_trail_among_bad_passes(self):
+        bad = {**_GOOD_TRAIL, "Name": "bad", "TrailARN": "arn:bad"}
+        rows = _sm09_rows(
+            trails=[bad, _GOOD_TRAIL], statuses={"arn:bad": {"IsLogging": False}}
+        )
+        assert _statuses_of(rows, self.TRAIL) == ["Passed"]
+
+    def test_describe_trails_error_is_incomplete(self):
+        rows = _sm09_rows(trail_error=_make_client_error("AccessDeniedException"))
+        assert _statuses_of(rows, self.TRAIL) == ["N/A"]
+
+    def test_unreadable_trail_status_is_incomplete_not_passed(self):
+        rows = _sm09_rows(
+            statuses={_GOOD_TRAIL["TrailARN"]: _make_client_error("AccessDenied")}
+        )
+        assert _statuses_of(rows, self.TRAIL) == ["N/A"]
+
+
+class TestSM09NotebookConfigRules:
+    RULES = sagemaker_app.NOTEBOOK_CONFIG_RULES_FINDING
+
+    def _with(self, index, **change):
+        rules = [dict(rule) for rule in _NOTEBOOK_RULES]
+        rules[index].update(change)
+        return rules
+
+    @pytest.mark.parametrize(
+        "index,change,text",
+        [
+            (1, {"InputParameters": "{}"}, "no kmsKeyArns"),
+            (1, {"InputParameters": json.dumps({"kmsKeyArns": " "})}, "no kmsKeyArns"),
+            (0, {"ConfigRuleState": "DELETING"}, "no ACTIVE rule"),
+            (0, {"Scope": {"ComplianceResourceId": "nb"}}, "scoped"),
+            (1, {"Scope": {"TagKey": "env"}}, "scoped"),
+            (0, {"Source": {"Owner": "CUSTOM_LAMBDA"}}, "no ACTIVE rule"),
+        ],
+    )
+    def test_missing_or_narrowed_rule_fails(self, index, change, text):
+        rows = _sm09_rows(rules=self._with(index, **change))
+        config_rows = _by_finding(rows, self.RULES)
+        assert [r["Status"] for r in config_rows] == ["Failed"]
+        assert text in config_rows[0]["Finding_Details"]
+
+    def test_both_rules_pass(self):
+        rows = _sm09_rows()
+        assert _statuses_of(rows, self.RULES) == ["Passed"]
+
+    def test_second_unpinned_copy_does_not_hide_a_pinned_one(self):
+        unpinned = dict(_NOTEBOOK_RULES[1], ConfigRuleName="nb-kms-any")
+        unpinned["InputParameters"] = "{}"
+        rows = _sm09_rows(rules=[unpinned] + _NOTEBOOK_RULES)
+        assert _statuses_of(rows, self.RULES) == ["Passed"]
+
+    def test_describe_error_is_incomplete(self):
+        rows = _sm09_rows(rules_error=_make_client_error("AccessDeniedException"))
+        assert _statuses_of(rows, self.RULES) == ["N/A"]
+
+
+# ===================================================================
+# AIR-SGM-TRN-05: SM-09 notebook creation and presigned-URL guardrails
+# ===================================================================
+SCP_NOTEBOOK_ACCESS_DENIES = [
+    _scp_deny(
+        "sagemaker:CreateNotebookInstance",
+        "StringNotEquals",
+        "sagemaker:RootAccess",
+        "Disabled",
+    ),
+    _scp_deny(
+        "sagemaker:CreateNotebookInstance",
+        "StringNotEquals",
+        "sagemaker:DirectInternetAccess",
+        "Disabled",
+    ),
+    _scp_deny(
+        "sagemaker:CreateNotebookInstance", "Null", "sagemaker:VpcSubnets", "true"
+    ),
+    _scp_deny(
+        "sagemaker:CreateNotebookInstance",
+        "Null",
+        "sagemaker:VolumeKmsKeyArn",
+        "true",
+    ),
+    _scp_deny(
+        [
+            "sagemaker:CreatePresignedNotebookInstanceUrl",
+            "sagemaker:CreatePresignedDomainUrl",
+        ],
+        "NotIpAddress",
+        "aws:SourceIp",
+        ["203.0.113.0/24"],
+    ),
+]
+
+
+class TestSM09NotebookAccessGuardrails:
+    def _run(self, statements, cache=OPEN_CACHE):
+        inventory = TestSM34CreationGuardrails._inventory(
+            ("NotebookBar", {"Version": "2012-10-17", "Statement": statements})
+        )
+        with patch(
+            "sagemaker_app.boto3.client",
+            side_effect=TestSM34CreationGuardrails._member_account_clients(),
+        ):
+            return extract_csv_data(
+                sagemaker_app.check_sagemaker_notebook_access_guardrails(
+                    region="Global", scp_inventory=inventory, permission_cache=cache
+                )
+            )
+
+    def test_attached_scp_holding_all_six_passes(self):
+        rows = self._run(SCP_NOTEBOOK_ACCESS_DENIES)
+        assert [r["Status"] for r in rows] == ["Passed"]
+        assert "All 6 notebook access requirements" in rows[0]["Finding_Details"]
+        assert rows[0]["Check_ID"] == "SM-09"
+
+    @pytest.mark.parametrize("dropped", range(5))
+    def test_each_missing_deny_fails_with_an_open_principal(self, dropped):
+        statements = [
+            s for i, s in enumerate(SCP_NOTEBOOK_ACCESS_DENIES) if i != dropped
+        ]
+        rows = self._run(statements)
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "Role 'Admin'" in rows[0]["Finding_Details"]
+
+    def test_presigned_ip_deny_alongside_another_condition_is_incomplete(self):
+        conjunctive = dict(SCP_NOTEBOOK_ACCESS_DENIES[-1])
+        conjunctive["Condition"] = {
+            "NotIpAddress": {"aws:SourceIp": ["203.0.113.0/24"]},
+            "Bool": {"aws:ViaAWSService": "false"},
+        }
+        rows = self._run(SCP_NOTEBOOK_ACCESS_DENIES[:-1] + [conjunctive])
+        assert [r["Status"] for r in rows] == ["N/A"]
+
+    def test_source_vpce_deny_on_profile_arns_passes(self):
+        vpce = _scp_deny(
+            [
+                "sagemaker:CreatePresignedNotebookInstanceUrl",
+                "sagemaker:CreatePresignedDomainUrl",
+            ],
+            "StringNotEquals",
+            "aws:SourceVpce",
+            ["vpce-1"],
+            resource=[
+                "arn:aws:sagemaker:*:*:notebook-instance/*",
+                "arn:aws:sagemaker:*:*:user-profile/*/*",
+            ],
+        )
+        rows = self._run(SCP_NOTEBOOK_ACCESS_DENIES[:-1] + [vpce])
+        assert [r["Status"] for r in rows] == ["Passed"]
+
+    def test_root_access_deny_for_enabled_only_fails_open(self):
+        # StringEquals Enabled does not fire when the request omits the key.
+        weak = _scp_deny(
+            "sagemaker:CreateNotebookInstance",
+            "StringEquals",
+            "sagemaker:RootAccess",
+            "Enabled",
+        )
+        rows = self._run([weak] + SCP_NOTEBOOK_ACCESS_DENIES[1:])
+        assert [r["Status"] for r in rows] == ["Failed"]
+
+    def test_identity_conditions_alone_pass(self):
+        cache = _creation_cache(
+            {
+                "DataScientist": [
+                    {
+                        "Effect": "Allow",
+                        "Action": [
+                            "sagemaker:CreatePresignedNotebookInstanceUrl",
+                            "sagemaker:CreatePresignedDomainUrl",
+                        ],
+                        "Resource": "*",
+                        "Condition": {"IpAddress": {"aws:SourceIp": "203.0.113.0/24"}},
+                    },
+                    {
+                        "Effect": "Allow",
+                        "Action": "sagemaker:CreateNotebookInstance",
+                        "Resource": "*",
+                        "Condition": {
+                            "StringEquals": {
+                                "sagemaker:RootAccess": "Disabled",
+                                "sagemaker:DirectInternetAccess": "Disabled",
+                            },
+                            "ArnEquals": {"sagemaker:VolumeKmsKeyArn": APPROVED_KEY},
+                            "Null": {"sagemaker:VpcSubnets": "false"},
+                        },
+                    },
+                ]
+            }
+        )
+        rows = self._run([], cache=cache)
+        assert [r["Status"] for r in rows] == ["Passed"]
+
+    def test_scp_unread_and_no_cache_is_na(self):
+        inventory = {"items": [], "errors": [], "list_error": "AccessDenied"}
+        with patch(
+            "sagemaker_app.boto3.client",
+            side_effect=TestSM34CreationGuardrails._member_account_clients(),
+        ):
+            rows = extract_csv_data(
+                sagemaker_app.check_sagemaker_notebook_access_guardrails(
+                    region="Global", scp_inventory=inventory, permission_cache=None
+                )
+            )
+        assert [r["Status"] for r in rows] == ["N/A"]

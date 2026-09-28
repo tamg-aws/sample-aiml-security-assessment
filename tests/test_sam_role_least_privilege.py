@@ -280,6 +280,9 @@ _EXPECTED_ACTIONS = {
         "s3:GetEncryptionConfiguration",
         "s3:GetBucketPolicy",
         "kms:DescribeKey",
+        "sagemaker:DescribeUserProfile",
+        "cloudtrail:GetTrailStatus",
+        "cloudtrail:GetEventSelectors",
     },
     "AgentCoreSecurityAssessmentFunction": {
         "bedrock-agentcore:GetAgentRuntime",

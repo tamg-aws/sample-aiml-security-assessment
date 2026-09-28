@@ -910,6 +910,14 @@ _VERIFIED_REMEDIATION_CONDITION_KEYS |= {
     "aws:SecureTransport",
 }
 
+# Verified on 2026-09-27 with one IDENTITY_POLICY validate-policy run for
+# SM-09's notebook access leg, one statement per name. The negative controls
+# sagemaker:CreateNotebookInstances and aws:SourceIpAddress came back
+# INVALID_ACTION and INVALID_GLOBAL_CONDITION_KEY at statement indexes 1 and 2,
+# and index 0, which names both entries below, drew only PRIVATE_IP_ADDRESS.
+_VERIFIED_REMEDIATION_IAM_ACTIONS |= {"sagemaker:CreateNotebookInstance"}
+_VERIFIED_REMEDIATION_CONDITION_KEYS |= {"aws:SourceIp"}
+
 _NON_IAM_REMEDIATION_TOKENS = {
     # SM-41 names the AWS IoT Core policy variables
     # ${iot:Connection.Thing.ThingName} and iot:Connection.Thing.IsAttached, and

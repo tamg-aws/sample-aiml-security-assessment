@@ -683,6 +683,7 @@ Resources:
                 - sagemaker:DescribeAutoMLJob
                 - sagemaker:DescribeCluster
                 - sagemaker:GetModelPackageGroupPolicy
+                - sagemaker:DescribeUserProfile # SM-09
               Resource:
                 - !Sub 'arn:${AWS::Partition}:sagemaker:*:${AWS::AccountId}:notebook-instance/*'
                 - !Sub 'arn:${AWS::Partition}:sagemaker:*:${AWS::AccountId}:domain/*'
@@ -702,6 +703,7 @@ Resources:
                 - !Sub 'arn:${AWS::Partition}:sagemaker:*:${AWS::AccountId}:compilation-job/*'
                 - !Sub 'arn:${AWS::Partition}:sagemaker:*:${AWS::AccountId}:automl-job/*'
                 - !Sub 'arn:${AWS::Partition}:sagemaker:*:${AWS::AccountId}:cluster/*'
+                - !Sub 'arn:${AWS::Partition}:sagemaker:*:${AWS::AccountId}:user-profile/*/*'
         - Statement:
             - Sid: GuardDutyInventoryPermissions
               Effect: Allow
@@ -720,7 +722,7 @@ Resources:
               Effect: Allow
               Action:
                 - config:DescribeConfigurationRecorders # SM-32
-                - config:DescribeConfigRules # SM-32
+                - config:DescribeConfigRules # SM-09, SM-32
                 - config:DescribeComplianceByConfigRule # SM-32
               Resource: '*'
             - Sid: OrganizationsInventoryPermissions
@@ -770,6 +772,15 @@ Resources:
                 - securityhub:DescribeOrganizationConfiguration # SM-36
                 - securityhub:ListEnabledProductsForImport # SM-04
               Resource: !Sub 'arn:${AWS::Partition}:securityhub:*:${AWS::AccountId}:hub/default'
+            - Sid: NotebookApiTrailRead
+              # SM-09 reads whether a trail that records SageMaker API calls is
+              # logging to CloudWatch Logs. The account segment stays open because
+              # an organization trail's ARN names the management account.
+              Effect: Allow
+              Action:
+                - cloudtrail:GetTrailStatus # SM-09
+                - cloudtrail:GetEventSelectors # SM-09
+              Resource: !Sub 'arn:${AWS::Partition}:cloudtrail:*:*:trail/*'
             - Sid: FlowLogMetricFilterRead
               Effect: Allow
               Action:
