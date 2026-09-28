@@ -1129,6 +1129,15 @@ _VERIFIED_REMEDIATION_CONDITION_KEYS |= {"aws:ViaAWSService"}
 # gateway encryption guide's example key policy, and the token scan stops at
 # the second colon.
 _VERIFIED_REMEDIATION_CONDITION_KEYS |= {"kms:EncryptionContext"}
+# Verified on 2026-09-28 against the xray service reference JSON, which lists
+# GetTraceSegmentDestination as a Read action with no resource type. AC-19
+# names it when the Transaction Search destination cannot be read.
+_VERIFIED_REMEDIATION_IAM_ACTIONS |= {"xray:GetTraceSegmentDestination"}
+# Verified on 2026-09-28 against the logs service reference JSON, which lists
+# DescribeDeliveryDestinations as a List action with no resource type. AC-20
+# names it with DescribeDeliveries and DescribeDeliverySources when the log
+# groups behind AgentCore deliveries cannot be resolved.
+_VERIFIED_REMEDIATION_IAM_ACTIONS |= {"logs:DescribeDeliveryDestinations"}
 
 _NON_IAM_REMEDIATION_TOKENS = {
     # SM-41 names the AWS IoT Core policy variables

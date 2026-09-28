@@ -8200,7 +8200,9 @@ class TestAC20LogDataProtection:
         passed = by_group["/aws/vendedlogs/bedrock-agentcore/gateway/g"]
         assert passed["Status"] == "Passed"
         assert "AC-26 judges that key's policy" in passed["Finding_Details"]
-        assert "outside the AgentCore prefixes" in passed["Finding_Details"]
+        # Delivery-destination groups outside the prefixes are now read, so the
+        # Passed no longer discloses them as unread.
+        assert "outside the AgentCore prefixes" not in passed["Finding_Details"]
         assert by_group["/aws/vendedlogs/bedrock-agentcore/memory/m"]["Status"] == (
             "Failed"
         )
@@ -34818,3 +34820,341 @@ class TestAC01RuntimeVersionsAndRollout:
         (row,) = [r for r in rows if "'rt-x'" in r["Finding_Details"]]
         assert row["Status"] == "N/A"
         assert "bedrock-agentcore:GetAgentRuntime" in row["Resolution"]
+
+
+class TestAC19TransactionSearch:
+    """AIR-ACR-OBS-03: AC-19 reads the region's trace segment destination,
+    because AgentCore spans need CloudWatch Transaction Search."""
+
+    @staticmethod
+    def _run(mock_ac, mock_logs, gateways=("gw-1",), memories=()):
+        mock_logs.describe_delivery_sources.return_value = {"deliverySources": []}
+        mock_logs.describe_deliveries.return_value = {"deliveries": []}
+        _empty_agentcore_inventory(mock_ac)
+        mock_ac.list_gateways.return_value = {
+            "items": [{"gatewayId": g, "name": g} for g in gateways]
+        }
+        mock_ac.list_memories.return_value = {
+            "memories": [
+                {
+                    "id": m,
+                    "arn": f"arn:aws:bedrock-agentcore:us-east-1:111122223333:memory/{m}",
+                }
+                for m in memories
+            ]
+        }
+        findings = agentcore_app.check_agentcore_log_delivery_configuration()
+        for finding in findings:
+            assert_finding_schema(finding)
+        return findings
+
+    @staticmethod
+    def _search(findings):
+        return [
+            f
+            for f in findings
+            if f["Finding"] == agentcore_app.AGENTCORE_TRANSACTION_SEARCH_FINDING
+        ]
+
+    @patch("agentcore_app.xray_client")
+    @patch("agentcore_app.agentcore_client")
+    @patch("agentcore_app.logs_client")
+    def test_a_cloudwatch_logs_destination_that_is_active_passes(
+        self, mock_logs, mock_ac, mock_xray
+    ):
+        mock_xray.get_trace_segment_destination.return_value = {
+            "Destination": "CloudWatchLogs",
+            "Status": "ACTIVE",
+        }
+        (row,) = self._search(self._run(mock_ac, mock_logs))
+        assert row["Status"] == "Passed"
+        assert row["Check_ID"] == "AC-19"
+        assert "CloudWatchLogs with status ACTIVE" in row["Finding_Details"]
+
+    @patch("agentcore_app.xray_client")
+    @patch("agentcore_app.agentcore_client")
+    @patch("agentcore_app.logs_client")
+    def test_an_xray_destination_fails_once_for_every_resource(
+        self, mock_logs, mock_ac, mock_xray
+    ):
+        mock_xray.get_trace_segment_destination.return_value = {
+            "Destination": "XRay",
+            "Status": "ACTIVE",
+        }
+        findings = self._run(
+            mock_ac, mock_logs, gateways=("gw-1", "gw-2"), memories=("mem-1",)
+        )
+        (row,) = self._search(findings)
+        assert row["Status"] == "Failed"
+        assert row["Severity"] == "Medium"
+        assert "Transaction Search is off" in row["Finding_Details"]
+        assert mock_xray.get_trace_segment_destination.call_count == 1
+
+    @patch("agentcore_app.xray_client")
+    @patch("agentcore_app.agentcore_client")
+    @patch("agentcore_app.logs_client")
+    def test_a_pending_cloudwatch_logs_destination_is_na_not_a_pass(
+        self, mock_logs, mock_ac, mock_xray
+    ):
+        mock_xray.get_trace_segment_destination.return_value = {
+            "Destination": "CloudWatchLogs",
+            "Status": "PENDING",
+        }
+        (row,) = self._search(self._run(mock_ac, mock_logs))
+        assert row["Status"] == "N/A"
+        assert "PENDING" in row["Finding_Details"]
+
+    @patch("agentcore_app.xray_client")
+    @patch("agentcore_app.agentcore_client")
+    @patch("agentcore_app.logs_client")
+    def test_a_denied_read_is_na_naming_the_action(self, mock_logs, mock_ac, mock_xray):
+        mock_xray.get_trace_segment_destination.side_effect = _make_client_error(
+            "AccessDeniedException", "denied"
+        )
+        (row,) = self._search(self._run(mock_ac, mock_logs))
+        assert row["Status"] == "N/A"
+        assert "AccessDeniedException" in row["Finding_Details"]
+        assert row["Resolution"] == "Grant xray:GetTraceSegmentDestination and retry."
+
+    @patch("agentcore_app.xray_client")
+    @patch("agentcore_app.agentcore_client")
+    @patch("agentcore_app.logs_client")
+    def test_a_transport_error_is_na_and_keeps_the_resource_rows(
+        self, mock_logs, mock_ac, mock_xray
+    ):
+        mock_xray.get_trace_segment_destination.side_effect = EndpointConnectionError(
+            endpoint_url="https://xray.example.com"
+        )
+        findings = self._run(mock_ac, mock_logs, gateways=("gw-1", "gw-2"))
+        (row,) = self._search(findings)
+        assert row["Status"] == "N/A"
+        assert "EndpointConnectionError" in row["Finding_Details"]
+        assert {
+            name
+            for name in ("gw-1", "gw-2")
+            if any(f"Gateway '{name}'" in f["Finding_Details"] for f in findings)
+        } == {"gw-1", "gw-2"}
+
+    @patch("agentcore_app.xray_client", None)
+    @patch("agentcore_app.agentcore_client")
+    @patch("agentcore_app.logs_client")
+    def test_no_xray_client_is_na_not_a_pass(self, mock_logs, mock_ac):
+        (row,) = self._search(self._run(mock_ac, mock_logs))
+        assert row["Status"] == "N/A"
+        assert "no X-Ray client" in row["Finding_Details"]
+
+    @patch("agentcore_app.xray_client")
+    @patch("agentcore_app.agentcore_client")
+    @patch("agentcore_app.logs_client")
+    def test_no_agentcore_resource_reads_no_destination(
+        self, mock_logs, mock_ac, mock_xray
+    ):
+        findings = self._run(mock_ac, mock_logs, gateways=())
+        assert self._search(findings) == []
+        assert mock_xray.get_trace_segment_destination.call_count == 0
+
+
+class TestAC20DeliveryDestinationGroups:
+    """AIR-ACR-OBS-04: AC-20 judges a log group outside the AgentCore prefixes
+    that a delivery from an AgentCore source writes to."""
+
+    _MASKING_POLICY = TestAC20LogDataProtection._MASKING_POLICY
+    _KMS_KEY = TestAC20LogDataProtection._KMS_KEY
+
+    @staticmethod
+    def _wire(mock_logs, groups_by_prefix, sources, deliveries, destinations):
+        mock_logs.describe_account_policies.return_value = {
+            "accountPolicies": [
+                {
+                    "policyName": "acct",
+                    "policyDocument": TestAC20DeliveryDestinationGroups._MASKING_POLICY,
+                }
+            ]
+        }
+        mock_logs.describe_log_groups.side_effect = _log_group_side_effect(
+            groups_by_prefix
+        )
+        mock_logs.describe_delivery_sources.return_value = {"deliverySources": sources}
+        mock_logs.describe_deliveries.return_value = {"deliveries": deliveries}
+        if isinstance(destinations, Exception):
+            mock_logs.describe_delivery_destinations.side_effect = destinations
+        else:
+            mock_logs.describe_delivery_destinations.return_value = {
+                "deliveryDestinations": destinations
+            }
+
+    @staticmethod
+    def _source(name, service="bedrock-agentcore"):
+        return {"name": name, "service": service, "logType": "APPLICATION_LOGS"}
+
+    @staticmethod
+    def _delivery(source, destination, kind="CWL"):
+        return {
+            "deliverySourceName": source,
+            "deliveryDestinationArn": destination,
+            "deliveryDestinationType": kind,
+        }
+
+    @staticmethod
+    def _destination(arn, group, kind="CWL"):
+        return {
+            "arn": arn,
+            "deliveryDestinationType": kind,
+            "deliveryDestinationConfiguration": {
+                "destinationResourceArn": (
+                    f"arn:aws:logs:us-east-1:111122223333:log-group:{group}:*"
+                )
+            },
+        }
+
+    @staticmethod
+    def _by_group(findings):
+        for finding in findings:
+            assert finding["Check_ID"] == "AC-20"
+            assert_finding_schema(finding)
+        return {
+            f["Finding_Details"].split("'")[1]: f["Status"]
+            for f in findings
+            if f["Finding_Details"].startswith("Log group '")
+        }
+
+    @patch("agentcore_app.logs_client")
+    def test_a_delivered_group_outside_the_prefixes_is_judged(self, mock_logs):
+        self._wire(
+            mock_logs,
+            {
+                "/aws/bedrock-agentcore/": [
+                    {
+                        "logGroupName": "/aws/bedrock-agentcore/runtimes/rt-1",
+                        "kmsKeyId": self._KMS_KEY,
+                    }
+                ],
+                "team/agent-logs": [
+                    {"logGroupName": "team/agent-logs"},
+                    {"logGroupName": "team/agent-logs-archive"},
+                ],
+                "team/other-logs": [{"logGroupName": "team/other-logs"}],
+            },
+            sources=[
+                self._source("gw-src"),
+                self._source("mem-src"),
+                self._source("lambda-src", service="lambda"),
+            ],
+            deliveries=[
+                self._delivery("gw-src", "dd-arn-1"),
+                self._delivery("mem-src", "dd-arn-2", kind="S3"),
+                self._delivery("lambda-src", "dd-arn-3"),
+            ],
+            destinations=[
+                self._destination("dd-arn-1", "team/agent-logs"),
+                self._destination("dd-arn-2", "bucket", kind="S3"),
+                self._destination("dd-arn-3", "team/other-logs"),
+            ],
+        )
+        by_group = self._by_group(
+            agentcore_app.check_agentcore_log_group_data_protection()
+        )
+        assert by_group == {
+            "/aws/bedrock-agentcore/runtimes/rt-1": "Passed",
+            "team/agent-logs": "Failed",
+        }
+
+    @patch("agentcore_app.logs_client")
+    def test_a_delivered_group_alone_is_judged_not_reported_absent(self, mock_logs):
+        self._wire(
+            mock_logs,
+            {
+                "team/agent-logs": [
+                    {"logGroupName": "team/agent-logs", "kmsKeyId": self._KMS_KEY}
+                ]
+            },
+            sources=[self._source("gw-src")],
+            deliveries=[self._delivery("gw-src", "dd-arn-1")],
+            destinations=[self._destination("dd-arn-1", "team/agent-logs")],
+        )
+        findings = agentcore_app.check_agentcore_log_group_data_protection()
+        assert self._by_group(findings) == {"team/agent-logs": "Passed"}
+        assert not [
+            f for f in findings if "No AgentCore log groups" in f["Finding_Details"]
+        ]
+
+    @patch("agentcore_app.logs_client")
+    def test_a_denied_destination_read_is_na_naming_the_action(self, mock_logs):
+        self._wire(
+            mock_logs,
+            {
+                "/aws/bedrock-agentcore/": [
+                    {"logGroupName": "/aws/bedrock-agentcore/runtimes/rt-1"},
+                    {
+                        "logGroupName": "/aws/bedrock-agentcore/runtimes/rt-2",
+                        "kmsKeyId": self._KMS_KEY,
+                    },
+                ]
+            },
+            sources=[self._source("gw-src")],
+            deliveries=[self._delivery("gw-src", "dd-arn-1")],
+            destinations=_make_client_error("AccessDeniedException", "denied"),
+        )
+        findings = agentcore_app.check_agentcore_log_group_data_protection()
+        (na,) = [f for f in findings if f["Status"] == "N/A"]
+        assert "AccessDeniedException" in na["Finding_Details"]
+        assert "logs:DescribeDeliveryDestinations" in na["Resolution"]
+        assert self._by_group(findings) == {
+            "/aws/bedrock-agentcore/runtimes/rt-1": "Failed",
+            "/aws/bedrock-agentcore/runtimes/rt-2": "Passed",
+        }
+
+    @patch("agentcore_app.logs_client")
+    def test_a_denied_read_with_no_prefix_group_is_still_na(self, mock_logs):
+        self._wire(
+            mock_logs,
+            {},
+            sources=[self._source("gw-src")],
+            deliveries=[self._delivery("gw-src", "dd-arn-1")],
+            destinations=_make_client_error("AccessDeniedException", "denied"),
+        )
+        findings = agentcore_app.check_agentcore_log_group_data_protection()
+        assert [f["Status"] for f in findings] == ["N/A", "N/A"]
+        assert any(
+            "logs:DescribeDeliveryDestinations" in f["Resolution"] for f in findings
+        )
+
+    @patch("agentcore_app.logs_client")
+    def test_a_delivered_group_under_a_prefix_is_not_judged_twice(self, mock_logs):
+        name = "/aws/vendedlogs/bedrock-agentcore/gateway/g"
+        self._wire(
+            mock_logs,
+            {"/aws/vendedlogs/bedrock-agentcore/": [{"logGroupName": name}]},
+            sources=[self._source("gw-src")],
+            deliveries=[self._delivery("gw-src", "dd-arn-1")],
+            destinations=[self._destination("dd-arn-1", name)],
+        )
+        findings = agentcore_app.check_agentcore_log_group_data_protection()
+        assert [f["Status"] for f in findings] == ["Failed"]
+
+    @patch("agentcore_app.logs_client")
+    def test_no_agentcore_log_delivery_reads_no_destination(self, mock_logs):
+        self._wire(
+            mock_logs,
+            {"/aws/bedrock-agentcore/": [{"logGroupName": "/aws/bedrock-agentcore/x"}]},
+            sources=[self._source("gw-src"), self._source("fn", service="lambda")],
+            deliveries=[
+                self._delivery("gw-src", "dd-arn-1", kind="S3"),
+                self._delivery("fn", "dd-arn-2"),
+            ],
+            destinations=[],
+        )
+        agentcore_app.check_agentcore_log_group_data_protection()
+        mock_logs.describe_delivery_destinations.assert_not_called()
+
+    @patch("agentcore_app.logs_client")
+    def test_a_delivered_group_that_no_longer_exists_is_not_judged(self, mock_logs):
+        self._wire(
+            mock_logs,
+            {"/aws/bedrock-agentcore/": [{"logGroupName": "/aws/bedrock-agentcore/x"}]},
+            sources=[self._source("gw-src")],
+            deliveries=[self._delivery("gw-src", "dd-arn-1")],
+            destinations=[self._destination("dd-arn-1", "team/deleted")],
+        )
+        findings = agentcore_app.check_agentcore_log_group_data_protection()
+        assert self._by_group(findings) == {"/aws/bedrock-agentcore/x": "Failed"}

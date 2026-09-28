@@ -50,6 +50,7 @@ route53resolver_client = None
 cognito_client = None
 events_client = None
 bedrock_client = None
+xray_client = None
 
 # Environment variables
 BUCKET_NAME = os.environ.get("AIML_ASSESSMENT_BUCKET_NAME")
@@ -752,6 +753,11 @@ AGENTCORE_DELETION_PROTECTED_LOG_GROUP_PREFIXES = (
     "/aws/vendedlogs/bedrock-agentcore/",
 )
 TRANSACTION_SEARCH_SPANS_LOG_GROUP = "aws/spans"
+TRANSACTION_SEARCH_REFERENCE_URL = (
+    "https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/"
+    "CloudWatch-Transaction-Search.html"
+)
+AGENTCORE_TRANSACTION_SEARCH_FINDING = "AgentCore Transaction Search"
 
 # AgentCore does not configure log destinations automatically. Memory and gateway
 # application logs reach CloudWatch only through a vended-log delivery source
@@ -10339,14 +10345,96 @@ def _log_delivery_finding(
     )
 
 
+def _agentcore_transaction_search_finding() -> Dict[str, Any]:
+    """Judge whether this region's trace segments reach CloudWatch Logs.
+
+    Transaction Search requires the CloudWatchLogs destination, and AgentCore
+    spans are searchable only with Transaction Search on. PENDING means the
+    destination is still changing, so it is not read as either answer.
+    """
+
+    def unread(detail: str) -> Dict[str, Any]:
+        return create_finding(
+            check_id="AC-19",
+            finding_name=AGENTCORE_TRANSACTION_SEARCH_FINDING,
+            finding_details=(
+                "Whether CloudWatch Transaction Search, which AgentCore tracing "
+                f"needs, is on in this region was not established: {detail}."
+            ),
+            resolution="Grant xray:GetTraceSegmentDestination and retry.",
+            reference=TRANSACTION_SEARCH_REFERENCE_URL,
+            severity=SeverityEnum.INFORMATIONAL,
+            status=StatusEnum.NA,
+        )
+
+    if xray_client is None:
+        return unread("no X-Ray client was available")
+    try:
+        response = xray_client.get_trace_segment_destination()
+    except (BotoCoreError, ClientError) as error:
+        return unread(
+            "xray:GetTraceSegmentDestination failed with "
+            f"{_assessment_error_label(error)}"
+        )
+    destination = (response or {}).get("Destination")
+    status = (response or {}).get("Status")
+    if destination == "CloudWatchLogs" and status == "ACTIVE":
+        return create_finding(
+            check_id="AC-19",
+            finding_name=AGENTCORE_TRANSACTION_SEARCH_FINDING,
+            finding_details=(
+                "X-Ray reports this region's trace segment destination as "
+                "CloudWatchLogs with status ACTIVE, which CloudWatch Transaction "
+                "Search requires. The share of spans it indexes was not read."
+            ),
+            resolution="No action required.",
+            reference=TRANSACTION_SEARCH_REFERENCE_URL,
+            severity=SeverityEnum.INFORMATIONAL,
+            status=StatusEnum.PASSED,
+        )
+    if destination == "XRay":
+        return create_finding(
+            check_id="AC-19",
+            finding_name=AGENTCORE_TRANSACTION_SEARCH_FINDING,
+            finding_details=(
+                "X-Ray reports this region's trace segment destination as XRay "
+                f"(status {status or 'not reported'}), so CloudWatch Transaction "
+                "Search is off and the spans AgentCore emits cannot be searched "
+                "in CloudWatch."
+            ),
+            resolution=(
+                "Turn on CloudWatch Transaction Search in this region, which sets "
+                "the trace segment destination to CloudWatchLogs."
+            ),
+            reference=TRANSACTION_SEARCH_REFERENCE_URL,
+            severity=SeverityEnum.MEDIUM,
+            status=StatusEnum.FAILED,
+        )
+    return create_finding(
+        check_id="AC-19",
+        finding_name=AGENTCORE_TRANSACTION_SEARCH_FINDING,
+        finding_details=(
+            "X-Ray reports this region's trace segment destination as "
+            f"{destination or 'not reported'} with status "
+            f"{status or 'not reported'}, so whether CloudWatch Transaction "
+            "Search is on was not established."
+        ),
+        resolution="Retry once the destination change completes.",
+        reference=TRANSACTION_SEARCH_REFERENCE_URL,
+        severity=SeverityEnum.INFORMATIONAL,
+        status=StatusEnum.NA,
+    )
+
+
 def check_agentcore_log_delivery_configuration() -> List[Dict[str, Any]]:
     """AC-19: Report log and trace delivery per runtime, gateway and memory.
 
     A gateway or memory needs an APPLICATION_LOGS and a TRACES delivery, because
     AgentCore configures no destination for either. A runtime needs a TRACES
     delivery only: AgentCore creates a log group for its service-provided logs.
-    Whether CloudWatch Transaction Search is on, which tracing needs, is not
-    read, because xray:GetTraceSegmentDestination is not granted.
+    When any of them exists, the region's trace segment destination is read,
+    because AgentCore tracing needs CloudWatch Transaction Search, which
+    requires the CloudWatchLogs destination.
     """
     if logs_client is None:
         return [
@@ -10482,6 +10570,9 @@ def check_agentcore_log_delivery_configuration() -> List[Dict[str, Any]]:
                 AGENTCORE_RESOURCE_DELIVERY_TYPES,
             )
         )
+
+    if runtimes or gateways or memories:
+        findings.append(_agentcore_transaction_search_finding())
 
     if not findings:
         findings.append(
@@ -10675,6 +10766,51 @@ def _agentcore_log_groups() -> List[Dict[str, Any]]:
     return log_groups
 
 
+def _agentcore_delivery_log_group_names() -> Set[str]:
+    """Name the log groups a delivery from an AgentCore source writes to.
+
+    A delivery names its destination by the delivery destination's own ARN, so
+    the log group behind it is read from DescribeDeliveryDestinations. That
+    call is made only when an AgentCore delivery goes to CloudWatch Logs.
+    """
+    sources = _paginate_aws_list(
+        logs_client, "describe_delivery_sources", "deliverySources"
+    )
+    source_names = {
+        source.get("name")
+        for source in sources
+        if source.get("service") == AGENTCORE_VENDED_LOG_SERVICE and source.get("name")
+    }
+    deliveries = _paginate_aws_list(logs_client, "describe_deliveries", "deliveries")
+    destination_arns = {
+        delivery.get("deliveryDestinationArn")
+        for delivery in deliveries
+        if delivery.get("deliverySourceName") in source_names
+        and delivery.get("deliveryDestinationType") in (None, "CWL")
+        and delivery.get("deliveryDestinationArn")
+    }
+    if not destination_arns:
+        return set()
+    destinations = _paginate_aws_list(
+        logs_client, "describe_delivery_destinations", "deliveryDestinations"
+    )
+    names: Set[str] = set()
+    for destination in destinations:
+        if destination.get("arn") not in destination_arns:
+            continue
+        if destination.get("deliveryDestinationType") != "CWL":
+            continue
+        resource_arn = (destination.get("deliveryDestinationConfiguration") or {}).get(
+            "destinationResourceArn"
+        ) or ""
+        _, _, name = str(resource_arn).partition(":log-group:")
+        if name.endswith(":*"):
+            name = name[:-2]
+        if name:
+            names.add(name)
+    return names
+
+
 def check_agentcore_log_group_data_protection() -> List[Dict[str, Any]]:
     """AC-20: Report masking and CMK encryption on AgentCore log groups.
 
@@ -10682,9 +10818,10 @@ def check_agentcore_log_group_data_protection() -> List[Dict[str, Any]]:
     verbatim, so a guardrail at the model boundary does not cover them. An
     account data-protection policy takes no selectionCriteria and its scope can
     only be ALL, so it covers every group. AC-26 reads the policy of the key
-    named here for the same groups. A delivery destination log group named
-    outside the AgentCore prefixes is not read: finding it needs
-    logs:DescribeDeliveryDestinations, which is not granted.
+    named here for the same groups. A log group outside the AgentCore prefixes
+    that a delivery from an AgentCore source writes to is judged as well, read
+    through logs:DescribeDeliveryDestinations; when that read fails an N/A row
+    names it.
     """
     if logs_client is None:
         return [
@@ -10734,8 +10871,44 @@ def check_agentcore_log_group_data_protection() -> List[Dict[str, Any]]:
             )
         ]
 
+    findings = []
+    known_names = {group.get("logGroupName") for group in log_groups}
+    try:
+        for name in sorted(_agentcore_delivery_log_group_names() - known_names):
+            log_groups.extend(
+                group
+                for group in _paginate_aws_list(
+                    logs_client,
+                    "describe_log_groups",
+                    "logGroups",
+                    logGroupNamePrefix=name,
+                )
+                if group.get("logGroupName") == name
+            )
+    except (BotoCoreError, ClientError) as error:
+        findings.append(
+            create_finding(
+                check_id="AC-20",
+                finding_name="AgentCore Log Data Protection",
+                finding_details=(
+                    "The log groups outside the AgentCore prefixes that a delivery "
+                    "from an AgentCore resource writes to could not be read, so "
+                    "they were not judged: "
+                    f"{_assessment_error_label(error)}."
+                ),
+                resolution=(
+                    "Grant logs:DescribeDeliveryDestinations, "
+                    "logs:DescribeDeliveries and logs:DescribeDeliverySources "
+                    "and retry."
+                ),
+                reference=LOGS_DATA_PROTECTION_REFERENCE_URL,
+                severity=SeverityEnum.INFORMATIONAL,
+                status=StatusEnum.NA,
+            )
+        )
+
     if not log_groups:
-        return [
+        return findings + [
             create_finding(
                 check_id="AC-20",
                 finding_name="AgentCore Log Data Protection",
@@ -10747,7 +10920,6 @@ def check_agentcore_log_group_data_protection() -> List[Dict[str, Any]]:
             )
         ]
 
-    findings = []
     for log_group in log_groups:
         log_group_name = log_group.get("logGroupName")
         if not log_group_name:
@@ -10805,8 +10977,7 @@ def check_agentcore_log_group_data_protection() -> List[Dict[str, Any]]:
                         f"identifier, through a {masking_scope} data-protection "
                         "policy and is encrypted "
                         "with a customer managed key. AC-26 judges that key's "
-                        "policy. Log groups outside the AgentCore prefixes that a "
-                        "delivery writes to are not read."
+                        "policy."
                     ),
                     resolution=(
                         "No action required. Confirm the data identifiers cover "
@@ -25832,7 +26003,7 @@ def lambda_handler(event, context):
     global cloudwatch_client, cloudtrail_client, oam_client, agentcore_client
     global kms_client, organizations_client
     global wafv2_client, route53resolver_client, cognito_client, events_client
-    global bedrock_client
+    global bedrock_client, xray_client
     start_time = time.time()
 
     try:
@@ -25878,6 +26049,8 @@ def lambda_handler(event, context):
         bedrock_client = boto3.client(
             "bedrock", config=boto3_config, region_name=region
         )
+        # AC-19 reads where this region's trace segments go.
+        xray_client = boto3.client("xray", config=boto3_config, region_name=region)
 
         # Collect all findings
         all_findings = []
