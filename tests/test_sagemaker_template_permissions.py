@@ -61,6 +61,12 @@ SCOPED_SAGEMAKER_GRANTS = {
     "cloudtrail:GetEventSelectors": ":cloudtrail:*:*:trail/*'",
     "config:DescribeConfigurationRecorderStatus": ":configuration-recorder/*/*'",
     "config:DescribeConformancePackCompliance": ":conformance-pack/*/*'",
+    "cloudwatch:DescribeAlarmHistory": ":cloudwatch:*:${AWS::AccountId}:alarm:*'",
+    "ecr:DescribeRepositories": ":ecr:*:${AWS::AccountId}:repository/*'",
+    "ecr:DescribeImageSigningStatus": ":ecr:*:${AWS::AccountId}:repository/*'",
+    "elasticfilesystem:DescribeFileSystems": (
+        ":elasticfilesystem:*:${AWS::AccountId}:file-system/*'"
+    ),
 }
 
 
@@ -107,6 +113,8 @@ APPROVED_WILDCARD_SAGEMAKER_GRANTS = {
     "iot:ListScheduledAudits": "ApprovedInventoryWithoutResourceType",
     "ram:ListResources": "ApprovedInventoryWithoutResourceType",
     "securityhub:GetConfigurationPolicyAssociation": "ApprovedInventoryWithoutResourceType",
+    "ecr:GetSigningConfiguration": "ApprovedInventoryWithoutResourceType",
+    "fsx:DescribeFileSystems": "ApprovedInventoryWithoutResourceType",
 }
 
 # Reads the SageMaker legs call that are not approved. Each leg reports "not

@@ -2881,6 +2881,50 @@ TRAINING_FILE_SYSTEM_READ_ACTIONS = {
 }
 
 
+def _training_file_system_encryption(system_type: str, file_system_id: str, region):
+    """
+    Read one training file system's encryption at rest.
+
+    Returns {"state": ...} with "unencrypted", "key" (and "key_id"),
+    "service-key" for an FSx for Lustre SCRATCH file system, which FSx encrypts
+    with its own service key, or "unread" (and "detail").
+    """
+    action = TRAINING_FILE_SYSTEM_READ_ACTIONS.get(system_type)
+    if action is None:
+        return {"state": "unread", "detail": f"file system type {system_type}"}
+    try:
+        if system_type == "EFS":
+            client = boto3.client("efs", config=boto3_config, region_name=region)
+            systems = client.describe_file_systems(FileSystemId=file_system_id).get(
+                "FileSystems", []
+            )
+        else:
+            client = boto3.client("fsx", config=boto3_config, region_name=region)
+            systems = client.describe_file_systems(FileSystemIds=[file_system_id]).get(
+                "FileSystems", []
+            )
+    except Exception as error:
+        return {
+            "state": "unread",
+            "detail": f"{action}: {get_assessment_error_label(error)}",
+        }
+    system = next(
+        (item for item in systems if item.get("FileSystemId") == file_system_id), None
+    )
+    if system is None:
+        return {"state": "unread", "detail": f"{action} did not return it"}
+    if system_type == "EFS":
+        if system.get("Encrypted") is not True:
+            return {"state": "unencrypted"}
+    elif str(
+        (system.get("LustreConfiguration") or {}).get("DeploymentType") or ""
+    ).startswith("SCRATCH"):
+        return {"state": "service-key"}
+    if system.get("KmsKeyId"):
+        return {"state": "key", "key_id": system["KmsKeyId"]}
+    return {"state": "unread", "detail": f"{action} returned no KmsKeyId"}
+
+
 def _training_instance_count(job_details: Dict[str, Any]) -> Optional[int]:
     """Instances a training job ran on, summed over heterogeneous instance
     groups, or None when the job does not record it."""
@@ -2901,22 +2945,10 @@ def _training_channel_unread_source(
     job_name: str, channel: Dict[str, Any], data_source: Dict[str, Any]
 ) -> List[str]:
     """
-    Name the non-S3 training sources whose encryption at rest this check does
-    not read: an EFS or FSx for Lustre file system, which the assessment role
-    has no grant to describe, and a dataset ARN.
+    Name the non-S3 training source whose encryption at rest this check does
+    not read: a dataset ARN. File system sources are read separately.
     """
     label = f"training job '{job_name}' channel '{channel.get('ChannelName')}'"
-    file_system = data_source.get("FileSystemDataSource") or {}
-    if file_system:
-        system_type = file_system.get("FileSystemType")
-        action = TRAINING_FILE_SYSTEM_READ_ACTIONS.get(
-            system_type, "the file system's describe action"
-        )
-        return [
-            f"{label} reads {system_type} file system "
-            f"{file_system.get('FileSystemId')}, whose encryption at rest was not "
-            f"read ({action} is not granted to this assessment role)"
-        ]
     dataset = data_source.get("DatasetSource") or {}
     if dataset:
         return [
@@ -3028,6 +3060,8 @@ def check_sagemaker_data_protection(region: str = "") -> Dict[str, Any]:
 
         def note_key(resource_type, name, key_id):
             keyed.append({"type": resource_type, "name": name, "key_id": key_id})
+
+        training_file_systems: Dict[tuple, List[str]] = {}
 
         # Check Notebook Instances
         try:
@@ -3192,6 +3226,18 @@ def check_sagemaker_data_protection(region: str = "") -> Dict[str, Any]:
                             bucket = _s3_uri_bucket(source.get("S3Uri"))
                             if bucket:
                                 bucket_users.setdefault(bucket, []).append(job_name)
+                            file_system = data_source.get("FileSystemDataSource") or {}
+                            if file_system:
+                                training_file_systems.setdefault(
+                                    (
+                                        file_system.get("FileSystemType"),
+                                        file_system.get("FileSystemId"),
+                                    ),
+                                    [],
+                                ).append(
+                                    f"training job '{job_name}' channel "
+                                    f"'{channel.get('ChannelName')}'"
+                                )
                             unread.extend(
                                 _training_channel_unread_source(
                                     job_name, channel, data_source
@@ -3205,6 +3251,37 @@ def check_sagemaker_data_protection(region: str = "") -> Dict[str, Any]:
             unread.append(
                 f"sagemaker:ListTrainingJobs ({get_assessment_error_label(e)})"
             )
+
+        for (system_type, file_system_id), users in sorted(
+            training_file_systems.items(), key=str
+        ):
+            read = _training_file_system_encryption(system_type, file_system_id, region)
+            kind = f"{system_type} file system"
+            if read["state"] == "unencrypted":
+                resources_without_encryption.append(
+                    {
+                        "type": kind,
+                        "name": file_system_id,
+                        "issue": "Encryption at rest is not enabled (read by "
+                        f"{', '.join(users[:3])})",
+                    }
+                )
+            elif read["state"] == "service-key":
+                resources_with_aws_managed_keys.append(
+                    {
+                        "type": kind,
+                        "name": file_system_id,
+                        "key_id": "the Amazon FSx service key of the account, "
+                        "because its deployment type is SCRATCH",
+                    }
+                )
+            elif read["state"] == "key":
+                note_key(kind, file_system_id, read["key_id"])
+            else:
+                unread.append(
+                    f"{', '.join(users[:3])} reads {kind} {file_system_id}, whose "
+                    f"encryption at rest was not read ({read['detail']})"
+                )
 
         # A key named on a resource can still be an AWS managed key, and the
         # key ARN does not say so; kms:DescribeKey returns its KeyManager.
@@ -4927,8 +5004,9 @@ def _endpoint_hosting_inventory(sagemaker_client) -> Dict[str, Any]:
     Resolve every endpoint in the region to its endpoint config and models.
 
     Returns {"endpoints": [...], "unread": [...]}. Each endpoint carries its
-    name, status, the DescribeEndpointConfig output and the model names its
-    production and shadow variants serve. A variant with no ModelName hosts
+    name, status, the DescribeEndpointConfig output, the model names its
+    production and shadow variants serve, and the digest DescribeEndpoint
+    reports each specified image resolved to. A variant with no ModelName hosts
     inference components, and the endpoint config's own VpcConfig and
     EnableNetworkIsolation are the settings the scan can read for it. The
     list call is not caught: a failed inventory is the caller's to report.
@@ -4966,6 +5044,13 @@ def _endpoint_hosting_inventory(sagemaker_client) -> Dict[str, Any]:
                     "component_variants": [
                         v.get("VariantName") for v in variants if not v.get("ModelName")
                     ],
+                    "deployed_images": {
+                        image["SpecifiedImage"]: image["ResolvedImage"]
+                        for variant in list(endpoint.get("ProductionVariants") or [])
+                        + list(endpoint.get("ShadowProductionVariants") or [])
+                        for image in variant.get("DeployedImages") or []
+                        if image.get("SpecifiedImage") and image.get("ResolvedImage")
+                    },
                 }
             )
     return {"endpoints": endpoints, "unread": unread}
@@ -12907,7 +12992,8 @@ def _central_configuration_association_finding(region: str, row) -> Dict[str, An
     GetConfigurationPolicyAssociation answers only for the Security Hub
     delegated administrator in the home Region, so any other caller reads N/A.
     Whether an associated policy enables the AI standard is in the policy
-    itself, which only securityhub:GetConfigurationPolicy returns.
+    itself, which only securityhub:GetConfigurationPolicy returns, and only to
+    the delegated administrator, so a member account's ceiling is N/A.
     """
     try:
         account_id = boto3.client(
@@ -12961,10 +13047,13 @@ def _central_configuration_association_finding(region: str, row) -> Dict[str, An
         f"policy {policy_id or 'not returned'}, in AssociationStatus "
         f"{status or 'not returned'}, as securityhub:"
         "GetConfigurationPolicyAssociation reports. Whether that policy enables "
-        "the AI Security Best Practices standard was not read: it needs "
-        "securityhub:GetConfigurationPolicy, which this role is not granted.",
-        "Grant securityhub:GetConfigurationPolicy on the configuration policy and "
-        "retry.",
+        "the AI Security Best Practices standard was not read: the configuration "
+        "policy's enabled standards and controls are returned only by "
+        "securityhub:GetConfigurationPolicy, which only the Security Hub delegated "
+        "administrator can call, from its home Region.",
+        f"From the Security Hub delegated administrator in its home Region, "
+        f"confirm that configuration policy {policy_id or 'not returned'} lists "
+        "the AI Security Best Practices standard among its enabled standards.",
         "Informational",
         "N/A",
         name=f"{CENTRAL_CONFIGURATION_FINDING} Incomplete",
@@ -13244,10 +13333,12 @@ ENDPOINT_FLOW_LOG_SCOPE_NOTE = (
     "GuardDuty foundational flow-log analysis covers EC2 network interfaces, not "
     "SageMaker endpoints, so the customer flow log is the only network telemetry "
     "for an endpoint. AgentCore Runtime is not read by this module. The state "
-    "named for each alarm is its current StateValue. Whether an alarm has fired "
-    "before is recorded by cloudwatch:DescribeAlarmHistory, which this "
-    "assessment role is not granted, so no alarm history was read; whether a "
-    "fired alarm was triaged is not recorded by any CloudWatch API."
+    "named for each alarm is its current StateValue, and its last entry into "
+    "ALARM comes from the metric alarm's own StateUpdate history. A composite "
+    "alarm's history is returned only to cloudwatch:DescribeAlarmHistory on "
+    "'*', which this role is not granted, so a composite's own firing is not "
+    "read. Neither history result changes the status. Whether a fired alarm was "
+    "triaged is not recorded by any CloudWatch API."
 )
 FLOW_LOG_ALERTING_TRAFFIC_TYPES = ("ALL", "ACCEPT")
 FLOW_LOG_RECORD_TERM = re.compile(
@@ -13331,6 +13422,37 @@ def _actioned_alarms(
                     actioned[child] = actioned[parent] or parent
                     changed = True
     return actioned
+
+
+def _alarm_last_fired(cloudwatch_client, alarm_name: str) -> str:
+    """When a metric alarm last entered ALARM, from its StateUpdate history."""
+    try:
+        for page in cloudwatch_client.get_paginator("describe_alarm_history").paginate(
+            AlarmName=alarm_name,
+            HistoryItemType="StateUpdate",
+            ScanBy="TimestampDescending",
+        ):
+            for item in page.get("AlarmHistoryItems", []):
+                if item.get("AlarmName") not in (None, alarm_name):
+                    continue
+                try:
+                    data = json.loads(item.get("HistoryData") or "{}")
+                except (TypeError, ValueError):
+                    continue
+                new_state = data.get("newState") if isinstance(data, dict) else None
+                if isinstance(new_state, dict) and new_state.get("stateValue") == (
+                    "ALARM"
+                ):
+                    timestamp = item.get("Timestamp")
+                    if hasattr(timestamp, "isoformat"):
+                        timestamp = timestamp.isoformat()
+                    return f"last entered ALARM at {timestamp or 'an unreturned time'}"
+    except Exception as error:
+        return (
+            "alarm history not read (cloudwatch:DescribeAlarmHistory: "
+            f"{get_assessment_error_label(error)})"
+        )
+    return "no entry into ALARM in the alarm history CloudWatch returned"
 
 
 def _alarm_metrics(alarm: Dict[str, Any]) -> List[tuple]:
@@ -13518,7 +13640,7 @@ def check_sagemaker_endpoint_flow_log_alerting(region: str = "") -> Dict[str, An
                 if composite:
                     label += f", actioned through composite alarm '{composite}'"
                 for metric in _alarm_metrics(alarm):
-                    alarmed_metrics.setdefault(metric, label)
+                    alarmed_metrics.setdefault(metric, (label, alarm["AlarmName"]))
         except Exception as error:
             alarm_error = get_assessment_error_label(error)
 
@@ -13556,7 +13678,7 @@ def check_sagemaker_endpoint_flow_log_alerting(region: str = "") -> Dict[str, An
                 uncovered.append(subnet)
                 continue
             hits = [
-                (g, alarmed_metrics[metric])
+                (g, *alarmed_metrics[metric])
                 for g in sorted(covering)
                 for metric in sorted(group_metrics.get(g, set()), key=str)
                 if metric in alarmed_metrics
@@ -13574,14 +13696,7 @@ def check_sagemaker_endpoint_flow_log_alerting(region: str = "") -> Dict[str, An
         groups = {g for covering in unalarmed.values() for g in covering}
         unread_groups = sorted(g for g in groups if g in group_errors)
         if not unalarmed:
-            passed.append(
-                f"endpoint '{name}' ("
-                + "; ".join(
-                    f"log group {group}, {label}"
-                    for group, label in sorted(set(alarmed))
-                )
-                + ")"
-            )
+            passed.append((name, sorted(set(alarmed))))
         elif unread_groups:
             unread.append(
                 f"metric filters of {', '.join(unread_groups)} for endpoint '{name}' "
@@ -13608,6 +13723,20 @@ def check_sagemaker_endpoint_flow_log_alerting(region: str = "") -> Dict[str, An
                     else ""
                 )
             )
+
+    history = {
+        alarm: _alarm_last_fired(cloudwatch_client, alarm)
+        for alarm in sorted({hit[2] for _, hits in passed for hit in hits})
+    }
+    passed = [
+        f"endpoint '{name}' ("
+        + "; ".join(
+            f"log group {group}, {label}, {history[alarm]}"
+            for group, label, alarm in hits
+        )
+        + ")"
+        for name, hits in passed
+    ]
 
     if failed:
         shown = "; ".join(failed[:10])
@@ -13644,6 +13773,548 @@ def check_sagemaker_endpoint_flow_log_alerting(region: str = "") -> Dict[str, An
                 "Medium",
                 "Passed",
             )
+        )
+    return findings
+
+
+MODEL_ARTIFACT_INTEGRITY_FINDING = "SageMaker Model Artifact Integrity"
+MODEL_ARTIFACT_INTEGRITY_REFERENCE = (
+    "https://docs.aws.amazon.com/AmazonECR/latest/userguide/image-tag-mutability.html"
+)
+MODEL_ARTIFACT_INTEGRITY_RESOLUTION = (
+    "Reference each serving image by digest (@sha256:) or by a tag in an Amazon "
+    "ECR repository with immutable tags, and keep images signed where a managed "
+    "signing rule covers the repository. Deploy model data through "
+    "ModelDataSource with its S3 ETag or ManifestEtag recorded, or from a model "
+    "package container that records ModelDataETag, in place of a bare "
+    "ModelDataUrl or a hub model id read at startup, and encrypt the artifact "
+    "bucket with SSE-KMS under a named key."
+)
+MODEL_ARTIFACT_INTEGRITY_SCOPE_NOTE = (
+    "A recorded ETag, ManifestEtag or ModelDataETag means an expected value is "
+    "recorded; whether SageMaker or the container compared it to the object at "
+    "load time is not returned by any API this check reads. Weights fetched by "
+    "container startup code, and models loaded by workloads on ECS, EKS or EC2, "
+    "are not read. Of each container's environment only the keys are read."
+)
+ECR_IMAGE_URI = re.compile(
+    r"^(\d{12})\.dkr\.ecr(?:-fips)?\.([a-z0-9-]+)\.amazonaws\.com(?:\.cn)?/"
+    r"([^:@]+)(?::([^@]+))?(?:@(sha256:[0-9a-fA-F]{64}))?$"
+)
+
+
+def _ecr_wildcard_match(pattern: str, value: str) -> bool:
+    """An ECR filter match, where * matches any sequence of characters."""
+    expression = ".*".join(re.escape(part) for part in (pattern or "").split("*"))
+    return re.fullmatch(expression, value) is not None
+
+
+def _ecr_tag_is_immutable(repository: Dict[str, Any], tag: str) -> Optional[bool]:
+    """
+    Whether a repository's tag mutability setting holds this tag fixed.
+
+    An exclusion filter takes a tag out of the repository's setting, so an
+    excluded tag is mutable in an IMMUTABLE_WITH_EXCLUSION repository and
+    immutable in a MUTABLE_WITH_EXCLUSION one. None for any other value.
+    """
+    mutability = repository.get("imageTagMutability")
+    excluded = any(
+        f.get("filterType", "WILDCARD") == "WILDCARD"
+        and _ecr_wildcard_match(f.get("filter") or "", tag)
+        for f in repository.get("imageTagMutabilityExclusionFilters") or []
+    )
+    return {
+        "IMMUTABLE": True,
+        "MUTABLE": False,
+        "IMMUTABLE_WITH_EXCLUSION": not excluded,
+        "MUTABLE_WITH_EXCLUSION": excluded,
+    }.get(mutability)
+
+
+def _signing_rule_covers(rule: Dict[str, Any], repository_name: str) -> bool:
+    """A signing rule with no repository filters signs every repository."""
+    filters = rule.get("repositoryFilters") or []
+    return not filters or any(
+        f.get("filterType") == "WILDCARD_MATCH"
+        and _ecr_wildcard_match(f.get("filter") or "", repository_name)
+        for f in filters
+    )
+
+
+def check_sagemaker_model_artifact_integrity(region: str = "") -> Dict[str, Any]:
+    """
+    SM-43: Verify every InService endpoint serves pinned images and model data
+    with a recorded expected value, from an SSE-KMS artifact bucket.
+
+    Each serving container is judged on four legs: its image is pinned by
+    digest or by a tag its ECR repository holds immutable, and signed when a
+    managed signing rule covers the repository; its S3 model data records an
+    ETag, ManifestEtag or ModelDataETag, or comes from SageMaker hub content;
+    it does not name an HF_MODEL_ID with no model data; and each artifact
+    bucket defaults to SSE-KMS with a named key. A denied read leaves that
+    endpoint N/A, never Failed.
+    """
+    findings = {"csv_data": []}
+
+    def _row(details, resolution, severity, status):
+        return create_finding(
+            check_id="SM-43",
+            finding_name=MODEL_ARTIFACT_INTEGRITY_FINDING,
+            finding_details=f"{details} {MODEL_ARTIFACT_INTEGRITY_SCOPE_NOTE}",
+            resolution=resolution,
+            reference=MODEL_ARTIFACT_INTEGRITY_REFERENCE,
+            severity=severity,
+            status=status,
+            region=region,
+        )
+
+    try:
+        sagemaker_client = boto3.client(
+            "sagemaker", config=boto3_config, region_name=region
+        )
+        inventory = _endpoint_hosting_inventory(sagemaker_client)
+    except Exception as error:
+        findings["csv_data"].append(
+            _row(
+                build_could_not_assess_detail(error, region),
+                COULD_NOT_ASSESS_RESOLUTION,
+                "Informational",
+                "N/A",
+            )
+        )
+        return findings
+
+    endpoints = [e for e in inventory["endpoints"] if e["status"] == "InService"]
+    unread = list(inventory["unread"])
+    if not endpoints and not unread:
+        findings["csv_data"].append(
+            _row(
+                "No InService SageMaker endpoints were found in this region.",
+                "No action required",
+                "Informational",
+                "N/A",
+            )
+        )
+        return findings
+
+    ecr_clients = {}
+    repositories = {}
+    signing = {}
+    buckets = {}
+    models = {}
+    packages = {}
+    s3_client = boto3.client("s3", config=boto3_config, region_name=region)
+
+    def _ecr(image_region):
+        if image_region not in ecr_clients:
+            ecr_clients[image_region] = boto3.client(
+                "ecr", config=boto3_config, region_name=image_region
+            )
+        return ecr_clients[image_region]
+
+    def _repository(image_region, registry, name):
+        key = (image_region, registry, name)
+        if key not in repositories:
+            try:
+                found = (
+                    _ecr(image_region)
+                    .describe_repositories(registryId=registry, repositoryNames=[name])
+                    .get("repositories")
+                    or []
+                )
+                repositories[key] = (
+                    found[0]
+                    if found
+                    else "ecr:DescribeRepositories returned no repository"
+                )
+            except Exception as error:
+                repositories[key] = (
+                    f"ecr:DescribeRepositories: {get_assessment_error_label(error)}"
+                )
+        return repositories[key]
+
+    def _signing_rules(image_region):
+        if image_region not in signing:
+            try:
+                response = _ecr(image_region).get_signing_configuration()
+                signing[image_region] = (
+                    response.get("registryId"),
+                    (response.get("signingConfiguration") or {}).get("rules") or [],
+                )
+            except Exception as error:
+                label = get_assessment_error_label(error)
+                signing[image_region] = (
+                    (None, [])
+                    if label == "SigningConfigurationNotFoundException"
+                    else f"ecr:GetSigningConfiguration: {label}"
+                )
+        return signing[image_region]
+
+    def _judge_image(label, image, resolved):
+        problems, unreads = [], []
+        match = ECR_IMAGE_URI.match(image)
+        if not match:
+            if "@sha256:" not in image:
+                unreads.append(
+                    f"{label} image is outside Amazon ECR, so its tag mutability "
+                    "is not readable"
+                )
+            return problems, unreads
+        registry, image_region, name, tag, digest = match.groups()
+        tag = tag or "latest"
+        if not digest:
+            repository = _repository(image_region, registry, name)
+            if isinstance(repository, str):
+                unreads.append(
+                    f"{label} image repository {name} in account {registry} was "
+                    f"not read ({repository})"
+                )
+            else:
+                immutable = _ecr_tag_is_immutable(repository, tag)
+                mutability = repository.get("imageTagMutability")
+                if immutable is None:
+                    unreads.append(
+                        f"{label} repository {name} returned imageTagMutability "
+                        f"{mutability}, which this check does not interpret"
+                    )
+                elif not immutable:
+                    problems.append(
+                        f"{label} image is pinned by tag '{tag}' in repository "
+                        f"{name}, whose imageTagMutability {mutability} lets "
+                        "that tag move"
+                    )
+        rules = _signing_rules(image_region)
+        if isinstance(rules, str):
+            unreads.append(f"{label} image signing rules were not read ({rules})")
+            return problems, unreads
+        registry_id, rule_list = rules
+        if registry_id != registry or not any(
+            _signing_rule_covers(rule, name) for rule in rule_list
+        ):
+            return problems, unreads
+        resolved_digest = (
+            resolved.split("@", 1)[1] if resolved and "@sha256:" in resolved else None
+        )
+        image_id = (
+            {"imageDigest": digest or resolved_digest}
+            if digest or resolved_digest
+            else {"imageTag": tag}
+        )
+        try:
+            statuses = (
+                _ecr(image_region)
+                .describe_image_signing_status(
+                    registryId=registry, repositoryName=name, imageId=image_id
+                )
+                .get("signingStatuses")
+                or []
+            )
+        except Exception as error:
+            unreads.append(
+                f"{label} image signing status was not read "
+                f"(ecr:DescribeImageSigningStatus: {get_assessment_error_label(error)})"
+            )
+            return problems, unreads
+        states = {s.get("status") for s in statuses}
+        if "COMPLETE" in states:
+            return problems, unreads
+        if "IN_PROGRESS" in states:
+            unreads.append(f"{label} image signing is IN_PROGRESS")
+        elif statuses:
+            codes = sorted({str(s.get("failureCode")) for s in statuses})
+            problems.append(
+                f"{label} image failed managed signing ({', '.join(codes)})"
+            )
+        else:
+            problems.append(
+                f"{label} image has no managed signing status, though a signing "
+                f"rule covers repository {name}"
+            )
+        return problems, unreads
+
+    def _bucket_encryption(bucket):
+        if bucket not in buckets:
+            try:
+                rules = (
+                    s3_client.get_bucket_encryption(Bucket=bucket)
+                    .get("ServerSideEncryptionConfiguration", {})
+                    .get("Rules", [])
+                )
+                defaults = [
+                    r.get("ApplyServerSideEncryptionByDefault") or {} for r in rules
+                ]
+                kms_defaults = [
+                    d
+                    for d in defaults
+                    if d.get("SSEAlgorithm") in S3_ENCRYPTION_KMS_ALGORITHMS
+                ]
+                if not kms_defaults:
+                    algorithms = sorted({str(d.get("SSEAlgorithm")) for d in defaults})
+                    buckets[bucket] = (
+                        "failed",
+                        "default encryption is not SSE-KMS "
+                        f"({', '.join(algorithms) or 'no default rule'})",
+                    )
+                elif not kms_defaults[0].get("KMSMasterKeyID"):
+                    buckets[bucket] = (
+                        "failed",
+                        "default encryption is SSE-KMS with no KMSMasterKeyID, so "
+                        "it uses the AWS managed key aws/s3",
+                    )
+                else:
+                    buckets[bucket] = (None, None)
+            except Exception as error:
+                label = get_assessment_error_label(error)
+                buckets[bucket] = (
+                    ("failed", "the bucket has no default encryption configuration")
+                    if label == "ServerSideEncryptionConfigurationNotFoundError"
+                    else ("unread", f"s3:GetEncryptionConfiguration: {label}")
+                )
+        return buckets[bucket]
+
+    def _judge_data(label, unit, env_keys):
+        problems, unreads, uris = [], [], []
+        url = unit.get("ModelDataUrl")
+        source = (unit.get("ModelDataSource") or {}).get("S3DataSource")
+        if url:
+            uris.append(url)
+            if not unit.get("ModelDataETag"):
+                problems.append(
+                    f"{label} loads ModelDataUrl {url} with no expected value recorded"
+                )
+        sources = [("ModelDataSource", source)] if source else []
+        for extra in unit.get("AdditionalModelDataSources") or []:
+            if extra.get("S3DataSource"):
+                sources.append(
+                    (
+                        f"additional source {extra.get('ChannelName')}",
+                        extra["S3DataSource"],
+                    )
+                )
+        for name, s3_source in sources:
+            if (s3_source.get("HubAccessConfig") or {}).get("HubContentArn"):
+                continue
+            uris.append(s3_source.get("S3Uri"))
+            if not (s3_source.get("ETag") or s3_source.get("ManifestEtag")):
+                problems.append(
+                    f"{label} {name} {s3_source.get('S3Uri')} records no ETag or "
+                    "ManifestEtag"
+                )
+        if "HF_MODEL_ID" in env_keys and not url and not source:
+            problems.append(
+                f"{label} sets HF_MODEL_ID with no ModelDataUrl or ModelDataSource, "
+                "so its weights come from a model hub at container startup with "
+                "no recorded source"
+            )
+        for uri in uris:
+            bucket = _s3_uri_bucket(uri)
+            if not bucket:
+                continue
+            state, detail = _bucket_encryption(bucket)
+            if state == "failed":
+                problems.append(f"{label} artifact bucket {bucket}: {detail}")
+            elif state == "unread":
+                unreads.append(
+                    f"{label} artifact bucket {bucket} encryption was not read "
+                    f"({detail})"
+                )
+        return problems, unreads
+
+    def _package_containers(package_name):
+        if package_name not in packages:
+            try:
+                packages[package_name] = list(
+                    (
+                        sagemaker_client.describe_model_package(
+                            ModelPackageName=package_name
+                        ).get("InferenceSpecification")
+                        or {}
+                    ).get("Containers")
+                    or []
+                )
+            except Exception as error:
+                packages[package_name] = (
+                    "sagemaker:DescribeModelPackage: "
+                    f"{get_assessment_error_label(error)}"
+                )
+        return packages[package_name]
+
+    def _model_units(model_name):
+        """
+        Each serving container of a model as (label, container, env keys), or
+        a string naming a model package that was not read.
+        """
+        if model_name not in models:
+            try:
+                model = sagemaker_client.describe_model(ModelName=model_name)
+            except Exception as error:
+                models[model_name] = (
+                    f"model '{model_name}' was not read "
+                    f"({get_assessment_error_label(error)})"
+                )
+                return models[model_name]
+            containers = (
+                [model["PrimaryContainer"]]
+                if model.get("PrimaryContainer")
+                else list(model.get("Containers") or [])
+            )
+            units = []
+            for index, container in enumerate(containers, start=1):
+                label = (
+                    f"model '{model_name}' container "
+                    f"{container.get('ContainerHostname') or index}"
+                )
+                env_keys = set(container.get("Environment") or {})
+                package_name = container.get("ModelPackageName")
+                if not package_name:
+                    units.append((label, container, env_keys))
+                    continue
+                package = _package_containers(package_name)
+                if isinstance(package, str):
+                    units.append(
+                        f"{label} model package {package_name} was not read ({package})"
+                    )
+                    continue
+                for position, package_container in enumerate(package, start=1):
+                    units.append(
+                        (
+                            f"{label} (model package {package_name} container "
+                            f"{position})",
+                            package_container,
+                            env_keys | set(package_container.get("Environment") or {}),
+                        )
+                    )
+            models[model_name] = units
+        return models[model_name]
+
+    def _component_units(endpoint):
+        units, unreads = [], []
+        for variant in endpoint["component_variants"]:
+            action = "sagemaker:ListInferenceComponents"
+            try:
+                for page in sagemaker_client.get_paginator(
+                    "list_inference_components"
+                ).paginate(
+                    EndpointNameEquals=endpoint["name"], VariantNameEquals=variant
+                ):
+                    for component in page.get("InferenceComponents", []):
+                        name = component.get("InferenceComponentName")
+                        action = "sagemaker:DescribeInferenceComponent"
+                        spec = (
+                            sagemaker_client.describe_inference_component(
+                                InferenceComponentName=name
+                            ).get("Specification")
+                            or {}
+                        )
+                        if spec.get("ModelName"):
+                            units.append(("model", spec["ModelName"], None))
+                            continue
+                        container = spec.get("Container") or {}
+                        deployed = container.get("DeployedImage") or {}
+                        units.append(
+                            (
+                                "container",
+                                f"inference component '{name}' container",
+                                {
+                                    "Image": deployed.get("SpecifiedImage"),
+                                    "ResolvedImage": deployed.get("ResolvedImage"),
+                                    "ModelDataUrl": container.get("ArtifactUrl"),
+                                    "Environment": container.get("Environment"),
+                                },
+                            )
+                        )
+            except Exception as error:
+                unreads.append(
+                    f"inference components of variant {variant} were not read "
+                    f"({action}: {get_assessment_error_label(error)})"
+                )
+        return units, unreads
+
+    failed = []
+    compliant = []
+    for endpoint in endpoints:
+        problems, unreads = [], []
+        work = [("model", name, None) for name in endpoint["models"]]
+        component_work, component_unreads = _component_units(endpoint)
+        work += component_work
+        unreads += component_unreads
+        judged = []
+        for kind, name, container in work:
+            if kind == "container":
+                judged.append(
+                    (
+                        name,
+                        container,
+                        set(container.get("Environment") or {}),
+                        container.get("ResolvedImage"),
+                    )
+                )
+                continue
+            units = _model_units(name)
+            if isinstance(units, str):
+                unreads.append(units)
+                continue
+            for entry in units:
+                if isinstance(entry, str):
+                    unreads.append(entry)
+                    continue
+                label, unit, env_keys = entry
+                judged.append(
+                    (
+                        label,
+                        unit,
+                        env_keys,
+                        endpoint["deployed_images"].get(unit.get("Image")),
+                    )
+                )
+        for label, unit, env_keys, resolved in judged:
+            if unit.get("Image"):
+                image_problems, image_unreads = _judge_image(
+                    label, unit["Image"], resolved
+                )
+                problems += image_problems
+                unreads += image_unreads
+            data_problems, data_unreads = _judge_data(label, unit, env_keys)
+            problems += data_problems
+            unreads += data_unreads
+        problems = list(dict.fromkeys(problems))
+        unread += [
+            f"endpoint '{endpoint['name']}': {u}" for u in dict.fromkeys(unreads)
+        ]
+        if problems:
+            failed.append((endpoint["name"], problems))
+        elif not unreads:
+            compliant.append(endpoint["name"])
+
+    for name, problems in failed:
+        findings["csv_data"].append(
+            _row(
+                f"Endpoint '{name}' serves model artifacts whose integrity is not "
+                f"pinned or recorded: {'; '.join(problems)}.",
+                MODEL_ARTIFACT_INTEGRITY_RESOLUTION,
+                "Medium",
+                "Failed",
+            )
+        )
+    read_details = (
+        f"{len(compliant)} InService endpoint(s) serve only pinned images and "
+        f"model data with a recorded expected value from SSE-KMS buckets: "
+        f"{', '.join(compliant[:10]) or 'none'}."
+    )
+    if unread:
+        findings["csv_data"].append(
+            _unread_resources_finding(
+                "SM-43",
+                MODEL_ARTIFACT_INTEGRITY_FINDING,
+                unread,
+                f"{read_details} {MODEL_ARTIFACT_INTEGRITY_SCOPE_NOTE}",
+                MODEL_ARTIFACT_INTEGRITY_REFERENCE,
+                region,
+            )
+        )
+    elif compliant and not failed:
+        findings["csv_data"].append(
+            _row(read_details, "No action required", "Medium", "Passed")
         )
     return findings
 
@@ -16314,6 +16985,9 @@ def lambda_handler(event, context):
 
         logger.info("Running SageMaker endpoint flow log alerting check (SM-37)")
         all_findings.append(check_sagemaker_endpoint_flow_log_alerting(region=region))
+
+        logger.info("Running SageMaker model artifact integrity check (SM-43)")
+        all_findings.append(check_sagemaker_model_artifact_integrity(region=region))
 
         logger.info("Running GuardDuty Runtime Monitoring check (SM-38)")
         all_findings.append(

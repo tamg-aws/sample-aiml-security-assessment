@@ -331,6 +331,12 @@ _EXPECTED_ACTIONS = {
         "iot:ListScheduledAudits",
         "ram:ListResources",
         "securityhub:GetConfigurationPolicyAssociation",
+        "cloudwatch:DescribeAlarmHistory",
+        "ecr:DescribeRepositories",
+        "ecr:DescribeImageSigningStatus",
+        "ecr:GetSigningConfiguration",
+        "elasticfilesystem:DescribeFileSystems",
+        "fsx:DescribeFileSystems",
     },
     "AgentCoreSecurityAssessmentFunction": {
         "bedrock-agentcore:GetAgentRuntime",
