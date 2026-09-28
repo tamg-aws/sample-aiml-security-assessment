@@ -32974,18 +32974,30 @@ class TestJWTAllowListValues:
         mock_ac.list_agent_runtimes.return_value = {
             "agentRuntimes": [{"agentRuntimeId": "rt-1", "agentRuntimeName": "One"}]
         }
-        mock_ac.get_agent_runtime.return_value = _jwt_runtime(
-            discoveryUrl=_ISSUER, allowedAudience=["agent-api"]
-        )
+        mock_ac.get_agent_runtime.return_value = {
+            **_jwt_runtime(discoveryUrl=_ISSUER, allowedAudience=["agent-api"]),
+            "agentRuntimeVersion": "3",
+        }
+        # The endpoint leg is now read: this asserted the text "other versions
+        # an endpoint serves were not read" while the check skipped it.
+        mock_ac.list_agent_runtime_endpoints.return_value = {
+            "runtimeEndpoints": [
+                {"name": "DEFAULT", "liveVersion": "3", "targetVersion": "3"}
+            ]
+        }
 
         findings = agentcore_app.check_agentcore_runtime_inbound_authorization()
 
-        assert findings[0]["Status"] == "Passed"
+        assert [f["Status"] for f in findings] == ["Passed"]
         assert (
-            "other versions an endpoint serves were not read"
+            "version 3, served by endpoint(s) DEFAULT,"
             in (findings[0]["Finding_Details"])
         )
+        assert "No endpoint serves another version." in findings[0]["Finding_Details"]
         mock_ac.get_agent_runtime.assert_called_once_with(agentRuntimeId="rt-1")
+        mock_ac.list_agent_runtime_endpoints.assert_called_once_with(
+            agentRuntimeId="rt-1"
+        )
 
 
 _PLAIN_ISSUER = "http://idp.example/.well-known/openid-configuration"
@@ -35633,3 +35645,171 @@ class TestAC06AccountPublicAccessBlock:
         )
         assert [f["Status"] for f in findings] == ["Failed", "Passed"]
         assert "BlockPublicPolicy off" in findings[0]["Finding_Details"]
+
+
+class TestAC30EndpointVersions:
+    """AIR-ACR-ID-08: every version a runtime endpoint serves carries its own
+    authorizer, so AC-30 judges each one and not only the default version."""
+
+    _PINNED = _jwt_runtime(discoveryUrl=_ISSUER, allowedAudience=["agent-api"])
+    _OPEN = _jwt_runtime(discoveryUrl=_ISSUER)
+
+    def _run(self, mock_ac, runtimes, endpoints, versions):
+        """runtimes: [(id, default_version)]; versions: {(id, version): detail}."""
+        mock_ac.list_agent_runtimes.return_value = {
+            "agentRuntimes": [
+                {"agentRuntimeId": rid, "agentRuntimeName": rid.upper()}
+                for rid, _ in runtimes
+            ]
+        }
+        defaults = dict(runtimes)
+
+        def get_agent_runtime(agentRuntimeId, agentRuntimeVersion=None):
+            version = agentRuntimeVersion or defaults[agentRuntimeId]
+            detail = versions[(agentRuntimeId, version)]
+            if isinstance(detail, Exception):
+                raise detail
+            return {**detail, "agentRuntimeVersion": version}
+
+        mock_ac.get_agent_runtime.side_effect = get_agent_runtime
+
+        def list_endpoints(agentRuntimeId, **_):
+            listed = endpoints[agentRuntimeId]
+            if isinstance(listed, Exception):
+                raise listed
+            return {"runtimeEndpoints": listed}
+
+        mock_ac.list_agent_runtime_endpoints.side_effect = list_endpoints
+        findings = agentcore_app.check_agentcore_runtime_inbound_authorization()
+        for finding in findings:
+            assert finding["Check_ID"] == "AC-30"
+            assert_finding_schema(finding)
+        return findings
+
+    @staticmethod
+    def _endpoint(name, live, target=None):
+        return {"name": name, "liveVersion": live, "targetVersion": target or live}
+
+    @patch("agentcore_app.agentcore_client")
+    def test_an_unbounded_version_behind_another_endpoint_fails(self, mock_ac):
+        findings = self._run(
+            mock_ac,
+            [("rt-1", "3")],
+            {"rt-1": [self._endpoint("DEFAULT", "3"), self._endpoint("beta", "2")]},
+            {("rt-1", "3"): self._PINNED, ("rt-1", "2"): self._OPEN},
+        )
+        assert [f["Status"] for f in findings] == ["Passed", "Failed"]
+        assert (
+            "version 3, served by endpoint(s) DEFAULT,"
+            in findings[0]["Finding_Details"]
+        )
+        assert "The other 1 version(s)" in findings[0]["Finding_Details"]
+        assert (
+            "version 2, served by endpoint(s) beta," in findings[1]["Finding_Details"]
+        )
+        assert findings[1]["Finding"].endswith("Unbounded")
+        mock_ac.get_agent_runtime.assert_any_call(
+            agentRuntimeId="rt-1", agentRuntimeVersion="2"
+        )
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_target_version_mid_rollout_is_judged(self, mock_ac):
+        findings = self._run(
+            mock_ac,
+            [("rt-1", "3")],
+            {"rt-1": [self._endpoint("DEFAULT", "3", target="4")]},
+            {("rt-1", "3"): self._PINNED, ("rt-1", "4"): self._OPEN},
+        )
+        assert [f["Status"] for f in findings] == ["Passed", "Failed"]
+        assert "version 4" in findings[1]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_each_runtime_lists_its_own_endpoints(self, mock_ac):
+        findings = self._run(
+            mock_ac,
+            [("rt-1", "1"), ("rt-2", "5")],
+            {
+                "rt-1": [self._endpoint("DEFAULT", "1")],
+                "rt-2": [self._endpoint("DEFAULT", "5"), self._endpoint("old", "4")],
+            },
+            {
+                ("rt-1", "1"): self._PINNED,
+                ("rt-2", "5"): self._PINNED,
+                ("rt-2", "4"): self._PINNED,
+            },
+        )
+        assert [f["Status"] for f in findings] == ["Passed", "Passed", "Passed"]
+        assert "RT-2" in findings[2]["Finding_Details"]
+        assert "version 4, served by endpoint(s) old," in findings[2]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_version_two_endpoints_serve_is_judged_once(self, mock_ac):
+        findings = self._run(
+            mock_ac,
+            [("rt-1", "3")],
+            {
+                "rt-1": [
+                    self._endpoint("DEFAULT", "3"),
+                    self._endpoint("a", "2"),
+                    self._endpoint("b", "2"),
+                ]
+            },
+            {("rt-1", "3"): self._PINNED, ("rt-1", "2"): self._PINNED},
+        )
+        assert len(findings) == 2
+        assert "served by endpoint(s) a, b," in findings[1]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_denied_endpoint_list_withholds_passed(self, mock_ac):
+        findings = self._run(
+            mock_ac,
+            [("rt-1", "3"), ("rt-2", "1")],
+            {
+                "rt-1": _make_client_error("AccessDeniedException", "denied"),
+                "rt-2": _make_client_error("AccessDeniedException", "denied"),
+            },
+            {("rt-1", "3"): self._PINNED, ("rt-2", "1"): self._OPEN},
+        )
+        assert [f["Status"] for f in findings] == ["N/A", "Failed"]
+        assert findings[0]["Resolution"] == (
+            "Grant bedrock-agentcore:ListAgentRuntimeEndpoints and retry."
+        )
+        assert (
+            "ListAgentRuntimeEndpoints failed with AccessDeniedException"
+            in (findings[0]["Finding_Details"])
+        )
+        assert (
+            "ListAgentRuntimeEndpoints failed with AccessDeniedException"
+            in (findings[1]["Finding_Details"])
+        )
+
+    @patch("agentcore_app.agentcore_client")
+    def test_an_unreadable_served_version_is_na_by_name(self, mock_ac):
+        findings = self._run(
+            mock_ac,
+            [("rt-1", "3")],
+            {"rt-1": [self._endpoint("DEFAULT", "3"), self._endpoint("beta", "2")]},
+            {
+                ("rt-1", "3"): self._PINNED,
+                ("rt-1", "2"): _make_client_error("ResourceNotFoundException", "x"),
+            },
+        )
+        assert [f["Status"] for f in findings] == ["Passed", "N/A"]
+        assert "version 2" in findings[1]["Finding_Details"]
+        assert "ResourceNotFoundException" in findings[1]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_endpoints_are_read_across_pages(self, mock_ac):
+        mock_ac.list_agent_runtimes.return_value = {
+            "agentRuntimes": [{"agentRuntimeId": "rt-1", "agentRuntimeName": "One"}]
+        }
+        mock_ac.get_agent_runtime.side_effect = lambda agentRuntimeId, **kw: {
+            **(self._OPEN if kw.get("agentRuntimeVersion") == "2" else self._PINNED),
+            "agentRuntimeVersion": kw.get("agentRuntimeVersion", "3"),
+        }
+        mock_ac.list_agent_runtime_endpoints.side_effect = [
+            {"runtimeEndpoints": [self._endpoint("DEFAULT", "3")], "nextToken": "t"},
+            {"runtimeEndpoints": [self._endpoint("beta", "2")]},
+        ]
+        findings = agentcore_app.check_agentcore_runtime_inbound_authorization()
+        assert [f["Status"] for f in findings] == ["Passed", "Failed"]

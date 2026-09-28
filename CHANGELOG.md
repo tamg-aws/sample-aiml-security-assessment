@@ -242,6 +242,11 @@ section.
   bucket was `N/A`. The assessment roles hold no
   `s3:GetAccountPublicAccessBlock` grant, so it stays `N/A`, naming that
   action, until it is added.
+- `AC-30` judges the inbound authorizer of every version a runtime endpoint
+  serves, not only the default version, which let an endpoint route callers
+  to a version with an unbounded JWT authorizer while the runtime passed. The
+  assessment roles hold no `bedrock-agentcore:ListAgentRuntimeEndpoints`
+  grant, so a runtime that would pass is `N/A` naming it until it is added.
 - `AC-45` judges each AgentCore runtime's own execution role by the rules it
   applies to a tool role. No check read a runtime role outside the AgentCore
   namespace, so one granting `s3:*` or every foundation model passed.

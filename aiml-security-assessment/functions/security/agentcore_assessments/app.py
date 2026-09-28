@@ -15906,6 +15906,111 @@ def _jwt_issuer_not_https_finding(
     )
 
 
+def _runtime_inbound_authorization_finding(
+    label: str, details: Dict[str, Any], scope_note: str = ""
+) -> Dict[str, Any]:
+    """Judge the inbound authorizer of one runtime version for AC-30."""
+    authorizer_configuration = details.get("authorizerConfiguration") or {}
+    jwt_authorizer = authorizer_configuration.get("customJWTAuthorizer") or {}
+
+    if not authorizer_configuration:
+        return create_finding(
+            check_id="AC-30",
+            finding_name="AgentCore Runtime Inbound Authorization",
+            finding_details=(
+                f"{label} carries no inbound authorizer, so every invoke "
+                "must be SigV4-signed and IAM decides which principal may "
+                "reach the agent."
+            ),
+            resolution=(
+                "No action required. Confirm the IAM principals allowed to "
+                "call InvokeAgentRuntime are the intended callers, because "
+                "SigV4 proves the caller's AWS identity and not an end "
+                "user's."
+            ),
+            reference=AGENTCORE_RUNTIME_INBOUND_AUTH_REFERENCE_URL,
+            severity=SeverityEnum.HIGH,
+            status=StatusEnum.PASSED,
+        )
+
+    if not jwt_authorizer:
+        return create_finding(
+            check_id="AC-30",
+            finding_name="AgentCore Runtime Inbound Authorization",
+            finding_details=(
+                f"{label} carries an inbound authorizer this assessment "
+                "cannot read: authorizerConfiguration holds "
+                f"{', '.join(sorted(authorizer_configuration))} and not "
+                "customJWTAuthorizer, the only member botocore 1.43.85 "
+                "defines."
+            ),
+            resolution=(
+                "Upgrade the assessment's botocore so the new authorizer "
+                "member can be judged, then re-run."
+            ),
+            reference=AGENTCORE_RUNTIME_INBOUND_AUTH_REFERENCE_URL,
+            severity=SeverityEnum.INFORMATIONAL,
+            status=StatusEnum.NA,
+        )
+
+    discovery_url = jwt_authorizer.get("discoveryUrl", "an unnamed issuer")
+    if "discoveryUrl" in jwt_authorizer and not _jwt_discovery_url_is_https(
+        jwt_authorizer
+    ):
+        return _jwt_issuer_not_https_finding(
+            "AC-30",
+            "AgentCore Runtime Inbound Authorization Issuer Not HTTPS",
+            label,
+            discovery_url,
+            AGENTCORE_RUNTIME_INBOUND_AUTH_REFERENCE_URL,
+        )
+    caller_claims = _jwt_authorizer_claims(jwt_authorizer, JWT_AUTHORIZER_CALLER_CLAIMS)
+    other_claims = _jwt_authorizer_claims(jwt_authorizer, JWT_AUTHORIZER_OTHER_CLAIMS)
+    if caller_claims:
+        validated = caller_claims + other_claims
+        return create_finding(
+            check_id="AC-30",
+            finding_name="AgentCore Runtime Inbound Authorization",
+            finding_details=(
+                f"{label} accepts JWTs from {discovery_url} and validates "
+                f"the {', '.join(validated)} claim(s) before the agent's "
+                f"code runs.{scope_note}"
+            ),
+            resolution=(
+                "No action required. Confirm the pinned values name this "
+                "workload's own audience, clients and scopes."
+            ),
+            reference=AGENTCORE_RUNTIME_INBOUND_AUTH_REFERENCE_URL,
+            severity=SeverityEnum.HIGH,
+            status=StatusEnum.PASSED,
+        )
+    else:
+        validated = (
+            f"validates the {', '.join(other_claims)} claim(s) but"
+            if other_claims
+            else "validates"
+        )
+        return create_finding(
+            check_id="AC-30",
+            finding_name="AgentCore Runtime Inbound Authorization Unbounded",
+            finding_details=(
+                f"{label} accepts JWTs from {discovery_url}, {validated} "
+                "neither the audience nor the client id, so a token that "
+                "issuer minted for a different application invokes this "
+                "agent."
+                f"{_jwt_unbounded_allow_list_note(jwt_authorizer)}"
+            ),
+            resolution=(
+                "Set allowedAudience or allowedClients on the runtime's "
+                "customJWTAuthorizer, and keep allowedScopes or "
+                "customClaims where the agent's actions differ per caller."
+            ),
+            reference=AGENTCORE_RUNTIME_INBOUND_AUTH_REFERENCE_URL,
+            severity=SeverityEnum.HIGH,
+            status=StatusEnum.FAILED,
+        )
+
+
 def check_agentcore_runtime_inbound_authorization() -> List[Dict[str, Any]]:
     """AC-30: Report how each runtime authenticates the caller that invokes it.
 
@@ -15915,7 +16020,8 @@ def check_agentcore_runtime_inbound_authorization() -> List[Dict[str, Any]]:
     every token its issuer minted for every application registered with that
     issuer, so a token issued to a different application reaches this agent.
     AG-24 asks this of a gateway; a runtime that callers invoke directly never
-    passes through one.
+    passes through one. Each version a runtime endpoint serves is judged, since
+    every version carries its own authorizer.
     """
     if agentcore_client is None:
         return [
@@ -15983,125 +16089,106 @@ def check_agentcore_runtime_inbound_authorization() -> List[Dict[str, Any]]:
             )
             continue
 
-        authorizer_configuration = details.get("authorizerConfiguration") or {}
-        jwt_authorizer = authorizer_configuration.get("customJWTAuthorizer") or {}
-
-        if not authorizer_configuration:
-            findings.append(
-                create_finding(
-                    check_id="AC-30",
-                    finding_name="AgentCore Runtime Inbound Authorization",
-                    finding_details=(
-                        f"{label} carries no inbound authorizer, so every invoke "
-                        "must be SigV4-signed and IAM decides which principal may "
-                        "reach the agent."
-                    ),
-                    resolution=(
-                        "No action required. Confirm the IAM principals allowed to "
-                        "call InvokeAgentRuntime are the intended callers, because "
-                        "SigV4 proves the caller's AWS identity and not an end "
-                        "user's."
-                    ),
-                    reference=AGENTCORE_RUNTIME_INBOUND_AUTH_REFERENCE_URL,
-                    severity=SeverityEnum.HIGH,
-                    status=StatusEnum.PASSED,
-                )
+        default_version = details.get("agentRuntimeVersion")
+        try:
+            endpoints = _agentcore_list_all(
+                "list_agent_runtime_endpoints",
+                ["runtimeEndpoints"],
+                agentRuntimeId=runtime_id,
             )
-            continue
-
-        if not jwt_authorizer:
-            findings.append(
-                create_finding(
+        except (BotoCoreError, ClientError) as error:
+            finding = _runtime_inbound_authorization_finding(
+                label,
+                details,
+                " This is the authorizer of the version GetAgentRuntime returns "
+                "with no agentRuntimeVersion.",
+            )
+            unread = (
+                " The versions its endpoints serve could not be listed: "
+                "ListAgentRuntimeEndpoints failed with "
+                f"{_assessment_error_label(error)}."
+            )
+            if finding["Status"] == StatusEnum.PASSED.value:
+                finding = create_finding(
                     check_id="AC-30",
                     finding_name="AgentCore Runtime Inbound Authorization",
                     finding_details=(
-                        f"{label} carries an inbound authorizer this assessment "
-                        "cannot read: authorizerConfiguration holds "
-                        f"{', '.join(sorted(authorizer_configuration))} and not "
-                        "customJWTAuthorizer, the only member botocore 1.43.85 "
-                        "defines."
+                        f"{finding['Finding_Details']}{unread} A version an "
+                        "endpoint serves may carry another authorizer, so the "
+                        "runtime is not reported as authenticated."
                     ),
                     resolution=(
-                        "Upgrade the assessment's botocore so the new authorizer "
-                        "member can be judged, then re-run."
+                        "Grant bedrock-agentcore:ListAgentRuntimeEndpoints and retry."
                     ),
                     reference=AGENTCORE_RUNTIME_INBOUND_AUTH_REFERENCE_URL,
                     severity=SeverityEnum.INFORMATIONAL,
                     status=StatusEnum.NA,
                 )
-            )
+            else:
+                finding["Finding_Details"] += unread
+            findings.append(finding)
             continue
 
-        discovery_url = jwt_authorizer.get("discoveryUrl", "an unnamed issuer")
-        if "discoveryUrl" in jwt_authorizer and not _jwt_discovery_url_is_https(
-            jwt_authorizer
-        ):
-            findings.append(
-                _jwt_issuer_not_https_finding(
-                    "AC-30",
-                    "AgentCore Runtime Inbound Authorization Issuer Not HTTPS",
-                    label,
-                    discovery_url,
-                    AGENTCORE_RUNTIME_INBOUND_AUTH_REFERENCE_URL,
-                )
-            )
-            continue
-        caller_claims = _jwt_authorizer_claims(
-            jwt_authorizer, JWT_AUTHORIZER_CALLER_CLAIMS
-        )
-        other_claims = _jwt_authorizer_claims(
-            jwt_authorizer, JWT_AUTHORIZER_OTHER_CLAIMS
-        )
-        if caller_claims:
-            validated = caller_claims + other_claims
-            findings.append(
-                create_finding(
-                    check_id="AC-30",
-                    finding_name="AgentCore Runtime Inbound Authorization",
-                    finding_details=(
-                        f"{label} accepts JWTs from {discovery_url} and validates "
-                        f"the {', '.join(validated)} claim(s) before the agent's "
-                        "code runs. This is the authorizer of the version "
-                        "GetAgentRuntime returns with no agentRuntimeVersion; "
-                        "other versions an endpoint serves were not read."
-                    ),
-                    resolution=(
-                        "No action required. Confirm the pinned values name this "
-                        "workload's own audience, clients and scopes."
-                    ),
-                    reference=AGENTCORE_RUNTIME_INBOUND_AUTH_REFERENCE_URL,
-                    severity=SeverityEnum.HIGH,
-                    status=StatusEnum.PASSED,
-                )
-            )
-        else:
-            validated = (
-                f"validates the {', '.join(other_claims)} claim(s) but"
-                if other_claims
-                else "validates"
-            )
-            findings.append(
-                create_finding(
-                    check_id="AC-30",
-                    finding_name="AgentCore Runtime Inbound Authorization Unbounded",
-                    finding_details=(
-                        f"{label} accepts JWTs from {discovery_url}, {validated} "
-                        "neither the audience nor the client id, so a token that "
-                        "issuer minted for a different application invokes this "
-                        "agent."
-                        f"{_jwt_unbounded_allow_list_note(jwt_authorizer)}"
-                    ),
-                    resolution=(
-                        "Set allowedAudience or allowedClients on the runtime's "
-                        "customJWTAuthorizer, and keep allowedScopes or "
-                        "customClaims where the agent's actions differ per caller."
-                    ),
-                    reference=AGENTCORE_RUNTIME_INBOUND_AUTH_REFERENCE_URL,
-                    severity=SeverityEnum.HIGH,
-                    status=StatusEnum.FAILED,
-                )
+        served: Dict[str, List[str]] = {}
+        for endpoint in endpoints:
+            endpoint_name = endpoint.get("name") or endpoint.get("id") or "unnamed"
+            for field in ("liveVersion", "targetVersion"):
+                version = endpoint.get(field)
+                if version and endpoint_name not in served.setdefault(str(version), []):
+                    served[str(version)].append(endpoint_name)
+
+        def served_label(version: Any) -> str:
+            names = served.get(str(version))
+            if not names:
+                return f"{label} version {version}"
+            return (
+                f"{label} version {version}, served by endpoint(s) "
+                f"{', '.join(sorted(names))},"
             )
 
+        others = sorted(v for v in served if v != str(default_version))
+        default_label = (
+            served_label(default_version) if default_version is not None else label
+        )
+        findings.append(
+            _runtime_inbound_authorization_finding(
+                default_label,
+                details,
+                f" The other {len(others)} version(s) its endpoints serve are "
+                "judged on their own rows."
+                if others
+                else " No endpoint serves another version.",
+            )
+        )
+        for version in others:
+            try:
+                version_details = agentcore_client.get_agent_runtime(
+                    agentRuntimeId=runtime_id, agentRuntimeVersion=version
+                )
+            except (BotoCoreError, ClientError) as error:
+                findings.append(
+                    create_finding(
+                        check_id="AC-30",
+                        finding_name="AgentCore Runtime Inbound Authorization",
+                        finding_details=(
+                            f"{served_label(version)} inbound authorizer could "
+                            f"not be read: {_assessment_error_label(error)}."
+                        ),
+                        resolution=(
+                            "Grant bedrock-agentcore:GetAgentRuntime on this "
+                            "runtime and retry."
+                        ),
+                        reference=AGENTCORE_RUNTIME_INBOUND_AUTH_REFERENCE_URL,
+                        severity=SeverityEnum.INFORMATIONAL,
+                        status=StatusEnum.NA,
+                    )
+                )
+                continue
+            findings.append(
+                _runtime_inbound_authorization_finding(
+                    served_label(version), version_details
+                )
+            )
     return findings
 
 
