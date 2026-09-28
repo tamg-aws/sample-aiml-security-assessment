@@ -919,7 +919,12 @@ AI_SUBJECT_ROWS = [
         "read, turns a missing filter into Not Applicable with the group named. Only a "
         "rule whose action is Block is credited. AWS managed groups are credited by name, "
         "and not for a filter whose providing rule is overridden to an action other than "
-        "Block or excluded. A gateway whose wafConfiguration failureMode is FAIL_OPEN "
+        "Block or excluded. A customer SQL injection statement is credited only at "
+        "SensitivityLevel HIGH, and a customer SQL injection or cross-site scripting "
+        "statement on the body only with OversizeHandling MATCH, or NO_MATCH beside a "
+        "rule that blocks an oversized body. The statements inside an AWS managed group "
+        "are not returned by GetWebACL, so their sensitivity and oversize handling are "
+        "not read. A gateway whose wafConfiguration failureMode is FAIL_OPEN "
         "fails, because it allows a request when AWS WAF cannot be evaluated, and one "
         "that reports no failureMode is Not Applicable. The subject is AgentCore gateways",
         [],
@@ -1169,10 +1174,15 @@ FOUNDATION_ROWS = [
         "BR-33 ('Amazon Inspector Lambda Code Scanning Check') covers Lambda "
         "functions and no container image. AC-50 covers the images: it reads "
         "GetRegistryScanningConfiguration and passes when scanType is ENHANCED "
-        "and a rule with SCAN_ON_PUSH or CONTINUOUS_SCAN has wildcard filters "
-        "that match every ECR repository whose name marks it as AgentCore or "
-        "Bedrock agent code. BASIC scanning fails, and a filter that misses a "
-        "repository fails and names it",
+        "and a CONTINUOUS_SCAN rule has wildcard filters that match every ECR "
+        "repository an AgentCore runtime's containerUri names, and every one "
+        "whose name marks it as AgentCore or Bedrock agent code. SCAN_ON_PUSH "
+        "alone fails, because a CVE published after the push is not reported. "
+        "BASIC scanning fails, and a filter that misses a repository fails and "
+        "names it. A runtime whose image could not be read, or comes from a "
+        "registry in another account or region, is Not Applicable. No check "
+        "reads a deploy gate that blocks on finding severity, because no AWS "
+        "API records whether a pipeline stage fails on an Inspector finding",
         [],
         6,
     ),
@@ -1296,7 +1306,11 @@ FOUNDATION_ROWS = [
         "any API, so they are not judged. The gateway's web ACL comes from the "
         "lookup AG-27 and AG-39 already make, and the ACL passes when its rules "
         "include AWSManagedRulesAntiDDoSRuleSet with an override action other than "
-        "Count",
+        "Count. A passing finding names the Block and Challenge sensitivities the "
+        "group runs with, API defaults filled in, and does not grade them, since "
+        "the control asks for a deliberate choice and names no value. Shield "
+        "Advanced enrollment is not judged, because shield:CreateProtection "
+        "accepts no AgentCore gateway ARN",
         [],
         6,
     ),

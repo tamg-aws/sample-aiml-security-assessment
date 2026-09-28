@@ -415,6 +415,18 @@ section.
     inbound leg fails security groups whose ranges together cover
     `0.0.0.0/0` or `::/0`, which passed when split across narrower ranges.
     VPCs are read across every page.
+  - `AG-39` credits a customer `SqliMatchStatement` only at `SensitivityLevel`
+    `HIGH`, where the `LOW` default passed, and a customer SQL injection or
+    cross-site scripting statement on the body only with `OversizeHandling`
+    `MATCH`, or `NO_MATCH` beside a rule that blocks an oversized body, where
+    the `CONTINUE` default passed.
+  - `AC-51` names the Block and Challenge sensitivities the Anti-DDoS group
+    runs with, and says that Shield Advanced enrollment is not judged because
+    `shield:CreateProtection` accepts no AgentCore gateway ARN.
+  - `AC-50` judges every repository an AgentCore runtime's `containerUri`
+    names, where only repositories named for AgentCore were judged, and
+    fails `SCAN_ON_PUSH` alone, which passed. A runtime whose image could
+    not be read or lives in another registry is `N/A`.
 
 ### Deployment impact
 
@@ -513,6 +525,13 @@ applies it. Until it runs, `AC-40` rows that meet the evaluator legs report
 `ec2:DescribeVpcs` are already on the AgentCore role. A region whose only
 AgentCore endpoint is the control-plane or runtime endpoint now fails where
 its gateways are in use.
+
+`AG-39`, `AC-50` and `AC-51` change no IAM grant: they read fields of
+`wafv2:GetWebACL`, `bedrock-agentcore:ListAgentRuntimes`,
+`bedrock-agentcore:GetAgentRuntime` and `ecr:DescribeRepositories`, which
+the AgentCore role already holds. A web ACL whose customer SQL injection or
+cross-site scripting statements use the API defaults, and a repository
+scanned at `SCAN_ON_PUSH` alone, now fail where they passed.
 
 ## 2.0.0 - 2026-09-18
 

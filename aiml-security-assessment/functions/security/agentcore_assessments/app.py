@@ -277,6 +277,11 @@ LOGS_DELETION_PROTECTION_REFERENCE_URL = (
 # The scan frequencies under which ECR enhanced scanning scans a matched
 # repository without a manual request.
 ECR_ENHANCED_SCAN_FREQUENCIES = ("SCAN_ON_PUSH", "CONTINUOUS_SCAN")
+# The repository an ECR image URI names: registry account, region, then the
+# repository path before the tag or digest.
+ECR_IMAGE_URI_PATTERN = re.compile(
+    r"^(\d{12})\.dkr\.ecr\.([a-z0-9-]+)\.amazonaws\.com(?:\.cn)?/([^:@]+)"
+)
 
 
 def _assessment_error_label(error: Exception) -> str:
@@ -4235,14 +4240,71 @@ def check_agentcore_encryption() -> List[Dict[str, Any]]:
     return findings
 
 
-def _agentcore_ecr_repositories() -> List[Dict[str, Any]]:
-    """List every ECR repository in the region that AC-05 treats as AgentCore's."""
+def _agentcore_ecr_repositories(
+    runtime_images: Dict[str, List[str]],
+) -> Tuple[List[Dict[str, Any]], Dict[str, List[str]]]:
+    """List the ECR repositories in the region that hold AgentCore images.
+
+    A repository is in scope when a runtime's container image comes from it, or
+    when its name is one AC-05 treats as AgentCore's. runtime_images maps a
+    "registry/region/repository" key to the runtimes whose image names it.
+    Returns the repositories and, per repository name, the runtimes using it,
+    with the keys no listed repository matched left in runtime_images.
+    """
+    region = ecr_client.meta.region_name
     repositories = []
+    used_by: Dict[str, List[str]] = {}
     for repo in _paginate_aws_list(ecr_client, "describe_repositories", "repositories"):
-        repo_name = repo.get("repositoryName", "").lower()
-        if "agentcore" in repo_name or "bedrock-agent" in repo_name:
+        repo_name = repo.get("repositoryName", "")
+        runtimes = [
+            runtime
+            for key in list(runtime_images)
+            if key.split("/", 2)[1] == region
+            and key.split("/", 2)[2] == repo_name
+            and repo.get("registryId") == key.split("/", 2)[0]
+            for runtime in runtime_images.pop(key)
+        ]
+        if runtimes:
+            used_by[repo_name] = runtimes
+        lowered = repo_name.lower()
+        if runtimes or "agentcore" in lowered or "bedrock-agent" in lowered:
             repositories.append(repo)
-    return repositories
+    return repositories, used_by
+
+
+def _agentcore_runtime_images() -> Tuple[Dict[str, List[str]], List[str]]:
+    """Map each ECR repository a runtime's container image comes from to its runtimes.
+
+    Returns the map, keyed "registry/region/repository", and one note per
+    runtime whose image could not be read. A runtime deployed from code has no
+    container image and is not in the map.
+    """
+    images: Dict[str, List[str]] = {}
+    unread: List[str] = []
+    if agentcore_client is None:
+        return images, unread
+    for runtime in _agentcore_list_all("list_agent_runtimes", ["agentRuntimes"]):
+        runtime_id = runtime.get("agentRuntimeId", "unknown")
+        label = f"'{runtime.get('agentRuntimeName', runtime_id)}' ({runtime_id})"
+        try:
+            detail = agentcore_client.get_agent_runtime(agentRuntimeId=runtime_id)
+        except ClientError as error:
+            unread.append(f"runtime {label}: {_assessment_error_label(error)}")
+            continue
+        uri = (
+            ((detail.get("agentRuntimeArtifact") or {}).get("containerConfiguration"))
+            or {}
+        ).get("containerUri")
+        if not uri:
+            continue
+        match = ECR_IMAGE_URI_PATTERN.match(uri)
+        if not match:
+            unread.append(
+                f"runtime {label}: its image {uri} is not an Amazon ECR image URI"
+            )
+            continue
+        images.setdefault("/".join(match.groups()), []).append(label)
+    return images, unread
 
 
 def _ecr_scanning_filter_matches(repository_filter: str, repo_name: str) -> bool:
@@ -4288,7 +4350,13 @@ def check_agentcore_ecr_enhanced_scanning() -> List[Dict[str, Any]]:
     to scan; enhanced scanning adds language-package findings and, once a
     repository matches a filter, scans it without anyone asking. Enhanced
     scanning turns scanning off for every repository no filter matches, so a
-    registry set to ENHANCED can still leave an agent image unscanned.
+    registry set to ENHANCED can still leave an agent image unscanned. Only
+    CONTINUOUS_SCAN rescans an image after the push, so SCAN_ON_PUSH fails.
+
+    The population is every repository a runtime's container image comes from,
+    read from GetAgentRuntime, plus the repositories named for AgentCore. A
+    runtime whose image could not be read, or whose image lives in a registry
+    this assessment does not list, is reported as not judged.
     """
     finding_name = "AgentCore ECR Enhanced Scanning"
     if ecr_client is None:
@@ -4304,10 +4372,76 @@ def check_agentcore_ecr_enhanced_scanning() -> List[Dict[str, Any]]:
             )
         ]
 
+    runtime_findings = []
+    runtime_images: Dict[str, List[str]] = {}
     try:
-        repositories = _agentcore_ecr_repositories()
+        runtime_images, unread_runtimes = _agentcore_runtime_images()
+    except ClientError as error:
+        unread_runtimes = []
+        runtime_findings.append(
+            create_finding(
+                check_id="AC-50",
+                finding_name=finding_name,
+                finding_details=(
+                    "AgentCore runtimes could not be listed, so the repositories "
+                    "their container images come from were not identified and "
+                    "only repositories named for AgentCore were judged: "
+                    f"{_assessment_error_label(error)}."
+                ),
+                resolution=(
+                    "Grant bedrock-agentcore:ListAgentRuntimes and "
+                    "bedrock-agentcore:GetAgentRuntime, then rerun the assessment."
+                ),
+                reference=ECR_ENHANCED_SCANNING_REFERENCE_URL,
+                severity=SeverityEnum.INFORMATIONAL,
+                status=StatusEnum.NA,
+            )
+        )
+    for note in unread_runtimes:
+        runtime_findings.append(
+            create_finding(
+                check_id="AC-50",
+                finding_name=finding_name,
+                finding_details=(
+                    f"The container image of AgentCore {note}, so the repository "
+                    "it comes from was not judged."
+                ),
+                resolution=(
+                    "Grant bedrock-agentcore:GetAgentRuntime, then rerun the "
+                    "assessment."
+                ),
+                reference=ECR_ENHANCED_SCANNING_REFERENCE_URL,
+                severity=SeverityEnum.INFORMATIONAL,
+                status=StatusEnum.NA,
+            )
+        )
+
+    try:
+        repositories, used_by = _agentcore_ecr_repositories(runtime_images)
+        for key, runtimes in runtime_images.items():
+            registry, region, repo_name = key.split("/", 2)
+            runtime_findings.append(
+                create_finding(
+                    check_id="AC-50",
+                    finding_name=finding_name,
+                    finding_details=(
+                        f"AgentCore runtime(s) {', '.join(runtimes)} run images "
+                        f"from repository '{repo_name}' in registry {registry} "
+                        f"in {region}, which is not a repository this "
+                        "assessment listed in this account and region, so its "
+                        "scanning was not judged."
+                    ),
+                    resolution=(
+                        "Assess the registry that holds the repository, or move "
+                        "the image into this account's registry in this region."
+                    ),
+                    reference=ECR_ENHANCED_SCANNING_REFERENCE_URL,
+                    severity=SeverityEnum.INFORMATIONAL,
+                    status=StatusEnum.NA,
+                )
+            )
         if not repositories:
-            return [
+            return runtime_findings or [
                 create_finding(
                     check_id="AC-50",
                     finding_name=finding_name,
@@ -4339,6 +4473,12 @@ def check_agentcore_ecr_enhanced_scanning() -> List[Dict[str, Any]]:
     findings = []
     for repo in repositories:
         repo_name = repo.get("repositoryName", "unknown")
+        runtimes = used_by.get(repo_name)
+        used_text = (
+            f" AgentCore runtime(s) {', '.join(runtimes)} run images from it."
+            if runtimes
+            else ""
+        )
         if scan_type != "ENHANCED":
             findings.append(
                 create_finding(
@@ -4347,7 +4487,7 @@ def check_agentcore_ecr_enhanced_scanning() -> List[Dict[str, Any]]:
                     finding_details=(
                         f"ECR repository '{repo_name}' is in a registry whose scan "
                         f"type is {scan_type or 'not set'}, so its agent images get "
-                        "no language-package vulnerability findings."
+                        f"no language-package vulnerability findings.{used_text}"
                     ),
                     resolution=(
                         "Set the private registry's scan type to ENHANCED with a "
@@ -4370,12 +4510,34 @@ def check_agentcore_ecr_enhanced_scanning() -> List[Dict[str, Any]]:
                     finding_details=(
                         f"ECR repository '{repo_name}' matches no enhanced scanning "
                         "filter, so its scan frequency is Off and its agent images "
-                        "are never scanned."
+                        f"are never scanned.{used_text}"
                     ),
                     resolution=(
                         "Add a continuous or scan-on-push repository filter to the "
                         "registry scanning configuration that matches this "
                         "repository."
+                    ),
+                    reference=ECR_ENHANCED_SCANNING_REFERENCE_URL,
+                    severity=SeverityEnum.MEDIUM,
+                    status=StatusEnum.FAILED,
+                )
+            )
+            continue
+
+        if frequency == "SCAN_ON_PUSH":
+            findings.append(
+                create_finding(
+                    check_id="AC-50",
+                    finding_name=finding_name,
+                    finding_details=(
+                        f"ECR repository '{repo_name}' is scanned by enhanced "
+                        "scanning at frequency SCAN_ON_PUSH only, so an image is "
+                        "scanned once when pushed and a CVE published after the "
+                        f"push is not reported against it.{used_text}"
+                    ),
+                    resolution=(
+                        "Add a CONTINUOUS_SCAN repository filter to the registry "
+                        "scanning configuration that matches this repository."
                     ),
                     reference=ECR_ENHANCED_SCANNING_REFERENCE_URL,
                     severity=SeverityEnum.MEDIUM,
@@ -4390,7 +4552,7 @@ def check_agentcore_ecr_enhanced_scanning() -> List[Dict[str, Any]]:
                 finding_name=finding_name,
                 finding_details=(
                     f"ECR repository '{repo_name}' is covered by enhanced scanning "
-                    f"at frequency {frequency}."
+                    f"at frequency {frequency}.{used_text}"
                 ),
                 resolution="No action required.",
                 reference=ECR_ENHANCED_SCANNING_REFERENCE_URL,
@@ -4399,7 +4561,7 @@ def check_agentcore_ecr_enhanced_scanning() -> List[Dict[str, Any]]:
             )
         )
 
-    return findings
+    return runtime_findings + findings
 
 
 def check_browser_tool_recording(
@@ -18632,11 +18794,26 @@ WAF_SQL_INJECTION_GROUP_TOKEN = "sqli"
 WAF_CROSS_SITE_SCRIPTING_GROUP_TOKEN = "commonruleset"
 WAF_CROSS_SITE_SCRIPTING_RULE_PREFIX = "crosssitescripting_"
 
+# A custom SQL injection match statement inspects at SensitivityLevel LOW unless
+# it names HIGH, and the API documents HIGH as detecting more attacks. A match
+# statement on Body or JsonBody forwards the part of an oversized body past the
+# inspection limit uninspected under OversizeHandling CONTINUE, the API default;
+# MATCH treats the oversized request as a match, and NO_MATCH leaves it to a
+# size-constraint rule that blocks the oversized body. The core rule set's
+# SizeRestrictions_BODY rule is one such rule.
+WAF_SQLI_REQUIRED_SENSITIVITY = "HIGH"
+WAF_BODY_FIELDS = ("Body", "JsonBody")
+WAF_CORE_RULE_SET_BODY_SIZE_RULE = "SizeRestrictions_BODY"
+
 # AC-51 reads for the AWS managed Anti-DDoS rule group by its published name.
 # Its soft mitigation already challenges, so only an inner override to Count or
 # Allow, or an exclusion, stops a rule from mitigating.
 WAF_ANTI_DDOS_RULE_GROUP = "AWSManagedRulesAntiDDoSRuleSet"
 WAF_ANTI_DDOS_DISABLING_ACTIONS = ("Count", "Allow")
+# The API defaults for the group's two sensitivity settings, applied when the
+# group's AWSManagedRulesAntiDDoSRuleSet configuration omits them.
+WAF_ANTI_DDOS_DEFAULT_BLOCK_SENSITIVITY = "LOW"
+WAF_ANTI_DDOS_DEFAULT_CHALLENGE_SENSITIVITY = "HIGH"
 
 
 def _waf_statement_nodes(statement: Any) -> List[Dict[str, Any]]:
@@ -18704,6 +18881,13 @@ def _waf_rule_coverage(web_acl: Dict[str, Any]) -> Dict[str, Any]:
     The Anti-DDoS group is credited under anti_ddos while it runs; the Count
     overrides that stop it are listed under anti_ddos_overridden, apart from
     overridden, so the SQL injection and cross-site scripting text is unchanged.
+
+    A custom SQL injection or cross-site scripting statement is credited only
+    at the values that make it inspect: SensitivityLevel HIGH for SQL injection,
+    and on the body an OversizeHandling of MATCH, or NO_MATCH beside a rule that
+    blocks an oversized body. The statements inside an AWS managed rule group
+    are not returned by GetWebACL, so their sensitivity and oversize handling
+    are not read. A statement credited for neither is listed under weakened.
     """
     coverage: Dict[str, Any] = {
         "block": False,
@@ -18714,8 +18898,14 @@ def _waf_rule_coverage(web_acl: Dict[str, Any]) -> Dict[str, Any]:
         "opaque": [],
         "overridden": [],
         "anti_ddos_overridden": [],
+        "anti_ddos_config": None,
+        "weakened": [],
         "evidence": {},
     }
+    # Match statements that credit a filter only once a rule blocks the
+    # oversized body they decline to match.
+    no_match_pending: List[Tuple[str, str]] = []
+    body_size_rule = False
 
     if "Block" in (web_acl.get("DefaultAction") or {}):
         coverage["block"] = True
@@ -18742,12 +18932,38 @@ def _waf_rule_coverage(web_acl: Dict[str, Any]) -> Dict[str, Any]:
             coverage["evidence"]["block"] = f"rule '{rule_name}'"
 
         for node in _waf_statement_nodes(rule.get("Statement")):
-            if blocks and "SqliMatchStatement" in node and not coverage["sqli"]:
-                coverage["sqli"] = True
-                coverage["evidence"]["sqli"] = f"rule '{rule_name}'"
-            if blocks and "XssMatchStatement" in node and not coverage["xss"]:
-                coverage["xss"] = True
-                coverage["evidence"]["xss"] = f"rule '{rule_name}'"
+            for kind, key in (
+                ("sqli", "SqliMatchStatement"),
+                ("xss", "XssMatchStatement"),
+            ):
+                if not blocks or key not in node:
+                    continue
+                statement = node.get(key) or {}
+                weakness = []
+                if kind == "sqli":
+                    sensitivity = statement.get("SensitivityLevel") or "LOW"
+                    if sensitivity != WAF_SQLI_REQUIRED_SENSITIVITY:
+                        weakness.append(
+                            f"rule '{rule_name}' inspects for SQL injection at "
+                            f"SensitivityLevel {sensitivity}, which detects fewer "
+                            "attacks than HIGH"
+                        )
+                oversize = _waf_body_oversize_handling(statement)
+                if oversize == "CONTINUE":
+                    weakness.append(
+                        f"rule '{rule_name}' inspects the body with "
+                        "OversizeHandling CONTINUE, so the part of a body past "
+                        "the inspection limit is forwarded uninspected"
+                    )
+                if weakness:
+                    coverage["weakened"].extend(weakness)
+                elif oversize == "NO_MATCH":
+                    no_match_pending.append((kind, f"rule '{rule_name}'"))
+                elif not coverage[kind]:
+                    coverage[kind] = True
+                    coverage["evidence"][kind] = f"rule '{rule_name}'"
+            if blocks and _waf_blocks_oversized_body(node):
+                body_size_rule = True
             if blocks and "RateBasedStatement" in node and not coverage["rate"]:
                 coverage["rate"] = True
                 coverage["evidence"]["rate"] = f"rule '{rule_name}'"
@@ -18772,6 +18988,10 @@ def _waf_rule_coverage(web_acl: Dict[str, Any]) -> Dict[str, Any]:
                 continue
 
             non_blocking = _waf_group_non_blocking_rules(group)
+            if WAF_CROSS_SITE_SCRIPTING_GROUP_TOKEN in name.lower() and not any(
+                member == WAF_CORE_RULE_SET_BODY_SIZE_RULE for member, _ in non_blocking
+            ):
+                body_size_rule = True
             if name == WAF_ANTI_DDOS_RULE_GROUP:
                 disabled = [
                     (member, action)
@@ -18786,6 +19006,15 @@ def _waf_rule_coverage(web_acl: Dict[str, Any]) -> Dict[str, Any]:
                 elif not coverage["anti_ddos"]:
                     coverage["anti_ddos"] = True
                     coverage["evidence"]["anti_ddos"] = f"rule '{rule_name}'"
+                    coverage["anti_ddos_config"] = next(
+                        (
+                            config[WAF_ANTI_DDOS_RULE_GROUP]
+                            for config in group.get("ManagedRuleGroupConfigs") or []
+                            if isinstance(config, dict)
+                            and isinstance(config.get(WAF_ANTI_DDOS_RULE_GROUP), dict)
+                        ),
+                        None,
+                    )
 
             lowered = name.lower()
             provides = False
@@ -18823,7 +19052,42 @@ def _waf_rule_coverage(web_acl: Dict[str, Any]) -> Dict[str, Any]:
                     f"the blocking rules of {name} in rule '{rule_name}'"
                 )
 
+    for kind, evidence in no_match_pending:
+        if not body_size_rule:
+            coverage["weakened"].append(
+                f"{evidence} inspects the body with OversizeHandling NO_MATCH, and "
+                "no rule that blocks an oversized body was found"
+            )
+        elif not coverage[kind]:
+            coverage[kind] = True
+            coverage["evidence"][kind] = (
+                f"{evidence}, with OversizeHandling NO_MATCH beside a rule that "
+                "blocks an oversized body"
+            )
+
     return coverage
+
+
+def _waf_body_oversize_handling(statement: Dict[str, Any]) -> str:
+    """Return the OversizeHandling of a match statement on the body, or ""."""
+    field_to_match = statement.get("FieldToMatch") or {}
+    for field in WAF_BODY_FIELDS:
+        if field in field_to_match:
+            return (field_to_match.get(field) or {}).get("OversizeHandling") or (
+                "CONTINUE"
+            )
+    return ""
+
+
+def _waf_blocks_oversized_body(node: Dict[str, Any]) -> bool:
+    """True when a statement matches a body larger than a size it names."""
+    size = node.get("SizeConstraintStatement")
+    if not isinstance(size, dict):
+        return False
+    field_to_match = size.get("FieldToMatch") or {}
+    return any(field in field_to_match for field in WAF_BODY_FIELDS) and (
+        size.get("ComparisonOperator") in ("GT", "GE")
+    )
 
 
 def _waf_body_inspection_limit(web_acl: Dict[str, Any]) -> str:
@@ -18885,6 +19149,11 @@ def _gateway_waf_rule_findings(
         f"{'; '.join(coverage['overridden'])}."
         if coverage["overridden"]
         else ""
+    ) + (
+        " Not credited because the match statement does not inspect the whole "
+        f"request: {'; '.join(coverage['weakened'])}."
+        if coverage["weakened"]
+        else ""
     )
     fails_open = (
         " The gateway's wafConfiguration failureMode is FAIL_OPEN, so the gateway "
@@ -18916,7 +19185,10 @@ def _gateway_waf_rule_findings(
                     "cross-site scripting rules, a rate-based rule whose action "
                     "is Block, and a DefaultSizeInspectionLimit above KB_16 for "
                     "the AGENTCORE_GATEWAY association, which costs additional "
-                    "WCUs."
+                    "WCUs. A custom SqliMatchStatement needs SensitivityLevel "
+                    "HIGH, and a custom match statement on the body needs "
+                    "OversizeHandling MATCH, or NO_MATCH beside a rule that "
+                    "blocks an oversized body."
                     + (
                         " Set the gateway's wafConfiguration failureMode to FAIL_CLOSE."
                         if failure_mode == "FAIL_OPEN"
@@ -19056,6 +19328,44 @@ AC51_OUT_OF_SCOPE_FRONT_DOORS = (
     "Front doors other than AgentCore gateways (API Gateway, ALB, CloudFront) are "
     "not identifiable as AI entry points by any API, so they are not judged."
 )
+AC51_SHIELD_NOT_JUDGED = (
+    "Shield Advanced enrollment is not judged, because shield:CreateProtection "
+    "accepts no AgentCore gateway ARN."
+)
+
+
+def _anti_ddos_settings_text(config: Optional[Dict[str, Any]]) -> str:
+    """Describe the Block and Challenge settings the Anti-DDoS group runs with.
+
+    The two sensitivities are reported with the API default filled in where
+    the configuration omits one. They are not graded: the control asks for a
+    deliberate choice, and the configuration records a value, not whether it
+    was chosen.
+    """
+    if config is None:
+        return (
+            f"The web ACL records no {WAF_ANTI_DDOS_RULE_GROUP} configuration, so "
+            "its Block and Challenge settings were not read."
+        )
+    block = config.get("SensitivityToBlock") or (
+        f"{WAF_ANTI_DDOS_DEFAULT_BLOCK_SENSITIVITY} (the default)"
+    )
+    challenge = (config.get("ClientSideActionConfig") or {}).get("Challenge") or {}
+    usage = challenge.get("UsageOfAction")
+    if usage == "DISABLED":
+        return (
+            f"DDoSRequests blocks at sensitivity {block}. Challenge UsageOfAction "
+            "is DISABLED, so ChallengeAllDuringEvent and ChallengeDDoSRequests "
+            "are not evaluated."
+        )
+    challenge_sensitivity = challenge.get("Sensitivity") or (
+        f"{WAF_ANTI_DDOS_DEFAULT_CHALLENGE_SENSITIVITY} (the default)"
+    )
+    return (
+        f"DDoSRequests blocks at sensitivity {block}, and ChallengeDDoSRequests "
+        f"challenges at sensitivity {challenge_sensitivity} with UsageOfAction "
+        f"{usage or 'not recorded'}."
+    )
 
 
 def check_agentcore_web_acl_anti_ddos() -> List[Dict[str, Any]]:
@@ -19070,7 +19380,9 @@ def check_agentcore_web_acl_anti_ddos() -> List[Dict[str, Any]]:
     as an AI entry point, and each is judged by the web ACL GetGateway reports.
     The group is credited only while it runs: a Count override on the rule that
     holds it, or an inner rule overridden to Count or Allow or excluded, turns
-    that mitigation off.
+    that mitigation off. A passing gateway's finding names the Block and
+    Challenge sensitivities the group runs with. Shield Advanced enrollment is
+    not read, because CreateProtection accepts no AgentCore gateway ARN.
     """
     finding_name = "AgentCore Gateway Anti-DDoS Protection"
 
@@ -19078,7 +19390,9 @@ def check_agentcore_web_acl_anti_ddos() -> List[Dict[str, Any]]:
         return create_finding(
             check_id="AC-51",
             finding_name=finding_name,
-            finding_details=f"{details} {AC51_OUT_OF_SCOPE_FRONT_DOORS}",
+            finding_details=(
+                f"{details} {AC51_SHIELD_NOT_JUDGED} {AC51_OUT_OF_SCOPE_FRONT_DOORS}"
+            ),
             resolution=resolution,
             reference=WAF_ANTI_DDOS_REFERENCE_URL,
             severity=severity,
@@ -19187,7 +19501,8 @@ def check_agentcore_web_acl_anti_ddos() -> List[Dict[str, Any]]:
                 finding(
                     f"{label} is associated with web ACL {acl_name}, which runs "
                     f"{WAF_ANTI_DDOS_RULE_GROUP} from "
-                    f"{coverage['evidence']['anti_ddos']}.",
+                    f"{coverage['evidence']['anti_ddos']}. "
+                    f"{_anti_ddos_settings_text(coverage['anti_ddos_config'])}",
                     "No action required.",
                     SeverityEnum.MEDIUM,
                     StatusEnum.PASSED,

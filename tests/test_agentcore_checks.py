@@ -19168,6 +19168,42 @@ def _match_rule(name, statement_key, **overrides):
     return rule
 
 
+def _inspecting_rule(
+    name, statement_key, sensitivity="HIGH", oversize="MATCH", field="Body"
+):
+    """A blocking match rule at the values AG-39 credits unless told otherwise."""
+    statement = {
+        "FieldToMatch": {
+            field: {} if oversize is None else {"OversizeHandling": oversize}
+        },
+        "TextTransformations": [{"Priority": 0, "Type": "NONE"}],
+    }
+    if statement_key == "SqliMatchStatement" and sensitivity is not None:
+        statement["SensitivityLevel"] = sensitivity
+    return {
+        "Name": name,
+        "Action": {"Block": {}},
+        "Statement": {statement_key: statement},
+    }
+
+
+def _body_size_rule(name="body-size", operator="GT", **overrides):
+    rule = {
+        "Name": name,
+        "Action": {"Block": {}},
+        "Statement": {
+            "SizeConstraintStatement": {
+                "FieldToMatch": {"Body": {"OversizeHandling": "MATCH"}},
+                "ComparisonOperator": operator,
+                "Size": 16384,
+                "TextTransformations": [{"Priority": 0, "Type": "NONE"}],
+            }
+        },
+    }
+    rule.update(overrides)
+    return rule
+
+
 class TestAG39GatewayWafRuleCoverage:
     """AG-39: the five filters that decide whether a gateway's web ACL acts."""
 
@@ -19352,7 +19388,11 @@ class TestAG39GatewayWafRuleCoverage:
                         {
                             "OrStatement": {
                                 "Statements": [
-                                    {"SqliMatchStatement": {}},
+                                    {
+                                        "SqliMatchStatement": {
+                                            "SensitivityLevel": "HIGH"
+                                        }
+                                    },
                                     {"XssMatchStatement": {}},
                                 ]
                             }
@@ -19600,9 +19640,7 @@ class TestAG39GatewayWafRuleCoverage:
             self._acl(
                 rules=[
                     _match_rule("sqli-soft", "SqliMatchStatement", Action={action: {}}),
-                    _match_rule(
-                        "sqli-block", "SqliMatchStatement", Action={"Block": {}}
-                    ),
+                    _inspecting_rule("sqli-block", "SqliMatchStatement"),
                     _managed_rule("common", "AWSManagedRulesCommonRuleSet"),
                     _rate_rule(),
                 ]
@@ -19972,6 +20010,308 @@ class TestAG39GatewayWafRuleCoverage:
 
         assert agentcore_app.WAF_AGENTCORE_RESOURCE_TYPE in request_body.key.enum
         assert agentcore_app.WAF_DEFAULT_BODY_INSPECTION_LIMIT in limit.enum
+
+    def test_the_match_statement_values_are_the_ones_the_api_models(self):
+        model = agentcore_app.boto3.client(
+            "wafv2",
+            region_name="us-east-1",
+            aws_access_key_id="testing",
+            aws_secret_access_key="testing",  # pragma: allowlist secret - synthetic test credential
+        ).meta.service_model
+        sqli = model.shape_for("SqliMatchStatement")
+        field_to_match = sqli.members["FieldToMatch"]
+
+        assert agentcore_app.WAF_SQLI_REQUIRED_SENSITIVITY in (
+            sqli.members["SensitivityLevel"].enum
+        )
+        for field in agentcore_app.WAF_BODY_FIELDS:
+            assert {"CONTINUE", "MATCH", "NO_MATCH"} == set(
+                field_to_match.members[field].members["OversizeHandling"].enum
+            )
+        assert {"GT", "GE"} <= set(
+            model.shape_for("SizeConstraintStatement")
+            .members["ComparisonOperator"]
+            .enum
+        )
+
+    # The managed SQL injection group stands in for SQL injection wherever a
+    # test judges cross-site scripting alone, and the reverse.
+    _SQLI_GROUP = _managed_rule("sqli", "AWSManagedRulesSQLiRuleSet")
+    _CORE_GROUP = _managed_rule("common", "AWSManagedRulesCommonRuleSet")
+
+    @pytest.mark.parametrize("sensitivity", ["LOW", None], ids=["low", "unset"])
+    @patch("agentcore_app.wafv2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_low_sensitivity_sqli_statement_is_not_coverage(
+        self, mock_ac, mock_waf, sensitivity
+    ):
+        findings = self._ag39(
+            mock_ac,
+            mock_waf,
+            self._acl(
+                rules=[
+                    _inspecting_rule(
+                        "sqli-low", "SqliMatchStatement", sensitivity=sensitivity
+                    ),
+                    self._CORE_GROUP,
+                    _rate_rule(),
+                ]
+            ),
+        )
+
+        assert findings[0]["Status"] == "Failed"
+        assert "missing 1 of the five" in findings[0]["Finding_Details"]
+        assert "SQL injection inspection" in findings[0]["Finding_Details"]
+        assert (
+            "rule 'sqli-low' inspects for SQL injection at SensitivityLevel LOW"
+            in findings[0]["Finding_Details"]
+        )
+
+    @patch("agentcore_app.wafv2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_high_sensitivity_rule_beside_a_low_one_is_credited(
+        self, mock_ac, mock_waf
+    ):
+        findings = self._ag39(
+            mock_ac,
+            mock_waf,
+            self._acl(
+                rules=[
+                    _inspecting_rule(
+                        "sqli-low", "SqliMatchStatement", sensitivity="LOW"
+                    ),
+                    _inspecting_rule("sqli-high", "SqliMatchStatement"),
+                    self._CORE_GROUP,
+                    _rate_rule(),
+                ]
+            ),
+        )
+
+        assert findings[0]["Status"] == "Passed"
+        assert "rule 'sqli-high'" in findings[0]["Finding_Details"]
+        assert "rule 'sqli-low'" not in findings[0]["Finding_Details"]
+
+    @pytest.mark.parametrize("field", ["Body", "JsonBody"])
+    @pytest.mark.parametrize("oversize", ["CONTINUE", None], ids=["continue", "unset"])
+    @patch("agentcore_app.wafv2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_body_statement_that_continues_past_the_limit_is_not_coverage(
+        self, mock_ac, mock_waf, oversize, field
+    ):
+        findings = self._ag39(
+            mock_ac,
+            mock_waf,
+            self._acl(
+                rules=[
+                    self._SQLI_GROUP,
+                    _inspecting_rule(
+                        "xss-body", "XssMatchStatement", oversize=oversize, field=field
+                    ),
+                    _rate_rule(),
+                ]
+            ),
+        )
+
+        assert findings[0]["Status"] == "Failed"
+        assert "cross-site scripting inspection" in findings[0]["Finding_Details"]
+        assert (
+            "rule 'xss-body' inspects the body with OversizeHandling CONTINUE"
+            in findings[0]["Finding_Details"]
+        )
+
+    @pytest.mark.parametrize("field", ["Body", "JsonBody"])
+    @patch("agentcore_app.wafv2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_body_statement_that_matches_oversize_is_coverage(
+        self, mock_ac, mock_waf, field
+    ):
+        findings = self._ag39(
+            mock_ac,
+            mock_waf,
+            self._acl(
+                rules=[
+                    self._SQLI_GROUP,
+                    _inspecting_rule("xss-body", "XssMatchStatement", field=field),
+                    _rate_rule(),
+                ]
+            ),
+        )
+
+        assert findings[0]["Status"] == "Passed"
+        assert "rule 'xss-body'" in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.wafv2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_statement_off_the_body_has_no_oversize_setting_to_judge(
+        self, mock_ac, mock_waf
+    ):
+        findings = self._ag39(
+            mock_ac,
+            mock_waf,
+            self._acl(
+                rules=[
+                    self._SQLI_GROUP,
+                    _inspecting_rule(
+                        "xss-query",
+                        "XssMatchStatement",
+                        oversize=None,
+                        field="QueryString",
+                    ),
+                    _rate_rule(),
+                ]
+            ),
+        )
+
+        assert findings[0]["Status"] == "Passed"
+        assert "rule 'xss-query'" in findings[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        ("size_rules", "verdict"),
+        [
+            ([], "Failed"),
+            ([_body_size_rule()], "Passed"),
+            ([_body_size_rule(operator="GE")], "Passed"),
+            ([_body_size_rule(operator="LT")], "Failed"),
+            ([_body_size_rule(Action={"Count": {}})], "Failed"),
+        ],
+        ids=["no-size-rule", "gt", "ge", "lt", "count"],
+    )
+    @patch("agentcore_app.wafv2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_no_match_needs_a_rule_that_blocks_the_oversized_body(
+        self, mock_ac, mock_waf, size_rules, verdict
+    ):
+        findings = self._ag39(
+            mock_ac,
+            mock_waf,
+            self._acl(
+                rules=[
+                    self._SQLI_GROUP,
+                    _inspecting_rule(
+                        "xss-body", "XssMatchStatement", oversize="NO_MATCH"
+                    ),
+                    _rate_rule(),
+                    *size_rules,
+                ]
+            ),
+        )
+
+        assert findings[0]["Status"] == verdict
+        if verdict == "Failed":
+            assert (
+                "rule 'xss-body' inspects the body with OversizeHandling NO_MATCH, "
+                "and no rule that blocks an oversized body was found"
+                in findings[0]["Finding_Details"]
+            )
+        else:
+            assert (
+                "OversizeHandling NO_MATCH beside a rule"
+                in findings[0]["Finding_Details"]
+            )
+
+    @pytest.mark.parametrize(
+        ("core_group", "verdict"),
+        [
+            (_managed_rule("common", "AWSManagedRulesCommonRuleSet"), "Passed"),
+            (
+                _managed_rule(
+                    "common",
+                    "AWSManagedRulesCommonRuleSet",
+                    Statement={
+                        "ManagedRuleGroupStatement": {
+                            "VendorName": "AWS",
+                            "Name": "AWSManagedRulesCommonRuleSet",
+                            "RuleActionOverrides": [
+                                {
+                                    "Name": "SizeRestrictions_BODY",
+                                    "ActionToUse": {"Count": {}},
+                                }
+                            ],
+                        }
+                    },
+                ),
+                "Failed",
+            ),
+        ],
+        ids=["size-rule-runs", "size-rule-counted"],
+    )
+    @patch("agentcore_app.wafv2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_the_core_rule_set_body_size_rule_backs_no_match(
+        self, mock_ac, mock_waf, core_group, verdict
+    ):
+        findings = self._ag39(
+            mock_ac,
+            mock_waf,
+            self._acl(
+                rules=[
+                    _inspecting_rule(
+                        "sqli-body", "SqliMatchStatement", oversize="NO_MATCH"
+                    ),
+                    core_group,
+                    _rate_rule(),
+                ]
+            ),
+        )
+
+        assert findings[0]["Status"] == verdict
+        if verdict == "Failed":
+            assert "SQL injection inspection" in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.wafv2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_two_gateways_one_with_a_low_sensitivity_statement(self, mock_ac, mock_waf):
+        second_arn = _WEB_ACL_ARN.replace("gw-acl", "gw-acl-2")
+        mock_ac.list_gateways.return_value = {
+            "items": [
+                {"gatewayId": "gw-high", "name": "High"},
+                {"gatewayId": "gw-low", "name": "Low"},
+            ]
+        }
+        details = {
+            gateway_id: {
+                "gatewayId": gateway_id,
+                "name": name,
+                "authorizerType": "AWS_IAM",
+                "webAclArn": arn,
+                "wafConfiguration": {"failureMode": "FAIL_CLOSE"},
+            }
+            for gateway_id, name, arn in (
+                ("gw-high", "High", _WEB_ACL_ARN),
+                ("gw-low", "Low", second_arn),
+            )
+        }
+        mock_ac.get_gateway.side_effect = lambda gatewayIdentifier: details[
+            gatewayIdentifier
+        ]
+        acls = {
+            _WEB_ACL_ARN: self._acl(
+                rules=[
+                    _inspecting_rule("sqli", "SqliMatchStatement"),
+                    self._CORE_GROUP,
+                    _rate_rule(),
+                ]
+            ),
+            second_arn: self._acl(
+                Name="gw-acl-2",
+                rules=[
+                    _inspecting_rule("sqli", "SqliMatchStatement", sensitivity="LOW"),
+                    self._CORE_GROUP,
+                    _rate_rule(),
+                ],
+            ),
+        }
+        mock_waf.get_web_acl.side_effect = lambda ARN: {"WebACL": acls[ARN]}
+
+        findings = [
+            finding
+            for finding in agentcore_app.check_agentcore_gateway_agentic_security()
+            if finding["Check_ID"] == "AG-39"
+        ]
+
+        assert [finding["Status"] for finding in findings] == ["Passed", "Failed"]
+        assert "Gateway 'Low' (gw-low)" in findings[1]["Finding_Details"]
+        assert "SensitivityLevel LOW" in findings[1]["Finding_Details"]
 
 
 # ===================================================================
@@ -20544,7 +20884,7 @@ class TestAC50EcrEnhancedScanning:
 
         findings = agentcore_app.check_agentcore_ecr_enhanced_scanning()
 
-        assert [finding["Status"] for finding in findings] == ["Passed", "Passed"]
+        assert [finding["Status"] for finding in findings] == ["Passed", "Failed"]
         assert "CONTINUOUS_SCAN" in findings[0]["Finding_Details"]
         assert "SCAN_ON_PUSH" in findings[1]["Finding_Details"]
 
@@ -20580,7 +20920,7 @@ class TestAC50EcrEnhancedScanning:
             {"repositories": [_ecr_repo("other"), _ecr_repo("agentcore-b")]},
         ]
         mock_ecr.get_registry_scanning_configuration.return_value = _scanning(
-            "ENHANCED", ("SCAN_ON_PUSH", ["agentcore-a"])
+            "ENHANCED", ("CONTINUOUS_SCAN", ["agentcore-a"])
         )
 
         findings = agentcore_app.check_agentcore_ecr_enhanced_scanning()
@@ -20623,6 +20963,254 @@ class TestAC50EcrEnhancedScanning:
             )
             == self._ECR_GUIDE_TABLE[pattern]
         )
+
+
+def _image_uri(repo, account="123456789012", region="us-east-1", ref=":v1"):
+    return f"{account}.dkr.ecr.{region}.amazonaws.com/{repo}{ref}"
+
+
+def _runtimes_with_images(mock_ac, images):
+    """Answer ListAgentRuntimes and GetAgentRuntime for runtime id to image.
+
+    An image of None is a runtime deployed from code, and an exception is what
+    GetAgentRuntime raises for that runtime.
+    """
+    mock_ac.list_agent_runtimes.return_value = {
+        "agentRuntimes": [
+            {"agentRuntimeId": runtime_id, "agentRuntimeName": f"name-{runtime_id}"}
+            for runtime_id in images
+        ]
+    }
+
+    def get_agent_runtime(agentRuntimeId):
+        image = images[agentRuntimeId]
+        if isinstance(image, Exception):
+            raise image
+        if image is None:
+            artifact = {"codeConfiguration": {"entryPoint": ["main.py"]}}
+        else:
+            artifact = {"containerConfiguration": {"containerUri": image}}
+        return {"agentRuntimeId": agentRuntimeId, "agentRuntimeArtifact": artifact}
+
+    mock_ac.get_agent_runtime.side_effect = get_agent_runtime
+
+
+def _owned_repo(name, registry_id="123456789012"):
+    return {"repositoryName": name, "registryId": registry_id}
+
+
+class TestAC50RuntimeImagePopulation:
+    """AC-50 judges the repositories runtimes run images from, and CONTINUOUS_SCAN."""
+
+    @staticmethod
+    def _ecr(mock_ecr, repos, *rules):
+        mock_ecr.meta.region_name = "us-east-1"
+        mock_ecr.describe_repositories.return_value = {"repositories": repos}
+        mock_ecr.get_registry_scanning_configuration.return_value = _scanning(
+            "ENHANCED", *rules
+        )
+
+    @patch("agentcore_app.agentcore_client", None)
+    @patch("agentcore_app.ecr_client")
+    def test_scan_on_push_alone_fails_beside_a_continuous_repository(self, mock_ecr):
+        self._ecr(
+            mock_ecr,
+            [_owned_repo("agentcore-a"), _owned_repo("agentcore-b")],
+            ("CONTINUOUS_SCAN", ["agentcore-a"]),
+            ("SCAN_ON_PUSH", ["agentcore-b"]),
+        )
+
+        findings = agentcore_app.check_agentcore_ecr_enhanced_scanning()
+
+        assert [finding["Status"] for finding in findings] == ["Passed", "Failed"]
+        assert "'agentcore-b'" in findings[1]["Finding_Details"]
+        assert "SCAN_ON_PUSH only" in findings[1]["Finding_Details"]
+        assert "CONTINUOUS_SCAN" in findings[1]["Resolution"]
+
+    @patch("agentcore_app.agentcore_client")
+    @patch("agentcore_app.ecr_client")
+    def test_a_runtime_image_repository_is_judged_whatever_its_name(
+        self, mock_ecr, mock_ac
+    ):
+        self._ecr(
+            mock_ecr,
+            [
+                _owned_repo("support-bot"),
+                _owned_repo("web-frontend"),
+                _owned_repo("triage"),
+            ],
+            ("CONTINUOUS_SCAN", ["support-bot"]),
+        )
+        _runtimes_with_images(
+            mock_ac,
+            {
+                "rt-1": _image_uri("support-bot"),
+                "rt-2": _image_uri("triage", ref="@sha256:" + "a" * 64),
+            },
+        )
+
+        findings = agentcore_app.check_agentcore_ecr_enhanced_scanning()
+
+        assert [finding["Status"] for finding in findings] == ["Passed", "Failed"]
+        assert "'support-bot'" in findings[0]["Finding_Details"]
+        assert "'name-rt-1' (rt-1) run images from it" in findings[0]["Finding_Details"]
+        assert "'triage'" in findings[1]["Finding_Details"]
+        assert "(rt-2)" in findings[1]["Finding_Details"]
+        assert all("web-frontend" not in f["Finding_Details"] for f in findings)
+
+    @patch("agentcore_app.agentcore_client")
+    @patch("agentcore_app.ecr_client")
+    def test_a_nested_repository_path_is_matched_whole(self, mock_ecr, mock_ac):
+        self._ecr(
+            mock_ecr,
+            [_owned_repo("team/agents/support"), _owned_repo("support")],
+            ("CONTINUOUS_SCAN", ["support"]),
+        )
+        _runtimes_with_images(mock_ac, {"rt-1": _image_uri("team/agents/support")})
+
+        findings = agentcore_app.check_agentcore_ecr_enhanced_scanning()
+
+        assert len(findings) == 1
+        assert "'team/agents/support'" in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    @patch("agentcore_app.ecr_client")
+    def test_a_repository_named_for_agentcore_stays_in_scope(self, mock_ecr, mock_ac):
+        self._ecr(
+            mock_ecr,
+            [_owned_repo("agentcore-legacy"), _owned_repo("support-bot")],
+            ("CONTINUOUS_SCAN", ["*"]),
+        )
+        _runtimes_with_images(mock_ac, {"rt-1": _image_uri("support-bot")})
+
+        findings = agentcore_app.check_agentcore_ecr_enhanced_scanning()
+
+        assert [finding["Status"] for finding in findings] == ["Passed", "Passed"]
+        assert "'agentcore-legacy'" in findings[0]["Finding_Details"]
+        assert "run images from it" not in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    @patch("agentcore_app.ecr_client")
+    def test_an_unreadable_runtime_is_na_beside_a_passing_repository(
+        self, mock_ecr, mock_ac
+    ):
+        self._ecr(mock_ecr, [_owned_repo("support-bot")], ("CONTINUOUS_SCAN", ["*"]))
+        _runtimes_with_images(
+            mock_ac,
+            {
+                "rt-1": _image_uri("support-bot"),
+                "rt-2": _make_client_error("AccessDeniedException", "no"),
+            },
+        )
+
+        findings = agentcore_app.check_agentcore_ecr_enhanced_scanning()
+
+        assert [finding["Status"] for finding in findings] == ["N/A", "Passed"]
+        assert "'name-rt-2' (rt-2)" in findings[0]["Finding_Details"]
+        assert "AccessDeniedException" in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    @patch("agentcore_app.ecr_client")
+    def test_an_unlistable_runtime_inventory_is_na_and_names_are_still_judged(
+        self, mock_ecr, mock_ac
+    ):
+        self._ecr(mock_ecr, [_owned_repo("agentcore-a")], ("CONTINUOUS_SCAN", ["*"]))
+        mock_ac.list_agent_runtimes.side_effect = _make_client_error(
+            "AccessDeniedException", "no"
+        )
+
+        findings = agentcore_app.check_agentcore_ecr_enhanced_scanning()
+
+        assert [finding["Status"] for finding in findings] == ["N/A", "Passed"]
+        assert "could not be listed" in findings[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        ("uri", "registry_id", "named"),
+        [
+            (_image_uri("support-bot", account="444455556666"), None, "444455556666"),
+            (_image_uri("support-bot", region="us-west-2"), None, "us-west-2"),
+            (_image_uri("support-bot"), "111122223333", "123456789012"),
+        ],
+        ids=["other-account", "other-region", "registry-id-differs"],
+    )
+    @patch("agentcore_app.agentcore_client")
+    @patch("agentcore_app.ecr_client")
+    def test_an_image_from_a_registry_not_listed_is_na(
+        self, mock_ecr, mock_ac, uri, registry_id, named
+    ):
+        repo = _owned_repo("support-bot")
+        if registry_id:
+            repo["registryId"] = registry_id
+        self._ecr(mock_ecr, [repo], ("CONTINUOUS_SCAN", ["*"]))
+        _runtimes_with_images(mock_ac, {"rt-1": uri})
+
+        findings = agentcore_app.check_agentcore_ecr_enhanced_scanning()
+
+        assert [finding["Status"] for finding in findings] == ["N/A"]
+        assert named in findings[0]["Finding_Details"]
+        assert "(rt-1)" in findings[0]["Finding_Details"]
+        mock_ecr.get_registry_scanning_configuration.assert_not_called()
+
+    @patch("agentcore_app.agentcore_client")
+    @patch("agentcore_app.ecr_client")
+    def test_a_non_ecr_image_is_na(self, mock_ecr, mock_ac):
+        self._ecr(mock_ecr, [_owned_repo("agentcore-a")], ("CONTINUOUS_SCAN", ["*"]))
+        _runtimes_with_images(mock_ac, {"rt-1": "public.ecr.aws/example/agent:latest"})
+
+        findings = agentcore_app.check_agentcore_ecr_enhanced_scanning()
+
+        assert [finding["Status"] for finding in findings] == ["N/A", "Passed"]
+        assert "not an Amazon ECR image URI" in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    @patch("agentcore_app.ecr_client")
+    def test_a_runtime_deployed_from_code_adds_no_repository(self, mock_ecr, mock_ac):
+        self._ecr(mock_ecr, [_owned_repo("web-frontend")], ("CONTINUOUS_SCAN", ["*"]))
+        _runtimes_with_images(mock_ac, {"rt-1": None})
+
+        findings = agentcore_app.check_agentcore_ecr_enhanced_scanning()
+
+        assert [finding["Status"] for finding in findings] == ["N/A"]
+        assert "No AgentCore ECR repositories" in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    @patch("agentcore_app.ecr_client")
+    def test_runtimes_on_a_later_page_are_read(self, mock_ecr, mock_ac):
+        self._ecr(
+            mock_ecr, [_owned_repo("support-bot")], ("SCAN_ON_PUSH", ["support-bot"])
+        )
+        mock_ac.list_agent_runtimes.side_effect = [
+            {"agentRuntimes": [{"agentRuntimeId": "rt-1"}], "nextToken": "t1"},
+            {"agentRuntimes": [{"agentRuntimeId": "rt-2"}]},
+        ]
+        mock_ac.get_agent_runtime.side_effect = lambda agentRuntimeId: {
+            "agentRuntimeArtifact": {
+                "containerConfiguration": {
+                    "containerUri": _image_uri(
+                        "support-bot" if agentRuntimeId == "rt-2" else "elsewhere"
+                    )
+                }
+            }
+        }
+
+        findings = agentcore_app.check_agentcore_ecr_enhanced_scanning()
+
+        statuses = [finding["Status"] for finding in findings]
+        assert statuses == ["N/A", "Failed"]
+        assert "(rt-2)" in findings[1]["Finding_Details"]
+
+    def test_the_image_uri_field_is_the_one_the_api_models(self):
+        model = agentcore_app.boto3.client(
+            "bedrock-agentcore-control",
+            region_name="us-east-1",
+            aws_access_key_id="testing",
+            aws_secret_access_key="testing",  # pragma: allowlist secret - synthetic test credential
+        ).meta.service_model
+        artifact = model.operation_model("GetAgentRuntime").output_shape.members[
+            "agentRuntimeArtifact"
+        ]
+
+        assert "containerUri" in (artifact.members["containerConfiguration"].members)
 
 
 def _anti_ddos_rule(name="anti-ddos", vendor="AWS", **group_overrides):
@@ -20968,6 +21556,187 @@ class TestAC51GatewayAntiDdos:
 
         mock_waf.list_web_acls.assert_not_called()
         mock_waf.list_resources_for_web_acl.assert_not_called()
+
+
+def _anti_ddos_config(block=None, usage="ENABLED", challenge=None):
+    """An AWSManagedRulesAntiDDoSRuleSet entry for ManagedRuleGroupConfigs."""
+    challenge_config = {"UsageOfAction": usage}
+    if challenge is not None:
+        challenge_config["Sensitivity"] = challenge
+    config = {"ClientSideActionConfig": {"Challenge": challenge_config}}
+    if block is not None:
+        config["SensitivityToBlock"] = block
+    return {"AWSManagedRulesAntiDDoSRuleSet": config}
+
+
+class TestAC51AntiDdosSettings:
+    """AC-51 names the Block and Challenge settings the group runs with."""
+
+    @staticmethod
+    def _one(mock_ac, mock_waf, configs):
+        _gateway_stub(
+            mock_ac,
+            mock_waf,
+            {"gw-1": "acl"},
+            {
+                "acl": {
+                    "Name": "acl",
+                    "Rules": [_anti_ddos_rule(ManagedRuleGroupConfigs=configs)],
+                }
+            },
+        )
+        return agentcore_app.check_agentcore_web_acl_anti_ddos()
+
+    @patch("agentcore_app.wafv2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_the_set_sensitivities_are_named(self, mock_ac, mock_waf):
+        findings = self._one(
+            mock_ac, mock_waf, [_anti_ddos_config(block="MEDIUM", challenge="LOW")]
+        )
+
+        assert [finding["Status"] for finding in findings] == ["Passed"]
+        details = findings[0]["Finding_Details"]
+        assert "DDoSRequests blocks at sensitivity MEDIUM" in details
+        assert (
+            "ChallengeDDoSRequests challenges at sensitivity LOW with UsageOfAction "
+            "ENABLED" in details
+        )
+        assert "(the default)" not in details
+
+    @patch("agentcore_app.wafv2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_an_omitted_sensitivity_is_named_as_the_api_default(
+        self, mock_ac, mock_waf
+    ):
+        findings = self._one(mock_ac, mock_waf, [_anti_ddos_config()])
+
+        details = findings[0]["Finding_Details"]
+        assert "DDoSRequests blocks at sensitivity LOW (the default)" in details
+        assert "challenges at sensitivity HIGH (the default)" in details
+
+    @patch("agentcore_app.wafv2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_disabled_challenge_is_named_and_not_graded(self, mock_ac, mock_waf):
+        findings = self._one(
+            mock_ac,
+            mock_waf,
+            [_anti_ddos_config(block="HIGH", usage="DISABLED", challenge="HIGH")],
+        )
+
+        assert [finding["Status"] for finding in findings] == ["Passed"]
+        details = findings[0]["Finding_Details"]
+        assert "DDoSRequests blocks at sensitivity HIGH." in details
+        assert "Challenge UsageOfAction is DISABLED" in details
+        assert "challenges at sensitivity" not in details
+
+    @patch("agentcore_app.wafv2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_no_configuration_says_the_settings_were_not_read(self, mock_ac, mock_waf):
+        findings = self._one(mock_ac, mock_waf, None)
+
+        assert (
+            "records no AWSManagedRulesAntiDDoSRuleSet configuration"
+            in (findings[0]["Finding_Details"])
+        )
+
+    @patch("agentcore_app.wafv2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_another_groups_configuration_is_not_read_as_anti_ddos(
+        self, mock_ac, mock_waf
+    ):
+        findings = self._one(
+            mock_ac,
+            mock_waf,
+            [
+                {"AWSManagedRulesBotControlRuleSet": {"InspectionLevel": "TARGETED"}},
+                _anti_ddos_config(block="MEDIUM"),
+            ],
+        )
+
+        assert (
+            "DDoSRequests blocks at sensitivity MEDIUM"
+            in (findings[0]["Finding_Details"])
+        )
+
+    @patch("agentcore_app.wafv2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_each_gateway_names_its_own_acls_settings(self, mock_ac, mock_waf):
+        _gateway_stub(
+            mock_ac,
+            mock_waf,
+            {"gw-1": "tuned", "gw-2": "untuned"},
+            {
+                "tuned": {
+                    "Name": "tuned",
+                    "Rules": [
+                        _anti_ddos_rule(
+                            ManagedRuleGroupConfigs=[
+                                _anti_ddos_config(block="HIGH", challenge="MEDIUM")
+                            ]
+                        )
+                    ],
+                },
+                "untuned": {"Name": "untuned", "Rules": [_anti_ddos_rule()]},
+            },
+        )
+
+        findings = agentcore_app.check_agentcore_web_acl_anti_ddos()
+
+        assert [finding["Status"] for finding in findings] == ["Passed", "Passed"]
+        assert "blocks at sensitivity HIGH" in findings[0]["Finding_Details"]
+        assert "records no" not in findings[0]["Finding_Details"]
+        assert "records no" in findings[1]["Finding_Details"]
+        assert "blocks at sensitivity HIGH" not in findings[1]["Finding_Details"]
+
+    @patch("agentcore_app.wafv2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_every_finding_says_shield_advanced_is_not_judged(self, mock_ac, mock_waf):
+        _gateway_stub(
+            mock_ac,
+            mock_waf,
+            {"gw-1": "acl", "gw-2": None},
+            {"acl": {"Name": "acl", "Rules": [_anti_ddos_rule()]}},
+        )
+
+        findings = agentcore_app.check_agentcore_web_acl_anti_ddos()
+
+        assert [finding["Status"] for finding in findings] == ["Passed", "Failed"]
+        for finding in findings:
+            assert (
+                "Shield Advanced enrollment is not judged"
+                in (finding["Finding_Details"])
+            )
+
+    def test_the_settings_and_defaults_are_the_ones_the_api_models(self):
+        credentials = {
+            "region_name": "us-east-1",
+            "aws_access_key_id": "testing",
+            "aws_secret_access_key": "testing",  # pragma: allowlist secret - synthetic test credential
+        }
+        waf = agentcore_app.boto3.client("wafv2", **credentials).meta.service_model
+        config = waf.shape_for("ManagedRuleGroupConfig").members[
+            agentcore_app.WAF_ANTI_DDOS_RULE_GROUP
+        ]
+        block = config.members["SensitivityToBlock"]
+        challenge = config.members["ClientSideActionConfig"].members["Challenge"]
+
+        assert "Default: <code>LOW</code>" in block.documentation
+        assert agentcore_app.WAF_ANTI_DDOS_DEFAULT_BLOCK_SENSITIVITY in block.enum
+        assert (
+            "Default: <code>HIGH</code>"
+            in challenge.members["Sensitivity"].documentation
+        )
+        assert agentcore_app.WAF_ANTI_DDOS_DEFAULT_CHALLENGE_SENSITIVITY in (
+            challenge.members["Sensitivity"].enum
+        )
+        assert set(challenge.members["UsageOfAction"].enum) == {"ENABLED", "DISABLED"}
+
+        shield = agentcore_app.boto3.client("shield", **credentials).meta.service_model
+        resource_arn = shield.operation_model("CreateProtection").input_shape.members[
+            "ResourceArn"
+        ]
+        assert "cloudfront" in resource_arn.documentation
+        assert "bedrock-agentcore" not in resource_arn.documentation
 
 
 class TestEcrScanningAndAntiDdosCheckRegistration:
