@@ -1810,7 +1810,12 @@ class TestBR06CloudTrailLogging:
         with patch(
             "bedrock_app._invocation_record_state",
             create=True,
-            return_value={"logging": True, "gaps": [], "unread": []},
+            return_value={
+                "logging": True,
+                "text_delivery": True,
+                "gaps": [],
+                "unread": [],
+            },
         ):
             yield
 
@@ -2152,7 +2157,7 @@ INFERENCE_TYPES = (
     "AWS::Bedrock::InlineAgent",
 )
 KB_DATA_TYPE = "AWS::Bedrock::KnowledgeBase"
-COMPLETE_RECORD = {"logging": True, "gaps": [], "unread": []}
+COMPLETE_RECORD = {"logging": True, "text_delivery": True, "gaps": [], "unread": []}
 
 
 def _management(name="management", **extra_fields):
@@ -2406,6 +2411,7 @@ class TestBR06SelectorValues:
             {"a": {"advanced": [_data([KB_DATA_TYPE])]}},
             record={
                 "logging": False,
+                "text_delivery": None,
                 "gaps": ["model invocation logging is off"],
                 "unread": [],
             },
@@ -2416,11 +2422,56 @@ class TestBR06SelectorValues:
             "Model invocation logging is off, so the response a retrieval informed"
         )
 
+    def test_knowledge_base_events_without_text_delivery_fail(self):
+        # Both trails cover the knowledge base type; the invocation log still
+        # omits the text of the response a retrieval informed.
+        rows = self._run(
+            {
+                "a": {"advanced": [_data([KB_DATA_TYPE])]},
+                "b": {"advanced": [_management(), _data([KB_DATA_TYPE])]},
+            },
+            record={
+                "logging": True,
+                "text_delivery": False,
+                "gaps": ["textDataDeliveryEnabled is not true"],
+                "unread": [],
+            },
+            knowledge_bases=({"knowledgeBaseId": "kb-1"}, {"knowledgeBaseId": "kb-2"}),
+        )
+        row = rows["Bedrock Knowledge Base Retrieval Data Event Logging"]
+        assert row["Status"] == "Failed"
+        assert row["Finding_Details"].startswith(
+            "Model invocation logging has textDataDeliveryEnabled not true, so the "
+            "text of the response a retrieval informed is not recorded"
+        )
+        assert "2 knowledge base(s)" in row["Finding_Details"]
+        assert "textDataDeliveryEnabled true" in row["Resolution"]
+
+    def test_knowledge_base_events_with_an_unreturned_text_flag_are_not_judged(
+        self,
+    ):
+        rows = self._run(
+            {"a": {"advanced": [_data([KB_DATA_TYPE])]}},
+            record={
+                "logging": True,
+                "text_delivery": None,
+                "gaps": [],
+                "unread": ["textDataDeliveryEnabled, which was not returned"],
+            },
+        )
+        row = rows["Bedrock Knowledge Base Retrieval Data Event Logging"]
+        assert row["Status"] == "N/A"
+        assert (
+            "textDataDeliveryEnabled, which GetModelInvocationLoggingConfiguration "
+            "did not return" in row["Finding_Details"]
+        )
+
     def test_knowledge_base_events_with_unread_logging_are_not_judged(self):
         rows = self._run(
             {"a": {"advanced": [_data([KB_DATA_TYPE])]}},
             record={
                 "logging": None,
+                "text_delivery": None,
                 "gaps": [],
                 "unread": [
                     "bedrock:GetModelInvocationLoggingConfiguration (Throttling)"
@@ -2437,6 +2488,7 @@ class TestBR06SelectorValues:
             {"a": {"advanced": [_management()]}},
             record={
                 "logging": True,
+                "text_delivery": False,
                 "gaps": [
                     "group key is aws managed",
                     "textDataDeliveryEnabled is not true",
@@ -2536,11 +2588,13 @@ class TestInvocationRecordState:
             {"textDataDeliveryEnabled": False, "s3Config": {"bucketName": "logs"}}
         )
         assert any("textDataDeliveryEnabled" in gap for gap in state["gaps"])
+        assert state["text_delivery"] is False
 
     def test_an_unreturned_text_flag_is_unread_not_off(self):
         state, _ = self._state({"s3Config": {"bucketName": "logs"}})
         assert state["gaps"] == []
         assert any("textDataDeliveryEnabled" in item for item in state["unread"])
+        assert state["text_delivery"] is None
 
     def test_every_destination_is_judged(self):
         state, judged = self._state(
@@ -2566,7 +2620,12 @@ class TestInvocationRecordState:
                 "cloudWatchConfig": {"logGroupName": "/bedrock/invocations"},
             }
         )
-        assert state == {"logging": True, "gaps": [], "unread": []}
+        assert state == {
+            "logging": True,
+            "text_delivery": True,
+            "gaps": [],
+            "unread": [],
+        }
 
     def test_a_failed_log_group_is_a_gap(self):
         state, _ = self._state(
@@ -4105,20 +4164,34 @@ def _br10_cache(roles=None, users=None, errors=None):
     return cache
 
 
-_BOTH_DIRECTIONS = {"contentPolicy": {"filters": [{"type": "PROMPT_ATTACK"}]}}
+# The live fixture guardrail 9mls97oibka9 v1 returns this filter, with no
+# inputEnabled or inputAction fields.
+_BOTH_DIRECTIONS = {
+    "contentPolicy": {
+        "filters": [{"type": "HATE", "inputStrength": "HIGH", "outputStrength": "HIGH"}]
+    }
+}
+
+_NO_CENTRAL = {"mechanisms": [], "unread": []}
 
 
 class TestBR10GuardrailBinding:
     """BR-10 judges each invoke grant of every role and user on its value."""
 
-    def _run(self, cache, guardrail=None, versions=None, client=None):
+    def _run(self, cache, guardrail=None, versions=None, client=None, central=None):
         bedrock_client = client or MagicMock()
         if client is None:
             bedrock_client.get_guardrail.return_value = guardrail or _BOTH_DIRECTIONS
             bedrock_client.list_guardrails.return_value = {
                 "guardrails": [{"id": "abc123", "version": v} for v in versions or []]
             }
-        with patch("bedrock_app.boto3.client", return_value=bedrock_client):
+        with (
+            patch("bedrock_app.boto3.client", return_value=bedrock_client),
+            patch(
+                "bedrock_app._central_guardrail_bindings",
+                return_value=central or _NO_CENTRAL,
+            ),
+        ):
             result = bedrock_app.check_bedrock_guardrail_iam_enforcement(
                 cache, region="us-east-1"
             )
@@ -4291,8 +4364,18 @@ class TestBR10GuardrailBinding:
         guardrail = {
             "contentPolicy": {
                 "filters": [
-                    {"type": "PROMPT_ATTACK", "outputEnabled": False},
-                    {"type": "HATE", "inputEnabled": True, "outputEnabled": False},
+                    {
+                        "type": "PROMPT_ATTACK",
+                        "inputStrength": "HIGH",
+                        "outputStrength": "NONE",
+                    },
+                    {
+                        "type": "HATE",
+                        "inputStrength": "HIGH",
+                        "outputStrength": "HIGH",
+                        "inputEnabled": True,
+                        "outputEnabled": False,
+                    },
                 ]
             }
         }
@@ -4306,6 +4389,157 @@ class TestBR10GuardrailBinding:
         assert [f["Status"] for f in findings] == ["Failed"]
         assert "version 1 evaluates no output" in findings[0]["Finding_Details"]
         assert "role 'BoundRole'" in findings[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "guardrail,skipped",
+        [
+            (
+                {
+                    "topicPolicy": {"topics": [{"name": "t"}]},
+                    "wordPolicy": {"words": [{"text": "w"}]},
+                    "sensitiveInformationPolicy": {
+                        "piiEntities": [{"type": "EMAIL", "action": "BLOCK"}]
+                    },
+                },
+                "input and no output",
+            ),
+            (
+                {
+                    "contentPolicy": {
+                        "filters": [
+                            {
+                                "type": "HATE",
+                                "inputStrength": "HIGH",
+                                "outputStrength": "NONE",
+                            }
+                        ]
+                    }
+                },
+                "output",
+            ),
+            (
+                {
+                    "contentPolicy": {
+                        "filters": [
+                            {
+                                "type": "VIOLENCE",
+                                "inputStrength": "MEDIUM",
+                                "outputStrength": "MEDIUM",
+                                "inputAction": "NONE",
+                            }
+                        ]
+                    }
+                },
+                "input",
+            ),
+        ],
+    )
+    def test_a_version_without_a_blocking_content_filter_fails(
+        self, guardrail, skipped
+    ):
+        findings, _ = self._run(
+            _br10_cache(
+                roles={"BoundRole": _br10_identity(_br10_bound(GR_ARN + ":1"))}
+            ),
+            guardrail=guardrail,
+        )
+
+        assert [f["Status"] for f in findings] == ["Failed"]
+        assert (
+            f"version 1 evaluates no {skipped} with a blocking content filter"
+            in findings[0]["Finding_Details"]
+        )
+
+    def test_two_filters_one_per_direction_cover_both(self):
+        guardrail = {
+            "contentPolicy": {
+                "filters": [
+                    {
+                        "type": "PROMPT_ATTACK",
+                        "inputStrength": "HIGH",
+                        "outputStrength": "NONE",
+                    },
+                    {
+                        "type": "INSULTS",
+                        "inputStrength": "LOW",
+                        "outputStrength": "LOW",
+                        "inputEnabled": False,
+                    },
+                ]
+            }
+        }
+        findings, _ = self._run(
+            _br10_cache(
+                roles={"BoundRole": _br10_identity(_br10_bound(GR_ARN + ":1"))}
+            ),
+            guardrail=guardrail,
+        )
+
+        assert [f["Status"] for f in findings] == ["Passed"]
+        assert "blocking content filter to both" in findings[0]["Finding_Details"]
+
+    def test_a_central_mechanism_binds_an_unbound_identity(self):
+        central = {
+            "mechanisms": [
+                ("account-enforced guardrail X", [GR_ARN + ":1"]),
+            ],
+            "unread": [],
+        }
+        findings, client = self._run(
+            _br10_cache(
+                roles={
+                    "OpenRole": _br10_identity(_br10_allow()),
+                    "BoundRole": _br10_identity(_br10_bound(GR_ARN + ":1")),
+                }
+            ),
+            central=central,
+        )
+
+        assert [f["Status"] for f in findings] == ["Passed"]
+        details = findings[0]["Finding_Details"]
+        assert "1 identity/identities may invoke without naming" in details
+        assert "role 'OpenRole'" in details
+        assert "bound by account-enforced guardrail X" in details
+        assert "role 'BoundRole'" in details
+
+    def test_a_central_guardrail_without_an_output_filter_fails(self):
+        guardrail = {
+            "contentPolicy": {
+                "filters": [
+                    {"type": "HATE", "inputStrength": "HIGH", "outputStrength": "NONE"}
+                ]
+            }
+        }
+        central = {
+            "mechanisms": [("the effective policy Y", [GR_ARN + ":4"])],
+            "unread": [],
+        }
+        findings, _ = self._run(
+            _br10_cache(roles={"OpenRole": _br10_identity(_br10_allow())}),
+            guardrail=guardrail,
+            central=central,
+        )
+
+        assert [f["Status"] for f in findings] == ["Failed"]
+        assert "named by the effective policy Y" in findings[0]["Finding_Details"]
+        assert "version 4 evaluates no output" in findings[0]["Finding_Details"]
+
+    def test_an_unread_central_source_keeps_the_identity_failed(self):
+        central = {"mechanisms": [], "unread": ["the effective Bedrock policy (x)"]}
+        findings, _ = self._run(
+            _br10_cache(
+                roles={
+                    "OpenRole": _br10_identity(_br10_allow()),
+                    "BoundRole": _br10_identity(_br10_bound()),
+                }
+            ),
+            central=central,
+        )
+
+        assert [f["Status"] for f in findings] == ["Failed", "Passed"]
+        details = findings[0]["Finding_Details"]
+        assert "No central mechanism binds invocation in us-east-1" in details
+        assert "unread: the effective Bedrock policy (x)" in details
 
     def test_output_only_grounding_does_not_cover_the_input(self):
         guardrail = {
@@ -5835,6 +6069,151 @@ class TestBR15CrossAccountGuardrails:
 # ===================================================================
 # BR-41: check_bedrock_central_guardrail_enforcement
 # ===================================================================
+class TestBR10CentralGuardrailBindings:
+    """The central leg of BR-10 reads what binds invocation in one Region."""
+
+    ARN = "arn:aws:bedrock:us-east-1:123456789012:guardrail/central01"
+
+    @staticmethod
+    def _deny(resource="*"):
+        return json.dumps(
+            {
+                "Statement": [
+                    {
+                        "Sid": "Require",
+                        "Effect": "Deny",
+                        "Action": _INVOKE_BOTH,
+                        "Resource": resource,
+                        "Condition": {
+                            "StringNotEquals": {
+                                "bedrock:GuardrailIdentifier": (
+                                    TestBR10CentralGuardrailBindings.ARN + ":2"
+                                )
+                            }
+                        },
+                    }
+                ]
+            }
+        )
+
+    def _read(
+        self,
+        configs=(),
+        effective=None,
+        scps=None,
+        management=False,
+        list_error=None,
+        in_use=True,
+    ):
+        bedrock = MagicMock()
+        if list_error is not None:
+            bedrock.get_paginator.side_effect = list_error
+        else:
+            bedrock.get_paginator.return_value.paginate.return_value = [
+                {"guardrailsConfig": list(configs)}
+            ]
+        org = MagicMock()
+        if effective is None:
+            org.describe_effective_policy.side_effect = ClientError(
+                {"Error": {"Code": "EffectivePolicyNotFoundException"}},
+                "DescribeEffectivePolicy",
+            )
+        else:
+            org.describe_effective_policy.return_value = {
+                "EffectivePolicy": {"PolicyContent": json.dumps(effective)}
+            }
+        inventory = {
+            "items": [
+                {"name": f"Scp{i}", "id": f"p-{i}", "content": content}
+                for i, content in enumerate(scps or [])
+            ],
+            "errors": [],
+            "list_error": "",
+            "detached": [],
+            "account": "123456789012",
+            "path": [],
+            "management_account": management,
+        }
+        with (
+            patch(
+                "bedrock_app.boto3.client",
+                side_effect=lambda service, **_: {
+                    "bedrock": bedrock,
+                    "organizations": org,
+                }[service],
+            ),
+            patch(
+                "bedrock_app._organization_policy_context",
+                return_value={"in_use": in_use},
+            ),
+        ):
+            return bedrock_app._central_guardrail_bindings("us-east-1", inventory)
+
+    def test_an_account_config_scoped_to_all_models_binds(self):
+        good = {
+            "configId": "all",
+            "guardrailArn": self.ARN,
+            "guardrailVersion": "2",
+            "modelEnforcement": {"includedModels": ["ALL"], "excludedModels": []},
+        }
+        narrow = dict(
+            good,
+            configId="one",
+            modelEnforcement={"includedModels": ["m1"], "excludedModels": []},
+        )
+        both = self._read(configs=[narrow, good])
+        only_narrow = self._read(configs=[narrow])
+
+        assert [values for _, values in both["mechanisms"]] == [[self.ARN + ":2"]]
+        assert "configuration all" in both["mechanisms"][0][0]
+        assert only_narrow["mechanisms"] == []
+
+    def test_the_effective_policy_binds_only_its_region(self):
+        def document(region):
+            return {
+                "bedrock": {
+                    "guardrail_inference": {
+                        region: {"c1": {"identifier": self.ARN + ":2"}}
+                    }
+                }
+            }
+
+        here = self._read(effective=document("us-east-1"))
+        elsewhere = self._read(effective=document("eu-west-1"))
+
+        assert [values for _, values in here["mechanisms"]] == [[self.ARN + ":2"]]
+        assert elsewhere["mechanisms"] == []
+
+    def test_an_scp_binds_in_a_member_account_only(self):
+        member = self._read(scps=[self._deny()])
+        management = self._read(scps=[self._deny()], management=True)
+        foundation_only = self._read(
+            scps=[self._deny("arn:aws:bedrock:*::foundation-model/*")]
+        )
+
+        assert [values for _, values in member["mechanisms"]] == [[self.ARN + ":2"]]
+        assert "service control policy 'Scp0'" in member["mechanisms"][0][0]
+        assert management["mechanisms"] == []
+        assert foundation_only["mechanisms"] == []
+
+    def test_an_unreadable_account_config_is_reported_unread(self):
+        observed = self._read(
+            list_error=ClientError(
+                {"Error": {"Code": "AccessDeniedException", "Message": "no"}},
+                "ListEnforcedGuardrailsConfiguration",
+            )
+        )
+
+        assert observed["mechanisms"] == []
+        assert len(observed["unread"]) == 1
+        assert "account-enforced guardrail configurations" in observed["unread"][0]
+
+    def test_no_organization_reads_the_account_leg_only(self):
+        observed = self._read(in_use=False, scps=[self._deny()])
+
+        assert observed == {"mechanisms": [], "unread": []}
+
+
 class TestBR41CentralGuardrailEnforcement:
     """BR-41: Read the enforced guardrail version out of the policy document."""
 
@@ -5843,18 +6222,24 @@ class TestBR41CentralGuardrailEnforcement:
         "arn:aws:bedrock:us-east-1:123456789012:guardrail/zzzz9999yyyy"
     )
 
+    # The documented Bedrock policy layout: a source policy wraps each value in
+    # @@assign, and the effective policy Organizations computes carries the
+    # plain value.
     @staticmethod
-    def _bedrock_policy_document(guardrail_arn, guardrail_version):
-        return {
-            "bedrock": {
-                "guardrails_configuration": {
-                    "@@assign": {
-                        "guardrail_identifier": guardrail_arn,
-                        "guardrail_version": guardrail_version,
-                    }
-                }
-            }
-        }
+    def _bedrock_policy_document(
+        guardrail_arn, guardrail_version, region="us-east-1", **extra
+    ):
+        config = {"identifier": {"@@assign": f"{guardrail_arn}:{guardrail_version}"}}
+        config.update(extra)
+        return {"bedrock": {"guardrail_inference": {region: {"config_1": config}}}}
+
+    @staticmethod
+    def _effective_policy_document(
+        guardrail_arn, guardrail_version, region="us-east-1", **extra
+    ):
+        config = {"identifier": f"{guardrail_arn}:{guardrail_version}"}
+        config.update(extra)
+        return {"bedrock": {"guardrail_inference": {region: {"config_1": config}}}}
 
     @staticmethod
     def _deny_without_guardrail(operator, condition_value):
@@ -6038,7 +6423,7 @@ class TestBR41CentralGuardrailEnforcement:
 
     def test_br41_draft_version_fails_while_published_version_passes(self):
         org_client, findings = self._run(
-            effective=self._bedrock_policy_document(self.GUARDRAIL_ARN, "3"),
+            effective=self._effective_policy_document(self.GUARDRAIL_ARN, "3"),
             bedrock_policies=[
                 {"Id": "p-published", "Name": "PublishedGuardrail"},
                 {"Id": "p-draft", "Name": "DraftGuardrail"},
@@ -6440,7 +6825,7 @@ class TestBR41CentralGuardrailEnforcement:
 
     def test_br41_effective_draft_policy_fails(self):
         _, findings = self._run(
-            effective=self._bedrock_policy_document(self.GUARDRAIL_ARN, "DRAFT")
+            effective=self._effective_policy_document(self.GUARDRAIL_ARN, "DRAFT")
         )
 
         assert not [f for f in findings if f["Status"] == "Passed"]
@@ -6467,7 +6852,7 @@ class TestBR41CentralGuardrailEnforcement:
 
     def test_br41_missing_guardrail_share_fails(self):
         _, findings = self._run(
-            effective=self._bedrock_policy_document(self.GUARDRAIL_ARN, "3"),
+            effective=self._effective_policy_document(self.GUARDRAIL_ARN, "3"),
             share_policy={"Version": "2012-10-17", "Statement": []},
         )
 
@@ -6482,7 +6867,7 @@ class TestBR41CentralGuardrailEnforcement:
 
     def test_br41_share_to_every_principal_fails(self):
         _, findings = self._run(
-            effective=self._bedrock_policy_document(self.GUARDRAIL_ARN, "3"),
+            effective=self._effective_policy_document(self.GUARDRAIL_ARN, "3"),
             share_policy={
                 "Version": "2012-10-17",
                 "Statement": [
@@ -6506,15 +6891,183 @@ class TestBR41CentralGuardrailEnforcement:
     def test_br41_share_of_a_guardrail_owned_elsewhere_is_not_read(self):
         foreign = "arn:aws:bedrock:us-east-1:999988887777:guardrail/central0001"
         _, bedrock_client, findings = self._run_clients(
-            effective=self._bedrock_policy_document(foreign, "2")
+            effective=self._effective_policy_document(foreign, "2")
         )
 
         bedrock_client.get_resource_policy.assert_not_called()
-        passed = [f for f in findings if f["Status"] == "Passed"]
-        share = [f for f in findings if f["Status"] == "N/A"]
-        assert len(passed) == 1
-        assert len(share) == 1
-        assert "999988887777" in share[0]["Finding_Details"]
+        # The Bedrock policy is the only mechanism, so its unread share holds
+        # the enforcement row back from Passed.
+        assert [f["Status"] for f in findings] == ["N/A", "N/A"]
+        share, held = findings
+        assert "999988887777" in share["Finding_Details"]
+        assert held["Severity"] == "Informational"
+        assert "configured to be enforced" in held["Finding_Details"]
+        assert (
+            f"Whether member accounts can apply {foreign} was not read"
+            in held["Finding_Details"]
+        )
+
+    def test_br41_an_unread_share_does_not_hold_back_an_account_enforced_region(
+        self,
+    ):
+        foreign = "arn:aws:bedrock:us-east-1:999988887777:guardrail/central0001"
+        _, _, findings = self._run_clients(
+            effective=self._effective_policy_document(foreign, "2"),
+            account_configs=[self._account_config("cfg-all")],
+        )
+
+        assert [f["Status"] for f in findings] == ["N/A", "Passed"]
+        assert "999988887777" in findings[0]["Finding_Details"]
+        assert "account-enforced" in findings[1]["Finding_Details"]
+        assert "was not read" not in findings[1]["Finding_Details"]
+
+    def test_br41_effective_policy_scoped_to_one_model_fails(self):
+        _, findings = self._run(
+            effective=self._effective_policy_document(
+                self.GUARDRAIL_ARN,
+                "3",
+                model_enforcement={
+                    "included_models": ["anthropic.claude-3-haiku-20240307-v1:0"],
+                    "excluded_models": [],
+                },
+            )
+        )
+
+        assert not [f for f in findings if f["Status"] == "Passed"]
+        failed = [f for f in findings if f["Status"] == "Failed"]
+        assert len(failed) == 1
+        details = failed[0]["Finding_Details"]
+        assert details.startswith("Organizations Bedrock policy guardrail")
+        assert "includedModels does not name ALL" in details
+        assert "model_enforcement" in failed[0]["Resolution"]
+
+    def test_br41_effective_policy_with_selective_system_guarding_fails(self):
+        _, findings = self._run(
+            effective=self._effective_policy_document(
+                self.GUARDRAIL_ARN,
+                "3",
+                selective_content_guarding={
+                    "system": "selective",
+                    "messages": "comprehensive",
+                },
+            )
+        )
+
+        assert [f["Status"] for f in findings if f["Status"] != "N/A"] == ["Failed"]
+        assert "system content is guarded SELECTIVE" in findings[0]["Finding_Details"]
+
+    def test_br41_effective_policy_with_empty_included_models_covers_all(self):
+        # The policy syntax states an empty included_models applies to all
+        # models, so a reading of [] as no model would fail a sound policy.
+        _, findings = self._run(
+            effective=self._effective_policy_document(
+                self.GUARDRAIL_ARN,
+                "3",
+                model_enforcement={"included_models": [], "excluded_models": []},
+            )
+        )
+
+        assert [f["Status"] for f in findings] == ["Passed"]
+        assert "because includedModels names ALL" in findings[0]["Finding_Details"]
+
+    def test_br41_effective_policy_for_another_region_is_not_credited(self):
+        _, findings = self._run(
+            effective=self._effective_policy_document(
+                self.GUARDRAIL_ARN.replace("us-east-1", "eu-west-1"),
+                "3",
+                region="eu-west-1",
+            )
+        )
+
+        assert not [f for f in findings if f["Status"] == "Passed"]
+        assert [f["Status"] for f in findings] == ["Failed"]
+        assert "us-east-1" in findings[0]["Finding_Details"]
+
+    def test_br41_effective_policy_covers_only_its_own_region(self):
+        with patch.dict(os.environ, {"TARGET_REGIONS": "us-east-1,us-west-2"}):
+            _, findings = self._run(
+                effective=self._effective_policy_document(self.GUARDRAIL_ARN, "3")
+            )
+
+        assert not [f for f in findings if f["Status"] == "Passed"]
+        failed = [f for f in findings if f["Status"] == "Failed"]
+        assert len(failed) == 1
+        assert "exists in us-west-2," in failed[0]["Finding_Details"]
+
+    def test_br41_effective_policy_in_an_undocumented_layout_is_not_credited(self):
+        _, findings = self._run(
+            effective={
+                "bedrock": {
+                    "guardrails_configuration": {
+                        "guardrail_identifier": self.GUARDRAIL_ARN + ":3"
+                    }
+                }
+            }
+        )
+
+        assert [f["Status"] for f in findings] == ["N/A"]
+        assert "outside the documented" in findings[0]["Finding_Details"]
+
+    def test_br41_account_config_honoring_input_tags_fails(self):
+        honoring = dict(self._account_config("cfg-tags"), inputTags="HONOR")
+        ignoring = dict(self._account_config("cfg-ok"), inputTags="IGNORE")
+        _, findings = self._run(account_configs=[honoring])
+        _, both = self._run(account_configs=[honoring, ignoring])
+
+        assert not [f for f in findings if f["Status"] == "Passed"]
+        failed = [f for f in findings if f["Status"] == "Failed"]
+        assert "configuration cfg-tags" in failed[0]["Finding_Details"]
+        assert "inputTags is HONOR" in failed[0]["Finding_Details"]
+        assert [f["Status"] for f in both] == ["Passed"]
+        assert "configuration cfg-ok" in both[0]["Finding_Details"]
+
+    def test_br41_scp_on_foundation_models_only_is_not_enforcement(self):
+        document = self._deny_without_guardrail("StringNotEquals", self.GUARDRAIL_ARN)
+        document["Statement"][0]["Resource"] = "arn:aws:bedrock:*::foundation-model/*"
+        _, findings = self._scp_run({"p-fm": document})
+
+        assert not [f for f in findings if f["Status"] == "Passed"]
+        details = " ".join(f["Finding_Details"] for f in findings)
+        assert "imported-model" in details
+        assert "provisioned-model" in details
+        assert "foundation-model," not in details
+
+    def test_br41_scp_listing_every_invoke_resource_type_is_enforcement(self):
+        document = self._deny_without_guardrail("StringNotEquals", self.GUARDRAIL_ARN)
+        document["Statement"][0]["Resource"] = [
+            "arn:aws:bedrock:*::foundation-model/*",
+            "arn:aws:bedrock:*:*:*",
+        ]
+        narrow = self._deny_without_guardrail("StringNotEquals", self.GUARDRAIL_ARN)
+        narrow["Statement"][0]["Resource"] = "arn:aws:bedrock:*:*:imported-model/*"
+        _, findings = self._scp_run({"p-all": document})
+        _, mixed = self._scp_run({"p-narrow": narrow})
+
+        assert [f["Status"] for f in findings] == ["Passed"]
+        assert "Scp-p-all" in findings[0]["Finding_Details"]
+        assert not [f for f in mixed if f["Status"] == "Passed"]
+
+    def test_br41_scp_naming_the_assessed_region_covers_it(self):
+        document = self._deny_without_guardrail("StringNotEquals", self.GUARDRAIL_ARN)
+        document["Statement"][0]["Resource"] = "arn:aws:bedrock:us-east-1:*:*"
+        with patch.dict(os.environ, {"TARGET_REGIONS": "us-east-1,us-west-2"}):
+            _, findings = self._scp_run({"p-east": document})
+
+        assert not [f for f in findings if f["Status"] == "Passed"]
+        failed = [f for f in findings if f["Status"] == "Failed"]
+        assert any("in us-west-2" in f["Finding_Details"] for f in failed)
+        assert not any(
+            "in us-east-1," in f["Finding_Details"]
+            or "in us-east-1)" in f["Finding_Details"]
+            for f in failed
+        )
+
+    def test_br41_scp_with_a_question_mark_run_over_the_id_is_not_enforcement(self):
+        document = self._deny_without_guardrail("StringNotEquals", self.GUARDRAIL_ARN)
+        document["Statement"][0]["Resource"] = "arn:aws:bedrock:*:*:?"
+        _, findings = self._scp_run({"p-q": document})
+
+        assert not [f for f in findings if f["Status"] == "Passed"]
 
     def _run_regions(self, per_region):
         """per_region: {region: configs list, or an exception to raise}."""
@@ -18682,9 +19235,7 @@ class TestBR49GuardrailInvocationDeny:
         bedrock_client.list_guardrails.return_value = {
             "guardrails": [{"id": "gr-1", "name": "TestGuardrail"}]
         }
-        bedrock_client.get_guardrail.return_value = {
-            "contentPolicy": {"filters": [{"type": "PROMPT_ATTACK"}]}
-        }
+        bedrock_client.get_guardrail.return_value = _BOTH_DIRECTIONS
         with patch("bedrock_app.boto3.client", return_value=bedrock_client):
             br10 = extract_csv_data(
                 bedrock_app.check_bedrock_guardrail_iam_enforcement(

@@ -208,6 +208,17 @@ section.
 
 ### Fixed
 
+- `BR-10` counts a guardrail direction only from a content filter with
+  strength `LOW`, `MEDIUM` or `HIGH` and action `BLOCK`, where any configured
+  element used to count. An identity that names no guardrail passes when a
+  central mechanism binds every invocation in the Region: an account-enforced
+  configuration, the effective Organizations Bedrock policy, or an attached
+  service control policy in a member account. `BR-41` reads the effective
+  Bedrock policy's per-Region configurations and judges their model and
+  content scope, fails `inputTags` `HONOR`, credits a service control policy
+  only when its Deny covers every invoke resource type, and reports `N/A`
+  where a Region relies on a guardrail share it could not read. The `BR-06`
+  knowledge base row needs `textDataDeliveryEnabled`.
 - Bedrock checks judge values that they used to credit on presence. `BR-07`,
   `BR-17`, `BR-20` (S3 Vectors), `BR-30` and `BR-38` describe each named KMS
   key and pass only an enabled customer managed key. `BR-07` also fails inline

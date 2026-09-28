@@ -4305,7 +4305,12 @@ def _invocation_record_state(region: str) -> Dict[str, Any]:
     inference, and whether every destination is under an enabled customer
     managed KMS key (AIR-BDR-MDL-07).
     """
-    state: Dict[str, Any] = {"logging": None, "gaps": [], "unread": []}
+    state: Dict[str, Any] = {
+        "logging": None,
+        "text_delivery": None,
+        "gaps": [],
+        "unread": [],
+    }
     try:
         bedrock_client = boto3.client(
             "bedrock", config=boto3_config, region_name=region
@@ -4341,10 +4346,13 @@ def _invocation_record_state(region: str) -> Dict[str, Any]:
             "did not return"
         )
     elif config["textDataDeliveryEnabled"] is not True:
+        state["text_delivery"] = False
         state["gaps"].append(
             "textDataDeliveryEnabled is not true, so text prompts and responses "
             "are not delivered"
         )
+    else:
+        state["text_delivery"] = True
     buckets = []
     if bucket_name:
         buckets.append((bucket_name, "S3 bucket for invocation logs"))
@@ -4406,7 +4414,7 @@ def _bedrock_data_event_findings(
         if knowledge_base_count
         else ""
     )
-    if kb_trails and record["logging"] is True:
+    if kb_trails and record["logging"] is True and record["text_delivery"] is True:
         data_event_findings.append(
             create_finding(
                 check_id="BR-06",
@@ -4442,9 +4450,17 @@ def _bedrock_data_event_findings(
             kb_gaps.append(
                 "model invocation logging is off, so the response a retrieval informed is not recorded"
             )
+        elif record["text_delivery"] is False:
+            kb_gaps.append(
+                "model invocation logging has textDataDeliveryEnabled not true, so the text of the response a retrieval informed is not recorded"
+            )
         unread = list(unread_trails) if not kb_trails else []
         if record["logging"] is None:
             unread.extend(record["unread"])
+        elif record["logging"] is True and record["text_delivery"] is None:
+            unread.append(
+                "textDataDeliveryEnabled, which GetModelInvocationLoggingConfiguration did not return"
+            )
         if kb_gaps:
             kb_detail = "; ".join(kb_gaps)
             data_event_findings.append(
@@ -4455,7 +4471,7 @@ def _bedrock_data_event_findings(
                     resolution=CLOUDTRAIL_DATA_EVENT_RESOLUTION.format(
                         BEDROCK_KNOWLEDGE_BASE_DATA_EVENT_TYPE
                     )
-                    + " Enable model invocation logging.",
+                    + " Enable model invocation logging with textDataDeliveryEnabled true.",
                     reference="https://docs.aws.amazon.com/bedrock/latest/userguide/logging-using-cloudtrail.html",
                     severity="Medium",
                     status="Failed",
@@ -6024,42 +6040,37 @@ def _parse_guardrail_reference(value: str, region: str) -> Dict[str, str]:
     }
 
 
+GUARDRAIL_BLOCKING_STRENGTHS = ("LOW", "MEDIUM", "HIGH")
+
+
 def _guardrail_directions(detail: Dict[str, Any]) -> Dict[str, bool]:
     """
-    Say whether a guardrail version evaluates the input and the output.
+    Say whether a guardrail version applies a blocking content filter to the
+    input and to the output.
 
-    Each content filter, denied topic, word, managed word list, PII entity and
-    regex carries inputEnabled and outputEnabled, which default to enabled when
-    absent. Contextual grounding and Automated Reasoning evaluate the response
-    only.
+    Only contentPolicy filters count as content safety. A filter covers a
+    direction when its strength there is LOW, MEDIUM or HIGH (NONE applies no
+    filtering), its enabled flag there is not false (absent means enabled), and
+    its action there is not NONE (absent means BLOCK). Denied topics, words,
+    PII entities, regexes, contextual grounding and Automated Reasoning do not
+    filter harmful content, so a version carrying only those covers neither.
     """
-    elements = []
-    content = detail.get("contentPolicy") or {}
-    elements += content.get("filters") or []
-    topics = detail.get("topicPolicy") or {}
-    elements += topics.get("topics") or []
-    words = detail.get("wordPolicy") or {}
-    elements += words.get("words") or []
-    elements += words.get("managedWordLists") or []
-    sensitive = detail.get("sensitiveInformationPolicy") or {}
-    elements += sensitive.get("piiEntities") or []
-    elements += sensitive.get("regexes") or []
-    elements = [element for element in elements if isinstance(element, dict)]
-    grounding = [
-        grounding_filter
-        for grounding_filter in (detail.get("contextualGroundingPolicy") or {}).get(
-            "filters"
-        )
-        or []
-        if isinstance(grounding_filter, dict)
-        and grounding_filter.get("enabled") is not False
+    filters = [
+        content_filter
+        for content_filter in (detail.get("contentPolicy") or {}).get("filters") or []
+        if isinstance(content_filter, dict)
     ]
-    return {
-        "input": any(element.get("inputEnabled") is not False for element in elements),
-        "output": any(element.get("outputEnabled") is not False for element in elements)
-        or bool(grounding)
-        or bool(detail.get("automatedReasoningPolicy")),
-    }
+
+    def covers(side: str) -> bool:
+        return any(
+            str(content_filter.get(f"{side}Strength") or "").upper()
+            in GUARDRAIL_BLOCKING_STRENGTHS
+            and content_filter.get(f"{side}Enabled") is not False
+            and str(content_filter.get(f"{side}Action") or "BLOCK").upper() != "NONE"
+            for content_filter in filters
+        )
+
+    return {"input": covers("input"), "output": covers("output")}
 
 
 def _read_guardrail_directions(
@@ -6112,7 +6123,7 @@ def _read_guardrail_directions(
             skipped = [side for side in ("input", "output") if not directions[side]]
             if skipped:
                 result["gaps"].append(
-                    "version {} evaluates no {}".format(
+                    "version {} evaluates no {} with a blocking content filter".format(
                         version, " and no ".join(skipped)
                     )
                 )
@@ -6126,8 +6137,120 @@ def _read_guardrail_directions(
     return result
 
 
+def _central_guardrail_bindings(
+    region: str, scp_inventory: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
+    """
+    Read what binds every invocation in ``region`` to a named guardrail
+    whatever an identity's own grants say: an account-enforced guardrail
+    configuration scoped to all models, a configuration for the Region in the
+    effective Organizations Bedrock policy, or service control policies that
+    deny both invoke actions unless bedrock:GuardrailIdentifier names one.
+
+    Returns {"mechanisms": [(text, [value, ...])], "unread": [...]}, where each
+    value is "<guardrail>:<version>" for _read_guardrail_directions. Service
+    control policies never restrict the management account, so they are not
+    credited there.
+    """
+    observed = {"mechanisms": [], "unread": []}
+    try:
+        client = boto3.client("bedrock", config=boto3_config, region_name=region)
+        configs = []
+        paginator = client.get_paginator("list_enforced_guardrails_configuration")
+        for page in paginator.paginate():
+            configs.extend(page.get("guardrailsConfig", []))
+        for config in configs:
+            scope = _account_enforced_guardrail_scope(config)
+            guardrail = config.get("guardrailArn") or config.get("guardrailId")
+            if scope["enforced"] and guardrail and config.get("guardrailVersion"):
+                observed["mechanisms"].append(
+                    (
+                        f"account-enforced {scope['label']}",
+                        [f"{guardrail}:{config['guardrailVersion']}"],
+                    )
+                )
+    except (ClientError, BotoCoreError) as error:
+        observed["unread"].append(
+            "account-enforced guardrail configurations ("
+            f"{describe_api_error(error, 'bedrock:ListEnforcedGuardrailsConfiguration', region)})"
+        )
+
+    context = _organization_policy_context()
+    if not context.get("in_use", True):
+        return observed
+    try:
+        response = boto3.client(
+            "organizations", config=boto3_config
+        ).describe_effective_policy(PolicyType="BEDROCK_POLICY")
+        for entry in _bedrock_policy_guardrail_configs(
+            response["EffectivePolicy"]["PolicyContent"] or "{}"
+        ):
+            config = entry["config"]
+            version = config["guardrailVersion"]
+            if (
+                entry["region"] != region
+                or not version
+                or version.upper() == GUARDRAIL_DRAFT_VERSION
+            ):
+                continue
+            scope = _account_enforced_guardrail_scope(config)
+            if scope["enforced"]:
+                observed["mechanisms"].append(
+                    (
+                        f"the effective Organizations Bedrock policy {scope['label']}",
+                        [f"{config['guardrailArn']}:{version}"],
+                    )
+                )
+    except ClientError as error:
+        code = error.response.get("Error", {}).get("Code", "")
+        if code not in AI_OPT_OUT_ABSENT_CODES | {"AWSOrganizationsNotInUseException"}:
+            observed["unread"].append(
+                "the effective Bedrock policy ("
+                f"{describe_api_error(error, 'organizations:DescribeEffectivePolicy', region)})"
+            )
+    except (BotoCoreError, KeyError, ValueError, TypeError) as error:
+        observed["unread"].append(
+            f"the effective Bedrock policy ({get_assessment_error_label(error)})"
+        )
+
+    scps = (
+        scp_inventory
+        if scp_inventory is not None
+        else get_service_control_policy_inventory()
+    )
+    if scps.get("list_error"):
+        observed["unread"].append(f"service control policies ({scps['list_error']})")
+    observed["unread"].extend(scps.get("errors") or [])
+    if scps.get("management_account"):
+        return observed
+    actions = set()
+    texts = []
+    values = []
+    for item in scps.get("items") or []:
+        try:
+            controls = _scp_guardrail_controls(
+                item["content"] or "{}", region, scps.get("account") or ""
+            )
+        except (ValueError, TypeError) as error:
+            observed["unread"].append(
+                f"service control policy '{item['name']}' ({str(error)})"
+            )
+            continue
+        actions.update(controls["actions"])
+        values.extend(controls["values"])
+        texts.extend(
+            f"service control policy '{item['name']}' {control}"
+            for control in controls["enforcing"]
+        )
+    if texts and all(action in actions for action in GUARDRAIL_INVOKE_ACTIONS):
+        observed["mechanisms"].append(("; ".join(texts), sorted(set(values))))
+    return observed
+
+
 def check_bedrock_guardrail_iam_enforcement(
-    permission_cache, region: str = ""
+    permission_cache,
+    region: str = "",
+    scp_inventory: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     BR-10: Verify every role and user that can invoke a model must name an
@@ -6143,6 +6266,12 @@ def check_bedrock_guardrail_iam_enforcement(
     requires a named guardrail, or when the boundary allows the action only under
     such a test. Group policies and permissions boundaries are read with the
     role and user policies.
+
+    An identity whose own grants are unbound is not a finding when a central
+    mechanism binds every invocation in the Region (_central_guardrail_bindings),
+    and the guardrails that mechanism names are read like the IAM ones. A
+    guardrail version counts only when a content filter blocks in each
+    direction (_guardrail_directions).
     """
     logger.debug("Starting check for Bedrock Guardrail IAM enforcement")
     check_name = "Bedrock Guardrail IAM Enforcement Check"
@@ -6301,7 +6430,16 @@ def check_bedrock_guardrail_iam_enforcement(
                 region,
             )
 
-        if unbound:
+        central = (
+            _central_guardrail_bindings(region, scp_inventory) if unbound else None
+        )
+        centrally_bound = bool(central and central["mechanisms"])
+        if centrally_bound:
+            for text, values in central["mechanisms"]:
+                for value in values:
+                    named_values.setdefault(value, set()).add(text)
+
+        if unbound and not centrally_bound:
             findings["status"] = "WARN"
             findings["details"] = (
                 f"Found {len(unbound)} identities with Bedrock invoke permissions "
@@ -6323,7 +6461,21 @@ def check_bedrock_guardrail_iam_enforcement(
                             "; and {} more".format(len(unbound) - 10)
                             if len(unbound) > 10
                             else "",
-                            SCP_NOT_EVALUATED_NOTE,
+                            "No central mechanism binds invocation in {}: no "
+                            "account-enforced guardrail configuration scoped to all "
+                            "models, no configuration for the Region in the "
+                            "effective Organizations Bedrock policy, and no attached "
+                            "service control policy denying both invoke actions "
+                            "without an approved {}{}. {}".format(
+                                region,
+                                GUARDRAIL_CONDITION_KEY,
+                                " among the sources read; unread: {}".format(
+                                    "; ".join(central["unread"][:3])
+                                )
+                                if central["unread"]
+                                else "",
+                                SCP_NOT_EVALUATED_NOTE,
+                            ),
                         )
                     ),
                     resolution=(
@@ -6366,16 +6518,18 @@ def check_bedrock_guardrail_iam_enforcement(
                     check_id="BR-10",
                     finding_name="Bedrock Guardrail IAM Enforcement Missing",
                     finding_details=(
-                        "{} guardrail(s) that IAM requires on invocation skip the "
-                        "input or the output path, so content in that direction "
-                        "reaches the model or the caller unevaluated: {}.".format(
+                        "{} guardrail(s) required on invocation apply no blocking "
+                        "content filter to the input or the output, so harmful "
+                        "content in that direction reaches the model or the "
+                        "caller unfiltered: {}.".format(
                             len(direction_gaps), "; ".join(direction_gaps[:5])
                         )
                     ),
                     resolution=(
-                        "Enable input and output evaluation on at least one policy "
-                        "of each version the identities may name, or pin the "
-                        "condition to a version that evaluates both."
+                        "Give each version that may be named a content filter with "
+                        "strength LOW, MEDIUM or HIGH and action BLOCK on both the "
+                        "input and the output, or pin the condition to a version "
+                        "that has one."
                     ),
                     reference=GUARDRAIL_IAM_REFERENCE,
                     severity="High",
@@ -6390,8 +6544,8 @@ def check_bedrock_guardrail_iam_enforcement(
                     check_id="BR-10",
                     finding_name=check_name,
                     finding_details=(
-                        "{} guardrail(s) named by an IAM condition could not be "
-                        "read, so whether they evaluate input and output is not "
+                        "{} guardrail(s) required on invocation could not be "
+                        "read, so whether they filter input and output is not "
                         "known: {}.".format(len(unread), "; ".join(unread[:5]))
                     ),
                     resolution=COULD_NOT_ASSESS_RESOLUTION,
@@ -6402,19 +6556,37 @@ def check_bedrock_guardrail_iam_enforcement(
                 )
             )
 
-        if bound and not direction_gaps:
+        if (bound or centrally_bound) and not direction_gaps:
+            statements = []
+            if bound:
+                statements.append(
+                    "{} of {} identity/identities that can invoke a model must name "
+                    "an approved guardrail on every invoke grant: {}.".format(
+                        len(bound),
+                        len(bound) + len(unbound),
+                        ", ".join(bound[:10]),
+                    )
+                )
+            if centrally_bound:
+                statements.append(
+                    "{} identity/identities may invoke without naming a guardrail "
+                    "in their own grants ({}), and every invocation in {} is "
+                    "bound by {}.".format(
+                        len(unbound),
+                        ", ".join(label for label, _ in unbound[:10]),
+                        region,
+                        "; ".join(text for text, _ in central["mechanisms"][:3]),
+                    )
+                )
             findings["csv_data"].append(
                 create_finding(
                     check_id="BR-10",
                     finding_name=check_name,
                     finding_details=(
-                        "{} of {} identity/identities that can invoke a model must "
-                        "name an approved guardrail on every invoke grant: {}. Each "
-                        "guardrail version they may name evaluates both input and "
-                        "output{}.{} {}".format(
-                            len(bound),
-                            len(bound) + len(unbound),
-                            ", ".join(bound[:10]),
+                        "{} Each guardrail version that may be named applies a "
+                        "blocking content filter to both input and output{}.{} "
+                        "{}".format(
+                            " ".join(statements),
                             " among those read" if unread else "",
                             " {} named guardrail(s) do not exist, so the grants "
                             "naming them cannot be exercised: {}.".format(
@@ -8132,19 +8304,89 @@ GUARDRAIL_NEGATED_OPERATORS = (
 )
 
 
-def _scp_guardrail_controls(document: Any) -> Dict[str, Any]:
+# The resource types bedrock:InvokeModel names in the Service Authorization
+# Reference (bedrock.json), with each ARN format. InvokeModelWithResponseStream
+# names the same list less async-invoke and project. A request is authorized
+# against the resource it targets, so a Deny on foundation-model/* leaves an
+# imported, provisioned or custom model invocable without the guardrail.
+INVOKE_MODEL_RESOURCE_FORMATS = (
+    (
+        "application-inference-profile",
+        "arn:aws:bedrock:{region}:{account}:application-inference-profile/{id}",
+    ),
+    ("async-invoke", "arn:aws:bedrock:{region}:{account}:async-invoke/{id}"),
+    (
+        "bedrock-marketplace-model-endpoint",
+        "arn:aws:bedrock:{region}:{account}:marketplace/model-endpoint/all-access",
+    ),
+    (
+        "custom-model-deployment",
+        "arn:aws:bedrock:{region}:{account}:custom-model-deployment/{id}",
+    ),
+    (
+        "default-prompt-router",
+        "arn:aws:bedrock:{region}:{account}:default-prompt-router/{id}",
+    ),
+    ("foundation-model", "arn:aws:bedrock:{region}::foundation-model/{id}"),
+    ("imported-model", "arn:aws:bedrock:{region}:{account}:imported-model/{id}"),
+    (
+        "inference-profile",
+        "arn:aws:bedrock:{region}:{account}:inference-profile/{id}",
+    ),
+    ("project", "arn:aws:bedrock:{region}:{account}:project/{id}"),
+    ("prompt-router", "arn:aws:bedrock:{region}:{account}:prompt-router/{id}"),
+    (
+        "provisioned-model",
+        "arn:aws:bedrock:{region}:{account}:provisioned-model/{id}",
+    ),
+    ("system-tool", "arn:aws:bedrock::{account}:system-tool/{id}"),
+)
+
+
+def _invocation_resources_uncovered(
+    resources: List[Any], region: str = "", account: str = ""
+) -> List[str]:
+    """
+    Return the invoke resource types that no entry in ``resources`` matches.
+
+    Each type is matched in the given Region and account, or in any when they
+    are not given, and with a one-character and a 64-character resource id: a
+    pattern that matches both carries a * over the id, and not a run of ?.
+    """
+    uncovered = []
+    for name, template in INVOKE_MODEL_RESOURCE_FORMATS:
+        for size in (1, 64):
+            text = template.format(
+                region=region or ANY_MODEL_ID_CHARACTER * size,
+                account=account or ANY_MODEL_ID_CHARACTER * size,
+                id=ANY_MODEL_ID_CHARACTER * size,
+            )
+            if not any(
+                isinstance(resource, str) and _wildcard_matches(resource.strip(), text)
+                for resource in resources
+            ):
+                uncovered.append(name)
+                break
+    return uncovered
+
+
+def _scp_guardrail_controls(
+    document: Any, region: str = "", account: str = ""
+) -> Dict[str, Any]:
     """
     Describe how each Deny in a service control policy requires an approved
     bedrock:GuardrailIdentifier on model invocation.
 
-    A statement enforces only when it denies over every model, tests the key
-    with a negated operator whose values each name one guardrail with no
-    wildcard, and carries no other condition key that narrows the Deny. Null on
+    A statement enforces only when its Resource covers every invoke resource
+    type in INVOKE_MODEL_RESOURCE_FORMATS (in ``region`` and ``account`` when
+    given, else in any), tests the key with a negated operator whose values
+    each name one guardrail with no wildcard, and carries no other condition key that narrows the Deny. Null on
     its own requires some guardrail, not the approved one, so it is recorded
     as a gap. ``actions`` is the set of invoke actions an enforcing statement
     covers; the caller requires the union to reach every invoke action.
+    ``values`` holds the guardrail values the enforcing statements approve.
     """
-    observed = {"actions": set(), "enforcing": [], "gaps": []}
+    observed = {"actions": set(), "enforcing": [], "gaps": [], "values": []}
     for statement in _policy_statements(document):
         if str(statement.get("Effect", "")).upper() != "DENY":
             continue
@@ -8166,16 +8408,24 @@ def _scp_guardrail_controls(document: Any) -> Dict[str, Any]:
         )
         reasons = []
         resources = _as_list(statement.get("Resource"))
-        if "NotResource" in statement or not any(
-            isinstance(resource, str)
-            and (resource.strip() == "*" or _pattern_covers_every_model(resource))
-            for resource in resources
-        ):
+        if "NotResource" in statement:
             reasons.append(
-                "its Resource does not cover every model ({})".format(
-                    ", ".join(str(resource) for resource in resources) or "NotResource"
+                "its NotResource ({}) exempts resources from the Deny".format(
+                    ", ".join(
+                        str(item) for item in _as_list(statement.get("NotResource"))
+                    )
                 )
             )
+        else:
+            uncovered = _invocation_resources_uncovered(resources, region, account)
+            if uncovered:
+                reasons.append(
+                    "its Resource ({}) does not cover the invoke resource type(s) "
+                    "{}, which stay invocable without the guardrail".format(
+                        ", ".join(str(resource) for resource in resources) or "empty",
+                        ", ".join(uncovered),
+                    )
+                )
         other_keys = sorted(
             {key for _, key, _ in conditions if key != GUARDRAIL_CONDITION_KEY}
         )
@@ -8217,6 +8467,9 @@ def _scp_guardrail_controls(document: Any) -> Dict[str, Any]:
                 test_ok = True
         if test_ok and not reasons:
             observed["actions"].update(covered)
+            observed["values"].extend(
+                str(value).strip() for _, values in guardrail_tests for value in values
+            )
             observed["enforcing"].append(
                 "{} denies {} unless {} is {}".format(
                     label,
@@ -8332,6 +8585,11 @@ ENFORCED_ALL_MODELS_VALUE = "ALL"
 # unguarded even though the guardrail is attached.
 SELECTIVE_GUARDING_VALUE = "SELECTIVE"
 
+# ListEnforcedGuardrailsConfiguration returns inputTags HONOR or IGNORE ("Whether
+# to honor or ignore input tags at runtime"). HONOR lets the caller's guard
+# content tags decide what is evaluated, the same narrowing as SELECTIVE.
+ENFORCED_HONOR_INPUT_TAGS_VALUE = "HONOR"
+
 MAX_REPORTED_ENFORCED_CONFIGS = 10
 
 
@@ -8402,6 +8660,12 @@ def _account_enforced_guardrail_scope(config: Dict[str, Any]) -> Dict[str, Any]:
     else:
         guarding_scope = "system and messages guarding modes unreported"
 
+    if str(config.get("inputTags") or "").upper() == ENFORCED_HONOR_INPUT_TAGS_VALUE:
+        narrowings.append(
+            "inputTags is HONOR, so a caller that marks content with input tags "
+            "chooses which content the guardrail evaluates"
+        )
+
     return {
         "enforced": not narrowings,
         "model_scope": model_scope,
@@ -8413,6 +8677,71 @@ def _account_enforced_guardrail_scope(config: Dict[str, Any]) -> Dict[str, Any]:
             config.get("configId") or "unnamed",
         ),
     }
+
+
+def _bedrock_policy_guardrail_configs(document: Any) -> List[Dict[str, Any]]:
+    """
+    Read each guardrail configuration an Organizations Bedrock policy enforces,
+    at bedrock.guardrail_inference.<region>.<configuration>, into the shape
+    ListEnforcedGuardrailsConfiguration returns, so one judge reads both.
+
+    A source policy wraps each value in @@assign and the effective policy
+    carries the plain value, so both are read. A key starting with @@ is an
+    inheritance operator, not a Region or a configuration. The policy syntax
+    states the defaults: selective_content_guarding modes absent are
+    comprehensive, model_enforcement absent enforces on all models, and an
+    empty included_models list applies enforcement to all models.
+    """
+    if isinstance(document, str):
+        document = json.loads(document)
+
+    def value(node: Any) -> Any:
+        if isinstance(node, dict) and "@@assign" in node:
+            return node["@@assign"]
+        return node
+
+    def child(node: Any, key: str) -> Any:
+        return value(node.get(key)) if isinstance(node, dict) else None
+
+    def entries(node: Any):
+        if not isinstance(node, dict):
+            return []
+        return [
+            (key, item)
+            for key, item in node.items()
+            if isinstance(key, str) and not key.startswith("@@")
+        ]
+
+    configs = []
+    inference = child(child(document, "bedrock"), "guardrail_inference")
+    for policy_region, region_node in entries(inference):
+        for name, node in entries(value(region_node)):
+            identifier = str(child(node, "identifier") or "").strip()
+            parts = identifier.split(":")
+            config = {
+                "guardrailArn": ":".join(parts[:6]),
+                "guardrailVersion": parts[6].strip() if len(parts) > 6 else "",
+                "configId": name,
+            }
+            guarding = child(node, "selective_content_guarding")
+            guarding = guarding if isinstance(guarding, dict) else {}
+            config["selectiveContentGuarding"] = {
+                mode: str(child(guarding, mode) or "COMPREHENSIVE").upper()
+                for mode in ("system", "messages")
+            }
+            enforcement = child(node, "model_enforcement")
+            if isinstance(enforcement, dict):
+                config["modelEnforcement"] = {
+                    "includedModels": list(
+                        _as_list(child(enforcement, "included_models"))
+                    )
+                    or [ENFORCED_ALL_MODELS_VALUE],
+                    "excludedModels": list(
+                        _as_list(child(enforcement, "excluded_models"))
+                    ),
+                }
+            configs.append({"region": policy_region, "config": config})
+    return configs
 
 
 def _guardrail_share_finding(
@@ -8536,13 +8865,16 @@ def check_bedrock_central_guardrail_enforcement(
             "csv_data": [],
         }
 
-        org_mechanisms = []
         region_mechanisms = {}
+        # Regions credited by a mechanism other than the Bedrock policy, whose
+        # credit does not rest on the guardrail's share.
+        region_unshared = set()
+        policy_credited = {}
         narrowed_configs = []
         deficient_policies = []
         policy_errors = []
         region_errors = {}
-        share_rows = []
+        share_rows = {}
 
         regions = _assessed_regions(api_region)
         for scan_region in regions:
@@ -8574,8 +8906,10 @@ def check_bedrock_central_guardrail_enforcement(
                             scope["guarding_scope"],
                         )
                     )
+                    region_unshared.add(scan_region)
                 else:
                     scope["region"] = scan_region
+                    scope["source"] = "Account-enforced"
                     narrowed_configs.append(scope)
 
         context = _organization_policy_context()
@@ -8592,9 +8926,11 @@ def check_bedrock_central_guardrail_enforcement(
                 response = orgs_client.describe_effective_policy(
                     PolicyType="BEDROCK_POLICY"
                 )
-                effective = _summarize_guardrail_policy_document(
-                    response["EffectivePolicy"]["PolicyContent"] or "{}"
-                )
+                content = response["EffectivePolicy"]["PolicyContent"] or "{}"
+                effective = {
+                    "summary": _summarize_guardrail_policy_document(content),
+                    "configs": _bedrock_policy_guardrail_configs(content),
+                }
             except ClientError as error:
                 code = error.response.get("Error", {}).get("Code", "")
                 if code == "AWSOrganizationsNotInUseException":
@@ -8704,92 +9040,147 @@ def check_bedrock_central_guardrail_enforcement(
                 elif any(target.get("TargetId") in path_ids for target in targets):
                     attached_bedrock_policies[policy_name] = target_names
 
-        if effective and effective["guardrail_arns"]:
-            if effective["draft_versions"]:
-                deficient_policies.append(
-                    {
-                        "name": "effective Bedrock policy",
-                        "id": caller_account or "this account",
-                        "reason": "the policy Organizations applies to this account enforces the DRAFT guardrail version",
-                        "observed": ", ".join(effective["guardrail_arns"]),
-                    }
-                )
-            else:
-                sources = "; ".join(
-                    "Bedrock policy '{}' attached to {}".format(name, ", ".join(names))
-                    for name, names in sorted(attached_bedrock_policies.items())
-                )
-                org_mechanisms.append(
-                    "the effective Bedrock policy of account {} enforcing {} at "
-                    "version {}{}".format(
+        if effective is not None:
+            sources = "; ".join(
+                "Bedrock policy '{}' attached to {}".format(name, ", ".join(names))
+                for name, names in sorted(attached_bedrock_policies.items())
+            )
+            for entry in effective["configs"]:
+                scan_region = entry["region"]
+                config = entry["config"]
+                if scan_region not in regions:
+                    continue
+                version = config["guardrailVersion"]
+                if not version or version.upper() == GUARDRAIL_DRAFT_VERSION:
+                    deficient_policies.append(
+                        {
+                            "name": "effective Bedrock policy",
+                            "id": caller_account or "this account",
+                            "reason": "the policy Organizations applies to this account enforces {} in {} {}".format(
+                                config["guardrailArn"] or "an unnamed guardrail",
+                                scan_region,
+                                "at the DRAFT guardrail version"
+                                if version
+                                else "with no guardrail version",
+                            ),
+                            "observed": "configuration {}".format(config["configId"]),
+                        }
+                    )
+                    continue
+                scope = _account_enforced_guardrail_scope(config)
+                if not scope["enforced"]:
+                    scope["region"] = scan_region
+                    scope["source"] = "Organizations Bedrock policy"
+                    narrowed_configs.append(scope)
+                    continue
+                region_mechanisms.setdefault(scan_region, []).append(
+                    "the effective Bedrock policy of account {} enforcing {} in {} "
+                    "applying to {} with {}{}".format(
                         caller_account or "unknown",
-                        ", ".join(effective["guardrail_arns"]),
-                        ", ".join(effective["versions"]) or "unspecified",
+                        scope["label"],
+                        scan_region,
+                        scope["model_scope"],
+                        scope["guarding_scope"],
                         f" ({sources})" if sources else "",
                     )
                 )
-                for guardrail_arn in effective["guardrail_arns"]:
-                    share_rows.append(
-                        _guardrail_share_finding(
-                            guardrail_arn, caller_account, reference, region
-                        )
+                policy_credited.setdefault(scan_region, set()).add(
+                    config["guardrailArn"]
+                )
+            if effective["summary"]["guardrail_arns"] and not effective["configs"]:
+                policy_errors.append(
+                    "the effective Bedrock policy names {} outside the documented "
+                    "bedrock.guardrail_inference.<region>.<configuration>.identifier "
+                    "layout, so no configuration was credited".format(
+                        ", ".join(effective["summary"]["guardrail_arns"])
                     )
+                )
+            for guardrail_arn in sorted(
+                {arn for arns in policy_credited.values() for arn in arns}
+            ):
+                share_rows[guardrail_arn] = _guardrail_share_finding(
+                    guardrail_arn, caller_account, reference, region
+                )
 
-        # The service control policy leg is read only when no organization-wide
-        # mechanism enforces, because it costs one DescribePolicy per SCP.
+        # The service control policy leg is read only for Regions no other
+        # mechanism covers, because it costs one DescribePolicy per SCP.
         scp_note = ""
-        if not org_mechanisms and organizations_in_use and not context["readable"]:
+        scp_pending = [r for r in regions if r not in region_mechanisms]
+        if scp_pending and organizations_in_use and not context["readable"]:
             policy_errors.append(context["detail"])
-        elif not org_mechanisms and organizations_in_use:
+        elif scp_pending and organizations_in_use:
             scps = (
                 scp_inventory
                 if scp_inventory is not None
                 else get_service_control_policy_inventory()
             )
-            scp_note = " " + _scp_scope_note(scps)
             if scps["list_error"]:
                 policy_errors.append(
                     f"SERVICE_CONTROL_POLICY listing: {scps['list_error']}"
                 )
             policy_errors.extend(scps["errors"])
-            scp_actions = set()
-            scp_enforcing = []
-            for item in scps["items"]:
-                try:
-                    controls = _scp_guardrail_controls(item["content"] or "{}")
-                except (ValueError, TypeError) as error:
-                    policy_errors.append(f"policy '{item['name']}': {str(error)}")
-                    continue
-                scp_actions.update(controls["actions"])
-                scp_enforcing.extend(
-                    f"service control policy '{item['name']}' {control}"
-                    for control in controls["enforcing"]
-                )
-                for gap in controls["gaps"]:
-                    deficient_policies.append(
-                        {
-                            "name": item["name"],
-                            "id": item["id"],
-                            "reason": "its guardrail Deny does not enforce the approved guardrail",
-                            "observed": gap,
-                        }
+            scp_gaps = {}
+            scp_short = {}
+            for scan_region in scp_pending:
+                scp_actions = set()
+                scp_enforcing = []
+                for item in scps["items"]:
+                    try:
+                        controls = _scp_guardrail_controls(
+                            item["content"] or "{}", scan_region, caller_account
+                        )
+                    except (ValueError, TypeError) as error:
+                        policy_errors.append(f"policy '{item['name']}': {str(error)}")
+                        continue
+                    scp_actions.update(controls["actions"])
+                    scp_enforcing.extend(
+                        f"service control policy '{item['name']}' {control}"
+                        for control in controls["enforcing"]
                     )
-            missing = [a for a in GUARDRAIL_INVOKE_ACTIONS if a not in scp_actions]
-            if scp_enforcing and not missing:
-                org_mechanisms.extend(scp_enforcing)
-            elif scp_enforcing:
-                deficient_policies.append(
-                    {
-                        "name": ", ".join(
+                    for gap in controls["gaps"]:
+                        scp_gaps.setdefault((item["name"], item["id"], gap), []).append(
+                            scan_region
+                        )
+                missing = [a for a in GUARDRAIL_INVOKE_ACTIONS if a not in scp_actions]
+                if scp_enforcing and not missing:
+                    region_mechanisms.setdefault(scan_region, []).extend(
+                        f"{text} in {scan_region}" for text in scp_enforcing
+                    )
+                    region_unshared.add(scan_region)
+                    scp_note = " " + _scp_scope_note(scps)
+                elif scp_enforcing:
+                    key = (
+                        ", ".join(
                             sorted({text.split("'")[1] for text in scp_enforcing})
                         ),
-                        "id": "service control policy",
-                        "reason": "no attached statement also covers {}, so that action runs without the approved guardrail".format(
-                            ", ".join(missing)
+                        ", ".join(missing),
+                        "; ".join(scp_enforcing[:3]),
+                    )
+                    scp_short.setdefault(key, []).append(scan_region)
+            for (name, policy_id, gap), gap_regions in scp_gaps.items():
+                deficient_policies.append(
+                    {
+                        "name": name,
+                        "id": policy_id,
+                        "reason": "its guardrail Deny does not enforce the approved guardrail in {}".format(
+                            ", ".join(gap_regions)
                         ),
-                        "observed": "; ".join(scp_enforcing[:3]),
+                        "observed": gap,
                     }
                 )
+            for (names, missing_text, observed), short_regions in scp_short.items():
+                deficient_policies.append(
+                    {
+                        "name": names,
+                        "id": "service control policy",
+                        "reason": "no attached statement also covers {} in {}, so that action runs without the approved guardrail".format(
+                            missing_text, ", ".join(short_regions)
+                        ),
+                        "observed": observed,
+                    }
+                )
+            if not scp_note:
+                scp_note = " " + _scp_scope_note(scps)
 
         for policy in deficient_policies:
             findings["status"] = "WARN"
@@ -8814,7 +9205,7 @@ def check_bedrock_central_guardrail_enforcement(
         uncovered = [
             scan_region
             for scan_region in regions
-            if not org_mechanisms and scan_region not in region_mechanisms
+            if scan_region not in region_mechanisms
         ]
         unread = [
             scan_region for scan_region in uncovered if scan_region in region_errors
@@ -8836,14 +9227,17 @@ def check_bedrock_central_guardrail_enforcement(
                 create_finding(
                     check_id="BR-41",
                     finding_name=check_name,
-                    finding_details="Account-enforced {} in {} does not cover every invocation: {}. It currently applies to {} ({}).".format(
+                    finding_details="{} {} in {} does not cover every invocation: {}. It currently applies to {} ({}).".format(
+                        scope["source"],
                         scope["label"],
                         scope["region"],
                         "; ".join(scope["narrowings"]),
                         scope["model_scope"],
                         scope["guarding_scope"],
                     ),
-                    resolution="Call PutEnforcedGuardrailConfiguration with includedModels set to ALL, excludedModels empty, and both selectiveContentGuarding modes COMPREHENSIVE, so no model can be invoked without the approved guardrail.",
+                    resolution="Call PutEnforcedGuardrailConfiguration with includedModels set to ALL, excludedModels empty, and both selectiveContentGuarding modes COMPREHENSIVE, so no model can be invoked without the approved guardrail."
+                    if scope["source"] == "Account-enforced"
+                    else "Set the Bedrock policy configuration's model_enforcement included_models to ALL with excluded_models empty, and both selective_content_guarding modes to comprehensive, so no model can be invoked without the approved guardrail.",
                     reference=reference,
                     severity="High",
                     status="Failed",
@@ -8869,18 +9263,32 @@ def check_bedrock_central_guardrail_enforcement(
 
         # A share the owning account shows is part of the enforcement verdict,
         # so it is folded into that row; a gap or an unread share stands alone.
-        share_passed = [row for row in share_rows if row["Status"] == "Passed"]
-        for row in share_rows:
+        share_passed = [row for row in share_rows.values() if row["Status"] == "Passed"]
+        for row in share_rows.values():
             if row["Status"] != "Passed":
                 findings["csv_data"].append(row)
                 if row["Status"] == "Failed":
                     findings["status"] = "WARN"
 
-        if not uncovered and any(row["Status"] == "Failed" for row in share_rows):
+        if not uncovered and any(
+            row["Status"] == "Failed" for row in share_rows.values()
+        ):
             return findings
 
         if not uncovered:
-            mechanisms = org_mechanisms + [
+            # A Region credited only by the Bedrock policy is enforced only if
+            # member accounts can apply the guardrail it names, so an unread
+            # share leaves that Region undetermined.
+            unread_shares = sorted(
+                {
+                    arn
+                    for scan_region in regions
+                    if scan_region not in region_unshared
+                    for arn in policy_credited.get(scan_region, set())
+                    if share_rows[arn]["Status"] != "Passed"
+                }
+            )
+            mechanisms = [
                 text
                 for scan_region in regions
                 for text in region_mechanisms.get(scan_region, [])
@@ -8897,18 +9305,28 @@ def check_bedrock_central_guardrail_enforcement(
                 create_finding(
                     check_id="BR-41",
                     finding_name=check_name,
-                    finding_details="A published guardrail is enforced for every model in the {} assessed Region(s) ({}) by {} mechanism(s): {}.{}".format(
+                    finding_details="A published guardrail is {} for every model in the {} assessed Region(s) ({}) by {} mechanism(s): {}.{}{}".format(
+                        "configured to be enforced" if unread_shares else "enforced",
                         len(regions),
                         ", ".join(regions),
                         len(mechanisms),
                         mechanism_text,
                         "".join(" " + row["Finding_Details"] for row in share_passed)
-                        + (scp_note if not region_mechanisms else ""),
+                        + scp_note,
+                        " Whether member accounts can apply {} was not read, and "
+                        "the Bedrock policy is the only mechanism in a Region that "
+                        "relies on it, so the enforcement is not credited.".format(
+                            ", ".join(unread_shares)
+                        )
+                        if unread_shares
+                        else "",
                     ),
-                    resolution="No action required. Re-publish and re-point the configuration whenever the approved guardrail changes.",
+                    resolution="Run the assessment in the guardrail's owning account to read the share."
+                    if unread_shares
+                    else "No action required. Re-publish and re-point the configuration whenever the approved guardrail changes.",
                     reference=reference,
-                    severity="Medium",
-                    status="Passed",
+                    severity="Informational" if unread_shares else "Medium",
+                    status="N/A" if unread_shares else "Passed",
                     region=region,
                 )
             )
@@ -26725,7 +27143,7 @@ def lambda_handler(event, context):
             )
             if permission_cache is None
             else check_bedrock_guardrail_iam_enforcement(
-                permission_cache, region=region
+                permission_cache, region=region, scp_inventory=scp_inventory
             )
         )
         all_findings.append(guardrail_iam_findings)
