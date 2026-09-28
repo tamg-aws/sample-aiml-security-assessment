@@ -1360,11 +1360,15 @@ Resources:
               Condition:
                 StringEquals:
                   cloudwatch:namespace: AIMLSecurity/AgentCore
-            - Sid: EvaluationScoreAlarmRead
+            - Sid: AgentCoreCompositeAlarmRead
+              # AC-36, AC-40, AC-45, AC-46 and AC-53 credit an alarm actioned
+              # through a composite alarm. The CloudWatch API reference page
+              # API_DescribeAlarms says composite alarm information is returned
+              # only when the permission is scoped to '*'.
               Effect: Allow
               Action:
-                - cloudwatch:DescribeAlarms # AC-40, AC-46, AC-53
-              Resource: !Sub 'arn:${AWS::Partition}:cloudwatch:*:${AWS::AccountId}:alarm:*'
+                - cloudwatch:DescribeAlarms # AC-36, AC-40, AC-45, AC-46, AC-53
+              Resource: '*'
             - Sid: AgentCoreApprovedReadsWithoutResourceType
               # Read-only reads approved for the AgentCore legs. None of these
               # has a resource type in the service authorization reference, so

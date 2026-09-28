@@ -20173,7 +20173,8 @@ class TestAC40EvaluationSafetyCoverage:
 
         assert findings[0]["Status"] == "Passed"
         assert self.mock_cw.describe_alarms.call_args_list[1].kwargs == {
-            "NextToken": "page-2"
+            "AlarmTypes": ["MetricAlarm", "CompositeAlarm"],
+            "NextToken": "page-2",
         }
 
     @patch("agentcore_app.agentcore_client")
@@ -37360,7 +37361,9 @@ class TestAC53CoordinationAnomalyAlarms:
             ],
         }
 
-    def _run(self, metrics, alarms, runtimes=None, gateways=None, engines=None):
+    def _run(
+        self, metrics, alarms, runtimes=None, gateways=None, engines=None, composites=()
+    ):
         agentcore = MagicMock()
         agentcore.list_agent_runtimes.return_value = {
             "agentRuntimes": self.RUNTIMES if runtimes is None else runtimes
@@ -37386,7 +37389,10 @@ class TestAC53CoordinationAnomalyAlarms:
         if isinstance(alarms, Exception):
             cloudwatch.describe_alarms.side_effect = alarms
         else:
-            cloudwatch.describe_alarms.return_value = {"MetricAlarms": alarms}
+            cloudwatch.describe_alarms.return_value = {
+                "MetricAlarms": alarms,
+                "CompositeAlarms": list(composites),
+            }
         with (
             patch.object(agentcore_app, "agentcore_client", agentcore),
             patch.object(agentcore_app, "cloudwatch_client", cloudwatch),
@@ -37695,3 +37701,212 @@ class TestAC53Registration:
     def test_the_handler_registers_the_check_once(self):
         source = textwrap.dedent(inspect.getsource(agentcore_app.lambda_handler))
         assert source.count("check_agentcore_coordination_anomaly_alarms") == 1
+
+
+def _composite(name, rule, actions=True):
+    """A composite alarm over the given rule, with or without enabled actions."""
+    return {
+        "AlarmName": name,
+        "AlarmArn": f"arn:aws:cloudwatch:us-east-1:123456789012:alarm:{name}",
+        "AlarmRule": rule,
+        "ActionsEnabled": actions,
+        "AlarmActions": ["arn:aws:sns:us-east-1:123456789012:ops"],
+    }
+
+
+def _silent(alarm):
+    """The same metric alarm with its own actions disabled."""
+    return {**alarm, "ActionsEnabled": False}
+
+
+class TestAgentCoreCompositeAlarmCredit:
+    """AC-36, AC-40, AC-45, AC-46 and AC-53 credit a metric alarm that notifies
+    only through a composite alarm whose own actions are enabled."""
+
+    @staticmethod
+    def _actioned(*pages):
+        client = MagicMock()
+        client.describe_alarms.side_effect = list(pages)
+        with patch.object(agentcore_app, "cloudwatch_client", client):
+            actioned = agentcore_app._agentcore_actioned_metric_alarms()
+        return {a["AlarmName"]: c for a, c in actioned}, client
+
+    def test_both_alarm_types_are_paged_and_composites_on_page_two_count(self):
+        actioned, client = self._actioned(
+            {"MetricAlarms": [_silent(_score_alarm("a"))], "NextToken": "p2"},
+            {"CompositeAlarms": [_composite("rollup", 'ALARM("a")')]},
+        )
+        assert actioned == {"a": "rollup"}
+        assert [c.kwargs for c in client.describe_alarms.call_args_list] == [
+            {"AlarmTypes": ["MetricAlarm", "CompositeAlarm"]},
+            {"AlarmTypes": ["MetricAlarm", "CompositeAlarm"], "NextToken": "p2"},
+        ]
+
+    def test_a_composite_with_disabled_actions_credits_nothing(self):
+        actioned, _ = self._actioned(
+            {
+                "MetricAlarms": [_silent(_score_alarm("a"))],
+                "CompositeAlarms": [_composite("rollup", 'ALARM("a")', actions=False)],
+            }
+        )
+        assert actioned == {}
+
+    @pytest.mark.parametrize(
+        "rule",
+        ['ALARM("a") AND ALARM("b")', 'NOT ALARM("a")', 'ALARM("a") OR OK("b")'],
+    )
+    def test_a_rule_that_can_stay_out_of_alarm_credits_nothing(self, rule):
+        actioned, _ = self._actioned(
+            {
+                "MetricAlarms": [
+                    _silent(_score_alarm("a")),
+                    _silent(_score_alarm("b")),
+                ],
+                "CompositeAlarms": [_composite("rollup", rule)],
+            }
+        )
+        assert actioned == {}
+
+    def test_only_the_second_of_two_alarms_left_out_of_the_composite_is_unactioned(
+        self,
+    ):
+        actioned, _ = self._actioned(
+            {
+                "MetricAlarms": [
+                    _silent(_score_alarm("a")),
+                    _silent(_score_alarm("b")),
+                ],
+                "CompositeAlarms": [_composite("rollup", 'ALARM("a")')],
+            }
+        )
+        assert actioned == {"a": "rollup"}
+
+    def test_a_nested_composite_and_an_arn_reference_are_followed(self):
+        arn = "arn:aws:cloudwatch:us-east-1:123456789012:alarm:inner"
+        actioned, _ = self._actioned(
+            {
+                "MetricAlarms": [_silent(_score_alarm("a")), _score_alarm("b")],
+                "CompositeAlarms": [
+                    _composite("inner", 'ALARM("a")', actions=False),
+                    _composite("outer", f"ALARM({arn})"),
+                ],
+            }
+        )
+        assert actioned == {"a": "outer", "b": None}
+
+    @patch("agentcore_app.agentcore_client")
+    def test_ac40_a_score_alarm_actioned_only_by_a_composite_passes(self, mock_ac):
+        _online_evaluation_client(mock_ac)
+        with patch("agentcore_app.cloudwatch_client") as mock_cw:
+            mock_cw.describe_alarms.return_value = {
+                "MetricAlarms": [_silent(_score_alarm())],
+                "CompositeAlarms": [_composite("rollup", 'ALARM("eval-score-drop")')],
+            }
+            findings = agentcore_app.check_agentcore_evaluation_safety_coverage()
+
+        assert findings[0]["Status"] == "Passed"
+        assert (
+            "eval-score-drop (actioned through composite alarm rollup)"
+            in findings[0]["Finding_Details"]
+        )
+
+    @patch("agentcore_app.agentcore_client")
+    def test_ac40_a_disabled_composite_does_not_pass(self, mock_ac):
+        _online_evaluation_client(mock_ac)
+        with patch("agentcore_app.cloudwatch_client") as mock_cw:
+            mock_cw.describe_alarms.return_value = {
+                "MetricAlarms": [_silent(_score_alarm())],
+                "CompositeAlarms": [
+                    _composite("rollup", 'ALARM("eval-score-drop")', actions=False)
+                ],
+            }
+            findings = agentcore_app.check_agentcore_evaluation_safety_coverage()
+
+        assert findings[0]["Status"] == "Failed"
+
+    @pytest.mark.parametrize("actions", [True, False], ids=["enabled", "disabled"])
+    @patch("agentcore_app.cloudwatch_client")
+    @patch("agentcore_app.logs_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_ac46_a_session_alarm_through_a_composite(
+        self, mock_ac, mock_logs, mock_cw, actions
+    ):
+        _wire_runtimes(mock_ac, [_bounded_runtime("rt-1"), _bounded_runtime("rt-2")])
+        _wire_session_monitoring(mock_logs, mock_cw, delivered_ids=("rt-1", "rt-2"))
+        mock_cw.describe_alarms.return_value = {
+            "MetricAlarms": [_silent(_session_alarm())],
+            "CompositeAlarms": [
+                _composite("rollup", 'ALARM("runtime-sessions")', actions=actions)
+            ],
+        }
+
+        findings = agentcore_app.check_agentcore_runtime_session_limits()
+
+        expected = "Passed" if actions else "Failed"
+        assert [finding["Status"] for finding in findings] == [expected, expected]
+        if actions:
+            for finding in findings:
+                assert (
+                    "runtime-sessions (actioned through composite alarm rollup)"
+                    in finding["Finding_Details"]
+                )
+
+    @pytest.mark.parametrize("actions", [True, False], ids=["enabled", "disabled"])
+    @patch("agentcore_app.kms_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_ac36_a_metric_filter_alarm_through_a_composite(
+        self, mock_ac, mock_kms, actions
+    ):
+        suite = TestAC36KeyLossAlarmAndServiceBounds()
+        cloudwatch = MagicMock()
+        cloudwatch.describe_alarms.return_value = {
+            "MetricAlarms": [_silent(suite._ALARM)],
+            "CompositeAlarms": [
+                _composite("rollup", 'ALARM("kms-key-loss")', actions=actions)
+            ],
+        }
+        findings = suite._run(
+            mock_ac,
+            mock_kms,
+            events=_key_loss_events(),
+            logs=suite._logs(suite._FILTER),
+            cloudwatch=cloudwatch,
+        )
+
+        assert [f["Status"] for f in findings] == ["Passed" if actions else "Failed"]
+        if actions:
+            assert (
+                "alarm kms-key-loss (actioned through composite alarm rollup) "
+                "with an action watches the metric of filter "
+                in findings[0]["Finding_Details"]
+            )
+
+    def test_ac53_only_the_edge_left_out_of_the_composite_fails(self):
+        suite = TestAC53CoordinationAnomalyAlarms()
+        first = suite._metric("Latency", "alpha.DEFAULT", "beta.DEFAULT")
+        second = suite._metric("Latency", "alpha.DEFAULT", "gamma.DEFAULT")
+        findings, _ = suite._run(
+            [first, second],
+            [
+                suite._band_alarm("a-to-b", first, actions=False),
+                suite._band_alarm("a-to-g", second, actions=False),
+            ],
+            composites=[_composite("rollup", 'ALARM("a-to-b")')],
+        )
+        assert [f["Status"] for f in findings] == ["Failed"]
+        assert "gamma-CCCCCCCCCC" in findings[0]["Finding_Details"]
+        assert "beta-BBBBBBBBBB" not in findings[0]["Finding_Details"]
+
+    def test_ac53_a_composite_actioned_edge_passes_and_is_named(self):
+        suite = TestAC53CoordinationAnomalyAlarms()
+        edge = suite._metric("Fault", "alpha.DEFAULT", "beta.DEFAULT")
+        findings, _ = suite._run(
+            [edge],
+            [suite._band_alarm("a-to-b", edge, actions=False)],
+            composites=[_composite("rollup", 'ALARM("a-to-b")')],
+        )
+        assert [f["Status"] for f in findings] == ["Passed"]
+        assert (
+            "a-to-b (actioned through composite alarm rollup) on Fault"
+            in findings[0]["Finding_Details"]
+        )

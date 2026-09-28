@@ -1456,3 +1456,39 @@ def test_responsible_ai_non_bedrock_resource_reads_are_arn_scoped(template):
     assert "organizations::*:policy/*/*/*" in organizations
     assert "organizations::aws:policy/*/*" in organizations
     assert not re.search(r"Resource:\s+['\"]\*['\"]", organizations)
+
+
+@pytest.mark.parametrize("template", _SAM_TEMPLATES, ids=os.path.basename)
+def test_agentcore_reads_alarms_on_star_so_composites_are_returned(template):
+    """DescribeAlarms omits composite alarms under a grant narrower than '*'
+    (API_DescribeAlarms), which would fail every alarm actioned only through
+    a composite. The '*' grant must be the role's only DescribeAlarms grant."""
+    with open(template, encoding="utf-8") as template_file:
+        data = yaml.load(template_file, Loader=_CfnLoader)  # nosec B506
+
+    statements = [
+        statement
+        for policy in data["Resources"]["AgentCoreSecurityAssessmentFunction"][
+            "Properties"
+        ]["Policies"]
+        if isinstance(policy, dict)
+        for statement in policy.get("Statement", [])
+    ]
+    reading = [
+        statement
+        for statement in statements
+        if "cloudwatch:DescribeAlarms" in (statement.get("Action") or [])
+    ]
+
+    assert reading == [
+        {
+            "Sid": "AgentCoreCompositeAlarmRead",
+            "Effect": "Allow",
+            "Action": ["cloudwatch:DescribeAlarms"],
+            "Resource": "*",
+        }
+    ]
+    block = _statement_block(
+        template, "AgentCoreSecurityAssessmentFunction", "AgentCoreCompositeAlarmRead"
+    )
+    assert "API_DescribeAlarms" in block

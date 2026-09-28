@@ -19201,6 +19201,96 @@ def _kms_key_loss_alarm_leg() -> Tuple[str, List[str]]:
     return "", unread + alarm_unread
 
 
+COMPOSITE_ALARM_TERM = re.compile(r'\bALARM\(\s*"?([^")]+?)"?\s*\)')
+
+
+def _composite_rule_alarms(rule: str) -> List[str]:
+    """The alarms whose ALARM state alone puts a composite alarm in ALARM.
+
+    Only a rule that joins ALARM() terms with OR credits them. A rule holding
+    AND, NOT, OK(), INSUFFICIENT_DATA(), TRUE or FALSE credits none, because a
+    child in ALARM can leave that composite out of ALARM.
+    """
+    names = COMPOSITE_ALARM_TERM.findall(rule or "")
+    rest = COMPOSITE_ALARM_TERM.sub(" ", rule or "").replace("(", " ").replace(")", " ")
+    if not names or any(token != "OR" for token in rest.split()):
+        return []
+    return [name.strip() for name in names]
+
+
+def _agentcore_actioned_metric_alarms() -> List[Tuple[Dict[str, Any], Optional[str]]]:
+    """Every metric alarm whose ALARM state reaches an alarm action.
+
+    Each alarm is paired with the composite alarm that carries the action, or
+    None when the alarm carries its own. A composite credits a child only when
+    its own actions are enabled and non-empty, including through a nested
+    composite. DescribeAlarms returns composite alarms only to a grant on '*'
+    (https://docs.aws.amazon.com/AmazonCloudWatch/latest/APIReference/API_DescribeAlarms.html),
+    so under a narrower grant a composite route reads as unactioned.
+    """
+    metric_alarms: List[Dict[str, Any]] = []
+    composite_alarms: List[Dict[str, Any]] = []
+    next_token = None
+    seen_tokens = set()
+    while True:
+        kwargs: Dict[str, Any] = {"AlarmTypes": ["MetricAlarm", "CompositeAlarm"]}
+        if next_token:
+            kwargs["NextToken"] = next_token
+        response = cloudwatch_client.describe_alarms(**kwargs)
+        if not isinstance(response, dict):
+            break
+        metric_alarms.extend(
+            a for a in response.get("MetricAlarms") or [] if isinstance(a, dict)
+        )
+        composite_alarms.extend(
+            a for a in response.get("CompositeAlarms") or [] if isinstance(a, dict)
+        )
+        next_token = response.get("NextToken")
+        if (
+            not isinstance(next_token, str)
+            or not next_token
+            or next_token in seen_tokens
+        ):
+            break
+        seen_tokens.add(next_token)
+
+    names: Dict[str, str] = {}
+    for alarm in metric_alarms + composite_alarms:
+        names[alarm.get("AlarmName")] = alarm.get("AlarmName")
+        if alarm.get("AlarmArn"):
+            names[alarm["AlarmArn"]] = alarm.get("AlarmName")
+    actioned: Dict[str, Optional[str]] = {
+        alarm.get("AlarmName"): None
+        for alarm in metric_alarms + composite_alarms
+        if alarm.get("ActionsEnabled") is True and alarm.get("AlarmActions")
+    }
+    changed = True
+    while changed:
+        changed = False
+        for composite in composite_alarms:
+            parent = composite.get("AlarmName")
+            if parent not in actioned:
+                continue
+            for reference in _composite_rule_alarms(composite.get("AlarmRule")):
+                child = names.get(reference, reference)
+                if child not in actioned:
+                    actioned[child] = actioned[parent] or parent
+                    changed = True
+    return [
+        (alarm, actioned[alarm.get("AlarmName")])
+        for alarm in metric_alarms
+        if alarm.get("AlarmName") in actioned
+    ]
+
+
+def _actioned_alarm_label(alarm: Dict[str, Any], composite: Optional[str]) -> str:
+    """Name an alarm, and the composite alarm that carries its action if any."""
+    name = str(alarm.get("AlarmName", "unnamed"))
+    return (
+        f"{name} (actioned through composite alarm {composite})" if composite else name
+    )
+
+
 def _metric_filter_alarm(
     filter_matches: Callable[[Dict[str, Any]], bool],
 ) -> Tuple[str, List[str]]:
@@ -19234,25 +19324,15 @@ def _metric_filter_alarm(
     if not metrics:
         return "", []
     try:
-        alarms = _paginate_aws_list(
-            cloudwatch_client,
-            "describe_alarms",
-            "MetricAlarms",
-            token_request_key="NextToken",
-            token_response_key="NextToken",
-        )
+        alarms = _agentcore_actioned_metric_alarms()
     except Exception as error:
         return "", [f"cloudwatch:DescribeAlarms ({_assessment_error_label(error)})"]
-    for alarm in alarms:
+    for alarm, composite in alarms:
         metric = (alarm.get("Namespace"), alarm.get("MetricName"))
-        if (
-            metric in metrics
-            and alarm.get("ActionsEnabled")
-            and alarm.get("AlarmActions")
-        ):
+        if metric in metrics:
             return (
-                f"alarm {alarm.get('AlarmName')} with an action watches the metric "
-                f"of filter {metrics[metric]}",
+                f"alarm {_actioned_alarm_label(alarm, composite)} with an action "
+                f"watches the metric of filter {metrics[metric]}",
                 [],
             )
     return "", []
@@ -20935,17 +21015,16 @@ def check_agentcore_evaluation_safety_coverage() -> List[Dict[str, Any]]:
 
     alarm_error = None
     alarms: List[Dict[str, Any]] = []
+    alarm_labels: Dict[str, str] = {}
     if cloudwatch_client is None:
         alarm_error = "CloudWatch client not available in this region"
     else:
         try:
-            alarms = _paginate_aws_list(
-                cloudwatch_client,
-                "describe_alarms",
-                "MetricAlarms",
-                token_request_key="NextToken",
-                token_response_key="NextToken",
-            )
+            for alarm, composite in _agentcore_actioned_metric_alarms():
+                alarms.append(alarm)
+                alarm_labels[str(alarm.get("AlarmName"))] = _actioned_alarm_label(
+                    alarm, composite
+                )
         except Exception as error:
             alarm_error = _assessment_error_label(error)
 
@@ -20960,11 +21039,7 @@ def check_agentcore_evaluation_safety_coverage() -> List[Dict[str, Any]]:
         )
         namespace_text = " or ".join(namespaces)
         watching_alarms = [
-            alarm
-            for alarm in alarms
-            if _alarm_reads_namespace(alarm, namespaces)
-            and alarm.get("ActionsEnabled") is True
-            and alarm.get("AlarmActions")
+            alarm for alarm in alarms if _alarm_reads_namespace(alarm, namespaces)
         ]
         metric_failures: List[str] = []
         published: set = set()
@@ -21026,7 +21101,9 @@ def check_agentcore_evaluation_safety_coverage() -> List[Dict[str, Any]]:
             )
         else:
             metric_note = ""
-        watching = sorted(str(alarm.get("AlarmName")) for alarm in watching_alarms)
+        watching = sorted(
+            alarm_labels[str(alarm.get("AlarmName"))] for alarm in watching_alarms
+        )
         attached = [
             str(reference.get("evaluatorId"))
             for reference in detail.get("evaluators") or []
@@ -23532,20 +23609,10 @@ def _alarm_reads_session_count(alarm: Dict[str, Any]) -> bool:
 
 def _agentcore_session_count_alarms() -> List[str]:
     """Name every alarm with actions that reads the runtime's session count."""
-    alarms = _paginate_aws_list(
-        cloudwatch_client,
-        "describe_alarms",
-        "MetricAlarms",
-        token_request_key="NextToken",
-        token_response_key="NextToken",
-    )
     return sorted(
-        alarm.get("AlarmName", "unnamed")
-        for alarm in alarms
-        if isinstance(alarm, dict)
-        and alarm.get("ActionsEnabled") is True
-        and alarm.get("AlarmActions")
-        and _alarm_reads_session_count(alarm)
+        _actioned_alarm_label(alarm, composite)
+        for alarm, composite in _agentcore_actioned_metric_alarms()
+        if _alarm_reads_session_count(alarm)
     )
 
 
@@ -27693,24 +27760,12 @@ def check_agentcore_coordination_anomaly_alarms() -> List[Dict[str, Any]]:
         ]
 
     try:
-        alarms = _paginate_aws_list(
-            cloudwatch_client,
-            "describe_alarms",
-            "MetricAlarms",
-            token_request_key="NextToken",
-            token_response_key="NextToken",
-        )
+        alarms = _agentcore_actioned_metric_alarms()
     except (BotoCoreError, ClientError) as error:
         return unread("cloudwatch:DescribeAlarms", error)
 
     alarmed: Dict[Tuple[str, str], List[str]] = {}
-    for alarm in alarms:
-        if not (
-            isinstance(alarm, dict)
-            and alarm.get("ActionsEnabled") is True
-            and alarm.get("AlarmActions")
-        ):
-            continue
+    for alarm, composite in alarms:
         for metric_name, dimension_set in _anomaly_band_edge_keys(alarm):
             if metric_name not in APPLICATION_SIGNALS_EDGE_METRIC_NAMES:
                 continue
@@ -27718,7 +27773,7 @@ def check_agentcore_coordination_anomaly_alarms() -> List[Dict[str, Any]]:
             edge = (dimensions.get("Service"), dimensions.get("RemoteService"))
             if edge in edges:
                 alarmed.setdefault(edge, []).append(
-                    f"{alarm.get('AlarmName', 'unnamed')} on {metric_name}"
+                    f"{_actioned_alarm_label(alarm, composite)} on {metric_name}"
                 )
 
     findings: List[Dict[str, Any]] = list(unnamed)

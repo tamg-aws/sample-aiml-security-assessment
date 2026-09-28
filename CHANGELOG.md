@@ -261,6 +261,17 @@ section.
 
 ### Fixed
 
+- `AC-36`, `AC-40`, `AC-45`, `AC-46` and `AC-53` credit a metric alarm that
+  notifies only through a composite alarm. Each failed such an alarm, because
+  it read `MetricAlarms` alone and required the alarm's own actions. The
+  checks now page `DescribeAlarms` with `AlarmTypes` `MetricAlarm` and
+  `CompositeAlarm`, and credit a metric alarm when a composite alarm with
+  enabled, non-empty actions joins it with `OR`-only `ALARM(...)` terms,
+  directly or through a nested composite. A composite with `ActionsEnabled`
+  false credits nothing, and each row names the composite that carries the
+  action. The AgentCore role's `cloudwatch:DescribeAlarms` grant moves from
+  `alarm:*` to `'*'`, because `API_DescribeAlarms` returns composite alarms
+  only to a `'*'`-scoped grant.
 - `AC-01` reads every runtime version `ListAgentRuntimeVersions` returns, not
   only the latest one, and fails a runtime created before the 2026-05-05
   rollout that does not report `requireServiceS3Endpoint`, since an unset
