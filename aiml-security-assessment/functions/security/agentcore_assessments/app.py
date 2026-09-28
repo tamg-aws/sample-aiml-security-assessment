@@ -6985,6 +6985,37 @@ def _online_evaluation_covers_runtime(
     return names_group and names_service
 
 
+def _online_evaluation_covers_endpoint(
+    detail: Dict[str, Any], runtime: Dict[str, Any], endpoint_name: str
+) -> bool:
+    """Whether one online evaluation's input names one endpoint's traces.
+
+    The endpoint's log group is /aws/bedrock-agentcore/runtimes/<runtimeId>-
+    <endpointName>, so an explicit input group must equal it and a prefix must be
+    a prefix of it. A service name counts when it is the runtime id or name, or
+    that identity followed by this endpoint's name, so a configuration scoped to
+    agent.DEFAULT does not score the prod endpoint.
+    """
+    source = (detail.get("dataSourceConfig") or {}).get("cloudWatchLogs") or {}
+    runtime_id = runtime.get("agentRuntimeId") or ""
+    runtime_name = runtime.get("agentRuntimeName") or ""
+    if not runtime_id:
+        return False
+    group = f"{AGENTCORE_RUNTIME_LOG_GROUP_PREFIX}{runtime_id}-{endpoint_name}"
+
+    names_group = group in (source.get("logGroupNames") or []) or any(
+        isinstance(prefix, str) and prefix and group.startswith(prefix)
+        for prefix in source.get("logGroupNamePrefixes") or []
+    )
+    names_service = any(
+        service in (identity, f"{identity}.{endpoint_name}")
+        for service in source.get("serviceNames") or []
+        for identity in (runtime_id, runtime_name)
+        if identity
+    )
+    return names_group and names_service
+
+
 def _online_evaluation_filter_note(detail: Dict[str, Any]) -> str:
     """Say how many rule filters narrow the sessions an evaluation scores."""
     filters = (detail.get("rule") or {}).get("filters") or []
@@ -7000,11 +7031,14 @@ def check_agentcore_online_evaluation_coverage() -> List[Dict[str, Any]]:
     sets. A runtime passes when an online evaluation configuration that is
     running (AC-39's settings: ACTIVE, ENABLED, sampling above zero, an input log
     group and service, an output log group and an evaluator) reads that runtime's
-    log group and service name. A runtime only a stopped configuration names
-    fails and the stopped settings are named, and a configuration that could not
-    be read leaves every runtime it might cover N/A. The rule filters are counted
-    and not judged, because which sessions an operator means to score has no API
-    field.
+    log group and service name, and every endpoint ListAgentRuntimeEndpoints
+    returns for it has its own log group read by one: a configuration over the
+    DEFAULT endpoint leaves a prod endpoint unscored. An endpoint list that
+    cannot be read withholds the pass. A runtime only a stopped configuration
+    names fails and the stopped settings are named, and a configuration that
+    could not be read leaves every runtime it might cover N/A. The rule filters
+    are counted and not judged, because which sessions an operator means to
+    score has no API field.
 
     With no runtime in the region, REQUIRE_AGENTCORE_ONLINE_EVALUATION set to
     true still requires one running configuration, for agents hosted outside
@@ -7151,6 +7185,96 @@ def check_agentcore_online_evaluation_coverage() -> List[Dict[str, Any]]:
                 f"percent{_online_evaluation_filter_note(detail)}"
                 for label, detail in running
             )
+            try:
+                endpoints = _agentcore_list_all(
+                    "list_agent_runtime_endpoints",
+                    ["runtimeEndpoints"],
+                    agentRuntimeId=runtime.get("agentRuntimeId"),
+                )
+            except (BotoCoreError, ClientError) as error:
+                findings.append(
+                    create_finding(
+                        check_id="AC-17",
+                        finding_name=finding_name,
+                        finding_details=(
+                            f"{runtime_label} is scored by a running online "
+                            "evaluation that reads a log group under its id and "
+                            f"its service name: {scored_by}. Its endpoints could "
+                            "not be listed: ListAgentRuntimeEndpoints failed with "
+                            f"{_assessment_error_label(error)}, so whether every "
+                            "endpoint's log group is read is unknown."
+                        ),
+                        resolution=(
+                            "Grant bedrock-agentcore:ListAgentRuntimeEndpoints and "
+                            "retry."
+                        ),
+                        reference=AGENTCORE_ONLINE_EVALUATION_REFERENCE_URL,
+                        severity=SeverityEnum.INFORMATIONAL,
+                        status=StatusEnum.NA,
+                    )
+                )
+                continue
+            endpoint_names = [
+                endpoint["name"]
+                for endpoint in endpoints
+                if isinstance(endpoint, dict)
+                and isinstance(endpoint.get("name"), str)
+                and endpoint["name"]
+            ]
+            unscored = [
+                name
+                for name in endpoint_names
+                if not any(
+                    _online_evaluation_covers_endpoint(detail, runtime, name)
+                    for _, detail in running
+                )
+            ]
+            if unscored:
+                groups = ", ".join(
+                    f"{AGENTCORE_RUNTIME_LOG_GROUP_PREFIX}"
+                    f"{runtime.get('agentRuntimeId')}-{name}"
+                    for name in unscored
+                )
+                details_text = (
+                    f"{runtime_label} is scored by a running online evaluation "
+                    f"({scored_by}), but {len(unscored)} of its "
+                    f"{len(endpoint_names)} endpoint(s) are read by none: "
+                    f"{', '.join(unscored)} (log group {groups})."
+                )
+                if unreadable:
+                    status, severity = StatusEnum.NA, SeverityEnum.INFORMATIONAL
+                    details_text += (
+                        f" {unreadable_text} Whether one of those scores them is "
+                        "unknown."
+                    )
+                    resolution = unreadable_resolution
+                else:
+                    status, severity = StatusEnum.FAILED, SeverityEnum.MEDIUM
+                    details_text += " Their production traffic is unscored."
+                    resolution = (
+                        "Add each unscored endpoint's log group and service name "
+                        "(<agentRuntimeName>.<endpointName>) to a running online "
+                        "evaluation configuration's dataSourceConfig."
+                    )
+                findings.append(
+                    create_finding(
+                        check_id="AC-17",
+                        finding_name=finding_name,
+                        finding_details=details_text,
+                        resolution=resolution,
+                        reference=AGENTCORE_ONLINE_EVALUATION_REFERENCE_URL,
+                        severity=severity,
+                        status=status,
+                    )
+                )
+                continue
+            endpoint_note = (
+                f" Each of its {len(endpoint_names)} endpoint(s) "
+                f"({', '.join(endpoint_names)}) has its log group read."
+                if endpoint_names
+                else " No endpoint was listed for it, so its log groups were "
+                "matched on the runtime id alone."
+            )
             findings.append(
                 create_finding(
                     check_id="AC-17",
@@ -7158,6 +7282,7 @@ def check_agentcore_online_evaluation_coverage() -> List[Dict[str, Any]]:
                     finding_details=(
                         f"{runtime_label} is scored by a running online evaluation "
                         f"that reads its log group and service name: {scored_by}."
+                        f"{endpoint_note}"
                     ),
                     resolution=(
                         "No action required. Confirm the sampling percentage and "

@@ -247,6 +247,13 @@ section.
   to a version with an unbounded JWT authorizer while the runtime passed. The
   assessment roles hold no `bedrock-agentcore:ListAgentRuntimeEndpoints`
   grant, so a runtime that would pass is `N/A` naming it until it is added.
+- `AC-17` requires the log group of every endpoint a runtime serves to be
+  read by a running online evaluation, which let a configuration over
+  `<runtimeId>-DEFAULT` pass a runtime whose `prod` endpoint was unscored. A
+  service name scoped to one endpoint (`agent.DEFAULT`) no longer covers the
+  others. Without a `bedrock-agentcore:ListAgentRuntimeEndpoints` grant, which
+  the assessment roles do not hold, a runtime that would pass is `N/A` naming
+  it until it is added.
 - `AC-45` judges each AgentCore runtime's own execution role by the rules it
   applies to a tool role. No check read a runtime role outside the AgentCore
   namespace, so one granting `s3:*` or every foundation model passed.

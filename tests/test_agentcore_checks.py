@@ -19279,6 +19279,177 @@ class TestAC17RuntimeCoverage:
         assert findings[0]["Status"] == verdict
 
 
+def _ac17_endpoints(mock_ac, by_runtime):
+    """List each runtime's endpoints by name, keyed on the runtime id."""
+    mock_ac.list_agent_runtime_endpoints.side_effect = lambda agentRuntimeId, **_: {
+        "runtimeEndpoints": [
+            {"name": name, "liveVersion": "1"} for name in by_runtime[agentRuntimeId]
+        ]
+    }
+
+
+def _ac17_prefix_reads(runtime_id, service, **overrides):
+    """A running configuration whose input is every log group of one runtime."""
+    return _online_evaluation_detail(
+        dataSourceConfig={
+            "cloudWatchLogs": {
+                "logGroupNamePrefixes": [
+                    f"/aws/bedrock-agentcore/runtimes/{runtime_id}-"
+                ],
+                "serviceNames": [service],
+            }
+        },
+        **overrides,
+    )
+
+
+class TestAC17EndpointCoverage:
+    """AC-17: every endpoint of a runtime writes to a log group that is scored."""
+
+    @patch.dict(os.environ, {}, clear=True)
+    @patch("agentcore_app.agentcore_client")
+    def test_an_endpoint_whose_log_group_is_not_read_fails(self, mock_ac):
+        _online_evaluation_client(mock_ac, [_ac17_reads("agent")])
+        _ac17_runtimes(mock_ac, "agent")
+        _ac17_endpoints(mock_ac, {"agent": ["DEFAULT", "prod"]})
+
+        findings = agentcore_app.check_agentcore_online_evaluation_coverage()
+
+        assert len(findings) == 1
+        assert findings[0]["Status"] == "Failed"
+        assert (
+            "1 of its 2 endpoint(s) are read by none: prod"
+            in (findings[0]["Finding_Details"])
+        )
+        assert (
+            "/aws/bedrock-agentcore/runtimes/agent-prod"
+            in (findings[0]["Finding_Details"])
+        )
+
+    @patch.dict(os.environ, {}, clear=True)
+    @patch("agentcore_app.agentcore_client")
+    def test_a_prefix_over_every_endpoint_passes_and_names_them(self, mock_ac):
+        _online_evaluation_client(mock_ac, [_ac17_prefix_reads("agent", "agent")])
+        _ac17_runtimes(mock_ac, "agent")
+        _ac17_endpoints(mock_ac, {"agent": ["DEFAULT", "prod"]})
+
+        findings = agentcore_app.check_agentcore_online_evaluation_coverage()
+
+        assert findings[0]["Status"] == "Passed"
+        assert (
+            "Each of its 2 endpoint(s) (DEFAULT, prod) has its log group read."
+            in (findings[0]["Finding_Details"])
+        )
+        mock_ac.list_agent_runtime_endpoints.assert_called_once_with(
+            agentRuntimeId="agent"
+        )
+
+    @patch.dict(os.environ, {}, clear=True)
+    @patch("agentcore_app.agentcore_client")
+    def test_a_service_name_scoped_to_one_endpoint_leaves_the_other_unscored(
+        self, mock_ac
+    ):
+        # The prefix reaches both log groups, so only the service name can
+        # leave prod unscored.
+        _online_evaluation_client(
+            mock_ac, [_ac17_prefix_reads("agent", "agent.DEFAULT")]
+        )
+        _ac17_runtimes(mock_ac, "agent")
+        _ac17_endpoints(mock_ac, {"agent": ["DEFAULT", "prod"]})
+
+        findings = agentcore_app.check_agentcore_online_evaluation_coverage()
+
+        assert findings[0]["Status"] == "Failed"
+        assert "read by none: prod " in findings[0]["Finding_Details"]
+
+    @patch.dict(os.environ, {}, clear=True)
+    @patch("agentcore_app.agentcore_client")
+    def test_each_runtime_is_judged_on_its_own_endpoints(self, mock_ac):
+        _online_evaluation_client(
+            mock_ac,
+            [
+                _ac17_prefix_reads("agent", "agent"),
+                _ac17_reads("other-1", onlineEvaluationConfigId="oec-2"),
+            ],
+        )
+        _ac17_runtimes(mock_ac, "agent", "other-1")
+        _ac17_endpoints(
+            mock_ac, {"agent": ["DEFAULT", "prod"], "other-1": ["DEFAULT", "beta"]}
+        )
+
+        by_runtime = _ac17_by_runtime(
+            agentcore_app.check_agentcore_online_evaluation_coverage()
+        )
+
+        assert by_runtime["agent"]["Status"] == "Passed"
+        assert by_runtime["other-1"]["Status"] == "Failed"
+        assert "read by none: beta " in by_runtime["other-1"]["Finding_Details"]
+
+    @patch.dict(os.environ, {}, clear=True)
+    @patch("agentcore_app.agentcore_client")
+    def test_a_denied_endpoint_list_withholds_the_pass(self, mock_ac):
+        _online_evaluation_client(mock_ac, [_ac17_reads("agent")])
+        _ac17_runtimes(mock_ac, "agent")
+        mock_ac.list_agent_runtime_endpoints.side_effect = _make_client_error(
+            "AccessDeniedException", "no"
+        )
+
+        findings = agentcore_app.check_agentcore_online_evaluation_coverage()
+
+        assert findings[0]["Status"] == "N/A"
+        assert (
+            "ListAgentRuntimeEndpoints failed with AccessDeniedException"
+            in (findings[0]["Finding_Details"])
+        )
+        assert findings[0]["Resolution"] == (
+            "Grant bedrock-agentcore:ListAgentRuntimeEndpoints and retry."
+        )
+
+    @patch.dict(os.environ, {}, clear=True)
+    @patch("agentcore_app.agentcore_client")
+    def test_a_denied_endpoint_list_does_not_clear_an_unscored_runtime(self, mock_ac):
+        _online_evaluation_client(mock_ac, [_ac17_reads("agent")])
+        _ac17_runtimes(mock_ac, "other-1")
+        mock_ac.list_agent_runtime_endpoints.side_effect = _make_client_error(
+            "AccessDeniedException", "no"
+        )
+
+        findings = agentcore_app.check_agentcore_online_evaluation_coverage()
+
+        assert findings[0]["Status"] == "Failed"
+
+    @patch.dict(os.environ, {}, clear=True)
+    @patch("agentcore_app.agentcore_client")
+    def test_an_unscored_endpoint_beside_an_unreadable_configuration_is_na(
+        self, mock_ac
+    ):
+        readable = _ac17_reads("agent")
+        _online_evaluation_client(mock_ac, [readable])
+        mock_ac.list_online_evaluation_configs.return_value = {
+            "onlineEvaluationConfigs": [
+                _online_evaluation_summary("oec-1", "continuous"),
+                _online_evaluation_summary("oec-2", "hidden"),
+            ]
+        }
+
+        def _get(onlineEvaluationConfigId):
+            if onlineEvaluationConfigId == "oec-2":
+                raise _make_client_error("AccessDeniedException", "no")
+            return readable
+
+        mock_ac.get_online_evaluation_config.side_effect = _get
+        _ac17_runtimes(mock_ac, "agent")
+        _ac17_endpoints(mock_ac, {"agent": ["DEFAULT", "prod"]})
+
+        findings = agentcore_app.check_agentcore_online_evaluation_coverage()
+
+        assert findings[0]["Status"] == "N/A"
+        assert "read by none: prod " in findings[0]["Finding_Details"]
+        assert (
+            "1 configuration(s) could not be read" in (findings[0]["Finding_Details"])
+        )
+
+
 class TestAC39OnlineEvaluationOperation:
     """AC-39: a configuration that exists is judged whatever the scanner was told."""
 
