@@ -4661,6 +4661,7 @@ class TestBedrockHandlerMultiRegion:
         "check_lambda_public_invoke_configuration": "BR-54",
         "check_kms_enclave_key_binding": "BR-55",
         "check_bedrock_llm_jacking_activity": "BR-56",
+        "check_agent_handoff_source_identity": "BR-57",
     }
 
     # Checks that read a global surface (the IAM permissions cache or the
@@ -23528,3 +23529,722 @@ class TestBR11ValueDepth:
         na = self._rows(findings, self.DATA_ROW, "N/A")
         assert len(na) == 1 and "kms:DescribeKey" in na[0]["Finding_Details"]
         assert not self._rows(findings, self.DATA_ROW, "Passed")
+
+
+class TestBR57AgentHandoffSourceIdentity:
+    """BR-57: agent-to-agent handoffs need a checked caller binding."""
+
+    ACCOUNT = "123456789012"
+    FINDING = "Agent Handoff Source Identity"
+
+    @classmethod
+    def _role_arn(cls, name):
+        return f"arn:aws:iam::{cls.ACCOUNT}:role/{name}"
+
+    @classmethod
+    def _alias_arn(cls, agent_id, alias_id):
+        return (
+            f"arn:aws:bedrock:us-east-1:{cls.ACCOUNT}:agent-alias/{agent_id}/{alias_id}"
+        )
+
+    @staticmethod
+    def _cache(roles, errors=None, version=2):
+        cache = {"role_permissions": roles, "user_permissions": {}}
+        if version is not None:
+            cache["cache_schema_version"] = version
+            cache["principal_errors"] = errors or []
+        return cache
+
+    @classmethod
+    def _inventory(cls, roles, collaborations=(), errors=(), runtime_error=None):
+        return {
+            "roles": {cls._role_arn(name): labels for name, labels in roles.items()},
+            "collaborations": list(collaborations),
+            "errors": list(errors),
+            "runtime_error": runtime_error,
+            "agent_count": len(roles),
+            "runtime_count": 0,
+        }
+
+    @staticmethod
+    def _trust(*statements):
+        return _policy(*statements)
+
+    @classmethod
+    def _assume(cls, principal, condition=None, sid="handoff"):
+        statement = {
+            "Sid": sid,
+            "Effect": "Allow",
+            "Principal": principal,
+            "Action": "sts:AssumeRole",
+        }
+        if condition is not None:
+            statement["Condition"] = condition
+        return statement
+
+    def _run(self, cache, inventory, trusts):
+        iam = MagicMock()
+
+        def get_role(RoleName):
+            outcome = trusts.get(RoleName)
+            if isinstance(outcome, Exception):
+                raise outcome
+            return {
+                "Role": {
+                    "Arn": self._role_arn(RoleName),
+                    "AssumeRolePolicyDocument": outcome
+                    if outcome is not None
+                    else self._trust(),
+                }
+            }
+
+        iam.get_role.side_effect = get_role
+        with patch("boto3.client", return_value=iam):
+            result = bedrock_app.check_agent_handoff_source_identity(
+                cache, region="us-east-1", agent_inventory=inventory
+            )
+        return result, extract_csv_data(result), iam
+
+    @staticmethod
+    def _status(rows, status):
+        return [row for row in rows if row["Status"] == status]
+
+    def test_trust_naming_agent_role_without_source_identity_fails(self):
+        agent = self._role_arn("agent-a")
+        cache = self._cache(
+            {"agent-a": _identity(), "tool-1": _identity(), "tool-2": _identity()}
+        )
+        result, rows, _ = self._run(
+            cache,
+            self._inventory({"agent-a": ["Bedrock agent 'a' version DRAFT"]}),
+            {
+                "tool-1": self._trust(self._assume({"AWS": agent})),
+                "tool-2": self._trust(
+                    self._assume(
+                        {"AWS": agent},
+                        {"StringEquals": {"sts:SourceIdentity": "agent-a"}},
+                    )
+                ),
+            },
+        )
+        failed = self._status(rows, "Failed")
+        assert result["status"] == "WARN"
+        assert len(failed) == 1
+        detail = failed[0]["Finding_Details"]
+        assert "role 'tool-1'" in detail
+        assert "role 'tool-2'" not in detail
+        assert "not evaluated per principal" in detail
+        assert not self._status(rows, "Passed")
+
+    def test_pinned_trust_passes_and_names_the_binding(self):
+        agent = self._role_arn("agent-a")
+        cache = self._cache({"agent-a": _identity(), "tool-1": _identity()})
+        result, rows, _ = self._run(
+            cache,
+            self._inventory({"agent-a": ["Bedrock agent 'a' version DRAFT"]}),
+            {
+                "tool-1": self._trust(
+                    self._assume(
+                        {"AWS": [agent]},
+                        {"StringEquals": {"sts:SourceIdentity": ["agent-a"]}},
+                    )
+                )
+            },
+        )
+        passed = self._status(rows, "Passed")
+        assert result["status"] == "PASS"
+        assert len(passed) == 1 and len(rows) == 1
+        assert (
+            "1 trust edge(s) from an agent role were found and each pins"
+            in (passed[0]["Finding_Details"])
+        )
+        assert "not evaluated per principal" in passed[0]["Finding_Details"]
+        assert "ECS task roles" in passed[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "condition",
+        [
+            {"StringLike": {"sts:SourceIdentity": "*"}},
+            {"StringLike": {"sts:SourceIdentity": "agent-?"}},
+            {"StringEqualsIfExists": {"sts:SourceIdentity": "agent-a"}},
+            {"ForAllValues:StringEquals": {"sts:SourceIdentity": "agent-a"}},
+            {"StringNotEquals": {"sts:SourceIdentity": "other"}},
+            {"Null": {"sts:SourceIdentity": "false"}},
+            {"StringEquals": {"sts:SourceIdentity": ["agent-a", "*"]}},
+            {"StringEquals": {"aws:PrincipalTag/team": "agents"}},
+        ],
+    )
+    def test_source_identity_is_judged_by_value(self, condition):
+        """The hiding direction: a present but open condition must not pass."""
+        agent = self._role_arn("agent-a")
+        cache = self._cache({"agent-a": _identity(), "tool-1": _identity()})
+        result, rows, _ = self._run(
+            cache,
+            self._inventory({"agent-a": ["Bedrock agent 'a' version DRAFT"]}),
+            {"tool-1": self._trust(self._assume({"AWS": agent}, condition))},
+        )
+        assert result["status"] == "WARN"
+        assert self._status(rows, "Failed")
+        assert not self._status(rows, "Passed")
+
+    @pytest.mark.parametrize(
+        "condition",
+        [
+            {"StringEquals": {"sts:SourceIdentity": "agent-a"}},
+            {"StringEqualsIgnoreCase": {"sts:SourceIdentity": "Agent-A"}},
+            {"ForAnyValue:StringEquals": {"sts:SourceIdentity": ["a", "b"]}},
+            {"StringLike": {"aws:SourceIdentity": "agent-a"}},
+        ],
+    )
+    def test_pinned_source_identity_forms_pass(self, condition):
+        agent = self._role_arn("agent-a")
+        cache = self._cache({"agent-a": _identity(), "tool-1": _identity()})
+        result, rows, _ = self._run(
+            cache,
+            self._inventory({"agent-a": ["Bedrock agent 'a' version DRAFT"]}),
+            {"tool-1": self._trust(self._assume({"AWS": agent}, condition))},
+        )
+        assert result["status"] == "PASS"
+        assert self._status(rows, "Passed")
+
+    def test_account_trust_counts_only_when_agent_policy_allows_the_role(self):
+        """An account trust is an edge only through the agent's own grant."""
+        allow_tool_1 = _customer_policy(
+            "assume",
+            {
+                "Effect": "Allow",
+                "Action": "sts:AssumeRole",
+                "Resource": self._role_arn("tool-1"),
+            },
+        )
+        cache = self._cache(
+            {
+                "agent-a": _identity(attached=[allow_tool_1]),
+                "tool-1": _identity(),
+                "tool-2": _identity(),
+            }
+        )
+        root = f"arn:aws:iam::{self.ACCOUNT}:root"
+        result, rows, _ = self._run(
+            cache,
+            self._inventory({"agent-a": ["AgentCore runtime 'r' version 1"]}),
+            {
+                "tool-1": self._trust(self._assume({"AWS": root})),
+                "tool-2": self._trust(self._assume({"AWS": self.ACCOUNT})),
+            },
+        )
+        failed = self._status(rows, "Failed")
+        assert len(failed) == 1
+        detail = failed[0]["Finding_Details"]
+        assert "role 'tool-1'" in detail and "trusts the account" in detail
+        assert "role 'tool-2'" not in detail
+
+    def test_wildcard_agent_grant_reaches_every_account_trust(self):
+        allow_all = _customer_policy(
+            "assume",
+            {"Effect": "Allow", "Action": "sts:*", "Resource": "*"},
+        )
+        cache = self._cache(
+            {
+                "agent-a": _identity(attached=[allow_all]),
+                "tool-1": _identity(),
+                "tool-2": _identity(),
+            }
+        )
+        _, rows, _ = self._run(
+            cache,
+            self._inventory({"agent-a": ["Bedrock agent 'a' version DRAFT"]}),
+            {
+                "tool-1": self._trust(self._assume("*")),
+                "tool-2": self._trust(
+                    {
+                        "Effect": "Allow",
+                        "NotPrincipal": {"AWS": "arn:aws:iam::999999999999:root"},
+                        "Action": "sts:AssumeRole",
+                    }
+                ),
+            },
+        )
+        detail = self._status(rows, "Failed")[0]["Finding_Details"]
+        assert "2 agent handoff(s)" in detail
+        assert "role 'tool-1'" in detail and "role 'tool-2'" in detail
+
+    def test_boundary_without_assume_role_removes_the_account_edge(self):
+        allow_all = _customer_policy(
+            "assume", {"Effect": "Allow", "Action": "sts:AssumeRole", "Resource": "*"}
+        )
+        agent = _identity(attached=[allow_all])
+        agent["permissions_boundary"] = {
+            "document": _policy(
+                {"Effect": "Allow", "Action": "bedrock:InvokeModel", "Resource": "*"}
+            )
+        }
+        cache = self._cache({"agent-a": agent, "tool-1": _identity()})
+        result, rows, _ = self._run(
+            cache,
+            self._inventory({"agent-a": ["Bedrock agent 'a' version DRAFT"]}),
+            {"tool-1": self._trust(self._assume({"AWS": self.ACCOUNT}))},
+        )
+        assert not self._status(rows, "Failed")
+        assert result["status"] == "PASS"
+
+    def test_other_account_trust_is_not_an_edge(self):
+        allow_all = _customer_policy(
+            "assume", {"Effect": "Allow", "Action": "sts:AssumeRole", "Resource": "*"}
+        )
+        cache = self._cache(
+            {"agent-a": _identity(attached=[allow_all]), "tool-1": _identity()}
+        )
+        _, rows, _ = self._run(
+            cache,
+            self._inventory({"agent-a": ["Bedrock agent 'a' version DRAFT"]}),
+            {"tool-1": self._trust(self._assume({"AWS": "999999999999"}))},
+        )
+        assert not self._status(rows, "Failed")
+
+    def test_agent_role_missing_from_cache_is_unread(self):
+        cache = self._cache({"tool-1": _identity()})
+        result, rows, _ = self._run(
+            cache,
+            self._inventory({"agent-a": ["Bedrock agent 'a' version DRAFT"]}),
+            {"tool-1": self._trust(self._assume({"AWS": self.ACCOUNT}))},
+        )
+        assert result["status"] == "N/A"
+        assert not self._status(rows, "Passed")
+        assert any(
+            "is not in the IAM permissions cache" in row["Finding_Details"]
+            for row in self._status(rows, "N/A")
+        )
+
+    def test_trust_read_error_is_na_not_passed(self):
+        cache = self._cache({"agent-a": _identity(), "tool-1": _identity()})
+        result, rows, _ = self._run(
+            cache,
+            self._inventory({"agent-a": ["Bedrock agent 'a' version DRAFT"]}),
+            {"tool-1": _make_client_error("AccessDenied")},
+        )
+        assert result["status"] == "N/A"
+        assert not self._status(rows, "Passed")
+        assert any(
+            "role 'tool-1' trust policy was not read" in row["Finding_Details"]
+            for row in rows
+        )
+
+    def test_url_encoded_trust_document_is_decoded(self):
+        from urllib.parse import quote
+
+        agent = self._role_arn("agent-a")
+        cache = self._cache({"agent-a": _identity(), "tool-1": _identity()})
+        _, rows, _ = self._run(
+            cache,
+            self._inventory({"agent-a": ["Bedrock agent 'a' version DRAFT"]}),
+            {"tool-1": quote(json.dumps(self._trust(self._assume({"AWS": agent}))))},
+        )
+        assert self._status(rows, "Failed")
+
+    def test_self_trust_is_not_a_handoff(self):
+        agent = self._role_arn("agent-a")
+        cache = self._cache({"agent-a": _identity()})
+        result, rows, _ = self._run(
+            cache,
+            self._inventory({"agent-a": ["Bedrock agent 'a' version DRAFT"]}),
+            {"agent-a": self._trust(self._assume({"AWS": agent}))},
+        )
+        assert result["status"] == "PASS"
+        assert not self._status(rows, "Failed")
+
+    def test_no_agents_is_na_and_reads_no_trust_policy(self):
+        cache = self._cache({"tool-1": _identity()})
+        result, rows, iam = self._run(cache, self._inventory({}), {})
+        assert result["status"] == "N/A"
+        assert len(rows) == 1 and rows[0]["Status"] == "N/A"
+        iam.get_role.assert_not_called()
+
+    def test_errored_principal_turns_passed_into_na(self):
+        cache = self._cache(
+            {"agent-a": _identity()},
+            errors=[{"type": "role", "name": "broken", "error": "AccessDenied"}],
+        )
+        result, rows, _ = self._run(
+            cache,
+            self._inventory({"agent-a": ["Bedrock agent 'a' version DRAFT"]}),
+            {},
+        )
+        assert not self._status(rows, "Passed")
+        assert result["status"] == "N/A"
+        assert any("'broken'" in row["Finding_Details"] for row in rows)
+
+    def test_v1_cache_keeps_passed_and_says_errors_were_not_recorded(self):
+        cache = self._cache({"agent-a": _identity()}, version=None)
+        _, rows, _ = self._run(
+            cache,
+            self._inventory({"agent-a": ["Bedrock agent 'a' version DRAFT"]}),
+            {},
+        )
+        passed = self._status(rows, "Passed")
+        assert passed and "schema version 1" in passed[0]["Finding_Details"]
+
+    def test_collaborator_sharing_supervisor_role_fails(self):
+        shared = self._role_arn("shared")
+        own = self._role_arn("own")
+        cache = self._cache({"shared": _identity(), "own": _identity()})
+        collaborations = [
+            {
+                "supervisor": "'sup' version DRAFT",
+                "supervisor_role": shared,
+                "collaborator": "same-role",
+                "alias_arn": self._alias_arn("B", "X"),
+                "collaborator_roles": [shared],
+            },
+            {
+                "supervisor": "'sup' version DRAFT",
+                "supervisor_role": shared,
+                "collaborator": "own-role",
+                "alias_arn": self._alias_arn("C", "Y"),
+                "collaborator_roles": [own],
+            },
+        ]
+        result, rows, _ = self._run(
+            cache,
+            self._inventory(
+                {"shared": ["Bedrock agent 'sup' version DRAFT"], "own": ["c"]},
+                collaborations,
+            ),
+            {},
+        )
+        failed = self._status(rows, "Failed")
+        assert result["status"] == "WARN" and len(failed) == 1
+        detail = failed[0]["Finding_Details"]
+        assert "'same-role'" in detail and "'own-role'" not in detail
+
+    def test_unresolved_collaborator_is_na_not_passed(self):
+        cache = self._cache({"sup": _identity()})
+        collaborations = [
+            {
+                "supervisor": "'sup' version DRAFT",
+                "supervisor_role": self._role_arn("sup"),
+                "collaborator": "remote",
+                "alias_arn": "arn:aws:bedrock:us-west-2:999999999999:agent-alias/Z/Q",
+                "collaborator_roles": None,
+            }
+        ]
+        result, rows, _ = self._run(
+            cache,
+            self._inventory({"sup": ["s"]}, collaborations),
+            {},
+        )
+        assert result["status"] == "N/A"
+        assert not self._status(rows, "Passed")
+        assert any("'remote'" in row["Finding_Details"] for row in rows)
+        summary = [
+            row for row in rows if "trust polic(ies) checked" in row["Finding_Details"]
+        ]
+        assert (
+            "0 Bedrock collaborator(s) run as a role other"
+            in (summary[0]["Finding_Details"])
+        )
+
+    def test_runtime_list_error_names_the_grant(self):
+        cache = self._cache({"agent-a": _identity()})
+        result, rows, _ = self._run(
+            cache,
+            self._inventory(
+                {"agent-a": ["a"]},
+                runtime_error="AgentCore runtimes were not listed (AccessDenied)",
+            ),
+            {},
+        )
+        assert result["status"] == "N/A"
+        assert not self._status(rows, "Passed")
+        assert any(
+            "bedrock-agentcore:ListAgentRuntimes" in row["Finding_Details"]
+            for row in rows
+        )
+
+    def test_runtime_error_alone_is_na_not_empty_estate(self):
+        """The hiding direction: an unlisted estate is not an empty one."""
+        result, rows, _ = self._run(
+            self._cache({}),
+            self._inventory({}, runtime_error="AgentCore runtimes were not listed"),
+            {},
+        )
+        assert result["status"] == "N/A"
+        assert not any(
+            "so no agent handoff exists" in r["Finding_Details"] for r in rows
+        )
+
+
+class TestBR57AgentRoleInventory:
+    """BR-57: the agent role population and the collaborator pairs."""
+
+    ACCOUNT = "123456789012"
+
+    @classmethod
+    def _role(cls, name):
+        return f"arn:aws:iam::{cls.ACCOUNT}:role/{name}"
+
+    @classmethod
+    def _alias_arn(cls, agent_id, alias_id):
+        return (
+            f"arn:aws:bedrock:us-east-1:{cls.ACCOUNT}:agent-alias/{agent_id}/{alias_id}"
+        )
+
+    def _run(self, agents, runtimes=None, runtime_error=None, collaborators=None):
+        """agents: id -> {"name", "versions": {v: (role, collab)}, "aliases": {id: [v]}}"""
+        agent = MagicMock()
+        agent.list_agents.return_value = {
+            "agentSummaries": [
+                {"agentId": agent_id, "agentName": spec["name"]}
+                for agent_id, spec in agents.items()
+            ]
+        }
+
+        def get_agent(agentId):
+            spec = agents[agentId]
+            if isinstance(spec.get("error"), Exception):
+                raise spec["error"]
+            role, collaboration = spec["versions"]["DRAFT"]
+            return {
+                "agent": {
+                    "agentResourceRoleArn": role,
+                    "agentCollaboration": collaboration,
+                }
+            }
+
+        def list_agent_aliases(agentId, **kwargs):
+            return {
+                "agentAliasSummaries": [
+                    {
+                        "agentAliasId": alias_id,
+                        "routingConfiguration": [{"agentVersion": v} for v in routed],
+                    }
+                    for alias_id, routed in agents[agentId].get("aliases", {}).items()
+                ]
+            }
+
+        def get_agent_version(agentId, agentVersion):
+            role, collaboration = agents[agentId]["versions"][agentVersion]
+            return {
+                "agentVersion": {
+                    "agentResourceRoleArn": role,
+                    "agentCollaboration": collaboration,
+                }
+            }
+
+        collaborators = collaborators or {}
+
+        def list_agent_collaborators(agentId, agentVersion, **kwargs):
+            outcome = collaborators.get((agentId, agentVersion), [])
+            if isinstance(outcome, Exception):
+                raise outcome
+            return {
+                "agentCollaboratorSummaries": [
+                    {"collaboratorName": name, "agentDescriptor": {"aliasArn": arn}}
+                    for name, arn in outcome
+                ]
+            }
+
+        agent.get_agent.side_effect = get_agent
+        agent.list_agent_aliases.side_effect = list_agent_aliases
+        agent.get_agent_version.side_effect = get_agent_version
+        agent.list_agent_collaborators.side_effect = list_agent_collaborators
+
+        control = MagicMock()
+        runtimes = runtimes or {}
+        if runtime_error is not None:
+            control.list_agent_runtimes.side_effect = runtime_error
+        else:
+            control.list_agent_runtimes.return_value = {
+                "agentRuntimes": [
+                    {
+                        "agentRuntimeId": runtime_id,
+                        "agentRuntimeName": runtime_id,
+                        "agentRuntimeVersion": spec["latest"],
+                    }
+                    for runtime_id, spec in runtimes.items()
+                ]
+            }
+        control.list_agent_runtime_endpoints.side_effect = lambda agentRuntimeId, **kw: {
+            "runtimeEndpoints": runtimes[agentRuntimeId]["endpoints"]
+        }
+        control.get_agent_runtime.side_effect = (
+            lambda agentRuntimeId, agentRuntimeVersion: {
+                "roleArn": runtimes[agentRuntimeId]["roles"][agentRuntimeVersion]
+            }
+        )
+
+        def client(service, **kwargs):
+            return {"bedrock-agent": agent, "bedrock-agentcore-control": control}[
+                service
+            ]
+
+        with patch("boto3.client", side_effect=client):
+            inventory = bedrock_app.get_agent_role_inventory("us-east-1")
+        return inventory, agent, control
+
+    def test_routed_versions_and_runtime_endpoint_versions_are_read(self):
+        inventory, agent, control = self._run(
+            {
+                "A": {
+                    "name": "a",
+                    "versions": {
+                        "DRAFT": (self._role("a-draft"), "DISABLED"),
+                        "2": (self._role("a-v2"), "DISABLED"),
+                        "3": (self._role("a-v3"), "DISABLED"),
+                    },
+                    "aliases": {"L1": ["2"], "L2": ["3", "DRAFT"]},
+                },
+                "B": {
+                    "name": "b",
+                    "versions": {"DRAFT": (self._role("b-draft"), "DISABLED")},
+                },
+            },
+            runtimes={
+                "rt1": {
+                    "latest": "7",
+                    "endpoints": [
+                        {"liveVersion": "5", "targetVersion": "6"},
+                        {"liveVersion": "7"},
+                    ],
+                    "roles": {
+                        "5": self._role("rt-old"),
+                        "6": self._role("rt-new"),
+                        "7": self._role("rt-new"),
+                    },
+                }
+            },
+        )
+        assert set(inventory["roles"]) == {
+            self._role(name)
+            for name in ("a-draft", "a-v2", "a-v3", "b-draft", "rt-old", "rt-new")
+        }
+        assert inventory["roles"][self._role("rt-new")] == [
+            "AgentCore runtime 'rt1' version 6",
+            "AgentCore runtime 'rt1' version 7",
+        ]
+        assert not inventory["errors"] and inventory["runtime_error"] is None
+        agent.get_agent_version.assert_has_calls(
+            [call(agentId="A", agentVersion="2"), call(agentId="A", agentVersion="3")],
+            any_order=True,
+        )
+        assert agent.get_agent_version.call_count == 2
+
+    def test_collaborators_resolve_to_alias_version_roles(self):
+        inventory, agent, _ = self._run(
+            {
+                "S": {
+                    "name": "sup",
+                    "versions": {
+                        "DRAFT": (self._role("sup"), "SUPERVISOR"),
+                        "4": (self._role("sup-v4"), "SUPERVISOR_ROUTER"),
+                    },
+                    "aliases": {"LIVE": ["4"]},
+                },
+                "C": {
+                    "name": "c",
+                    "versions": {
+                        "DRAFT": (self._role("c-draft"), "DISABLED"),
+                        "1": (self._role("sup-v4"), "DISABLED"),
+                    },
+                    "aliases": {"CA": ["1"]},
+                },
+            },
+            collaborators={
+                ("S", "DRAFT"): [("helper", self._alias_arn("C", "CA"))],
+                ("S", "4"): [
+                    ("helper", self._alias_arn("C", "CA")),
+                    (
+                        "remote",
+                        "arn:aws:bedrock:us-west-2:999999999999:agent-alias/Z/Q",
+                    ),
+                ],
+            },
+        )
+        pairs = {
+            (pair["supervisor"], pair["collaborator"]): pair
+            for pair in inventory["collaborations"]
+        }
+        assert len(pairs) == 3
+        assert pairs[("'sup' version 4", "helper")]["collaborator_roles"] == [
+            self._role("sup-v4")
+        ]
+        assert pairs[("'sup' version 4", "helper")]["supervisor_role"] == self._role(
+            "sup-v4"
+        )
+        assert pairs[("'sup' version DRAFT", "helper")]["supervisor_role"] == (
+            self._role("sup")
+        )
+        assert pairs[("'sup' version 4", "remote")]["collaborator_roles"] is None
+        called = {
+            (c.kwargs["agentId"], c.kwargs["agentVersion"])
+            for c in agent.list_agent_collaborators.call_args_list
+        }
+        assert called == {("S", "DRAFT"), ("S", "4")}
+
+    def test_shared_collaborator_role_fails_end_to_end(self):
+        inventory, _, _ = self._run(
+            {
+                "S": {
+                    "name": "sup",
+                    "versions": {"DRAFT": (self._role("shared"), "SUPERVISOR")},
+                },
+                "C": {
+                    "name": "c",
+                    "versions": {
+                        "DRAFT": (self._role("c"), "DISABLED"),
+                        "1": (self._role("shared"), "DISABLED"),
+                    },
+                    "aliases": {"CA": ["1"]},
+                },
+            },
+            collaborators={("S", "DRAFT"): [("helper", self._alias_arn("C", "CA"))]},
+        )
+        iam = MagicMock()
+        iam.get_role.side_effect = lambda RoleName: {
+            "Role": {"Arn": self._role(RoleName), "AssumeRolePolicyDocument": _policy()}
+        }
+        cache = {
+            "cache_schema_version": 2,
+            "principal_errors": [],
+            "role_permissions": {"shared": _identity(), "c": _identity()},
+            "user_permissions": {},
+        }
+        with patch("boto3.client", return_value=iam):
+            result = bedrock_app.check_agent_handoff_source_identity(
+                cache, region="us-east-1", agent_inventory=inventory
+            )
+        rows = extract_csv_data(result)
+        assert result["status"] == "WARN"
+        assert any(
+            row["Status"] == "Failed" and "'helper'" in row["Finding_Details"]
+            for row in rows
+        )
+
+    def test_agent_and_collaborator_read_errors_are_recorded(self):
+        inventory, _, _ = self._run(
+            {
+                "A": {
+                    "name": "a",
+                    "versions": {"DRAFT": (self._role("a"), "DISABLED")},
+                    "error": _make_client_error("AccessDeniedException"),
+                },
+                "S": {
+                    "name": "sup",
+                    "versions": {"DRAFT": (self._role("sup"), "SUPERVISOR")},
+                },
+            },
+            collaborators={("S", "DRAFT"): _make_client_error("AccessDeniedException")},
+        )
+        assert self._role("sup") in inventory["roles"]
+        assert self._role("a") not in inventory["roles"]
+        assert len(inventory["errors"]) == 2
+        assert any("Bedrock agent 'a'" in error for error in inventory["errors"])
+        assert any(
+            "bedrock:ListAgentCollaborators" in error for error in inventory["errors"]
+        )
+
+    def test_runtime_list_denied_is_recorded(self):
+        inventory, _, _ = self._run(
+            {}, runtime_error=_make_client_error("AccessDeniedException")
+        )
+        assert "bedrock-agentcore:ListAgentRuntimes" in inventory["runtime_error"]

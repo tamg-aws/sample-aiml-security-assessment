@@ -54,6 +54,7 @@ AISF_COMPLIANCE_MAP = {
     "BR-53": "AISF AIR-FND-GOV-02",
     "BR-54": "AISF AIR-SLF-RT-08",
     "BR-55": "AISF AIR-FND-DAT-10",
+    "BR-57": "AISF AIR-SLF-AGT-05",
 }
 
 

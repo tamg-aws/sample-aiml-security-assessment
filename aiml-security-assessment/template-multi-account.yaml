@@ -380,7 +380,17 @@ Resources:
                 - bedrock:ListAgentAliases # BR-26, BR-27, BR-34
                 - bedrock:GetAgentVersion # BR-26, BR-27, BR-34
                 - bedrock:ListAgentKnowledgeBases # BR-26, BR-34
+                - bedrock:ListAgentCollaborators # BR-57
               Resource: !Sub 'arn:${AWS::Partition}:bedrock:*:${AWS::AccountId}:agent/*'
+            - Sid: AgentCoreRuntimeRoleRead
+              # BR-57 reads the role each AgentCore runtime version runs as.
+              # ListAgentRuntimes and ListAgentRuntimeEndpoints need Resource
+              # '*' and are not granted, so BR-57 reports the runtime leg as
+              # not read until they are.
+              Effect: Allow
+              Action:
+                - bedrock-agentcore:GetAgentRuntime # BR-57
+              Resource: !Sub 'arn:${AWS::Partition}:bedrock-agentcore:*:${AWS::AccountId}:runtime/*'
             - Sid: BedrockCustomModelRead
               Effect: Allow
               Action:
@@ -543,9 +553,10 @@ Resources:
             - Sid: AIRoleTrustPolicyRead
               # BR-51 reads the trust policy of each role holding an AI write
               # grant, to find users or accounts that can assume it without MFA.
+              # BR-57 reads every role's trust policy for edges from agent roles.
               Effect: Allow
               Action:
-                - iam:GetRole # BR-51
+                - iam:GetRole # BR-51, BR-57
               Resource: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/*'
             - Sid: EC2InstanceProfileRoleRead
               # BR-02 resolves the role of each EC2 instance to the Bedrock

@@ -122,6 +122,7 @@ _EXPECTED_ACTIONS = {
     "BedrockSecurityAssessmentFunction": {
         "backup:DescribeBackupVault",
         "backup:ListBackupVaults",
+        "bedrock-agentcore:GetAgentRuntime",
         "bedrock:GetAccountDataRetention",
         "bedrock:GetAgent",
         "bedrock:GetAgentActionGroup",
@@ -141,6 +142,7 @@ _EXPECTED_ACTIONS = {
         "bedrock:GetResourcePolicy",
         "bedrock:ListAgentActionGroups",
         "bedrock:ListAgentAliases",
+        "bedrock:ListAgentCollaborators",
         "bedrock:ListAgentKnowledgeBases",
         "bedrock:ListAgents",
         "bedrock:ListAutomatedReasoningPolicies",

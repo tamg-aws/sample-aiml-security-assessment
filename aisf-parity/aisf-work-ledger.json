@@ -7,12 +7,12 @@
     "fnd_ai_subject": 11,
     "foundation": 27,
     "total": 105,
-    "covered": 99,
+    "covered": 100,
     "tighten": 0,
     "tighten_extend": 0,
     "tighten_new_id": 0,
     "new": 0,
-    "not_implementable": 6,
+    "not_implementable": 5,
     "unassessed": 0,
     "new_check_functions": 0,
     "extensions": 0,
@@ -2532,6 +2532,29 @@
       "source": "controls/ai-specific/selfhosted-runtime.yaml"
     },
     {
+      "control": "AIR-SLF-AGT-05",
+      "area": "SLF",
+      "question": "In multi-agent orchestration, is one agent prevented from impersonating or acting with another agent's authority without an explicit, checked handoff?",
+      "assert": "Delegation/handoff authorization configuration",
+      "workload_agnostic": false,
+      "verdict": "covered",
+      "disposition": null,
+      "target_modules": [
+        "bedrock_assessments"
+      ],
+      "incumbents": [
+        "BR-57"
+      ],
+      "incumbent_names": [
+        "Agent Handoff Source Identity"
+      ],
+      "gap": "BR-57 takes the agent roles to be the roles Bedrock agents run as, from GetAgent and from GetAgentVersion for every version an alias routes to, and the roles AgentCore runtimes run as, from GetAgentRuntime for the latest version and each endpoint's live and target version. A Bedrock collaborator, read with ListAgentCollaborators on every supervisor version and resolved through its alias routing, fails when it runs as its supervisor's own role. Every cached role's trust policy is read with iam:GetRole. An Allow on sts:AssumeRole is an edge from an agent role when it names that role, or names its account or * and the agent role's own identity policy allows sts:AssumeRole on the target, and a boundary that allows sts:AssumeRole nowhere removes it. An edge passes only on a positive string test of sts:SourceIdentity with no wildcard value, no IfExists form and no ForAllValues: prefix. An unread agent, runtime, collaborator alias, trust policy or cached principal reports N/A, never Passed. Partial, ceiling reached: no AWS API marks which ECS task or Lambda execution roles host an agent, GetAgentRuntime returns no field for a runtime session's token scope, and the runtime list needs bedrock-agentcore:ListAgentRuntimes and ListAgentRuntimeEndpoints on *, which are not granted",
+      "extra_iam": [],
+      "phase": 6,
+      "tier": "foundation",
+      "source": "controls/ai-specific/selfhosted-agent.yaml"
+    },
+    {
       "control": "AIR-FND-DET-10",
       "area": "FND",
       "question": "Are coordination-level metrics for multi-agent workflows \u2014 inter-agent message rates, per-agent-pair error rates, workflow execution frequency, and communication topology \u2014 baselined and alarmed on, rather than only each agent's own health and error metrics?",
@@ -2564,23 +2587,6 @@
       "phase": null,
       "tier": "foundation",
       "source": "controls/baseline/governance-compliance.yaml"
-    },
-    {
-      "control": "AIR-SLF-AGT-05",
-      "area": "SLF",
-      "question": "In multi-agent orchestration, is one agent prevented from impersonating or acting with another agent's authority without an explicit, checked handoff?",
-      "assert": "Delegation/handoff authorization configuration",
-      "workload_agnostic": false,
-      "verdict": "not_implementable",
-      "disposition": null,
-      "target_modules": [],
-      "incumbents": [],
-      "incumbent_names": [],
-      "gap": "Trust policies are readable, but no AWS API marks which roles belong to agents or which agent-to-agent handoffs are expected, so a missing sts:SourceIdentity condition cannot be told apart from a role that never takes part in a handoff.",
-      "extra_iam": [],
-      "phase": null,
-      "tier": "foundation",
-      "source": "controls/ai-specific/selfhosted-agent.yaml"
     },
     {
       "control": "AIR-SLF-CMP-08",

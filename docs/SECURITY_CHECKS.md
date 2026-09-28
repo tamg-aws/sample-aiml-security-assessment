@@ -1,10 +1,10 @@
 # Security Checks Reference
 
-This document provides a comprehensive reference for all 273 security checks performed by the AI/ML Security Assessment framework (158 core checks across Amazon Bedrock, Amazon SageMaker AI, Amazon Bedrock AgentCore, and AWS Agent Registry, 39 Agentic AI Security checks, 64 Responsible AI GRC checks, and 12 OWASP Top 10 for LLM checks).
+This document provides a comprehensive reference for all 274 security checks performed by the AI/ML Security Assessment framework (159 core checks across Amazon Bedrock, Amazon SageMaker AI, Amazon Bedrock AgentCore, and AWS Agent Registry, 39 Agentic AI Security checks, 64 Responsible AI GRC checks, and 12 OWASP Top 10 for LLM checks).
 
 Sources differ by bucket and are not interchangeable: the core Bedrock, SageMaker, AgentCore, and AWS Agent Registry checks derive from the AWS Well-Architected **Generative AI Lens** security best practices (`gensec*`) and service security documentation; the Agentic AI Security checks from the AWS Well-Architected **Agentic AI Lens**; the `FS-*` **Responsible AI GRC** checks from the AWS GRC User Guide; and the `OW-*` checks from the OWASP Top 10 for LLM. The AWS Well-Architected **Responsible AI Lens** is not a source for any of them — see [Responsible AI GRC — scope, sources, and compatibility](RESPONSIBLE_AI_GRC_SCOPE.md).
 
-The 64 Responsible AI GRC checks occupy 69 `FS-*` numbers: 64 ship as standalone checks and 5 are merged into upstream Bedrock/SageMaker checks. The framework also emits `BR-00`, `SM-00`, `AC-00`, `AR-00`, `FS-00`, `OW-00`, and `AISF-00` operational marker rows at runtime; these are not controls and are excluded from the 273-check total. `AISF-01` through `AISF-08` are AWS AI Security Framework view rows: each one restates the verdict of a check already counted above under an AISF control id, so they are excluded from the 273-check total for the same reason ([AWS AI Security Framework (AISF) Checks](SECURITY_CHECKS_AISF.md)). Per-control provenance, including which controls are project extensions rather than guide-derived, is recorded in [`provenance.json`](../aiml-security-assessment/functions/security/responsible_ai_grc_assessments/provenance.json).
+The 64 Responsible AI GRC checks occupy 69 `FS-*` numbers: 64 ship as standalone checks and 5 are merged into upstream Bedrock/SageMaker checks. The framework also emits `BR-00`, `SM-00`, `AC-00`, `AR-00`, `FS-00`, `OW-00`, and `AISF-00` operational marker rows at runtime; these are not controls and are excluded from the 274-check total. `AISF-01` through `AISF-08` are AWS AI Security Framework view rows: each one restates the verdict of a check already counted above under an AISF control id, so they are excluded from the 274-check total for the same reason ([AWS AI Security Framework (AISF) Checks](SECURITY_CHECKS_AISF.md)). Per-control provenance, including which controls are project extensions rather than guide-derived, is recorded in [`provenance.json`](../aiml-security-assessment/functions/security/responsible_ai_grc_assessments/provenance.json).
 
 ## Table of Contents
 
@@ -14,7 +14,7 @@ The 64 Responsible AI GRC checks occupy 69 `FS-*` numbers: 64 ship as standalone
 - [Severity Levels](#severity-levels)
 - [Status Values](#status-values)
 - [Amazon SageMaker AI Security Checks (40)](#amazon-sagemaker-ai-security-checks-40)
-- [Amazon Bedrock Security Checks (56)](#amazon-bedrock-security-checks-56)
+- [Amazon Bedrock Security Checks (57)](#amazon-bedrock-security-checks-57)
 - [Amazon Bedrock AgentCore Security Checks (52)](#amazon-bedrock-agentcore-security-checks-52)
 - [AWS Agent Registry Security Checks (10)](#aws-agent-registry-security-checks-10)
 - [Agentic AI Security Checks (39)](#agentic-ai-security-checks-39)
@@ -30,7 +30,7 @@ The framework evaluates your AI/ML workloads against AWS security best practices
 | Service | Number of Checks | Focus Areas |
 | --------- | ------------------ | ------------- |
 | Amazon SageMaker AI | 40 | Security Hub controls, encryption, network isolation, GuardDuty AI Protection, HyperPod, IAM, MLOps, Model Registry policy exposure, inference data capture, Config compliance evaluation, training VPC boundary, creation guardrails, security service delegated administration, the Security Hub AI standard, GuardDuty Lambda Protection and Runtime Monitoring, EKS network policy, secret rotation, IoT device-scoped policies |
-| Amazon Bedrock | 56 | Guardrails, prompt-attack/image filters, retention, inference profiles, automated reasoning and Marketplace endpoint governance, encryption, networking, IAM, logging, monitoring, evaluation, central guardrail enforcement, model allow-lists, Region and Marketplace subscription control, API key governance, knowledge base source classification, LLM jacking activity in CloudTrail event history |
+| Amazon Bedrock | 57 | Guardrails, prompt-attack/image filters, retention, inference profiles, automated reasoning and Marketplace endpoint governance, encryption, networking, IAM, logging, monitoring, evaluation, central guardrail enforcement, model allow-lists, Region and Marketplace subscription control, API key governance, knowledge base source classification, LLM jacking activity in CloudTrail event history, agent handoff source identity |
 | Amazon Bedrock AgentCore | 52 | Runtime/tool VPC isolation, encryption, browser recording, observability, resource policies, Identity token vaults, online evaluation, and the Cognito user pools that issue tokens to gateways and runtimes |
 | AWS Agent Registry | 10 | IAM access, approval governance, discovery authorization, encryption, organization auto-detection, record lifecycle, and provenance |
 | Agentic AI Security | 39 | Bounded autonomy, agent identity, tool authorization, Registry governance and provenance, guardrail enforcement, prompt/input protection, memory privacy, auditability, continuous assurance, abuse protection |
@@ -46,7 +46,7 @@ Each security check has a unique identifier with a service prefix:
 | Prefix | Service | Example |
 | -------- | --------- | --------- |
 | **SM-XX** | Amazon SageMaker | SM-01, SM-41 (`SM-29` reserved) |
-| **BR-XX** | Amazon Bedrock | BR-01, BR-56 |
+| **BR-XX** | Amazon Bedrock | BR-01, BR-57 |
 | **AC-XX** | Amazon Bedrock AgentCore | AC-01, AC-52 |
 | **AR-XX** | AWS Agent Registry | AR-01, AR-10 |
 | **AG-XX** | Agentic AI Security | AG-01, AG-39 |
@@ -337,7 +337,7 @@ investigation and remediation.
 
 ---
 
-## Amazon Bedrock Security Checks (56)
+## Amazon Bedrock Security Checks (57)
 
 ### BR-01: AWS IAM Least Privilege
 
@@ -643,6 +643,11 @@ inventory is never treated as evidence of compliance.
 
 - **Severity:** High
 - **Description:** Reproduces Prowler's `cloudtrail_threat_detection_llm_jacking`, which Prowler maps to its AISF-AI-06 "Bedrock API Audit Trail" requirement. Reads the Region's CloudTrail event history with `LookupEvents`, one event name at a time, over the last 24 hours, for Prowler's 14 actions: `PutUseCaseForModelAccess`, `PutFoundationModelEntitlement`, `PutModelInvocationLoggingConfiguration`, `CreateFoundationModelAgreement`, `InvokeModel`, `InvokeModelWithResponseStream`, `GetUseCaseForModelAccess`, `GetModelInvocationLoggingConfiguration`, `GetFoundationModelAvailability`, `ListFoundationModelAgreementOffers`, `ListFoundationModels`, `ListProvisionedModelThroughputs`, `SearchAgreements` and `AcceptAgreementRequest`. An identity, keyed by `userIdentity.arn` and `userIdentity.type`, fails when the share of those actions it called is above 0.4, which is 6 or more of the 14. Events with no identity ARN are skipped as AWS service calls, as Prowler does. Event history holds management events only, whether or not a trail exists: it sees `InvokeModel` and `InvokeModelWithResponseStream`, and it cannot see `InvokeModelWithBidirectionalStream`, `StartAsyncInvoke`, `GetAsyncInvoke`, `InvokeAgent` or `InvokeInlineAgent`, which Bedrock logs as data events. `Converse` and `ConverseStream` are management events but are not in Prowler's list. Every `Passed` and `N/A` row states this. Three departures from Prowler: each event name is read up to 5 pages of 50 events, where Prowler reads one page; the Region under assessment is read, where Prowler reads only its trails' home Region and passes an account with no trail; and an event name that was cut off at the page limit, failed to read, or held an unparseable event is never passed over. Such a name is credited to every identity, and an identity that could then exceed the threshold is reported in one informational `N/A` row with the names that were not read in full. The `Passed` row names any such names when crediting them changes no verdict. When every lookup fails the check is informational `N/A` with the error code.
+
+### BR-57: Agent Handoff Source Identity
+
+- **Severity:** High
+- **Description:** Fails an agent-to-agent handoff that carries no checked caller binding. The agent roles are the roles Bedrock agents run as (`GetAgent` for the working draft and `GetAgentVersion` for every version an alias routes to, `agentResourceRoleArn`) and the roles AgentCore runtimes run as (`GetAgentRuntime` `roleArn` for the latest version and for the live and target version of every endpoint). Two legs are judged. First, for every supervisor version (`agentCollaboration` `SUPERVISOR` or `SUPERVISOR_ROUTER`), `ListAgentCollaborators` names each collaborator's alias, the alias routing is resolved to the collaborator's version roles, and a collaborator that runs as its supervisor's own role fails, because it acts with the supervisor's authority. Second, the trust policy of every role in the IAM permissions cache is read with `iam:GetRole`, and an `Allow` statement on `sts:AssumeRole` is an edge from an agent role when it names the agent role as a principal, or when it names the agent role's account or `*` (or uses `NotPrincipal`) and the agent role's own cached identity policy allows `sts:AssumeRole` on that role. A permissions boundary that allows `sts:AssumeRole` nowhere removes the edge. An edge passes only when the statement pins `sts:SourceIdentity` (or `aws:SourceIdentity`) with `StringEquals`, `StringEqualsIgnoreCase` or `StringLike` and no value holds a wildcard; an `IfExists` operator, a `ForAllValues:` prefix, a negated operator or a `Null` test does not pin it. Identity-policy `Deny` statements and service control policies are not evaluated per principal, which can only add an edge. A collaborator alias in another account or Region, an agent or runtime that failed to read, an agent role missing from the cache, a trust policy that failed to read, and a principal the cache recorded as unread each report an informational `N/A` row, and the `Passed` row becomes `N/A`. Listing AgentCore runtimes needs `bedrock-agentcore:ListAgentRuntimes` and `bedrock-agentcore:ListAgentRuntimeEndpoints`, which take no resource type and are not granted to the Bedrock assessment role, so the runtime leg reports `N/A` naming both actions until they are. Partial, ceiling reached: no AWS API marks which ECS task roles, Lambda execution roles or other roles host an agent, `GetAgentRuntime` returns no field for the scope of a runtime session's token, and a role in another account that trusts an agent role is not read.
 
 ---
 

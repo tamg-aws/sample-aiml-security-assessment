@@ -1388,7 +1388,35 @@ FOUNDATION_ROWS = [
         [],
         6,
     ),
-    # ---------------- not_implementable: 4 controls ----------------
+    (
+        "AIR-SLF-AGT-05",
+        COVERED,
+        None,
+        "bedrock_assessments",
+        ["BR-57"],
+        "BR-57 takes the agent roles to be the roles Bedrock agents run as, from "
+        "GetAgent and from GetAgentVersion for every version an alias routes to, "
+        "and the roles AgentCore runtimes run as, from GetAgentRuntime for the "
+        "latest version and each endpoint's live and target version. A Bedrock "
+        "collaborator, read with ListAgentCollaborators on every supervisor "
+        "version and resolved through its alias routing, fails when it runs as "
+        "its supervisor's own role. Every cached role's trust policy is read with "
+        "iam:GetRole. An Allow on sts:AssumeRole is an edge from an agent role "
+        "when it names that role, or names its account or * and the agent role's "
+        "own identity policy allows sts:AssumeRole on the target, and a boundary "
+        "that allows sts:AssumeRole nowhere removes it. An edge passes only on a "
+        "positive string test of sts:SourceIdentity with no wildcard value, no "
+        "IfExists form and no ForAllValues: prefix. An unread agent, runtime, "
+        "collaborator alias, trust policy or cached principal reports N/A, never "
+        "Passed. Partial, ceiling reached: no AWS API marks which ECS task or "
+        "Lambda execution roles host an agent, GetAgentRuntime returns no field "
+        "for a runtime session's token scope, and the runtime list needs "
+        "bedrock-agentcore:ListAgentRuntimes and ListAgentRuntimeEndpoints on *, "
+        "which are not granted",
+        [],
+        6,
+    ),
+    # ---------------- not_implementable: 3 controls ----------------
     (
         "AIR-FND-DET-10",
         NOT_IMPL,
@@ -1410,19 +1438,6 @@ FOUNDATION_ROWS = [
         "The review queue and its backlog metrics are customer-built and "
         "customer-named, and no AWS API identifies which queue holds agent "
         "decisions awaiting review.",
-        [],
-        None,
-    ),
-    (
-        "AIR-SLF-AGT-05",
-        NOT_IMPL,
-        None,
-        None,
-        [],
-        "Trust policies are readable, but no AWS API marks which roles belong to "
-        "agents or which agent-to-agent handoffs are expected, so a missing "
-        "sts:SourceIdentity condition cannot be told apart from a role that never "
-        "takes part in a handoff.",
         [],
         None,
     ),
@@ -1503,6 +1518,7 @@ INCUMBENT_NAMES = {
     "BR-53": "Bedrock Resource Owner Tag",
     "BR-54": "Lambda Function Public Invoke Configuration",
     "BR-55": "KMS Key Enclave Attestation Binding",
+    "BR-57": "Agent Handoff Source Identity",
     # Five names: the Passed and N/A rows carry "AgentCore VPC Configuration
     # Check", and the Failed rows one of the other four, by resource and leg.
     "AC-01": (

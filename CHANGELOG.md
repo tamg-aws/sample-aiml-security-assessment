@@ -12,6 +12,19 @@ section.
 
 ### Added
 
+- Added `BR-57` Agent Handoff Source Identity, growing the catalog from 273
+  to 274 checks (159 core). It covers AISF `AIR-SLF-AGT-05`, which the ledger
+  had marked `not_implementable`. It fails a Bedrock collaborator that runs as
+  its supervisor's own role, and a role trust statement that an agent role can
+  use to call `sts:AssumeRole` without an `sts:SourceIdentity` condition naming
+  exact values. The agent roles are the Bedrock agent roles of every routed
+  version and the AgentCore runtime roles. ECS task and Lambda execution roles
+  are not marked as agents by any AWS API and are not judged. The Bedrock
+  assessment role gains `bedrock:ListAgentCollaborators` on the account's
+  agents and `bedrock-agentcore:GetAgentRuntime` on its runtimes, both
+  read-only. Listing runtimes needs `bedrock-agentcore:ListAgentRuntimes` and
+  `bedrock-agentcore:ListAgentRuntimeEndpoints` on `*`, which are not granted,
+  so the runtime leg reports `N/A` naming them.
 - Added an **AWS AI Security Framework (AISF)** section to the HTML report,
   alongside OWASP Top 10 for LLM under "By Compliance Standard". It reports 8
   of the 105 in-scope AISF controls as `AISF-01` through `AISF-08`. Behavior
@@ -19,7 +32,7 @@ section.
   - The section is always on. It needs no deployment parameter, runs no
     additional AWS API calls, and adds no scan time, because each row restates
     the verdict of a check that already ran under an AISF control id.
-  - `AISF-` rows are excluded from the 273-check catalog total, from the report
+  - `AISF-` rows are excluded from the 274-check catalog total, from the report
     pass rate, and from Open Action Items, for the same reason OWASP-mapped
     rows are: the underlying check is already counted.
   - `AISF-08` aggregates three SageMaker checks (`SM-09`, `SM-01`, `SM-03`). It
@@ -41,8 +54,8 @@ section.
   Bedrock, `SM-35` to `SM-41` in SageMaker AI, and `AC-50` and `AC-51` in
   AgentCore, with new legs on `BR-01`, `BR-04`, `BR-12`, `BR-43`, `SM-02` and
   `AC-26`. The three entries that follow give the per-module detail.
-- The AISF parity ledger now reports 99 of the 105 in-scope AISF controls as
-  `covered` and 6 as `not_implementable`, with none left `tighten` or `new`.
+- The AISF parity ledger now reports 100 of the 105 in-scope AISF controls as
+  `covered` and 5 as `not_implementable`, with none left `tighten` or `new`.
   The 19 foundation controls that waited on those checks and legs are
   `covered`, and the new check ids carry their AISF control in the
   `Compliance_Frameworks` column.

@@ -23556,6 +23556,553 @@ def check_bedrock_llm_jacking_activity(region: str = "") -> Dict[str, Any]:
         }
 
 
+AGENT_HANDOFF_FINDING = "Agent Handoff Source Identity"
+
+AGENT_HANDOFF_REFERENCE = (
+    "https://docs.aws.amazon.com/IAM/latest/UserGuide/id_credentials_temp_control-access_monitor.html\n"
+    "https://docs.aws.amazon.com/bedrock/latest/userguide/agents-multi-agent-collaboration.html"
+)
+
+AGENT_HANDOFF_CEILING = (
+    "Agent roles are the Bedrock agent roles (GetAgent and GetAgentVersion "
+    "agentResourceRoleArn) and the AgentCore runtime roles (GetAgentRuntime "
+    "roleArn) of this Region. No AWS API marks which ECS task roles, Lambda "
+    "execution roles or other roles host an agent, and GetAgentRuntime returns no "
+    "field for the scope of a runtime session's token, so neither is read; a role "
+    "in another account that trusts an agent role is not read either."
+)
+
+# Condition keys that bind the caller's source identity into an AssumeRole
+# request. sts:SourceIdentity is the value the request sets; aws:SourceIdentity
+# is the value a chained session already carries (UNVERIFIED for AssumeRole).
+SOURCE_IDENTITY_CONDITION_KEYS = ("sts:sourceidentity", "aws:sourceidentity")
+
+AGENT_HANDOFF_SCOPE_NOTE = (
+    "Service control policies are not evaluated per principal, and neither are "
+    "identity-policy Deny statements, so an edge counted here may be one that "
+    "no request can use."
+)
+
+AGENT_RUNTIME_LIST_GRANT = (
+    "bedrock-agentcore:ListAgentRuntimes and "
+    "bedrock-agentcore:ListAgentRuntimeEndpoints"
+)
+
+
+def _source_identity_binding(statement: Dict[str, Any]) -> Optional[str]:
+    """
+    Name the test that pins the caller's source identity, or return None.
+
+    Only a positive string test with no IfExists form, no ForAllValues: prefix
+    and no wildcard in any value pins it, because each of those admits a caller
+    with any or no source identity.
+    """
+    for operator, key, values in _condition_keys_by_operator(statement):
+        if key not in SOURCE_IDENTITY_CONDITION_KEYS or not values:
+            continue
+        if operator.startswith("forallvalues:"):
+            continue
+        base = _strip_condition_set_operator(operator)
+        if base not in ("stringequals", "stringequalsignorecase", "stringlike"):
+            continue
+        texts = [str(value) for value in values]
+        if all(text and "*" not in text and "?" not in text for text in texts):
+            return f"{operator} {key} {', '.join(texts)}"
+    return None
+
+
+def _trust_policy_document(role: Dict[str, Any]) -> Any:
+    """Return a role's trust policy, decoding the URL-encoded form if needed."""
+    document = role.get("AssumeRolePolicyDocument")
+    if isinstance(document, str):
+        from urllib.parse import unquote
+
+        document = json.loads(unquote(document))
+    return document
+
+
+def _identity_allows_assume_role(permissions: Dict[str, Any], role_arn: str) -> bool:
+    """
+    Return True when a cached identity's policies allow sts:AssumeRole on a role.
+
+    A boundary is an intersection, so a boundary that allows sts:AssumeRole
+    nowhere removes the grant. Identity-policy Deny statements are not
+    evaluated, which can only add an edge.
+    """
+    if _boundary_allowance(permissions, "sts:assumerole") == "denied":
+        return False
+    target = role_arn.lower()
+    for _, policy in _cached_identity_policies(permissions):
+        for statement in _policy_statements(policy.get("document") or {}):
+            if str(statement.get("Effect", "")).upper() != "ALLOW":
+                continue
+            if not _statement_matches_action(statement, "sts:assumerole"):
+                continue
+            if "NotResource" in statement:
+                matched = not any(
+                    isinstance(resource, str)
+                    and _wildcard_matches(resource.strip().lower(), target)
+                    for resource in _as_list(statement.get("NotResource"))
+                )
+            else:
+                matched = any(
+                    isinstance(resource, str)
+                    and _wildcard_matches(resource.strip().lower(), target)
+                    for resource in _as_list(statement.get("Resource"))
+                )
+            if matched:
+                return True
+    return False
+
+
+def get_agent_role_inventory(region: str) -> Dict[str, Any]:
+    """
+    Read the roles Bedrock agents and AgentCore runtimes run as, and the
+    supervisor-to-collaborator pairs of every Bedrock multi-agent collaboration.
+
+    ``roles`` maps a role ARN to the agents that run as it. ``collaborations``
+    holds one entry per collaborator of each supervisor version, with the roles
+    of both sides. ``errors`` names every agent or runtime that was not read, and
+    ``runtime_error`` is set when AgentCore runtimes could not be listed.
+    """
+    inventory = {
+        "roles": {},
+        "collaborations": [],
+        "errors": [],
+        "runtime_error": None,
+        "agent_count": 0,
+        "runtime_count": 0,
+    }
+
+    def add_role(role_arn, label):
+        if role_arn:
+            inventory["roles"].setdefault(role_arn, [])
+            if label not in inventory["roles"][role_arn]:
+                inventory["roles"][role_arn].append(label)
+
+    agent_client = boto3.client(
+        "bedrock-agent", config=boto3_config, region_name=region
+    )
+    try:
+        agents = _list_all_items(agent_client, "list_agents", "agentSummaries")
+    except (ClientError, BotoCoreError, TypeError) as error:
+        agents = []
+        inventory["errors"].append(
+            "Bedrock agents were not read with bedrock:ListAgents "
+            f"({get_assessment_error_label(error)})"
+        )
+    inventory["agent_count"] = len(agents)
+
+    # agent id -> {"name", "versions": {version: role}, "aliases": {alias id: [versions]}}
+    agent_records = {}
+    for agent in agents:
+        agent_id = agent.get("agentId")
+        name = agent.get("agentName") or agent_id
+        try:
+            detail = agent_client.get_agent(agentId=agent_id).get("agent", {})
+            aliases = _list_all_items(
+                agent_client,
+                "list_agent_aliases",
+                "agentAliasSummaries",
+                agentId=agent_id,
+            )
+            record = {
+                "name": name,
+                "versions": {
+                    GUARDRAIL_DRAFT_VERSION: (
+                        detail.get("agentResourceRoleArn"),
+                        detail.get("agentCollaboration"),
+                    )
+                },
+                "aliases": {
+                    alias.get("agentAliasId"): [
+                        str(route.get("agentVersion"))
+                        for route in alias.get("routingConfiguration") or []
+                        if route.get("agentVersion")
+                    ]
+                    for alias in aliases
+                },
+            }
+            for version in sorted(
+                {
+                    version
+                    for routed in record["aliases"].values()
+                    for version in routed
+                    if version != GUARDRAIL_DRAFT_VERSION
+                }
+            ):
+                version_detail = agent_client.get_agent_version(
+                    agentId=agent_id, agentVersion=version
+                ).get("agentVersion", {})
+                record["versions"][version] = (
+                    version_detail.get("agentResourceRoleArn"),
+                    version_detail.get("agentCollaboration"),
+                )
+        except (ClientError, BotoCoreError, TypeError) as error:
+            inventory["errors"].append(
+                f"Bedrock agent '{name}' was not read with bedrock:GetAgent, "
+                "bedrock:ListAgentAliases and bedrock:GetAgentVersion "
+                f"({get_assessment_error_label(error)})"
+            )
+            continue
+        agent_records[agent_id] = record
+        for version, (role_arn, _) in record["versions"].items():
+            add_role(role_arn, f"Bedrock agent '{name}' version {version}")
+
+    for agent_id, record in agent_records.items():
+        for version, (role_arn, collaboration) in record["versions"].items():
+            if collaboration not in ("SUPERVISOR", "SUPERVISOR_ROUTER"):
+                continue
+            try:
+                collaborators = _list_all_items(
+                    agent_client,
+                    "list_agent_collaborators",
+                    "agentCollaboratorSummaries",
+                    agentId=agent_id,
+                    agentVersion=version,
+                )
+            except (ClientError, BotoCoreError, TypeError) as error:
+                inventory["errors"].append(
+                    f"collaborators of Bedrock agent '{record['name']}' version "
+                    f"{version} were not read with bedrock:ListAgentCollaborators "
+                    f"({get_assessment_error_label(error)})"
+                )
+                continue
+            for collaborator in collaborators:
+                alias_arn = str(
+                    (collaborator.get("agentDescriptor") or {}).get("aliasArn") or ""
+                )
+                # arn:aws:bedrock:<region>:<account>:agent-alias/<agent id>/<alias id>
+                path = alias_arn.split(":", 5)[-1].split("/")
+                target = agent_records.get(path[1]) if len(path) == 3 else None
+                routed = target["aliases"].get(path[2]) if target else None
+                inventory["collaborations"].append(
+                    {
+                        "supervisor": f"'{record['name']}' version {version}",
+                        "supervisor_role": role_arn,
+                        "collaborator": collaborator.get("collaboratorName")
+                        or alias_arn,
+                        "alias_arn": alias_arn,
+                        "collaborator_roles": sorted(
+                            {
+                                target["versions"][routed_version][0]
+                                for routed_version in routed
+                                if routed_version in target["versions"]
+                                and target["versions"][routed_version][0]
+                            }
+                        )
+                        if routed
+                        else None,
+                    }
+                )
+
+    runtime_client = boto3.client(
+        "bedrock-agentcore-control", config=boto3_config, region_name=region
+    )
+    try:
+        runtimes = _list_all_items(
+            runtime_client, "list_agent_runtimes", "agentRuntimes"
+        )
+    except (ClientError, BotoCoreError, TypeError) as error:
+        inventory["runtime_error"] = (
+            "AgentCore runtimes were not listed with "
+            f"bedrock-agentcore:ListAgentRuntimes ({get_assessment_error_label(error)})"
+        )
+        return inventory
+    inventory["runtime_count"] = len(runtimes)
+    for runtime in runtimes:
+        runtime_id = runtime.get("agentRuntimeId")
+        name = runtime.get("agentRuntimeName") or runtime_id
+        try:
+            versions = {str(runtime.get("agentRuntimeVersion") or "")}
+            endpoints = _list_all_items(
+                runtime_client,
+                "list_agent_runtime_endpoints",
+                "runtimeEndpoints",
+                agentRuntimeId=runtime_id,
+            )
+            for endpoint in endpoints:
+                for field in ("liveVersion", "targetVersion"):
+                    if endpoint.get(field):
+                        versions.add(str(endpoint[field]))
+            for version in sorted(version for version in versions if version):
+                detail = runtime_client.get_agent_runtime(
+                    agentRuntimeId=runtime_id, agentRuntimeVersion=version
+                )
+                add_role(
+                    detail.get("roleArn"),
+                    f"AgentCore runtime '{name}' version {version}",
+                )
+        except (ClientError, BotoCoreError, TypeError) as error:
+            inventory["errors"].append(
+                f"AgentCore runtime '{name}' was not read with "
+                "bedrock-agentcore:ListAgentRuntimeEndpoints and "
+                f"bedrock-agentcore:GetAgentRuntime ({get_assessment_error_label(error)})"
+            )
+    return inventory
+
+
+def check_agent_handoff_source_identity(
+    permission_cache, region: str = "", agent_inventory: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
+    """
+    BR-57: Fail an identifiable agent-to-agent handoff with no checked caller
+    binding. A Bedrock collaborator that runs as its supervisor's role acts
+    with the supervisor's authority. A role that an agent role can assume,
+    named in its trust policy or reached through an account trust and the
+    agent role's sts:AssumeRole grant, fails unless the trust statement pins
+    sts:SourceIdentity to named values.
+    """
+    logger.debug("Starting check for agent handoff source identity")
+    check_name = AGENT_HANDOFF_FINDING
+    try:
+        findings = {
+            "check_name": check_name,
+            "status": "PASS",
+            "details": "",
+            "csv_data": [],
+        }
+
+        def row(details, resolution, severity, status):
+            return create_finding(
+                check_id="BR-57",
+                finding_name=check_name,
+                finding_details=f"{details} {AGENT_HANDOFF_CEILING}",
+                resolution=resolution,
+                reference=AGENT_HANDOFF_REFERENCE,
+                severity=severity,
+                status=status,
+                region=region,
+            )
+
+        inventory = (
+            agent_inventory
+            if agent_inventory is not None
+            else get_agent_role_inventory(region)
+        )
+        agent_roles = inventory["roles"]
+        unread = list(inventory["errors"])
+        if inventory["runtime_error"]:
+            unread.append(
+                "{}; grant {} to read them".format(
+                    inventory["runtime_error"], AGENT_RUNTIME_LIST_GRANT
+                )
+            )
+
+        failures = []
+        for pair in inventory["collaborations"]:
+            roles = pair["collaborator_roles"]
+            if roles is None:
+                unread.append(
+                    f"collaborator '{pair['collaborator']}' of supervisor "
+                    f"{pair['supervisor']} names alias {pair['alias_arn'] or 'unknown'}, "
+                    "which is not an agent alias read in this Region"
+                )
+                continue
+            if pair["supervisor_role"] and pair["supervisor_role"] in roles:
+                failures.append(
+                    "Bedrock collaborator '{}' of supervisor {} runs as the "
+                    "supervisor's role {}, so it acts with the supervisor's "
+                    "authority".format(
+                        pair["collaborator"],
+                        pair["supervisor"],
+                        pair["supervisor_role"],
+                    )
+                )
+
+        role_cache = (permission_cache or {}).get("role_permissions") or {}
+        edges = []
+        bound_edges = []
+        roles_read = 0
+        if agent_roles:
+            iam_client = boto3.client("iam", config=boto3_config)
+            for role_name in sorted(role_cache):
+                try:
+                    role = iam_client.get_role(RoleName=role_name).get("Role", {})
+                    document = _trust_policy_document(role)
+                except (ClientError, BotoCoreError, ValueError, TypeError) as error:
+                    unread.append(
+                        f"role '{role_name}' trust policy was not read with "
+                        f"iam:GetRole ({get_assessment_error_label(error)})"
+                    )
+                    continue
+                roles_read += 1
+                role_arn = role.get("Arn") or ""
+                for statement in _policy_statements(document or {}):
+                    if str(statement.get("Effect", "")).upper() != "ALLOW":
+                        continue
+                    if not _statement_matches_action(statement, "sts:assumerole"):
+                        continue
+                    principal = statement.get("Principal")
+                    entries = _principal_entries(
+                        principal.get("AWS")
+                        if isinstance(principal, dict)
+                        else principal
+                    )
+                    # An account entry or "*" delegates the decision to the
+                    # caller's identity policy; NotPrincipal on an Allow admits
+                    # every principal it does not list.
+                    delegated_accounts = {
+                        entry.split(":")[4] if entry.endswith(":root") else entry
+                        for entry in entries
+                        if entry.endswith(":root") or re.fullmatch(r"\d{12}", entry)
+                    }
+                    delegates_all = "*" in entries or "NotPrincipal" in statement
+                    binding = _source_identity_binding(statement)
+                    label = statement.get("Sid") or "unnamed statement"
+                    for agent_role, agent_labels in sorted(agent_roles.items()):
+                        if agent_role == role_arn:
+                            continue
+                        if agent_role in entries:
+                            how = "names it as a principal"
+                        elif (
+                            delegates_all
+                            or agent_role.split(":")[4] in delegated_accounts
+                        ):
+                            agent_permissions = role_cache.get(
+                                agent_role.rsplit("/", 1)[-1]
+                            )
+                            if agent_permissions is None:
+                                unread.append(
+                                    f"agent role {agent_role} is not in the IAM "
+                                    "permissions cache, so its sts:AssumeRole "
+                                    f"grant on role '{role_name}' was not read"
+                                )
+                                continue
+                            if not _identity_allows_assume_role(
+                                agent_permissions, role_arn
+                            ):
+                                continue
+                            how = (
+                                "trusts the account and the agent role's identity "
+                                "policy allows sts:AssumeRole on it"
+                            )
+                        else:
+                            continue
+                        edge = "role '{}' statement '{}' {}; the agent role runs {}".format(
+                            role_name, label, how, ", ".join(agent_labels[:3])
+                        )
+                        if binding:
+                            bound_edges.append(
+                                f"{edge}, and the statement pins {binding}"
+                            )
+                        else:
+                            edges.append(
+                                f"agent role {agent_role} can assume {edge}, with no "
+                                "sts:SourceIdentity condition naming the caller"
+                            )
+
+        if failures or edges:
+            findings["status"] = "WARN"
+            findings["csv_data"].append(
+                row(
+                    "{} agent handoff(s) carry no checked caller binding: {}. {}".format(
+                        len(failures) + len(edges),
+                        "; ".join((failures + edges)[:10]),
+                        AGENT_HANDOFF_SCOPE_NOTE,
+                    ),
+                    "Give each collaborator its own agent resource role, and add a "
+                    "StringEquals sts:SourceIdentity condition naming the calling "
+                    "agent, with sts:SetSourceIdentity allowed, to every trust "
+                    "statement an agent role can assume.",
+                    "High",
+                    "Failed",
+                )
+            )
+
+        if not agent_roles and not unread:
+            findings["status"] = "N/A"
+            findings["csv_data"].append(
+                row(
+                    "No Bedrock agent or AgentCore runtime with a role exists in "
+                    f"{region or 'this Region'}, so no agent handoff exists.",
+                    "No action required",
+                    "Informational",
+                    "N/A",
+                )
+            )
+            return findings
+
+        if agent_roles and not failures and not edges:
+            detail = (
+                "{} agent role(s) were read and {} role trust polic(ies) checked. "
+                "{} trust edge(s) from an agent role were found and each pins "
+                "sts:SourceIdentity{}, and {} Bedrock collaborator(s) run as a "
+                "role other than their supervisor's.".format(
+                    len(agent_roles),
+                    roles_read,
+                    len(bound_edges),
+                    ": " + "; ".join(bound_edges[:5]) if bound_edges else "",
+                    sum(
+                        1
+                        for pair in inventory["collaborations"]
+                        if pair["collaborator_roles"] is not None
+                    ),
+                )
+                + " "
+                + AGENT_HANDOFF_SCOPE_NOTE
+            )
+            findings["csv_data"].append(
+                row(
+                    detail
+                    + (
+                        " This is not reported as Passed because part of the "
+                        "population was not read."
+                        if unread
+                        else ""
+                    ),
+                    "No action required",
+                    "High",
+                    "N/A" if unread else "Passed",
+                )
+            )
+        if unread:
+            if findings["status"] == "PASS":
+                findings["status"] = "N/A"
+            findings["csv_data"].append(
+                row(
+                    "{} part(s) of the agent handoff population were not read: "
+                    "{}.".format(len(unread), "; ".join(unread[:10])),
+                    COULD_NOT_ASSESS_RESOLUTION,
+                    "Informational",
+                    "N/A",
+                )
+            )
+        if agent_roles:
+            _apply_cache_population_gaps(
+                findings,
+                permission_cache,
+                "BR-57",
+                check_name,
+                AGENT_HANDOFF_REFERENCE,
+                region,
+                principal_types=("role",),
+            )
+        return findings
+
+    except Exception as e:
+        logger.error(
+            f"Error in check_agent_handoff_source_identity: {str(e)}", exc_info=True
+        )
+        return {
+            "check_name": check_name,
+            "status": "ERROR",
+            "details": f"Error during check: {str(e)}",
+            "csv_data": [
+                create_finding(
+                    check_id="BR-57",
+                    finding_name=check_name,
+                    finding_details=build_could_not_assess_detail(e, region),
+                    resolution=COULD_NOT_ASSESS_RESOLUTION,
+                    reference=AGENT_HANDOFF_REFERENCE,
+                    severity="Informational",
+                    status="N/A",
+                    region=region,
+                )
+            ],
+        }
+
+
 AI_SERVICES_OPT_OUT_REFERENCE = "https://docs.aws.amazon.com/organizations/latest/userguide/orgs_manage_policies_ai-opt-out.html"
 
 AI_SERVICES_OPT_OUT_POLICY_TYPE = "AISERVICES_OPT_OUT_POLICY"
@@ -25273,6 +25820,13 @@ def lambda_handler(event, context):
 
         logger.info("Running Bedrock LLM jacking activity check (BR-56)")
         all_findings.append(check_bedrock_llm_jacking_activity(region=region))
+
+        logger.info("Running agent handoff source identity check (BR-57)")
+        all_findings.append(
+            _permission_cache_unavailable_result("BR-57", AGENT_HANDOFF_FINDING, region)
+            if permission_cache is None
+            else check_agent_handoff_source_identity(permission_cache, region=region)
+        )
 
         logger.info("Building Agentic AI Security findings from Bedrock results")
         all_findings.append(build_agentic_bedrock_security_findings(all_findings))
