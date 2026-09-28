@@ -812,6 +812,16 @@ Resources:
                 - iot:GetPolicy # SM-41
                 - iot:ListTargetsForPolicy # SM-41
               Resource: !Sub 'arn:${AWS::Partition}:iot:*:${AWS::AccountId}:policy/*'
+            - Sid: IoTCertificateThingRead
+              Effect: Allow
+              Action:
+                - iot:ListPrincipalThings # SM-41
+              Resource: !Sub 'arn:${AWS::Partition}:iot:*:${AWS::AccountId}:cert/*'
+            - Sid: IoTScheduledAuditRead
+              Effect: Allow
+              Action:
+                - iot:DescribeScheduledAudit # SM-41
+              Resource: !Sub 'arn:${AWS::Partition}:iot:*:${AWS::AccountId}:scheduledaudit/*'
 
   AgentCoreSecurityAssessmentFunction:
     Type: AWS::Serverless::Function

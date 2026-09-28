@@ -9890,7 +9890,17 @@ IOT_DEVICE_POLICY_RESOLUTION = (
 )
 IOT_DEVICE_ACTIONS = ("iot:publish", "iot:subscribe", "iot:receive", "iot:connect")
 IOT_THING_NAME_VARIABLE = "${iot:Connection.Thing.ThingName}"
-IOT_BROAD_RESOURCE_SUFFIXES = (":*", "topic/*", "topicfilter/*", "client/*")
+IOT_UNIQUE_CERTIFICATE_FINDING = "AWS IoT Unique Device Certificate"
+IOT_UNIQUE_CERTIFICATE_REFERENCE = (
+    "https://docs.aws.amazon.com/iot/latest/developerguide/x509-client-certs.html"
+)
+IOT_AUDIT_FINDING = "AWS IoT Device Defender Audit"
+IOT_AUDIT_REFERENCE = (
+    "https://docs.aws.amazon.com/iot-device-defender/latest/devguide/"
+    "device-defender-audit.html"
+)
+IOT_SHARED_CERTIFICATE_CHECK = "DEVICE_CERTIFICATE_SHARED_CHECK"
+IOT_AUDIT_FINDING_WINDOW_DAYS = 31
 
 
 def _iot_statement_actions(statement: Dict[str, Any]) -> List[str]:
@@ -9912,13 +9922,25 @@ def _iot_statement_actions(statement: Dict[str, Any]) -> List[str]:
     ]
 
 
+def _iot_resource_bounded_to_thing(resource: str) -> bool:
+    """
+    True when the thing-name variable fills a whole path segment.
+
+    A resource without the variable reaches every device's topic, and a
+    wildcard or other text right after it (topic/${ThingName}*) reaches the
+    topics of every thing whose name starts with this one.
+    """
+    parts = resource.split(IOT_THING_NAME_VARIABLE)
+    if len(parts) < 2:
+        return False
+    return all(part == "" or part.startswith("/") for part in parts[1:])
+
+
 def _iot_broad_resource(statement: Dict[str, Any]) -> Optional[str]:
     if "NotResource" in statement:
         return "NotResource"
     for resource in _policy_values(statement.get("Resource")):
-        if IOT_THING_NAME_VARIABLE in resource:
-            continue
-        if resource == "*" or resource.endswith(IOT_BROAD_RESOURCE_SUFFIXES):
+        if not _iot_resource_bounded_to_thing(str(resource)):
             return resource
     return None
 
@@ -9955,7 +9977,8 @@ def _iot_policy_problems(document: Any) -> List[str]:
         if resource:
             problems.append(
                 f"allows {', '.join(a.split(':')[1].capitalize() for a in actions)} on "
-                f"'{resource}' without the thing-name policy variable"
+                f"'{resource}' without the thing-name policy variable bounding a "
+                "path segment"
             )
         if "iot:connect" in actions and not _iot_requires_attached_thing(statement):
             problems.append(
@@ -10003,19 +10026,19 @@ def check_iot_device_scoped_policies(region: str = "") -> Dict[str, Any]:
         return findings
 
     failed, passed, errors = [], [], []
+    certificates = set()
     for policy in policies:
         name = policy.get("policyName")
         if not name:
             continue
         try:
-            attached = False
+            targets = []
             paginator = iot_client.get_paginator("list_targets_for_policy")
             for page in paginator.paginate(policyName=name):
-                if page.get("targets"):
-                    attached = True
-                    break
-            if not attached:
+                targets.extend(page.get("targets") or [])
+            if not targets:
                 continue
+            certificates.update(t for t in targets if ":cert/" in str(t))
             document = iot_client.get_policy(policyName=name).get("policyDocument")
         except Exception as error:
             errors.append((name, error))
@@ -10079,7 +10102,205 @@ def check_iot_device_scoped_policies(region: str = "") -> Dict[str, Any]:
                 "N/A",
             )
         )
+    findings["csv_data"].append(
+        _iot_unique_certificate_finding(iot_client, sorted(certificates), region)
+    )
+    findings["csv_data"].append(_iot_audit_finding(iot_client, region))
     return findings
+
+
+def _iot_unique_certificate_finding(
+    iot_client, certificates: List[str], region: str
+) -> Dict[str, Any]:
+    """SM-41: each certificate a device policy is attached to serves one thing."""
+
+    def _row(details, resolution, severity, status):
+        return create_finding(
+            check_id="SM-41",
+            finding_name=IOT_UNIQUE_CERTIFICATE_FINDING,
+            finding_details=details,
+            resolution=resolution,
+            reference=IOT_UNIQUE_CERTIFICATE_REFERENCE,
+            severity=severity,
+            status=status,
+            region=region,
+        )
+
+    if not certificates:
+        return _row(
+            "No attached AWS IoT policy in this region is attached to a "
+            "certificate, so there is no device certificate to assess.",
+            "No action required",
+            "Informational",
+            "N/A",
+        )
+    shared, unread = [], []
+    for certificate in certificates:
+        certificate_id = certificate.rsplit("/", 1)[-1]
+        try:
+            things = []
+            paginator = iot_client.get_paginator("list_principal_things")
+            for page in paginator.paginate(principal=certificate):
+                things.extend(page.get("things") or [])
+        except Exception as error:
+            unread.append(
+                f"certificate {certificate_id} ({get_assessment_error_label(error)})"
+            )
+            continue
+        if len(set(things)) > 1:
+            shown = ", ".join(sorted(set(things))[:5])
+            shared.append(
+                f"certificate {certificate_id} is attached to {len(set(things))} "
+                f"things ({shown})"
+            )
+    ceiling = (
+        " Whether one certificate is installed on more than one physical device "
+        "is not an API field; Device Defender's "
+        f"{IOT_SHARED_CERTIFICATE_CHECK} infers it from concurrent connections "
+        "and is reported in the audit row."
+    )
+    if shared:
+        return _row(
+            f"{len(shared)} of {len(certificates)} device certificate(s) are shared "
+            f"across things: {'; '.join(shared[:10])}. Recovering that "
+            "certificate from one device yields every thing it serves." + ceiling,
+            "Issue each device its own certificate and attach each certificate to "
+            "exactly one thing with AttachThingPrincipal.",
+            "High",
+            "Failed",
+        )
+    if unread:
+        return _unread_resources_finding(
+            "SM-41",
+            IOT_UNIQUE_CERTIFICATE_FINDING,
+            unread,
+            f"{len(certificates) - len(unread)} certificate(s) read are each "
+            "attached to at most one thing." + ceiling,
+            IOT_UNIQUE_CERTIFICATE_REFERENCE,
+            region,
+        )
+    return _row(
+        f"Each of the {len(certificates)} certificate(s) that an attached AWS IoT "
+        "policy is attached to is attached to at most one thing." + ceiling,
+        "No action required",
+        "High",
+        "Passed",
+    )
+
+
+def _iot_audit_finding(iot_client, region: str) -> Dict[str, Any]:
+    """
+    SM-41: Device Defender audit runs the shared-certificate check on a schedule,
+    and the last window holds no unsuppressed finding.
+    """
+
+    def _row(details, resolution, severity, status):
+        return create_finding(
+            check_id="SM-41",
+            finding_name=IOT_AUDIT_FINDING,
+            finding_details=details,
+            resolution=resolution,
+            reference=IOT_AUDIT_REFERENCE,
+            severity=severity,
+            status=status,
+            region=region,
+        )
+
+    problems, unread = [], []
+    try:
+        configuration = iot_client.describe_account_audit_configuration()
+        check = (configuration.get("auditCheckConfigurations") or {}).get(
+            IOT_SHARED_CERTIFICATE_CHECK
+        ) or {}
+        if check.get("enabled") is not True:
+            problems.append(
+                f"the {IOT_SHARED_CERTIFICATE_CHECK} audit check is not enabled"
+            )
+    except Exception as error:
+        unread.append(
+            "iot:DescribeAccountAuditConfiguration "
+            f"({get_assessment_error_label(error)})"
+        )
+
+    try:
+        scheduled = []
+        for page in iot_client.get_paginator("list_scheduled_audits").paginate():
+            scheduled.extend(page.get("scheduledAudits") or [])
+        covering, audits_unread = [], []
+        for audit in scheduled:
+            name = audit.get("scheduledAuditName")
+            try:
+                detail = iot_client.describe_scheduled_audit(scheduledAuditName=name)
+            except Exception as error:
+                audits_unread.append(
+                    f"scheduled audit '{name}' ({get_assessment_error_label(error)})"
+                )
+                continue
+            if IOT_SHARED_CERTIFICATE_CHECK in (detail.get("targetCheckNames") or []):
+                covering.append(name)
+        if not covering:
+            unread.extend(audits_unread)
+        if not covering and not audits_unread:
+            problems.append(
+                f"none of the {len(scheduled)} scheduled audit(s) runs "
+                f"{IOT_SHARED_CERTIFICATE_CHECK}"
+            )
+    except Exception as error:
+        unread.append(f"iot:ListScheduledAudits ({get_assessment_error_label(error)})")
+
+    try:
+        end = datetime.now(timezone.utc)
+        start = end - timedelta(days=IOT_AUDIT_FINDING_WINDOW_DAYS)
+        open_findings = {}
+        for page in iot_client.get_paginator("list_audit_findings").paginate(
+            startTime=start, endTime=end, listSuppressedFindings=False
+        ):
+            for audit_finding in page.get("findings") or []:
+                if audit_finding.get("isSuppressed"):
+                    continue
+                name = audit_finding.get("checkName") or "unnamed check"
+                open_findings[name] = open_findings.get(name, 0) + 1
+        if open_findings:
+            counts = ", ".join(
+                f"{name} ({count})" for name, count in sorted(open_findings.items())
+            )
+            problems.append(
+                f"the last {IOT_AUDIT_FINDING_WINDOW_DAYS} days hold "
+                f"{sum(open_findings.values())} unsuppressed audit finding(s): {counts}"
+            )
+    except Exception as error:
+        unread.append(f"iot:ListAuditFindings ({get_assessment_error_label(error)})")
+
+    if problems:
+        details = "Device Defender audit does not show a clean, scheduled audit: "
+        details += "; ".join(problems) + "."
+        if unread:
+            details += f" Not read: {'; '.join(unread)}."
+        return _row(
+            details,
+            "Enable the Device Defender audit checks, including "
+            f"{IOT_SHARED_CERTIFICATE_CHECK}, schedule an audit that runs them, "
+            "and resolve or suppress each finding with a recorded reason.",
+            "Medium",
+            "Failed",
+        )
+    if unread:
+        return _unread_resources_finding(
+            "SM-41",
+            IOT_AUDIT_FINDING,
+            unread,
+            "no audit problem was found in the parts that were read.",
+            IOT_AUDIT_REFERENCE,
+            region,
+        )
+    return _row(
+        f"The {IOT_SHARED_CERTIFICATE_CHECK} audit check is enabled, a scheduled "
+        "audit runs it, and the last "
+        f"{IOT_AUDIT_FINDING_WINDOW_DAYS} days hold no unsuppressed audit finding.",
+        "No action required",
+        "Medium",
+        "Passed",
+    )
 
 
 def handle_aws_throttling(func, *args, **kwargs):

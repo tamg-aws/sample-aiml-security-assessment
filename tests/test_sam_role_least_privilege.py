@@ -275,6 +275,8 @@ _EXPECTED_ACTIONS = {
         "cloudwatch:DescribeAlarms",
         "logs:DescribeMetricFilters",
         "events:ListTargetsByRule",
+        "iot:ListPrincipalThings",
+        "iot:DescribeScheduledAudit",
     },
     "AgentCoreSecurityAssessmentFunction": {
         "bedrock-agentcore:GetAgentRuntime",

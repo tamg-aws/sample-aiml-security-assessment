@@ -50,6 +50,8 @@ SCOPED_SAGEMAKER_GRANTS = {
     "logs:DescribeMetricFilters": ":log-group:*'",
     "cloudwatch:DescribeAlarms": ":alarm:*'",
     "events:ListTargetsByRule": ":rule/*'",
+    "iot:ListPrincipalThings": ":cert/*'",
+    "iot:DescribeScheduledAudit": ":scheduledaudit/*'",
 }
 
 

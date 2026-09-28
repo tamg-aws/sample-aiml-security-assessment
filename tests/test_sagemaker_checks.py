@@ -6787,15 +6787,90 @@ class TestSM41IoTDeviceScopedPolicies:
             is expected
         )
 
-    def _client(self, policies_pages, targets, documents):
+    def _client(
+        self,
+        policies_pages,
+        targets,
+        documents,
+        principal_things=None,
+        audit_config=None,
+        scheduled=None,
+        audit_findings=None,
+        errors=None,
+    ):
         client = MagicMock()
+        errors = errors or {}
+        principal_things = principal_things or {}
 
         def list_targets(policyName):
             return targets[policyName]
 
+        def list_principal_things(principal):
+            if principal in errors:
+                raise errors[principal]
+            return [{"things": principal_things.get(principal, ["thing-1"])}]
+
+        def raising(operation, pages):
+            def paginate(**kwargs):
+                if operation in errors:
+                    raise errors[operation]
+                return pages
+
+            return paginate
+
         client.get_paginator.side_effect = _pager(
-            {"list_policies": policies_pages, "list_targets_for_policy": list_targets}
+            {
+                "list_policies": policies_pages,
+                "list_targets_for_policy": list_targets,
+                "list_principal_things": list_principal_things,
+                "list_scheduled_audits": raising(
+                    "list_scheduled_audits",
+                    [
+                        {"scheduledAudits": []},
+                        {
+                            "scheduledAudits": [
+                                {"scheduledAuditName": n}
+                                for n in (
+                                    scheduled
+                                    or {
+                                        "daily": [
+                                            sagemaker_app.IOT_SHARED_CERTIFICATE_CHECK
+                                        ]
+                                    }
+                                )
+                            ]
+                        },
+                    ],
+                ),
+                "list_audit_findings": raising(
+                    "list_audit_findings", [{"findings": audit_findings or []}]
+                ),
+            }
         )
+
+        def describe_config():
+            if "describe_account_audit_configuration" in errors:
+                raise errors["describe_account_audit_configuration"]
+            return {
+                "auditCheckConfigurations": audit_config
+                if audit_config is not None
+                else {sagemaker_app.IOT_SHARED_CERTIFICATE_CHECK: {"enabled": True}}
+            }
+
+        client.describe_account_audit_configuration.side_effect = describe_config
+
+        def describe_scheduled_audit(scheduledAuditName):
+            if scheduledAuditName in errors:
+                raise errors[scheduledAuditName]
+            checks = (
+                scheduled or {"daily": [sagemaker_app.IOT_SHARED_CERTIFICATE_CHECK]}
+            )[scheduledAuditName]
+            return {
+                "scheduledAuditName": scheduledAuditName,
+                "targetCheckNames": checks,
+            }
+
+        client.describe_scheduled_audit.side_effect = describe_scheduled_audit
 
         def get_policy(policyName):
             value = documents[policyName]
@@ -6865,7 +6940,15 @@ class TestSM41IoTDeviceScopedPolicies:
             },
         )
         mock_client.return_value = client
-        rows = _rows(sagemaker_app.check_iot_device_scoped_policies("us-east-1"))
+        all_rows = _rows(sagemaker_app.check_iot_device_scoped_policies("us-east-1"))
+        assert [(r["Finding"], r["Status"]) for r in all_rows[-2:]] == [
+            (sagemaker_app.IOT_UNIQUE_CERTIFICATE_FINDING, "Passed"),
+            (sagemaker_app.IOT_AUDIT_FINDING, "Passed"),
+        ]
+        rows = all_rows[:-2]
+        assert all(
+            r["Finding"] == sagemaker_app.IOT_DEVICE_POLICY_FINDING for r in rows
+        )
         failed = [r["Finding_Details"] for r in rows if r["Status"] == "Failed"]
         passed = [r["Finding_Details"] for r in rows if r["Status"] == "Passed"]
         na = [r["Finding_Details"] for r in rows if r["Status"] == "N/A"]
@@ -6896,7 +6979,9 @@ class TestSM41IoTDeviceScopedPolicies:
         )
         mock_client.return_value = client
         rows = _rows(sagemaker_app.check_iot_device_scoped_policies("us-east-1"))
-        assert [r["Status"] for r in rows] == ["Passed"]
+        # The only target is a thing group, so no certificate is assessed.
+        assert [r["Status"] for r in rows] == ["Passed", "N/A", "Passed"]
+        assert rows[1]["Finding"] == sagemaker_app.IOT_UNIQUE_CERTIFICATE_FINDING
 
     @patch("sagemaker_app.boto3.client")
     def test_no_attached_policies_is_na(self, mock_client):
@@ -6918,6 +7003,176 @@ class TestSM41IoTDeviceScopedPolicies:
         rows = _rows(sagemaker_app.check_iot_device_scoped_policies("us-east-1"))
         assert len(rows) == 1
         assert_could_not_assess_finding(rows[0])
+
+
+class TestSM41DeviceIdentityAndAudit:
+    """AIR-PHY-EDG-01: per-device resources, unique certificates, audit."""
+
+    CERT_A = "arn:aws:iot:us-east-1:123456789012:cert/" + "a" * 64
+    CERT_B = "arn:aws:iot:us-east-1:123456789012:cert/" + "b" * 64
+
+    def _run(self, mock_client, document=None, targets=None, **kwargs):
+        client = TestSM41IoTDeviceScopedPolicies()._client(
+            [{"policies": [{"policyName": "p"}, {"policyName": "q"}]}],
+            targets
+            or {
+                "p": [{"targets": [self.CERT_A]}],
+                "q": [{"targets": []}, {"targets": [self.CERT_B]}],
+            },
+            {"p": document or _scoped_iot_document(), "q": _scoped_iot_document()},
+            **kwargs,
+        )
+        mock_client.return_value = client
+        rows = _rows(sagemaker_app.check_iot_device_scoped_policies("us-east-1"))
+        by_name = {}
+        for row in rows:
+            # Policy "p" is read first, so its row is the one kept.
+            by_name.setdefault(row["Finding"].replace(" Incomplete", ""), row)
+        return by_name, rows
+
+    @pytest.mark.parametrize(
+        "resource",
+        [
+            _IOT_TOPIC + "fleet/*",
+            _IOT_TOPIC + "fleet/telemetry",
+            _IOT_TOPIC + "devices/${iot:Connection.Thing.ThingName}*",
+            _IOT_TOPIC + "devices/${iot:Connection.Thing.ThingName}-x/*",
+            _IOT_TOPIC + "dev?ces/*",
+        ],
+    )
+    @patch("sagemaker_app.boto3.client")
+    def test_resource_not_bounded_to_the_thing_fails(self, mock_client, resource):
+        by_name, _ = self._run(
+            mock_client,
+            _iot_document(
+                json.loads(_scoped_iot_document())["Statement"][0],
+                {"Effect": "Allow", "Action": "iot:Publish", "Resource": resource},
+            ),
+        )
+        row = by_name[sagemaker_app.IOT_DEVICE_POLICY_FINDING]
+        assert row["Status"] == "Failed"
+        assert f"on '{resource}'" in row["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "resource",
+        [
+            _IOT_TOPIC + "devices/${iot:Connection.Thing.ThingName}",
+            _IOT_TOPIC + "devices/${iot:Connection.Thing.ThingName}/*",
+            _IOT_TOPIC + "$aws/things/${iot:Connection.Thing.ThingName}/shadow/*",
+        ],
+    )
+    def test_resource_bounded_to_the_thing(self, resource):
+        assert sagemaker_app._iot_resource_bounded_to_thing(resource)
+
+    @patch("sagemaker_app.boto3.client")
+    def test_every_certificate_on_one_thing_passes(self, mock_client):
+        by_name, rows = self._run(mock_client)
+        row = by_name[sagemaker_app.IOT_UNIQUE_CERTIFICATE_FINDING]
+        assert row["Status"] == "Passed"
+        assert "Each of the 2 certificate(s)" in row["Finding_Details"]
+        assert "not an API field" in row["Finding_Details"]
+        assert all(r["Check_ID"] == "SM-41" for r in rows)
+
+    @patch("sagemaker_app.boto3.client")
+    def test_one_certificate_on_two_things_fails(self, mock_client):
+        by_name, _ = self._run(
+            mock_client,
+            principal_things={self.CERT_B: ["thing-1", "thing-2"]},
+        )
+        row = by_name[sagemaker_app.IOT_UNIQUE_CERTIFICATE_FINDING]
+        assert row["Status"] == "Failed"
+        assert "1 of 2 device certificate(s)" in row["Finding_Details"]
+        assert "b" * 64 in row["Finding_Details"]
+        assert "a" * 64 not in row["Finding_Details"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_unread_certificate_is_incomplete(self, mock_client):
+        by_name, _ = self._run(
+            mock_client, errors={self.CERT_A: _make_client_error("AccessDenied")}
+        )
+        row = by_name[sagemaker_app.IOT_UNIQUE_CERTIFICATE_FINDING]
+        assert row["Status"] == "N/A"
+        assert "a" * 64 in row["Finding_Details"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_clean_scheduled_audit_passes(self, mock_client):
+        by_name, _ = self._run(mock_client)
+        row = by_name[sagemaker_app.IOT_AUDIT_FINDING]
+        assert row["Status"] == "Passed"
+
+    @pytest.mark.parametrize(
+        "kwargs,text",
+        [
+            (
+                {
+                    "audit_config": {
+                        "DEVICE_CERTIFICATE_SHARED_CHECK": {"enabled": False}
+                    }
+                },
+                "audit check is not enabled",
+            ),
+            ({"audit_config": {}}, "audit check is not enabled"),
+            (
+                {"scheduled": {"weekly": ["CA_CERTIFICATE_EXPIRING_CHECK"]}},
+                "none of the 1 scheduled audit(s)",
+            ),
+            (
+                {
+                    "audit_findings": [
+                        {
+                            "checkName": "CA_CERTIFICATE_EXPIRING_CHECK",
+                            "isSuppressed": True,
+                        },
+                        {
+                            "checkName": "DEVICE_CERTIFICATE_SHARED_CHECK",
+                            "isSuppressed": False,
+                        },
+                    ]
+                },
+                "1 unsuppressed audit finding(s): DEVICE_CERTIFICATE_SHARED_CHECK (1)",
+            ),
+        ],
+    )
+    @patch("sagemaker_app.boto3.client")
+    def test_audit_that_is_not_clean_and_scheduled_fails(
+        self, mock_client, kwargs, text
+    ):
+        by_name, _ = self._run(mock_client, **kwargs)
+        row = by_name[sagemaker_app.IOT_AUDIT_FINDING]
+        assert row["Status"] == "Failed"
+        assert text in row["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "operation,label",
+        [
+            (
+                "describe_account_audit_configuration",
+                "iot:DescribeAccountAuditConfiguration",
+            ),
+            ("list_scheduled_audits", "iot:ListScheduledAudits"),
+            ("list_audit_findings", "iot:ListAuditFindings"),
+            ("daily", "scheduled audit 'daily'"),
+        ],
+    )
+    @patch("sagemaker_app.boto3.client")
+    def test_unread_audit_leg_is_incomplete(self, mock_client, operation, label):
+        by_name, _ = self._run(
+            mock_client, errors={operation: _make_client_error("AccessDenied")}
+        )
+        row = by_name[sagemaker_app.IOT_AUDIT_FINDING]
+        assert row["Status"] == "N/A"
+        assert label in row["Finding_Details"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_known_audit_failure_stands_beside_an_unread_leg(self, mock_client):
+        by_name, _ = self._run(
+            mock_client,
+            audit_config={},
+            errors={"list_audit_findings": _make_client_error("AccessDenied")},
+        )
+        row = by_name[sagemaker_app.IOT_AUDIT_FINDING]
+        assert row["Status"] == "Failed"
+        assert "Not read: iot:ListAuditFindings" in row["Finding_Details"]
 
 
 class TestScope27HandlerWiring:
