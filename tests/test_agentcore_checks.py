@@ -22603,3 +22603,283 @@ class TestAG27WafFailureMode:
 
         assert [f["Status"] for f in findings] == ["Failed"]
         assert findings[0]["Finding"].endswith("Missing")
+
+
+def _gateway_role_cache(roles, version=2, errors=None):
+    cache = {
+        "cache_schema_version": version,
+        "role_permissions": {
+            name: {"attached_policies": [], "inline_policies": list(policies)}
+            for name, policies in roles.items()
+        },
+    }
+    if errors is not None:
+        cache["principal_errors"] = errors
+    return cache
+
+
+def _gateway_role_policy(action, resource):
+    return _tool_policy(
+        "GatewayInline",
+        {"Statement": [{"Effect": "Allow", "Action": action, "Resource": resource}]},
+    )
+
+
+_SCOPED_FUNCTION = "arn:aws:lambda:us-east-1:123456789012:function:orders-tool"
+
+
+class TestAC25GatewayRoleScope:
+    """AC-25: the role every GATEWAY_IAM_ROLE target calls its backend with."""
+
+    @staticmethod
+    def _wire(mock_ac, roles):
+        mock_ac.list_gateways.return_value = {
+            "items": [{"gatewayId": g, "name": f"name-{g}"} for g in roles]
+        }
+
+        def detail(gatewayIdentifier, **kwargs):
+            value = roles[gatewayIdentifier]
+            if isinstance(value, Exception):
+                raise value
+            return {"roleArn": value} if value else {}
+
+        mock_ac.get_gateway.side_effect = detail
+
+    @staticmethod
+    def _by_gateway(findings, gateway_ids):
+        return {
+            gateway_id: finding
+            for finding in findings
+            for gateway_id in gateway_ids
+            if f"({gateway_id})" in finding["Finding_Details"]
+        }
+
+    @patch("agentcore_app.agentcore_client")
+    def test_each_gateway_role_gets_its_own_verdict(self, mock_ac):
+        self._wire(
+            mock_ac,
+            {
+                "gw-scoped": "arn:aws:iam::123456789012:role/ScopedRole",
+                "gw-wide": "arn:aws:iam::123456789012:role/service-role/WideRole",
+            },
+        )
+        cache = _gateway_role_cache(
+            {
+                "ScopedRole": [
+                    _gateway_role_policy("lambda:InvokeFunction", _SCOPED_FUNCTION)
+                ],
+                "WideRole": [_gateway_role_policy("lambda:InvokeFunction", "*")],
+            }
+        )
+
+        findings = agentcore_app.check_agentcore_gateway_role_scope(cache)
+
+        by_gateway = self._by_gateway(findings, ["gw-scoped", "gw-wide"])
+        assert len(findings) == 2
+        assert by_gateway["gw-scoped"]["Status"] == "Passed"
+        assert by_gateway["gw-wide"]["Status"] == "Failed"
+        assert by_gateway["gw-wide"]["Severity"] == "High"
+        assert by_gateway["gw-wide"]["Finding"].endswith("Unscoped")
+        assert "WideRole" in by_gateway["gw-wide"]["Finding_Details"]
+        assert (
+            agentcore_app.IAM_CACHE_SCP_NOTE in by_gateway["gw-wide"]["Finding_Details"]
+        )
+        for finding in findings:
+            assert finding["Check_ID"] == "AC-25"
+            assert_finding_schema(finding)
+
+    @pytest.mark.parametrize(
+        "action,resource",
+        [
+            ("lambda:*", _SCOPED_FUNCTION),
+            ("lambda:Invoke*", _SCOPED_FUNCTION),
+            (
+                "lambda:InvokeFunction",
+                "arn:aws:lambda:us-east-1:123456789012:function:*",
+            ),
+            ("lambda:InvokeFunction", "arn:aws:lambda:*:*:function:orders-tool"),
+        ],
+    )
+    @patch("agentcore_app.agentcore_client")
+    def test_a_wildcard_in_the_action_or_resource_fails(
+        self, mock_ac, action, resource
+    ):
+        self._wire(mock_ac, {"gw-1": "arn:aws:iam::123456789012:role/GwRole"})
+        cache = _gateway_role_cache(
+            {"GwRole": [_gateway_role_policy(action, resource)]}
+        )
+
+        findings = agentcore_app.check_agentcore_gateway_role_scope(cache)
+
+        assert [f["Status"] for f in findings] == ["Failed"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_an_unread_role_is_never_passed_even_with_a_scoped_cached_policy(
+        self, mock_ac
+    ):
+        self._wire(
+            mock_ac,
+            {
+                "gw-read": "arn:aws:iam::123456789012:role/ReadRole",
+                "gw-unread": "arn:aws:iam::123456789012:role/UnreadRole",
+            },
+        )
+        scoped = [_gateway_role_policy("lambda:InvokeFunction", _SCOPED_FUNCTION)]
+        cache = _gateway_role_cache(
+            {"ReadRole": scoped, "UnreadRole": scoped},
+            errors=[
+                {
+                    "type": "role",
+                    "name": "UnreadRole",
+                    "stage": "list_role_policies",
+                    "error": "AccessDenied",
+                }
+            ],
+        )
+
+        findings = agentcore_app.check_agentcore_gateway_role_scope(cache)
+
+        by_gateway = self._by_gateway(findings, ["gw-read", "gw-unread"])
+        assert by_gateway["gw-read"]["Status"] == "Passed"
+        assert by_gateway["gw-unread"]["Status"] == "N/A"
+        assert by_gateway["gw-unread"]["Finding"].endswith("Incomplete")
+        assert (
+            "list_role_policies: AccessDenied"
+            in (by_gateway["gw-unread"]["Finding_Details"])
+        )
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_role_missing_from_the_cache_is_not_judged(self, mock_ac):
+        self._wire(mock_ac, {"gw-1": "arn:aws:iam::444455556666:role/OtherAccountRole"})
+
+        findings = agentcore_app.check_agentcore_gateway_role_scope(
+            _gateway_role_cache({})
+        )
+
+        assert [f["Status"] for f in findings] == ["N/A"]
+        assert "not in the IAM permission cache" in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_no_cache_is_incomplete(self, mock_ac):
+        self._wire(mock_ac, {"gw-1": "arn:aws:iam::123456789012:role/GwRole"})
+
+        findings = agentcore_app.check_agentcore_gateway_role_scope(None)
+
+        assert [f["Status"] for f in findings] == ["N/A"]
+        assert "1 gateway(s)" in findings[0]["Finding_Details"]
+        assert mock_ac.get_gateway.call_count == 0
+
+    @patch("agentcore_app.agentcore_client")
+    def test_an_unreadable_gateway_or_absent_role_does_not_hide_the_others(
+        self, mock_ac
+    ):
+        self._wire(
+            mock_ac,
+            {
+                "gw-denied": _make_client_error("AccessDeniedException", "Denied"),
+                "gw-norole": None,
+                "gw-wide": "arn:aws:iam::123456789012:role/WideRole",
+            },
+        )
+        cache = _gateway_role_cache(
+            {"WideRole": [_gateway_role_policy("lambda:InvokeFunction", "*")]}
+        )
+
+        findings = agentcore_app.check_agentcore_gateway_role_scope(cache)
+
+        by_gateway = self._by_gateway(findings, ["gw-denied", "gw-norole", "gw-wide"])
+        assert by_gateway["gw-denied"]["Status"] == "N/A"
+        assert "AccessDenied" in by_gateway["gw-denied"]["Finding_Details"]
+        assert by_gateway["gw-norole"]["Status"] == "N/A"
+        assert "roleArn" in by_gateway["gw-norole"]["Finding_Details"]
+        assert by_gateway["gw-wide"]["Status"] == "Failed"
+
+    @patch("agentcore_app.agentcore_client")
+    def test_gateways_are_read_from_every_page(self, mock_ac):
+        mock_ac.list_gateways.side_effect = [
+            {"items": [{"gatewayId": "gw-1", "name": "One"}], "nextToken": "page-2"},
+            {"items": [{"gatewayId": "gw-2", "name": "Two"}]},
+        ]
+        mock_ac.get_gateway.side_effect = lambda gatewayIdentifier, **kwargs: {
+            "roleArn": f"arn:aws:iam::123456789012:role/{gatewayIdentifier}-role"
+        }
+        cache = _gateway_role_cache(
+            {
+                "gw-1-role": [
+                    _gateway_role_policy("lambda:InvokeFunction", _SCOPED_FUNCTION)
+                ],
+                "gw-2-role": [_gateway_role_policy("lambda:InvokeFunction", "*")],
+            }
+        )
+
+        findings = agentcore_app.check_agentcore_gateway_role_scope(cache)
+
+        assert mock_ac.list_gateways.call_count == 2
+        assert [f["Status"] for f in findings] == ["Passed", "Failed"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_deny_or_boundary_removes_the_wide_grant(self, mock_ac):
+        self._wire(
+            mock_ac,
+            {
+                "gw-deny": "arn:aws:iam::123456789012:role/DenyRole",
+                "gw-boundary": "arn:aws:iam::123456789012:role/BoundedRole",
+            },
+        )
+        wide = _gateway_role_policy("s3:GetObject", "*")
+        deny = _tool_policy(
+            "GatewayDeny",
+            {"Statement": [{"Effect": "Deny", "Action": "s3:*", "Resource": "*"}]},
+        )
+        cache = _gateway_role_cache({"DenyRole": [wide, deny], "BoundedRole": [wide]})
+        cache["role_permissions"]["BoundedRole"]["permissions_boundary"] = {
+            "Statement": [
+                {
+                    "Effect": "Allow",
+                    "Action": "lambda:InvokeFunction",
+                    "Resource": _SCOPED_FUNCTION,
+                }
+            ]
+        }
+
+        findings = agentcore_app.check_agentcore_gateway_role_scope(cache)
+
+        assert [f["Status"] for f in findings] == ["Passed", "Passed"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_version_1_cache_says_principal_errors_were_not_recorded(self, mock_ac):
+        self._wire(mock_ac, {"gw-1": "arn:aws:iam::123456789012:role/GwRole"})
+        cache = _gateway_role_cache(
+            {
+                "GwRole": [
+                    _gateway_role_policy("lambda:InvokeFunction", _SCOPED_FUNCTION)
+                ]
+            },
+            version=1,
+        )
+
+        findings = agentcore_app.check_agentcore_gateway_role_scope(cache)
+
+        assert findings[0]["Status"] == "Passed"
+        assert agentcore_app.IAM_CACHE_V1_NOTE in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_an_unparseable_policy_blocks_a_pass(self, mock_ac):
+        self._wire(mock_ac, {"gw-1": "arn:aws:iam::123456789012:role/GwRole"})
+        cache = _gateway_role_cache(
+            {
+                "GwRole": [
+                    _gateway_role_policy("lambda:InvokeFunction", _SCOPED_FUNCTION),
+                    _tool_policy("Broken", "{not json"),
+                ]
+            }
+        )
+
+        findings = agentcore_app.check_agentcore_gateway_role_scope(cache)
+
+        assert [f["Status"] for f in findings] == ["N/A"]
+        assert findings[0]["Finding"].endswith("Incomplete")
+
+    def test_the_leg_is_registered_under_ac25(self):
+        source = inspect.getsource(agentcore_app.lambda_handler)
+        assert "check_agentcore_gateway_role_scope(permission_cache)" in source

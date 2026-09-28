@@ -8478,6 +8478,250 @@ def check_agentcore_gateway_target_authorization() -> List[Dict[str, Any]]:
     return findings
 
 
+def check_agentcore_gateway_role_scope(
+    permission_cache: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    """AC-25: Judge the execution role each gateway calls its targets with.
+
+    A target with GATEWAY_IAM_ROLE outbound auth reaches its backend with the
+    gateway's roleArn, and every tool the gateway exposes shares that role, so a
+    grant of every resource of a kind is a grant to any caller the gateway
+    admits. The role's Allow statements are read from the IAM permission cache
+    with the rules AC-45 applies to a tool role. A role the cache could not
+    read, a role missing from it, and an unparseable policy never pass.
+    """
+    if agentcore_client is None:
+        return [
+            create_finding(
+                check_id="AC-25",
+                finding_name="AgentCore Gateway Role Scope",
+                finding_details="AgentCore client not available in this region.",
+                resolution="No action required unless AgentCore runs in this region.",
+                reference=AGENTCORE_GATEWAY_API_REFERENCE_URL,
+                severity=SeverityEnum.INFORMATIONAL,
+                status=StatusEnum.NA,
+            )
+        ]
+
+    try:
+        gateways = _agentcore_list_all("list_gateways", ["items", "gateways"])
+    except Exception as error:
+        return [
+            _incomplete_check_finding(
+                check_id="AC-25",
+                finding_name="AgentCore Gateway Role Scope",
+                error=error,
+                reference=AGENTCORE_GATEWAY_API_REFERENCE_URL,
+            )
+        ]
+
+    if not gateways:
+        return [
+            create_finding(
+                check_id="AC-25",
+                finding_name="AgentCore Gateway Role Scope",
+                finding_details="No AgentCore gateways found in this region.",
+                resolution="No action required.",
+                reference=AGENTCORE_GATEWAY_API_REFERENCE_URL,
+                severity=SeverityEnum.INFORMATIONAL,
+                status=StatusEnum.NA,
+            )
+        ]
+
+    if not isinstance(permission_cache, dict):
+        return [
+            create_finding(
+                check_id="AC-25",
+                finding_name="AgentCore Gateway Role Scope Incomplete",
+                finding_details=(
+                    f"The IAM permission cache was not available, so the "
+                    f"execution roles of {len(gateways)} gateway(s) were not read."
+                ),
+                resolution=(
+                    "No action is required on the assessed workload based on this "
+                    "result. Rerun the assessment once the IAM permission cache is "
+                    "produced."
+                ),
+                reference=AGENTCORE_GATEWAY_API_REFERENCE_URL,
+                severity=SeverityEnum.INFORMATIONAL,
+                status=StatusEnum.NA,
+            )
+        ]
+
+    role_permissions = permission_cache.get("role_permissions") or {}
+    gap_labels, recorded = _cache_principal_read_gaps(permission_cache, ("role",))
+    unread_roles = {
+        str(entry.get("name", ""))
+        for entry in (permission_cache.get("principal_errors") or [])
+        if isinstance(entry, dict) and entry.get("type") == "role"
+    }
+    v1_note = "" if recorded else " " + IAM_CACHE_V1_NOTE
+
+    findings = []
+    for gateway in gateways:
+        gateway_id = gateway.get("gatewayId", "unknown")
+        gateway_name = gateway.get("name", gateway_id)
+        label = f"Gateway '{gateway_name}' ({gateway_id})"
+
+        try:
+            detail = agentcore_client.get_gateway(gatewayIdentifier=gateway_id)
+        except Exception as error:
+            findings.append(
+                create_finding(
+                    check_id="AC-25",
+                    finding_name="AgentCore Gateway Role Scope",
+                    finding_details=(
+                        f"{label} could not be read: "
+                        f"{_assessment_error_label(error)}, so its execution role "
+                        "was not judged."
+                    ),
+                    resolution="Grant bedrock-agentcore:GetGateway and retry.",
+                    reference=AGENTCORE_GATEWAY_API_REFERENCE_URL,
+                    severity=SeverityEnum.INFORMATIONAL,
+                    status=StatusEnum.NA,
+                )
+            )
+            continue
+
+        role_arn = detail.get("roleArn")
+        if not role_arn:
+            # roleArn is required on CreateGateway, so an answer without it is
+            # an incomplete read and not a gateway without credentials.
+            findings.append(
+                create_finding(
+                    check_id="AC-25",
+                    finding_name="AgentCore Gateway Role Scope",
+                    finding_details=(
+                        f"{label} reported no roleArn, which CreateGateway "
+                        "requires, so its execution role was not judged."
+                    ),
+                    resolution="Grant bedrock-agentcore:GetGateway and retry.",
+                    reference=AGENTCORE_GATEWAY_API_REFERENCE_URL,
+                    severity=SeverityEnum.INFORMATIONAL,
+                    status=StatusEnum.NA,
+                )
+            )
+            continue
+
+        role_name = str(role_arn).rsplit("/", 1)[-1]
+        if role_name in unread_roles:
+            findings.append(
+                create_finding(
+                    check_id="AC-25",
+                    finding_name="AgentCore Gateway Role Scope Incomplete",
+                    finding_details=(
+                        f"{label} uses execution role {role_name}, whose policies "
+                        "the IAM permission cache could not read, so what its "
+                        "targets reach was not judged: "
+                        + ", ".join(
+                            gap
+                            for gap in gap_labels
+                            if gap.startswith(f"role {role_name} (")
+                        )
+                        + "."
+                    ),
+                    resolution=(
+                        "No action is required on the assessed workload based on "
+                        "this result. Grant the cache producer read access to the "
+                        "role's policies and rerun the assessment."
+                    ),
+                    reference=AGENTCORE_GATEWAY_API_REFERENCE_URL,
+                    severity=SeverityEnum.INFORMATIONAL,
+                    status=StatusEnum.NA,
+                )
+            )
+            continue
+        permissions = role_permissions.get(role_name)
+        if not isinstance(permissions, dict):
+            findings.append(
+                create_finding(
+                    check_id="AC-25",
+                    finding_name="AgentCore Gateway Role Scope",
+                    finding_details=(
+                        f"{label} uses execution role {role_arn}, which is not in "
+                        "the IAM permission cache, so what its targets reach was "
+                        "not judged."
+                    ),
+                    resolution=(
+                        "No action is required on the assessed workload based on "
+                        "this result. Confirm the role exists in this account and "
+                        "rerun the assessment."
+                    ),
+                    reference=AGENTCORE_GATEWAY_API_REFERENCE_URL,
+                    severity=SeverityEnum.INFORMATIONAL,
+                    status=StatusEnum.NA,
+                )
+            )
+            continue
+
+        problems, unreadable = _tool_execution_role_problems(permissions)
+        if unreadable:
+            findings.append(
+                create_finding(
+                    check_id="AC-25",
+                    finding_name="AgentCore Gateway Role Scope Incomplete",
+                    finding_details=(
+                        f"{unreadable} cached policy document(s) on {label}'s "
+                        f"execution role {role_name} could not be parsed, so a "
+                        "grant inside one of them was not judged."
+                    ),
+                    resolution=(
+                        "No action is required on the assessed workload based on "
+                        "this result. Repair the unreadable policy documents in the "
+                        "IAM permission cache and rerun the assessment."
+                    ),
+                    reference=AGENTCORE_GATEWAY_API_REFERENCE_URL,
+                    severity=SeverityEnum.INFORMATIONAL,
+                    status=StatusEnum.NA,
+                )
+            )
+        if problems:
+            findings.append(
+                create_finding(
+                    check_id="AC-25",
+                    finding_name="AgentCore Gateway Role Unscoped",
+                    finding_details=(
+                        f"{label} uses execution role {role_name}, which "
+                        f"{'; '.join(problems)}. Every target that authenticates "
+                        "with the gateway's role reaches its backend with it, so "
+                        "any caller the gateway admits reaches everything the "
+                        f"role reaches. {IAM_CACHE_SCP_NOTE}"
+                    ),
+                    resolution=(
+                        "Rewrite the role's policies to name the functions, "
+                        "endpoints and other ARNs this gateway's targets call, "
+                        "and the actions each needs."
+                    ),
+                    reference=AGENTCORE_GATEWAY_API_REFERENCE_URL,
+                    severity=SeverityEnum.HIGH,
+                    status=StatusEnum.FAILED,
+                )
+            )
+        elif not unreadable:
+            findings.append(
+                create_finding(
+                    check_id="AC-25",
+                    finding_name="AgentCore Gateway Role Scope",
+                    finding_details=(
+                        f"{label} uses execution role {role_name}, whose Allow "
+                        "statements name their resources and actions instead of "
+                        "granting every resource or every action of a service."
+                        f"{v1_note}"
+                    ),
+                    resolution=(
+                        "No action required for this check. Confirm the named "
+                        "resources are the ones this gateway's targets need, which "
+                        "is a decision this check does not make."
+                    ),
+                    reference=AGENTCORE_GATEWAY_API_REFERENCE_URL,
+                    severity=SeverityEnum.HIGH,
+                    status=StatusEnum.PASSED,
+                )
+            )
+
+    return findings
+
+
 def _kms_key_policy_allows_open_decrypt(policy_document: Any) -> bool:
     """Return whether a key policy lets every principal decrypt with no condition.
 
@@ -19290,6 +19534,11 @@ def lambda_handler(event, context):
                 ["AC-25"],
                 "Gateway Target Authorization",
                 check_agentcore_gateway_target_authorization,
+            ),
+            (
+                ["AC-25"],
+                "Gateway Role Scope",
+                lambda: check_agentcore_gateway_role_scope(permission_cache),
             ),
             (
                 ["AC-26"],

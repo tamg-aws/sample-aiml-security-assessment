@@ -331,6 +331,13 @@ section.
     web ACL association. `FAIL_OPEN` fails, an unset value is `N/A`, and only
     `FAIL_CLOSE` passes, so an `AG-27` row that passed before can now be
     `Failed` or `N/A`.
+  - `AC-25` adds a `Gateway Role Scope` row per gateway. It reads the
+    attached and inline policies of the gateway's `roleArn` from the IAM
+    permission cache with the `AC-45` rules, so a wildcard action, a
+    `Resource: "*"` or an unbounded ARN segment that no Deny or permissions
+    boundary removes fails as `Unscoped`. A role the cache records as
+    unreadable, a role missing from the cache, and a missing cache are `N/A`
+    and never `Passed`. No new IAM action.
 
 ### Deployment impact
 
