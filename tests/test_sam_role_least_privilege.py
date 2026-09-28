@@ -397,6 +397,25 @@ _EXPECTED_ACTIONS = {
         "s3:GetObject",
         "s3:PutObject",
         "wafv2:GetWebACL",
+        "bedrock-agentcore:GetBatchEvaluation",
+        "bedrock-agentcore:GetEvaluator",
+        "bedrock-agentcore:ListAgentRuntimeEndpoints",
+        "bedrock-agentcore:ListBatchEvaluations",
+        "bedrock-agentcore:ListHarnesses",
+        "bedrock-agentcore:ListPaymentManagers",
+        "ce:GetAnomalySubscriptions",
+        "cloudwatch:ListMetrics",
+        "ec2:GetManagedPrefixListEntries",
+        "events:ListRules",
+        "inspector2:ListCoverage",
+        "logs:DescribeDeliveryDestinations",
+        "network-firewall:DescribeFirewall",
+        "network-firewall:DescribeRuleGroup",
+        "network-firewall:ListFirewalls",
+        "oam:ListLinks",
+        "organizations:DescribeOrganization",
+        "s3:GetAccountPublicAccessBlock",
+        "xray:GetTraceSegmentDestination",
     },
     "AgentRegistrySecurityAssessmentFunction": {
         "agent-registry:GetRegistry",
@@ -1100,6 +1119,93 @@ def test_agentcore_observability_and_governance_reads_are_scoped_where_iam_allow
     assert "Resource: !Sub 'arn:${AWS::Partition}:s3:::*'" in recording
     assert "s3:GetAccountPublicAccessBlock" not in recording
     assert not re.search(r"Resource:\s+['\"]\*['\"]", recording)
+
+
+@pytest.mark.parametrize("template", _SAM_TEMPLATES, ids=os.path.basename)
+def test_agentcore_round2_reads_wildcard_only_enumerations(template):
+    """The round-2 AgentCore reads take '*' only where no resource is named.
+
+    The first statement's actions have no resource type in the service
+    authorization reference. The second statement's actions list every
+    resource of their type, so the request names no ARN to match. Every
+    per-resource read is scoped to its resource type.
+    """
+    unscoped = _statement_block(
+        template,
+        "AgentCoreSecurityAssessmentFunction",
+        "AgentCoreApprovedReadsWithoutResourceType",
+    )
+    for action in (
+        "xray:GetTraceSegmentDestination",
+        "logs:DescribeDeliveryDestinations",
+        "organizations:DescribeOrganization",
+        "oam:ListLinks",
+        "s3:GetAccountPublicAccessBlock",
+        "events:ListRules",
+        "inspector2:ListCoverage",
+        "bedrock-agentcore:ListPaymentManagers",
+        "bedrock-agentcore:ListHarnesses",
+        "bedrock-agentcore:ListBatchEvaluations",
+        "bedrock-agentcore:ListAgentRuntimeEndpoints",
+    ):
+        assert action in unscoped
+    assert re.search(r"Resource:\s+['\"]\*['\"]", unscoped)
+
+    enumerations = _statement_block(
+        template, "AgentCoreSecurityAssessmentFunction", "AgentCoreApprovedEnumerations"
+    )
+    for action in (
+        "network-firewall:ListFirewalls",
+        "cloudwatch:ListMetrics",
+        "ce:GetAnomalySubscriptions",
+    ):
+        assert action in enumerations
+    assert "network-firewall:Describe" not in enumerations
+
+    scoped = {
+        "NetworkFirewallRead": (
+            ("network-firewall:DescribeFirewall", "network-firewall:DescribeRuleGroup"),
+            (
+                "network-firewall:*:${AWS::AccountId}:firewall/*",
+                "network-firewall:*:*:stateful-rulegroup/*",
+            ),
+        ),
+        "PrefixListEntryRead": (
+            ("ec2:GetManagedPrefixListEntries",),
+            ("ec2:*:*:prefix-list/*",),
+        ),
+        "AgentCoreEvaluationRead": (
+            ("bedrock-agentcore:GetEvaluator", "bedrock-agentcore:GetBatchEvaluation"),
+            (
+                "bedrock-agentcore:*:${AWS::AccountId}:evaluator/*",
+                "bedrock-agentcore:*:${AWS::AccountId}:batch-evaluate/*",
+            ),
+        ),
+    }
+    for sid, (actions, resources) in scoped.items():
+        statement = _statement_block(
+            template, "AgentCoreSecurityAssessmentFunction", sid
+        )
+        for action in actions:
+            assert action in statement
+        for resource in resources:
+            assert resource in statement
+        assert not re.search(r"Resource:\s+['\"]\*['\"]", statement)
+
+    # These calls are made by the AgentCore legs but were not approved, so the
+    # legs report N/A naming them until they are.
+    agentcore = _actions(template, "AgentCoreSecurityAssessmentFunction")
+    for action in (
+        "network-firewall:DescribeFirewallPolicy",
+        "events:ListTargetsByRule",
+        "ec2:DescribeNatGateways",
+        "ce:GetAnomalyMonitors",
+        "logs:DescribeMetricFilters",
+        "bedrock:GetModelInvocationLoggingConfiguration",
+        "bedrock-agentcore:ListAgentRuntimeVersions",
+        "wafv2:GetSampledRequests",
+    ):
+        assert action not in agentcore
 
 
 @pytest.mark.parametrize("template", _SAM_TEMPLATES, ids=os.path.basename)

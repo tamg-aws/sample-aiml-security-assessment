@@ -1324,6 +1324,65 @@ Resources:
               Action:
                 - cloudwatch:DescribeAlarms # AC-40, AC-46
               Resource: !Sub 'arn:${AWS::Partition}:cloudwatch:*:${AWS::AccountId}:alarm:*'
+            - Sid: AgentCoreApprovedReadsWithoutResourceType
+              # Read-only reads approved for the AgentCore legs. None of these
+              # has a resource type in the service authorization reference, so
+              # each needs Resource '*'.
+              Effect: Allow
+              Action:
+                - xray:GetTraceSegmentDestination # AC-19
+                - logs:DescribeDeliveryDestinations # AC-20
+                - organizations:DescribeOrganization # AC-22
+                - oam:ListLinks # AC-22
+                - s3:GetAccountPublicAccessBlock # AC-06
+                - events:ListRules # AC-36, AC-50
+                - inspector2:ListCoverage # AC-50
+                - bedrock-agentcore:ListPaymentManagers # AC-02, AC-48
+                - bedrock-agentcore:ListHarnesses # AC-34, AC-48
+                - bedrock-agentcore:ListBatchEvaluations # AC-41
+                - bedrock-agentcore:ListAgentRuntimeEndpoints # AC-17, AC-30
+              Resource: '*'
+            - Sid: AgentCoreApprovedEnumerations
+              # These three list every resource of their type and name none in
+              # the request. The service authorization reference gives each a
+              # resource type (firewall, dataset, anomalysubscription), but a
+              # request that names no resource is authorized against '*', so an
+              # ARN here would deny the call the way it does for GetTokenVault.
+              Effect: Allow
+              Action:
+                - network-firewall:ListFirewalls # AC-49
+                - cloudwatch:ListMetrics # AC-40
+                - ce:GetAnomalySubscriptions # AC-46
+              Resource: '*'
+            - Sid: NetworkFirewallRead
+              # AC-49 reads each firewall a hosting subnet routes to, in this
+              # account. A rule group can be shared through AWS RAM from another
+              # account, so its account segment stays open.
+              Effect: Allow
+              Action:
+                - network-firewall:DescribeFirewall # AC-49
+                - network-firewall:DescribeRuleGroup # AC-49
+              Resource:
+                - !Sub 'arn:${AWS::Partition}:network-firewall:*:${AWS::AccountId}:firewall/*'
+                - !Sub 'arn:${AWS::Partition}:network-firewall:*:*:stateful-rulegroup/*'
+            - Sid: PrefixListEntryRead
+              # AC-01 and AC-08 resolve the prefix lists a security group rule
+              # names. AWS-managed lists carry the account segment aws, and a
+              # customer list can be shared through AWS RAM, so the account
+              # segment stays open.
+              Effect: Allow
+              Action:
+                - ec2:GetManagedPrefixListEntries # AC-01, AC-08
+              Resource: !Sub 'arn:${AWS::Partition}:ec2:*:*:prefix-list/*'
+            - Sid: AgentCoreEvaluationRead
+              # AC-41 and AC-44 read each custom evaluator and batch evaluation.
+              Effect: Allow
+              Action:
+                - bedrock-agentcore:GetEvaluator # AC-41, AC-44
+                - bedrock-agentcore:GetBatchEvaluation # AC-41
+              Resource:
+                - !Sub 'arn:${AWS::Partition}:bedrock-agentcore:*:${AWS::AccountId}:evaluator/*'
+                - !Sub 'arn:${AWS::Partition}:bedrock-agentcore:*:${AWS::AccountId}:batch-evaluate/*'
             - Sid: BrowserRecordingBucketRead
               # AC-06 reads the configuration of each custom browser's recording
               # bucket. The bucket name is customer-chosen, so it is not known at

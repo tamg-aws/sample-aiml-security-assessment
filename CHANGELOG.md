@@ -219,70 +219,71 @@ section.
 - `AC-19` reads the region's X-Ray trace segment destination when AgentCore
   runtimes, gateways or memories exist, and fails `XRay`, because AgentCore
   tracing needs CloudWatch Transaction Search, which sends segments to
-  CloudWatch Logs. The report said the setting was not read. The assessment
-  roles hold no `xray:GetTraceSegmentDestination` grant, so the row is `N/A`
-  naming that action until it is added.
+  CloudWatch Logs. The report said the setting was not read. The AgentCore
+  assessment role gains `xray:GetTraceSegmentDestination`, and a denied read
+  is `N/A` naming that action.
 - `AC-20` judges a log group outside the AgentCore prefixes that an AgentCore
   delivery writes to. A delivery to such a group escaped the check. The
-  assessment roles hold no `logs:DescribeDeliveryDestinations` grant, so the
-  check reports an `N/A` row naming it and judges the prefixed groups only.
+  AgentCore assessment role gains `logs:DescribeDeliveryDestinations`. When it
+  is denied, the check reports an `N/A` row naming it and judges the prefixed
+  groups only.
 - `AC-22` reads the links an account with no sink shares telemetry through,
   and fails a link that omits log groups, traces or metrics. The check said
-  source-account links were not read. The assessment roles hold no
-  `oam:ListLinks` grant, so the row is `N/A` naming that action until it is
-  added.
+  source-account links were not read. The AgentCore assessment role gains
+  `oam:ListLinks` and `organizations:DescribeOrganization`, and a denied read
+  is `N/A` naming the action.
 - `AC-46` judges runtime spend on a new `AgentCore Runtime Cost Anomaly
   Alerting` row: the account needs a Cost Anomaly Detection subscription that
   notifies someone about a monitor for every AWS service. The check reported
-  that no cost limit could be read. The AgentCore assessment role holds no
-  `ce:GetAnomalySubscriptions` or `ce:GetAnomalyMonitors` grant, so the row is
-  `N/A` naming them until they are added.
+  that no cost limit could be read. The AgentCore assessment role gains
+  `ce:GetAnomalySubscriptions`. It holds no `ce:GetAnomalyMonitors` grant, so
+  the row is `N/A` naming that action until it is added.
 - `AC-06` reads the recording account's Block Public Access settings when the
   recording bucket leaves one off, and fails a setting off on both. Such a
-  bucket was `N/A`. The assessment roles hold no
-  `s3:GetAccountPublicAccessBlock` grant, so it stays `N/A`, naming that
-  action, until it is added.
+  bucket was `N/A`. The AgentCore assessment role gains
+  `s3:GetAccountPublicAccessBlock`, and a denied read stays `N/A` naming that
+  action.
 - `AC-30` judges the inbound authorizer of every version a runtime endpoint
   serves, not only the default version, which let an endpoint route callers
   to a version with an unbounded JWT authorizer while the runtime passed. The
-  assessment roles hold no `bedrock-agentcore:ListAgentRuntimeEndpoints`
-  grant, so a runtime that would pass is `N/A` naming it until it is added.
+  AgentCore assessment role gains `bedrock-agentcore:ListAgentRuntimeEndpoints`;
+  when it is denied, a runtime that would pass is `N/A` naming it.
 - `AC-17` requires the log group of every endpoint a runtime serves to be
   read by a running online evaluation, which let a configuration over
   `<runtimeId>-DEFAULT` pass a runtime whose `prod` endpoint was unscored. A
   service name scoped to one endpoint (`agent.DEFAULT`) no longer covers the
-  others. Without a `bedrock-agentcore:ListAgentRuntimeEndpoints` grant, which
-  the assessment roles do not hold, a runtime that would pass is `N/A` naming
-  it until it is added.
+  others. When `bedrock-agentcore:ListAgentRuntimeEndpoints` is denied, a
+  runtime that would pass is `N/A` naming it.
 - `AC-44` fails a bounded model pattern on an evaluation execution role that
   reaches no model the role's custom evaluators call, as `GetEvaluator`
   reports it. `AC-41` gains rows for the key of each custom evaluator and
   batch evaluation, credited only by `DescribeKey`, and judges each batch
-  evaluation's results log group. The assessment roles hold no
-  `bedrock-agentcore:GetEvaluator`, `ListBatchEvaluations` or
-  `GetBatchEvaluation` grant, so those legs are `N/A` naming the action until
-  it is added.
+  evaluation's results log group. The AgentCore assessment role gains
+  `bedrock-agentcore:GetEvaluator`, `ListBatchEvaluations` and
+  `GetBatchEvaluation`, and a denied leg is `N/A` naming the action.
 - `AC-40` counts a score alarm only when `cloudwatch:ListMetrics` lists the
   metric it reads, by name and dimension set, in the configuration's
   namespace. An alarm on a misspelled metric name, or on a dimension set the
   service does not publish, passed on its namespace alone and never fires.
-  The assessment roles hold no `cloudwatch:ListMetrics` grant, so a
-  configuration that would pass is `N/A` naming it until it is added.
+  The AgentCore assessment role gains `cloudwatch:ListMetrics`; when it is
+  denied, a configuration that would pass is `N/A` naming it.
 - `AC-49` gains a Network Firewall leg that follows each hosting subnet's
   default route to a firewall endpoint, one hop or through a NAT gateway,
   and judges the reached policy for a domain allow-list over `TLS_SNI` and
   `HTTP_HOST` and for AWS managed threat signature and domain reputation
   groups. DNS Firewall alone passed a VPC whose agents could connect to any
-  address. The assessment roles hold no `network-firewall` read or
+  address. The AgentCore assessment role gains
+  `network-firewall:ListFirewalls`, `DescribeFirewall` and `DescribeRuleGroup`.
+  It holds no `network-firewall:DescribeFirewallPolicy` or
   `ec2:DescribeNatGateways` grant, so the rows are `N/A` naming the action
   until it is added.
 - `AC-50` reads Inspector coverage per AgentCore repository and requires an
   EventBridge rule with a target that matches Inspector findings on ECR
   images. A registry scanning rule passed while Inspector reported the
   repository `INACTIVE`, and no finding had to reach a deploy stage. The
-  assessment roles hold no `inspector2:ListCoverage`, `events:ListRules` or
-  `events:ListTargetsByRule` grant, so the rows are `N/A` naming the action
-  until it is added.
+  AgentCore assessment role gains `inspector2:ListCoverage` and
+  `events:ListRules`. It holds no `events:ListTargetsByRule` grant, so the
+  gate row is `N/A` naming that action until it is added.
 - `AC-45` judges each AgentCore runtime's own execution role by the rules it
   applies to a tool role. No check read a runtime role outside the AgentCore
   namespace, so one granting `s3:*` or every foundation model passed.
