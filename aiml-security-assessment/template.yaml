@@ -68,7 +68,7 @@ Parameters:
     Type: String
     Default: "false"
     AllowedValues: ["true", "false"]
-    Description: Fail AC-17 when no complete active online evaluation configuration is found.
+    Description: Fail AC-17 in a region with no AgentCore runtime when no running online evaluation configuration is found. Every runtime is judged whatever this is set to.
   RequireAgentRegistryCMK:
     Type: String
     Default: "false"
@@ -979,6 +979,12 @@ Resources:
                 - bedrock-agentcore:ListGatewayRateLimits
                 - bedrock-agentcore:ListGatewayTargets
                 - bedrock-agentcore:GetGatewayTarget
+                # AC-02 reads a payment manager's retrieval role when the list
+                # summary omits it, and AC-48 reads each harness's execution
+                # role. The service authorization reference lists the
+                # payment-manager and harness resource types for these.
+                - bedrock-agentcore:GetPaymentManager
+                - bedrock-agentcore:GetHarness
               Resource:
                 - !Sub 'arn:${AWS::Partition}:bedrock-agentcore:*:${AWS::AccountId}:runtime/*'
                 - !Sub 'arn:${AWS::Partition}:bedrock-agentcore:*:${AWS::AccountId}:runtime/*/runtime-endpoint/*'
@@ -989,6 +995,8 @@ Resources:
                 - !Sub 'arn:${AWS::Partition}:bedrock-agentcore:*:${AWS::AccountId}:code-interpreter-custom/*'
                 - !Sub 'arn:${AWS::Partition}:bedrock-agentcore:*:${AWS::AccountId}:browser-custom/*'
                 - !Sub 'arn:${AWS::Partition}:bedrock-agentcore:*:${AWS::AccountId}:online-evaluation-config/*'
+                - !Sub 'arn:${AWS::Partition}:bedrock-agentcore:*:${AWS::AccountId}:payment-manager/*'
+                - !Sub 'arn:${AWS::Partition}:bedrock-agentcore:*:${AWS::AccountId}:harness/*'
             - Sid: AgentCoreTokenVaultRead
               Effect: Allow
               Action:
@@ -996,6 +1004,21 @@ Resources:
                 # token-vault resource type documented for the action.
                 - bedrock-agentcore:GetTokenVault
               Resource: '*'
+            # AC-18 counts workload identities and credential providers to decide
+            # which identity data-event types are in use, and AC-14 reads the
+            # token vault each provider ARN names. The service authorization
+            # reference lists workload-identity-directory for
+            # ListWorkloadIdentities and token-vault for the three provider lists.
+            - Sid: AgentCoreIdentityInventory
+              Effect: Allow
+              Action:
+                - bedrock-agentcore:ListWorkloadIdentities
+                - bedrock-agentcore:ListOauth2CredentialProviders
+                - bedrock-agentcore:ListApiKeyCredentialProviders
+                - bedrock-agentcore:ListPaymentCredentialProviders
+              Resource:
+                - !Sub 'arn:${AWS::Partition}:bedrock-agentcore:*:${AWS::AccountId}:workload-identity-directory/*'
+                - !Sub 'arn:${AWS::Partition}:bedrock-agentcore:*:${AWS::AccountId}:token-vault/*'
             - Sid: IAMRolePermissions
               Effect: Allow
               Action:
@@ -1116,6 +1139,8 @@ Resources:
               Effect: Allow
               Action:
                 - cloudtrail:GetEventSelectors
+                - cloudtrail:GetTrail # AC-26 log file validation, AC-18 trail region
+                - cloudtrail:GetTrailStatus # AC-18 IsLogging
               Resource: !Sub 'arn:${AWS::Partition}:cloudtrail:*:${AWS::AccountId}:trail/*'
             # AC-19 pairs each AgentCore delivery source with its delivery.
             - Sid: LogsDeliveryInventory
@@ -1154,6 +1179,15 @@ Resources:
               Action:
                 - kms:GetKeyPolicy
               Resource: !Sub 'arn:${AWS::Partition}:kms:*:${AWS::AccountId}:key/*'
+            # AC-07, AC-11 and AC-14 read a memory, policy engine or token vault
+            # key's manager and state, and AC-36 lists the key's grants to find
+            # the engine's management and evaluation grants.
+            - Sid: PolicyEngineKeyStateRead
+              Effect: Allow
+              Action:
+                - kms:DescribeKey
+                - kms:ListGrants
+              Resource: !Sub 'arn:${AWS::Partition}:kms:*:${AWS::AccountId}:key/*'
             # AC-28 reads the organization's service control policies to see
             # whether one denies creating a gateway with no inbound authorizer.
             # ListPolicies takes no resource; DescribePolicy is scoped to the
@@ -1171,6 +1205,21 @@ Resources:
               Resource:
                 - !Sub 'arn:${AWS::Partition}:organizations::*:policy/*/*/*'
                 - !Sub 'arn:${AWS::Partition}:organizations::aws:policy/*/*'
+            # AC-28 and AC-29 count an SCP only when it binds this account, so
+            # they walk this account's parents up to the root and read where
+            # each guarding policy is attached.
+            - Sid: OrganizationsPolicyAttachmentRead
+              Effect: Allow
+              Action:
+                - organizations:ListTargetsForPolicy # AC-28, AC-29
+              Resource: !Sub 'arn:${AWS::Partition}:organizations::*:policy/o-*/service_control_policy/p-*'
+            - Sid: OrganizationsParentRead
+              Effect: Allow
+              Action:
+                - organizations:ListParents # AC-28, AC-29
+              Resource:
+                - !Sub 'arn:${AWS::Partition}:organizations::*:account/o-*/${AWS::AccountId}'
+                - !Sub 'arn:${AWS::Partition}:organizations::*:ou/o-*/ou-*'
             - Sid: CloudWatchPermissions
               Effect: Allow
               Action:
@@ -1179,6 +1228,23 @@ Resources:
               Condition:
                 StringEquals:
                   cloudwatch:namespace: AIMLSecurity/AgentCore
+            - Sid: EvaluationScoreAlarmRead
+              Effect: Allow
+              Action:
+                - cloudwatch:DescribeAlarms # AC-40, AC-46
+              Resource: !Sub 'arn:${AWS::Partition}:cloudwatch:*:${AWS::AccountId}:alarm:*'
+            - Sid: BrowserRecordingBucketRead
+              # AC-06 reads the configuration of each custom browser's recording
+              # bucket. The bucket name is customer-chosen, so it is not known at
+              # deploy time; every call also passes ExpectedBucketOwner.
+              Effect: Allow
+              Action:
+                - s3:GetEncryptionConfiguration
+                - s3:GetBucketPublicAccessBlock
+                - s3:GetBucketPolicy
+                - s3:GetLifecycleConfiguration
+                - s3:GetBucketVersioning
+              Resource: !Sub 'arn:${AWS::Partition}:s3:::*'
 
 
   AgentRegistrySecurityAssessmentFunction:

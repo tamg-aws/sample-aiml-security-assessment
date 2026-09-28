@@ -176,12 +176,21 @@ REQUIRED_AGENTCORE_ACTIONS = {
     "bedrock-agentcore:ListGatewayRateLimits",
     "bedrock-agentcore:ListGatewayTargets",
     "bedrock-agentcore:GetGatewayTarget",
+    # AC-18 counts the identity resources and reads each trail's region and
+    # logging state.
+    "bedrock-agentcore:ListWorkloadIdentities",
+    "bedrock-agentcore:ListOauth2CredentialProviders",
+    "bedrock-agentcore:ListApiKeyCredentialProviders",
+    "cloudtrail:GetTrail",
+    "cloudtrail:GetTrailStatus",
     # AC-50 reads the registry scanning configuration.
     "ecr:GetRegistryScanningConfiguration",
     # AC-52 reads the Cognito user pools AgentCore JWT authorizers name.
     "cognito-idp:DescribeUserPool",
     "cognito-idp:ListUserPoolClients",
     "cognito-idp:DescribeUserPoolClient",
+    # AC-40 reads the alarms on evaluation scores.
+    "cloudwatch:DescribeAlarms",
 }
 
 REQUIRED_AGENT_REGISTRY_ACTIONS = {
@@ -780,6 +789,10 @@ _VERIFIED_REMEDIATION_CONDITION_KEYS = {
     "bedrock-agentcore:InboundJwtClaim",
     # Same second run as the AC-42 action block above.
     "iam:PassedToService",
+    # Verified 2026-09-28 with ValidatePolicy (RESOURCE_POLICY) on a key policy
+    # statement: kms:CallerAccountNotReal came back INVALID_SERVICE_CONDITION_KEY
+    # and kms:CallerAccount raised nothing.
+    "kms:CallerAccount",
 }
 
 # Verified the same way and on the same date: ValidatePolicy reports an
@@ -917,6 +930,106 @@ _VERIFIED_REMEDIATION_CONDITION_KEYS |= {
     "aws:PrincipalArn",
     "aws:SourceVpc",
     "aws:SecureTransport",
+}
+
+# Verified on 2026-09-28 with one IDENTITY_POLICY validate-policy run for the
+# AC-14 vault population, one statement per name on a token-vault ARN.
+# bedrock-agentcore:ListOauth2CredentialProviders,
+# ListApiKeyCredentialProviders and ListPaymentCredentialProviders at indexes 0
+# to 2 were not reported. The negative controls
+# bedrock-agentcore:ListOauth2CredentialProvider and
+# ListPaymentCredentialProviderz came back INVALID_ACTION at indexes 3 and 4.
+_VERIFIED_REMEDIATION_IAM_ACTIONS |= {
+    "bedrock-agentcore:ListOauth2CredentialProviders",
+    "bedrock-agentcore:ListApiKeyCredentialProviders",
+    "bedrock-agentcore:ListPaymentCredentialProviders",
+}
+
+# Verified on 2026-09-28 with one IDENTITY_POLICY validate-policy run for the
+# AC-11 and AC-36 key legs, one statement per name on a key ARN.
+# kms:ListGrants at index 0, kms:DescribeKey at index 1 and
+# kms:GrantConstraintType on kms:CreateGrant at index 2 were not reported. The
+# negative controls kms:ListGrantz and kms:DescribeKeyz came back INVALID_ACTION
+# at indexes 3 and 4, and kms:GrantConstraintTypez came back
+# INVALID_SERVICE_CONDITION_KEY at index 5.
+_VERIFIED_REMEDIATION_IAM_ACTIONS |= {"kms:ListGrants", "kms:DescribeKey"}
+
+_VERIFIED_REMEDIATION_CONDITION_KEYS |= {"kms:GrantConstraintType"}
+
+# Verified on 2026-09-27 with one IDENTITY_POLICY validate-policy run for the
+# AgentCore payment manager and harness legs of AC-02 and AC-48, one statement
+# per name. The negative controls bedrock-agentcore:ListPaymentManager,
+# bedrock-agentcore:DescribePaymentManager and bedrock-agentcore:ListHarness
+# came back INVALID_ACTION at statement indexes 5, 6 and 7, and
+# aws:AccountOfPrincipal came back INVALID_GLOBAL_CONDITION_KEY at index 8.
+# Indexes 0 to 4, the names below, were not reported.
+_VERIFIED_REMEDIATION_IAM_ACTIONS |= {
+    "bedrock-agentcore:ListPaymentManagers",
+    "bedrock-agentcore:GetPaymentManager",
+    "bedrock-agentcore:ListHarnesses",
+    "bedrock-agentcore:GetHarness",
+}
+
+_VERIFIED_REMEDIATION_CONDITION_KEYS |= {"aws:PrincipalAccount"}
+
+# Verified on 2026-09-27 with one IDENTITY_POLICY validate-policy run for the
+# AC-23 remediation, one statement per key. aws:PrincipalTag/userId at index 0
+# and as a policy variable inside bedrock-agentcore:namespace at index 2, and
+# bedrock-agentcore:actorId and sessionId at index 3, were not reported. The
+# negative controls aws:PrincipalTagz/userId came back
+# INVALID_GLOBAL_CONDITION_KEY at index 1 and bedrock-agentcore:actorIdz came
+# back INVALID_SERVICE_CONDITION_KEY at index 4.
+_VERIFIED_REMEDIATION_CONDITION_KEYS |= {"aws:PrincipalTag"}
+
+# Verified on 2026-09-27 with one IDENTITY_POLICY validate-policy run for the
+# AC-45 command shell leg, one statement per name on a runtime ARN.
+# bedrock-agentcore:InvokeAgentRuntimeCommandShell at index 0 and
+# bedrock-agentcore:InvokeAgentRuntimeCommand at index 1 were not reported. The
+# negative controls bedrock-agentcore:InvokeAgentRuntimeCommandShellz and
+# bedrock-agentcore:InvokeAgentRuntimeCommandz came back INVALID_ACTION at
+# indexes 2 and 3.
+_VERIFIED_REMEDIATION_IAM_ACTIONS |= {
+    "bedrock-agentcore:InvokeAgentRuntimeCommandShell",
+    "bedrock-agentcore:InvokeAgentRuntimeCommand",
+}
+
+# Verified on 2026-09-27 with one IDENTITY_POLICY validate-policy run for the
+# AC-27 and AC-47 Deny-form legs, three names in one Action list.
+# bedrock-agentcore:InvokeGateway at action index 0 and
+# bedrock-agentcore:InvokeAgentRuntime at index 1 were not reported. The negative
+# control bedrock-agentcore:InvokeGatewayz came back INVALID_ACTION at index 2.
+_VERIFIED_REMEDIATION_IAM_ACTIONS |= {
+    "bedrock-agentcore:InvokeGateway",
+    "bedrock-agentcore:InvokeAgentRuntime",
+}
+
+# Verified on 2026-09-27 with one IDENTITY_POLICY validate-policy run for the
+# AC-28 and AC-29 attachment legs, one statement per name on its resource type.
+# organizations:ListParents at index 0 and organizations:ListTargetsForPolicy at
+# index 1 were not reported. The negative control organizations:ListParentz came
+# back INVALID_ACTION at index 2.
+_VERIFIED_REMEDIATION_IAM_ACTIONS |= {
+    "organizations:ListParents",
+    "organizations:ListTargetsForPolicy",
+}
+
+# Verified on 2026-09-27 with one IDENTITY_POLICY validate-policy run for the
+# AC-26 trail log file validation leg, on the trail resource type.
+# cloudtrail:GetTrail at index 0 was not reported. The negative control
+# cloudtrail:GetTrailz came back INVALID_ACTION at index 1.
+_VERIFIED_REMEDIATION_IAM_ACTIONS |= {
+    "cloudtrail:GetTrail",
+}
+
+# Verified on 2026-09-27 with one IDENTITY_POLICY validate-policy run for the
+# AC-18 trail status and identity inventory legs. cloudtrail:GetTrailStatus,
+# cloudtrail:GetTrail, bedrock-agentcore:ListWorkloadIdentities,
+# bedrock-agentcore:ListOauth2CredentialProviders and
+# bedrock-agentcore:ListApiKeyCredentialProviders were not reported. The
+# negative controls bedrock-agentcore:ListNotARealThing and
+# cloudtrail:GetTrailStatusAndStuff came back INVALID_ACTION.
+_VERIFIED_REMEDIATION_IAM_ACTIONS |= {
+    "cloudtrail:GetTrailStatus",
 }
 
 # Verified on 2026-09-27 with one IDENTITY_POLICY validate-policy run for
