@@ -71,40 +71,42 @@ AI_SUBJECT_ROWS = [
     ("AIR-BDR-MDL-09", COVERED, None, "bedrock_assessments", ["BR-45"], "", [], 3),
     (
         "AIR-BDR-KB-05",
-        NOT_IMPL,
+        COVERED,
         None,
-        None,
+        "bedrock_assessments",
+        ["BR-34"],
+        "partial, ceiling reached. BR-34 reads every data source with GetDataSource "
+        "for a POST_CHUNKING transformation Lambda, and every agent version and flow "
+        "node that retrieves from the knowledge base, at DRAFT and at each "
+        "alias-routed version, with ListAgentKnowledgeBases and the flow definition. "
+        "It fails a knowledge base that ingests a source with no transformation step "
+        "and is reached through no guardrail whose PROMPT_ATTACK input filter blocks "
+        "at HIGH strength, or through an agent or node with no such guardrail, and it "
+        "never passes one. The ceiling: a transformation Lambda's logic is opaque, "
+        "KnowledgeBase has no guardrailConfiguration member, and a direct "
+        "RetrieveAndGenerate caller supplies guardrailId per request, so no read can "
+        "show that retrieved chunks are screened",
         [],
-        "the screening step is readable configuration and reading it proves nothing: "
-        "GetDataSource returns vectorIngestionConfiguration.customTransformationConfiguration"
-        ".transformations[].transformationFunction.transformationLambdaConfiguration.lambdaArn "
-        "with stepToApply POST_CHUNKING, so a check can see that a customer Lambda rewrites "
-        "each chunk, and no API says whether it looks for instruction-like patterns. The "
-        "guardrail leg is readable and unattributable: GetGuardrail exposes the PROMPT_ATTACK "
-        "content filter, but KnowledgeBase has no guardrailConfiguration member, only Agent "
-        "and KnowledgeBaseFlowNodeConfiguration do, and a direct RetrieveAndGenerate caller "
-        "supplies guardrailId per request, so a read cannot bind the filter to this knowledge "
-        "base",
-        [],
-        None,
+        3,
     ),
     (
         "AIR-BDR-KB-08",
-        NOT_IMPL,
+        COVERED,
         None,
-        None,
+        "bedrock_assessments",
+        ["BR-26"],
+        "partial, ceiling reached. BR-26 fails a knowledge base that ingests a source "
+        "with no POST_CHUNKING transformation step and no completed Comprehend "
+        "ONLY_REDACTION job whose output location holds everything the source "
+        "ingests, and that is reached through no agent version or flow node whose "
+        "guardrail sets a PII entity type to BLOCK or ANONYMIZE, or through one that "
+        "sets none. It never passes one. comprehend:ListPiiEntitiesDetectionJobs has "
+        "no resource type and is not granted, so an S3 source reads as not judged "
+        "until it is. The ceiling: a transformation Lambda's logic and a Glue job's "
+        "effect are not recorded, and a direct RetrieveAndGenerate caller supplies "
+        "guardrailId per request",
         [],
-        "every nearby surface is readable and none of them is evidence of redaction: a "
-        "pre-ingestion Comprehend or Glue job is not an attribute of the knowledge base, "
-        "macie2 GetAutomatedDiscoveryConfiguration reports that discovery is enabled and "
-        "where sensitive data was found, never that it was removed, and a guardrail "
-        "sensitiveInformationPolicy with piiEntities action ANONYMIZE or BLOCK is readable on "
-        "GetGuardrail but recorded on an Agent or a flow node and not on the knowledge base, "
-        "with a direct RetrieveAndGenerate caller supplying guardrailId per request. The "
-        "strongest assertable statement is that some guardrail in the account masks PII, "
-        "which is not evidence that this knowledge base's content reaches a model redacted",
-        [],
-        None,
+        3,
     ),
     (
         "AIR-BDR-MDL-08",

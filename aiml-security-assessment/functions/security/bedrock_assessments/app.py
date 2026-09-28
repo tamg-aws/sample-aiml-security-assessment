@@ -11016,6 +11016,485 @@ def _check_guardrail_content_filters_from_inventory(
     return findings
 
 
+def _knowledge_base_id(value: Any) -> str:
+    """Reduce a knowledge base ID or ARN to the ID."""
+    return str(value or "").rsplit("/", 1)[-1]
+
+
+def get_knowledge_base_screening_inventory(
+    region: str = "", attachment_inventory: Dict[str, Any] = None
+) -> Dict[str, Any]:
+    """
+    Read what stands between each knowledge base and a model: the POST_CHUNKING
+    transformation step of each data source, and each agent version and flow
+    node that retrieves from it together with the guardrail version it applies.
+
+    Agents and flows are read at DRAFT and at every version an alias routes to.
+    A failed agent or flow read is recorded once in ``errors``, because any
+    knowledge base could be reached through the agent or flow that was not read.
+    """
+    inventory = {
+        "knowledge_bases": [],
+        "errors": [],
+        "enforced": [],
+        "enforced_errors": [],
+        "details": {},
+        "list_error": "",
+    }
+    errors = inventory["errors"]
+    client = boto3.client("bedrock-agent", config=boto3_config, region_name=region)
+    try:
+        summaries = _list_all_items(
+            client, "list_knowledge_bases", "knowledgeBaseSummaries"
+        )
+    except (ClientError, BotoCoreError, TypeError) as error:
+        inventory["list_error"] = get_assessment_error_label(error)
+        return inventory
+    by_id = {}
+    for summary in summaries:
+        kb_id = summary.get("knowledgeBaseId")
+        if not kb_id:
+            continue
+        entry = {
+            "id": kb_id,
+            "label": f"knowledge base '{summary.get('name') or kb_id}'",
+            "sources": [],
+            "fronts": [],
+            "errors": [],
+        }
+        by_id[kb_id] = entry
+        inventory["knowledge_bases"].append(entry)
+        try:
+            sources = _list_all_items(
+                client,
+                "list_data_sources",
+                "dataSourceSummaries",
+                knowledgeBaseId=kb_id,
+            )
+            for source in sources:
+                source_id = source.get("dataSourceId")
+                if not source_id:
+                    continue
+                data_source = (
+                    client.get_data_source(
+                        knowledgeBaseId=kb_id, dataSourceId=source_id
+                    ).get("dataSource")
+                    or {}
+                )
+                transformations = (
+                    (data_source.get("vectorIngestionConfiguration") or {}).get(
+                        "customTransformationConfiguration"
+                    )
+                    or {}
+                ).get("transformations") or []
+                configuration = data_source.get("dataSourceConfiguration") or {}
+                s3_configuration = configuration.get("s3Configuration") or {}
+                entry["sources"].append(
+                    {
+                        "label": f"data source '{data_source.get('name') or source_id}'",
+                        "type": str(configuration.get("type") or "unspecified"),
+                        "transformations": sorted(
+                            str(
+                                (
+                                    (step.get("transformationFunction") or {}).get(
+                                        "transformationLambdaConfiguration"
+                                    )
+                                    or {}
+                                ).get("lambdaArn")
+                            )
+                            for step in transformations
+                            if isinstance(step, dict)
+                            and step.get("stepToApply") == "POST_CHUNKING"
+                            and (
+                                (step.get("transformationFunction") or {}).get(
+                                    "transformationLambdaConfiguration"
+                                )
+                                or {}
+                            ).get("lambdaArn")
+                        ),
+                        "bucket": _s3_bucket_name_from_arn(
+                            s3_configuration.get("bucketArn")
+                        ),
+                        "prefixes": [
+                            str(prefix)
+                            for prefix in s3_configuration.get("inclusionPrefixes")
+                            or []
+                        ],
+                    }
+                )
+        except (ClientError, BotoCoreError, TypeError) as error:
+            entry["errors"].append(
+                "its data sources were not read with bedrock:ListDataSources and "
+                f"bedrock:GetDataSource ({get_assessment_error_label(error)})"
+            )
+
+    def front(kb_id: Any, surface: str, guardrail: Dict[str, Any]) -> None:
+        entry = by_id.get(_knowledge_base_id(kb_id))
+        if entry is None:
+            return
+        reference = None
+        if isinstance(guardrail, dict) and guardrail.get("guardrailIdentifier"):
+            parsed = _parse_guardrail_reference(
+                str(guardrail["guardrailIdentifier"]), region
+            )
+            reference = {
+                "identifier": parsed["identifier"],
+                "region": parsed["region"] or region,
+                "version": str(guardrail.get("guardrailVersion") or "")
+                or GUARDRAIL_DRAFT_VERSION,
+            }
+        entry["fronts"].append({"surface": surface, "guardrail": reference})
+
+    try:
+        agents = _list_all_items(client, "list_agents", "agentSummaries")
+    except (ClientError, BotoCoreError, TypeError) as error:
+        agents = []
+        errors.append(
+            f"agents were not read with bedrock:ListAgents ({get_assessment_error_label(error)})"
+        )
+    for agent in agents:
+        agent_id = agent.get("agentId")
+        name = agent.get("agentName") or agent_id
+        try:
+            aliases = _list_all_items(
+                client, "list_agent_aliases", "agentAliasSummaries", agentId=agent_id
+            )
+            versions = [(GUARDRAIL_DRAFT_VERSION, agent.get("guardrailConfiguration"))]
+            for version in sorted(
+                {
+                    str(route.get("agentVersion"))
+                    for alias in aliases
+                    for route in alias.get("routingConfiguration") or []
+                    if route.get("agentVersion")
+                    and route.get("agentVersion") != GUARDRAIL_DRAFT_VERSION
+                }
+            ):
+                detail = client.get_agent_version(
+                    agentId=agent_id, agentVersion=version
+                ).get("agentVersion", {})
+                versions.append((version, detail.get("guardrailConfiguration")))
+            for version, guardrail in versions:
+                linked = _list_all_items(
+                    client,
+                    "list_agent_knowledge_bases",
+                    "agentKnowledgeBaseSummaries",
+                    agentId=agent_id,
+                    agentVersion=version,
+                )
+                for link in linked:
+                    if link.get("knowledgeBaseState") == "DISABLED":
+                        continue
+                    front(
+                        link.get("knowledgeBaseId"),
+                        f"agent '{name}' {version}",
+                        guardrail,
+                    )
+        except (ClientError, BotoCoreError, TypeError) as error:
+            errors.append(
+                f"agent '{name}' was not read with bedrock:ListAgentAliases, "
+                "bedrock:GetAgentVersion and bedrock:ListAgentKnowledgeBases "
+                f"({get_assessment_error_label(error)})"
+            )
+
+    try:
+        flows = _list_all_items(client, "list_flows", "flowSummaries")
+    except (ClientError, BotoCoreError, TypeError) as error:
+        flows = []
+        errors.append(
+            f"flows were not read with bedrock:ListFlows ({get_assessment_error_label(error)})"
+        )
+    for flow in flows:
+        flow_id = flow.get("id")
+        name = flow.get("name") or flow_id
+        try:
+            definitions = [
+                (
+                    GUARDRAIL_DRAFT_VERSION,
+                    client.get_flow(flowIdentifier=flow_id).get("definition"),
+                )
+            ]
+            aliases = _list_all_items(
+                client,
+                "list_flow_aliases",
+                "flowAliasSummaries",
+                flowIdentifier=flow_id,
+            )
+            for version in sorted(
+                {
+                    str(route.get("flowVersion"))
+                    for alias in aliases
+                    for route in alias.get("routingConfiguration") or []
+                    if route.get("flowVersion")
+                    and route.get("flowVersion") != GUARDRAIL_DRAFT_VERSION
+                }
+            ):
+                definitions.append(
+                    (
+                        version,
+                        client.get_flow_version(
+                            flowIdentifier=flow_id, flowVersion=version
+                        ).get("definition"),
+                    )
+                )
+        except (ClientError, BotoCoreError, TypeError) as error:
+            errors.append(
+                f"flow '{name}' was not read with bedrock:GetFlow, "
+                "bedrock:ListFlowAliases and bedrock:GetFlowVersion "
+                f"({get_assessment_error_label(error)})"
+            )
+            continue
+        for version, definition in definitions:
+            nodes = definition.get("nodes") if isinstance(definition, dict) else None
+            for node in nodes or []:
+                if not isinstance(node, dict):
+                    continue
+                configuration = (node.get("configuration") or {}).get(
+                    "knowledgeBase"
+                ) or {}
+                if configuration.get("knowledgeBaseId"):
+                    front(
+                        configuration["knowledgeBaseId"],
+                        f"flow '{name}' {version} node '{node.get('name') or 'unnamed'}'",
+                        configuration.get("guardrailConfiguration"),
+                    )
+
+    attachment_inventory = attachment_inventory or {}
+    for attachment in attachment_inventory.get("attachments") or []:
+        if str(attachment.get("surface", "")).startswith("account-enforced"):
+            inventory["enforced"].append(
+                {
+                    "surface": attachment["surface"],
+                    "guardrail": {
+                        "identifier": attachment["identifier"],
+                        "region": attachment.get("region") or region,
+                        "version": attachment["version"],
+                    },
+                }
+            )
+    inventory["enforced_errors"] = [
+        str(error)
+        for error in attachment_inventory.get("errors") or []
+        if "account-enforced" in str(error)
+    ]
+
+    known = attachment_inventory.get("versions") or {}
+    clients = {}
+    references = [
+        item["guardrail"]
+        for entry in inventory["knowledge_bases"]
+        for item in entry["fronts"]
+        if item["guardrail"]
+    ] + [item["guardrail"] for item in inventory["enforced"]]
+    for reference in references:
+        key = (reference["identifier"], reference["version"])
+        if key in inventory["details"]:
+            continue
+        if key in known:
+            inventory["details"][key] = {
+                "detail": known[key].get("detail"),
+                "error": known[key].get("error", ""),
+            }
+            continue
+        if reference["region"] not in clients:
+            clients[reference["region"]] = boto3.client(
+                "bedrock", config=boto3_config, region_name=reference["region"]
+            )
+        try:
+            response = clients[reference["region"]].get_guardrail(
+                guardrailIdentifier=reference["identifier"],
+                guardrailVersion=reference["version"],
+            )
+            inventory["details"][key] = {
+                "detail": response.get("guardrail", response),
+                "error": "",
+            }
+        except (ClientError, BotoCoreError) as error:
+            inventory["details"][key] = {
+                "detail": None,
+                "error": get_assessment_error_label(error),
+            }
+    return inventory
+
+
+KNOWLEDGE_BASE_SCREENING_CEILING = (
+    "A transformation Lambda's logic is not read, a knowledge base carries no "
+    "guardrail of its own, and a guardrail a caller passes per request to "
+    "RetrieveAndGenerate is recorded by no configuration API, so this row can "
+    "find a knowledge base with no screening step and cannot show that one is "
+    "screened."
+)
+
+
+def _knowledge_base_screening_findings(
+    check_id: str,
+    finding_name: str,
+    reference: str,
+    region: str,
+    inventory: Dict[str, Any],
+    screens: Callable[[Dict[str, Any]], bool],
+    screen_text: str,
+    source_credit: Callable[[Dict[str, Any]], str],
+    source_unread: str,
+    resolution: str,
+    severity: str,
+) -> List[Dict[str, Any]]:
+    """
+    Fail each knowledge base that has a data source with no screening step
+    and is reached by an agent version or flow node applying no guardrail
+    that ``screens``, or by nothing at all. Never passes one.
+
+    ``source_credit`` names what screens a data source other than a
+    transformation step, or returns "". ``source_unread`` names a source-side
+    credit that could not be read for S3 sources; while it is set, an
+    unscreened S3 source cannot be failed.
+    """
+
+    def row(details: str, status: str, action: str) -> Dict[str, Any]:
+        return create_finding(
+            check_id=check_id,
+            finding_name=finding_name,
+            finding_details=details,
+            resolution=action,
+            reference=reference,
+            severity=severity if status == "Failed" else "Informational",
+            status=status,
+            region=region,
+        )
+
+    if inventory.get("list_error"):
+        return [
+            row(
+                "Knowledge bases were not read with bedrock:ListKnowledgeBases "
+                f"({inventory['list_error']}), so no knowledge base was judged.",
+                "N/A",
+                COULD_NOT_ASSESS_RESOLUTION,
+            )
+        ]
+    if not inventory.get("knowledge_bases"):
+        return [
+            row(
+                "No Bedrock knowledge bases in this region.",
+                "N/A",
+                "No action required.",
+            )
+        ]
+
+    def judge(item: Dict[str, Any]) -> str:
+        if not item["guardrail"]:
+            return "open"
+        key = (item["guardrail"]["identifier"], item["guardrail"]["version"])
+        entry = (inventory.get("details") or {}).get(key) or {}
+        if entry.get("detail") is None:
+            return "unread"
+        return "screened" if screens(entry["detail"]) else "open"
+
+    enforced = [
+        (item["surface"], judge(item)) for item in inventory.get("enforced") or []
+    ]
+    enforced_screen = sorted(s for s, state in enforced if state == "screened")
+    enforced_unread = [
+        f"the guardrail of {s} was not read with bedrock:GetGuardrail"
+        for s, state in sorted(enforced)
+        if state == "unread"
+    ] + list(inventory.get("enforced_errors") or [])
+    path_errors = list(inventory.get("errors") or [])
+    not_failed_action = (
+        "No action required. Review each transformation Lambda and each direct "
+        "RetrieveAndGenerate caller."
+    )
+    rows = []
+    for entry in sorted(inventory["knowledge_bases"], key=lambda e: e["label"]):
+        credited = []
+        unscreened = []
+        for source in entry["sources"]:
+            if source["transformations"]:
+                credited.append(
+                    "{} runs POST_CHUNKING Lambda {}".format(
+                        source["label"], ", ".join(source["transformations"])
+                    )
+                )
+                continue
+            credit = source_credit(source)
+            if credit:
+                credited.append(f"{source['label']} {credit}")
+            else:
+                unscreened.append(source)
+        fronts = [(item["surface"], judge(item)) for item in entry["fronts"]]
+        open_fronts = sorted({s for s, state in fronts if state == "open"})
+        screened_fronts = sorted({s for s, state in fronts if state == "screened"})
+        unread_fronts = [
+            f"the guardrail of {s} was not read with bedrock:GetGuardrail"
+            for s in sorted({s for s, state in fronts if state == "unread"})
+        ]
+        not_failed = "Bedrock {} is not failed: {}. {}".format(
+            entry["label"],
+            "; ".join(credited + screened_fronts + enforced_screen)
+            or "no data source is attached",
+            KNOWLEDGE_BASE_SCREENING_CEILING,
+        )
+        if not unscreened:
+            if entry["errors"]:
+                rows.append(
+                    row(
+                        f"Bedrock {entry['label']} was not judged: "
+                        f"{'; '.join(entry['errors'])}.",
+                        "N/A",
+                        COULD_NOT_ASSESS_RESOLUTION,
+                    )
+                )
+            else:
+                rows.append(row(not_failed, "N/A", not_failed_action))
+            continue
+        if enforced_screen:
+            rows.append(row(not_failed, "N/A", not_failed_action))
+            continue
+        names = ", ".join(f"{s['label']} ({s['type']})" for s in unscreened)
+        blocked = (
+            [source_unread]
+            if source_unread and any(s["type"] == "S3" for s in unscreened)
+            else []
+        )
+        if not blocked and not enforced_unread and open_fronts:
+            rows.append(
+                row(
+                    f"Bedrock {entry['label']} ingests {names} with no screening "
+                    f"step, and {', '.join(open_fronts)} retrieves from it with no "
+                    f"guardrail {screen_text}. {KNOWLEDGE_BASE_SCREENING_CEILING}",
+                    "Failed",
+                    resolution,
+                )
+            )
+            continue
+        if not blocked and not enforced_unread and not fronts and not path_errors:
+            rows.append(
+                row(
+                    f"Bedrock {entry['label']} ingests {names} with no screening "
+                    "step, and no agent version or flow node retrieves from it, so "
+                    f"no configured guardrail {screen_text} stands in front of it. "
+                    f"{KNOWLEDGE_BASE_SCREENING_CEILING}",
+                    "Failed",
+                    resolution,
+                )
+            )
+            continue
+        unread = blocked + enforced_unread + unread_fronts
+        if not fronts:
+            unread += path_errors
+        if unread:
+            rows.append(
+                row(
+                    f"Bedrock {entry['label']} ingests {names} with no screening "
+                    "step, and whether anything screens it was not established: "
+                    f"{'; '.join(unread)}.",
+                    "N/A",
+                    COULD_NOT_ASSESS_RESOLUTION,
+                )
+            )
+            continue
+        rows.append(row(not_failed, "N/A", not_failed_action))
+    return rows
+
+
 def _prompt_attack_verdict(detail: Dict[str, Any]) -> Tuple[str, str]:
     """
     Judge one guardrail version's PROMPT_ATTACK filter and content-filter tier.
@@ -11084,14 +11563,21 @@ def check_bedrock_guardrail_prompt_attack_filter(
     region: str = "",
     guardrail_inventory: Dict[str, Any] = None,
     attachment_inventory: Dict[str, Any] = None,
+    knowledge_base_inventory: Dict[str, Any] = None,
 ) -> Dict[str, Any]:
     """
     BR-34: Require a preventive PROMPT_ATTACK input filter on the STANDARD
-    tier, on each guardrail's working draft and on each deployed version.
+    tier, on each guardrail's working draft and on each deployed version, and
+    fail each knowledge base that ingests a data source with no transformation
+    step and is reached through no guardrail with such a filter.
     """
     inventory = guardrail_inventory or get_guardrail_detail_inventory(region)
     if attachment_inventory is None:
         attachment_inventory = get_guardrail_attachment_inventory(region)
+    if knowledge_base_inventory is None:
+        knowledge_base_inventory = get_knowledge_base_screening_inventory(
+            region, attachment_inventory
+        )
     reference = "https://docs.aws.amazon.com/bedrock/latest/userguide/guardrails-prompt-attack.html"
     deployed = _deployed_guardrail_findings(
         "BR-34",
@@ -11102,6 +11588,24 @@ def check_bedrock_guardrail_prompt_attack_filter(
         _prompt_attack_verdict,
         PROMPT_ATTACK_RESOLUTION,
         "High",
+    )
+    deployed.extend(
+        _knowledge_base_screening_findings(
+            "BR-34",
+            "Knowledge Base Ingestion Prompt Attack Screening",
+            "https://docs.aws.amazon.com/bedrock/latest/userguide/kb-custom-transformation.html",
+            region,
+            knowledge_base_inventory,
+            lambda detail: _prompt_attack_verdict(detail)[0] != "Failed",
+            "whose PROMPT_ATTACK input filter blocks at HIGH strength",
+            lambda source: "",
+            "",
+            "Screen ingested content for embedded instructions with a POST_CHUNKING "
+            "transformation Lambda, and retrieve through an agent or flow node whose "
+            "guardrail blocks PROMPT_ATTACK at HIGH strength, or run Retrieve and "
+            "wrap the chunks in guardContent tags before the model call.",
+            "High",
+        )
     )
     if inventory.get("list_error"):
         findings = _guardrail_inventory_na_finding(
@@ -11946,13 +12450,65 @@ SENSITIVE_INFORMATION_RESOLUTION = (
 )
 
 
+def _comprehend_redaction_outputs(region: str) -> Tuple[List[Dict[str, str]], str]:
+    """
+    List the S3 output locations of completed Comprehend PII redaction jobs,
+    or return the reason they were not read.
+    """
+    try:
+        client = boto3.client("comprehend", config=boto3_config, region_name=region)
+        jobs = _list_all_items(
+            client,
+            "list_pii_entities_detection_jobs",
+            "PiiEntitiesDetectionJobPropertiesList",
+            max_results_param="MaxResults",
+            token_param="NextToken",
+            max_results=500,
+        )
+    except (ClientError, BotoCoreError, TypeError) as error:
+        return [], get_assessment_error_label(error)
+    outputs = []
+    for job in jobs:
+        uri = str((job.get("OutputDataConfig") or {}).get("S3Uri") or "")
+        if (
+            job.get("JobStatus") != "COMPLETED"
+            or job.get("Mode") != "ONLY_REDACTION"
+            or not uri.startswith("s3://")
+        ):
+            continue
+        bucket, _, prefix = uri[len("s3://") :].partition("/")
+        outputs.append(
+            {
+                "name": str(job.get("JobName") or job.get("JobId") or "unnamed"),
+                "uri": uri,
+                "bucket": bucket,
+                "prefix": prefix,
+            }
+        )
+    return outputs, ""
+
+
+def _pii_entity_masks(detail: Dict[str, Any]) -> bool:
+    """True when some PII entity type blocks or masks on the input or the output."""
+    policy = detail.get("sensitiveInformationPolicy") or {}
+    return any(
+        _sensitive_information_action(entity, side) in SENSITIVE_INFORMATION_ACTING
+        for entity in policy.get("piiEntities") or []
+        if isinstance(entity, dict)
+        for side in ("input", "output")
+    )
+
+
 def check_bedrock_guardrail_pii_filters(
-    region: str = "", attachment_inventory: Dict[str, Any] = None
+    region: str = "",
+    attachment_inventory: Dict[str, Any] = None,
+    knowledge_base_inventory: Dict[str, Any] = None,
 ) -> Dict[str, Any]:
     """
     BR-26: Verify guardrails block or mask sensitive information on the input
     and the output, on each working draft and each deployed version
-    (extends BR-23, which only covers the harmful-content filters).
+    (extends BR-23, which only covers the harmful-content filters), and fail
+    each knowledge base whose content reaches a model with no redaction step.
     """
     logger.debug("Starting check for Bedrock guardrail sensitive-information filters")
     try:
@@ -11973,6 +12529,53 @@ def check_bedrock_guardrail_pii_filters(
             _sensitive_information_verdict,
             SENSITIVE_INFORMATION_RESOLUTION,
             "High",
+        )
+        if knowledge_base_inventory is None:
+            knowledge_base_inventory = get_knowledge_base_screening_inventory(
+                region, attachment_inventory
+            )
+        redaction_outputs, redaction_error = (
+            _comprehend_redaction_outputs(region)
+            if knowledge_base_inventory.get("knowledge_bases")
+            else ([], "")
+        )
+
+        def redaction_credit(source: Dict[str, Any]) -> str:
+            for job in redaction_outputs:
+                if job["bucket"] == source["bucket"] and (
+                    not job["prefix"]
+                    or (
+                        source["prefixes"]
+                        and all(p.startswith(job["prefix"]) for p in source["prefixes"])
+                    )
+                ):
+                    return (
+                        f"ingests only the output of Comprehend PII redaction job "
+                        f"'{job['name']}' ({job['uri']})"
+                    )
+            return ""
+
+        deployed.extend(
+            _knowledge_base_screening_findings(
+                "BR-26",
+                "Knowledge Base PII Redaction Before Model",
+                "https://docs.aws.amazon.com/comprehend/latest/dg/how-pii.html",
+                region,
+                knowledge_base_inventory,
+                _pii_entity_masks,
+                "that blocks or masks a PII entity type",
+                redaction_credit,
+                "Comprehend PII redaction jobs were not read with "
+                f"comprehend:ListPiiEntitiesDetectionJobs ({redaction_error}), so a "
+                "redaction job whose output an S3 source ingests is not credited"
+                if redaction_error
+                else "",
+                "Redact PII before ingestion with a Comprehend PII redaction job whose "
+                "output the data source ingests, or a POST_CHUNKING transformation "
+                "Lambda, and retrieve through an agent or flow node whose guardrail "
+                "sets PII entity types to BLOCK or ANONYMIZE.",
+                "High",
+            )
         )
 
         bedrock_client = boto3.client(
@@ -24205,6 +24808,9 @@ def lambda_handler(event, context):
 
         guardrail_inventory = get_guardrail_detail_inventory(region)
         guardrail_attachments = get_guardrail_attachment_inventory(region)
+        knowledge_base_screening = get_knowledge_base_screening_inventory(
+            region, guardrail_attachments
+        )
         logger.info("Running guardrail content filter coverage check (BR-23)")
         content_filter_findings = check_bedrock_guardrail_content_filters(
             region=region, guardrail_inventory=guardrail_inventory
@@ -24223,7 +24829,9 @@ def lambda_handler(event, context):
 
         logger.info("Running guardrail sensitive-information filter check (BR-26)")
         guardrail_pii_findings = check_bedrock_guardrail_pii_filters(
-            region=region, attachment_inventory=guardrail_attachments
+            region=region,
+            attachment_inventory=guardrail_attachments,
+            knowledge_base_inventory=knowledge_base_screening,
         )
         all_findings.append(guardrail_pii_findings)
 
@@ -24273,6 +24881,7 @@ def lambda_handler(event, context):
                 region=region,
                 guardrail_inventory=guardrail_inventory,
                 attachment_inventory=guardrail_attachments,
+                knowledge_base_inventory=knowledge_base_screening,
             )
         )
 

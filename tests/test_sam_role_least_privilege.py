@@ -141,6 +141,7 @@ _EXPECTED_ACTIONS = {
         "bedrock:GetResourcePolicy",
         "bedrock:ListAgentActionGroups",
         "bedrock:ListAgentAliases",
+        "bedrock:ListAgentKnowledgeBases",
         "bedrock:ListAgents",
         "bedrock:ListAutomatedReasoningPolicies",
         "bedrock:ListCustomModels",

@@ -378,6 +378,7 @@ Resources:
                 - bedrock:GetAgentActionGroup
                 - bedrock:ListAgentAliases # BR-26, BR-27, BR-34
                 - bedrock:GetAgentVersion # BR-26, BR-27, BR-34
+                - bedrock:ListAgentKnowledgeBases # BR-26, BR-34
               Resource: !Sub 'arn:${AWS::Partition}:bedrock:*:${AWS::AccountId}:agent/*'
             - Sid: BedrockCustomModelRead
               Effect: Allow

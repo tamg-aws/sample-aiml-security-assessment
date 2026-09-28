@@ -7,12 +7,12 @@
     "fnd_ai_subject": 11,
     "foundation": 27,
     "total": 105,
-    "covered": 97,
+    "covered": 99,
     "tighten": 0,
     "tighten_extend": 0,
     "tighten_new_id": 0,
     "new": 0,
-    "not_implementable": 8,
+    "not_implementable": 6,
     "unassessed": 0,
     "new_check_functions": 0,
     "extensions": 0,
@@ -411,14 +411,21 @@
       "question": "Is ingestion of new documents into a knowledge base screened to prevent injection of malicious instructions embedded in the content (indirect prompt injection)?",
       "assert": "Content-screening step in the ingestion pipeline",
       "workload_agnostic": true,
-      "verdict": "not_implementable",
+      "verdict": "covered",
       "disposition": null,
-      "target_modules": [],
-      "incumbents": [],
-      "incumbent_names": [],
-      "gap": "the screening step is readable configuration and reading it proves nothing: GetDataSource returns vectorIngestionConfiguration.customTransformationConfiguration.transformations[].transformationFunction.transformationLambdaConfiguration.lambdaArn with stepToApply POST_CHUNKING, so a check can see that a customer Lambda rewrites each chunk, and no API says whether it looks for instruction-like patterns. The guardrail leg is readable and unattributable: GetGuardrail exposes the PROMPT_ATTACK content filter, but KnowledgeBase has no guardrailConfiguration member, only Agent and KnowledgeBaseFlowNodeConfiguration do, and a direct RetrieveAndGenerate caller supplies guardrailId per request, so a read cannot bind the filter to this knowledge base",
+      "target_modules": [
+        "bedrock_assessments"
+      ],
+      "incumbents": [
+        "BR-34"
+      ],
+      "incumbent_names": [
+        "Guardrail Prompt Attack Filter",
+        "Deployed Guardrail Prompt Attack Filter"
+      ],
+      "gap": "partial, ceiling reached. BR-34 reads every data source with GetDataSource for a POST_CHUNKING transformation Lambda, and every agent version and flow node that retrieves from the knowledge base, at DRAFT and at each alias-routed version, with ListAgentKnowledgeBases and the flow definition. It fails a knowledge base that ingests a source with no transformation step and is reached through no guardrail whose PROMPT_ATTACK input filter blocks at HIGH strength, or through an agent or node with no such guardrail, and it never passes one. The ceiling: a transformation Lambda's logic is opaque, KnowledgeBase has no guardrailConfiguration member, and a direct RetrieveAndGenerate caller supplies guardrailId per request, so no read can show that retrieved chunks are screened",
       "extra_iam": [],
-      "phase": null,
+      "phase": 3,
       "tier": "ai_subject",
       "source": "controls/ai-specific/bedrock-knowledge-bases.yaml"
     },
@@ -428,14 +435,21 @@
       "question": "Is PII/PHI redacted or masked from knowledge-base content before it reaches a model?",
       "assert": "Ingestion/retrieval redaction step evidence",
       "workload_agnostic": true,
-      "verdict": "not_implementable",
+      "verdict": "covered",
       "disposition": null,
-      "target_modules": [],
-      "incumbents": [],
-      "incumbent_names": [],
-      "gap": "every nearby surface is readable and none of them is evidence of redaction: a pre-ingestion Comprehend or Glue job is not an attribute of the knowledge base, macie2 GetAutomatedDiscoveryConfiguration reports that discovery is enabled and where sensitive data was found, never that it was removed, and a guardrail sensitiveInformationPolicy with piiEntities action ANONYMIZE or BLOCK is readable on GetGuardrail but recorded on an Agent or a flow node and not on the knowledge base, with a direct RetrieveAndGenerate caller supplying guardrailId per request. The strongest assertable statement is that some guardrail in the account masks PII, which is not evidence that this knowledge base's content reaches a model redacted",
+      "target_modules": [
+        "bedrock_assessments"
+      ],
+      "incumbents": [
+        "BR-26"
+      ],
+      "incumbent_names": [
+        "Guardrail Sensitive Information Filter Check",
+        "Deployed Guardrail Sensitive Information Filter"
+      ],
+      "gap": "partial, ceiling reached. BR-26 fails a knowledge base that ingests a source with no POST_CHUNKING transformation step and no completed Comprehend ONLY_REDACTION job whose output location holds everything the source ingests, and that is reached through no agent version or flow node whose guardrail sets a PII entity type to BLOCK or ANONYMIZE, or through one that sets none. It never passes one. comprehend:ListPiiEntitiesDetectionJobs has no resource type and is not granted, so an S3 source reads as not judged until it is. The ceiling: a transformation Lambda's logic and a Glue job's effect are not recorded, and a direct RetrieveAndGenerate caller supplies guardrailId per request",
       "extra_iam": [],
-      "phase": null,
+      "phase": 3,
       "tier": "ai_subject",
       "source": "controls/ai-specific/bedrock-knowledge-bases.yaml"
     },

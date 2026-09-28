@@ -41,8 +41,8 @@ section.
   Bedrock, `SM-35` to `SM-41` in SageMaker AI, and `AC-50` and `AC-51` in
   AgentCore, with new legs on `BR-01`, `BR-04`, `BR-12`, `BR-43`, `SM-02` and
   `AC-26`. The three entries that follow give the per-module detail.
-- The AISF parity ledger now reports 97 of the 105 in-scope AISF controls as
-  `covered` and 8 as `not_implementable`, with none left `tighten` or `new`.
+- The AISF parity ledger now reports 99 of the 105 in-scope AISF controls as
+  `covered` and 6 as `not_implementable`, with none left `tighten` or `new`.
   The 19 foundation controls that waited on those checks and legs are
   `covered`, and the new check ids carry their AISF control in the
   `Compliance_Frameworks` column.

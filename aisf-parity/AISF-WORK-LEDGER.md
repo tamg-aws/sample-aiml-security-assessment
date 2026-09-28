@@ -6,11 +6,11 @@ Generated 2026-09-28 by `aisf-parity/build_ledger.py`. Do not hand-edit: change 
 
 | verdict | rows | meaning |
 |---|---|---|
-| covered | 97 | an incumbent already asserts this; nothing to write |
+| covered | 99 | an incumbent already asserts this; nothing to write |
 | tighten / extend | 0 | incumbent name is honest, its assertion is narrower; extend it in place |
 | tighten / new_id | 0 | incumbent name claims more than it asserts; allocate a new id beside it |
 | new | 0 | no incumbent asserts any part of it |
-| not_implementable | 8 | flagged machine_checkable in the ledger but is not checkable from configuration |
+| not_implementable | 6 | flagged machine_checkable in the ledger but is not checkable from configuration |
 | unassessed | 0 | in scope, dedup pass not yet run |
 
 **0 new check functions and 0 extensions to existing checks.**
@@ -30,7 +30,9 @@ Generated 2026-09-28 by `aisf-parity/build_ledger.py`. Do not hand-edit: change 
 | `AIR-BDR-GRD-10` | covered | — | `bedrock_assessments` | `BR-41` | — |
 | `AIR-BDR-KB-01` | covered | — | `bedrock_assessments` | `BR-46` | — |
 | `AIR-BDR-KB-03` | covered | — | `bedrock_assessments` | `BR-20` | — |
+| `AIR-BDR-KB-05` | covered | — | `bedrock_assessments` | `BR-34` | partial, ceiling reached. BR-34 reads every data source with GetDataSource for a POST_CHUNKING transformation Lambda, and every agent version and flow node that retrieves from the knowledge base, at DRAFT and at each alias-routed version, with ListAgentKnowledgeBases and the flow definition. It fails a knowledge base that ingests a source with no transformation step and is reached through no guardrail whose PROMPT_ATTACK input filter blocks at HIGH strength, or through an agent or node with no such guardrail, and it never passes one. The ceiling: a transformation Lambda's logic is opaque, KnowledgeBase has no guardrailConfiguration member, and a direct RetrieveAndGenerate caller supplies guardrailId per request, so no read can show that retrieved chunks are screened |
 | `AIR-BDR-KB-06` | covered | — | `bedrock_assessments` | `BR-06` | — |
+| `AIR-BDR-KB-08` | covered | — | `bedrock_assessments` | `BR-26` | partial, ceiling reached. BR-26 fails a knowledge base that ingests a source with no POST_CHUNKING transformation step and no completed Comprehend ONLY_REDACTION job whose output location holds everything the source ingests, and that is reached through no agent version or flow node whose guardrail sets a PII entity type to BLOCK or ANONYMIZE, or through one that sets none. It never passes one. comprehend:ListPiiEntitiesDetectionJobs has no resource type and is not granted, so an S3 source reads as not judged until it is. The ceiling: a transformation Lambda's logic and a Glue job's effect are not recorded, and a direct RetrieveAndGenerate caller supplies guardrailId per request |
 | `AIR-BDR-MDL-01` *(workload-specific)* | covered | — | `bedrock_assessments` | `BR-42` | — |
 | `AIR-BDR-MDL-02` | covered | — | `bedrock_assessments` | `BR-04`, `BR-12` | — |
 | `AIR-BDR-MDL-03` *(workload-specific)* | covered | — | `bedrock_assessments` | `BR-43` | — |
@@ -39,8 +41,6 @@ Generated 2026-09-28 by `aisf-parity/build_ledger.py`. Do not hand-edit: change 
 | `AIR-BDR-MDL-08` | covered | — | `bedrock_assessments` | `BR-07` | BR-07 holds the catalog leg (ListPrompts non-empty is its Passed row, zero prompts is Not Applicable) and now the production-version leg as well. For each prompt it calls ListPrompts(promptIdentifier=...) for the numbered versions, fails a prompt that has only its DRAFT, and reads GetPrompt(promptVersion=N) on the highest numbered version for customerEncryptionKeyArn, which PromptSummary does not carry. For flows it reads the prompt node's resource.promptArn and fails a node that pins no version suffix, since an unversioned ARN resolves to the working draft. A version != DRAFT test on bare ListPrompts or on a GetPrompt with no promptVersion would have failed every prompt in every account, because both return the draft |
 | `AIR-BDR-MDL-09` | covered | — | `bedrock_assessments` | `BR-45` | — |
 | `AIR-BDR-MDL-10` | covered | — | `bedrock_assessments` | `BR-37` | same GetAccountDataRetention call |
-| `AIR-BDR-KB-05` | not_implementable | — | — | — | the screening step is readable configuration and reading it proves nothing: GetDataSource returns vectorIngestionConfiguration.customTransformationConfiguration.transformations[].transformationFunction.transformationLambdaConfiguration.lambdaArn with stepToApply POST_CHUNKING, so a check can see that a customer Lambda rewrites each chunk, and no API says whether it looks for instruction-like patterns. The guardrail leg is readable and unattributable: GetGuardrail exposes the PROMPT_ATTACK content filter, but KnowledgeBase has no guardrailConfiguration member, only Agent and KnowledgeBaseFlowNodeConfiguration do, and a direct RetrieveAndGenerate caller supplies guardrailId per request, so a read cannot bind the filter to this knowledge base |
-| `AIR-BDR-KB-08` | not_implementable | — | — | — | every nearby surface is readable and none of them is evidence of redaction: a pre-ingestion Comprehend or Glue job is not an attribute of the knowledge base, macie2 GetAutomatedDiscoveryConfiguration reports that discovery is enabled and where sensitive data was found, never that it was removed, and a guardrail sensitiveInformationPolicy with piiEntities action ANONYMIZE or BLOCK is readable on GetGuardrail but recorded on an Agent or a flow node and not on the knowledge base, with a direct RetrieveAndGenerate caller supplying guardrailId per request. The strongest assertable statement is that some guardrail in the account masks PII, which is not evidence that this knowledge base's content reaches a model redacted |
 
 ## SGM (11 controls)
 

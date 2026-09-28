@@ -65,6 +65,16 @@ def test_caller_identity_partition_handles_incomplete_arns(
     assert bedrock_app._caller_identity_partition(caller_identity) == expected_partition
 
 
+NO_KNOWLEDGE_BASES = {
+    "knowledge_bases": [],
+    "errors": [],
+    "enforced": [],
+    "enforced_errors": [],
+    "details": {},
+    "list_error": "",
+}
+
+
 def assert_could_not_assess_finding(finding):
     assert finding["Status"] == "N/A"
     assert finding["Severity"] == "Informational"
@@ -12068,6 +12078,14 @@ class TestBR26GuardrailPIIFilters:
     """BR-26: Verify guardrails configure sensitive-information (PII) filters."""
 
     @pytest.fixture(autouse=True)
+    def _no_knowledge_bases(self):
+        with patch(
+            "bedrock_app.get_knowledge_base_screening_inventory",
+            return_value=NO_KNOWLEDGE_BASES,
+        ):
+            yield
+
+    @pytest.fixture(autouse=True)
     def _no_deployed_guardrails(self):
         with patch(
             "bedrock_app.get_guardrail_attachment_inventory",
@@ -12166,6 +12184,471 @@ class TestBR26GuardrailPIIFilters:
 # ===================================================================
 # BR-27: check_bedrock_guardrail_contextual_grounding
 # ===================================================================
+class TestKnowledgeBaseScreening:
+    """
+    AIR-BDR-KB-05 and AIR-BDR-KB-08: BR-34 and BR-26 fail a knowledge base
+    that ingests a data source with no screening step and is reached through
+    no guardrail that screens it. Neither leg ever passes a knowledge base.
+    """
+
+    REGION = "us-east-1"
+    PROMPT_ATTACK = {
+        "contentPolicy": {
+            "filters": [
+                {
+                    "type": "PROMPT_ATTACK",
+                    "inputEnabled": True,
+                    "inputAction": "BLOCK",
+                    "inputStrength": "HIGH",
+                }
+            ],
+            "tier": {"tierName": "STANDARD"},
+        }
+    }
+    DETECT_ONLY = {
+        "contentPolicy": {
+            "filters": [
+                {
+                    "type": "PROMPT_ATTACK",
+                    "inputEnabled": True,
+                    "inputAction": "NONE",
+                    "inputStrength": "HIGH",
+                }
+            ],
+            "tier": {"tierName": "STANDARD"},
+        }
+    }
+    MASKS_PII = {
+        "sensitiveInformationPolicy": {
+            "piiEntities": [{"type": "EMAIL", "action": "ANONYMIZE"}]
+        }
+    }
+    REGEX_ONLY = {
+        "sensitiveInformationPolicy": {
+            "regexes": [{"name": "k", "pattern": "k", "action": "BLOCK"}]
+        }
+    }
+
+    @staticmethod
+    def _source(name, kind="S3", lambdas=(), bucket="docs", prefixes=()):
+        return {
+            "label": f"data source '{name}'",
+            "type": kind,
+            "transformations": list(lambdas),
+            "bucket": bucket,
+            "prefixes": list(prefixes),
+        }
+
+    @staticmethod
+    def _front(surface, guardrail="gr-1", version="1"):
+        return {
+            "surface": surface,
+            "guardrail": {
+                "identifier": guardrail,
+                "region": "us-east-1",
+                "version": version,
+            }
+            if guardrail
+            else None,
+        }
+
+    @staticmethod
+    def _kb(name, sources, fronts=(), errors=()):
+        return {
+            "id": name,
+            "label": f"knowledge base '{name}'",
+            "sources": sources,
+            "fronts": list(fronts),
+            "errors": list(errors),
+        }
+
+    @staticmethod
+    def _inventory(kbs, details=None, errors=(), enforced=(), enforced_errors=()):
+        return {
+            "knowledge_bases": kbs,
+            "errors": list(errors),
+            "enforced": list(enforced),
+            "enforced_errors": list(enforced_errors),
+            "details": {
+                key: {"detail": detail, "error": "" if detail else "AccessDenied"}
+                for key, detail in (details or {}).items()
+            },
+            "list_error": "",
+        }
+
+    def _br34(self, inventory):
+        result = bedrock_app.check_bedrock_guardrail_prompt_attack_filter(
+            region=self.REGION,
+            guardrail_inventory={"items": [], "errors": [], "list_error": None},
+            attachment_inventory={"attachments": [], "versions": {}, "errors": []},
+            knowledge_base_inventory=inventory,
+        )
+        return [
+            f
+            for f in extract_csv_data(result)
+            if f["Finding"] == "Knowledge Base Ingestion Prompt Attack Screening"
+        ]
+
+    def _br26(self, inventory, jobs=None, jobs_error=None):
+        client = MagicMock()
+        client.list_guardrails.return_value = {"guardrails": []}
+        if jobs_error:
+            client.list_pii_entities_detection_jobs.side_effect = jobs_error
+        else:
+            client.list_pii_entities_detection_jobs.return_value = {
+                "PiiEntitiesDetectionJobPropertiesList": jobs or []
+            }
+        with patch("bedrock_app.boto3.client", return_value=client):
+            result = bedrock_app.check_bedrock_guardrail_pii_filters(
+                region=self.REGION,
+                attachment_inventory={"attachments": [], "versions": {}, "errors": []},
+                knowledge_base_inventory=inventory,
+            )
+        return [
+            f
+            for f in extract_csv_data(result)
+            if f["Finding"] == "Knowledge Base PII Redaction Before Model"
+        ]
+
+    def test_br34_unscreened_source_behind_an_unguarded_agent_fails(self):
+        rows = self._br34(
+            self._inventory(
+                [
+                    self._kb(
+                        "kb-open",
+                        [self._source("raw")],
+                        [self._front("agent 'a' DRAFT", guardrail=None)],
+                    ),
+                    self._kb(
+                        "kb-transformed",
+                        [self._source("clean", lambdas=["arn:aws:lambda:fn:scan"])],
+                        [self._front("agent 'a' DRAFT", guardrail=None)],
+                    ),
+                ]
+            )
+        )
+        assert [r["Status"] for r in rows] == ["Failed", "N/A"]
+        assert "knowledge base 'kb-open'" in rows[0]["Finding_Details"]
+        assert (
+            "data source 'raw' (S3) with no screening step"
+            in rows[0]["Finding_Details"]
+        )
+        assert "agent 'a' DRAFT retrieves from it" in rows[0]["Finding_Details"]
+        assert rows[0]["Severity"] == "High"
+        assert "is not failed" in rows[1]["Finding_Details"]
+        assert (
+            "POST_CHUNKING Lambda arn:aws:lambda:fn:scan" in rows[1]["Finding_Details"]
+        )
+        assert "logic is not read" in rows[1]["Finding_Details"]
+        assert "Passed" not in {r["Status"] for r in rows}
+
+    def test_br34_detect_only_guardrail_is_not_credited(self):
+        rows = self._br34(
+            self._inventory(
+                [
+                    self._kb(
+                        "kb",
+                        [self._source("raw")],
+                        [self._front("flow 'f' 1 node 'n'")],
+                    )
+                ],
+                {("gr-1", "1"): self.DETECT_ONLY},
+            )
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "flow 'f' 1 node 'n' retrieves from it" in rows[0]["Finding_Details"]
+
+    def test_br34_one_screened_front_does_not_clear_an_open_one(self):
+        rows = self._br34(
+            self._inventory(
+                [
+                    self._kb(
+                        "kb",
+                        [self._source("raw")],
+                        [
+                            self._front("agent 'guarded' 2"),
+                            self._front("agent 'bare' DRAFT", guardrail=None),
+                        ],
+                    )
+                ],
+                {("gr-1", "1"): self.PROMPT_ATTACK},
+            )
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "agent 'bare' DRAFT" in rows[0]["Finding_Details"]
+        assert "agent 'guarded' 2" not in rows[0]["Finding_Details"]
+
+    def test_br34_screened_fronts_are_not_failed_and_never_pass(self):
+        rows = self._br34(
+            self._inventory(
+                [self._kb("kb", [self._source("raw")], [self._front("agent 'g' 2")])],
+                {("gr-1", "1"): self.PROMPT_ATTACK},
+            )
+        )
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert "is not failed: agent 'g' 2" in rows[0]["Finding_Details"]
+        assert rows[0]["Severity"] == "Informational"
+
+    def test_br34_no_front_fails_only_when_every_agent_and_flow_was_read(self):
+        kb = self._kb("kb", [self._source("raw", kind="WEB")])
+        read = self._br34(self._inventory([kb]))
+        assert [r["Status"] for r in read] == ["Failed"]
+        assert (
+            "no agent version or flow node retrieves from it"
+            in read[0]["Finding_Details"]
+        )
+        unread = self._br34(
+            self._inventory(
+                [kb],
+                errors=["agents were not read with bedrock:ListAgents (AccessDenied)"],
+            )
+        )
+        assert [r["Status"] for r in unread] == ["N/A"]
+        assert (
+            "agents were not read with bedrock:ListAgents"
+            in unread[0]["Finding_Details"]
+        )
+
+    def test_br34_unread_front_guardrail_is_na(self):
+        rows = self._br34(
+            self._inventory(
+                [self._kb("kb", [self._source("raw")], [self._front("agent 'g' 2")])],
+                {("gr-1", "1"): None},
+            )
+        )
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert "the guardrail of agent 'g' 2 was not read" in rows[0]["Finding_Details"]
+
+    def test_br34_account_enforced_guardrail_credit_and_unread(self):
+        kb = self._kb(
+            "kb",
+            [self._source("raw")],
+            [self._front("agent 'a' DRAFT", guardrail=None)],
+        )
+        enforced = [self._front("account-enforced configuration c1", guardrail="gr-e")]
+        screened = self._br34(
+            self._inventory(
+                [kb], {("gr-e", "1"): self.PROMPT_ATTACK}, enforced=enforced
+            )
+        )
+        assert [r["Status"] for r in screened] == ["N/A"]
+        assert "account-enforced configuration c1" in screened[0]["Finding_Details"]
+        unread = self._br34(
+            self._inventory(
+                [kb],
+                enforced_errors=[
+                    "account-enforced guardrail configurations were not read (AccessDenied)"
+                ],
+            )
+        )
+        assert [r["Status"] for r in unread] == ["N/A"]
+        assert (
+            "account-enforced guardrail configurations were not read"
+            in unread[0]["Finding_Details"]
+        )
+
+    def test_br34_list_error_and_no_knowledge_base_are_na(self):
+        errored = self._inventory([])
+        errored["list_error"] = "AccessDeniedException"
+        rows = self._br34(errored)
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert (
+            "bedrock:ListKnowledgeBases (AccessDeniedException)"
+            in rows[0]["Finding_Details"]
+        )
+        empty = self._br34(self._inventory([]))
+        assert [r["Status"] for r in empty] == ["N/A"]
+
+    def test_br26_pii_masking_front_is_credited_and_regex_only_is_not(self):
+        rows = self._br26(
+            self._inventory(
+                [
+                    self._kb(
+                        "kb-masked",
+                        [self._source("raw", kind="WEB")],
+                        [self._front("agent 'm' 1")],
+                    ),
+                    self._kb(
+                        "kb-regex",
+                        [self._source("raw", kind="WEB")],
+                        [self._front("agent 'r' 1", guardrail="gr-r")],
+                    ),
+                ],
+                {("gr-1", "1"): self.MASKS_PII, ("gr-r", "1"): self.REGEX_ONLY},
+            )
+        )
+        assert [r["Status"] for r in rows] == ["N/A", "Failed"]
+        assert "is not failed: agent 'm' 1" in rows[0]["Finding_Details"]
+        assert (
+            "agent 'r' 1 retrieves from it with no guardrail that blocks or masks a PII entity type"
+            in rows[1]["Finding_Details"]
+        )
+
+    def test_br26_comprehend_redaction_output_credits_only_the_matching_source(self):
+        job = {
+            "JobName": "redact-docs",
+            "JobStatus": "COMPLETED",
+            "Mode": "ONLY_REDACTION",
+            "OutputDataConfig": {"S3Uri": "s3://docs/redacted/"},
+        }
+        offsets = dict(
+            job,
+            JobName="offsets",
+            Mode="ONLY_OFFSETS",
+            OutputDataConfig={"S3Uri": "s3://docs/"},
+        )
+        rows = self._br26(
+            self._inventory(
+                [
+                    self._kb("kb-a", [self._source("in", prefixes=["redacted/2026/"])]),
+                    self._kb("kb-b", [self._source("whole")]),
+                ]
+            ),
+            jobs=[job, offsets],
+        )
+        assert [r["Status"] for r in rows] == ["N/A", "Failed"]
+        assert (
+            "Comprehend PII redaction job 'redact-docs' (s3://docs/redacted/)"
+            in rows[0]["Finding_Details"]
+        )
+        assert "data source 'whole' (S3)" in rows[1]["Finding_Details"]
+
+    def test_br26_unread_comprehend_jobs_block_only_s3_sources(self):
+        rows = self._br26(
+            self._inventory(
+                [
+                    self._kb("kb-s3", [self._source("raw")]),
+                    self._kb("kb-web", [self._source("site", kind="WEB")]),
+                ]
+            ),
+            jobs_error=_make_client_error("AccessDeniedException"),
+        )
+        assert [r["Status"] for r in rows] == ["N/A", "Failed"]
+        assert "comprehend:ListPiiEntitiesDetectionJobs" in rows[0]["Finding_Details"]
+        assert "knowledge base 'kb-web'" in rows[1]["Finding_Details"]
+
+    def test_inventory_reads_every_agent_version_flow_version_and_source(self):
+        client = MagicMock()
+        client.list_knowledge_bases.return_value = {
+            "knowledgeBaseSummaries": [
+                {"knowledgeBaseId": "KB1", "name": "one"},
+                {"knowledgeBaseId": "KB2", "name": "two"},
+            ]
+        }
+        client.list_data_sources.side_effect = lambda knowledgeBaseId, **_: {
+            "dataSourceSummaries": [{"dataSourceId": f"{knowledgeBaseId}-ds"}]
+        }
+        transform = {
+            "customTransformationConfiguration": {
+                "transformations": [
+                    {
+                        "stepToApply": "POST_CHUNKING",
+                        "transformationFunction": {
+                            "transformationLambdaConfiguration": {"lambdaArn": "arn:fn"}
+                        },
+                    }
+                ]
+            }
+        }
+        client.get_data_source.side_effect = lambda knowledgeBaseId, dataSourceId: {
+            "dataSource": {
+                "name": dataSourceId,
+                "dataSourceConfiguration": {
+                    "type": "S3",
+                    "s3Configuration": {"bucketArn": "arn:aws:s3:::docs"},
+                },
+                "vectorIngestionConfiguration": transform
+                if knowledgeBaseId == "KB2"
+                else {},
+            }
+        }
+        client.list_agents.return_value = {
+            "agentSummaries": [{"agentId": "A1", "agentName": "agent"}]
+        }
+        client.list_agent_aliases.return_value = {
+            "agentAliasSummaries": [{"routingConfiguration": [{"agentVersion": "3"}]}]
+        }
+        client.get_agent_version.return_value = {
+            "agentVersion": {
+                "guardrailConfiguration": {
+                    "guardrailIdentifier": "gr-9",
+                    "guardrailVersion": "2",
+                }
+            }
+        }
+        client.list_agent_knowledge_bases.side_effect = (
+            lambda agentId, agentVersion, **_: {
+                "agentKnowledgeBaseSummaries": [
+                    {"knowledgeBaseId": "KB1", "knowledgeBaseState": "ENABLED"},
+                    {"knowledgeBaseId": "KB2", "knowledgeBaseState": "DISABLED"},
+                ]
+            }
+        )
+        client.list_flows.return_value = {
+            "flowSummaries": [{"id": "F1", "name": "flow"}]
+        }
+        client.get_flow.return_value = {
+            "definition": {
+                "nodes": [
+                    {
+                        "name": "retrieve",
+                        "type": "KnowledgeBase",
+                        "configuration": {
+                            "knowledgeBase": {
+                                "knowledgeBaseId": "arn:aws:bedrock:us-east-1:111122223333:knowledge-base/KB2"
+                            }
+                        },
+                    }
+                ]
+            }
+        }
+        client.list_flow_aliases.return_value = {"flowAliasSummaries": []}
+        client.get_guardrail.return_value = {"guardrail": self.PROMPT_ATTACK}
+        with patch("bedrock_app.boto3.client", return_value=client):
+            inventory = bedrock_app.get_knowledge_base_screening_inventory(
+                self.REGION, {"attachments": [], "versions": {}, "errors": []}
+            )
+        by_id = {kb["id"]: kb for kb in inventory["knowledge_bases"]}
+        assert [s["transformations"] for s in by_id["KB1"]["sources"]] == [[]]
+        assert [s["transformations"] for s in by_id["KB2"]["sources"]] == [["arn:fn"]]
+        assert [(f["surface"], f["guardrail"]) for f in by_id["KB1"]["fronts"]] == [
+            ("agent 'agent' DRAFT", None),
+            (
+                "agent 'agent' 3",
+                {"identifier": "gr-9", "region": "us-east-1", "version": "2"},
+            ),
+        ]
+        assert [(f["surface"], f["guardrail"]) for f in by_id["KB2"]["fronts"]] == [
+            ("flow 'flow' DRAFT node 'retrieve'", None)
+        ]
+        assert inventory["details"][("gr-9", "2")]["detail"] == self.PROMPT_ATTACK
+        assert inventory["errors"] == []
+        assert client.list_agent_knowledge_bases.call_args_list == [
+            call(agentId="A1", agentVersion="DRAFT", maxResults=100),
+            call(agentId="A1", agentVersion="3", maxResults=100),
+        ]
+
+    def test_inventory_records_an_unread_agent_for_every_knowledge_base(self):
+        client = MagicMock()
+        client.list_knowledge_bases.return_value = {
+            "knowledgeBaseSummaries": [{"knowledgeBaseId": "KB1", "name": "one"}]
+        }
+        client.list_data_sources.return_value = {"dataSourceSummaries": []}
+        client.list_agents.return_value = {
+            "agentSummaries": [{"agentId": "A1", "agentName": "agent"}]
+        }
+        client.list_agent_aliases.return_value = {"agentAliasSummaries": []}
+        client.list_agent_knowledge_bases.side_effect = _make_client_error(
+            "AccessDeniedException"
+        )
+        client.list_flows.return_value = {"flowSummaries": []}
+        with patch("bedrock_app.boto3.client", return_value=client):
+            inventory = bedrock_app.get_knowledge_base_screening_inventory(self.REGION)
+        assert len(inventory["errors"]) == 1
+        assert "agent 'agent' was not read" in inventory["errors"][0]
+        assert "bedrock:ListAgentKnowledgeBases" in inventory["errors"][0]
+
+
 class TestBR27ContextualGrounding:
     """BR-27: Verify guardrails enable contextual grounding checks."""
 
@@ -12342,6 +12825,14 @@ class TestDeployedGuardrailVersions:
     BR-26, BR-27 and BR-34 judge each guardrail version an agent, flow node or
     account-enforced configuration applies, and read values, not presence.
     """
+
+    @pytest.fixture(autouse=True)
+    def _no_knowledge_bases(self):
+        with patch(
+            "bedrock_app.get_knowledge_base_screening_inventory",
+            return_value=NO_KNOWLEDGE_BASES,
+        ):
+            yield
 
     REGION = "us-east-1"
     PREVENTIVE = {
@@ -14237,6 +14728,14 @@ class TestAgenticBedrockMapping:
 
 class TestProposedBedrockChecks:
     """BR-34 through BR-40 proposal checks."""
+
+    @pytest.fixture(autouse=True)
+    def _no_knowledge_bases(self):
+        with patch(
+            "bedrock_app.get_knowledge_base_screening_inventory",
+            return_value=NO_KNOWLEDGE_BASES,
+        ):
+            yield
 
     @pytest.fixture(autouse=True)
     def _no_deployed_guardrails(self):
