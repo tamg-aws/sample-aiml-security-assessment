@@ -460,6 +460,7 @@ Resources:
               Action:
                 - kms:DescribeKey # BR-40, BR-55, BR-12, BR-20, BR-11
                 - kms:GetKeyPolicy # BR-55
+                - kms:ListGrants # BR-55
               Resource: !Sub 'arn:${AWS::Partition}:kms:*:${AWS::AccountId}:key/*'
             - Sid: KMSKeyInventory
               # BR-55 enumerates the account's keys; kms:ListKeys has no

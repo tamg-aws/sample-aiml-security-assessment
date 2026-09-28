@@ -21796,6 +21796,47 @@ ENCLAVE_SENSITIVE_ACTIONS = (
 )
 
 
+# The Nitro Enclave measurements that bind the deployment and not only the image:
+# PCR3 is the parent instance's IAM role, PCR4 its instance ID and PCR8 the
+# image signing certificate. The EIF is not secret, so an image pin alone is
+# met by the same image launched from any parent.
+ENCLAVE_DEPLOYMENT_KEYS = (
+    ATTESTATION_CONDITION_PREFIX + "pcr3",
+    ATTESTATION_CONDITION_PREFIX + "pcr4",
+    ATTESTATION_CONDITION_PREFIX + "pcr8",
+)
+
+# The grant operations that release key material RecipientAttestation can gate.
+ENCLAVE_SENSITIVE_GRANT_OPERATIONS = {
+    "Decrypt": "kms:decrypt",
+    "DeriveSharedSecret": "kms:derivesharedsecret",
+    "GenerateDataKey": "kms:generatedatakey",
+    "GenerateDataKeyPair": "kms:generatedatakeypair",
+}
+
+
+def _exact_attestation_keys(statement: Dict[str, Any], negated: bool) -> set:
+    """
+    Return the attestation keys a statement tests against exact values.
+
+    ``negated`` selects negated tests (a Deny that refuses a wrong value) over
+    positive ones (an Allow that requires the value). A Null, an IfExists or a
+    wildcard value is never exact.
+    """
+    keys = set()
+    for operator, key, values in _condition_keys_by_operator(statement):
+        if not ATTESTATION_BINDING_KEY.match(key):
+            continue
+        test = _strip_condition_set_operator(operator)
+        if "null" in test or test.endswith("ifexists") or ("not" in test) != negated:
+            continue
+        if values and not any(
+            "*" in str(value) or "?" in str(value) for value in values
+        ):
+            keys.add(key)
+    return keys
+
+
 def _attestation_family(key: str) -> str:
     """Name the attestation family a RecipientAttestation condition key belongs to."""
     return "NitroTPM" if key.startswith(NITRO_TPM_KEY_PREFIX) else "Nitro Enclave"
@@ -21852,13 +21893,28 @@ def _deny_attestation_test(statement: Dict[str, Any]) -> Optional[str]:
     refuses only a request with no attestation; and None when the Deny does
     not fire on a missing attestation. A positive operator, IfExists or not,
     passes a request that carries no attestation, so it is never credited.
+    Condition keys in one statement are ANDed, so a Deny that also tests any
+    other key fires only for part of the requests and is not credited, and a
+    Deny with two attestation tests pins neither: a request that matches one
+    measurement escapes it.
     """
     if not _principal_is_everyone(statement.get("Principal")):
         return None
+    conditions = _condition_keys_by_operator(statement)
+    if any(not ATTESTATION_BINDING_KEY.match(key) for _, key, _ in conditions):
+        return None
+    if len(conditions) > 1:
+        fires_when_missing = all(
+            "not" in _strip_condition_set_operator(operator)
+            or (
+                _strip_condition_set_operator(operator) == "null"
+                and any(str(value).lower() == "true" for value in values)
+            )
+            for operator, _, values in conditions
+        )
+        return "missing" if fires_when_missing else None
     outcome = None
-    for operator, key, values in _condition_keys_by_operator(statement):
-        if not ATTESTATION_BINDING_KEY.match(key):
-            continue
+    for operator, key, values in conditions:
         test = _strip_condition_set_operator(operator)
         if "not" in test:
             if values and not any(
@@ -21910,6 +21966,7 @@ def _enclave_key_assessment(document: Any) -> Dict[str, Any]:
     )
 
     denied = set()
+    deployment_denied = set()
     pinned = False
     for statement in statements:
         if str(statement.get("Effect", "")).upper() != "DENY":
@@ -21918,21 +21975,46 @@ def _enclave_key_assessment(document: Any) -> Dict[str, Any]:
         if test:
             denied.update(_statement_covers_kms_actions(statement))
             pinned = pinned or test == "pins"
+            if test == "pins" and _exact_attestation_keys(
+                statement, negated=True
+            ) & set(ENCLAVE_DEPLOYMENT_KEYS):
+                deployment_denied.update(_statement_covers_kms_actions(statement))
 
     bypasses = []
+    deployment_gaps = []
     for statement in statements:
         if str(statement.get("Effect", "")).upper() != "ALLOW":
             continue
         actions = _statement_covers_kms_actions(statement)
         if not actions:
             continue
-        if _allow_pins_enclave_image(statement):
+        label = statement.get("Sid") or "unnamed statement"
+        own_keys = _exact_attestation_keys(statement, negated=False)
+        statement_pins = _allow_pins_enclave_image(statement)
+        open_actions = [action for action in actions if action not in denied]
+        enclave_bound = (
+            any(not key.startswith(NITRO_TPM_KEY_PREFIX) for key in own_keys)
+            if own_keys
+            else "Nitro Enclave" in families
+        )
+        if (
+            (statement_pins or not open_actions)
+            and enclave_bound
+            and not own_keys & set(ENCLAVE_DEPLOYMENT_KEYS)
+        ):
+            unbound = [a for a in actions if a not in deployment_denied]
+            if unbound:
+                deployment_gaps.append(
+                    f"statement '{label}' releases {', '.join(unbound)} with no "
+                    "exact PCR3 (parent IAM role), PCR4 (parent instance ID) or "
+                    "PCR8 (signing certificate) value, so an enclave launched "
+                    "from any parent instance satisfies it"
+                )
+        if statement_pins:
             pinned = True
             continue
-        open_actions = [action for action in actions if action not in denied]
         if not open_actions:
             continue
-        label = statement.get("Sid") or "unnamed statement"
         if _principal_is_account_root(statement.get("Principal")):
             bypasses.append(
                 f"statement '{label}' grants {', '.join(open_actions)} to the "
@@ -21949,6 +22031,8 @@ def _enclave_key_assessment(document: Any) -> Dict[str, Any]:
         "families": families,
         "pinned": pinned,
         "bypasses": bypasses,
+        "deployment_gaps": deployment_gaps,
+        "denied": denied,
     }
 
 
@@ -22022,6 +22106,57 @@ def check_kms_enclave_key_binding(region: str = "") -> Dict[str, Any]:
                     "value, so the key is not bound to one attested image"
                 )
             deficiencies.extend(assessment["bypasses"])
+            deficiencies.extend(assessment["deployment_gaps"])
+            # A grant carries only encryption context constraints, so it
+            # releases its operations with no attestation unless a key policy
+            # Deny to every principal refuses them.
+            try:
+                grants = _list_all_items(
+                    kms_client,
+                    "list_grants",
+                    "Grants",
+                    max_results_param="Limit",
+                    token_param="Marker",
+                    token_response_keys=("NextMarker",),
+                    max_results=100,
+                    KeyId=key_id,
+                )
+            except Exception as error:
+                grants_error = get_assessment_error_label(error)
+            else:
+                grants_error = ""
+                for grant in grants:
+                    released = [
+                        action
+                        for operation, action in (
+                            ENCLAVE_SENSITIVE_GRANT_OPERATIONS.items()
+                        )
+                        if operation in (grant.get("Operations") or [])
+                        and action not in assessment["denied"]
+                    ]
+                    if released:
+                        deficiencies.append(
+                            "grant '{}' lets {} call {} with no attestation "
+                            "condition".format(
+                                grant.get("Name") or grant.get("GrantId"),
+                                grant.get("GranteePrincipal")
+                                or grant.get("GranteeServicePrincipal")
+                                or "an unnamed grantee",
+                                ", ".join(released),
+                            )
+                        )
+            if grants_error and not deficiencies:
+                indeterminate.append(
+                    f"{key_id}: its key policy binds attestation, but its grants "
+                    f"were not read ({grants_error}), and a grant can release "
+                    "key material with no attestation"
+                )
+                continue
+            if grants_error:
+                deficiencies.append(
+                    f"its grants were not read ({grants_error}), so a grant "
+                    "path was not ruled out"
+                )
             if not deficiencies:
                 passed.append(f"{key_id} ({family})")
                 continue
@@ -22037,7 +22172,9 @@ def check_kms_enclave_key_binding(region: str = "") -> Dict[str, Any]:
                     "stay unconditioned, add a Deny statement for every "
                     "principal on those operations with a Null condition that "
                     "is true on the RecipientAttestation key, so a request "
-                    "without attestation is refused.",
+                    "without attestation is refused. Pin PCR3 or PCR4, or PCR8, "
+                    "beside the image measurement, and retire any grant of "
+                    "those operations the Deny does not cover.",
                     "High",
                     "Failed",
                 )
@@ -22046,9 +22183,11 @@ def check_kms_enclave_key_binding(region: str = "") -> Dict[str, Any]:
         if passed:
             findings["csv_data"].append(
                 row(
-                    "{} attestation-bound KMS key(s) pin an attestation measurement "
-                    "and allow decryption, shared secret derivation and data key "
-                    "generation only with attestation: {}.".format(
+                    "{} attestation-bound KMS key(s) pin an attestation measurement, "
+                    "bind a Nitro Enclave pin to its deployment through PCR3, PCR4 "
+                    "or PCR8, and allow decryption, shared secret derivation and "
+                    "data key generation only with attestation, through the key "
+                    "policy and every grant: {}.".format(
                         len(passed), ", ".join(passed[:5])
                     ),
                     "No action required",
@@ -22059,9 +22198,8 @@ def check_kms_enclave_key_binding(region: str = "") -> Dict[str, Any]:
         if indeterminate:
             findings["csv_data"].append(
                 row(
-                    "The key policy of {} KMS key(s) could not be read: {}.".format(
-                        len(indeterminate), "; ".join(indeterminate[:5])
-                    ),
+                    "The key policy or grants of {} KMS key(s) could not be read: "
+                    "{}.".format(len(indeterminate), "; ".join(indeterminate[:5])),
                     COULD_NOT_ASSESS_RESOLUTION,
                     "Informational",
                     "N/A",

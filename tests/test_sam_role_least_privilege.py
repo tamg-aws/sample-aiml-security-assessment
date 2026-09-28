@@ -181,6 +181,7 @@ _EXPECTED_ACTIONS = {
         "inspector2:BatchGetAccountStatus",
         "kms:DescribeKey",
         "kms:GetKeyPolicy",
+        "kms:ListGrants",
         "kms:ListKeys",
         "lambda:GetFunction",
         "lambda:GetPolicy",

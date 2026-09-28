@@ -20263,18 +20263,47 @@ class TestBR55EnclaveKeyBinding:
         "Resource": "*",
     }
 
-    def _enclave_allow(self, key="kms:RecipientAttestation:ImageSha384", **kwargs):
+    PCR3 = "kms:RecipientAttestation:PCR3"
+    DEPLOYMENT_GAP = (
+        "with no exact PCR3 (parent IAM role), PCR4 (parent instance ID) or PCR8 "
+        "(signing certificate) value"
+    )
+
+    def _enclave_allow(
+        self, key="kms:RecipientAttestation:ImageSha384", deployment=True, **kwargs
+    ):
+        values = {key: self.DIGEST}
+        if deployment and "NitroTPM" not in key:
+            values[self.PCR3] = self.DIGEST
         statement = {
             "Sid": "EnclaveDecrypt",
             "Effect": "Allow",
             "Principal": {"AWS": "arn:aws:iam::123456789012:role/enclave"},
             "Action": ["kms:Decrypt", "kms:GenerateDataKey"],
             "Resource": "*",
-            "Condition": kwargs.get(
-                "condition", {"StringEqualsIgnoreCase": {key: self.DIGEST}}
-            ),
+            "Condition": kwargs.get("condition", {"StringEqualsIgnoreCase": values}),
         }
         return statement
+
+    def _deployment_deny(self):
+        return {
+            "Sid": "DenyOtherParents",
+            "Effect": "Deny",
+            "Principal": "*",
+            "Action": ["kms:Decrypt", "kms:DeriveSharedSecret", "kms:GenerateDataKey*"],
+            "Resource": "*",
+            "Condition": {"StringNotEqualsIgnoreCase": {self.PCR3: self.DIGEST}},
+        }
+
+    def _assert_root_closed_but_unbound(self, row):
+        """The Deny closed the unattested root path; only the parent is open."""
+        details = row["Finding_Details"]
+        assert "to the account" not in details
+        assert (
+            f"statement 'Enable IAM User Permissions' releases kms:decrypt, "
+            f"kms:derivesharedsecret, kms:generatedatakey, kms:generatedatakeypair "
+            f"{self.DEPLOYMENT_GAP}" in details
+        )
 
     def _admin(self):
         return {
@@ -20285,8 +20314,28 @@ class TestBR55EnclaveKeyBinding:
             "Resource": "*",
         }
 
-    def _run(self, policies, key_manager=None, pages=None, policy_error=None):
+    def _run(
+        self,
+        policies,
+        key_manager=None,
+        pages=None,
+        policy_error=None,
+        grants=None,
+        grants_error=None,
+    ):
         kms = MagicMock()
+
+        def list_grants(KeyId, **kwargs):
+            if grants_error and KeyId in grants_error:
+                raise grants_error[KeyId]
+            pages_for_key = (grants or {}).get(KeyId, [[]])
+            index = int(kwargs.get("Marker") or 0)
+            response = {"Grants": pages_for_key[index]}
+            if index + 1 < len(pages_for_key):
+                response["NextMarker"] = str(index + 1)
+            return response
+
+        kms.list_grants.side_effect = list_grants
         if pages is not None:
             kms.list_keys.side_effect = lambda **kwargs: (
                 pages[1] if kwargs.get("Marker") else pages[0]
@@ -20377,7 +20426,8 @@ class TestBR55EnclaveKeyBinding:
                     self._enclave_allow(
                         condition={
                             "ForAnyValue:StringEqualsIgnoreCase": {
-                                "kms:RecipientAttestation:ImageSha384": [self.DIGEST]
+                                "kms:RecipientAttestation:ImageSha384": [self.DIGEST],
+                                self.PCR3: [self.DIGEST],
                             }
                         }
                     )
@@ -20399,8 +20449,16 @@ class TestBR55EnclaveKeyBinding:
                 }
             },
         }
-        _, rows, _ = self._run({"k": [self.ROOT, deny]})
-        assert [r["Status"] for r in rows] == ["Passed"]
+        _, rows, _ = self._run(
+            {
+                "a-image-only": [self.ROOT, deny],
+                "b-with-parent": [self.ROOT, deny, self._deployment_deny()],
+            }
+        )
+        assert [r["Status"] for r in rows] == ["Failed", "Passed"]
+        assert "arn:k/a-image-only" in rows[0]["Finding_Details"]
+        self._assert_root_closed_but_unbound(rows[0])
+        assert "arn:k/b-with-parent" in rows[1]["Finding_Details"]
 
     def _null_deny(self, action=None, **kwargs):
         statement = {
@@ -20428,15 +20486,16 @@ class TestBR55EnclaveKeyBinding:
                 "b-root": [self.ROOT, self._enclave_allow()],
             }
         )
-        assert [r["Status"] for r in rows] == ["Failed", "Passed"]
-        assert "arn:k/b-root" in rows[0]["Finding_Details"]
-        assert "to the account" in rows[0]["Finding_Details"]
-        assert "delegates to the account root" in rows[0]["Resolution"]
+        assert [r["Status"] for r in rows] == ["Failed", "Failed"]
+        assert "arn:k/b-root" in rows[1]["Finding_Details"]
+        assert "to the account" in rows[1]["Finding_Details"]
+        assert "delegates to the account root" in rows[1]["Resolution"]
         assert (
             "Deny statement for every principal on those operations with a Null "
             "condition that is true on the RecipientAttestation key"
-        ) in rows[0]["Resolution"]
-        assert "arn:k/a-denied" in rows[1]["Finding_Details"]
+        ) in rows[1]["Resolution"]
+        assert "arn:k/a-denied" in rows[0]["Finding_Details"]
+        self._assert_root_closed_but_unbound(rows[0])
 
     def test_br55_null_deny_forms_that_cover_the_family_close_the_root_path(self):
         for deny in (
@@ -20450,8 +20509,10 @@ class TestBR55EnclaveKeyBinding:
                     "b-root": [self.ROOT, self._enclave_allow()],
                 }
             )
-            assert [r["Status"] for r in rows] == ["Failed", "Passed"], deny
-            assert "arn:k/a-denied" in rows[1]["Finding_Details"], deny
+            assert [r["Status"] for r in rows] == ["Failed", "Failed"], deny
+            assert "arn:k/a-denied" in rows[0]["Finding_Details"], deny
+            self._assert_root_closed_but_unbound(rows[0])
+            assert "to the account" in rows[1]["Finding_Details"], deny
 
     def test_br55_null_deny_omitting_derive_shared_secret_fails(self):
         deny = self._null_deny(action=["kms:Decrypt", "kms:GenerateDataKey*"])
@@ -20461,10 +20522,11 @@ class TestBR55EnclaveKeyBinding:
                 "b-partial": [self.ROOT, self._enclave_allow(), deny],
             }
         )
-        assert [r["Status"] for r in rows] == ["Failed", "Passed"]
-        assert "arn:k/b-partial" in rows[0]["Finding_Details"]
+        assert [r["Status"] for r in rows] == ["Failed", "Failed"]
+        self._assert_root_closed_but_unbound(rows[0])
+        assert "arn:k/b-partial" in rows[1]["Finding_Details"]
         assert (
-            "grants kms:derivesharedsecret to the account" in rows[0]["Finding_Details"]
+            "grants kms:derivesharedsecret to the account" in rows[1]["Finding_Details"]
         )
 
     def test_br55_positive_if_exists_deny_is_not_credited(self):
@@ -20481,14 +20543,19 @@ class TestBR55EnclaveKeyBinding:
                     "b-if-exists": [self.ROOT, self._enclave_allow(), deny],
                 }
             )
-            assert [r["Status"] for r in rows] == ["Failed", "Passed"], condition
-            assert "arn:k/b-if-exists" in rows[0]["Finding_Details"], condition
+            assert [r["Status"] for r in rows] == ["Failed", "Failed"], condition
+            self._assert_root_closed_but_unbound(rows[0])
+            assert "arn:k/b-if-exists" in rows[1]["Finding_Details"], condition
+            assert "to the account" in rows[1]["Finding_Details"], condition
 
     def test_br55_root_statement_with_attestation_condition_passes(self):
         attested_root = dict(
             self.ROOT,
             Condition={
-                "StringEqualsIgnoreCase": {"kms:RecipientAttestation:PCR0": self.DIGEST}
+                "StringEqualsIgnoreCase": {
+                    "kms:RecipientAttestation:PCR0": self.DIGEST,
+                    self.PCR3: self.DIGEST,
+                }
             },
         )
         _, rows, _ = self._run(
@@ -20513,8 +20580,10 @@ class TestBR55EnclaveKeyBinding:
                     "b-null-only": [self.ROOT, deny],
                 }
             )
-            assert [r["Status"] for r in rows] == ["Failed", "Passed"], condition
-            details = rows[0]["Finding_Details"]
+            assert [r["Status"] for r in rows] == ["Failed", "Failed"], condition
+            self._assert_root_closed_but_unbound(rows[0])
+            assert "not bound to one attested image" not in rows[0]["Finding_Details"]
+            details = rows[1]["Finding_Details"]
             assert "arn:k/b-null-only" in details, condition
             assert "not bound to one attested image" in details, condition
             assert "to the account" not in details, condition
@@ -20657,6 +20726,174 @@ class TestBR55EnclaveKeyBinding:
         for finding in rows:
             assert_finding_schema(finding)
             assert finding["Check_ID"] == "BR-55"
+
+    def test_br55_image_pin_without_a_deployment_pcr_fails(self):
+        """AIR-FND-DAT-10: an EIF is not secret, so PCR0 alone binds no parent."""
+        _, rows, _ = self._run(
+            {
+                "a-image-only": [self._enclave_allow(deployment=False)],
+                "b-pcr0-only": [
+                    self._enclave_allow(
+                        key="kms:RecipientAttestation:PCR0", deployment=False
+                    )
+                ],
+                "c-pcr4": [
+                    self._enclave_allow(
+                        condition={
+                            "StringEqualsIgnoreCase": {
+                                "kms:RecipientAttestation:PCR0": self.DIGEST,
+                                "kms:RecipientAttestation:PCR4": self.DIGEST,
+                            }
+                        }
+                    )
+                ],
+                "d-pcr8": [self._enclave_allow(key="kms:RecipientAttestation:PCR8")],
+            }
+        )
+        assert [r["Status"] for r in rows] == ["Failed", "Failed", "Passed"]
+        assert "arn:k/a-image-only" in rows[0]["Finding_Details"]
+        assert "arn:k/b-pcr0-only" in rows[1]["Finding_Details"]
+        for row in rows[:2]:
+            assert (
+                "statement 'EnclaveDecrypt' releases kms:decrypt, kms:generatedatakey "
+                f"{self.DEPLOYMENT_GAP}" in row["Finding_Details"]
+            )
+            assert "Pin PCR3 or PCR4, or PCR8" in row["Resolution"]
+        assert "arn:k/c-pcr4 (Nitro Enclave)" in rows[2]["Finding_Details"]
+        assert "arn:k/d-pcr8 (Nitro Enclave)" in rows[2]["Finding_Details"]
+
+    def test_br55_one_image_only_statement_beside_a_bound_one_fails(self):
+        image_only = dict(self._enclave_allow(deployment=False), Sid="Loose")
+        _, rows, _ = self._run({"k": [self._enclave_allow(), image_only]})
+        assert [r["Status"] for r in rows] == ["Failed"]
+        details = rows[0]["Finding_Details"]
+        assert "statement 'Loose' releases" in details
+        assert "statement 'EnclaveDecrypt' releases" not in details
+
+    def test_br55_nitro_tpm_pin_needs_no_enclave_deployment_pcr(self):
+        _, rows, _ = self._run(
+            {"k": [self._enclave_allow(key="kms:RecipientAttestation:NitroTPMPCR7")]}
+        )
+        assert [r["Status"] for r in rows] == ["Passed"]
+
+    def test_br55_deny_narrowed_by_another_condition_key_is_not_credited(self):
+        narrowed = dict(
+            self._null_deny(),
+            Condition={
+                "Null": {"kms:RecipientAttestation:ImageSha384": "true"},
+                "StringEquals": {"aws:PrincipalAccount": "111122223333"},
+            },
+        )
+        _, rows, _ = self._run(
+            {
+                "a-narrowed": [self.ROOT, self._enclave_allow(), narrowed],
+                "b-whole": [
+                    self.ROOT,
+                    self._enclave_allow(),
+                    self._null_deny(),
+                    self._deployment_deny(),
+                ],
+            }
+        )
+        assert [r["Status"] for r in rows] == ["Failed", "Passed"]
+        assert "arn:k/a-narrowed" in rows[0]["Finding_Details"]
+        assert "to the account" in rows[0]["Finding_Details"]
+        assert "arn:k/b-whole" in rows[1]["Finding_Details"]
+
+    def test_br55_deny_testing_two_measurements_pins_neither(self):
+        """Two negated keys are ANDed: a right image with a wrong parent escapes."""
+        joint = dict(
+            self._deployment_deny(),
+            Condition={
+                "StringNotEqualsIgnoreCase": {
+                    "kms:RecipientAttestation:ImageSha384": self.DIGEST,
+                    self.PCR3: self.DIGEST,
+                }
+            },
+        )
+        _, rows, _ = self._run(
+            {
+                "a-joint": [self.ROOT, joint],
+                "b-separate": [
+                    self.ROOT,
+                    dict(
+                        self._deployment_deny(),
+                        Sid="DenyOtherImages",
+                        Condition={
+                            "StringNotEqualsIgnoreCase": {
+                                "kms:RecipientAttestation:ImageSha384": self.DIGEST
+                            }
+                        },
+                    ),
+                    self._deployment_deny(),
+                ],
+            }
+        )
+        assert [r["Status"] for r in rows] == ["Failed", "Passed"]
+        details = rows[0]["Finding_Details"]
+        assert "arn:k/a-joint" in details
+        assert "not bound to one attested image" in details
+        assert self.DEPLOYMENT_GAP in details
+
+    def test_br55_grant_of_decrypt_is_a_bypass_unless_a_deny_covers_it(self):
+        grant = {
+            "GrantId": "g-1",
+            "Name": "app-grant",
+            "GranteePrincipal": "arn:aws:iam::123456789012:role/app",
+            "Operations": ["Decrypt", "Encrypt"],
+        }
+        harmless = {
+            "GrantId": "g-2",
+            "GranteePrincipal": "arn:aws:iam::123456789012:role/other",
+            "Operations": ["Encrypt", "GenerateDataKeyWithoutPlaintext"],
+        }
+        _, rows, kms = self._run(
+            {
+                "a-granted": [self._enclave_allow()],
+                "b-denied": [
+                    self._enclave_allow(),
+                    self._null_deny(),
+                    self._deployment_deny(),
+                ],
+                "c-harmless": [self._enclave_allow()],
+            },
+            grants={
+                "arn:k/a-granted": [[harmless], [grant]],
+                "arn:k/b-denied": [[grant]],
+                "arn:k/c-harmless": [[harmless]],
+            },
+        )
+        assert [r["Status"] for r in rows] == ["Failed", "Passed"]
+        assert "arn:k/a-granted" in rows[0]["Finding_Details"]
+        assert (
+            "grant 'app-grant' lets arn:aws:iam::123456789012:role/app call "
+            "kms:decrypt with no attestation condition" in rows[0]["Finding_Details"]
+        )
+        assert "g-2" not in rows[0]["Finding_Details"]
+        assert "arn:k/b-denied" in rows[1]["Finding_Details"]
+        assert "arn:k/c-harmless" in rows[1]["Finding_Details"]
+        kms.list_grants.assert_any_call(KeyId="arn:k/a-granted", Limit=100, Marker="1")
+
+    def test_br55_unread_grants_never_pass_a_key(self):
+        _, rows, _ = self._run(
+            {
+                "a-clean": [self._enclave_allow()],
+                "b-unread": [self._enclave_allow()],
+                "c-bypass": [self.ROOT, self._enclave_allow()],
+            },
+            grants_error={
+                "arn:k/b-unread": _make_client_error("AccessDeniedException"),
+                "arn:k/c-bypass": _make_client_error("AccessDeniedException"),
+            },
+        )
+        assert [r["Status"] for r in rows] == ["Failed", "Passed", "N/A"]
+        assert "arn:k/c-bypass" in rows[0]["Finding_Details"]
+        assert "its grants were not read" in rows[0]["Finding_Details"]
+        assert "arn:k/b-unread" not in rows[1]["Finding_Details"]
+        assert (
+            "arn:k/b-unread: its key policy binds attestation, but its grants"
+            in (rows[2]["Finding_Details"])
+        )
 
 
 def test_handler_reports_br50_and_br51_unassessed_without_a_cache():

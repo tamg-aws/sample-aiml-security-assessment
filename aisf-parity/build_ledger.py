@@ -1253,8 +1253,14 @@ FOUNDATION_ROWS = [
         "statement that grants the account root is such a bypass unless it "
         "carries an attestation pin or that Deny is present. A Null Deny alone "
         "refuses a missing attestation but admits any image, so a key with no "
-        "exact pin still fails. Which workloads must be enclave-bound is the "
-        "customer's decision, so a key without the condition is never failed",
+        "exact pin still fails. A Nitro Enclave image pin alone fails too: every "
+        "releasing statement also needs an exact PCR3, PCR4 or PCR8 value, in "
+        "itself or through a single-test Deny, because the image file is not "
+        "secret. A Deny narrowed by another condition key is not credited. Every "
+        "grant is read, and a grant of the four operations fails the key unless a "
+        "Deny covers it; unread grants are N/A. Which workloads must be "
+        "enclave-bound is the customer's decision, and no API records it, so a key "
+        "without the condition is never failed",
         [],
         6,
     ),
