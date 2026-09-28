@@ -7920,6 +7920,83 @@ class TestBR42ModelAllowList:
             f["Finding_Details"] for f in findings if f["Status"] == "Passed"
         )
 
+    @staticmethod
+    def _deny_list_document(deny):
+        return {
+            "Version": "2012-10-17",
+            "Statement": [
+                {"Effect": "Allow", "Action": "bedrock:*", "Resource": "*"},
+                dict(
+                    {
+                        "Effect": "Deny",
+                        "Action": [
+                            "bedrock:InvokeModel",
+                            "bedrock:InvokeModelWithResponseStream",
+                        ],
+                    },
+                    **deny,
+                ),
+            ],
+        }
+
+    @pytest.mark.parametrize(
+        "deny",
+        [
+            {
+                "NotResource": [
+                    "arn:aws:bedrock:*::foundation-model/anthropic.claude-3-5-sonnet-v1:0"
+                ],
+                "Condition": {"StringEquals": {"aws:PrincipalTag/team": "ml"}},
+            },
+            {
+                "NotResource": [
+                    "arn:aws:bedrock:*::foundation-model/anthropic.claude-3-5-sonnet-v1:0",
+                    "arn:aws:bedrock:*::foundation-model/*",
+                ]
+            },
+            {"NotResource": ["arn:aws:bedrock:*::foundation-model/anthropic.*"]},
+            {
+                "Resource": "*",
+                "Condition": {
+                    "ArnNotLike": {
+                        "bedrock:ModelArn": "arn:aws:bedrock:*::foundation-model/anthropic.claude-3-5-sonnet-v1:0"
+                    },
+                    "Bool": {"aws:ViaAWSService": "false"},
+                },
+            },
+        ],
+        ids=[
+            "other-key",
+            "match-all-beside-named",
+            "id-wildcard",
+            "condition-other-key",
+        ],
+    )
+    def test_br42_an_identity_deny_list_that_is_narrowed_does_not_scope_the_grant(
+        self, deny
+    ):
+        findings = self._run(
+            _identity_cache(
+                roles={
+                    "NarrowedDenyRole": [
+                        ("AllowWithDenyList", self._deny_list_document(deny))
+                    ],
+                    "ExactDenyRole": [
+                        (
+                            "AllowWithExactDenyList",
+                            self._deny_list_document({"NotResource": [self.MODEL_ARN]}),
+                        )
+                    ],
+                }
+            )
+        )
+        failed = [f for f in findings if f["Status"] == "Failed"]
+        assert len(failed) == 1
+        assert "Role 'NarrowedDenyRole'" in failed[0]["Finding_Details"]
+        assert "ExactDenyRole" in " ".join(
+            f["Finding_Details"] for f in findings if f["Status"] == "Passed"
+        )
+
     def test_br42_bedrock_mantle_inference_needs_a_model_condition(self):
         project = "arn:aws:bedrock-mantle:us-east-1:123456789012:project/*"
         findings = self._run(
@@ -9918,6 +9995,77 @@ class TestBR44MarketplaceModelControl:
             )
             assert [f["Status"] for f in findings] == ["Failed"]
 
+    OUTRIGHT_DENY = {
+        "Effect": "Deny",
+        "Action": ["aws-marketplace:Subscribe", "aws-marketplace:Unsubscribe"],
+        "Resource": "*",
+    }
+
+    def test_br44_an_unconditioned_identity_deny_removes_the_grant(self):
+        document = {
+            "Version": "2012-10-17",
+            "Statement": [
+                {"Effect": "Allow", "Action": "aws-marketplace:*", "Resource": "*"},
+                self.OUTRIGHT_DENY,
+            ],
+        }
+        findings = self._run(
+            _identity_cache(
+                roles={
+                    "DeniedRole": [("DenyAll", document)],
+                    "OpenRole": [("Open", _allow("aws-marketplace:Subscribe", "*"))],
+                }
+            )
+        )
+        failed = [f for f in findings if f["Status"] == "Failed"]
+        passed = [f for f in findings if f["Status"] == "Passed"]
+        assert len(failed) == 1
+        assert "Role 'OpenRole'" in failed[0]["Finding_Details"]
+        assert "DeniedRole" not in failed[0]["Finding_Details"]
+        assert (
+            "denies aws-marketplace:subscribe with no condition"
+            in passed[0]["Finding_Details"]
+        )
+
+    def test_br44_an_identity_deny_on_one_action_leaves_the_other_open(self):
+        document = {
+            "Version": "2012-10-17",
+            "Statement": [
+                {"Effect": "Allow", "Action": "aws-marketplace:*", "Resource": "*"},
+                dict(self.OUTRIGHT_DENY, Action="aws-marketplace:Subscribe"),
+            ],
+        }
+        findings = self._run(_identity_cache(roles={"Half": [("Half", document)]}))
+        assert [f["Status"] for f in findings] == ["Failed"]
+        assert "aws-marketplace:unsubscribe" in findings[0]["Finding_Details"]
+
+    def test_br44_an_unconditioned_scp_deny_bounds_open_grants(self):
+        cache = _identity_cache(
+            roles={
+                "OpenA": [("Open", _allow("aws-marketplace:Subscribe", "*"))],
+                "OpenB": [("Open", _allow("aws-marketplace:*", "*"))],
+            }
+        )
+        findings = extract_csv_data(
+            bedrock_app.check_bedrock_marketplace_model_control(
+                cache, region="Global", scp_inventory=self._scp(self.OUTRIGHT_DENY)
+            )
+        )
+        assert [f["Status"] for f in findings] == ["Passed"]
+        details = findings[0]["Finding_Details"]
+        assert "denies aws-marketplace:subscribe with no condition" in details
+        assert "role 'OpenA'" in details and "role 'OpenB'" in details
+        conditioned = dict(
+            self.OUTRIGHT_DENY,
+            Condition={"StringEquals": {"aws:PrincipalTag/team": "ml"}},
+        )
+        narrowed = extract_csv_data(
+            bedrock_app.check_bedrock_marketplace_model_control(
+                cache, region="Global", scp_inventory=self._scp(conditioned)
+            )
+        )
+        assert [f["Status"] for f in narrowed] == ["Failed", "Failed"]
+
     def test_br44_unread_scp_is_named(self):
         inventory = self._scp(self.SCP_ALLOW_LIST)
         inventory["errors"] = ["policy 'Other': AccessDenied"]
@@ -10922,8 +11070,25 @@ class TestBR46KnowledgeBaseSourceClassification:
         job_details=None,
         customization_jobs=None,
         customization_error=None,
+        ingestion_jobs=None,
+        ingestion_error=None,
+        training_jobs=None,
+        training_error=None,
     ):
         agent_client = MagicMock()
+        ingestion_jobs = ingestion_jobs or {}
+        agent_client.list_ingestion_jobs.side_effect = (
+            ingestion_error
+            if ingestion_error
+            else lambda **kwargs: {
+                "ingestionJobSummaries": [
+                    {"ingestionJobId": f"ing-{index}", "startedAt": started}
+                    for index, started in enumerate(
+                        ingestion_jobs.get(kwargs["dataSourceId"], [])
+                    )
+                ]
+            }
+        )
         agent_client.list_knowledge_bases.return_value = {
             "knowledgeBaseSummaries": list(knowledge_bases)
         }
@@ -11002,12 +11167,28 @@ class TestBR46KnowledgeBaseSourceClassification:
         macie_client.describe_classification_job.side_effect = describe_job
         self.macie_client = macie_client
 
+        sagemaker_client = MagicMock()
+        training_jobs = training_jobs or {}
+        if training_error:
+            sagemaker_client.list_training_jobs.side_effect = training_error
+        else:
+            sagemaker_client.list_training_jobs.return_value = {
+                "TrainingJobSummaries": [
+                    {"TrainingJobName": name} for name in training_jobs
+                ]
+            }
+        sagemaker_client.describe_training_job.side_effect = lambda TrainingJobName: (
+            training_jobs[TrainingJobName]
+        )
+        self.sagemaker_client = sagemaker_client
+
         with patch(
             "bedrock_app.boto3.client",
             side_effect=lambda service, **kwargs: {
                 "bedrock-agent": agent_client,
                 "bedrock": bedrock_client,
                 "macie2": macie_client,
+                "sagemaker": sagemaker_client,
             }[service],
         ):
             return extract_csv_data(
@@ -11603,7 +11784,8 @@ class TestBR46ClassificationJobCoverage:
         )
         self._hr_fails_because(findings, "skips keys starting with policies/")
 
-    def test_br46_extension_exclude_passes_and_says_it_was_not_judged(self):
+    def test_br46_extension_exclude_is_na_and_says_it_was_not_judged(self):
+        """An exclude the check cannot compare with the source is not a pass."""
         scoping = {
             "excludes": {
                 "and": [
@@ -11622,8 +11804,168 @@ class TestBR46ClassificationJobCoverage:
             {"job-no-images": self._detail(s3JobDefinition={"scoping": scoping})},
         )
         assert not [f for f in findings if f["Status"] == "Failed"]
+        unjudged = self._hr_rows(findings, "N/A")
+        assert len(unjudged) == 1, [f["Finding_Details"] for f in findings]
+        assert "1 exclude condition(s) on extension" in unjudged[0]["Finding_Details"]
         passed = [f for f in findings if f["Status"] == "Passed"]
-        assert "1 exclude condition(s) on extension" in passed[0]["Finding_Details"]
+        assert "1 of 2 AI data source(s)" in passed[0]["Finding_Details"]
+
+    CREATED = "2026-08-15T00:00:00Z"
+
+    def test_br46_ingestion_before_the_job_was_created_fails(self):
+        """hr was ingested before its job existed; support has no ingestion."""
+        findings = self._run(
+            [self._job("nightly-hr")],
+            {"job-nightly-hr": self._detail(createdAt=self.CREATED)},
+            ingestion_jobs={"ds-2": ["2026-09-10T00:00:00Z", "2026-08-01T00:00:00Z"]},
+        )
+        self._hr_fails_because(
+            findings,
+            "the first ingestion job started at 2026-08-01T00:00:00Z, before the "
+            "job was created at 2026-08-15T00:00:00Z",
+        )
+
+    def test_br46_ingestion_after_the_job_was_created_passes_and_says_so(self):
+        findings = self._run(
+            [self._job("nightly-hr")],
+            {"job-nightly-hr": self._detail(createdAt=self.CREATED)},
+            ingestion_jobs={"ds-2": ["2026-08-20T00:00:00Z", "2026-09-10T00:00:00Z"]},
+        )
+        assert not [f for f in findings if f["Status"] in ("Failed", "N/A")]
+        details = findings[0]["Finding_Details"]
+        assert "2 of 2 AI data source(s)" in details
+        assert (
+            "the first ingestion job started at 2026-08-20T00:00:00Z, after the job "
+            "was created" in details
+        )
+        assert (
+            "the latest ingestion job started at 2026-09-10T00:00:00Z, after the "
+            "last run" in details
+        )
+        assert "object write times are not read" in details
+
+    def test_br46_ingestion_without_a_job_creation_time_is_na(self):
+        findings = self._run(
+            [self._job("nightly-hr")],
+            ingestion_jobs={"ds-2": ["2026-08-01T00:00:00Z"]},
+        )
+        assert not [f for f in findings if f["Status"] == "Failed"]
+        unjudged = self._hr_rows(findings, "N/A")
+        assert len(unjudged) == 1, [f["Finding_Details"] for f in findings]
+        assert "the job reports no createdAt" in unjudged[0]["Finding_Details"]
+        passed = [f for f in findings if f["Status"] == "Passed"]
+        assert "1 of 2 AI data source(s)" in passed[0]["Finding_Details"]
+
+    def test_br46_unread_ingestion_jobs_are_na_naming_the_action(self):
+        findings = self._run(
+            [self._job("nightly-hr")],
+            ingestion_error=ClientError(
+                {"Error": {"Code": "AccessDeniedException", "Message": "no"}},
+                "ListIngestionJobs",
+            ),
+        )
+        assert not [f for f in findings if f["Status"] in ("Failed", "Passed")]
+        assert "bedrock:ListIngestionJobs" in " ".join(
+            f["Finding_Details"] for f in findings
+        )
+
+    def test_br46_customization_before_the_job_was_created_fails(self):
+        estate = TestBR46KnowledgeBaseSourceClassification()
+        findings = estate._two_bucket_estate(
+            macie_buckets=self._BUCKETS + [{"bucketName": "tune-bucket"}],
+            classification_jobs=[
+                estate._job("support", ["support-bucket"]),
+                estate._job("nightly-hr", ["hr-bucket"]),
+                estate._job("tune", ["tune-bucket"]),
+            ],
+            job_details={"job-tune": self._detail(createdAt=self.CREATED)},
+            customization_jobs={
+                "tune-1": {
+                    "creationTime": "2026-08-01T00:00:00Z",
+                    "trainingDataConfig": {"s3Uri": "s3://tune-bucket/train.jsonl"},
+                }
+            },
+        )
+        failed = [f for f in findings if f["Status"] == "Failed"]
+        assert len(failed) == 1, [f["Finding_Details"] for f in findings]
+        assert (
+            "customization job 'tune-1' started at 2026-08-01"
+            in (failed[0]["Finding_Details"])
+        )
+        passed = [f for f in findings if f["Status"] == "Passed"]
+        assert "2 of 3 AI data source(s)" in passed[0]["Finding_Details"]
+
+    @staticmethod
+    def _training_job(uri, created="2026-08-20T00:00:00Z"):
+        return {
+            "CreationTime": created,
+            "InputDataConfig": [
+                {
+                    "ChannelName": "train",
+                    "DataSource": {"S3DataSource": {"S3Uri": uri}},
+                }
+            ],
+            "OutputDataConfig": {"S3OutputPath": "s3://out-bucket/"},
+            "ModelArtifacts": {"S3ModelArtifacts": "s3://out-bucket/model.tar.gz"},
+        }
+
+    def test_br46_sagemaker_training_data_is_a_source(self):
+        """One training bucket has a job, the other does not."""
+        findings = self._run(
+            [self._job("nightly-hr"), self._job("train-a", ["train-a"])],
+            {"job-train-a": self._detail(createdAt=self.CREATED)},
+            macie_buckets=self._BUCKETS
+            + [{"bucketName": "train-a"}, {"bucketName": "train-b"}],
+            training_jobs={
+                "tj-a": self._training_job("s3://train-a/data/"),
+                "tj-b": self._training_job("s3://train-b/data/"),
+            },
+        )
+        failed = [f for f in findings if f["Status"] == "Failed"]
+        assert len(failed) == 1, [f["Finding_Details"] for f in findings]
+        assert (
+            "the training data channel 'train' of SageMaker training job 'tj-b'"
+            in failed[0]["Finding_Details"]
+        )
+        assert "out-bucket" not in " ".join(f["Finding_Details"] for f in findings)
+        passed = [f for f in findings if f["Status"] == "Passed"]
+        assert "3 of 4 AI data source(s)" in passed[0]["Finding_Details"]
+
+    def test_br46_unread_sagemaker_training_jobs_are_na_naming_the_action(self):
+        findings = self._run(
+            [self._job("nightly-hr")],
+            training_error=ClientError(
+                {"Error": {"Code": "AccessDeniedException", "Message": "no"}},
+                "ListTrainingJobs",
+            ),
+        )
+        unread = [
+            f
+            for f in findings
+            if f["Status"] == "N/A"
+            and "sagemaker:ListTrainingJobs" in f["Finding_Details"]
+        ]
+        assert len(unread) == 1, [f["Finding_Details"] for f in findings]
+
+    def test_br46_training_jobs_past_the_read_cap_are_named(self):
+        estate = TestBR46KnowledgeBaseSourceClassification()
+        jobs = {
+            f"tj-{index}": self._training_job("s3://support-bucket/data/")
+            for index in range(3)
+        }
+        with patch.object(bedrock_app, "MAX_SAGEMAKER_TRAINING_JOB_READS", 2):
+            findings = estate._two_bucket_estate(
+                macie_buckets=self._BUCKETS,
+                classification_jobs=[
+                    estate._job("support", ["support-bucket"]),
+                    estate._job("nightly-hr", ["hr-bucket"]),
+                ],
+                training_jobs=jobs,
+            )
+        assert estate.sagemaker_client.describe_training_job.call_count == 2
+        assert "1 older SageMaker training job(s) past the newest 2" in " ".join(
+            f["Finding_Details"] for f in findings if f["Status"] == "N/A"
+        )
 
     def test_br46_job_naming_another_bucket_does_not_clear_this_one(self):
         findings = self._run([self._job("nightly-other", ["unrelated-bucket"])])
@@ -21914,6 +22256,45 @@ class TestBR43ApprovedModelControl:
             )
         )
         assert [r["Status"] for r in rows] == ["Failed"]
+
+    @pytest.mark.parametrize(
+        "extra, reason",
+        [
+            (
+                {"Condition": {"StringEquals": {"aws:PrincipalTag/team": "ml"}}},
+                "it also requires stringequals on aws:principaltag/team",
+            ),
+            (
+                {"NotResource": ["arn:aws:bedrock:*::foundation-model/*"]},
+                "has a wildcard in the model or profile id",
+            ),
+        ],
+        ids=["other-key", "match-all-beside-named"],
+    )
+    def test_br43_a_narrowed_list_is_not_credited_beside_an_exact_one(
+        self, extra, reason
+    ):
+        actions = ["bedrock:InvokeModel", "bedrock:InvokeModelWithResponseStream"]
+        narrowed = {"Effect": "Deny", "Action": actions, "NotResource": self.MODELS}
+        if "NotResource" in extra:
+            narrowed["NotResource"] = self.MODELS + extra["NotResource"]
+        else:
+            narrowed.update(extra)
+        alone = self._run(self._inventory(_policy(narrowed)))
+        assert [r["Status"] for r in alone] == ["Failed"]
+        assert "Not credited: policy 'policy-0'" in alone[0]["Finding_Details"]
+        assert reason in alone[0]["Finding_Details"].lower()
+        beside = self._run(
+            self._inventory(
+                _policy(narrowed),
+                _policy(
+                    {"Effect": "Deny", "Action": actions, "NotResource": self.MODELS}
+                ),
+            )
+        )
+        assert [r["Status"] for r in beside] == ["Passed"]
+        assert "policy 'policy-1'" in beside[0]["Finding_Details"]
+        assert "Not credited: policy 'policy-0'" in beside[0]["Finding_Details"]
 
     def test_br43_unreadable_organization_is_na(self):
         rows = self._run(self._inventory(), readable=False)

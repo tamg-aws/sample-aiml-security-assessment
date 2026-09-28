@@ -979,16 +979,19 @@ AI_SUBJECT_ROWS = [
         ["BR-46"],
         "BR-46 judges the per-object leg by value on every AI source bucket: each "
         "knowledge base S3 source with its inclusion prefixes, and the training, "
-        "validation and invocation-log source buckets of every customization job. "
+        "validation and invocation-log source buckets of every customization job, "
+        "and the training data buckets of the newest 200 SageMaker training jobs. "
         "DescribeClassificationJob is read for each job that names the bucket or is its "
         "jobDetails.lastJobId, and a job clears the source only when it is SCHEDULED, "
         "RUNNING or IDLE, has run at least once with no ERROR, ran over existing "
         "objects, samples 100 percent, has data identifiers, and scopes in the source "
         "prefix. Automated discovery samples, so a MONITORED bucket with no such job "
-        "fails. Exclude conditions on extension, size, date or tag are counted and not "
-        "judged, and a failed read is N/A. The order of classification and ingestion "
-        "per object, and the pre-ingest Comprehend detection the control also "
-        "recommends, are not recorded by any account configuration",
+        "fails. A source that an ingestion, customization or training job read "
+        "before the Macie job was created fails. An exclude condition on extension, "
+        "size, date or tag is N/A, and a failed read is N/A. The order of "
+        "classification and ingestion per object needs object write times, which "
+        "are not read, and the pre-ingest Comprehend detection the control also "
+        "recommends is not recorded by any account configuration",
         [],
         5,
     ),

@@ -18081,7 +18081,7 @@ def _identity_model_access(
         if denied(action):
             continue
         listed_by_deny = any(
-            action in control["actions"]
+            action in control["actions"] and not control["gaps"]
             for _, policy, _ in documents
             for control in _scp_model_list_controls(policy.get("document") or "{}")
         )
@@ -19662,6 +19662,11 @@ def _scp_model_list_controls(document: Any) -> List[Dict[str, Any]]:
     a negated condition whose values name them. A Deny written with NotAction
     covers every action it does not name. A pattern that matches every model,
     such as arn:aws:bedrock:*::foundation-model/*, is no list at all.
+
+    ``gaps`` names what keeps a control from denying every unlisted model: a
+    list value with a wildcard in its resource type or ID, which exempts every
+    model it matches, or a condition key besides the list, which denies only
+    the requests that also meet it. A control with gaps is not credited.
     """
     controls = []
     for statement in _policy_statements(document):
@@ -19687,24 +19692,77 @@ def _scp_model_list_controls(document: Any) -> List[Dict[str, Any]]:
             ]
         if not covered:
             continue
-        named = [
-            str(value)
-            for value in _as_list(statement.get("NotResource"))
-            if _names_a_model_list(value)
-        ]
+        conditions = _condition_keys_by_operator(statement)
+        listed = _as_list(statement.get("NotResource"))
+        named = [str(value) for value in listed if _names_a_model_list(value)]
         form = "NotResource"
+        list_key = None
         if not named:
             form = "condition"
-            for operator, key, values in _condition_keys_by_operator(statement):
+            for operator, key, values in conditions:
                 if "not" not in _strip_condition_set_operator(operator):
                     continue
                 named = [str(value) for value in values if _names_a_model_list(value)]
                 if named:
                     form = f"{operator} on {key}"
+                    list_key = (operator, key)
+                    listed = values
                     break
-        if named:
-            controls.append({"actions": covered, "form": form, "models": named})
+        if not named:
+            continue
+        gaps = []
+        open_values = [
+            str(value)
+            for value in listed
+            if _is_model_list_pattern(value) and not _names_one_listed_model(value)
+        ]
+        if open_values:
+            gaps.append(
+                "its list value {} has a wildcard in the model or profile ID, so "
+                "every model it matches is exempt".format(", ".join(open_values))
+            )
+        narrowing = sorted(
+            {
+                f"{operator} on {key}"
+                for operator, key, _ in conditions
+                if (operator, key) != list_key
+            }
+        )
+        if narrowing:
+            gaps.append(
+                "it also requires {}, so it denies only the requests that meet "
+                "that test too".format(", ".join(narrowing))
+            )
+        controls.append(
+            {"actions": covered, "form": form, "models": named, "gaps": gaps}
+        )
     return controls
+
+
+def _names_one_listed_model(value: Any) -> bool:
+    """
+    Return True when a Deny list value names one model or profile ID. A policy
+    written for many accounts wildcards the Region and account segments, and
+    the value still exempts that one ID in each of them, so only the resource
+    type and ID are judged.
+    """
+    segments = str(value).strip().lower().split(":", 5)
+    if len(segments) != 6:
+        return False
+    resource_type, _, resource_id = segments[5].partition("/")
+    return bool(resource_type and resource_id) and not any(
+        char in resource_type + resource_id for char in "*?"
+    )
+
+
+def _is_model_list_pattern(value: Any) -> bool:
+    """Return True for a Bedrock model or inference-profile ARN or pattern."""
+    if not isinstance(value, str):
+        return False
+    value = value.strip().lower()
+    return any(prefix in value for prefix in MODEL_RESOURCE_TYPE_PREFIXES) or (
+        _pattern_covers_every_model(value)
+    )
 
 
 def _approved_model_control_row(
@@ -19786,6 +19844,7 @@ def check_bedrock_approved_model_control(
         )
 
         enforcing = []
+        not_credited = []
         covered_actions = set()
         read_errors = list(inventory["errors"])
         if inventory["list_error"]:
@@ -19802,6 +19861,13 @@ def check_bedrock_approved_model_control(
                 read_errors.append(f"policy '{item['name']}': {str(error)}")
                 continue
             for control in controls:
+                if control["gaps"]:
+                    not_credited.append(
+                        "policy '{}' ({})".format(
+                            item["name"], "; ".join(control["gaps"])
+                        )
+                    )
+                    continue
                 covered_actions.update(control["actions"])
                 enforcing.append(
                     "policy '{}' denies {} outside {} named model(s) through {} "
@@ -19823,6 +19889,10 @@ def check_bedrock_approved_model_control(
                 _scp_scope_note(inventory)
             )
         )
+        if not_credited:
+            scope_note = (
+                "Not credited: {}. ".format("; ".join(not_credited[:5])) + scope_note
+            )
         if enforcing and not uncovered:
             findings["details"] = "Bedrock invocation is limited to a model list"
             findings["csv_data"].append(
@@ -20076,10 +20146,14 @@ def _marketplace_scp_bounds(
             if str(statement.get("Effect", "")).upper() != "DENY":
                 continue
             binding = _marketplace_statement_binding(statement)
-            if not binding["bound"]:
-                continue
             for action in MARKETPLACE_CHANGE_ACTIONS:
-                if _statement_matches_action(statement, action):
+                if _identity_denies_everywhere(statement, action):
+                    observed["bounded"].setdefault(action, []).append(
+                        "policy '{}' (denies {} with no condition)".format(
+                            item.get("name"), action
+                        )
+                    )
+                elif binding["bound"] and _statement_matches_action(statement, action):
                     observed["bounded"].setdefault(action, []).append(
                         "policy '{}' ({})".format(item.get("name"), binding["detail"])
                     )
@@ -20168,6 +20242,16 @@ def check_bedrock_marketplace_model_control(
 
             for action in MARKETPLACE_CHANGE_ACTIONS:
                 if _boundary_allowance(permissions, action) == "denied":
+                    continue
+                outright = [
+                    label
+                    for label, statement in identity_statements
+                    if _identity_denies_everywhere(statement, action)
+                ]
+                if outright:
+                    scoped_statements.append(
+                        f"{outright[0]}: denies {action} with no condition"
+                    )
                     continue
                 denies = [
                     (label, statement)
@@ -22028,6 +22112,8 @@ def _knowledge_base_s3_sources(region: str = "") -> Dict[str, Any]:
                 {
                     "label": label,
                     "bucket": bucket,
+                    "knowledge_base_id": kb_id,
+                    "data_source_id": data_source_id,
                     "owner_account": str(
                         s3_configuration.get("bucketOwnerAccountId") or ""
                     ),
@@ -22344,6 +22430,103 @@ def _classification_job_gap(
     )
 
 
+def _ingestion_job_window(
+    region: str, knowledge_base_id: str, data_source_id: str
+) -> Dict[str, Any]:
+    """
+    Return when one data source was first and last ingested, from every page of
+    ListIngestionJobs, as a ``first_read`` record for _classification_order.
+    """
+    label = "the first ingestion job"
+    try:
+        client = boto3.client("bedrock-agent", config=boto3_config, region_name=region)
+        jobs = _list_all_items(
+            client,
+            "list_ingestion_jobs",
+            "ingestionJobSummaries",
+            knowledgeBaseId=knowledge_base_id,
+            dataSourceId=data_source_id,
+        )
+    except (ClientError, BotoCoreError, TypeError) as error:
+        return {
+            "label": label,
+            "first": None,
+            "latest": None,
+            "error": (
+                "its ingestion jobs were not read with bedrock:ListIngestionJobs "
+                f"({get_assessment_error_label(error)})"
+            ),
+        }
+    started = [job.get("startedAt") for job in jobs if job.get("startedAt")]
+    epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
+    ordered = sorted(started, key=lambda value: _days_between(epoch, value) or 0.0)
+    return {
+        "label": label,
+        "first": ordered[0] if ordered else None,
+        "latest": ordered[-1] if ordered else None,
+        "error": "",
+    }
+
+
+def _classification_order(
+    detail: Dict[str, Any], first_read: Optional[Dict[str, Any]]
+) -> Dict[str, str]:
+    """
+    Compare a passing Macie job's createdAt and lastRunTime with when the
+    source was first and last read.
+
+    A reader that started before the job was created read objects the job had
+    not classified, so that is Failed. A latest ingestion after the last run
+    read any object written between the two unclassified; object write times
+    are not read, so that is stated and not judged.
+    """
+    if not first_read:
+        return {"status": "Passed", "detail": ""}
+    if first_read.get("error"):
+        return {
+            "status": "N/A",
+            "detail": (
+                f"{first_read['error']}, so whether it was classified before it "
+                "was read is unknown"
+            ),
+        }
+    first = first_read.get("first")
+    if not first:
+        return {
+            "status": "Passed",
+            "detail": f"; {first_read['label']} has no recorded start",
+        }
+    created = detail.get("createdAt")
+    lead = _days_between(created, first)
+    if lead is None:
+        return {
+            "status": "N/A",
+            "detail": (
+                "the job reports no createdAt, so it cannot be ordered against "
+                f"{first_read['label']}, which started at {first}"
+            ),
+        }
+    if lead < 0:
+        return {
+            "status": "Failed",
+            "detail": (
+                f"{first_read['label']} started at {first}, before the job was "
+                f"created at {created}, so what it read was not classified by "
+                "this job first"
+            ),
+        }
+    note = f"; {first_read['label']} started at {first}, after the job was created"
+    latest = first_read.get("latest")
+    gap = _days_between(detail.get("lastRunTime"), latest) if latest else None
+    if gap is not None and gap > 0:
+        note += (
+            f"; the latest ingestion job started at {latest}, after the last run, "
+            "so an object written between the two was ingested before this job "
+            "classified it, and object write times are not read"
+        )
+    return {"status": "Passed", "detail": note}
+
+
 def _classification_source_verdict(
     source: Dict[str, Any],
     record: Dict[str, Any],
@@ -22374,24 +22557,33 @@ def _classification_source_verdict(
             continue
         name = detail.get("name") or job["name"]
         verdict = _classification_job_gap(detail, source["prefixes"])
-        if verdict["gap"] is None:
-            note = (
-                f"; {verdict['unjudged']} exclude condition(s) on extension, size, "
-                "date or tag are not judged"
-                if verdict["unjudged"]
-                else ""
+        if verdict["gap"] is not None:
+            reasons.append(f"Macie job '{name}' names it, but {verdict['gap']}")
+            continue
+        if verdict["unjudged"]:
+            unread.append(
+                f"Macie job '{name}' names it and {verdict['unjudged']} exclude "
+                "condition(s) on extension, size, date or tag skip objects that "
+                "were not compared with what the source ingests"
             )
-            return {
-                "status": "Passed",
-                "detail": (
-                    f"{source['label']} (bucket {source['bucket']}) is classified by "
-                    f"scheduled Macie job '{name}' ({detail.get('jobStatus')}, "
-                    f"{(detail.get('statistics') or {}).get('numberOfRuns')} run(s), "
-                    f"last run {detail.get('lastRunTime') or 'not recorded'}, "
-                    f"full sampling, initial run over existing objects{note})"
-                ),
-            }
-        reasons.append(f"Macie job '{name}' names it, but {verdict['gap']}")
+            continue
+        order = _classification_order(detail, source.get("first_read"))
+        if order["status"] == "Failed":
+            reasons.append(f"Macie job '{name}' names it, but {order['detail']}")
+            continue
+        if order["status"] == "N/A":
+            unread.append(f"Macie job '{name}' names it, but {order['detail']}")
+            continue
+        return {
+            "status": "Passed",
+            "detail": (
+                f"{source['label']} (bucket {source['bucket']}) is classified by "
+                f"scheduled Macie job '{name}' ({detail.get('jobStatus')}, "
+                f"{(detail.get('statistics') or {}).get('numberOfRuns')} run(s), "
+                f"last run {detail.get('lastRunTime') or 'not recorded'}, "
+                f"full sampling, initial run over existing objects{order['detail']})"
+            ),
+        }
 
     monitored_by_job = str(
         (record.get("jobDetails") or {}).get("isMonitoredByJob") or "UNKNOWN"
@@ -22517,27 +22709,59 @@ def check_bedrock_knowledge_base_source_classification(
                 if location["role"] == "output":
                     continue
                 key = str(location["uri"]).split("://", 1)[-1].partition("/")[2]
+                label = (
+                    f"the {location['role']} of customization job '{location['job']}'"
+                )
                 sources.append(
                     {
-                        "label": (
-                            f"the {location['role']} of customization job "
-                            f"'{location['job']}'"
-                        ),
+                        "label": label,
                         "bucket": _s3_uri_bucket(location["uri"]),
                         "owner_account": "",
                         "prefixes": [key] if key else [],
+                        "first_read": {
+                            "label": f"customization job '{location['job']}'",
+                            "first": location.get("started"),
+                            "latest": None,
+                            "error": "",
+                        },
                     }
                 )
 
+        sagemaker = _sagemaker_training_locations(region)
+        read_errors.extend(sagemaker["errors"])
+        for location in sagemaker["locations"]:
+            if not location["role"].startswith("training data"):
+                continue
+            key = str(location["uri"]).split("://", 1)[-1].partition("/")[2]
+            sources.append(
+                {
+                    "label": (
+                        f"the {location['role']} of SageMaker training job "
+                        f"'{location['job']}'"
+                    ),
+                    "bucket": _s3_uri_bucket(location["uri"]),
+                    "owner_account": "",
+                    "prefixes": [key] if key else [],
+                    "first_read": {
+                        "label": f"SageMaker training job '{location['job']}'",
+                        "first": location.get("started"),
+                        "latest": None,
+                        "error": "",
+                    },
+                }
+            )
+
         if read_errors:
             na(
-                "{} data source read(s) failed across knowledge bases and model "
-                "customization jobs, so the source list is incomplete: {}.".format(
+                "{} data source read(s) failed across knowledge bases, model "
+                "customization jobs and SageMaker training jobs, so the source list "
+                "is incomplete: {}.".format(
                     len(read_errors), "; ".join(read_errors[:5])
                 ),
                 "Grant bedrock:ListKnowledgeBases, bedrock:ListDataSources, "
-                "bedrock:GetDataSource, bedrock:ListModelCustomizationJobs and "
-                "bedrock:GetModelCustomizationJob, then retry.",
+                "bedrock:GetDataSource, bedrock:ListModelCustomizationJobs, "
+                "bedrock:GetModelCustomizationJob, sagemaker:ListTrainingJobs and "
+                "sagemaker:DescribeTrainingJob, then retry.",
             )
 
         if other_sources:
@@ -22557,8 +22781,9 @@ def check_bedrock_knowledge_base_source_classification(
                     finding_name=check_name,
                     finding_details=(
                         "{} knowledge base(s) exist in {} and none of them ingests "
-                        "from an S3 bucket, and no model customization job reads one, "
-                        "so there is no source bucket to classify.".format(
+                        "from an S3 bucket, and no model customization job or "
+                        "SageMaker training job reads one, so there is no source "
+                        "bucket to classify.".format(
                             knowledge_base_count, region or "this region"
                         )
                     ),
@@ -22661,6 +22886,10 @@ def check_bedrock_knowledge_base_source_classification(
                 )
                 continue
 
+            if source.get("knowledge_base_id") and "first_read" not in source:
+                source["first_read"] = _ingestion_job_window(
+                    region, source["knowledge_base_id"], source["data_source_id"]
+                )
             candidates = list(job_index["jobs_by_bucket"].get(bucket_name) or [])
             last_job = str((record.get("jobDetails") or {}).get("lastJobId") or "")
             if last_job and last_job not in {job["id"] for job in candidates}:
@@ -22714,10 +22943,12 @@ def check_bedrock_knowledge_base_source_classification(
                     finding_name=CLASSIFICATION_JOB_FINDING,
                     finding_details=(
                         "{} of {} AI data source(s) are classified by a recurring, "
-                        "full-depth Macie job: {}. Whether each object was classified "
-                        "before the ingestion or customization job that read it, and "
+                        "full-depth Macie job: {}. Each job's createdAt is compared "
+                        "with when its source was first read. Object write times are "
+                        "not read, so whether each object was classified before the "
+                        "ingestion or training job that read it is not judged, and "
                         "whether the classification is carried into per-document "
-                        "metadata, is not recorded by any API and is not judged.".format(
+                        "metadata is not recorded by any API and is not judged.".format(
                             len(passed), len(sources), "; ".join(passed)
                         )
                     ),
@@ -23073,7 +23304,97 @@ def _customization_job_locations(region: str = "") -> Dict[str, Any]:
         ]
         for role, uri in pairs:
             if _s3_uri_bucket(uri):
-                locations.append({"role": role, "uri": str(uri), "job": job_name})
+                locations.append(
+                    {
+                        "role": role,
+                        "uri": str(uri),
+                        "job": job_name,
+                        "started": detail.get("creationTime"),
+                    }
+                )
+    return {"locations": locations, "errors": errors}
+
+
+# DescribeTrainingJob is one call per job, so the most recent jobs are read and
+# the rest are named as unread.
+MAX_SAGEMAKER_TRAINING_JOB_READS = 200
+
+
+def _sagemaker_training_locations(region: str = "") -> Dict[str, Any]:
+    """
+    Read the S3 locations of the SageMaker training jobs in ``region``.
+
+    ListTrainingJobs summaries carry no S3 location, so each job takes one
+    DescribeTrainingJob call: every InputDataConfig channel's S3Uri is training
+    data, OutputDataConfig.S3OutputPath is output and
+    ModelArtifacts.S3ModelArtifacts is a model artifact. Every page is listed,
+    newest first, and jobs past MAX_SAGEMAKER_TRAINING_JOB_READS are named in
+    ``errors``. Each location is {"role", "uri", "job", "started"}.
+    """
+    locations = []
+    errors = []
+    client = boto3.client("sagemaker", config=boto3_config, region_name=region)
+    try:
+        jobs = _list_all_items(
+            client,
+            "list_training_jobs",
+            "TrainingJobSummaries",
+            max_results_param="MaxResults",
+            token_param="NextToken",
+            SortBy="CreationTime",
+            SortOrder="Descending",
+        )
+    except (ClientError, BotoCoreError, TypeError) as error:
+        return {
+            "locations": [],
+            "errors": [
+                "SageMaker training jobs were not read with "
+                f"sagemaker:ListTrainingJobs ({get_assessment_error_label(error)})"
+            ],
+        }
+    if len(jobs) > MAX_SAGEMAKER_TRAINING_JOB_READS:
+        errors.append(
+            "{} older SageMaker training job(s) past the newest {} were not read "
+            "with sagemaker:DescribeTrainingJob".format(
+                len(jobs) - MAX_SAGEMAKER_TRAINING_JOB_READS,
+                MAX_SAGEMAKER_TRAINING_JOB_READS,
+            )
+        )
+    for job in jobs[:MAX_SAGEMAKER_TRAINING_JOB_READS]:
+        name = job.get("TrainingJobName") or "unnamed"
+        try:
+            detail = client.describe_training_job(TrainingJobName=name)
+        except (ClientError, BotoCoreError) as error:
+            errors.append(
+                f"SageMaker training job '{name}' was not read with "
+                f"sagemaker:DescribeTrainingJob ({get_assessment_error_label(error)})"
+            )
+            continue
+        pairs = [
+            (
+                f"training data channel '{channel.get('ChannelName') or 'unnamed'}'",
+                ((channel.get("DataSource") or {}).get("S3DataSource") or {}).get(
+                    "S3Uri"
+                ),
+            )
+            for channel in detail.get("InputDataConfig") or []
+        ] + [
+            ("output", (detail.get("OutputDataConfig") or {}).get("S3OutputPath")),
+            (
+                "model artifacts",
+                (detail.get("ModelArtifacts") or {}).get("S3ModelArtifacts"),
+            ),
+        ]
+        for role, uri in pairs:
+            if _s3_uri_bucket(uri):
+                locations.append(
+                    {
+                        "role": role,
+                        "uri": str(uri),
+                        "job": name,
+                        "started": detail.get("CreationTime"),
+                    }
+                )
     return {"locations": locations, "errors": errors}
 
 

@@ -230,6 +230,13 @@ section.
   and reports a per-version or metric-math alarm as `N/A`. The knowledge base
   rows of `BR-26` and `BR-34` no longer credit an account-enforced
   configuration that narrows its model or content scope.
+- `BR-42` and `BR-43` no longer credit a model deny list that has a wildcard
+  in a model or profile ID or requires a second condition key, and `BR-43`
+  names each uncredited list. `BR-44` counts an unconditioned `Deny` on a
+  marketplace action as removing the grant. `BR-46` reports an exclude
+  condition it cannot compare as `N/A`, fails a source that an ingestion,
+  customization or SageMaker training job read before its Macie job was
+  created, and adds SageMaker training data buckets to the population.
 - Bedrock checks judge values that they used to credit on presence. `BR-07`,
   `BR-17`, `BR-20` (S3 Vectors), `BR-30` and `BR-38` describe each named KMS
   key and pass only an enabled customer managed key. `BR-07` also fails inline
