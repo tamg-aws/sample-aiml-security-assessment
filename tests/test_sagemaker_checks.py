@@ -3427,28 +3427,112 @@ def _raise(error):
     raise error
 
 
+_SM32_REQUIRED_RULES = [
+    {
+        "ConfigRuleName": "sm-endpoint-kms",
+        "ConfigRuleState": "ACTIVE",
+        "Source": {
+            "Owner": "AWS",
+            "SourceIdentifier": "SAGEMAKER_ENDPOINT_CONFIGURATION_KMS_KEY_CONFIGURED",
+        },
+        "InputParameters": json.dumps(
+            {"kmsKeyArns": "arn:aws:kms:us-east-1:123456789012:key/approved"}
+        ),
+    },
+    {
+        "ConfigRuleName": "sm-notebook-kms",
+        "ConfigRuleState": "ACTIVE",
+        "Source": {
+            "Owner": "AWS",
+            "SourceIdentifier": "SAGEMAKER_NOTEBOOK_INSTANCE_KMS_KEY_CONFIGURED",
+        },
+    },
+    {
+        "ConfigRuleName": "sm-notebook-internet",
+        "ConfigRuleState": "ACTIVE",
+        "Source": {
+            "Owner": "AWS",
+            "SourceIdentifier": "SAGEMAKER_NOTEBOOK_NO_DIRECT_INTERNET_ACCESS",
+        },
+    },
+]
+_SM32_REQUIRED_RULE_NAMES = [rule["ConfigRuleName"] for rule in _SM32_REQUIRED_RULES]
+_SM32_ORG_PACK = {
+    "ConformancePackName": "org-sagemaker",
+    "CreatedBy": "config-multiaccountsetup.amazonaws.com",
+}
+
+
 class TestSM32ConfigComplianceEvaluation:
     """AIR-SGM-GOV-10: SM-32 asserts Config recording and rule evaluation."""
 
     @staticmethod
-    def _config(mock_client, recorders, rules, compliance):
+    def _config(
+        mock_client,
+        recorders,
+        rules,
+        compliance,
+        summaries=(),
+        packs=(),
+        pack_rules=None,
+        statuses=None,
+    ):
+        """
+        Every covered recorder records unless statuses says otherwise, and each
+        Config paginator gets its own page set.
+        """
         config_client = MagicMock()
         config_client.describe_configuration_recorders.return_value = {
             "ConfigurationRecorders": recorders
         }
-        rule_paginator = MagicMock()
-        rule_paginator.paginate.return_value = [{"ConfigRules": rules}]
-        compliance_paginator = MagicMock()
-        compliance_paginator.paginate.return_value = [
-            {"ComplianceByConfigRules": compliance}
-        ]
-        config_client.get_paginator.side_effect = lambda name: (
-            rule_paginator if name == "describe_config_rules" else compliance_paginator
-        )
+        config_client.describe_configuration_recorder_status.return_value = {
+            "ConfigurationRecordersStatus": (
+                statuses
+                if statuses is not None
+                else [{"name": r.get("name"), "recording": True} for r in recorders]
+            )
+        }
+        pages = {
+            "describe_config_rules": [{"ConfigRules": rules}],
+            "describe_compliance_by_config_rule": [
+                {"ComplianceByConfigRules": compliance}
+            ],
+            "list_configuration_recorders": [
+                {"ConfigurationRecorderSummaries": list(summaries)}
+            ],
+            "describe_conformance_packs": [{"ConformancePackDetails": list(packs)}],
+        }
+        paginators = {}
+        for name, value in pages.items():
+            paginator = MagicMock()
+            if isinstance(value, Exception):
+                paginator.paginate.side_effect = value
+            else:
+                paginator.paginate.return_value = value
+            paginators[name] = paginator
+        pack_paginator = MagicMock()
+
+        def pack_pages(ConformancePackName):
+            value = (pack_rules or {}).get(ConformancePackName, [])
+            if isinstance(value, Exception):
+                raise value
+            return [
+                {
+                    "ConformancePackRuleComplianceList": [
+                        {"ConfigRuleName": rule_name} for rule_name in value
+                    ]
+                }
+            ]
+
+        pack_paginator.paginate.side_effect = pack_pages
+        paginators["describe_conformance_pack_compliance"] = pack_paginator
+        config_client.get_paginator.side_effect = lambda name: paginators[name]
         mock_client.return_value = config_client
         return config_client
 
     def test_recorder_and_compliant_rule_pass(self):
+        # A Passed-only result now needs the three required rules, pinned, in
+        # an organization conformance pack, and a recorder that is recording.
         with patch("sagemaker_app.boto3.client") as mock_client:
             self._config(
                 mock_client,
@@ -3462,24 +3546,16 @@ class TestSM32ConfigComplianceEvaluation:
                         },
                     }
                 ],
+                _SM32_REQUIRED_RULES,
                 [
                     {
-                        "ConfigRuleName": "sagemaker-notebook-no-direct-internet",
-                        "ConfigRuleState": "ACTIVE",
-                        "Source": {
-                            "Owner": "AWS",
-                            "SourceIdentifier": (
-                                "SAGEMAKER_NOTEBOOK_NO_DIRECT_INTERNET_ACCESS"
-                            ),
-                        },
-                    }
-                ],
-                [
-                    {
-                        "ConfigRuleName": "sagemaker-notebook-no-direct-internet",
+                        "ConfigRuleName": rule["ConfigRuleName"],
                         "Compliance": {"ComplianceType": "COMPLIANT"},
                     }
+                    for rule in _SM32_REQUIRED_RULES
                 ],
+                packs=[_SM32_ORG_PACK],
+                pack_rules={"org-sagemaker": _SM32_REQUIRED_RULE_NAMES},
             )
             findings = extract_csv_data(
                 sagemaker_app.check_sagemaker_config_compliance_evaluation(
@@ -3497,26 +3573,39 @@ class TestSM32ConfigComplianceEvaluation:
             assert f["Check_ID"] == "SM-32"
             assert_finding_schema(f)
 
-    def test_no_recorder_is_indeterminate_and_no_rule_still_fails(self):
+    def test_no_recorder_is_failed_once_the_full_list_is_read_and_no_rule_fails(
+        self,
+    ):
+        # An empty no-arg DescribeConfigurationRecorders hides a service-linked
+        # recorder. ListConfigurationRecorders lists those too, so an empty
+        # customer-managed set is now decidable and fails.
         with patch("sagemaker_app.boto3.client") as mock_client:
-            self._config(mock_client, [], [], [])
+            self._config(
+                mock_client,
+                [],
+                [],
+                [],
+                summaries=[
+                    {
+                        "name": "AWSConfigurationRecorderForSecurityHubCSPM",
+                        "servicePrincipal": "cspm.securityhub.amazonaws.com",
+                    }
+                ],
+            )
             findings = extract_csv_data(
                 sagemaker_app.check_sagemaker_config_compliance_evaluation(
                     region="us-east-1"
                 )
             )
-        # An empty no-arg DescribeConfigurationRecorders hides a service-linked
-        # recorder, so it cannot carry a Failed on its own. The rule leg is
-        # independent and still fails.
-        assert [f["Status"] for f in findings] == ["N/A", "Failed"]
+        recording = _by_finding(findings, sagemaker_app.CONFIG_RECORDING_FINDING)
+        assert [f["Status"] for f in recording] == ["Failed"]
         assert (
-            "no customer-managed AWS Config recorder" in findings[0]["Finding_Details"]
+            "No customer-managed AWS Config recorder" in recording[0]["Finding_Details"]
         )
-        assert (
-            "returned only when the call names its ServicePrincipal"
-            in findings[0]["Finding_Details"]
-        )
-        assert "No ACTIVE AWS Config rule" in findings[1]["Finding_Details"]
+        assert "cspm.securityhub.amazonaws.com" in recording[0]["Finding_Details"]
+        rule_rows = self._rule_rows(findings)
+        assert [f["Status"] for f in rule_rows] == ["Failed"]
+        assert "No ACTIVE AWS Config rule" in rule_rows[0]["Finding_Details"]
 
     def test_recorder_recording_other_services_only_is_failed(self):
         with patch("sagemaker_app.boto3.client") as mock_client:
@@ -9817,3 +9906,280 @@ class TestSM09NotebookAccessGuardrails:
                 )
             )
         assert [r["Status"] for r in rows] == ["N/A"]
+
+
+# ===================================================================
+# AIR-SGM-GOV-10: SM-32 recorder status, required rules, conformance pack
+# ===================================================================
+_SM32_RECORDER = {"name": "default", "recordingGroup": {"allSupported": True}}
+
+
+def _sm32_rows(
+    recorders=(_SM32_RECORDER,),
+    rules=None,
+    compliance=None,
+    **kwargs,
+):
+    rules = _SM32_REQUIRED_RULES if rules is None else rules
+    if compliance is None:
+        compliance = [
+            {
+                "ConfigRuleName": rule["ConfigRuleName"],
+                "Compliance": {"ComplianceType": "COMPLIANT"},
+            }
+            for rule in rules
+        ]
+    kwargs.setdefault("packs", [_SM32_ORG_PACK])
+    kwargs.setdefault("pack_rules", {"org-sagemaker": _SM32_REQUIRED_RULE_NAMES})
+    extra = kwargs.pop("configure", None)
+    with patch("sagemaker_app.boto3.client") as mock_client:
+        config_client = TestSM32ConfigComplianceEvaluation._config(
+            mock_client, list(recorders), rules, compliance, **kwargs
+        )
+        if extra:
+            extra(config_client)
+        return extract_csv_data(
+            sagemaker_app.check_sagemaker_config_compliance_evaluation(
+                region="us-east-1"
+            )
+        )
+
+
+class TestSM32RecorderStatus:
+    RECORDING = sagemaker_app.CONFIG_RECORDING_FINDING
+
+    def test_clean_environment_passes_every_row(self):
+        rows = _sm32_rows()
+        assert {r["Status"] for r in rows} == {"Passed"}
+        assert len(rows) == 4
+
+    def test_one_stopped_recorder_of_two_fails_only_that_one(self):
+        second = {"name": "second", "recordingGroup": {"allSupported": True}}
+        rows = _sm32_rows(
+            recorders=[_SM32_RECORDER, second],
+            statuses=[
+                {"name": "default", "recording": True},
+                {"name": "second", "recording": False},
+            ],
+        )
+        recording = _by_finding(rows, self.RECORDING)
+        assert [r["Status"] for r in recording] == ["Passed", "Failed"]
+        assert "'second'" in recording[1]["Finding_Details"]
+        assert "stopped" in recording[1]["Finding_Details"]
+
+    def test_failed_last_status_fails(self):
+        rows = _sm32_rows(
+            statuses=[
+                {
+                    "name": "default",
+                    "recording": True,
+                    "lastStatus": "Failure",
+                    "lastErrorCode": "AccessDenied",
+                }
+            ]
+        )
+        recording = _by_finding(rows, self.RECORDING)
+        assert [r["Status"] for r in recording] == ["Failed"]
+        assert "AccessDenied" in recording[0]["Finding_Details"]
+
+    def test_status_read_error_withholds_passed(self):
+        def configure(client):
+            client.describe_configuration_recorder_status.side_effect = (
+                _make_client_error("AccessDeniedException")
+            )
+
+        rows = _sm32_rows(configure=configure)
+        recording = _by_finding(rows, self.RECORDING)
+        assert [r["Status"] for r in recording] == ["N/A"]
+        assert "AccessDeniedException" in recording[0]["Finding_Details"]
+
+    def test_status_missing_for_the_recorder_is_na(self):
+        rows = _sm32_rows(statuses=[{"name": "other", "recording": True}])
+        assert [r["Status"] for r in _by_finding(rows, self.RECORDING)] == ["N/A"]
+
+    def test_no_recorder_of_any_kind_fails(self):
+        rows = _sm32_rows(recorders=[])
+        recording = _by_finding(rows, self.RECORDING)
+        assert [r["Status"] for r in recording] == ["Failed"]
+        assert "0 service-linked" in recording[0]["Finding_Details"]
+
+    def test_list_recorders_error_is_na(self):
+        rows = _sm32_rows(
+            recorders=[],
+            configure=lambda client: setattr(
+                client.get_paginator("list_configuration_recorders").paginate,
+                "side_effect",
+                _make_client_error("AccessDeniedException"),
+            ),
+        )
+        recording = _by_finding(rows, self.RECORDING)
+        assert [r["Status"] for r in recording] == ["N/A"]
+        assert "ListConfigurationRecorders" in recording[0]["Finding_Details"]
+
+
+class TestSM32RequiredRules:
+    REQUIRED = sagemaker_app.REQUIRED_CONFIG_RULES_FINDING
+
+    def _rules(self, index=None, **change):
+        rules = [dict(rule) for rule in _SM32_REQUIRED_RULES]
+        if index is not None:
+            rules[index].update(change)
+        return rules
+
+    def _status(self, rules):
+        return [
+            r["Status"] for r in _by_finding(_sm32_rows(rules=rules), self.REQUIRED)
+        ]
+
+    def test_all_three_pass(self):
+        assert self._status(self._rules()) == ["Passed"]
+
+    @pytest.mark.parametrize("dropped", range(3))
+    def test_each_missing_rule_fails(self, dropped):
+        rules = [r for i, r in enumerate(self._rules()) if i != dropped]
+        rows = _by_finding(_sm32_rows(rules=rules), self.REQUIRED)
+        assert [r["Status"] for r in rows] == ["Failed"]
+        identifier = _SM32_REQUIRED_RULES[dropped]["Source"]["SourceIdentifier"]
+        assert f"{identifier}: no ACTIVE rule" in rows[0]["Finding_Details"]
+
+    def test_endpoint_rule_without_kms_key_arns_fails(self):
+        assert self._status(self._rules(0, InputParameters="{}")) == ["Failed"]
+
+    def test_unpinned_copy_does_not_hide_a_pinned_one(self):
+        rules = self._rules()
+        unpinned = dict(
+            rules[0], ConfigRuleName="sm-endpoint-any", InputParameters="{}"
+        )
+        assert self._status([unpinned] + rules) == ["Passed"]
+
+    def test_scoped_rule_fails(self):
+        rules = self._rules(2, Scope={"ComplianceResourceId": "nb-1"})
+        assert self._status(rules) == ["Failed"]
+
+    def test_inactive_rule_fails(self):
+        assert self._status(self._rules(1, ConfigRuleState="EVALUATING")) == ["Failed"]
+
+
+class TestSM32ConformancePack:
+    PACK = sagemaker_app.CONFORMANCE_PACK_FINDING
+
+    def _rows(self, packs, pack_rules, **kwargs):
+        return _by_finding(
+            _sm32_rows(packs=packs, pack_rules=pack_rules, **kwargs), self.PACK
+        )
+
+    def test_organization_pack_with_all_three_passes(self):
+        rows = self._rows(
+            [_SM32_ORG_PACK], {"org-sagemaker": _SM32_REQUIRED_RULE_NAMES}
+        )
+        assert [r["Status"] for r in rows] == ["Passed"]
+
+    def test_account_pack_with_all_three_fails(self):
+        rows = self._rows(
+            [{"ConformancePackName": "local"}], {"local": _SM32_REQUIRED_RULE_NAMES}
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "this account only" in rows[0]["Finding_Details"]
+
+    def test_organization_pack_missing_a_rule_fails(self):
+        rows = self._rows(
+            [_SM32_ORG_PACK], {"org-sagemaker": _SM32_REQUIRED_RULE_NAMES[1:]}
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert (
+            "lacks SAGEMAKER_ENDPOINT_CONFIGURATION_KMS_KEY_CONFIGURED"
+            in rows[0]["Finding_Details"]
+        )
+
+    def test_good_pack_after_a_bad_pack_passes(self):
+        bad = {**_SM32_ORG_PACK, "ConformancePackName": "partial"}
+        rows = self._rows(
+            [bad, _SM32_ORG_PACK],
+            {"partial": [], "org-sagemaker": _SM32_REQUIRED_RULE_NAMES},
+        )
+        assert [r["Status"] for r in rows] == ["Passed"]
+
+    def test_no_pack_fails(self):
+        rows = self._rows([], {})
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "no conformance pack is deployed" in rows[0]["Finding_Details"]
+
+    def test_pack_list_error_is_na(self):
+        rows = self._rows(
+            [],
+            {},
+            configure=lambda client: setattr(
+                client.get_paginator("describe_conformance_packs").paginate,
+                "side_effect",
+                _make_client_error("AccessDeniedException"),
+            ),
+        )
+        assert [r["Status"] for r in rows] == ["N/A"]
+
+    def test_unreadable_pack_with_no_good_pack_is_na(self):
+        rows = self._rows(
+            [_SM32_ORG_PACK],
+            {"org-sagemaker": _make_client_error("AccessDeniedException")},
+        )
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert "org-sagemaker" in rows[0]["Finding_Details"]
+
+    def test_unreadable_pack_beside_a_good_one_passes(self):
+        other = {**_SM32_ORG_PACK, "ConformancePackName": "hidden"}
+        rows = self._rows(
+            [other, _SM32_ORG_PACK],
+            {
+                "hidden": _make_client_error("AccessDeniedException"),
+                "org-sagemaker": _SM32_REQUIRED_RULE_NAMES,
+            },
+        )
+        assert [r["Status"] for r in rows] == ["Passed"]
+
+
+class TestSM32UnevaluatedRules:
+    RULES = sagemaker_app.CONFIG_RULE_COMPLIANCE_FINDING
+
+    def _compliance(self, *types):
+        return [
+            {"ConfigRuleName": name, "Compliance": {"ComplianceType": kind}}
+            for name, kind in zip(_SM32_REQUIRED_RULE_NAMES, types)
+            if kind
+        ]
+
+    def test_insufficient_data_withholds_passed(self):
+        rows = _by_finding(
+            _sm32_rows(
+                compliance=self._compliance(
+                    "COMPLIANT", "INSUFFICIENT_DATA", "COMPLIANT"
+                )
+            ),
+            self.RULES,
+        )
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert "sm-notebook-kms" in rows[0]["Finding_Details"]
+
+    def test_rule_with_no_compliance_entry_withholds_passed(self):
+        rows = _by_finding(
+            _sm32_rows(compliance=self._compliance("COMPLIANT", "COMPLIANT", None)),
+            self.RULES,
+        )
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert "sm-notebook-internet" in rows[0]["Finding_Details"]
+
+    def test_one_non_compliant_rule_leaves_no_passed_row(self):
+        rows = _by_finding(
+            _sm32_rows(
+                compliance=self._compliance("COMPLIANT", "NON_COMPLIANT", "COMPLIANT")
+            ),
+            self.RULES,
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+
+    def test_not_applicable_counts_as_evaluated(self):
+        rows = _by_finding(
+            _sm32_rows(
+                compliance=self._compliance("COMPLIANT", "NOT_APPLICABLE", "COMPLIANT")
+            ),
+            self.RULES,
+        )
+        assert [r["Status"] for r in rows] == ["Passed"]

@@ -58,6 +58,8 @@ SCOPED_SAGEMAKER_GRANTS = {
     "sagemaker:DescribeUserProfile": ":user-profile/*/*'",
     "cloudtrail:GetTrailStatus": ":cloudtrail:*:*:trail/*'",
     "cloudtrail:GetEventSelectors": ":cloudtrail:*:*:trail/*'",
+    "config:DescribeConfigurationRecorderStatus": ":configuration-recorder/*/*'",
+    "config:DescribeConformancePackCompliance": ":conformance-pack/*/*'",
 }
 
 

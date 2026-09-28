@@ -917,6 +917,10 @@ _VERIFIED_REMEDIATION_CONDITION_KEYS |= {
 # and index 0, which names both entries below, drew only PRIVATE_IP_ADDRESS.
 _VERIFIED_REMEDIATION_IAM_ACTIONS |= {"sagemaker:CreateNotebookInstance"}
 _VERIFIED_REMEDIATION_CONDITION_KEYS |= {"aws:SourceIp"}
+# Verified on 2026-09-27 with one IDENTITY_POLICY validate-policy run for
+# SM-32's recorder leg. The negative control config:ListConfigurationRecorder
+# came back INVALID_ACTION at statement index 1, and index 0 drew nothing.
+_VERIFIED_REMEDIATION_IAM_ACTIONS |= {"config:ListConfigurationRecorders"}
 
 _NON_IAM_REMEDIATION_TOKENS = {
     # SM-41 names the AWS IoT Core policy variables

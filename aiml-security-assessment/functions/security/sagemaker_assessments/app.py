@@ -5,7 +5,7 @@ import os
 import logging
 from datetime import datetime, timedelta, timezone
 import time
-from typing import Dict, List, Any, Optional, Iterator
+from typing import Dict, List, Any, Optional, Iterator, Tuple
 from io import StringIO
 from botocore.config import Config
 from botocore.exceptions import ClientError, EndpointConnectionError
@@ -3569,25 +3569,17 @@ def _environment_trail_finding(region: str) -> Dict[str, Any]:
     )
 
 
-def _notebook_config_rules_finding(region: str) -> Dict[str, Any]:
-    """Report whether the two notebook Config rules are active and unnarrowed."""
-    config_client = boto3.client("config", config=boto3_config, region_name=region)
-    rules = []
-    try:
-        for page in config_client.get_paginator("describe_config_rules").paginate():
-            rules.extend(page.get("ConfigRules", []))
-    except Exception as error:
-        return _unread_resources_finding(
-            "SM-09",
-            NOTEBOOK_CONFIG_RULES_FINDING,
-            [f"config:DescribeConfigRules ({get_assessment_error_label(error)})"],
-            "no Config rule was read.",
-            NOTEBOOK_CONFIG_RULES_REFERENCE,
-            region,
-        )
+def _managed_rule_problems(
+    rules: List[Dict[str, Any]], identifiers: Tuple[str, ...], pinned: Tuple[str, ...]
+) -> Tuple[List[str], List[str]]:
+    """
+    Match each AWS managed rule identifier to an ACTIVE rule that is not scoped
+    to named or tagged resources, and for a pinned identifier sets kmsKeyArns.
+    Returns (problems, passing) as display strings.
+    """
     problems = []
     passing = []
-    for identifier in NOTEBOOK_CONFIG_RULE_IDENTIFIERS:
+    for identifier in identifiers:
         matches = [
             rule
             for rule in rules
@@ -3605,7 +3597,7 @@ def _notebook_config_rules_finding(region: str) -> Dict[str, Any]:
                     "tagged resources"
                 )
                 continue
-            if identifier == NOTEBOOK_KMS_RULE_IDENTIFIER:
+            if identifier in pinned:
                 try:
                     parameters = json.loads(rule.get("InputParameters") or "{}")
                 except ValueError:
@@ -3624,6 +3616,28 @@ def _notebook_config_rules_finding(region: str) -> Dict[str, Any]:
             problems.append(f"{identifier}: {'; '.join(reasons[:3])}")
         else:
             problems.append(f"{identifier}: no ACTIVE rule")
+    return problems, passing
+
+
+def _notebook_config_rules_finding(region: str) -> Dict[str, Any]:
+    """Report whether the two notebook Config rules are active and unnarrowed."""
+    config_client = boto3.client("config", config=boto3_config, region_name=region)
+    rules = []
+    try:
+        for page in config_client.get_paginator("describe_config_rules").paginate():
+            rules.extend(page.get("ConfigRules", []))
+    except Exception as error:
+        return _unread_resources_finding(
+            "SM-09",
+            NOTEBOOK_CONFIG_RULES_FINDING,
+            [f"config:DescribeConfigRules ({get_assessment_error_label(error)})"],
+            "no Config rule was read.",
+            NOTEBOOK_CONFIG_RULES_REFERENCE,
+            region,
+        )
+    problems, passing = _managed_rule_problems(
+        rules, NOTEBOOK_CONFIG_RULE_IDENTIFIERS, (NOTEBOOK_KMS_RULE_IDENTIFIER,)
+    )
     if problems:
         return create_finding(
             check_id="SM-09",
@@ -8326,6 +8340,27 @@ CONFIG_RULE_RESOLUTION = (
     "non-compliant resource."
 )
 SAGEMAKER_CONFIG_RESOURCE_PREFIX = "AWS::SageMaker::"
+REQUIRED_CONFIG_RULES_FINDING = "SageMaker Required Config Rules"
+REQUIRED_CONFIG_RULES_REFERENCE = (
+    "https://docs.aws.amazon.com/config/latest/developerguide/"
+    "sagemaker-endpoint-configuration-kms-key-configured.html"
+)
+ENDPOINT_CONFIG_KMS_RULE_IDENTIFIER = (
+    "SAGEMAKER_ENDPOINT_CONFIGURATION_KMS_KEY_CONFIGURED"
+)
+REQUIRED_SAGEMAKER_CONFIG_RULES = (
+    ENDPOINT_CONFIG_KMS_RULE_IDENTIFIER,
+    NOTEBOOK_KMS_RULE_IDENTIFIER,
+    "SAGEMAKER_NOTEBOOK_NO_DIRECT_INTERNET_ACCESS",
+)
+CONFORMANCE_PACK_FINDING = "SageMaker Config Conformance Pack"
+CONFORMANCE_PACK_REFERENCE = (
+    "https://docs.aws.amazon.com/config/latest/developerguide/"
+    "security-and-governance-best-practices-for-amazon-sagemaker-ai.html"
+)
+# ConformancePackDetail.CreatedBy names the service that created a pack; an
+# organization conformance pack is created in each member account by this one.
+ORGANIZATION_CONFORMANCE_PACK_CREATOR = "config-multiaccountsetup.amazonaws.com"
 
 
 def _sagemaker_recording_coverage(recorder: Dict[str, Any]) -> Dict[str, Any]:
@@ -8413,6 +8448,291 @@ def _rule_targets_sagemaker(rule: Dict[str, Any]) -> bool:
     return "sagemaker" in str(rule.get("ConfigRuleName") or "").lower()
 
 
+def _no_customer_recorder_finding(config_client: Any, region: str) -> Dict[str, Any]:
+    """
+    Decide the recorder leg when DescribeConfigurationRecorders returns nothing.
+
+    Called without arguments it returns only the customer-managed recorder, so
+    ListConfigurationRecorders, which lists service-linked recorders as well, is
+    what makes an empty result decidable.
+    """
+    where = region or "this region"
+    try:
+        summaries = []
+        for page in config_client.get_paginator(
+            "list_configuration_recorders"
+        ).paginate():
+            summaries.extend(page.get("ConfigurationRecorderSummaries", []))
+    except Exception as error:
+        return create_finding(
+            check_id="SM-32",
+            finding_name=CONFIG_RECORDING_FINDING,
+            finding_details=(
+                "DescribeConfigurationRecorders returned no customer-managed AWS "
+                f"Config recorder in {where}, and ListConfigurationRecorders, which "
+                "also lists service-linked recorders, was not read "
+                f"({get_assessment_error_label(error)}), so whether SageMaker "
+                "configuration items are recorded here could not be determined."
+            ),
+            resolution="Grant config:ListConfigurationRecorders and retry.",
+            reference=CONFIG_REFERENCE,
+            severity="Informational",
+            status="N/A",
+            region=region,
+        )
+    customer = [item for item in summaries if not item.get("servicePrincipal")]
+    if customer:
+        return create_finding(
+            check_id="SM-32",
+            finding_name=CONFIG_RECORDING_FINDING,
+            finding_details=(
+                f"ListConfigurationRecorders names customer-managed recorder(s) "
+                f"{', '.join(str(item.get('name')) for item in customer)} in {where}, "
+                "but DescribeConfigurationRecorders returned none, so their "
+                "recording scope was not read."
+            ),
+            resolution="Retry the assessment; the two Config reads disagreed.",
+            reference=CONFIG_REFERENCE,
+            severity="Informational",
+            status="N/A",
+            region=region,
+        )
+    linked = sorted(str(item.get("servicePrincipal")) for item in summaries)
+    return create_finding(
+        check_id="SM-32",
+        finding_name=CONFIG_RECORDING_FINDING,
+        finding_details=(
+            f"No customer-managed AWS Config recorder exists in {where}. "
+            f"ListConfigurationRecorders returned {len(linked)} service-linked "
+            "recorder(s)"
+            + (f", created by {', '.join(linked)}" if linked else "")
+            + ". A service-linked recorder is created and scoped by its owning "
+            "service, so nothing here records SageMaker configuration items for "
+            "the account's own rules."
+        ),
+        resolution=CONFIG_RECORDING_RESOLUTION,
+        reference=CONFIG_REFERENCE,
+        severity="Medium",
+        status="Failed",
+        region=region,
+    )
+
+
+def _recorder_findings(
+    config_client: Any, recorders: List[Dict[str, Any]], region: str
+) -> List[Dict[str, Any]]:
+    """One row per customer-managed recorder: SageMaker scope and whether it runs."""
+    statuses = {}
+    status_error = "no status was returned for it"
+    try:
+        response = config_client.describe_configuration_recorder_status(
+            ConfigurationRecorderNames=[
+                recorder["name"] for recorder in recorders if recorder.get("name")
+            ]
+        )
+        for status in response.get("ConfigurationRecordersStatus", []):
+            statuses[status.get("name")] = status
+    except Exception as error:
+        status_error = get_assessment_error_label(error)
+    rows = []
+    for recorder in recorders:
+        recorder_name = recorder.get("name") or "default"
+        coverage = _sagemaker_recording_coverage(recorder)
+        detail = f"AWS Config recorder '{recorder_name}' {coverage['detail']}"
+        status = statuses.get(recorder.get("name"))
+        if not coverage["covered"]:
+            outcome = ("Failed", f"{detail}.", CONFIG_RECORDING_RESOLUTION)
+        elif status is None:
+            outcome = (
+                "N/A",
+                f"{detail}, but config:DescribeConfigurationRecorderStatus was not "
+                f"read ({status_error}), so whether it is recording could not be "
+                "established.",
+                "Grant config:DescribeConfigurationRecorderStatus and retry.",
+            )
+        elif status.get("recording") is not True:
+            outcome = (
+                "Failed",
+                f"{detail}, but it is stopped (recording is false), so no "
+                "configuration item is being recorded.",
+                "Start the configuration recorder.",
+            )
+        elif str(status.get("lastStatus") or "").upper() == "FAILURE":
+            outcome = (
+                "Failed",
+                f"{detail}, but its last recording attempt failed "
+                f"({status.get('lastErrorCode') or 'no error code'}).",
+                "Fix the recorder's delivery role or channel so recording succeeds.",
+            )
+        else:
+            outcome = (
+                "Passed",
+                f"{detail} and is recording.",
+                "No action required",
+            )
+        rows.append(
+            create_finding(
+                check_id="SM-32",
+                finding_name=CONFIG_RECORDING_FINDING,
+                finding_details=outcome[1],
+                resolution=outcome[2],
+                reference=CONFIG_REFERENCE,
+                severity="Informational" if outcome[0] == "N/A" else "Medium",
+                status=outcome[0],
+                region=region,
+            )
+        )
+    return rows
+
+
+def _required_config_rules_finding(
+    rules: List[Dict[str, Any]], region: str
+) -> Dict[str, Any]:
+    """Require the three SageMaker managed rules the recommendation names."""
+    problems, passing = _managed_rule_problems(
+        rules, REQUIRED_SAGEMAKER_CONFIG_RULES, (ENDPOINT_CONFIG_KMS_RULE_IDENTIFIER,)
+    )
+    where = region or "this region"
+    if problems:
+        return create_finding(
+            check_id="SM-32",
+            finding_name=REQUIRED_CONFIG_RULES_FINDING,
+            finding_details=(
+                f"{len(problems)} of {len(REQUIRED_SAGEMAKER_CONFIG_RULES)} required "
+                f"SageMaker managed Config rules are missing or narrowed in {where}: "
+                f"{'; '.join(problems)}."
+            ),
+            resolution=(
+                "Deploy sagemaker-endpoint-configuration-kms-key-configured with "
+                "kmsKeyArns set to the approved keys, "
+                "sagemaker-notebook-instance-kms-key-configured and "
+                "sagemaker-notebook-no-direct-internet-access, unscoped by resource "
+                "id or tag."
+            ),
+            reference=REQUIRED_CONFIG_RULES_REFERENCE,
+            severity="Medium",
+            status="Failed",
+            region=region,
+        )
+    return create_finding(
+        check_id="SM-32",
+        finding_name=REQUIRED_CONFIG_RULES_FINDING,
+        finding_details=(
+            f"All {len(REQUIRED_SAGEMAKER_CONFIG_RULES)} required SageMaker managed "
+            f"Config rules are active in {where}: {'; '.join(passing)}. They are "
+            "periodic, and Config records no training, processing or transform "
+            "job, so those jobs depend on the preventive controls."
+        ),
+        resolution="No action required",
+        reference=REQUIRED_CONFIG_RULES_REFERENCE,
+        severity="Medium",
+        status="Passed",
+        region=region,
+    )
+
+
+def _conformance_pack_finding(
+    config_client: Any, rules: List[Dict[str, Any]], region: str
+) -> Dict[str, Any]:
+    """Pass only when an organization conformance pack carries all three rules."""
+    identifier_by_rule = {
+        rule.get("ConfigRuleName"): (rule.get("Source") or {}).get("SourceIdentifier")
+        for rule in rules
+        if (rule.get("Source") or {}).get("Owner") == "AWS"
+    }
+    try:
+        packs = []
+        for page in config_client.get_paginator(
+            "describe_conformance_packs"
+        ).paginate():
+            packs.extend(page.get("ConformancePackDetails", []))
+    except Exception as error:
+        return _unread_resources_finding(
+            "SM-32",
+            CONFORMANCE_PACK_FINDING,
+            [f"config:DescribeConformancePacks ({get_assessment_error_label(error)})"],
+            "no conformance pack was read.",
+            CONFORMANCE_PACK_REFERENCE,
+            region,
+        )
+    unread = []
+    described = []
+    for pack in packs:
+        name = pack.get("ConformancePackName")
+        rule_names = set()
+        try:
+            for page in config_client.get_paginator(
+                "describe_conformance_pack_compliance"
+            ).paginate(ConformancePackName=name):
+                for entry in page.get("ConformancePackRuleComplianceList", []):
+                    rule_names.add(entry.get("ConfigRuleName"))
+        except Exception as error:
+            unread.append(
+                f"config:DescribeConformancePackCompliance {name} "
+                f"({get_assessment_error_label(error)})"
+            )
+            continue
+        carried = {identifier_by_rule.get(rule_name) for rule_name in rule_names}
+        missing = [
+            item for item in REQUIRED_SAGEMAKER_CONFIG_RULES if item not in carried
+        ]
+        organization = pack.get("CreatedBy") == ORGANIZATION_CONFORMANCE_PACK_CREATOR
+        if organization and not missing:
+            return create_finding(
+                check_id="SM-32",
+                finding_name=CONFORMANCE_PACK_FINDING,
+                finding_details=(
+                    f"Organization conformance pack '{name}' in "
+                    f"{region or 'this region'} deploys all "
+                    f"{len(REQUIRED_SAGEMAKER_CONFIG_RULES)} required SageMaker "
+                    "managed rules."
+                ),
+                resolution="No action required",
+                reference=CONFORMANCE_PACK_REFERENCE,
+                severity="Medium",
+                status="Passed",
+                region=region,
+            )
+        described.append(
+            f"'{name}' ("
+            + ("organization" if organization else "this account only")
+            + (f", lacks {', '.join(missing)}" if missing else "")
+            + ")"
+        )
+    read_text = (
+        f"{len(described)} pack(s) read, none an organization pack carrying all "
+        f"{len(REQUIRED_SAGEMAKER_CONFIG_RULES)} required rules: "
+        f"{'; '.join(described[:5])}."
+        if described
+        else "no conformance pack is deployed."
+    )
+    if unread:
+        return _unread_resources_finding(
+            "SM-32",
+            CONFORMANCE_PACK_FINDING,
+            unread,
+            read_text,
+            CONFORMANCE_PACK_REFERENCE,
+            region,
+        )
+    return create_finding(
+        check_id="SM-32",
+        finding_name=CONFORMANCE_PACK_FINDING,
+        finding_details=(
+            f"No organization conformance pack deploys the required SageMaker "
+            f"managed rules in {region or 'this region'}: {read_text}"
+        ),
+        resolution=(
+            "Deploy the Security and Governance Best Practices for Amazon SageMaker "
+            "AI conformance pack as an organization conformance pack."
+        ),
+        reference=CONFORMANCE_PACK_REFERENCE,
+        severity="Medium",
+        status="Failed",
+        region=region,
+    )
+
+
 def check_sagemaker_config_compliance_evaluation(region: str = "") -> Dict[str, Any]:
     """
     SM-32: Verify SageMaker configuration state is continuously evaluated and
@@ -8423,6 +8743,10 @@ def check_sagemaker_config_compliance_evaluation(region: str = "") -> Dict[str, 
     current compliance result. A recorder without rules evaluates nothing, and a
     rule without a recorder cannot see configuration changes, so neither verdict
     implies the other.
+
+    Two more legs read the three managed rules AIR-SGM-GOV-10 names and whether
+    an organization conformance pack deploys them. A rule with no current
+    evaluation withholds Passed.
     """
     logger.debug("Starting check for SageMaker AWS Config coverage")
     findings = {"csv_data": []}
@@ -8440,59 +8764,22 @@ def check_sagemaker_config_compliance_evaluation(region: str = "") -> Dict[str, 
 
         if not recorders:
             findings["csv_data"].append(
-                create_finding(
-                    check_id="SM-32",
-                    finding_name=CONFIG_RECORDING_FINDING,
-                    finding_details=(
-                        "DescribeConfigurationRecorders returned no "
-                        f"customer-managed AWS Config recorder in {region or 'this region'}, "
-                        "so whether SageMaker configuration items are recorded here "
-                        "could not be determined. A service-linked recorder is "
-                        "returned only when the call names its ServicePrincipal, "
-                        "which this check does not guess at, so an empty result is "
-                        "not evidence that recording is off."
-                    ),
-                    resolution=(
-                        "Confirm whether a service-linked configuration recorder "
-                        "covers this account, then create a customer-managed "
-                        "recorder if SageMaker resource types are not recorded."
-                    ),
-                    reference=CONFIG_REFERENCE,
-                    severity="Informational",
-                    status="N/A",
-                    region=region,
-                )
+                _no_customer_recorder_finding(config_client, region)
             )
         else:
-            for recorder in recorders:
-                recorder_name = recorder.get("name") or "default"
-                coverage = _sagemaker_recording_coverage(recorder)
-                findings["csv_data"].append(
-                    create_finding(
-                        check_id="SM-32",
-                        finding_name=CONFIG_RECORDING_FINDING,
-                        finding_details=(
-                            f"AWS Config recorder '{recorder_name}' "
-                            f"{coverage['detail']}."
-                        ),
-                        resolution=(
-                            "No action required"
-                            if coverage["covered"]
-                            else CONFIG_RECORDING_RESOLUTION
-                        ),
-                        reference=CONFIG_REFERENCE,
-                        severity="Medium",
-                        status="Passed" if coverage["covered"] else "Failed",
-                        region=region,
-                    )
-                )
+            findings["csv_data"].extend(
+                _recorder_findings(config_client, recorders, region)
+            )
 
-        sagemaker_rules = []
+        all_rules = []
         rule_paginator = config_client.get_paginator("describe_config_rules")
         for page in rule_paginator.paginate():
-            for rule in page.get("ConfigRules", []):
-                if _rule_targets_sagemaker(rule):
-                    sagemaker_rules.append(rule)
+            all_rules.extend(page.get("ConfigRules", []))
+        sagemaker_rules = [rule for rule in all_rules if _rule_targets_sagemaker(rule)]
+        findings["csv_data"].append(_required_config_rules_finding(all_rules, region))
+        findings["csv_data"].append(
+            _conformance_pack_finding(config_client, all_rules, region)
+        )
 
         active_rules = [
             rule for rule in sagemaker_rules if rule.get("ConfigRuleState") == "ACTIVE"
@@ -8617,7 +8904,19 @@ def check_sagemaker_config_compliance_evaluation(region: str = "") -> Dict[str, 
             for name, compliance in compliance_by_rule.items()
             if compliance.get("ComplianceType") == "COMPLIANT"
         )
-        if compliant_names or (not non_compliant and not compliance_error):
+        # INSUFFICIENT_DATA, or no entry at all, means Config holds no current
+        # evaluation for the rule, so it has flagged nothing either way.
+        unevaluated = (
+            []
+            if compliance_error
+            else sorted(
+                name
+                for name in rule_names
+                if (compliance_by_rule.get(name) or {}).get("ComplianceType")
+                not in ("COMPLIANT", "NON_COMPLIANT", "NOT_APPLICABLE")
+            )
+        )
+        if not non_compliant and not compliance_error and not unevaluated:
             described = ", ".join((compliant_names or rule_names)[:5])
             findings["csv_data"].append(
                 create_finding(
@@ -8635,6 +8934,29 @@ def check_sagemaker_config_compliance_evaluation(region: str = "") -> Dict[str, 
                     reference=CONFIG_REFERENCE,
                     severity="Medium",
                     status="Passed",
+                    region=region,
+                )
+            )
+
+        if unevaluated:
+            findings["csv_data"].append(
+                create_finding(
+                    check_id="SM-32",
+                    finding_name=CONFIG_RULE_COMPLIANCE_FINDING,
+                    finding_details=(
+                        f"{len(unevaluated)} of {len(readable_rules)} ACTIVE "
+                        "SageMaker Config rule(s) have no current evaluation "
+                        "(INSUFFICIENT_DATA or no compliance entry), so they have "
+                        f"not assessed any resource: {', '.join(unevaluated[:10])}."
+                    ),
+                    resolution=(
+                        "Check each rule's evaluation status with "
+                        "DescribeConfigRuleEvaluationStatus, fix the failing "
+                        "invocation or recorder, and re-evaluate the rule."
+                    ),
+                    reference=CONFIG_REFERENCE,
+                    severity="Medium",
+                    status="N/A",
                     region=region,
                 )
             )

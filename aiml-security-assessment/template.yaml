@@ -725,6 +725,18 @@ Resources:
                 - config:DescribeConfigRules # SM-09, SM-32
                 - config:DescribeComplianceByConfigRule # SM-32
               Resource: '*'
+            - Sid: ConfigRecorderStatusRead
+              # SM-32 reads whether each customer-managed recorder is recording.
+              Effect: Allow
+              Action:
+                - config:DescribeConfigurationRecorderStatus # SM-32
+              Resource: !Sub 'arn:${AWS::Partition}:config:*:${AWS::AccountId}:configuration-recorder/*/*'
+            - Sid: ConformancePackRuleRead
+              # SM-32 reads which rules each conformance pack deploys.
+              Effect: Allow
+              Action:
+                - config:DescribeConformancePackCompliance # SM-32
+              Resource: !Sub 'arn:${AWS::Partition}:config:*:${AWS::AccountId}:conformance-pack/*/*'
             - Sid: OrganizationsInventoryPermissions
               # None of these three Organizations actions has a resource type in IAM.
               Effect: Allow

@@ -283,6 +283,8 @@ _EXPECTED_ACTIONS = {
         "sagemaker:DescribeUserProfile",
         "cloudtrail:GetTrailStatus",
         "cloudtrail:GetEventSelectors",
+        "config:DescribeConfigurationRecorderStatus",
+        "config:DescribeConformancePackCompliance",
     },
     "AgentCoreSecurityAssessmentFunction": {
         "bedrock-agentcore:GetAgentRuntime",
