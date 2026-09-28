@@ -1874,10 +1874,11 @@ def _service_wide_grant_findings(
                 if ":iam::aws:policy/" not in (policy.get("arn") or "")
             ] + list(permissions.get("inline_policies") or [])
             # A boundary that does not allow every SageMaker action leaves the
-            # identity without a service-wide grant, whatever its policies say.
+            # identity without a service-wide grant, whatever its policies say,
+            # and so does an account-wide Deny that leaves it no SageMaker action.
             if not _boundary_allows_every_sagemaker_action(
                 permissions.get("permissions_boundary")
-            ):
+            ) or not _boundary_leaves_sagemaker(permissions):
                 policies_read += len(policies)
                 continue
             for policy in policies:
@@ -1967,8 +1968,9 @@ def _service_wide_grant_findings(
                 finding_details=(
                     f"None of the {policies_read} customer-managed, inline or "
                     'group policies read grants sagemaker:* or "*" or reaches '
-                    "SageMaker through a NotAction Allow that a permissions "
-                    "boundary leaves in force. Whether each identity's action "
+                    "SageMaker through a NotAction Allow that the identity's "
+                    "permissions boundary and account-wide Denies leave in "
+                    "force. Whether each identity's action "
                     "list matches its role is a workload decision this check "
                     "does not make."
                 ),
@@ -1980,6 +1982,20 @@ def _service_wide_grant_findings(
             )
         )
     return emitted
+
+
+def _boundary_leaves_sagemaker(permissions: Dict[str, Any]) -> bool:
+    """Whether the identity is granted any SageMaker action once its boundary
+    and account-wide Denies apply. A policy that cannot be parsed keeps the
+    grant."""
+    try:
+        return bool(
+            _granted_actions(
+                permissions, _identity_statements(permissions), IAM_ACCESS_LEVEL_ACTIONS
+            )
+        )
+    except (ValueError, TypeError, AttributeError):
+        return True
 
 
 MERGED_READ_WRITE_FINDING = "SageMaker Read and Write Merged in One Grant"

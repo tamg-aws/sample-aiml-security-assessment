@@ -9557,6 +9557,41 @@ class TestSM02CacheContractOtherLegs:
         assert len(failed) == 1
         assert "Unbounded" in failed[0]["Finding_Details"]
 
+    @staticmethod
+    def _allow_all_with_deny(denied_action):
+        return {
+            "Statement": [
+                {"Effect": "Allow", "Action": "sagemaker:*", "Resource": "*"},
+                {"Effect": "Deny", "Action": denied_action, "Resource": "*"},
+            ]
+        }
+
+    def test_service_wide_grant_stripped_by_account_wide_deny_is_not_failed(self):
+        cache = _v2_cache(
+            {
+                "Denied": [("All", self._allow_all_with_deny("sagemaker:*"))],
+                "Open": [("All", _identity_policy("sagemaker:*", "*"))],
+            }
+        )
+        rows = _by_finding(_sm02_rows(cache), sagemaker_app.SERVICE_WIDE_GRANT_FINDING)
+        failed = [r for r in rows if r["Status"] == "Failed"]
+        assert len(failed) == 1
+        assert "Role 'Open'" in failed[0]["Finding_Details"]
+        assert all("Denied" not in r["Finding_Details"] for r in rows)
+
+    def test_deny_on_another_service_leaves_the_grant_failed(self):
+        cache = _v2_cache(
+            {
+                "Denied": [("All", self._allow_all_with_deny("s3:*"))],
+                "Open": [("All", _identity_policy("sagemaker:*", "*"))],
+            }
+        )
+        rows = _by_finding(_sm02_rows(cache), sagemaker_app.SERVICE_WIDE_GRANT_FINDING)
+        failed = sorted(
+            r["Finding_Details"].split("'")[1] for r in rows if r["Status"] == "Failed"
+        )
+        assert failed == ["Denied", "Open"]
+
     def test_boundary_with_notaction_listing_sagemaker_narrows(self):
         boundary = {
             "Statement": [
