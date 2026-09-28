@@ -536,8 +536,37 @@ class TestSeverityCollapseDisclosure(unittest.TestCase):
         self.assertIn("keep four levels", methodology)
 
 
+class TestBatchGuardrailLeg(unittest.TestCase):
+    """AISF-07 needs SM-42 beside SM-18.
+
+    SM-18 reads the transform jobs that exist. SM-42 reads the preventive
+    guardrail on CreateModel and CreateTransformJob, which the control's
+    resolution asks for across both actions. A job-only verdict published
+    Passed for an account whose guardrail was absent.
+    """
+
+    def _ai07(self, statuses):
+        rows = aisf_mappings.derive_aisf_findings(
+            [_source_row(cid, status) for cid, status in statuses.items()]
+        )
+        return _derived_by_id(rows)["AISF-07"]
+
+    def test_a_failed_guardrail_fails_the_control(self):
+        row = self._ai07({"SM-18": "Passed", "SM-42": "Failed"})
+        self.assertEqual(row["Status"], "Failed")
+
+    def test_jobs_alone_do_not_publish_a_pass(self):
+        row = self._ai07({"SM-18": "Passed"})
+        self.assertEqual(row["Status"], "N/A")
+        self.assertIn("SM-42", row["Finding_Details"])
+
+    def test_both_legs_passed_is_passed(self):
+        row = self._ai07({"SM-18": "Passed", "SM-42": "Passed"})
+        self.assertEqual(row["Status"], "Passed")
+
+
 class TestMultiLegAggregation(unittest.TestCase):
-    """AISF-08 is the only multi-leg mapping: SM-09, SM-01 and SM-03."""
+    """AISF-08, the three-leg mapping: SM-09, SM-01 and SM-03."""
 
     LEGS = ("SM-09", "SM-01", "SM-03")
 

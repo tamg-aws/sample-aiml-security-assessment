@@ -136,7 +136,7 @@ AI_SUBJECT_ROWS = [
         COVERED,
         None,
         "sagemaker_assessments",
-        ["SM-18"],
+        ["SM-18", "SM-42"],
         "",
         [],
         3,
@@ -2009,6 +2009,7 @@ INCUMBENT_NAMES = {
     "SM-39": "EKS VPC CNI Network Policy Enforcement",
     "SM-40": "Secrets Manager Automatic Rotation",
     "SM-41": "AWS IoT Device-Scoped Policy",
+    "SM-42": "SageMaker Batch Transform Creation Guardrail",
 }
 
 

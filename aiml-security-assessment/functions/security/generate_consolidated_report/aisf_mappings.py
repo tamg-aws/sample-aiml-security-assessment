@@ -160,8 +160,8 @@ AISF_DERIVED_MAP: List[Dict[str, Any]] = [
     {
         "check_id": "AISF-07",
         "control": "AIR-SGM-EP-08",
-        # ledger verdict: covered. incumbents: SM-18
-        "sources": ["SM-18"],
+        # ledger verdict: covered. incumbents: SM-18, SM-42
+        "sources": ["SM-18", "SM-42"],
         "finding": "AISF AIR-SGM-EP-08: Batch Inference Network and Encryption Parity",
         "risk": "high",
         "severity": "High",
