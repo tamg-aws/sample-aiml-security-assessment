@@ -296,12 +296,11 @@ def _row(
 def derive_aisf_findings(source_rows: List[Dict[str, Any]]) -> List[Dict[str, str]]:
     """Restate incumbent verdicts as `AISF-` rows, one per control per join key.
 
-    The join key is `(Account_ID, Region)`. Two source checks also emit rows
-    under the `Global` sentinel, from their once-per-account legs on the primary
-    Region: `SM-09` (`check_sagemaker_notebook_access_guardrails`) and `BR-37`
-    (`check_bedrock_data_retention_scp`). An account-wide verdict holds in every
-    Region, so each `Global` row is folded into every regional key of the same
-    account and aggregated there with the regional rows. The `Global` key itself
+    The join key is `(Account_ID, Region)`. A source check can also emit rows
+    under the `Global` sentinel, from a once-per-account leg on the primary
+    Region. An account-wide verdict holds in every Region, so each `Global` row
+    is folded into every regional key of the same account and aggregated there
+    with the regional rows. The `Global` key itself
     is emitted only for an account that has no regional key: beside a regional
     verdict it would repeat the same evidence as a half-populated `N/A`.
 
