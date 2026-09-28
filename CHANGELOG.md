@@ -19,8 +19,10 @@ section.
   `ApplicationSignals` namespace names each pair where an AgentCore runtime
   or gateway calls another one. Each pair fails without a metric alarm that
   has actions and whose threshold is an `ANOMALY_DETECTION_BAND` over one of
-  those metrics, with the pair's `Service` and `RemoteService` and no
-  `Operation`. A gateway's call to its policy engine is not a pair. With no
+  those metrics, with the pair's `Service` and `RemoteService` whatever other
+  dimensions it carries. A caller whose `RemoteService` is
+  `UnknownRemoteService` is named in an `N/A` row, never `Passed`, because the
+  callee may be an agent. A gateway's call to its policy engine is not a pair. With no
   pair the row is `N/A` and says runtimes not instrumented with Application
   Signals cannot be assessed. Every row names what no API records: workflow
   run frequency, per-workflow metric definitions, and alerting on a new pair.

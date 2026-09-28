@@ -37480,21 +37480,31 @@ class TestAC53CoordinationAnomalyAlarms:
         findings, _ = self._run([edge], [self._band_alarm("wrong", elsewhere)])
         assert [f["Status"] for f in findings] == ["Failed"]
 
-    def test_a_band_on_an_unpublished_dimension_set_does_not_count(self):
+    def test_a_band_without_the_environment_dimension_still_counts(self):
         edge = self._metric("Fault", "alpha.DEFAULT", "beta.DEFAULT")
-        unpublished = dict(edge)
-        unpublished["Dimensions"] = [
+        no_env = dict(edge)
+        no_env["Dimensions"] = [
             d for d in edge["Dimensions"] if d["Name"] != "Environment"
         ]
-        findings, _ = self._run([edge], [self._band_alarm("never", unpublished)])
-        assert [f["Status"] for f in findings] == ["Failed"]
+        findings, _ = self._run([edge], [self._band_alarm("no-env", no_env)])
+        assert [f["Status"] for f in findings] == ["Passed"]
+        assert "no-env on Fault" in findings[0]["Finding_Details"]
 
-    def test_a_per_operation_band_watches_part_of_the_edge_only(self):
+    def test_a_band_with_an_operation_dimension_still_counts(self):
         edge = self._metric("Fault", "alpha.DEFAULT", "beta.DEFAULT")
         one_op = self._metric(
             "Fault", "alpha.DEFAULT", "beta.DEFAULT", Operation="POST /invocations"
         )
         findings, _ = self._run([edge, one_op], [self._band_alarm("one-op", one_op)])
+        assert [f["Status"] for f in findings] == ["Passed"]
+
+    def test_a_band_without_the_remote_service_dimension_does_not_count(self):
+        edge = self._metric("Fault", "alpha.DEFAULT", "beta.DEFAULT")
+        caller_only = dict(edge)
+        caller_only["Dimensions"] = [
+            d for d in edge["Dimensions"] if d["Name"] != "RemoteService"
+        ]
+        findings, _ = self._run([edge], [self._band_alarm("caller", caller_only)])
         assert [f["Status"] for f in findings] == ["Failed"]
 
     def test_an_alarm_without_enabled_actions_does_not_count(self):
@@ -37531,13 +37541,54 @@ class TestAC53CoordinationAnomalyAlarms:
 
     def test_a_callee_that_is_no_agentcore_resource_publishes_no_edge(self):
         findings, _ = self._run(
+            [self._metric("Fault", "alpha.DEFAULT", "AWS::S3")],
+            [],
+        )
+        assert [f["Status"] for f in findings] == ["N/A"]
+        assert "cannot be assessed" in findings[0]["Finding_Details"]
+        assert "UnknownRemoteService" not in findings[0]["Finding_Details"]
+
+    def test_an_unknown_remote_service_is_named_and_not_applicable(self):
+        findings, cloudwatch = self._run(
+            [self._metric("Fault", "tools-gw-dddddddddd", "UnknownRemoteService")],
+            [],
+        )
+        assert [f["Status"] for f in findings] == ["N/A"]
+        assert "'tools-gw-dddddddddd'" in findings[0]["Finding_Details"]
+        assert "UnknownRemoteService" in findings[0]["Finding_Details"]
+        cloudwatch.describe_alarms.assert_not_called()
+
+    def test_an_unknown_remote_service_beside_an_alarmed_edge_is_never_passed(self):
+        edge = self._metric("Fault", "alpha.DEFAULT", "beta.DEFAULT")
+        findings, _ = self._run(
+            [edge, self._metric("Fault", "gamma.DEFAULT", "UnknownRemoteService")],
+            [self._band_alarm("a-to-b", edge)],
+        )
+        assert [f["Status"] for f in findings] == ["N/A", "Passed"]
+        assert "'gamma.DEFAULT'" in findings[0]["Finding_Details"]
+        assert "gamma" not in findings[1]["Finding_Details"]
+
+    def test_an_unknown_remote_service_beside_an_unalarmed_edge(self):
+        findings, _ = self._run(
+            [
+                self._metric("Fault", "alpha.DEFAULT", "beta.DEFAULT"),
+                self._metric("Fault", "gamma.DEFAULT", "UnknownRemoteService"),
+            ],
+            [],
+        )
+        assert [f["Status"] for f in findings] == ["N/A", "Failed"]
+
+    def test_every_caller_of_an_unknown_remote_service_is_named(self):
+        findings, _ = self._run(
             [
                 self._metric("Fault", "alpha.DEFAULT", "UnknownRemoteService"),
-                self._metric("Fault", "alpha.DEFAULT", "AWS::S3"),
+                self._metric("Latency", "gamma.DEFAULT", "UnknownRemoteService"),
             ],
             [],
         )
         assert [f["Status"] for f in findings] == ["N/A"]
+        assert "'alpha.DEFAULT'" in findings[0]["Finding_Details"]
+        assert "'gamma.DEFAULT'" in findings[0]["Finding_Details"]
 
     def test_a_call_to_itself_is_not_an_edge(self):
         findings, _ = self._run(

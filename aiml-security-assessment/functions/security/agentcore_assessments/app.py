@@ -27464,8 +27464,9 @@ APPLICATION_SIGNALS_NAMESPACE = "ApplicationSignals"
 AGENTCORE_APPLICATION_SIGNALS_ENVIRONMENT_PREFIX = "bedrock-agentcore:"
 # The dependency metrics Application Signals publishes per caller and callee.
 APPLICATION_SIGNALS_EDGE_METRIC_NAMES = ("Error", "Fault", "Latency")
-# A dependency metric scoped to one operation watches part of an edge only.
-APPLICATION_SIGNALS_OPERATION_DIMENSIONS = ("Operation", "RemoteOperation")
+# The RemoteService value Application Signals records when it cannot name the
+# callee, so the call may or may not reach another agent.
+APPLICATION_SIGNALS_UNKNOWN_REMOTE_SERVICE = "UnknownRemoteService"
 ANOMALY_DETECTION_BAND_PATTERN = re.compile(
     r"^\s*ANOMALY_DETECTION_BAND\s*\(\s*([A-Za-z0-9_]+)"
 )
@@ -27541,11 +27542,11 @@ def check_agentcore_coordination_anomaly_alarms() -> List[Dict[str, Any]]:
     decides tool access and is not an agent.
 
     Each edge needs a metric alarm with actions whose threshold is an
-    ANOMALY_DETECTION_BAND over the edge's Error, Fault or Latency metric, with
-    the edge's Service and RemoteService, on a dimension set ListMetrics lists
-    and with no Operation or RemoteOperation, since a per-operation alarm
-    watches part of the edge. A runtime not instrumented with Application
-    Signals publishes no edge, so it cannot be assessed.
+    ANOMALY_DETECTION_BAND over the edge's Error, Fault or Latency metric with
+    the edge's Service and RemoteService, whatever other dimensions it carries.
+    A pair whose RemoteService is UnknownRemoteService is N/A by name, never
+    Passed. A runtime not instrumented with Application Signals publishes no
+    edge, so it cannot be assessed.
     """
     could_not_assess = (
         "No action is required on the assessed workload based on this result. "
@@ -27616,8 +27617,8 @@ def check_agentcore_coordination_anomaly_alarms() -> List[Dict[str, Any]]:
     except (BotoCoreError, ClientError) as error:
         return unread("bedrock-agentcore:ListPolicyEngines", error)
 
-    published: set = set()
     edges: Dict[Tuple[str, str], Tuple[str, str]] = {}
+    unknown: set = set()
     try:
         for metric_name in APPLICATION_SIGNALS_EDGE_METRIC_NAMES:
             for metric in _paginate_aws_list(
@@ -27635,9 +27636,6 @@ def check_agentcore_coordination_anomaly_alarms() -> List[Dict[str, Any]]:
                     dimension.get("Name"): dimension.get("Value")
                     for dimension in metric.get("Dimensions") or []
                 }
-                published.add(
-                    (str(metric.get("MetricName")), frozenset(dimensions.items()))
-                )
                 service = dimensions.get("Service")
                 remote = dimensions.get("RemoteService")
                 if not (
@@ -27647,6 +27645,9 @@ def check_agentcore_coordination_anomaly_alarms() -> List[Dict[str, Any]]:
                         AGENTCORE_APPLICATION_SIGNALS_ENVIRONMENT_PREFIX
                     )
                 ):
+                    continue
+                if remote == APPLICATION_SIGNALS_UNKNOWN_REMOTE_SERVICE:
+                    unknown.add(service)
                     continue
                 if _agentcore_signal_identity(remote, engines):
                     continue
@@ -27659,6 +27660,23 @@ def check_agentcore_coordination_anomaly_alarms() -> List[Dict[str, Any]]:
     except (BotoCoreError, ClientError) as error:
         return unread("cloudwatch:ListMetrics", error)
 
+    unnamed: List[Dict[str, Any]] = []
+    if unknown:
+        unnamed.append(
+            finding(
+                f"Application Signals records calls from {', '.join(repr(service) for service in sorted(unknown))} "
+                f"with RemoteService '{APPLICATION_SIGNALS_UNKNOWN_REMOTE_SERVICE}', "
+                "so whether each callee is another agent, and whether that pair "
+                "is alarmed, was not established.",
+                "Configure the callers so Application Signals names the service "
+                "they call, then rerun the assessment.",
+                SeverityEnum.INFORMATIONAL,
+                StatusEnum.NA,
+            )
+        )
+
+    if not edges and unnamed:
+        return unnamed
     if not edges:
         return [
             finding(
@@ -27694,18 +27712,16 @@ def check_agentcore_coordination_anomaly_alarms() -> List[Dict[str, Any]]:
         ):
             continue
         for metric_name, dimension_set in _anomaly_band_edge_keys(alarm):
-            dimensions = dict(dimension_set)
-            if (metric_name, dimension_set) not in published or any(
-                name in dimensions for name in APPLICATION_SIGNALS_OPERATION_DIMENSIONS
-            ):
+            if metric_name not in APPLICATION_SIGNALS_EDGE_METRIC_NAMES:
                 continue
+            dimensions = dict(dimension_set)
             edge = (dimensions.get("Service"), dimensions.get("RemoteService"))
             if edge in edges:
                 alarmed.setdefault(edge, []).append(
                     f"{alarm.get('AlarmName', 'unnamed')} on {metric_name}"
                 )
 
-    findings: List[Dict[str, Any]] = []
+    findings: List[Dict[str, Any]] = list(unnamed)
     for (service, remote), (kind, callee_id) in sorted(edges.items()):
         if (service, remote) in alarmed:
             continue
@@ -27724,13 +27740,13 @@ def check_agentcore_coordination_anomaly_alarms() -> List[Dict[str, Any]]:
                 StatusEnum.FAILED,
             )
         )
-    if findings:
+    if len(findings) > len(unnamed):
         return findings
     covered = "; ".join(
         f"'{service}' to '{remote}' by {', '.join(sorted(alarmed[(service, remote)]))}"
         for service, remote in sorted(edges)
     )
-    return [
+    return unnamed + [
         finding(
             f"Every one of the {len(edges)} AgentCore caller and callee pair(s) "
             "Application Signals records has an alarm with actions on an anomaly "

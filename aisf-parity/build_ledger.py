@@ -1749,8 +1749,9 @@ FOUNDATION_ROWS = [
         "or gateway. A gateway's call to its policy engine is not a pair. Each "
         "pair fails without a metric alarm with actions whose ThresholdMetricId "
         "names an ANOMALY_DETECTION_BAND over one of those metrics, with the "
-        "pair's Service and RemoteService, on a listed dimension set and with no "
-        "Operation. No pair is N/A, never Passed. Partial, ceiling reached: "
+        "pair's Service and RemoteService, whatever other dimensions it carries. "
+        "A pair whose RemoteService is UnknownRemoteService is N/A by name, and no "
+        "pair is N/A, never Passed. Partial, ceiling reached: "
         "runtimes not instrumented with Application Signals publish no pair, and "
         "no AWS API records workflow execution frequency, per-workflow metric "
         "definitions, or whether a new pair raises an alert",
