@@ -896,6 +896,26 @@ Resources:
               Action:
                 - cloudwatch:DescribeAlarms # SM-23, SM-31, SM-37
               Resource: !Sub 'arn:${AWS::Partition}:cloudwatch:*:${AWS::AccountId}:alarm:*'
+            - Sid: FlowLogAlarmHistoryRead
+              # SM-37 reads whether a crediting alarm has entered ALARM.
+              Effect: Allow
+              Action:
+                - cloudwatch:DescribeAlarmHistory # SM-37
+              Resource: !Sub 'arn:${AWS::Partition}:cloudwatch:*:${AWS::AccountId}:alarm:*'
+            - Sid: ModelImageRepositoryRead
+              # SM-43 reads tag mutability and image signing status of the ECR
+              # repositories endpoint containers run from.
+              Effect: Allow
+              Action:
+                - ecr:DescribeRepositories # SM-43
+                - ecr:DescribeImageSigningStatus # SM-43
+              Resource: !Sub 'arn:${AWS::Partition}:ecr:*:${AWS::AccountId}:repository/*'
+            - Sid: TrainingFileSystemRead
+              # SM-03 reads the encryption of EFS file systems training jobs read.
+              Effect: Allow
+              Action:
+                - elasticfilesystem:DescribeFileSystems # SM-03
+              Resource: !Sub 'arn:${AWS::Partition}:elasticfilesystem:*:${AWS::AccountId}:file-system/*'
             - Sid: GuardDutyAlertRuleTargetRead
               Effect: Allow
               Action:
@@ -915,7 +935,7 @@ Resources:
               Resource: '*'
             - Sid: ApprovedInventoryWithoutResourceType
               # Read-only inventory approved for the SageMaker legs. None of these
-              # ten actions has a resource type in the service authorization
+              # twelve actions has a resource type in the service authorization
               # reference, so each needs Resource '*'.
               Effect: Allow
               Action:
@@ -929,6 +949,8 @@ Resources:
                 - ecs:ListServices # SM-39, SM-40
                 - ecs:DescribeTaskDefinition # SM-40
                 - iot:ListScheduledAudits # SM-41
+                - ecr:GetSigningConfiguration # SM-43
+                - fsx:DescribeFileSystems # SM-03
               Resource: '*'
             - Sid: EC2NetworkPostureInventory
               # SM-02, SM-11, SM-18 and SM-33 read interface VPC endpoints, SM-37
@@ -995,10 +1017,11 @@ Resources:
               Resource: !Sub 'arn:${AWS::Partition}:iot:*:${AWS::AccountId}:scheduledaudit/*'
             - Sid: JobDataBucketProtectionRead
               # SM-03 and SM-18 read the default encryption and bucket policy of the
-              # buckets training and transform jobs read from and write to.
+              # buckets training and transform jobs read from and write to; SM-43 reads
+              # the default encryption of the model artifact buckets endpoints load.
               Effect: Allow
               Action:
-                - s3:GetEncryptionConfiguration # SM-03, SM-18
+                - s3:GetEncryptionConfiguration # SM-03, SM-18, SM-43
                 - s3:GetBucketPolicy # SM-03, SM-18
               Resource: !Sub 'arn:${AWS::Partition}:s3:::*'
             - Sid: JobKeyManagerRead
