@@ -237,6 +237,11 @@ section.
   that no cost limit could be read. The AgentCore assessment role holds no
   `ce:GetAnomalySubscriptions` or `ce:GetAnomalyMonitors` grant, so the row is
   `N/A` naming them until they are added.
+- `AC-06` reads the recording account's Block Public Access settings when the
+  recording bucket leaves one off, and fails a setting off on both. Such a
+  bucket was `N/A`. The assessment roles hold no
+  `s3:GetAccountPublicAccessBlock` grant, so it stays `N/A`, naming that
+  action, until it is added.
 - `AC-45` judges each AgentCore runtime's own execution role by the rules it
   applies to a tool role. No check read a runtime role outside the AgentCore
   namespace, so one granting `s3:*` or every foundation model passed.

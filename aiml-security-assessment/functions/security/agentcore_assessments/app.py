@@ -52,6 +52,7 @@ events_client = None
 bedrock_client = None
 xray_client = None
 ce_client = None
+s3control_client = None
 
 # Environment variables
 BUCKET_NAME = os.environ.get("AIML_ASSESSMENT_BUCKET_NAME")
@@ -5667,7 +5668,9 @@ def _read_recording_bucket(bucket: str, account: str) -> Dict[str, Tuple[str, An
 
     Each leg is ("read", response), ("absent", None) or ("error", label).
     ExpectedBucketOwner makes a bucket owned by another account an error and
-    not a configuration the assessed account controls.
+    not a configuration the assessed account controls. The owning account's
+    Block Public Access settings are read too, because S3 applies the more
+    restrictive of the bucket and account settings.
     """
     reads: Dict[str, Tuple[str, Any]] = {}
     for leg, operation, absent_code, _ in BROWSER_RECORDING_BUCKET_READS:
@@ -5683,6 +5686,25 @@ def _read_recording_bucket(bucket: str, account: str) -> Dict[str, Tuple[str, An
                 reads[leg] = ("absent", None)
             else:
                 reads[leg] = ("error", _assessment_error_label(error))
+    if s3control_client is None:
+        reads["account_public_access_block"] = (
+            "error",
+            "was not called: no S3 Control client was available",
+        )
+    else:
+        try:
+            reads["account_public_access_block"] = (
+                "read",
+                s3control_client.get_public_access_block(AccountId=account),
+            )
+        except (BotoCoreError, ClientError) as error:
+            if _s3_error_code(error) == "NoSuchPublicAccessBlockConfiguration":
+                reads["account_public_access_block"] = ("absent", None)
+            else:
+                reads["account_public_access_block"] = (
+                    "error",
+                    f"failed with {_assessment_error_label(error)}",
+                )
     return reads
 
 
@@ -5810,17 +5832,41 @@ def _recording_bucket_gaps(
             for field in S3_PUBLIC_ACCESS_BLOCK_FIELDS
             if config.get(field) is not True
         ]
-        if off:
+        account_state, account_response = reads["account_public_access_block"]
+        if not off:
+            facts.append("blocks all public access")
+        elif account_state == "error":
             unread.append(
                 f"whether account-level Block Public Access sets {', '.join(off)}, "
                 f"which bucket '{bucket}' leaves off (s3:GetAccountPublicAccessBlock "
-                "is not granted)"
+                f"{account_response})"
             )
             retries.append(
-                "Turn on all four Block Public Access settings on the recording bucket."
+                "Grant s3:GetAccountPublicAccessBlock and retry, or turn on all "
+                "four Block Public Access settings on the recording bucket."
             )
         else:
-            facts.append("blocks all public access")
+            account_config = (account_response or {}).get(
+                "PublicAccessBlockConfiguration"
+            ) or {}
+            still_off = [
+                field for field in off if account_config.get(field) is not True
+            ]
+            if still_off:
+                problems.append(
+                    f"bucket '{bucket}' and its account both leave Block Public "
+                    f"Access {', '.join(still_off)} off, so a bucket policy or "
+                    "ACL can make the recordings public"
+                )
+                fixes.append(
+                    "Turn on all four Block Public Access settings on the "
+                    "recording bucket or its account."
+                )
+            else:
+                facts.append(
+                    "blocks all public access through the account-level "
+                    f"settings for {', '.join(off)}"
+                )
 
     state, response = reads["policy"]
     if state == "error":
@@ -26257,7 +26303,7 @@ def lambda_handler(event, context):
     global cloudwatch_client, cloudtrail_client, oam_client, agentcore_client
     global kms_client, organizations_client
     global wafv2_client, route53resolver_client, cognito_client, events_client
-    global bedrock_client, xray_client, ce_client
+    global bedrock_client, xray_client, ce_client, s3control_client
     start_time = time.time()
 
     try:
@@ -26308,6 +26354,10 @@ def lambda_handler(event, context):
         # AC-46 reads the account's cost anomaly alerting. Cost Explorer has
         # one global endpoint, which botocore resolves from any region.
         ce_client = boto3.client("ce", config=boto3_config, region_name=region)
+        # AC-06 reads the account-level Block Public Access settings.
+        s3control_client = boto3.client(
+            "s3control", config=boto3_config, region_name=region
+        )
 
         # Collect all findings
         all_findings = []

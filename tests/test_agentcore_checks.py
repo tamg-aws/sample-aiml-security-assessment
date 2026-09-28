@@ -3625,21 +3625,30 @@ class TestAC06RecordingDestination:
         assert "no default algorithm" in finding["Finding_Details"]
 
     @pytest.mark.parametrize("field", ["BlockPublicAcls", "RestrictPublicBuckets"])
+    @patch("agentcore_app.s3control_client")
     @patch("agentcore_app.s3_client")
-    def test_bucket_public_access_left_off_is_na_not_passed(self, mock_s3, field):
+    def test_bucket_public_access_left_off_is_na_not_passed(
+        self, mock_s3, mock_s3control, field
+    ):
+        # The account-level read is now made, so a denied read is what leaves
+        # it unread; this asserted the fixed text "is not granted" before.
         _wire_recording_bucket(mock_s3)
         mock_s3.get_public_access_block.return_value["PublicAccessBlockConfiguration"][
             field
         ] = False
+        mock_s3control.get_public_access_block.side_effect = _make_client_error(
+            "AccessDenied", "denied"
+        )
 
         finding = _record(_browser_inventory(_recorded_browser()))[0]
 
         assert finding["Status"] == "N/A"
         assert field in finding["Finding_Details"]
         assert (
-            "s3:GetAccountPublicAccessBlock is not granted"
+            "s3:GetAccountPublicAccessBlock failed with AccessDenied"
             in finding["Finding_Details"]
         )
+        assert "Grant s3:GetAccountPublicAccessBlock" in finding["Resolution"]
 
     @patch("agentcore_app.s3_client")
     def test_no_bucket_public_access_block_is_na_not_passed(self, mock_s3):
@@ -35464,3 +35473,163 @@ class TestAC46CostAnomalyAlerting:
         source = textwrap.dedent(inspect.getsource(agentcore_app.lambda_handler))
         assert source.count("check_agentcore_runtime_cost_alerting") == 1
         assert 'ce_client = boto3.client("ce"' in source
+
+
+class TestAC06AccountPublicAccessBlock:
+    """AIR-ACR-RT-09: S3 applies the more restrictive of the bucket and account
+    Block Public Access settings, so AC-06 reads the recording account's."""
+
+    _FIELDS = agentcore_app.S3_PUBLIC_ACCESS_BLOCK_FIELDS
+
+    @classmethod
+    def _config(cls, off=()):
+        return {
+            "PublicAccessBlockConfiguration": {
+                field: field not in off for field in cls._FIELDS
+            }
+        }
+
+    def _run(self, mock_s3, mock_s3control, bucket_off, account, browsers=None):
+        _wire_recording_bucket(mock_s3)
+        mock_s3.get_public_access_block.return_value = self._config(bucket_off)
+        if isinstance(account, Exception):
+            mock_s3control.get_public_access_block.side_effect = account
+        else:
+            mock_s3control.get_public_access_block.return_value = account
+        findings = _record(_browser_inventory(*(browsers or [_recorded_browser()])))
+        for finding in findings:
+            assert finding["Check_ID"] == "AC-06"
+            assert_finding_schema(finding)
+        return findings
+
+    @patch("agentcore_app.s3control_client")
+    @patch("agentcore_app.s3_client")
+    def test_the_account_setting_covers_what_the_bucket_leaves_off(
+        self, mock_s3, mock_s3control
+    ):
+        (finding,) = self._run(
+            mock_s3,
+            mock_s3control,
+            bucket_off=("BlockPublicAcls", "RestrictPublicBuckets"),
+            account=self._config(),
+        )
+        assert finding["Status"] == "Passed"
+        assert (
+            "account-level settings for BlockPublicAcls, RestrictPublicBuckets"
+            in finding["Finding_Details"]
+        )
+        mock_s3control.get_public_access_block.assert_called_with(
+            AccountId="123456789012"
+        )
+
+    @patch("agentcore_app.s3control_client")
+    @patch("agentcore_app.s3_client")
+    def test_a_field_off_on_both_fails_and_is_named(self, mock_s3, mock_s3control):
+        (finding,) = self._run(
+            mock_s3,
+            mock_s3control,
+            bucket_off=("BlockPublicAcls", "RestrictPublicBuckets"),
+            account=self._config(off=("RestrictPublicBuckets", "IgnorePublicAcls")),
+        )
+        assert finding["Status"] == "Failed"
+        assert (
+            "leave Block Public Access RestrictPublicBuckets off"
+            in (finding["Finding_Details"])
+        )
+        assert "BlockPublicAcls off" not in finding["Finding_Details"]
+
+    @patch("agentcore_app.s3control_client")
+    @patch("agentcore_app.s3_client")
+    def test_no_account_configuration_fails_what_the_bucket_leaves_off(
+        self, mock_s3, mock_s3control
+    ):
+        (finding,) = self._run(
+            mock_s3,
+            mock_s3control,
+            bucket_off=("IgnorePublicAcls",),
+            account=_make_client_error("NoSuchPublicAccessBlockConfiguration", "none"),
+        )
+        assert finding["Status"] == "Failed"
+        assert "IgnorePublicAcls off" in finding["Finding_Details"]
+
+    @patch("agentcore_app.s3control_client")
+    @patch("agentcore_app.s3_client")
+    def test_a_bucket_blocking_everything_passes_whatever_the_account(
+        self, mock_s3, mock_s3control
+    ):
+        (finding,) = self._run(
+            mock_s3,
+            mock_s3control,
+            bucket_off=(),
+            account=_make_client_error("AccessDenied", "denied"),
+        )
+        assert finding["Status"] == "Passed"
+        assert "blocks all public access" in finding["Finding_Details"]
+
+    @patch("agentcore_app.s3control_client")
+    @patch("agentcore_app.s3_client")
+    def test_a_denied_account_read_does_not_hide_another_failure(
+        self, mock_s3, mock_s3control
+    ):
+        _wire_recording_bucket(mock_s3, algorithm="AES256")
+        mock_s3.get_public_access_block.return_value = self._config(
+            ("BlockPublicPolicy",)
+        )
+        mock_s3control.get_public_access_block.side_effect = _make_client_error(
+            "AccessDenied", "denied"
+        )
+        (finding,) = _record(_browser_inventory(_recorded_browser()))
+        assert finding["Status"] == "Failed"
+        assert (
+            "s3:GetAccountPublicAccessBlock failed with AccessDenied"
+            in (finding["Finding_Details"])
+        )
+
+    @patch("agentcore_app.s3control_client")
+    @patch("agentcore_app.s3_client")
+    def test_each_bucket_is_judged_against_the_account(self, mock_s3, mock_s3control):
+        _wire_recording_bucket(mock_s3)
+        configs = {
+            "open": self._config(("BlockPublicPolicy",)),
+            "closed": self._config(),
+        }
+        mock_s3.get_public_access_block.side_effect = (
+            lambda Bucket, ExpectedBucketOwner: configs[Bucket]
+        )
+        mock_s3.get_bucket_policy.return_value = {
+            "Policy": json.dumps(
+                {
+                    "Statement": [
+                        _plaintext_deny(
+                            Resource=[
+                                "arn:aws:s3:::open/*",
+                                "arn:aws:s3:::closed/*",
+                            ]
+                        )
+                    ]
+                }
+            )
+        }
+        mock_s3control.get_public_access_block.return_value = self._config(
+            ("BlockPublicPolicy",)
+        )
+        findings = _record(
+            _browser_inventory(
+                _recorded_browser("br-1", bucket="open"),
+                _recorded_browser("br-2", bucket="closed"),
+            ),
+            _recorder_cache(
+                statements=[
+                    {
+                        "Effect": "Allow",
+                        "Action": "s3:PutObject",
+                        "Resource": [
+                            "arn:aws:s3:::open/rec/*",
+                            "arn:aws:s3:::closed/rec/*",
+                        ],
+                    }
+                ]
+            ),
+        )
+        assert [f["Status"] for f in findings] == ["Failed", "Passed"]
+        assert "BlockPublicPolicy off" in findings[0]["Finding_Details"]
