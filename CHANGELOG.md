@@ -1127,9 +1127,26 @@ account's `knowledge-base/*` ARNs (`BR-46`), `sagemaker:ListTrainingJobs` on
 `*` and `sagemaker:DescribeTrainingJob` on the account's `training-job/*`
 ARNs (`BR-46`, `BR-47`, `BR-52`). `aoss:ListAccessPolicies`,
 `aoss:GetAccessPolicy` and `sagemaker:ListTrainingJobs` have no resource type
-in the IAM service authorization reference. All six are read-only, and the
-same CodeBuild run creates the policy and attaches it, so each stack creates
-one more customer managed policy.
+in the IAM service authorization reference. All six are read-only. Each
+stack creates one more customer managed policy, named with the stack name as
+its prefix.
+
+**Update the deployment stack first.** The CodeBuild and member deployment
+roles could attach only `AWSLambdaBasicExecutionRole` and could not create a
+managed policy, so an assessment deploy from this version on an old deployment
+stack fails with `iam:CreatePolicy` denied and rolls back. Update
+`deployment/aiml-security-single-account.yaml` or
+`deployment/2-aiml-security-codebuild.yaml`, and the member-role StackSet from
+`deployment/1-aiml-security-member-roles.yaml`, before the next assessment
+deploy. Each deployment role gains `iam:CreatePolicy`, `iam:DeletePolicy`,
+`iam:GetPolicy`, `iam:GetPolicyVersion`, `iam:ListPolicyVersions`,
+`iam:CreatePolicyVersion`, `iam:DeletePolicyVersion` and
+`iam:ListEntitiesForPolicy` on the account's `policy/aiml-security-*` and
+`policy/aiml-sec-*` ARNs (the `AWS::IAM::ManagedPolicy` handler permissions),
+and its `iam:AttachRolePolicy` and `iam:DetachRolePolicy` condition admits
+those two policy patterns beside `AWSLambdaBasicExecutionRole`. The roles
+could already write any inline policy on the same `aiml-security-*` and
+`aiml-sec-*` roles.
 
 The AgentCore assessment role gains `bedrock-agentcore:GetPaymentManager` and
 `bedrock-agentcore:GetHarness`, scoped to the account's `payment-manager/*` and
