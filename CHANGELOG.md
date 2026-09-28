@@ -246,6 +246,22 @@ section.
     wildcard-only value no longer pass. A scoped principal is reported as
     bound to the caller when every value carries a policy variable, and as
     fixed otherwise.
+  - `AC-32`, `AC-33`, `AC-42` and `AC-44` read the same way as `AC-23`: a
+    bare `Action: "*"` and group policies count, a grant the principal's own
+    Deny or boundary removes does not, and a principal the IAM cache could
+    not read is named in an `N/A` row that withholds `Passed`.
+  - `AC-32` accepts an issuer pin only by value: every value of
+    `InboundJwtClaim/iss` must be a literal or a pattern narrower than `*`.
+  - `AC-33` fails a token grant written with `NotResource`, or with a
+    wildcard in the region or account of the workload identity ARN.
+  - `AC-42` reads a `NotResource` pass-role grant as reaching every role it
+    does not list, and adds a writer leg on the primary region that fails a
+    principal able to create or update an online evaluation configuration
+    whose `iam:PassRole` grant does not name its roles or does not pin
+    `iam:PassedToService` to `bedrock-agentcore.amazonaws.com`.
+  - `AC-44` fails a model grant whose service, account or resource type
+    segment is a wildcard (`arn:aws:bedrock:*::*`) or that uses
+    `NotResource`. A region wildcard on a named model still passes.
 
 ### Deployment impact
 

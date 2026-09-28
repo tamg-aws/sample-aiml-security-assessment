@@ -8485,12 +8485,14 @@ class TestAC32InboundJwtIssuerConditions:
         )
         assert [f["Status"] for f in findings] == ["Failed"]
 
-    def test_a_bare_wildcard_action_is_left_to_ac_02(self):
+    def test_a_bare_wildcard_action_is_detected(self):
+        # Stricter than before: this asserted Passed with "No cached IAM role
+        # or user", leaving an Action "*" grant to AC-02.
         findings = agentcore_app.check_agentcore_inbound_jwt_issuer_conditions(
             self._cache(["*"])
         )
-        assert [f["Status"] for f in findings] == ["Passed"]
-        assert "No cached IAM role or user" in findings[0]["Finding_Details"]
+        assert [f["Status"] for f in findings] == ["Failed"]
+        assert "role agent-role" in findings[0]["Finding_Details"]
 
     def test_the_token_actions_that_take_no_inbound_jwt_are_not_assessed(self):
         # IAM publishes no InboundJwtClaim key for these two, so a Failed verdict
@@ -8659,7 +8661,10 @@ class TestAC32InboundJwtIssuerConditions:
 
         findings = agentcore_app.check_agentcore_inbound_jwt_issuer_conditions(cache)
 
-        assert [f["Status"] for f in findings] == ["Failed"]
+        # Stricter than before: this asserted ["Failed"] alone, so the unread
+        # policy went unreported.
+        assert [f["Status"] for f in findings] == ["N/A", "Failed"]
+        assert "role agent-role (policy broken)" in findings[0]["Finding_Details"]
 
     def test_an_unusable_cache_is_reported_incomplete(self):
         findings = agentcore_app.check_agentcore_inbound_jwt_issuer_conditions(None)
@@ -8830,16 +8835,17 @@ class TestAC33TokenIssuanceScope:
         )
         assert [f["Status"] for f in findings] == ["Failed"]
 
-    def test_a_region_wildcard_leaves_the_identity_named(self):
-        # A multi-region policy wildcards the region, which widens where the
-        # identity lives and not which identity it is.
+    def test_a_region_wildcard_reaches_the_name_in_every_region(self):
+        # Stricter than before: this asserted Passed, reading a region wildcard
+        # as leaving the identity named. It reaches the same identity name in
+        # every region, which widens the population (brief rule 6).
         findings = agentcore_app.check_agentcore_token_issuance_scope(
             self._cache(
                 ["bedrock-agentcore:GetWorkloadAccessToken"],
                 resource=[_IDENTITY_ARN.replace("us-east-1", "*")],
             )
         )
-        assert [f["Status"] for f in findings] == ["Passed"]
+        assert [f["Status"] for f in findings] == ["Failed"]
 
     def test_the_directory_arn_is_not_read_as_an_identity_arn(self):
         # workload-identity-directory/ does not contain workload-identity/, which
@@ -8878,12 +8884,14 @@ class TestAC33TokenIssuanceScope:
         )
         assert [f["Status"] for f in findings] == ["Failed"]
 
-    def test_a_bare_wildcard_action_is_left_to_ac_02(self):
+    def test_a_bare_wildcard_action_is_detected(self):
+        # Stricter than before: this asserted Passed with "No cached IAM role
+        # or user", leaving an Action "*" grant to AC-02.
         findings = agentcore_app.check_agentcore_token_issuance_scope(
             self._cache(["*"])
         )
-        assert [f["Status"] for f in findings] == ["Passed"]
-        assert "No cached IAM role or user" in findings[0]["Finding_Details"]
+        assert [f["Status"] for f in findings] == ["Failed"]
+        assert "role agent-role" in findings[0]["Finding_Details"]
 
     def test_a_deny_statement_is_ignored(self):
         findings = agentcore_app.check_agentcore_token_issuance_scope(
@@ -9019,7 +9027,10 @@ class TestAC33TokenIssuanceScope:
 
         findings = agentcore_app.check_agentcore_token_issuance_scope(cache)
 
-        assert [f["Status"] for f in findings] == ["Failed"]
+        # Stricter than before: this asserted ["Failed"] alone, so the unread
+        # policy went unreported.
+        assert [f["Status"] for f in findings] == ["N/A", "Failed"]
+        assert "role agent-role (policy broken)" in findings[0]["Finding_Details"]
 
     def test_an_unusable_cache_is_reported_incomplete(self):
         findings = agentcore_app.check_agentcore_token_issuance_scope(None)
@@ -12062,9 +12073,11 @@ class TestAC42EvaluationPassRoleScope:
 
         findings = agentcore_app.check_agentcore_evaluation_pass_role_scope(cache)
 
+        # Stricter than before: this asserted ["Passed", "N/A"], a population
+        # Passed beside a policy that was never read.
         statuses = [finding["Status"] for finding in findings]
-        assert statuses == ["Passed", "N/A"]
-        assert "1 cached policy document(s)" in findings[1]["Finding_Details"]
+        assert statuses == ["N/A"]
+        assert "role EvaluationDeployer (policy )" in findings[0]["Finding_Details"]
 
     @patch("agentcore_app.agentcore_client")
     def test_an_empty_cache_is_na(self, mock_ac):
@@ -12460,8 +12473,10 @@ class TestAC44EvaluationJudgeModelScope:
 
         findings = agentcore_app.check_agentcore_evaluation_judge_model_scope(cache)
 
+        # Stricter than before: the unreadable document could hold the grant,
+        # so the role no longer also reads as Passed for holding none.
         statuses = [finding["Status"] for finding in findings]
-        assert statuses == ["N/A", "Passed"]
+        assert statuses == ["N/A"]
         assert "1 cached policy document(s)" in findings[0]["Finding_Details"]
 
     @patch("agentcore_app.agentcore_client")
@@ -12546,6 +12561,10 @@ class TestAC44EvaluationJudgeModelScope:
             ("arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-3", False),
             ("arn:aws:bedrock:*::foundation-model/anthropic.*", False),
             ("arn:aws:bedrock:*:123456789012:inference-profile/global.claude", False),
+            ("arn:aws:bedrock:*::*", True),
+            ("arn:aws:bedrock:us-east-1:*:inference-profile/global.claude", True),
+            ("arn:aws:bedrock:us-east-1::*/anthropic.claude-3", True),
+            ("arn:aws:*:us-east-1::foundation-model/anthropic.claude-3", True),
         ],
     )
     def test_the_model_scope_predicate(self, resource, unbounded):
@@ -19217,3 +19236,800 @@ class TestAC23WholePopulation:
         )
         assert [f["Status"] for f in findings] == ["Passed"]
         assert findings[0]["Finding_Details"].endswith(agentcore_app.IAM_CACHE_V1_NOTE)
+
+
+def _principal_with(statements, boundary=None, key="attached_policies"):
+    permissions = {"attached_policies": [], "inline_policies": []}
+    permissions[key] = [{"name": "p", "document": {"Statement": statements}}]
+    if boundary is not None:
+        permissions["permissions_boundary"] = boundary
+    return permissions
+
+
+def _v2_cache(roles=None, users=None, errors=()):
+    return {
+        "cache_schema_version": 2,
+        "principal_errors": list(errors),
+        "role_permissions": roles or {},
+        "user_permissions": users or {},
+    }
+
+
+class TestAC32WholePopulation:
+    """AC-32 pins the issuer by value and reads every principal's grants."""
+
+    _EXCHANGE = "bedrock-agentcore:GetWorkloadAccessTokenForJWT"
+    _PIN = {
+        "StringEquals": {
+            "bedrock-agentcore:InboundJwtClaim/iss": "https://idp.example.com"
+        }
+    }
+
+    @classmethod
+    def _allow(cls, action, condition=None):
+        statement = {"Effect": "Allow", "Action": action, "Resource": "*"}
+        if condition is not None:
+            statement["Condition"] = condition
+        return statement
+
+    @pytest.mark.parametrize(
+        "condition",
+        [
+            {
+                "StringEqualsIfExists": {
+                    "bedrock-agentcore:InboundJwtClaim/iss": "https://idp.example.com"
+                }
+            },
+            {"StringLike": {"bedrock-agentcore:InboundJwtClaim/iss": "*"}},
+            {
+                "StringNotEquals": {
+                    "bedrock-agentcore:InboundJwtClaim/iss": "https://evil.example"
+                }
+            },
+            {
+                "ForAllValues:StringEquals": {
+                    "bedrock-agentcore:InboundJwtClaim/aud": "app-1"
+                }
+            },
+        ],
+        ids=["if-exists", "wildcard-only", "negated", "for-all-values-only"],
+    )
+    def test_a_condition_that_does_not_pin_fails_only_that_role(self, condition):
+        findings = agentcore_app.check_agentcore_inbound_jwt_issuer_conditions(
+            _v2_cache(
+                roles={
+                    "wide": _principal_with([self._allow(self._EXCHANGE, condition)]),
+                    "narrow": _principal_with([self._allow(self._EXCHANGE, self._PIN)]),
+                }
+            )
+        )
+
+        failed = [f for f in findings if f["Status"] == "Failed"]
+        assert len(failed) == 1
+        assert "role wide" in failed[0]["Finding_Details"]
+        assert "role narrow" not in failed[0]["Finding_Details"]
+        assert agentcore_app.IAM_CACHE_SCP_NOTE in failed[0]["Finding_Details"]
+        passed = [f for f in findings if f["Status"] == "Passed"]
+        assert len(passed) == 1
+        assert "role narrow" in passed[0]["Finding_Details"]
+
+    def test_for_any_value_on_the_audience_pins(self):
+        findings = agentcore_app.check_agentcore_inbound_jwt_issuer_conditions(
+            _v2_cache(
+                roles={
+                    "role": _principal_with(
+                        [
+                            self._allow(
+                                self._EXCHANGE,
+                                {
+                                    "ForAnyValue:StringEquals": {
+                                        "bedrock-agentcore:InboundJwtClaim/aud": "app-1"
+                                    }
+                                },
+                            )
+                        ]
+                    )
+                }
+            )
+        )
+        assert [f["Status"] for f in findings] == ["Passed"]
+
+    @pytest.mark.parametrize(
+        "statement",
+        [
+            {"Effect": "Allow", "NotAction": "s3:*", "Resource": "*"},
+            {
+                "Effect": "Allow",
+                "Action": "*:GetWorkloadAccessTokenFor*",
+                "Resource": "*",
+            },
+        ],
+        ids=["not-action", "any-service"],
+    )
+    def test_patterns_that_reach_the_exchange_are_counted(self, statement):
+        findings = agentcore_app.check_agentcore_inbound_jwt_issuer_conditions(
+            _v2_cache(roles={"role": _principal_with([statement])})
+        )
+        assert [f["Status"] for f in findings] == ["Failed"]
+
+    @pytest.mark.parametrize(
+        ("statements", "boundary"),
+        [
+            (
+                [
+                    {
+                        "Effect": "Allow",
+                        "Action": "bedrock-agentcore:*",
+                        "Resource": "*",
+                    },
+                    {
+                        "Effect": "Deny",
+                        "Action": [
+                            "bedrock-agentcore:GetWorkloadAccessTokenForJWT",
+                            "bedrock-agentcore:CompleteResourceTokenAuth",
+                        ],
+                        "Resource": "*",
+                    },
+                ],
+                None,
+            ),
+            (
+                [{"Effect": "Allow", "Action": "*", "Resource": "*"}],
+                {"Statement": [{"Effect": "Allow", "Action": "s3:*", "Resource": "*"}]},
+            ),
+        ],
+        ids=["deny", "boundary"],
+    )
+    def test_an_exchange_removed_by_deny_or_boundary_is_not_counted(
+        self, statements, boundary
+    ):
+        findings = agentcore_app.check_agentcore_inbound_jwt_issuer_conditions(
+            _v2_cache(roles={"removed": _principal_with(statements, boundary)})
+        )
+        assert [f["Status"] for f in findings] == ["Passed"]
+        assert "No cached IAM role or user" in findings[0]["Finding_Details"]
+
+    def test_a_group_grant_on_a_user_is_counted(self):
+        findings = agentcore_app.check_agentcore_inbound_jwt_issuer_conditions(
+            _v2_cache(
+                users={
+                    "analyst": _principal_with(
+                        [self._allow(self._EXCHANGE)], key="group_policies"
+                    ),
+                    "viewer": _principal_with([self._allow("s3:GetObject")]),
+                }
+            )
+        )
+        assert [f["Status"] for f in findings] == ["Failed"]
+        assert "user analyst" in findings[0]["Finding_Details"]
+        assert "viewer" not in findings[0]["Finding_Details"]
+
+    def test_a_principal_error_withholds_the_population_pass(self):
+        findings = agentcore_app.check_agentcore_inbound_jwt_issuer_conditions(
+            _v2_cache(
+                roles={"reader": _principal_with([self._allow("s3:GetObject")])},
+                errors=[
+                    {
+                        "type": "role",
+                        "name": "hidden",
+                        "stage": "get_role_policy",
+                        "error": "AccessDenied",
+                    }
+                ],
+            )
+        )
+        assert [f["Status"] for f in findings] == ["N/A"]
+        assert (
+            "role hidden (get_role_policy: AccessDenied)"
+            in findings[0]["Finding_Details"]
+        )
+
+    def test_a_v1_cache_pass_says_errors_were_not_recorded(self):
+        findings = agentcore_app.check_agentcore_inbound_jwt_issuer_conditions(
+            {
+                "role_permissions": {
+                    "reader": _principal_with([self._allow("s3:GetObject")])
+                },
+                "user_permissions": {},
+            }
+        )
+        assert [f["Status"] for f in findings] == ["Passed"]
+        assert findings[0]["Finding_Details"].endswith(agentcore_app.IAM_CACHE_V1_NOTE)
+
+
+class TestAC33WholePopulation:
+    """AC-33 reads every principal's token issuance grants by resource value."""
+
+    _ISSUE = "bedrock-agentcore:GetWorkloadAccessToken"
+
+    @classmethod
+    def _allow(cls, action, resource):
+        return {"Effect": "Allow", "Action": action, "Resource": resource}
+
+    @pytest.mark.parametrize(
+        "resource",
+        [
+            _IDENTITY_ARN.replace("123456789012", "*"),
+            _IDENTITY_ARN.replace("us-east-1", "*"),
+            _IDENTITY_ARN.replace("agent-1", "agent-?"),
+            _IDENTITY_ARN.replace("arn:aws:", "arn:*:"),
+        ],
+        ids=["account", "region", "trailing-question-mark", "partition"],
+    )
+    def test_a_widening_wildcard_fails_only_that_role(self, resource):
+        findings = agentcore_app.check_agentcore_token_issuance_scope(
+            _v2_cache(
+                roles={
+                    "wide": _principal_with(
+                        [self._allow(self._ISSUE, [_DIRECTORY_ARN, resource])]
+                    ),
+                    "narrow": _principal_with(
+                        [self._allow(self._ISSUE, [_DIRECTORY_ARN, _IDENTITY_ARN])]
+                    ),
+                }
+            )
+        )
+
+        failed = [f for f in findings if f["Status"] == "Failed"]
+        assert len(failed) == 1
+        assert "role wide" in failed[0]["Finding_Details"]
+        assert "role narrow" not in failed[0]["Finding_Details"]
+        assert agentcore_app.IAM_CACHE_SCP_NOTE in failed[0]["Finding_Details"]
+        passed = [f for f in findings if f["Status"] == "Passed"]
+        assert len(passed) == 1
+        assert "role narrow" in passed[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "statement",
+        [
+            {"Effect": "Allow", "NotAction": "s3:*", "Resource": "*"},
+            {
+                "Effect": "Allow",
+                "Action": "bedrock-agentcore:GetWorkloadAccessToken",
+                "NotResource": _IDENTITY_ARN,
+            },
+        ],
+        ids=["not-action", "not-resource"],
+    )
+    def test_not_action_is_counted_and_not_resource_is_unbounded(self, statement):
+        findings = agentcore_app.check_agentcore_token_issuance_scope(
+            _v2_cache(roles={"role": _principal_with([statement])})
+        )
+        assert "Failed" in [f["Status"] for f in findings]
+
+    @pytest.mark.parametrize(
+        ("statements", "boundary"),
+        [
+            (
+                [
+                    {
+                        "Effect": "Allow",
+                        "Action": "bedrock-agentcore:*",
+                        "Resource": "*",
+                    },
+                    {
+                        "Effect": "Deny",
+                        "Action": [
+                            "bedrock-agentcore:GetWorkloadAccessToken*",
+                            "bedrock-agentcore:GetResourceOauth2Token",
+                            "bedrock-agentcore:CompleteResourceTokenAuth",
+                        ],
+                        "Resource": "*",
+                    },
+                ],
+                None,
+            ),
+            (
+                [{"Effect": "Allow", "Action": "*", "Resource": "*"}],
+                {"Statement": [{"Effect": "Allow", "Action": "s3:*", "Resource": "*"}]},
+            ),
+        ],
+        ids=["deny", "boundary"],
+    )
+    def test_issuance_removed_by_deny_or_boundary_is_not_counted(
+        self, statements, boundary
+    ):
+        findings = agentcore_app.check_agentcore_token_issuance_scope(
+            _v2_cache(roles={"removed": _principal_with(statements, boundary)})
+        )
+        assert [f["Status"] for f in findings] == ["Passed"]
+        assert "No cached IAM role or user" in findings[0]["Finding_Details"]
+
+    def test_a_group_grant_on_a_user_is_counted(self):
+        findings = agentcore_app.check_agentcore_token_issuance_scope(
+            _v2_cache(
+                users={
+                    "analyst": _principal_with(
+                        [self._allow(self._ISSUE, "*")], key="group_policies"
+                    ),
+                    "viewer": _principal_with([self._allow("s3:GetObject", "*")]),
+                }
+            )
+        )
+        assert [f["Status"] for f in findings] == ["Failed"]
+        assert "user analyst" in findings[0]["Finding_Details"]
+        assert "viewer" not in findings[0]["Finding_Details"]
+
+    def test_a_principal_error_withholds_the_population_pass(self):
+        findings = agentcore_app.check_agentcore_token_issuance_scope(
+            _v2_cache(
+                roles={"reader": _principal_with([self._allow("s3:GetObject", "*")])},
+                errors=[
+                    {
+                        "type": "user",
+                        "name": "hidden",
+                        "stage": "list_groups_for_user",
+                        "error": "Throttling",
+                    }
+                ],
+            )
+        )
+        assert [f["Status"] for f in findings] == ["N/A"]
+        assert (
+            "user hidden (list_groups_for_user: Throttling)"
+            in findings[0]["Finding_Details"]
+        )
+
+    def test_a_v1_cache_pass_says_errors_were_not_recorded(self):
+        findings = agentcore_app.check_agentcore_token_issuance_scope(
+            {
+                "role_permissions": {
+                    "reader": _principal_with([self._allow("s3:GetObject", "*")])
+                },
+                "user_permissions": {},
+            }
+        )
+        assert [f["Status"] for f in findings] == ["Passed"]
+        assert findings[0]["Finding_Details"].endswith(agentcore_app.IAM_CACHE_V1_NOTE)
+
+
+class TestAC42WholePopulation:
+    """AC-42 reads the PassedToService value and every principal's grants."""
+
+    _WRITE = {
+        "Effect": "Allow",
+        "Action": "bedrock-agentcore:CreateOnlineEvaluationConfig",
+        "Resource": "*",
+    }
+
+    @staticmethod
+    def _pass(resource=_EVALUATION_ROLE_ARN, condition=_PASSED_TO_SERVICE, **extra):
+        statement = {"Effect": "Allow", "Action": "iam:PassRole", "Resource": resource}
+        if condition is not None:
+            statement["Condition"] = condition
+        statement.update(extra)
+        if "NotResource" in extra:
+            del statement["Resource"]
+        return statement
+
+    @pytest.mark.parametrize(
+        "condition",
+        [
+            {"StringEquals": {"iam:PassedToService": "ec2.amazonaws.com"}},
+            {
+                "StringEquals": {
+                    "iam:PassedToService": [
+                        "bedrock-agentcore.amazonaws.com",
+                        "lambda.amazonaws.com",
+                    ]
+                }
+            },
+            {"StringLike": {"iam:PassedToService": "*"}},
+            {"StringNotEquals": {"iam:PassedToService": "ec2.amazonaws.com"}},
+        ],
+        ids=["other-service", "second-service", "wildcard", "negated"],
+    )
+    @patch("agentcore_app.agentcore_client")
+    def test_a_condition_not_naming_agentcore_alone_fails_only_that_role(
+        self, mock_ac, condition
+    ):
+        _online_evaluation_client(mock_ac)
+        cache = _v2_cache(
+            roles={
+                "wide": _principal_with([self._pass(condition=condition)]),
+                "narrow": _principal_with([self._pass()]),
+            }
+        )
+
+        findings = agentcore_app.check_agentcore_evaluation_pass_role_scope(cache)
+
+        failed = [f for f in findings if f["Status"] == "Failed"]
+        assert len(failed) == 1
+        assert "role wide" in failed[0]["Finding_Details"]
+        assert "role narrow" not in failed[0]["Finding_Details"]
+        assert "no iam:PassedToService" in failed[0]["Finding_Details"]
+        assert agentcore_app.IAM_CACHE_SCP_NOTE in failed[0]["Finding_Details"]
+        passed = [f for f in findings if f["Status"] == "Passed"]
+        assert len(passed) == 1
+        assert "role narrow" in passed[0]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_not_resource_reaching_the_role_is_wide(self, mock_ac):
+        _online_evaluation_client(mock_ac)
+        cache = _v2_cache(
+            roles={
+                "role": _principal_with(
+                    [self._pass(NotResource="arn:aws:iam::123456789012:role/Admin")]
+                )
+            }
+        )
+        findings = agentcore_app.check_agentcore_evaluation_pass_role_scope(cache)
+        assert [f["Status"] for f in findings] == ["Failed"]
+        assert "also reaches other roles" in findings[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        ("statements", "boundary"),
+        [
+            (
+                [
+                    {"Effect": "Allow", "Action": "iam:PassRole", "Resource": "*"},
+                    {"Effect": "Deny", "Action": "iam:PassRole", "Resource": "*"},
+                ],
+                None,
+            ),
+            (
+                [{"Effect": "Allow", "Action": "*", "Resource": "*"}],
+                {"Statement": [{"Effect": "Allow", "Action": "s3:*", "Resource": "*"}]},
+            ),
+        ],
+        ids=["deny", "boundary"],
+    )
+    @patch("agentcore_app.agentcore_client")
+    def test_a_pass_role_removed_by_deny_or_boundary_is_not_counted(
+        self, mock_ac, statements, boundary
+    ):
+        _online_evaluation_client(mock_ac)
+        cache = _v2_cache(roles={"removed": _principal_with(statements, boundary)})
+        findings = agentcore_app.check_agentcore_evaluation_pass_role_scope(cache)
+        assert [f["Status"] for f in findings] == ["Passed"]
+        assert "No cached IAM role or user" in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_group_grant_on_a_user_is_counted(self, mock_ac):
+        _online_evaluation_client(mock_ac)
+        cache = _v2_cache(
+            users={
+                "analyst": _principal_with(
+                    [self._pass(resource="*")], key="group_policies"
+                ),
+                "viewer": _principal_with(
+                    [{"Effect": "Allow", "Action": "s3:GetObject", "Resource": "*"}]
+                ),
+            }
+        )
+        findings = agentcore_app.check_agentcore_evaluation_pass_role_scope(cache)
+        assert [f["Status"] for f in findings] == ["Failed"]
+        assert "user analyst" in findings[0]["Finding_Details"]
+        assert "viewer" not in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_principal_error_withholds_the_population_pass(self, mock_ac):
+        _online_evaluation_client(mock_ac)
+        cache = _v2_cache(
+            roles={"reader": _principal_with([self._pass()])},
+            errors=[
+                {
+                    "type": "role",
+                    "name": "hidden",
+                    "stage": "list_role_policies",
+                    "error": "AccessDenied",
+                }
+            ],
+        )
+        findings = agentcore_app.check_agentcore_evaluation_pass_role_scope(cache)
+        statuses = [f["Status"] for f in findings]
+        assert statuses == ["N/A", "Passed"]
+        assert (
+            "role hidden (list_role_policies: AccessDenied)"
+            in findings[0]["Finding_Details"]
+        )
+        assert "role reader" in findings[1]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_principal_error_withholds_the_nobody_pass(self, mock_ac):
+        _online_evaluation_client(mock_ac)
+        cache = _v2_cache(
+            roles={"reader": _principal_with([self._WRITE])},
+            errors=[
+                {
+                    "type": "role",
+                    "name": "hidden",
+                    "stage": "list_role_policies",
+                    "error": "AccessDenied",
+                }
+            ],
+        )
+        findings = agentcore_app.check_agentcore_evaluation_pass_role_scope(cache)
+        assert [f["Status"] for f in findings] == ["N/A"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_v1_cache_pass_says_errors_were_not_recorded(self, mock_ac):
+        _online_evaluation_client(mock_ac)
+        findings = agentcore_app.check_agentcore_evaluation_pass_role_scope(
+            {"role_permissions": {"reader": _principal_with([self._WRITE])}}
+        )
+        assert [f["Status"] for f in findings] == ["Passed"]
+        assert findings[0]["Finding_Details"].endswith(agentcore_app.IAM_CACHE_V1_NOTE)
+
+    @pytest.mark.parametrize("configured", [True, False], ids=["config", "no-config"])
+    @patch("agentcore_app.agentcore_client")
+    def test_a_writer_with_an_unbounded_pass_role_fails_with_or_without_a_config(
+        self, mock_ac, configured
+    ):
+        if configured:
+            _online_evaluation_client(mock_ac)
+        else:
+            mock_ac.list_online_evaluation_configs.return_value = {
+                "onlineEvaluationConfigs": []
+            }
+        cache = _v2_cache(
+            roles={
+                "writer": _principal_with(
+                    [
+                        self._WRITE,
+                        self._pass(
+                            resource="arn:aws:iam::123456789012:role/Other",
+                            condition=None,
+                        ),
+                    ]
+                ),
+                "scoped-writer": _principal_with(
+                    [self._WRITE, self._pass(resource=_EVALUATION_ROLE_ARN)]
+                ),
+            }
+        )
+
+        findings = agentcore_app.check_agentcore_evaluation_pass_role_scope(
+            cache, assess_writers=True
+        )
+
+        writer_rows = [
+            f
+            for f in findings
+            if f["Finding"] == "AgentCore Evaluation Writer Pass Role Unbounded"
+        ]
+        assert [f["Status"] for f in writer_rows] == ["Failed"]
+        assert "role writer" in writer_rows[0]["Finding_Details"]
+        assert "scoped-writer" not in writer_rows[0]["Finding_Details"]
+        assert writer_rows[0]["Region"] == agentcore_app.GLOBAL_REGION_LABEL
+
+    @patch("agentcore_app.agentcore_client")
+    def test_the_writer_leg_runs_only_when_asked(self, mock_ac):
+        _online_evaluation_client(mock_ac)
+        cache = _v2_cache(
+            roles={"writer": _principal_with([self._WRITE, self._pass(resource="*")])}
+        )
+        findings = agentcore_app.check_agentcore_evaluation_pass_role_scope(cache)
+        assert "AgentCore Evaluation Writer Pass Role Unbounded" not in [
+            f["Finding"] for f in findings
+        ]
+
+    def test_the_handler_asks_for_the_writer_leg_on_the_primary_region_only(self):
+        source = textwrap.dedent(inspect.getsource(agentcore_app.lambda_handler))
+        calls = [
+            node
+            for node in ast.walk(ast.parse(source))
+            if isinstance(node, ast.Call)
+            and ast.unparse(node.func) == "check_agentcore_evaluation_pass_role_scope"
+        ]
+        assert len(calls) == 1
+        keywords = {kw.arg: ast.unparse(kw.value) for kw in calls[0].keywords}
+        assert keywords == {"assess_writers": "is_primary_region"}
+
+
+class TestAC44WholePopulation:
+    """AC-44 reads every judge role's grants after its Deny and boundary."""
+
+    _NAMED = "arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-3"
+    _INVOKE = ["bedrock:InvokeModel", "bedrock:InvokeModelWithResponseStream"]
+
+    def _two_roles(self, mock_ac):
+        _online_evaluation_client(
+            mock_ac,
+            [
+                _online_evaluation_detail(),
+                _online_evaluation_detail(
+                    onlineEvaluationConfigId="oec-2",
+                    onlineEvaluationConfigName="second",
+                    evaluationExecutionRoleArn="arn:aws:iam::123456789012:role/SecondRole",
+                ),
+            ],
+        )
+
+    def _allow(self, resource, **extra):
+        return {
+            "Effect": "Allow",
+            "Action": self._INVOKE,
+            "Resource": resource,
+            **extra,
+        }
+
+    @pytest.mark.parametrize(
+        "resource",
+        [
+            "arn:aws:bedrock:*::*",
+            "arn:aws:bedrock:us-east-1:*:inference-profile/global.claude",
+        ],
+        ids=["every-bedrock-resource", "any-account-profile"],
+    )
+    @patch("agentcore_app.agentcore_client")
+    def test_a_segment_wildcard_on_the_second_role_fails(self, mock_ac, resource):
+        self._two_roles(mock_ac)
+        cache = _v2_cache(
+            roles={
+                "EvaluationRole": _principal_with([self._allow(self._NAMED)]),
+                "SecondRole": _principal_with([self._allow(resource)]),
+            }
+        )
+
+        findings = agentcore_app.check_agentcore_evaluation_judge_model_scope(cache)
+
+        assert [f["Status"] for f in findings] == ["Passed", "Failed"]
+        assert "SecondRole" in findings[1]["Finding_Details"]
+        assert resource in findings[1]["Finding_Details"]
+        assert agentcore_app.IAM_CACHE_SCP_NOTE in findings[1]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_not_resource_reaches_every_model_it_does_not_list(self, mock_ac):
+        _online_evaluation_client(mock_ac)
+        statement = {
+            "Effect": "Allow",
+            "Action": self._INVOKE,
+            "NotResource": self._NAMED,
+        }
+        cache = _v2_cache(roles={"EvaluationRole": _principal_with([statement])})
+
+        findings = agentcore_app.check_agentcore_evaluation_judge_model_scope(cache)
+
+        assert [f["Status"] for f in findings] == ["Failed"]
+        assert "NotResource" in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_an_unconditioned_deny_removes_the_grant(self, mock_ac):
+        _online_evaluation_client(mock_ac)
+        cache = _v2_cache(
+            roles={
+                "EvaluationRole": _principal_with(
+                    [
+                        self._allow("*"),
+                        {"Effect": "Deny", "Action": "bedrock:*", "Resource": "*"},
+                    ]
+                )
+            }
+        )
+
+        findings = agentcore_app.check_agentcore_evaluation_judge_model_scope(cache)
+
+        assert [f["Status"] for f in findings] == ["Passed"]
+        assert "permissions boundary" in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_conditioned_deny_leaves_the_grant(self, mock_ac):
+        _online_evaluation_client(mock_ac)
+        cache = _v2_cache(
+            roles={
+                "EvaluationRole": _principal_with(
+                    [
+                        self._allow("*"),
+                        {
+                            "Effect": "Deny",
+                            "Action": "bedrock:*",
+                            "Resource": "*",
+                            "Condition": {"Bool": {"aws:SecureTransport": "false"}},
+                        },
+                    ]
+                )
+            }
+        )
+
+        findings = agentcore_app.check_agentcore_evaluation_judge_model_scope(cache)
+
+        assert [f["Status"] for f in findings] == ["Failed"]
+
+    @pytest.mark.parametrize(
+        ("boundary_action", "status"),
+        [("s3:GetObject", "Passed"), ("bedrock:InvokeModel", "Failed")],
+        ids=["boundary-excludes", "boundary-allows"],
+    )
+    @patch("agentcore_app.agentcore_client")
+    def test_the_boundary_is_an_intersection(self, mock_ac, boundary_action, status):
+        _online_evaluation_client(mock_ac)
+        boundary = {
+            "Statement": [
+                {"Effect": "Allow", "Action": boundary_action, "Resource": "*"}
+            ]
+        }
+        cache = _v2_cache(
+            roles={"EvaluationRole": _principal_with([self._allow("*")], boundary)}
+        )
+
+        findings = agentcore_app.check_agentcore_evaluation_judge_model_scope(cache)
+
+        assert [f["Status"] for f in findings] == [status]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_principal_error_withholds_the_verdict_for_that_role_only(self, mock_ac):
+        self._two_roles(mock_ac)
+        cache = _v2_cache(
+            roles={
+                "EvaluationRole": _principal_with([]),
+                "SecondRole": _principal_with([self._allow(self._NAMED)]),
+            },
+            errors=[
+                {
+                    "type": "role",
+                    "name": "EvaluationRole",
+                    "stage": "list_attached_role_policies",
+                    "error": "AccessDenied",
+                }
+            ],
+        )
+
+        findings = agentcore_app.check_agentcore_evaluation_judge_model_scope(cache)
+
+        assert [f["Status"] for f in findings] == ["N/A", "Passed"]
+        assert findings[0]["Finding"].endswith("Incomplete")
+        assert (
+            "role EvaluationRole (list_attached_role_policies"
+            in (findings[0]["Finding_Details"])
+        )
+        assert "SecondRole" in findings[1]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_role_missing_from_the_cache_after_an_error_is_incomplete(self, mock_ac):
+        # The producer failed before recording the role at all.
+        _online_evaluation_client(mock_ac)
+        cache = _v2_cache(
+            roles={"SomeOtherRole": _principal_with([])},
+            errors=[
+                {
+                    "type": "role",
+                    "name": "EvaluationRole",
+                    "stage": "get_role",
+                    "error": "Throttling",
+                }
+            ],
+        )
+
+        findings = agentcore_app.check_agentcore_evaluation_judge_model_scope(cache)
+
+        assert [f["Status"] for f in findings] == ["N/A"]
+        assert findings[0]["Finding"].endswith("Incomplete")
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_v1_cache_says_principal_errors_were_not_recorded(self, mock_ac):
+        _online_evaluation_client(mock_ac)
+        cache = {
+            "role_permissions": {
+                "EvaluationRole": _principal_with([self._allow(self._NAMED)])
+            }
+        }
+
+        findings = agentcore_app.check_agentcore_evaluation_judge_model_scope(cache)
+
+        assert [f["Status"] for f in findings] == ["Passed"]
+        assert findings[0]["Finding_Details"].endswith(agentcore_app.IAM_CACHE_V1_NOTE)
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_v2_cache_carries_no_v1_note(self, mock_ac):
+        _online_evaluation_client(mock_ac)
+        cache = _v2_cache(
+            roles={"EvaluationRole": _principal_with([self._allow(self._NAMED)])}
+        )
+
+        findings = agentcore_app.check_agentcore_evaluation_judge_model_scope(cache)
+
+        assert agentcore_app.IAM_CACHE_V1_NOTE not in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_group_policy_grant_is_read(self, mock_ac):
+        _online_evaluation_client(mock_ac)
+        permissions = _principal_with([])
+        permissions["group_policies"] = [
+            {"name": "g", "document": {"Statement": [self._allow("*")]}}
+        ]
+        cache = _v2_cache(roles={"EvaluationRole": permissions})
+
+        findings = agentcore_app.check_agentcore_evaluation_judge_model_scope(cache)
+
+        assert [f["Status"] for f in findings] == ["Failed"]

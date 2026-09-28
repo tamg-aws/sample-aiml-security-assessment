@@ -15,7 +15,7 @@ import time
 from fnmatch import fnmatchcase
 from io import StringIO
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 from botocore.config import Config
 from botocore.exceptions import ClientError, EndpointConnectionError
 
@@ -2734,26 +2734,27 @@ def _payment_duty_collisions(
     return sorted(labels)
 
 
-def _payment_pass_role_gaps(
+def _writer_pass_role_gaps(
     permissions_by_name: Dict[str, Any],
     principal_kind: str,
+    write_actions: Tuple[str, ...],
 ) -> List[str]:
-    """Return each payment-manager writer whose iam:PassRole is not scoped.
+    """Return each writer of an AgentCore resource whose iam:PassRole is not scoped.
 
-    A principal that can create or update a payment manager and holds an
-    iam:PassRole Allow whose Resource is unbounded, or that does not pin
-    iam:PassedToService to the AgentCore service principal, can hand any role it
-    reaches to the payment manager as its ResourceRetrievalRole, or hand the
-    retrieval role to another service. iam:PassedToService is always in a
-    PassRole request, so its IfExists form is read as the plain one.
+    A principal that can create or update a resource carrying a role, such as a
+    payment manager's ResourceRetrievalRole or an online evaluation's execution
+    role, and holds an iam:PassRole Allow whose Resource is unbounded, or that
+    does not pin iam:PassedToService to the AgentCore service principal, can
+    hand any role it reaches to that resource, or hand the role to another
+    service. iam:PassedToService is always in a PassRole request, so its
+    IfExists form is read as the plain one.
     """
     labels: List[str] = []
     for principal_name, permissions in permissions_by_name.items():
         if not isinstance(permissions, dict):
             continue
         if not any(
-            _principal_holds_action(permissions, action)
-            for action in PAYMENT_MANAGER_WRITE_ACTIONS
+            _principal_holds_action(permissions, action) for action in write_actions
         ):
             continue
         if not _grant_survives(permissions, IAM_PASS_ROLE_ACTION):
@@ -3287,8 +3288,12 @@ def check_agentcore_full_access_roles(
         # the ResourceRetrievalRole when it writes the manager, so its PassRole
         # is the one grant that decides which role the service retrieves as.
         pass_role_gaps = [
-            *_payment_pass_role_gaps(role_permissions, "role"),
-            *_payment_pass_role_gaps(user_permissions, "user"),
+            *_writer_pass_role_gaps(
+                role_permissions, "role", PAYMENT_MANAGER_WRITE_ACTIONS
+            ),
+            *_writer_pass_role_gaps(
+                user_permissions, "user", PAYMENT_MANAGER_WRITE_ACTIONS
+            ),
         ]
         if pass_role_gaps:
             findings.append(
@@ -7774,26 +7779,37 @@ def _memory_read_scope(statement: Dict[str, Any], action: str) -> str:
     return "fixed"
 
 
-def _statement_memory_reads(statement: Dict[str, Any]) -> List[str]:
-    """Return the scopable memory read actions one Allow statement reaches."""
+def _statement_reached_actions(
+    statement: Dict[str, Any], actions: Iterable[str]
+) -> List[str]:
+    """Return which of the named bedrock-agentcore actions one Allow reaches.
+
+    Any Action pattern matching the action counts, a bare `*` included, and a
+    NotAction grants every action it does not exclude.
+    """
     if "Action" not in statement and "NotAction" in statement:
         exclusions = _statement_not_actions(statement)
         return [
-            read
-            for read in MEMORY_RECORD_READ_ACTIONS
+            action
+            for action in actions
             if not any(
-                _action_pattern_covers(excluded, f"bedrock-agentcore:{read}")
+                _action_pattern_covers(excluded, f"bedrock-agentcore:{action}")
                 for excluded in exclusions
             )
         ]
     return [
-        read
-        for read in MEMORY_RECORD_READ_ACTIONS
+        action
+        for action in actions
         if any(
-            _action_patterns_overlap(action, f"bedrock-agentcore:{read}")
-            for action in _statement_actions(statement)
+            _action_patterns_overlap(pattern, f"bedrock-agentcore:{action}")
+            for pattern in _statement_actions(statement)
         )
     ]
+
+
+def _statement_memory_reads(statement: Dict[str, Any]) -> List[str]:
+    """Return the scopable memory read actions one Allow statement reaches."""
+    return _statement_reached_actions(statement, MEMORY_RECORD_READ_ACTIONS)
 
 
 def _principals_reading_memory_records(
@@ -10201,76 +10217,93 @@ INBOUND_JWT_ISSUER_CONDITION_KEYS = (
 )
 
 
-def _statement_grants_inbound_jwt_exchange(statement: Dict[str, Any]) -> bool:
-    """Return whether one statement grants an inbound JWT token exchange."""
-    for action in _statement_actions(statement):
-        action_parts = action.split(":", 1)
-        if len(action_parts) != 2:
-            continue
-        service_namespace, action_pattern = action_parts
-        if service_namespace not in AGENT_PLATFORM_IAM_NAMESPACES:
-            continue
-        if any(
-            fnmatchcase(exchange_action, action_pattern)
-            for exchange_action in INBOUND_JWT_EXCHANGE_ACTIONS
-        ):
-            return True
-    return False
+# Operators under which an issuer condition keeps a token from another issuer
+# out. IfExists passes a token that lacks the claim, ForAllValues passes an
+# empty claim set, and a negated operator admits every issuer it does not name.
+INBOUND_JWT_PIN_OPERATORS = {"stringequals", "stringequalsignorecase", "stringlike"}
 
 
 def _statement_pins_inbound_jwt_issuer(statement: Dict[str, Any]) -> bool:
-    """Return whether one statement binds the exchange to named issuers or clients."""
-    return any(
-        condition_key in INBOUND_JWT_ISSUER_CONDITION_KEYS
-        for condition_key in _statement_condition_keys(statement)
-    )
+    """Return whether one statement binds the exchange to named issuers or clients.
+
+    The claim must sit under StringEquals or StringLike, optionally qualified
+    with ForAnyValue, and every value must name something narrower than a
+    wildcard.
+    """
+    conditions = statement.get("Condition")
+    if not isinstance(conditions, dict):
+        return False
+    for operator, block in conditions.items():
+        if not isinstance(block, dict):
+            continue
+        operator_name = str(operator).strip().lower()
+        if operator_name.startswith("foranyvalue:"):
+            operator_name = operator_name[len("foranyvalue:") :]
+        if operator_name not in INBOUND_JWT_PIN_OPERATORS:
+            continue
+        for key, values in block.items():
+            if str(key).strip().lower() not in INBOUND_JWT_ISSUER_CONDITION_KEYS:
+                continue
+            if isinstance(values, str):
+                values = [values]
+            if not isinstance(values, list) or not values:
+                continue
+            if all(
+                str(value) and not set(str(value)) <= {"*", "?"} for value in values
+            ):
+                return True
+    return False
 
 
 def _principals_exchanging_inbound_jwts(
     permissions_by_name: Dict[str, Any],
     principal_kind: str,
-) -> Tuple[List[str], List[str]]:
+) -> Tuple[List[str], List[str], List[str]]:
     """Split principals exchanging inbound JWTs into unpinned and pinned grants.
 
     The resource element cannot answer this question: both actions take the
     workload identity as their resource, so naming one workload still accepts a
     token from any issuer that workload's authorizer trusts. Only a condition on
     the issuer, audience or client id narrows which tokens the exchange accepts.
+    Any action pattern reaching an exchange counts, a bare `Action: "*"`
+    included, and only if it survives the principal's own unconditioned Deny
+    statements and permissions boundary. The third list names principals with
+    a policy that could not be parsed.
     """
     unpinned: List[str] = []
     pinned: List[str] = []
+    unreadable: List[str] = []
 
     for principal_name, permissions in permissions_by_name.items():
         if not isinstance(permissions, dict):
             continue
         label = f"{principal_kind} {principal_name}"
-        attached_policies = permissions.get("attached_policies", [])
-        inline_policies = permissions.get("inline_policies", [])
-        if not isinstance(attached_policies, list):
-            attached_policies = []
-        if not isinstance(inline_policies, list):
-            inline_policies = []
+        verdicts = set()
 
-        exchanges_tokens = False
-        exchanges_tokens_unpinned = False
-
-        for policy in [*attached_policies, *inline_policies]:
+        for policy in _principal_policies(permissions):
             try:
-                for statement in _allow_statements(policy):
-                    if not _statement_grants_inbound_jwt_exchange(statement):
-                        continue
-                    exchanges_tokens = True
-                    if not _statement_pins_inbound_jwt_issuer(statement):
-                        exchanges_tokens_unpinned = True
-            except Exception as error:
+                statements = list(_allow_statements(policy))
+            except (TypeError, ValueError) as error:
                 logger.warning(f"Error parsing policy for {label}: {error}")
+                unreadable.append(f"{label} (policy {policy.get('name', '')})")
+                continue
+            for statement in statements:
+                reached = [
+                    action
+                    for action in _statement_reached_actions(
+                        statement, INBOUND_JWT_EXCHANGE_ACTIONS
+                    )
+                    if _grant_survives(permissions, f"bedrock-agentcore:{action}")
+                ]
+                if reached:
+                    verdicts.add(_statement_pins_inbound_jwt_issuer(statement))
 
-        if exchanges_tokens_unpinned:
+        if False in verdicts:
             unpinned.append(label)
-        elif exchanges_tokens:
+        elif True in verdicts:
             pinned.append(label)
 
-    return unpinned, pinned
+    return unpinned, pinned, unreadable
 
 
 def check_agentcore_inbound_jwt_issuer_conditions(
@@ -10283,18 +10316,23 @@ def check_agentcore_inbound_jwt_issuer_conditions(
     holding GetWorkloadAccessTokenForJWT or CompleteResourceTokenAuth with no
     InboundJwtClaim condition trades a token from any issuer the workload trusts
     for a workload access token, without passing through a gateway authorizer.
-    An action element of "*" is a service-agnostic administrator grant and is
-    left to AC-02; this check reads the grants that name the bedrock-agentcore
-    namespace.
+    An action element of "*" reaches both exchanges and is counted here too.
     """
     findings = []
 
     try:
         role_permissions = permission_cache.get("role_permissions", {})
         user_permissions = permission_cache.get("user_permissions", {})
+        gap_rows, v1_note = _cache_read_gap_findings(
+            permission_cache,
+            "AC-32",
+            "AgentCore Inbound JWT Issuer Conditions",
+            AGENTCORE_IAM_CONDITION_KEY_REFERENCE_URL,
+            region=GLOBAL_REGION_LABEL,
+        )
 
         if not role_permissions and not user_permissions:
-            return [
+            return gap_rows + [
                 create_finding(
                     check_id="AC-32",
                     finding_name="AgentCore Inbound JWT Issuer Conditions",
@@ -10307,14 +10345,34 @@ def check_agentcore_inbound_jwt_issuer_conditions(
                 )
             ]
 
-        unpinned_roles, pinned_roles = _principals_exchanging_inbound_jwts(
-            role_permissions, "role"
-        )
-        unpinned_users, pinned_users = _principals_exchanging_inbound_jwts(
-            user_permissions, "user"
-        )
-        unpinned = sorted(unpinned_roles + unpinned_users)
-        pinned = sorted(pinned_roles + pinned_users)
+        role_groups = _principals_exchanging_inbound_jwts(role_permissions, "role")
+        user_groups = _principals_exchanging_inbound_jwts(user_permissions, "user")
+        unpinned = sorted(role_groups[0] + user_groups[0])
+        pinned = sorted(role_groups[1] + user_groups[1])
+        unreadable = sorted(role_groups[2] + user_groups[2])
+        findings.extend(gap_rows)
+        if unreadable:
+            findings.append(
+                create_finding(
+                    check_id="AC-32",
+                    finding_name="AgentCore Inbound JWT Issuer Conditions Incomplete",
+                    finding_details=(
+                        "A policy of these principals could not be parsed, so "
+                        "their token exchange grants were not judged and no "
+                        "Passed result is reported for the population: "
+                        f"{', '.join(unreadable)}."
+                    ),
+                    resolution=(
+                        "No action is required on the assessed workload based on "
+                        "this result. Correct the named policy documents and "
+                        "rerun the assessment."
+                    ),
+                    reference=AGENTCORE_IAM_CONDITION_KEY_REFERENCE_URL,
+                    severity=SeverityEnum.INFORMATIONAL,
+                    status=StatusEnum.NA,
+                    region=GLOBAL_REGION_LABEL,
+                )
+            )
 
         if unpinned:
             findings.append(
@@ -10326,7 +10384,9 @@ def check_agentcore_inbound_jwt_issuer_conditions(
                         "for a workload access token with no condition on the "
                         "token's issuer, audience or client id, so a token minted "
                         "by any issuer the workload trusts is accepted: "
-                        f"{', '.join(unpinned)}."
+                        f"{', '.join(unpinned)}. A condition under IfExists, "
+                        "ForAllValues or a negated operator, or with a "
+                        f"wildcard-only value, does not pin. {IAM_CACHE_SCP_NOTE}"
                     ),
                     resolution=(
                         "Add a bedrock-agentcore:InboundJwtClaim/iss condition "
@@ -10336,8 +10396,9 @@ def check_agentcore_inbound_jwt_issuer_conditions(
                         "GetWorkloadAccessTokenForJWT or CompleteResourceTokenAuth. "
                         "client_id resolves only where the JWT carries that claim "
                         "under that exact name, and aud arrives as a multi-valued "
-                        "key, so qualify it with ForAllValues to keep one approved "
-                        "audience from admitting a token that also carries others."
+                        "key, so qualify it with ForAnyValue to require an approved "
+                        "audience, and add ForAllValues beside it to keep a token "
+                        "that also carries other audiences out."
                     ),
                     reference=AGENTCORE_IAM_CONDITION_KEY_REFERENCE_URL,
                     severity=SeverityEnum.HIGH,
@@ -10353,7 +10414,8 @@ def check_agentcore_inbound_jwt_issuer_conditions(
                     finding_name="AgentCore Inbound JWT Issuer Conditions",
                     finding_details=(
                         "The following principals exchange inbound JWTs only under "
-                        "an issuer, audience or client id condition: "
+                        "an issuer, audience or client id condition that names a "
+                        "value under StringEquals or StringLike: "
                         f"{', '.join(pinned)}."
                     ),
                     resolution=(
@@ -10367,7 +10429,7 @@ def check_agentcore_inbound_jwt_issuer_conditions(
                 )
             )
 
-        if not unpinned and not pinned:
+        if not unpinned and not pinned and not gap_rows and not unreadable:
             findings.append(
                 create_finding(
                     check_id="AC-32",
@@ -10375,8 +10437,9 @@ def check_agentcore_inbound_jwt_issuer_conditions(
                     finding_details=(
                         "No cached IAM role or user grants "
                         "GetWorkloadAccessTokenForJWT or CompleteResourceTokenAuth, "
+                        "after its own Deny statements and permissions boundary, "
                         "so no principal exchanges an inbound JWT for a workload "
-                        "access token through IAM policy."
+                        f"access token through IAM policy.{v1_note}"
                     ),
                     resolution="No action required.",
                     reference=AGENTCORE_IAM_CONDITION_KEY_REFERENCE_URL,
@@ -10418,23 +10481,6 @@ TOKEN_ISSUANCE_ACTIONS = (
 WORKLOAD_IDENTITY_ARN_SEGMENT = "workload-identity/"
 
 
-def _statement_grants_token_issuance(statement: Dict[str, Any]) -> bool:
-    """Return whether one statement grants an agent token or credential read."""
-    for action in _statement_actions(statement):
-        action_parts = action.split(":", 1)
-        if len(action_parts) != 2:
-            continue
-        service_namespace, action_pattern = action_parts
-        if service_namespace not in AGENT_PLATFORM_IAM_NAMESPACES:
-            continue
-        if any(
-            fnmatchcase(issuance_action, action_pattern)
-            for issuance_action in TOKEN_ISSUANCE_ACTIONS
-        ):
-            return True
-    return False
-
-
 def _resource_names_one_workload_identity(resource: str) -> bool:
     """Return whether one resource element names a single workload identity.
 
@@ -10454,12 +10500,17 @@ def _token_issuance_scope_verdict(statement: Dict[str, Any]) -> str:
     AWS's own scoped example lists the directory ARN alongside the workload
     identity's, because both resource types are required on these actions, so a
     directory ARN in the list is not the widening. A trailing wildcard is: it
-    reaches every identity, vault or provider under that prefix. A wildcard
-    earlier in the ARN, in the region or the account, leaves the named identity
-    named, so it is read as scoped.
+    reaches every identity, vault or provider under that prefix. So is a
+    wildcard in the partition, service, region or account segment, which
+    reaches the same name in every region or account, and a NotResource.
     """
+    if "NotResource" in statement:
+        return "unbounded"
     resources = _statement_resources(statement)
-    if any(resource.endswith("*") for resource in resources):
+    if any(
+        resource.endswith(("*", "?")) or _arn_pattern_is_unbounded(resource)
+        for resource in resources
+    ):
         return "unbounded"
     if any(_resource_names_one_workload_identity(resource) for resource in resources):
         return "scoped"
@@ -10475,32 +10526,37 @@ def _principals_issuing_agent_tokens(
     A principal is judged on the union of its resource elements, so `scoped`
     outranks `directory_only`: AWS's own scoped policy lists the directory ARN
     beside the workload identity's, and splitting those two ARNs into two
-    statements is the same grant.
+    statements is the same grant. Any action pattern reaching an issuance
+    action counts, a bare `Action: "*"` included, and only if it survives the
+    principal's own unconditioned Deny statements and permissions boundary.
+    The fourth list names principals with a policy that could not be parsed.
     """
     unbounded: List[str] = []
     directory_only: List[str] = []
     scoped: List[str] = []
+    unreadable: List[str] = []
 
     for principal_name, permissions in permissions_by_name.items():
         if not isinstance(permissions, dict):
             continue
         label = f"{principal_kind} {principal_name}"
-        attached_policies = permissions.get("attached_policies", [])
-        inline_policies = permissions.get("inline_policies", [])
-        if not isinstance(attached_policies, list):
-            attached_policies = []
-        if not isinstance(inline_policies, list):
-            inline_policies = []
 
         verdicts = set()
-        for policy in [*attached_policies, *inline_policies]:
+        for policy in _principal_policies(permissions):
             try:
-                for statement in _allow_statements(policy):
-                    if not _statement_grants_token_issuance(statement):
-                        continue
-                    verdicts.add(_token_issuance_scope_verdict(statement))
-            except Exception as error:
+                statements = list(_allow_statements(policy))
+            except (TypeError, ValueError) as error:
                 logger.warning(f"Error parsing policy for {label}: {error}")
+                unreadable.append(f"{label} (policy {policy.get('name', '')})")
+                continue
+            for statement in statements:
+                if any(
+                    _grant_survives(permissions, f"bedrock-agentcore:{action}")
+                    for action in _statement_reached_actions(
+                        statement, TOKEN_ISSUANCE_ACTIONS
+                    )
+                ):
+                    verdicts.add(_token_issuance_scope_verdict(statement))
 
         if "unbounded" in verdicts:
             unbounded.append(label)
@@ -10509,7 +10565,7 @@ def _principals_issuing_agent_tokens(
         elif "directory_only" in verdicts:
             directory_only.append(label)
 
-    return unbounded, directory_only, scoped
+    return unbounded, directory_only, scoped, unreadable
 
 
 def check_agentcore_token_issuance_scope(
@@ -10531,9 +10587,16 @@ def check_agentcore_token_issuance_scope(
     try:
         role_permissions = permission_cache.get("role_permissions", {})
         user_permissions = permission_cache.get("user_permissions", {})
+        gap_rows, v1_note = _cache_read_gap_findings(
+            permission_cache,
+            "AC-33",
+            "AgentCore Token Issuance Scope",
+            AGENTCORE_WORKLOAD_IDENTITY_SCOPE_REFERENCE_URL,
+            region=GLOBAL_REGION_LABEL,
+        )
 
         if not role_permissions and not user_permissions:
-            return [
+            return gap_rows + [
                 create_finding(
                     check_id="AC-33",
                     finding_name="AgentCore Token Issuance Scope",
@@ -10551,6 +10614,30 @@ def check_agentcore_token_issuance_scope(
         unbounded = sorted(role_groups[0] + user_groups[0])
         directory_only = sorted(role_groups[1] + user_groups[1])
         scoped = sorted(role_groups[2] + user_groups[2])
+        unreadable = sorted(role_groups[3] + user_groups[3])
+        findings.extend(gap_rows)
+        if unreadable:
+            findings.append(
+                create_finding(
+                    check_id="AC-33",
+                    finding_name="AgentCore Token Issuance Scope Incomplete",
+                    finding_details=(
+                        "A policy of these principals could not be parsed, so "
+                        "their token issuance grants were not judged and no "
+                        "Passed result is reported for the population: "
+                        f"{', '.join(unreadable)}."
+                    ),
+                    resolution=(
+                        "No action is required on the assessed workload based on "
+                        "this result. Correct the named policy documents and "
+                        "rerun the assessment."
+                    ),
+                    reference=AGENTCORE_WORKLOAD_IDENTITY_SCOPE_REFERENCE_URL,
+                    severity=SeverityEnum.INFORMATIONAL,
+                    status=StatusEnum.NA,
+                    region=GLOBAL_REGION_LABEL,
+                )
+            )
 
         if unbounded:
             findings.append(
@@ -10561,8 +10648,9 @@ def check_agentcore_token_issuance_scope(
                         "The following principals can mint agent access tokens or "
                         "read stored credentials against a wildcard resource, so "
                         "one compromised agent reaches every workload identity, "
-                        "token vault and credential provider in the account: "
-                        f"{', '.join(unbounded)}."
+                        "token vault and credential provider in the account, or "
+                        "the same name in every region or account: "
+                        f"{', '.join(unbounded)}. {IAM_CACHE_SCP_NOTE}"
                     ),
                     resolution=(
                         "Replace the wildcard resource with the agent's own "
@@ -10591,7 +10679,8 @@ def check_agentcore_token_issuance_scope(
                         "workload-identity-directory as required on these actions "
                         "and does not say whether allowing only the directory "
                         "authorizes the call, so this grant either reaches every "
-                        "identity the directory holds or authorizes nothing."
+                        "identity the directory holds or authorizes nothing. "
+                        f"{IAM_CACHE_SCP_NOTE}"
                     ),
                     resolution=(
                         "Add the agent's own workload-identity ARN "
@@ -10629,15 +10718,22 @@ def check_agentcore_token_issuance_scope(
                 )
             )
 
-        if not unbounded and not directory_only and not scoped:
+        if (
+            not unbounded
+            and not directory_only
+            and not scoped
+            and not gap_rows
+            and not unreadable
+        ):
             findings.append(
                 create_finding(
                     check_id="AC-33",
                     finding_name="AgentCore Token Issuance Scope",
                     finding_details=(
                         "No cached IAM role or user grants an AgentCore token "
-                        "issuance or stored-credential action, so no principal "
-                        "mints an agent token through IAM policy."
+                        "issuance or stored-credential action after its own Deny "
+                        "statements and permissions boundary, so no principal "
+                        f"mints an agent token through IAM policy.{v1_note}"
                     ),
                     resolution="No action required.",
                     reference=AGENTCORE_WORKLOAD_IDENTITY_SCOPE_REFERENCE_URL,
@@ -12678,7 +12774,14 @@ IAM_PASS_ROLE_ACTION = "iam:passrole"
 IAM_PASSED_TO_SERVICE_CONDITION_KEY = "iam:passedtoservice"
 
 PASS_ROLE_WIDE_RESOURCE_LEG = "its Resource pattern also reaches other roles"
-PASS_ROLE_MISSING_CONDITION_LEG = "it carries no iam:PassedToService condition"
+PASS_ROLE_MISSING_CONDITION_LEG = (
+    "it carries no iam:PassedToService condition naming "
+    f"{AGENTCORE_SERVICE_PRINCIPAL} alone"
+)
+EVALUATION_CONFIG_WRITE_ACTIONS = (
+    "bedrock-agentcore:CreateOnlineEvaluationConfig",
+    "bedrock-agentcore:UpdateOnlineEvaluationConfig",
+)
 
 
 def _evaluation_pass_role_grants(
@@ -12691,12 +12794,18 @@ def _evaluation_pass_role_grants(
     Each entry pairs a principal's label with the guards its widest reaching
     PassRole statement is missing, so an entry with no missing guard is bounded. A
     principal holding no PassRole statement that reaches one of the named roles is
+    PassRole statement that reaches one of the named roles is
     absent from the result: it is neither reported nor counted as passing. A narrow
     statement elsewhere in the same policy set does not narrow a wide one, which is
-    why the widest is the one judged.
+    why the widest is the one judged. Group policies count for users, a grant the
+    principal's own unconditioned Deny or permissions boundary removes does not
+    count, and a NotResource reaches every role it does not list. The condition
+    leg holds only when iam:PassedToService names the AgentCore service
+    principal and nothing else. The second value names each principal with a
+    policy that could not be parsed.
     """
     grants: List[Tuple[str, List[str]]] = []
-    unreadable = 0
+    unreadable: List[str] = []
 
     for principal_name, permissions in permissions_by_name.items():
         if not isinstance(permissions, dict):
@@ -12704,34 +12813,49 @@ def _evaluation_pass_role_grants(
         label = f"{principal_kind} {principal_name}"
         widest: List[str] = []
         reaches = False
+        if not _grant_survives(permissions, IAM_PASS_ROLE_ACTION):
+            continue
 
-        for policy in [
-            *(permissions.get("attached_policies") or []),
-            *(permissions.get("inline_policies") or []),
-        ]:
+        for policy in _principal_policies(permissions):
             try:
                 statements = list(_allow_statements(policy))
-            except Exception as error:
-                unreadable += 1
+            except (TypeError, ValueError) as error:
+                unreadable.append(f"{label} (policy {policy.get('name', '')})")
                 logger.warning(f"Error parsing policy for {label}: {error}")
                 continue
 
             for statement in statements:
                 if not _statement_matches_action(statement, IAM_PASS_ROLE_ACTION):
                     continue
-                reaching = [
-                    resource
-                    for resource in _statement_resources(statement)
-                    if any(fnmatchcase(role_arn, resource) for role_arn in role_arns)
-                ]
+                if "NotResource" in statement:
+                    excluded = statement.get("NotResource") or []
+                    if isinstance(excluded, str):
+                        excluded = [excluded]
+                    reaching = [
+                        "*"
+                        for role_arn in role_arns
+                        if not any(
+                            fnmatchcase(role_arn, pattern) for pattern in excluded
+                        )
+                    ][:1]
+                else:
+                    reaching = [
+                        resource
+                        for resource in _statement_resources(statement)
+                        if any(
+                            fnmatchcase(role_arn, resource) for role_arn in role_arns
+                        )
+                    ]
                 if not reaching:
                     continue
 
                 missing: List[str] = []
                 if any("*" in resource or "?" in resource for resource in reaching):
                     missing.append(PASS_ROLE_WIDE_RESOURCE_LEG)
-                if IAM_PASSED_TO_SERVICE_CONDITION_KEY not in _statement_condition_keys(
-                    statement
+                if not _condition_pins_value(
+                    statement,
+                    IAM_PASSED_TO_SERVICE_CONDITION_KEY,
+                    AGENTCORE_SERVICE_PRINCIPAL,
                 ):
                     missing.append(PASS_ROLE_MISSING_CONDITION_LEG)
 
@@ -12747,6 +12871,7 @@ def _evaluation_pass_role_grants(
 
 def check_agentcore_evaluation_pass_role_scope(
     permission_cache: Dict[str, Any],
+    assess_writers: bool = False,
 ) -> List[Dict[str, Any]]:
     """AC-42: Judge who can hand a role to the evaluation service, and which role.
 
@@ -12758,6 +12883,13 @@ def check_agentcore_evaluation_pass_role_scope(
     it. iam:PassedToService narrows the same grant to the service the role was
     written for, so a role meant for evaluations cannot be handed to another
     service that trusts it.
+
+    On-demand and batch evaluations take no role in their request (Evaluate and
+    StartBatchEvaluation carry no role member), so online configurations are
+    the whole population of roles passed to evaluations. assess_writers adds the
+    leg for principals that can write an online configuration and pass a role
+    wider than one, whether or not a configuration exists yet; the caller sets
+    it in one region only, because the IAM cache is the same in every region.
     """
     if agentcore_client is None:
         return [
@@ -12790,6 +12922,55 @@ def check_agentcore_evaluation_pass_role_scope(
         errors,
         IAM_PASS_ROLE_REFERENCE_URL,
     )
+    role_permissions = (permission_cache or {}).get("role_permissions") or {}
+    user_permissions = (permission_cache or {}).get("user_permissions") or {}
+    gap_rows, v1_note = (
+        _cache_read_gap_findings(
+            permission_cache,
+            "AC-42",
+            "AgentCore Evaluation Pass Role Scope",
+            IAM_PASS_ROLE_REFERENCE_URL,
+        )
+        if isinstance(permission_cache, dict)
+        else ([], "")
+    )
+    findings.extend(gap_rows)
+
+    writer_gaps = (
+        [
+            *_writer_pass_role_gaps(
+                role_permissions, "role", EVALUATION_CONFIG_WRITE_ACTIONS
+            ),
+            *_writer_pass_role_gaps(
+                user_permissions, "user", EVALUATION_CONFIG_WRITE_ACTIONS
+            ),
+        ]
+        if assess_writers
+        else []
+    )
+    if writer_gaps:
+        findings.append(
+            create_finding(
+                check_id="AC-42",
+                finding_name="AgentCore Evaluation Writer Pass Role Unbounded",
+                finding_details=(
+                    "The following principals can create or update an online "
+                    "evaluation configuration and hold an iam:PassRole grant that "
+                    "would let them name any role they reach as its execution "
+                    "role, whether or not a configuration exists today: "
+                    f"{'; '.join(sorted(writer_gaps))}. {IAM_CACHE_SCP_NOTE}"
+                ),
+                resolution=(
+                    "Scope iam:PassRole to the evaluation execution role's own ARN "
+                    "and add an iam:PassedToService condition naming "
+                    f"{AGENTCORE_SERVICE_PRINCIPAL}."
+                ),
+                reference=IAM_PASS_ROLE_REFERENCE_URL,
+                severity=SeverityEnum.HIGH,
+                status=StatusEnum.FAILED,
+                region=GLOBAL_REGION_LABEL,
+            )
+        )
 
     role_arns = sorted(
         {
@@ -12816,8 +12997,6 @@ def check_agentcore_evaluation_pass_role_scope(
         )
         return findings
 
-    role_permissions = (permission_cache or {}).get("role_permissions") or {}
-    user_permissions = (permission_cache or {}).get("user_permissions") or {}
     if not role_permissions and not user_permissions:
         findings.append(
             create_finding(
@@ -12864,7 +13043,7 @@ def check_agentcore_evaluation_pass_role_scope(
                         f"{label}, where {' and '.join(missing)}"
                         for label, missing in unbounded
                     )
-                    + "."
+                    + f". {IAM_CACHE_SCP_NOTE}"
                 ),
                 resolution=(
                     "Scope iam:PassRole to the evaluation execution role's own ARN "
@@ -12885,29 +13064,26 @@ def check_agentcore_evaluation_pass_role_scope(
                 finding_name="AgentCore Evaluation Pass Role Scope",
                 finding_details=(
                     "The following principals can pass an evaluation execution role "
-                    f"({named_roles}) only by its own ARN and only to a named "
-                    f"service: {', '.join(bounded)}."
+                    f"({named_roles}) only by its own ARN and only to "
+                    f"{AGENTCORE_SERVICE_PRINCIPAL}: {', '.join(bounded)}."
                 ),
-                resolution=(
-                    "No action required. Confirm the iam:PassedToService value names "
-                    "the evaluation service rather than every service this role "
-                    "trusts."
-                ),
+                resolution="No action required.",
                 reference=IAM_PASS_ROLE_REFERENCE_URL,
                 severity=SeverityEnum.HIGH,
                 status=StatusEnum.PASSED,
             )
         )
 
-    if not grants:
+    if not grants and not gap_rows and not role_unreadable and not user_unreadable:
         findings.append(
             create_finding(
                 check_id="AC-42",
                 finding_name="AgentCore Evaluation Pass Role Scope",
                 finding_details=(
                     "No cached IAM role or user can pass an evaluation execution "
-                    f"role ({named_roles}), so no principal in this snapshot can "
-                    "point an evaluation at a different role."
+                    f"role ({named_roles}) after its own Deny statements and "
+                    "permissions boundary, so no principal in this snapshot can "
+                    f"point an evaluation at a different role.{v1_note}"
                 ),
                 resolution=(
                     "No action required. Grant iam:PassRole on the evaluation "
@@ -12926,9 +13102,10 @@ def check_agentcore_evaluation_pass_role_scope(
                 check_id="AC-42",
                 finding_name="AgentCore Evaluation Pass Role Scope Incomplete",
                 finding_details=(
-                    f"{role_unreadable + user_unreadable} cached policy document(s) "
-                    "could not be parsed, so a PassRole grant inside one of them was "
-                    "not judged."
+                    "A policy of these principals could not be parsed, so a "
+                    "PassRole grant inside it was not judged and no Passed result "
+                    "is reported for the population: "
+                    f"{', '.join(sorted(role_unreadable + user_unreadable))}."
                 ),
                 resolution=(
                     "No action is required on the assessed workload based on this "
@@ -13126,9 +13303,17 @@ def _bedrock_model_resource_is_unbounded(resource: str) -> bool:
     wildcard reaches every model of that resource type and a bare `*` reaches
     every model of every type. A pattern naming part of an id, such as one
     provider's prefix, is narrower, and which models belong inside it is the
-    workload owner's decision and not this check's to assert.
+    workload owner's decision and not this check's to assert. A wildcard in the
+    partition, service, account or resource type segment, such as
+    `arn:aws:bedrock:*::*`, reaches every model too. A region wildcard does not:
+    a model id names the same model in every region, and cross-Region inference
+    requires the foundation-model grant in each destination region.
     """
-    return resource == "*" or resource.endswith("/*")
+    return (
+        resource == "*"
+        or resource.endswith("/*")
+        or _arn_pattern_is_unbounded(resource, region_widens=False)
+    )
 
 
 def _model_invocation_scope(
@@ -13140,16 +13325,21 @@ def _model_invocation_scope(
     documents that could not be parsed. A statement whose action list reaches a
     model-invocation action by any pattern counts, including a bare wildcard: on
     an evaluation execution role a grant of every action is a grant of every
-    model, unlike on the administrator roles AC-02 leaves alone.
+    model, unlike on the administrator roles AC-02 leaves alone. A grant the
+    role's own unconditioned Deny or permissions boundary removes is not
+    counted, and an Allow written with NotResource reaches every model it does
+    not list.
     """
     unbounded: List[str] = []
     bounded: List[str] = []
     unreadable = 0
+    if not any(
+        _grant_survives(permissions, action)
+        for action in BEDROCK_MODEL_INVOCATION_ACTIONS
+    ):
+        permissions = {**permissions, "attached_policies": [], "inline_policies": []}
 
-    for policy in [
-        *(permissions.get("attached_policies") or []),
-        *(permissions.get("inline_policies") or []),
-    ]:
+    for policy in _principal_policies(permissions):
         try:
             statements = list(_allow_statements(policy))
         except Exception as error:
@@ -13163,6 +13353,8 @@ def _model_invocation_scope(
                 for action in BEDROCK_MODEL_INVOCATION_ACTIONS
             ):
                 continue
+            if "NotResource" in statement:
+                unbounded.append("NotResource")
             for resource in _statement_resources(statement):
                 if _bedrock_model_resource_is_unbounded(resource):
                     unbounded.append(resource)
@@ -13267,9 +13459,44 @@ def check_agentcore_evaluation_judge_model_scope(
         )
         return findings
 
+    gap_labels, recorded = _cache_principal_read_gaps(permission_cache, ("role",))
+    unread_roles = {
+        str(entry.get("name", ""))
+        for entry in (permission_cache.get("principal_errors") or [])
+        if isinstance(entry, dict) and entry.get("type") == "role"
+    }
+    v1_note = "" if recorded else " " + IAM_CACHE_V1_NOTE
+
     for role_arn in role_arns:
         role_name = role_arn.rsplit("/", 1)[-1]
         permissions = role_permissions.get(role_name)
+        if role_name in unread_roles:
+            findings.append(
+                create_finding(
+                    check_id="AC-44",
+                    finding_name="AgentCore Evaluation Judge Model Scope Incomplete",
+                    finding_details=(
+                        "The IAM permissions cache could not read every policy of "
+                        "evaluation execution role "
+                        f"{role_name}, so the models it can invoke are not judged: "
+                        + ", ".join(
+                            label
+                            for label in gap_labels
+                            if label.startswith(f"role {role_name} (")
+                        )
+                        + "."
+                    ),
+                    resolution=(
+                        "No action is required on the assessed workload based on "
+                        "this result. Grant the cache producer read access to the "
+                        "role's policies and rerun the assessment."
+                    ),
+                    reference=AGENTCORE_EVALUATORS_REFERENCE_URL,
+                    severity=SeverityEnum.INFORMATIONAL,
+                    status=StatusEnum.NA,
+                )
+            )
+            continue
         if not isinstance(permissions, dict):
             findings.append(
                 create_finding(
@@ -13325,7 +13552,8 @@ def check_agentcore_evaluation_judge_model_scope(
                         f"through {len(unbounded)} Resource pattern(s) that name no "
                         f"model: {', '.join(unbounded)}. The judge prompt carries "
                         "the agent output being scored, so every model this reaches "
-                        "is a model attacker-influenced text can be sent to."
+                        "is a model attacker-influenced text can be sent to. "
+                        f"{IAM_CACHE_SCP_NOTE}"
                     ),
                     resolution=(
                         "Replace the pattern with the ARNs of the models this "
@@ -13337,6 +13565,8 @@ def check_agentcore_evaluation_judge_model_scope(
                     status=StatusEnum.FAILED,
                 )
             )
+        elif unreadable:
+            continue
         elif bounded:
             findings.append(
                 create_finding(
@@ -13345,7 +13575,7 @@ def check_agentcore_evaluation_judge_model_scope(
                     finding_details=(
                         f"Evaluation execution role {role_name} can invoke a model "
                         f"only through {len(bounded)} Resource pattern(s) that name "
-                        f"a model: {', '.join(bounded)}."
+                        f"a model: {', '.join(bounded)}.{v1_note}"
                     ),
                     resolution=(
                         "No action required for this check. Confirm the named models "
@@ -13364,7 +13594,9 @@ def check_agentcore_evaluation_judge_model_scope(
                     finding_name="AgentCore Evaluation Judge Model Scope",
                     finding_details=(
                         f"Evaluation execution role {role_name} holds no "
-                        "model-invocation grant, so it invokes no judge model at all."
+                        "model-invocation grant after its own Deny statements and "
+                        "permissions boundary, so it invokes no judge model at all."
+                        f"{v1_note}"
                     ),
                     resolution=(
                         "No action required for this check. An evaluator that scores "
@@ -17158,7 +17390,9 @@ def lambda_handler(event, context):
             (
                 ["AC-42"],
                 "Evaluation Pass Role Scope",
-                lambda: check_agentcore_evaluation_pass_role_scope(permission_cache),
+                lambda: check_agentcore_evaluation_pass_role_scope(
+                    permission_cache, assess_writers=is_primary_region
+                ),
             ),
             (
                 ["AC-43"],
