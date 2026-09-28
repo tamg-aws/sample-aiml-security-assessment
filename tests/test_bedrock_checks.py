@@ -950,13 +950,14 @@ class TestBR02WorkloadConnectivity:
     def _function(name, role, vpc_id="vpc-1"):
         return {"kind": "Lambda function", "name": name, "vpc_id": vpc_id, "role": role}
 
-    def _run(self, cache, endpoints, workloads, errors=None):
+    def _run(self, cache, endpoints, workloads, errors=None, agentcore=()):
         with (
             patch(
                 "bedrock_app.check_bedrock_vpc_endpoints",
                 return_value={
                     "has_endpoints": bool(endpoints),
                     "found_endpoints": list(endpoints),
+                    "agentcore_endpoints": list(agentcore),
                     "all_vpcs": ["vpc-1", "vpc-2"],
                 },
             ),
@@ -1031,6 +1032,82 @@ class TestBR02WorkloadConnectivity:
 
         assert [row["Status"] for row in rows] == ["Failed"]
         assert "is granted bedrock-agent-runtime" in rows[0]["Finding_Details"]
+
+    def test_br02_agentcore_grant_is_not_carried_by_bedrock_endpoints(self):
+        rows = self._run(
+            self._cache(
+                {
+                    "AgentRole": self._role(
+                        ["bedrock:InvokeModel", "bedrock-agentcore:InvokeAgentRuntime"]
+                    )
+                }
+            ),
+            [
+                self._endpoint(surface)
+                for surface in bedrock_app.BEDROCK_ENDPOINT_SURFACES
+            ],
+            [self._function("agent", "AgentRole")],
+        )
+
+        assert [row["Status"] for row in rows] == ["Failed"]
+        assert (
+            "is granted bedrock-agentcore with no private-DNS endpoint"
+            in rows[0]["Finding_Details"]
+        )
+        assert "bedrock-agentcore-control" not in rows[0]["Finding_Details"]
+        assert "com.amazonaws.us-east-1.bedrock-agentcore" in rows[0]["Resolution"]
+
+    def test_br02_gateway_and_control_grants_each_need_their_endpoint(self):
+        role = self._role(
+            ["bedrock-agentcore:InvokeGateway", "bedrock-agentcore:CreateGateway"]
+        )
+        rows = self._run(
+            self._cache({"GatewayRole": role, "Covered": role}),
+            [],
+            [
+                self._function("exposed", "GatewayRole", vpc_id="vpc-2"),
+                self._function("covered", "Covered", vpc_id="vpc-1"),
+            ],
+            agentcore=[
+                self._endpoint("bedrock-agentcore.gateway", endpoint_id="vpce-g"),
+                self._endpoint("bedrock-agentcore-control", endpoint_id="vpce-c"),
+            ],
+        )
+
+        assert [row["Status"] for row in rows] == ["Failed", "Passed"]
+        detail = rows[0]["Finding_Details"]
+        assert "'exposed' in vpc-2" in detail
+        assert "bedrock-agentcore.gateway" in detail
+        assert "bedrock-agentcore-control" in detail
+        assert "'covered'" not in detail
+        assert (
+            "'covered' in vpc-1 (bedrock-agentcore-control, bedrock-agentcore.gateway)"
+            in rows[1]["Finding_Details"]
+        )
+
+    def test_br02_agentcore_only_role_is_a_workload_in_scope(self):
+        rows = self._run(
+            self._cache({"MemoryRole": self._role(["bedrock-agentcore:GetMemory"])}),
+            [],
+            [self._function("memory", "MemoryRole", vpc_id=None)],
+        )
+
+        assert [row["Status"] for row in rows] == ["Failed"]
+        assert "is not attached to a VPC" in rows[0]["Finding_Details"]
+
+    def test_br02_ceiling_names_the_ungranted_compute_reads(self):
+        rows = self._run(
+            self._cache({"InvokeRole": self._role(["bedrock:InvokeModel"])}),
+            [self._endpoint("bedrock-runtime")],
+            [self._function("summarize", "InvokeRole")],
+        )
+
+        for action in (
+            "ecs:ListServices",
+            "ecs:DescribeServices",
+            "sagemaker:ListNotebookInstances",
+        ):
+            assert action in rows[0]["Finding_Details"]
 
     def test_br02_endpoint_with_private_dns_off_does_not_cover_the_workload(self):
         rows = self._run(
@@ -1283,6 +1360,42 @@ class TestBR02WorkloadConnectivity:
         assert [endpoint["endpoint_id"] for endpoint in result["found_endpoints"]] == [
             "vpce-m"
         ]
+
+    def test_br02_collector_keeps_agentcore_endpoints_apart(self):
+        ec2_client = MagicMock()
+        endpoints = [
+            {
+                "VpcEndpointId": f"vpce-{index}",
+                "VpcId": "vpc-1",
+                "ServiceName": f"com.amazonaws.us-east-1.{service}",
+                "PrivateDnsEnabled": True,
+            }
+            for index, service in enumerate(
+                [
+                    "bedrock-runtime",
+                    "bedrock-agentcore",
+                    "bedrock-agentcore-control",
+                    "bedrock-agentcore.gateway",
+                    "s3",
+                ]
+            )
+        ]
+        pages = {
+            "describe_vpcs": [{"Vpcs": [{"VpcId": "vpc-1"}]}],
+            "describe_vpc_endpoints": [{"VpcEndpoints": endpoints}],
+        }
+        ec2_client.get_paginator.side_effect = lambda name: MagicMock(
+            paginate=MagicMock(return_value=pages[name])
+        )
+        with patch("bedrock_app.boto3.client", return_value=ec2_client):
+            result = bedrock_app.check_bedrock_vpc_endpoints(region=self.REGION)
+
+        assert [endpoint["endpoint_id"] for endpoint in result["found_endpoints"]] == [
+            "vpce-0"
+        ]
+        assert [
+            endpoint["endpoint_id"] for endpoint in result["agentcore_endpoints"]
+        ] == ["vpce-1", "vpce-2", "vpce-3"]
 
 
 # ===================================================================

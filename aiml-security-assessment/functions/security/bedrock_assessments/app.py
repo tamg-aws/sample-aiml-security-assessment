@@ -2320,6 +2320,17 @@ BEDROCK_ENDPOINT_SURFACES = (
     "bedrock-mantle",
 )
 
+# The AgentCore API surfaces, each its own interface endpoint service. The data
+# plane and control plane follow their botocore models. Gateway traffic is
+# authorized by bedrock-agentcore:InvokeGateway, which no botocore model defines.
+AGENTCORE_ENDPOINT_SURFACES = (
+    "bedrock-agentcore",
+    "bedrock-agentcore-control",
+    "bedrock-agentcore.gateway",
+)
+
+WORKLOAD_ENDPOINT_SURFACES = BEDROCK_ENDPOINT_SURFACES + AGENTCORE_ENDPOINT_SURFACES
+
 
 def check_bedrock_vpc_endpoints(region: str = "") -> Dict[str, Any]:
     """
@@ -2334,6 +2345,9 @@ def check_bedrock_vpc_endpoints(region: str = "") -> Dict[str, Any]:
     bedrock_endpoints = [
         f"com.amazonaws.{region}.{surface}" for surface in BEDROCK_ENDPOINT_SURFACES
     ]
+    agentcore_endpoints = [
+        f"com.amazonaws.{region}.{surface}" for surface in AGENTCORE_ENDPOINT_SURFACES
+    ]
 
     vpc_ids = []
     for page in ec2_client.get_paginator("describe_vpcs").paginate():
@@ -2341,16 +2355,21 @@ def check_bedrock_vpc_endpoints(region: str = "") -> Dict[str, Any]:
     logger.debug(f"Found VPCs: {vpc_ids}")
 
     found_endpoints = []
+    found_agentcore = []
     for page in ec2_client.get_paginator("describe_vpc_endpoints").paginate():
         for endpoint in page["VpcEndpoints"]:
             service_name = endpoint["ServiceName"]
             vpc_id = endpoint["VpcId"]
-            if service_name not in bedrock_endpoints:
+            if service_name in agentcore_endpoints:
+                target = found_agentcore
+            elif service_name in bedrock_endpoints:
+                target = found_endpoints
+            else:
                 continue
             logger.info(
                 f"Found matching Bedrock endpoint: {service_name} in VPC: {vpc_id}"
             )
-            found_endpoints.append(
+            target.append(
                 {
                     "vpc_id": vpc_id,
                     "service": service_name,
@@ -2366,6 +2385,9 @@ def check_bedrock_vpc_endpoints(region: str = "") -> Dict[str, Any]:
     return {
         "has_endpoints": len(found_endpoints) > 0,
         "found_endpoints": found_endpoints,
+        # AgentCore endpoints feed only the workload leg. AC-08 judges their
+        # private DNS and policies.
+        "agentcore_endpoints": found_agentcore,
         "all_vpcs": vpc_ids,
     }
 
@@ -2421,29 +2443,42 @@ _BEDROCK_SURFACE_ACTIONS: Dict[str, tuple] = {}
 
 def _bedrock_surface_actions() -> Dict[str, tuple]:
     """
-    Map each Bedrock endpoint surface to the lowercase IAM actions it serves.
+    Map each Bedrock and AgentCore endpoint surface to the lowercase IAM actions
+    it serves.
 
     The bedrock IAM prefix covers four botocore services, so an action is placed
     on every surface whose model defines an operation of that name. Converse and
     ConverseStream authorize as InvokeModel and InvokeModelWithResponseStream,
-    which are already bedrock-runtime operations.
+    which are already bedrock-runtime operations. The bedrock-agentcore prefix
+    covers the data plane and control plane models.
     """
     if not _BEDROCK_SURFACE_ACTIONS:
         session = botocore.session.get_session()
-        for surface in BEDROCK_ENDPOINT_SURFACES:
+        for surface in WORKLOAD_ENDPOINT_SURFACES:
             if surface == "bedrock-mantle":
                 _BEDROCK_SURFACE_ACTIONS[surface] = BEDROCK_MANTLE_ACTIONS
                 continue
+            if surface == "bedrock-agentcore.gateway":
+                _BEDROCK_SURFACE_ACTIONS[surface] = ("bedrock-agentcore:invokegateway",)
+                continue
+            prefix = (
+                "bedrock-agentcore:"
+                if surface in AGENTCORE_ENDPOINT_SURFACES
+                else "bedrock:"
+            )
             _BEDROCK_SURFACE_ACTIONS[surface] = tuple(
-                "bedrock:" + name.lower()
+                prefix + name.lower()
                 for name in session.get_service_model(surface).operation_names
             )
     return _BEDROCK_SURFACE_ACTIONS
 
 
-def _granted_bedrock_surfaces(permissions: Dict[str, Any]) -> set:
+def _granted_bedrock_surfaces(
+    permissions: Dict[str, Any], surfaces_to_test: tuple = BEDROCK_ENDPOINT_SURFACES
+) -> set:
     """
-    Return the Bedrock surfaces a cached identity's Allow statements reach.
+    Return the surfaces, Bedrock ones by default, that a cached identity's Allow
+    statements reach.
 
     Attached, inline and group policies are read and NotAction is honoured. A
     permissions boundary that denies an action removes it. Identity Deny
@@ -2456,7 +2491,8 @@ def _granted_bedrock_surfaces(permissions: Dict[str, Any]) -> set:
         for statement in _policy_statements(policy.get("document") or {}):
             if str(statement.get("Effect", "")).upper() != "ALLOW":
                 continue
-            for surface, actions in surface_actions.items():
+            for surface in surfaces_to_test:
+                actions = surface_actions[surface]
                 if surface in surfaces:
                     continue
                 if any(
@@ -2471,9 +2507,11 @@ def _granted_bedrock_surfaces(permissions: Dict[str, Any]) -> set:
 WORKLOAD_CONNECTIVITY_FINDING = "Bedrock Workload Private Connectivity"
 
 WORKLOAD_CONNECTIVITY_CEILING = (
-    "ECS tasks, EKS pods, SageMaker notebooks and endpoints are not read, and "
-    "AgentCore runtimes are judged by AC-08. Endpoints reached from another VPC "
-    "through a shared private hosted zone are not read."
+    "ECS tasks, EKS pods, SageMaker notebooks and endpoints are not read: the "
+    "Bedrock role holds no ecs:ListServices, ecs:DescribeServices or "
+    "sagemaker:ListNotebookInstances. AgentCore runtimes are judged by AC-08. "
+    "Endpoints reached from another VPC through a shared private hosted zone are "
+    "not read."
 )
 
 
@@ -2599,7 +2637,9 @@ def _workload_connectivity_findings(
             )
             continue
         try:
-            surfaces = _granted_bedrock_surfaces(roles[role])
+            surfaces = _granted_bedrock_surfaces(
+                roles[role], WORKLOAD_ENDPOINT_SURFACES
+            )
         except (ValueError, TypeError, AttributeError):
             unread.append(
                 f"{label} runs as role '{role}', whose policies could not be parsed"
@@ -2650,14 +2690,18 @@ def _workload_connectivity_findings(
             create_finding(
                 check_id="BR-02",
                 finding_name=WORKLOAD_CONNECTIVITY_FINDING,
-                finding_details="{} workload(s) can call a Bedrock surface outside "
-                "PrivateLink: {}. {}".format(len(gaps), "; ".join(gaps[:10]), scope),
+                finding_details="{} workload(s) can call a Bedrock or AgentCore "
+                "surface outside PrivateLink: {}. {}".format(
+                    len(gaps), "; ".join(gaps[:10]), scope
+                ),
                 resolution=(
                     "Create one interface endpoint with private DNS for each "
                     "Bedrock surface (com.amazonaws.{0}.bedrock, bedrock-runtime, "
-                    "bedrock-agent, bedrock-agent-runtime or bedrock-mantle) in "
+                    "bedrock-agent, bedrock-agent-runtime or bedrock-mantle) and "
+                    "each AgentCore surface (com.amazonaws.{0}.bedrock-agentcore, "
+                    "bedrock-agentcore-control or bedrock-agentcore.gateway) in "
                     "each VPC whose workloads call it, and attach Lambda functions "
-                    "that call Bedrock to a VPC.".format(region)
+                    "that call Bedrock or AgentCore to a VPC.".format(region)
                 ),
                 reference=VPC_ENDPOINT_REFERENCE,
                 severity="Medium",
@@ -2671,7 +2715,8 @@ def _workload_connectivity_findings(
                 check_id="BR-02",
                 finding_name=WORKLOAD_CONNECTIVITY_FINDING,
                 finding_details="{} workload(s) have a private-DNS endpoint in "
-                "their VPC for every Bedrock surface their role is granted: {}. "
+                "their VPC for every Bedrock and AgentCore surface their role is "
+                "granted: {}. "
                 "{}{}".format(
                     len(covered),
                     "; ".join(covered[:10]),
@@ -2717,7 +2762,7 @@ def _workload_connectivity_findings(
                 finding_name=WORKLOAD_CONNECTIVITY_FINDING,
                 finding_details=(
                     "No Lambda function or EC2 instance runs as a role granted a "
-                    f"Bedrock surface. {scope}"
+                    f"Bedrock or AgentCore surface. {scope}"
                 ),
                 resolution="No action required",
                 reference=VPC_ENDPOINT_REFERENCE,
@@ -3308,7 +3353,8 @@ def check_bedrock_access_and_vpc_endpoints(
             {
                 "csv_data": _workload_connectivity_findings(
                     permission_cache,
-                    vpc_endpoint_check["found_endpoints"],
+                    vpc_endpoint_check["found_endpoints"]
+                    + vpc_endpoint_check.get("agentcore_endpoints", []),
                     workload_inventory,
                     region,
                 )

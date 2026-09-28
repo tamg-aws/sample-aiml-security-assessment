@@ -1138,7 +1138,13 @@ AI_SUBJECT_ROWS = [
         "private DNS and the endpoint policy on the Bedrock endpoints, where it used to "
         "report only that an endpoint existed. An endpoint policy counts as scoped only "
         "on exact principal or network values: a Deny needs one negated condition and "
-        "Resource '*', and an Allow a positive test that is not IfExists",
+        "Resource '*', and an Allow a positive test that is not IfExists. BR-02 also fails "
+        "a Lambda function whose role is granted a Bedrock or AgentCore surface (the "
+        "AgentCore data plane, control plane and Gateway each count) with no private-DNS "
+        "endpoint for that surface in the function's VPC. EC2 instances, ECS tasks, EKS "
+        "pods and SageMaker notebooks and endpoints are not read, because the Bedrock role "
+        "holds no ec2:DescribeInstances, ecs:ListServices, ecs:DescribeServices or "
+        "sagemaker:ListNotebookInstances",
         [],
         5,
     ),
