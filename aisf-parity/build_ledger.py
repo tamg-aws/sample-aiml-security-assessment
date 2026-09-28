@@ -1580,11 +1580,20 @@ INCUMBENT_NAMES = {
     "BR-15": "Cross-Account Guardrails Enforcement Check",
     "BR-17": "Custom Model Customer-Managed KMS Encryption Check",
     "BR-20": "Knowledge Base Customer-Managed KMS Encryption Check",
-    "BR-26": "Guardrail Sensitive Information Filter Check",
-    "BR-27": "Guardrail Contextual Grounding Check",
+    "BR-26": (
+        "Guardrail Sensitive Information Filter Check",
+        "Deployed Guardrail Sensitive Information Filter",
+    ),
+    "BR-27": (
+        "Guardrail Contextual Grounding Check",
+        "Deployed Guardrail Contextual Grounding",
+    ),
     "BR-32": "Bedrock CloudWatch Alarm Check",
     "BR-33": "Amazon Inspector Lambda Code Scanning Check",
-    "BR-34": "Guardrail Prompt Attack Filter",
+    "BR-34": (
+        "Guardrail Prompt Attack Filter",
+        "Deployed Guardrail Prompt Attack Filter",
+    ),
     "BR-37": "Bedrock Account Data Retention",
     "BR-39": "Marketplace Model Endpoint VPC Configuration",
     "BR-41": "Central Guardrail Enforcement Policy Check",

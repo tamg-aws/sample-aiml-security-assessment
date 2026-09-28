@@ -57,7 +57,8 @@
         "BR-26"
       ],
       "incumbent_names": [
-        "Guardrail Sensitive Information Filter Check"
+        "Guardrail Sensitive Information Filter Check",
+        "Deployed Guardrail Sensitive Information Filter"
       ],
       "gap": "",
       "extra_iam": [],
@@ -126,7 +127,8 @@
         "BR-34"
       ],
       "incumbent_names": [
-        "Guardrail Prompt Attack Filter"
+        "Guardrail Prompt Attack Filter",
+        "Deployed Guardrail Prompt Attack Filter"
       ],
       "gap": "",
       "extra_iam": [],
@@ -172,7 +174,8 @@
         "BR-27"
       ],
       "incumbent_names": [
-        "Guardrail Contextual Grounding Check"
+        "Guardrail Contextual Grounding Check",
+        "Deployed Guardrail Contextual Grounding"
       ],
       "gap": "",
       "extra_iam": [],
@@ -1750,6 +1753,7 @@
       ],
       "incumbent_names": [
         "Guardrail Prompt Attack Filter",
+        "Deployed Guardrail Prompt Attack Filter",
         "Central Guardrail Enforcement Policy Check",
         "Guardrail Invocation Deny Enforcement"
       ],

@@ -4,7 +4,7 @@ import os
 import logging
 from datetime import datetime, timedelta, timezone
 import time
-from typing import Dict, List, Any, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 from io import StringIO
 import botocore.session
 from botocore.config import Config
@@ -380,6 +380,316 @@ def get_guardrail_detail_inventory(region: str = "") -> Dict[str, Any]:
     except Exception as error:
         inventory["list_error"] = error
     return inventory
+
+
+GUARDRAIL_DEPLOYMENT_CEILING = (
+    "A guardrail passed per request to InvokeModel, Converse, ApplyGuardrail or "
+    "RetrieveAndGenerate is recorded by no configuration API, so those callers are "
+    "not judged here, and neither is whether a caller marks untrusted input with "
+    "guardContent tags or grounding qualifiers."
+)
+
+
+def _flow_node_guardrails(definition: Any) -> List[Tuple[str, Dict[str, Any]]]:
+    """Name each Prompt and KnowledgeBase flow node that carries a guardrail."""
+    found = []
+    nodes = definition.get("nodes") if isinstance(definition, dict) else None
+    for node in nodes or []:
+        if not isinstance(node, dict):
+            continue
+        configuration = node.get("configuration") or {}
+        for key in ("prompt", "knowledgeBase"):
+            guardrail = (configuration.get(key) or {}).get("guardrailConfiguration")
+            if isinstance(guardrail, dict) and guardrail.get("guardrailIdentifier"):
+                found.append((node.get("name") or "unnamed", guardrail))
+    return found
+
+
+def get_guardrail_attachment_inventory(region: str = "") -> Dict[str, Any]:
+    """
+    Read the guardrail versions that agents, flow nodes and account-enforced
+    configurations in this Region apply, and the detail of each version.
+
+    Agents and flows are read at DRAFT and at every version an alias routes to.
+    """
+    inventory = {"attachments": [], "versions": {}, "errors": []}
+    attachments = inventory["attachments"]
+    errors = inventory["errors"]
+    agent_client = boto3.client(
+        "bedrock-agent", config=boto3_config, region_name=region
+    )
+
+    def attach(surface: str, identifier: str, version: Any) -> None:
+        reference = _parse_guardrail_reference(str(identifier), region)
+        attachments.append(
+            {
+                "surface": surface,
+                "identifier": reference["identifier"],
+                "region": reference["region"] or region,
+                "version": str(version) if version else GUARDRAIL_DRAFT_VERSION,
+            }
+        )
+
+    try:
+        agents = _list_all_items(agent_client, "list_agents", "agentSummaries")
+    except (ClientError, BotoCoreError, TypeError) as error:
+        agents = []
+        errors.append(
+            f"agents were not read with bedrock:ListAgents ({get_assessment_error_label(error)})"
+        )
+    for agent in agents:
+        agent_id = agent.get("agentId")
+        name = agent.get("agentName") or agent_id
+        guardrail = agent.get("guardrailConfiguration") or {}
+        if guardrail.get("guardrailIdentifier"):
+            attach(
+                f"agent '{name}' DRAFT",
+                guardrail["guardrailIdentifier"],
+                guardrail.get("guardrailVersion"),
+            )
+        try:
+            aliases = _list_all_items(
+                agent_client,
+                "list_agent_aliases",
+                "agentAliasSummaries",
+                agentId=agent_id,
+            )
+            versions = sorted(
+                {
+                    str(route.get("agentVersion"))
+                    for alias in aliases
+                    for route in alias.get("routingConfiguration") or []
+                    if route.get("agentVersion")
+                    and route.get("agentVersion") != GUARDRAIL_DRAFT_VERSION
+                }
+            )
+            for version in versions:
+                detail = agent_client.get_agent_version(
+                    agentId=agent_id, agentVersion=version
+                ).get("agentVersion", {})
+                guardrail = detail.get("guardrailConfiguration") or {}
+                if guardrail.get("guardrailIdentifier"):
+                    attach(
+                        f"agent '{name}' version {version}",
+                        guardrail["guardrailIdentifier"],
+                        guardrail.get("guardrailVersion"),
+                    )
+        except (ClientError, BotoCoreError, TypeError) as error:
+            errors.append(
+                f"the published versions of agent '{name}' were not read with "
+                f"bedrock:ListAgentAliases and bedrock:GetAgentVersion "
+                f"({get_assessment_error_label(error)})"
+            )
+
+    try:
+        flows = _list_all_items(agent_client, "list_flows", "flowSummaries")
+    except (ClientError, BotoCoreError, TypeError) as error:
+        flows = []
+        errors.append(
+            f"flows were not read with bedrock:ListFlows ({get_assessment_error_label(error)})"
+        )
+    for flow in flows:
+        flow_id = flow.get("id")
+        name = flow.get("name") or flow_id
+        try:
+            definitions = [
+                (
+                    GUARDRAIL_DRAFT_VERSION,
+                    agent_client.get_flow(flowIdentifier=flow_id).get("definition"),
+                )
+            ]
+            aliases = _list_all_items(
+                agent_client,
+                "list_flow_aliases",
+                "flowAliasSummaries",
+                flowIdentifier=flow_id,
+            )
+            versions = sorted(
+                {
+                    str(route.get("flowVersion"))
+                    for alias in aliases
+                    for route in alias.get("routingConfiguration") or []
+                    if route.get("flowVersion")
+                    and route.get("flowVersion") != GUARDRAIL_DRAFT_VERSION
+                }
+            )
+            for version in versions:
+                definitions.append(
+                    (
+                        version,
+                        agent_client.get_flow_version(
+                            flowIdentifier=flow_id, flowVersion=version
+                        ).get("definition"),
+                    )
+                )
+        except (ClientError, BotoCoreError, TypeError) as error:
+            errors.append(
+                f"flow '{name}' was not read with bedrock:GetFlow, "
+                f"bedrock:ListFlowAliases and bedrock:GetFlowVersion "
+                f"({get_assessment_error_label(error)})"
+            )
+            continue
+        for version, definition in definitions:
+            for node_name, guardrail in _flow_node_guardrails(definition):
+                attach(
+                    f"flow '{name}' {version} node '{node_name}'",
+                    guardrail["guardrailIdentifier"],
+                    guardrail.get("guardrailVersion"),
+                )
+
+    try:
+        bedrock_client = boto3.client(
+            "bedrock", config=boto3_config, region_name=region
+        )
+        enforced = _list_all_items(
+            bedrock_client,
+            "list_enforced_guardrails_configuration",
+            "guardrailsConfig",
+            max_results_param=None,
+        )
+        for config in enforced:
+            identifier = config.get("guardrailArn") or config.get("guardrailId")
+            if identifier:
+                attach(
+                    f"account-enforced configuration {config.get('configId', 'unnamed')}",
+                    identifier,
+                    config.get("guardrailVersion"),
+                )
+    except (ClientError, BotoCoreError, TypeError) as error:
+        errors.append(
+            "account-enforced guardrail configurations were not read with "
+            f"bedrock:ListEnforcedGuardrailsConfiguration ({get_assessment_error_label(error)})"
+        )
+
+    clients = {}
+    for attachment in attachments:
+        key = (attachment["identifier"], attachment["version"])
+        if key in inventory["versions"]:
+            inventory["versions"][key]["surfaces"].append(attachment["surface"])
+            continue
+        entry = {"surfaces": [attachment["surface"]], "detail": None, "error": ""}
+        inventory["versions"][key] = entry
+        target_region = attachment["region"]
+        if target_region not in clients:
+            clients[target_region] = boto3.client(
+                "bedrock", config=boto3_config, region_name=target_region
+            )
+        try:
+            response = clients[target_region].get_guardrail(
+                guardrailIdentifier=attachment["identifier"],
+                guardrailVersion=attachment["version"],
+            )
+            entry["detail"] = response.get("guardrail", response)
+        except (ClientError, BotoCoreError) as error:
+            entry["error"] = get_assessment_error_label(error)
+    return inventory
+
+
+def _deployed_guardrail_findings(
+    check_id: str,
+    finding_name: str,
+    reference: str,
+    region: str,
+    attachment_inventory: Dict[str, Any],
+    judge: Callable[[Dict[str, Any]], Tuple[str, str]],
+    resolution: str,
+    severity: str,
+) -> List[Dict[str, Any]]:
+    """
+    Judge each guardrail version a workload in this Region applies. A version
+    that could not be read, or an attachment source that could not be listed,
+    keeps the passing row from reading as Passed.
+    """
+    rows = []
+    passed = []
+    unread = list(attachment_inventory.get("errors") or [])
+    for (identifier, version), entry in sorted(
+        (attachment_inventory.get("versions") or {}).items()
+    ):
+        label = "guardrail {} version {} (applied by {})".format(
+            identifier, version, ", ".join(entry["surfaces"])
+        )
+        if entry.get("detail") is None:
+            unread.append(
+                f"{label} was not read with bedrock:GetGuardrail ({entry.get('error') or 'no detail returned'})"
+            )
+            continue
+        status, text = judge(entry["detail"])
+        if status == "Passed":
+            passed.append(f"{label}: {text}")
+        elif status == "Failed":
+            rows.append(
+                create_finding(
+                    check_id=check_id,
+                    finding_name=finding_name,
+                    finding_details=f"The deployed {label} fails: {text} {GUARDRAIL_DEPLOYMENT_CEILING}",
+                    resolution=resolution,
+                    reference=reference,
+                    severity=severity,
+                    status="Failed",
+                    region=region,
+                )
+            )
+        else:
+            unread.append(f"{label} could not be judged: {text}")
+    if passed:
+        rows.append(
+            create_finding(
+                check_id=check_id,
+                finding_name=finding_name,
+                finding_details="{} deployed guardrail version(s) pass: {}.{} {}".format(
+                    len(passed),
+                    "; ".join(passed),
+                    (
+                        " This is not reported as Passed because "
+                        + "; ".join(unread)
+                        + "."
+                    )
+                    if unread
+                    else "",
+                    GUARDRAIL_DEPLOYMENT_CEILING,
+                ),
+                resolution="No action required."
+                if not unread
+                else COULD_NOT_ASSESS_RESOLUTION,
+                reference=reference,
+                severity="Low" if not unread else "Informational",
+                status="Passed" if not unread else "N/A",
+                region=region,
+            )
+        )
+    elif unread:
+        rows.append(
+            create_finding(
+                check_id=check_id,
+                finding_name=finding_name,
+                finding_details="The deployed guardrail versions were not all judged: {}. {}".format(
+                    "; ".join(unread), GUARDRAIL_DEPLOYMENT_CEILING
+                ),
+                resolution=COULD_NOT_ASSESS_RESOLUTION,
+                reference=reference,
+                severity="Informational",
+                status="N/A",
+                region=region,
+            )
+        )
+    elif not rows:
+        rows.append(
+            create_finding(
+                check_id=check_id,
+                finding_name=finding_name,
+                finding_details=(
+                    "No agent, flow node or account-enforced configuration in this "
+                    f"Region applies a guardrail. {GUARDRAIL_DEPLOYMENT_CEILING}"
+                ),
+                resolution="No action required",
+                reference=reference,
+                severity="Informational",
+                status="N/A",
+                region=region,
+            )
+        )
+    return rows
 
 
 def detect_bedrock_regional_footprint(region: str = "") -> Optional[bool]:
@@ -9254,53 +9564,31 @@ def _check_guardrail_content_filters_from_inventory(
     return findings
 
 
-def check_bedrock_guardrail_prompt_attack_filter(
-    region: str = "", guardrail_inventory: Dict[str, Any] = None
-) -> Dict[str, Any]:
-    """BR-34: Require a preventive PROMPT_ATTACK input filter."""
-    inventory = guardrail_inventory or get_guardrail_detail_inventory(region)
-    if inventory.get("list_error"):
-        return _guardrail_inventory_na_finding(
-            "BR-34",
-            "Guardrail Prompt Attack Filter",
-            "https://docs.aws.amazon.com/bedrock/latest/userguide/guardrails-prompt-attack.html",
-            region,
-            inventory["list_error"],
-        )
-    findings = {"csv_data": []}
-    if not inventory.get("items") and not inventory.get("errors"):
-        findings["csv_data"].append(
-            create_finding(
-                check_id="BR-34",
-                finding_name="Guardrail Prompt Attack Filter",
-                finding_details="No Bedrock guardrails configured in this region",
-                resolution="Create guardrails with a preventive PROMPT_ATTACK filter.",
-                reference="https://docs.aws.amazon.com/bedrock/latest/userguide/guardrails-prompt-attack.html",
-                severity="Informational",
-                status="N/A",
-                region=region,
-            )
-        )
-        return findings
+def _prompt_attack_verdict(detail: Dict[str, Any]) -> Tuple[str, str]:
+    """
+    Judge one guardrail version's PROMPT_ATTACK filter and content-filter tier.
 
-    for item in inventory.get("items", []):
-        summary = item["summary"]
-        detail = item["detail"]
-        prompt_filters = [
-            filter_item
-            for filter_item in (detail.get("contentPolicy") or {}).get("filters", [])
-            if filter_item.get("type") == "PROMPT_ATTACK"
-        ]
-        # inputStrength is a required member of GuardrailContentFilter with enum
-        # NONE|LOW|MEDIUM|HIGH. HIGH is required here because a weaker strength
-        # leaves jailbreak and prompt-injection attempts below the filter
-        # threshold even when the action is BLOCK.
-        preventive = any(
-            filter_item.get("inputEnabled") is True
-            and filter_item.get("inputAction") == "BLOCK"
-            and filter_item.get("inputStrength") == "HIGH"
-            for filter_item in prompt_filters
-        )
+    Prompt-leakage detection exists on the STANDARD tier only, so a CLASSIC
+    tier fails. A tier GetGuardrail does not report is not assumed.
+    """
+    content_policy = detail.get("contentPolicy") or {}
+    prompt_filters = [
+        filter_item
+        for filter_item in content_policy.get("filters") or []
+        if isinstance(filter_item, dict) and filter_item.get("type") == "PROMPT_ATTACK"
+    ]
+    # inputStrength is a required member of GuardrailContentFilter with enum
+    # NONE|LOW|MEDIUM|HIGH. HIGH is required here because a weaker strength
+    # leaves jailbreak and prompt-injection attempts below the filter
+    # threshold even when the action is BLOCK.
+    preventive = any(
+        filter_item.get("inputEnabled") is True
+        and filter_item.get("inputAction") == "BLOCK"
+        and filter_item.get("inputStrength") == "HIGH"
+        for filter_item in prompt_filters
+    )
+    tier = (content_policy.get("tier") or {}).get("tierName")
+    if not preventive:
         observed = (
             ", ".join(
                 sorted(
@@ -9316,28 +9604,98 @@ def check_bedrock_guardrail_prompt_attack_filter(
             )
             or "no PROMPT_ATTACK filter is configured"
         )
-        tier = (
-            (detail.get("contentPolicy") or {})
-            .get("tier", {})
-            .get("tierName", "unspecified")
+        return (
+            "Failed",
+            "it does not have a preventive PROMPT_ATTACK input filter at HIGH "
+            f"strength (observed strength/action/state: {observed}).",
         )
+    if tier == "STANDARD":
+        return (
+            "Passed",
+            "a preventive PROMPT_ATTACK input filter at HIGH strength on the STANDARD tier.",
+        )
+    if tier:
+        return (
+            "Failed",
+            f"its PROMPT_ATTACK filter is preventive at HIGH strength, but the content-filter tier is {tier}, which has no prompt-leakage detection.",
+        )
+    return (
+        "N/A",
+        "its PROMPT_ATTACK filter is preventive at HIGH strength, but GetGuardrail did not report contentPolicy.tier.tierName, so prompt-leakage detection is not shown.",
+    )
+
+
+PROMPT_ATTACK_RESOLUTION = "On the STANDARD content-filter tier, configure PROMPT_ATTACK with inputEnabled=true, inputAction=BLOCK, and inputStrength=HIGH."
+
+
+def check_bedrock_guardrail_prompt_attack_filter(
+    region: str = "",
+    guardrail_inventory: Dict[str, Any] = None,
+    attachment_inventory: Dict[str, Any] = None,
+) -> Dict[str, Any]:
+    """
+    BR-34: Require a preventive PROMPT_ATTACK input filter on the STANDARD
+    tier, on each guardrail's working draft and on each deployed version.
+    """
+    inventory = guardrail_inventory or get_guardrail_detail_inventory(region)
+    if attachment_inventory is None:
+        attachment_inventory = get_guardrail_attachment_inventory(region)
+    reference = "https://docs.aws.amazon.com/bedrock/latest/userguide/guardrails-prompt-attack.html"
+    deployed = _deployed_guardrail_findings(
+        "BR-34",
+        "Deployed Guardrail Prompt Attack Filter",
+        reference,
+        region,
+        attachment_inventory,
+        _prompt_attack_verdict,
+        PROMPT_ATTACK_RESOLUTION,
+        "High",
+    )
+    if inventory.get("list_error"):
+        findings = _guardrail_inventory_na_finding(
+            "BR-34",
+            "Guardrail Prompt Attack Filter",
+            reference,
+            region,
+            inventory["list_error"],
+        )
+        findings["csv_data"].extend(deployed)
+        return findings
+    findings = {"csv_data": []}
+    if not inventory.get("items") and not inventory.get("errors"):
         findings["csv_data"].append(
             create_finding(
                 check_id="BR-34",
                 finding_name="Guardrail Prompt Attack Filter",
-                finding_details=(
-                    f"Guardrail '{summary.get('name', 'unknown')}' has a preventive PROMPT_ATTACK input filter at HIGH strength (tier: {tier})."
-                    if preventive
-                    else f"Guardrail '{summary.get('name', 'unknown')}' does not have a preventive PROMPT_ATTACK input filter at HIGH strength (observed strength/action/state: {observed})."
-                ),
-                resolution=(
-                    "No action required. Use Standard tier where prompt-leakage detection is required."
-                    if preventive
-                    else "Configure PROMPT_ATTACK with inputEnabled=true, inputAction=BLOCK, and inputStrength=HIGH."
-                ),
-                reference="https://docs.aws.amazon.com/bedrock/latest/userguide/guardrails-prompt-attack.html",
-                severity="High",
-                status="Passed" if preventive else "Failed",
+                finding_details="No Bedrock guardrails configured in this region",
+                resolution="Create guardrails with a preventive PROMPT_ATTACK filter.",
+                reference=reference,
+                severity="Informational",
+                status="N/A",
+                region=region,
+            )
+        )
+        findings["csv_data"].extend(deployed)
+        return findings
+
+    for item in inventory.get("items", []):
+        name = item["summary"].get("name", "unknown")
+        status, text = _prompt_attack_verdict(item["detail"])
+        findings["csv_data"].append(
+            create_finding(
+                check_id="BR-34",
+                finding_name="Guardrail Prompt Attack Filter",
+                finding_details=f"The working draft of guardrail '{name}' has {text}"
+                if status == "Passed"
+                else f"The working draft of guardrail '{name}' fails: {text}"
+                if status == "Failed"
+                else f"The working draft of guardrail '{name}' could not be judged: {text}",
+                resolution="No action required. The deployed versions are judged in the Deployed Guardrail Prompt Attack Filter rows."
+                if status == "Passed"
+                else PROMPT_ATTACK_RESOLUTION,
+                reference=reference,
+                severity="High" if status != "N/A" else "Informational",
+                status=status,
                 region=region,
             )
         )
@@ -9348,12 +9706,13 @@ def check_bedrock_guardrail_prompt_attack_filter(
                 finding_name="Guardrail Prompt Attack Filter",
                 finding_details=f"Guardrail '{item['summary'].get('name', 'unknown')}' could not be assessed: {get_assessment_error_label(item['error'])}.",
                 resolution="Grant bedrock:GetGuardrail and retry.",
-                reference="https://docs.aws.amazon.com/bedrock/latest/userguide/guardrails-prompt-attack.html",
+                reference=reference,
                 severity="Informational",
                 status="N/A",
                 region=region,
             )
         )
+    findings["csv_data"].extend(deployed)
     return findings
 
 
@@ -10046,9 +10405,101 @@ def check_bedrock_rag_evaluation_jobs(region: str = "") -> Dict[str, Any]:
         }
 
 
-def check_bedrock_guardrail_pii_filters(region: str = "") -> Dict[str, Any]:
+SENSITIVE_INFORMATION_ACTING = ("BLOCK", "ANONYMIZE")
+
+SENSITIVE_INFORMATION_TOOL_CEILING = (
+    "The filter does not evaluate toolUse input, toolResult content or a toolSpec, "
+    "and no configuration API records whether a workload screens those fields itself."
+)
+
+
+def _sensitive_information_action(element: Dict[str, Any], side: str) -> str:
+    """Return the action a PII entity or regex takes on the input or the output."""
+    if element.get(f"{side}Enabled") is False:
+        return "disabled"
+    return element.get(f"{side}Action") or element.get("action") or "NONE"
+
+
+def _sensitive_information_verdict(detail: Dict[str, Any]) -> Tuple[str, str]:
     """
-    BR-26: Verify guardrails configure sensitive-information (PII) protection
+    Judge one guardrail version's sensitive-information policy by the action
+    each entity and regex takes. A version passes when some entity or regex
+    blocks or masks on the input and on the output, and a custom regex blocks
+    or masks on the output for the secrets the built-in types do not name.
+    """
+    policy = detail.get("sensitiveInformationPolicy") or {}
+    entities = [e for e in policy.get("piiEntities") or [] if isinstance(e, dict)]
+    regexes = [r for r in policy.get("regexes") or [] if isinstance(r, dict)]
+    if not entities and not regexes:
+        return (
+            "Failed",
+            "it has no sensitive-information filter (no PII entity and no regex).",
+        )
+    elements = [(e.get("type") or "unspecified", e) for e in entities] + [
+        (f"regex '{r.get('name') or 'unnamed'}'", r) for r in regexes
+    ]
+    acting = {
+        side: [
+            label
+            for label, element in elements
+            if _sensitive_information_action(element, side)
+            in SENSITIVE_INFORMATION_ACTING
+        ]
+        for side in ("input", "output")
+    }
+    output_regexes = [
+        f"'{r.get('name') or 'unnamed'}'"
+        for r in regexes
+        if _sensitive_information_action(r, "output") in SENSITIVE_INFORMATION_ACTING
+    ]
+    gaps = []
+    for side in ("output", "input"):
+        if not acting[side]:
+            gaps.append(f"no PII entity or regex blocks or masks on the {side}")
+    if not output_regexes:
+        gaps.append(
+            "no custom regex blocks or masks secrets, credentials or internal identifiers on the output"
+        )
+    detect_only = sorted(
+        label
+        for label, element in elements
+        if _sensitive_information_action(element, "output")
+        not in SENSITIVE_INFORMATION_ACTING
+    )
+    observed = (
+        f" On the output, {', '.join(detect_only)} take no blocking or masking action."
+        if detect_only
+        else ""
+    )
+    if gaps:
+        return "Failed", "; ".join(gaps) + "." + observed
+    return (
+        "Passed",
+        "PII entities or regexes block or mask on the input ({}) and the output ({}), "
+        "and custom regex {} acts on the output; the regex patterns themselves are "
+        "not evaluated.{}".format(
+            ", ".join(acting["input"]),
+            ", ".join(acting["output"]),
+            ", ".join(output_regexes),
+            observed,
+        ),
+    )
+
+
+SENSITIVE_INFORMATION_RESOLUTION = (
+    "Set the required PII entity types to BLOCK or ANONYMIZE on both the input and the "
+    "output, add custom regexes for secrets, credentials and internal identifiers with "
+    "BLOCK or ANONYMIZE on the output, and screen tool inputs and results in the "
+    "application or through ApplyGuardrail."
+)
+
+
+def check_bedrock_guardrail_pii_filters(
+    region: str = "", attachment_inventory: Dict[str, Any] = None
+) -> Dict[str, Any]:
+    """
+    BR-26: Verify guardrails block or mask sensitive information on the input
+    and the output, on each working draft and each deployed version
     (extends BR-23, which only covers the harmful-content filters).
     """
     logger.debug("Starting check for Bedrock guardrail sensitive-information filters")
@@ -10059,6 +10510,18 @@ def check_bedrock_guardrail_pii_filters(region: str = "") -> Dict[str, Any]:
             "details": "",
             "csv_data": [],
         }
+        if attachment_inventory is None:
+            attachment_inventory = get_guardrail_attachment_inventory(region)
+        deployed = _deployed_guardrail_findings(
+            "BR-26",
+            "Deployed Guardrail Sensitive Information Filter",
+            "https://docs.aws.amazon.com/bedrock/latest/userguide/guardrails-sensitive-filters.html",
+            region,
+            attachment_inventory,
+            _sensitive_information_verdict,
+            SENSITIVE_INFORMATION_RESOLUTION,
+            "High",
+        )
 
         bedrock_client = boto3.client(
             "bedrock", config=boto3_config, region_name=region
@@ -10083,6 +10546,7 @@ def check_bedrock_guardrail_pii_filters(region: str = "") -> Dict[str, Any]:
                         region=region,
                     )
                 )
+                findings["csv_data"].extend(deployed)
                 return findings
 
             guardrails_without_pii = []
@@ -10119,17 +10583,16 @@ def check_bedrock_guardrail_pii_filters(region: str = "") -> Dict[str, Any]:
 
                 # GetGuardrail reports PII protection under
                 # sensitiveInformationPolicy.piiEntities and .regexes.
-                sensitive_policy = guardrail_config.get(
-                    "sensitiveInformationPolicy", {}
-                )
-                pii_entities = sensitive_policy.get("piiEntities", [])
-                regexes = sensitive_policy.get("regexes", [])
-
-                if pii_entities or regexes:
+                verdict, verdict_text = _sensitive_information_verdict(guardrail_config)
+                if verdict == "Passed":
                     guardrails_with_pii.append(guardrail_name)
                 else:
                     guardrails_without_pii.append(
-                        {"name": guardrail_name, "id": guardrail_id}
+                        {
+                            "name": guardrail_name,
+                            "id": guardrail_id,
+                            "text": verdict_text,
+                        }
                     )
 
             if guardrails_without_pii:
@@ -10143,8 +10606,8 @@ def check_bedrock_guardrail_pii_filters(region: str = "") -> Dict[str, Any]:
                         create_finding(
                             check_id="BR-26",
                             finding_name="Guardrail Sensitive Information Filter Check",
-                            finding_details=f"Guardrail '{gr['name']}' (ID: {gr['id']}) has no sensitive-information filters configured (no PII entities or regex patterns). Prompts and model responses are not screened for sensitive data such as PII.",
-                            resolution="Configure sensitive-information filters on the guardrail: add PII entity types (e.g. NAME, EMAIL, SSN, CREDIT_DEBIT_CARD_NUMBER) and/or custom regex patterns, and set the appropriate BLOCK or ANONYMIZE action for input and output.",
+                            finding_details=f"The working draft of guardrail '{gr['name']}' (ID: {gr['id']}) fails: {gr['text']} {SENSITIVE_INFORMATION_TOOL_CEILING}",
+                            resolution=SENSITIVE_INFORMATION_RESOLUTION,
                             reference="https://docs.aws.amazon.com/bedrock/latest/userguide/guardrails-sensitive-filters.html",
                             severity="High",
                             status="Failed",
@@ -10157,8 +10620,8 @@ def check_bedrock_guardrail_pii_filters(region: str = "") -> Dict[str, Any]:
                     create_finding(
                         check_id="BR-26",
                         finding_name="Guardrail Sensitive Information Filter Check",
-                        finding_details=f"{len(guardrails_with_pii)} guardrails have sensitive-information (PII) filters configured",
-                        resolution="No action required. Periodically review the PII entity types and regex patterns to ensure coverage matches your data.",
+                        finding_details=f"The working drafts of {len(guardrails_with_pii)} guardrail(s) ({', '.join(sorted(guardrails_with_pii))}) block or mask sensitive information on the input and the output, with a custom regex on the output. The deployed versions are judged in the Deployed Guardrail Sensitive Information Filter rows. {SENSITIVE_INFORMATION_TOOL_CEILING}",
+                        resolution="No action required. Review the PII entity types and regex patterns against the data the workload handles.",
                         reference="https://docs.aws.amazon.com/bedrock/latest/userguide/guardrails-sensitive-filters.html",
                         severity="Low",
                         status="Passed",
@@ -10202,6 +10665,7 @@ def check_bedrock_guardrail_pii_filters(region: str = "") -> Dict[str, Any]:
             else:
                 raise
 
+        findings["csv_data"].extend(deployed)
         return findings
 
     except Exception as e:
@@ -10227,10 +10691,99 @@ def check_bedrock_guardrail_pii_filters(region: str = "") -> Dict[str, Any]:
         }
 
 
-def check_bedrock_guardrail_contextual_grounding(region: str = "") -> Dict[str, Any]:
+def _grounding_blocking_gaps(
+    detail: Dict[str, Any],
+) -> Tuple[List[Dict[str, Any]], List[str], str]:
+    """
+    Return a guardrail version's active contextual grounding filters, the
+    filter types that do not block, and the observed configuration.
+    """
+    # GetGuardrail reports grounding/relevance checks under
+    # contextualGroundingPolicy.filters. A filter is active when it
+    # is enabled (the enabled flag defaults to True when omitted).
+    grounding_policy = detail.get("contextualGroundingPolicy") or {}
+    active_filters = [
+        f
+        for f in grounding_policy.get("filters") or []
+        if isinstance(f, dict) and f.get("enabled", True)
+    ]
+    # Both filter types have to block for an ungrounded or
+    # off-topic response to be stopped rather than scored and
+    # returned. threshold is a required member; the documented
+    # range is 0 to 0.99, where 0 blocks nothing and 1 is not a
+    # valid threshold. action is optional and postdates the
+    # feature, so an omitted action is the original BLOCK
+    # behaviour.
+    blocking_types = {
+        filter_item.get("type")
+        for filter_item in active_filters
+        if filter_item.get("action", "BLOCK") == "BLOCK"
+        and isinstance(filter_item.get("threshold"), (int, float))
+        and 0 < filter_item["threshold"] <= 0.99
+    }
+    missing_types = [
+        filter_type
+        for filter_type in ("GROUNDING", "RELEVANCE")
+        if filter_type not in blocking_types
+    ]
+    observed = ", ".join(
+        sorted(
+            "{} threshold={} action={}".format(
+                filter_item.get("type", "unspecified"),
+                filter_item.get("threshold", "unspecified"),
+                filter_item.get("action", "BLOCK (omitted)"),
+            )
+            for filter_item in active_filters
+        )
+    )
+    return active_filters, missing_types, observed
+
+
+def _automated_reasoning_note(detail: Dict[str, Any]) -> str:
+    """Describe the Automated Reasoning policies a guardrail version applies."""
+    policy = detail.get("automatedReasoningPolicy") or {}
+    policies = [p for p in policy.get("policies") or [] if isinstance(p, str)]
+    if not policies:
+        return "No Automated Reasoning policy is attached."
+    return "Automated Reasoning applies {} at confidenceThreshold {}.".format(
+        ", ".join(policies), policy.get("confidenceThreshold", "unspecified")
+    )
+
+
+def _contextual_grounding_verdict(detail: Dict[str, Any]) -> Tuple[str, str]:
+    """Judge one guardrail version's GROUNDING and RELEVANCE filters."""
+    active_filters, missing_types, observed = _grounding_blocking_gaps(detail)
+    reasoning = f"{_automated_reasoning_note(detail)} {CONTEXTUAL_GROUNDING_CEILING}"
+    if not active_filters:
+        return (
+            "Failed",
+            f"contextual grounding checks are not enabled, so an ungrounded or off-topic response is returned as is. {reasoning}",
+        )
+    if missing_types:
+        return (
+            "Failed",
+            f"contextual grounding does not block on {', '.join(missing_types)} with a threshold in the 0-0.99 range (observed: {observed}), so an ungrounded or off-topic response is scored but still returned. {reasoning}",
+        )
+    return (
+        "Passed",
+        f"GROUNDING and RELEVANCE both block with thresholds in the 0-0.99 range ({observed}). {reasoning}",
+    )
+
+
+CONTEXTUAL_GROUNDING_CEILING = (
+    "Whether callers supply the grounding_source and query qualifiers, and any scored "
+    "response, are recorded by no configuration API, and RetrieveAndGenerate passes no "
+    "grounding source to the guardrail."
+)
+
+
+def check_bedrock_guardrail_contextual_grounding(
+    region: str = "", attachment_inventory: Dict[str, Any] = None
+) -> Dict[str, Any]:
     """
     BR-27: Verify guardrails enable contextual grounding checks to detect
-    hallucinations and irrelevant responses (extends BR-05).
+    hallucinations and irrelevant responses, on each working draft and each
+    deployed version (extends BR-05).
     """
     logger.debug("Starting check for Bedrock guardrail contextual grounding")
     try:
@@ -10240,6 +10793,18 @@ def check_bedrock_guardrail_contextual_grounding(region: str = "") -> Dict[str, 
             "details": "",
             "csv_data": [],
         }
+        if attachment_inventory is None:
+            attachment_inventory = get_guardrail_attachment_inventory(region)
+        deployed = _deployed_guardrail_findings(
+            "BR-27",
+            "Deployed Guardrail Contextual Grounding",
+            "https://docs.aws.amazon.com/bedrock/latest/userguide/guardrails-contextual-grounding-check.html",
+            region,
+            attachment_inventory,
+            _contextual_grounding_verdict,
+            "Configure both the GROUNDING and RELEVANCE contextual grounding filter types with action=BLOCK and a threshold above 0 and no higher than 0.99, publish a version, and point the agent, flow node or enforced configuration at it.",
+            "Medium",
+        )
 
         bedrock_client = boto3.client(
             "bedrock", config=boto3_config, region_name=region
@@ -10264,6 +10829,7 @@ def check_bedrock_guardrail_contextual_grounding(region: str = "") -> Dict[str, 
                         region=region,
                     )
                 )
+                findings["csv_data"].extend(deployed)
                 return findings
 
             guardrails_without_grounding = []
@@ -10299,14 +10865,9 @@ def check_bedrock_guardrail_contextual_grounding(region: str = "") -> Dict[str, 
                     continue
                 guardrail_config = guardrail_detail.get("guardrail", guardrail_detail)
 
-                # GetGuardrail reports grounding/relevance checks under
-                # contextualGroundingPolicy.filters. A filter is active when it
-                # is enabled (the enabled flag defaults to True when omitted).
-                grounding_policy = guardrail_config.get("contextualGroundingPolicy", {})
-                grounding_filters = grounding_policy.get("filters", [])
-                active_filters = [
-                    f for f in grounding_filters if f.get("enabled", True)
-                ]
+                active_filters, missing_types, observed = _grounding_blocking_gaps(
+                    guardrail_config
+                )
 
                 if not active_filters:
                     guardrails_without_grounding.append(
@@ -10314,41 +10875,13 @@ def check_bedrock_guardrail_contextual_grounding(region: str = "") -> Dict[str, 
                     )
                     continue
 
-                # Both filter types have to block for an ungrounded or
-                # off-topic response to be stopped rather than scored and
-                # returned. threshold is a required member; the documented
-                # range is 0 to 0.99, where 0 blocks nothing and 1 is not a
-                # valid threshold. action is optional and postdates the
-                # feature, so an omitted action is the original BLOCK
-                # behaviour.
-                blocking_types = {
-                    filter_item.get("type")
-                    for filter_item in active_filters
-                    if filter_item.get("action", "BLOCK") == "BLOCK"
-                    and isinstance(filter_item.get("threshold"), (int, float))
-                    and 0 < filter_item["threshold"] <= 0.99
-                }
-                missing_types = [
-                    filter_type
-                    for filter_type in ("GROUNDING", "RELEVANCE")
-                    if filter_type not in blocking_types
-                ]
                 if missing_types:
                     guardrails_with_incomplete_grounding.append(
                         {
                             "name": guardrail_name,
                             "id": guardrail_id,
                             "missing": ", ".join(missing_types),
-                            "observed": ", ".join(
-                                sorted(
-                                    "{} threshold={} action={}".format(
-                                        filter_item.get("type", "unspecified"),
-                                        filter_item.get("threshold", "unspecified"),
-                                        filter_item.get("action", "BLOCK (omitted)"),
-                                    )
-                                    for filter_item in active_filters
-                                )
-                            ),
+                            "observed": observed,
                         }
                     )
                 else:
@@ -10443,6 +10976,7 @@ def check_bedrock_guardrail_contextual_grounding(region: str = "") -> Dict[str, 
             else:
                 raise
 
+        findings["csv_data"].extend(deployed)
         return findings
 
     except Exception as e:
@@ -21363,6 +21897,7 @@ def lambda_handler(event, context):
         all_findings.append(service_quotas_findings)
 
         guardrail_inventory = get_guardrail_detail_inventory(region)
+        guardrail_attachments = get_guardrail_attachment_inventory(region)
         logger.info("Running guardrail content filter coverage check (BR-23)")
         content_filter_findings = check_bedrock_guardrail_content_filters(
             region=region, guardrail_inventory=guardrail_inventory
@@ -21380,12 +21915,14 @@ def lambda_handler(event, context):
         all_findings.append(rag_eval_findings)
 
         logger.info("Running guardrail sensitive-information filter check (BR-26)")
-        guardrail_pii_findings = check_bedrock_guardrail_pii_filters(region=region)
+        guardrail_pii_findings = check_bedrock_guardrail_pii_filters(
+            region=region, attachment_inventory=guardrail_attachments
+        )
         all_findings.append(guardrail_pii_findings)
 
         logger.info("Running guardrail contextual grounding check (BR-27)")
         guardrail_grounding_findings = check_bedrock_guardrail_contextual_grounding(
-            region=region
+            region=region, attachment_inventory=guardrail_attachments
         )
         all_findings.append(guardrail_grounding_findings)
 
@@ -21422,7 +21959,9 @@ def lambda_handler(event, context):
         logger.info("Running guardrail prompt attack filter check (BR-34)")
         all_findings.append(
             check_bedrock_guardrail_prompt_attack_filter(
-                region=region, guardrail_inventory=guardrail_inventory
+                region=region,
+                guardrail_inventory=guardrail_inventory,
+                attachment_inventory=guardrail_attachments,
             )
         )
 

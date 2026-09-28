@@ -11058,6 +11058,14 @@ class TestBR25RAGEvaluationJobs:
 class TestBR26GuardrailPIIFilters:
     """BR-26: Verify guardrails configure sensitive-information (PII) filters."""
 
+    @pytest.fixture(autouse=True)
+    def _no_deployed_guardrails(self):
+        with patch(
+            "bedrock_app.get_guardrail_attachment_inventory",
+            return_value={"attachments": [], "versions": {}, "errors": []},
+        ):
+            yield
+
     @patch("bedrock_app.boto3.client")
     def test_br26_no_guardrails_returns_na(self, mock_client):
         check = bedrock_app.check_bedrock_guardrail_pii_filters
@@ -11081,7 +11089,13 @@ class TestBR26GuardrailPIIFilters:
             "guardrail": {
                 "sensitiveInformationPolicy": {
                     "piiEntities": [{"type": "EMAIL", "action": "ANONYMIZE"}],
-                    "regexes": [],
+                    "regexes": [
+                        {
+                            "name": "internal-token",
+                            "pattern": "tok_[A-Za-z0-9]{32}",
+                            "action": "BLOCK",
+                        }
+                    ],
                 }
             }
         }
@@ -11145,6 +11159,14 @@ class TestBR26GuardrailPIIFilters:
 # ===================================================================
 class TestBR27ContextualGrounding:
     """BR-27: Verify guardrails enable contextual grounding checks."""
+
+    @pytest.fixture(autouse=True)
+    def _no_deployed_guardrails(self):
+        with patch(
+            "bedrock_app.get_guardrail_attachment_inventory",
+            return_value={"attachments": [], "versions": {}, "errors": []},
+        ):
+            yield
 
     @patch("bedrock_app.boto3.client")
     def test_br27_no_guardrails_returns_na(self, mock_client):
@@ -11287,7 +11309,11 @@ class TestBR27ContextualGrounding:
         )
         mock_client.return_value = bedrock_client
 
-        findings = extract_csv_data(check(region="us-east-1"))
+        findings = [
+            f
+            for f in extract_csv_data(check(region="us-east-1"))
+            if f["Finding"] == "Guardrail Contextual Grounding Check"
+        ]
         assert [f["Status"] for f in findings] == ["Passed"]
 
     def test_br27_schema_valid(self):
@@ -11300,6 +11326,465 @@ class TestBR27ContextualGrounding:
 
         for f in extract_csv_data(result):
             assert_finding_schema(f)
+
+
+class TestDeployedGuardrailVersions:
+    """
+    BR-26, BR-27 and BR-34 judge each guardrail version an agent, flow node or
+    account-enforced configuration applies, and read values, not presence.
+    """
+
+    REGION = "us-east-1"
+    PREVENTIVE = {
+        "type": "PROMPT_ATTACK",
+        "inputEnabled": True,
+        "inputAction": "BLOCK",
+        "inputStrength": "HIGH",
+    }
+    GOOD_PII = {
+        "piiEntities": [{"type": "EMAIL", "action": "ANONYMIZE"}],
+        "regexes": [
+            {"name": "api-key", "pattern": "key_[0-9a-f]{40}", "action": "BLOCK"}
+        ],
+    }
+
+    @classmethod
+    def _content(cls, filters, tier="STANDARD"):
+        policy = {"filters": filters}
+        if tier:
+            policy["tier"] = {"tierName": tier}
+        return {"contentPolicy": policy}
+
+    @staticmethod
+    def _grounding(grounding=0.8, relevance=0.8, reasoning=None):
+        detail = {
+            "contextualGroundingPolicy": {
+                "filters": [
+                    {"type": "GROUNDING", "threshold": grounding, "action": "BLOCK"},
+                    {"type": "RELEVANCE", "threshold": relevance, "action": "BLOCK"},
+                ]
+            }
+        }
+        if reasoning:
+            detail["automatedReasoningPolicy"] = reasoning
+        return detail
+
+    @staticmethod
+    def _attachments(versions, errors=None):
+        return {
+            "attachments": [],
+            "versions": {
+                (identifier, version): {
+                    "surfaces": surfaces,
+                    "detail": detail,
+                    "error": "" if detail is not None else "AccessDeniedException",
+                }
+                for (identifier, version), (surfaces, detail) in versions.items()
+            },
+            "errors": errors or [],
+        }
+
+    @staticmethod
+    def _draft(detail, name="Draft"):
+        return {
+            "items": [{"summary": {"id": "gr-d", "name": name}, "detail": detail}],
+            "errors": [],
+            "list_error": None,
+        }
+
+    @staticmethod
+    def _rows(result, name):
+        return [f for f in extract_csv_data(result) if f["Finding"] == name]
+
+    def _prompt_attack(self, draft, attachments):
+        return bedrock_app.check_bedrock_guardrail_prompt_attack_filter(
+            region=self.REGION,
+            guardrail_inventory=draft,
+            attachment_inventory=attachments,
+        )
+
+    def test_br34_classic_tier_fails_a_preventive_filter(self):
+        result = self._prompt_attack(
+            self._draft(self._content([self.PREVENTIVE], tier="CLASSIC")),
+            self._attachments({}),
+        )
+
+        rows = self._rows(result, "Guardrail Prompt Attack Filter")
+        assert [row["Status"] for row in rows] == ["Failed"]
+        assert "the content-filter tier is CLASSIC" in rows[0]["Finding_Details"]
+        assert "no prompt-leakage detection" in rows[0]["Finding_Details"]
+
+    def test_br34_unreported_tier_is_not_assumed(self):
+        result = self._prompt_attack(
+            self._draft(self._content([self.PREVENTIVE], tier=None)),
+            self._attachments({}),
+        )
+
+        rows = self._rows(result, "Guardrail Prompt Attack Filter")
+        assert [row["Status"] for row in rows] == ["N/A"]
+        assert (
+            "did not report contentPolicy.tier.tierName" in rows[0]["Finding_Details"]
+        )
+
+    def test_br34_deployed_version_is_judged_apart_from_a_passing_draft(self):
+        result = self._prompt_attack(
+            self._draft(self._content([self.PREVENTIVE])),
+            self._attachments(
+                {
+                    ("gr-d", "1"): (["agent 'support' version 3"], self._content([])),
+                    ("gr-d", "2"): (
+                        ["flow 'intake' DRAFT node 'answer'"],
+                        self._content([self.PREVENTIVE]),
+                    ),
+                }
+            ),
+        )
+
+        assert [
+            row["Status"]
+            for row in self._rows(result, "Guardrail Prompt Attack Filter")
+        ] == ["Passed"]
+        deployed = self._rows(result, "Deployed Guardrail Prompt Attack Filter")
+        assert [row["Status"] for row in deployed] == ["Failed", "Passed"]
+        assert (
+            "gr-d version 1 (applied by agent 'support' version 3)"
+            in deployed[0]["Finding_Details"]
+        )
+        assert "no PROMPT_ATTACK filter is configured" in deployed[0]["Finding_Details"]
+        assert "gr-d version 2" in deployed[1]["Finding_Details"]
+        assert "version 1" not in deployed[1]["Finding_Details"]
+        assert (
+            bedrock_app.GUARDRAIL_DEPLOYMENT_CEILING in deployed[1]["Finding_Details"]
+        )
+
+    def test_br34_unread_deployed_version_blocks_a_clean_pass(self):
+        result = self._prompt_attack(
+            self._draft(self._content([self.PREVENTIVE])),
+            self._attachments(
+                {
+                    ("gr-d", "1"): (
+                        ["agent 'a' DRAFT"],
+                        self._content([self.PREVENTIVE]),
+                    ),
+                    ("arn:aws:bedrock:us-east-1:999999999999:guardrail/x", "4"): (
+                        ["account-enforced configuration c-1"],
+                        None,
+                    ),
+                }
+            ),
+        )
+
+        deployed = self._rows(result, "Deployed Guardrail Prompt Attack Filter")
+        assert [row["Status"] for row in deployed] == ["N/A"]
+        assert "This is not reported as Passed" in deployed[0]["Finding_Details"]
+        assert "guardrail/x version 4" in deployed[0]["Finding_Details"]
+
+    def test_br34_unlisted_attachment_source_blocks_a_clean_pass(self):
+        result = self._prompt_attack(
+            self._draft(self._content([self.PREVENTIVE])),
+            self._attachments(
+                {
+                    ("gr-d", "1"): (
+                        ["agent 'a' DRAFT"],
+                        self._content([self.PREVENTIVE]),
+                    )
+                },
+                errors=[
+                    "flows were not read with bedrock:ListFlows (AccessDeniedException)"
+                ],
+            ),
+        )
+
+        deployed = self._rows(result, "Deployed Guardrail Prompt Attack Filter")
+        assert [row["Status"] for row in deployed] == ["N/A"]
+        assert "bedrock:ListFlows" in deployed[0]["Finding_Details"]
+
+    def test_br34_no_attachment_is_na_and_names_the_ceiling(self):
+        result = self._prompt_attack(
+            self._draft(self._content([self.PREVENTIVE])), self._attachments({})
+        )
+
+        deployed = self._rows(result, "Deployed Guardrail Prompt Attack Filter")
+        assert [row["Status"] for row in deployed] == ["N/A"]
+        assert "guardContent" in deployed[0]["Finding_Details"]
+
+    @staticmethod
+    def _pii_client(details):
+        client = MagicMock()
+        client.list_guardrails.return_value = {
+            "guardrails": [
+                {"id": f"gr-{index}", "name": name}
+                for index, name in enumerate(details)
+            ]
+        }
+        client.get_guardrail.side_effect = [
+            {"guardrail": {"sensitiveInformationPolicy": policy}}
+            for policy in details.values()
+        ]
+        return client
+
+    def _pii(self, details, attachments=None):
+        with patch("bedrock_app.boto3.client", return_value=self._pii_client(details)):
+            return bedrock_app.check_bedrock_guardrail_pii_filters(
+                region=self.REGION,
+                attachment_inventory=attachments or self._attachments({}),
+            )
+
+    def test_br26_detect_only_entities_fail(self):
+        result = self._pii(
+            {
+                "DetectOnly": {
+                    "piiEntities": [{"type": "EMAIL", "action": "NONE"}],
+                    "regexes": [{"name": "k", "pattern": "k", "action": "NONE"}],
+                }
+            }
+        )
+
+        rows = self._rows(result, "Guardrail Sensitive Information Filter Check")
+        assert [row["Status"] for row in rows] == ["Failed"]
+        detail = rows[0]["Finding_Details"]
+        assert "no PII entity or regex blocks or masks on the output" in detail
+        assert "no PII entity or regex blocks or masks on the input" in detail
+        assert "EMAIL, regex 'k' take no blocking or masking action" in detail
+
+    def test_br26_output_disabled_fails_the_output_side_only(self):
+        result = self._pii(
+            {
+                "InputOnly": {
+                    "piiEntities": [
+                        {"type": "EMAIL", "action": "BLOCK", "outputEnabled": False}
+                    ],
+                    "regexes": [
+                        {
+                            "name": "k",
+                            "pattern": "k",
+                            "action": "BLOCK",
+                            "outputEnabled": False,
+                        }
+                    ],
+                }
+            }
+        )
+
+        detail = self._rows(result, "Guardrail Sensitive Information Filter Check")[0][
+            "Finding_Details"
+        ]
+        assert "blocks or masks on the output" in detail
+        assert "on the input" not in detail
+
+    def test_br26_side_action_overrides_the_legacy_action(self):
+        result = self._pii(
+            {
+                "OutputNone": {
+                    "piiEntities": [
+                        {"type": "EMAIL", "action": "BLOCK", "outputAction": "NONE"}
+                    ],
+                    "regexes": [
+                        {
+                            "name": "k",
+                            "pattern": "k",
+                            "action": "BLOCK",
+                            "outputAction": "NONE",
+                        }
+                    ],
+                }
+            }
+        )
+
+        rows = self._rows(result, "Guardrail Sensitive Information Filter Check")
+        assert rows[0]["Status"] == "Failed"
+        assert "blocks or masks on the output" in rows[0]["Finding_Details"]
+
+    def test_br26_entities_without_a_secrets_regex_fail(self):
+        result = self._pii(
+            {
+                "EntitiesOnly": {
+                    "piiEntities": [{"type": "EMAIL", "action": "ANONYMIZE"}],
+                    "regexes": [],
+                }
+            }
+        )
+
+        rows = self._rows(result, "Guardrail Sensitive Information Filter Check")
+        assert rows[0]["Status"] == "Failed"
+        assert "no custom regex blocks or masks secrets" in rows[0]["Finding_Details"]
+
+    def test_br26_two_guardrails_reach_both_verdicts(self):
+        result = self._pii(
+            {
+                "Good": self.GOOD_PII,
+                "Weak": {"piiEntities": [{"type": "EMAIL", "action": "NONE"}]},
+            }
+        )
+
+        rows = self._rows(result, "Guardrail Sensitive Information Filter Check")
+        assert [row["Status"] for row in rows] == ["Failed", "Passed"]
+        assert "'Weak'" in rows[0]["Finding_Details"]
+        assert "(Good)" in rows[1]["Finding_Details"]
+        assert "Weak" not in rows[1]["Finding_Details"]
+        assert (
+            bedrock_app.SENSITIVE_INFORMATION_TOOL_CEILING in rows[1]["Finding_Details"]
+        )
+
+    def test_br26_deployed_version_is_judged_apart_from_a_passing_draft(self):
+        result = self._pii(
+            {"Good": self.GOOD_PII},
+            self._attachments(
+                {
+                    ("gr-0", "1"): (
+                        ["agent 'a' version 1"],
+                        {"sensitiveInformationPolicy": {"piiEntities": []}},
+                    )
+                }
+            ),
+        )
+
+        deployed = self._rows(result, "Deployed Guardrail Sensitive Information Filter")
+        assert [row["Status"] for row in deployed] == ["Failed"]
+        assert "no sensitive-information filter" in deployed[0]["Finding_Details"]
+
+    def test_br27_deployed_version_reports_automated_reasoning(self):
+        with patch("bedrock_app.boto3.client") as client:
+            client.return_value.list_guardrails.return_value = {"guardrails": []}
+            result = bedrock_app.check_bedrock_guardrail_contextual_grounding(
+                region=self.REGION,
+                attachment_inventory=self._attachments(
+                    {
+                        ("gr-1", "2"): (
+                            ["flow 'f' 1 node 'kb'"],
+                            self._grounding(
+                                reasoning={
+                                    "policies": [
+                                        "arn:aws:bedrock:us-east-1:1:automated-reasoning-policy/p"
+                                    ],
+                                    "confidenceThreshold": 0.9,
+                                }
+                            ),
+                        ),
+                        ("gr-1", "3"): (
+                            ["agent 'a' DRAFT"],
+                            self._grounding(relevance=0),
+                        ),
+                    }
+                ),
+            )
+
+        deployed = self._rows(result, "Deployed Guardrail Contextual Grounding")
+        assert [row["Status"] for row in deployed] == ["Failed", "Passed"]
+        assert "does not block on RELEVANCE" in deployed[0]["Finding_Details"]
+        assert (
+            "No Automated Reasoning policy is attached."
+            in deployed[0]["Finding_Details"]
+        )
+        assert (
+            "automated-reasoning-policy/p at confidenceThreshold 0.9"
+            in deployed[1]["Finding_Details"]
+        )
+        assert (
+            bedrock_app.CONTEXTUAL_GROUNDING_CEILING in deployed[1]["Finding_Details"]
+        )
+
+    def test_attachment_inventory_reads_every_deployed_version(self):
+        agent_client = MagicMock()
+        agent_client.list_agents.side_effect = [
+            {
+                "agentSummaries": [
+                    {
+                        "agentId": "A1",
+                        "agentName": "support",
+                        "guardrailConfiguration": {
+                            "guardrailIdentifier": "gr-1",
+                            "guardrailVersion": "DRAFT",
+                        },
+                    }
+                ],
+                "nextToken": "t",
+            },
+            {"agentSummaries": [{"agentId": "A2", "agentName": "bare"}]},
+        ]
+        agent_client.list_agent_aliases.side_effect = lambda agentId, **_: {
+            "agentAliasSummaries": [
+                {"routingConfiguration": [{"agentVersion": "DRAFT"}]},
+                {"routingConfiguration": [{"agentVersion": "2"}]},
+            ]
+            if agentId == "A1"
+            else []
+        }
+        agent_client.get_agent_version.return_value = {
+            "agentVersion": {
+                "guardrailConfiguration": {
+                    "guardrailIdentifier": "arn:aws:bedrock:us-west-2:123456789012:guardrail/gr-2",
+                    "guardrailVersion": "5",
+                }
+            }
+        }
+        agent_client.list_flows.return_value = {
+            "flowSummaries": [{"id": "F1", "name": "intake"}]
+        }
+        agent_client.get_flow.return_value = {"definition": {"nodes": []}}
+        agent_client.list_flow_aliases.return_value = {
+            "flowAliasSummaries": [{"routingConfiguration": [{"flowVersion": "1"}]}]
+        }
+        agent_client.get_flow_version.return_value = {
+            "definition": {
+                "nodes": [
+                    {
+                        "name": "kb",
+                        "configuration": {
+                            "knowledgeBase": {
+                                "guardrailConfiguration": {
+                                    "guardrailIdentifier": "gr-1",
+                                    "guardrailVersion": "DRAFT",
+                                }
+                            }
+                        },
+                    }
+                ]
+            }
+        }
+        bedrock_clients = {}
+
+        def client(service, region_name=None, **_):
+            if service == "bedrock-agent":
+                return agent_client
+            if region_name not in bedrock_clients:
+                bedrock_clients[region_name] = MagicMock()
+                bedrock_clients[
+                    region_name
+                ].list_enforced_guardrails_configuration.side_effect = ClientError(
+                    {"Error": {"Code": "AccessDeniedException", "Message": "x"}},
+                    "ListEnforcedGuardrailsConfiguration",
+                )
+                bedrock_clients[region_name].get_guardrail.return_value = {
+                    "guardrail": {"name": region_name}
+                }
+            return bedrock_clients[region_name]
+
+        with patch("bedrock_app.boto3.client", side_effect=client):
+            inventory = bedrock_app.get_guardrail_attachment_inventory(self.REGION)
+
+        assert agent_client.list_agents.call_count == 2
+        agent_client.get_agent_version.assert_called_once_with(
+            agentId="A1", agentVersion="2"
+        )
+        agent_client.get_flow_version.assert_called_once_with(
+            flowIdentifier="F1", flowVersion="1"
+        )
+        assert inventory["versions"][("gr-1", "DRAFT")]["surfaces"] == [
+            "agent 'support' DRAFT",
+            "flow 'intake' 1 node 'kb'",
+        ]
+        west = inventory["versions"][
+            ("arn:aws:bedrock:us-west-2:123456789012:guardrail/gr-2", "5")
+        ]
+        assert west["detail"] == {"name": "us-west-2"}
+        assert west["surfaces"] == ["agent 'support' version 2"]
+        bedrock_clients["us-west-2"].get_guardrail.assert_called_once_with(
+            guardrailIdentifier="arn:aws:bedrock:us-west-2:123456789012:guardrail/gr-2",
+            guardrailVersion="5",
+        )
+        assert len(inventory["errors"]) == 1
+        assert "bedrock:ListEnforcedGuardrailsConfiguration" in inventory["errors"][0]
 
 
 # ===================================================================
@@ -12247,6 +12732,14 @@ class TestAgenticBedrockMapping:
 class TestProposedBedrockChecks:
     """BR-34 through BR-40 proposal checks."""
 
+    @pytest.fixture(autouse=True)
+    def _no_deployed_guardrails(self):
+        with patch(
+            "bedrock_app.get_guardrail_attachment_inventory",
+            return_value={"attachments": [], "versions": {}, "errors": []},
+        ):
+            yield
+
     @staticmethod
     def _guardrail_inventory(filters):
         return {
@@ -12344,7 +12837,11 @@ class TestProposedBedrockChecks:
                 ],
             ),
         )
-        findings = extract_csv_data(result)
+        findings = [
+            f
+            for f in extract_csv_data(result)
+            if f["Finding"] == "Guardrail Prompt Attack Filter"
+        ]
         assert [f["Status"] for f in findings] == ["Passed", "Failed"]
         assert (
             "has a preventive PROMPT_ATTACK input filter at HIGH strength"

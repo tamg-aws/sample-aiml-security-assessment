@@ -376,6 +376,8 @@ Resources:
                 - bedrock:GetAgent
                 - bedrock:ListAgentActionGroups
                 - bedrock:GetAgentActionGroup
+                - bedrock:ListAgentAliases # BR-26, BR-27, BR-34
+                - bedrock:GetAgentVersion # BR-26, BR-27, BR-34
               Resource: !Sub 'arn:${AWS::Partition}:bedrock:*:${AWS::AccountId}:agent/*'
             - Sid: BedrockCustomModelRead
               Effect: Allow
@@ -391,6 +393,8 @@ Resources:
               Effect: Allow
               Action:
                 - bedrock:GetFlow
+                - bedrock:ListFlowAliases # BR-26, BR-27, BR-34
+                - bedrock:GetFlowVersion # BR-26, BR-27, BR-34
               Resource: !Sub 'arn:${AWS::Partition}:bedrock:*:${AWS::AccountId}:flow/*'
             - Sid: BedrockKnowledgeBaseRead
               Effect: Allow
