@@ -170,6 +170,14 @@ AGENTCORE_GATEWAY_INBOUND_AUTH_REFERENCE_URL = (
     "https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/"
     "gateway-inbound-auth.html"
 )
+SERVICE_CONTROL_POLICY_REFERENCE_URL = (
+    "https://docs.aws.amazon.com/organizations/latest/userguide/"
+    "orgs_manage_policies_scps.html"
+)
+CLOUDTRAIL_LOG_FILE_VALIDATION_REFERENCE_URL = (
+    "https://docs.aws.amazon.com/awscloudtrail/latest/userguide/"
+    "cloudtrail-log-file-validation-intro.html"
+)
 AGENTCORE_IAM_CONDITION_KEY_REFERENCE_URL = (
     "https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/"
     "security_iam_service-with-iam.html"
@@ -1796,20 +1804,21 @@ def _agentcore_egress_findings(
             findings.append(
                 create_finding(
                     check_id="AC-01",
-                    finding_name=AGENTCORE_EGRESS_FINDING_NAME,
+                    finding_name="AgentCore Egress Not Customer Filtered",
                     finding_details=(
                         f"{label} runs in SANDBOX network mode, which the devguide "
                         "describes as limited external network access and which "
-                        "attaches no customer security group."
+                        "attaches no customer security group, so no outbound rule "
+                        "of this account names the destinations it reaches."
                     ),
                     resolution=(
-                        "No action required. A workload that has to allow or deny "
-                        "named destinations needs VPC mode, where security group "
-                        "outbound rules express the destination list."
+                        "Move the tool to VPC network mode and attach security "
+                        "groups whose outbound rules name only the destinations "
+                        "this workload needs."
                     ),
                     reference=AGENTCORE_CODE_INTERPRETER_NETWORK_REFERENCE_URL,
                     severity=SeverityEnum.MEDIUM,
-                    status=StatusEnum.PASSED,
+                    status=StatusEnum.FAILED,
                 )
             )
             continue
@@ -1876,14 +1885,18 @@ def _agentcore_egress_findings(
             )
             continue
 
-        open_ranges: List[str] = []
-        unreadable: List[str] = []
-        for group_id in target_groups:
-            security_group = security_groups.get(str(group_id))
-            if security_group is None:
-                unreadable.append(str(group_id))
-                continue
-            open_ranges.extend(_security_group_open_egress(security_group))
+        unreadable = [
+            str(group_id)
+            for group_id in target_groups
+            if str(group_id) not in security_groups
+        ]
+        open_ranges = _security_groups_open_egress(
+            [
+                security_groups[str(group_id)]
+                for group_id in target_groups
+                if str(group_id) in security_groups
+            ]
+        )
 
         if open_ranges:
             findings.append(
@@ -1892,7 +1905,7 @@ def _agentcore_egress_findings(
                     finding_name="AgentCore Egress Unrestricted",
                     finding_details=(
                         f"{label} permits outbound traffic to "
-                        f"{', '.join(sorted(set(open_ranges)))} on its "
+                        f"{', '.join(open_ranges)} across the outbound ranges of its "
                         f"{len(target_groups)} security group(s), so code running "
                         "there reaches any address on the internet the subnet can "
                         "route to."
@@ -1929,8 +1942,9 @@ def _agentcore_egress_findings(
                     check_id="AC-01",
                     finding_name=AGENTCORE_EGRESS_FINDING_NAME,
                     finding_details=(
-                        f"{label} permits no outbound traffic to 0.0.0.0/0 or ::/0 "
-                        f"on any of its {len(target_groups)} security group(s)."
+                        f"The outbound ranges of {label}'s "
+                        f"{len(target_groups)} security group(s) together cover "
+                        "neither 0.0.0.0/0 nor ::/0."
                     ),
                     resolution=(
                         "No action required. Confirm the outbound rules name only "
@@ -5095,19 +5109,41 @@ def _security_group_open_ingress(security_group: Dict[str, Any]) -> List[str]:
     return sorted(set(open_ranges))
 
 
-def _security_group_open_egress(security_group: Dict[str, Any]) -> List[str]:
-    """Return the internet-open outbound CIDR ranges of one security group."""
+def _security_groups_open_egress(security_groups: List[Dict[str, Any]]) -> List[str]:
+    """Return 0.0.0.0/0 or ::/0 when the groups' outbound ranges together cover it.
+
+    The rules of every group on one interface add up, so 0.0.0.0/1 on one group
+    and 128.0.0.0/1 on another open the whole IPv4 internet as surely as one
+    0.0.0.0/0 rule does. A range that does not parse is left out.
+    """
+    networks = []
+    for security_group in security_groups:
+        for permission in security_group.get("IpPermissionsEgress") or []:
+            if not isinstance(permission, dict):
+                continue
+            for ranges, field in (("IpRanges", "CidrIp"), ("Ipv6Ranges", "CidrIpv6")):
+                for ip_range in permission.get(ranges) or []:
+                    if not isinstance(ip_range, dict):
+                        continue
+                    try:
+                        networks.append(
+                            ipaddress.ip_network(
+                                str(ip_range.get(field) or "").strip(), strict=False
+                            )
+                        )
+                    except ValueError:
+                        continue
     open_ranges: List[str] = []
-    for permission in security_group.get("IpPermissionsEgress") or []:
-        if not isinstance(permission, dict):
-            continue
-        for ip_range in permission.get("IpRanges") or []:
-            if isinstance(ip_range, dict) and ip_range.get("CidrIp") == "0.0.0.0/0":
-                open_ranges.append("0.0.0.0/0")
-        for ip_range in permission.get("Ipv6Ranges") or []:
-            if isinstance(ip_range, dict) and ip_range.get("CidrIpv6") == "::/0":
-                open_ranges.append("::/0")
-    return sorted(set(open_ranges))
+    for everything in (
+        ipaddress.ip_network("0.0.0.0/0"),
+        ipaddress.ip_network("::/0"),
+    ):
+        family = [
+            network for network in networks if network.version == everything.version
+        ]
+        if everything in ipaddress.collapse_addresses(family):
+            open_ranges.append(str(everything))
+    return open_ranges
 
 
 # The AgentCore service endpoints. The runtime, control-plane and gateway
@@ -8595,6 +8631,139 @@ def check_agentcore_log_retention_and_key_scope() -> List[Dict[str, Any]]:
     return findings
 
 
+AGENTCORE_TRAIL_VALIDATION_FINDING_NAME = "AgentCore Trail Log File Validation"
+
+
+def check_agentcore_trail_log_file_validation() -> List[Dict[str, Any]]:
+    """AC-26 integrity leg: every trail recording this Region validates its files.
+
+    Deletion protection keeps the CloudWatch copy of an agent's record. The
+    CloudTrail copy is only evidence while its digest files let an investigator
+    show no log file was changed or removed, which CloudTrail writes only when
+    log file validation is on. A trail records this Region when it is
+    multi-Region or its home Region is this one, so a trail is read with GetTrail
+    before it is counted or skipped, and an unread trail blocks a Passed.
+    """
+    reference = CLOUDTRAIL_LOG_FILE_VALIDATION_REFERENCE_URL
+    if cloudtrail_client is None:
+        return [
+            create_finding(
+                check_id="AC-26",
+                finding_name=AGENTCORE_TRAIL_VALIDATION_FINDING_NAME,
+                finding_details="CloudTrail client not available in this region.",
+                resolution="No action required unless AgentCore runs in this region.",
+                reference=reference,
+                severity=SeverityEnum.INFORMATIONAL,
+                status=StatusEnum.NA,
+            )
+        ]
+
+    try:
+        trails = _paginate_aws_list(
+            cloudtrail_client,
+            "list_trails",
+            "Trails",
+            token_request_key="NextToken",
+            token_response_key="NextToken",
+        )
+    except Exception as error:
+        return [
+            _incomplete_check_finding(
+                check_id="AC-26",
+                finding_name=AGENTCORE_TRAIL_VALIDATION_FINDING_NAME,
+                error=error,
+                reference=reference,
+            )
+        ]
+
+    region = cloudtrail_client.meta.region_name
+    findings: List[Dict[str, Any]] = []
+    validated: List[str] = []
+    for trail in trails:
+        identifier = trail.get("TrailARN") or trail.get("Name")
+        if not identifier:
+            continue
+        try:
+            detail = cloudtrail_client.get_trail(Name=identifier).get("Trail") or {}
+        except Exception as error:
+            findings.append(
+                create_finding(
+                    check_id="AC-26",
+                    finding_name=AGENTCORE_TRAIL_VALIDATION_FINDING_NAME,
+                    finding_details=(
+                        f"Trail {identifier} could not be read: "
+                        f"{_assessment_error_label(error)}, so whether it records "
+                        "this region and validates its log files is unknown."
+                    ),
+                    resolution="Grant cloudtrail:GetTrail and retry.",
+                    reference=reference,
+                    severity=SeverityEnum.INFORMATIONAL,
+                    status=StatusEnum.NA,
+                )
+            )
+            continue
+        if not detail.get("IsMultiRegionTrail") and detail.get("HomeRegion") != region:
+            continue
+        label = detail.get("TrailARN") or identifier
+        if detail.get("LogFileValidationEnabled") is True:
+            validated.append(label)
+            continue
+        findings.append(
+            create_finding(
+                check_id="AC-26",
+                finding_name="AgentCore Trail Log File Validation Disabled",
+                finding_details=(
+                    f"Trail {label} records this region with log file validation "
+                    "off, so CloudTrail writes no digest file and a changed or "
+                    "deleted log file cannot be detected."
+                ),
+                resolution=(
+                    "Turn on log file validation for the trail "
+                    "(EnableLogFileValidation in UpdateTrail)."
+                ),
+                reference=reference,
+                severity=SeverityEnum.MEDIUM,
+                status=StatusEnum.FAILED,
+            )
+        )
+
+    if findings:
+        return findings
+    if not validated:
+        return [
+            create_finding(
+                check_id="AC-26",
+                finding_name="AgentCore Trail Log File Validation Missing",
+                finding_details=(
+                    f"None of the {len(trails)} trail(s) listed records this "
+                    "region, so no CloudTrail log file of this region's AgentCore "
+                    "calls is written or validated."
+                ),
+                resolution=(
+                    "Create a multi-Region or organization trail with log file "
+                    "validation on."
+                ),
+                reference=reference,
+                severity=SeverityEnum.MEDIUM,
+                status=StatusEnum.FAILED,
+            )
+        ]
+    return [
+        create_finding(
+            check_id="AC-26",
+            finding_name=AGENTCORE_TRAIL_VALIDATION_FINDING_NAME,
+            finding_details=(
+                f"All {len(validated)} trail(s) recording this region validate "
+                f"their log files: {', '.join(sorted(validated))}."
+            ),
+            resolution="No action required.",
+            reference=reference,
+            severity=SeverityEnum.MEDIUM,
+            status=StatusEnum.PASSED,
+        )
+    ]
+
+
 def _agentcore_span_log_deletion_protection_finding() -> Optional[Dict[str, Any]]:
     """Judge deletion protection on the aws/spans log group for AC-26.
 
@@ -9489,7 +9658,7 @@ def _assessed_account_parent_chain(account_id: str) -> List[Tuple[str, str]]:
 
 
 def _scp_attachment(
-    policies: List[Dict[str, Any]], candidate_ids: Set[str]
+    policies: List[Dict[str, Any]], candidate_ids: Set[str], account_id: str = ""
 ) -> Dict[str, Any]:
     """Read where each candidate SCP is attached relative to the assessed account.
 
@@ -9497,7 +9666,8 @@ def _scp_attachment(
     restricts), the candidates attached to the account or an ancestor with the
     target that binds them, the candidates attached elsewhere, the candidates
     whose targets could not be read, and the error that stopped the parent walk.
-    Nothing is read when there is no candidate.
+    Nothing is read when there is no candidate. A caller that already read the
+    caller identity passes `account_id` so it is not read again.
     """
     result: Dict[str, Any] = {
         "account": "",
@@ -9510,9 +9680,10 @@ def _scp_attachment(
     if not candidate_ids:
         return result
     try:
-        account_id = boto3.client("sts", config=boto3_config).get_caller_identity()[
-            "Account"
-        ]
+        if not account_id:
+            account_id = boto3.client("sts", config=boto3_config).get_caller_identity()[
+                "Account"
+            ]
         result["account"] = account_id
         # A customer managed SCP's ARN carries the management account in its
         # account segment, so no DescribeOrganization call is needed.
@@ -10253,6 +10424,525 @@ JWT_AUTHORIZER_OTHER_CLAIMS = {
     "allowedScopes": "scope",
     "customClaims": "custom claim",
 }
+
+
+def _scp_guardrail_findings(
+    check_id: str,
+    reference: str,
+    legs: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Judge each preventive leg against the SCPs attached to the assessed account.
+
+    A leg names its `finding_name`, the `actions` to deny (lowercased action to
+    report spelling), `denies(statement, action, context)` judging one Deny
+    statement that already reaches the action, the `guard_text` describing the
+    denial, and the `remediation`. `context` carries the assessed account and
+    partition.
+
+    The organization's policies are listed and read once for every leg. A leg
+    passes only when every one of its actions is denied by a policy attached to
+    the account, to an organizational unit above it, or to the root. The
+    management account is never bound, and an unreadable list, parent chain or
+    attachment list is `N/A` and never `Passed`.
+    """
+    first_name = legs[0]["finding_name"]
+    if organizations_client is None:
+        return [
+            create_finding(
+                check_id=check_id,
+                finding_name=leg["finding_name"],
+                finding_details="Organizations client not available.",
+                resolution="No action required unless this account is in an organization.",
+                reference=reference,
+                severity=SeverityEnum.INFORMATIONAL,
+                status=StatusEnum.NA,
+            )
+            for leg in legs
+        ]
+
+    try:
+        policies = _paginate_aws_list(
+            organizations_client,
+            "list_policies",
+            "Policies",
+            token_request_key="NextToken",
+            token_response_key="NextToken",
+            Filter="SERVICE_CONTROL_POLICY",
+        )
+    except Exception as error:
+        if _assessment_error_label(error) in ORGANIZATIONS_UNREADABLE_ERROR_CODES:
+            return [
+                create_finding(
+                    check_id=check_id,
+                    finding_name=leg["finding_name"],
+                    finding_details=(
+                        "Service control policies could not be listed from this "
+                        f"account: {_assessment_error_label(error)}. A member "
+                        "account cannot read the organization's policies."
+                    ),
+                    resolution=(
+                        "Run the assessment from the management account or an "
+                        "Organizations delegated administrator, with "
+                        "organizations:ListPolicies and organizations:DescribePolicy."
+                    ),
+                    reference=reference,
+                    severity=SeverityEnum.INFORMATIONAL,
+                    status=StatusEnum.NA,
+                )
+                for leg in legs
+            ]
+        return [
+            _incomplete_check_finding(
+                check_id=check_id,
+                finding_name=leg["finding_name"],
+                error=error,
+                reference=reference,
+            )
+            for leg in legs
+        ]
+
+    try:
+        caller_identity = boto3.client("sts", config=boto3_config).get_caller_identity()
+    except Exception as error:
+        return [
+            _incomplete_check_finding(
+                check_id=check_id,
+                finding_name=leg["finding_name"],
+                error=error,
+                reference=reference,
+            )
+            for leg in legs
+        ]
+    context = {
+        "account": str(caller_identity["Account"]),
+        "partition": _caller_identity_partition(caller_identity),
+    }
+
+    documents: List[Tuple[str, str, List[Dict[str, Any]]]] = []
+    findings: List[Dict[str, Any]] = []
+    for policy in policies:
+        policy_name = policy.get("Name", policy.get("Id", "unknown"))
+        try:
+            detail = organizations_client.describe_policy(PolicyId=policy["Id"])
+        except Exception as error:
+            findings.append(
+                create_finding(
+                    check_id=check_id,
+                    finding_name=first_name,
+                    finding_details=(
+                        f"Service control policy '{policy_name}' could not be "
+                        f"read: {_assessment_error_label(error)}, so it was not "
+                        "judged."
+                    ),
+                    resolution="Grant organizations:DescribePolicy and retry.",
+                    reference=reference,
+                    severity=SeverityEnum.INFORMATIONAL,
+                    status=StatusEnum.NA,
+                )
+            )
+            continue
+        content = (detail.get("Policy") or {}).get("Content", "")
+        documents.append(
+            (policy["Id"], policy_name, _document_statements(content, effect="Deny"))
+        )
+
+    for leg in legs:
+        coverage: Dict[str, Tuple[str, Set[str]]] = {}
+        for policy_id, policy_name, statements in documents:
+            covered = {
+                action
+                for action in leg["actions"]
+                for statement in statements
+                if _statement_matches_action(statement, action)
+                and leg["denies"](statement, action, context)
+            }
+            if covered:
+                coverage[policy_id] = (policy_name, covered)
+
+        covered_actions, guarding, unattached, stop = _attached_scp_coverage(
+            check_id,
+            leg["finding_name"],
+            reference,
+            _scp_attachment(policies, set(coverage), context["account"]),
+            coverage,
+            leg["actions"],
+        )
+        if stop:
+            findings.extend(stop)
+            continue
+
+        action_label = ", ".join(sorted(leg["actions"].values()))
+        missing = sorted(
+            name
+            for action, name in leg["actions"].items()
+            if action not in covered_actions
+        )
+        guarding_label = ", ".join(name for name, _ in guarding)
+        attached_label = "; ".join(
+            f"{name} is attached to {target}" for name, target in guarding
+        )
+        unattached_note = (
+            f" Service control policy {', '.join(unattached)} would deny it too, "
+            "but is attached to neither this account nor an organizational unit "
+            "or root above it."
+            if unattached
+            else ""
+        )
+
+        if not missing:
+            findings.append(
+                create_finding(
+                    check_id=check_id,
+                    finding_name=leg["finding_name"],
+                    finding_details=(
+                        f"{action_label} are all denied {leg['guard_text']}, by "
+                        f"service control policy: {guarding_label}. "
+                        f"{attached_label}, which binds this account."
+                    ),
+                    resolution=(
+                        "No action required. Other accounts are judged by their "
+                        "own assessment."
+                    ),
+                    reference=reference,
+                    severity=SeverityEnum.HIGH,
+                    status=StatusEnum.PASSED,
+                )
+            )
+        elif covered_actions:
+            findings.append(
+                create_finding(
+                    check_id=check_id,
+                    finding_name=f"{leg['finding_name']} Partial",
+                    finding_details=(
+                        f"Service control policy {guarding_label} denies "
+                        f"{', '.join(sorted(leg['actions'][a] for a in covered_actions))} "
+                        f"{leg['guard_text']}, but not {', '.join(missing)}."
+                        f"{unattached_note}"
+                    ),
+                    resolution=leg["remediation"],
+                    reference=reference,
+                    severity=SeverityEnum.HIGH,
+                    status=StatusEnum.FAILED,
+                )
+            )
+        elif unattached:
+            findings.append(
+                create_finding(
+                    check_id=check_id,
+                    finding_name=f"{leg['finding_name']} Unattached",
+                    finding_details=(
+                        f"Service control policy {', '.join(unattached)} denies "
+                        f"{action_label} {leg['guard_text']} but is attached to neither this account "
+                        "nor an organizational unit or root above it, so it binds "
+                        "nothing here."
+                    ),
+                    resolution=(
+                        "Attach the policy to the root, or to the organizational "
+                        "unit that holds this account."
+                    ),
+                    reference=reference,
+                    severity=SeverityEnum.HIGH,
+                    status=StatusEnum.FAILED,
+                )
+            )
+        else:
+            findings.append(
+                create_finding(
+                    check_id=check_id,
+                    finding_name=f"{leg['finding_name']} Missing",
+                    finding_details=(
+                        f"None of the {len(documents)} readable service control "
+                        f"policy(s) denies {action_label} {leg['guard_text']}."
+                    ),
+                    resolution=leg["remediation"],
+                    reference=reference,
+                    severity=SeverityEnum.HIGH,
+                    status=StatusEnum.FAILED,
+                )
+            )
+    return findings
+
+
+def _statement_resource_covers(statement: Dict[str, Any], arns: List[str]) -> bool:
+    """Return whether one Deny statement reaches every one of `arns`.
+
+    A probe ARN carries `*` where the population is open, so only a pattern at
+    least as wide matches it. A NotResource statement reaches a probe that none
+    of its exclusions match.
+    """
+    if "NotResource" in statement:
+        excluded = statement.get("NotResource")
+        excluded = excluded if isinstance(excluded, list) else [excluded]
+        return not any(
+            fnmatchcase(arn, str(pattern))
+            for arn in arns
+            for pattern in excluded
+            if pattern
+        )
+    patterns = _statement_resources(statement)
+    return all(any(fnmatchcase(arn, pattern) for pattern in patterns) for arn in arns)
+
+
+# The condition keys an SCP guardrail may use to exempt the principals that
+# administer it. Any other key is ANDed into the Deny, so a request that fails
+# it is not denied.
+SCP_EXEMPTION_CONDITION_KEYS = {"aws:principalarn"}
+
+
+def _scp_exemption_is_bounded(values: List[str]) -> bool:
+    """Return whether principal ARN exemptions name principals, not everyone.
+
+    An exemption whose name is only wildcards, such as `role/*`, exempts every
+    role in the account and so exempts the callers the guardrail is for. A
+    wildcard account segment is read as bounded, because in the assessed
+    account it still exempts only the principals it names.
+    """
+    if not values:
+        return False
+    for value in values:
+        parts = value.split(":", 5)
+        if len(parts) < 6:
+            return False
+        name = parts[5].split("/", 1)[1] if "/" in parts[5] else ""
+        if not name.strip("*?/"):
+            return False
+    return True
+
+
+def _deny_binds_every_caller(statement: Dict[str, Any]) -> bool:
+    """Return whether a Deny fires for every caller but named exemptions.
+
+    The Deny may carry no condition, or only negated operators on
+    aws:PrincipalArn with bounded values.
+    """
+    condition = statement.get("Condition")
+    if not condition:
+        return True
+    if not isinstance(condition, dict):
+        return False
+    for operator, entries in condition.items():
+        name = str(operator).strip().lower()
+        if name.endswith("ifexists"):
+            name = name[: -len("ifexists")]
+        if name not in RESTRICTING_DENY_OPERATORS or not isinstance(entries, dict):
+            return False
+        for key, raw in entries.items():
+            if str(key).strip().lower() not in SCP_EXEMPTION_CONDITION_KEYS:
+                return False
+            if not _scp_exemption_is_bounded(
+                [value.strip() for value in _condition_values(raw)]
+            ):
+                return False
+    return True
+
+
+AGENTCORE_LOG_TAMPER_ACTIONS = {
+    "logs:deleteloggroup": "logs:DeleteLogGroup",
+    "logs:putretentionpolicy": "logs:PutRetentionPolicy",
+    "logs:putloggroupdeletionprotection": "logs:PutLogGroupDeletionProtection",
+    "logs:deletesubscriptionfilter": "logs:DeleteSubscriptionFilter",
+}
+
+# The log groups AgentCore writes to: runtime and tool logs under the two
+# service prefixes, and the aws/spans group Transaction Search writes.
+AGENTCORE_LOG_GROUP_PROBE_NAMES = (
+    "/aws/bedrock-agentcore/*",
+    "/aws/vendedlogs/bedrock-agentcore/*",
+    TRANSACTION_SEARCH_SPANS_LOG_GROUP,
+)
+
+
+def _agentcore_log_group_probes(context: Dict[str, str]) -> List[str]:
+    """Return the log-group ARNs, in every Region, a tamper guardrail must reach.
+
+    Each name is probed with and without the trailing `:*` because the service
+    authorization reference does not say which form each action is evaluated
+    against.
+    """
+    return [
+        f"arn:{context['partition']}:logs:*:{context['account']}:log-group:{name}{suffix}"
+        for name in AGENTCORE_LOG_GROUP_PROBE_NAMES
+        for suffix in ("", ":*")
+    ]
+
+
+def check_agentcore_log_tamper_scp() -> List[Dict[str, Any]]:
+    """AC-26 preventive leg: an attached SCP denies tampering with AgentCore logs.
+
+    Deletion protection on a log group stops a delete but not a caller who can
+    turn it off, shorten retention or drop the subscription that forwards the
+    events. This leg reads whether a service control policy that binds this
+    account denies all four of those writes on every AgentCore log group in
+    every Region, to every caller but principals named by ARN.
+    """
+    return _scp_guardrail_findings(
+        "AC-26",
+        SERVICE_CONTROL_POLICY_REFERENCE_URL,
+        [
+            {
+                "finding_name": "Log Tamper Guardrail",
+                "actions": AGENTCORE_LOG_TAMPER_ACTIONS,
+                "denies": lambda statement, action, context: (
+                    _deny_binds_every_caller(statement)
+                    and _statement_resource_covers(
+                        statement, _agentcore_log_group_probes(context)
+                    )
+                ),
+                "guard_text": (
+                    "on the AgentCore log groups and aws/spans in every Region"
+                ),
+                "remediation": (
+                    "Attach a service control policy that denies "
+                    "logs:DeleteLogGroup, logs:PutRetentionPolicy, "
+                    "logs:PutLogGroupDeletionProtection and "
+                    "logs:DeleteSubscriptionFilter on "
+                    "arn:aws:logs:*:*:log-group:/aws/bedrock-agentcore/*, the "
+                    "/aws/vendedlogs/bedrock-agentcore/* groups and aws/spans, "
+                    "exempting only the log administration role by "
+                    "aws:PrincipalArn."
+                ),
+            }
+        ],
+    )
+
+
+AGENTCORE_VPC_PLACEMENT_ACTIONS = {
+    "bedrock-agentcore:createagentruntime": "bedrock-agentcore:CreateAgentRuntime",
+    "bedrock-agentcore:updateagentruntime": "bedrock-agentcore:UpdateAgentRuntime",
+    "bedrock-agentcore:createcodeinterpreter": "bedrock-agentcore:CreateCodeInterpreter",
+    "bedrock-agentcore:createbrowser": "bedrock-agentcore:CreateBrowser",
+}
+
+AGENTCORE_VPC_PLACEMENT_KEYS = {
+    "bedrock-agentcore:subnets",
+    "bedrock-agentcore:securitygroups",
+}
+
+# The operators that deny a VPC placement outside the approved list. The keys
+# carry arrays, so ForAnyValue denies when any one subnet or group is not
+# listed. On an absent key ForAnyValue is false, which is why the Null leg is
+# judged separately.
+AGENTCORE_VPC_PIN_OPERATORS = {
+    "foranyvalue:stringnotequals",
+    "foranyvalue:stringnotequalsignorecase",
+    "foranyvalue:stringnotlike",
+}
+
+
+def _agentcore_vpc_placement_probes(action: str, context: Dict[str, str]) -> List[str]:
+    """Return the resource a VPC placement guardrail must reach for `action`.
+
+    The create actions carry no resource type, so only a `*` Resource reaches
+    them. UpdateAgentRuntime acts on every runtime in every Region.
+    """
+    if action == "bedrock-agentcore:updateagentruntime":
+        return [
+            f"arn:{context['partition']}:bedrock-agentcore:*:{context['account']}:runtime/*"
+        ]
+    return ["*"]
+
+
+def _deny_requires_vpc_placement(
+    statement: Dict[str, Any], action: str, context: Dict[str, str]
+) -> bool:
+    """Return whether a Deny fires on every call that names no subnet or group.
+
+    Every condition entry must be Null true on bedrock-agentcore:subnets or
+    bedrock-agentcore:securityGroups; any other entry is ANDed in.
+    """
+    condition = statement.get("Condition")
+    if not isinstance(condition, dict) or not condition:
+        return False
+    named = False
+    for operator, entries in condition.items():
+        if str(operator).strip().lower() != "null" or not isinstance(entries, dict):
+            return False
+        for key, raw in entries.items():
+            if str(key).strip().lower() not in AGENTCORE_VPC_PLACEMENT_KEYS:
+                return False
+            if [value.strip().lower() for value in _condition_values(raw)] != ["true"]:
+                return False
+            named = True
+    return named and _statement_resource_covers(
+        statement, _agentcore_vpc_placement_probes(action, context)
+    )
+
+
+def _deny_pins_vpc_placement(
+    statement: Dict[str, Any], action: str, context: Dict[str, str]
+) -> bool:
+    """Return whether a Deny fires on any subnet or group outside a fixed list.
+
+    A listed value with a wildcard admits every subnet or group it matches, so
+    it pins nothing.
+    """
+    condition = statement.get("Condition")
+    if not isinstance(condition, dict) or not condition:
+        return False
+    named = False
+    for operator, entries in condition.items():
+        name = str(operator).strip().lower()
+        if name.endswith("ifexists"):
+            name = name[: -len("ifexists")]
+        if name not in AGENTCORE_VPC_PIN_OPERATORS or not isinstance(entries, dict):
+            return False
+        for key, raw in entries.items():
+            if str(key).strip().lower() not in AGENTCORE_VPC_PLACEMENT_KEYS:
+                return False
+            values = [value.strip() for value in _condition_values(raw)]
+            if not values or any("*" in value or "?" in value for value in values):
+                return False
+            named = True
+    return named and _statement_resource_covers(
+        statement, _agentcore_vpc_placement_probes(action, context)
+    )
+
+
+def check_agentcore_vpc_placement_scp() -> List[Dict[str, Any]]:
+    """AC-01 preventive leg: an attached SCP keeps new runtimes and tools in the VPC.
+
+    The configuration leg reads the runtimes and tools that exist today. This
+    leg reads whether a service control policy that binds this account denies
+    CreateAgentRuntime, UpdateAgentRuntime, CreateCodeInterpreter and
+    CreateBrowser when the call names no subnet or security group, and when it
+    names one outside a fixed list.
+    """
+    return _scp_guardrail_findings(
+        "AC-01",
+        AGENTCORE_IAM_CONDITION_KEY_REFERENCE_URL,
+        [
+            {
+                "finding_name": "VPC Placement Guardrail",
+                "actions": AGENTCORE_VPC_PLACEMENT_ACTIONS,
+                "denies": _deny_requires_vpc_placement,
+                "guard_text": (
+                    "when bedrock-agentcore:subnets or "
+                    "bedrock-agentcore:securityGroups is absent"
+                ),
+                "remediation": (
+                    "Attach a service control policy that denies the four "
+                    "actions with a Null condition of true on "
+                    "bedrock-agentcore:subnets and on "
+                    "bedrock-agentcore:securityGroups."
+                ),
+            },
+            {
+                "finding_name": "VPC Pin Guardrail",
+                "actions": AGENTCORE_VPC_PLACEMENT_ACTIONS,
+                "denies": _deny_pins_vpc_placement,
+                "guard_text": (
+                    "when a subnet or security group is outside a fixed list"
+                ),
+                "remediation": (
+                    "Attach a service control policy that denies the four "
+                    "actions with ForAnyValue:StringNotEquals on "
+                    "bedrock-agentcore:subnets and "
+                    "bedrock-agentcore:securityGroups, listing the approved "
+                    "subnet and security group IDs without wildcards."
+                ),
+            },
+        ],
+    )
 
 
 def _jwt_authorizer_claims(
@@ -18005,6 +18695,16 @@ def lambda_handler(event, context):
                         "Runtime Authorizer Guardrail",
                         check_agentcore_runtime_authorizer_scp,
                     ),
+                    (
+                        ["AC-01"],
+                        "VPC Placement Guardrail",
+                        check_agentcore_vpc_placement_scp,
+                    ),
+                    (
+                        ["AC-26"],
+                        "Log Tamper Guardrail",
+                        check_agentcore_log_tamper_scp,
+                    ),
                 ]
             else:
                 global_checks = [
@@ -18074,6 +18774,16 @@ def lambda_handler(event, context):
                         ["AC-29"],
                         "Runtime Authorizer Guardrail",
                         check_agentcore_runtime_authorizer_scp,
+                    ),
+                    (
+                        ["AC-01"],
+                        "VPC Placement Guardrail",
+                        check_agentcore_vpc_placement_scp,
+                    ),
+                    (
+                        ["AC-26"],
+                        "Log Tamper Guardrail",
+                        check_agentcore_log_tamper_scp,
                     ),
                 ]
             for check_ids, check_name, check_func in global_checks:
@@ -18337,6 +19047,11 @@ def lambda_handler(event, context):
                 ["AC-26"],
                 "Log Retention and Key Scope",
                 check_agentcore_log_retention_and_key_scope,
+            ),
+            (
+                ["AC-26"],
+                "Trail Log File Validation",
+                check_agentcore_trail_log_file_validation,
             ),
             (
                 ["AC-27"],

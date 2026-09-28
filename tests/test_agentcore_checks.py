@@ -8139,6 +8139,425 @@ class TestSCPAttachment:
         assert findings[0]["Finding"].endswith("Inverted")
 
 
+_LOG_TAMPER_ACTIONS = [
+    "logs:DeleteLogGroup",
+    "logs:PutRetentionPolicy",
+    "logs:PutLogGroupDeletionProtection",
+    "logs:DeleteSubscriptionFilter",
+]
+_AGENTCORE_LOG_RESOURCES = [
+    "arn:aws:logs:*:*:log-group:/aws/bedrock-agentcore/*",
+    "arn:aws:logs:*:*:log-group:/aws/vendedlogs/bedrock-agentcore/*",
+    "arn:aws:logs:*:*:log-group:aws/spans",
+    "arn:aws:logs:*:*:log-group:aws/spans:*",
+]
+_VPC_PLACEMENT_ACTIONS = [
+    "bedrock-agentcore:CreateAgentRuntime",
+    "bedrock-agentcore:UpdateAgentRuntime",
+    "bedrock-agentcore:CreateCodeInterpreter",
+    "bedrock-agentcore:CreateBrowser",
+]
+
+
+def _log_tamper_guard(resource=None, condition=None, action=None):
+    statement = {
+        "Effect": "Deny",
+        "Action": action or _LOG_TAMPER_ACTIONS,
+        "Resource": resource or _AGENTCORE_LOG_RESOURCES,
+    }
+    if condition is not None:
+        statement["Condition"] = condition
+    return [statement]
+
+
+def _vpc_null_guard(condition=None, action=None, resource="*"):
+    return [
+        {
+            "Effect": "Deny",
+            "Action": action or _VPC_PLACEMENT_ACTIONS,
+            "Resource": resource,
+            "Condition": condition
+            or {
+                "Null": {
+                    "bedrock-agentcore:subnets": "true",
+                    "bedrock-agentcore:securityGroups": "true",
+                }
+            },
+        }
+    ]
+
+
+def _vpc_pin_guard(operator="ForAnyValue:StringNotEquals", values=None, action=None):
+    return [
+        {
+            "Effect": "Deny",
+            "Action": action or _VPC_PLACEMENT_ACTIONS,
+            "Resource": "*",
+            "Condition": {
+                operator: {
+                    "bedrock-agentcore:subnets": values or ["subnet-0a1b2c3d"],
+                    "bedrock-agentcore:securityGroups": values or ["sg-0a1b2c3d"],
+                }
+            },
+        }
+    ]
+
+
+@pytest.mark.usefixtures("_member_account")
+class TestAC26LogTamperSCP:
+    """AC-26: an attached SCP denies the four log tamper writes on AgentCore logs."""
+
+    _run = TestSCPAttachment._run
+
+    def _findings(self, mock_orgs, documents, targets=None):
+        return self._run(
+            mock_orgs, "check_agentcore_log_tamper_scp", documents, targets
+        )
+
+    @patch("agentcore_app.organizations_client")
+    def test_an_attached_deny_on_every_log_group_passes(self, mock_orgs):
+        findings = self._findings(mock_orgs, {"DenyLogTamper": _log_tamper_guard()})
+
+        assert [f["Status"] for f in findings] == ["Passed"]
+        assert findings[0]["Check_ID"] == "AC-26"
+        assert "DenyLogTamper is attached to root" in findings[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "resource",
+        [["*"], ["arn:aws:logs:*:*:log-group:*"], ["arn:aws:logs:*:111122223333:*"]],
+        ids=["star", "every-log-group", "this-account"],
+    )
+    @patch("agentcore_app.organizations_client")
+    def test_a_wider_resource_passes(self, mock_orgs, resource):
+        findings = self._findings(
+            mock_orgs, {"DenyLogTamper": _log_tamper_guard(resource=resource)}
+        )
+
+        assert [f["Status"] for f in findings] == ["Passed"]
+
+    @pytest.mark.parametrize(
+        "resource",
+        [
+            ["arn:aws:logs:us-east-1:*:log-group:*"],
+            ["arn:aws:logs:*:*:log-group:/aws/bedrock-agentcore/*"],
+            ["arn:aws:logs:*:444455556666:log-group:*"],
+            ["arn:aws:logs:*:*:log-group:/aws/*"],
+        ],
+        ids=["one-region", "no-spans", "other-account", "slash-prefix-misses-spans"],
+    )
+    @patch("agentcore_app.organizations_client")
+    def test_a_resource_that_misses_a_log_group_fails(self, mock_orgs, resource):
+        findings = self._findings(
+            mock_orgs, {"DenyLogTamper": _log_tamper_guard(resource=resource)}
+        )
+
+        assert [f["Status"] for f in findings] == ["Failed"]
+        assert findings[0]["Finding"] == "Log Tamper Guardrail Missing"
+
+    @patch("agentcore_app.organizations_client")
+    def test_one_missing_action_is_partial(self, mock_orgs):
+        findings = self._findings(
+            mock_orgs,
+            {"DenyLogTamper": _log_tamper_guard(action=_LOG_TAMPER_ACTIONS[:3])},
+        )
+
+        assert [f["Status"] for f in findings] == ["Failed"]
+        assert findings[0]["Finding"] == "Log Tamper Guardrail Partial"
+        assert "logs:DeleteSubscriptionFilter" in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.organizations_client")
+    def test_a_named_admin_exemption_passes(self, mock_orgs):
+        findings = self._findings(
+            mock_orgs,
+            {
+                "DenyLogTamper": _log_tamper_guard(
+                    condition={
+                        "ArnNotLike": {
+                            "aws:PrincipalArn": "arn:aws:iam::*:role/LogAdmin"
+                        }
+                    }
+                )
+            },
+        )
+
+        assert [f["Status"] for f in findings] == ["Passed"]
+
+    @pytest.mark.parametrize(
+        "condition",
+        [
+            {"ArnNotLike": {"aws:PrincipalArn": "arn:aws:iam::*:role/*"}},
+            {"StringEquals": {"aws:PrincipalTag/team": "untrusted"}},
+            {"StringNotEquals": {"aws:RequestedRegion": "us-east-1"}},
+            {"ArnLike": {"aws:PrincipalArn": "arn:aws:iam::*:role/Agent"}},
+        ],
+        ids=["every-role-exempt", "tag-scoped", "other-key", "positive-operator"],
+    )
+    @patch("agentcore_app.organizations_client")
+    def test_a_condition_that_spares_callers_does_not_count(self, mock_orgs, condition):
+        findings = self._findings(
+            mock_orgs, {"DenyLogTamper": _log_tamper_guard(condition=condition)}
+        )
+
+        assert [f["Status"] for f in findings] == ["Failed"]
+        assert findings[0]["Finding"] == "Log Tamper Guardrail Missing"
+
+    @patch("agentcore_app.organizations_client")
+    def test_an_unattached_guard_beside_a_weak_one_fails_unattached(self, mock_orgs):
+        # Two policies: the complete one binds nothing here and the attached one
+        # denies nothing that counts. Content alone would read as Passed.
+        findings = self._findings(
+            mock_orgs,
+            {
+                "WeakAttached": _log_tamper_guard(
+                    resource=["arn:aws:logs:us-east-1:*:log-group:*"]
+                ),
+                "CompleteDetached": _log_tamper_guard(),
+            },
+            targets={"p-1": [{"TargetId": _OTHER_OU, "Type": "ORGANIZATIONAL_UNIT"}]},
+        )
+
+        assert [f["Status"] for f in findings] == ["Failed"]
+        assert findings[0]["Finding"] == "Log Tamper Guardrail Unattached"
+        assert "CompleteDetached" in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.organizations_client")
+    def test_a_not_resource_that_excludes_spans_fails(self, mock_orgs):
+        statement = _log_tamper_guard()[0]
+        del statement["Resource"]
+        statement["NotResource"] = "arn:aws:logs:*:*:log-group:aws/spans*"
+
+        findings = self._findings(mock_orgs, {"DenyLogTamper": [statement]})
+
+        assert [f["Status"] for f in findings] == ["Failed"]
+
+    @patch("agentcore_app.organizations_client")
+    def test_a_member_account_that_cannot_list_policies_is_na(self, mock_orgs):
+        mock_orgs.list_policies.side_effect = _make_client_error(
+            "AccessDeniedException", "denied"
+        )
+
+        findings = agentcore_app.check_agentcore_log_tamper_scp()
+
+        assert [f["Status"] for f in findings] == ["N/A"]
+        assert mock_orgs.describe_policy.call_count == 0
+
+    @patch("agentcore_app.organizations_client")
+    def test_an_unreadable_policy_blocks_a_missing_verdict_from_passing(
+        self, mock_orgs
+    ):
+        _attach(mock_orgs)
+        mock_orgs.list_policies.return_value = {
+            "Policies": [{"Id": "p-0", "Name": "Unreadable"}]
+        }
+        mock_orgs.describe_policy.side_effect = _make_client_error(
+            "AccessDeniedException", "denied"
+        )
+
+        findings = agentcore_app.check_agentcore_log_tamper_scp()
+
+        assert "Passed" not in [f["Status"] for f in findings]
+        assert "Unreadable" in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.organizations_client")
+    def test_the_management_account_is_not_enforced(self, mock_orgs):
+        findings = self._run(
+            mock_orgs,
+            "check_agentcore_log_tamper_scp",
+            {"DenyLogTamper": _log_tamper_guard()},
+            arns={
+                "DenyLogTamper": (
+                    f"arn:aws:organizations::{_MEMBER_ACCOUNT}:policy/"
+                    "o-a1b2c3d4e5/service_control_policy/p-0"
+                )
+            },
+        )
+
+        assert [f["Status"] for f in findings] == ["Failed"]
+        assert findings[0]["Finding"] == "Log Tamper Guardrail Not Enforced"
+        assert mock_orgs.list_targets_for_policy.call_count == 0
+
+
+@pytest.mark.usefixtures("_member_account")
+class TestAC01VPCPlacementSCP:
+    """AC-01: attached SCPs require VPC placement and pin it to approved IDs."""
+
+    _run = TestSCPAttachment._run
+
+    def _findings(self, mock_orgs, documents, targets=None):
+        findings = self._run(
+            mock_orgs, "check_agentcore_vpc_placement_scp", documents, targets
+        )
+        return {f["Finding"].split(" Guardrail")[0]: f for f in findings}
+
+    @patch("agentcore_app.organizations_client")
+    def test_attached_null_and_pin_denies_pass_both_legs(self, mock_orgs):
+        findings = self._findings(
+            mock_orgs,
+            {"RequireVpc": _vpc_null_guard(), "PinVpc": _vpc_pin_guard()},
+        )
+
+        assert findings["VPC Placement"]["Status"] == "Passed"
+        assert findings["VPC Pin"]["Status"] == "Passed"
+        assert findings["VPC Placement"]["Check_ID"] == "AC-01"
+
+    @patch("agentcore_app.organizations_client")
+    def test_a_pin_without_a_null_deny_fails_the_placement_leg(self, mock_orgs):
+        # ForAnyValue on an absent key is false, so a pin alone lets a call that
+        # names no subnet at all create a runtime outside the VPC.
+        findings = self._findings(mock_orgs, {"PinVpc": _vpc_pin_guard()})
+
+        assert findings["VPC Placement"]["Status"] == "Failed"
+        assert findings["VPC Placement"]["Finding"].endswith("Missing")
+        assert findings["VPC Pin"]["Status"] == "Passed"
+
+    @pytest.mark.parametrize(
+        "condition",
+        [
+            {"Null": {"bedrock-agentcore:subnets": "false"}},
+            {
+                "Null": {"bedrock-agentcore:subnets": "true"},
+                "StringEquals": {"aws:PrincipalTag/team": "agents"},
+            },
+            {"Null": {"aws:SourceVpc": "true"}},
+        ],
+        ids=["null-false", "anded-tag", "other-key"],
+    )
+    @patch("agentcore_app.organizations_client")
+    def test_a_null_deny_that_does_not_fire_on_absence_fails(
+        self, mock_orgs, condition
+    ):
+        findings = self._findings(
+            mock_orgs,
+            {"RequireVpc": _vpc_null_guard(condition=condition)},
+        )
+
+        assert findings["VPC Placement"]["Status"] == "Failed"
+
+    @patch("agentcore_app.organizations_client")
+    def test_a_null_deny_on_one_key_passes(self, mock_orgs):
+        findings = self._findings(
+            mock_orgs,
+            {
+                "RequireVpc": _vpc_null_guard(
+                    condition={"Null": {"bedrock-agentcore:subnets": "true"}}
+                )
+            },
+        )
+
+        assert findings["VPC Placement"]["Status"] == "Passed"
+
+    @patch("agentcore_app.organizations_client")
+    def test_a_tool_create_left_out_is_partial(self, mock_orgs):
+        findings = self._findings(
+            mock_orgs,
+            {"RequireVpc": _vpc_null_guard(action=_VPC_PLACEMENT_ACTIONS[:3])},
+        )
+
+        assert findings["VPC Placement"]["Finding"] == "VPC Placement Guardrail Partial"
+        assert (
+            "bedrock-agentcore:CreateBrowser"
+            in findings["VPC Placement"]["Finding_Details"]
+        )
+
+    @patch("agentcore_app.organizations_client")
+    def test_a_regional_resource_misses_the_create_actions(self, mock_orgs):
+        # The create actions carry no resource type, so only `*` reaches them;
+        # a runtime ARN pattern reaches UpdateAgentRuntime alone.
+        findings = self._findings(
+            mock_orgs,
+            {
+                "RequireVpc": _vpc_null_guard(
+                    resource="arn:aws:bedrock-agentcore:*:*:runtime/*"
+                )
+            },
+        )
+
+        assert findings["VPC Placement"]["Finding"] == "VPC Placement Guardrail Partial"
+        assert (
+            "bedrock-agentcore:CreateAgentRuntime"
+            in findings["VPC Placement"]["Finding_Details"]
+        )
+
+    @pytest.mark.parametrize(
+        "operator, values",
+        [
+            ("ForAnyValue:StringNotLike", ["subnet-*"]),
+            ("ForAllValues:StringNotEquals", ["subnet-0a1b2c3d"]),
+            ("StringNotEquals", ["subnet-0a1b2c3d"]),
+        ],
+        ids=["wildcard-value", "for-all-values", "no-set-operator"],
+    )
+    @patch("agentcore_app.organizations_client")
+    def test_a_pin_that_admits_any_subnet_fails(self, mock_orgs, operator, values):
+        findings = self._findings(
+            mock_orgs,
+            {
+                "RequireVpc": _vpc_null_guard(),
+                "PinVpc": _vpc_pin_guard(operator=operator, values=values),
+            },
+        )
+
+        assert findings["VPC Placement"]["Status"] == "Passed"
+        assert findings["VPC Pin"]["Status"] == "Failed"
+
+    @patch("agentcore_app.organizations_client")
+    def test_an_ifexists_pin_passes(self, mock_orgs):
+        findings = self._findings(
+            mock_orgs,
+            {"PinVpc": _vpc_pin_guard(operator="ForAnyValue:StringNotEqualsIfExists")},
+        )
+
+        assert findings["VPC Pin"]["Status"] == "Passed"
+
+    @patch("agentcore_app.organizations_client")
+    def test_a_detached_pin_fails_unattached(self, mock_orgs):
+        findings = self._findings(
+            mock_orgs,
+            {"RequireVpc": _vpc_null_guard(), "PinVpc": _vpc_pin_guard()},
+            targets={"p-1": []},
+        )
+
+        assert findings["VPC Placement"]["Status"] == "Passed"
+        assert findings["VPC Pin"]["Finding"] == "VPC Pin Guardrail Unattached"
+
+    @patch("agentcore_app.organizations_client")
+    def test_unreadable_targets_of_the_only_guard_are_incomplete(self, mock_orgs):
+        findings = self._findings(
+            mock_orgs,
+            {"RequireVpc": _vpc_null_guard()},
+            targets={"p-0": _make_client_error("AccessDeniedException", "denied")},
+        )
+
+        assert findings["VPC Placement"]["Status"] == "N/A"
+        assert findings["VPC Placement"]["Finding"].endswith("Incomplete")
+
+
+class TestSCPGuardrailRegistration:
+    """AC-01's and AC-26's SCP legs run once, on both cache paths."""
+
+    @pytest.mark.parametrize(
+        "name", ["check_agentcore_log_tamper_scp", "check_agentcore_vpc_placement_scp"]
+    )
+    def test_the_handler_registers_the_leg_on_both_cache_paths(self, name):
+        source = textwrap.dedent(inspect.getsource(agentcore_app.lambda_handler))
+        registrations = [
+            node
+            for node in ast.walk(ast.parse(source))
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name) and target.id == "global_checks"
+                for target in node.targets
+            )
+        ]
+        assert len(registrations) == 2
+        for registration in registrations:
+            assert name in ast.unparse(registration.value)
+
+    def test_the_trail_leg_runs_per_region(self):
+        source = textwrap.dedent(inspect.getsource(agentcore_app.lambda_handler))
+        assert "check_agentcore_trail_log_file_validation" in source
+
+
 class TestAC29CheckRegistration:
     """AC-29 is organization-wide, so it runs once and not per scanned region."""
 
@@ -13225,6 +13644,74 @@ class TestAC01EgressFiltering:
 
     @patch("agentcore_app.ec2_client")
     @patch("agentcore_app.agentcore_client")
+    def test_split_ranges_across_two_groups_fail(self, mock_ac, mock_ec2):
+        # 0.0.0.0/1 plus 128.0.0.0/1 reaches every IPv4 address. Split across
+        # two groups on one runtime, neither rule is a literal 0.0.0.0/0, which
+        # is the shape the literal match passed. The second runtime holds only
+        # one half and has to keep passing.
+        _wire_runtimes(
+            mock_ac,
+            [
+                _vpc_runtime("rt-split", security_groups=["sg-low", "sg-high"]),
+                _vpc_runtime("rt-half", security_groups=["sg-low"]),
+            ],
+        )
+        _wire_tools(mock_ac)
+        mock_ec2.describe_security_groups.return_value = {
+            "SecurityGroups": [
+                _security_group(
+                    "sg-low",
+                    [{"IpProtocol": "-1", "IpRanges": [{"CidrIp": "0.0.0.0/1"}]}],
+                ),
+                _security_group(
+                    "sg-high",
+                    [{"IpProtocol": "tcp", "IpRanges": [{"CidrIp": "128.0.0.0/1"}]}],
+                ),
+            ]
+        }
+
+        egress = self._egress(agentcore_app.check_agentcore_vpc_configuration())
+
+        by_runtime = {
+            runtime: finding
+            for finding in egress
+            for runtime in ("rt-split", "rt-half")
+            if runtime in finding["Finding_Details"]
+        }
+        assert by_runtime["rt-split"]["Status"] == "Failed"
+        assert by_runtime["rt-split"]["Finding"] == "AgentCore Egress Unrestricted"
+        assert "0.0.0.0/0" in by_runtime["rt-split"]["Finding_Details"]
+        assert by_runtime["rt-half"]["Status"] == "Passed"
+
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_split_ipv6_ranges_in_one_group_fail(self, mock_ac, mock_ec2):
+        _wire_runtimes(mock_ac, [_vpc_runtime()])
+        _wire_tools(mock_ac)
+        mock_ec2.describe_security_groups.return_value = {
+            "SecurityGroups": [
+                _security_group(
+                    "sg-runtime",
+                    [
+                        {
+                            "IpProtocol": "-1",
+                            "Ipv6Ranges": [
+                                {"CidrIpv6": "::/1"},
+                                {"CidrIpv6": "8000::/1"},
+                            ],
+                        }
+                    ],
+                )
+            ]
+        }
+
+        egress = self._egress(agentcore_app.check_agentcore_vpc_configuration())
+
+        assert [finding["Status"] for finding in egress] == ["Failed"]
+        assert "::/0" in egress[0]["Finding_Details"]
+
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
     def test_an_open_inbound_rule_does_not_fail_the_egress_leg(self, mock_ac, mock_ec2):
         # The devguide states inbound rules are not required because the
         # runtime only initiates outbound connections. A group open inbound and
@@ -13265,24 +13752,33 @@ class TestAC01EgressFiltering:
 
     @patch("agentcore_app.ec2_client")
     @patch("agentcore_app.agentcore_client")
-    def test_a_sandbox_code_interpreter_passes(self, mock_ac, mock_ec2):
-        # SANDBOX is the service-managed environment with limited external
-        # network access and no customer security group, so there is no
-        # outbound rule to name and nothing for the customer to fix.
+    def test_a_sandbox_code_interpreter_fails(self, mock_ac, mock_ec2):
+        # Stricter than before: SANDBOX passed. It carries no customer security
+        # group, so no outbound rule of the customer's names the destinations
+        # the tool reaches, and NET-06 asks for VPC mode for tools. A VPC-mode
+        # interpreter beside it with named rules still passes.
         _wire_runtimes(mock_ac, [])
         _wire_tools(
             mock_ac,
             interpreters=[
-                _code_interpreter(network_mode="SANDBOX", security_groups=None)
+                _code_interpreter(network_mode="SANDBOX", security_groups=None),
+                _code_interpreter("ci-vpc", security_groups=["sg-tool"]),
             ],
         )
+        mock_ec2.describe_security_groups.return_value = {
+            "SecurityGroups": [_security_group("sg-tool", [_NAMED_EGRESS])]
+        }
 
         egress = self._egress(agentcore_app.check_agentcore_vpc_configuration())
 
-        assert len(egress) == 1
-        assert egress[0]["Status"] == "Passed"
-        assert egress[0]["Severity"] == "Medium"
-        assert "SANDBOX" in egress[0]["Finding_Details"]
+        assert len(egress) == 2
+        sandbox = next(f for f in egress if "'ci-1'" in f["Finding_Details"])
+        assert sandbox["Status"] == "Failed"
+        assert sandbox["Severity"] == "Medium"
+        assert sandbox["Finding"] == "AgentCore Egress Not Customer Filtered"
+        assert "SANDBOX" in sandbox["Finding_Details"]
+        vpc = next(f for f in egress if "'ci-vpc'" in f["Finding_Details"])
+        assert vpc["Status"] == "Passed"
 
     @patch("agentcore_app.ec2_client")
     @patch("agentcore_app.agentcore_client")
@@ -21542,3 +22038,138 @@ class TestAC37WholePopulation:
             "role GatewayExecution (list_attached_role_policies"
             in (findings[0]["Finding_Details"])
         )
+
+
+def _trail(name, multi_region=True, home="us-east-1", validation=True):
+    return {
+        "Name": name,
+        "TrailARN": f"arn:aws:cloudtrail:{home}:123456789012:trail/{name}",
+        "HomeRegion": home,
+        "IsMultiRegionTrail": multi_region,
+        "LogFileValidationEnabled": validation,
+    }
+
+
+class TestAC26TrailLogFileValidation:
+    """AC-26: every trail recording this region validates its log files."""
+
+    def _run(self, mock_ct, trails, errors=None):
+        mock_ct.meta.region_name = "us-east-1"
+        mock_ct.list_trails.return_value = {
+            "Trails": [
+                {
+                    "Name": t["Name"],
+                    "TrailARN": t["TrailARN"],
+                    "HomeRegion": t["HomeRegion"],
+                }
+                for t in trails
+            ]
+        }
+        by_arn = {t["TrailARN"]: t for t in trails}
+
+        def get_trail(Name):
+            if errors and Name in errors:
+                raise errors[Name]
+            return {"Trail": by_arn[Name]}
+
+        mock_ct.get_trail.side_effect = get_trail
+        findings = agentcore_app.check_agentcore_trail_log_file_validation()
+        for finding in findings:
+            assert_finding_schema(finding)
+            assert finding["Check_ID"] == "AC-26"
+        return findings
+
+    @patch("agentcore_app.cloudtrail_client")
+    def test_every_trail_validating_passes(self, mock_ct):
+        findings = self._run(
+            mock_ct, [_trail("org"), _trail("local", multi_region=False)]
+        )
+
+        assert [f["Status"] for f in findings] == ["Passed"]
+        assert "All 2 trail(s)" in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.cloudtrail_client")
+    def test_one_trail_without_validation_fails_beside_a_good_one(self, mock_ct):
+        findings = self._run(
+            mock_ct,
+            [_trail("org"), _trail("local", multi_region=False, validation=False)],
+        )
+
+        assert [f["Status"] for f in findings] == ["Failed"]
+        assert findings[0]["Finding"] == "AgentCore Trail Log File Validation Disabled"
+        assert "trail/local" in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.cloudtrail_client")
+    def test_an_absent_validation_flag_reads_as_off(self, mock_ct):
+        trail = _trail("org")
+        del trail["LogFileValidationEnabled"]
+
+        findings = self._run(mock_ct, [trail])
+
+        assert [f["Status"] for f in findings] == ["Failed"]
+
+    @patch("agentcore_app.cloudtrail_client")
+    def test_a_single_region_trail_elsewhere_is_not_counted(self, mock_ct):
+        # A trail homed in another region that is not multi-region records
+        # nothing here: neither its missing validation nor its presence counts.
+        findings = self._run(
+            mock_ct,
+            [
+                _trail("org"),
+                _trail("west", multi_region=False, home="us-west-2", validation=False),
+            ],
+        )
+
+        assert [f["Status"] for f in findings] == ["Passed"]
+        assert "All 1 trail(s)" in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.cloudtrail_client")
+    def test_no_trail_recording_this_region_fails(self, mock_ct):
+        findings = self._run(
+            mock_ct, [_trail("west", multi_region=False, home="us-west-2")]
+        )
+
+        assert [f["Status"] for f in findings] == ["Failed"]
+        assert findings[0]["Finding"] == "AgentCore Trail Log File Validation Missing"
+
+    @patch("agentcore_app.cloudtrail_client")
+    def test_an_unreadable_trail_blocks_the_pass(self, mock_ct):
+        unreadable = _trail("org-shadow")
+        findings = self._run(
+            mock_ct,
+            [_trail("org"), unreadable],
+            errors={
+                unreadable["TrailARN"]: _make_client_error(
+                    "AccessDeniedException", "denied"
+                )
+            },
+        )
+
+        assert [f["Status"] for f in findings] == ["N/A"]
+        assert "cloudtrail:GetTrail" in findings[0]["Resolution"]
+
+    @patch("agentcore_app.cloudtrail_client")
+    def test_a_list_failure_is_incomplete(self, mock_ct):
+        mock_ct.list_trails.side_effect = _make_client_error(
+            "AccessDeniedException", "denied"
+        )
+
+        findings = agentcore_app.check_agentcore_trail_log_file_validation()
+
+        assert [f["Status"] for f in findings] == ["N/A"]
+
+    @patch("agentcore_app.cloudtrail_client")
+    def test_the_trail_list_is_paginated(self, mock_ct):
+        mock_ct.meta.region_name = "us-east-1"
+        good, bad = _trail("org"), _trail("second", validation=False)
+        mock_ct.list_trails.side_effect = [
+            {"Trails": [{"TrailARN": good["TrailARN"]}], "NextToken": "t"},
+            {"Trails": [{"TrailARN": bad["TrailARN"]}]},
+        ]
+        mock_ct.get_trail.side_effect = lambda Name: {
+            "Trail": {good["TrailARN"]: good, bad["TrailARN"]: bad}[Name]
+        }
+
+        findings = agentcore_app.check_agentcore_trail_log_file_validation()
+
+        assert [f["Status"] for f in findings] == ["Failed"]

@@ -954,6 +954,14 @@ _VERIFIED_REMEDIATION_IAM_ACTIONS |= {
     "organizations:ListTargetsForPolicy",
 }
 
+# Verified on 2026-09-27 with one IDENTITY_POLICY validate-policy run for the
+# AC-26 trail log file validation leg, on the trail resource type.
+# cloudtrail:GetTrail at index 0 was not reported. The negative control
+# cloudtrail:GetTrailz came back INVALID_ACTION at index 1.
+_VERIFIED_REMEDIATION_IAM_ACTIONS |= {
+    "cloudtrail:GetTrail",
+}
+
 _NON_IAM_REMEDIATION_TOKENS = {
     # SM-41 names the AWS IoT Core policy variables
     # ${iot:Connection.Thing.ThingName} and iot:Connection.Thing.IsAttached, and

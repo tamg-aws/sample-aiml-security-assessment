@@ -293,6 +293,7 @@ _EXPECTED_ACTIONS = {
         "bedrock-agentcore:ListPolicies",
         "bedrock-agentcore:ListPolicyEngines",
         "cloudtrail:GetEventSelectors",
+        "cloudtrail:GetTrail",
         "cloudtrail:ListTrails",
         "cloudwatch:PutMetricData",
         "cognito-idp:DescribeUserPool",

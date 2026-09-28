@@ -1000,6 +1000,7 @@ Resources:
               Effect: Allow
               Action:
                 - cloudtrail:GetEventSelectors
+                - cloudtrail:GetTrail # AC-26 log file validation
               Resource: !Sub 'arn:${AWS::Partition}:cloudtrail:*:${AWS::AccountId}:trail/*'
             # AC-19 pairs each AgentCore delivery source with its delivery.
             - Sid: LogsDeliveryInventory

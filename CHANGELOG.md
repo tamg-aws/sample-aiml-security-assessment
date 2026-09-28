@@ -297,6 +297,24 @@ section.
     `N/A` and never `Passed`. `IfExists` operators now read as their plain
     form, so `StringEqualsIfExists` on the denied value counts. An inverted
     `AC-29` policy is reported only when it is attached.
+  - `AC-01` adds a preventive leg, reported once under `Global`: an attached
+    service control policy has to deny `CreateAgentRuntime`,
+    `UpdateAgentRuntime`, `CreateCodeInterpreter` and `CreateBrowser` with a
+    `Null` true test on `bedrock-agentcore:subnets` or
+    `bedrock-agentcore:securityGroups`, and a second one has to pin both keys
+    with `ForAnyValue:StringNotEquals` to IDs without wildcards. The egress leg
+    now unions the outbound ranges of every security group on a resource, so
+    `0.0.0.0/1` plus `128.0.0.0/1` fails as `0.0.0.0/0` does. A tool in
+    `SANDBOX` network mode now fails at Medium severity instead of passing,
+    because no customer security group names what it reaches.
+  - `AC-26` adds two legs. A `Global` leg requires an attached service control
+    policy that denies `logs:DeleteLogGroup`, `logs:PutRetentionPolicy`,
+    `logs:PutLogGroupDeletionProtection` and `logs:DeleteSubscriptionFilter`
+    on the AgentCore log groups and `aws/spans` in every Region, exempting at
+    most principals named by `aws:PrincipalArn`. A regional leg reads every
+    trail with `cloudtrail:GetTrail` and fails a trail that records the
+    Region with log file validation off; an unreadable trail is `N/A` and
+    blocks a `Passed`.
 
 ### Deployment impact
 
@@ -356,6 +374,12 @@ scoped to this account's own `account` ARN and to `ou` ARNs, in both SAM
 templates, so `AC-28` and `AC-29` can read attachment. Both are read-only, and
 the same CodeBuild run applies them. A member account that cannot list the
 organization's policies still reports `N/A`, as before.
+
+The AgentCore assessment role gains `cloudtrail:GetTrail`, scoped to the
+account's `trail/*` ARNs, in both SAM templates, so `AC-26` can read log file
+validation. It is read-only, and the same CodeBuild run applies it. The new
+`AC-01` and `AC-26` service control policy legs use the Organizations grants
+added for `AC-28` and `AC-29`.
 
 ## 2.0.0 - 2026-09-18
 
