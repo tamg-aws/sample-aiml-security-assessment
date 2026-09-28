@@ -253,6 +253,9 @@ section.
 - `BR-02` fails a workload whose role is granted AgentCore when its VPC has
   no private-DNS endpoint for the AgentCore data plane, control plane or
   Gateway it calls. Bedrock endpoints no longer cover an AgentCore grant.
+- `BR-33` scopes Lambda functions by the Bedrock and AgentCore grants on
+  their role as well as by name, and fails a function Inspector does not
+  scan: one encrypted with a customer managed key, or tagged for exclusion.
 - Bedrock checks judge values that they used to credit on presence. `BR-07`,
   `BR-17`, `BR-20` (S3 Vectors), `BR-30` and `BR-38` describe each named KMS
   key and pass only an enabled customer managed key. `BR-07` also fails inline

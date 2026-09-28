@@ -17350,8 +17350,15 @@ class TestBR33InspectorLambdaCodeScanning:
         lambda_error=None,
         inspector_response=None,
         inspector_error=None,
+        tags=None,
     ):
         lambda_client = MagicMock()
+        tags = tags or {}
+        lambda_client.get_function.side_effect = lambda FunctionName: (
+            tags[FunctionName]
+            if FunctionName in tags
+            else {"Configuration": {}, "Tags": {}}
+        )
         if lambda_error is not None:
             lambda_client.list_functions.side_effect = lambda_error
         else:
@@ -17394,6 +17401,201 @@ class TestBR33InspectorLambdaCodeScanning:
         assert findings[0]["Check_ID"] == "BR-33"
         assert findings[0]["Status"] == "Passed"
         assert findings[0]["Severity"] == "Medium"
+
+    @staticmethod
+    def _plain_lambda(name, role, **extra):
+        return {
+            "FunctionName": name,
+            "FunctionArn": f"arn:aws:lambda:us-east-1:123456789012:function:{name}",
+            "Role": f"arn:aws:iam::123456789012:role/service-role/{role}",
+            **extra,
+        }
+
+    @staticmethod
+    def _cache(roles, errors=None):
+        def permissions(actions):
+            return {
+                "attached_policies": [
+                    {
+                        "name": "Workload",
+                        "arn": "arn:aws:iam::123456789012:policy/Workload",
+                        "document": {
+                            "Version": "2012-10-17",
+                            "Statement": [
+                                {"Effect": "Allow", "Action": actions, "Resource": "*"}
+                            ],
+                        },
+                    }
+                ],
+                "inline_policies": [],
+            }
+
+        return {
+            "cache_schema_version": 2,
+            "principal_errors": errors or [],
+            "role_permissions": {
+                name: permissions(actions) for name, actions in roles.items()
+            },
+            "user_permissions": {},
+        }
+
+    @patch("bedrock_app.boto3.client")
+    def test_br33_role_granted_bedrock_brings_an_unnamed_function_into_scope(
+        self, mock_client
+    ):
+        self._wire_clients(
+            mock_client,
+            lambda_functions=[
+                self._plain_lambda("summarizer", "InvokeRole"),
+                self._plain_lambda("thumbnailer", "S3Role"),
+            ],
+        )
+
+        findings = extract_csv_data(
+            bedrock_app.check_inspector_lambda_code_scanning(
+                region="us-east-1",
+                permission_cache=self._cache(
+                    {"InvokeRole": ["bedrock:InvokeModel"], "S3Role": ["s3:GetObject"]}
+                ),
+            )
+        )
+
+        assert [row["Status"] for row in findings] == ["Passed"]
+        assert "none of the 1 in-scope" in findings[0]["Finding_Details"]
+        assert "summarizer" in findings[0]["Finding_Details"]
+        assert "thumbnailer" not in findings[0]["Finding_Details"]
+        assert "Partial, ceiling reached" in findings[0]["Finding_Details"]
+
+    @patch("bedrock_app.boto3.client")
+    def test_br33_agentcore_role_is_in_scope_and_not_na(self, mock_client):
+        self._wire_clients(
+            mock_client, lambda_functions=[self._plain_lambda("agent", "AgentRole")]
+        )
+
+        findings = extract_csv_data(
+            bedrock_app.check_inspector_lambda_code_scanning(
+                region="us-east-1",
+                permission_cache=self._cache(
+                    {"AgentRole": ["bedrock-agentcore:InvokeAgentRuntime"]}
+                ),
+            )
+        )
+
+        assert [row["Status"] for row in findings] == ["Passed"]
+        assert "none of the 1 in-scope" in findings[0]["Finding_Details"]
+
+    @patch("bedrock_app.boto3.client")
+    def test_br33_cmk_encrypted_function_fails_among_scanned_ones(self, mock_client):
+        key = "arn:aws:kms:us-east-1:123456789012:key/1111"
+        self._wire_clients(
+            mock_client,
+            lambda_functions=[
+                self._bedrock_lambda("bedrock-ok"),
+                {**self._bedrock_lambda("bedrock-cmk"), "KMSKeyArn": key},
+            ],
+        )
+
+        findings = extract_csv_data(
+            bedrock_app.check_inspector_lambda_code_scanning(
+                region="us-east-1", permission_cache=self._cache({})
+            )
+        )
+
+        assert [row["Status"] for row in findings] == ["Failed"]
+        detail = findings[0]["Finding_Details"]
+        assert "1 of the 2 in-scope" in detail
+        assert f"'bedrock-cmk' is encrypted with customer managed key {key}" in detail
+        assert "bedrock-ok" not in detail
+
+    @patch("bedrock_app.boto3.client")
+    def test_br33_exclusion_tag_fails_the_function(self, mock_client):
+        tagged = self._bedrock_lambda("bedrock-tagged")
+        self._wire_clients(
+            mock_client,
+            lambda_functions=[self._bedrock_lambda("bedrock-ok"), tagged],
+            tags={
+                tagged["FunctionArn"]: {
+                    "Tags": {"InspectorExclusion": "LambdaStandardScanning"}
+                }
+            },
+        )
+
+        findings = extract_csv_data(
+            bedrock_app.check_inspector_lambda_code_scanning(
+                region="us-east-1", permission_cache=self._cache({})
+            )
+        )
+
+        assert [row["Status"] for row in findings] == ["Failed"]
+        assert (
+            "'bedrock-tagged' carries InspectorExclusion=LambdaStandardScanning"
+            in findings[0]["Finding_Details"]
+        )
+
+    @patch("bedrock_app.boto3.client")
+    def test_br33_tags_withheld_without_list_tags_block_a_pass(self, mock_client):
+        withheld = self._bedrock_lambda("bedrock-withheld")
+        self._wire_clients(
+            mock_client,
+            lambda_functions=[self._bedrock_lambda("bedrock-ok"), withheld],
+            tags={
+                withheld["FunctionArn"]: {
+                    "TagsError": {"ErrorCode": "AccessDeniedException"}
+                }
+            },
+        )
+
+        findings = extract_csv_data(
+            bedrock_app.check_inspector_lambda_code_scanning(
+                region="us-east-1", permission_cache=self._cache({})
+            )
+        )
+
+        assert [row["Status"] for row in findings] == ["N/A", "N/A"]
+        assert "This is not reported as Passed" in findings[0]["Finding_Details"]
+        assert (
+            "'bedrock-withheld' (tags not returned, lambda:ListTags: "
+            "AccessDeniedException)" in findings[1]["Finding_Details"]
+        )
+
+    @patch("bedrock_app.boto3.client")
+    def test_br33_uncached_role_blocks_a_pass_and_an_empty_scope(self, mock_client):
+        self._wire_clients(
+            mock_client,
+            lambda_functions=[self._plain_lambda("mystery", "UncachedRole")],
+        )
+
+        findings = extract_csv_data(
+            bedrock_app.check_inspector_lambda_code_scanning(
+                region="us-east-1", permission_cache=self._cache({})
+            )
+        )
+
+        assert [row["Status"] for row in findings] == ["N/A"]
+        assert (
+            "'mystery' runs as role 'UncachedRole', which the IAM cache does not hold"
+            in findings[0]["Finding_Details"]
+        )
+        assert findings[0]["Resolution"] != "No action required."
+
+    @patch("bedrock_app.boto3.client")
+    def test_br33_cache_principal_errors_block_a_pass(self, mock_client):
+        self._wire_clients(mock_client)
+
+        findings = extract_csv_data(
+            bedrock_app.check_inspector_lambda_code_scanning(
+                region="us-east-1",
+                permission_cache=self._cache(
+                    {},
+                    errors=[
+                        {"type": "role", "name": "Hidden", "stage": "x", "error": "y"}
+                    ],
+                ),
+            )
+        )
+
+        assert "Passed" not in [row["Status"] for row in findings]
+        assert any("Hidden" in row["Finding_Details"] for row in findings)
 
     @patch("bedrock_app.boto3.client")
     def test_br33_code_scanning_disabled_returns_failed(self, mock_client):

@@ -16201,8 +16201,28 @@ def _lambda_has_bedrock_indicator(function_config: Dict[str, Any]) -> bool:
     return any(indicator in haystack for indicator in BEDROCK_LAMBDA_INDICATORS)
 
 
-def _list_bedrock_related_lambdas(region: str) -> List[Dict[str, Any]]:
-    """List Lambda functions whose configuration contains Bedrock indicators."""
+# Inspector skips a function carrying this tag in Lambda standard scanning.
+INSPECTOR_LAMBDA_EXCLUSION_TAG = ("inspectorexclusion", "lambdastandardscanning")
+
+INSPECTOR_LAMBDA_CEILING = (
+    "Per-function coverage (inspector2:ListCoverage, coveredResources[].scanStatus) "
+    "is not read, so a function neither invoked nor updated in 90 days, or on an "
+    "unsupported runtime, is not told apart from a scanned one; container-image "
+    "functions are scanned through ECR and judged by AC-50; an EventBridge rule "
+    "that gates deployment on Inspector severity is not read (events:ListRules is "
+    "not granted). Partial, ceiling reached."
+)
+
+
+def _list_bedrock_related_lambdas(
+    region: str, permission_cache: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
+    """
+    List the Lambda functions in scope: those whose configuration names Bedrock,
+    and those whose execution role the IAM cache shows granted a Bedrock or
+    AgentCore action. A function whose role cannot be judged is named in
+    ``unread``.
+    """
     lambda_client = boto3.client("lambda", config=boto3_config, region_name=region)
     functions = _list_all_items(
         lambda_client,
@@ -16213,15 +16233,95 @@ def _list_bedrock_related_lambdas(region: str) -> List[Dict[str, Any]]:
         token_response_keys=("NextMarker",),
         max_results=50,
     )
-    return [fn for fn in functions if _lambda_has_bedrock_indicator(fn)]
+    roles = (permission_cache or {}).get("role_permissions") or {}
+    in_scope = []
+    unread = []
+    for function in functions:
+        if _lambda_has_bedrock_indicator(function):
+            in_scope.append(function)
+            continue
+        role_arn = str(function.get("Role") or "")
+        if not role_arn:
+            continue
+        role = role_arn.rsplit("/", 1)[-1]
+        label = "Lambda function '{}'".format(function.get("FunctionName") or "unnamed")
+        if role not in roles:
+            unread.append(
+                f"{label} runs as role '{role}', which the IAM cache does not hold"
+            )
+            continue
+        try:
+            surfaces = _granted_bedrock_surfaces(
+                roles[role], WORKLOAD_ENDPOINT_SURFACES
+            )
+        except (ValueError, TypeError, AttributeError):
+            unread.append(
+                f"{label} runs as role '{role}', whose policies could not be parsed"
+            )
+            continue
+        if surfaces:
+            in_scope.append(function)
+    return {"functions": in_scope, "unread": unread}
 
 
-def check_inspector_lambda_code_scanning(region: str = "") -> Dict[str, Any]:
+def _inspector_lambda_exclusions(
+    region: str, functions: List[Dict[str, Any]]
+) -> Dict[str, List[str]]:
+    """
+    Name each in-scope function that Inspector does not scan: one encrypted with
+    a customer managed key, or one tagged for exclusion. GetFunction returns
+    tags only to a caller allowed lambda:ListTags, so a function whose tags did
+    not come back is named in ``unread``.
+    """
+    lambda_client = boto3.client("lambda", config=boto3_config, region_name=region)
+    excluded = []
+    unread = []
+    for function in functions:
+        name = function.get("FunctionName") or "unnamed"
+        if function.get("KMSKeyArn"):
+            excluded.append(
+                "'{}' is encrypted with customer managed key {}, which Inspector "
+                "does not scan".format(name, function["KMSKeyArn"])
+            )
+            continue
+        try:
+            response = lambda_client.get_function(
+                FunctionName=function.get("FunctionArn") or name
+            )
+        except Exception as error:
+            unread.append(
+                "'{}' (lambda:GetFunction, {})".format(
+                    name, get_assessment_error_label(error)
+                )
+            )
+            continue
+        tags = response.get("Tags")
+        if not isinstance(tags, dict):
+            code = (response.get("TagsError") or {}).get("ErrorCode") or "no tags"
+            unread.append(f"'{name}' (tags not returned, lambda:ListTags: {code})")
+            continue
+        if any(
+            (str(key).lower(), str(value).lower()) == INSPECTOR_LAMBDA_EXCLUSION_TAG
+            for key, value in tags.items()
+        ):
+            excluded.append(
+                f"'{name}' carries InspectorExclusion=LambdaStandardScanning"
+            )
+    return {"excluded": excluded, "unread": unread}
+
+
+def check_inspector_lambda_code_scanning(
+    region: str = "", permission_cache: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
     """
     BR-33: Verify Amazon Inspector Lambda code scanning is enabled in this
     region, so Lambda code that may invoke Bedrock is scanned for vulnerable
     dependencies and hardcoded secrets. This addresses the LLM03 supply-chain
     surface for GenAI Lambda workloads (SBOM / static analysis).
+
+    The population is every function that names Bedrock in its configuration or
+    whose role is granted a Bedrock or AgentCore action. Each is failed when
+    Inspector cannot scan it: a customer managed key, or an exclusion tag.
     """
     reference = "https://docs.aws.amazon.com/inspector/latest/user/scanning-lambda.html"
     findings = {
@@ -16233,7 +16333,7 @@ def check_inspector_lambda_code_scanning(region: str = "") -> Dict[str, Any]:
 
     try:
         try:
-            bedrock_related_lambdas = _list_bedrock_related_lambdas(region)
+            population = _list_bedrock_related_lambdas(region, permission_cache)
         except (ClientError, EndpointConnectionError) as e:
             code = ""
             if isinstance(e, ClientError):
@@ -16276,21 +16376,30 @@ def check_inspector_lambda_code_scanning(region: str = "") -> Dict[str, Any]:
                 return findings
             raise
 
+        bedrock_related_lambdas = population["functions"]
+        population_unread = population["unread"]
         if not bedrock_related_lambdas:
+            unread_note = (
+                " {} function(s) could not be judged: {}.".format(
+                    len(population_unread), "; ".join(population_unread[:10])
+                )
+                if population_unread
+                else ""
+            )
             findings["csv_data"].append(
                 create_finding(
                     check_id="BR-33",
                     finding_name="Amazon Inspector Lambda Code Scanning Check",
                     finding_details=(
-                        f"No Lambda functions with Bedrock indicators were found in "
-                        f"{region}; Inspector Lambda code-scanning coverage was not "
-                        "assessed for Bedrock-calling Lambda workloads."
+                        f"No Lambda function in {region} names Bedrock in its "
+                        "configuration or runs as a role granted a Bedrock or "
+                        "AgentCore action; Inspector Lambda code-scanning coverage "
+                        f"was not assessed.{unread_note}"
                     ),
                     resolution=(
-                        "No action required. If Bedrock-calling Lambda functions exist, "
-                        "ensure their function name, ARN, description, handler, role, or "
-                        "environment variables contain a Bedrock identifier that the "
-                        "assessment can detect, or evaluate Inspector coverage manually."
+                        "No action required."
+                        if not population_unread
+                        else COULD_NOT_ASSESS_RESOLUTION
                     ),
                     reference=reference,
                     severity="Informational",
@@ -16399,23 +16508,91 @@ def check_inspector_lambda_code_scanning(region: str = "") -> Dict[str, Any]:
         lambda_code_enabled = all(s == "ENABLED" for s in lambda_code_states)
 
         if lambda_enabled and lambda_code_enabled:
-            findings["csv_data"].append(
-                create_finding(
-                    check_id="BR-33",
-                    finding_name="Amazon Inspector Lambda Code Scanning Check",
-                    finding_details=(
-                        f"Amazon Inspector Lambda standard scanning and Lambda code "
-                        f"scanning are both ENABLED in {region}. Detected "
-                        f"{len(bedrock_related_lambdas)} Lambda function(s) with "
-                        f"Bedrock indicators: {sample_functions}{more_functions}."
-                    ),
-                    resolution="No action required.",
-                    reference=reference,
-                    severity="Medium",
-                    status="Passed",
-                    region=region,
+            legs = _inspector_lambda_exclusions(region, bedrock_related_lambdas)
+            if legs["excluded"]:
+                findings["status"] = "FAIL"
+                findings["csv_data"].append(
+                    create_finding(
+                        check_id="BR-33",
+                        finding_name="Amazon Inspector Lambda Code Scanning Check",
+                        finding_details=(
+                            "Inspector Lambda scanning is ENABLED in {}, but {} of the "
+                            "{} in-scope function(s) are not scanned: {}.".format(
+                                region,
+                                len(legs["excluded"]),
+                                len(bedrock_related_lambdas),
+                                "; ".join(legs["excluded"][:10]),
+                            )
+                        ),
+                        resolution=(
+                            "Remove the InspectorExclusion tag, or scan a function "
+                            "encrypted with a customer managed key in CI, since "
+                            "Inspector cannot read it."
+                        ),
+                        reference=reference,
+                        severity="Medium",
+                        status="Failed",
+                        region=region,
+                    )
                 )
-            )
+            unread = population_unread + legs["unread"]
+            if unread:
+                findings["csv_data"].append(
+                    create_finding(
+                        check_id="BR-33",
+                        finding_name="Amazon Inspector Lambda Code Scanning Check",
+                        finding_details=(
+                            "{} Lambda function(s) could not be judged: {}.".format(
+                                len(unread), "; ".join(unread[:10])
+                            )
+                        ),
+                        resolution=(
+                            "Grant lambda:ListTags on the account's functions to the "
+                            "Bedrock assessment role, and refresh the IAM cache."
+                        ),
+                        reference=reference,
+                        severity="Informational",
+                        status="N/A",
+                        region=region,
+                    )
+                )
+            if not legs["excluded"]:
+                findings["csv_data"].insert(
+                    0,
+                    create_finding(
+                        check_id="BR-33",
+                        finding_name="Amazon Inspector Lambda Code Scanning Check",
+                        finding_details=(
+                            f"Amazon Inspector Lambda standard scanning and Lambda "
+                            f"code scanning are both ENABLED in {region}, and none of "
+                            f"the {len(bedrock_related_lambdas)} in-scope Lambda "
+                            "function(s) is encrypted with a customer managed key or "
+                            f"tagged for exclusion: {sample_functions}"
+                            f"{more_functions}. {INSPECTOR_LAMBDA_CEILING}"
+                            + (
+                                " This is not reported as Passed because "
+                                f"{len(unread)} function(s) could not be judged."
+                                if unread
+                                else ""
+                            )
+                        ),
+                        resolution="No action required.",
+                        reference=reference,
+                        severity="Medium",
+                        status="N/A" if unread else "Passed",
+                        region=region,
+                    ),
+                )
+            if permission_cache is not None:
+                _apply_cache_population_gaps(
+                    findings,
+                    permission_cache,
+                    "BR-33",
+                    "Amazon Inspector Lambda Code Scanning Check",
+                    reference,
+                    region,
+                    principal_types=("role",),
+                )
         else:
             findings["status"] = "FAIL"
             findings["details"] = (
@@ -28515,7 +28692,9 @@ def lambda_handler(event, context):
         all_findings.append(cloudwatch_alarm_findings)
 
         logger.info("Running Amazon Inspector Lambda code scanning check (BR-33)")
-        inspector_lambda_findings = check_inspector_lambda_code_scanning(region=region)
+        inspector_lambda_findings = check_inspector_lambda_code_scanning(
+            region=region, permission_cache=permission_cache
+        )
         all_findings.append(inspector_lambda_findings)
 
         logger.info("Running guardrail prompt attack filter check (BR-34)")

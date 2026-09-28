@@ -1108,6 +1108,12 @@ _VERIFIED_REMEDIATION_IAM_ACTIONS |= {
 # reference JSON.
 _VERIFIED_REMEDIATION_IAM_ACTIONS |= {"sagemaker:ListTrainingJobs"}
 
+# BR-33 asks for lambda:ListTags, without which GetFunction withholds a
+# function's tags. validate-policy on 2026-09-28 reported the negative control
+# lambda:ListTagz as INVALID_ACTION at Action index 1 of one statement and
+# nothing at index 0.
+_VERIFIED_REMEDIATION_IAM_ACTIONS |= {"lambda:ListTags"}
+
 _NON_IAM_REMEDIATION_TOKENS = {
     # SM-41 names the AWS IoT Core policy variables
     # ${iot:Connection.Thing.ThingName} and iot:Connection.Thing.IsAttached, and
