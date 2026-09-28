@@ -537,9 +537,10 @@ class TestAC02FullAccessRoles:
         ],
         ids=["administrator-except-iam", "administrator-except-one-action"],
     )
-    def test_ac02_ignores_not_action_that_names_no_platform_namespace(self, not_action):
-        """A NotAction naming no platform namespace is an administrator-style
-        grant, which AC-02 ignores exactly as it ignores ``Action: "*"``."""
+    def test_ac02_reports_not_action_that_names_no_platform_namespace(self, not_action):
+        """A NotAction naming no platform namespace still grants every AgentCore
+        action, so AC-02 reports it as it reports ``Action: "*"``. This test
+        asserted Passed before the whole-population change."""
         permission_cache = {
             "role_permissions": {
                 "AllowExceptRole": {
@@ -562,8 +563,14 @@ class TestAC02FullAccessRoles:
 
         findings = agentcore_app.check_agentcore_full_access_roles(permission_cache)
 
-        assert len(findings) == 1
-        assert findings[0]["Status"] == "Passed"
+        wildcard_finding = next(
+            finding
+            for finding in findings
+            if finding["Finding"] == "AgentCore IAM Wildcard Permissions"
+        )
+        assert wildcard_finding["Status"] == "Failed"
+        assert "role AllowExceptRole" in wildcard_finding["Finding_Details"]
+        assert "Passed" not in [finding["Status"] for finding in findings]
 
     @pytest.mark.parametrize(
         "not_action",
@@ -649,31 +656,9 @@ class TestAC02FullAccessRoles:
         assert len(findings) == 1
         assert findings[0]["Status"] == "Passed"
 
-    @pytest.mark.parametrize(
-        "statements",
-        [
-            {
-                "Effect": "Allow",
-                "Action": "*",
-                "Resource": "*",
-            },
-            [
-                {
-                    "Effect": "Allow",
-                    "Action": "*",
-                    "Resource": "*",
-                },
-                {
-                    "Effect": "Deny",
-                    "Action": "bedrock-agentcore:*",
-                    "Resource": "*",
-                },
-            ],
-        ],
-        ids=["administrator-access", "administrator-access-with-platform-deny"],
-    )
-    def test_ac02_ignores_service_agnostic_wildcard_actions(self, statements):
-        permission_cache = {
+    @staticmethod
+    def _administrator_cache(statements):
+        return {
             "role_permissions": {
                 "Administrator": {
                     "attached_policies": [
@@ -687,7 +672,37 @@ class TestAC02FullAccessRoles:
             }
         }
 
-        findings = agentcore_app.check_agentcore_full_access_roles(permission_cache)
+    def test_ac02_reports_a_bare_wildcard_action(self):
+        """``Action: "*"`` on every resource grants every AgentCore action. This
+        case asserted Passed before the whole-population change."""
+        findings = agentcore_app.check_agentcore_full_access_roles(
+            self._administrator_cache(
+                {"Effect": "Allow", "Action": "*", "Resource": "*"}
+            )
+        )
+
+        wildcard_finding = next(
+            finding
+            for finding in findings
+            if finding["Finding"] == "AgentCore IAM Wildcard Permissions"
+        )
+        assert wildcard_finding["Status"] == "Failed"
+        assert "role Administrator (*)" in wildcard_finding["Finding_Details"]
+        assert "Passed" not in [finding["Status"] for finding in findings]
+
+    def test_ac02_a_platform_deny_removes_a_bare_wildcard(self):
+        findings = agentcore_app.check_agentcore_full_access_roles(
+            self._administrator_cache(
+                [
+                    {"Effect": "Allow", "Action": "*", "Resource": "*"},
+                    {
+                        "Effect": "Deny",
+                        "Action": "bedrock-agentcore:*",
+                        "Resource": "*",
+                    },
+                ]
+            )
+        )
 
         assert len(findings) == 1
         assert findings[0]["Status"] == "Passed"
@@ -756,8 +771,18 @@ class TestAC02FullAccessRoles:
             "bedrock-agentcore:*Evaluat*",
             "bedrock-agentcore:DeleteOnlineEvaluationConfi?",
             "bedrock-*:*OnlineEvaluationConfig",
+            # Listed under the ignore test as service-agnostic before the
+            # whole-population change; a bare `*` reaches every evaluation write.
+            "*",
         ],
-        ids=["all", "delete-prefix", "embedded", "question-mark", "service-pattern"],
+        ids=[
+            "all",
+            "delete-prefix",
+            "embedded",
+            "question-mark",
+            "service-pattern",
+            "service-agnostic",
+        ],
     )
     def test_ac02_reports_a_wildcard_reaching_an_evaluation_write_on_a_scoped_resource(
         self, action
@@ -809,14 +834,12 @@ class TestAC02FullAccessRoles:
             "bedrock-agentcore:Get*",
             "bedrock-agentcore:*Runtime*",
             "unrelated-service:*Evaluator",
-            "*",
         ],
         ids=[
             "named-write",
             "read-prefix",
             "other-resource-family",
             "other-service",
-            "service-agnostic",
         ],
     )
     def test_ac02_ignores_patterns_that_reach_no_evaluation_write(self, action):
@@ -1320,6 +1343,826 @@ class TestAC02FullAccessRoles:
                 agentcore_app.PAYMENT_EXECUTION_ACTION,
             )
         } <= agentcore_app.AGENT_PLATFORM_IAM_NAMESPACES
+
+
+class TestIamCacheContract:
+    """The consumer side of the version 2 IAM permission cache contract."""
+
+    @pytest.mark.parametrize(
+        ("first", "second", "expected"),
+        [
+            ("*", "bedrock-agentcore:*", True),
+            ("bedrock-*:*", "bedrock-agentcore:getevaluator", True),
+            ("bedrock-agentcore:get*", "bedrock-agentcore:*evaluator", True),
+            ("bedrock-agentcore:get*", "bedrock-agentcore:delete*", False),
+            ("bedrock-agentcore-control:*", "bedrock-agentcore:*", False),
+            ("s3:*", "bedrock-agentcore:*", False),
+            ("bedrock-agentcore:getevaluato?", "bedrock-agentcore:getevaluator", True),
+        ],
+    )
+    def test_action_patterns_overlap(self, first, second, expected):
+        assert agentcore_app._action_patterns_overlap(first, second) is expected
+        assert agentcore_app._action_patterns_overlap(second, first) is expected
+
+    @pytest.mark.parametrize(
+        ("resource", "expected"),
+        [
+            ("*", True),
+            ("arn:aws:bedrock-agentcore:*:*:*", True),
+            ("arn:aws:bedrock:*::*", True),
+            ("arn:*:bedrock-agentcore:us-east-1:123456789012:runtime/rt-1", True),
+            ("arn:aws:bedrock-agentcore:us-east-1:*:runtime/rt-1", True),
+            ("arn:aws:bedrock-agentcore:*:123456789012:runtime/rt-1", True),
+            ("arn:aws:bedrock-agentcore:us-east-1:123456789012:runtime/*", True),
+            ("arn:aws:bedrock-agentcore:us-east-1:123456789012:*", True),
+            ("arn:aws:bedrock-agentcore:us-east-1:123456789012:run*/rt-1", True),
+            ("arn:aws:bedrock-agentcore:us-east-1:123456789012:runtime/rt-1", False),
+            ("arn:aws:bedrock-agentcore:us-east-1:123456789012:runtime/prod-*", False),
+        ],
+    )
+    def test_arn_pattern_is_unbounded(self, resource, expected):
+        assert agentcore_app._arn_pattern_is_unbounded(resource) is expected
+
+    def test_a_region_wildcard_can_be_read_as_bounded_where_it_is_by_design(self):
+        resource = "arn:aws:bedrock:*::foundation-model/anthropic.claude-v2"
+        assert agentcore_app._arn_pattern_is_unbounded(resource) is True
+        assert (
+            agentcore_app._arn_pattern_is_unbounded(resource, region_widens=False)
+            is False
+        )
+
+    @pytest.mark.parametrize(
+        "boundary",
+        [
+            {"Statement": {"Effect": "Allow", "Action": "s3:*", "Resource": "*"}},
+            json.dumps(
+                {"Statement": {"Effect": "Allow", "Action": "s3:*", "Resource": "*"}}
+            ),
+            {
+                "arn": "arn:aws:iam::123456789012:policy/boundary",
+                "document": {
+                    "Statement": {"Effect": "Allow", "Action": "s3:*", "Resource": "*"}
+                },
+            },
+            {
+                "Statement": [
+                    {"Effect": "Allow", "Action": "*", "Resource": "*"},
+                    {
+                        "Effect": "Deny",
+                        "Action": "bedrock-agentcore:*",
+                        "Resource": "*",
+                    },
+                ]
+            },
+        ],
+        ids=["mapping", "json-string", "wrapped-document", "boundary-deny"],
+    )
+    def test_a_boundary_removes_a_grant_it_does_not_allow(self, boundary):
+        assert (
+            agentcore_app._grant_survives(
+                {"permissions_boundary": boundary}, "bedrock-agentcore:*"
+            )
+            is False
+        )
+
+    @pytest.mark.parametrize(
+        "boundary",
+        [
+            None,
+            "arn:aws:iam::123456789012:policy/boundary",
+            {"Statement": {"Effect": "Allow", "Action": "bedrock-agentcore:Get*"}},
+            {"Statement": {"Effect": "Allow", "NotAction": "iam:*"}},
+            {
+                "Statement": [
+                    {"Effect": "Allow", "Action": "*", "Resource": "*"},
+                    {
+                        "Effect": "Deny",
+                        "Action": "bedrock-agentcore:*",
+                        "Resource": "*",
+                        "Condition": {"Bool": {"aws:MultiFactorAuthPresent": "false"}},
+                    },
+                ]
+            },
+        ],
+        ids=[
+            "none",
+            "unreadable-arn",
+            "overlapping-allow",
+            "not-action",
+            "conditioned-deny",
+        ],
+    )
+    def test_a_boundary_that_lets_part_of_the_grant_through_keeps_it(self, boundary):
+        assert (
+            agentcore_app._grant_survives(
+                {"permissions_boundary": boundary}, "bedrock-agentcore:*"
+            )
+            is True
+        )
+
+    def test_a_version_1_cache_records_no_principal_errors(self):
+        labels, recorded = agentcore_app._cache_principal_read_gaps(
+            {"role_permissions": {}, "user_permissions": {}}
+        )
+        assert labels == []
+        assert recorded is False
+
+    def test_principal_errors_are_filtered_to_the_requested_kinds(self):
+        cache = {
+            "cache_schema_version": 2,
+            "principal_errors": [
+                {
+                    "type": "role",
+                    "name": "RoleA",
+                    "stage": "list_attached",
+                    "error": "AccessDenied",
+                },
+                {
+                    "type": "user",
+                    "name": "UserB",
+                    "stage": "list_inline",
+                    "error": "Throttling",
+                },
+                "not-a-mapping",
+            ],
+            "role_permissions": {},
+            "user_permissions": {
+                "UserC": {"group_policies_error": "AccessDenied"},
+                "UserD": {"group_policies": []},
+            },
+        }
+
+        labels, recorded = agentcore_app._cache_principal_read_gaps(cache, ("role",))
+        assert recorded is True
+        assert labels == ["role RoleA (list_attached: AccessDenied)"]
+
+        labels, _ = agentcore_app._cache_principal_read_gaps(cache)
+        assert labels == [
+            "role RoleA (list_attached: AccessDenied)",
+            "user UserB (list_inline: Throttling)",
+            "user UserC (group policies: AccessDenied)",
+        ]
+
+
+class TestAC02WholePopulation:
+    """AC-02 over users, groups, boundaries, unbounded ARNs and cache gaps."""
+
+    _CONFIG_ARN = "arn:aws:bedrock-agentcore:us-east-1:123456789012:online-evaluation-config/oec-1"
+    _PAYMENT_MANAGER_ARN = (
+        "arn:aws:bedrock-agentcore:us-east-1:123456789012:payment-manager/pm-1"
+    )
+
+    @staticmethod
+    def _policy(statements, name="Policy"):
+        return {"name": name, "document": {"Statement": statements}}
+
+    @classmethod
+    def _principal(cls, statements=None, **extra):
+        permissions = {
+            "attached_policies": [],
+            "inline_policies": [cls._policy(statements)] if statements else [],
+        }
+        permissions.update(extra)
+        return permissions
+
+    @staticmethod
+    def _finding(findings, name):
+        return next(f for f in findings if f["Finding"] == name)
+
+    @staticmethod
+    def _names(findings):
+        return [f["Finding"] for f in findings]
+
+    def test_a_bare_wildcard_on_one_evaluation_arn_reaches_every_write(self):
+        cache = {
+            "role_permissions": {
+                "Scoped": self._principal(
+                    {
+                        "Effect": "Allow",
+                        "Action": "bedrock-agentcore:GetEvaluator",
+                        "Resource": "*",
+                    }
+                ),
+                "Admin": self._principal(
+                    {"Effect": "Allow", "Action": "*", "Resource": self._CONFIG_ARN}
+                ),
+            },
+            "user_permissions": {},
+        }
+
+        findings = agentcore_app.check_agentcore_full_access_roles(cache)
+
+        details = self._finding(
+            findings, "AgentCore Evaluation Administration Wildcard"
+        )["Finding_Details"]
+        assert "role Admin (*)" in details
+        assert "Scoped" not in details
+        assert "Passed" not in [f["Status"] for f in findings]
+
+    def test_the_wildcard_leg_reads_users_and_their_group_policies(self):
+        grant = {"Effect": "Allow", "Action": "bedrock-agentcore:*", "Resource": "*"}
+        cache = {
+            "role_permissions": {},
+            "user_permissions": {
+                "CleanUser": self._principal(),
+                "GroupUser": {
+                    "attached_policies": [],
+                    "inline_policies": [],
+                    "group_policies": [
+                        {
+                            "name": "Ops",
+                            "group": "Operators",
+                            "document": {"Statement": grant},
+                        }
+                    ],
+                },
+                "DirectUser": self._principal(grant),
+            },
+        }
+
+        findings = agentcore_app.check_agentcore_full_access_roles(cache)
+
+        details = self._finding(findings, "AgentCore IAM Wildcard Permissions")[
+            "Finding_Details"
+        ]
+        assert "user GroupUser (bedrock-agentcore:*)" in details
+        assert "user DirectUser (bedrock-agentcore:*)" in details
+        assert "CleanUser" not in details
+
+    def test_the_full_access_leg_reads_users_and_group_policies(self):
+        managed = {
+            "name": "BedrockAgentCoreFullAccess",
+            "arn": "arn:aws:iam::aws:policy/BedrockAgentCoreFullAccess",
+            "document": {
+                "Statement": {
+                    "Effect": "Allow",
+                    "Action": "bedrock-agentcore:GetAgentRuntime",
+                    "Resource": "arn:aws:bedrock-agentcore:us-east-1:123456789012:runtime/rt-1",
+                }
+            },
+        }
+        cache = {
+            "role_permissions": {"CleanRole": self._principal()},
+            "user_permissions": {
+                "AttachedUser": {"attached_policies": [managed], "inline_policies": []},
+                "GroupUser": {
+                    "attached_policies": [],
+                    "inline_policies": [],
+                    "group_policies": [dict(managed, group="Admins")],
+                },
+            },
+        }
+
+        findings = agentcore_app.check_agentcore_full_access_roles(cache)
+
+        details = self._finding(findings, "AgentCore IAM Full Access Policy")[
+            "Finding_Details"
+        ]
+        assert "user AttachedUser" in details
+        assert "user GroupUser" in details
+        assert "CleanRole" not in details
+
+    @pytest.mark.parametrize(
+        "resource",
+        [
+            "arn:aws:bedrock-agentcore:*:*:*",
+            "arn:aws:bedrock-agentcore:us-east-1:123456789012:*",
+            "arn:aws:bedrock-agentcore:us-east-1:*:runtime/rt-1",
+            "arn:aws:bedrock-agentcore:us-east-1:123456789012:runtime/*",
+        ],
+        ids=["every-segment", "every-resource", "every-account", "every-runtime"],
+    )
+    def test_a_wildcard_in_any_arn_segment_is_unbounded(self, resource):
+        cache = {
+            "role_permissions": {
+                "Bounded": self._principal(
+                    {
+                        "Effect": "Allow",
+                        "Action": "bedrock-agentcore:*",
+                        "Resource": "arn:aws:bedrock-agentcore:us-east-1:123456789012:runtime/prod-*",
+                    }
+                ),
+                "Unbounded": self._principal(
+                    {
+                        "Effect": "Allow",
+                        "Action": "bedrock-agentcore:*",
+                        "Resource": resource,
+                    }
+                ),
+            },
+            "user_permissions": {},
+        }
+
+        findings = agentcore_app.check_agentcore_full_access_roles(cache)
+
+        details = self._finding(findings, "AgentCore IAM Wildcard Permissions")[
+            "Finding_Details"
+        ]
+        assert "role Unbounded" in details
+        assert "Bounded (" not in details
+
+    def test_a_not_resource_allow_is_unbounded(self):
+        cache = {
+            "role_permissions": {
+                "AllowExcept": self._principal(
+                    {
+                        "Effect": "Allow",
+                        "Action": "bedrock-agentcore:*",
+                        "NotResource": "arn:aws:bedrock-agentcore:us-east-1:123456789012:runtime/rt-1",
+                    }
+                )
+            },
+            "user_permissions": {},
+        }
+
+        findings = agentcore_app.check_agentcore_full_access_roles(cache)
+
+        assert (
+            "role AllowExcept"
+            in self._finding(findings, "AgentCore IAM Wildcard Permissions")[
+                "Finding_Details"
+            ]
+        )
+
+    def test_a_boundary_removes_the_wildcard_for_one_role_only(self):
+        grant = {"Effect": "Allow", "Action": "*", "Resource": "*"}
+        cache = {
+            "role_permissions": {
+                "Bounded": self._principal(
+                    grant,
+                    permissions_boundary={
+                        "Statement": {
+                            "Effect": "Allow",
+                            "Action": "s3:*",
+                            "Resource": "*",
+                        }
+                    },
+                ),
+                "Unbounded": self._principal(grant, permissions_boundary=None),
+            },
+            "user_permissions": {},
+        }
+
+        findings = agentcore_app.check_agentcore_full_access_roles(cache)
+
+        for name in (
+            "AgentCore IAM Wildcard Permissions",
+            "AgentCore Evaluation Administration Wildcard",
+            "AgentCore Payments Duty Separation",
+        ):
+            details = self._finding(findings, name)["Finding_Details"]
+            assert "role Unbounded" in details
+            assert "role Bounded" not in details
+            assert "Service control policies are not evaluated" in details
+
+    def test_a_boundary_that_keeps_platform_actions_keeps_the_finding(self):
+        cache = {
+            "role_permissions": {
+                "Operator": self._principal(
+                    {
+                        "Effect": "Allow",
+                        "Action": "bedrock-agentcore:*",
+                        "Resource": "*",
+                    },
+                    permissions_boundary={
+                        "Statement": {
+                            "Effect": "Allow",
+                            "Action": "bedrock-agentcore:Get*",
+                            "Resource": "*",
+                        }
+                    },
+                )
+            },
+            "user_permissions": {},
+        }
+
+        findings = agentcore_app.check_agentcore_full_access_roles(cache)
+
+        assert (
+            "role Operator"
+            in self._finding(findings, "AgentCore IAM Wildcard Permissions")[
+                "Finding_Details"
+            ]
+        )
+
+    def test_a_principal_error_withholds_passed_and_names_the_principal(self):
+        cache = {
+            "cache_schema_version": 2,
+            "principal_errors": [
+                {
+                    "type": "role",
+                    "name": "Unread",
+                    "stage": "list_attached_role_policies",
+                    "error": "AccessDenied",
+                }
+            ],
+            "role_permissions": {"Clean": self._principal()},
+            "user_permissions": {},
+        }
+
+        findings = agentcore_app.check_agentcore_full_access_roles(cache)
+
+        assert [f["Status"] for f in findings] == ["N/A"]
+        assert findings[0]["Finding"] == "AgentCore IAM Full Access Check Incomplete"
+        assert (
+            "role Unread (list_attached_role_policies: AccessDenied)"
+            in (findings[0]["Finding_Details"])
+        )
+        assert_finding_schema(findings[0])
+
+    def test_a_principal_error_is_reported_beside_the_failures_it_does_not_hide(self):
+        cache = {
+            "cache_schema_version": 2,
+            "principal_errors": [
+                {
+                    "type": "user",
+                    "name": "Unread",
+                    "stage": "list_user_policies",
+                    "error": "Throttling",
+                }
+            ],
+            "role_permissions": {
+                "Wild": self._principal(
+                    {
+                        "Effect": "Allow",
+                        "Action": "bedrock-agentcore:*",
+                        "Resource": "*",
+                    }
+                )
+            },
+            "user_permissions": {},
+        }
+
+        findings = agentcore_app.check_agentcore_full_access_roles(cache)
+
+        assert "AgentCore IAM Wildcard Permissions" in self._names(findings)
+        assert "AgentCore IAM Full Access Check Incomplete" in self._names(findings)
+        assert "Passed" not in [f["Status"] for f in findings]
+
+    def test_a_group_read_error_withholds_passed(self):
+        cache = {
+            "role_permissions": {},
+            "user_permissions": {
+                "Member": {
+                    "attached_policies": [],
+                    "inline_policies": [],
+                    "group_policies_error": "AccessDenied",
+                }
+            },
+        }
+
+        findings = agentcore_app.check_agentcore_full_access_roles(cache)
+
+        assert [f["Status"] for f in findings] == ["N/A"]
+        assert (
+            "user Member (group policies: AccessDenied)"
+            in findings[0]["Finding_Details"]
+        )
+
+    def test_a_version_2_cache_with_no_errors_passes_without_the_version_1_note(self):
+        cache = {
+            "cache_schema_version": 2,
+            "principal_errors": [],
+            "role_permissions": {"Clean": self._principal()},
+            "user_permissions": {"Other": self._principal()},
+        }
+
+        findings = agentcore_app.check_agentcore_full_access_roles(cache)
+
+        assert [f["Status"] for f in findings] == ["Passed"]
+        assert (
+            "None of the 2 cached IAM roles and users" in findings[0]["Finding_Details"]
+        )
+        assert "did not record" not in findings[0]["Finding_Details"]
+
+    def test_a_version_1_cache_passes_and_says_errors_were_not_recorded(self):
+        cache = {
+            "role_permissions": {"Clean": self._principal()},
+            "user_permissions": {},
+        }
+
+        findings = agentcore_app.check_agentcore_full_access_roles(cache)
+
+        assert [f["Status"] for f in findings] == ["Passed"]
+        assert (
+            "did not record per-principal read errors" in findings[0]["Finding_Details"]
+        )
+
+    # --- EVAL-01: evaluator authors separated from readers ---
+
+    _SEPARATION = "AgentCore Evaluator Author Reader Separation"
+
+    def test_authors_with_no_read_only_principal_fail(self):
+        cache = {
+            "role_permissions": {
+                "AuthorOne": self._principal(
+                    {
+                        "Effect": "Allow",
+                        "Action": [
+                            "bedrock-agentcore:CreateEvaluator",
+                            "bedrock-agentcore:GetEvaluator",
+                        ],
+                        "Resource": "*",
+                    }
+                ),
+                "AuthorTwo": self._principal(
+                    {
+                        "Effect": "Allow",
+                        "Action": "bedrock-agentcore:UpdateEvaluator",
+                        "Resource": "*",
+                    }
+                ),
+                "Unrelated": self._principal(
+                    {"Effect": "Allow", "Action": "s3:GetObject", "Resource": "*"}
+                ),
+            },
+            "user_permissions": {},
+        }
+
+        findings = agentcore_app.check_agentcore_full_access_roles(cache)
+
+        finding = self._finding(findings, self._SEPARATION)
+        assert finding["Status"] == "Failed"
+        assert "role AuthorOne, role AuthorTwo" in finding["Finding_Details"]
+        assert "none of the 3 cached principals" in finding["Finding_Details"]
+        assert "Passed" not in [f["Status"] for f in findings]
+        assert_finding_schema(finding)
+
+    def test_a_read_only_principal_satisfies_the_separation(self):
+        cache = {
+            "role_permissions": {
+                "Author": self._principal(
+                    {
+                        "Effect": "Allow",
+                        "Action": "bedrock-agentcore:CreateEvaluator",
+                        "Resource": "*",
+                    }
+                ),
+                "Reader": self._principal(
+                    {
+                        "Effect": "Allow",
+                        "Action": "bedrock-agentcore:ListEvaluators",
+                        "Resource": "*",
+                    }
+                ),
+            },
+            "user_permissions": {},
+        }
+
+        findings = agentcore_app.check_agentcore_full_access_roles(cache)
+
+        assert self._SEPARATION not in self._names(findings)
+        assert [f["Status"] for f in findings] == ["Passed"]
+
+    def test_a_reader_denied_nothing_but_holding_a_bare_wildcard_is_an_author(self):
+        cache = {
+            "role_permissions": {
+                "Author": self._principal(
+                    {
+                        "Effect": "Allow",
+                        "Action": "bedrock-agentcore:CreateEvaluator",
+                        "Resource": "*",
+                    }
+                ),
+                "LooksLikeReader": self._principal(
+                    [
+                        {
+                            "Effect": "Allow",
+                            "Action": "bedrock-agentcore:GetEvaluator",
+                            "Resource": "*",
+                        },
+                        {
+                            "Effect": "Allow",
+                            "Action": "*",
+                            "Resource": self._CONFIG_ARN,
+                        },
+                    ]
+                ),
+            },
+            "user_permissions": {},
+        }
+
+        findings = agentcore_app.check_agentcore_full_access_roles(cache)
+
+        assert (
+            "role LooksLikeReader"
+            in self._finding(findings, self._SEPARATION)["Finding_Details"]
+        )
+
+    def test_a_reader_whose_boundary_removes_authoring_counts_as_a_reader(self):
+        cache = {
+            "role_permissions": {
+                "Author": self._principal(
+                    {
+                        "Effect": "Allow",
+                        "Action": "bedrock-agentcore:CreateEvaluator",
+                        "Resource": "*",
+                    }
+                ),
+                "BoundedReader": self._principal(
+                    {
+                        "Effect": "Allow",
+                        "Action": "bedrock-agentcore:*Evaluator*",
+                        "Resource": self._CONFIG_ARN,
+                    },
+                    permissions_boundary={
+                        "Statement": {
+                            "Effect": "Allow",
+                            "Action": [
+                                "bedrock-agentcore:GetEvaluator",
+                                "bedrock-agentcore:ListEvaluators",
+                            ],
+                            "Resource": "*",
+                        }
+                    },
+                ),
+            },
+            "user_permissions": {},
+        }
+
+        findings = agentcore_app.check_agentcore_full_access_roles(cache)
+
+        assert self._SEPARATION not in self._names(findings)
+
+    # --- PAY-01: bare wildcards and the ControlPlaneRole PassRole ---
+
+    @pytest.mark.parametrize(
+        "statement",
+        [
+            {"Effect": "Allow", "Action": "*", "Resource": _PAYMENT_MANAGER_ARN},
+            {"Effect": "Allow", "NotAction": "iam:*", "Resource": _PAYMENT_MANAGER_ARN},
+        ],
+        ids=["bare-wildcard", "not-action"],
+    )
+    def test_a_service_agnostic_grant_holds_both_payment_authorities(self, statement):
+        cache = {
+            "role_permissions": {
+                "Clean": self._principal(
+                    {
+                        "Effect": "Allow",
+                        "Action": "bedrock-agentcore:ProcessPayment",
+                        "Resource": self._PAYMENT_MANAGER_ARN,
+                    }
+                ),
+                "Broad": self._principal(statement),
+            },
+            "user_permissions": {},
+        }
+
+        findings = agentcore_app.check_agentcore_full_access_roles(cache)
+
+        details = self._finding(findings, "AgentCore Payments Duty Separation")[
+            "Finding_Details"
+        ]
+        assert "role Broad" in details
+        assert "Clean" not in details
+
+    def test_a_boundary_without_process_payment_removes_the_collision(self):
+        cache = {
+            "role_permissions": {
+                "Manager": self._principal(
+                    {
+                        "Effect": "Allow",
+                        "Action": "bedrock-agentcore:*Payment*",
+                        "Resource": self._PAYMENT_MANAGER_ARN,
+                    },
+                    permissions_boundary={
+                        "Statement": {
+                            "Effect": "Allow",
+                            "Action": "bedrock-agentcore:CreatePaymentSession",
+                            "Resource": "*",
+                        }
+                    },
+                )
+            },
+            "user_permissions": {},
+        }
+
+        findings = agentcore_app.check_agentcore_full_access_roles(cache)
+
+        assert "AgentCore Payments Duty Separation" not in self._names(findings)
+
+    _PASS_ROLE = "AgentCore Payments Pass Role Scope"
+    _RETRIEVAL_ROLE_ARN = "arn:aws:iam::123456789012:role/ResourceRetrievalRole"
+
+    @classmethod
+    def _control_plane(cls, pass_role_statement):
+        return cls._principal(
+            [
+                {
+                    "Effect": "Allow",
+                    "Action": "bedrock-agentcore:CreatePaymentManager",
+                    "Resource": "*",
+                },
+                pass_role_statement,
+            ]
+        )
+
+    def _scoped_pass_role(
+        self, operator="StringEquals", value="bedrock-agentcore.amazonaws.com"
+    ):
+        return {
+            "Effect": "Allow",
+            "Action": "iam:PassRole",
+            "Resource": self._RETRIEVAL_ROLE_ARN,
+            "Condition": {operator: {"iam:PassedToService": value}},
+        }
+
+    @pytest.mark.parametrize(
+        ("operator", "value"),
+        [
+            ("StringEquals", "bedrock-agentcore.amazonaws.com"),
+            ("StringEqualsIfExists", "bedrock-agentcore.amazonaws.com"),
+            ("StringLike", ["bedrock-agentcore.amazonaws.com"]),
+        ],
+        ids=["equals", "equals-if-exists", "like-literal"],
+    )
+    def test_a_scoped_control_plane_pass_role_passes(self, operator, value):
+        cache = {
+            "role_permissions": {
+                "ControlPlane": self._control_plane(
+                    self._scoped_pass_role(operator, value)
+                )
+            },
+            "user_permissions": {},
+        }
+
+        findings = agentcore_app.check_agentcore_full_access_roles(cache)
+
+        assert self._PASS_ROLE not in self._names(findings)
+
+    @pytest.mark.parametrize(
+        ("statement_changes", "leg"),
+        [
+            (
+                {"Resource": "arn:aws:iam::123456789012:role/*"},
+                "its Resource reaches every role",
+            ),
+            ({"Resource": "*"}, "its Resource reaches every role"),
+            ({"Condition": {}}, "does not pin iam:PassedToService"),
+            (
+                {"Condition": {"StringLike": {"iam:PassedToService": "bedrock-*"}}},
+                "does not pin iam:PassedToService",
+            ),
+            (
+                {
+                    "Condition": {
+                        "StringEquals": {
+                            "iam:PassedToService": [
+                                "bedrock-agentcore.amazonaws.com",
+                                "lambda.amazonaws.com",
+                            ]
+                        }
+                    }
+                },
+                "does not pin iam:PassedToService",
+            ),
+            (
+                {"Condition": {"StringEquals": {"aws:SourceAccount": "123456789012"}}},
+                "does not pin iam:PassedToService",
+            ),
+        ],
+        ids=[
+            "role-wildcard",
+            "bare-wildcard",
+            "no-condition",
+            "wildcard-value",
+            "second-service",
+            "other-key",
+        ],
+    )
+    def test_an_unscoped_control_plane_pass_role_fails(self, statement_changes, leg):
+        wide = dict(self._scoped_pass_role(), **statement_changes)
+        cache = {
+            "role_permissions": {
+                "Scoped": self._control_plane(self._scoped_pass_role()),
+                "Wide": self._control_plane(wide),
+            },
+            "user_permissions": {},
+        }
+
+        findings = agentcore_app.check_agentcore_full_access_roles(cache)
+
+        finding = self._finding(findings, self._PASS_ROLE)
+        assert finding["Status"] == "Failed"
+        assert "role Wide, where" in finding["Finding_Details"]
+        assert leg in finding["Finding_Details"]
+        assert "Scoped" not in finding["Finding_Details"]
+        assert_finding_schema(finding)
+
+    def test_pass_role_without_a_payment_manager_write_is_not_this_leg(self):
+        cache = {
+            "role_permissions": {
+                "Deployer": self._principal(
+                    {"Effect": "Allow", "Action": "iam:PassRole", "Resource": "*"}
+                )
+            },
+            "user_permissions": {},
+        }
+
+        findings = agentcore_app.check_agentcore_full_access_roles(cache)
+
+        assert self._PASS_ROLE not in self._names(findings)
 
 
 # ===================================================================
@@ -5703,7 +6546,13 @@ class TestAC27GatewayPolicyConditions:
         assert mock_ac.list_gateways.call_count == 2
 
     def test_the_confused_deputy_predicate_only_fires_on_borrowed_principals(self):
-        exposed = agentcore_app._statement_is_confused_deputy_exposed
+        # Before the guard was judged by value, ArnLike aws:SourceArn "arn:aws:*"
+        # counted as a guard. It names every account, so it now reads as exposed.
+        def exposed(statement):
+            return agentcore_app._statement_is_confused_deputy_exposed(
+                statement, "123456789012"
+            )
+
         assert exposed(
             {
                 "Principal": {"Service": "bedrock-agentcore.amazonaws.com"},
@@ -5712,12 +6561,24 @@ class TestAC27GatewayPolicyConditions:
         )
         assert exposed({"Principal": "*", "Action": "sts:AssumeRole"})
         assert exposed({"Principal": {"AWS": "*"}, "Action": "sts:AssumeRole"})
-        # aws:SourceArn alone is enough; the two keys are alternatives.
-        assert not exposed(
+        assert exposed(
             {
                 "Principal": {"Service": "bedrock-agentcore.amazonaws.com"},
                 "Action": "sts:AssumeRole",
                 "Condition": {"ArnLike": {"aws:SourceArn": "arn:aws:*"}},
+            }
+        )
+        # aws:SourceArn alone is enough when it names this account; the two keys
+        # are alternatives.
+        assert not exposed(
+            {
+                "Principal": {"Service": "bedrock-agentcore.amazonaws.com"},
+                "Action": "sts:AssumeRole",
+                "Condition": {
+                    "ArnLike": {
+                        "aws:SourceArn": "arn:aws:bedrock-agentcore:us-east-1:123456789012:gateway/*"
+                    }
+                },
             }
         )
         # A named account principal is a trust the account owner wrote down.
@@ -16862,3 +17723,757 @@ class TestCognitoUserPoolCheckRegistration:
         source = textwrap.dedent(inspect.getsource(agentcore_app.lambda_handler))
         assert source.count("check_agentcore_cognito_user_pool_authentication") == 1
         assert '"cognito-idp", config=boto3_config, region_name=region' in source
+
+
+# ===================================================================
+# Trust and resource policies judged by value (AC-02 PAY-01, AC-10, AC-27,
+# AC-43, AC-48)
+# ===================================================================
+_ACCOUNT = "123456789012"
+_OTHER_ACCOUNT = "444455556666"
+
+
+def _service_trust(condition=None, principal=None):
+    statement = {
+        "Effect": "Allow",
+        "Principal": principal or {"Service": "bedrock-agentcore.amazonaws.com"},
+        "Action": "sts:AssumeRole",
+    }
+    if condition is not None:
+        statement["Condition"] = condition
+    return {"Version": "2012-10-17", "Statement": [statement]}
+
+
+class TestConfusedDeputyGuardByValue:
+    """A guard counts only when every value names the assessed account."""
+
+    @staticmethod
+    def _exposed(condition):
+        statement = _service_trust(condition)["Statement"][0]
+        return agentcore_app._statement_is_confused_deputy_exposed(statement, _ACCOUNT)
+
+    @pytest.mark.parametrize(
+        "condition",
+        [
+            {"StringEquals": {"aws:SourceAccount": _ACCOUNT}},
+            {"StringEquals": {"aws:SourceAccount": [_ACCOUNT]}},
+            {"StringLike": {"aws:SourceAccount": _ACCOUNT}},
+            {
+                "ArnLike": {
+                    "aws:SourceArn": f"arn:aws:bedrock-agentcore:us-east-1:{_ACCOUNT}:*"
+                }
+            },
+            {
+                "ForAnyValue:StringEquals": {"aws:SourceAccount": _ACCOUNT},
+            },
+        ],
+        ids=[
+            "equals",
+            "equals-list",
+            "like-literal",
+            "arn-in-account",
+            "for-any-value",
+        ],
+    )
+    def test_a_guard_naming_this_account_holds(self, condition):
+        assert self._exposed(condition) is False
+
+    @pytest.mark.parametrize(
+        "condition",
+        [
+            {"StringEquals": {"aws:SourceAccount": _OTHER_ACCOUNT}},
+            {"StringEquals": {"aws:SourceAccount": [_ACCOUNT, _OTHER_ACCOUNT]}},
+            {"StringLike": {"aws:SourceAccount": "*"}},
+            {"StringEqualsIfExists": {"aws:SourceAccount": _ACCOUNT}},
+            {"ForAllValues:StringEquals": {"aws:SourceAccount": _ACCOUNT}},
+            {"StringNotEquals": {"aws:SourceAccount": _OTHER_ACCOUNT}},
+            {"ArnLike": {"aws:SourceArn": "arn:aws:bedrock-agentcore:*:*:*"}},
+            {
+                "ArnLike": {
+                    "aws:SourceArn": f"arn:aws:bedrock-agentcore:us-east-1:{_OTHER_ACCOUNT}:*"
+                }
+            },
+            {"StringEquals": {"aws:SourceAccount": []}},
+            {"Bool": {"aws:SecureTransport": "true"}},
+        ],
+        ids=[
+            "other-account",
+            "one-of-two-other",
+            "wildcard",
+            "if-exists",
+            "for-all-values",
+            "negated",
+            "arn-any-account",
+            "arn-other-account",
+            "empty-list",
+            "unrelated-key",
+        ],
+    )
+    def test_a_guard_that_admits_another_account_is_exposed(self, condition):
+        assert self._exposed(condition) is True
+
+    def test_an_unknown_account_cannot_be_guarded(self):
+        statement = _service_trust({"StringEquals": {"aws:SourceAccount": _ACCOUNT}})[
+            "Statement"
+        ][0]
+        assert (
+            agentcore_app._statement_is_confused_deputy_exposed(statement, "") is True
+        )
+
+
+class TestAC27GatewayRoleTrustByValue:
+    """AC-27 compares the guard to the account and names every foreign principal."""
+
+    def _run(self, mock_ac, mock_iam, trusts):
+        gateways = [
+            {"gatewayId": f"gw-{i}", "name": f"gw-{i}"} for i in range(len(trusts))
+        ]
+        mock_ac.list_gateways.return_value = {"items": gateways}
+        mock_ac.get_gateway.side_effect = lambda gatewayIdentifier: {
+            "gatewayArn": f"arn:aws:bedrock-agentcore:us-east-1:{_ACCOUNT}:gateway/{gatewayIdentifier}",
+            "roleArn": f"arn:aws:iam::{_ACCOUNT}:role/Role-{gatewayIdentifier}",
+        }
+        mock_ac.get_resource_policy.side_effect = ClientError(
+            {"Error": {"Code": "ResourceNotFoundException"}}, "GetResourcePolicy"
+        )
+        documents = {f"Role-gw-{i}": trust for i, trust in enumerate(trusts)}
+        mock_iam.get_role.side_effect = lambda RoleName: {
+            "Role": {"AssumeRolePolicyDocument": documents[RoleName]}
+        }
+        return agentcore_app.check_agentcore_gateway_policy_conditions()
+
+    @patch("agentcore_app.iam_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_guard_naming_another_account_fails_only_that_gateway(
+        self, mock_ac, mock_iam
+    ):
+        findings = self._run(
+            mock_ac,
+            mock_iam,
+            [
+                _service_trust({"StringEquals": {"aws:SourceAccount": _ACCOUNT}}),
+                _service_trust({"StringEquals": {"aws:SourceAccount": _OTHER_ACCOUNT}}),
+            ],
+        )
+
+        missing = [
+            f
+            for f in findings
+            if f["Finding"]
+            == "AgentCore Gateway Role Trust Confused Deputy Guard Missing"
+        ]
+        assert len(missing) == 1
+        assert "(gw-1)" in missing[0]["Finding_Details"]
+        assert f"names account {_ACCOUNT}" in missing[0]["Finding_Details"]
+        passed = [
+            f
+            for f in findings
+            if f["Finding"] == "AgentCore Gateway Role Trust Confused Deputy Guard"
+        ]
+        assert len(passed) == 1
+        assert "(gw-0)" in passed[0]["Finding_Details"]
+
+    @patch("agentcore_app.iam_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_second_principal_in_the_trust_fails_the_principal_scope(
+        self, mock_ac, mock_iam
+    ):
+        guard = {"StringEquals": {"aws:SourceAccount": _ACCOUNT}}
+        shared = _service_trust(
+            guard,
+            principal={
+                "Service": [
+                    "bedrock-agentcore.amazonaws.com",
+                    "lambda.amazonaws.com",
+                ]
+            },
+        )
+        findings = self._run(mock_ac, mock_iam, [_service_trust(guard), shared])
+
+        scope = [
+            f
+            for f in findings
+            if f["Finding"] == "AgentCore Gateway Role Trust Principal Scope"
+        ]
+        assert len(scope) == 1
+        assert scope[0]["Status"] == "Failed"
+        assert "(gw-1)" in scope[0]["Finding_Details"]
+        assert "lambda.amazonaws.com" in scope[0]["Finding_Details"]
+        assert_finding_schema(scope[0])
+
+
+class TestAC43EvaluationRoleTrustByValue:
+    """AC-43 fails the evaluation role whose guard names another account."""
+
+    @patch("agentcore_app.iam_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_one_of_two_roles_guarded_for_another_account(self, mock_ac, mock_iam):
+        configs = [
+            {
+                "onlineEvaluationConfigId": f"oec-{i}",
+                "onlineEvaluationConfigName": f"oec-{i}",
+            }
+            for i in range(2)
+        ]
+        mock_ac.list_online_evaluation_configs.return_value = {
+            "onlineEvaluationConfigs": configs
+        }
+        mock_ac.get_online_evaluation_config.side_effect = lambda **kwargs: {
+            "onlineEvaluationConfigId": kwargs["onlineEvaluationConfigId"],
+            "evaluationExecutionRoleArn": (
+                f"arn:aws:iam::{_ACCOUNT}:role/Eval-{kwargs['onlineEvaluationConfigId']}"
+            ),
+        }
+        documents = {
+            "Eval-oec-0": _service_trust(
+                {"StringEquals": {"aws:SourceAccount": _ACCOUNT}}
+            ),
+            "Eval-oec-1": _service_trust(
+                {"StringEqualsIfExists": {"aws:SourceAccount": _ACCOUNT}}
+            ),
+        }
+        mock_iam.get_role.side_effect = lambda RoleName: {
+            "Role": {"AssumeRolePolicyDocument": documents[RoleName]}
+        }
+
+        findings = agentcore_app.check_agentcore_evaluation_role_trust()
+
+        failed = [f for f in findings if f["Status"] == "Failed"]
+        passed = [f for f in findings if f["Status"] == "Passed"]
+        assert len(failed) == 1
+        assert "Eval-oec-1" in failed[0]["Finding_Details"]
+        assert len(passed) == 1
+        assert "Eval-oec-0" in passed[0]["Finding_Details"]
+
+
+class TestAC48WidenedPopulation:
+    """AC-48 reads memory, payment manager and harness roles, and judges a
+    condition on an account-root principal by what it names."""
+
+    def _wire(self, mock_ac, mock_iam, memories=(), trust=None, payment_error=None):
+        mock_ac.list_agent_runtimes.return_value = {"agentRuntimes": []}
+        mock_ac.list_gateways.return_value = {"items": []}
+        mock_ac.list_code_interpreters.return_value = {"codeInterpreterSummaries": []}
+        mock_ac.list_memories.return_value = {
+            "memories": [{"id": f"mem-{i}"} for i in range(len(memories))]
+        }
+        details = {
+            f"mem-{i}": (
+                {"memoryExecutionRoleArn": f"arn:aws:iam::{_ACCOUNT}:role/{role}"}
+                if role
+                else {}
+            )
+            for i, role in enumerate(memories)
+        }
+        mock_ac.get_memory.side_effect = lambda memoryId: {"memory": details[memoryId]}
+        if payment_error:
+            mock_ac.list_payment_managers.side_effect = payment_error
+        else:
+            mock_ac.list_payment_managers.return_value = {"paymentManagers": []}
+        mock_ac.list_harnesses.return_value = {"harnesses": []}
+        documents = dict(trust or {})
+        mock_iam.get_role.side_effect = lambda RoleName: {
+            "Role": {
+                "AssumeRolePolicyDocument": documents.get(RoleName, _GUARDED_TRUST)
+            }
+        }
+        return {"items": [], "errors": [], "list_error": None}
+
+    @patch("agentcore_app.iam_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_memory_execution_roles_are_judged(self, mock_ac, mock_iam):
+        inventory = self._wire(
+            mock_ac,
+            mock_iam,
+            memories=["GoodMemoryRole", "OpenMemoryRole", None],
+            trust={"OpenMemoryRole": _UNGUARDED_TRUST},
+        )
+
+        findings = agentcore_app.check_agentcore_execution_role_trust_and_sharing(
+            inventory
+        )
+
+        failed = [
+            f
+            for f in findings
+            if f["Finding"] == "AgentCore Execution Role Trust Guard Missing"
+        ]
+        assert len(failed) == 1
+        assert "OpenMemoryRole" in failed[0]["Finding_Details"]
+        assert "[memory family]" in failed[0]["Finding_Details"]
+        assert any(
+            f["Status"] == "Passed" and "GoodMemoryRole" in f["Finding_Details"]
+            for f in findings
+        )
+
+    @patch("agentcore_app.iam_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_payment_managers_name_their_retrieval_role(self, mock_ac, mock_iam):
+        inventory = self._wire(mock_ac, mock_iam)
+        mock_ac.list_payment_managers.return_value = {
+            "paymentManagers": [
+                {
+                    "paymentManagerId": "pm-1",
+                    "name": "pm-1",
+                    "roleArn": f"arn:aws:iam::{_ACCOUNT}:role/SharedRole",
+                }
+            ]
+        }
+        mock_ac.list_memories.return_value = {"memories": [{"id": "mem-0"}]}
+        mock_ac.get_memory.side_effect = lambda memoryId: {
+            "memory": {
+                "memoryExecutionRoleArn": f"arn:aws:iam::{_ACCOUNT}:role/SharedRole"
+            }
+        }
+
+        findings = agentcore_app.check_agentcore_execution_role_trust_and_sharing(
+            inventory
+        )
+
+        shared = [
+            f
+            for f in findings
+            if f["Finding"] == "AgentCore Execution Role Shared Across Workloads"
+        ]
+        assert len(shared) == 1
+        assert "[payment manager family]" in shared[0]["Finding_Details"]
+        assert "[memory family]" in shared[0]["Finding_Details"]
+
+    @patch("agentcore_app.iam_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_denied_family_list_withholds_the_sharing_pass(self, mock_ac, mock_iam):
+        denied = ClientError(
+            {"Error": {"Code": "AccessDeniedException"}}, "ListPaymentManagers"
+        )
+        inventory = self._wire(
+            mock_ac, mock_iam, memories=["RoleA", "RoleB"], payment_error=denied
+        )
+
+        findings = agentcore_app.check_agentcore_execution_role_trust_and_sharing(
+            inventory
+        )
+        names = [f["Finding"] for f in findings]
+
+        assert "AgentCore Execution Role Sharing" not in names
+        incomplete = [
+            f
+            for f in findings
+            if f["Finding"] == "AgentCore Execution Role Sharing Incomplete"
+        ]
+        assert len(incomplete) == 1
+        assert "payment managers" in incomplete[0]["Finding_Details"]
+        assert "bedrock-agentcore:ListPaymentManagers" in incomplete[0]["Resolution"]
+        assert any(
+            f["Status"] == "N/A" and "AccessDeniedException" in f["Finding_Details"]
+            for f in findings
+        )
+
+    @pytest.mark.parametrize(
+        ("condition", "account_wide"),
+        [
+            ({"Bool": {"aws:MultiFactorAuthPresent": "true"}}, True),
+            ({"StringEquals": {"sts:ExternalId": "abc"}}, True),
+            (
+                {"ArnLike": {"aws:PrincipalArn": f"arn:aws:iam::{_ACCOUNT}:role/*"}},
+                True,
+            ),
+            (
+                {
+                    "StringEqualsIfExists": {
+                        "aws:PrincipalArn": f"arn:aws:iam::{_ACCOUNT}:role/Deployer"
+                    }
+                },
+                True,
+            ),
+            (
+                {
+                    "ArnEquals": {
+                        "aws:PrincipalArn": f"arn:aws:iam::{_ACCOUNT}:role/Deployer"
+                    }
+                },
+                False,
+            ),
+            ({"StringEquals": {"aws:PrincipalTag/team": "agents"}}, False),
+            ({"StringLike": {"aws:PrincipalTag/team": "*"}}, True),
+        ],
+        ids=[
+            "mfa",
+            "external-id",
+            "principal-arn-wildcard",
+            "principal-arn-if-exists",
+            "principal-arn",
+            "principal-tag",
+            "principal-tag-wildcard",
+        ],
+    )
+    @patch("agentcore_app.iam_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_condition_on_account_root_counts_only_if_it_names_the_caller(
+        self, mock_ac, mock_iam, condition, account_wide
+    ):
+        root = {
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Effect": "Allow",
+                    "Principal": {"AWS": f"arn:aws:iam::{_ACCOUNT}:root"},
+                    "Action": "sts:AssumeRole",
+                    "Condition": condition,
+                }
+            ],
+        }
+        inventory = self._wire(
+            mock_ac,
+            mock_iam,
+            memories=["RootRole", "GoodRole"],
+            trust={"RootRole": root},
+        )
+
+        findings = agentcore_app.check_agentcore_execution_role_trust_and_sharing(
+            inventory
+        )
+        wide = [
+            f
+            for f in findings
+            if f["Finding"] == "AgentCore Execution Role Account Wide Trust"
+        ]
+
+        assert bool(wide) is account_wide
+        if wide:
+            assert "RootRole" in wide[0]["Finding_Details"]
+            assert "GoodRole" not in wide[0]["Finding_Details"]
+
+
+class TestAC10ResourcePolicyStatements:
+    """AC-10 reads the statements of each policy, and reports a failed list."""
+
+    _RUNTIME_ARN = f"arn:aws:bedrock-agentcore:us-east-1:{_ACCOUNT}:runtime/"
+
+    def _run(self, mock_ac, policies):
+        mock_ac.list_agent_runtimes.return_value = {
+            "agentRuntimes": [
+                {
+                    "agentRuntimeId": name,
+                    "agentRuntimeName": name,
+                    "agentRuntimeArn": self._RUNTIME_ARN + name,
+                }
+                for name in policies
+            ]
+        }
+        mock_ac.list_gateways.return_value = {"items": []}
+        mock_ac.get_resource_policy.side_effect = lambda resourceArn: {
+            "policy": json.dumps(policies[resourceArn.rsplit("/", 1)[-1]])
+        }
+        return agentcore_app.check_agentcore_resource_based_policies()
+
+    @staticmethod
+    def _policy(condition=None, principal="*"):
+        statement = {
+            "Effect": "Allow",
+            "Principal": principal,
+            "Action": "bedrock-agentcore:InvokeAgentRuntime",
+            "Resource": "*",
+        }
+        if condition:
+            statement["Condition"] = condition
+        return {"Version": "2012-10-17", "Statement": [statement]}
+
+    @pytest.mark.parametrize(
+        "condition",
+        [
+            None,
+            {"StringLike": {"aws:PrincipalOrgID": "o-*"}},
+            {"StringEquals": {"aws:PrincipalAccount": _OTHER_ACCOUNT}},
+            {"StringEqualsIfExists": {"aws:PrincipalAccount": _ACCOUNT}},
+        ],
+        ids=["unconditioned", "any-org", "other-account", "if-exists"],
+    )
+    @patch("agentcore_app.agentcore_client")
+    def test_an_open_statement_fails_only_its_runtime(self, mock_ac, condition):
+        findings = self._run(
+            mock_ac,
+            {
+                "closed": self._policy(
+                    {"StringEquals": {"aws:PrincipalOrgID": "o-a1b2c3d4e5"}}
+                ),
+                "open": self._policy(condition),
+            },
+        )
+
+        failed = [
+            f
+            for f in findings
+            if f["Finding"] == "AgentCore Resource-Based Policy Open Principal"
+        ]
+        assert len(failed) == 1
+        assert failed[0]["Status"] == "Failed"
+        assert "Runtime 'open' statement 1 (*)" in failed[0]["Finding_Details"]
+        assert "closed" not in failed[0]["Finding_Details"]
+        assert "Passed" not in [f["Status"] for f in findings]
+        assert_finding_schema(failed[0])
+
+    @pytest.mark.parametrize(
+        "condition",
+        [
+            {"StringEquals": {"aws:PrincipalAccount": _ACCOUNT}},
+            {"StringEquals": {"aws:PrincipalOrgID": "o-a1b2c3d4e5"}},
+            {"StringEquals": {"aws:SourceAccount": _ACCOUNT}},
+        ],
+        ids=["principal-account", "org", "source-account"],
+    )
+    @patch("agentcore_app.agentcore_client")
+    def test_a_bound_statement_passes(self, mock_ac, condition):
+        findings = self._run(
+            mock_ac,
+            {
+                "one": self._policy(condition),
+                "two": self._policy(
+                    principal={"AWS": f"arn:aws:iam::{_ACCOUNT}:role/Caller"}
+                ),
+            },
+        )
+
+        assert [f["Status"] for f in findings] == ["Passed"]
+        assert "No Allow statement" in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_failed_runtime_list_is_reported_and_withholds_passed(self, mock_ac):
+        mock_ac.list_agent_runtimes.side_effect = ClientError(
+            {"Error": {"Code": "AccessDeniedException"}}, "ListAgentRuntimes"
+        )
+        mock_ac.list_gateways.return_value = {
+            "items": [{"gatewayId": "gw-1", "name": "gw-1"}]
+        }
+        mock_ac.get_gateway.return_value = {
+            "gatewayArn": f"arn:aws:bedrock-agentcore:us-east-1:{_ACCOUNT}:gateway/gw-1"
+        }
+        mock_ac.get_resource_policy.return_value = {
+            "policy": json.dumps(
+                self._policy({"StringEquals": {"aws:PrincipalAccount": _ACCOUNT}})
+            )
+        }
+
+        findings = agentcore_app.check_agentcore_resource_based_policies()
+
+        assert "Passed" not in [f["Status"] for f in findings]
+        incomplete = [
+            f
+            for f in findings
+            if f["Finding"] == "AgentCore Resource-Based Policy Assessment Incomplete"
+        ]
+        assert len(incomplete) == 1
+        assert (
+            "ListAgentRuntimes (AccessDeniedException)"
+            in incomplete[0]["Finding_Details"]
+        )
+
+
+class TestAC02PaymentRetrievalRoleTrust:
+    """AC-02 PAY-01: each payment manager's ResourceRetrievalRole trust."""
+
+    _PM = f"arn:aws:bedrock-agentcore:us-east-1:{_ACCOUNT}:payment-manager/"
+
+    def _run(self, mock_ac, mock_iam, trusts):
+        mock_ac.list_payment_managers.return_value = {
+            "paymentManagers": [
+                {
+                    "paymentManagerId": name,
+                    "name": name,
+                    "paymentManagerArn": self._PM + name,
+                    "roleArn": f"arn:aws:iam::{_ACCOUNT}:role/Retrieval-{name}",
+                }
+                for name in trusts
+            ]
+        }
+        mock_iam.get_role.side_effect = lambda RoleName: {
+            "Role": {"AssumeRolePolicyDocument": trusts[RoleName.split("-", 1)[1]]}
+        }
+        return agentcore_app.check_agentcore_payment_retrieval_role_trust()
+
+    def _scoped(self, name, operator="ArnEquals"):
+        return _service_trust(
+            {
+                "StringEquals": {"aws:SourceAccount": _ACCOUNT},
+                operator: {"aws:SourceArn": self._PM + name},
+            }
+        )
+
+    @pytest.mark.parametrize(
+        ("trust", "expected"),
+        [
+            (_service_trust(), "does not pin aws:SourceArn"),
+            (
+                _service_trust({"StringEquals": {"aws:SourceAccount": _ACCOUNT}}),
+                "does not pin aws:SourceArn",
+            ),
+            (
+                _service_trust({"ArnEqualsIfExists": {"aws:SourceArn": _PM + "bad"}}),
+                "does not pin aws:SourceArn",
+            ),
+            (
+                _service_trust({"ArnLike": {"aws:SourceArn": _PM + "*"}}),
+                "not this payment manager's ARN alone",
+            ),
+            (
+                _service_trust({"ArnEquals": {"aws:SourceArn": _PM + "other"}}),
+                "not this payment manager's ARN alone",
+            ),
+            (
+                _service_trust(
+                    {"ArnEquals": {"aws:SourceArn": _PM + "bad"}},
+                    principal={
+                        "Service": "bedrock-agentcore.amazonaws.com",
+                        "AWS": "*",
+                    },
+                ),
+                "trusts * besides",
+            ),
+        ],
+        ids=[
+            "no-condition",
+            "account-only",
+            "if-exists",
+            "every-manager",
+            "other-manager",
+            "extra-principal",
+        ],
+    )
+    @patch("agentcore_app.iam_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_an_unscoped_trust_fails_only_its_manager(
+        self, mock_ac, mock_iam, trust, expected
+    ):
+        findings = self._run(
+            mock_ac, mock_iam, {"good": self._scoped("good"), "bad": trust}
+        )
+
+        failed = [f for f in findings if f["Status"] == "Failed"]
+        passed = [f for f in findings if f["Status"] == "Passed"]
+        assert len(failed) == 1
+        assert failed[0]["Check_ID"] == "AC-02"
+        assert (
+            failed[0]["Finding"]
+            == "AgentCore Payments Retrieval Role Trust Scope Missing"
+        )
+        assert "(bad)" in failed[0]["Finding_Details"]
+        assert expected in failed[0]["Finding_Details"]
+        assert len(passed) == 1
+        assert "(good)" in passed[0]["Finding_Details"]
+        assert_finding_schema(failed[0])
+
+    @patch("agentcore_app.iam_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_trust_with_no_allow_statement_fails(self, mock_ac, mock_iam):
+        findings = self._run(mock_ac, mock_iam, {"empty": {"Statement": []}})
+        assert [f["Status"] for f in findings] == ["Failed"]
+        assert "no Allow statement" in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.iam_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_denied_list_reports_the_region_as_not_read(self, mock_ac, mock_iam):
+        mock_ac.list_payment_managers.side_effect = ClientError(
+            {"Error": {"Code": "AccessDeniedException"}}, "ListPaymentManagers"
+        )
+
+        findings = agentcore_app.check_agentcore_payment_retrieval_role_trust()
+
+        assert [f["Status"] for f in findings] == ["N/A"]
+        assert (
+            findings[0]["Finding"]
+            == "AgentCore Payments Retrieval Role Trust Incomplete"
+        )
+        assert "AccessDeniedException" in findings[0]["Finding_Details"]
+        assert "bedrock-agentcore:ListPaymentManagers" in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.iam_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_an_unreadable_role_is_not_passed(self, mock_ac, mock_iam):
+        mock_ac.list_payment_managers.return_value = {
+            "paymentManagers": [
+                {
+                    "paymentManagerId": "pm-1",
+                    "paymentManagerArn": self._PM + "pm-1",
+                    "roleArn": f"arn:aws:iam::{_ACCOUNT}:role/Retrieval",
+                }
+            ]
+        }
+        mock_iam.get_role.side_effect = ClientError(
+            {"Error": {"Code": "AccessDenied"}}, "GetRole"
+        )
+
+        findings = agentcore_app.check_agentcore_payment_retrieval_role_trust()
+
+        assert [f["Status"] for f in findings] == ["N/A"]
+        assert "AccessDenied" in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.iam_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_summary_without_role_reads_the_detail(self, mock_ac, mock_iam):
+        mock_ac.list_payment_managers.return_value = {
+            "paymentManagers": [{"paymentManagerId": "pm-1"}]
+        }
+        mock_ac.get_payment_manager.return_value = {
+            "paymentManagerArn": self._PM + "pm-1",
+            "roleArn": f"arn:aws:iam::{_ACCOUNT}:role/Retrieval",
+        }
+        mock_iam.get_role.return_value = {
+            "Role": {"AssumeRolePolicyDocument": self._scoped("pm-1")}
+        }
+
+        findings = agentcore_app.check_agentcore_payment_retrieval_role_trust()
+
+        mock_ac.get_payment_manager.assert_called_once_with(paymentManagerId="pm-1")
+        assert [f["Status"] for f in findings] == ["Passed"]
+
+    def test_the_timeout_backfill_names_the_skipped_leg(self):
+        findings = agentcore_app.build_agentcore_timeout_findings("us-west-2", [])
+        legs = [
+            f
+            for f in findings
+            if f["Finding"] == "AgentCore Payments Retrieval Role Trust Incomplete"
+        ]
+        assert len(legs) == 1
+        assert legs[0]["Check_ID"] == "AC-02"
+
+    def test_the_backfill_skips_a_leg_that_reported(self):
+        reported = agentcore_app.create_finding(
+            check_id="AC-02",
+            finding_name="AgentCore Payments Retrieval Role Trust",
+            finding_details="x",
+            resolution="No action required.",
+            reference="https://docs.aws.amazon.com/",
+            severity=agentcore_app.SeverityEnum.HIGH,
+            status=agentcore_app.StatusEnum.PASSED,
+        )
+        global_row = dict(reported, Finding="AgentCore IAM Full Access Check")
+        assert not [
+            f
+            for f in agentcore_app.build_agentcore_timeout_findings(
+                "us-west-2", [reported]
+            )
+            if f["Check_ID"] == "AC-02"
+        ]
+        # The primary region's global AC-02 row is not this leg.
+        assert [
+            f["Finding"]
+            for f in agentcore_app.build_agentcore_timeout_findings(
+                "us-east-1", [global_row]
+            )
+            if f["Check_ID"] == "AC-02"
+        ] == ["AgentCore Payments Retrieval Role Trust Incomplete"]
+
+    def test_the_runtime_probe_backfill_names_the_leg(self):
+        findings = []
+        agentcore_app.prepare_agentcore_runtime_incomplete_report_findings(
+            findings, "us-east-1", "ExpiredToken"
+        )
+        assert "AgentCore Payments Retrieval Role Trust Incomplete" in {
+            f["Finding"] for f in findings
+        }
+
+    def test_the_handler_registers_the_leg_first(self):
+        source = textwrap.dedent(inspect.getsource(agentcore_app.lambda_handler))
+        assert source.count("check_agentcore_payment_retrieval_role_trust") == 1
+        assert source.index(
+            "check_agentcore_payment_retrieval_role_trust"
+        ) < source.index("check_agentcore_vpc_configuration(browser_inventory)")

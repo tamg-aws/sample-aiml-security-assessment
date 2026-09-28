@@ -855,6 +855,12 @@ Resources:
                 - bedrock-agentcore:ListGatewayRateLimits
                 - bedrock-agentcore:ListGatewayTargets
                 - bedrock-agentcore:GetGatewayTarget
+                # AC-02 reads a payment manager's retrieval role when the list
+                # summary omits it, and AC-48 reads each harness's execution
+                # role. The service authorization reference lists the
+                # payment-manager and harness resource types for these.
+                - bedrock-agentcore:GetPaymentManager
+                - bedrock-agentcore:GetHarness
               Resource:
                 - !Sub 'arn:${AWS::Partition}:bedrock-agentcore:*:${AWS::AccountId}:runtime/*'
                 - !Sub 'arn:${AWS::Partition}:bedrock-agentcore:*:${AWS::AccountId}:runtime/*/runtime-endpoint/*'
@@ -865,6 +871,8 @@ Resources:
                 - !Sub 'arn:${AWS::Partition}:bedrock-agentcore:*:${AWS::AccountId}:code-interpreter-custom/*'
                 - !Sub 'arn:${AWS::Partition}:bedrock-agentcore:*:${AWS::AccountId}:browser-custom/*'
                 - !Sub 'arn:${AWS::Partition}:bedrock-agentcore:*:${AWS::AccountId}:online-evaluation-config/*'
+                - !Sub 'arn:${AWS::Partition}:bedrock-agentcore:*:${AWS::AccountId}:payment-manager/*'
+                - !Sub 'arn:${AWS::Partition}:bedrock-agentcore:*:${AWS::AccountId}:harness/*'
             - Sid: AgentCoreTokenVaultRead
               Effect: Allow
               Action:

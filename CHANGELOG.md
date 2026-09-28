@@ -204,6 +204,33 @@ section.
   The AgentCore assessment role gains that `kms:Decrypt` grant, and a
   remaining denial names the key policy, which must also allow the role.
 
+- AgentCore checks that read the IAM permissions cache, trust policies and
+  resource policies now judge the values they read and the whole population
+  they cover:
+  - The cache consumers accept the version 2 contract. A principal named in
+    `principal_errors` withholds `Passed` from every population-wide claim
+    that includes it and is named in an `N/A` row; a permissions boundary is
+    intersected with the principal's grants; a version 1 cache is read with a
+    note that principal read errors were not recorded. SCPs are not evaluated
+    per principal, and the finding text says so.
+  - `AC-02` reads users and group policies as well as roles, counts a bare
+    `Action: "*"` and a `NotAction` that leaves AgentCore in, and adds three
+    legs: evaluator author and reader separation, the payments `iam:PassRole`
+    scope, and each payment manager's retrieval role trust, which must name
+    only `bedrock-agentcore.amazonaws.com` and pin `aws:SourceArn` to that
+    manager.
+  - The confused-deputy guard in `AC-27`, `AC-43` and `AC-48` counts only when
+    every `aws:SourceAccount` or `aws:SourceArn` value names the assessed
+    account. `IfExists`, `ForAllValues` and wildcard values no longer pass.
+    `AC-27` fails a gateway role that trusts a second principal.
+  - `AC-10` fails an Allow statement that opens a runtime or gateway to any
+    principal without binding the caller's account or organization, and
+    reports a failed runtime or gateway list instead of passing.
+  - `AC-48` adds memory, payment manager and harness execution roles to the
+    population, withholds the sharing `Passed` when any family could not be
+    listed, and clears an account-root trust only when its condition names
+    the calling principal.
+
 ### Deployment impact
 
 **CodeBuild run required.** No parameter or deployment-stack change. The AWS
@@ -247,6 +274,14 @@ role, `cognito-idp:DescribeUserPool`, `cognito-idp:ListUserPoolClients` and
 `cognito-idp:DescribeUserPoolClient`, scoped to the account's user pools. All
 are read-only, and the same CodeBuild run applies them. No parameter,
 deployment-stack or member-role StackSet change is required.
+
+The AgentCore assessment role gains `bedrock-agentcore:GetPaymentManager` and
+`bedrock-agentcore:GetHarness`, scoped to the account's `payment-manager/*` and
+`harness/*` ARNs, in both SAM templates. Both are read-only, and the same
+CodeBuild run applies them. `bedrock-agentcore:ListPaymentManagers` and
+`bedrock-agentcore:ListHarnesses` have no resource type and are not granted;
+until they are, the payment manager and harness legs of `AC-02` and `AC-48`
+report `N/A` naming the missing action.
 
 ## 2.0.0 - 2026-09-18
 

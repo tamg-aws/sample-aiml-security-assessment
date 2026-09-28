@@ -897,6 +897,22 @@ _VERIFIED_REMEDIATION_CONDITION_KEYS |= {
     "aws:SecureTransport",
 }
 
+# Verified on 2026-09-27 with one IDENTITY_POLICY validate-policy run for the
+# AgentCore payment manager and harness legs of AC-02 and AC-48, one statement
+# per name. The negative controls bedrock-agentcore:ListPaymentManager,
+# bedrock-agentcore:DescribePaymentManager and bedrock-agentcore:ListHarness
+# came back INVALID_ACTION at statement indexes 5, 6 and 7, and
+# aws:AccountOfPrincipal came back INVALID_GLOBAL_CONDITION_KEY at index 8.
+# Indexes 0 to 4, the names below, were not reported.
+_VERIFIED_REMEDIATION_IAM_ACTIONS |= {
+    "bedrock-agentcore:ListPaymentManagers",
+    "bedrock-agentcore:GetPaymentManager",
+    "bedrock-agentcore:ListHarnesses",
+    "bedrock-agentcore:GetHarness",
+}
+
+_VERIFIED_REMEDIATION_CONDITION_KEYS |= {"aws:PrincipalAccount"}
+
 _NON_IAM_REMEDIATION_TOKENS = {
     # SM-41 names the AWS IoT Core policy variables
     # ${iot:Connection.Thing.ThingName} and iot:Connection.Thing.IsAttached, and
