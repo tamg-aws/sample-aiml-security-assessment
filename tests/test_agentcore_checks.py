@@ -4241,7 +4241,10 @@ class TestProposedAgentCoreChecks:
         assert finding["Status"] == "Failed"
 
     @patch("agentcore_app.agentcore_client")
-    def test_ac17_operational_evaluation_passes_advisory(self, mock_ac):
+    def test_ac17_operational_evaluation_passes(self, mock_ac):
+        mock_ac.list_agent_runtimes.return_value = {
+            "agentRuntimes": [{"agentRuntimeId": "rt-1", "agentRuntimeName": "rt"}]
+        }
         mock_ac.list_online_evaluation_configs.return_value = {
             "onlineEvaluationConfigs": [
                 {
@@ -4256,7 +4259,10 @@ class TestProposedAgentCoreChecks:
             "rule": {"samplingConfig": {"samplingPercentage": 10}},
             "evaluators": [{"evaluatorId": "evaluator-1"}],
             "dataSourceConfig": {
-                "cloudWatchLogs": {"logGroupNames": ["/aws/agentcore/input"]}
+                "cloudWatchLogs": {
+                    "logGroupNames": ["/aws/bedrock-agentcore/runtimes/rt-1-DEFAULT"],
+                    "serviceNames": ["rt.DEFAULT"],
+                }
             },
             "outputConfig": {
                 "cloudWatchConfig": {"logGroupName": "/aws/agentcore/output"}
@@ -4265,7 +4271,7 @@ class TestProposedAgentCoreChecks:
         finding = agentcore_app.check_agentcore_online_evaluation_coverage()[0]
         assert finding["Check_ID"] == "AC-17"
         assert finding["Status"] == "Passed"
-        assert finding["Severity"] == "Informational"
+        assert finding["Severity"] == "Medium"
 
     @patch.dict(
         os.environ,
@@ -4273,7 +4279,10 @@ class TestProposedAgentCoreChecks:
         clear=False,
     )
     @patch("agentcore_app.agentcore_client")
-    def test_ac17_incomplete_advisory_evaluation_returns_na(self, mock_ac):
+    def test_ac17_incomplete_evaluation_fails_with_the_opt_in_off(self, mock_ac):
+        mock_ac.list_agent_runtimes.return_value = {
+            "agentRuntimes": [{"agentRuntimeId": "rt-1", "agentRuntimeName": "rt"}]
+        }
         mock_ac.list_online_evaluation_configs.return_value = {
             "onlineEvaluationConfigs": [
                 {
@@ -4285,13 +4294,20 @@ class TestProposedAgentCoreChecks:
         mock_ac.get_online_evaluation_config.return_value = {
             "status": "ACTIVE",
             "executionStatus": "DISABLED",
+            "dataSourceConfig": {
+                "cloudWatchLogs": {
+                    "logGroupNames": ["/aws/bedrock-agentcore/runtimes/rt-1-DEFAULT"],
+                    "serviceNames": ["rt-1"],
+                }
+            },
         }
 
         finding = agentcore_app.check_agentcore_online_evaluation_coverage()[0]
 
-        assert finding["Status"] == "N/A"
-        assert finding["Severity"] == "Informational"
-        assert finding["Resolution"].startswith("Set the evaluation ACTIVE")
+        assert finding["Status"] == "Failed"
+        assert finding["Severity"] == "Medium"
+        assert "executionStatus DISABLED" in finding["Finding_Details"]
+        assert finding["Resolution"].startswith("Create or fix")
 
     @patch.dict(
         os.environ,
@@ -13258,6 +13274,275 @@ def _online_evaluation_client(mock_ac, details=None, catalogue=None):
     return mock_ac
 
 
+def _ac17_runtimes(mock_ac, *runtime_ids):
+    """List runtimes whose name is the id's text before the first hyphen."""
+    mock_ac.list_agent_runtimes.return_value = {
+        "agentRuntimes": [
+            {"agentRuntimeId": runtime_id, "agentRuntimeName": runtime_id.split("-")[0]}
+            for runtime_id in runtime_ids
+        ]
+    }
+
+
+def _ac17_reads(runtime_id, service=None, **overrides):
+    """A running configuration whose input is one runtime's DEFAULT log group."""
+    return _online_evaluation_detail(
+        dataSourceConfig={
+            "cloudWatchLogs": {
+                "logGroupNames": [
+                    f"/aws/bedrock-agentcore/runtimes/{runtime_id}-DEFAULT"
+                ],
+                "serviceNames": [service or runtime_id],
+            }
+        },
+        **overrides,
+    )
+
+
+def _ac17_by_runtime(findings):
+    return {
+        runtime_id: finding
+        for finding in findings
+        for runtime_id in ("agent", "other-1", "rt-1", "myagent-AbC123")
+        if f"({runtime_id})" in finding["Finding_Details"]
+    }
+
+
+class TestAC17RuntimeCoverage:
+    """AC-17: every runtime is judged on a running evaluation that reads it."""
+
+    @patch.dict(os.environ, {}, clear=True)
+    @patch("agentcore_app.agentcore_client")
+    def test_every_runtime_is_judged_and_the_unscored_one_fails(self, mock_ac):
+        _online_evaluation_client(mock_ac, [_ac17_reads("agent")])
+        _ac17_runtimes(mock_ac, "agent", "other-1")
+
+        findings = agentcore_app.check_agentcore_online_evaluation_coverage()
+        by_runtime = _ac17_by_runtime(findings)
+
+        assert len(findings) == 2
+        assert by_runtime["agent"]["Status"] == "Passed"
+        assert "samples 100.0 percent" in by_runtime["agent"]["Finding_Details"]
+        assert by_runtime["other-1"]["Status"] == "Failed"
+        assert (
+            "/aws/bedrock-agentcore/runtimes/other-1-<endpoint>"
+            in by_runtime["other-1"]["Finding_Details"]
+        )
+
+    @patch.dict(os.environ, {}, clear=True)
+    @patch("agentcore_app.agentcore_client")
+    def test_a_runtime_only_a_disabled_configuration_reads_fails(self, mock_ac):
+        disabled = _ac17_reads("agent", executionStatus="DISABLED")
+        running = _ac17_reads("other-1", onlineEvaluationConfigId="oec-2")
+        _online_evaluation_client(mock_ac, [disabled, running])
+        _ac17_runtimes(mock_ac, "agent", "other-1")
+
+        by_runtime = _ac17_by_runtime(
+            agentcore_app.check_agentcore_online_evaluation_coverage()
+        )
+
+        assert by_runtime["agent"]["Status"] == "Failed"
+        assert "executionStatus DISABLED" in by_runtime["agent"]["Finding_Details"]
+        assert by_runtime["other-1"]["Status"] == "Passed"
+
+    @patch.dict(os.environ, {}, clear=True)
+    @patch("agentcore_app.agentcore_client")
+    def test_no_configuration_fails_every_runtime_without_the_opt_in(self, mock_ac):
+        mock_ac.list_online_evaluation_configs.return_value = {
+            "onlineEvaluationConfigs": []
+        }
+        _ac17_runtimes(mock_ac, "agent", "other-1")
+
+        findings = agentcore_app.check_agentcore_online_evaluation_coverage()
+
+        assert [finding["Status"] for finding in findings] == ["Failed", "Failed"]
+        assert all(finding["Severity"] == "Medium" for finding in findings)
+
+    @pytest.mark.parametrize(
+        "log_group, service",
+        [
+            ("/aws/bedrock-agentcore/runtimes/agent-DEFAULT", "someone_else"),
+            ("/aws/bedrock-agentcore/runtimes/agent2-DEFAULT", "agent"),
+            ("/aws/bedrock-agentcore/runtimes/agent-DEFAULT", "agentx.DEFAULT"),
+        ],
+        ids=["other-service", "other-runtime-id-prefix", "service-name-prefix"],
+    )
+    @patch.dict(os.environ, {}, clear=True)
+    @patch("agentcore_app.agentcore_client")
+    def test_a_configuration_naming_another_runtime_does_not_cover(
+        self, mock_ac, log_group, service
+    ):
+        detail = _online_evaluation_detail(
+            dataSourceConfig={
+                "cloudWatchLogs": {
+                    "logGroupNames": [log_group],
+                    "serviceNames": [service],
+                }
+            }
+        )
+        _online_evaluation_client(mock_ac, [detail])
+        _ac17_runtimes(mock_ac, "agent")
+
+        findings = agentcore_app.check_agentcore_online_evaluation_coverage()
+
+        assert findings[0]["Status"] == "Failed"
+        assert "is read by none of the 1" in findings[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "prefix",
+        [
+            "/aws/bedrock-agentcore/runtimes/",
+            "/aws/bedrock-agentcore/runtimes/myagent-AbC123-",
+            "/aws/bedrock-agentcore/runtimes/myagent-AbC123-prod",
+        ],
+    )
+    @patch.dict(os.environ, {}, clear=True)
+    @patch("agentcore_app.agentcore_client")
+    def test_a_prefix_and_the_documented_service_name_cover(self, mock_ac, prefix):
+        detail = _online_evaluation_detail(
+            dataSourceConfig={
+                "cloudWatchLogs": {
+                    "logGroupNamePrefixes": [prefix],
+                    "serviceNames": ["myagent.DEFAULT"],
+                }
+            }
+        )
+        _online_evaluation_client(mock_ac, [detail])
+        mock_ac.list_agent_runtimes.return_value = {
+            "agentRuntimes": [
+                {"agentRuntimeId": "myagent-AbC123", "agentRuntimeName": "myagent"}
+            ]
+        }
+
+        findings = agentcore_app.check_agentcore_online_evaluation_coverage()
+
+        assert findings[0]["Status"] == "Passed"
+
+    @patch.dict(os.environ, {}, clear=True)
+    @patch("agentcore_app.agentcore_client")
+    def test_an_unreadable_configuration_leaves_an_unscored_runtime_na(self, mock_ac):
+        mock_ac.list_online_evaluation_configs.return_value = {
+            "onlineEvaluationConfigs": [
+                _online_evaluation_summary("oec-1", "continuous"),
+                _online_evaluation_summary("oec-2", "locked"),
+            ]
+        }
+        readable = _ac17_reads("agent")
+
+        def get(onlineEvaluationConfigId):
+            if onlineEvaluationConfigId == "oec-2":
+                raise _make_client_error("AccessDeniedException", "denied")
+            return readable
+
+        mock_ac.get_online_evaluation_config.side_effect = get
+        _ac17_runtimes(mock_ac, "agent", "other-1")
+
+        by_runtime = _ac17_by_runtime(
+            agentcore_app.check_agentcore_online_evaluation_coverage()
+        )
+
+        assert by_runtime["agent"]["Status"] == "Passed"
+        assert by_runtime["other-1"]["Status"] == "N/A"
+        assert "'locked' (oec-2)" in by_runtime["other-1"]["Finding_Details"]
+
+    @patch.dict(os.environ, {}, clear=True)
+    @patch("agentcore_app.agentcore_client")
+    def test_every_runtime_page_is_read(self, mock_ac):
+        _online_evaluation_client(mock_ac, [_ac17_reads("agent")])
+        mock_ac.list_agent_runtimes.side_effect = [
+            {
+                "agentRuntimes": [
+                    {"agentRuntimeId": "agent", "agentRuntimeName": "agent"}
+                ],
+                "nextToken": "page-2",
+            },
+            {
+                "agentRuntimes": [
+                    {"agentRuntimeId": "other-1", "agentRuntimeName": "other"}
+                ]
+            },
+        ]
+
+        by_runtime = _ac17_by_runtime(
+            agentcore_app.check_agentcore_online_evaluation_coverage()
+        )
+
+        assert by_runtime["other-1"]["Status"] == "Failed"
+
+    @patch.dict(os.environ, {}, clear=True)
+    @patch("agentcore_app.agentcore_client")
+    def test_an_unlistable_runtime_inventory_is_na_and_never_passed(self, mock_ac):
+        _online_evaluation_client(mock_ac, [_ac17_reads("agent")])
+        mock_ac.list_agent_runtimes.side_effect = _make_client_error(
+            "AccessDeniedException", "denied"
+        )
+
+        findings = agentcore_app.check_agentcore_online_evaluation_coverage()
+
+        assert len(findings) == 1
+        assert findings[0]["Status"] == "N/A"
+        assert "bedrock-agentcore:ListAgentRuntimes" in findings[0]["Resolution"]
+
+    @patch.dict(os.environ, {}, clear=True)
+    @patch("agentcore_app.agentcore_client")
+    def test_the_pass_counts_the_rule_filters(self, mock_ac):
+        filtered = _ac17_reads(
+            "agent",
+            rule={
+                "samplingConfig": {"samplingPercentage": 10.0},
+                "filters": [
+                    {
+                        "key": "session.tier",
+                        "operator": "Equals",
+                        "value": {"stringValue": "gold"},
+                    }
+                ],
+            },
+        )
+        _online_evaluation_client(mock_ac, [filtered])
+        _ac17_runtimes(mock_ac, "agent")
+
+        finding = agentcore_app.check_agentcore_online_evaluation_coverage()[0]
+
+        assert finding["Status"] == "Passed"
+        assert "with 1 rule filter(s)" in finding["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "required, details, verdict",
+        [
+            ("", [], "N/A"),
+            ("", [_ac17_reads("agent", executionStatus="DISABLED")], "N/A"),
+            ("true", [], "Failed"),
+            ("true", [_ac17_reads("agent", executionStatus="DISABLED")], "Failed"),
+            ("true", [_ac17_reads("agent")], "Passed"),
+        ],
+    )
+    @patch("agentcore_app.agentcore_client")
+    def test_a_region_without_runtimes_follows_the_opt_in(
+        self, mock_ac, required, details, verdict
+    ):
+        with patch.dict(
+            os.environ, {"REQUIRE_AGENTCORE_ONLINE_EVALUATION": required}, clear=True
+        ):
+            mock_ac.list_online_evaluation_configs.return_value = {
+                "onlineEvaluationConfigs": [
+                    _online_evaluation_summary(
+                        detail["onlineEvaluationConfigId"], "continuous"
+                    )
+                    for detail in details
+                ]
+            }
+            mock_ac.get_online_evaluation_config.side_effect = (
+                lambda onlineEvaluationConfigId: details[0]
+            )
+            mock_ac.list_agent_runtimes.return_value = {"agentRuntimes": []}
+
+            findings = agentcore_app.check_agentcore_online_evaluation_coverage()
+
+        assert len(findings) == 1
+        assert findings[0]["Status"] == verdict
+
+
 class TestAC39OnlineEvaluationOperation:
     """AC-39: a configuration that exists is judged whatever the scanner was told."""
 
@@ -13395,18 +13680,18 @@ class TestAC39OnlineEvaluationOperation:
 
     @patch.dict(os.environ, {}, clear=True)
     @patch("agentcore_app.agentcore_client")
-    def test_a_disabled_evaluation_fails_where_ac17_abstains(self, mock_ac):
-        # AC-17 reports N/A for the same configuration unless the environment
-        # sets REQUIRE_AGENTCORE_ONLINE_EVALUATION, which is the verdict gap
-        # AC-39 closes.
+    def test_a_disabled_evaluation_fails_in_both_checks(self, mock_ac):
+        # With REQUIRE_AGENTCORE_ONLINE_EVALUATION unset, AC-17 judges the
+        # runtime the configuration reads and AC-39 judges the configuration.
         _online_evaluation_client(
             mock_ac, [_online_evaluation_detail(executionStatus="DISABLED")]
         )
+        _ac17_runtimes(mock_ac, "agent")
 
         incumbent = agentcore_app.check_agentcore_online_evaluation_coverage()
         findings = agentcore_app.check_agentcore_online_evaluation_operation()
 
-        assert incumbent[0]["Status"] == "N/A"
+        assert incumbent[0]["Status"] == "Failed"
         assert findings[0]["Status"] == "Failed"
 
     @patch("agentcore_app.agentcore_client")

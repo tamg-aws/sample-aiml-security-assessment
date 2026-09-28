@@ -730,8 +730,8 @@ inventory is never treated as evidence of compliance.
 
 ### AC-17: Online Evaluation Coverage
 
-- **Severity:** Informational by default; Medium when required
-- **Description:** Reports whether online evaluation configurations are active/enabled and include non-zero sampling, evaluators, CloudWatch input data, and output logging. Set the `RequireAgentCoreOnlineEvaluation` deployment parameter to `true` (`REQUIRE_AGENTCORE_ONLINE_EVALUATION` in the Lambda) to make incomplete coverage fail.
+- **Severity:** Medium
+- **Description:** Reports one finding per AgentCore runtime, whatever the deployment parameters say. A runtime passes when a running online evaluation configuration reads it: the configuration is `ACTIVE` and `ENABLED`, samples above zero, attaches an evaluator and writes to an output log group, and its `dataSourceConfig.cloudWatchLogs` names a log group under `/aws/bedrock-agentcore/runtimes/<runtimeId>-` (by `logGroupNames` or `logGroupNamePrefixes`) together with a `serviceNames` entry equal to the runtime id or name, or starting with either and a dot. A runtime no configuration reads fails, and one only a stopped configuration reads fails with the stopped settings named. A configuration that cannot be read makes every runtime not already scored `N/A`, and an unlistable runtime inventory is `N/A`. Rule filters are counted in the `Passed` text and not judged, because which sessions an operator means to score has no API field. In a region with no runtime, `RequireAgentCoreOnlineEvaluation` set to `true` (`REQUIRE_AGENTCORE_ONLINE_EVALUATION` in the Lambda) requires one running configuration, for agents hosted outside AgentCore Runtime; unset, that region is informational `N/A`.
 
 ### AC-18: CloudTrail Data Event Coverage
 
@@ -841,7 +841,7 @@ inventory is never treated as evidence of compliance.
 ### AC-39: Online Evaluation Operation
 
 - **Severity:** Medium
-- **Description:** Requires each online evaluation configuration to be `ACTIVE` and `ENABLED`, to sample a non-zero share of traffic, to read from at least one input source, and to write its scores to a log group, and names which of those stopped it running. AC-17 reads the same settings but reports `N/A` unless `REQUIRE_AGENTCORE_ONLINE_EVALUATION` is set, so the one verdict it cannot return by default is Failed. This check judges a configuration that exists whatever that parameter is set to. A region with no configurations is informational `N/A`, and AC-17 reports whether one is expected.
+- **Description:** Requires each online evaluation configuration to be `ACTIVE` and `ENABLED`, to sample a non-zero share of traffic, to read from at least one input source, and to write its scores to a log group, and names which of those stopped it running. An input log group is read from `logGroupNames` or `logGroupNamePrefixes`. A region with no configurations is informational `N/A`, and AC-17 reports whether each runtime is scored.
 
 ### AC-40: Evaluation Safety Coverage
 

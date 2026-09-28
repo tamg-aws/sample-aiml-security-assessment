@@ -69,7 +69,7 @@ Parameters:
     Type: String
     Default: "false"
     AllowedValues: ["true", "false"]
-    Description: Fail AC-17 when no complete active online evaluation configuration is found.
+    Description: Fail AC-17 in a region with no AgentCore runtime when no running online evaluation configuration is found. Every runtime is judged whatever this is set to.
   RequireAgentRegistryManualApproval:
     Type: String
     Default: "false"

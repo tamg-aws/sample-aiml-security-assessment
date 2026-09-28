@@ -320,7 +320,7 @@ enforced by default.
 | --- | --- | --- | --- |
 | `RequireBedrockZeroDataRetention` | `false` | BR-37 | When `true`, the Bedrock account retention modes `default` and `inherit` fail the explicit zero-data-retention baseline. `provider_data_share` fails regardless of this setting. |
 | `RequireMarketplaceEndpointCMK` | `true` | BR-40 | When `true`, a Bedrock Marketplace model endpoint without a customer-managed KMS key fails. BR-40 uses `kms:DescribeKey` and requires `KeyManager=CUSTOMER`; AWS-managed keys do not pass. When `false`, a missing or AWS-managed key is reported as an informational `N/A` hardening advisory. |
-| `RequireAgentCoreOnlineEvaluation` | `false` | AC-17 | When `true`, missing or incomplete active AgentCore online evaluation coverage fails. When `false`, absent coverage is informational. |
+| `RequireAgentCoreOnlineEvaluation` | `false` | AC-17 | When `true`, a region with no AgentCore runtime fails unless a running online evaluation configuration exists. When `false`, that region is informational. Every runtime is judged either way. |
 | `RequireAgentRegistryManualApproval` | `false` | AR-03 | When `true`, Agent Registry instances configured to approve all submitted records fail. When `false`, automatic approval is reported as an informational governance advisory. |
 | `RequireAgentRegistryCMK` | `false` | AR-05 | When `true`, registries using the default AWS owned encryption key fail. When `false`, AWS owned key encryption is reported as an informational hardening advisory; registries with a customer-managed KMS key pass. |
 | `AgentCoreTokenVaultId` | `default` | AC-14 | Selects the regional AgentCore Identity token vault whose customer-managed KMS encryption is assessed. |

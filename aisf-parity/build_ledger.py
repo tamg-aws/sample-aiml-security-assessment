@@ -256,12 +256,13 @@ AI_SUBJECT_ROWS = [
         None,
         "agentcore_assessments",
         ["AC-17", "AC-39"],
-        "AC-39 judges every online evaluation configuration that exists whatever "
-        "REQUIRE_AGENTCORE_ONLINE_EVALUATION is set to, and names the setting that stops it "
-        "running: a status other than ACTIVE, an executionStatus other than ENABLED, no "
-        "sampling percentage above zero, no input log group or service, no output log group, "
-        "or no evaluator attached. AC-17 reads the same settings and returns N/A with that "
-        "variable unset, so Failed is the verdict it cannot reach by default",
+        "AC-39 judges every online evaluation configuration that exists and names the "
+        "setting that stops it running: a status other than ACTIVE, an executionStatus other "
+        "than ENABLED, no sampling percentage above zero, no input log group or service, no "
+        "output log group, or no evaluator attached. AC-17 judges every runtime whatever "
+        "REQUIRE_AGENTCORE_ONLINE_EVALUATION is set to, and fails one that no running "
+        "configuration reads by its log group and service name. The rule filters are counted "
+        "and not judged, because which sessions an operator means to score has no API field",
         [],
         4,
     ),

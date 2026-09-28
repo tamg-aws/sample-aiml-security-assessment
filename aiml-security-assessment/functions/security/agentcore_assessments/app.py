@@ -4791,13 +4791,78 @@ def check_agentcore_browser_network_isolation(
     return findings
 
 
+def _online_evaluation_covers_runtime(
+    detail: Dict[str, Any], runtime: Dict[str, Any]
+) -> bool:
+    """Whether one online evaluation's input names this runtime's traces.
+
+    A runtime endpoint writes to /aws/bedrock-agentcore/runtimes/<runtimeId>-
+    <endpointName>, so an explicit input log group must start with the runtime id
+    and a hyphen, and a log group name prefix must either be a prefix of that stem
+    or start with it. serviceNames then picks the agent's traces out of those
+    groups: the devguide gives the service name as
+    <agentRuntimeName>.<endpointName>, and a configuration created from an agent
+    endpoint carries the runtime id, so either spelling is read as this runtime's.
+    """
+    source = (detail.get("dataSourceConfig") or {}).get("cloudWatchLogs") or {}
+    runtime_id = runtime.get("agentRuntimeId") or ""
+    runtime_name = runtime.get("agentRuntimeName") or ""
+    if not runtime_id:
+        return False
+    group_stem = f"{AGENTCORE_RUNTIME_LOG_GROUP_PREFIX}{runtime_id}-"
+
+    names_group = any(
+        isinstance(group, str) and group.startswith(group_stem)
+        for group in source.get("logGroupNames") or []
+    ) or any(
+        isinstance(prefix, str)
+        and prefix
+        and (group_stem.startswith(prefix) or prefix.startswith(group_stem))
+        for prefix in source.get("logGroupNamePrefixes") or []
+    )
+    names_service = any(
+        isinstance(service, str)
+        and any(
+            service == identity or service.startswith(f"{identity}.")
+            for identity in (runtime_id, runtime_name)
+            if identity
+        )
+        for service in source.get("serviceNames") or []
+    )
+    return names_group and names_service
+
+
+def _online_evaluation_filter_note(detail: Dict[str, Any]) -> str:
+    """Say how many rule filters narrow the sessions an evaluation scores."""
+    filters = (detail.get("rule") or {}).get("filters") or []
+    if not filters:
+        return ""
+    return f", with {len(filters)} rule filter(s) that limit it to matching sessions"
+
+
 def check_agentcore_online_evaluation_coverage() -> List[Dict[str, Any]]:
-    """AC-17: Report whether an operational online-evaluation config exists."""
+    """AC-17: Judge whether every AgentCore runtime is scored by online evaluation.
+
+    Every runtime in the region is judged, whatever the assessment environment
+    sets. A runtime passes when an online evaluation configuration that is
+    running (AC-39's settings: ACTIVE, ENABLED, sampling above zero, an input log
+    group and service, an output log group and an evaluator) reads that runtime's
+    log group and service name. A runtime only a stopped configuration names
+    fails and the stopped settings are named, and a configuration that could not
+    be read leaves every runtime it might cover N/A. The rule filters are counted
+    and not judged, because which sessions an operator means to score has no API
+    field.
+
+    With no runtime in the region, REQUIRE_AGENTCORE_ONLINE_EVALUATION set to
+    true still requires one running configuration, for agents hosted outside
+    AgentCore Runtime whose traces reach CloudWatch; unset, that case is N/A.
+    """
+    finding_name = "AgentCore Online Evaluation Coverage"
     if agentcore_client is None:
         return [
             create_finding(
                 check_id="AC-17",
-                finding_name="AgentCore Online Evaluation Coverage",
+                finding_name=finding_name,
                 finding_details="AgentCore client not available in this region",
                 resolution="No action required unless online evaluation is expected.",
                 reference=AGENTCORE_ONLINE_EVALUATION_REFERENCE_URL,
@@ -4812,104 +4877,198 @@ def check_agentcore_online_evaluation_coverage() -> List[Dict[str, Any]]:
         "yes",
     }
     try:
-        configs = _agentcore_list_all(
-            "list_online_evaluation_configs", ["onlineEvaluationConfigs"]
-        )
-        if not configs:
-            return [
-                create_finding(
-                    check_id="AC-17",
-                    finding_name="AgentCore Online Evaluation Coverage",
-                    finding_details="No AgentCore online evaluation configurations found.",
-                    resolution="Configure online evaluation for production agent workloads where continuous assurance is required.",
-                    reference=AGENTCORE_ONLINE_EVALUATION_REFERENCE_URL,
-                    severity=SeverityEnum.MEDIUM
-                    if required
-                    else SeverityEnum.INFORMATIONAL,
-                    status=StatusEnum.FAILED if required else StatusEnum.NA,
-                )
-            ]
-
-        findings = []
-        for summary in configs:
-            config_id = summary.get("onlineEvaluationConfigId")
-            name = summary.get("onlineEvaluationConfigName", config_id or "unknown")
-            try:
-                detail = agentcore_client.get_online_evaluation_config(
-                    onlineEvaluationConfigId=config_id
-                )
-                sampling = (
-                    (detail.get("rule") or {})
-                    .get("samplingConfig", {})
-                    .get("samplingPercentage", 0)
-                )
-                data_source = (detail.get("dataSourceConfig") or {}).get(
-                    "cloudWatchLogs", {}
-                )
-                output = (detail.get("outputConfig") or {}).get("cloudWatchConfig", {})
-                operational = all(
-                    [
-                        detail.get("status") == "ACTIVE",
-                        detail.get("executionStatus") == "ENABLED",
-                        sampling > 0,
-                        bool(detail.get("evaluators")),
-                        bool(data_source.get("logGroupNames"))
-                        or bool(data_source.get("serviceNames")),
-                        bool(output.get("logGroupName")),
-                    ]
-                )
-                findings.append(
-                    create_finding(
-                        check_id="AC-17",
-                        finding_name="AgentCore Online Evaluation Coverage",
-                        finding_details=(
-                            f"Online evaluation '{name}' ({config_id}) is active with sampling, evaluators, input logs, and output logging."
-                            if operational
-                            else f"Online evaluation '{name}' ({config_id}) is missing one or more operational coverage settings."
-                        ),
-                        resolution=(
-                            "No action required. Confirm the rule filters cover the intended production traces."
-                            if operational
-                            else "Set the evaluation ACTIVE and ENABLED, use non-zero sampling, add evaluators, and configure CloudWatch input and output log groups."
-                        ),
-                        reference=AGENTCORE_ONLINE_EVALUATION_REFERENCE_URL,
-                        severity=SeverityEnum.MEDIUM
-                        if required
-                        else SeverityEnum.INFORMATIONAL,
-                        status=(
-                            StatusEnum.PASSED
-                            if operational
-                            else StatusEnum.FAILED
-                            if required
-                            else StatusEnum.NA
-                        ),
-                    )
-                )
-            except Exception as error:
-                findings.append(
-                    create_finding(
-                        check_id="AC-17",
-                        finding_name="AgentCore Online Evaluation Coverage",
-                        finding_details=f"Online evaluation '{name}' could not be assessed: {type(error).__name__}.",
-                        resolution="Grant bedrock-agentcore:GetOnlineEvaluationConfig and retry.",
-                        reference=AGENTCORE_ONLINE_EVALUATION_REFERENCE_URL,
-                        severity=SeverityEnum.INFORMATIONAL,
-                        status=StatusEnum.NA,
-                    )
-                )
-        return findings
+        runtimes = _agentcore_list_all("list_agent_runtimes", ["agentRuntimes"])
     except Exception as error:
         return [
             create_finding(
                 check_id="AC-17",
-                finding_name="AgentCore Online Evaluation Coverage",
-                finding_details=f"Could not list online evaluation configurations: {type(error).__name__}.",
+                finding_name=finding_name,
+                finding_details=(
+                    "Runtimes could not be listed, so which runtimes online "
+                    f"evaluation scores is unknown: {type(error).__name__}."
+                ),
+                resolution="Grant bedrock-agentcore:ListAgentRuntimes and retry.",
+                reference=AGENTCORE_ONLINE_EVALUATION_REFERENCE_URL,
+                severity=SeverityEnum.INFORMATIONAL,
+                status=StatusEnum.NA,
+            )
+        ]
+    try:
+        details, errors = _online_evaluation_details()
+    except Exception as error:
+        return [
+            create_finding(
+                check_id="AC-17",
+                finding_name=finding_name,
+                finding_details=(
+                    "Could not list online evaluation configurations: "
+                    f"{type(error).__name__}."
+                ),
                 resolution="Grant bedrock-agentcore:ListOnlineEvaluationConfigs and retry.",
                 reference=AGENTCORE_ONLINE_EVALUATION_REFERENCE_URL,
                 severity=SeverityEnum.INFORMATIONAL,
                 status=StatusEnum.NA,
             )
         ]
+
+    judged = [
+        (label, detail, _online_evaluation_problems(detail))
+        for label, detail in details
+    ]
+    unreadable = [label for label, _ in errors]
+    unreadable_text = (
+        f"{len(unreadable)} configuration(s) could not be read: "
+        f"{', '.join(unreadable)}."
+    )
+    unreadable_resolution = (
+        "Grant bedrock-agentcore:GetOnlineEvaluationConfig on every online "
+        "evaluation configuration and retry."
+    )
+
+    if not runtimes:
+        running = [label for label, _, problems in judged if not problems]
+        if running:
+            status, severity = StatusEnum.PASSED, SeverityEnum.MEDIUM
+            details_text = (
+                "No AgentCore runtimes found in this region, and "
+                f"{len(running)} online evaluation configuration(s) are running: "
+                f"{', '.join(running)}."
+            )
+            resolution = "No action required."
+        elif unreadable:
+            status, severity = StatusEnum.NA, SeverityEnum.INFORMATIONAL
+            details_text = (
+                "No AgentCore runtimes found in this region, and no readable "
+                f"online evaluation configuration is running. {unreadable_text}"
+            )
+            resolution = unreadable_resolution
+        elif required:
+            status, severity = StatusEnum.FAILED, SeverityEnum.MEDIUM
+            details_text = (
+                "No AgentCore runtimes found in this region, and "
+                "REQUIRE_AGENTCORE_ONLINE_EVALUATION is set, but no online "
+                f"evaluation configuration is running ({len(judged)} found)."
+            )
+            resolution = (
+                "Create an online evaluation configuration over the CloudWatch "
+                "log groups the agents in this region write traces to, and set it "
+                "ENABLED with a sampling percentage above zero."
+            )
+        else:
+            status, severity = StatusEnum.NA, SeverityEnum.INFORMATIONAL
+            details_text = (
+                "No AgentCore runtimes found in this region, so no runtime needs "
+                "online evaluation. AC-39 judges any configuration that exists."
+            )
+            resolution = (
+                "No action required unless agents hosted outside AgentCore Runtime "
+                "run here. Set REQUIRE_AGENTCORE_ONLINE_EVALUATION to true to "
+                "require online evaluation for them."
+            )
+        return [
+            create_finding(
+                check_id="AC-17",
+                finding_name=finding_name,
+                finding_details=details_text,
+                resolution=resolution,
+                reference=AGENTCORE_ONLINE_EVALUATION_REFERENCE_URL,
+                severity=severity,
+                status=status,
+            )
+        ]
+
+    findings = []
+    for runtime in runtimes:
+        runtime_label = (
+            f"Runtime '{runtime.get('agentRuntimeName', 'unknown')}' "
+            f"({runtime.get('agentRuntimeId', 'unknown')})"
+        )
+        covering = [
+            (label, detail, problems)
+            for label, detail, problems in judged
+            if _online_evaluation_covers_runtime(detail, runtime)
+        ]
+        running = [
+            (label, detail) for label, detail, problems in covering if not problems
+        ]
+        if running:
+            scored_by = "; ".join(
+                f"{label} samples "
+                f"{((detail.get('rule') or {}).get('samplingConfig') or {}).get('samplingPercentage')} "
+                f"percent{_online_evaluation_filter_note(detail)}"
+                for label, detail in running
+            )
+            findings.append(
+                create_finding(
+                    check_id="AC-17",
+                    finding_name=finding_name,
+                    finding_details=(
+                        f"{runtime_label} is scored by a running online evaluation "
+                        f"that reads its log group and service name: {scored_by}."
+                    ),
+                    resolution=(
+                        "No action required. Confirm the sampling percentage and "
+                        "any rule filters cover the production sessions."
+                    ),
+                    reference=AGENTCORE_ONLINE_EVALUATION_REFERENCE_URL,
+                    severity=SeverityEnum.MEDIUM,
+                    status=StatusEnum.PASSED,
+                )
+            )
+            continue
+
+        if unreadable:
+            findings.append(
+                create_finding(
+                    check_id="AC-17",
+                    finding_name=finding_name,
+                    finding_details=(
+                        f"{runtime_label} is scored by no readable, running online "
+                        f"evaluation, and {unreadable_text} Whether one of those "
+                        "scores it is unknown."
+                    ),
+                    resolution=unreadable_resolution,
+                    reference=AGENTCORE_ONLINE_EVALUATION_REFERENCE_URL,
+                    severity=SeverityEnum.INFORMATIONAL,
+                    status=StatusEnum.NA,
+                )
+            )
+            continue
+
+        if covering:
+            stopped = "; ".join(
+                f"{label} {', '.join(problems)}" for label, _, problems in covering
+            )
+            details_text = (
+                f"{runtime_label} is read only by online evaluation that is not "
+                f"running: {stopped}. Its production traffic is unscored."
+            )
+        else:
+            details_text = (
+                f"{runtime_label} is read by none of the {len(judged)} online "
+                "evaluation configuration(s) in this region: no input names its "
+                f"log group ({AGENTCORE_RUNTIME_LOG_GROUP_PREFIX}"
+                f"{runtime.get('agentRuntimeId', 'unknown')}-<endpoint>) together "
+                "with its service name. Its production traffic is unscored."
+            )
+        findings.append(
+            create_finding(
+                check_id="AC-17",
+                finding_name=finding_name,
+                finding_details=details_text,
+                resolution=(
+                    "Create or fix an online evaluation configuration whose "
+                    "dataSourceConfig names this runtime's log group and its "
+                    "service name, set it ACTIVE and ENABLED with a sampling "
+                    "percentage above zero, attach at least one evaluator and "
+                    "write results to a log group."
+                ),
+                reference=AGENTCORE_ONLINE_EVALUATION_REFERENCE_URL,
+                severity=SeverityEnum.MEDIUM,
+                status=StatusEnum.FAILED,
+            )
+        )
+    return findings
 
 
 def _memory_strategy_namespaces(strategy: Dict[str, Any]) -> List[str]:
@@ -14616,15 +14775,61 @@ ONLINE_EVALUATION_BUILT_STATUS = "ACTIVE"
 ONLINE_EVALUATION_RUNNING_STATUS = "ENABLED"
 
 
+def _online_evaluation_problems(detail: Dict[str, Any]) -> List[str]:
+    """Name every setting that stops one online evaluation scoring traffic."""
+    problems: List[str] = []
+
+    status = detail.get("status")
+    if status != ONLINE_EVALUATION_BUILT_STATUS:
+        failure_reason = detail.get("failureReason")
+        problems.append(
+            f"reports status {status or 'unspecified'} rather than "
+            f"{ONLINE_EVALUATION_BUILT_STATUS}"
+            + (f" ({failure_reason})" if failure_reason else "")
+        )
+
+    execution_status = detail.get("executionStatus")
+    if execution_status != ONLINE_EVALUATION_RUNNING_STATUS:
+        problems.append(
+            f"reports executionStatus {execution_status or 'unspecified'} rather "
+            f"than {ONLINE_EVALUATION_RUNNING_STATUS}, so it scores no traffic"
+        )
+
+    sampling = ((detail.get("rule") or {}).get("samplingConfig") or {}).get(
+        "samplingPercentage"
+    )
+    if not isinstance(sampling, (int, float)) or sampling <= 0:
+        problems.append(
+            "defines no sampling percentage above zero, so it scores none of the "
+            "traffic it is attached to"
+        )
+
+    data_source = (detail.get("dataSourceConfig") or {}).get("cloudWatchLogs") or {}
+    input_groups = (data_source.get("logGroupNames") or []) + (
+        data_source.get("logGroupNamePrefixes") or []
+    )
+    if not input_groups and not data_source.get("serviceNames"):
+        problems.append(
+            "names no input log group and no service, so it has no traffic to read"
+        )
+
+    output = (detail.get("outputConfig") or {}).get("cloudWatchConfig") or {}
+    if not output.get("logGroupName"):
+        problems.append("writes its results to no log group")
+
+    evaluators = detail.get("evaluators") or []
+    if not evaluators:
+        problems.append("attaches no evaluator, so it scores nothing")
+    return problems
+
+
 def check_agentcore_online_evaluation_operation() -> List[Dict[str, Any]]:
     """AC-39: Judge whether each online evaluation samples live agent traffic.
 
-    AC-17 reads the same settings but reports N/A unless the assessment
-    environment sets REQUIRE_AGENTCORE_ONLINE_EVALUATION, so the one verdict it
-    cannot return by default is Failed: an evaluation left DISABLED, or built and
-    sampling nothing, passes an unconfigured scan. A configuration that exists is a
-    commitment to evaluate something whatever the scanner was told, so this check
-    judges it unconditionally and names the setting that stops it running.
+    A configuration that exists is a commitment to evaluate something, so this
+    check judges each one and names every setting that stops it running. An input
+    log group is read from logGroupNames or logGroupNamePrefixes. AC-17 judges
+    whether each runtime is read by a running configuration.
     """
     if agentcore_client is None:
         return [
@@ -14676,48 +14881,16 @@ def check_agentcore_online_evaluation_operation() -> List[Dict[str, Any]]:
     )
 
     for label, detail in details:
-        problems: List[str] = []
-
-        status = detail.get("status")
-        if status != ONLINE_EVALUATION_BUILT_STATUS:
-            failure_reason = detail.get("failureReason")
-            problems.append(
-                f"reports status {status or 'unspecified'} rather than "
-                f"{ONLINE_EVALUATION_BUILT_STATUS}"
-                + (f" ({failure_reason})" if failure_reason else "")
-            )
-
-        execution_status = detail.get("executionStatus")
-        if execution_status != ONLINE_EVALUATION_RUNNING_STATUS:
-            problems.append(
-                f"reports executionStatus {execution_status or 'unspecified'} rather "
-                f"than {ONLINE_EVALUATION_RUNNING_STATUS}, so it scores no traffic"
-            )
-
+        problems = _online_evaluation_problems(detail)
         sampling = ((detail.get("rule") or {}).get("samplingConfig") or {}).get(
             "samplingPercentage"
         )
-        if not isinstance(sampling, (int, float)) or sampling <= 0:
-            problems.append(
-                "defines no sampling percentage above zero, so it scores none of the "
-                "traffic it is attached to"
-            )
-
         data_source = (detail.get("dataSourceConfig") or {}).get("cloudWatchLogs") or {}
-        input_groups = data_source.get("logGroupNames") or []
+        input_groups = (data_source.get("logGroupNames") or []) + (
+            data_source.get("logGroupNamePrefixes") or []
+        )
         input_services = data_source.get("serviceNames") or []
-        if not input_groups and not input_services:
-            problems.append(
-                "names no input log group and no service, so it has no traffic to read"
-            )
-
-        output = (detail.get("outputConfig") or {}).get("cloudWatchConfig") or {}
-        if not output.get("logGroupName"):
-            problems.append("writes its results to no log group")
-
         evaluators = detail.get("evaluators") or []
-        if not evaluators:
-            problems.append("attaches no evaluator, so it scores nothing")
 
         if problems:
             findings.append(
@@ -14727,8 +14900,7 @@ def check_agentcore_online_evaluation_operation() -> List[Dict[str, Any]]:
                     finding_details=(
                         f"{label} {'; '.join(problems)}. A configuration that does "
                         "not score live traffic leaves production behaviour "
-                        "unmeasured between deployments, and this check reports it "
-                        "whatever REQUIRE_AGENTCORE_ONLINE_EVALUATION is set to."
+                        "unmeasured between deployments."
                     ),
                     resolution=(
                         "Set the configuration ACTIVE and ENABLED with a sampling "

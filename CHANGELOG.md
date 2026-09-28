@@ -389,6 +389,12 @@ section.
   - `AC-20` states in its `Passed` text that `AC-26` judges the key policy
     and that delivery destination log groups outside the AgentCore prefixes
     are not read.
+  - `AC-17` reports one finding per runtime and no longer waits on
+    `RequireAgentCoreOnlineEvaluation`. A runtime that no running online
+    evaluation reads by its log group and service name fails, where it was
+    `N/A` with the parameter unset. The parameter now decides only a region
+    with no runtime. An unreadable configuration or runtime inventory is
+    `N/A`. `AC-39` also reads `logGroupNamePrefixes` as an input source.
 
 ### Deployment impact
 
@@ -470,6 +476,12 @@ passed before can now fail after the same CodeBuild run.
 
 `AC-19` changes no IAM grant: it reads runtimes with
 `bedrock-agentcore:ListAgentRuntimes`, which the role already holds.
+
+`AC-17` changes no IAM grant either, and reads the same two list calls. The
+`RequireAgentCoreOnlineEvaluation` parameter keeps its name and default, and
+only its description changes in both templates. With the default `false`, a
+region with runtimes that online evaluation does not score now reports
+`Failed` rows where it reported `N/A`.
 
 ## 2.0.0 - 2026-09-18
 
