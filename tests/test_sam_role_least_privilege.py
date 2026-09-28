@@ -204,6 +204,7 @@ _EXPECTED_ACTIONS = {
         "s3:GetEncryptionConfiguration",
         "s3:GetLifecycleConfiguration",
         "s3:GetObject",
+        "s3:GetReplicationConfiguration",
         "s3:PutObject",
         "s3vectors:GetIndex",
         "s3vectors:GetVectorBucket",

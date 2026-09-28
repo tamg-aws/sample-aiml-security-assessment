@@ -2394,8 +2394,15 @@ class TestInvocationRecordState:
         assert "AccessDeniedException" in state["unread"][0]
 
     def test_text_delivery_must_be_true(self):
-        state, _ = self._state({"s3Config": {"bucketName": "logs"}})
+        state, _ = self._state(
+            {"textDataDeliveryEnabled": False, "s3Config": {"bucketName": "logs"}}
+        )
         assert any("textDataDeliveryEnabled" in gap for gap in state["gaps"])
+
+    def test_an_unreturned_text_flag_is_unread_not_off(self):
+        state, _ = self._state({"s3Config": {"bucketName": "logs"}})
+        assert state["gaps"] == []
+        assert any("textDataDeliveryEnabled" in item for item in state["unread"])
 
     def test_every_destination_is_judged(self):
         state, judged = self._state(
@@ -20541,3 +20548,223 @@ class TestIamCacheContract:
             )
             == expected
         )
+
+
+EXPIRING = {
+    "Rules": [
+        {
+            "ID": "expire",
+            "Status": "Enabled",
+            "Filter": {"Prefix": ""},
+            "Expiration": {"Days": 30},
+        }
+    ]
+}
+
+
+class TestBR04RetentionDepth:
+    """AIR-FND-DAT-08: every copy of the record is judged, not one bucket."""
+
+    FINDING = "Bedrock Invocation Log Retention"
+
+    @staticmethod
+    def _not_found(code, operation):
+        return ClientError({"Error": {"Code": code, "Message": "x"}}, operation)
+
+    def _rows(self, logging_config, lifecycles, locks=None, replication=None):
+        """lifecycles, locks, replication: {bucket: response or exception}."""
+
+        def per_bucket(table, missing_code, operation):
+            def read(Bucket):
+                value = (table or {}).get(Bucket)
+                if value is None:
+                    raise self._not_found(missing_code, operation)
+                if isinstance(value, Exception):
+                    raise value
+                return value
+
+            return read
+
+        s3 = MagicMock()
+        s3.get_bucket_lifecycle_configuration.side_effect = per_bucket(
+            lifecycles,
+            "NoSuchLifecycleConfiguration",
+            "GetBucketLifecycleConfiguration",
+        )
+        s3.get_bucket_versioning.return_value = {}
+        s3.get_object_lock_configuration.side_effect = per_bucket(
+            locks,
+            "ObjectLockConfigurationNotFoundError",
+            "GetObjectLockConfiguration",
+        )
+        s3.get_bucket_replication.side_effect = per_bucket(
+            replication,
+            "ReplicationConfigurationNotFoundError",
+            "GetBucketReplication",
+        )
+        s3.get_bucket_encryption.return_value = {}
+        bedrock = MagicMock()
+        bedrock.get_model_invocation_logging_configuration.return_value = {
+            "loggingConfig": logging_config
+        }
+        logs = MagicMock()
+        logs.describe_log_groups.return_value = {
+            "logGroups": [{"logGroupName": "/bedrock/logs", "retentionInDays": 30}]
+        }
+
+        def factory(service, **kwargs):
+            return {"s3": s3, "bedrock": bedrock, "logs": logs}.get(
+                service, MagicMock()
+            )
+
+        with (
+            patch("boto3.client", side_effect=factory),
+            patch("bedrock_app.detect_bedrock_regional_footprint", return_value=True),
+        ):
+            findings = extract_csv_data(
+                bedrock_app.check_bedrock_logging_configuration(region="us-east-1")
+            )
+        return [f for f in findings if f["Finding"] == self.FINDING], s3
+
+    LARGE = {
+        "cloudWatchConfig": {
+            "logGroupName": "/bedrock/logs",
+            "largeDataDeliveryS3Config": {"bucketName": "large", "keyPrefix": "big"},
+        },
+        "s3Config": {"bucketName": "logs"},
+    }
+
+    def test_large_data_bucket_without_expiry_fails(self):
+        rows, _ = self._rows(self.LARGE, {"logs": EXPIRING})
+        failed = [r for r in rows if r["Status"] == "Failed"]
+        assert len(failed) == 1
+        assert (
+            "Large-data S3 bucket 'large' has no enabled lifecycle rule that "
+            "expires objects under 'big/AWSLogs/'" in failed[0]["Finding_Details"]
+        )
+        passed = [r for r in rows if r["Status"] == "Passed"]
+        assert "S3 bucket 'logs' lifecycle" in passed[0]["Finding_Details"]
+
+    def test_large_data_bucket_with_expiry_passes_beside_the_others(self):
+        rows, _ = self._rows(self.LARGE, {"logs": EXPIRING, "large": EXPIRING})
+        assert [r["Status"] for r in rows] == ["Passed"]
+        assert "3 destination(s)" in rows[0]["Finding_Details"]
+        assert "Large-data S3 bucket 'large' lifecycle" in rows[0]["Finding_Details"]
+        assert "Whether lifecycle deletion has run" in rows[0]["Finding_Details"]
+
+    def test_large_data_bucket_equal_to_the_log_bucket_is_read_once(self):
+        config = {
+            "cloudWatchConfig": {
+                "logGroupName": "/bedrock/logs",
+                "largeDataDeliveryS3Config": {"bucketName": "logs"},
+            },
+            "s3Config": {"bucketName": "logs"},
+        }
+        rows, s3 = self._rows(config, {"logs": EXPIRING})
+        assert [r["Status"] for r in rows] == ["Passed"]
+        assert s3.get_bucket_lifecycle_configuration.call_count == 1
+
+    @staticmethod
+    def _replicates(*destinations, status="Enabled"):
+        return {
+            "ReplicationConfiguration": {
+                "Rules": [
+                    {"Status": status, "Destination": {"Bucket": f"arn:aws:s3:::{d}"}}
+                    for d in destinations
+                ]
+            }
+        }
+
+    def test_replica_without_expiry_fails(self):
+        rows, _ = self._rows(
+            {"s3Config": {"bucketName": "logs"}},
+            {"logs": EXPIRING, "replica-a": EXPIRING},
+            replication={"logs": self._replicates("replica-a", "replica-b")},
+        )
+        failed = [r for r in rows if r["Status"] == "Failed"]
+        assert len(failed) == 1
+        assert (
+            "Replica S3 bucket (copied from 'logs') 'replica-b' has no enabled "
+            "lifecycle rule" in failed[0]["Finding_Details"]
+        )
+        passed = [r for r in rows if r["Status"] == "Passed"]
+        assert "'replica-a' lifecycle" in passed[0]["Finding_Details"]
+
+    def test_disabled_replication_rule_is_not_a_copy(self):
+        rows, _ = self._rows(
+            {"s3Config": {"bucketName": "logs"}},
+            {"logs": EXPIRING},
+            replication={"logs": self._replicates("replica", status="Disabled")},
+        )
+        assert [r["Status"] for r in rows] == ["Passed"]
+        assert "Replica" not in rows[0]["Finding_Details"]
+
+    def test_unreadable_replica_is_not_judged(self):
+        rows, _ = self._rows(
+            {"s3Config": {"bucketName": "logs"}},
+            {
+                "logs": EXPIRING,
+                "replica": self._not_found(
+                    "AccessDenied", "GetBucketLifecycleConfiguration"
+                ),
+            },
+            replication={"logs": self._replicates("replica")},
+        )
+        assert sorted(r["Status"] for r in rows) == ["N/A", "Passed"]
+        na = [r for r in rows if r["Status"] == "N/A"][0]
+        assert "'replica'" in na["Finding_Details"]
+
+    def test_unreadable_replication_is_not_judged(self):
+        rows, _ = self._rows(
+            {"s3Config": {"bucketName": "logs"}},
+            {"logs": EXPIRING},
+            replication={
+                "logs": self._not_found("AccessDenied", "GetBucketReplication")
+            },
+        )
+        na = [r for r in rows if r["Status"] == "N/A"]
+        assert len(na) == 1
+        assert "s3:GetReplicationConfiguration" in na[0]["Finding_Details"]
+
+    def test_object_lock_default_retention_is_stated(self):
+        rows, _ = self._rows(
+            {"s3Config": {"bucketName": "logs"}},
+            {"logs": EXPIRING},
+            locks={
+                "logs": {
+                    "ObjectLockConfiguration": {
+                        "ObjectLockEnabled": "Enabled",
+                        "Rule": {
+                            "DefaultRetention": {"Mode": "COMPLIANCE", "Days": 400}
+                        },
+                    }
+                }
+            },
+        )
+        assert [r["Status"] for r in rows] == ["Passed"]
+        assert (
+            "Object Lock default retention (COMPLIANCE mode for 400 day(s)) holds "
+            "each version until it ends" in rows[0]["Finding_Details"]
+        )
+
+    def test_object_lock_without_default_retention_adds_nothing(self):
+        rows, _ = self._rows(
+            {"s3Config": {"bucketName": "logs"}},
+            {"logs": EXPIRING},
+            locks={
+                "logs": {"ObjectLockConfiguration": {"ObjectLockEnabled": "Enabled"}}
+            },
+        )
+        assert [r["Status"] for r in rows] == ["Passed"]
+        assert "Object Lock" not in rows[0]["Finding_Details"]
+
+    def test_unreadable_object_lock_is_not_judged(self):
+        rows, _ = self._rows(
+            {"s3Config": {"bucketName": "logs"}},
+            {"logs": EXPIRING},
+            locks={
+                "logs": self._not_found("AccessDenied", "GetObjectLockConfiguration")
+            },
+        )
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert "s3:GetBucketObjectLockConfiguration" in rows[0]["Finding_Details"]

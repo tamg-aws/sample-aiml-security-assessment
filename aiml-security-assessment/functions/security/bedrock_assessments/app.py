@@ -2932,11 +2932,147 @@ def _bucket_expiration_rules(
     }
 
 
+def _object_lock_default_retention(s3_client: Any, bucket_name: str) -> Optional[str]:
+    """Describe a bucket's Object Lock default retention, or None when it has none."""
+    try:
+        configuration = (
+            s3_client.get_object_lock_configuration(Bucket=bucket_name).get(
+                "ObjectLockConfiguration"
+            )
+            or {}
+        )
+    except ClientError as error:
+        if error.response["Error"]["Code"] == "ObjectLockConfigurationNotFoundError":
+            return None
+        raise
+    retention = (configuration.get("Rule") or {}).get("DefaultRetention") or {}
+    if configuration.get("ObjectLockEnabled") != "Enabled" or not retention:
+        return None
+    period = (
+        f"{retention['Days']} day(s)"
+        if retention.get("Days")
+        else f"{retention.get('Years')} year(s)"
+    )
+    return f"{retention.get('Mode', 'unknown')} mode for {period}"
+
+
+def _replica_buckets(s3_client: Any, bucket_name: str) -> List[str]:
+    """Name the other buckets an enabled replication rule copies this bucket to."""
+    try:
+        rules = (
+            s3_client.get_bucket_replication(Bucket=bucket_name)
+            .get("ReplicationConfiguration", {})
+            .get("Rules", [])
+        )
+    except ClientError as error:
+        if error.response["Error"]["Code"] == "ReplicationConfigurationNotFoundError":
+            return []
+        raise
+    replicas = set()
+    for rule in rules:
+        if rule.get("Status") != "Enabled":
+            continue
+        destination = str((rule.get("Destination") or {}).get("Bucket") or "")
+        name = destination.rsplit(":", 1)[-1]
+        if name and name != bucket_name:
+            replicas.add(name)
+    return sorted(replicas)
+
+
+def _judge_log_bucket_retention(
+    bucket_name: str,
+    key_prefix: Optional[str],
+    label: str,
+    region: str,
+    retained: List[str],
+    unretained: List[str],
+    undetermined: List[str],
+) -> None:
+    """
+    Judge one invocation log bucket's lifecycle, its Object Lock default
+    retention, and the lifecycle of every bucket it replicates to (AIR-FND-DAT-08).
+
+    A replica is a second copy of every prompt and response, so a source rule
+    that expires objects deletes nothing at the destination.
+    """
+    try:
+        lifecycle = _bucket_expiration_rules(bucket_name, region, key_prefix)
+    except Exception as error:
+        logger.warning(
+            f"Unable to read lifecycle configuration for bucket {bucket_name}: {error}"
+        )
+        undetermined.append(
+            f"{label} '{bucket_name}': "
+            f"{describe_api_error(error, 's3:GetLifecycleConfiguration', region)}"
+        )
+        return
+    if lifecycle["undetermined"]:
+        undetermined.append(f"{label} '{bucket_name}': {lifecycle['undetermined']}")
+        return
+    if lifecycle["deficiency"]:
+        unretained.append(f"{label} '{bucket_name}' {lifecycle['deficiency']}")
+        return
+
+    s3_client = boto3.client("s3", config=boto3_config, region_name=region)
+    try:
+        lock = _object_lock_default_retention(s3_client, bucket_name)
+    except Exception as error:
+        undetermined.append(
+            f"{label} '{bucket_name}': "
+            f"{describe_api_error(error, 's3:GetBucketObjectLockConfiguration', region)}"
+        )
+        return
+    lock_note = (
+        f"; Object Lock default retention ({lock}) holds each version until it "
+        "ends, so lifecycle deletion waits for the longer of the two periods"
+        if lock
+        else ""
+    )
+    retained.append(
+        f"{label} '{bucket_name}' lifecycle: "
+        f"{'; '.join(lifecycle['expirations'])}{lock_note}"
+    )
+
+    try:
+        replicas = _replica_buckets(s3_client, bucket_name)
+    except Exception as error:
+        undetermined.append(
+            f"{label} '{bucket_name}': "
+            f"{describe_api_error(error, 's3:GetReplicationConfiguration', region)}"
+        )
+        return
+    for replica in replicas:
+        replica_label = f"Replica S3 bucket (copied from '{bucket_name}')"
+        try:
+            replica_lifecycle = _bucket_expiration_rules(replica, region, key_prefix)
+        except Exception as error:
+            undetermined.append(
+                f"{replica_label} '{replica}': "
+                f"{describe_api_error(error, 's3:GetLifecycleConfiguration', region)}"
+            )
+            continue
+        if replica_lifecycle["undetermined"]:
+            undetermined.append(
+                f"{replica_label} '{replica}': {replica_lifecycle['undetermined']}"
+            )
+        elif replica_lifecycle["deficiency"]:
+            unretained.append(
+                f"{replica_label} '{replica}' {replica_lifecycle['deficiency']}"
+            )
+        else:
+            retained.append(
+                f"{replica_label} '{replica}' lifecycle: "
+                f"{'; '.join(replica_lifecycle['expirations'])}"
+            )
+
+
 def _invocation_log_retention_findings(
     s3_bucket_name: Optional[str],
     log_group_name: Optional[str],
     region: str,
     s3_key_prefix: Optional[str] = None,
+    large_data_bucket: Optional[str] = None,
+    large_data_prefix: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """Assess a stated retention period on each configured logging destination.
 
@@ -2976,31 +3112,15 @@ def _invocation_log_retention_findings(
                 f"{describe_api_error(error, 'logs:DescribeLogGroups', region)}"
             )
 
+    buckets = []
     if s3_bucket_name:
-        try:
-            lifecycle = _bucket_expiration_rules(s3_bucket_name, region, s3_key_prefix)
-            if lifecycle["undetermined"]:
-                undetermined.append(
-                    f"S3 bucket '{s3_bucket_name}': {lifecycle['undetermined']}"
-                )
-            elif lifecycle["deficiency"]:
-                unretained.append(
-                    f"S3 bucket '{s3_bucket_name}' {lifecycle['deficiency']}"
-                )
-            else:
-                retained.append(
-                    f"S3 bucket '{s3_bucket_name}' lifecycle: "
-                    f"{'; '.join(lifecycle['expirations'])}"
-                )
-        except Exception as error:
-            logger.warning(
-                f"Unable to read lifecycle configuration for bucket "
-                f"{s3_bucket_name}: {error}"
-            )
-            undetermined.append(
-                f"S3 bucket '{s3_bucket_name}': "
-                f"{describe_api_error(error, 's3:GetLifecycleConfiguration', region)}"
-            )
+        buckets.append((s3_bucket_name, s3_key_prefix, "S3 bucket"))
+    if large_data_bucket and large_data_bucket != s3_bucket_name:
+        buckets.append((large_data_bucket, large_data_prefix, "Large-data S3 bucket"))
+    for bucket, prefix, label in buckets:
+        _judge_log_bucket_retention(
+            bucket, prefix, label, region, retained, unretained, undetermined
+        )
 
     retention_findings = []
     for deficiency in unretained:
@@ -3028,7 +3148,9 @@ def _invocation_log_retention_findings(
                     "Invocation log retention is stated on "
                     f"{len(retained)} destination(s): {'; '.join(retained)}. "
                     "Confirm the stated period meets your own record-retention "
-                    "policy."
+                    "policy. Whether lifecycle deletion has run, and any legal "
+                    "hold on an individual object version, are not read by this "
+                    "check."
                 ),
                 resolution="No action required",
                 reference=INVOCATION_LOG_RETENTION_REFERENCE,
@@ -3412,6 +3534,12 @@ def check_bedrock_logging_configuration(region: str = "") -> Dict[str, Any]:
                     log_group_name,
                     region,
                     (s3_config or {}).get("keyPrefix"),
+                    _extract_s3_bucket_name(
+                        (cloudwatch_config or {}).get("largeDataDeliveryS3Config")
+                    ),
+                    (
+                        (cloudwatch_config or {}).get("largeDataDeliveryS3Config") or {}
+                    ).get("keyPrefix"),
                 )
             )
 
@@ -3642,7 +3770,12 @@ def _invocation_record_state(region: str) -> Dict[str, Any]:
         )
         return state
     state["logging"] = True
-    if config.get("textDataDeliveryEnabled") is not True:
+    if "textDataDeliveryEnabled" not in config:
+        state["unread"].append(
+            "textDataDeliveryEnabled, which GetModelInvocationLoggingConfiguration "
+            "did not return"
+        )
+    elif config["textDataDeliveryEnabled"] is not True:
         state["gaps"].append(
             "textDataDeliveryEnabled is not true, so text prompts and responses "
             "are not delivered"

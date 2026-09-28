@@ -573,7 +573,8 @@ Resources:
                 - s3:GetLifecycleConfiguration # BR-04
                 - s3:GetBucketPolicy # BR-47
                 - s3:GetBucketVersioning # BR-04, BR-52
-                - s3:GetBucketObjectLockConfiguration # BR-52
+                - s3:GetBucketObjectLockConfiguration # BR-52, BR-04
+                - s3:GetReplicationConfiguration # BR-04
               Resource: !Sub 'arn:${AWS::Partition}:s3:::*'
             - Sid: BackupVaultInventory
               # BR-52 lists backup vaults and their Locked and MinRetentionDays
