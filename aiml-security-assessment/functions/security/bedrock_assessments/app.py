@@ -3235,6 +3235,74 @@ def _invocation_log_coverage_findings(
     return coverage_findings
 
 
+BEDROCK_INFERENCE_MANAGEMENT_EVENTS = (
+    "InvokeModel",
+    "InvokeModelWithResponseStream",
+    "Converse",
+    "ConverseStream",
+)
+
+
+def _bedrock_inference_observed(region: str = "") -> Optional[bool]:
+    """
+    Read whether the Region's event history holds a Bedrock inference call.
+    These four are management events, so an account that only calls on-demand
+    models shows here with no Bedrock resource. None when a lookup failed.
+    """
+    client = boto3.client("cloudtrail", config=boto3_config, region_name=region)
+    unread = False
+    for event_name in BEDROCK_INFERENCE_MANAGEMENT_EVENTS:
+        try:
+            response = client.lookup_events(
+                LookupAttributes=[
+                    {"AttributeKey": "EventName", "AttributeValue": event_name}
+                ],
+                MaxResults=1,
+            )
+            if not isinstance(response, dict):
+                raise TypeError("LookupEvents returned no response object")
+        except (ClientError, BotoCoreError, TypeError) as error:
+            logger.warning(f"{event_name} event lookup failed in {region}: {error}")
+            unread = True
+            continue
+        if any(
+            event.get("EventSource") == "bedrock.amazonaws.com"
+            for event in response.get("Events") or []
+        ):
+            return True
+    return None if unread else False
+
+
+def _bedrock_usage_na_detail(region: str = "") -> Optional[str]:
+    """
+    Return N/A text when the Region shows no Bedrock use, or None when it does:
+    a Bedrock resource, or an inference call in event history.
+    """
+    footprint = detect_bedrock_regional_footprint(region=region)
+    if footprint is True:
+        return None
+    observed = _bedrock_inference_observed(region)
+    if observed is True:
+        return None
+    if footprint is False and observed is False:
+        return (
+            "No regional Bedrock resources found, and this Region's event history "
+            "holds no InvokeModel, InvokeModelWithResponseStream, Converse or "
+            "ConverseStream call from the last 90 days, so there is no model use "
+            "to monitor with invocation logging."
+        )
+    unread = []
+    if footprint is None:
+        unread.append("the Bedrock resource lists")
+    if observed is None:
+        unread.append("cloudtrail:LookupEvents for the four inference calls")
+    return (
+        "Whether this Region uses Bedrock could not be determined, because "
+        f"{' and '.join(unread)} could not be read; invocation logging is off and "
+        "is not reported as Failed or as out of scope."
+    )
+
+
 def check_bedrock_logging_configuration(region: str = "") -> Dict[str, Any]:
     """
     Check if model invocation logging is enabled for Amazon Bedrock
@@ -3253,26 +3321,6 @@ def check_bedrock_logging_configuration(region: str = "") -> Dict[str, Any]:
             "details": "",
             "csv_data": [],
         }
-
-        bedrock_footprint_found = detect_bedrock_regional_footprint(region=region)
-        if bedrock_footprint_found is not True:
-            findings["details"] = bedrock_footprint_na_detail(bedrock_footprint_found)
-            findings["csv_data"].append(
-                create_finding(
-                    check_id="BR-04",
-                    finding_name="Bedrock Model Invocation Logging Check",
-                    finding_details=bedrock_footprint_na_detail(
-                        bedrock_footprint_found,
-                        "to monitor with invocation logging",
-                    ),
-                    resolution="No action required",
-                    reference="https://docs.aws.amazon.com/bedrock/latest/userguide/model-invocation-logging.html",
-                    severity="Informational",
-                    status="N/A",
-                    region=region,
-                )
-            )
-            return findings
 
         bedrock_client = boto3.client(
             "bedrock", config=boto3_config, region_name=region
@@ -3301,6 +3349,7 @@ def check_bedrock_logging_configuration(region: str = "") -> Dict[str, Any]:
                 logging_enabled = True
                 enabled_destinations.append("CloudWatch Logs")
 
+            usage_na = None if logging_enabled else _bedrock_usage_na_detail(region)
             if logging_enabled:
                 findings["details"] = (
                     f"Model invocation logging is enabled with delivery to: {', '.join(enabled_destinations)}"
@@ -3314,6 +3363,24 @@ def check_bedrock_logging_configuration(region: str = "") -> Dict[str, Any]:
                         reference="https://docs.aws.amazon.com/bedrock/latest/userguide/model-invocation-logging.html",
                         severity="Medium",
                         status="Passed",
+                        region=region,
+                    )
+                )
+            elif usage_na is not None:
+                findings["details"] = usage_na
+                findings["csv_data"].append(
+                    create_finding(
+                        check_id="BR-04",
+                        finding_name="Bedrock Model Invocation Logging Check",
+                        finding_details=usage_na,
+                        resolution=(
+                            COULD_NOT_ASSESS_RESOLUTION
+                            if usage_na.startswith("Whether")
+                            else "No action required"
+                        ),
+                        reference="https://docs.aws.amazon.com/bedrock/latest/userguide/model-invocation-logging.html",
+                        severity="Informational",
+                        status="N/A",
                         region=region,
                     )
                 )
@@ -5346,9 +5413,250 @@ def _invocation_log_group_deletion_findings(
     ]
 
 
+INVOCATION_LOG_ENCRYPTION_REFERENCE = (
+    "https://docs.aws.amazon.com/bedrock/latest/userguide/model-invocation-logging.html"
+)
+
+INVOCATION_LOG_GROUP_ENCRYPTION_FINDING = "Bedrock Invocation Log Group Encryption"
+
+INVOCATION_LOG_GROUP_ENCRYPTION_REFERENCE = (
+    "https://docs.aws.amazon.com/AmazonCloudWatch/latest/logs/encrypt-log-data-kms.html"
+)
+
+S3_KMS_ALGORITHMS = ("aws:kms", "aws:kms:dsse")
+
+
+def _describe_kms_key(key_id: str, region: str) -> Dict[str, Any]:
+    """
+    Read who manages a KMS key and its state. An aws/ alias names an AWS
+    managed key without a call; any other identifier is resolved with
+    DescribeKey in the Region its ARN names.
+    """
+    if key_id.startswith("alias/aws/") or ":alias/aws/" in key_id:
+        return {"manager": "AWS", "state": None, "arn": key_id, "error": None}
+    key_region = region
+    if key_id.startswith("arn:"):
+        parts = key_id.split(":")
+        if len(parts) > 3 and parts[3]:
+            key_region = parts[3]
+    try:
+        client = boto3.client("kms", config=boto3_config, region_name=key_region)
+        response = client.describe_key(KeyId=key_id)
+        if not isinstance(response, dict):
+            raise TypeError("DescribeKey returned no response object")
+        metadata = response.get("KeyMetadata") or {}
+    except (ClientError, BotoCoreError, TypeError) as error:
+        return {"manager": None, "state": None, "arn": key_id, "error": error}
+    return {
+        "manager": metadata.get("KeyManager"),
+        "state": metadata.get("KeyState"),
+        "arn": metadata.get("Arn") or key_id,
+        "error": None,
+    }
+
+
+def _kms_key_verdict(key_id: str, region: str) -> Tuple[str, str]:
+    """Judge one key as a customer managed, enabled key: (status, text)."""
+    key = _describe_kms_key(key_id, region)
+    if key["error"] is not None:
+        return (
+            "N/A",
+            f"KMS key '{key_id}' could not be read (kms:DescribeKey: "
+            f"{get_assessment_error_label(key['error'])}), so whether it is "
+            "customer managed is not known",
+        )
+    if key["manager"] != "CUSTOMER":
+        return (
+            "Failed",
+            f"KMS key '{key['arn']}' is managed by {key['manager'] or 'an unreported manager'}, not a customer managed key",
+        )
+    if key["state"] != "Enabled":
+        return (
+            "Failed",
+            f"customer managed KMS key '{key['arn']}' is in state {key['state'] or 'absent'}, so it cannot encrypt new log data",
+        )
+    return "Passed", f"customer managed KMS key '{key['arn']}' is Enabled"
+
+
+def _invocation_log_bucket_encryption_rows(
+    bucket_name: str, label: str, s3_client: Any, region: str
+) -> Tuple[List[Dict[str, Any]], str]:
+    """Judge one invocation log bucket's default encryption; returns rows and roll-up."""
+    try:
+        encryption_response = s3_client.get_bucket_encryption(Bucket=bucket_name)
+    except ClientError as e:
+        if (
+            e.response["Error"]["Code"]
+            == "ServerSideEncryptionConfigurationNotFoundError"
+        ):
+            return [
+                create_finding(
+                    check_id="BR-12",
+                    finding_name="Bedrock Invocation Log Encryption Missing",
+                    finding_details=f"{label} '{bucket_name}' has NO encryption configured. Logs containing prompts and responses are stored unencrypted.",
+                    resolution="Enable SSE-KMS encryption with a customer-managed key on the S3 bucket immediately",
+                    reference=INVOCATION_LOG_ENCRYPTION_REFERENCE,
+                    severity="Informational",
+                    status="N/A",
+                    region=region,
+                )
+            ], "FAIL"
+        if _is_access_denied_client_error(e):
+            return [
+                create_finding(
+                    check_id="BR-12",
+                    finding_name="Bedrock Invocation Log Encryption Check",
+                    finding_details=f"Unable to assess encryption for {label.lower()} '{bucket_name}' because access to the bucket encryption configuration was denied.",
+                    resolution="Grant the assessment role s3:GetEncryptionConfiguration on the logging bucket, and allow it in the bucket policy.",
+                    reference=INVOCATION_LOG_ENCRYPTION_REFERENCE,
+                    severity="Informational",
+                    status="N/A",
+                    region=region,
+                )
+            ], "WARN"
+        raise
+
+    rules = encryption_response.get("ServerSideEncryptionConfiguration", {}).get(
+        "Rules", []
+    )
+    status = "Failed"
+    observed = "no default encryption rule"
+    for rule in rules:
+        default_encryption = rule.get("ApplyServerSideEncryptionByDefault", {})
+        sse_algorithm = default_encryption.get("SSEAlgorithm", "")
+        kms_key_id = default_encryption.get("KMSMasterKeyID", "")
+        if sse_algorithm in S3_KMS_ALGORITHMS and kms_key_id:
+            status, observed = _kms_key_verdict(kms_key_id, region)
+            observed = f"{sse_algorithm} with {observed}"
+        elif sse_algorithm in S3_KMS_ALGORITHMS:
+            observed = f"{sse_algorithm} with no key named, which is the AWS managed key aws/s3"
+        elif sse_algorithm == "AES256":
+            observed = "SSE-S3 (AES256)"
+        elif sse_algorithm:
+            observed = sse_algorithm
+
+    if status == "Passed":
+        return [
+            create_finding(
+                check_id="BR-12",
+                finding_name="Bedrock Invocation Log Encryption Check",
+                finding_details=f"{label} '{bucket_name}' uses customer-managed KMS encryption: {observed}.",
+                resolution="No action required",
+                reference=INVOCATION_LOG_ENCRYPTION_REFERENCE,
+                severity="Medium",
+                status="Passed",
+                region=region,
+            )
+        ], "PASS"
+    if status == "N/A":
+        return [
+            create_finding(
+                check_id="BR-12",
+                finding_name="Bedrock Invocation Log Encryption Check",
+                finding_details=f"Encryption of {label.lower()} '{bucket_name}' was not judged: {observed}.",
+                resolution="Grant kms:DescribeKey on the key, or allow it in the key policy, and retry.",
+                reference=INVOCATION_LOG_ENCRYPTION_REFERENCE,
+                severity="Informational",
+                status="N/A",
+                region=region,
+            )
+        ], "WARN"
+    return [
+        create_finding(
+            check_id="BR-12",
+            finding_name="Bedrock Invocation Log Encryption",
+            finding_details=f"{label} '{bucket_name}' uses {observed} instead of an enabled customer-managed KMS key. Invocation logs may contain sensitive prompts and responses.",
+            resolution="1. Enable SSE-KMS with a customer-managed key on the S3 bucket\n2. Update bucket policy to require encrypted uploads\n3. Consider enabling S3 bucket versioning and MFA delete for log integrity",
+            reference=INVOCATION_LOG_ENCRYPTION_REFERENCE,
+            severity="Medium",
+            status="Failed",
+            region=region,
+        )
+    ], "WARN"
+
+
+def _invocation_log_group_encryption_rows(
+    log_group_name: str, region: str
+) -> List[Dict[str, Any]]:
+    """Judge whether the invocation log group is encrypted with an enabled CMK."""
+
+    def row(details: str, resolution: str, severity: str, status: str):
+        return create_finding(
+            check_id="BR-12",
+            finding_name=INVOCATION_LOG_GROUP_ENCRYPTION_FINDING,
+            finding_details=details,
+            resolution=resolution,
+            reference=INVOCATION_LOG_GROUP_ENCRYPTION_REFERENCE,
+            severity=severity,
+            status=status,
+            region=region,
+        )
+
+    resolution = "Associate a customer managed KMS key with the invocation log group (logs:AssociateKmsKey) and keep the key Enabled."
+    try:
+        group = _describe_log_group(log_group_name, region)
+    except Exception as error:  # noqa: BLE001 - reported as N/A
+        return [
+            row(
+                f"Encryption of invocation log group '{log_group_name}' could not be assessed: {describe_api_error(error, 'logs:DescribeLogGroups', region)}.",
+                COULD_NOT_ASSESS_RESOLUTION,
+                "Informational",
+                "N/A",
+            )
+        ]
+    if group is None:
+        return [
+            row(
+                f"Invocation log group '{log_group_name}' was not returned by DescribeLogGroups for this account, so its encryption could not be assessed.",
+                COULD_NOT_ASSESS_RESOLUTION,
+                "Informational",
+                "N/A",
+            )
+        ]
+    kms_key_id = group.get("kmsKeyId")
+    if not kms_key_id:
+        return [
+            row(
+                f"Invocation log group '{log_group_name}' has no KMS key associated (kmsKeyId is absent), so its prompts and responses are encrypted only with CloudWatch Logs service-owned keys.",
+                resolution,
+                "Medium",
+                "Failed",
+            )
+        ]
+    status, observed = _kms_key_verdict(kms_key_id, region)
+    if status == "Passed":
+        return [
+            row(
+                f"Invocation log group '{log_group_name}' is encrypted with {observed}.",
+                "No action required",
+                "Medium",
+                "Passed",
+            )
+        ]
+    if status == "N/A":
+        return [
+            row(
+                f"Encryption of invocation log group '{log_group_name}' was not judged: {observed}.",
+                "Grant kms:DescribeKey on the key, or allow it in the key policy, and retry.",
+                "Informational",
+                "N/A",
+            )
+        ]
+    return [
+        row(
+            f"Invocation log group '{log_group_name}' is associated with a key that does not qualify: {observed}.",
+            resolution,
+            "Medium",
+            "Failed",
+        )
+    ]
+
+
 def check_bedrock_invocation_log_encryption(region: str = "") -> Dict[str, Any]:
     """
-    Check if S3 buckets used for model invocation logging have proper encryption
+    Check that every model invocation log destination is encrypted with an
+    enabled customer managed KMS key: the S3 bucket, the CloudWatch Logs log
+    group, and the large-data delivery bucket.
     """
     logger.debug("Starting check for Bedrock invocation log encryption")
     try:
@@ -5372,24 +5680,29 @@ def check_bedrock_invocation_log_encryption(region: str = "") -> Dict[str, Any]:
             s3_config = logging_config.get("s3Config")
 
             bucket_name = _extract_s3_bucket_name(s3_config)
+            cloudwatch_config = logging_config.get("cloudWatchConfig") or {}
+            log_group_name = cloudwatch_config.get("logGroupName")
+            large_data_bucket = _extract_s3_bucket_name(
+                cloudwatch_config.get("largeDataDeliveryS3Config")
+            )
 
             # AIR-FND-DET-09 asks that the invocation record cannot be deleted,
             # which for CloudWatch delivery is the log group's own setting.
             deletion_rows = _invocation_log_group_deletion_findings(
-                (logging_config.get("cloudWatchConfig") or {}).get("logGroupName"),
+                log_group_name,
                 region,
             )
             if any(r["Status"] == "Failed" for r in deletion_rows):
                 findings["status"] = "WARN"
 
-            if not bucket_name:
+            if not bucket_name and not log_group_name:
                 findings["csv_data"].append(
                     create_finding(
                         check_id="BR-12",
                         finding_name="Bedrock Invocation Log Encryption Check",
-                        finding_details="Model invocation logging to S3 is not configured",
-                        resolution="If logging is enabled to CloudWatch only, ensure CloudWatch log group uses CMK encryption",
-                        reference="https://docs.aws.amazon.com/bedrock/latest/userguide/model-invocation-logging.html",
+                        finding_details="Model invocation logging delivers to neither S3 nor CloudWatch Logs, so there is no invocation log destination to encrypt.",
+                        resolution="No action required",
+                        reference=INVOCATION_LOG_ENCRYPTION_REFERENCE,
                         severity="Informational",
                         status="N/A",
                         region=region,
@@ -5398,98 +5711,35 @@ def check_bedrock_invocation_log_encryption(region: str = "") -> Dict[str, Any]:
                 findings["csv_data"].extend(deletion_rows)
                 return findings
 
-            # Check S3 bucket encryption
-            try:
-                encryption_response = s3_client.get_bucket_encryption(
-                    Bucket=bucket_name
+            roll_ups = []
+            buckets = []
+            if bucket_name:
+                buckets.append((bucket_name, "S3 bucket for invocation logs"))
+            if large_data_bucket and large_data_bucket != bucket_name:
+                buckets.append(
+                    (
+                        large_data_bucket,
+                        "Large-data delivery S3 bucket for invocation logs",
+                    )
                 )
-                rules = encryption_response.get(
-                    "ServerSideEncryptionConfiguration", {}
-                ).get("Rules", [])
-
-                has_cmk = False
-                encryption_type = "None"
-
-                for rule in rules:
-                    default_encryption = rule.get(
-                        "ApplyServerSideEncryptionByDefault", {}
-                    )
-                    sse_algorithm = default_encryption.get("SSEAlgorithm", "")
-                    kms_key_id = default_encryption.get("KMSMasterKeyID", "")
-
-                    if sse_algorithm == "aws:kms":
-                        encryption_type = "KMS"
-                        if kms_key_id and not kms_key_id.startswith("alias/aws/"):
-                            has_cmk = True
-                            encryption_type = "Customer-Managed KMS"
-                    elif sse_algorithm == "AES256":
-                        encryption_type = "SSE-S3"
-
-                if has_cmk:
-                    findings["csv_data"].append(
-                        create_finding(
-                            check_id="BR-12",
-                            finding_name="Bedrock Invocation Log Encryption Check",
-                            finding_details=f"S3 bucket '{bucket_name}' for invocation logs uses customer-managed KMS encryption",
-                            resolution="No action required",
-                            reference="https://docs.aws.amazon.com/bedrock/latest/userguide/model-invocation-logging.html",
-                            severity="Medium",
-                            status="Passed",
-                            region=region,
-                        )
-                    )
-                else:
-                    findings["status"] = "WARN"
-                    findings["csv_data"].append(
-                        create_finding(
-                            check_id="BR-12",
-                            finding_name="Bedrock Invocation Log Encryption",
-                            finding_details=f"S3 bucket '{bucket_name}' for invocation logs uses {encryption_type} encryption instead of customer-managed KMS. Invocation logs may contain sensitive prompts and responses.",
-                            resolution="1. Enable SSE-KMS with a customer-managed key on the S3 bucket\n2. Update bucket policy to require encrypted uploads\n3. Consider enabling S3 bucket versioning and MFA delete for log integrity",
-                            reference="https://docs.aws.amazon.com/bedrock/latest/userguide/model-invocation-logging.html",
-                            severity="Medium",
-                            status="Failed",
-                            region=region,
-                        )
-                    )
-
-            except ClientError as e:
-                if (
-                    e.response["Error"]["Code"]
-                    == "ServerSideEncryptionConfigurationNotFoundError"
-                ):
-                    findings["status"] = "FAIL"
-                    findings["csv_data"].append(
-                        create_finding(
-                            check_id="BR-12",
-                            finding_name="Bedrock Invocation Log Encryption Missing",
-                            finding_details=f"S3 bucket '{bucket_name}' for invocation logs has NO encryption configured. Logs containing prompts and responses are stored unencrypted.",
-                            resolution="Enable SSE-KMS encryption with a customer-managed key on the S3 bucket immediately",
-                            reference="https://docs.aws.amazon.com/bedrock/latest/userguide/model-invocation-logging.html",
-                            severity="Informational",
-                            status="N/A",
-                            region=region,
-                        )
-                    )
-                elif _is_access_denied_client_error(e):
-                    findings["status"] = "WARN"
-                    findings["details"] = (
-                        f"Unable to assess encryption for bucket '{bucket_name}' due to access denied"
-                    )
-                    findings["csv_data"].append(
-                        create_finding(
-                            check_id="BR-12",
-                            finding_name="Bedrock Invocation Log Encryption Check",
-                            finding_details=f"Unable to assess encryption for bucket '{bucket_name}' because access to the bucket encryption configuration was denied.",
-                            resolution="Ensure the assessment role and bucket policy allow s3:GetEncryptionConfiguration for the logging bucket.",
-                            reference="https://docs.aws.amazon.com/bedrock/latest/userguide/model-invocation-logging.html",
-                            severity="Informational",
-                            status="N/A",
-                            region=region,
-                        )
-                    )
-                else:
-                    raise
+            for name, label in buckets:
+                rows, roll_up = _invocation_log_bucket_encryption_rows(
+                    name, label, s3_client, region
+                )
+                findings["csv_data"].extend(rows)
+                roll_ups.append(roll_up)
+            if log_group_name:
+                group_rows = _invocation_log_group_encryption_rows(
+                    log_group_name, region
+                )
+                findings["csv_data"].extend(group_rows)
+                roll_ups.append(
+                    "PASS" if group_rows[0]["Status"] == "Passed" else "WARN"
+                )
+            if "FAIL" in roll_ups:
+                findings["status"] = "FAIL"
+            elif "WARN" in roll_ups:
+                findings["status"] = "WARN"
 
             findings["csv_data"].extend(deletion_rows)
 
@@ -5500,7 +5750,7 @@ def check_bedrock_invocation_log_encryption(region: str = "") -> Dict[str, Any]:
                     finding_name="Bedrock Invocation Log Encryption Check",
                     finding_details="Model invocation logging is not configured",
                     resolution="Configure model invocation logging with an encrypted S3 bucket",
-                    reference="https://docs.aws.amazon.com/bedrock/latest/userguide/model-invocation-logging.html",
+                    reference=INVOCATION_LOG_ENCRYPTION_REFERENCE,
                     severity="Informational",
                     status="N/A",
                     region=region,

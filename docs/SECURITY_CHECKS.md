@@ -362,7 +362,7 @@ inventory is never treated as evidence of compliance.
 ### BR-04: Model Invocation Logging
 
 - **Severity:** Medium
-- **Description:** Checks invocation logging is enabled. For S3 delivery, the retention leg credits only an enabled lifecycle rule whose filter covers `<keyPrefix>/AWSLogs/`, the root Bedrock writes under. A rule on another prefix, or one that also filters on tags or object size, is named and not credited. When the bucket has versioning `Enabled` or `Suspended`, a rule that expires noncurrent versions is also required, because expiring the current object leaves a noncurrent version behind. An unreadable versioning status is `N/A`, never a pass.
+- **Description:** Checks invocation logging is enabled. The check is scoped by use, not by resources: a Region with no Bedrock resource is still judged when its CloudTrail event history holds an `InvokeModel`, `InvokeModelWithResponseStream`, `Converse` or `ConverseStream` call from `bedrock.amazonaws.com`, because on-demand inference creates no resource to list. Only a Region with neither is `N/A` as out of scope; when either read fails, the result is `N/A` and names the read that failed. Enabled logging is judged whatever the footprint. For S3 delivery, the retention leg credits only an enabled lifecycle rule whose filter covers `<keyPrefix>/AWSLogs/`, the root Bedrock writes under. A rule on another prefix, or one that also filters on tags or object size, is named and not credited. When the bucket has versioning `Enabled` or `Suspended`, a rule that expires noncurrent versions is also required, because expiring the current object leaves a noncurrent version behind. An unreadable versioning status is `N/A`, never a pass.
 
 ### BR-05: Guardrail Configuration
 
@@ -402,7 +402,7 @@ inventory is never treated as evidence of compliance.
 ### BR-12: Invocation Log Encryption
 
 - **Severity:** Medium
-- **Description:** Verifies logs are encrypted with AWS KMS. A second finding, `Bedrock Invocation Log Group Deletion Protection`, reads `deletionProtectionEnabled` on the CloudWatch Logs group that receives invocation logs and fails when it is not `true`; `DescribeLogGroups` omits the field on a group that never had it set, so an absent value reads as off. No CloudWatch delivery, or a group that is not returned to this account, is `N/A`.
+- **Description:** Judges the key on every destination invocation logs are written to: the S3 bucket, the large-data delivery bucket when it differs, and the CloudWatch Logs group. A bucket passes only when its default encryption is `aws:kms` or `aws:kms:dsse` with a key that `kms:DescribeKey` reports as `KeyManager` `CUSTOMER` and `KeyState` `Enabled`. SSE-S3, the `aws/s3` managed key, and `aws:kms` with no key id (which S3 serves with `aws/s3`) fail. The log group finding, `Bedrock Invocation Log Group Encryption`, fails when the group has no `kmsKeyId` or its key is not an enabled customer managed key. A key that cannot be described, including a key in another account, is `N/A`. A second finding, `Bedrock Invocation Log Group Deletion Protection`, reads `deletionProtectionEnabled` on the CloudWatch Logs group that receives invocation logs and fails when it is not `true`; `DescribeLogGroups` omits the field on a group that never had it set, so an absent value reads as off. No CloudWatch delivery, or a group that is not returned to this account, is `N/A`.
 
 ### BR-13: Flows Guardrails
 

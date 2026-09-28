@@ -1224,18 +1224,85 @@ class TestBR04LoggingConfiguration:
         assert findings[0]["Status"] == "Failed"
         assert findings[0]["Severity"] == "Medium"
 
+    @patch("bedrock_app._bedrock_inference_observed", return_value=False)
     @patch("boto3.client")
     @patch("bedrock_app.detect_bedrock_regional_footprint", return_value=False)
-    def test_br04_no_regional_footprint_returns_na(self, mock_footprint, mock_client):
+    def test_br04_no_regional_footprint_returns_na(
+        self, mock_footprint, mock_client, mock_observed
+    ):
         check = bedrock_app.check_bedrock_logging_configuration
+        mock_bedrock = MagicMock()
+        mock_client.return_value = mock_bedrock
+        mock_bedrock.get_model_invocation_logging_configuration.return_value = {
+            "loggingConfig": {"s3Config": {}, "cloudWatchConfig": {}}
+        }
         result = check(region="eu-west-1")
         findings = extract_csv_data(result)
         assert len(findings) >= 1
         assert findings[0]["Status"] == "N/A"
-        assert findings[0]["Finding_Details"] == (
-            "No regional Bedrock resources found to monitor with invocation logging"
+        assert findings[0]["Finding_Details"].startswith(
+            "No regional Bedrock resources found, and this Region's event history "
+            "holds no InvokeModel"
         )
-        mock_client.assert_not_called()
+        mock_observed.assert_called_once_with("eu-west-1")
+
+    @patch("bedrock_app._bedrock_inference_observed", return_value=True)
+    @patch("boto3.client")
+    @patch("bedrock_app.detect_bedrock_regional_footprint", return_value=False)
+    def test_br04_on_demand_use_without_resources_is_judged(
+        self, mock_footprint, mock_client, mock_observed
+    ):
+        """AIR-BDR-MDL-02: an on-demand-only account has no resource to find."""
+        mock_bedrock = MagicMock()
+        mock_client.return_value = mock_bedrock
+        mock_bedrock.get_model_invocation_logging_configuration.return_value = {
+            "loggingConfig": {"s3Config": {}, "cloudWatchConfig": {}}
+        }
+        findings = extract_csv_data(
+            bedrock_app.check_bedrock_logging_configuration(region="eu-west-1")
+        )
+        assert findings[0]["Status"] == "Failed"
+
+    @patch("bedrock_app._bedrock_inference_observed", return_value=False)
+    @patch("boto3.client")
+    @patch("bedrock_app.detect_bedrock_regional_footprint", return_value=False)
+    def test_br04_enabled_logging_is_judged_without_a_footprint(
+        self, mock_footprint, mock_client, mock_observed
+    ):
+        mock_bedrock = MagicMock()
+        mock_client.return_value = mock_bedrock
+        mock_bedrock.get_model_invocation_logging_configuration.return_value = {
+            "loggingConfig": {"s3Config": {"bucketName": "log-bucket"}}
+        }
+        findings = extract_csv_data(
+            bedrock_app.check_bedrock_logging_configuration(region="eu-west-1")
+        )
+        assert findings[0]["Status"] == "Passed"
+        assert any(f["Finding"] == "Bedrock Invocation Log Retention" for f in findings)
+
+    @patch("bedrock_app._bedrock_inference_observed", return_value=None)
+    @patch("boto3.client")
+    @patch("bedrock_app.detect_bedrock_regional_footprint", return_value=None)
+    def test_br04_unread_usage_is_not_out_of_scope(
+        self, mock_footprint, mock_client, mock_observed
+    ):
+        mock_bedrock = MagicMock()
+        mock_client.return_value = mock_bedrock
+        mock_bedrock.get_model_invocation_logging_configuration.return_value = {
+            "loggingConfig": {}
+        }
+        findings = extract_csv_data(
+            bedrock_app.check_bedrock_logging_configuration(region="eu-west-1")
+        )
+        assert findings[0]["Status"] == "N/A"
+        assert (
+            "the Bedrock resource lists and cloudtrail:LookupEvents for the four "
+            "inference calls could not be read" in findings[0]["Finding_Details"]
+        )
+        assert (
+            "No regional Bedrock resources found" not in findings[0]["Finding_Details"]
+        )
+        assert findings[0]["Resolution"] == bedrock_app.COULD_NOT_ASSESS_RESOLUTION
 
     @patch("boto3.client")
     def test_br04_exception_returns_error_finding(self, mock_client):
@@ -3409,7 +3476,17 @@ class TestBR12InvocationLogEncryption:
                 return mock_bedrock
             return mock_s3
 
-        mock_client.side_effect = client_factory
+        mock_kms = MagicMock()
+        mock_kms.describe_key.return_value = {
+            "KeyMetadata": {
+                "Arn": "arn:aws:kms:us-east-1:123:key/custom-key",
+                "KeyManager": "CUSTOMER",
+                "KeyState": "Enabled",
+            }
+        }
+        mock_client.side_effect = lambda service, **kwargs: (
+            mock_kms if service == "kms" else client_factory(service, **kwargs)
+        )
         mock_bedrock.get_model_invocation_logging_configuration.return_value = {
             "loggingConfig": {"s3Config": {"bucketName": "log-bucket"}}
         }
@@ -3503,6 +3580,268 @@ class TestBR12InvocationLogEncryption:
         result = check()
         for f in extract_csv_data(result):
             assert_finding_schema(f)
+
+
+CMK_ARN = "arn:aws:kms:us-east-1:123456789012:key/cmk"
+AWS_S3_KEY_ARN = "arn:aws:kms:us-east-1:123456789012:key/aws-s3"
+
+
+class TestBedrockInferenceObserved:
+    """Event history read that scopes BR-04 for on-demand-only accounts."""
+
+    @staticmethod
+    def _run(responses):
+        client = MagicMock()
+        client.lookup_events.side_effect = responses
+        with patch("boto3.client", return_value=client):
+            return bedrock_app._bedrock_inference_observed("us-east-1"), client
+
+    def test_a_later_event_name_is_found(self):
+        observed, client = self._run(
+            [
+                {"Events": []},
+                {"Events": []},
+                {"Events": [{"EventSource": "bedrock.amazonaws.com"}]},
+                {"Events": []},
+            ]
+        )
+        assert observed is True
+        assert client.lookup_events.call_count == 3
+
+    def test_an_event_from_another_service_is_not_bedrock_use(self):
+        observed, _ = self._run(
+            [{"Events": [{"EventSource": "other.amazonaws.com"}]}]
+            + [{"Events": []}] * 3
+        )
+        assert observed is False
+
+    def test_a_failed_lookup_with_nothing_found_is_unread(self):
+        observed, _ = self._run(
+            [
+                {"Events": []},
+                ClientError(
+                    {"Error": {"Code": "ThrottlingException", "Message": "x"}},
+                    "LookupEvents",
+                ),
+                {"Events": []},
+                {"Events": []},
+            ]
+        )
+        assert observed is None
+
+
+class TestBR12DestinationKeys:
+    """AIR-BDR-MDL-02 / AIR-FND-DET-01: every log destination needs an enabled CMK."""
+
+    KEYS = {
+        CMK_ARN: {"Arn": CMK_ARN, "KeyManager": "CUSTOMER", "KeyState": "Enabled"},
+        AWS_S3_KEY_ARN: {
+            "Arn": AWS_S3_KEY_ARN,
+            "KeyManager": "AWS",
+            "KeyState": "Enabled",
+        },
+        "arn:aws:kms:us-east-1:123456789012:key/doomed": {
+            "Arn": "arn:aws:kms:us-east-1:123456789012:key/doomed",
+            "KeyManager": "CUSTOMER",
+            "KeyState": "PendingDeletion",
+        },
+        "arn:aws:kms:eu-west-1:123456789012:key/remote": {
+            "Arn": "arn:aws:kms:eu-west-1:123456789012:key/remote",
+            "KeyManager": "CUSTOMER",
+            "KeyState": "Enabled",
+        },
+    }
+
+    def _run(self, logging_config, bucket_rules=None, log_groups=None, denied_keys=()):
+        bedrock = MagicMock()
+        bedrock.get_model_invocation_logging_configuration.return_value = {
+            "loggingConfig": logging_config
+        }
+        s3 = MagicMock()
+        bucket_rules = bucket_rules or {}
+        s3.get_bucket_encryption.side_effect = lambda Bucket: {
+            "ServerSideEncryptionConfiguration": {"Rules": bucket_rules[Bucket]}
+        }
+        logs = MagicMock()
+        logs.describe_log_groups.return_value = {"logGroups": log_groups or []}
+        kms_regions = []
+
+        def kms_factory(region_name):
+            kms = MagicMock()
+
+            def describe_key(KeyId):
+                if KeyId in denied_keys:
+                    raise ClientError(
+                        {"Error": {"Code": "AccessDeniedException", "Message": "x"}},
+                        "DescribeKey",
+                    )
+                return {"KeyMetadata": self.KEYS[KeyId]}
+
+            kms.describe_key.side_effect = describe_key
+            kms_regions.append(region_name)
+            return kms
+
+        def factory(service, **kwargs):
+            if service == "kms":
+                return kms_factory(kwargs.get("region_name"))
+            return {"bedrock": bedrock, "s3": s3, "logs": logs}[service]
+
+        with patch("boto3.client", side_effect=factory):
+            result = bedrock_app.check_bedrock_invocation_log_encryption(
+                region="us-east-1"
+            )
+        rows = extract_csv_data(result)
+        for row in rows:
+            assert_finding_schema(row)
+        encryption = [
+            r
+            for r in rows
+            if r["Finding"] != "Bedrock Invocation Log Group Deletion Protection"
+        ]
+        return result, encryption, kms_regions
+
+    @staticmethod
+    def _kms_rule(key_id, algorithm="aws:kms"):
+        rule = {"SSEAlgorithm": algorithm}
+        if key_id:
+            rule["KMSMasterKeyID"] = key_id
+        return [{"ApplyServerSideEncryptionByDefault": rule}]
+
+    S3 = {"s3Config": {"bucketName": "log-bucket"}}
+
+    def test_aws_s3_managed_key_given_as_a_key_arn_fails(self):
+        _, rows, _ = self._run(self.S3, {"log-bucket": self._kms_rule(AWS_S3_KEY_ARN)})
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert (
+            "is managed by AWS, not a customer managed key"
+            in rows[0]["Finding_Details"]
+        )
+
+    def test_aws_s3_alias_arn_fails_without_a_call(self):
+        _, rows, regions = self._run(
+            self.S3,
+            {
+                "log-bucket": self._kms_rule(
+                    "arn:aws:kms:us-east-1:123456789012:alias/aws/s3"
+                )
+            },
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert regions == []
+
+    def test_aws_s3_alias_name_fails(self):
+        _, rows, _ = self._run(self.S3, {"log-bucket": self._kms_rule("alias/aws/s3")})
+        assert [r["Status"] for r in rows] == ["Failed"]
+
+    def test_kms_without_a_key_is_the_aws_managed_key(self):
+        _, rows, _ = self._run(self.S3, {"log-bucket": self._kms_rule(None)})
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "the AWS managed key aws/s3" in rows[0]["Finding_Details"]
+
+    def test_customer_key_pending_deletion_fails(self):
+        _, rows, _ = self._run(
+            self.S3,
+            {
+                "log-bucket": self._kms_rule(
+                    "arn:aws:kms:us-east-1:123456789012:key/doomed"
+                )
+            },
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "is in state PendingDeletion" in rows[0]["Finding_Details"]
+
+    def test_unreadable_key_is_not_judged(self):
+        _, rows, _ = self._run(
+            self.S3, {"log-bucket": self._kms_rule(CMK_ARN)}, denied_keys=(CMK_ARN,)
+        )
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert "kms:DescribeKey: AccessDeniedException" in rows[0]["Finding_Details"]
+
+    def test_dsse_with_a_customer_key_passes(self):
+        _, rows, _ = self._run(
+            self.S3, {"log-bucket": self._kms_rule(CMK_ARN, algorithm="aws:kms:dsse")}
+        )
+        assert [r["Status"] for r in rows] == ["Passed"]
+
+    def test_key_arn_is_read_in_its_own_region(self):
+        _, rows, regions = self._run(
+            self.S3,
+            {
+                "log-bucket": self._kms_rule(
+                    "arn:aws:kms:eu-west-1:123456789012:key/remote"
+                )
+            },
+        )
+        assert [r["Status"] for r in rows] == ["Passed"]
+        assert regions == ["eu-west-1"]
+
+    CW = {"cloudWatchConfig": {"logGroupName": "/aws/bedrock/invocations"}}
+
+    def test_cloudwatch_only_log_group_without_a_key_fails(self):
+        result, rows, _ = self._run(
+            self.CW, log_groups=[{"logGroupName": "/aws/bedrock/invocations"}]
+        )
+        assert [(r["Finding"], r["Status"]) for r in rows] == [
+            ("Bedrock Invocation Log Group Encryption", "Failed")
+        ]
+        assert "kmsKeyId is absent" in rows[0]["Finding_Details"]
+        assert result["status"] == "WARN"
+
+    def test_cloudwatch_log_group_with_a_customer_key_passes(self):
+        _, rows, _ = self._run(
+            self.CW,
+            log_groups=[
+                {"logGroupName": "/aws/bedrock/invocations-old"},
+                {"logGroupName": "/aws/bedrock/invocations", "kmsKeyId": CMK_ARN},
+            ],
+        )
+        assert [r["Status"] for r in rows] == ["Passed"]
+
+    def test_log_group_with_an_aws_managed_key_fails(self):
+        _, rows, _ = self._run(
+            self.CW,
+            log_groups=[
+                {"logGroupName": "/aws/bedrock/invocations", "kmsKeyId": AWS_S3_KEY_ARN}
+            ],
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+
+    def test_unlisted_log_group_is_not_judged(self):
+        _, rows, _ = self._run(
+            self.CW,
+            log_groups=[{"logGroupName": "/aws/bedrock/other", "kmsKeyId": CMK_ARN}],
+        )
+        assert [r["Status"] for r in rows] == ["N/A"]
+
+    def test_every_destination_is_judged(self):
+        result, rows, _ = self._run(
+            {
+                "s3Config": {"bucketName": "log-bucket"},
+                "cloudWatchConfig": {
+                    "logGroupName": "/aws/bedrock/invocations",
+                    "largeDataDeliveryS3Config": {"bucketName": "large-bucket"},
+                },
+            },
+            {
+                "log-bucket": self._kms_rule(CMK_ARN),
+                "large-bucket": [
+                    {"ApplyServerSideEncryptionByDefault": {"SSEAlgorithm": "AES256"}}
+                ],
+            },
+            log_groups=[
+                {"logGroupName": "/aws/bedrock/invocations", "kmsKeyId": CMK_ARN}
+            ],
+        )
+        assert [r["Status"] for r in rows] == ["Passed", "Failed", "Passed"]
+        assert (
+            "Large-data delivery S3 bucket for invocation logs 'large-bucket' uses SSE-S3"
+            in rows[1]["Finding_Details"]
+        )
+        assert result["status"] == "WARN"
+
+    def test_no_destination_is_not_applicable(self):
+        _, rows, _ = self._run({})
+        assert [r["Status"] for r in rows] == ["N/A"]
 
 
 # ===================================================================

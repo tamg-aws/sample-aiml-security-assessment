@@ -1575,6 +1575,7 @@ INCUMBENT_NAMES = {
     ),
     "BR-12": (
         "Bedrock Invocation Log Encryption",
+        "Bedrock Invocation Log Group Encryption",
         "Bedrock Invocation Log Group Deletion Protection",
     ),
     "BR-15": "Cross-Account Guardrails Enforcement Check",

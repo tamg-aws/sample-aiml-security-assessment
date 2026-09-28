@@ -441,7 +441,7 @@ Resources:
             - Sid: KMSPermissions
               Effect: Allow
               Action:
-                - kms:DescribeKey # BR-40, BR-55
+                - kms:DescribeKey # BR-40, BR-55, BR-12
                 - kms:GetKeyPolicy # BR-55
               Resource: !Sub 'arn:${AWS::Partition}:kms:*:${AWS::AccountId}:key/*'
             - Sid: KMSKeyInventory
@@ -600,13 +600,13 @@ Resources:
                 - cloudtrail:GetTrailStatus
               Resource: '*'
             - Sid: CloudTrailEventHistoryRead
-              # BR-56 reads the Region's event history, and BR-32 reads whether
-              # it holds an ApplyGuardrail call. LookupEvents has no
+              # BR-56 reads the Region's event history; BR-32 and BR-04 read whether
+              # it holds ApplyGuardrail or inference calls. LookupEvents has no
               # resource type in the service authorization reference, so it
               # takes '*'.
               Effect: Allow
               Action:
-                - cloudtrail:LookupEvents # BR-56, BR-32
+                - cloudtrail:LookupEvents # BR-56, BR-32, BR-04
               Resource: '*'
             - Sid: LambdaInventoryPermissions
               Effect: Allow

@@ -610,6 +610,10 @@ _VERIFIED_REMEDIATION_IAM_ACTIONS |= {
     "s3:GetObject",
 }
 
+# Verified on 2026-09-27 against the same Service Authorization Reference JSON:
+# the logs file lists AssociateKmsKey on the log-group resource.
+_VERIFIED_REMEDIATION_IAM_ACTIONS |= {"logs:AssociateKmsKey"}
+
 # Verified on 2026-09-25 by submitting a policy naming each action to
 # iam-access-analyzer ValidatePolicy (a read-only call that creates nothing):
 # an action the service does not define comes back as INVALID_ACTION, and every
