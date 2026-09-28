@@ -8323,8 +8323,12 @@ SECURITY_SERVICE_PRINCIPALS = (
     ("Amazon Macie", "macie.amazonaws.com"),
     ("AWS Config", "config.amazonaws.com"),
     ("IAM Access Analyzer", "access-analyzer.amazonaws.com"),
+    ("AWS CloudTrail", "cloudtrail.amazonaws.com"),
 )
 SECURITY_SERVICE_LIST_TEXT = ", ".join(name for name, _ in SECURITY_SERVICE_PRINCIPALS)
+DELEGATED_ADMIN_CONSOLIDATION_FINDING = (
+    "Security Service Delegated Administrator Consolidation"
+)
 
 
 def check_security_service_delegated_admin(region: str = "") -> Dict[str, Any]:
@@ -8381,6 +8385,8 @@ def check_security_service_delegated_admin(region: str = "") -> Dict[str, Any]:
         )
         return findings
 
+    admins_by_service = {}
+    unread_services = []
     for service_name, principal in SECURITY_SERVICE_PRINCIPALS:
         try:
             admins = []
@@ -8406,8 +8412,10 @@ def check_security_service_delegated_admin(region: str = "") -> Dict[str, Any]:
             findings["csv_data"].append(
                 _row(details, COULD_NOT_ASSESS_RESOLUTION, "Informational", "N/A")
             )
+            unread_services.append(service_name)
             continue
         except Exception as error:
+            unread_services.append(service_name)
             findings["csv_data"].append(
                 _row(
                     f"{service_name} ({principal}): "
@@ -8425,6 +8433,7 @@ def check_security_service_delegated_admin(region: str = "") -> Dict[str, Any]:
             for admin in active
             if admin.get("Id") and admin.get("Id") != master_account_id
         )
+        admins_by_service[service_name] = dedicated
         if dedicated:
             findings["csv_data"].append(
                 _row(
@@ -8463,7 +8472,89 @@ def check_security_service_delegated_admin(region: str = "") -> Dict[str, Any]:
                 )
             )
 
+    findings["csv_data"].append(
+        _delegated_admin_consolidation_finding(
+            admins_by_service, unread_services, region
+        )
+    )
     return findings
+
+
+def _delegated_admin_consolidation_finding(
+    admins_by_service: Dict[str, List[str]],
+    unread_services: List[str],
+    region: str,
+) -> Dict[str, Any]:
+    """
+    Report whether every security service shares one non-management administrator.
+
+    Administrator-member relationships do not carry across services, so two
+    services administered from different accounts split the security view.
+    """
+    accounts = {}
+    for service_name, dedicated in admins_by_service.items():
+        for account_id in dedicated:
+            accounts.setdefault(account_id, []).append(service_name)
+    without = [name for name, dedicated in admins_by_service.items() if not dedicated]
+
+    def _row(details, resolution, severity, status, name=None):
+        return create_finding(
+            check_id="SM-35",
+            finding_name=name or DELEGATED_ADMIN_CONSOLIDATION_FINDING,
+            finding_details=details,
+            resolution=resolution,
+            reference=DELEGATED_ADMIN_REFERENCE,
+            severity=severity,
+            status=status,
+            region=region,
+        )
+
+    if len(accounts) > 1:
+        split = "; ".join(
+            f"account {account_id}: {', '.join(services)}"
+            for account_id, services in sorted(accounts.items())
+        )
+        return _row(
+            f"The security services are administered from {len(accounts)} "
+            f"different non-management accounts ({split}). Administrator-member "
+            "relationships do not carry across services, so no single account "
+            "holds the whole security view.",
+            "Move every security service's delegated administrator to the one "
+            "security tooling account.",
+            "Medium",
+            "Failed",
+        )
+    if without:
+        return _row(
+            f"Not every security service has a non-management delegated "
+            f"administrator ({', '.join(without)}), so the services are not "
+            "administered from one security tooling account.",
+            "Register the same security tooling account as delegated administrator "
+            "for each service named.",
+            "Medium",
+            "Failed",
+        )
+    if unread_services or not accounts:
+        return _row(
+            "Whether every security service shares one delegated administrator "
+            "was not established: the administrators of "
+            f"{', '.join(unread_services)} could not be listed.",
+            COULD_NOT_ASSESS_RESOLUTION,
+            "Informational",
+            "N/A",
+            name=f"{DELEGATED_ADMIN_CONSOLIDATION_FINDING} Incomplete",
+        )
+    (account_id,) = accounts
+    return _row(
+        f"All {len(admins_by_service)} security services checked "
+        f"({SECURITY_SERVICE_LIST_TEXT}) are administered from the one "
+        f"non-management account {account_id}. Whether that account is a "
+        "dedicated security tooling account and not an AI workload account is "
+        "not recorded by any Organizations API and was not assessed.",
+        "No action required",
+        "Medium",
+        "Passed",
+    )
 
 
 AI_SECURITY_STANDARD_FINDING = "Security Hub AI Security Best Practices Standard"

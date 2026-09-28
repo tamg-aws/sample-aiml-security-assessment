@@ -5345,6 +5345,7 @@ class TestSM35SecurityServiceDelegatedAdmin:
                     {"DelegatedAdministrators": []},
                     {"DelegatedAdministrators": [active]},
                 ],
+                "cloudtrail.amazonaws.com": [{"DelegatedAdministrators": [active]}],
             }
         )
         rows = _rows(
@@ -5357,11 +5358,16 @@ class TestSM35SecurityServiceDelegatedAdmin:
             "Failed",
             "Failed",
             "Passed",
+            "Passed",
+            "Failed",
         ]
         assert all(r["Check_ID"] == "SM-35" for r in rows)
         assert all(
             "Services checked (fixed list): Amazon GuardDuty" in r["Finding_Details"]
-            for r in rows
+            for r in rows[:-1]
+        )
+        assert rows[-1]["Finding"] == (
+            sagemaker_app.DELEGATED_ADMIN_CONSOLIDATION_FINDING
         )
         assert self.SECURITY in rows[0]["Finding_Details"]
         assert "No active delegated administrator" in rows[1]["Finding_Details"]
@@ -5384,8 +5390,12 @@ class TestSM35SecurityServiceDelegatedAdmin:
             }
         )
         rows = _rows(sagemaker_app.check_security_service_delegated_admin())
-        assert [r["Status"] for r in rows] == ["Passed"] * 6
+        assert [r["Status"] for r in rows] == ["Passed"] * 8
         assert self.MANAGEMENT not in rows[0]["Finding_Details"].split(".")[0]
+        assert (
+            f"one non-management account {self.SECURITY}"
+            in (rows[-1]["Finding_Details"])
+        )
 
     @patch("sagemaker_app.boto3.client")
     def test_non_access_error_is_could_not_assess_without_access_reason(
@@ -5398,7 +5408,7 @@ class TestSM35SecurityServiceDelegatedAdmin:
         pages["guardduty.amazonaws.com"] = _make_client_error("TooManyRequests")
         mock_client.return_value = self._client(pages)
         rows = _rows(sagemaker_app.check_security_service_delegated_admin())
-        assert len(rows) == 6
+        assert len(rows) == 8
         assert_could_not_assess_finding(rows[0])
         assert "readable only from" not in rows[0]["Finding_Details"]
         assert rows[1]["Status"] == "Failed"
@@ -5426,6 +5436,103 @@ class TestSM35SecurityServiceDelegatedAdmin:
         rows = _rows(sagemaker_app.check_security_service_delegated_admin())
         assert len(rows) == 1
         assert_could_not_assess_finding(rows[0])
+
+
+class TestSM35DelegatedAdminConsolidation:
+    """AIR-FND-ACC-09: every security service shares one tooling account."""
+
+    MANAGEMENT = "111122223333"
+    SECURITY = "444455556666"
+    OTHER = "777788889999"
+
+    def _rows(self, mock_client, overrides=None):
+        pages = {
+            principal: [
+                {"DelegatedAdministrators": [{"Id": self.SECURITY, "Status": "ACTIVE"}]}
+            ]
+            for _, principal in sagemaker_app.SECURITY_SERVICE_PRINCIPALS
+        }
+        pages.update(overrides or {})
+        mock_client.return_value = TestSM35SecurityServiceDelegatedAdmin()._client(
+            pages
+        )
+        return _rows(sagemaker_app.check_security_service_delegated_admin())
+
+    def test_cloudtrail_is_a_checked_service(self):
+        assert ("AWS CloudTrail", "cloudtrail.amazonaws.com") in (
+            sagemaker_app.SECURITY_SERVICE_PRINCIPALS
+        )
+
+    @patch("sagemaker_app.boto3.client")
+    def test_one_shared_administrator_passes(self, mock_client):
+        rows = self._rows(mock_client)
+        assert rows[-1]["Status"] == "Passed"
+        assert "7 security services" in rows[-1]["Finding_Details"]
+        assert "not recorded by any Organizations API" in rows[-1]["Finding_Details"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_one_service_on_a_different_account_fails(self, mock_client):
+        rows = self._rows(
+            mock_client,
+            {
+                "inspector2.amazonaws.com": [
+                    {
+                        "DelegatedAdministrators": [
+                            {"Id": self.OTHER, "Status": "ACTIVE"}
+                        ]
+                    }
+                ]
+            },
+        )
+        # Every per-service row passes; only the cross-service row sees the split.
+        assert [r["Status"] for r in rows[:-1]] == ["Passed"] * 7
+        assert rows[-1]["Status"] == "Failed"
+        assert f"account {self.OTHER}: Amazon Inspector" in rows[-1]["Finding_Details"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_split_on_a_later_page_fails(self, mock_client):
+        rows = self._rows(
+            mock_client,
+            {
+                "cloudtrail.amazonaws.com": [
+                    {"DelegatedAdministrators": []},
+                    {
+                        "DelegatedAdministrators": [
+                            {"Id": self.OTHER, "Status": "ACTIVE"}
+                        ]
+                    },
+                ]
+            },
+        )
+        assert rows[-1]["Status"] == "Failed"
+        assert f"account {self.OTHER}: AWS CloudTrail" in rows[-1]["Finding_Details"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_unread_service_is_incomplete_not_passed(self, mock_client):
+        rows = self._rows(
+            mock_client,
+            {"cloudtrail.amazonaws.com": _make_client_error("AccessDeniedException")},
+        )
+        assert rows[-1]["Status"] == "N/A"
+        assert rows[-1]["Finding"].endswith("Incomplete")
+        assert "AWS CloudTrail" in rows[-1]["Finding_Details"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_service_with_only_the_management_account_fails(self, mock_client):
+        rows = self._rows(
+            mock_client,
+            {
+                "macie.amazonaws.com": [
+                    {
+                        "DelegatedAdministrators": [
+                            {"Id": self.MANAGEMENT, "Status": "ACTIVE"}
+                        ]
+                    }
+                ]
+            },
+        )
+        assert rows[-1]["Status"] == "Failed"
+        assert "Amazon Macie" in rows[-1]["Finding_Details"]
 
 
 class TestSM36SecurityHubAIStandard:
@@ -6259,7 +6366,7 @@ class TestScope27HandlerWiring:
         assert resp["statusCode"] == 200
         rows = [r for f in findings for r in f.get("csv_data", [])]
         sm35 = [r for r in rows if r["Check_ID"] == "SM-35"]
-        assert len(sm35) == len(sagemaker_app.SECURITY_SERVICE_PRINCIPALS)
+        assert len(sm35) == len(sagemaker_app.SECURITY_SERVICE_PRINCIPALS) + 1
         assert {r["Region"] for r in sm35} == {"Global"}
 
     @patch("sagemaker_app.boto3.client")
