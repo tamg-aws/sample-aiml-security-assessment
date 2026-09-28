@@ -186,6 +186,7 @@ _EXPECTED_ACTIONS = {
         "lambda:ListFunctions",
         "logs:DescribeLogGroups",
         "logs:DescribeMetricFilters",
+        "logs:DescribeSubscriptionFilters",
         "macie2:DescribeBuckets",
         "macie2:GetAutomatedDiscoveryConfiguration",
         "macie2:GetMacieSession",
@@ -1046,6 +1047,10 @@ def test_aisf_phase5_reads_wildcard_only_where_iam_has_no_resource_type(template
         ("BedrockSecurityAssessmentFunction", "EC2InstanceProfileRoleRead"): (
             "iam:GetInstanceProfile",
             "iam::${AWS::AccountId}:instance-profile/*",
+        ),
+        ("BedrockSecurityAssessmentFunction", "BedrockInvocationLogInspection"): (
+            "logs:DescribeSubscriptionFilters",
+            "logs:*:${AWS::AccountId}:log-group:*",
         ),
         ("BedrockSecurityAssessmentFunction", "OrganizationsEffectivePolicyRead"): (
             "organizations:DescribeEffectivePolicy",

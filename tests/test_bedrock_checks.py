@@ -12131,6 +12131,26 @@ class TestBR31BatchInferenceOutputEncryption:
 class TestBR32CloudWatchAlarms:
     """BR-32: Verify CloudWatch alarms exist on AWS/Bedrock metrics."""
 
+    @pytest.fixture(autouse=True)
+    def _guardrails_in_scope(self):
+        """One local guardrail, no attachments, no ApplyGuardrail call."""
+        with (
+            patch(
+                "bedrock_app.get_guardrail_detail_inventory",
+                return_value={
+                    "items": [{"summary": {"id": "gr-1"}, "detail": {}}],
+                    "errors": [],
+                    "list_error": None,
+                },
+            ),
+            patch(
+                "bedrock_app.get_guardrail_attachment_inventory",
+                return_value={"attachments": [], "versions": {}, "errors": []},
+            ),
+            patch("bedrock_app._apply_guardrail_called", return_value=False),
+        ):
+            yield
+
     @patch("bedrock_app.detect_bedrock_regional_footprint", return_value=False)
     @patch("bedrock_app.boto3.client")
     def test_br32_no_footprint_returns_na(self, mock_client, mock_footprint):
@@ -12149,7 +12169,12 @@ class TestBR32CloudWatchAlarms:
         paginator.paginate.return_value = [
             {
                 "MetricAlarms": [
-                    {"AlarmName": "bedrock-throttle", "Namespace": "AWS/Bedrock"}
+                    {
+                        "AlarmName": "bedrock-throttle",
+                        "Namespace": "AWS/Bedrock",
+                        "ActionsEnabled": True,
+                        "AlarmActions": [SNS_TOPIC],
+                    }
                 ]
             }
         ]
@@ -12172,6 +12197,8 @@ class TestBR32CloudWatchAlarms:
                 "MetricAlarms": [
                     {
                         "AlarmName": "bedrock-tpm",
+                        "ActionsEnabled": True,
+                        "AlarmActions": [SNS_TOPIC],
                         "Metrics": [
                             {"MetricStat": {"Metric": {"Namespace": "AWS/Bedrock"}}}
                         ],
@@ -12222,6 +12249,9 @@ class TestBR32CloudWatchAlarms:
         logs_client.describe_metric_filters.return_value = {
             "metricFilters": metric_filters or []
         }
+        logs_client.describe_subscription_filters.return_value = {
+            "subscriptionFilters": []
+        }
 
         def client_factory(service, **kwargs):
             if service == "bedrock":
@@ -12241,10 +12271,13 @@ class TestBR32CloudWatchAlarms:
         check = bedrock_app.check_bedrock_cloudwatch_alarms
         client_factory, _ = self._alarm_clients(
             [
-                {"AlarmName": "bedrock-throttle", "Namespace": "AWS/Bedrock"},
+                ACTING_RUNTIME_ALARM,
                 {
                     "AlarmName": "guardrail-intervened",
                     "Namespace": "AWS/Bedrock/Guardrails",
+                    "MetricName": "InvocationsIntervened",
+                    "ActionsEnabled": True,
+                    "AlarmActions": [SNS_TOPIC],
                 },
             ]
         )
@@ -12259,8 +12292,8 @@ class TestBR32CloudWatchAlarms:
         assert len(signal) == 1
         assert signal[0]["Status"] == "Passed"
         assert (
-            "1 CloudWatch alarm(s) on the AWS/Bedrock/Guardrails namespace "
-            "(guardrail-intervened)" in signal[0]["Finding_Details"]
+            "CloudWatch alarm(s) guardrail-intervened on AWS/Bedrock/Guardrails "
+            "InvocationsIntervened" in signal[0]["Finding_Details"]
         )
         for finding in findings:
             assert_finding_schema(finding)
@@ -12272,7 +12305,7 @@ class TestBR32CloudWatchAlarms:
     ):
         check = bedrock_app.check_bedrock_cloudwatch_alarms
         client_factory, logs_client = self._alarm_clients(
-            [{"AlarmName": "bedrock-throttle", "Namespace": "AWS/Bedrock"}],
+            [ACTING_RUNTIME_ALARM, INTERVENED_FILTER_ALARM],
             logging_config={
                 "cloudWatchConfig": {
                     "logGroupName": "/aws/bedrock/invocations",
@@ -12283,6 +12316,9 @@ class TestBR32CloudWatchAlarms:
                 {
                     "filterName": "GuardrailIntervened",
                     "filterPattern": '{ $.["amazon-bedrock-guardrailAction"] = "INTERVENED" }',
+                    "metricTransformations": [
+                        {"metricName": "Intervened", "metricNamespace": "Security"}
+                    ],
                 },
                 {"filterName": "Unrelated", "filterPattern": "{ $.errorCode = * }"},
             ],
@@ -12297,9 +12333,9 @@ class TestBR32CloudWatchAlarms:
         ]
         assert signal[0]["Status"] == "Passed"
         assert (
-            "1 metric filter(s) on log group '/aws/bedrock/invocations' matching a "
-            "guardrail intervention field (GuardrailIntervened)"
-            in signal[0]["Finding_Details"]
+            "metric filter(s) on log group '/aws/bedrock/invocations' selecting "
+            "INTERVENED with an acting alarm: GuardrailIntervened (alarm "
+            "intervened-spike)" in signal[0]["Finding_Details"]
         )
         logs_client.describe_metric_filters.assert_called_once_with(
             logGroupName="/aws/bedrock/invocations"
@@ -12312,7 +12348,7 @@ class TestBR32CloudWatchAlarms:
     ):
         check = bedrock_app.check_bedrock_cloudwatch_alarms
         client_factory, _ = self._alarm_clients(
-            [{"AlarmName": "bedrock-throttle", "Namespace": "AWS/Bedrock"}],
+            [ACTING_RUNTIME_ALARM],
             logging_config={
                 "cloudWatchConfig": {
                     "logGroupName": "/aws/bedrock/invocations",
@@ -12332,7 +12368,7 @@ class TestBR32CloudWatchAlarms:
         assert signal["Status"] == "Failed"
         assert (
             "no metric filter on invocation log group '/aws/bedrock/invocations' "
-            "matches an intervention field" in signal["Finding_Details"]
+            "that selects INTERVENED feeds an acting alarm" in signal["Finding_Details"]
         )
 
     @patch("bedrock_app.detect_bedrock_regional_footprint", return_value=True)
@@ -12342,7 +12378,7 @@ class TestBR32CloudWatchAlarms:
     ):
         check = bedrock_app.check_bedrock_cloudwatch_alarms
         client_factory, logs_client = self._alarm_clients(
-            [{"AlarmName": "bedrock-throttle", "Namespace": "AWS/Bedrock"}],
+            [ACTING_RUNTIME_ALARM],
             logging_config={"s3Config": {"bucketName": "bedrock-logs"}},
         )
         mock_client.side_effect = client_factory
@@ -12363,7 +12399,7 @@ class TestBR32CloudWatchAlarms:
     ):
         check = bedrock_app.check_bedrock_cloudwatch_alarms
         client_factory, logs_client = self._alarm_clients(
-            [{"AlarmName": "bedrock-throttle", "Namespace": "AWS/Bedrock"}],
+            [ACTING_RUNTIME_ALARM],
             logging_config={
                 "cloudWatchConfig": {
                     "logGroupName": "/aws/bedrock/invocations",
@@ -12397,6 +12433,467 @@ class TestBR32CloudWatchAlarms:
         result = check(region="us-east-1")
         for f in extract_csv_data(result):
             assert_finding_schema(f)
+
+
+SNS_TOPIC = "arn:aws:sns:us-east-1:123456789012:security-alerts"
+
+ACTING_RUNTIME_ALARM = {
+    "AlarmName": "bedrock-throttle",
+    "Namespace": "AWS/Bedrock",
+    "ActionsEnabled": True,
+    "AlarmActions": [SNS_TOPIC],
+}
+
+INTERVENED_FILTER_ALARM = {
+    "AlarmName": "intervened-spike",
+    "Namespace": "Security",
+    "MetricName": "Intervened",
+    "ActionsEnabled": True,
+    "AlarmActions": [SNS_TOPIC],
+}
+
+INVOCATION_LOGGING = {
+    "cloudWatchConfig": {
+        "logGroupName": "/aws/bedrock/invocations",
+        "roleArn": "arn:aws:iam::123456789012:role/BedrockLogs",
+    }
+}
+
+
+def _intervened_alarm(
+    name, actions_enabled=True, actions=True, metric="InvocationsIntervened"
+):
+    return {
+        "AlarmName": name,
+        "Namespace": "AWS/Bedrock/Guardrails",
+        "MetricName": metric,
+        "ActionsEnabled": actions_enabled,
+        "AlarmActions": [SNS_TOPIC] if actions else [],
+    }
+
+
+def _intervened_filter(name, pattern, metric="Intervened"):
+    return {
+        "filterName": name,
+        "filterPattern": pattern,
+        "metricTransformations": [
+            {"metricName": metric, "metricNamespace": "Security"}
+        ],
+    }
+
+
+class TestBR32ActingIntervention:
+    """AIR-BDR-GRD-04: an intervention signal counts only when it reaches an acting alarm."""
+
+    @pytest.fixture(autouse=True)
+    def _scope(self):
+        self.guardrails = {
+            "items": [{"summary": {"id": "gr-1"}, "detail": {}}],
+            "errors": [],
+            "list_error": None,
+        }
+        self.attachments = {"attachments": [], "versions": {}, "errors": []}
+        self.apply_called = False
+        with (
+            patch(
+                "bedrock_app.get_guardrail_detail_inventory",
+                side_effect=lambda region: self.guardrails,
+            ),
+            patch(
+                "bedrock_app.get_guardrail_attachment_inventory",
+                side_effect=lambda region: self.attachments,
+            ),
+            patch(
+                "bedrock_app._apply_guardrail_called",
+                side_effect=lambda region: self.apply_called,
+            ),
+            patch("bedrock_app.detect_bedrock_regional_footprint", return_value=True),
+        ):
+            yield
+
+    def _run(
+        self,
+        alarms,
+        metric_filters=None,
+        composites=None,
+        logging_config=INVOCATION_LOGGING,
+        subscriptions=None,
+    ):
+        cw_client = MagicMock()
+        paginator = MagicMock()
+        paginator.paginate.return_value = [
+            {"MetricAlarms": alarms, "CompositeAlarms": composites or []}
+        ]
+        cw_client.get_paginator.return_value = paginator
+        bedrock_client = MagicMock()
+        bedrock_client.get_model_invocation_logging_configuration.return_value = {
+            "loggingConfig": logging_config
+        }
+        logs_client = MagicMock()
+        logs_client.describe_metric_filters.return_value = {
+            "metricFilters": metric_filters or []
+        }
+        logs_client.describe_subscription_filters.return_value = {
+            "subscriptionFilters": subscriptions or []
+        }
+
+        def factory(service, **kwargs):
+            return {"bedrock": bedrock_client, "logs": logs_client}.get(
+                service, cw_client
+            )
+
+        with patch("bedrock_app.boto3.client", side_effect=factory):
+            findings = extract_csv_data(
+                bedrock_app.check_bedrock_cloudwatch_alarms(region="us-east-1")
+            )
+        for finding in findings:
+            assert_finding_schema(finding)
+        runtime = [
+            f for f in findings if f["Finding"] == "Bedrock CloudWatch Alarm Check"
+        ]
+        signal = [
+            f
+            for f in findings
+            if f["Finding"] == "Guardrail Intervention Monitoring Signal"
+        ]
+        assert len(signal) == 1
+        return runtime, signal[0]
+
+    def test_alarm_with_actions_disabled_is_not_a_signal(self):
+        _, signal = self._run(
+            [ACTING_RUNTIME_ALARM, _intervened_alarm("muted", actions_enabled=False)]
+        )
+        assert signal["Status"] == "Failed"
+        assert (
+            "alarm(s) muted on InvocationsIntervened reach no action"
+            in signal["Finding_Details"]
+        )
+
+    def test_alarm_without_alarm_actions_is_not_a_signal(self):
+        _, signal = self._run([_intervened_alarm("no-target", actions=False)])
+        assert signal["Status"] == "Failed"
+        assert (
+            "no-target on InvocationsIntervened reach no action"
+            in signal["Finding_Details"]
+        )
+
+    def test_alarm_on_another_guardrail_metric_is_not_a_signal(self):
+        _, signal = self._run([_intervened_alarm("volume", metric="Invocations")])
+        assert signal["Status"] == "Failed"
+        assert (
+            "alarm(s) volume evaluate a AWS/Bedrock/Guardrails metric other than "
+            "InvocationsIntervened" in signal["Finding_Details"]
+        )
+
+    def test_one_acting_alarm_among_silent_ones_passes_and_names_the_rest(self):
+        _, signal = self._run(
+            [
+                _intervened_alarm("muted", actions_enabled=False),
+                _intervened_alarm("paged"),
+                _intervened_alarm("volume", metric="Invocations"),
+            ]
+        )
+        assert signal["Status"] == "Passed"
+        assert "CloudWatch alarm(s) paged on" in signal["Finding_Details"]
+        assert (
+            "muted on InvocationsIntervened reach no action"
+            in signal["Finding_Details"]
+        )
+        assert "alarm(s) volume evaluate" in signal["Finding_Details"]
+
+    def test_acting_composite_alarm_carries_a_silent_metric_alarm(self):
+        _, signal = self._run(
+            [_intervened_alarm("child", actions=False)],
+            composites=[
+                {
+                    "AlarmName": "parent",
+                    "AlarmRule": 'ALARM("child") OR ALARM(other)',
+                    "ActionsEnabled": True,
+                    "AlarmActions": [SNS_TOPIC],
+                }
+            ],
+        )
+        assert signal["Status"] == "Passed"
+        assert "CloudWatch alarm(s) child on" in signal["Finding_Details"]
+
+    def test_negated_or_silent_composite_does_not_carry_the_alarm(self):
+        _, signal = self._run(
+            [
+                _intervened_alarm("child", actions=False),
+                _intervened_alarm("sibling", actions=False),
+            ],
+            composites=[
+                {
+                    "AlarmName": "negated",
+                    "AlarmRule": 'NOT ALARM("child")',
+                    "ActionsEnabled": True,
+                    "AlarmActions": [SNS_TOPIC],
+                },
+                {
+                    "AlarmName": "silent-parent",
+                    "AlarmRule": 'ALARM("sibling")',
+                    "ActionsEnabled": False,
+                    "AlarmActions": [SNS_TOPIC],
+                },
+            ],
+        )
+        assert signal["Status"] == "Failed"
+        assert (
+            "child, sibling on InvocationsIntervened reach no action"
+            in signal["Finding_Details"]
+        )
+
+    def test_metric_filter_without_an_alarm_is_not_a_signal(self):
+        _, signal = self._run(
+            [ACTING_RUNTIME_ALARM],
+            metric_filters=[
+                _intervened_filter(
+                    "GuardrailIntervened",
+                    '{ $.["amazon-bedrock-guardrailAction"] = "INTERVENED" }',
+                )
+            ],
+        )
+        assert signal["Status"] == "Failed"
+        assert (
+            "metric filter(s) GuardrailIntervened match an intervention but no acting "
+            "alarm evaluates the metric they emit" in signal["Finding_Details"]
+        )
+
+    def test_metric_filter_alarm_on_a_different_metric_is_not_a_signal(self):
+        _, signal = self._run(
+            [dict(INTERVENED_FILTER_ALARM, MetricName="Other")],
+            metric_filters=[
+                _intervened_filter(
+                    "GuardrailIntervened", '{ $.stopReason = "guardrail_intervened" }'
+                )
+            ],
+        )
+        assert signal["Status"] == "Failed"
+
+    def test_a_pattern_on_guardrail_action_none_is_not_credited(self):
+        _, signal = self._run(
+            [INTERVENED_FILTER_ALARM],
+            metric_filters=[
+                _intervened_filter(
+                    "GuardrailNone", '{ $.["amazon-bedrock-guardrailAction"] = "NONE" }'
+                )
+            ],
+        )
+        assert signal["Status"] == "Failed"
+        assert (
+            "metric filter(s) GuardrailNone name a guardrail field without selecting "
+            "INTERVENED" in signal["Finding_Details"]
+        )
+
+    def test_a_pattern_excluding_intervened_is_not_credited(self):
+        _, signal = self._run(
+            [INTERVENED_FILTER_ALARM],
+            metric_filters=[
+                _intervened_filter(
+                    "NotIntervened", '{ $.stopReason != "guardrail_intervened" }'
+                ),
+                _intervened_filter("TermExcluded", 'guardrail -"INTERVENED"'),
+            ],
+        )
+        assert signal["Status"] == "Failed"
+        assert (
+            "NotIntervened, TermExcluded name a guardrail field"
+            in signal["Finding_Details"]
+        )
+
+    def test_one_alarmed_filter_among_unalarmed_ones_passes(self):
+        _, signal = self._run(
+            [INTERVENED_FILTER_ALARM],
+            metric_filters=[
+                _intervened_filter(
+                    "Unalarmed",
+                    '{ $.stopReason = "guardrail_intervened" }',
+                    metric="Orphan",
+                ),
+                _intervened_filter(
+                    "Alarmed", '{ $.["amazon-bedrock-guardrailAction"] = "INTERVENED" }'
+                ),
+            ],
+        )
+        assert signal["Status"] == "Passed"
+        assert "Alarmed (alarm intervened-spike)" in signal["Finding_Details"]
+        assert (
+            "metric filter(s) Unalarmed match an intervention"
+            in signal["Finding_Details"]
+        )
+
+    def test_apply_guardrail_calls_are_not_covered_by_a_metric_filter(self):
+        self.apply_called = True
+        _, signal = self._run(
+            [INTERVENED_FILTER_ALARM],
+            metric_filters=[
+                _intervened_filter(
+                    "Alarmed", '{ $.stopReason = "guardrail_intervened" }'
+                )
+            ],
+        )
+        assert signal["Status"] == "Failed"
+        assert "ApplyGuardrail is called in this Region" in signal["Finding_Details"]
+
+    def test_unread_apply_guardrail_history_is_not_a_pass_for_a_filter(self):
+        self.apply_called = None
+        _, signal = self._run(
+            [INTERVENED_FILTER_ALARM],
+            metric_filters=[
+                _intervened_filter(
+                    "Alarmed", '{ $.stopReason = "guardrail_intervened" }'
+                )
+            ],
+        )
+        assert signal["Status"] == "N/A"
+        assert "cloudtrail:LookupEvents" in signal["Finding_Details"]
+        assert "not reported as Passed" in signal["Finding_Details"]
+
+    def test_namespace_alarm_passes_when_apply_guardrail_is_called(self):
+        self.apply_called = True
+        _, signal = self._run([_intervened_alarm("paged")])
+        assert signal["Status"] == "Passed"
+        assert (
+            "ApplyGuardrail calls in this Region's event history"
+            in signal["Finding_Details"]
+        )
+
+    def test_signal_is_judged_without_a_regional_footprint(self):
+        with patch("bedrock_app.detect_bedrock_regional_footprint", return_value=False):
+            runtime, signal = self._run([])
+        assert runtime[0]["Status"] == "N/A"
+        assert signal["Status"] == "Failed"
+
+    def test_an_enforced_configuration_alone_brings_the_signal_in_scope(self):
+        self.guardrails = {"items": [], "errors": [], "list_error": None}
+        self.attachments = {
+            "attachments": [],
+            "versions": {
+                ("arn:aws:bedrock:us-east-1:111122223333:guardrail/g", "1"): {}
+            },
+            "errors": [],
+        }
+        _, signal = self._run([])
+        assert signal["Status"] == "Failed"
+        assert "1 guardrail version(s) applied by agents" in signal["Finding_Details"]
+
+    def test_apply_guardrail_calls_alone_bring_the_signal_in_scope(self):
+        self.guardrails = {"items": [], "errors": [], "list_error": None}
+        self.apply_called = True
+        _, signal = self._run([])
+        assert signal["Status"] == "Failed"
+
+    def test_no_guardrail_anywhere_is_not_applicable(self):
+        self.guardrails = {"items": [], "errors": [], "list_error": None}
+        _, signal = self._run([])
+        assert signal["Status"] == "N/A"
+        assert "there is no intervention to monitor" in signal["Finding_Details"]
+
+    def test_unread_guardrail_list_is_not_reported_as_out_of_scope(self):
+        self.guardrails = {
+            "items": [],
+            "errors": [],
+            "list_error": ClientError(
+                {"Error": {"Code": "AccessDeniedException", "Message": "x"}},
+                "ListGuardrails",
+            ),
+        }
+        _, signal = self._run([])
+        assert signal["Status"] == "N/A"
+        assert (
+            "bedrock:ListGuardrails: AccessDeniedException" in signal["Finding_Details"]
+        )
+        assert "no intervention to monitor" not in signal["Finding_Details"]
+
+    def test_runtime_alarm_without_actions_does_not_pass(self):
+        runtime, _ = self._run(
+            [
+                dict(
+                    ACTING_RUNTIME_ALARM,
+                    AlarmName="muted-throttle",
+                    ActionsEnabled=False,
+                )
+            ]
+        )
+        assert runtime[0]["Status"] == "Failed"
+        assert (
+            "muted-throttle evaluate AWS/Bedrock metrics but reach no action"
+            in runtime[0]["Finding_Details"]
+        )
+
+    def test_runtime_alarms_mixed_pass_on_the_acting_one(self):
+        runtime, _ = self._run(
+            [
+                ACTING_RUNTIME_ALARM,
+                dict(ACTING_RUNTIME_ALARM, AlarmName="muted-throttle", AlarmActions=[]),
+            ]
+        )
+        assert runtime[0]["Status"] == "Passed"
+        assert (
+            "evaluate Amazon Bedrock runtime metrics (AWS/Bedrock namespace): bedrock-throttle."
+            in runtime[0]["Finding_Details"]
+        )
+        assert (
+            "muted-throttle evaluate AWS/Bedrock metrics but reach no action"
+            in runtime[0]["Finding_Details"]
+        )
+
+    def test_log_forwarding_is_reported(self):
+        _, signal = self._run(
+            [_intervened_alarm("paged")],
+            subscriptions=[
+                {
+                    "filterName": "to-siem",
+                    "destinationArn": "arn:aws:firehose:us-east-1:123456789012:deliverystream/siem",
+                }
+            ],
+        )
+        assert (
+            "forwarded by subscription filter(s) to-siem to "
+            "arn:aws:firehose:us-east-1:123456789012:deliverystream/siem"
+            in signal["Finding_Details"]
+        )
+
+    def test_no_log_forwarding_is_reported(self):
+        _, signal = self._run([_intervened_alarm("paged")])
+        assert (
+            "No subscription filter forwards log group '/aws/bedrock/invocations'"
+            in signal["Finding_Details"]
+        )
+
+    def test_every_row_names_the_apply_guardrail_ceiling(self):
+        _, signal = self._run([_intervened_alarm("paged")])
+        assert bedrock_app.GUARDRAIL_SIGNAL_CEILING in signal["Finding_Details"]
+
+
+class TestApplyGuardrailCalled:
+    def test_events_mean_called(self):
+        client = MagicMock()
+        client.lookup_events.return_value = {
+            "Events": [{"EventName": "ApplyGuardrail"}]
+        }
+        with patch("bedrock_app.boto3.client", return_value=client):
+            assert bedrock_app._apply_guardrail_called("us-east-1") is True
+        client.lookup_events.assert_called_once_with(
+            LookupAttributes=[
+                {"AttributeKey": "EventName", "AttributeValue": "ApplyGuardrail"}
+            ],
+            MaxResults=1,
+        )
+
+    def test_no_events_mean_not_called(self):
+        client = MagicMock()
+        client.lookup_events.return_value = {"Events": []}
+        with patch("bedrock_app.boto3.client", return_value=client):
+            assert bedrock_app._apply_guardrail_called("us-east-1") is False
+
+    def test_denied_lookup_is_unread(self):
+        client = MagicMock()
+        client.lookup_events.side_effect = ClientError(
+            {"Error": {"Code": "AccessDeniedException", "Message": "x"}}, "LookupEvents"
+        )
+        with patch("bedrock_app.boto3.client", return_value=client):
+            assert bedrock_app._apply_guardrail_called("us-east-1") is None
 
 
 # ===================================================================

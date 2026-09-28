@@ -11691,15 +11691,74 @@ def check_bedrock_batch_inference_output_encryption(
 
 GUARDRAIL_METRIC_NAMESPACE = "AWS/Bedrock/Guardrails"
 
+GUARDRAIL_INTERVENTION_METRIC = "InvocationsIntervened"
+
 # A metric filter feeds guardrail interventions to monitoring by matching the
-# field the runtime API returns: InvokeModel and InvokeModelWithResponseStream
+# value the runtime API returns: InvokeModel and InvokeModelWithResponseStream
 # emit amazon-bedrock-guardrailAction=INTERVENED, Converse and ConverseStream
-# emit stopReason=guardrail_intervened.
-GUARDRAIL_INTERVENTION_PATTERN_TOKENS = (
-    "guardrailaction",
-    "guardrail_intervened",
-    "intervened",
+# emit stopReason=guardrail_intervened. A pattern must name that value; a
+# pattern on the guardrailAction key alone also matches NONE, and a "!=" or a
+# "-" term excludes the value it names.
+GUARDRAIL_INTERVENTION_TOKEN = "intervened"
+
+GUARDRAIL_INTERVENTION_EXCLUSION = re.compile(r'!=|-"?[\w]*intervened')
+
+GUARDRAIL_SIGNAL_CEILING = (
+    "Model invocation logging records only InvokeModel, InvokeModelWithResponseStream, "
+    "Converse and ConverseStream, so an intervention raised by ApplyGuardrail reaches "
+    "no metric filter, and whether a caller records the detect-mode decisions it "
+    "acted on is not visible to any AWS API."
 )
+
+COMPOSITE_ALARM_REFERENCE = re.compile(r'(NOT\s+)?ALARM\(\s*"?([^")]+?)"?\s*\)')
+
+
+def _alarm_metrics(alarm: Dict[str, Any]) -> List[Tuple[str, str]]:
+    """Name each (namespace, metric name) an alarm evaluates, metric math included."""
+    metrics = [(alarm.get("Namespace") or "", alarm.get("MetricName") or "")]
+    for metric in alarm.get("Metrics") or []:
+        stat_metric = (metric.get("MetricStat") or {}).get("Metric") or {}
+        metrics.append(
+            (stat_metric.get("Namespace") or "", stat_metric.get("MetricName") or "")
+        )
+    return metrics
+
+
+def _notifying_alarm_names(
+    metric_alarms: List[Dict[str, Any]], composite_alarms: List[Dict[str, Any]]
+) -> set:
+    """
+    Name the alarms whose state change reaches an action: an alarm with
+    ActionsEnabled true and an AlarmActions target, or an alarm an acting
+    composite alarm's rule reads as ALARM(...).
+    """
+
+    def acts(alarm: Dict[str, Any]) -> bool:
+        return alarm.get("ActionsEnabled") is True and bool(alarm.get("AlarmActions"))
+
+    notifying = set()
+    for alarm in metric_alarms + composite_alarms:
+        if acts(alarm):
+            notifying.update(
+                key for key in (alarm.get("AlarmName"), alarm.get("AlarmArn")) if key
+            )
+    changed = True
+    while changed:
+        changed = False
+        for composite in composite_alarms:
+            if not (
+                composite.get("AlarmName") in notifying
+                or composite.get("AlarmArn") in notifying
+            ):
+                continue
+            for negated, reference in COMPOSITE_ALARM_REFERENCE.findall(
+                composite.get("AlarmRule") or ""
+            ):
+                if negated or reference in notifying:
+                    continue
+                notifying.add(reference)
+                changed = True
+    return notifying
 
 
 def _get_invocation_log_group_name(region: str = "") -> Optional[str]:
@@ -11722,33 +11781,148 @@ def _get_invocation_log_group_name(region: str = "") -> Optional[str]:
 
 def _find_guardrail_intervention_metric_filters(
     log_group_name: str, region: str = ""
-) -> List[str]:
-    """Name the metric filters on a log group that match a guardrail intervention."""
+) -> Dict[str, List[Dict[str, Any]]]:
+    """
+    Sort the metric filters on a log group into those whose pattern selects a
+    guardrail intervention and those that name the guardrail fields without
+    selecting INTERVENED.
+    """
     client = boto3.client("logs", config=boto3_config, region_name=region)
     matched = []
-    next_token = None
+    rejected = []
+    request = {"logGroupName": log_group_name}
     while True:
-        request = {"logGroupName": log_group_name}
-        if next_token:
-            request["nextToken"] = next_token
         response = client.describe_metric_filters(**request)
         if not isinstance(response, dict):
-            break
+            raise TypeError("DescribeMetricFilters returned no response object")
         for metric_filter in response.get("metricFilters", []):
             pattern = (metric_filter.get("filterPattern") or "").lower()
-            if any(token in pattern for token in GUARDRAIL_INTERVENTION_PATTERN_TOKENS):
-                matched.append(metric_filter.get("filterName") or "unnamed")
+            name = metric_filter.get("filterName") or "unnamed"
+            if GUARDRAIL_INTERVENTION_TOKEN in pattern and not (
+                GUARDRAIL_INTERVENTION_EXCLUSION.search(pattern)
+            ):
+                matched.append(
+                    {
+                        "name": name,
+                        "metrics": [
+                            (
+                                transformation.get("metricNamespace") or "",
+                                transformation.get("metricName") or "",
+                            )
+                            for transformation in metric_filter.get(
+                                "metricTransformations"
+                            )
+                            or []
+                        ],
+                    }
+                )
+            elif "guardrail" in pattern:
+                rejected.append({"name": name, "metrics": []})
         next_token = response.get("nextToken")
         if not next_token:
             break
-    return matched
+        request["nextToken"] = next_token
+    return {"matched": matched, "rejected": rejected}
 
 
-def check_bedrock_cloudwatch_alarms(region: str = "") -> Dict[str, Any]:
+def _describe_log_forwarding(log_group_name: str, region: str = "") -> str:
+    """Report the subscription filters that forward a log group, as evidence only."""
+    try:
+        client = boto3.client("logs", config=boto3_config, region_name=region)
+        destinations = []
+        request = {"logGroupName": log_group_name}
+        while True:
+            response = client.describe_subscription_filters(**request)
+            if not isinstance(response, dict):
+                raise TypeError(
+                    "DescribeSubscriptionFilters returned no response object"
+                )
+            for subscription in response.get("subscriptionFilters", []):
+                destinations.append(
+                    f"{subscription.get('filterName') or 'unnamed'} to "
+                    f"{subscription.get('destinationArn') or 'an unnamed destination'}"
+                )
+            next_token = response.get("nextToken")
+            if not next_token:
+                break
+            request["nextToken"] = next_token
+    except (ClientError, BotoCoreError, TypeError) as error:
+        return (
+            f"The subscription filters on log group '{log_group_name}' were not read "
+            f"(logs:DescribeSubscriptionFilters: {get_assessment_error_label(error)}), "
+            "so forwarding to a SIEM is not reported."
+        )
+    if destinations:
+        return (
+            f"Log group '{log_group_name}' is forwarded by subscription filter(s) "
+            f"{'; '.join(sorted(destinations))}. Whether the destination is a "
+            "reviewed SIEM is not read."
+        )
+    return (
+        f"No subscription filter forwards log group '{log_group_name}'; forwarding "
+        "from the S3 logging destination or by a reader of the log group is not read."
+    )
+
+
+def _apply_guardrail_called(region: str = "") -> Optional[bool]:
+    """Read whether event history holds an ApplyGuardrail call; None when unread."""
+    try:
+        client = boto3.client("cloudtrail", config=boto3_config, region_name=region)
+        response = client.lookup_events(
+            LookupAttributes=[
+                {"AttributeKey": "EventName", "AttributeValue": "ApplyGuardrail"}
+            ],
+            MaxResults=1,
+        )
+        if not isinstance(response, dict):
+            raise TypeError("LookupEvents returned no response object")
+    except (ClientError, BotoCoreError, TypeError) as error:
+        logger.warning(f"ApplyGuardrail event lookup failed in {region}: {error}")
+        return None
+    return bool(response.get("Events"))
+
+
+def _guardrail_scope(
+    guardrail_inventory: Dict[str, Any],
+    attachment_inventory: Dict[str, Any],
+    apply_guardrail_called: Optional[bool],
+) -> Tuple[List[str], List[str]]:
+    """Return what shows guardrails are in use here, and what was not read."""
+    evidence = []
+    unread = []
+    local = len(guardrail_inventory.get("items") or []) + len(
+        guardrail_inventory.get("errors") or []
+    )
+    if local:
+        evidence.append(f"{local} guardrail(s) in this Region")
+    if guardrail_inventory.get("list_error") is not None:
+        unread.append(
+            "bedrock:ListGuardrails: "
+            + get_assessment_error_label(guardrail_inventory["list_error"])
+        )
+    attached = attachment_inventory.get("versions") or {}
+    if attached:
+        evidence.append(
+            f"{len(attached)} guardrail version(s) applied by agents, flow nodes or "
+            "account-enforced configurations"
+        )
+    unread.extend(attachment_inventory.get("errors") or [])
+    if apply_guardrail_called:
+        evidence.append("ApplyGuardrail calls in this Region's event history")
+    elif apply_guardrail_called is None:
+        unread.append("cloudtrail:LookupEvents for ApplyGuardrail")
+    return evidence, unread
+
+
+def check_bedrock_cloudwatch_alarms(
+    region: str = "",
+    guardrail_inventory: Optional[Dict[str, Any]] = None,
+    attachment_inventory: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     """
-    BR-32: Verify CloudWatch alarms exist on Amazon Bedrock runtime metrics
-    (AWS/Bedrock namespace) to detect abuse, throttling, and cost spikes, and
-    that guardrail interventions reach monitoring as their own signal.
+    BR-32: Verify CloudWatch alarms that reach an action exist on Amazon
+    Bedrock runtime metrics (AWS/Bedrock namespace), and that guardrail
+    interventions reach an acting alarm as their own signal.
     """
     logger.debug("Starting check for CloudWatch alarms on Bedrock metrics")
     try:
@@ -11759,160 +11933,110 @@ def check_bedrock_cloudwatch_alarms(region: str = "") -> Dict[str, Any]:
             "csv_data": [],
         }
 
-        # Only assess this when the region actually has Bedrock resources, to
-        # avoid recommending alarms in regions where Bedrock is unused.
-        bedrock_footprint_found = detect_bedrock_regional_footprint(region=region)
-        if bedrock_footprint_found is not True:
-            findings["details"] = bedrock_footprint_na_detail(bedrock_footprint_found)
-            findings["csv_data"].append(
-                create_finding(
-                    check_id="BR-32",
-                    finding_name="Bedrock CloudWatch Alarm Check",
-                    finding_details=bedrock_footprint_na_detail(
-                        bedrock_footprint_found,
-                        "to monitor with CloudWatch alarms",
-                    ),
-                    resolution="No action required",
-                    reference="https://docs.aws.amazon.com/bedrock/latest/userguide/monitoring-runtime-metrics.html",
-                    severity="Informational",
-                    status="N/A",
-                    region=region,
-                )
-            )
-            return findings
-
         cloudwatch_client = boto3.client(
             "cloudwatch", config=boto3_config, region_name=region
         )
 
         try:
-            bedrock_alarms = []
-            guardrail_alarms = []
+            metric_alarms = []
+            composite_alarms = []
             paginator = cloudwatch_client.get_paginator("describe_alarms")
-            for page in paginator.paginate(AlarmTypes=["MetricAlarm"]):
-                for alarm in page.get("MetricAlarms", []):
-                    # A metric alarm targets Bedrock either directly (Namespace)
-                    # or via a metric-math expression referencing AWS/Bedrock.
-                    namespaces = {alarm.get("Namespace") or ""}
-                    for metric in alarm.get("Metrics", []):
-                        metric_stat = metric.get("MetricStat", {})
-                        namespaces.add(
-                            metric_stat.get("Metric", {}).get("Namespace", "")
-                        )
-                    if "AWS/Bedrock" in namespaces:
-                        bedrock_alarms.append(alarm.get("AlarmName"))
-                    if GUARDRAIL_METRIC_NAMESPACE in namespaces:
-                        guardrail_alarms.append(alarm.get("AlarmName"))
+            for page in paginator.paginate(
+                AlarmTypes=["MetricAlarm", "CompositeAlarm"]
+            ):
+                metric_alarms.extend(page.get("MetricAlarms", []))
+                composite_alarms.extend(page.get("CompositeAlarms", []))
+            notifying = _notifying_alarm_names(metric_alarms, composite_alarms)
 
-            if bedrock_alarms:
-                findings["details"] = (
-                    f"Found {len(bedrock_alarms)} CloudWatch alarms on Bedrock metrics"
+            def alarms_on(
+                predicate: Callable[[str, str], bool],
+            ) -> Tuple[List[str], List[str]]:
+                acting, silent = [], []
+                for alarm in metric_alarms:
+                    if any(predicate(ns, name) for ns, name in _alarm_metrics(alarm)):
+                        name = alarm.get("AlarmName") or "unnamed"
+                        (acting if name in notifying else silent).append(name)
+                return sorted(acting), sorted(silent)
+
+            bedrock_alarms, silent_bedrock_alarms = alarms_on(
+                lambda ns, _name: ns == "AWS/Bedrock"
+            )
+            silent_note = (
+                f" Alarm(s) {', '.join(silent_bedrock_alarms)} evaluate AWS/Bedrock metrics but reach no action: ActionsEnabled is false, AlarmActions is empty, and no acting composite alarm reads them."
+                if silent_bedrock_alarms
+                else ""
+            )
+
+            # Runtime metrics are recommended only where the Region has Bedrock
+            # resources; the guardrail signal below is judged on its own scope.
+            bedrock_footprint_found = detect_bedrock_regional_footprint(region=region)
+            if bedrock_footprint_found is not True:
+                findings["details"] = bedrock_footprint_na_detail(
+                    bedrock_footprint_found
                 )
                 findings["csv_data"].append(
                     create_finding(
                         check_id="BR-32",
                         finding_name="Bedrock CloudWatch Alarm Check",
-                        finding_details=f"Found {len(bedrock_alarms)} CloudWatch alarm(s) monitoring Amazon Bedrock runtime metrics (AWS/Bedrock namespace).",
-                        resolution="No action required. Review alarm thresholds and notification targets periodically to ensure they still detect abuse, throttling, and cost anomalies.",
-                        reference="https://docs.aws.amazon.com/bedrock/latest/userguide/monitoring-runtime-metrics.html",
-                        severity="Low",
-                        status="Passed",
-                        region=region,
-                    )
-                )
-            else:
-                findings["status"] = "WARN"
-                findings["details"] = "No CloudWatch alarms found on Bedrock metrics"
-                findings["csv_data"].append(
-                    create_finding(
-                        check_id="BR-32",
-                        finding_name="Bedrock CloudWatch Alarm Check",
-                        finding_details="No CloudWatch alarms are configured on Amazon Bedrock runtime metrics (AWS/Bedrock namespace). Without alarms, abuse, denial-of-wallet, sustained throttling, and content-filter spikes can go undetected.",
-                        resolution="Create CloudWatch alarms on AWS/Bedrock runtime metrics such as Invocations, InvocationThrottles, InputTokenCount, OutputTokenCount, and ContentFilteredCount, and route them to an Amazon SNS topic for notification.",
-                        reference="https://docs.aws.amazon.com/bedrock/latest/userguide/monitoring-runtime-metrics.html",
-                        severity="Medium",
-                        status="Failed",
-                        region=region,
-                    )
-                )
-
-            # A guardrail intervention is a separate signal from the runtime
-            # metrics above: it reaches monitoring either as an alarm on the
-            # AWS/Bedrock/Guardrails namespace or as a metric filter over the
-            # invocation log group.
-            log_group_name = None
-            intervention_filters = []
-            signal_error = None
-            try:
-                log_group_name = _get_invocation_log_group_name(region)
-                if log_group_name:
-                    intervention_filters = _find_guardrail_intervention_metric_filters(
-                        log_group_name, region
-                    )
-            except Exception as error:  # noqa: BLE001 - reported as N/A below
-                signal_error = error
-
-            intervention_reference = "https://docs.aws.amazon.com/bedrock/latest/userguide/guardrails-enforcements.html"
-            if guardrail_alarms or intervention_filters:
-                observed = []
-                if guardrail_alarms:
-                    observed.append(
-                        f"{len(guardrail_alarms)} CloudWatch alarm(s) on the {GUARDRAIL_METRIC_NAMESPACE} namespace ({', '.join(sorted(name for name in guardrail_alarms if name))})"
-                    )
-                if intervention_filters:
-                    observed.append(
-                        f"{len(intervention_filters)} metric filter(s) on log group '{log_group_name}' matching a guardrail intervention field ({', '.join(sorted(intervention_filters))})"
-                    )
-                findings["csv_data"].append(
-                    create_finding(
-                        check_id="BR-32",
-                        finding_name="Guardrail Intervention Monitoring Signal",
-                        finding_details=f"Guardrail interventions feed monitoring through {' and '.join(observed)}.",
-                        resolution="No action required. Confirm the alarm or metric filter routes to the security monitoring destination that is actually reviewed.",
-                        reference=intervention_reference,
-                        severity="Low",
-                        status="Passed",
-                        region=region,
-                    )
-                )
-            elif signal_error is not None:
-                findings["csv_data"].append(
-                    create_finding(
-                        check_id="BR-32",
-                        finding_name="Guardrail Intervention Monitoring Signal",
-                        finding_details=(
-                            f"No CloudWatch alarm on the {GUARDRAIL_METRIC_NAMESPACE} namespace was found, and whether a metric filter "
-                            f"matches guardrail interventions could not be determined: {get_assessment_error_label(signal_error)}."
+                        finding_details=bedrock_footprint_na_detail(
+                            bedrock_footprint_found,
+                            "to monitor with CloudWatch alarms",
                         ),
-                        resolution="Grant bedrock:GetModelInvocationLoggingConfiguration and logs:DescribeMetricFilters and retry before concluding that no intervention signal exists.",
-                        reference=intervention_reference,
+                        resolution="No action required",
+                        reference="https://docs.aws.amazon.com/bedrock/latest/userguide/monitoring-runtime-metrics.html",
                         severity="Informational",
                         status="N/A",
                         region=region,
                     )
                 )
-            else:
-                findings["status"] = "WARN"
+            elif bedrock_alarms:
+                findings["details"] = (
+                    f"Found {len(bedrock_alarms)} acting CloudWatch alarms on Bedrock metrics"
+                )
                 findings["csv_data"].append(
                     create_finding(
                         check_id="BR-32",
-                        finding_name="Guardrail Intervention Monitoring Signal",
-                        finding_details=(
-                            f"No guardrail-intervention signal reaches monitoring: no CloudWatch alarm uses the {GUARDRAIL_METRIC_NAMESPACE} namespace, and "
-                            + (
-                                f"no metric filter on invocation log group '{log_group_name}' matches an intervention field."
-                                if log_group_name
-                                else "model invocation logging has no CloudWatch Logs destination, so no metric filter can match an intervention field."
-                            )
-                            + " A blocked or modified request is therefore not distinguishable from a normal one in monitoring."
-                        ),
-                        resolution="Alarm on InvocationsIntervened in the AWS/Bedrock/Guardrails namespace, or send model invocation logs to CloudWatch Logs and add a metric filter on amazon-bedrock-guardrailAction=INTERVENED (Converse: stopReason=guardrail_intervened) with an alarm on the derived metric.",
-                        reference=intervention_reference,
+                        finding_name="Bedrock CloudWatch Alarm Check",
+                        finding_details=f"{len(bedrock_alarms)} CloudWatch alarm(s) that reach an action evaluate Amazon Bedrock runtime metrics (AWS/Bedrock namespace): {', '.join(bedrock_alarms)}.{silent_note}",
+                        resolution="No action required. Review alarm thresholds and notification targets periodically so they still detect abuse, throttling, and cost anomalies.",
+                        reference="https://docs.aws.amazon.com/bedrock/latest/userguide/monitoring-runtime-metrics.html",
+                        severity="Low",
+                        status="Passed",
+                        region=region,
+                    )
+                )
+            else:
+                findings["status"] = "WARN"
+                findings["details"] = (
+                    "No acting CloudWatch alarms found on Bedrock metrics"
+                )
+                findings["csv_data"].append(
+                    create_finding(
+                        check_id="BR-32",
+                        finding_name="Bedrock CloudWatch Alarm Check",
+                        finding_details=f"No CloudWatch alarm that reaches an action evaluates Amazon Bedrock runtime metrics (AWS/Bedrock namespace).{silent_note} Without one, abuse, denial-of-wallet, sustained throttling, and content-filter spikes can go undetected.",
+                        resolution="Create CloudWatch alarms on AWS/Bedrock runtime metrics such as Invocations, InvocationThrottles, InputTokenCount, OutputTokenCount, and ContentFilteredCount, enable their actions, and route them to an Amazon SNS topic for notification.",
+                        reference="https://docs.aws.amazon.com/bedrock/latest/userguide/monitoring-runtime-metrics.html",
                         severity="Medium",
                         status="Failed",
                         region=region,
                     )
                 )
+
+            findings["csv_data"].append(
+                _guardrail_intervention_signal_finding(
+                    region,
+                    guardrail_inventory
+                    if guardrail_inventory is not None
+                    else get_guardrail_detail_inventory(region),
+                    attachment_inventory
+                    if attachment_inventory is not None
+                    else get_guardrail_attachment_inventory(region),
+                    alarms_on,
+                )
+            )
+            if findings["csv_data"][-1]["Status"] == "Failed":
+                findings["status"] = "WARN"
 
         except ClientError as e:
             error_code = e.response.get("Error", {}).get("Code", "")
@@ -11957,6 +12081,172 @@ def check_bedrock_cloudwatch_alarms(region: str = "") -> Dict[str, Any]:
                 )
             ],
         }
+
+
+def _guardrail_intervention_signal_finding(
+    region: str,
+    guardrail_inventory: Dict[str, Any],
+    attachment_inventory: Dict[str, Any],
+    alarms_on: Callable[..., Tuple[List[str], List[str]]],
+) -> Dict[str, Any]:
+    """
+    Judge whether guardrail interventions reach an acting alarm: an alarm on
+    AWS/Bedrock/Guardrails InvocationsIntervened, or an alarm on the metric a
+    filter over the invocation log group derives from INTERVENED.
+    """
+    finding_name = "Guardrail Intervention Monitoring Signal"
+    reference = "https://docs.aws.amazon.com/bedrock/latest/userguide/guardrails-enforcements.html"
+    apply_guardrail_called = _apply_guardrail_called(region)
+    evidence, unread = _guardrail_scope(
+        guardrail_inventory, attachment_inventory, apply_guardrail_called
+    )
+    unread_text = "; ".join(str(item) for item in unread)
+
+    def row(
+        details: str, resolution: str, severity: str, status: str
+    ) -> Dict[str, Any]:
+        return create_finding(
+            check_id="BR-32",
+            finding_name=finding_name,
+            finding_details=f"{details} {GUARDRAIL_SIGNAL_CEILING}",
+            resolution=resolution,
+            reference=reference,
+            severity=severity,
+            status=status,
+            region=region,
+        )
+
+    if not evidence:
+        if unread:
+            return row(
+                f"Whether any guardrail applies in this Region could not be determined, because these reads failed: {unread_text}.",
+                "Grant the named read permissions and retry before concluding that no guardrail needs an intervention signal.",
+                "Informational",
+                "N/A",
+            )
+        return row(
+            "No guardrail is defined in this Region, no agent, flow node or account-enforced configuration applies one, and event history holds no ApplyGuardrail call, so there is no intervention to monitor. A guardrail from another account passed per request to InvokeModel or Converse is not visible to this read.",
+            "No action required",
+            "Informational",
+            "N/A",
+        )
+
+    scope_text = f"Guardrails apply here ({'; '.join(evidence)})."
+    acting_alarms, silent_alarms = alarms_on(
+        lambda ns, name: (
+            ns == GUARDRAIL_METRIC_NAMESPACE and name == GUARDRAIL_INTERVENTION_METRIC
+        )
+    )
+    other_guardrail_alarms = sorted(
+        set().union(
+            *alarms_on(
+                lambda ns, name: (
+                    ns == GUARDRAIL_METRIC_NAMESPACE
+                    and name != GUARDRAIL_INTERVENTION_METRIC
+                )
+            )
+        )
+        - set(acting_alarms)
+        - set(silent_alarms)
+    )
+
+    log_group_name = None
+    filters = {"matched": [], "rejected": []}
+    signal_error = None
+    try:
+        log_group_name = _get_invocation_log_group_name(region)
+        if log_group_name:
+            filters = _find_guardrail_intervention_metric_filters(
+                log_group_name, region
+            )
+    except Exception as error:  # noqa: BLE001 - reported as N/A below
+        signal_error = error
+
+    alarmed_filters = []
+    unalarmed_filters = []
+    for metric_filter in filters["matched"]:
+        metric_set = set(metric_filter["metrics"])
+        acting, _ = alarms_on(lambda ns, name: (ns, name) in metric_set)
+        (alarmed_filters if acting else unalarmed_filters).append(
+            f"{metric_filter['name']} (alarm {', '.join(acting)})"
+            if acting
+            else metric_filter["name"]
+        )
+
+    gaps = []
+    if silent_alarms:
+        gaps.append(
+            f"alarm(s) {', '.join(silent_alarms)} on {GUARDRAIL_INTERVENTION_METRIC} reach no action"
+        )
+    if other_guardrail_alarms:
+        gaps.append(
+            f"alarm(s) {', '.join(other_guardrail_alarms)} evaluate a {GUARDRAIL_METRIC_NAMESPACE} metric other than {GUARDRAIL_INTERVENTION_METRIC}, which counts calls whether or not the guardrail intervened"
+        )
+    if unalarmed_filters:
+        gaps.append(
+            f"metric filter(s) {', '.join(sorted(unalarmed_filters))} match an intervention but no acting alarm evaluates the metric they emit"
+        )
+    if filters["rejected"]:
+        gaps.append(
+            f"metric filter(s) {', '.join(sorted(f['name'] for f in filters['rejected']))} name a guardrail field without selecting INTERVENED"
+        )
+    gap_text = f" Not credited: {'; '.join(gaps)}." if gaps else ""
+    forwarding = (
+        " " + _describe_log_forwarding(log_group_name, region) if log_group_name else ""
+    )
+
+    observed = []
+    if acting_alarms:
+        observed.append(
+            f"CloudWatch alarm(s) {', '.join(acting_alarms)} on {GUARDRAIL_METRIC_NAMESPACE} {GUARDRAIL_INTERVENTION_METRIC}"
+        )
+    if alarmed_filters:
+        observed.append(
+            f"metric filter(s) on log group '{log_group_name}' selecting INTERVENED with an acting alarm: {', '.join(sorted(alarmed_filters))}"
+        )
+
+    resolution = "Alarm on InvocationsIntervened in the AWS/Bedrock/Guardrails namespace with an enabled alarm action, or send model invocation logs to CloudWatch Logs, add a metric filter on amazon-bedrock-guardrailAction=INTERVENED (Converse: stopReason=guardrail_intervened), and alarm on the metric it emits. Forward the invocation logs to the SIEM."
+
+    if acting_alarms or (alarmed_filters and apply_guardrail_called is False):
+        return row(
+            f"{scope_text} Guardrail interventions reach an acting alarm through {' and '.join(observed)}.{gap_text}{forwarding}",
+            "No action required. Confirm the alarm action reaches the security monitoring destination that is reviewed.",
+            "Low",
+            "Passed",
+        )
+    if alarmed_filters and apply_guardrail_called is None:
+        return row(
+            f"{scope_text} Interventions on the four logged inference APIs reach an acting alarm through {' and '.join(observed)}, but whether ApplyGuardrail is called here was not read (cloudtrail:LookupEvents), and its interventions reach no metric filter, so this is not reported as Passed.{gap_text}{forwarding}",
+            "Grant cloudtrail:LookupEvents and retry, or alarm on InvocationsIntervened in the AWS/Bedrock/Guardrails namespace.",
+            "Informational",
+            "N/A",
+        )
+    if alarmed_filters:
+        return row(
+            f"{scope_text} Interventions on the four logged inference APIs reach an acting alarm through {' and '.join(observed)}, but ApplyGuardrail is called in this Region and its interventions reach no metric filter, and no acting alarm evaluates {GUARDRAIL_METRIC_NAMESPACE} {GUARDRAIL_INTERVENTION_METRIC}.{gap_text}{forwarding}",
+            resolution,
+            "Medium",
+            "Failed",
+        )
+    if signal_error is not None:
+        return row(
+            f"{scope_text} No acting CloudWatch alarm evaluates {GUARDRAIL_METRIC_NAMESPACE} {GUARDRAIL_INTERVENTION_METRIC}, and whether a metric filter selects guardrail interventions could not be determined: {get_assessment_error_label(signal_error)}.{gap_text}",
+            "Grant bedrock:GetModelInvocationLoggingConfiguration and logs:DescribeMetricFilters and retry before concluding that no intervention signal exists.",
+            "Informational",
+            "N/A",
+        )
+    return row(
+        f"{scope_text} No guardrail-intervention signal reaches an acting alarm: no acting CloudWatch alarm evaluates {GUARDRAIL_METRIC_NAMESPACE} {GUARDRAIL_INTERVENTION_METRIC}, and "
+        + (
+            f"no metric filter on invocation log group '{log_group_name}' that selects INTERVENED feeds an acting alarm."
+            if log_group_name
+            else "model invocation logging has no CloudWatch Logs destination, so no metric filter can match an intervention field."
+        )
+        + f" A blocked or modified request is therefore not distinguishable from a normal one in monitoring.{gap_text}{forwarding}",
+        resolution,
+        "Medium",
+        "Failed",
+    )
 
 
 BEDROCK_LAMBDA_INDICATORS = (
@@ -21949,7 +22239,11 @@ def lambda_handler(event, context):
         all_findings.append(batch_inference_findings)
 
         logger.info("Running CloudWatch alarm check (BR-32)")
-        cloudwatch_alarm_findings = check_bedrock_cloudwatch_alarms(region=region)
+        cloudwatch_alarm_findings = check_bedrock_cloudwatch_alarms(
+            region=region,
+            guardrail_inventory=guardrail_inventory,
+            attachment_inventory=guardrail_attachments,
+        )
         all_findings.append(cloudwatch_alarm_findings)
 
         logger.info("Running Amazon Inspector Lambda code scanning check (BR-33)")

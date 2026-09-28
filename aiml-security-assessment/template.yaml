@@ -537,11 +537,12 @@ Resources:
               Resource: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:instance-profile/*'
             - Sid: BedrockInvocationLogInspection
               # BR-04 reads the retention period of the invocation log group and
-              # BR-32 reads the metric filters defined on it.
+              # BR-32 reads the metric and subscription filters defined on it.
               Effect: Allow
               Action:
                 - logs:DescribeLogGroups # BR-04
                 - logs:DescribeMetricFilters # BR-32
+                - logs:DescribeSubscriptionFilters # BR-32
               Resource: !Sub 'arn:${AWS::Partition}:logs:*:${AWS::AccountId}:log-group:*'
             - Sid: MaciePermissions
               # macie2 GetMacieSession, GetAutomatedDiscoveryConfiguration and
@@ -598,12 +599,13 @@ Resources:
                 - cloudtrail:GetTrailStatus
               Resource: '*'
             - Sid: CloudTrailEventHistoryRead
-              # BR-56 reads the Region's event history. LookupEvents has no
+              # BR-56 reads the Region's event history, and BR-32 reads whether
+              # it holds an ApplyGuardrail call. LookupEvents has no
               # resource type in the service authorization reference, so it
               # takes '*'.
               Effect: Allow
               Action:
-                - cloudtrail:LookupEvents # BR-56
+                - cloudtrail:LookupEvents # BR-56, BR-32
               Resource: '*'
             - Sid: LambdaInventoryPermissions
               Effect: Allow
