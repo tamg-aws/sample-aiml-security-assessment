@@ -2563,9 +2563,10 @@ def _ecs_service_workloads(region: str, inventory: Dict[str, Any]) -> None:
         for start in range(0, len(service_arns), 10):
             batch = service_arns[start : start + 10]
             try:
-                services = ecs_client.describe_services(
+                described = ecs_client.describe_services(
                     services=batch, **cluster_kwargs
-                ).get("services", [])
+                )
+                services = described.get("services", [])
             except (ClientError, BotoCoreError) as error:
                 inventory["errors"].append(
                     "ECS service(s) {} were not described with "
@@ -2574,6 +2575,14 @@ def _ecs_service_workloads(region: str, inventory: Dict[str, Any]) -> None:
                     )
                 )
                 continue
+            for failure in described.get("failures") or []:
+                inventory["errors"].append(
+                    "ECS service {} was not described with ecs:DescribeServices "
+                    "({})".format(
+                        failure.get("arn") or "unnamed",
+                        failure.get("reason") or "no reason returned",
+                    )
+                )
             for service in services:
                 label = "ECS service '{}'".format(
                     service.get("serviceName") or service.get("serviceArn")
@@ -4621,15 +4630,13 @@ CLOUDTRAIL_DATA_EVENT_RESOLUTION = (
 
 INFERENCE_FORENSIC_RECORD_FINDING = "Bedrock Inference Forensic Record"
 
-# A CloudTrail Lake event data store can record Bedrock data events in place of
-# a trail. ListEventDataStores returns only each store's ARN and name (botocore
-# marks AdvancedEventSelectors "no longer returned by ListEventDataStores"), and
-# GetEventDataStore, which returns the selectors, is not granted.
-EVENT_DATA_STORE_CEILING = (
-    "Partial, ceiling reached: the stores' AdvancedEventSelectors are returned "
-    "only by cloudtrail:GetEventDataStore, which the assessment role does not "
-    "hold (https://docs.aws.amazon.com/awscloudtrail/latest/APIReference/"
-    "API_GetEventDataStore.html)."
+# A CloudTrail Lake event data store can record Bedrock events in place of a
+# trail. ListEventDataStores returns only each store's ARN and name (botocore
+# marks AdvancedEventSelectors "no longer returned by ListEventDataStores"), so
+# each store is read with GetEventDataStore for its Status and selectors.
+EVENT_DATA_STORE_REFERENCE = (
+    "https://docs.aws.amazon.com/awscloudtrail/latest/APIReference/"
+    "API_GetEventDataStore.html"
 )
 
 EVENT_DATA_STORE_ELSEWHERE_NOTE = (
@@ -4639,8 +4646,24 @@ EVENT_DATA_STORE_ELSEWHERE_NOTE = (
 )
 
 
-def _event_data_store_names(cloudtrail_client) -> Dict[str, Any]:
-    """List the Region's CloudTrail Lake event data stores by name."""
+def _event_data_store_coverage(cloudtrail_client) -> Dict[str, Any]:
+    """
+    List the Region's CloudTrail Lake event data stores and read each one's
+    Status and AdvancedEventSelectors (GetEventDataStore).
+
+    A store is credited only while its Status is ENABLED, and its selectors are
+    judged with the same rules as a trail's. A store whose read fails is
+    unread, so no trail gap in the Region becomes a verdict.
+    """
+    coverage: Dict[str, Any] = {
+        "names": [],
+        "error": None,
+        "management": [],
+        "credited": {},
+        "narrowed": {},
+        "inactive": [],
+        "unread": [],
+    }
     try:
         stores = _list_all_items(
             cloudtrail_client,
@@ -4652,18 +4675,46 @@ def _event_data_store_names(cloudtrail_client) -> Dict[str, Any]:
             token_response_keys=("NextToken",),
         )
     except (ClientError, BotoCoreError, TypeError) as error:
-        return {
-            "names": [],
-            "error": "CloudTrail Lake event data stores were not listed with "
-            f"cloudtrail:ListEventDataStores ({get_assessment_error_label(error)})",
-        }
-    return {
-        "names": sorted(
-            str(store.get("Name") or store.get("EventDataStoreArn") or "unnamed")
-            for store in stores
-        ),
-        "error": None,
-    }
+        coverage["error"] = (
+            "CloudTrail Lake event data stores were not listed with "
+            f"cloudtrail:ListEventDataStores ({get_assessment_error_label(error)})"
+        )
+        return coverage
+    for store in stores:
+        name = str(store.get("Name") or store.get("EventDataStoreArn") or "unnamed")
+        coverage["names"].append(name)
+        arn = store.get("EventDataStoreArn")
+        if not arn:
+            coverage["unread"].append(f"{name} (ListEventDataStores returned no ARN)")
+            continue
+        try:
+            detail = cloudtrail_client.get_event_data_store(EventDataStore=arn)
+            if not isinstance(detail, dict):
+                raise TypeError("GetEventDataStore returned no document")
+        except (ClientError, BotoCoreError, TypeError) as error:
+            coverage["unread"].append(
+                f"{name} (cloudtrail:GetEventDataStore: "
+                f"{get_assessment_error_label(error)})"
+            )
+            continue
+        status = detail.get("Status")
+        if status != "ENABLED":
+            coverage["inactive"].append(f"{name} (Status {status or 'absent'})")
+            continue
+        label = f"event data store {name}"
+        selectors = detail.get("AdvancedEventSelectors") or []
+        covered, _ = _trail_bedrock_management_coverage(
+            {"AdvancedEventSelectors": selectors}
+        )
+        if covered:
+            coverage["management"].append(label)
+        credited, narrowed = _trail_data_event_coverage(selectors)
+        for resource_type in credited:
+            coverage["credited"].setdefault(resource_type, []).append(label)
+        for resource_type, fields in narrowed.items():
+            coverage["narrowed"].setdefault(resource_type, []).extend(fields)
+    coverage["names"].sort()
+    return coverage
 
 
 def _event_data_store_unread(event_data_stores: Dict[str, Any]) -> str:
@@ -4673,13 +4724,33 @@ def _event_data_store_unread(event_data_stores: Dict[str, Any]) -> str:
             f"{event_data_stores['error']}, and an event data store could record "
             "these calls"
         )
-    if event_data_stores["names"]:
+    if event_data_stores["unread"]:
         return (
-            "event data store(s) {} in this Region could record these calls. {}".format(
-                ", ".join(event_data_stores["names"]), EVENT_DATA_STORE_CEILING
+            "event data store(s) in this Region were not read, and each could "
+            "record these calls: {} ({}).".format(
+                "; ".join(event_data_stores["unread"]), EVENT_DATA_STORE_REFERENCE
             )
         )
     return ""
+
+
+def _event_data_store_note(event_data_stores: Dict[str, Any]) -> str:
+    """Describe the Region's read event data stores beside a trail gap."""
+    if not event_data_stores["names"]:
+        return EVENT_DATA_STORE_ELSEWHERE_NOTE
+    inactive = (
+        " Store(s) not ENABLED are not credited: {}.".format(
+            "; ".join(event_data_stores["inactive"])
+        )
+        if event_data_stores["inactive"]
+        else ""
+    )
+    return (
+        "Event data store(s) {} in this Region were read with "
+        "GetEventDataStore and are counted with the trails.{} A multi-Region "
+        "event data store homed in another Region is named in that Region's "
+        "row.".format(", ".join(event_data_stores["names"]), inactive)
+    )
 
 
 def _selector_field_map(selector: Any) -> Dict[str, Dict[str, Any]]:
@@ -4888,10 +4959,22 @@ def _bedrock_data_event_findings(
     """
     BR-06 data-event legs: knowledge base retrieval traceability
     (AIR-BDR-KB-06) and end-to-end inference traceability (AIR-BDR-MDL-07).
-    A trail gap is a verdict only when the Region has no event data store,
-    because a store's selectors are not read.
+    The Region's ENABLED event data stores are credited beside the trails,
+    and a trail gap is a verdict only when every store was read.
     """
     store_unread = _event_data_store_unread(event_data_stores)
+    store_note = _event_data_store_note(event_data_stores)
+    data_event_trails = {
+        resource_type: list(labels)
+        for resource_type, labels in data_event_trails.items()
+    }
+    narrowed_types = {
+        resource_type: list(fields) for resource_type, fields in narrowed_types.items()
+    }
+    for resource_type, labels in event_data_stores["credited"].items():
+        data_event_trails.setdefault(resource_type, []).extend(labels)
+    for resource_type, fields in event_data_stores["narrowed"].items():
+        narrowed_types.setdefault(resource_type, []).extend(fields)
     observed = ", ".join(sorted(data_event_trails)) or "none"
     narrowed_note = "".join(
         f" {resource_type} is named only in selector(s) narrowed by "
@@ -4914,7 +4997,7 @@ def _bedrock_data_event_findings(
             create_finding(
                 check_id="BR-06",
                 finding_name="Bedrock Knowledge Base Retrieval Data Event Logging",
-                finding_details=f"Trail(s) {', '.join(sorted(set(kb_trails)))} name {BEDROCK_KNOWLEDGE_BASE_DATA_EVENT_TYPE} in a resources.type field selector with no narrowing field, so each Retrieve and RetrieveAndGenerate call is recorded with the knowledge base that served it, and model invocation logging records the response it informed. The citations that tie a response to a source chunk are returned in the RetrieveAndGenerate response and are not read by this check.{kb_inventory}",
+                finding_details=f"Trail(s) or event data store(s) {', '.join(sorted(set(kb_trails)))} name {BEDROCK_KNOWLEDGE_BASE_DATA_EVENT_TYPE} in a resources.type field selector with no narrowing field, so each Retrieve and RetrieveAndGenerate call is recorded with the knowledge base that served it, and model invocation logging records the response it informed. The citations that tie a response to a source chunk are returned in the RetrieveAndGenerate response and are not read by this check.{kb_inventory}",
                 resolution="No action required. Retain the data events long enough to answer which source document informed a past response.",
                 reference="https://docs.aws.amazon.com/bedrock/latest/userguide/logging-using-cloudtrail.html",
                 severity="Medium",
@@ -4939,7 +5022,7 @@ def _bedrock_data_event_findings(
         kb_gaps = []
         if not kb_trails and not unread_trails and not store_unread:
             kb_gaps.append(
-                f"no logging multi-region trail names {BEDROCK_KNOWLEDGE_BASE_DATA_EVENT_TYPE} in a resources.type field selector with no narrowing field, so a retrieved chunk cannot be traced back to the knowledge base that produced it. {EVENT_DATA_STORE_ELSEWHERE_NOTE}"
+                f"no logging multi-region trail names {BEDROCK_KNOWLEDGE_BASE_DATA_EVENT_TYPE} in a resources.type field selector with no narrowing field, so a retrieved chunk cannot be traced back to the knowledge base that produced it. {store_note}"
             )
         if record["logging"] is False:
             kb_gaps.append(
@@ -5033,7 +5116,7 @@ def _bedrock_data_event_findings(
                 finding_name="Bedrock Model Invocation Data Event Logging",
                 finding_details=f"No logging multi-region trail names {', '.join(missing)} in a resources.type field selector with no narrowing field (observed data-event resource types: {observed}), but {store_unread}{narrowed_note}",
                 resolution=COULD_NOT_ASSESS_RESOLUTION,
-                reference="https://docs.aws.amazon.com/awscloudtrail/latest/APIReference/API_GetEventDataStore.html",
+                reference=EVENT_DATA_STORE_REFERENCE,
                 severity="Informational",
                 status="N/A",
                 region=region,
@@ -5044,7 +5127,7 @@ def _bedrock_data_event_findings(
             create_finding(
                 check_id="BR-06",
                 finding_name="Bedrock Model Invocation Data Event Logging",
-                finding_details=f"No logging multi-region trail names {', '.join(missing)} in a resources.type field selector with no narrowing field, so an inference on those paths cannot be traced from the invoking identity to the model or agent that answered it (observed data-event resource types: {observed}). {EVENT_DATA_STORE_ELSEWHERE_NOTE}{narrowed_note}",
+                finding_details=f"No logging multi-region trail names {', '.join(missing)} in a resources.type field selector with no narrowing field, so an inference on those paths cannot be traced from the invoking identity to the model or agent that answered it (observed data-event resource types: {observed}). {store_note}{narrowed_note}",
                 resolution=CLOUDTRAIL_DATA_EVENT_RESOLUTION.format(", ".join(missing)),
                 reference="https://docs.aws.amazon.com/bedrock/latest/userguide/logging-using-cloudtrail.html",
                 severity="Medium",
@@ -5197,6 +5280,10 @@ def check_bedrock_cloudtrail_logging(region: str = "") -> Dict[str, Any]:
                 for resource_type, fields in narrowed.items():
                     narrowed_types.setdefault(resource_type, []).extend(fields)
 
+            event_data_stores = _event_data_store_coverage(cloudtrail_client)
+            logging_trails.extend(event_data_stores["management"])
+            store_unread = _event_data_store_unread(event_data_stores)
+
             if logging_trails:
                 findings["details"] = (
                     f"CloudTrail logging enabled for Bedrock in trails: {', '.join(logging_trails)}"
@@ -5205,7 +5292,7 @@ def check_bedrock_cloudtrail_logging(region: str = "") -> Dict[str, Any]:
                     create_finding(
                         check_id="BR-06",
                         finding_name="Bedrock CloudTrail Logging Check",
-                        finding_details=f"Trail(s) {', '.join(logging_trails)} record every Bedrock management event, read and write, including InvokeModel, InvokeModelWithResponseStream, Converse and ConverseStream.",
+                        finding_details=f"Trail(s) or event data store(s) {', '.join(logging_trails)} record every Bedrock management event, read and write, including InvokeModel, InvokeModelWithResponseStream, Converse and ConverseStream.",
                         resolution="No action required. Continue monitoring CloudTrail logs for Bedrock activity.",
                         reference="https://docs.aws.amazon.com/bedrock/latest/userguide/logging-using-cloudtrail.html",
                         severity="Medium",
@@ -5213,14 +5300,24 @@ def check_bedrock_cloudtrail_logging(region: str = "") -> Dict[str, Any]:
                         region=region,
                     )
                 )
-            elif unread_trails:
+            elif unread_trails or store_unread:
                 findings["status"] = "WARN"
                 findings["details"] = "Not every CloudTrail trail could be read"
+                unread_note = (
+                    f" These trails were not read: {'; '.join(unread_trails)}."
+                    if unread_trails
+                    else ""
+                )
+                store_note = (
+                    f" {store_unread[0].upper()}{store_unread[1:]}"
+                    if store_unread
+                    else ""
+                )
                 findings["csv_data"].append(
                     create_finding(
                         check_id="BR-06",
                         finding_name="Bedrock CloudTrail Logging Check",
-                        finding_details=f"No read trail records every Bedrock management event, and these trails were not read: {'; '.join(unread_trails)}.",
+                        finding_details=f"No read trail or event data store records every Bedrock management event.{unread_note}{store_note}",
                         resolution=COULD_NOT_ASSESS_RESOLUTION,
                         reference="https://docs.aws.amazon.com/bedrock/latest/userguide/logging-using-cloudtrail.html",
                         severity="Informational",
@@ -5281,7 +5378,7 @@ def check_bedrock_cloudtrail_logging(region: str = "") -> Dict[str, Any]:
                     knowledge_base_count,
                     _invocation_record_state(region),
                     region,
-                    _event_data_store_names(cloudtrail_client),
+                    event_data_stores,
                 )
             )
 
@@ -11316,6 +11413,161 @@ def _store_read_error(error: Exception, action: str, region: str) -> str:
     return describe_api_error(error, action, region)
 
 
+AOSS_DATA_ACCESS_REFERENCE = (
+    "https://docs.aws.amazon.com/opensearch-service/latest/developerguide/"
+    "serverless-data-access.html"
+)
+
+AOSS_ACCESS_RESOLUTION = (
+    "Scope every data access policy rule that reaches the knowledge base's index "
+    "to this collection (index/<collection>/<index>, not index/*/*) and name each "
+    "principal by its full ARN. OpenSearch Serverless does not check a caller's "
+    f"permission on the collection's KMS key ({AOSS_DATA_ACCESS_REFERENCE})."
+)
+
+
+def _aoss_index_access(
+    collection_name: str, index_name: str, region: str
+) -> Dict[str, str]:
+    """
+    Judge who the OpenSearch Serverless data access policies let reach one
+    knowledge base index, for BR-20.
+
+    Every data policy is listed (aoss:ListAccessPolicies, every page) and read
+    (aoss:GetAccessPolicy). The policies are additive and carry no Deny, so any
+    index rule whose Resource pattern matches index/<collection>/<index> grants
+    its principals access. A rule whose collection segment holds a wildcard
+    (index/*/..., index/kb*/...) reaches other collections' indexes, and a
+    principal with a wildcard is not a named identity; either fails. The key is
+    not the boundary, because OpenSearch Serverless does not check a caller's
+    permission on the collection's KMS key.
+    """
+    if not collection_name or not index_name:
+        return {
+            "status": "N/A",
+            "detail": (
+                "Its data access policies were not judged: the collection name "
+                "or the knowledge base's vectorIndexName is missing."
+            ),
+        }
+    target = f"index/{collection_name}/{index_name}".lower()
+    client = boto3.client(
+        "opensearchserverless", config=boto3_config, region_name=region
+    )
+    try:
+        summaries = _list_all_items(
+            client,
+            "list_access_policies",
+            "accessPolicySummaries",
+            token_response_keys=("nextToken",),
+            type="data",
+        )
+    except (ClientError, BotoCoreError, TypeError) as error:
+        return {
+            "status": "N/A",
+            "detail": (
+                "Its data access policies could not be listed: "
+                f"{_store_read_error(error, 'aoss:ListAccessPolicies', region)}."
+            ),
+        }
+    reaching = []
+    broad = []
+    unread = []
+    for summary in summaries:
+        name = str(summary.get("name") or "")
+        try:
+            document = (
+                client.get_access_policy(type="data", name=name).get(
+                    "accessPolicyDetail"
+                )
+                or {}
+            ).get("policy")
+            if isinstance(document, str):
+                document = json.loads(document)
+            if not isinstance(document, list):
+                raise ValueError("the policy is not a list of rule sets")
+        except (ClientError, BotoCoreError) as error:
+            unread.append(
+                f"'{name}' ({_store_read_error(error, 'aoss:GetAccessPolicy', region)})"
+            )
+            continue
+        except (TypeError, ValueError) as error:
+            unread.append(
+                f"'{name}' (unparseable: {get_assessment_error_label(error)})"
+            )
+            continue
+        for entry in document:
+            if not isinstance(entry, dict):
+                continue
+            principals = [
+                str(principal) for principal in _as_list(entry.get("Principal"))
+            ]
+            for rule in _as_list(entry.get("Rules")):
+                if not isinstance(rule, dict):
+                    continue
+                if str(rule.get("ResourceType") or "").lower() != "index":
+                    continue
+                patterns = [
+                    str(pattern)
+                    for pattern in _as_list(rule.get("Resource"))
+                    if _wildcard_matches(str(pattern).strip().lower(), target)
+                ]
+                if not patterns:
+                    continue
+                label = "'{}' grants {} on {} to {}".format(
+                    name,
+                    ", ".join(str(item) for item in _as_list(rule.get("Permission")))
+                    or "no permission",
+                    ", ".join(patterns),
+                    ", ".join(principals) or "no principal",
+                )
+                reaching.append(label)
+                reasons = []
+                if any(
+                    "*" in pattern.strip()[len("index/") :].split("/", 1)[0]
+                    for pattern in patterns
+                ):
+                    reasons.append(
+                        "its collection segment is a wildcard, so it reaches "
+                        "other collections' indexes"
+                    )
+                wildcard = [principal for principal in principals if "*" in principal]
+                if wildcard:
+                    reasons.append(
+                        "principal(s) {} are not named identities".format(
+                            ", ".join(wildcard)
+                        )
+                    )
+                if reasons:
+                    broad.append(f"{label} ({'; '.join(reasons)})")
+    counted = (
+        f"{len(summaries)} data access policy(ies) were read for index "
+        f"'{index_name}' of collection '{collection_name}'"
+    )
+    if broad:
+        return {
+            "status": "Failed",
+            "detail": "{}, and {} rule(s) reaching the index are not scoped: "
+            "{}.".format(counted, len(broad), "; ".join(broad[:5])),
+        }
+    if unread:
+        return {
+            "status": "N/A",
+            "detail": "{}, but {} could not be read, so a rule reaching the index "
+            "may be missing: {}.".format(counted, len(unread), "; ".join(unread[:5])),
+        }
+    if not reaching:
+        return {
+            "status": "Passed",
+            "detail": f"{counted}, and no index rule in them reaches the index.",
+        }
+    return {
+        "status": "Passed",
+        "detail": "{}, and every rule reaching the index names this collection and "
+        "named principals: {}.".format(counted, "; ".join(reaching[:5])),
+    }
+
+
 def _assess_storage_layer_encryption(
     storage_config: Dict[str, Any], storage_type: str, region: str
 ) -> Dict[str, str]:
@@ -11367,14 +11619,40 @@ def _assess_storage_layer_encryption(
                 f"({reason}), so its encryption key could not be read.",
             )
         key = str(details[0].get("kmsKeyArn") or "")
+        access = _aoss_index_access(
+            str(details[0].get("name") or ""),
+            str(
+                (storage_config.get("opensearchServerlessConfiguration") or {}).get(
+                    "vectorIndexName"
+                )
+                or ""
+            ),
+            store_region,
+        )
         if not key.startswith("arn:"):
-            return _store_verdict(
-                "Failed",
+            status = "Failed"
+            key_detail = (
                 f"uses {located}, whose kmsKeyArn is '{key or 'absent'}', not a "
-                "customer managed KMS key ARN.",
+                "customer managed KMS key ARN."
             )
-        status, observed = _kms_key_verdict(key, store_region)
-        return _store_verdict(status, f"uses {located}, encrypted with {observed}.")
+        else:
+            status, observed = _kms_key_verdict(key, store_region)
+            key_detail = f"uses {located}, encrypted with {observed}."
+        verdict = _store_verdict(
+            "Failed"
+            if "Failed" in (status, access["status"])
+            else "N/A"
+            if "N/A" in (status, access["status"])
+            else "Passed",
+            f"{key_detail} {access['detail']}",
+        )
+        if access["status"] == "Failed":
+            verdict["resolution"] = (
+                AOSS_ACCESS_RESOLUTION
+                if status != "Failed"
+                else f"{verdict['resolution']} {AOSS_ACCESS_RESOLUTION}"
+            )
+        return verdict
 
     if storage_type == "RDS":
         arn = (storage_config.get("rdsConfiguration") or {}).get("resourceArn") or ""
@@ -16975,6 +17253,25 @@ def check_inspector_lambda_code_scanning(
                 f"Inspector Lambda scanning status in {region}: "
                 f"lambda={lambda_states}, lambdaCode={lambda_code_states}"
             )
+            coverage = _inspector_lambda_coverage(region, bedrock_related_lambdas, ())
+            if coverage["unread"]:
+                coverage_note = " Per-function coverage was not read: {}.".format(
+                    "; ".join(coverage["unread"])
+                )
+            elif coverage["inactive"]:
+                coverage_note = (
+                    " Per-function coverage in inspector2:ListCoverage: {} of the "
+                    "{} in-scope function(s) are not scanned: {}.".format(
+                        len(coverage["inactive"]),
+                        len(bedrock_related_lambdas),
+                        "; ".join(coverage["inactive"][:10]),
+                    )
+                )
+            else:
+                coverage_note = (
+                    " Every in-scope zip function has ACTIVE $LATEST PACKAGE and "
+                    "CODE coverage records in inspector2:ListCoverage."
+                )
             findings["csv_data"].append(
                 create_finding(
                     check_id="BR-33",
@@ -16987,11 +17284,14 @@ def check_inspector_lambda_code_scanning(
                         f"with Bedrock indicators: {sample_functions}{more_functions}. "
                         "Without both scan types enabled, vulnerable dependencies and "
                         "hardcoded secrets in these in-scope functions will not be detected."
+                        f"{coverage_note}"
                     ),
                     resolution=(
                         "Enable both Lambda standard scanning and Lambda code scanning in "
                         "Amazon Inspector for this account and region. Console: Inspector -> "
-                        "Account management -> Activate for Lambda functions and Lambda code."
+                        "Account management -> Activate for Lambda functions and Lambda code. "
+                        "Update or invoke a function whose scan eligibility expired after "
+                        "90 days."
                     ),
                     reference=reference,
                     severity="Medium",
@@ -22301,10 +22601,14 @@ def _identity_center_ai_permission_sets(
 ) -> Dict[str, List[str]]:
     """
     Name each permission set whose inline policy grants a non-read Bedrock,
-    SageMaker AI or AgentCore action, across every page of every instance.
+    SageMaker AI or AgentCore action, across every page of every instance, and
+    split them by whether the same inline policy carries an aws:PrincipalTag
+    Deny over every AI service it grants.
     """
     client = boto3.client("sso-admin", config=boto3_config, region_name=region)
     granting = []
+    guarded = []
+    unguarded = []
     unread = []
     for instance_arn in instance_arns:
         try:
@@ -22333,6 +22637,10 @@ def _identity_center_ai_permission_sets(
                     if document
                     else []
                 )
+                denies = [
+                    _principal_tag_deny_statement(statement)
+                    for statement in (_policy_statements(document) if services else [])
+                ]
             except (ClientError, BotoCoreError) as error:
                 unread.append(
                     f"sso:GetInlinePolicyForPermissionSet on {permission_set_arn} "
@@ -22345,11 +22653,112 @@ def _identity_center_ai_permission_sets(
                     f"parsed ({get_assessment_error_label(error)})"
                 )
                 continue
-            if services:
-                granting.append(
-                    "{} ({})".format(permission_set_arn, ", ".join(services))
+            if not services:
+                continue
+            label = "{} ({})".format(permission_set_arn, ", ".join(services))
+            granting.append(label)
+            covered = {service for deny in denies for service in deny["services"]}
+            tests = [deny["test"] for deny in denies if deny["services"]]
+            uncovered = [service for service in services if service not in covered]
+            if uncovered:
+                unguarded.append(
+                    {
+                        "arn": permission_set_arn,
+                        "services": services,
+                        "uncovered": uncovered,
+                        "tests": tests,
+                    }
                 )
-    return {"granting": granting, "unread": unread}
+            else:
+                guarded.append("{}: {}".format(label, "; ".join(tests)))
+    return {
+        "granting": granting,
+        "guarded": guarded,
+        "unguarded": unguarded,
+        "unread": unread,
+    }
+
+
+def _identity_center_leg(sso_region: str) -> Dict[str, Any]:
+    """
+    Read the IAM Identity Center leg of BR-51: the instances visible in
+    sso_region and, for each, the permission sets that grant AI writes and
+    whether each carries an aws:PrincipalTag Deny over those writes.
+
+    The instance's MFA mode is returned by no sso-admin operation, so a visible
+    instance keeps the row at N/A even when every permission set is covered.
+    """
+    identity_center = _identity_center_instances(sso_region)
+    if identity_center["error"]:
+        return {
+            "note": (
+                "Identity Center instances were not listed with "
+                f"{identity_center['error']}, so people who sign in through "
+                "one may hold AI write access."
+            ),
+            "status": "N/A",
+            "severity": "Informational",
+            "unguarded": [],
+        }
+    if not identity_center["instances"]:
+        return {
+            "note": (
+                f"sso:ListInstances in {sso_region} returned no IAM Identity "
+                "Center instance. An instance homed only in another Region is "
+                "not listed here."
+            ),
+            "status": "Passed",
+            "severity": "High",
+            "unguarded": [],
+        }
+    permission_sets = _identity_center_ai_permission_sets(
+        identity_center["arns"], sso_region
+    )
+    if permission_sets["granting"]:
+        sets_note = (
+            " {} permission set(s) grant AI writes in their inline policy: {}.".format(
+                len(permission_sets["granting"]),
+                "; ".join(permission_sets["granting"][:10]),
+            )
+        )
+        sets_note += (
+            " {} of them carry, in the same inline policy, a Deny keyed on "
+            "aws:PrincipalTag over every AI service they grant{}.".format(
+                len(permission_sets["guarded"]),
+                ": " + "; ".join(permission_sets["guarded"][:10])
+                if permission_sets["guarded"]
+                else "",
+            )
+        )
+        if permission_sets["unguarded"]:
+            sets_note += " {} do not, and each is failed in its own row.".format(
+                len(permission_sets["unguarded"])
+            )
+    else:
+        sets_note = " No permission set inline policy that was read grants AI writes."
+    if permission_sets["unread"]:
+        sets_note += " These reads failed: {}.".format(
+            "; ".join(permission_sets["unread"][:5])
+        )
+    return {
+        "note": (
+            "IAM Identity Center instance(s) {} are visible to this "
+            "account, and the people who sign in through them are judged "
+            "by no row.{} Partial, ceiling reached: the instance's MFA "
+            "settings are returned by no sso-admin operation ({}); the "
+            "attributes for access control that set the tag "
+            "(sso:DescribeInstanceAccessControlAttributeConfiguration) and "
+            "the managed policies attached to a permission set are not "
+            "read.".format(
+                ", ".join(identity_center["instances"][:5]),
+                sets_note,
+                IDENTITY_CENTER_MFA_REFERENCE,
+            )
+        ),
+        "status": "N/A",
+        "severity": "Informational",
+        "unguarded": permission_sets["unguarded"],
+    }
 
 
 MFA_PRESENT_CONDITION_KEY = "aws:multifactorauthpresent"
@@ -22405,6 +22814,11 @@ def _mfa_deny_statement_services(statement: Dict[str, Any]) -> List[str]:
             return []
         if any(str(value).strip().lower() != wanted for value in values):
             return []
+    return _deny_statement_ai_services(statement)
+
+
+def _deny_statement_ai_services(statement: Dict[str, Any]) -> List[str]:
+    """Return the AI services whose every action a statement's actions cover."""
     if "NotAction" in statement:
         excluded = [
             str(action).strip().lower()
@@ -22425,6 +22839,57 @@ def _mfa_deny_statement_services(statement: Dict[str, Any]) -> List[str]:
             for action in _as_list(statement.get("Action"))
         )
     ]
+
+
+PRINCIPAL_TAG_KEY_PREFIX = "aws:principaltag/"
+
+# Negated string tests evaluate true when the key is absent, so an untagged
+# session is denied too. The IfExists forms and set operators do not, and are
+# not credited (reference_policies_elements_condition_operators.html).
+PRINCIPAL_TAG_DENY_OPERATORS = (
+    "stringnotequals",
+    "stringnotequalsignorecase",
+    "stringnotlike",
+)
+
+
+def _principal_tag_deny_statement(statement: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Return the AI services a Deny blocks unless the session carries one
+    aws:PrincipalTag value, with the test that does it, or no services.
+
+    This is how IAM Identity Center sessions are held to MFA: the identity
+    source passes the authentication method as a tag, and a Deny keyed on
+    aws:MultiFactorAuthPresent does not work for federated sessions. Only one
+    aws:PrincipalTag key under a plain negated string operator is credited; a
+    second key or operator narrows the Deny.
+    """
+    empty = {"services": [], "test": ""}
+    if str(statement.get("Effect", "")).upper() != "DENY":
+        return empty
+    if not _deny_applies_to_every_resource(statement):
+        return empty
+    conditions = _condition_keys_by_operator(statement)
+    if len(conditions) != 1:
+        return empty
+    operator, key, values = conditions[0]
+    if not key.startswith(PRINCIPAL_TAG_KEY_PREFIX) or key == PRINCIPAL_TAG_KEY_PREFIX:
+        return empty
+    if operator not in PRINCIPAL_TAG_DENY_OPERATORS or not values:
+        return empty
+    written_operator, block = next(
+        (name, keys)
+        for name, keys in statement["Condition"].items()
+        if isinstance(keys, dict)
+    )
+    return {
+        "services": _deny_statement_ai_services(statement),
+        "test": "{} {} {}".format(
+            written_operator,
+            next(iter(block)),
+            ", ".join(str(value) for value in values),
+        ),
+    }
 
 
 def _mfa_deny_source(permissions: Dict[str, Any]) -> str:
@@ -22556,18 +23021,56 @@ def check_bedrock_ai_user_console_mfa(
                 region,
             )
         )
+        identity_center = _identity_center_leg(
+            identity_center_region or os.environ.get("AWS_REGION", "us-east-1")
+        )
+
+        def add_permission_set_failures():
+            for permission_set in identity_center["unguarded"]:
+                findings["status"] = "WARN"
+                findings["csv_data"].append(
+                    row(
+                        "IAM Identity Center permission set {} grants AI writes "
+                        "({}) in its inline policy, and that policy carries no "
+                        "Deny keyed on an aws:PrincipalTag authentication tag over "
+                        "{}{}, so a session that did not complete MFA is not "
+                        "denied those writes. A Deny on aws:MultiFactorAuthPresent "
+                        "does not hold federated sessions to MFA, because the key "
+                        "is not present for them. Managed and customer managed "
+                        "policies attached to the permission set are not "
+                        "read.".format(
+                            permission_set["arn"],
+                            ", ".join(permission_set["services"]),
+                            ", ".join(permission_set["uncovered"]),
+                            " (the PrincipalTag Deny it has, {}, covers only the "
+                            "other services)".format("; ".join(permission_set["tests"]))
+                            if permission_set["tests"]
+                            else "",
+                        ),
+                        "Pass the authentication method from the identity source "
+                        "as a session tag (attributes for access control), and add "
+                        "to the permission set a Deny on every Bedrock, SageMaker "
+                        "AI and AgentCore write it grants, with StringNotEquals on "
+                        "that aws:PrincipalTag key and the value your identity "
+                        "source sends for MFA.",
+                        "High",
+                        "Failed",
+                    )
+                )
+
         if not population["users"] and not roles["users"]:
             findings["status"] = "N/A"
             findings["csv_data"].append(
                 row(
                     "No IAM user or role in the permissions cache holds a "
                     "non-read Bedrock, SageMaker AI or AgentCore permission. "
-                    f"{AI_USER_SCOPE_NOTE}",
+                    f"{AI_USER_SCOPE_NOTE} {identity_center['note']}",
                     "No action required",
                     "Informational",
                     "N/A",
                 )
             )
+            add_permission_set_failures()
             return finish()
 
         iam_client = boto3.client("iam", config=boto3_config)
@@ -22735,56 +23238,11 @@ def check_bedrock_ai_user_console_mfa(
                 trusted.append(role_name)
 
         if protected or no_console or deny_protected or trusted:
-            sso_region = identity_center_region or os.environ.get(
-                "AWS_REGION", "us-east-1"
+            sso_note, status, severity = (
+                identity_center["note"],
+                identity_center["status"],
+                identity_center["severity"],
             )
-            identity_center = _identity_center_instances(sso_region)
-            if identity_center["error"]:
-                sso_note = (
-                    "Identity Center instances were not listed with "
-                    f"{identity_center['error']}, so people who sign in through "
-                    "one may hold AI write access."
-                )
-                status, severity = "N/A", "Informational"
-            elif identity_center["instances"]:
-                permission_sets = _identity_center_ai_permission_sets(
-                    identity_center["arns"], sso_region
-                )
-                if permission_sets["granting"]:
-                    sets_note = (
-                        " {} permission set(s) grant AI writes in their inline "
-                        "policy: {}.".format(
-                            len(permission_sets["granting"]),
-                            "; ".join(permission_sets["granting"][:10]),
-                        )
-                    )
-                else:
-                    sets_note = (
-                        " No permission set inline policy that was read grants "
-                        "AI writes."
-                    )
-                if permission_sets["unread"]:
-                    sets_note += " These reads failed: {}.".format(
-                        "; ".join(permission_sets["unread"][:5])
-                    )
-                sso_note = (
-                    "IAM Identity Center instance(s) {} are visible to this "
-                    "account, and the people who sign in through them are judged "
-                    "by no row.{} Partial, ceiling reached: the instance's MFA "
-                    "settings are returned by no sso-admin operation ({}).".format(
-                        ", ".join(identity_center["instances"][:5]),
-                        sets_note,
-                        IDENTITY_CENTER_MFA_REFERENCE,
-                    )
-                )
-                status, severity = "N/A", "Informational"
-            else:
-                sso_note = (
-                    f"sso:ListInstances in {sso_region} returned no IAM Identity "
-                    "Center instance. An instance homed only in another Region is "
-                    "not listed here."
-                )
-                status, severity = "Passed", "High"
             findings["csv_data"].append(
                 row(
                     "{} of the {} in-scope IAM user(s) have an MFA device ({}) and "
@@ -22812,6 +23270,7 @@ def check_bedrock_ai_user_console_mfa(
                     status,
                 )
             )
+        add_permission_set_failures()
         return finish()
 
     except Exception as e:
@@ -25558,7 +26017,10 @@ RESOURCE_OWNER_SWEEP_SERVICES = (
 # List reads that enumerate resources GetResources misses because they were
 # never tagged: (GetResources filter, label, noun, client, operation, result
 # key, summary field, IAM action, extra kwargs). A gateway summary carries no ARN, so
-# gatewayId is matched against the gateway/<id> resource segment.
+# gatewayId is matched against the resource segment of the service reference's
+# gateway ARN, arn:${Partition}:bedrock-agentcore:${Region}:${Account}:gateway/${GatewayId}.
+AGENTCORE_GATEWAY_RESOURCE_SEGMENT = "gateway/{}"
+
 RESOURCE_OWNER_SWEEP_LISTS = (
     (
         "sagemaker",
@@ -25769,7 +26231,7 @@ def check_ai_resource_owner_tag_sweep(region: str = "") -> Dict[str, Any]:
             if not value:
                 continue
             segment = (
-                f"gateway/{value}".lower()
+                AGENTCORE_GATEWAY_RESOURCE_SEGMENT.format(value).lower()
                 if field == "gatewayId"
                 else _arn_resource_segment(value)
             )

@@ -123,6 +123,8 @@ _EXPECTED_ACTIONS = {
     },
     "BedrockSecurityAssessmentFunction": {
         "aoss:BatchGetCollection",
+        "aoss:GetAccessPolicy",
+        "aoss:ListAccessPolicies",
         "backup:DescribeBackupVault",
         "backup:ListBackupVaults",
         "bedrock-agentcore:GetAgentRuntime",
@@ -170,6 +172,7 @@ _EXPECTED_ACTIONS = {
         "bedrock:ListPrompts",
         "bedrock:ListProvisionedModelThroughputs",
         "bedrock:ListTagsForResource",
+        "cloudtrail:GetEventDataStore",
         "cloudtrail:GetEventSelectors",
         "cloudtrail:GetTrail",
         "cloudtrail:GetTrailStatus",
@@ -771,6 +774,19 @@ def test_bedrock_resource_level_actions_are_arn_scoped(template):
         statement = _statement_block(template, "BedrockSecurityAssessmentFunction", sid)
         assert resource in statement
         assert not re.search(r"Resource:\s+['\"]\*['\"]", statement)
+    # BR-43's GetResourcePolicy and BR-46's data-source reads share the
+    # custom-model/* and knowledge-base/* resources, so they sit in those
+    # statements instead of two duplicate-resource Sids.
+    for sid, actions in {
+        "BedrockCustomModelRead": ("bedrock:GetResourcePolicy",),
+        "BedrockKnowledgeBaseRead": (
+            "bedrock:ListDataSources",
+            "bedrock:GetDataSource",
+        ),
+    }.items():
+        statement = _statement_block(template, "BedrockSecurityAssessmentFunction", sid)
+        for action in actions:
+            assert action in statement
 
 
 @pytest.mark.parametrize("template", _SAM_TEMPLATES, ids=os.path.basename)
@@ -1184,6 +1200,8 @@ def test_aisf_phase5_reads_wildcard_only_where_iam_has_no_resource_type(template
             "ec2:DescribeRouteTables",
             "bedrock:ListModelCustomizationJobs",
             "aoss:BatchGetCollection",
+            "aoss:ListAccessPolicies",
+            "aoss:GetAccessPolicy",
             "comprehend:ListPiiEntitiesDetectionJobs",
             "sso:ListInstances",
             "bedrock-agentcore:ListAgentRuntimes",
@@ -1274,6 +1292,10 @@ def test_aisf_phase5_reads_wildcard_only_where_iam_has_no_resource_type(template
         ("BedrockSecurityAssessmentFunction", "SSOPermissionSetList"): (
             "sso:ListPermissionSets",
             "sso:::instance/*",
+        ),
+        ("BedrockSecurityAssessmentFunction", "CloudTrailEventDataStoreRead"): (
+            "cloudtrail:GetEventDataStore",
+            "cloudtrail:*:${AWS::AccountId}:eventdatastore/*",
         ),
         ("BedrockSecurityAssessmentFunction", "SSOPermissionSetRead"): (
             "sso:GetInlinePolicyForPermissionSet",

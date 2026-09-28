@@ -298,11 +298,11 @@ section.
   DescribeAlarms returns no composite alarm to a grant narrower than `*`, so a
   runtime or guardrail alarm reached only through an acting composite alarm
   was reported as reaching no action. The grant is now on `*`.
-- `BR-06` lists the Region's CloudTrail Lake event data stores. A trail gap
-  on the knowledge base or inference data-event row, which a store could
-  close, is `N/A` with "Partial, ceiling reached" when a store exists, because
-  only `cloudtrail:GetEventDataStore` returns its selectors. With no store the
-  row stays `Failed`.
+- `BR-06` lists the Region's CloudTrail Lake event data stores and reads
+  each one with `cloudtrail:GetEventDataStore`. An `ENABLED` store's advanced
+  selectors are judged as a trail's are, and can credit the management row
+  and each data-event row. A store that could not be read turns a gap into
+  `N/A` naming the action; a gap that no read store closes stays `Failed`.
 - `BR-51` no longer passes an account whose IAM Identity Center instance it
   cannot judge. The `Passed` row becomes `N/A` when `sso:ListInstances` in the
   primary scan Region returns an instance, or cannot be read.
@@ -324,13 +324,26 @@ section.
   subnet fails as outside a VPC, and an ECS service with no `awsvpc` subnets
   is named as not read.
 - `BR-51` names the IAM Identity Center permission sets whose inline policy
-  grants an AI write. The row stays `N/A` with its ceiling.
+  grants an AI write. The row stays `N/A` with its ceiling. Each such
+  permission set fails in its own row unless the same inline policy carries a
+  `Deny` over every AI service it grants, keyed on one `aws:PrincipalTag`
+  value under a negated string operator.
+- `BR-02` names an ECS service that `ecs:DescribeServices` returns in its
+  `failures` list as not read, and never reads a service's `roleArn` as its
+  task role.
+- `BR-33` names, on the `Failed` row for disabled Lambda code scanning, each
+  in-scope function without `ACTIVE` coverage in `inspector2:ListCoverage`,
+  with its reason, such as `SCAN_ELIGIBILITY_EXPIRED`.
 - `BR-52` names `backup:ListRecoveryPointsByResource` or
   `backup:DescribeRecoveryPoint` as not granted, "Partial, ceiling reached",
   when the read is denied.
 - `BR-20` reads OpenSearch Serverless collections with
   `aoss:BatchGetCollection`, now granted, and names the action when the read
-  fails.
+  fails. It also reads every data access policy and fails a knowledge base when
+  an index rule reaching its index has a wildcard in the collection segment,
+  or a wildcard principal, because OpenSearch Serverless
+  does not check a caller's permission on the collection's KMS key. An unread
+  policy is `N/A`.
 - Bedrock checks judge values that they used to credit on presence. `BR-07`,
   `BR-17`, `BR-20` (S3 Vectors), `BR-30` and `BR-38` describe each named KMS
   key and pass only an enabled customer managed key. `BR-07` also fails inline
@@ -848,7 +861,12 @@ the account's `function:*` ARNs (`BR-33`), `ecs:DescribeServices` on
 `service/*` (`BR-02`), `sagemaker:DescribeNotebookInstance` on
 `notebook-instance/*` (`BR-02`), `sso:ListPermissionSets` on Identity Center
 `instance/*` ARNs, and `sso:GetInlinePolicyForPermissionSet` on `instance/*`
-and `permissionSet/*/*` ARNs (`BR-51`). Every unconditioned `*` statement of
+and `permissionSet/*/*` ARNs (`BR-51`). It gains `aoss:ListAccessPolicies`
+and `aoss:GetAccessPolicy` on `*` (`BR-20`), and `cloudtrail:GetEventDataStore`
+on the account's `eventdatastore/*` ARNs (`BR-06`). `bedrock:GetResourcePolicy`
+(`BR-43`) and `bedrock:ListDataSources` and `bedrock:GetDataSource` (`BR-46`)
+move into the statements that already grant the same `custom-model/*` and
+`knowledge-base/*` resources. Every unconditioned `*` statement of
 the role is folded into one `AccountReadsOnWildcard` statement, which keeps
 the rendered inline policy under 9000 characters; the folded statement grants
 exactly the actions the former statements did, plus the new ones. All are

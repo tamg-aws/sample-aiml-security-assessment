@@ -350,6 +350,8 @@ Resources:
                 - bedrock:ListPrompts # BR-04, BR-05, BR-06, BR-07, BR-18, BR-22, BR-32, BR-53
                 - bedrock:ListAutomatedReasoningPolicies # BR-38
                 - aoss:BatchGetCollection # BR-20
+                - aoss:ListAccessPolicies # BR-20
+                - aoss:GetAccessPolicy # BR-20
                 - comprehend:ListPiiEntitiesDetectionJobs # BR-26
                 - sso:ListInstances # BR-51
                 - bedrock-agentcore:ListAgentRuntimes # BR-42, BR-47, BR-52, BR-53, BR-57
@@ -414,11 +416,6 @@ Resources:
                 - bedrock:GetGuardrail
                 - bedrock:GetResourcePolicy # BR-41
               Resource: !Sub 'arn:${AWS::Partition}:bedrock:*:${AWS::AccountId}:guardrail/*'
-            - Sid: BedrockCustomModelPolicyRead
-              Effect: Allow
-              Action:
-                - bedrock:GetResourcePolicy # BR-43
-              Resource: !Sub 'arn:${AWS::Partition}:bedrock:*:${AWS::AccountId}:custom-model/*'
             - Sid: BedrockPromptRead
               Effect: Allow
               Action:
@@ -447,9 +444,12 @@ Resources:
                 - bedrock-agentcore:GetAgentRuntime # BR-57
               Resource: !Sub 'arn:${AWS::Partition}:bedrock-agentcore:*:${AWS::AccountId}:runtime/*'
             - Sid: BedrockCustomModelRead
+              # Holds the former Sid BedrockCustomModelPolicyRead, which had the
+              # same resource, to keep the rendered policy under 9000 bytes.
               Effect: Allow
               Action:
                 - bedrock:GetCustomModel
+                - bedrock:GetResourcePolicy # BR-43
               Resource: !Sub 'arn:${AWS::Partition}:bedrock:*:${AWS::AccountId}:custom-model/*'
             - Sid: BedrockCustomizationJobRead
               Effect: Allow
@@ -464,10 +464,24 @@ Resources:
                 - bedrock:GetFlowVersion # BR-07, BR-26, BR-27, BR-34
               Resource: !Sub 'arn:${AWS::Partition}:bedrock:*:${AWS::AccountId}:flow/*'
             - Sid: BedrockKnowledgeBaseRead
+              # Holds the former Sid BedrockKnowledgeBaseDataSourceRead, which
+              # had the same resource. BR-46 resolves each knowledge base data
+              # source to the S3 bucket it ingests from; both data source
+              # operations authorize on the knowledge base.
               Effect: Allow
               Action:
                 - bedrock:GetKnowledgeBase
+                - bedrock:ListDataSources # BR-46
+                - bedrock:GetDataSource # BR-46
               Resource: !Sub 'arn:${AWS::Partition}:bedrock:*:${AWS::AccountId}:knowledge-base/*'
+            - Sid: CloudTrailEventDataStoreRead
+              # BR-06 reads each event data store's Status and
+              # AdvancedEventSelectors. ListEventDataStores has no resource
+              # type and is granted on '*' in AccountReadsOnWildcard.
+              Effect: Allow
+              Action:
+                - cloudtrail:GetEventDataStore # BR-06
+              Resource: !Sub 'arn:${AWS::Partition}:cloudtrail:*:${AWS::AccountId}:eventdatastore/*'
             - Sid: S3VectorsKnowledgeBaseStoreRead
               # BR-20 follows a knowledge base's s3VectorsConfiguration.vectorBucketArn
               # to the vector bucket, and its indexArn/indexName to the one index that
@@ -486,8 +500,9 @@ Resources:
               # BR-20 follows a bring-your-own vector store to the key it is
               # encrypted with, and a third-party store to its credentials
               # secret. The region is wildcarded for the same reason as above.
-              # aoss:BatchGetCollection has no resource type and is granted on
-              # '*' in AccountReadsOnWildcard.
+              # aoss:BatchGetCollection, ListAccessPolicies and GetAccessPolicy
+              # have no resource type and are granted on '*' in
+              # AccountReadsOnWildcard.
               Effect: Allow
               Action:
                 - rds:DescribeDBClusters # BR-20
@@ -613,14 +628,6 @@ Resources:
               Action:
                 - macie2:DescribeClassificationJob # BR-46
               Resource: !Sub 'arn:${AWS::Partition}:macie2:*:${AWS::AccountId}:classification-job/*'
-            - Sid: BedrockKnowledgeBaseDataSourceRead
-              # BR-46 resolves each knowledge base data source to the S3 bucket it
-              # ingests from. Both operations authorize on the knowledge base.
-              Effect: Allow
-              Action:
-                - bedrock:ListDataSources # BR-46
-                - bedrock:GetDataSource # BR-46
-              Resource: !Sub 'arn:${AWS::Partition}:bedrock:*:${AWS::AccountId}:knowledge-base/*'
             - Sid: S3BucketEncryptionPermissions
               Effect: Allow
               Action:

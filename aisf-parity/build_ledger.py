@@ -37,7 +37,24 @@ AI_SUBJECT_ROWS = [
     # ---------------- BDR: 19 controls, bedrock_assessments ----------------
     ("AIR-BDR-GRD-01", COVERED, None, "bedrock_assessments", ["BR-10"], "", [], 3),
     ("AIR-BDR-GRD-03", COVERED, None, "bedrock_assessments", ["BR-26"], "", [], 3),
-    ("AIR-BDR-KB-03", COVERED, None, "bedrock_assessments", ["BR-20"], "", [], 3),
+    (
+        "AIR-BDR-KB-03",
+        COVERED,
+        None,
+        "bedrock_assessments",
+        ["BR-20"],
+        "BR-20 judges the vector store key of every knowledge base by DescribeKey. For "
+        "an OpenSearch Serverless collection it also reads every data access policy "
+        "(aoss:ListAccessPolicies, aoss:GetAccessPolicy) and fails an index rule "
+        "reaching the knowledge base's index whose collection segment or principal is "
+        "a wildcard, since OpenSearch Serverless does not check a caller's KMS "
+        "permission; an unread policy is N/A. For S3 Vectors it judges the bucket "
+        "policy. The access policies of Aurora, OpenSearch domain and Neptune "
+        "Analytics stores are not read, and whether access matches the source data's "
+        "is not compared",
+        [],
+        3,
+    ),
     (
         "AIR-BDR-MDL-10",
         COVERED,
@@ -53,7 +70,19 @@ AI_SUBJECT_ROWS = [
     ("AIR-BDR-GRD-09", COVERED, None, "bedrock_assessments", ["BR-27"], "", [], 3),
     ("AIR-BDR-GRD-10", COVERED, None, "bedrock_assessments", ["BR-41"], "", [], 3),
     ("AIR-BDR-KB-06", COVERED, None, "bedrock_assessments", ["BR-06"], "", [], 3),
-    ("AIR-BDR-MDL-07", COVERED, None, "bedrock_assessments", ["BR-06"], "", [], 3),
+    (
+        "AIR-BDR-MDL-07",
+        COVERED,
+        None,
+        "bedrock_assessments",
+        ["BR-06"],
+        "BR-06 credits Bedrock management and data events from multi-region trails and "
+        "from each ENABLED CloudTrail Lake event data store, whose advanced selectors "
+        "it reads with cloudtrail:GetEventDataStore and judges as a trail's. An unread "
+        "trail or store keeps a gap N/A. No record is traced end to end",
+        [],
+        3,
+    ),
     (
         "AIR-BDR-MDL-02",
         COVERED,
@@ -1664,8 +1693,11 @@ FOUNDATION_ROWS = [
         "sso:ListInstances in the primary scan Region returns an instance or "
         "cannot be read, the Passed row is N/A, partial, ceiling reached. That row "
         "names each permission set whose inline policy grants an AI write "
-        "(sso:ListPermissionSets, sso:GetInlinePolicyForPermissionSet); managed "
-        "policies attached to a permission set are not read",
+        "(sso:ListPermissionSets, sso:GetInlinePolicyForPermissionSet), and fails "
+        "each one whose inline policy carries no Deny keyed on one aws:PrincipalTag "
+        "value over every AI service it grants; managed policies attached to a "
+        "permission set, and the attributes for access control that set the tag, "
+        "are not read",
         [],
         6,
     ),

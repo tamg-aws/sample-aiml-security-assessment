@@ -1347,8 +1347,12 @@ class TestBR02WorkloadConnectivity:
         notebooks=None,
         notebook_details=None,
         subnets=None,
+        describe_failures=(),
     ):
-        """Run the inventory with Lambda and EC2 empty and ECS/SageMaker wired."""
+        """Run the inventory with Lambda and EC2 empty and ECS/SageMaker wired.
+
+        `describe_failures` names services DescribeServices returns as failures.
+        """
         lambda_client = MagicMock()
         lambda_client.get_paginator.return_value.paginate.return_value = [
             {"Functions": []}
@@ -1399,7 +1403,18 @@ class TestBR02WorkloadConnectivity:
                 if isinstance(listed, list)
                 for s in listed
             }
-            return {"services": [by_arn[arn] for arn in kwargs["services"]]}
+            return {
+                "services": [
+                    by_arn[arn]
+                    for arn in kwargs["services"]
+                    if by_arn[arn]["serviceName"] not in describe_failures
+                ],
+                "failures": [
+                    {"arn": arn, "reason": "MISSING"}
+                    for arn in kwargs["services"]
+                    if by_arn[arn]["serviceName"] in describe_failures
+                ],
+            }
 
         ecs.list_services.side_effect = list_services
         ecs.describe_services.side_effect = describe_services
@@ -1497,6 +1512,82 @@ class TestBR02WorkloadConnectivity:
             "ecs:DescribeTaskDefinition (AccessDeniedException)"
         ]
 
+    def test_br02_only_the_second_clusters_service_fails(self):
+        inventory = self._inventory(
+            clusters=[self.CLUSTER_A, self.CLUSTER_B],
+            services={
+                self.CLUSTER_A: [self._service("api", "td-api:1")],
+                self.CLUSTER_B: [
+                    self._service("worker", "td-worker:1", subnets=("subnet-2",))
+                ],
+            },
+            task_roles={
+                "td-api:1": "arn:aws:iam::123456789012:role/InvokeRole",
+                "td-worker:1": "arn:aws:iam::123456789012:role/InvokeRole",
+            },
+            subnets={"subnet-1": "vpc-1", "subnet-2": "vpc-2"},
+        )
+        rows = self._run(
+            self._cache({"InvokeRole": self._role(["bedrock:InvokeModel"])}),
+            [self._endpoint("bedrock-runtime", vpc_id="vpc-1")],
+            inventory["workloads"],
+            inventory["errors"],
+        )
+        assert [row["Status"] for row in rows] == ["Failed", "Passed"]
+        assert "ECS service 'worker' in vpc-2" in rows[0]["Finding_Details"]
+        assert "'api'" not in rows[0]["Finding_Details"]
+        assert "ECS service 'api' in vpc-1" in rows[1]["Finding_Details"]
+
+    def test_br02_second_cluster_unlisted_is_na_and_the_first_judged(self):
+        inventory = self._inventory(
+            clusters=[self.CLUSTER_A, self.CLUSTER_B],
+            services={
+                self.CLUSTER_A: [self._service("api", "td-api:1")],
+                self.CLUSTER_B: _make_client_error("AccessDeniedException"),
+            },
+            task_roles={"td-api:1": "arn:aws:iam::123456789012:role/InvokeRole"},
+        )
+        assert self._names(inventory) == [("ECS service", "api", "vpc-1", "InvokeRole")]
+        assert inventory["errors"] == [
+            f"ECS services in {self.CLUSTER_B} were not listed with "
+            "ecs:ListServices (AccessDeniedException)"
+        ]
+        rows = self._run(
+            self._cache({"InvokeRole": self._role(["bedrock:InvokeModel"])}),
+            [self._endpoint("bedrock-runtime", vpc_id="vpc-1")],
+            inventory["workloads"],
+            inventory["errors"],
+        )
+        assert [row["Status"] for row in rows] == ["N/A", "N/A"]
+
+    def test_br02_service_returned_as_a_describe_failure_is_named(self):
+        inventory = self._inventory(
+            clusters=[self.CLUSTER_A],
+            services={
+                self.CLUSTER_A: [
+                    self._service("api", "td-api:1"),
+                    self._service("gone", "td-api:1"),
+                ]
+            },
+            task_roles={"td-api:1": "arn:aws:iam::123456789012:role/ApiTask"},
+            describe_failures=("gone",),
+        )
+        assert self._names(inventory) == [("ECS service", "api", "vpc-1", "ApiTask")]
+        assert inventory["errors"] == [
+            "ECS service arn:svc/gone was not described with ecs:DescribeServices "
+            "(MISSING)"
+        ]
+
+    def test_br02_the_service_role_is_not_read_as_the_task_role(self):
+        service = self._service("api", "td-api:1")
+        service["roleArn"] = "arn:aws:iam::123456789012:role/InvokeRole"
+        inventory = self._inventory(
+            clusters=[self.CLUSTER_A],
+            services={self.CLUSTER_A: [service]},
+            task_roles={"td-api:1": None},
+        )
+        assert self._names(inventory) == [("ECS service", "api", "vpc-1", None)]
+
     def test_br02_denied_cluster_list_falls_back_to_the_default_cluster(self):
         inventory = self._inventory(
             clusters=_make_client_error("AccessDeniedException"),
@@ -1591,6 +1682,68 @@ class TestBR02WorkloadConnectivity:
             "SageMaker notebook instance 'denied' was not described with "
             "sagemaker:DescribeNotebookInstance (AccessDeniedException)"
         ]
+
+    def test_br02_only_the_second_notebook_fails(self):
+        inventory = self._inventory(
+            notebooks=[
+                {
+                    "NotebookInstances": [
+                        {"NotebookInstanceName": "private"},
+                        {"NotebookInstanceName": "public"},
+                    ]
+                }
+            ],
+            notebook_details={
+                "private": {
+                    "SubnetId": "subnet-1",
+                    "RoleArn": "arn:aws:iam::123456789012:role/InvokeRole",
+                },
+                "public": {"RoleArn": "arn:aws:iam::123456789012:role/InvokeRole"},
+            },
+        )
+        rows = self._run(
+            self._cache({"InvokeRole": self._role(["bedrock:InvokeModel"])}),
+            [self._endpoint("bedrock-runtime", vpc_id="vpc-1")],
+            inventory["workloads"],
+            inventory["errors"],
+        )
+        assert [row["Status"] for row in rows] == ["Failed", "Passed"]
+        assert (
+            "SageMaker notebook instance 'public' (role 'InvokeRole') is not "
+            "attached to a VPC" in rows[0]["Finding_Details"]
+        )
+        assert "'private'" not in rows[0]["Finding_Details"]
+        assert (
+            "SageMaker notebook instance 'private' in vpc-1"
+            in rows[1]["Finding_Details"]
+        )
+
+    def test_br02_undescribed_second_notebook_keeps_the_first_from_passing(self):
+        inventory = self._inventory(
+            notebooks=[
+                {
+                    "NotebookInstances": [
+                        {"NotebookInstanceName": "private"},
+                        {"NotebookInstanceName": "denied"},
+                    ]
+                }
+            ],
+            notebook_details={
+                "private": {
+                    "SubnetId": "subnet-1",
+                    "RoleArn": "arn:aws:iam::123456789012:role/InvokeRole",
+                },
+                "denied": _make_client_error("AccessDeniedException"),
+            },
+        )
+        rows = self._run(
+            self._cache({"InvokeRole": self._role(["bedrock:InvokeModel"])}),
+            [self._endpoint("bedrock-runtime", vpc_id="vpc-1")],
+            inventory["workloads"],
+            inventory["errors"],
+        )
+        assert [row["Status"] for row in rows] == ["N/A", "N/A"]
+        assert "'denied' was not described" in rows[1]["Finding_Details"]
 
     def test_br02_unlisted_notebooks_block_the_population(self):
         inventory = self._inventory(
@@ -2321,6 +2474,7 @@ class TestBR06CloudTrailLogging:
         mock_ct = MagicMock()
         mock_client.return_value = mock_ct
         mock_ct.list_trails.return_value = {"Trails": []}
+        mock_ct.list_event_data_stores.return_value = {"EventDataStores": []}
         result = check()
         findings = extract_csv_data(result)
         assert len(findings) >= 1
@@ -2342,6 +2496,7 @@ class TestBR06CloudTrailLogging:
             "EventSelectors": [],
             "AdvancedEventSelectors": [],
         }
+        mock_ct.list_event_data_stores.return_value = {"EventDataStores": []}
         result = check()
         findings = extract_csv_data(result)
         assert len(findings) >= 1
@@ -2620,10 +2775,13 @@ class TestBR06SelectorValues:
         record=None,
         knowledge_bases=({"knowledgeBaseId": "kb-1"},),
         event_data_stores=({"EventDataStores": []},),
+        store_details=None,
     ):
         """
         trails: {name: {"advanced": [...], "basic": [...], "error": code}}.
         event_data_stores: ListEventDataStores pages, or an exception to raise.
+        store_details: {store ARN: GetEventDataStore response, or an exception};
+        an ARN left out answers ENABLED with no selectors.
         """
 
         def name_of(arn):
@@ -2661,6 +2819,16 @@ class TestBR06SelectorValues:
             if isinstance(event_data_stores, Exception)
             else list(event_data_stores)
         )
+
+        def get_store(EventDataStore):
+            answer = (store_details or {}).get(
+                EventDataStore, {"Status": "ENABLED", "AdvancedEventSelectors": []}
+            )
+            if isinstance(answer, Exception):
+                raise answer
+            return {"EventDataStoreArn": EventDataStore, **answer}
+
+        client.get_event_data_store.side_effect = get_store
         TestBR06SelectorValues.store_client = client
         with (
             patch("boto3.client", return_value=client),
@@ -2866,26 +3034,82 @@ class TestBR06SelectorValues:
                 in rows[name]["Finding_Details"]
             )
 
-    def test_event_data_stores_on_any_page_make_the_trail_gap_a_ceiling(self):
-        arn = "arn:aws:cloudtrail:us-east-1:123:eventdatastore/"
+    STORE_ARN = "arn:aws:cloudtrail:us-east-1:123:eventdatastore/"
+
+    def _two_page_stores(self):
+        return (
+            {
+                "EventDataStores": [
+                    {"EventDataStoreArn": self.STORE_ARN + "1", "Name": "lake-a"}
+                ],
+                "NextToken": "page-2",
+            },
+            {
+                "EventDataStores": [
+                    {"EventDataStoreArn": self.STORE_ARN + "2", "Name": "lake-b"}
+                ]
+            },
+        )
+
+    def test_event_data_store_on_the_second_page_is_read_and_credited(self):
         rows = self._run(
             {"a": {"advanced": [_management()]}},
-            event_data_stores=(
-                {
-                    "EventDataStores": [
-                        {"EventDataStoreArn": arn + "1", "Name": "lake-a"}
-                    ],
-                    "NextToken": "page-2",
-                },
-                {
-                    "EventDataStores": [
-                        {"EventDataStoreArn": arn + "2", "Name": "lake-b"}
-                    ]
-                },
-            ),
+            event_data_stores=self._two_page_stores(),
+            store_details={
+                self.STORE_ARN + "2": {
+                    "Status": "ENABLED",
+                    "AdvancedEventSelectors": [_data([KB_DATA_TYPE, *INFERENCE_TYPES])],
+                }
+            },
         )
         assert self.store_client.list_event_data_stores.call_args_list[1] == call(
             MaxResults=1000, NextToken="page-2"
+        )
+        assert self.store_client.get_event_data_store.call_args_list == [
+            call(EventDataStore=self.STORE_ARN + "1"),
+            call(EventDataStore=self.STORE_ARN + "2"),
+        ]
+        kb = rows["Bedrock Knowledge Base Retrieval Data Event Logging"]
+        assert kb["Status"] == "Passed"
+        assert (
+            "event data store(s) event data store lake-b name"
+            in (kb["Finding_Details"])
+        )
+        model = rows["Bedrock Model Invocation Data Event Logging"]
+        assert model["Status"] == "Passed"
+        assert (
+            "AWS::Bedrock::InlineAgent by event data store lake-b"
+            in (model["Finding_Details"])
+        )
+        assert "lake-a" not in model["Finding_Details"]
+
+    def test_read_event_data_stores_without_bedrock_selectors_fail(self):
+        rows = self._run(
+            {"a": {"advanced": [_management()]}},
+            event_data_stores=self._two_page_stores(),
+        )
+        for name in (
+            "Bedrock Knowledge Base Retrieval Data Event Logging",
+            "Bedrock Model Invocation Data Event Logging",
+        ):
+            row = rows[name]
+            assert row["Status"] == "Failed", name
+            assert (
+                "Event data store(s) lake-a, lake-b in this Region were read"
+                in row["Finding_Details"]
+            )
+            assert "No CloudTrail Lake event data store" not in row["Finding_Details"]
+
+    def test_only_the_second_event_data_store_unread_leaves_the_gap_unjudged(self):
+        rows = self._run(
+            {"a": {"advanced": [_management()]}},
+            event_data_stores=self._two_page_stores(),
+            store_details={
+                self.STORE_ARN + "2": ClientError(
+                    {"Error": {"Code": "AccessDeniedException", "Message": "x"}},
+                    "GetEventDataStore",
+                )
+            },
         )
         for name in (
             "Bedrock Knowledge Base Retrieval Data Event Logging",
@@ -2893,15 +3117,79 @@ class TestBR06SelectorValues:
         ):
             row = rows[name]
             assert row["Status"] == "N/A", name
-            assert (
-                "event data store(s) lake-a, lake-b in this Region"
-                in (row["Finding_Details"])
+            details = row["Finding_Details"]
+            assert "lake-b (cloudtrail:GetEventDataStore: AccessDeniedException)" in (
+                details
             )
-            assert "Partial, ceiling reached" in row["Finding_Details"]
-            assert "AdvancedEventSelectors" in row["Finding_Details"]
-            assert "cloudtrail:GetEventDataStore" in row["Finding_Details"]
-            assert "API_GetEventDataStore" in row["Finding_Details"]
-            assert "homed in this Region" not in row["Finding_Details"]
+            assert "lake-a (" not in details
+            assert "API_GetEventDataStore" in details
+            assert "homed in this Region" not in details
+
+    def test_inactive_event_data_store_is_not_credited(self):
+        rows = self._run(
+            {"a": {"advanced": [_management()]}},
+            event_data_stores=self._two_page_stores(),
+            store_details={
+                self.STORE_ARN + "2": {
+                    "Status": "STOPPED_INGESTION",
+                    "AdvancedEventSelectors": [_data([KB_DATA_TYPE, *INFERENCE_TYPES])],
+                }
+            },
+        )
+        model = rows["Bedrock Model Invocation Data Event Logging"]
+        assert model["Status"] == "Failed"
+        assert "lake-b (Status STOPPED_INGESTION)" in model["Finding_Details"]
+
+    def test_narrowed_event_data_store_selector_is_not_credited(self):
+        rows = self._run(
+            {"a": {"advanced": [_management()]}},
+            event_data_stores=self._two_page_stores(),
+            store_details={
+                self.STORE_ARN + "1": {
+                    "Status": "ENABLED",
+                    "AdvancedEventSelectors": [
+                        _data(INFERENCE_TYPES, readOnly={"Equals": ["false"]})
+                    ],
+                }
+            },
+        )
+        model = rows["Bedrock Model Invocation Data Event Logging"]
+        assert model["Status"] == "Failed"
+        assert "narrowed by readOnly" in model["Finding_Details"]
+
+    def test_event_data_store_management_selector_credits_management(self):
+        rows = self._run(
+            {},
+            event_data_stores=self._two_page_stores(),
+            store_details={
+                self.STORE_ARN + "2": {
+                    "Status": "ENABLED",
+                    "AdvancedEventSelectors": [_management()],
+                }
+            },
+        )
+        row = rows["Bedrock CloudTrail Logging Check"]
+        assert row["Status"] == "Passed"
+        assert "event data store lake-b record every" in row["Finding_Details"]
+
+    def test_unread_event_data_store_turns_the_management_gap_to_na(self):
+        rows = self._run(
+            {},
+            event_data_stores=self._two_page_stores(),
+            store_details={
+                self.STORE_ARN + "1": ClientError(
+                    {"Error": {"Code": "AccessDeniedException", "Message": "x"}},
+                    "GetEventDataStore",
+                )
+            },
+        )
+        row = rows["Bedrock CloudTrail Logging Check"]
+        assert row["Status"] == "N/A"
+        assert "lake-a (cloudtrail:GetEventDataStore" in row["Finding_Details"]
+
+    def test_management_gap_with_every_store_read_stays_failed(self):
+        rows = self._run({}, event_data_stores=self._two_page_stores())
+        assert rows["Bedrock CloudTrail Logging Check"]["Status"] == "Failed"
 
     def test_unlisted_event_data_stores_leave_the_trail_gap_unjudged(self):
         rows = self._run(
@@ -3052,6 +3340,7 @@ class TestBR06SelectorValues:
         client = MagicMock()
         client.list_trails.return_value = {"Trails": []}
         client.list_knowledge_bases.return_value = {"knowledgeBaseSummaries": []}
+        client.list_event_data_stores.return_value = {"EventDataStores": []}
         with (
             patch("boto3.client", return_value=client),
             patch("bedrock_app.detect_bedrock_regional_footprint", return_value=False),
@@ -17931,6 +18220,96 @@ class TestBR33InspectorLambdaCodeScanning:
         assert findings[0]["Status"] == "Passed"
         assert findings[0]["Severity"] == "Medium"
 
+    def _stale_coverage(self):
+        ok, stale = (
+            self._bedrock_lambda("bedrock-ok"),
+            self._bedrock_lambda("bedrock-stale"),
+        )
+        return [ok, stale], [
+            self._coverage(ok["FunctionArn"], "PACKAGE"),
+            self._coverage(ok["FunctionArn"], "CODE"),
+            self._coverage(
+                stale["FunctionArn"], "PACKAGE", "INACTIVE", "SCAN_ELIGIBILITY_EXPIRED"
+            ),
+            self._coverage(
+                stale["FunctionArn"], "CODE", "INACTIVE", "SCAN_ELIGIBILITY_EXPIRED"
+            ),
+        ]
+
+    @patch("bedrock_app.boto3.client")
+    def test_br33_code_scanning_disabled_names_both_causes(self, mock_client):
+        functions, coverage = self._stale_coverage()
+        self._wire_clients(
+            mock_client,
+            lambda_functions=functions,
+            coverage=coverage,
+            inspector_response=self._inspector_response("ENABLED", "DISABLED"),
+        )
+        findings = extract_csv_data(
+            bedrock_app.check_inspector_lambda_code_scanning(region="us-east-1")
+        )
+        assert [row["Status"] for row in findings] == ["Failed"]
+        detail = findings[0]["Finding_Details"]
+        assert "Lambda code scan status: DISABLED" in detail
+        assert (
+            "1 of the 2 in-scope function(s) are not scanned: 'bedrock-stale' is not "
+            "scanned: PACKAGE scan INACTIVE (SCAN_ELIGIBILITY_EXPIRED), CODE scan "
+            "INACTIVE (SCAN_ELIGIBILITY_EXPIRED)"
+        ) in detail
+        assert "'bedrock-ok' is not scanned" not in detail
+        assert "scan eligibility expired after 90 days" in findings[0]["Resolution"]
+
+    @patch("bedrock_app.boto3.client")
+    def test_br33_code_scanning_disabled_with_every_function_active(self, mock_client):
+        self._wire_clients(
+            mock_client,
+            inspector_response=self._inspector_response("ENABLED", "DISABLED"),
+        )
+        findings = extract_csv_data(
+            bedrock_app.check_inspector_lambda_code_scanning(region="us-east-1")
+        )
+        assert [row["Status"] for row in findings] == ["Failed"]
+        assert (
+            "Every in-scope zip function has ACTIVE $LATEST PACKAGE and CODE "
+            "coverage records" in findings[0]["Finding_Details"]
+        )
+
+    @patch("bedrock_app.boto3.client")
+    def test_br33_code_scanning_disabled_with_unread_coverage_stays_failed(
+        self, mock_client
+    ):
+        self._wire_clients(
+            mock_client,
+            inspector_response=self._inspector_response("ENABLED", "DISABLED"),
+            coverage_error=_make_client_error("AccessDeniedException"),
+        )
+        findings = extract_csv_data(
+            bedrock_app.check_inspector_lambda_code_scanning(region="us-east-1")
+        )
+        assert [row["Status"] for row in findings] == ["Failed"]
+        detail = findings[0]["Finding_Details"]
+        assert "Lambda code scan status: DISABLED" in detail
+        assert (
+            "Per-function coverage was not read: per-function coverage "
+            "(inspector2:ListCoverage, AccessDeniedException)"
+        ) in detail
+        assert "Every in-scope zip function" not in detail
+
+    @patch("bedrock_app.boto3.client")
+    def test_br33_enabled_with_expired_eligibility_on_the_second_function_fails(
+        self, mock_client
+    ):
+        functions, coverage = self._stale_coverage()
+        self._wire_clients(mock_client, lambda_functions=functions, coverage=coverage)
+        findings = extract_csv_data(
+            bedrock_app.check_inspector_lambda_code_scanning(region="us-east-1")
+        )
+        assert [row["Status"] for row in findings] == ["Failed"]
+        detail = findings[0]["Finding_Details"]
+        assert "'bedrock-stale' is not scanned" in detail
+        assert "SCAN_ELIGIBILITY_EXPIRED" in detail
+        assert "'bedrock-ok' is not scanned" not in detail
+
     @staticmethod
     def _plain_lambda(name, role, **extra):
         return {
@@ -24104,7 +24483,9 @@ class TestBR51AIUserConsoleMFA:
                 self.PS_LATE: self._policy("sagemaker:CreateEndpoint"),
             },
         )
-        assert [r["Status"] for r in rows] == ["N/A"]
+        assert [r["Status"] for r in rows] == ["N/A", "Failed", "Failed"]
+        assert self.PS_WRITE in rows[1]["Finding_Details"]
+        assert self.PS_LATE in rows[2]["Finding_Details"]
         details = rows[0]["Finding_Details"]
         assert "2 permission set(s) grant AI writes in their inline policy" in details
         assert f"{self.PS_WRITE} (bedrock)" in details
@@ -24141,6 +24522,186 @@ class TestBR51AIUserConsoleMFA:
         assert (
             f"sso:GetInlinePolicyForPermissionSet on {self.PS_WRITE} "
             "(AccessDeniedException)" in details
+        )
+
+    @staticmethod
+    def _tag_deny(
+        operator="StringNotEquals",
+        key="aws:PrincipalTag/authn",
+        value="mfa",
+        actions=("bedrock:*", "sagemaker:*", "bedrock-agentcore:*"),
+        **statement,
+    ):
+        body = {
+            "Effect": "Deny",
+            "Action": list(actions),
+            "Resource": "*",
+            "Condition": {operator: {key: value}},
+        }
+        body.update(statement)
+        return body
+
+    @staticmethod
+    def _grant_with(*denies, actions=("bedrock:CreateGuardrail",)):
+        return json.dumps(
+            {
+                "Version": "2012-10-17",
+                "Statement": [
+                    {"Effect": "Allow", "Action": list(actions), "Resource": "*"},
+                    *denies,
+                ],
+            }
+        )
+
+    def test_br51_permission_set_without_a_principal_tag_deny_fails(self):
+        _, rows = self._run_sets(
+            permission_sets={self.INSTANCE: [self.PS_WRITE]},
+            inline={self.PS_WRITE: self._grant_with()},
+        )
+        assert [r["Status"] for r in rows] == ["N/A", "Failed"]
+        failed = rows[1]
+        assert failed["Check_ID"] == "BR-51"
+        assert failed["Severity"] == "High"
+        assert (
+            f"permission set {self.PS_WRITE} grants AI writes (bedrock) in its "
+            "inline policy, and that policy carries no Deny keyed on an "
+            "aws:PrincipalTag authentication tag over bedrock"
+            in failed["Finding_Details"]
+        )
+        assert (
+            "policies attached to the permission set are not read"
+            in (failed["Finding_Details"])
+        )
+        assert "0 of them carry" in rows[0]["Finding_Details"]
+
+    def test_br51_only_the_second_permission_set_without_the_deny_fails(self):
+        _, rows = self._run_sets(
+            permission_sets={
+                self.INSTANCE: {
+                    None: {"PermissionSets": [self.PS_READ], "NextToken": "p2"},
+                    "p2": {"PermissionSets": [self.PS_WRITE]},
+                }
+            },
+            inline={
+                self.PS_READ: self._grant_with(self._tag_deny()),
+                self.PS_WRITE: self._grant_with(),
+            },
+        )
+        assert [r["Status"] for r in rows] == ["N/A", "Failed"]
+        assert self.PS_WRITE in rows[1]["Finding_Details"]
+        assert self.PS_READ not in rows[1]["Finding_Details"]
+        details = rows[0]["Finding_Details"]
+        assert "1 of them carry" in details
+        assert (
+            f"{self.PS_READ} (bedrock): StringNotEquals aws:PrincipalTag/authn mfa"
+            in details
+        )
+        assert "1 do not, and each is failed in its own row." in details
+
+    def test_br51_every_permission_set_carrying_the_deny_stays_at_the_ceiling(self):
+        _, rows = self._run_sets(
+            permission_sets={self.INSTANCE: [self.PS_WRITE, self.PS_LATE]},
+            inline={
+                self.PS_WRITE: self._grant_with(self._tag_deny()),
+                self.PS_LATE: self._grant_with(
+                    self._tag_deny(
+                        operator="StringNotLike",
+                        actions=(),
+                        NotAction=["bedrock:Get*", "bedrock:List*"],
+                    )
+                ),
+            },
+        )
+        assert [r["Status"] for r in rows] == ["N/A"]
+        details = rows[0]["Finding_Details"]
+        assert "2 of them carry" in details
+        assert "Partial, ceiling reached" in details
+        assert "sso:DescribeInstanceAccessControlAttributeConfiguration" in details
+
+    def test_br51_principal_tag_deny_forms_that_do_not_fire_are_not_credited(self):
+        forms = {
+            "ifexists": self._tag_deny(operator="StringNotEqualsIfExists"),
+            "set": self._tag_deny(operator="ForAnyValue:StringNotEquals"),
+            "equals": self._tag_deny(operator="StringEquals"),
+            "resource": self._tag_deny(Resource="arn:aws:bedrock:*:*:agent/*"),
+            "other_key": self._tag_deny(key="aws:RequestTag/authn"),
+            "bare_prefix": self._tag_deny(key="aws:PrincipalTag/"),
+            "second_key": self._tag_deny(
+                Condition={
+                    "StringNotEquals": {
+                        "aws:PrincipalTag/authn": "mfa",
+                        "aws:PrincipalAccount": "111122223333",
+                    }
+                }
+            ),
+            "allow": self._tag_deny(Effect="Allow"),
+        }
+        sets = {
+            f"arn:aws:sso:::permissionSet/ssoins-1/ps-{name}": self._grant_with(deny)
+            for name, deny in forms.items()
+        }
+        _, rows = self._run_sets(
+            permission_sets={self.INSTANCE: list(sets)}, inline=sets
+        )
+        failed = [r["Finding_Details"] for r in rows if r["Status"] == "Failed"]
+        assert len(failed) == len(forms)
+        for arn in sets:
+            assert sum(arn + " " in text for text in failed) == 1, arn
+
+    def test_br51_deny_over_one_service_fails_the_other_it_grants(self):
+        _, rows = self._run_sets(
+            permission_sets={self.INSTANCE: [self.PS_WRITE]},
+            inline={
+                self.PS_WRITE: self._grant_with(
+                    self._tag_deny(actions=("bedrock:*",)),
+                    actions=("bedrock:CreateGuardrail", "sagemaker:CreateEndpoint"),
+                )
+            },
+        )
+        assert [r["Status"] for r in rows] == ["N/A", "Failed"]
+        details = rows[1]["Finding_Details"]
+        assert "grants AI writes (bedrock, sagemaker)" in details
+        assert "authentication tag over sagemaker (the PrincipalTag Deny it has" in (
+            details
+        )
+
+    def test_br51_permission_set_failure_is_not_hidden_by_failing_iam_users(self):
+        _, rows = self._run(
+            _ai_user_cache(),
+            login={"alice": "yes", "bob": "yes"},
+            instances=[{"Instances": [{"InstanceArn": self.INSTANCE}]}],
+            permission_sets={self.INSTANCE: [self.PS_WRITE]},
+            inline={self.PS_WRITE: self._grant_with()},
+        )
+        statuses = [r["Status"] for r in rows]
+        assert statuses.count("Failed") == 3
+        assert self.PS_WRITE in rows[-1]["Finding_Details"]
+
+    def test_br51_permission_set_failure_is_reported_with_no_iam_population(
+        self, empty_permission_cache
+    ):
+        _, rows = self._run(
+            empty_permission_cache,
+            instances=[{"Instances": [{"InstanceArn": self.INSTANCE}]}],
+            permission_sets={self.INSTANCE: [self.PS_WRITE]},
+            inline={self.PS_WRITE: self._grant_with()},
+        )
+        assert [r["Status"] for r in rows] == ["N/A", "Failed"]
+        assert "Partial, ceiling reached" in rows[0]["Finding_Details"]
+        assert self.PS_WRITE in rows[1]["Finding_Details"]
+
+    def test_br51_unread_inline_policy_is_not_failed_or_credited(self):
+        _, rows = self._run_sets(
+            permission_sets={self.INSTANCE: [self.PS_WRITE, self.PS_LATE]},
+            inline={
+                self.PS_WRITE: self._grant_with(self._tag_deny()),
+                self.PS_LATE: _make_client_error("AccessDeniedException"),
+            },
+        )
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert (
+            f"sso:GetInlinePolicyForPermissionSet on {self.PS_LATE}"
+            in (rows[0]["Finding_Details"])
         )
 
     def test_br51_denied_permission_set_list_is_named(self):
@@ -25092,6 +25653,29 @@ class TestBR53OwnerTagSweep:
 
     def _owned(self, arn):
         return {"ResourceARN": arn, "Tags": [{"Key": "Owner", "Value": "ml"}]}
+
+    # The service reference's gateway ARN format (bedrock-agentcore, resource
+    # type "gateway"), transcribed from the service authorization JSON.
+    GATEWAY_ARN_FORMAT = (
+        "arn:${Partition}:bedrock-agentcore:${Region}:${Account}:gateway/${GatewayId}"
+    )
+
+    def test_gateway_segment_matches_the_service_reference_arn_format(self):
+        for gateway_id in ("gw-a", "Uc3-RBAC-gateway-0bzobcwcfe"):
+            arn = (
+                self.GATEWAY_ARN_FORMAT.replace("${Partition}", "aws-us-gov")
+                .replace("${Region}", "us-gov-west-1")
+                .replace("${Account}", "123456789012")
+                .replace("${GatewayId}", gateway_id)
+            )
+            assert bedrock_app._arn_resource_segment(arn) == (
+                bedrock_app.AGENTCORE_GATEWAY_RESOURCE_SEGMENT.format(
+                    gateway_id
+                ).lower()
+            )
+        assert bedrock_app.AGENTCORE_GATEWAY_RESOURCE_SEGMENT.format("x") == (
+            self.GATEWAY_ARN_FORMAT.rsplit(":", 1)[-1].replace("${GatewayId}", "x")
+        )
 
     def test_each_list_names_its_never_tagged_resource_beside_a_tagged_one(self):
         _, rows, tagging = self._run(
@@ -28198,27 +28782,73 @@ class TestBR20ValueDepth:
 
     # --- bring-your-own stores --------------------------------------------
 
-    @staticmethod
-    def _aoss(key=None, error=None, details=True):
+    @classmethod
+    def _data_rule(cls, resource="index/kb-coll/kb-index", principal=None):
+        return [
+            {
+                "Rules": [
+                    {
+                        "ResourceType": "index",
+                        "Resource": [resource],
+                        "Permission": ["aoss:ReadDocument", "aoss:WriteDocument"],
+                    }
+                ],
+                "Principal": [principal or cls.ROLE],
+            }
+        ]
+
+    @classmethod
+    def _aoss(cls, key=None, error=None, details=True, policies=None, list_error=None):
+        """`policies` is {name: document or Exception}, listed over two pages."""
         client = MagicMock()
         if error is not None:
             client.batch_get_collection.side_effect = error
         else:
             client.batch_get_collection.side_effect = lambda ids: {
                 "collectionDetails": (
-                    [{"id": ids[0], "kmsKeyArn": key}] if details else []
+                    [{"id": ids[0], "name": "kb-coll", "kmsKeyArn": key}]
+                    if details
+                    else []
                 ),
                 "collectionErrorDetails": (
                     [] if details else [{"id": ids[0], "errorCode": "NOT_FOUND"}]
                 ),
             }
+        policies = {"kb-data": cls._data_rule()} if policies is None else policies
+        names = list(policies)
+        pages = {
+            None: {
+                "accessPolicySummaries": [{"name": n} for n in names[:1]],
+                "nextToken": "p2",
+            },
+            "p2": {"accessPolicySummaries": [{"name": n} for n in names[1:]]},
+        }
+
+        def list_access_policies(type, **kwargs):
+            assert type == "data"
+            if list_error is not None:
+                raise list_error
+            return pages[kwargs.get("nextToken")]
+
+        def get_access_policy(type, name):
+            assert type == "data"
+            outcome = policies[name]
+            if isinstance(outcome, Exception):
+                raise outcome
+            return {"accessPolicyDetail": {"name": name, "policy": outcome}}
+
+        client.list_access_policies.side_effect = list_access_policies
+        client.get_access_policy.side_effect = get_access_policy
         return client
 
     def _aoss_body(self):
         return self._store_body(
             "OPENSEARCH_SERVERLESS",
             "opensearchServerlessConfiguration",
-            {"collectionArn": f"arn:aws:aoss:us-west-2:{self.ACCOUNT}:collection/c1"},
+            {
+                "collectionArn": f"arn:aws:aoss:us-west-2:{self.ACCOUNT}:collection/c1",
+                "vectorIndexName": "kb-index",
+            },
         )
 
     def test_opensearch_serverless_on_a_customer_key_passes(self):
@@ -28232,6 +28862,11 @@ class TestBR20ValueDepth:
             f"customer managed KMS key '{self.CMK}' is Enabled"
             in rows[0]["Finding_Details"]
         )
+        assert (
+            "every rule reaching the index names this collection and named "
+            f"principals: 'kb-data' grants aoss:ReadDocument, aoss:WriteDocument "
+            f"on index/kb-coll/kb-index to {self.ROLE}"
+        ) in rows[0]["Finding_Details"]
 
     def test_opensearch_serverless_without_a_key_arn_fails(self):
         rows = self._run(
@@ -28272,6 +28907,168 @@ class TestBR20ValueDepth:
         )
         assert [r["Status"] for r in rows] == ["N/A"]
         assert "NOT_FOUND" in rows[0]["Finding_Details"]
+
+    # --- OpenSearch Serverless data access policies ----------------------
+
+    def _aoss_run(self, policies=None, key=None, **kwargs):
+        return self._run(
+            {"kb1": self._aoss_body()},
+            clients={
+                "opensearchserverless": self._aoss(
+                    key or self.CMK, policies=policies, **kwargs
+                )
+            },
+        )
+
+    def test_opensearch_serverless_index_rule_on_every_collection_fails(self):
+        rows = self._aoss_run({"all": self._data_rule("index/*/*")})
+        assert [r["Status"] for r in rows] == ["Failed"]
+        details = rows[0]["Finding_Details"]
+        assert "'all' grants" in details and "on index/*/* to" in details
+        assert "reaches other collections' indexes" in details
+        # The key leg passed, so the row carries the access resolution alone.
+        assert rows[0]["Resolution"] == bedrock_app.AOSS_ACCESS_RESOLUTION
+
+    def test_opensearch_serverless_wildcard_collection_prefix_fails(self):
+        rows = self._aoss_run({"prefix": self._data_rule("index/kb*/kb-index")})
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "on index/kb*/kb-index to" in rows[0]["Finding_Details"]
+
+    def test_opensearch_serverless_wildcard_principal_fails(self):
+        rows = self._aoss_run(
+            {"open": self._data_rule(principal=f"arn:aws:iam::{self.ACCOUNT}:role/*")}
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert (
+            f"principal(s) arn:aws:iam::{self.ACCOUNT}:role/* are not named identities"
+            in rows[0]["Finding_Details"]
+        )
+
+    def test_opensearch_serverless_only_the_second_policy_is_broad(self):
+        # Two pages: the scoped policy on page one, the broad one on page two.
+        client = self._aoss(
+            self.CMK,
+            policies={
+                "scoped": self._data_rule(),
+                "broad": self._data_rule("index/*/kb-index"),
+            },
+        )
+        rows = self._run(
+            {"kb1": self._aoss_body()}, clients={"opensearchserverless": client}
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        details = rows[0]["Finding_Details"]
+        assert "2 data access policy(ies)" in details
+        assert "1 rule(s) reaching the index are not scoped: 'broad' grants" in details
+        assert "'scoped' grants" not in details
+        assert client.list_access_policies.call_count == 2
+
+    def test_opensearch_serverless_second_knowledge_base_alone_fails(self):
+        # One policy set, two collections: only kb2's collection has a
+        # wildcard principal on its index.
+        client = self._aoss(
+            self.CMK,
+            policies={
+                "scoped": self._data_rule(),
+                "open": self._data_rule("index/kb-open/kb-index", principal="*"),
+            },
+        )
+        names = {"c1": "kb-coll", "c2": "kb-open"}
+        client.batch_get_collection.side_effect = lambda ids: {
+            "collectionDetails": [
+                {"id": ids[0], "name": names[ids[0]], "kmsKeyArn": self.CMK}
+            ],
+            "collectionErrorDetails": [],
+        }
+        second = self._aoss_body()
+        second["storageConfiguration"]["opensearchServerlessConfiguration"][
+            "collectionArn"
+        ] = f"arn:aws:aoss:us-west-2:{self.ACCOUNT}:collection/c2"
+        rows = self._run(
+            {"kb1": self._aoss_body(), "kb2": second},
+            clients={"opensearchserverless": client},
+        )
+        assert [(r["Status"], "(ID: kb2)" in r["Finding_Details"]) for r in rows] == [
+            ("Passed", False),
+            ("Failed", True),
+        ]
+        assert "principal(s) * are not named identities" in rows[1]["Finding_Details"]
+
+    def test_opensearch_serverless_unread_policy_is_na_not_passed(self):
+        rows = self._aoss_run(
+            {
+                "scoped": self._data_rule(),
+                "hidden": _client_error(
+                    "AccessDeniedException", "denied", "GetAccessPolicy"
+                ),
+            }
+        )
+        assert [r["Status"] for r in rows] == ["N/A"]
+        details = rows[0]["Finding_Details"]
+        assert "1 could not be read" in details
+        assert "'hidden'" in details and "aoss:GetAccessPolicy" in details
+
+    def test_opensearch_serverless_broad_rule_beside_an_unread_one_fails(self):
+        rows = self._aoss_run(
+            {
+                "hidden": _client_error(
+                    "AccessDeniedException", "denied", "GetAccessPolicy"
+                ),
+                "all": self._data_rule("index/*/*"),
+            }
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "'all' grants" in rows[0]["Finding_Details"]
+
+    def test_opensearch_serverless_unparseable_policy_is_na(self):
+        rows = self._aoss_run({"scoped": self._data_rule(), "bad": "not json"})
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert "'bad' (unparseable" in rows[0]["Finding_Details"]
+
+    def test_opensearch_serverless_policy_as_json_string_is_read(self):
+        rows = self._aoss_run({"all": json.dumps(self._data_rule("index/*/*"))})
+        assert [r["Status"] for r in rows] == ["Failed"]
+
+    def test_opensearch_serverless_rules_off_the_index_are_not_counted(self):
+        other = self._data_rule("index/other-coll/*", principal="*")
+        other[0]["Rules"].append(
+            {
+                "ResourceType": "collection",
+                "Resource": ["collection/*"],
+                "Permission": ["aoss:DescribeCollectionItems"],
+            }
+        )
+        rows = self._aoss_run({"other": other})
+        assert [r["Status"] for r in rows] == ["Passed"]
+        assert "no index rule in them reaches the index" in rows[0]["Finding_Details"]
+
+    def test_opensearch_serverless_unlisted_policies_are_na_on_a_customer_key(self):
+        rows = self._aoss_run(
+            list_error=_client_error(
+                "AccessDeniedException", "denied", "ListAccessPolicies"
+            )
+        )
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert "aoss:ListAccessPolicies" in rows[0]["Finding_Details"]
+
+    def test_opensearch_serverless_key_and_access_failures_both_resolve(self):
+        rows = self._aoss_run({"all": self._data_rule("index/*/*")}, key="auto")
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "kmsKeyArn is 'auto'" in rows[0]["Finding_Details"]
+        assert "'all' grants" in rows[0]["Finding_Details"]
+        assert rows[0]["Resolution"].endswith(bedrock_app.AOSS_ACCESS_RESOLUTION)
+        assert rows[0]["Resolution"] != bedrock_app.AOSS_ACCESS_RESOLUTION
+
+    def test_opensearch_serverless_without_an_index_name_is_na(self):
+        body = self._aoss_body()
+        del body["storageConfiguration"]["opensearchServerlessConfiguration"][
+            "vectorIndexName"
+        ]
+        rows = self._run(
+            {"kb1": body}, clients={"opensearchserverless": self._aoss(self.CMK)}
+        )
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert "vectorIndexName is missing" in rows[0]["Finding_Details"]
 
     def _rds(self, clusters=None, error=None):
         client = MagicMock()

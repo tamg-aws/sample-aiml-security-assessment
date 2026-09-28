@@ -86,7 +86,7 @@
         "Knowledge Base Data Source Bucket Encryption",
         "Knowledge Base Data Source Transient Data Key"
       ],
-      "gap": "",
+      "gap": "BR-20 judges the vector store key of every knowledge base by DescribeKey. For an OpenSearch Serverless collection it also reads every data access policy (aoss:ListAccessPolicies, aoss:GetAccessPolicy) and fails an index rule reaching the knowledge base's index whose collection segment or principal is a wildcard, since OpenSearch Serverless does not check a caller's KMS permission; an unread policy is N/A. For S3 Vectors it judges the bucket policy. The access policies of Aurora, OpenSearch domain and Neptune Analytics stores are not read, and whether access matches the source data's is not compared",
       "extra_iam": [],
       "phase": 3,
       "tier": "ai_subject",
@@ -249,7 +249,7 @@
       "incumbent_names": [
         "Bedrock CloudTrail Logging Check"
       ],
-      "gap": "",
+      "gap": "BR-06 credits Bedrock management and data events from multi-region trails and from each ENABLED CloudTrail Lake event data store, whose advanced selectors it reads with cloudtrail:GetEventDataStore and judges as a trail's. An unread trail or store keeps a gap N/A. No record is traced end to end",
       "extra_iam": [],
       "phase": 3,
       "tier": "ai_subject",
@@ -2444,7 +2444,7 @@
       "incumbent_names": [
         "AI User Console MFA"
       ],
-      "gap": "BR-51 reads each cached IAM user whose attached, inline or group policies grant a non-read bedrock:, sagemaker: or bedrock-agentcore: action, and fails a user that has a console password (GetLoginProfile succeeds) and no MFA device. NoSuchEntity means no console password. IAM Identity Center users are outside it: no sso-admin operation returns an instance's MFA settings, and the finding says so. When sso:ListInstances in the primary scan Region returns an instance or cannot be read, the Passed row is N/A, partial, ceiling reached. That row names each permission set whose inline policy grants an AI write (sso:ListPermissionSets, sso:GetInlinePolicyForPermissionSet); managed policies attached to a permission set are not read",
+      "gap": "BR-51 reads each cached IAM user whose attached, inline or group policies grant a non-read bedrock:, sagemaker: or bedrock-agentcore: action, and fails a user that has a console password (GetLoginProfile succeeds) and no MFA device. NoSuchEntity means no console password. IAM Identity Center users are outside it: no sso-admin operation returns an instance's MFA settings, and the finding says so. When sso:ListInstances in the primary scan Region returns an instance or cannot be read, the Passed row is N/A, partial, ceiling reached. That row names each permission set whose inline policy grants an AI write (sso:ListPermissionSets, sso:GetInlinePolicyForPermissionSet), and fails each one whose inline policy carries no Deny keyed on one aws:PrincipalTag value over every AI service it grants; managed policies attached to a permission set, and the attributes for access control that set the tag, are not read",
       "extra_iam": [],
       "phase": 6,
       "tier": "foundation",
