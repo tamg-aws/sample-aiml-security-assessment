@@ -12712,6 +12712,71 @@ def _cedar_scope_is_unconstrained(scope: List[str], position: str) -> bool:
     return part == position
 
 
+def _cedar_scope_operators(part: str) -> List[str]:
+    """Return the words of one scope position with string literals blanked.
+
+    An entity id is a string literal and can hold any word, so `in` inside
+    `AgentCore::Gateway::"a in b"` must not read as the scope operator.
+    """
+    return re.sub(r'"(?:[^"\\]|\\.)*"', '""', part).split()
+
+
+def _cedar_principal_is_bounded(scope: List[str], conditions: str) -> bool:
+    """Return whether a permit names the callers it admits.
+
+    `principal is AgentCore::OAuthUser`, `principal == ...` and `principal in
+    ...` name a type or an entity. A bare `principal` admits every caller the
+    gateway's authorizer lets through, unless a condition reads the principal,
+    as the attribute-based pattern `principal.getTag(...)` does. The condition
+    body is not evaluated: a condition that reads the principal is taken as the
+    bound it was written to be.
+    """
+    if len(scope[0].split()) > 1:
+        return True
+    return re.search(r"\bprincipal\b", conditions) is not None
+
+
+def _cedar_resource_is_bounded(scope: List[str]) -> bool:
+    """Return whether a permit names the gateway it applies on.
+
+    `resource is AgentCore::Gateway` names only a type, which every gateway the
+    engine is attached to has, so it reads as Resource '*': the permit follows
+    the engine onto a gateway attached later. Only `==` or `in` an entity names
+    one.
+    """
+    operators = _cedar_scope_operators(scope[2])
+    return "==" in operators or "in" in operators
+
+
+def _cedar_allow_all_permits(
+    policies: List[Dict[str, Any]],
+) -> Tuple[List[str], List[str]]:
+    """Return the enforcing policies that permit every tool unconditioned, and
+    the ones whose text could not be read.
+
+    Such a permit leaves the engine's default-deny nothing to decide, so an
+    engine in ENFORCE mode that holds one enforces nothing.
+    """
+    allow_all: List[str] = []
+    unreadable: List[str] = []
+    for policy in policies:
+        policy_name = policy.get("name") or policy.get("policyId") or "unnamed"
+        parsed = _cedar_policies(_policy_statement_text(policy))
+        if not parsed or any(
+            len(scope) != len(CEDAR_SCOPE_POSITIONS) for _, scope, _ in parsed
+        ):
+            unreadable.append(policy_name)
+            continue
+        if any(
+            effect == "permit"
+            and _cedar_scope_is_unconstrained(scope, "action")
+            and not _cedar_condition_qualifiers(conditions)
+            for effect, scope, conditions in parsed
+        ):
+            allow_all.append(policy_name)
+    return allow_all, unreadable
+
+
 def _policy_statement_text(policy: Dict[str, Any]) -> str:
     """Return the Cedar text of a listed policy.
 
@@ -12770,8 +12835,15 @@ def check_agentcore_policy_tool_scope() -> List[Dict[str, Any]]:
     forbid-wins semantics automatically", so default-deny is not a setting to
     read; what a customer can still write is a permit that restores allow-all.
     The same page names the defect: Cedar analysis identifies "policies that
-    always allow (no conditions restrict access)". AG-25 counts enforcing
-    policies without reading one, so a single permit over every tool passes it.
+    always allow (no conditions restrict access)". AG-25 fails only a permit
+    over every action with no condition, so a conditioned permit over every
+    tool, or a permit over named tools to every caller, passes it.
+
+    A permit over named tools is also read for the callers and the gateway it
+    names. The AIR-ACR-POL-01 recommendation is to scope each policy "to a
+    specific principal type, exact action, and gateway ARN (never Resource
+    '*')". A policy whose text cannot be read withholds the gateway's Passed,
+    because it could permit any tool.
     """
     if agentcore_client is None:
         return [
@@ -12866,13 +12938,19 @@ def check_agentcore_policy_tool_scope() -> List[Dict[str, Any]]:
 
         always_allow: List[str] = []
         tool_wide: List[str] = []
+        caller_wide: List[str] = []
+        gateway_wide: List[str] = []
         unreadable: List[str] = []
         scoped: List[str] = []
         readable = 0
         for policy in policies:
             policy_name = policy.get("name") or policy.get("policyId") or "unnamed"
             parsed = _cedar_policies(_policy_statement_text(policy))
-            if not parsed:
+            # A head with fewer or more positions than the grammar has cannot be
+            # scored by position, so it is not read as bounded either.
+            if not parsed or any(
+                len(scope) != len(CEDAR_SCOPE_POSITIONS) for _, scope, _ in parsed
+            ):
                 unreadable.append(policy_name)
                 continue
             readable += 1
@@ -12881,6 +12959,10 @@ def check_agentcore_policy_tool_scope() -> List[Dict[str, Any]]:
                     continue
                 if not _cedar_scope_is_unconstrained(scope, "action"):
                     scoped.append(policy_name)
+                    if not _cedar_principal_is_bounded(scope, conditions):
+                        caller_wide.append(policy_name)
+                    if not _cedar_resource_is_bounded(scope):
+                        gateway_wide.append(policy_name)
                 elif _cedar_condition_qualifiers(conditions):
                     tool_wide.append(policy_name)
                 else:
@@ -12931,10 +13013,56 @@ def check_agentcore_policy_tool_scope() -> List[Dict[str, Any]]:
                     status=StatusEnum.FAILED,
                 )
             )
-        elif readable:
+        if caller_wide:
+            findings.append(
+                create_finding(
+                    check_id="AC-35",
+                    finding_name="AgentCore Policy Caller Scope Unbounded",
+                    finding_details=(
+                        f"{label} enforces policy engine {policy_engine_id}, whose "
+                        f"policy {', '.join(sorted(set(caller_wide)))} permits "
+                        "named tools to a bare principal and no condition reads "
+                        "the principal, so every caller the gateway authorizer "
+                        "accepts may call them."
+                    ),
+                    resolution=(
+                        "Name the caller population in the permit head, for "
+                        "example principal is AgentCore::OAuthUser or principal "
+                        "== an entity, or bound it with a condition on the "
+                        "principal's tags."
+                    ),
+                    reference=AGENTCORE_POLICY_CORE_CONCEPTS_REFERENCE_URL,
+                    severity=SeverityEnum.MEDIUM,
+                    status=StatusEnum.FAILED,
+                )
+            )
+        if gateway_wide:
+            findings.append(
+                create_finding(
+                    check_id="AC-35",
+                    finding_name="AgentCore Policy Gateway Scope Unbounded",
+                    finding_details=(
+                        f"{label} enforces policy engine {policy_engine_id}, whose "
+                        f"policy {', '.join(sorted(set(gateway_wide)))} permits "
+                        "named tools on a resource named by type alone or not at "
+                        "all, so the permit applies on every gateway the engine is "
+                        "attached to, including one attached later."
+                    ),
+                    resolution=(
+                        "Name the gateway in each permit with resource == "
+                        'AgentCore::Gateway::"<gateway ARN>".'
+                    ),
+                    reference=AGENTCORE_POLICY_CORE_CONCEPTS_REFERENCE_URL,
+                    severity=SeverityEnum.MEDIUM,
+                    status=StatusEnum.FAILED,
+                )
+            )
+        failed = bool(always_allow or tool_wide or caller_wide or gateway_wide)
+        if not failed and readable and not unreadable:
             bounded = (
                 f"every one of its {len(set(scoped))} enforcing permit policies "
-                "names the actions it authorizes"
+                "names the actions it authorizes, a principal type, entity or "
+                "principal condition, and the gateway it applies on"
                 if scoped
                 else f"none of its {readable} readable enforcing policies permits "
                 "an action at all"
@@ -12957,7 +13085,7 @@ def check_agentcore_policy_tool_scope() -> List[Dict[str, Any]]:
                     status=StatusEnum.PASSED,
                 )
             )
-        elif not unreadable:
+        elif not failed and not readable and not unreadable:
             findings.append(
                 create_finding(
                     check_id="AC-35",
@@ -12976,6 +13104,12 @@ def check_agentcore_policy_tool_scope() -> List[Dict[str, Any]]:
             )
 
         if unreadable:
+            withheld = (
+                " The readable policies raise no finding, but an unread policy "
+                "could permit any tool, so no Passed is reported."
+                if readable and not failed
+                else ""
+            )
             findings.append(
                 create_finding(
                     check_id="AC-35",
@@ -12983,8 +13117,10 @@ def check_agentcore_policy_tool_scope() -> List[Dict[str, Any]]:
                     finding_details=(
                         f"{label} enforces policy "
                         f"{', '.join(sorted(set(unreadable)))}, whose definition "
-                        "carries no policy text to read: a policy still being "
-                        "generated reports only its generation id."
+                        "carries no policy text to read, or a policy head this "
+                        "check cannot score by scope position: a policy still "
+                        "being generated reports only its generation id."
+                        f"{withheld}"
                     ),
                     resolution=(
                         "Rerun the assessment once policy generation has finished, "
@@ -13661,6 +13797,29 @@ def check_agentcore_policy_guardrail_wiring(
     return findings
 
 
+def _temporal_event_patterns(conditions: str) -> Tuple[List[str], bool]:
+    """Return the body of each event pattern a temporal condition matches.
+
+    A temporal predicate matches recorded events written as
+    `AgentCore::Action::"<tool>"::request{ ... }`, or `::response` or `::error`.
+    The second value is False when a pattern's braces do not close, so the
+    caller never reads a pattern it could not extract as one that is scoped.
+    """
+    bodies: List[str] = []
+    matches = list(re.finditer(r"::\s*(?:request|response|error)\s*\{", conditions))
+    for match in matches:
+        depth = 1
+        for index in range(match.end(), len(conditions)):
+            if conditions[index] == "{":
+                depth += 1
+            elif conditions[index] == "}":
+                depth -= 1
+                if depth == 0:
+                    bodies.append(conditions[match.end() : index])
+                    break
+    return bodies, len(bodies) == len(matches)
+
+
 def check_agentcore_policy_session_binding() -> List[Dict[str, Any]]:
     """AC-38: Judge session-aware policy and whether a session binds to a caller.
 
@@ -13670,8 +13829,15 @@ def check_agentcore_policy_session_binding() -> List[Dict[str, Any]]:
     a session to the caller's authenticated identity "on authenticated gateways
     (CUSTOM_JWT or AWS_IAM)", so on a gateway that authenticates no caller two
     callers presenting the same session id share one accumulated history, and a
-    per-session limit is reset or consumed by someone else. AG-25 counts
-    enforcing policies without reading whether any is session-aware.
+    per-session limit is reset or consumed by someone else. AG-25 does not read
+    whether any enforcing policy is session-aware.
+
+    The AIR-ACR-POL-07 recommendation adds that "every temporal predicate must
+    include `eventResource: resource`", so each event pattern a temporal policy
+    matches is read for that key. Whether the workload's multi-step rules are
+    the ones written, and whether the first caller sends the session id header,
+    are not readable from any API: the rules have no declared counterpart to
+    compare against, and the header is set per request.
     """
     if agentcore_client is None:
         return [
@@ -13765,16 +13931,25 @@ def check_agentcore_policy_session_binding() -> List[Dict[str, Any]]:
             continue
 
         temporal_policies = []
+        resource_unscoped: List[str] = []
+        unjudged: List[str] = []
         for policy in policies:
+            policy_name = policy.get("name") or policy.get("policyId") or "unnamed"
             for effect, _, conditions in _cedar_policies(
                 _policy_statement_text(policy)
             ):
                 if effect not in CEDAR_AUTHORIZING_EFFECTS:
                     continue
                 if CEDAR_TEMPORAL_QUALIFIER in _cedar_condition_qualifiers(conditions):
-                    temporal_policies.append(
-                        policy.get("name") or policy.get("policyId") or "unnamed"
-                    )
+                    temporal_policies.append(policy_name)
+                    patterns, complete = _temporal_event_patterns(conditions)
+                    if any(
+                        not re.search(r"\beventResource\s*:\s*\S", body)
+                        for body in patterns
+                    ):
+                        resource_unscoped.append(policy_name)
+                    elif not patterns or not complete:
+                        unjudged.append(policy_name)
                     break
 
         authorizer_type = detail.get("authorizerType") or gateway.get("authorizerType")
@@ -13803,7 +13978,53 @@ def check_agentcore_policy_session_binding() -> List[Dict[str, Any]]:
                     status=StatusEnum.FAILED,
                 )
             )
-        elif authorizer_type in GATEWAY_SESSION_BINDING_AUTHORIZERS:
+            continue
+
+        if resource_unscoped:
+            findings.append(
+                create_finding(
+                    check_id="AC-38",
+                    finding_name="AgentCore Policy Session Rule Resource Unscoped",
+                    finding_details=(
+                        f"{label} enforces temporal policy "
+                        f"{', '.join(sorted(set(resource_unscoped)))}, which "
+                        "matches a recorded event with no eventResource, so the "
+                        "rule is not tied to events on this gateway's resource."
+                    ),
+                    resolution=(
+                        "Add eventResource: resource to every event pattern a "
+                        "temporal predicate matches."
+                    ),
+                    reference=AGENTCORE_POLICY_SESSION_REFERENCE_URL,
+                    severity=SeverityEnum.MEDIUM,
+                    status=StatusEnum.FAILED,
+                )
+            )
+
+        binds = authorizer_type in GATEWAY_SESSION_BINDING_AUTHORIZERS
+        if binds and unjudged and not resource_unscoped:
+            findings.append(
+                create_finding(
+                    check_id="AC-38",
+                    finding_name="AgentCore Policy Session Binding Incomplete",
+                    finding_details=(
+                        f"{label} enforces temporal policy "
+                        f"{', '.join(sorted(set(unjudged)))}, in which no event "
+                        "pattern could be read, so whether each predicate names "
+                        "eventResource was not confirmed and no Passed is "
+                        "reported."
+                    ),
+                    resolution=(
+                        "Confirm each temporal predicate matches an event written "
+                        'as AgentCore::Action::"<tool>"::request{ ... '
+                        "eventResource: resource }."
+                    ),
+                    reference=AGENTCORE_POLICY_SESSION_REFERENCE_URL,
+                    severity=SeverityEnum.INFORMATIONAL,
+                    status=StatusEnum.NA,
+                )
+            )
+        elif binds and not resource_unscoped:
             findings.append(
                 create_finding(
                     check_id="AC-38",
@@ -13830,7 +14051,7 @@ def check_agentcore_policy_session_binding() -> List[Dict[str, Any]]:
                     status=StatusEnum.PASSED,
                 )
             )
-        else:
+        elif not binds:
             findings.append(
                 create_finding(
                     check_id="AC-38",
@@ -18865,6 +19086,7 @@ def check_agentcore_gateway_agentic_security() -> List[Dict[str, Any]]:
                     if policy.get("status") != "ACTIVE"
                     or policy.get("enforcementMode") != "ACTIVE"
                 ]
+                allow_all, unreadable = _cedar_allow_all_permits(active_policies)
                 if not active_policies:
                     findings.append(
                         create_finding(
@@ -18881,6 +19103,49 @@ def check_agentcore_gateway_agentic_security() -> List[Dict[str, Any]]:
                             status=StatusEnum.FAILED,
                         )
                     )
+                elif allow_all:
+                    findings.append(
+                        create_finding(
+                            check_id="AG-25",
+                            finding_name="Agentic AI Gateway Tool Policy Allows All",
+                            finding_details=(
+                                f"Gateway '{gateway_name}' ({gateway_id}) has policy engine "
+                                f"{policy_engine_arn or policy_engine_id or 'unknown'} in ENFORCE "
+                                f"mode, but enforcing policy {', '.join(sorted(allow_all))} "
+                                "permits every action with no condition, so the engine's "
+                                "default-deny denies no tool call."
+                            ),
+                            resolution=(
+                                "Replace the unconditioned permit with permits that name "
+                                "the tools, callers and gateway each one authorizes. AC-35 "
+                                "reports the scope of every permit."
+                            ),
+                            reference=AGENTCORE_POLICY_ENGINE_REFERENCE_URL,
+                            severity=SeverityEnum.HIGH,
+                            status=StatusEnum.FAILED,
+                        )
+                    )
+                elif unreadable:
+                    findings.append(
+                        create_finding(
+                            check_id="AG-25",
+                            finding_name="Agentic AI Gateway Tool Policy Enforcement Incomplete",
+                            finding_details=(
+                                f"Gateway '{gateway_name}' ({gateway_id}) has policy engine "
+                                f"{policy_engine_arn or policy_engine_id or 'unknown'} in ENFORCE "
+                                f"mode, but the text of enforcing policy "
+                                f"{', '.join(sorted(unreadable))} could not be read, and an "
+                                "unread policy could permit every tool, so no Passed is "
+                                "reported."
+                            ),
+                            resolution=(
+                                "Rerun the assessment once policy generation has finished."
+                            ),
+                            reference=AGENTCORE_POLICY_ENGINE_REFERENCE_URL,
+                            severity=SeverityEnum.INFORMATIONAL,
+                            status=StatusEnum.NA,
+                        )
+                    )
                 else:
                     advisory = (
                         f" {len(non_enforcing)} additional policies are inactive or LOG_ONLY."
@@ -18894,7 +19159,9 @@ def check_agentcore_gateway_agentic_security() -> List[Dict[str, Any]]:
                             finding_details=(
                                 f"Gateway '{gateway_name}' ({gateway_id}) has policy engine "
                                 f"{policy_engine_arn or policy_engine_id or 'unknown'} in ENFORCE "
-                                f"mode with {len(active_policies)} active enforcing policies."
+                                f"mode with {len(active_policies)} active enforcing policies, "
+                                "none of which permits every action unconditioned. AC-35 "
+                                "judges the tools, callers and gateway each permit names."
                                 f"{advisory}"
                             ),
                             resolution=(

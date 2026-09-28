@@ -338,6 +338,19 @@ section.
     boundary removes fails as `Unscoped`. A role the cache records as
     unreadable, a role missing from the cache, and a missing cache are `N/A`
     and never `Passed`. No new IAM action.
+  - `AG-25` reads the text of each enforcing policy it used to count. A
+    permit over every action with no condition fails as `Allows All`, and an
+    enforcing policy with no readable text is `N/A`, so a gateway that passed
+    on a policy count can now be `Failed` or `N/A`.
+  - `AC-35` reads the principal and resource of every permit over named
+    tools. A bare `principal` that no condition reads fails as
+    `Caller Scope Unbounded`, and a resource named by type alone or not at all
+    fails as `Gateway Scope Unbounded`. A policy with no readable text, or a
+    head without three scope positions, now withholds the gateway's `Passed`
+    where it was reported beside one.
+  - `AC-38` reads each event pattern of a temporal policy and fails one with
+    no `eventResource` as `Session Rule Resource Unscoped`. A temporal policy
+    with no readable event pattern is `N/A` and no longer passes.
 
 ### Deployment impact
 

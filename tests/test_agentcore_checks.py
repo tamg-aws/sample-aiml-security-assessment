@@ -4038,14 +4038,10 @@ class TestAgenticGatewaySecurity:
             # evaluated, so the association alone no longer passes.
             "wafConfiguration": {"failureMode": "FAIL_CLOSE"},
         }
+        # AG-25 reads the text of each enforcing policy, so a policy with no
+        # definition no longer passes.
         mock_ac.list_policies.return_value = {
-            "policies": [
-                {
-                    "policyId": "p-1",
-                    "status": "ACTIVE",
-                    "enforcementMode": "ACTIVE",
-                }
-            ]
+            "policies": [_cedar_policy("p-1", _SCOPED_PERMIT)]
         }
 
         findings = agentcore_app.check_agentcore_gateway_agentic_security()
@@ -10256,13 +10252,21 @@ _FORBID_ONLY = (
     "  resource is AgentCore::Gateway\n"
     ");"
 )
+# AC-38 reads each event pattern for eventResource, so this carries the event
+# pattern shape of the live probe estate's temporal forbid in place of a bare
+# session count.
 _TEMPORAL_PERMIT = (
     "permit(\n"
     "  principal,\n"
     '  action == AgentCore::Action::"payments___transfer",\n'
     "  resource is AgentCore::Gateway\n"
     ") when temporal {\n"
-    '  context.session.count("payments___verifyPayee") > 0\n'
+    "  exists (t: Timepoint). formerly within 1h (\n"
+    '    AgentCore::Action::"payments___verifyPayee"::response{\n'
+    "      eventPrincipal: principal,\n"
+    "      sessionId: context.sessionId,\n"
+    "      eventResource: resource\n"
+    "    } && tp(t))\n"
     "};"
 )
 _GUARDRAIL_FORBID = (
@@ -10445,7 +10449,9 @@ class TestAC35PolicyToolScope:
         assert "carries no policy text to read" in findings[0]["Finding_Details"]
 
     @patch("agentcore_app.agentcore_client")
-    def test_a_generating_policy_beside_a_scoped_permit_reports_both(self, mock_ac):
+    def test_a_generating_policy_beside_a_scoped_permit_withholds_the_pass(
+        self, mock_ac
+    ):
         mock_ac.list_gateways.return_value = {"items": [self._GATEWAYS[0]]}
         mock_ac.get_gateway.return_value = _policy_engine_gateway()
         mock_ac.list_policies.return_value = {
@@ -10463,11 +10469,11 @@ class TestAC35PolicyToolScope:
 
         findings = agentcore_app.check_agentcore_policy_tool_scope()
 
-        assert [finding["Status"] for finding in findings] == ["Passed", "N/A"]
-        assert (
-            "every one of its 1 enforcing permit policies"
-            in findings[0]["Finding_Details"]
-        )
+        # The unread policy could permit any tool, so the readable scoped permit
+        # no longer passes the gateway beside it.
+        assert [finding["Status"] for finding in findings] == ["N/A"]
+        assert "generating" in findings[0]["Finding_Details"]
+        assert "no Passed is reported" in findings[0]["Finding_Details"]
 
     @patch("agentcore_app.agentcore_client")
     def test_policies_are_read_once_per_engine_across_gateways(self, mock_ac):
@@ -11685,7 +11691,11 @@ class TestAC38PolicySessionBinding:
                     '  action == AgentCore::Action::"payments___transfer",\n'
                     "  resource\n"
                     ") when temporal {\n"
-                    '  context.session.sum("amount") > 1000\n'
+                    "  exists (t: Timepoint). formerly within 24h (\n"
+                    '    AgentCore::Action::"payments___transfer"::request{\n'
+                    "      eventPrincipal: principal,\n"
+                    "      eventResource: resource\n"
+                    "    } && tp(t))\n"
                     "};",
                 )
             ]
@@ -22883,3 +22893,503 @@ class TestAC25GatewayRoleScope:
     def test_the_leg_is_registered_under_ac25(self):
         source = inspect.getsource(agentcore_app.lambda_handler)
         assert "check_agentcore_gateway_role_scope(permission_cache)" in source
+
+
+_CALLER_WIDE_PERMIT = (
+    "permit(\n"
+    "  principal,\n"
+    '  action == AgentCore::Action::"payments___listPayees",\n'
+    '  resource == AgentCore::Gateway::"arn:aws:bedrock-agentcore:us-east-1:'
+    '123456789012:gateway/gw-1"\n'
+    ");"
+)
+_GATEWAY_WIDE_PERMIT = (
+    "permit(\n"
+    "  principal is AgentCore::OAuthUser,\n"
+    '  action == AgentCore::Action::"payments___listPayees",\n'
+    "  resource is AgentCore::Gateway\n"
+    ");"
+)
+
+
+class TestAC35CallerAndGatewayScope:
+    """AC-35 reads the principal and resource of a permit over named tools."""
+
+    @staticmethod
+    def _run(mock_ac, statements_by_gateway):
+        mock_ac.list_gateways.return_value = {
+            "items": [{"gatewayId": g, "name": g} for g in statements_by_gateway]
+        }
+        mock_ac.get_gateway.side_effect = lambda gatewayIdentifier, **kwargs: (
+            _policy_engine_gateway(arn=f"{_ENGINE_ARN}-{gatewayIdentifier}")
+        )
+        mock_ac.list_policies.side_effect = lambda policyEngineId, **kwargs: {
+            "policies": [
+                _cedar_policy(f"p{index}", statement)
+                for index, statement in enumerate(
+                    statements_by_gateway[policyEngineId.split("pe-1-", 1)[1]]
+                )
+            ]
+        }
+        return agentcore_app.check_agentcore_policy_tool_scope()
+
+    @patch("agentcore_app.agentcore_client")
+    def test_each_gateway_is_judged_on_all_three_positions(self, mock_ac):
+        findings = self._run(
+            mock_ac,
+            {
+                "gw-scoped": [_SCOPED_PERMIT],
+                "gw-callers": [_CALLER_WIDE_PERMIT],
+                "gw-gateways": [_GATEWAY_WIDE_PERMIT],
+            },
+        )
+
+        by_gateway = {}
+        for finding in findings:
+            assert_finding_schema(finding)
+            for gateway_id in ("gw-scoped", "gw-callers", "gw-gateways"):
+                if f"({gateway_id})" in finding["Finding_Details"]:
+                    by_gateway.setdefault(gateway_id, []).append(finding)
+        assert [f["Status"] for f in by_gateway["gw-scoped"]] == ["Passed"]
+        assert [f["Finding"] for f in by_gateway["gw-callers"]] == [
+            "AgentCore Policy Caller Scope Unbounded"
+        ]
+        assert by_gateway["gw-callers"][0]["Status"] == "Failed"
+        assert by_gateway["gw-callers"][0]["Severity"] == "Medium"
+        assert [f["Finding"] for f in by_gateway["gw-gateways"]] == [
+            "AgentCore Policy Gateway Scope Unbounded"
+        ]
+        assert by_gateway["gw-gateways"][0]["Status"] == "Failed"
+
+    @patch("agentcore_app.agentcore_client")
+    def test_one_wide_permit_among_scoped_ones_fails_the_engine(self, mock_ac):
+        findings = self._run(
+            mock_ac,
+            {"gw-1": [_SCOPED_PERMIT, _SCOPED_PERMIT, _CALLER_WIDE_PERMIT]},
+        )
+
+        assert [f["Status"] for f in findings] == ["Failed"]
+        assert "policy p2 permits" in findings[0]["Finding_Details"]
+        assert "p0" not in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_permit_open_on_both_positions_reports_both(self, mock_ac):
+        findings = self._run(
+            mock_ac,
+            {
+                "gw-1": [
+                    'permit(principal, action == AgentCore::Action::"a___b", resource);'
+                ]
+            },
+        )
+
+        assert [f["Finding"] for f in findings] == [
+            "AgentCore Policy Caller Scope Unbounded",
+            "AgentCore Policy Gateway Scope Unbounded",
+        ]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_condition_on_the_principal_bounds_a_bare_principal(self, mock_ac):
+        findings = self._run(
+            mock_ac,
+            {
+                "gw-1": [
+                    "permit(\n"
+                    "  principal,\n"
+                    '  action == AgentCore::Action::"a___b",\n'
+                    '  resource == AgentCore::Gateway::"arn:aws:bedrock-agentcore:'
+                    'us-east-1:123456789012:gateway/gw-1"\n'
+                    ") when {\n"
+                    '  principal.hasTag("team") && principal.getTag("team") == "pay"\n'
+                    "};"
+                ]
+            },
+        )
+
+        assert [f["Status"] for f in findings] == ["Passed"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_condition_on_the_input_does_not_bound_the_callers(self, mock_ac):
+        findings = self._run(
+            mock_ac,
+            {
+                "gw-1": [
+                    "permit(\n"
+                    "  principal,\n"
+                    '  action == AgentCore::Action::"a___b",\n'
+                    '  resource == AgentCore::Gateway::"arn:aws:bedrock-agentcore:'
+                    'us-east-1:123456789012:gateway/gw-1"\n'
+                    ") when {\n"
+                    "  context.input.amount < 100\n"
+                    "};"
+                ]
+            },
+        )
+
+        assert [f["Finding"] for f in findings] == [
+            "AgentCore Policy Caller Scope Unbounded"
+        ]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_an_event_resource_reference_does_not_name_a_gateway(self, mock_ac):
+        # A temporal predicate carries `eventResource: resource`, which reads the
+        # resource without naming one, so it must not count as the bound.
+        findings = self._run(mock_ac, {"gw-1": [_TEMPORAL_PERMIT]})
+
+        assert "AgentCore Policy Gateway Scope Unbounded" in [
+            f["Finding"] for f in findings
+        ]
+        assert "Passed" not in [f["Status"] for f in findings]
+
+    @pytest.mark.parametrize(
+        "resource",
+        [
+            'resource == AgentCore::Gateway::"arn:aws:bedrock-agentcore:us-east-1:'
+            '123456789012:gateway/gw-1"',
+            'resource in AgentCore::Gateway::"arn:aws:bedrock-agentcore:us-east-1:'
+            '123456789012:gateway/gw-1"',
+            'resource is AgentCore::Gateway in AgentCore::Gateway::"arn:aws:'
+            'bedrock-agentcore:us-east-1:123456789012:gateway/gw-1"',
+        ],
+    )
+    @patch("agentcore_app.agentcore_client")
+    def test_an_entity_resource_names_the_gateway(self, mock_ac, resource):
+        findings = self._run(
+            mock_ac,
+            {
+                "gw-1": [
+                    "permit(principal is AgentCore::OAuthUser, "
+                    f'action == AgentCore::Action::"a___b", {resource});'
+                ]
+            },
+        )
+
+        assert [f["Status"] for f in findings] == ["Passed"]
+
+    def test_an_operator_inside_a_string_literal_is_not_the_operator(self):
+        assert agentcore_app._cedar_scope_operators(
+            'resource is AgentCore::Gateway::"x in y == z"'
+        ) == ["resource", "is", 'AgentCore::Gateway::""']
+        assert not agentcore_app._cedar_resource_is_bounded(
+            ["principal", "action", 'resource is T::"a in b"']
+        )
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_head_with_two_positions_never_passes(self, mock_ac):
+        # A head this reader cannot score by position is not read as bounded.
+        findings = self._run(
+            mock_ac,
+            {
+                "gw-1": [
+                    _SCOPED_PERMIT,
+                    'permit(principal, action == AgentCore::Action::"a___b");',
+                ]
+            },
+        )
+
+        assert [f["Status"] for f in findings] == ["N/A"]
+        assert "p1" in findings[0]["Finding_Details"]
+        assert "no Passed is reported" in findings[0]["Finding_Details"]
+
+
+def _ag25_gateway(engine):
+    return {
+        "authorizerType": "AWS_IAM",
+        "policyEngineConfiguration": {
+            "arn": (
+                "arn:aws:bedrock-agentcore:us-east-1:123456789012:"
+                f"policy-engine/{engine}"
+            ),
+            "mode": "ENFORCE",
+        },
+    }
+
+
+class TestAG25EnforcingPolicyText:
+    """AG-25 reads the text of the enforcing policies it used to count."""
+
+    @staticmethod
+    def _ag25(mock_ac, gateways, policies_by_engine):
+        mock_ac.list_gateways.return_value = {
+            "items": [{"gatewayId": g, "name": f"name-{g}"} for g in gateways]
+        }
+        mock_ac.get_gateway.side_effect = lambda gatewayIdentifier, **kwargs: gateways[
+            gatewayIdentifier
+        ]
+        mock_ac.list_policies.side_effect = lambda policyEngineId, **kwargs: {
+            "policies": policies_by_engine[policyEngineId]
+        }
+        return [
+            f
+            for f in agentcore_app.check_agentcore_gateway_agentic_security()
+            if f["Check_ID"] == "AG-25"
+        ]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_an_allow_all_permit_fails_only_its_own_gateway(self, mock_ac):
+        findings = self._ag25(
+            mock_ac,
+            {"gw-open": _ag25_gateway("pe-open"), "gw-ok": _ag25_gateway("pe-ok")},
+            {
+                "pe-open": [
+                    _cedar_policy("scoped", _SCOPED_PERMIT),
+                    _cedar_policy("allow_all", _UNCONDITIONED_PERMIT),
+                ],
+                "pe-ok": [_cedar_policy("scoped", _SCOPED_PERMIT)],
+            },
+        )
+
+        by_gateway = {
+            g: f
+            for f in findings
+            for g in ("gw-open", "gw-ok")
+            if f"({g})" in f["Finding_Details"]
+        }
+        assert len(findings) == 2
+        assert by_gateway["gw-open"]["Status"] == "Failed"
+        assert by_gateway["gw-open"]["Finding"].endswith("Allows All")
+        assert "allow_all" in by_gateway["gw-open"]["Finding_Details"]
+        assert "scoped" not in by_gateway["gw-open"]["Finding_Details"]
+        assert by_gateway["gw-ok"]["Status"] == "Passed"
+        assert "AC-35" in by_gateway["gw-ok"]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_conditioned_permit_over_every_tool_is_left_to_ac35(self, mock_ac):
+        # The live tag permit names no action but carries a condition, so the
+        # engine still denies some calls. AC-35 reports its tool scope.
+        findings = self._ag25(
+            mock_ac,
+            {"gw-1": _ag25_gateway("pe-1")},
+            {"pe-1": [_cedar_policy("abac", _LIVE_TAG_PERMIT)]},
+        )
+
+        assert [f["Status"] for f in findings] == ["Passed"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_an_unreadable_enforcing_policy_never_passes(self, mock_ac):
+        generating = {
+            "policyId": "p-gen",
+            "name": "generating",
+            "status": "ACTIVE",
+            "enforcementMode": "ACTIVE",
+            "definition": {"policyGeneration": {"policyGenerationId": "pg-1"}},
+        }
+        findings = self._ag25(
+            mock_ac,
+            {"gw-1": _ag25_gateway("pe-1")},
+            {"pe-1": [_cedar_policy("scoped", _SCOPED_PERMIT), generating]},
+        )
+
+        assert [f["Status"] for f in findings] == ["N/A"]
+        assert findings[0]["Finding"].endswith("Incomplete")
+        assert "generating" in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_an_allow_all_permit_in_log_only_is_not_enforced(self, mock_ac):
+        findings = self._ag25(
+            mock_ac,
+            {"gw-1": _ag25_gateway("pe-1")},
+            {
+                "pe-1": [
+                    _cedar_policy("scoped", _SCOPED_PERMIT),
+                    _cedar_policy(
+                        "allow_all", _UNCONDITIONED_PERMIT, enforcement_mode="LOG_ONLY"
+                    ),
+                ]
+            },
+        )
+
+        assert [f["Status"] for f in findings] == ["Passed"]
+        assert "1 additional policies are inactive" in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_an_allow_all_permit_on_a_later_page_is_found(self, mock_ac):
+        mock_ac.list_gateways.return_value = {
+            "items": [{"gatewayId": "gw-1", "name": "gw"}]
+        }
+        mock_ac.get_gateway.return_value = _ag25_gateway("pe-1")
+        mock_ac.list_policies.side_effect = [
+            {"policies": [_cedar_policy("scoped", _SCOPED_PERMIT)], "nextToken": "t"},
+            {"policies": [_cedar_policy("allow_all", _UNCONDITIONED_PERMIT)]},
+        ]
+
+        findings = [
+            f
+            for f in agentcore_app.check_agentcore_gateway_agentic_security()
+            if f["Check_ID"] == "AG-25"
+        ]
+
+        assert [f["Status"] for f in findings] == ["Failed"]
+        assert findings[0]["Finding"].endswith("Allows All")
+
+
+def _temporal_statement(*patterns):
+    body = " && ".join(
+        f'AgentCore::Action::"payments___{tool}"::{kind}{{ {fields} }}'
+        for tool, kind, fields in patterns
+    )
+    return (
+        "permit(\n"
+        "  principal,\n"
+        '  action == AgentCore::Action::"payments___transfer",\n'
+        "  resource is AgentCore::Gateway\n"
+        ") when temporal {\n"
+        f"  exists (t: Timepoint). formerly within 1h ({body} && tp(t))\n"
+        "};"
+    )
+
+
+_SCOPED_EVENT = (
+    "verifyPayee",
+    "response",
+    "eventPrincipal: principal, eventResource: resource",
+)
+_UNSCOPED_EVENT = ("verifyPayee", "response", "eventPrincipal: principal")
+
+
+class TestAC38EventResource:
+    """AC-38 reads every event pattern of a temporal policy for eventResource."""
+
+    @staticmethod
+    def _run(mock_ac, statements_by_gateway, authorizer="AWS_IAM"):
+        mock_ac.list_gateways.return_value = {
+            "items": [{"gatewayId": g, "name": g} for g in statements_by_gateway]
+        }
+        mock_ac.get_gateway.side_effect = lambda gatewayIdentifier, **kwargs: (
+            _policy_engine_gateway(
+                arn=f"{_ENGINE_ARN}-{gatewayIdentifier}", authorizerType=authorizer
+            )
+        )
+        mock_ac.list_policies.side_effect = lambda policyEngineId, **kwargs: {
+            "policies": [
+                _cedar_policy(f"p{index}", statement)
+                for index, statement in enumerate(
+                    statements_by_gateway[policyEngineId.split("pe-1-", 1)[1]]
+                )
+            ]
+        }
+        return agentcore_app.check_agentcore_policy_session_binding()
+
+    @patch("agentcore_app.agentcore_client")
+    def test_each_gateway_is_judged_by_its_own_event_patterns(self, mock_ac):
+        findings = self._run(
+            mock_ac,
+            {
+                "gw-scoped": [_temporal_statement(_SCOPED_EVENT)],
+                "gw-unscoped": [_temporal_statement(_UNSCOPED_EVENT)],
+                "gw-unread": [
+                    "permit(principal, action, resource is AgentCore::Gateway) "
+                    'when temporal { context.session.count("x") > 0 };'
+                ],
+            },
+        )
+
+        by_gateway = {}
+        for finding in findings:
+            assert_finding_schema(finding)
+            for gateway_id in ("gw-scoped", "gw-unscoped", "gw-unread"):
+                if f"({gateway_id})" in finding["Finding_Details"]:
+                    by_gateway.setdefault(gateway_id, []).append(finding)
+        assert [f["Status"] for f in by_gateway["gw-scoped"]] == ["Passed"]
+        assert [f["Finding"] for f in by_gateway["gw-unscoped"]] == [
+            "AgentCore Policy Session Rule Resource Unscoped"
+        ]
+        assert by_gateway["gw-unscoped"][0]["Status"] == "Failed"
+        assert by_gateway["gw-unscoped"][0]["Severity"] == "Medium"
+        assert [f["Status"] for f in by_gateway["gw-unread"]] == ["N/A"]
+        assert by_gateway["gw-unread"][0]["Finding"].endswith("Incomplete")
+
+    @patch("agentcore_app.agentcore_client")
+    def test_one_unscoped_pattern_among_scoped_ones_fails_the_policy(self, mock_ac):
+        findings = self._run(
+            mock_ac,
+            {
+                "gw-1": [
+                    _temporal_statement(_SCOPED_EVENT, _UNSCOPED_EVENT, _SCOPED_EVENT)
+                ]
+            },
+        )
+
+        assert [f["Status"] for f in findings] == ["Failed"]
+        assert findings[0]["Finding"].endswith("Resource Unscoped")
+
+    @patch("agentcore_app.agentcore_client")
+    def test_only_the_unscoped_policy_is_named(self, mock_ac):
+        findings = self._run(
+            mock_ac,
+            {
+                "gw-1": [
+                    _temporal_statement(_SCOPED_EVENT),
+                    _temporal_statement(_UNSCOPED_EVENT),
+                ]
+            },
+        )
+
+        assert [f["Status"] for f in findings] == ["Failed"]
+        assert "policy p1," in findings[0]["Finding_Details"]
+        assert "p0" not in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_an_unauthenticated_gateway_reports_both_defects(self, mock_ac):
+        findings = self._run(
+            mock_ac, {"gw-1": [_temporal_statement(_UNSCOPED_EVENT)]}, "NONE"
+        )
+
+        assert [f["Finding"] for f in findings] == [
+            "AgentCore Policy Session Rule Resource Unscoped",
+            "AgentCore Policy Session Binding Unauthenticated",
+        ]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_an_empty_event_resource_value_is_unscoped(self, mock_ac):
+        findings = self._run(
+            mock_ac,
+            {
+                "gw-1": [
+                    _temporal_statement(
+                        (
+                            "verifyPayee",
+                            "request",
+                            "eventPrincipal: principal, eventResource:",
+                        )
+                    )
+                ]
+            },
+        )
+
+        assert [f["Status"] for f in findings] == ["Failed"]
+
+    @pytest.mark.parametrize("kind", ["request", "response", "error"])
+    @patch("agentcore_app.agentcore_client")
+    def test_every_event_kind_is_read(self, mock_ac, kind):
+        findings = self._run(
+            mock_ac,
+            {
+                "gw-1": [
+                    _temporal_statement(
+                        _SCOPED_EVENT,
+                        ("verifyPayee", kind, "eventPrincipal: principal"),
+                    )
+                ]
+            },
+        )
+
+        assert [f["Status"] for f in findings] == ["Failed"]
+
+    def test_an_unclosed_pattern_is_not_read_as_extracted(self):
+        bodies, complete = agentcore_app._temporal_event_patterns(
+            'A::"x"::request{ eventResource: resource } && B::"y"::error{ a: b'
+        )
+        assert bodies == [" eventResource: resource "]
+        assert not complete
+
+    @patch("agentcore_app.agentcore_client")
+    def test_an_unclosed_pattern_beside_a_scoped_one_never_passes(self, mock_ac):
+        statement = (
+            "permit(principal, action, resource is AgentCore::Gateway) "
+            'when temporal { A::"x"::request{ eventResource: resource } '
+            '&& B::"y"::error{ a: b };'
+        )
+        findings = self._run(mock_ac, {"gw-1": [statement]})
+
+        assert "Passed" not in [f["Status"] for f in findings]
