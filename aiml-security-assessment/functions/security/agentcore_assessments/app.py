@@ -54,6 +54,8 @@ xray_client = None
 ce_client = None
 s3control_client = None
 agentcore_data_client = None
+network_firewall_client = None
+inspector2_client = None
 
 # Environment variables
 BUCKET_NAME = os.environ.get("AIML_ASSESSMENT_BUCKET_NAME")
@@ -5600,6 +5602,331 @@ def check_agentcore_ecr_enhanced_scanning() -> List[Dict[str, Any]]:
         )
 
     return runtime_findings + findings
+
+
+# AIR-SLF-CMP-01 asks that Inspector findings on agent images reach the deploy
+# stage through EventBridge. Inspector publishes each finding to the default bus
+# as source aws.inspector2 with detail-type "Inspector2 Finding", and reports
+# per repository whether it scans it through ListCoverage.
+INSPECTOR_FINDING_EVENT_SOURCE = "aws.inspector2"
+INSPECTOR_FINDING_DETAIL_TYPE = "Inspector2 Finding"
+INSPECTOR_ECR_IMAGE_RESOURCE_TYPE = "AWS_ECR_CONTAINER_IMAGE"
+INSPECTOR_EVENTBRIDGE_REFERENCE_URL = (
+    "https://docs.aws.amazon.com/inspector/latest/user/"
+    "findings-managing-automating-responses.html"
+)
+
+
+def _inspector_finding_rule_matches(pattern: Dict[str, Any]) -> bool:
+    """Return whether a rule pattern matches Inspector findings on ECR images.
+
+    The source must name aws.inspector2 and a detail-type, if set, must name
+    Inspector2 Finding. A detail filter such as severity is the threshold the
+    workload chose and is not judged, except that a literal resource type list
+    must hold AWS_ECR_CONTAINER_IMAGE.
+    """
+    sources = pattern.get("source")
+    sources = sources if isinstance(sources, list) else [sources]
+    if INSPECTOR_FINDING_EVENT_SOURCE not in sources:
+        return False
+    if "detail-type" in pattern:
+        detail_types = pattern["detail-type"]
+        detail_types = (
+            detail_types if isinstance(detail_types, list) else [detail_types]
+        )
+        if INSPECTOR_FINDING_DETAIL_TYPE not in detail_types:
+            return False
+    resources = (pattern.get("detail") or {}).get("resources")
+    if isinstance(resources, dict) and "type" in resources:
+        types = resources["type"]
+        types = types if isinstance(types, list) else [types]
+        if all(isinstance(value, str) for value in types) and (
+            INSPECTOR_ECR_IMAGE_RESOURCE_TYPE not in types
+        ):
+            return False
+    return True
+
+
+def check_agentcore_image_scan_gate() -> List[Dict[str, Any]]:
+    """AC-50: Judge whether Inspector scans and routes findings on agent images.
+
+    The registry scanning configuration AC-50 reads says which repositories
+    enhanced scanning should cover. Inspector's ListCoverage reports whether it
+    does: a repository whose scanStatus is INACTIVE is not scanned, whatever
+    the configuration says, and the reason is reported. The deploy gate the
+    recommendation asks for consumes Inspector findings from EventBridge, so an
+    enabled rule on the default bus whose pattern matches Inspector findings
+    and that has a target is required. What the target does with a finding is
+    not read. A denied inspector2 or events read is informational N/A naming
+    the action, never Passed.
+    """
+    coverage_name = "AgentCore ECR Inspector Coverage"
+    gate_name = "AgentCore Image Finding Gate"
+    reference = ECR_ENHANCED_SCANNING_REFERENCE_URL
+    if ecr_client is None:
+        return [
+            create_finding(
+                check_id="AC-50",
+                finding_name=coverage_name,
+                finding_details="Amazon ECR client not available in this region.",
+                resolution="No action required unless AgentCore runs in this region.",
+                reference=reference,
+                severity=SeverityEnum.INFORMATIONAL,
+                status=StatusEnum.NA,
+            )
+        ]
+    try:
+        runtime_images, _ = _agentcore_runtime_images()
+    except ClientError:
+        runtime_images = {}
+    try:
+        repositories, _ = _agentcore_ecr_repositories(runtime_images)
+    except (BotoCoreError, ClientError) as error:
+        return [
+            _incomplete_check_finding(
+                check_id="AC-50",
+                finding_name=coverage_name,
+                error=error,
+                reference=reference,
+            )
+        ]
+    names = sorted({str(repo.get("repositoryName")) for repo in repositories if repo})
+    if not names:
+        return [
+            create_finding(
+                check_id="AC-50",
+                finding_name=coverage_name,
+                finding_details=(
+                    "No AgentCore ECR repositories found in this region, so no "
+                    "image's scan coverage or finding routing was judged."
+                ),
+                resolution="No action required.",
+                reference=reference,
+                severity=SeverityEnum.INFORMATIONAL,
+                status=StatusEnum.NA,
+            )
+        ]
+
+    findings = []
+    coverage_error = None
+    covered: Dict[str, Dict[str, Any]] = {}
+    if inspector2_client is None:
+        coverage_error = "the Inspector client is not available in this region"
+    else:
+        try:
+            resources = _paginate_aws_list(
+                inspector2_client,
+                "list_coverage",
+                "coveredResources",
+                token_request_key="nextToken",
+                token_response_key="nextToken",
+                filterCriteria={
+                    "resourceType": [
+                        {"comparison": "EQUALS", "value": "AWS_ECR_REPOSITORY"}
+                    ]
+                },
+            )
+        except (BotoCoreError, ClientError) as error:
+            coverage_error = _assessment_error_label(error)
+        else:
+            for resource in resources:
+                metadata = (resource.get("resourceMetadata") or {}).get(
+                    "ecrRepository"
+                ) or {}
+                name = metadata.get("name")
+                if name:
+                    covered[str(name)] = resource
+
+    for name in names:
+        if coverage_error:
+            findings.append(
+                create_finding(
+                    check_id="AC-50",
+                    finding_name=coverage_name,
+                    finding_details=(
+                        f"Whether Inspector scans ECR repository '{name}' is "
+                        f"unknown: ListCoverage failed ({coverage_error})."
+                    ),
+                    resolution="Grant inspector2:ListCoverage and retry.",
+                    reference=reference,
+                    severity=SeverityEnum.INFORMATIONAL,
+                    status=StatusEnum.NA,
+                )
+            )
+            continue
+        resource = covered.get(name)
+        if resource is None:
+            findings.append(
+                create_finding(
+                    check_id="AC-50",
+                    finding_name=coverage_name,
+                    finding_details=(
+                        f"Inspector's coverage lists no ECR repository '{name}' in "
+                        "this region, so its agent images are not scanned by "
+                        "Inspector."
+                    ),
+                    resolution=(
+                        "Activate Amazon Inspector ECR scanning in this region and "
+                        "add an enhanced scanning filter that matches this "
+                        "repository."
+                    ),
+                    reference=reference,
+                    severity=SeverityEnum.MEDIUM,
+                    status=StatusEnum.FAILED,
+                )
+            )
+            continue
+        scan_status = resource.get("scanStatus") or {}
+        code = scan_status.get("statusCode")
+        reason = scan_status.get("reason") or "no reason reported"
+        if code == "ACTIVE":
+            findings.append(
+                create_finding(
+                    check_id="AC-50",
+                    finding_name=coverage_name,
+                    finding_details=(
+                        f"Inspector reports ECR repository '{name}' as ACTIVE "
+                        f"({reason})."
+                    ),
+                    resolution="No action required.",
+                    reference=reference,
+                    severity=SeverityEnum.MEDIUM,
+                    status=StatusEnum.PASSED,
+                )
+            )
+        else:
+            findings.append(
+                create_finding(
+                    check_id="AC-50",
+                    finding_name=coverage_name,
+                    finding_details=(
+                        f"Inspector reports ECR repository '{name}' as "
+                        f"{code or 'no status'} ({reason}), so its agent images "
+                        "are not being scanned."
+                    ),
+                    resolution=(
+                        "Resolve the reason Inspector reports and confirm the "
+                        "repository returns to ACTIVE."
+                    ),
+                    reference=reference,
+                    severity=SeverityEnum.MEDIUM,
+                    status=StatusEnum.FAILED,
+                )
+            )
+
+    unread = None
+    gate = None
+    if events_client is None:
+        unread = ("the EventBridge client is not available", "events:ListRules")
+    else:
+        try:
+            rules = _paginate_aws_list(
+                events_client,
+                "list_rules",
+                "Rules",
+                token_request_key="NextToken",
+                token_response_key="NextToken",
+            )
+        except (BotoCoreError, ClientError) as error:
+            unread = (
+                f"ListRules failed ({_assessment_error_label(error)})",
+                "events:ListRules",
+            )
+            rules = []
+        untargeted = []
+        for rule in rules:
+            if rule.get("State") != "ENABLED":
+                continue
+            try:
+                pattern = json.loads(rule.get("EventPattern") or "")
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(pattern, dict) or not _inspector_finding_rule_matches(
+                pattern
+            ):
+                continue
+            try:
+                targets = _paginate_aws_list(
+                    events_client,
+                    "list_targets_by_rule",
+                    "Targets",
+                    token_request_key="NextToken",
+                    token_response_key="NextToken",
+                    Rule=rule.get("Name"),
+                )
+            except (BotoCoreError, ClientError) as error:
+                unread = (
+                    f"the targets of rule {rule.get('Name')} could not be listed "
+                    f"({_assessment_error_label(error)})",
+                    "events:ListTargetsByRule",
+                )
+                continue
+            if targets:
+                gate = (rule.get("Name"), len(targets))
+                break
+            untargeted.append(str(rule.get("Name")))
+
+    repo_text = ", ".join(f"'{name}'" for name in names)
+    if gate:
+        findings.append(
+            create_finding(
+                check_id="AC-50",
+                finding_name=gate_name,
+                finding_details=(
+                    f"Enabled EventBridge rule {gate[0]} on the default bus matches "
+                    f"Inspector findings on ECR images and has {gate[1]} target(s), "
+                    f"so a finding on repository {repo_text} reaches a consumer. "
+                    "Whether the consumer blocks a deploy is not read."
+                ),
+                resolution="No action required.",
+                reference=INSPECTOR_EVENTBRIDGE_REFERENCE_URL,
+                severity=SeverityEnum.MEDIUM,
+                status=StatusEnum.PASSED,
+            )
+        )
+    elif unread:
+        findings.append(
+            create_finding(
+                check_id="AC-50",
+                finding_name=gate_name,
+                finding_details=(
+                    "Whether an EventBridge rule routes Inspector findings on "
+                    f"repository {repo_text} to a deploy gate is unknown: "
+                    f"{unread[0]}."
+                ),
+                resolution=f"Grant {unread[1]} and retry.",
+                reference=INSPECTOR_EVENTBRIDGE_REFERENCE_URL,
+                severity=SeverityEnum.INFORMATIONAL,
+                status=StatusEnum.NA,
+            )
+        )
+    else:
+        untargeted_text = (
+            f" Rule(s) {', '.join(untargeted)} match them but have no target."
+            if untargeted
+            else ""
+        )
+        findings.append(
+            create_finding(
+                check_id="AC-50",
+                finding_name=gate_name,
+                finding_details=(
+                    "No enabled EventBridge rule with a target on the default bus "
+                    "matches Inspector findings on ECR images, so a vulnerability "
+                    f"found in repository {repo_text} stops no deploy."
+                    f"{untargeted_text}"
+                ),
+                resolution=(
+                    "Add an EventBridge rule on source aws.inspector2 and "
+                    "detail-type Inspector2 Finding at the agreed severity, with a "
+                    "target that fails the deploy stage."
+                ),
+                reference=INSPECTOR_EVENTBRIDGE_REFERENCE_URL,
+                severity=SeverityEnum.MEDIUM,
+                status=StatusEnum.FAILED,
+            )
+        )
+    return findings
 
 
 # AC-06 judges where recordings go as well as whether they are on. A recording
@@ -25215,6 +25542,682 @@ def check_agentcore_dns_egress_control(
     return findings
 
 
+# AC-49's second leg reads the AWS Network Firewall each hosting subnet's
+# default route reaches. A domain allow-list rule group names the hosts agents
+# may reach by TLS SNI and by HTTP Host header, and drops the traffic of those
+# protocols that matches no name. The AWS managed threat signature groups and
+# the domain reputation groups are the inspection AIR-FND-NET-04 names. A
+# managed group's ARN has the account segment aws-managed and ends in a
+# StrictOrder or ActionOrder variant of its name.
+NETWORK_FIREWALL_DOMAIN_LIST_REFERENCE_URL = (
+    "https://docs.aws.amazon.com/network-firewall/latest/developerguide/"
+    "stateful-rule-groups-domain-names.html"
+)
+NETWORK_FIREWALL_THREAT_SIGNATURE_REFERENCE_URL = (
+    "https://docs.aws.amazon.com/network-firewall/latest/developerguide/"
+    "aws-managed-rule-groups-threat-signature.html"
+)
+NETWORK_FIREWALL_DOMAIN_TARGET_TYPES = ("TLS_SNI", "HTTP_HOST")
+NETWORK_FIREWALL_THREAT_SIGNATURE_PREFIX = "ThreatSignatures"
+NETWORK_FIREWALL_REPUTATION_GROUPS = (
+    "MalwareDomains",
+    "BotNetCommandAndControlDomains",
+    "AbusedLegitMalwareDomains",
+)
+NETWORK_FIREWALL_ORDER_SUFFIXES = ("StrictOrder", "ActionOrder")
+
+
+def _network_firewall_managed_group_name(arn: str) -> Optional[str]:
+    """Return an AWS managed stateful group's name without its order variant."""
+    parts = str(arn).split(":", 5)
+    if len(parts) < 6 or parts[4] != "aws-managed":
+        return None
+    name = parts[5].split("/", 1)[-1]
+    for suffix in NETWORK_FIREWALL_ORDER_SUFFIXES:
+        if name.endswith(suffix):
+            return name[: -len(suffix)]
+    return name
+
+
+def _route_table_for_subnet(
+    tables: List[Dict[str, Any]], subnet_id: str
+) -> Optional[Dict[str, Any]]:
+    """Return the route table a subnet uses: its explicit one, else the main one."""
+    main = None
+    for table in tables:
+        for association in table.get("Associations") or []:
+            if association.get("SubnetId") == subnet_id:
+                return table
+            if association.get("Main"):
+                main = table
+    return main
+
+
+def _default_routes(table: Optional[Dict[str, Any]]) -> List[Tuple[str, str, str]]:
+    """Return (destination, target key, target id) for a table's default routes.
+
+    A blackhole route drops what it matches, so it sends nothing anywhere.
+    """
+    routes = []
+    for route in (table or {}).get("Routes") or []:
+        destination = route.get("DestinationCidrBlock") or route.get(
+            "DestinationIpv6CidrBlock"
+        )
+        if destination not in ("0.0.0.0/0", "::/0"):
+            continue
+        if route.get("State") == "blackhole":
+            continue
+        for key in (
+            "VpcEndpointId",
+            "NatGatewayId",
+            "GatewayId",
+            "EgressOnlyInternetGatewayId",
+            "TransitGatewayId",
+            "NetworkInterfaceId",
+            "InstanceId",
+            "VpcPeeringConnectionId",
+            "CoreNetworkArn",
+            "CarrierGatewayId",
+            "LocalGatewayId",
+        ):
+            if route.get(key):
+                routes.append((destination, key, str(route[key])))
+                break
+        else:
+            routes.append((destination, "no target", "none"))
+    return routes
+
+
+def _network_firewall_policy_gaps(
+    firewall_name: str,
+    policy: Dict[str, Any],
+    rule_groups: Dict[str, Dict[str, Any]],
+    subnet_cidrs: Dict[str, str],
+) -> Tuple[List[str], List[str], List[str]]:
+    """Return (allow-list gaps, threat inspection gaps, unread notes) for a policy.
+
+    rule_groups maps each customer stateful group ARN the policy references to
+    its DescribeRuleGroup RuleGroup. HOME_NET is compared to the hosting subnets
+    only where the policy or an allow-list group sets it; unset, it is the
+    firewall's own VPC, which holds the hosting subnets.
+    """
+    allow_gaps: List[str] = []
+    threat_gaps: List[str] = []
+    unread: List[str] = []
+    rule_order = (policy.get("StatefulEngineOptions") or {}).get(
+        "RuleOrder"
+    ) or "DEFAULT_ACTION_ORDER"
+    references = policy.get("StatefulRuleGroupReferences") or []
+
+    allow_types: Set[str] = set()
+    allow_groups: List[Dict[str, Any]] = []
+    silent_groups: List[str] = []
+    for reference in references:
+        arn = str(reference.get("ResourceArn") or "")
+        group = rule_groups.get(arn)
+        if group is None:
+            continue
+        source_list = (group.get("RulesSource") or {}).get("RulesSourceList") or {}
+        generated = source_list.get("GeneratedRulesType")
+        if generated == "ALLOWLIST":
+            allow_groups.append(group)
+            allow_types.update(source_list.get("TargetTypes") or [])
+        elif generated in ("REJECTLIST", "ALERTLIST"):
+            silent_groups.append(f"{arn.rsplit('/', 1)[-1]} ({generated})")
+
+    if not allow_groups:
+        allow_gaps.append(
+            f"firewall {firewall_name}'s policy references no stateful domain "
+            "list rule group of type ALLOWLIST, so no destination name is required"
+        )
+    else:
+        missing_types = [
+            target
+            for target in NETWORK_FIREWALL_DOMAIN_TARGET_TYPES
+            if target not in allow_types
+        ]
+        if missing_types:
+            allow_gaps.append(
+                f"firewall {firewall_name}'s domain allow-list matches no "
+                f"{' or '.join(missing_types)}, so traffic of that protocol is not "
+                "held to the list"
+            )
+    if silent_groups and rule_order == "DEFAULT_ACTION_ORDER":
+        allow_gaps.append(
+            f"firewall {firewall_name}'s policy uses DEFAULT_ACTION_ORDER and "
+            f"references the domain list group(s) {', '.join(silent_groups)}, "
+            "which the allow-list's drop is evaluated before, so they never act"
+        )
+
+    definitions: List[Tuple[str, List[str]]] = []
+    policy_home = (
+        ((policy.get("PolicyVariables") or {}).get("RuleVariables") or {}).get(
+            "HOME_NET"
+        )
+        or {}
+    ).get("Definition")
+    if policy_home:
+        definitions.append(("the policy", list(policy_home)))
+    for group in allow_groups:
+        group_home = (
+            ((group.get("RuleVariables") or {}).get("IPSets") or {}).get("HOME_NET")
+            or {}
+        ).get("Definition")
+        if group_home:
+            definitions.append(("an allow-list rule group", list(group_home)))
+
+    def covers(cidrs: List[str]) -> List[str]:
+        networks = []
+        for entry in cidrs:
+            try:
+                networks.append(ipaddress.ip_network(str(entry), strict=False))
+            except ValueError:
+                continue
+        uncovered = []
+        for subnet_id, cidr in sorted(subnet_cidrs.items()):
+            try:
+                subnet = ipaddress.ip_network(cidr, strict=False)
+            except ValueError:
+                continue
+            if not any(
+                subnet.version == network.version and subnet.subnet_of(network)
+                for network in networks
+            ):
+                uncovered.append(f"{subnet_id} ({cidr})")
+        return uncovered
+
+    if allow_groups and definitions:
+        results = [(where, cidrs, covers(cidrs)) for where, cidrs in definitions]
+        failing = [result for result in results if result[2]]
+        if failing and len(failing) == len(results):
+            where, cidrs, uncovered = failing[0]
+            allow_gaps.append(
+                f"firewall {firewall_name}'s HOME_NET, set in {where} to "
+                f"{', '.join(cidrs)}, does not hold hosting subnet(s) "
+                f"{', '.join(uncovered)}, so the allow-list does not inspect "
+                "their traffic"
+            )
+        elif failing:
+            unread.append(
+                f"firewall {firewall_name} sets HOME_NET in both the policy and an "
+                "allow-list rule group, only one of which holds every hosting "
+                "subnet, and which one applies is not read"
+            )
+
+    signatures: List[str] = []
+    reputation: List[str] = []
+    alerting: List[str] = []
+    for reference in references:
+        name = _network_firewall_managed_group_name(reference.get("ResourceArn"))
+        if not name:
+            continue
+        if (reference.get("Override") or {}).get("Action") == "DROP_TO_ALERT":
+            alerting.append(name)
+            continue
+        if name.startswith(NETWORK_FIREWALL_THREAT_SIGNATURE_PREFIX):
+            signatures.append(name)
+        elif name in NETWORK_FIREWALL_REPUTATION_GROUPS:
+            reputation.append(name)
+    alert_note = (
+        f" ({', '.join(sorted(alerting))} are overridden to DROP_TO_ALERT, so they "
+        "only alert)"
+        if alerting
+        else ""
+    )
+    if not signatures:
+        threat_gaps.append(
+            f"firewall {firewall_name}'s policy references no AWS managed "
+            f"{NETWORK_FIREWALL_THREAT_SIGNATURE_PREFIX} rule group that drops"
+            f"{alert_note}"
+        )
+    if not reputation:
+        threat_gaps.append(
+            f"firewall {firewall_name}'s policy references none of the domain "
+            f"reputation groups {', '.join(NETWORK_FIREWALL_REPUTATION_GROUPS)} "
+            f"that drops{alert_note if signatures else ''}"
+        )
+    return allow_gaps, threat_gaps, unread
+
+
+def check_agentcore_network_firewall_egress(
+    browser_inventory: Dict[str, Any] = None,
+) -> List[Dict[str, Any]]:
+    """AC-49: Judge the Network Firewall each AgentCore hosting subnet egresses through.
+
+    The DNS leg of AC-49 decides which names resolve. A connection to an address
+    needs no name, and a client can present an approved name while connecting
+    elsewhere, so the recommendation pairs DNS Firewall with an AWS Network
+    Firewall domain allow-list over TLS SNI and HTTP Host.
+
+    Each hosting subnet's default routes are followed one hop: to a firewall
+    endpoint in the VPC, or through a NAT gateway to the endpoint the NAT
+    gateway's subnet routes to. A route to an internet gateway, or a NAT gateway
+    whose subnet routes to one, bypasses inspection and fails. A transit gateway,
+    a Gateway Load Balancer endpoint or any other target is not followed and is
+    not judged. A subnet with no default route reaches only its routed
+    destinations, which this leg does not judge.
+
+    Two rows are reported for each VPC. The egress row judges each reached
+    firewall's policy for an ALLOWLIST domain group matching TLS_SNI and
+    HTTP_HOST, no REJECTLIST or ALERTLIST domain group beside it under
+    DEFAULT_ACTION_ORDER, and a HOME_NET that holds the hosting subnets where one
+    is set. The threat row requires an AWS managed ThreatSignatures group and a
+    domain reputation group that are not overridden to DROP_TO_ALERT. A denied
+    network-firewall or ec2 read makes the rows informational N/A naming the
+    action, never Passed.
+    """
+    egress_name = "AgentCore Network Firewall Egress"
+    threat_name = "AgentCore Network Firewall Threat Inspection"
+    reference = NETWORK_FIREWALL_DOMAIN_LIST_REFERENCE_URL
+    if agentcore_client is None or ec2_client is None:
+        return [
+            create_finding(
+                check_id="AC-49",
+                finding_name=egress_name,
+                finding_details=(
+                    "The AgentCore or EC2 client is not available in this region."
+                ),
+                resolution="No action required unless AgentCore runs in this region.",
+                reference=reference,
+                severity=SeverityEnum.INFORMATIONAL,
+                status=StatusEnum.NA,
+            )
+        ]
+
+    try:
+        subnet_references, errors = _agentcore_hosting_subnets(browser_inventory)
+    except Exception as error:
+        return [
+            _incomplete_check_finding(
+                check_id="AC-49",
+                finding_name=egress_name,
+                error=error,
+                reference=reference,
+            )
+        ]
+    if not subnet_references and not errors:
+        return [
+            create_finding(
+                check_id="AC-49",
+                finding_name=egress_name,
+                finding_details=(
+                    "No AgentCore runtime, browser or code interpreter in this "
+                    "region runs in a VPC, so no hosting subnet's egress was judged."
+                ),
+                resolution="No action required for this check.",
+                reference=reference,
+                severity=SeverityEnum.INFORMATIONAL,
+                status=StatusEnum.NA,
+            )
+        ]
+    findings = _agentcore_tool_read_findings("AC-49", egress_name, errors, reference)
+    if not subnet_references:
+        return findings
+
+    def not_read(details: str, action: str) -> Dict[str, Any]:
+        return create_finding(
+            check_id="AC-49",
+            finding_name=egress_name,
+            finding_details=details,
+            resolution=f"Grant {action} and retry.",
+            reference=reference,
+            severity=SeverityEnum.INFORMATIONAL,
+            status=StatusEnum.NA,
+        )
+
+    subnet_ids = sorted({subnet_id for _, subnet_id in subnet_references})
+    try:
+        described, missing_subnets = _describe_subnets_reporting_missing(subnet_ids)
+    except (BotoCoreError, ClientError) as error:
+        findings.append(
+            not_read(
+                f"The {len(subnet_ids)} subnet(s) that host AgentCore resources "
+                "could not be described, so their VPCs and routes are unknown: "
+                f"{_assessment_error_label(error)}.",
+                "ec2:DescribeSubnets",
+            )
+        )
+        return findings
+    if missing_subnets:
+        findings.append(
+            create_finding(
+                check_id="AC-49",
+                finding_name=egress_name,
+                finding_details=(
+                    f"{len(missing_subnets)} hosting subnet(s) are not present in "
+                    "this account and Region (InvalidSubnetID.NotFound), so their "
+                    f"egress was not judged: {', '.join(missing_subnets)}."
+                ),
+                resolution=(
+                    "Update the network configuration of these resources to name "
+                    "subnets that exist, then retry."
+                ),
+                reference=reference,
+                severity=SeverityEnum.INFORMATIONAL,
+                status=StatusEnum.NA,
+            )
+        )
+
+    vpc_subnets: Dict[str, Dict[str, str]] = {}
+    vpc_users: Dict[str, Set[str]] = {}
+    subnet_vpcs = {}
+    for subnet in described:
+        if subnet.get("SubnetId") and subnet.get("VpcId"):
+            subnet_vpcs[subnet["SubnetId"]] = subnet["VpcId"]
+            vpc_subnets.setdefault(subnet["VpcId"], {})[subnet["SubnetId"]] = str(
+                subnet.get("CidrBlock") or ""
+            )
+    for label, subnet_id in subnet_references:
+        if subnet_id in subnet_vpcs:
+            vpc_users.setdefault(subnet_vpcs[subnet_id], set()).add(label)
+
+    for vpc_id in sorted(vpc_users):
+        hosted = ", ".join(sorted(vpc_users[vpc_id]))
+        hosting = vpc_subnets[vpc_id]
+        subject = f"VPC {vpc_id}, which hosts {hosted},"
+        if network_firewall_client is None:
+            findings.append(
+                not_read(
+                    f"{subject} was not judged: the Network Firewall client is not "
+                    "available in this region.",
+                    "network-firewall:ListFirewalls",
+                )
+            )
+            continue
+        try:
+            listed = _paginate_aws_list(
+                network_firewall_client,
+                "list_firewalls",
+                "Firewalls",
+                token_request_key="NextToken",
+                token_response_key="NextToken",
+                VpcIds=[vpc_id],
+            )
+        except (BotoCoreError, ClientError) as error:
+            findings.append(
+                not_read(
+                    f"The Network Firewalls in {vpc_id}, which hosts {hosted}, could "
+                    f"not be listed: {_assessment_error_label(error)}.",
+                    "network-firewall:ListFirewalls",
+                )
+            )
+            continue
+
+        endpoints: Dict[str, Dict[str, Any]] = {}
+        firewall_error = None
+        for metadata in listed:
+            arn = metadata.get("FirewallArn")
+            try:
+                described_firewall = network_firewall_client.describe_firewall(
+                    FirewallArn=arn
+                )
+            except (BotoCoreError, ClientError) as error:
+                firewall_error = (
+                    f"Network Firewall {metadata.get('FirewallName') or arn} in "
+                    f"{vpc_id} could not be described: "
+                    f"{_assessment_error_label(error)}."
+                )
+                break
+            firewall = described_firewall.get("Firewall") or {}
+            status = described_firewall.get("FirewallStatus") or {}
+            for state in (status.get("SyncStates") or {}).values():
+                endpoint_id = (state.get("Attachment") or {}).get("EndpointId")
+                if endpoint_id:
+                    endpoints[endpoint_id] = firewall
+        if firewall_error:
+            findings.append(
+                not_read(firewall_error, "network-firewall:DescribeFirewall")
+            )
+            continue
+
+        try:
+            tables = _paginate_aws_list(
+                ec2_client,
+                "describe_route_tables",
+                "RouteTables",
+                token_request_key="NextToken",
+                token_response_key="NextToken",
+                Filters=[{"Name": "vpc-id", "Values": [vpc_id]}],
+            )
+        except (BotoCoreError, ClientError) as error:
+            findings.append(
+                not_read(
+                    f"The route tables of {vpc_id}, which hosts {hosted}, could not "
+                    f"be read: {_assessment_error_label(error)}.",
+                    "ec2:DescribeRouteTables",
+                )
+            )
+            continue
+
+        reached: Dict[str, Dict[str, Any]] = {}
+        bypassing: List[str] = []
+        unresolved: List[str] = []
+        unrouted: List[str] = []
+        nat_error = None
+        nat_subnets: Dict[str, Optional[str]] = {}
+        for subnet_id in sorted(hosting):
+            routes = _default_routes(_route_table_for_subnet(tables, subnet_id))
+            if not routes:
+                unrouted.append(subnet_id)
+            for destination, key, target in routes:
+                where = f"{subnet_id} ({destination} to {target})"
+                if key == "VpcEndpointId" and target in endpoints:
+                    firewall = endpoints[target]
+                    reached[str(firewall.get("FirewallArn"))] = firewall
+                elif key == "NatGatewayId":
+                    if target not in nat_subnets:
+                        try:
+                            gateways = _paginate_aws_list(
+                                ec2_client,
+                                "describe_nat_gateways",
+                                "NatGateways",
+                                token_request_key="NextToken",
+                                token_response_key="NextToken",
+                                NatGatewayIds=[target],
+                            )
+                        except (BotoCoreError, ClientError) as error:
+                            nat_error = (
+                                f"NAT gateway {target}, the default route of "
+                                f"hosting subnet {subnet_id}, could not be read: "
+                                f"{_assessment_error_label(error)}"
+                            )
+                            break
+                        nat_subnets[target] = next(
+                            (
+                                gateway.get("SubnetId")
+                                for gateway in gateways
+                                if gateway.get("SubnetId")
+                            ),
+                            None,
+                        )
+                    nat_subnet = nat_subnets[target]
+                    if not nat_subnet:
+                        unresolved.append(f"{where}, whose subnet is not reported")
+                        continue
+                    onward = _default_routes(
+                        _route_table_for_subnet(tables, nat_subnet)
+                    )
+                    for _, onward_key, onward_target in onward:
+                        if onward_key == "VpcEndpointId" and onward_target in endpoints:
+                            firewall = endpoints[onward_target]
+                            reached[str(firewall.get("FirewallArn"))] = firewall
+                        elif onward_key == "GatewayId" and onward_target.startswith(
+                            "igw-"
+                        ):
+                            bypassing.append(f"{where}, then to {onward_target}")
+                        else:
+                            unresolved.append(f"{where}, then to {onward_target}")
+                    if not onward:
+                        unrouted.append(subnet_id)
+                elif (key == "GatewayId" and target.startswith("igw-")) or (
+                    key == "EgressOnlyInternetGatewayId"
+                ):
+                    bypassing.append(where)
+                else:
+                    unresolved.append(where)
+            if nat_error:
+                break
+        if nat_error:
+            findings.append(
+                not_read(
+                    f"{subject} was not judged: {nat_error}.",
+                    "ec2:DescribeNatGateways",
+                )
+            )
+            continue
+
+        allow_gaps: List[str] = []
+        threat_gaps: List[str] = []
+        unread: List[str] = []
+        policy_action = None
+        for arn in sorted(reached):
+            firewall = reached[arn]
+            name = firewall.get("FirewallName") or arn
+            try:
+                policy = (
+                    network_firewall_client.describe_firewall_policy(
+                        FirewallPolicyArn=firewall.get("FirewallPolicyArn")
+                    ).get("FirewallPolicy")
+                    or {}
+                )
+            except (BotoCoreError, ClientError) as error:
+                unread.append(
+                    f"the policy of firewall {name} could not be read "
+                    f"({_assessment_error_label(error)})"
+                )
+                policy_action = "network-firewall:DescribeFirewallPolicy"
+                continue
+            groups: Dict[str, Dict[str, Any]] = {}
+            group_error = None
+            for group_reference in policy.get("StatefulRuleGroupReferences") or []:
+                group_arn = str(group_reference.get("ResourceArn") or "")
+                if not group_arn or _network_firewall_managed_group_name(group_arn):
+                    continue
+                try:
+                    groups[group_arn] = (
+                        network_firewall_client.describe_rule_group(
+                            RuleGroupArn=group_arn
+                        ).get("RuleGroup")
+                        or {}
+                    )
+                except (BotoCoreError, ClientError) as error:
+                    group_error = (
+                        f"rule group {group_arn.rsplit('/', 1)[-1]} of firewall "
+                        f"{name} could not be read ({_assessment_error_label(error)})"
+                    )
+                    break
+            if group_error:
+                unread.append(group_error)
+                policy_action = policy_action or "network-firewall:DescribeRuleGroup"
+                continue
+            gaps, threats, notes = _network_firewall_policy_gaps(
+                name, policy, groups, hosting
+            )
+            allow_gaps.extend(gaps)
+            threat_gaps.extend(threats)
+            unread.extend(notes)
+
+        route_text = ""
+        if unresolved:
+            route_text += (
+                f" Default route(s) {'; '.join(unresolved)} are not followed, so "
+                "whether that traffic is inspected is not judged."
+            )
+        if unrouted:
+            route_text += (
+                f" Hosting subnet(s) {', '.join(sorted(set(unrouted)))} have no "
+                "default route past the VPC."
+            )
+        reached_text = ", ".join(
+            sorted(str(f.get("FirewallName") or arn) for arn, f in reached.items())
+        )
+
+        for row_name, gaps, row_reference in (
+            (egress_name, allow_gaps, reference),
+            (threat_name, threat_gaps, NETWORK_FIREWALL_THREAT_SIGNATURE_REFERENCE_URL),
+        ):
+            problems = list(gaps)
+            if bypassing:
+                problems.insert(
+                    0,
+                    f"default route(s) {'; '.join(bypassing)} reach the internet "
+                    "through no Network Firewall",
+                )
+            if problems:
+                status, severity = StatusEnum.FAILED, SeverityEnum.MEDIUM
+                details = f"{subject} {'; and '.join(problems)}.{route_text}"
+                resolution = (
+                    "Route each hosting subnet's default route through a Network "
+                    "Firewall endpoint whose policy holds an ALLOWLIST domain rule "
+                    "group matching TLS_SNI and HTTP_HOST"
+                    if row_name == egress_name
+                    else "Route each hosting subnet's default route through a "
+                    "Network Firewall whose policy references an AWS managed "
+                    "ThreatSignatures rule group and a domain reputation group, "
+                    "neither overridden to DROP_TO_ALERT"
+                ) + "."
+            elif unread:
+                status, severity = StatusEnum.NA, SeverityEnum.INFORMATIONAL
+                details = (
+                    f"{subject} reaches firewall(s) {reached_text}, but "
+                    f"{'; '.join(unread)}.{route_text}"
+                )
+                resolution = (
+                    f"Grant {policy_action} and retry."
+                    if policy_action
+                    else "Set HOME_NET in one place that holds every hosting subnet."
+                )
+            elif not reached:
+                status, severity = StatusEnum.NA, SeverityEnum.INFORMATIONAL
+                details = (
+                    f"{subject} has no hosting subnet whose default route reaches "
+                    f"a Network Firewall in the VPC ({len(endpoints)} firewall "
+                    f"endpoint(s) listed).{route_text}"
+                )
+                resolution = (
+                    "No action required if egress is inspected in a VPC this "
+                    "check does not follow."
+                )
+            elif unresolved:
+                status, severity = StatusEnum.NA, SeverityEnum.INFORMATIONAL
+                details = (
+                    f"{subject} routes through firewall(s) {reached_text}, which "
+                    f"pass this row, but not every hosting subnet does.{route_text}"
+                )
+                resolution = (
+                    "No action required if the other routes are inspected in a VPC "
+                    "this check does not follow."
+                )
+            else:
+                status, severity = StatusEnum.PASSED, SeverityEnum.MEDIUM
+                details = (
+                    f"{subject} routes every hosting subnet's default route through "
+                    f"firewall(s) {reached_text}, "
+                    + (
+                        "whose policy holds a domain allow-list over TLS_SNI and "
+                        "HTTP_HOST. IP and CIDR rules beside it are not judged."
+                        if row_name == egress_name
+                        else "whose policy drops on an AWS managed ThreatSignatures "
+                        "group and a domain reputation group."
+                    )
+                    + route_text
+                )
+                resolution = "No action required."
+            findings.append(
+                create_finding(
+                    check_id="AC-49",
+                    finding_name=row_name,
+                    finding_details=details,
+                    resolution=resolution,
+                    reference=row_reference,
+                    severity=severity,
+                    status=status,
+                )
+            )
+
+    return findings
+
+
 # The web ACL setting that decides how much of an agent's tool payload AWS WAF
 # inspects. AGENTCORE_GATEWAY is the AssociatedResourceType key a gateway
 # association uses, and the API documents KB_16 as the limit that applies when
@@ -27056,7 +28059,7 @@ def lambda_handler(event, context):
     global kms_client, organizations_client
     global wafv2_client, route53resolver_client, cognito_client, events_client
     global bedrock_client, xray_client, ce_client, s3control_client
-    global agentcore_data_client
+    global agentcore_data_client, network_firewall_client, inspector2_client
     start_time = time.time()
 
     try:
@@ -27119,6 +28122,14 @@ def lambda_handler(event, context):
         except BotoCoreError as e:
             logger.warning(f"Could not create the bedrock-agentcore client: {e}")
             agentcore_data_client = None
+        # AC-49 reads the Network Firewall in each hosting VPC, and AC-50 reads
+        # Inspector's coverage of the agent image repositories.
+        network_firewall_client = boto3.client(
+            "network-firewall", config=boto3_config, region_name=region
+        )
+        inspector2_client = boto3.client(
+            "inspector2", config=boto3_config, region_name=region
+        )
 
         # Collect all findings
         all_findings = []
@@ -27666,9 +28677,19 @@ def lambda_handler(event, context):
                 lambda: check_agentcore_dns_egress_control(browser_inventory),
             ),
             (
+                ["AC-49"],
+                "Network Firewall Egress",
+                lambda: check_agentcore_network_firewall_egress(browser_inventory),
+            ),
+            (
                 ["AC-50"],
                 "ECR Enhanced Scanning",
                 check_agentcore_ecr_enhanced_scanning,
+            ),
+            (
+                ["AC-50"],
+                "Image Scan Coverage And Gate",
+                check_agentcore_image_scan_gate,
             ),
             (
                 ["AC-51"],

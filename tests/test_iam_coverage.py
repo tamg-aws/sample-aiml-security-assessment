@@ -1163,6 +1163,11 @@ _VERIFIED_REMEDIATION_IAM_ACTIONS |= {
 # defines the operation with a Namespace filter. AC-40 names it when the score
 # metrics an alarm reads cannot be listed.
 _VERIFIED_REMEDIATION_IAM_ACTIONS |= {"cloudwatch:ListMetrics"}
+# Verified on 2026-09-28 against the inspector2 service reference JSON, which
+# lists ListCoverage with no resource type, and botocore's inspector2 model,
+# which defines the operation with a resourceType filter. AC-50 names it when
+# Inspector's coverage of an agent image repository cannot be listed.
+_VERIFIED_REMEDIATION_IAM_ACTIONS |= {"inspector2:ListCoverage"}
 
 _NON_IAM_REMEDIATION_TOKENS = {
     # SM-41 names the AWS IoT Core policy variables

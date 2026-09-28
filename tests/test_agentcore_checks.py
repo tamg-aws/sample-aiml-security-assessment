@@ -36512,3 +36512,789 @@ class TestAC30EndpointVersions:
         ]
         findings = agentcore_app.check_agentcore_runtime_inbound_authorization()
         assert [f["Status"] for f in findings] == ["Passed", "Failed"]
+
+
+# ===================================================================
+# AC-49 Network Firewall egress
+# ===================================================================
+_NFW_ALLOW_ARN = (
+    "arn:aws:network-firewall:us-east-1:123456789012:stateful-rulegroup/allow"
+)
+_NFW_MANAGED = "arn:aws:network-firewall:us-east-1:aws-managed:stateful-rulegroup/"
+
+
+def _nfw_allow_group(
+    target_types=("TLS_SNI", "HTTP_HOST"), home_net=None, kind="ALLOWLIST"
+):
+    group = {
+        "RulesSource": {
+            "RulesSourceList": {
+                "Targets": [".amazonaws.com"],
+                "TargetTypes": list(target_types),
+                "GeneratedRulesType": kind,
+            }
+        }
+    }
+    if home_net is not None:
+        group["RuleVariables"] = {"IPSets": {"HOME_NET": {"Definition": home_net}}}
+    return group
+
+
+def _nfw_policy(
+    groups=(_NFW_ALLOW_ARN,),
+    managed=("ThreatSignaturesBotnetStrictOrder", "MalwareDomainsStrictOrder"),
+    order="STRICT_ORDER",
+    overrides=(),
+    home_net=None,
+):
+    references = [
+        {"ResourceArn": arn, "Priority": 10 * (i + 1)} for i, arn in enumerate(groups)
+    ]
+    for name in managed:
+        reference = {"ResourceArn": _NFW_MANAGED + name, "Priority": 900}
+        if name in overrides:
+            reference["Override"] = {"Action": "DROP_TO_ALERT"}
+        references.append(reference)
+    policy = {
+        "StatelessDefaultActions": ["aws:forward_to_sfe"],
+        "StatefulRuleGroupReferences": references,
+    }
+    if order:
+        policy["StatefulEngineOptions"] = {"RuleOrder": order}
+    if home_net is not None:
+        policy["PolicyVariables"] = {
+            "RuleVariables": {"HOME_NET": {"Definition": home_net}}
+        }
+    return policy
+
+
+class TestAC49NetworkFirewallEgress:
+    """AC-49's Network Firewall leg follows each hosting subnet's default route."""
+
+    def _wire(
+        self,
+        mock_ac,
+        mock_ec2,
+        mock_nfw,
+        subnets=None,
+        routes=None,
+        firewalls=None,
+        policies=None,
+        groups=None,
+        nat_subnets=None,
+    ):
+        """Stub VPC-mode runtimes, their subnets' routes and the firewalls.
+
+        subnets maps subnet id to (vpc id, cidr); routes maps subnet id to its
+        0.0.0.0/0 target; firewalls maps firewall name to (vpc id, endpoint ids,
+        policy name).
+        """
+        subnets = subnets or {"subnet-a": ("vpc-a", "10.0.1.0/24")}
+        runtime_subnets = [s for s in subnets if not s.startswith("subnet-pub")]
+        mock_ac.list_agent_runtimes.return_value = {
+            "agentRuntimes": [{"agentRuntimeId": "rt-1", "agentRuntimeName": "rt-1"}]
+        }
+        mock_ac.get_agent_runtime.return_value = {
+            "networkConfiguration": {
+                "networkMode": "VPC",
+                "networkModeConfig": {"subnets": runtime_subnets},
+            }
+        }
+        mock_ac.list_code_interpreters.return_value = {"codeInterpreterSummaries": []}
+        mock_ec2.describe_subnets.return_value = {
+            "Subnets": [
+                {"SubnetId": s, "VpcId": vpc, "CidrBlock": cidr}
+                for s, (vpc, cidr) in subnets.items()
+                if s in runtime_subnets
+            ]
+        }
+        routes = (
+            routes
+            if routes is not None
+            else {"subnet-a": ("VpcEndpointId", "vpce-fw1")}
+        )
+        tables = []
+        for subnet_id, target in routes.items():
+            route_list = [{"DestinationCidrBlock": "10.0.0.0/16", "GatewayId": "local"}]
+            if target:
+                key, value = target
+                route_list.append(
+                    {"DestinationCidrBlock": "0.0.0.0/0", key: value, "State": "active"}
+                )
+            tables.append(
+                {
+                    "RouteTableId": f"rtb-{subnet_id}",
+                    "Associations": [{"SubnetId": subnet_id, "Main": False}],
+                    "Routes": route_list,
+                }
+            )
+        mock_ec2.describe_route_tables.return_value = {"RouteTables": tables}
+        nat_subnets = nat_subnets or {}
+        mock_ec2.describe_nat_gateways.side_effect = lambda NatGatewayIds: {
+            "NatGateways": [
+                {"NatGatewayId": n, "SubnetId": nat_subnets[n]}
+                for n in NatGatewayIds
+                if n in nat_subnets
+            ]
+        }
+        firewalls = (
+            firewalls
+            if firewalls is not None
+            else {"fw1": ("vpc-a", ["vpce-fw1"], "p1")}
+        )
+        arn = "arn:aws:network-firewall:us-east-1:123456789012:firewall/{}".format
+        mock_nfw.list_firewalls.side_effect = lambda VpcIds, **_: {
+            "Firewalls": [
+                {"FirewallName": name, "FirewallArn": arn(name)}
+                for name, (vpc, _, _) in firewalls.items()
+                if vpc in VpcIds
+            ]
+        }
+
+        def describe_firewall(FirewallArn):
+            name = FirewallArn.rsplit("/", 1)[-1]
+            _, endpoints, policy = firewalls[name]
+            return {
+                "Firewall": {
+                    "FirewallName": name,
+                    "FirewallArn": FirewallArn,
+                    "FirewallPolicyArn": f"arn:aws:network-firewall:us-east-1:123456789012:firewall-policy/{policy}",
+                },
+                "FirewallStatus": {
+                    "Status": "READY",
+                    "SyncStates": {
+                        f"us-east-1{chr(97 + i)}": {
+                            "Attachment": {"EndpointId": e, "Status": "READY"}
+                        }
+                        for i, e in enumerate(endpoints)
+                    },
+                },
+            }
+
+        mock_nfw.describe_firewall.side_effect = describe_firewall
+        policies = policies if policies is not None else {"p1": _nfw_policy()}
+        mock_nfw.describe_firewall_policy.side_effect = lambda FirewallPolicyArn: {
+            "FirewallPolicy": policies[FirewallPolicyArn.rsplit("/", 1)[-1]]
+        }
+        groups = groups if groups is not None else {_NFW_ALLOW_ARN: _nfw_allow_group()}
+        mock_nfw.describe_rule_group.side_effect = lambda RuleGroupArn: {
+            "RuleGroup": groups[RuleGroupArn]
+        }
+        return None
+
+    @staticmethod
+    def _rows(findings):
+        return {
+            f["Finding"]
+            .replace(" Egress", "|egress")
+            .replace(" Threat Inspection", "|threat")
+            .split("|")[1]: f
+            for f in findings
+        }
+
+    def _run(self, mock_ac, mock_ec2, mock_nfw, **kwargs):
+        inventory = self._wire(mock_ac, mock_ec2, mock_nfw, **kwargs)
+        return agentcore_app.check_agentcore_network_firewall_egress(inventory)
+
+    @patch("agentcore_app.network_firewall_client")
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_routed_allow_list_with_threat_groups_passes_both_rows(
+        self, mock_ac, mock_ec2, mock_nfw
+    ):
+        findings = self._run(mock_ac, mock_ec2, mock_nfw)
+
+        rows = self._rows(findings)
+        assert len(findings) == 2
+        assert rows["egress"]["Status"] == "Passed"
+        assert rows["threat"]["Status"] == "Passed"
+        assert "firewall(s) fw1" in rows["egress"]["Finding_Details"]
+        assert all(f["Check_ID"] == "AC-49" for f in findings)
+        for finding in findings:
+            assert_finding_schema(finding)
+
+    @patch("agentcore_app.network_firewall_client")
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_route_to_an_internet_gateway_fails_both_rows(
+        self, mock_ac, mock_ec2, mock_nfw
+    ):
+        findings = self._run(
+            mock_ac, mock_ec2, mock_nfw, routes={"subnet-a": ("GatewayId", "igw-1")}
+        )
+
+        rows = self._rows(findings)
+        assert rows["egress"]["Status"] == "Failed"
+        assert rows["threat"]["Status"] == "Failed"
+        assert "subnet-a (0.0.0.0/0 to igw-1)" in rows["egress"]["Finding_Details"]
+        assert "through no Network Firewall" in rows["egress"]["Finding_Details"]
+
+    @patch("agentcore_app.network_firewall_client")
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_one_bypassing_subnet_fails_beside_a_routed_one(
+        self, mock_ac, mock_ec2, mock_nfw
+    ):
+        findings = self._run(
+            mock_ac,
+            mock_ec2,
+            mock_nfw,
+            subnets={
+                "subnet-a": ("vpc-a", "10.0.1.0/24"),
+                "subnet-b": ("vpc-a", "10.0.2.0/24"),
+            },
+            routes={
+                "subnet-a": ("VpcEndpointId", "vpce-fw1"),
+                "subnet-b": ("GatewayId", "igw-1"),
+            },
+        )
+
+        rows = self._rows(findings)
+        assert rows["egress"]["Status"] == "Failed"
+        assert "subnet-b (0.0.0.0/0 to igw-1)" in rows["egress"]["Finding_Details"]
+        assert "subnet-a (" not in rows["egress"]["Finding_Details"]
+
+    @patch("agentcore_app.network_firewall_client")
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_an_allow_list_without_http_host_fails_only_the_egress_row(
+        self, mock_ac, mock_ec2, mock_nfw
+    ):
+        findings = self._run(
+            mock_ac,
+            mock_ec2,
+            mock_nfw,
+            groups={_NFW_ALLOW_ARN: _nfw_allow_group(target_types=("TLS_SNI",))},
+        )
+
+        rows = self._rows(findings)
+        assert rows["egress"]["Status"] == "Failed"
+        assert "matches no HTTP_HOST" in rows["egress"]["Finding_Details"]
+        assert rows["threat"]["Status"] == "Passed"
+
+    @patch("agentcore_app.network_firewall_client")
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_deny_list_is_not_an_allow_list(self, mock_ac, mock_ec2, mock_nfw):
+        findings = self._run(
+            mock_ac,
+            mock_ec2,
+            mock_nfw,
+            groups={_NFW_ALLOW_ARN: _nfw_allow_group(kind="DENYLIST")},
+        )
+
+        rows = self._rows(findings)
+        assert rows["egress"]["Status"] == "Failed"
+        assert (
+            "no stateful domain list rule group of type ALLOWLIST"
+            in rows["egress"]["Finding_Details"]
+        )
+
+    @patch("agentcore_app.network_firewall_client")
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_an_alert_list_fails_under_default_order_only(
+        self, mock_ac, mock_ec2, mock_nfw
+    ):
+        alert_arn = _NFW_ALLOW_ARN + "-alert"
+        groups = {
+            _NFW_ALLOW_ARN: _nfw_allow_group(),
+            alert_arn: _nfw_allow_group(kind="ALERTLIST"),
+        }
+        default = self._rows(
+            self._run(
+                mock_ac,
+                mock_ec2,
+                mock_nfw,
+                policies={
+                    "p1": _nfw_policy(groups=(_NFW_ALLOW_ARN, alert_arn), order=None)
+                },
+                groups=groups,
+            )
+        )
+        strict = self._rows(
+            self._run(
+                mock_ac,
+                mock_ec2,
+                mock_nfw,
+                policies={"p1": _nfw_policy(groups=(_NFW_ALLOW_ARN, alert_arn))},
+                groups=groups,
+            )
+        )
+
+        assert default["egress"]["Status"] == "Failed"
+        assert "allow-alert (ALERTLIST)" in default["egress"]["Finding_Details"]
+        assert strict["egress"]["Status"] == "Passed"
+
+    @patch("agentcore_app.network_firewall_client")
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_home_net_that_misses_the_hosting_subnet_fails(
+        self, mock_ac, mock_ec2, mock_nfw
+    ):
+        narrow = self._rows(
+            self._run(
+                mock_ac,
+                mock_ec2,
+                mock_nfw,
+                groups={_NFW_ALLOW_ARN: _nfw_allow_group(home_net=["10.9.0.0/16"])},
+            )
+        )
+        wide = self._rows(
+            self._run(
+                mock_ac,
+                mock_ec2,
+                mock_nfw,
+                policies={"p1": _nfw_policy(home_net=["10.0.0.0/8"])},
+            )
+        )
+
+        assert narrow["egress"]["Status"] == "Failed"
+        assert "subnet-a (10.0.1.0/24)" in narrow["egress"]["Finding_Details"]
+        assert wide["egress"]["Status"] == "Passed"
+
+    @patch("agentcore_app.network_firewall_client")
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_disagreeing_home_net_settings_withhold_the_pass(
+        self, mock_ac, mock_ec2, mock_nfw
+    ):
+        rows = self._rows(
+            self._run(
+                mock_ac,
+                mock_ec2,
+                mock_nfw,
+                policies={"p1": _nfw_policy(home_net=["10.0.0.0/8"])},
+                groups={_NFW_ALLOW_ARN: _nfw_allow_group(home_net=["10.9.0.0/16"])},
+            )
+        )
+
+        assert rows["egress"]["Status"] == "N/A"
+        assert "which one applies is not read" in rows["egress"]["Finding_Details"]
+
+    @patch("agentcore_app.network_firewall_client")
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_threat_groups_overridden_to_alert_fail_the_threat_row(
+        self, mock_ac, mock_ec2, mock_nfw
+    ):
+        rows = self._rows(
+            self._run(
+                mock_ac,
+                mock_ec2,
+                mock_nfw,
+                policies={
+                    "p1": _nfw_policy(overrides=("ThreatSignaturesBotnetStrictOrder",))
+                },
+            )
+        )
+
+        assert rows["threat"]["Status"] == "Failed"
+        assert "DROP_TO_ALERT" in rows["threat"]["Finding_Details"]
+        assert rows["egress"]["Status"] == "Passed"
+
+    @patch("agentcore_app.network_firewall_client")
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_no_reputation_group_fails_the_threat_row(
+        self, mock_ac, mock_ec2, mock_nfw
+    ):
+        rows = self._rows(
+            self._run(
+                mock_ac,
+                mock_ec2,
+                mock_nfw,
+                policies={
+                    "p1": _nfw_policy(managed=("ThreatSignaturesIOCActionOrder",))
+                },
+            )
+        )
+
+        assert rows["threat"]["Status"] == "Failed"
+        assert (
+            "none of the domain reputation groups" in rows["threat"]["Finding_Details"]
+        )
+
+    @patch("agentcore_app.network_firewall_client")
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_nat_gateway_is_followed_to_the_firewall_or_the_internet(
+        self, mock_ac, mock_ec2, mock_nfw
+    ):
+        subnets = {"subnet-a": ("vpc-a", "10.0.1.0/24")}
+        routed = self._rows(
+            self._run(
+                mock_ac,
+                mock_ec2,
+                mock_nfw,
+                subnets=subnets,
+                routes={
+                    "subnet-a": ("NatGatewayId", "nat-1"),
+                    "subnet-pub": ("VpcEndpointId", "vpce-fw1"),
+                },
+                nat_subnets={"nat-1": "subnet-pub"},
+            )
+        )
+        direct = self._rows(
+            self._run(
+                mock_ac,
+                mock_ec2,
+                mock_nfw,
+                subnets=subnets,
+                routes={
+                    "subnet-a": ("NatGatewayId", "nat-1"),
+                    "subnet-pub": ("GatewayId", "igw-1"),
+                },
+                nat_subnets={"nat-1": "subnet-pub"},
+            )
+        )
+
+        assert routed["egress"]["Status"] == "Passed"
+        assert direct["egress"]["Status"] == "Failed"
+        assert "then to igw-1" in direct["egress"]["Finding_Details"]
+
+    @patch("agentcore_app.network_firewall_client")
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_second_firewall_without_an_allow_list_fails(
+        self, mock_ac, mock_ec2, mock_nfw
+    ):
+        rows = self._rows(
+            self._run(
+                mock_ac,
+                mock_ec2,
+                mock_nfw,
+                subnets={
+                    "subnet-a": ("vpc-a", "10.0.1.0/24"),
+                    "subnet-b": ("vpc-a", "10.0.2.0/24"),
+                },
+                routes={
+                    "subnet-a": ("VpcEndpointId", "vpce-fw1"),
+                    "subnet-b": ("VpcEndpointId", "vpce-fw2"),
+                },
+                firewalls={
+                    "fw1": ("vpc-a", ["vpce-fw1"], "p1"),
+                    "fw2": ("vpc-a", ["vpce-fw2"], "p2"),
+                },
+                policies={"p1": _nfw_policy(), "p2": _nfw_policy(groups=())},
+            )
+        )
+
+        assert rows["egress"]["Status"] == "Failed"
+        assert (
+            "firewall fw2's policy references no stateful domain"
+            in rows["egress"]["Finding_Details"]
+        )
+        assert "fw1's" not in rows["egress"]["Finding_Details"]
+
+    @patch("agentcore_app.network_firewall_client")
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_transit_gateway_route_is_not_judged(self, mock_ac, mock_ec2, mock_nfw):
+        rows = self._rows(
+            self._run(
+                mock_ac,
+                mock_ec2,
+                mock_nfw,
+                routes={"subnet-a": ("TransitGatewayId", "tgw-1")},
+                firewalls={},
+            )
+        )
+
+        assert rows["egress"]["Status"] == "N/A"
+        assert rows["threat"]["Status"] == "N/A"
+        assert "0.0.0.0/0 to tgw-1" in rows["egress"]["Finding_Details"]
+
+    @patch("agentcore_app.network_firewall_client")
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_transit_gateway_route_beside_a_passing_firewall_withholds_the_pass(
+        self, mock_ac, mock_ec2, mock_nfw
+    ):
+        rows = self._rows(
+            self._run(
+                mock_ac,
+                mock_ec2,
+                mock_nfw,
+                subnets={
+                    "subnet-a": ("vpc-a", "10.0.1.0/24"),
+                    "subnet-b": ("vpc-a", "10.0.2.0/24"),
+                },
+                routes={
+                    "subnet-a": ("VpcEndpointId", "vpce-fw1"),
+                    "subnet-b": ("TransitGatewayId", "tgw-1"),
+                },
+            )
+        )
+
+        assert rows["egress"]["Status"] == "N/A"
+        assert rows["threat"]["Status"] == "N/A"
+
+    @pytest.mark.parametrize(
+        "method, action",
+        [
+            ("list_firewalls", "network-firewall:ListFirewalls"),
+            ("describe_firewall", "network-firewall:DescribeFirewall"),
+            ("describe_firewall_policy", "network-firewall:DescribeFirewallPolicy"),
+            ("describe_rule_group", "network-firewall:DescribeRuleGroup"),
+        ],
+    )
+    @patch("agentcore_app.network_firewall_client")
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_denied_firewall_read_is_na_naming_the_action(
+        self, mock_ac, mock_ec2, mock_nfw, method, action
+    ):
+        self._wire(mock_ac, mock_ec2, mock_nfw)
+        getattr(mock_nfw, method).side_effect = _make_client_error(
+            "AccessDeniedException", "no"
+        )
+
+        findings = agentcore_app.check_agentcore_network_firewall_egress()
+
+        assert findings
+        assert all(f["Status"] == "N/A" for f in findings)
+        assert all(f["Resolution"] == f"Grant {action} and retry." for f in findings)
+
+    @patch("agentcore_app.network_firewall_client")
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_denied_nat_gateway_read_is_na_naming_the_action(
+        self, mock_ac, mock_ec2, mock_nfw
+    ):
+        self._wire(
+            mock_ac,
+            mock_ec2,
+            mock_nfw,
+            routes={"subnet-a": ("NatGatewayId", "nat-1")},
+        )
+        mock_ec2.describe_nat_gateways.side_effect = _make_client_error(
+            "UnauthorizedOperation", "no"
+        )
+
+        findings = agentcore_app.check_agentcore_network_firewall_egress()
+
+        assert [f["Status"] for f in findings] == ["N/A"]
+        assert findings[0]["Resolution"] == "Grant ec2:DescribeNatGateways and retry."
+
+    @patch("agentcore_app.network_firewall_client")
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_denied_policy_read_does_not_clear_a_bypassing_subnet(
+        self, mock_ac, mock_ec2, mock_nfw
+    ):
+        self._wire(
+            mock_ac,
+            mock_ec2,
+            mock_nfw,
+            subnets={
+                "subnet-a": ("vpc-a", "10.0.1.0/24"),
+                "subnet-b": ("vpc-a", "10.0.2.0/24"),
+            },
+            routes={
+                "subnet-a": ("VpcEndpointId", "vpce-fw1"),
+                "subnet-b": ("GatewayId", "igw-1"),
+            },
+        )
+        mock_nfw.describe_firewall_policy.side_effect = _make_client_error(
+            "AccessDeniedException", "no"
+        )
+
+        findings = agentcore_app.check_agentcore_network_firewall_egress()
+
+        assert [f["Status"] for f in findings] == ["Failed", "Failed"]
+
+    @patch("agentcore_app.network_firewall_client", None)
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_no_network_firewall_client_is_na(self, mock_ac, mock_ec2):
+        self._wire(mock_ac, mock_ec2, MagicMock())
+
+        findings = agentcore_app.check_agentcore_network_firewall_egress()
+
+        assert [f["Status"] for f in findings] == ["N/A"]
+        assert (
+            findings[0]["Resolution"]
+            == "Grant network-firewall:ListFirewalls and retry."
+        )
+
+    def test_the_handler_runs_the_leg_under_ac_49(self):
+        source = inspect.getsource(agentcore_app.lambda_handler)
+        assert "check_agentcore_network_firewall_egress(browser_inventory)" in source
+        assert "check_agentcore_image_scan_gate" in source
+
+
+# ===================================================================
+# AC-50 Inspector coverage and finding gate
+# ===================================================================
+def _coverage(name, code="ACTIVE", reason="SUCCESSFUL"):
+    return {
+        "resourceType": "AWS_ECR_REPOSITORY",
+        "resourceId": f"arn:aws:ecr:us-east-1:123456789012:repository/{name}",
+        "scanStatus": {"statusCode": code, "reason": reason},
+        "resourceMetadata": {
+            "ecrRepository": {"name": name, "scanFrequency": "CONTINUOUS_SCAN"}
+        },
+    }
+
+
+def _inspector_rule(name="inspector-gate", state="ENABLED", **pattern):
+    body = {"source": ["aws.inspector2"], "detail-type": ["Inspector2 Finding"]}
+    body.update(pattern)
+    return {"Name": name, "State": state, "EventPattern": json.dumps(body)}
+
+
+@patch("agentcore_app.agentcore_client", None)
+class TestAC50ImageScanGate:
+    """AC-50 reads Inspector's coverage and the rule that routes its findings."""
+
+    def _run(self, repos=("agentcore-a",), coverage=None, rules=None, targets=None):
+        with (
+            patch("agentcore_app.ecr_client") as mock_ecr,
+            patch("agentcore_app.inspector2_client") as mock_insp,
+            patch("agentcore_app.events_client") as mock_events,
+        ):
+            mock_ecr.meta.region_name = "us-east-1"
+            mock_ecr.describe_repositories.return_value = {
+                "repositories": [_owned_repo(name) for name in repos]
+            }
+            if isinstance(coverage, Exception):
+                mock_insp.list_coverage.side_effect = coverage
+            else:
+                mock_insp.list_coverage.return_value = {
+                    "coveredResources": coverage
+                    if coverage is not None
+                    else [_coverage(name) for name in repos]
+                }
+            if isinstance(rules, Exception):
+                mock_events.list_rules.side_effect = rules
+            else:
+                mock_events.list_rules.return_value = {
+                    "Rules": rules if rules is not None else [_inspector_rule()]
+                }
+            if isinstance(targets, Exception):
+                mock_events.list_targets_by_rule.side_effect = targets
+            else:
+                mock_events.list_targets_by_rule.side_effect = lambda Rule: {
+                    "Targets": (targets or {}).get(
+                        Rule,
+                        [
+                            {
+                                "Id": "t1",
+                                "Arn": "arn:aws:lambda:us-east-1:123456789012:function:gate",
+                            }
+                        ],
+                    )
+                }
+            self.mock_insp = mock_insp
+            return agentcore_app.check_agentcore_image_scan_gate()
+
+    def test_active_coverage_and_a_targeted_rule_pass(self):
+        findings = self._run()
+
+        assert [(f["Finding"], f["Status"]) for f in findings] == [
+            ("AgentCore ECR Inspector Coverage", "Passed"),
+            ("AgentCore Image Finding Gate", "Passed"),
+        ]
+        assert "inspector-gate" in findings[1]["Finding_Details"]
+        assert (
+            "Whether the consumer blocks a deploy is not read"
+            in findings[1]["Finding_Details"]
+        )
+        assert self.mock_insp.list_coverage.call_args.kwargs["filterCriteria"] == {
+            "resourceType": [{"comparison": "EQUALS", "value": "AWS_ECR_REPOSITORY"}]
+        }
+        for finding in findings:
+            assert finding["Check_ID"] == "AC-50"
+            assert_finding_schema(finding)
+
+    def test_each_repository_is_judged_by_its_own_coverage(self):
+        findings = self._run(
+            repos=("agentcore-a", "agentcore-b", "agentcore-c"),
+            coverage=[
+                _coverage("agentcore-a"),
+                _coverage("agentcore-b", "INACTIVE", "SCAN_FREQUENCY_MANUAL"),
+            ],
+        )
+
+        statuses = [f["Status"] for f in findings[:3]]
+        assert statuses == ["Passed", "Failed", "Failed"]
+        assert "INACTIVE (SCAN_FREQUENCY_MANUAL)" in findings[1]["Finding_Details"]
+        assert "lists no ECR repository 'agentcore-c'" in findings[2]["Finding_Details"]
+
+    def test_denied_coverage_is_na_naming_the_action(self):
+        findings = self._run(
+            repos=("agentcore-a", "agentcore-b"),
+            coverage=_make_client_error("AccessDeniedException", "no"),
+        )
+
+        assert [f["Status"] for f in findings[:2]] == ["N/A", "N/A"]
+        assert all(
+            f["Resolution"] == "Grant inspector2:ListCoverage and retry."
+            for f in findings[:2]
+        )
+
+    def test_denied_rules_are_na_naming_the_action(self):
+        findings = self._run(rules=_make_client_error("AccessDeniedException", "no"))
+
+        assert findings[-1]["Status"] == "N/A"
+        assert findings[-1]["Resolution"] == "Grant events:ListRules and retry."
+
+    def test_denied_targets_are_na_naming_the_action(self):
+        findings = self._run(targets=_make_client_error("AccessDeniedException", "no"))
+
+        assert findings[-1]["Status"] == "N/A"
+        assert findings[-1]["Resolution"] == "Grant events:ListTargetsByRule and retry."
+
+    def test_a_rule_with_no_target_fails(self):
+        findings = self._run(targets={"inspector-gate": []})
+
+        assert findings[-1]["Status"] == "Failed"
+        assert (
+            "inspector-gate match them but have no target"
+            in findings[-1]["Finding_Details"]
+        )
+
+    def test_a_disabled_or_unrelated_rule_fails(self):
+        findings = self._run(
+            rules=[
+                _inspector_rule(state="DISABLED"),
+                {
+                    "Name": "guardduty",
+                    "State": "ENABLED",
+                    "EventPattern": json.dumps({"source": ["aws.guardduty"]}),
+                },
+            ]
+        )
+
+        assert findings[-1]["Status"] == "Failed"
+
+    def test_a_rule_limited_to_ec2_findings_does_not_gate_images(self):
+        findings = self._run(
+            rules=[
+                _inspector_rule(detail={"resources": {"type": ["AWS_EC2_INSTANCE"]}})
+            ]
+        )
+
+        assert findings[-1]["Status"] == "Failed"
+
+    def test_a_severity_threshold_is_the_workloads_choice(self):
+        findings = self._run(
+            rules=[
+                _inspector_rule(
+                    name="ec2-only",
+                    detail={"resources": {"type": ["AWS_EC2_INSTANCE"]}},
+                ),
+                _inspector_rule(
+                    name="critical", detail={"severity": ["CRITICAL", "HIGH"]}
+                ),
+            ]
+        )
+
+        assert findings[-1]["Status"] == "Passed"
+        assert "critical" in findings[-1]["Finding_Details"]
+
+    def test_no_agentcore_repository_is_one_na(self):
+        findings = self._run(repos=())
+
+        assert [f["Status"] for f in findings] == ["N/A"]

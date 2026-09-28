@@ -268,6 +268,21 @@ section.
   service does not publish, passed on its namespace alone and never fires.
   The assessment roles hold no `cloudwatch:ListMetrics` grant, so a
   configuration that would pass is `N/A` naming it until it is added.
+- `AC-49` gains a Network Firewall leg that follows each hosting subnet's
+  default route to a firewall endpoint, one hop or through a NAT gateway,
+  and judges the reached policy for a domain allow-list over `TLS_SNI` and
+  `HTTP_HOST` and for AWS managed threat signature and domain reputation
+  groups. DNS Firewall alone passed a VPC whose agents could connect to any
+  address. The assessment roles hold no `network-firewall` read or
+  `ec2:DescribeNatGateways` grant, so the rows are `N/A` naming the action
+  until it is added.
+- `AC-50` reads Inspector coverage per AgentCore repository and requires an
+  EventBridge rule with a target that matches Inspector findings on ECR
+  images. A registry scanning rule passed while Inspector reported the
+  repository `INACTIVE`, and no finding had to reach a deploy stage. The
+  assessment roles hold no `inspector2:ListCoverage`, `events:ListRules` or
+  `events:ListTargetsByRule` grant, so the rows are `N/A` naming the action
+  until it is added.
 - `AC-45` judges each AgentCore runtime's own execution role by the rules it
   applies to a tool role. No check read a runtime role outside the AgentCore
   namespace, so one granting `s3:*` or every foundation model passed.
