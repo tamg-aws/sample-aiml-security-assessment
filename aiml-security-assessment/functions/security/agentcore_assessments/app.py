@@ -13612,12 +13612,50 @@ def check_agentcore_evaluation_judge_model_scope(
     return findings
 
 
-# The three ways a tool execution role stops being resource-scoped. Each is a
-# grant whose breadth does not depend on which workload holds the role, so each
-# is reportable without knowing what the tool is for.
+# The ways a tool execution role stops being resource-scoped. Each is a grant
+# whose breadth does not depend on which workload holds the role, so each is
+# reportable without knowing what the tool is for.
 TOOL_ROLE_EVERY_RESOURCE_LEG = "grants an action on every resource"
 TOOL_ROLE_ALLOW_EXCEPT_LEG = "grants every resource except the ones it names"
 TOOL_ROLE_EVERY_ACTION_LEG = "grants every action of a service"
+TOOL_ROLE_ACTION_PATTERN_LEG = "grants actions by a wildcard pattern"
+TOOL_ROLE_ALLOW_EXCEPT_ACTION_LEG = "grants every action except the ones it names"
+
+
+def _tool_resource_is_unbounded(resource: str) -> bool:
+    """Return whether one Resource of a tool role reaches a whole population.
+
+    A tool role can name any service, so the resource segment is read by where
+    the resource name sits: first for S3, whose ARN carries the bucket name and
+    no type, and after the type for every other service. A name made only of
+    wildcards, such as `arn:aws:s3:::*` or `table/*`, reaches every resource of
+    that kind, and a wildcard in the partition, service, account or type does
+    too. A wildcard after the name, such as `arn:aws:s3:::app-bucket/*`, stays
+    inside one named resource. A region wildcard reaches the same name in every
+    region, except on Amazon Bedrock, where a model or inference profile id names
+    the same model in every region and cross-Region inference needs the grant in
+    each destination.
+    """
+    resource = str(resource).strip()
+    parts = resource.split(":", 5)
+    if len(parts) < 6 or parts[0].lower() != "arn":
+        return any(wildcard in resource for wildcard in ("*", "?"))
+    _, partition, service, region, account, resource_part = parts
+    segments = [partition, service, account]
+    if service.lower() != "bedrock":
+        segments.append(region)
+    if any(wildcard in segment for segment in segments for wildcard in ("*", "?")):
+        return True
+    components = re.split(r"[/:]", resource_part)
+    name_index = 0 if service.lower() == "s3" or len(components) == 1 else 1
+    if any(
+        wildcard in component
+        for component in components[:name_index]
+        for wildcard in ("*", "?")
+    ):
+        return True
+    name = next((component for component in components[name_index:] if component), "")
+    return bool(name) and set(name) <= {"*", "?"}
 
 
 def _tool_execution_role_problems(
@@ -13625,19 +13663,20 @@ def _tool_execution_role_problems(
 ) -> Tuple[List[str], int]:
     """Return one tool execution role's unscoped grants and unreadable count.
 
-    Which resources a tool needs is the workload's decision, so the three
-    problems reported here are the ones that hold whatever the workload is: a
-    Resource of "*", an Allow written as NotResource, and a service-wide action
-    wildcard. AC-02 reads the same documents for the AgentCore namespace only, so
-    a tool role granting s3:* on every bucket passes it.
+    Which resources a tool needs is the workload's decision, so the problems
+    reported here are the ones that hold whatever the workload is: a Resource
+    that reaches every resource of a kind, an Allow written as NotResource or
+    NotAction, and an action wildcard, `s3:Get*` included, because a pattern
+    grants actions its author did not list and any the service adds later.
+    AC-02 reads the same documents for the AgentCore namespace only, so a tool
+    role granting s3:* on every bucket passes it. A statement whose every action
+    the role's own unconditioned Deny or permissions boundary removes is not a
+    grant, and group policies are read with the rest.
     """
     problems: List[str] = []
     unreadable = 0
 
-    for policy in [
-        *(permissions.get("attached_policies") or []),
-        *(permissions.get("inline_policies") or []),
-    ]:
+    for policy in _principal_policies(permissions):
         try:
             statements = list(_allow_statements(policy))
         except Exception as error:
@@ -13646,21 +13685,231 @@ def _tool_execution_role_problems(
             continue
 
         for statement in statements:
+            actions = _statement_actions(statement)
+            if "Action" not in statement and "NotAction" in statement:
+                if not _grant_survives(permissions, "*"):
+                    continue
+                problems.append(TOOL_ROLE_ALLOW_EXCEPT_ACTION_LEG)
+            elif not any(_grant_survives(permissions, action) for action in actions):
+                continue
             resources = _statement_resources(statement)
-            if any(resource == "*" for resource in resources):
-                problems.append(TOOL_ROLE_EVERY_RESOURCE_LEG)
+            unbounded = [
+                resource
+                for resource in resources
+                if _tool_resource_is_unbounded(resource)
+            ]
+            if unbounded:
+                problems.append(
+                    f"{TOOL_ROLE_EVERY_RESOURCE_LEG} ({', '.join(unbounded)})"
+                )
             if not resources and statement.get("NotResource"):
                 problems.append(TOOL_ROLE_ALLOW_EXCEPT_LEG)
-            for action in _statement_actions(statement):
+            for action in actions:
                 if action == "*" or action.endswith(":*"):
                     problems.append(TOOL_ROLE_EVERY_ACTION_LEG)
+                elif any(wildcard in action for wildcard in ("*", "?")):
+                    problems.append(f"{TOOL_ROLE_ACTION_PATTERN_LEG} ({action})")
 
     return sorted(set(problems)), unreadable
+
+
+# The two ways to run a command inside a live runtime session. The shell opens
+# a terminal whose commands reach the container filesystem and every credential
+# in it, and the service does not log what is typed, so the grant is read on
+# its own: a pattern that reaches it without naming it, or a grant on every
+# runtime, is access nobody chose to hand out.
+AGENTCORE_COMMAND_SHELL_ACTIONS = (
+    "invokeagentruntimecommandshell",
+    "invokeagentruntimecommand",
+)
+
+
+def _command_shell_holders(
+    permissions_by_name: Dict[str, Any], principal_kind: str
+) -> Tuple[List[str], List[str], List[str]]:
+    """Split principals reaching a runtime command action by how they got it.
+
+    The lists are principals whose grant is unnamed or reaches every runtime,
+    each with the reason, principals that name the action on named runtimes,
+    and principals with a policy that could not be parsed. A grant the
+    principal's own unconditioned Deny or permissions boundary removes is not
+    counted.
+    """
+    unbounded: List[str] = []
+    named: List[str] = []
+    unreadable: List[str] = []
+
+    for principal_name, permissions in permissions_by_name.items():
+        if not isinstance(permissions, dict):
+            continue
+        label = f"{principal_kind} {principal_name}"
+        reasons: set = set()
+        holds = False
+
+        for policy in _principal_policies(permissions):
+            try:
+                statements = list(_allow_statements(policy))
+            except (TypeError, ValueError) as error:
+                logger.warning(f"Error parsing policy for {label}: {error}")
+                unreadable.append(f"{label} (policy {policy.get('name', '')})")
+                continue
+            for statement in statements:
+                reached = [
+                    action
+                    for action in _statement_reached_actions(
+                        statement, AGENTCORE_COMMAND_SHELL_ACTIONS
+                    )
+                    if _grant_survives(permissions, f"bedrock-agentcore:{action}")
+                ]
+                if not reached:
+                    continue
+                holds = True
+                patterns = _statement_actions(statement)
+                unnamed = [
+                    action
+                    for action in reached
+                    if f"bedrock-agentcore:{action}" not in patterns
+                ]
+                if unnamed:
+                    source = (
+                        "NotAction"
+                        if "Action" not in statement
+                        else ", ".join(sorted(set(patterns)))
+                    )
+                    reasons.add(f"reaches {', '.join(unnamed)} through {source}")
+                if _statement_resource_is_unbounded(statement):
+                    reasons.add("on every runtime")
+
+        if reasons:
+            unbounded.append(f"{label} ({'; '.join(sorted(reasons))})")
+        elif holds:
+            named.append(label)
+
+    return unbounded, named, unreadable
+
+
+def _command_shell_findings(permission_cache: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Return the account-wide AC-45 rows on runtime command and shell access."""
+    finding_name = "AgentCore Runtime Command Shell Access"
+    cache = permission_cache if isinstance(permission_cache, dict) else {}
+    role_permissions = cache.get("role_permissions") or {}
+    user_permissions = cache.get("user_permissions") or {}
+    if not role_permissions and not user_permissions:
+        return [
+            create_finding(
+                check_id="AC-45",
+                finding_name=f"{finding_name} Incomplete",
+                finding_details=(
+                    "No IAM permissions found in cache, so who can open a command "
+                    "shell in an agent runtime session was not read."
+                ),
+                resolution=(
+                    "No action is required on the assessed workload based on this "
+                    "result. Resolve the IAM permission cache and rerun the "
+                    "assessment."
+                ),
+                reference=AGENTCORE_TOOL_EXECUTION_ROLE_REFERENCE_URL,
+                severity=SeverityEnum.INFORMATIONAL,
+                status=StatusEnum.NA,
+                region=GLOBAL_REGION_LABEL,
+            )
+        ]
+
+    findings, v1_note = _cache_read_gap_findings(
+        cache,
+        "AC-45",
+        finding_name,
+        AGENTCORE_TOOL_EXECUTION_ROLE_REFERENCE_URL,
+        region=GLOBAL_REGION_LABEL,
+    )
+    role_unbounded, role_named, role_unreadable = _command_shell_holders(
+        role_permissions, "role"
+    )
+    user_unbounded, user_named, user_unreadable = _command_shell_holders(
+        user_permissions, "user"
+    )
+    unbounded = role_unbounded + user_unbounded
+    named = role_named + user_named
+    unreadable = role_unreadable + user_unreadable
+
+    if unreadable:
+        findings.append(
+            create_finding(
+                check_id="AC-45",
+                finding_name=f"{finding_name} Incomplete",
+                finding_details=(
+                    "These cached policy documents could not be parsed, so a "
+                    "command or shell grant inside them was not judged: "
+                    f"{', '.join(unreadable)}."
+                ),
+                resolution=(
+                    "No action is required on the assessed workload based on this "
+                    "result. Repair the unreadable policy documents in the IAM "
+                    "permission cache and rerun the assessment."
+                ),
+                reference=AGENTCORE_TOOL_EXECUTION_ROLE_REFERENCE_URL,
+                severity=SeverityEnum.INFORMATIONAL,
+                status=StatusEnum.NA,
+                region=GLOBAL_REGION_LABEL,
+            )
+        )
+
+    if unbounded:
+        findings.append(
+            create_finding(
+                check_id="AC-45",
+                finding_name=f"{finding_name} Unscoped",
+                finding_details=(
+                    "These principals can run commands or open an interactive "
+                    "shell inside an agent runtime session through a grant that "
+                    "does not name the action or that reaches every runtime: "
+                    f"{', '.join(unbounded)}. Shell commands reach the container "
+                    "filesystem and every credential in it, and the service does "
+                    f"not log what is typed. {IAM_CACHE_SCP_NOTE}"
+                ),
+                resolution=(
+                    "Grant bedrock-agentcore:InvokeAgentRuntimeCommandShell and "
+                    "bedrock-agentcore:InvokeAgentRuntimeCommand by name, on named "
+                    "runtime ARNs, to a break-glass or developer role only, and "
+                    "deny both where interactive access is not needed."
+                ),
+                reference=AGENTCORE_TOOL_EXECUTION_ROLE_REFERENCE_URL,
+                severity=SeverityEnum.HIGH,
+                status=StatusEnum.FAILED,
+                region=GLOBAL_REGION_LABEL,
+            )
+        )
+    elif not findings:
+        holders = (
+            f"Only these principals name the action on named runtimes: "
+            f"{', '.join(named)}."
+            if named
+            else "No principal in the IAM permission cache can run a command or "
+            "open a shell inside an agent runtime session."
+        )
+        findings.append(
+            create_finding(
+                check_id="AC-45",
+                finding_name=finding_name,
+                finding_details=f"{holders}{v1_note}",
+                resolution=(
+                    "No action required for this check. Confirm each named "
+                    "principal is a break-glass or developer role, which is a "
+                    "decision this check does not make."
+                ),
+                reference=AGENTCORE_TOOL_EXECUTION_ROLE_REFERENCE_URL,
+                severity=SeverityEnum.HIGH,
+                status=StatusEnum.PASSED,
+                region=GLOBAL_REGION_LABEL,
+            )
+        )
+    return findings
 
 
 def check_agentcore_tool_execution_role_scope(
     permission_cache: Dict[str, Any],
     browser_inventory: Dict[str, Any] = None,
+    assess_shell: bool = False,
 ) -> List[Dict[str, Any]]:
     """AC-45: Judge the execution role a code interpreter or browser can use.
 
@@ -13671,10 +13920,16 @@ def check_agentcore_tool_execution_role_scope(
     talked into doing.
 
     executionRoleArn is optional on CreateCodeInterpreter and CreateBrowser, so a
-    tool that names no role holds no credentials to misuse and passes.
+    tool that names no role holds no credentials to misuse and passes. A role
+    the IAM cache could not read, or one with an unparseable policy, is named
+    and never passes. With assess_shell set, which the handler does on the
+    primary region only, the check also reads who can run a command or open a
+    shell inside a runtime session, which reaches the runtime's own role. The
+    trust policy and the reuse of a tool role across resources are AC-48's.
     """
+    shell_rows = _command_shell_findings(permission_cache) if assess_shell else []
     if agentcore_client is None:
-        return [
+        return shell_rows + [
             create_finding(
                 check_id="AC-45",
                 finding_name="AgentCore Tool Execution Role Scope",
@@ -13691,7 +13946,7 @@ def check_agentcore_tool_execution_role_scope(
     # interpreter list is denied. So there is no whole-check failure to catch
     # here, and each unreadable tool is reported on its own line below.
     details, errors = _agentcore_tool_details(browser_inventory)
-    findings = _agentcore_tool_read_findings(
+    findings = shell_rows + _agentcore_tool_read_findings(
         "AC-45",
         "AgentCore Tool Execution Role Scope",
         errors,
@@ -13716,6 +13971,14 @@ def check_agentcore_tool_execution_role_scope(
         return findings
 
     role_permissions = (permission_cache or {}).get("role_permissions") or {}
+    cache = permission_cache if isinstance(permission_cache, dict) else {}
+    gap_labels, recorded = _cache_principal_read_gaps(cache, ("role",))
+    unread_roles = {
+        str(entry.get("name", ""))
+        for entry in (cache.get("principal_errors") or [])
+        if isinstance(entry, dict) and entry.get("type") == "role"
+    }
+    v1_note = "" if recorded else " " + IAM_CACHE_V1_NOTE
 
     for label, detail in details:
         role_arn = detail.get("executionRoleArn")
@@ -13742,6 +14005,33 @@ def check_agentcore_tool_execution_role_scope(
 
         role_name = str(role_arn).rsplit("/", 1)[-1]
         permissions = role_permissions.get(role_name)
+        if role_name in unread_roles:
+            findings.append(
+                create_finding(
+                    check_id="AC-45",
+                    finding_name="AgentCore Tool Execution Role Scope Incomplete",
+                    finding_details=(
+                        f"{label} uses execution role {role_name}, whose policies "
+                        "the IAM permission cache could not read, so what code in "
+                        "the sandbox could reach was not judged: "
+                        + ", ".join(
+                            gap
+                            for gap in gap_labels
+                            if gap.startswith(f"role {role_name} (")
+                        )
+                        + "."
+                    ),
+                    resolution=(
+                        "No action is required on the assessed workload based on "
+                        "this result. Grant the cache producer read access to the "
+                        "role's policies and rerun the assessment."
+                    ),
+                    reference=AGENTCORE_TOOL_EXECUTION_ROLE_REFERENCE_URL,
+                    severity=SeverityEnum.INFORMATIONAL,
+                    status=StatusEnum.NA,
+                )
+            )
+            continue
         if not isinstance(permissions, dict):
             findings.append(
                 create_finding(
@@ -13796,7 +14086,7 @@ def check_agentcore_tool_execution_role_scope(
                         f"{label} uses execution role {role_name}, which "
                         f"{'; '.join(problems)}. Code the model writes runs with "
                         "this role, so the sandbox reaches everything the role "
-                        "reaches."
+                        f"reaches. {IAM_CACHE_SCP_NOTE}"
                     ),
                     resolution=(
                         "Rewrite the role's policies to name the ARNs this tool "
@@ -13807,7 +14097,7 @@ def check_agentcore_tool_execution_role_scope(
                     status=StatusEnum.FAILED,
                 )
             )
-        else:
+        elif not unreadable:
             findings.append(
                 create_finding(
                     check_id="AC-45",
@@ -13816,6 +14106,7 @@ def check_agentcore_tool_execution_role_scope(
                         f"{label} uses execution role {role_name}, whose Allow "
                         "statements name their resources and actions instead of "
                         "granting every resource or every action of a service."
+                        f"{v1_note}"
                     ),
                     resolution=(
                         "No action required for this check. Confirm the named "
@@ -17408,7 +17699,9 @@ def lambda_handler(event, context):
                 ["AC-45"],
                 "Tool Execution Role Scope",
                 lambda: check_agentcore_tool_execution_role_scope(
-                    permission_cache, browser_inventory
+                    permission_cache,
+                    browser_inventory,
+                    assess_shell=is_primary_region,
                 ),
             ),
             (

@@ -922,6 +922,18 @@ _VERIFIED_REMEDIATION_CONDITION_KEYS |= {"aws:PrincipalAccount"}
 # back INVALID_SERVICE_CONDITION_KEY at index 4.
 _VERIFIED_REMEDIATION_CONDITION_KEYS |= {"aws:PrincipalTag"}
 
+# Verified on 2026-09-27 with one IDENTITY_POLICY validate-policy run for the
+# AC-45 command shell leg, one statement per name on a runtime ARN.
+# bedrock-agentcore:InvokeAgentRuntimeCommandShell at index 0 and
+# bedrock-agentcore:InvokeAgentRuntimeCommand at index 1 were not reported. The
+# negative controls bedrock-agentcore:InvokeAgentRuntimeCommandShellz and
+# bedrock-agentcore:InvokeAgentRuntimeCommandz came back INVALID_ACTION at
+# indexes 2 and 3.
+_VERIFIED_REMEDIATION_IAM_ACTIONS |= {
+    "bedrock-agentcore:InvokeAgentRuntimeCommandShell",
+    "bedrock-agentcore:InvokeAgentRuntimeCommand",
+}
+
 _NON_IAM_REMEDIATION_TOKENS = {
     # SM-41 names the AWS IoT Core policy variables
     # ${iot:Connection.Thing.ThingName} and iot:Connection.Thing.IsAttached, and

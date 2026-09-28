@@ -20033,3 +20033,452 @@ class TestAC44WholePopulation:
         findings = agentcore_app.check_agentcore_evaluation_judge_model_scope(cache)
 
         assert [f["Status"] for f in findings] == ["Failed"]
+
+
+class TestAC45WholePopulation:
+    """AC-45 reads tool roles by value and who can open a runtime shell."""
+
+    _ROLE_ARN = "arn:aws:iam::123456789012:role/ToolRole"
+    _SECOND_ARN = "arn:aws:iam::123456789012:role/SecondRole"
+    _BUCKET = "arn:aws:s3:::app-bucket/*"
+    _RUNTIME = "arn:aws:bedrock-agentcore:us-east-1:123456789012:runtime/rt-1"
+    _SHELL = "bedrock-agentcore:InvokeAgentRuntimeCommandShell"
+
+    def _allow(self, action, resource, **extra):
+        return {"Effect": "Allow", "Action": action, "Resource": resource, **extra}
+
+    def _two_tools(self, mock_ac):
+        _wire_tools(
+            mock_ac,
+            interpreters=[
+                _code_interpreter("ci-good", executionRoleArn=self._ROLE_ARN),
+                _code_interpreter("ci-bad", executionRoleArn=self._SECOND_ARN),
+            ],
+        )
+
+    @pytest.mark.parametrize(
+        ("resource", "unbounded"),
+        [
+            ("*", True),
+            ("arn:aws:s3:::*", True),
+            ("arn:aws:s3:::app-bucket/*", False),
+            ("arn:aws:s3:::prod-*", False),
+            ("arn:aws:dynamodb:us-east-1:123456789012:table/*", True),
+            ("arn:aws:dynamodb:us-east-1:123456789012:table/orders", False),
+            ("arn:aws:dynamodb:*:123456789012:table/orders", True),
+            ("arn:aws:dynamodb:us-east-1:*:table/orders", True),
+            ("arn:aws:logs:us-east-1:123456789012:log-group:/*", True),
+            ("arn:aws:logs:us-east-1:123456789012:log-group:/aws/tool/*", False),
+            ("arn:aws:bedrock:*::foundation-model/anthropic.claude-3", False),
+            ("arn:aws:bedrock:us-east-1::*", True),
+            ("arn:aws:sqs:us-east-1:123456789012:*", True),
+            ("arn:aws:sqs:us-east-1:123456789012:jobs", False),
+            ("arn:aws:iam::123456789012:role/*", True),
+            ("arn:*", True),
+        ],
+    )
+    def test_the_tool_resource_predicate(self, resource, unbounded):
+        assert agentcore_app._tool_resource_is_unbounded(resource) is unbounded
+
+    @pytest.mark.parametrize(
+        ("statement", "leg"),
+        [
+            (
+                {
+                    "Effect": "Allow",
+                    "Action": "s3:GetObject",
+                    "Resource": "arn:aws:s3:::*",
+                },
+                "grants an action on every resource (arn:aws:s3:::*)",
+            ),
+            (
+                {
+                    "Effect": "Allow",
+                    "Action": "s3:Get*",
+                    "Resource": "arn:aws:s3:::app-bucket/*",
+                },
+                "grants actions by a wildcard pattern (s3:get*)",
+            ),
+            (
+                {
+                    "Effect": "Allow",
+                    "NotAction": "iam:*",
+                    "Resource": "arn:aws:s3:::app-bucket/*",
+                },
+                "grants every action except the ones it names",
+            ),
+        ],
+        ids=["bucket-wildcard", "action-prefix", "not-action"],
+    )
+    @patch("agentcore_app.agentcore_client")
+    def test_the_second_tool_role_fails_on_its_own_grant(self, mock_ac, statement, leg):
+        self._two_tools(mock_ac)
+        cache = _v2_cache(
+            roles={
+                "ToolRole": _principal_with(
+                    [self._allow("s3:GetObject", self._BUCKET)]
+                ),
+                "SecondRole": _principal_with([statement]),
+            }
+        )
+
+        findings = agentcore_app.check_agentcore_tool_execution_role_scope(cache)
+
+        assert [f["Status"] for f in findings] == ["Passed", "Failed"]
+        assert "ToolRole" in findings[0]["Finding_Details"]
+        assert "SecondRole" in findings[1]["Finding_Details"]
+        assert leg in findings[1]["Finding_Details"]
+        assert agentcore_app.IAM_CACHE_SCP_NOTE in findings[1]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_an_unconditioned_deny_removes_the_grant(self, mock_ac):
+        _wire_tools(
+            mock_ac, interpreters=[_code_interpreter(executionRoleArn=self._ROLE_ARN)]
+        )
+        cache = _v2_cache(
+            roles={
+                "ToolRole": _principal_with(
+                    [
+                        self._allow("s3:*", "*"),
+                        {"Effect": "Deny", "Action": "s3:*", "Resource": "*"},
+                    ]
+                )
+            }
+        )
+
+        findings = agentcore_app.check_agentcore_tool_execution_role_scope(cache)
+
+        assert [f["Status"] for f in findings] == ["Passed"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_conditioned_deny_leaves_the_grant(self, mock_ac):
+        _wire_tools(
+            mock_ac, interpreters=[_code_interpreter(executionRoleArn=self._ROLE_ARN)]
+        )
+        cache = _v2_cache(
+            roles={
+                "ToolRole": _principal_with(
+                    [
+                        self._allow("s3:*", "*"),
+                        {
+                            "Effect": "Deny",
+                            "Action": "s3:*",
+                            "Resource": "*",
+                            "Condition": {"Bool": {"aws:SecureTransport": "false"}},
+                        },
+                    ]
+                )
+            }
+        )
+
+        findings = agentcore_app.check_agentcore_tool_execution_role_scope(cache)
+
+        assert [f["Status"] for f in findings] == ["Failed"]
+
+    @pytest.mark.parametrize(
+        ("boundary_action", "status"),
+        [("dynamodb:GetItem", "Passed"), ("s3:GetObject", "Failed")],
+        ids=["boundary-excludes", "boundary-allows"],
+    )
+    @patch("agentcore_app.agentcore_client")
+    def test_the_boundary_is_an_intersection(self, mock_ac, boundary_action, status):
+        _wire_tools(
+            mock_ac, interpreters=[_code_interpreter(executionRoleArn=self._ROLE_ARN)]
+        )
+        boundary = {
+            "Statement": [
+                {"Effect": "Allow", "Action": boundary_action, "Resource": "*"}
+            ]
+        }
+        cache = _v2_cache(
+            roles={"ToolRole": _principal_with([self._allow("s3:*", "*")], boundary)}
+        )
+
+        findings = agentcore_app.check_agentcore_tool_execution_role_scope(cache)
+
+        assert [f["Status"] for f in findings] == [status]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_principal_error_withholds_the_verdict_for_that_role_only(self, mock_ac):
+        self._two_tools(mock_ac)
+        cache = _v2_cache(
+            roles={
+                "ToolRole": _principal_with([]),
+                "SecondRole": _principal_with(
+                    [self._allow("s3:GetObject", self._BUCKET)]
+                ),
+            },
+            errors=[
+                {
+                    "type": "role",
+                    "name": "ToolRole",
+                    "stage": "list_role_policies",
+                    "error": "AccessDenied",
+                }
+            ],
+        )
+
+        findings = agentcore_app.check_agentcore_tool_execution_role_scope(cache)
+
+        assert [f["Status"] for f in findings] == ["N/A", "Passed"]
+        assert findings[0]["Finding"].endswith("Incomplete")
+        assert "role ToolRole (list_role_policies" in findings[0]["Finding_Details"]
+        assert "SecondRole" in findings[1]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_an_unparseable_policy_alone_withholds_the_pass(self, mock_ac):
+        # Stricter than the older unparseable case, which paired the broken
+        # document with a wide one: here nothing else fails, so the role must
+        # not read as scoped.
+        _wire_tools(
+            mock_ac, interpreters=[_code_interpreter(executionRoleArn=self._ROLE_ARN)]
+        )
+        cache = _v2_cache(
+            roles={
+                "ToolRole": {
+                    "attached_policies": [{"name": "Broken", "document": "{not json"}],
+                    "inline_policies": [],
+                }
+            }
+        )
+
+        findings = agentcore_app.check_agentcore_tool_execution_role_scope(cache)
+
+        assert [f["Status"] for f in findings] == ["N/A"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_group_policy_grant_is_read(self, mock_ac):
+        _wire_tools(
+            mock_ac, interpreters=[_code_interpreter(executionRoleArn=self._ROLE_ARN)]
+        )
+        permissions = _principal_with([])
+        permissions["group_policies"] = [
+            {"name": "g", "document": {"Statement": [self._allow("s3:GetObject", "*")]}}
+        ]
+        cache = _v2_cache(roles={"ToolRole": permissions})
+
+        findings = agentcore_app.check_agentcore_tool_execution_role_scope(cache)
+
+        assert [f["Status"] for f in findings] == ["Failed"]
+
+    @pytest.mark.parametrize("v2", [True, False], ids=["v2", "v1"])
+    @patch("agentcore_app.agentcore_client")
+    def test_the_pass_names_a_v1_cache(self, mock_ac, v2):
+        _wire_tools(
+            mock_ac, interpreters=[_code_interpreter(executionRoleArn=self._ROLE_ARN)]
+        )
+        roles = {
+            "ToolRole": _principal_with([self._allow("s3:GetObject", self._BUCKET)])
+        }
+        cache = _v2_cache(roles=roles) if v2 else {"role_permissions": roles}
+
+        findings = agentcore_app.check_agentcore_tool_execution_role_scope(cache)
+
+        assert [f["Status"] for f in findings] == ["Passed"]
+        assert (agentcore_app.IAM_CACHE_V1_NOTE in findings[0]["Finding_Details"]) is (
+            not v2
+        )
+
+    # The command shell leg.
+
+    def _shell(self, cache, mock_ac):
+        _wire_tools(mock_ac)
+        findings = agentcore_app.check_agentcore_tool_execution_role_scope(
+            cache, assess_shell=True
+        )
+        return [f for f in findings if "Command Shell" in f["Finding"]]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_the_shell_leg_runs_only_when_asked(self, mock_ac):
+        _wire_tools(mock_ac)
+        cache = _v2_cache(roles={"Admin": _principal_with([self._allow("*", "*")])})
+
+        findings = agentcore_app.check_agentcore_tool_execution_role_scope(cache)
+
+        assert not [f for f in findings if "Command Shell" in f["Finding"]]
+
+    @pytest.mark.parametrize(
+        ("statement", "reason"),
+        [
+            (
+                {
+                    "Effect": "Allow",
+                    "Action": "bedrock-agentcore:Invoke*",
+                    "Resource": _RUNTIME,
+                },
+                "through bedrock-agentcore:invoke*",
+            ),
+            (
+                {"Effect": "Allow", "Action": "*", "Resource": _RUNTIME},
+                "through *",
+            ),
+            (
+                {"Effect": "Allow", "NotAction": "iam:*", "Resource": _RUNTIME},
+                "through NotAction",
+            ),
+            (
+                {"Effect": "Allow", "Action": _SHELL, "Resource": "*"},
+                "on every runtime",
+            ),
+            (
+                {
+                    "Effect": "Allow",
+                    "Action": _SHELL,
+                    "Resource": "arn:aws:bedrock-agentcore:*:123456789012:runtime/rt-1",
+                },
+                "on every runtime",
+            ),
+        ],
+        ids=["prefix", "star", "not-action", "every-runtime", "every-region"],
+    )
+    @patch("agentcore_app.agentcore_client")
+    def test_an_unnamed_or_unbounded_shell_grant_fails(
+        self, mock_ac, statement, reason
+    ):
+        cache = _v2_cache(
+            roles={
+                "BreakGlass": _principal_with(
+                    [self._allow(self._SHELL, self._RUNTIME)]
+                ),
+                "Wide": _principal_with([statement]),
+            }
+        )
+
+        rows = self._shell(cache, mock_ac)
+
+        assert [f["Status"] for f in rows] == ["Failed"]
+        assert rows[0]["Region"] == agentcore_app.GLOBAL_REGION_LABEL
+        assert "role Wide (" in rows[0]["Finding_Details"]
+        assert reason in rows[0]["Finding_Details"]
+        assert "BreakGlass" not in rows[0]["Finding_Details"]
+        assert agentcore_app.IAM_CACHE_SCP_NOTE in rows[0]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_named_grant_on_a_named_runtime_passes_and_is_listed(self, mock_ac):
+        cache = _v2_cache(
+            roles={
+                "BreakGlass": _principal_with(
+                    [self._allow(self._SHELL, self._RUNTIME)]
+                ),
+                "Reader": _principal_with([self._allow("s3:GetObject", self._BUCKET)]),
+            }
+        )
+
+        rows = self._shell(cache, mock_ac)
+
+        assert [f["Status"] for f in rows] == ["Passed"]
+        assert "role BreakGlass" in rows[0]["Finding_Details"]
+        assert "Reader" not in rows[0]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_user_group_grant_is_read(self, mock_ac):
+        permissions = _principal_with([])
+        permissions["group_policies"] = [
+            {
+                "name": "g",
+                "document": {"Statement": [self._allow("bedrock-agentcore:*", "*")]},
+            }
+        ]
+        cache = _v2_cache(users={"dev": permissions})
+
+        rows = self._shell(cache, mock_ac)
+
+        assert [f["Status"] for f in rows] == ["Failed"]
+        assert "user dev (" in rows[0]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_denied_shell_is_not_a_holder(self, mock_ac):
+        cache = _v2_cache(
+            roles={
+                "Admin": _principal_with(
+                    [
+                        self._allow("*", "*"),
+                        {
+                            "Effect": "Deny",
+                            "Action": "bedrock-agentcore:InvokeAgentRuntimeCommand*",
+                            "Resource": "*",
+                        },
+                    ]
+                )
+            }
+        )
+
+        rows = self._shell(cache, mock_ac)
+
+        assert [f["Status"] for f in rows] == ["Passed"]
+        assert "No principal" in rows[0]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_principal_error_withholds_the_shell_pass(self, mock_ac):
+        cache = _v2_cache(
+            roles={
+                "Reader": _principal_with([self._allow("s3:GetObject", self._BUCKET)])
+            },
+            errors=[
+                {
+                    "type": "user",
+                    "name": "ops",
+                    "stage": "list_user_policies",
+                    "error": "Throttling",
+                }
+            ],
+        )
+
+        rows = self._shell(cache, mock_ac)
+
+        assert [f["Status"] for f in rows] == ["N/A"]
+        assert "user ops (list_user_policies" in rows[0]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_an_unparseable_policy_withholds_the_shell_pass(self, mock_ac):
+        cache = _v2_cache(
+            roles={
+                "Reader": {
+                    "attached_policies": [{"name": "Broken", "document": "{not json"}],
+                    "inline_policies": [],
+                }
+            }
+        )
+
+        rows = self._shell(cache, mock_ac)
+
+        assert [f["Status"] for f in rows] == ["N/A"]
+        assert "role Reader (policy Broken)" in rows[0]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_an_empty_cache_is_incomplete(self, mock_ac):
+        rows = self._shell({}, mock_ac)
+
+        assert [f["Status"] for f in rows] == ["N/A"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_the_shell_pass_names_a_v1_cache(self, mock_ac):
+        cache = {"role_permissions": {"Reader": _principal_with([])}}
+
+        rows = self._shell(cache, mock_ac)
+
+        assert [f["Status"] for f in rows] == ["Passed"]
+        assert rows[0]["Finding_Details"].endswith(agentcore_app.IAM_CACHE_V1_NOTE)
+
+    @patch("agentcore_app.agentcore_client", None)
+    def test_the_shell_leg_runs_without_an_agentcore_client(self):
+        cache = _v2_cache(roles={"Admin": _principal_with([self._allow("*", "*")])})
+
+        findings = agentcore_app.check_agentcore_tool_execution_role_scope(
+            cache, assess_shell=True
+        )
+
+        assert [f["Status"] for f in findings] == ["Failed", "N/A"]
+        assert "Command Shell" in findings[0]["Finding"]
+
+    def test_the_handler_asks_for_the_shell_leg_on_the_primary_region_only(self):
+        source = textwrap.dedent(inspect.getsource(agentcore_app.lambda_handler))
+        calls = [
+            node
+            for node in ast.walk(ast.parse(source))
+            if isinstance(node, ast.Call)
+            and ast.unparse(node.func) == "check_agentcore_tool_execution_role_scope"
+        ]
+        assert len(calls) == 1
+        keywords = {kw.arg: ast.unparse(kw.value) for kw in calls[0].keywords}
+        assert keywords == {"assess_shell": "is_primary_region"}

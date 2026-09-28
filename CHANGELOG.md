@@ -262,6 +262,13 @@ section.
   - `AC-44` fails a model grant whose service, account or resource type
     segment is a wildcard (`arn:aws:bedrock:*::*`) or that uses
     `NotResource`. A region wildcard on a named model still passes.
+  - `AC-45` reads a tool role's resources by value, so `arn:aws:s3:::*`,
+    `table/*` and a region or account wildcard fail, and fails an action
+    pattern such as `s3:Get*` and an Allow written with `NotAction`. On the
+    primary region it adds a Global row naming every principal that can run a
+    command or open a shell in a runtime session through a grant that does not
+    name `bedrock-agentcore:InvokeAgentRuntimeCommandShell` or
+    `InvokeAgentRuntimeCommand`, or that reaches every runtime.
 
 ### Deployment impact
 
