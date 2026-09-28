@@ -21,6 +21,7 @@ import inspect
 import os
 import importlib.util
 import textwrap
+from datetime import datetime, timezone
 from unittest.mock import patch, MagicMock
 
 import pytest
@@ -34512,3 +34513,308 @@ class TestNet01AgentCorePrivateBoundary:
         assert passed["Finding_Details"].startswith("All 2 AgentCore runtime(s)")
         assert "'rt-a' (rt-a), 'rt-b' (rt-b)" in passed["Finding_Details"]
         assert "requireServiceS3Endpoint false" in passed["Finding_Details"]
+
+
+def _wire_runtime_versions(mock_ac, runtimes, versions):
+    """Stub the runtime reads from (summary, detail) plus ``versions``, which maps
+    a runtime id to {version: detail} for the versions ListAgentRuntimeVersions
+    returns. A version value that is an exception is raised by GetAgentRuntime,
+    and a runtime id mapped to an exception is raised by the version list."""
+    mock_ac.list_agent_runtimes.return_value = {
+        "agentRuntimes": [summary for summary, _ in runtimes]
+    }
+    latest = {summary["agentRuntimeId"]: detail for summary, detail in runtimes}
+
+    def list_versions(agentRuntimeId, **_):
+        listed = versions.get(agentRuntimeId, {})
+        if isinstance(listed, Exception):
+            raise listed
+        return {
+            "agentRuntimes": [
+                {"agentRuntimeId": agentRuntimeId, "agentRuntimeVersion": number}
+                for number in listed
+            ]
+        }
+
+    def get_runtime(agentRuntimeId, agentRuntimeVersion=None):
+        detail = (
+            latest[agentRuntimeId]
+            if agentRuntimeVersion is None
+            else versions[agentRuntimeId][agentRuntimeVersion]
+        )
+        if isinstance(detail, Exception):
+            raise detail
+        return detail
+
+    mock_ac.list_agent_runtime_versions.side_effect = list_versions
+    mock_ac.get_agent_runtime.side_effect = get_runtime
+
+
+def _versioned_runtime(runtime_id, latest_version, **network_mode_config):
+    summary, detail = _net01_runtime(runtime_id, **network_mode_config)
+    summary["agentRuntimeVersion"] = latest_version
+    detail["agentRuntimeVersion"] = latest_version
+    return summary, detail
+
+
+def _public_runtime_detail(runtime_id):
+    return {
+        "agentRuntimeArn": _runtime_arn(runtime_id),
+        "networkConfiguration": {"networkMode": "PUBLIC"},
+    }
+
+
+class TestAC01RuntimeVersionsAndRollout:
+    """AIR-FND-NET-01: AC-01 judges every runtime version, fails an unset
+    requireServiceS3Endpoint on a pre-rollout runtime, and records a runtime
+    GetAgentRuntime cannot find."""
+
+    @staticmethod
+    def _run(mock_ac, mock_ec2, runtimes, versions):
+        _net01_ec2(mock_ec2)
+        _wire_runtime_versions(mock_ac, runtimes, versions)
+        _wire_tools(mock_ac)
+        rows = extract_csv_data(agentcore_app.check_agentcore_vpc_configuration())
+        for row in rows:
+            assert row["Check_ID"] == "AC-01"
+            assert_finding_schema(row)
+        return rows
+
+    @staticmethod
+    def _passed(rows):
+        return [
+            r
+            for r in rows
+            if r["Finding"] == "AgentCore VPC Configuration Check"
+            and r["Status"] == "Passed"
+        ]
+
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_an_earlier_public_version_fails_while_the_latest_is_private(
+        self, mock_ac, mock_ec2
+    ):
+        rows = self._run(
+            mock_ac,
+            mock_ec2,
+            [
+                _versioned_runtime("rt-a", "2", requireServiceS3Endpoint=False),
+                _versioned_runtime("rt-b", "1", requireServiceS3Endpoint=False),
+            ],
+            {
+                "rt-a": {
+                    "1": _public_runtime_detail("rt-a"),
+                    "2": _net01_runtime("rt-a", requireServiceS3Endpoint=False)[1],
+                },
+                "rt-b": {
+                    "1": _net01_runtime("rt-b", requireServiceS3Endpoint=False)[1]
+                },
+            },
+        )
+        failed = [r for r in rows if r["Status"] == "Failed"]
+        assert len(failed) == 1
+        assert "'rt-a version 1' (rt-a)" in failed[0]["Finding_Details"]
+        assert self._passed(rows) == []
+        read_versions = sorted(
+            (c.kwargs["agentRuntimeId"], c.kwargs.get("agentRuntimeVersion", "latest"))
+            for c in mock_ac.get_agent_runtime.call_args_list
+        )
+        assert read_versions == [("rt-a", "1"), ("rt-a", "latest"), ("rt-b", "latest")]
+
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_an_earlier_version_with_the_service_s3_gateway_fails(
+        self, mock_ac, mock_ec2
+    ):
+        rows = self._run(
+            mock_ac,
+            mock_ec2,
+            [_versioned_runtime("rt-a", "3", requireServiceS3Endpoint=False)],
+            {
+                "rt-a": {
+                    "1": _net01_runtime("rt-a", requireServiceS3Endpoint=False)[1],
+                    "2": _net01_runtime("rt-a", requireServiceS3Endpoint=True)[1],
+                }
+            },
+        )
+        gateway = [
+            r
+            for r in rows
+            if r["Finding"] == agentcore_app.AGENTCORE_SERVICE_S3_GATEWAY_FINDING
+        ]
+        assert [r["Status"] for r in gateway] == ["Failed"]
+        assert "'rt-a version 2'" in gateway[0]["Finding_Details"]
+        assert self._passed(rows) == []
+
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_the_passed_counts_the_earlier_versions_it_judged(self, mock_ac, mock_ec2):
+        good = _net01_runtime("rt-a", requireServiceS3Endpoint=False)[1]
+        rows = self._run(
+            mock_ac,
+            mock_ec2,
+            [
+                _versioned_runtime("rt-a", "3", requireServiceS3Endpoint=False),
+                _versioned_runtime("rt-b", "1", requireServiceS3Endpoint=False),
+            ],
+            {"rt-a": {"1": good, "2": good, "3": good}, "rt-b": {"1": good}},
+        )
+        (passed,) = self._passed(rows)
+        assert passed["Finding_Details"].startswith("All 2 AgentCore runtime(s)")
+        assert (
+            "as do the 2 earlier version(s) ListAgentRuntimeVersions returned"
+            in passed["Finding_Details"]
+        )
+        assert "'rt-a' (rt-a), 'rt-b' (rt-b)." in passed["Finding_Details"]
+
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_the_latest_version_listed_again_is_not_judged_twice(
+        self, mock_ac, mock_ec2
+    ):
+        summary, detail = _versioned_runtime("rt-a", "2")
+        detail["networkConfiguration"] = {"networkMode": "PUBLIC"}
+        rows = self._run(
+            mock_ac,
+            mock_ec2,
+            [(summary, detail)],
+            {"rt-a": {"2": detail}},
+        )
+        assert [r["Status"] for r in rows if r["Status"] == "Failed"] == ["Failed"]
+        assert mock_ac.get_agent_runtime.call_count == 1
+
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_denied_version_list_is_na_naming_the_action_and_holds_the_pass(
+        self, mock_ac, mock_ec2
+    ):
+        rows = self._run(
+            mock_ac,
+            mock_ec2,
+            [
+                _versioned_runtime("rt-a", "1", requireServiceS3Endpoint=False),
+                _versioned_runtime("rt-b", "1", requireServiceS3Endpoint=False),
+            ],
+            {
+                "rt-b": _make_client_error("AccessDeniedException", "denied"),
+            },
+        )
+        na = [
+            r
+            for r in rows
+            if r["Status"] == "N/A" and "could not be listed" in r["Finding_Details"]
+        ]
+        assert len(na) == 1
+        assert "'rt-b' (rt-b)" in na[0]["Finding_Details"]
+        assert "AccessDeniedException" in na[0]["Finding_Details"]
+        assert "bedrock-agentcore:ListAgentRuntimeVersions" in na[0]["Resolution"]
+        assert self._passed(rows) == []
+
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_version_list_transport_error_is_na_not_a_lost_check(
+        self, mock_ac, mock_ec2
+    ):
+        rows = self._run(
+            mock_ac,
+            mock_ec2,
+            [
+                _versioned_runtime("rt-a", "1"),
+                _versioned_runtime("rt-b", "1", requireServiceS3Endpoint=True),
+            ],
+            {"rt-a": EndpointConnectionError(endpoint_url="https://example.com")},
+        )
+        assert any(
+            "'rt-a' (rt-a)" in r["Finding_Details"]
+            and "EndpointConnectionError" in r["Finding_Details"]
+            for r in rows
+            if r["Status"] == "N/A"
+        )
+        assert any(
+            "'rt-b'" in r["Finding_Details"] for r in rows if r["Status"] == "Failed"
+        )
+
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_an_unset_field_fails_only_on_a_runtime_created_before_the_rollout(
+        self, mock_ac, mock_ec2
+    ):
+        runtimes = [
+            _versioned_runtime("rt-old", "1"),
+            _versioned_runtime("rt-edge", "1"),
+            _versioned_runtime("rt-old-closed", "1", requireServiceS3Endpoint=False),
+            _versioned_runtime("rt-unknown", "1"),
+        ]
+        runtimes[0][1]["createdAt"] = datetime(
+            2026, 5, 4, 23, 59, 59, tzinfo=timezone.utc
+        )
+        runtimes[1][1]["createdAt"] = datetime(2026, 5, 5, tzinfo=timezone.utc)
+        runtimes[2][1]["createdAt"] = datetime(2025, 1, 1, tzinfo=timezone.utc)
+        rows = self._run(mock_ac, mock_ec2, runtimes, {})
+        gateway = {
+            r["Finding_Details"].split("'")[1]: r["Status"]
+            for r in rows
+            if r["Finding"] == agentcore_app.AGENTCORE_SERVICE_S3_GATEWAY_FINDING
+        }
+        assert gateway == {"rt-old": "Failed", "rt-edge": "N/A", "rt-unknown": "N/A"}
+        (old,) = [
+            r
+            for r in rows
+            if r["Status"] == "Failed" and "'rt-old'" in r["Finding_Details"]
+        ]
+        assert "remains provisioned" in old["Finding_Details"]
+        assert old["Severity"] == "Medium"
+
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_naive_pre_rollout_created_at_is_read_as_utc(self, mock_ac, mock_ec2):
+        summary, detail = _versioned_runtime("rt-old", "1")
+        detail["createdAt"] = datetime(2026, 5, 4, 12, 0, 0)
+        rows = self._run(mock_ac, mock_ec2, [(summary, detail)], {})
+        gateway = [
+            r
+            for r in rows
+            if r["Finding"] == agentcore_app.AGENTCORE_SERVICE_S3_GATEWAY_FINDING
+        ]
+        assert [r["Status"] for r in gateway] == ["Failed"]
+
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_runtime_that_is_not_found_is_na_and_holds_the_pass(
+        self, mock_ac, mock_ec2
+    ):
+        rows = self._run(
+            mock_ac,
+            mock_ec2,
+            [
+                _versioned_runtime("rt-a", "1", requireServiceS3Endpoint=False),
+                (
+                    {"agentRuntimeId": "rt-gone", "agentRuntimeName": "rt-gone"},
+                    _make_client_error("ResourceNotFoundException", "gone"),
+                ),
+            ],
+            {},
+        )
+        (gone,) = [r for r in rows if "'rt-gone'" in r["Finding_Details"]]
+        assert gone["Status"] == "N/A"
+        assert "ResourceNotFoundException" in gone["Finding_Details"]
+        assert "GetAgentRuntime" not in gone["Resolution"]
+        assert self._passed(rows) == []
+
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_denied_runtime_read_still_names_the_grant(self, mock_ac, mock_ec2):
+        rows = self._run(
+            mock_ac,
+            mock_ec2,
+            [
+                (
+                    {"agentRuntimeId": "rt-x", "agentRuntimeName": "rt-x"},
+                    _make_client_error("AccessDeniedException", "denied"),
+                )
+            ],
+            {},
+        )
+        (row,) = [r for r in rows if "'rt-x'" in r["Finding_Details"]]
+        assert row["Status"] == "N/A"
+        assert "bedrock-agentcore:GetAgentRuntime" in row["Resolution"]

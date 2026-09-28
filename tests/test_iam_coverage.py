@@ -1104,6 +1104,11 @@ _VERIFIED_REMEDIATION_IAM_ACTIONS |= {"ec2:DescribeVpcs"}
 # name it when a security group rule references a prefix list whose entries
 # could not be read.
 _VERIFIED_REMEDIATION_IAM_ACTIONS |= {"ec2:GetManagedPrefixListEntries"}
+# Verified on 2026-09-28 against the bedrock-agentcore service reference JSON,
+# which lists ListAgentRuntimeVersions as a List action with no resource type,
+# and botocore's bedrock-agentcore-control model, which defines the operation.
+# AC-01 names it when a runtime's versions cannot be listed.
+_VERIFIED_REMEDIATION_IAM_ACTIONS |= {"bedrock-agentcore:ListAgentRuntimeVersions"}
 # Verified on 2026-09-28 with one IDENTITY_POLICY validate-policy run for the
 # AC-47 runtime invoke actions, one statement per name on a runtime ARN.
 # aws:ViaAWSService at index 0 and bedrock-agentcore:InvokeAgentRuntimeForUser,

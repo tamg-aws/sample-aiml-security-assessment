@@ -208,6 +208,14 @@ section.
 
 ### Fixed
 
+- `AC-01` reads every runtime version `ListAgentRuntimeVersions` returns, not
+  only the latest one, and fails a runtime created before the 2026-05-05
+  rollout that does not report `requireServiceS3Endpoint`, since an unset
+  field keeps the service-managed Amazon S3 gateway. A runtime that
+  `GetAgentRuntime` cannot find is now `N/A` by name; it was dropped, and the
+  `Passed` row reported all runtimes without it. The assessment roles hold no
+  `bedrock-agentcore:ListAgentRuntimeVersions` grant, so each runtime is `N/A`
+  naming that action until it is added.
 - `AC-45` judges each AgentCore runtime's own execution role by the rules it
   applies to a tool role. No check read a runtime role outside the AgentCore
   namespace, so one granting `s3:*` or every foundation model passed.

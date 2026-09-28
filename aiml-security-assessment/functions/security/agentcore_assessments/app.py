@@ -1934,6 +1934,18 @@ def _agentcore_tool_read_findings(
 
 AGENTCORE_TOOL_SUBNET_FINDING = "AgentCore Tool Subnet Internet Exposure"
 AGENTCORE_SERVICE_S3_GATEWAY_FINDING = "AgentCore Runtime Service-Managed S3 Gateway"
+# The requireServiceS3Endpoint rollout began on this date and is gradual, so only
+# a runtime created before it is known to have the service-managed S3 gateway.
+AGENTCORE_S3_GATEWAY_ROLLOUT_START = datetime(2026, 5, 5, tzinfo=timezone.utc)
+
+
+def _agentcore_runtime_predates_s3_gateway_rollout(created_at: Any) -> bool:
+    """Return whether createdAt falls before the S3 gateway rollout began."""
+    if not isinstance(created_at, datetime):
+        return False
+    if created_at.tzinfo is None:
+        created_at = created_at.replace(tzinfo=timezone.utc)
+    return created_at < AGENTCORE_S3_GATEWAY_ROLLOUT_START
 
 
 def _agentcore_subnet_internet_route(
@@ -2348,7 +2360,11 @@ def check_agentcore_vpc_configuration(
     - The route table of every runtime, custom Code Interpreter and custom
       Browser subnet has no route to an internet gateway
     - Each VPC-mode runtime reports requireServiceS3Endpoint false, so no
-      service-managed Amazon S3 gateway sits outside its VPC configuration
+      service-managed Amazon S3 gateway sits outside its VPC configuration. A
+      runtime created before the 2026-05-05 rollout that does not report the
+      field keeps the gateway and fails
+    - Every version ListAgentRuntimeVersions returns is held to the same legs
+      as the latest one, since an endpoint can serve an earlier version
     - What the security groups of each VPC-mode resource permit outbound
 
     VPC endpoints are judged by AC-08. NAT gateways are not read: a NAT route
@@ -2361,6 +2377,7 @@ def check_agentcore_vpc_configuration(
     findings = []
     egress_targets: List[Tuple[str, str, List[str]]] = []
     private_runtimes: List[str] = []
+    earlier_versions = 0
 
     if agentcore_client is None:
         logger.error("AgentCore client not available")
@@ -2391,14 +2408,72 @@ def check_agentcore_vpc_configuration(
                 resources_found = True
                 logger.info(f"Found {len(runtimes)} AgentCore Runtimes")
 
+                # GetAgentRuntime without a version reads the latest one, and an
+                # endpoint can serve an earlier version, so every version
+                # ListAgentRuntimeVersions returns is judged as well.
+                runtime_targets: List[Tuple[Dict[str, Any], Optional[str]]] = []
                 for runtime in runtimes:
+                    runtime_targets.append((runtime, None))
                     runtime_id = runtime.get("agentRuntimeId", "unknown")
                     runtime_name = runtime.get("agentRuntimeName", runtime_id)
+                    try:
+                        versions = _agentcore_list_all(
+                            "list_agent_runtime_versions",
+                            ["agentRuntimes"],
+                            agentRuntimeId=runtime_id,
+                        )
+                    except (BotoCoreError, ClientError) as e:
+                        logger.warning(
+                            f"Error listing versions of runtime {runtime_id}: {e}"
+                        )
+                        findings.append(
+                            create_finding(
+                                check_id="AC-01",
+                                finding_name="AgentCore Runtime VPC Configuration",
+                                finding_details=(
+                                    f"The versions of runtime '{runtime_name}' "
+                                    f"({runtime_id}) could not be listed, so only "
+                                    "its latest version was judged and whether an "
+                                    "earlier version runs outside a private VPC "
+                                    "was not established: "
+                                    f"{_assessment_error_label(e)}."
+                                ),
+                                resolution=(
+                                    "Grant bedrock-agentcore:ListAgentRuntimeVersions "
+                                    "and retry."
+                                ),
+                                reference=AGENTCORE_VPC_REFERENCE_URL,
+                                severity=SeverityEnum.INFORMATIONAL,
+                                status=StatusEnum.NA,
+                            )
+                        )
+                        continue
+                    latest_version = runtime.get("agentRuntimeVersion")
+                    for version in versions:
+                        number = (version or {}).get("agentRuntimeVersion")
+                        if (
+                            isinstance(number, str)
+                            and number
+                            and number != latest_version
+                            and (runtime, number) not in runtime_targets
+                        ):
+                            runtime_targets.append((runtime, number))
+                earlier_versions = sum(
+                    1 for _, version in runtime_targets if version is not None
+                )
+
+                for runtime, version in runtime_targets:
+                    runtime_id = runtime.get("agentRuntimeId", "unknown")
+                    runtime_name = runtime.get("agentRuntimeName", runtime_id)
+                    version_kwargs = {}
+                    if version is not None:
+                        runtime_name = f"{runtime_name} version {version}"
+                        version_kwargs["agentRuntimeVersion"] = version
 
                     # Get detailed runtime info
                     try:
                         runtime_details = agentcore_client.get_agent_runtime(
-                            agentRuntimeId=runtime_id
+                            agentRuntimeId=runtime_id, **version_kwargs
                         )
                         network_config = runtime_details.get("networkConfiguration", {})
                         network_mode = network_config.get("networkMode", "PUBLIC")
@@ -2435,12 +2510,44 @@ def check_agentcore_vpc_configuration(
                             # AIR-FND-NET-01: a runtime created before the
                             # 2026-05-05 rollout keeps a service-managed S3
                             # gateway outside its VPC configuration until
-                            # requireServiceS3Endpoint is set false. An absent
-                            # field is not read as either answer.
+                            # requireServiceS3Endpoint is set false, and an
+                            # unset field keeps it. The rollout is gradual, so
+                            # an absent field on a later runtime is not read
+                            # as either answer.
                             require_s3 = (
                                 network_config.get("networkModeConfig") or {}
                             ).get("requireServiceS3Endpoint")
-                            if require_s3 is True:
+                            pre_rollout = (
+                                _agentcore_runtime_predates_s3_gateway_rollout(
+                                    runtime_details.get("createdAt")
+                                )
+                            )
+                            if require_s3 is None and pre_rollout:
+                                findings.append(
+                                    create_finding(
+                                        check_id="AC-01",
+                                        finding_name=AGENTCORE_SERVICE_S3_GATEWAY_FINDING,
+                                        finding_details=(
+                                            f"Runtime '{runtime_name}' ({runtime_id}) "
+                                            "runs in VPC mode, was created before "
+                                            "the 2026-05-05 rollout, and does not "
+                                            "report requireServiceS3Endpoint, so "
+                                            "the service-managed Amazon S3 gateway "
+                                            "outside its VPC configuration remains "
+                                            "provisioned."
+                                        ),
+                                        resolution=(
+                                            "Confirm the VPC gives the runtime the "
+                                            "Amazon S3 access it needs at startup, "
+                                            "then set requireServiceS3Endpoint to "
+                                            "false through UpdateAgentRuntime."
+                                        ),
+                                        reference=AGENTCORE_VPC_CONFIG_API_REFERENCE_URL,
+                                        severity=SeverityEnum.MEDIUM,
+                                        status=StatusEnum.FAILED,
+                                    )
+                                )
+                            elif require_s3 is True:
                                 findings.append(
                                     create_finding(
                                         check_id="AC-01",
@@ -2472,8 +2579,10 @@ def check_agentcore_vpc_configuration(
                                         finding_details=(
                                             f"Runtime '{runtime_name}' ({runtime_id}) "
                                             "runs in VPC mode but GetAgentRuntime "
-                                            "did not report requireServiceS3Endpoint, "
-                                            "so whether a service-managed Amazon S3 "
+                                            "did not report requireServiceS3Endpoint "
+                                            "or a createdAt before the 2026-05-05 "
+                                            "rollout, so whether a service-managed "
+                                            "Amazon S3 "
                                             "gateway sits outside its VPC "
                                             "configuration was not established."
                                         ),
@@ -2520,9 +2629,10 @@ def check_agentcore_vpc_configuration(
                                     )
                                 )
                             else:
-                                private_runtimes.append(
-                                    f"'{runtime_name}' ({runtime_id})"
-                                )
+                                if version is None:
+                                    private_runtimes.append(
+                                        f"'{runtime_name}' ({runtime_id})"
+                                    )
                                 # Check if subnets are private
                                 try:
                                     (
@@ -2631,30 +2741,39 @@ def check_agentcore_vpc_configuration(
                                     )
 
                     except ClientError as e:
-                        if e.response["Error"]["Code"] == "ResourceNotFoundException":
+                        # A runtime ListAgentRuntimes named that GetAgentRuntime
+                        # cannot find was not judged either, so it is recorded
+                        # and withholds the Passed.
+                        not_found = (
+                            e.response["Error"]["Code"] == "ResourceNotFoundException"
+                        )
+                        if not_found:
                             logger.warning(f"Runtime {runtime_id} not found")
                         else:
                             logger.error(f"Error describing runtime {runtime_id}: {e}")
-                            findings.append(
-                                create_finding(
-                                    check_id="AC-01",
-                                    finding_name="AgentCore Runtime VPC Configuration",
-                                    finding_details=(
-                                        f"The network configuration of runtime "
-                                        f"'{runtime_name}' ({runtime_id}) could not "
-                                        "be read, so whether it runs in a VPC with "
-                                        "private subnets was not established: "
-                                        f"{_assessment_error_label(e)}."
-                                    ),
-                                    resolution=(
-                                        "Grant bedrock-agentcore:GetAgentRuntime "
-                                        "and retry."
-                                    ),
-                                    reference=AGENTCORE_VPC_REFERENCE_URL,
-                                    severity=SeverityEnum.INFORMATIONAL,
-                                    status=StatusEnum.NA,
-                                )
+                        findings.append(
+                            create_finding(
+                                check_id="AC-01",
+                                finding_name="AgentCore Runtime VPC Configuration",
+                                finding_details=(
+                                    f"The network configuration of runtime "
+                                    f"'{runtime_name}' ({runtime_id}) could not "
+                                    "be read, so whether it runs in a VPC with "
+                                    "private subnets was not established: "
+                                    f"{_assessment_error_label(e)}."
+                                ),
+                                resolution=(
+                                    "Retry. A runtime deleted during the "
+                                    "assessment no longer needs judging."
+                                    if not_found
+                                    else "Grant bedrock-agentcore:GetAgentRuntime "
+                                    "and retry."
+                                ),
+                                reference=AGENTCORE_VPC_REFERENCE_URL,
+                                severity=SeverityEnum.INFORMATIONAL,
+                                status=StatusEnum.NA,
                             )
+                        )
 
         except ClientError as e:
             if e.response["Error"]["Code"] == "ResourceNotFoundException":
@@ -2683,7 +2802,9 @@ def check_agentcore_vpc_configuration(
                             f"All {len(private_runtimes)} AgentCore runtime(s) run "
                             "in VPC mode on subnets whose route tables have no "
                             "route to an internet gateway, and report "
-                            "requireServiceS3Endpoint false: "
+                            "requireServiceS3Endpoint false, as do the "
+                            f"{earlier_versions} earlier version(s) "
+                            "ListAgentRuntimeVersions returned for them: "
                             f"{named}{remainder}. Custom Code Interpreters and "
                             "Browsers are reported under "
                             f"'{AGENTCORE_TOOL_SUBNET_FINDING}'."
