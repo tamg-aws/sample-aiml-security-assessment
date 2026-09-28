@@ -157,6 +157,19 @@ VACUOUS=0, exit 0, over 19 legs. BR-10 moved from `ELSE_GUARDED` to `REACHABLE` 
 bedrock team's round-1 changes, which is what made the AISF-03 fixture both possible
 and necessary.
 
+Measured on 2026-09-28 with all three fixtures in place, after SM-42 joined AISF-07
+and the producer table began running each source's account-wide producer as well as
+its regional one: BOTH=6, ONE_ONLY=2, NONE=0, VACUOUS=0, exit 0, over 22 legs (one
+source read, 13 producers, 8 rows). The two account-wide producers are BR-37's
+`check_bedrock_data_retention_scp` and SM-09's
+`check_sagemaker_notebook_access_guardrails`, which the report labels Global and folds
+into every regional verdict. AISF-06 moved from ONE_ONLY to BOTH, and its two verdicts
+come from different producers: the regional retention setting reached Passed and the
+service control policy check reached Failed. The folded AISF-06 verdict for this
+account is therefore Failed, so BOTH here says that each producer's assertion fired,
+and not that AISF-06 can read Passed in this account. AISF-07 reached 7 findings from
+SM-18 and SM-42, all Failed.
+
 ## AISF-01: an AUTHENTICATE_ONLY gateway
 
 - `aisflive-gw-authonly` (`aisflive-gw-authonly-vmwcsepglu`), `authorizerType=AUTHENTICATE_ONLY`,
@@ -370,17 +383,21 @@ above are the ones that must stay for the gate to stay green.
 The 36 `prowlerlive*` resources in this account belong to the Prowler check
 pipeline and are not ours. Five of them bill hourly. Scan them, never modify them.
 
-Three rows stay at ONE_ONLY by construction and are recorded rather than failed
-(measured at `7fa0a41`):
+Two rows stay at ONE_ONLY by construction and are recorded rather than failed
+(measured on 2026-09-28):
 
-- **AISF-02 / AISF-07** (`AC-06`, `SM-18`) are `ELSE_GUARDED`: the only Passed emit
-  sits in the `else` of the guard that emits the Failed findings, so one
-  non-compliant resource suppresses Passed for the whole account. AISF-08's three
-  sources are `ELSE_GUARDED` as well, but between them they reached BOTH at
-  `7fa0a41`. No fixture can fix an `ELSE_GUARDED` row, and for transform jobs nothing
-  can: SageMaker has no `DeleteTransformJob`, so `prowlerlive-xf-noenc` is permanent.
-- **AISF-06** (`BR-37`) is `SINGLETON`: account-level data retention yields one
-  verdict per region by construction.
+- **AISF-02 / AISF-07** (`AC-06`; `SM-18` and `SM-42`) are `ELSE_GUARDED`: the only
+  Passed emit of `AC-06` and of `SM-18` sits in the `else` of the guard that emits
+  the Failed findings, so one non-compliant resource suppresses Passed for the whole
+  account. A row is only as reachable as its least reachable source, so SM-42 being
+  `REACHABLE` does not lift AISF-07. AISF-08's regional sources are `ELSE_GUARDED` as
+  well, but between them they reached BOTH. No fixture can fix an `ELSE_GUARDED` row,
+  and for transform jobs nothing can: SageMaker has no `DeleteTransformJob`, so
+  `prowlerlive-xf-noenc` is permanent.
+- **AISF-06** (`BR-37`) is `SINGLETON`: both of its producers, the regional data
+  retention setting and the account-wide service control policy check, yield one
+  verdict each by construction. It measured BOTH on 2026-09-28 only because the two
+  disagreed; see the measurement above.
 
 `probe_live.py` computes these classifications from each check's own source on
 every run, so none of them can go stale against an edited check. The excuse is
