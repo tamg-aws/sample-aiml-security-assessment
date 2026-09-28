@@ -11635,6 +11635,23 @@ CREATION_KEY_NONCOMPLIANT_VALUES = {
     "sagemaker:rootaccess": "enabled",
 }
 CREATION_PROBE_PARTITIONS = ("aws", "aws-cn", "aws-us-gov")
+# AIR-SGM-EP-08: the batch transform path. A transform job takes its network
+# posture from its model, so these two actions carry the whole guardrail.
+BATCH_CREATION_GUARDRAIL_FINDING = "SageMaker Batch Transform Creation Guardrail"
+BATCH_CREATION_GUARDRAIL_REFERENCE = (
+    "https://docs.aws.amazon.com/sagemaker/latest/dg/batch-vpc.html"
+)
+SAGEMAKER_BATCH_CREATE_ACTIONS = (
+    "sagemaker:CreateModel",
+    "sagemaker:CreateTransformJob",
+)
+SAGEMAKER_BATCH_CREATION_GUARDRAILS = tuple(
+    (
+        category,
+        tuple(r for r in requirements if r[0] in SAGEMAKER_BATCH_CREATE_ACTIONS),
+    )
+    for category, requirements in SAGEMAKER_CREATION_GUARDRAILS
+)
 # The ArrayOfString keys among them, per the sagemaker service-reference JSON.
 MULTIVALUED_CREATION_KEYS = {"sagemaker:vpcsubnets", "sagemaker:vpcsecuritygroupids"}
 
@@ -11871,7 +11888,9 @@ def _deny_guard_strength(statement: Dict[str, Any], keys: tuple) -> Optional[str
     non-compliant value but not when the request omits the key. A "presence"
     and an "absent-open" Deny together enforce the key. "conjunctive": the key
     shares the statement with other conditions, so the deny fires only when all
-    of them hold. None: the key is not named.
+    of them hold. "undefined-operator": a negated operator on a multivalued
+    key with no ForAllValues or ForAnyValue prefix, which IAM does not define,
+    so it earns no credit. None: the key is not named.
     """
     entries = _condition_entries(statement)
     matched = [entry for entry in entries if entry[1] in keys]
@@ -11884,6 +11903,8 @@ def _deny_guard_strength(statement: Dict[str, Any], keys: tuple) -> Optional[str
     if base == "null":
         return "presence" if "true" in values else "value"
     if "not" in base:
+        if not prefix and key in MULTIVALUED_CREATION_KEYS:
+            return "undefined-operator"
         # A negated operator is true for an absent key, except under
         # ForAnyValue, which is false over an empty set.
         if _like_values_unbounded(base, values):
@@ -11921,7 +11942,8 @@ def _allow_enforces_key(statement: Dict[str, Any], keys: tuple) -> bool:
     neither enforces it. ForAllValues does too, unless the statement also holds
     a Null false test on the same key. A Null test and a Like on a wildcard value
     require only that the key is present. ForAnyValue on a multivalued key
-    admits a request that mixes an approved value with an unapproved one.
+    admits a request that mixes an approved value with an unapproved one, and
+    IAM does not define a multivalued key under no set operator.
     """
     entries = _condition_entries(statement)
     required = {
@@ -11939,7 +11961,7 @@ def _allow_enforces_key(statement: Dict[str, Any], keys: tuple) -> bool:
             continue
         if prefix == "forallvalues" and key not in required:
             continue
-        if prefix == "foranyvalue" and key in MULTIVALUED_CREATION_KEYS:
+        if key in MULTIVALUED_CREATION_KEYS and prefix != "forallvalues":
             continue
         compliant = CREATION_KEY_COMPLIANT_VALUES.get(key)
         if compliant is None or (values and all(v == compliant for v in values)):
@@ -12032,7 +12054,8 @@ def _creation_scp_leg(scp: Dict[str, Any], action: str, keys: tuple) -> Dict[str
     Report whether an SCP governing this account enforces keys on action.
 
     Returns a state of "enforced", "unattached", "value", "presence",
-    "absent-open", "conjunctive", "attachment-unread", "missing" or the
+    "absent-open", "conjunctive", "undefined-operator", "attachment-unread",
+    "missing" or the
     leg-wide state ("none", "unread", "exempt"), with the policy names behind
     it. An attached "presence" Deny and an attached "absent-open" Deny that
     both cover every resource are "enforced" together.
@@ -12051,9 +12074,10 @@ def _creation_scp_leg(scp: Dict[str, Any], action: str, keys: tuple) -> Dict[str
             strength = _deny_guard_strength(statement, keys)
             if strength is None:
                 continue
-            if strength == "enforced" and not _deny_covers_every_resource(
-                statement, resource_type
-            ):
+            if strength in (
+                "enforced",
+                "undefined-operator",
+            ) and not _deny_covers_every_resource(statement, resource_type):
                 strength = "conjunctive"
             if "targets_error" in item:
                 attachment = "attachment-unread"
@@ -12100,6 +12124,7 @@ def _creation_scp_leg(scp: Dict[str, Any], action: str, keys: tuple) -> Dict[str
         "enforced",
         "attachment-unread",
         "conjunctive",
+        "undefined-operator",
         "value",
         "presence",
         "absent-open",
@@ -12136,6 +12161,11 @@ def _creation_scp_reason(scp_leg: Dict[str, Any], scp: Dict[str, Any]) -> str:
             f"service control policy {names} names the key alongside other "
             "conditions or on named resources only, so it denies only when all of "
             "them hold"
+        )
+    if state == "undefined-operator":
+        return (
+            f"service control policy {names} denies with an operator IAM does not "
+            "define for a multivalued key, so it earns no credit"
         )
     if state == "value":
         return (
@@ -12362,6 +12392,59 @@ def check_sagemaker_creation_guardrails(
     action.
     """
     logger.debug("Starting check for SageMaker creation guardrails")
+    return _creation_guardrail_findings(
+        region,
+        scp_inventory,
+        permission_cache,
+        SAGEMAKER_CREATION_GUARDRAILS,
+        check_id="SM-34",
+        finding_name=CREATION_GUARDRAIL_FINDING,
+        reference=CREATION_GUARDRAIL_REFERENCE,
+    )
+
+
+def check_sagemaker_batch_creation_guardrails(
+    region: str = "",
+    scp_inventory: Dict[str, Any] = None,
+    permission_cache: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """
+    SM-42: Verify CreateModel and CreateTransformJob are held to the encryption,
+    network and isolation guardrails at creation time (AIR-SGM-EP-08).
+
+    The SM-34 legs, over the batch transform path only, so a training or
+    notebook gap does not fail this verdict. Regional, so it shares a
+    (account, region) key with the SM-18 transform job rows.
+    """
+    logger.debug("Starting check for SageMaker batch creation guardrails")
+    return _creation_guardrail_findings(
+        region,
+        scp_inventory,
+        permission_cache,
+        SAGEMAKER_BATCH_CREATION_GUARDRAILS,
+        check_id="SM-42",
+        finding_name=BATCH_CREATION_GUARDRAIL_FINDING,
+        reference=BATCH_CREATION_GUARDRAIL_REFERENCE,
+        scope="on the SageMaker batch transform path",
+        consequence=(
+            "A transform job can run on a model outside the approved network or "
+            "write results under an unapproved key, and is only detected "
+            "afterwards."
+        ),
+    )
+
+
+def _creation_guardrail_findings(
+    region: str,
+    scp_inventory: Optional[Dict[str, Any]],
+    permission_cache: Optional[Dict[str, Any]],
+    guardrails: tuple,
+    check_id: str,
+    finding_name: str,
+    reference: str,
+    **category_kwargs: Any,
+) -> Dict[str, Any]:
+    """One creation guardrail verdict per category of guardrails."""
     findings = {"csv_data": []}
     try:
         scp = _creation_scp_state(scp_inventory)
@@ -12369,8 +12452,8 @@ def check_sagemaker_creation_guardrails(
         if scp["state"] != "read" and permission_cache is None:
             findings["csv_data"].append(
                 create_finding(
-                    check_id="SM-34",
-                    finding_name=CREATION_GUARDRAIL_FINDING,
+                    check_id=check_id,
+                    finding_name=finding_name,
                     finding_details=(
                         "Creation guardrails for SageMaker were not assessed: "
                         f"{scp['detail']}. The IAM permissions cache was not "
@@ -12378,7 +12461,7 @@ def check_sagemaker_creation_guardrails(
                         "either."
                     ),
                     resolution=scp["resolution"] or COULD_NOT_ASSESS_RESOLUTION,
-                    reference=CREATION_GUARDRAIL_REFERENCE,
+                    reference=reference,
                     severity="Informational",
                     status="N/A",
                     region=region,
@@ -12386,27 +12469,35 @@ def check_sagemaker_creation_guardrails(
             )
             return findings
 
-        for category, requirements in SAGEMAKER_CREATION_GUARDRAILS:
+        for category, requirements in guardrails:
             findings["csv_data"].append(
                 _creation_category_finding(
-                    category, requirements, scp, permission_cache, region
+                    category,
+                    requirements,
+                    scp,
+                    permission_cache,
+                    region,
+                    check_id=check_id,
+                    finding_name=finding_name,
+                    reference=reference,
+                    **category_kwargs,
                 )
             )
         return findings
 
     except Exception as error:
         logger.error(
-            f"Error in check_sagemaker_creation_guardrails: {str(error)}",
+            f"Error in {check_id} creation guardrail check: {str(error)}",
             exc_info=True,
         )
         return {
             "csv_data": [
                 create_finding(
-                    check_id="SM-34",
-                    finding_name=CREATION_GUARDRAIL_FINDING,
+                    check_id=check_id,
+                    finding_name=finding_name,
                     finding_details=build_could_not_assess_detail(error, region),
                     resolution=COULD_NOT_ASSESS_RESOLUTION,
-                    reference=CREATION_GUARDRAIL_REFERENCE,
+                    reference=reference,
                     severity="Informational",
                     status="N/A",
                     region=region,
@@ -16019,6 +16110,13 @@ def lambda_handler(event, context):
             region=region
         )
         all_findings.append(transform_job_encryption_findings)
+
+        logger.info("Running SageMaker batch creation guardrail check (SM-42)")
+        all_findings.append(
+            check_sagemaker_batch_creation_guardrails(
+                region=region, permission_cache=permission_cache
+            )
+        )
 
         logger.info(
             "Running SageMaker hyperparameter tuning job encryption check (SageMaker.12)"
