@@ -5,6 +5,7 @@ import importlib.util
 import json
 import os
 import sys
+import time
 from datetime import datetime, timedelta, timezone
 from io import StringIO
 from unittest.mock import MagicMock, patch
@@ -318,6 +319,90 @@ def test_ar01_passes_for_scoped_permissions_and_is_na_without_cached_roles():
             {"role_permissions": {}, "user_permissions": {}}
         )[0]["Status"]
         == "N/A"
+    )
+
+
+def _ar01_two_role_cache(statement):
+    """A scoped reader beside one role holding ``statement``."""
+    cache = _registry_permission_cache()
+    scoped = cache["role_permissions"]["registry-reader"]["inline_policies"][0][
+        "document"
+    ]["Statement"]
+    scoped["Action"] = "agent-registry:GetRegistry"
+    scoped["Resource"] = (
+        "arn:aws:agent-registry:us-east-1:123456789012:registry/abcdef123456"
+    )
+    cache["role_permissions"]["registry-browser"] = {
+        "attached_policies": [],
+        "inline_policies": [
+            {"document": {"Version": "2012-10-17", "Statement": statement}}
+        ],
+    }
+    cache["principal_errors"] = []
+    return cache
+
+
+@pytest.mark.parametrize(
+    "scope",
+    [
+        {"Resource": "arn:aws:agent-registry:*:*:*"},
+        {"Resource": "arn:aws:agent-registry:us-east-1:123456789012:registry/*"},
+        {"Resource": "arn:aws:agent-registry:us-east-1:*:registry/abcdef123456"},
+        {"Resource": "arn:aws:agent-registry:us-east-1:123456789012:registry/ab??*"},
+        {
+            "Resource": [
+                "arn:aws:agent-registry:us-east-1:123456789012:registry/abcdef123456",
+                "arn:aws:agent-registry:*:123456789012:registry/*",
+            ]
+        },
+        {
+            "NotResource": (
+                "arn:aws:agent-registry:us-east-1:123456789012:registry/abcdef123456"
+            )
+        },
+    ],
+)
+def test_ar01_a_wildcard_grant_on_a_partial_wildcard_resource_is_not_bounded(scope):
+    findings = agent_registry_app.check_agent_registry_full_access(
+        _ar01_two_role_cache(
+            {"Effect": "Allow", "Action": "agent-registry:Get*", **scope}
+        )
+    )
+
+    assert [(f["Finding"], f["Status"]) for f in findings] == [
+        ("AWS Agent Registry IAM Wildcard Permissions", "Failed")
+    ]
+    assert "registry-browser" in findings[0]["Finding_Details"]
+    assert "registry-reader" not in findings[0]["Finding_Details"]
+    assert "a wildcard in any segment" in findings[0]["Finding_Details"]
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        {
+            "Effect": "Allow",
+            "Action": "agent-registry:Get*",
+            "Resource": (
+                "arn:aws:agent-registry:us-east-1:123456789012:registry/abcdef123456"
+            ),
+        },
+        {
+            "Effect": "Allow",
+            "Action": "agent-registry:GetRegistry",
+            "Resource": "arn:aws:agent-registry:*:*:*",
+        },
+    ],
+)
+def test_ar01_a_named_resource_or_an_explicit_action_stays_passed(statement):
+    findings = agent_registry_app.check_agent_registry_full_access(
+        _ar01_two_role_cache(statement)
+    )
+
+    assert [f["Status"] for f in findings] == ["Passed"]
+    assert (
+        "a resource ARN with a wildcard in any segment"
+        in (findings[0]["Finding_Details"])
     )
 
 
@@ -1617,21 +1702,195 @@ def test_ar10_partial_detail_type_coverage_names_the_missing_transitions():
     [
         ("{not json", "not valid JSON"),
         ("[]", "not a JSON object"),
-        ({"source": [{"prefix": "aws.agent-"}]}, "which event sources"),
+        (
+            {
+                "$or": [
+                    {"source": [agent_registry_app.REGISTRY_EVENT_SOURCE]},
+                    {"detail-type": ["Other"]},
+                ]
+            },
+            "$or",
+        ),
+        # Matcher shapes the check does not evaluate stand in for any matcher
+        # EventBridge adds later.
+        (
+            {"source": [{"prefix": "aws.", "suffix": "-registry"}]},
+            "which event sources",
+        ),
+        ({"source": []}, "which event sources"),
         (
             {
                 "source": [agent_registry_app.REGISTRY_EVENT_SOURCE],
-                "detail-type": [{"prefix": "Registry Record State"}],
+                "detail-type": [{"regex": "Registry Record State.*"}],
             },
             "which detail types",
         ),
     ],
 )
 def test_ar10_a_pattern_this_check_cannot_decide_is_indeterminate(pattern, reason):
-    findings, _ = _routing_findings([_rule("opaque-rule", pattern)])
-    assert [f["Status"] for f in findings] == ["N/A", "Failed"]
+    # The rule may route every approval transition, so no Failed follows its N/A.
+    findings, client = _routing_findings([_rule("opaque-rule", pattern)])
+    assert [f["Status"] for f in findings] == ["N/A"]
     assert "opaque-rule" in findings[0]["Finding_Details"]
     assert reason in findings[0]["Finding_Details"]
+    assert client.target_calls == []
+
+
+@pytest.mark.parametrize(
+    "pattern",
+    [
+        {"source": [{"prefix": "aws.agent-"}]},
+        {"source": [{"prefix": {"equals-ignore-case": "AWS.AGENT"}}]},
+        {"source": [{"suffix": "-registry"}]},
+        {"source": [{"equals-ignore-case": "AWS.Agent-Registry"}]},
+        {"source": [{"wildcard": "aws.*-reg*"}]},
+        {"source": [{"anything-but": ["aws.s3", "aws.ec2"]}]},
+        {"source": [{"anything-but": {"prefix": "aws.s"}}]},
+        {"source": [{"exists": True}]},
+        {"source": ["aws.s3", {"prefix": "aws.agent"}]},
+        {
+            "source": [agent_registry_app.REGISTRY_EVENT_SOURCE],
+            "detail-type": [{"prefix": "Registry Record State"}],
+        },
+        {
+            "source": [agent_registry_app.REGISTRY_EVENT_SOURCE],
+            "detail-type": [{"wildcard": "Registry Record State changed to *"}],
+        },
+        {
+            "source": [agent_registry_app.REGISTRY_EVENT_SOURCE],
+            "detail-type": [
+                {"anything-but": {"prefix": "Registry Record State changed to D"}}
+            ],
+        },
+    ],
+)
+def test_ar10_a_content_matcher_reaching_the_approval_events_is_credited(pattern):
+    findings, client = _routing_findings(
+        [_rule("matcher-rule", pattern)], targets={"matcher-rule": 1}
+    )
+    assert [f["Status"] for f in findings] == ["Passed"]
+    assert "'matcher-rule' (1 target(s))" in findings[0]["Finding_Details"]
+    assert client.target_calls == ["matcher-rule"]
+
+
+@pytest.mark.parametrize(
+    "pattern",
+    [
+        {"source": [{"prefix": "aws.s3"}]},
+        {"source": [{"suffix": ".ec2"}]},
+        # Wildcard matching is case-sensitive.
+        {"source": [{"wildcard": "AWS.*"}]},
+        {"source": [{"wildcard": "aws.agent\\*"}]},
+        {
+            "source": [
+                {
+                    "anything-but": [
+                        agent_registry_app.REGISTRY_EVENT_SOURCE,
+                        agent_registry_app.REGISTRY_PREVIEW_EVENT_SOURCE,
+                    ]
+                }
+            ]
+        },
+        {"source": [{"anything-but": {"prefix": "aws."}}]},
+        {"source": [{"exists": False}]},
+        {"source": [{"numeric": [">", 0]}]},
+        {"source": [5, {"prefix": "aws.s3"}]},
+    ],
+)
+def test_ar10_a_content_matcher_missing_the_registry_source_is_another_rule(
+    pattern,
+):
+    # The rule cannot receive Registry events, so it is counted, its targets
+    # are not read, and it neither earns an N/A row nor holds back the Failed.
+    findings, client = _routing_findings(
+        [_rule("s3-prefix", pattern)], targets={"s3-prefix": 1}
+    )
+    assert [f["Status"] for f in findings] == ["Failed"]
+    assert "None of the 1 rule(s)" in findings[0]["Finding_Details"]
+    assert client.target_calls == []
+
+
+def test_ar10_a_detail_type_matcher_is_credited_only_with_what_it_matches():
+    approval_types = list(agent_registry_app.REGISTRY_APPROVAL_DETAIL_TYPES)
+    findings, _ = _routing_findings(
+        [
+            _rule(
+                "approved-only",
+                _approval_pattern(detail_types=[{"suffix": "to Approved"}]),
+            ),
+            _rule(
+                "rejected-only",
+                _approval_pattern(
+                    detail_types=[{"equals-ignore-case": approval_types[2].upper()}]
+                ),
+            ),
+        ],
+        targets={"approved-only": 1, "rejected-only": 1},
+    )
+    assert [f["Status"] for f in findings] == ["Failed"]
+    assert f"detail type(s) {approval_types[0]}, so" in findings[0]["Finding_Details"]
+    assert "'approved-only'" in findings[0]["Finding_Details"]
+    assert "'rejected-only'" in findings[0]["Finding_Details"]
+
+
+def test_ar10_a_literal_ga_source_beside_an_unknown_matcher_is_still_credited():
+    # The unknown element could only add the preview source, which does not
+    # change the kind of a rule that already matches the GA source.
+    findings, _ = _routing_findings(
+        [
+            _rule(
+                "ga-plus-unknown",
+                {
+                    "source": [
+                        agent_registry_app.REGISTRY_EVENT_SOURCE,
+                        {"regex": "aws\\..*"},
+                    ]
+                },
+            )
+        ],
+        targets={"ga-plus-unknown": 1},
+    )
+    assert [f["Status"] for f in findings] == ["Passed"]
+
+
+def test_ar10_an_unreadable_rule_holds_back_the_failed_a_clean_miss_would_earn():
+    approval_types = list(agent_registry_app.REGISTRY_APPROVAL_DETAIL_TYPES)
+    findings, _ = _routing_findings(
+        [
+            _rule("pending-only", _approval_pattern(detail_types=approval_types[:1])),
+            _rule("opaque-rule", {"$or": [{"source": ["aws.agent-registry"]}]}),
+            _rule("s3-events", {"source": ["aws.s3"]}),
+        ],
+        targets={"pending-only": 1},
+    )
+    assert [f["Status"] for f in findings] == ["N/A"]
+    assert "opaque-rule" in findings[0]["Finding_Details"]
+
+
+def test_ar10_an_unreadable_rule_does_not_hold_back_a_proven_pass():
+    findings, _ = _routing_findings(
+        [
+            _rule("opaque-rule", {"$or": [{"source": ["aws.agent-registry"]}]}),
+            _rule("all-registry-events", _approval_pattern()),
+        ],
+        targets={"all-registry-events": 1},
+    )
+    assert [f["Status"] for f in findings] == ["N/A", "Passed"]
+    assert "all-registry-events" in findings[1]["Finding_Details"]
+
+
+def test_ar10_wildcard_matching_does_not_backtrack():
+    wildcard = agent_registry_app._wildcard_matches
+    assert wildcard("aws.*-registry", "aws.agent-registry")
+    assert wildcard("*", "")
+    assert wildcard("a\\*b", "a*b")
+    assert not wildcard("a\\*b", "axb")
+    assert not wildcard("*registry*agent", "aws.agent-registry")
+    # Segments must not overlap the fixed head and tail.
+    assert not wildcard("ab*ba", "aba")
+    started = time.monotonic()
+    assert not wildcard("a*" * 40 + "b", "a" * 200)
+    assert time.monotonic() - started < 1
 
 
 def test_ar10_target_listing_failure_is_indeterminate_for_that_rule():
@@ -1651,6 +1910,62 @@ def test_ar10_target_listing_failure_is_indeterminate_for_that_rule():
     assert "unreadable-rule" in findings[0]["Finding_Details"]
     assert "events:ListTargetsByRule" in findings[0]["Resolution"]
     assert "good-rule" in findings[1]["Finding_Details"]
+
+
+_TARGETS_DENIED = ClientError(
+    {"Error": {"Code": "AccessDeniedException", "Message": "Denied"}},
+    "ListTargetsByRule",
+)
+
+
+def test_ar10_unread_targets_hold_back_only_the_transitions_that_rule_matches():
+    # The unread rule matches Pending Approval only, so the other two
+    # transitions, which no rule matches, are still Failed.
+    approval_types = list(agent_registry_app.REGISTRY_APPROVAL_DETAIL_TYPES)
+    findings, _ = _routing_findings(
+        [
+            _rule(
+                "unreadable-rule", _approval_pattern(detail_types=approval_types[:1])
+            ),
+            _rule("s3-events", {"source": ["aws.s3"]}),
+        ],
+        target_errors={"unreadable-rule": _TARGETS_DENIED},
+    )
+    assert [f["Status"] for f in findings] == ["N/A", "Failed"]
+    assert findings[0]["Finding"].endswith("Incomplete")
+    for detail_type in approval_types[1:]:
+        assert detail_type in findings[1]["Finding_Details"]
+    assert f"{approval_types[0]}," not in findings[1]["Finding_Details"]
+
+
+def test_ar10_unread_targets_on_a_full_rule_are_not_failed():
+    findings, _ = _routing_findings(
+        [_rule("unreadable-rule", _approval_pattern())],
+        target_errors={"unreadable-rule": _TARGETS_DENIED},
+    )
+    assert [f["Status"] for f in findings] == ["N/A"]
+    assert findings[0]["Finding"].endswith("Incomplete")
+
+
+@pytest.mark.parametrize(
+    ("pattern", "state"),
+    [
+        ({**_approval_pattern(), "detail": {"registryId": ["r1"]}}, "ENABLED"),
+        (_approval_pattern(), "DISABLED"),
+        (_approval_pattern(source=["aws.bedrock-agentcore"]), "ENABLED"),
+    ],
+    ids=["narrowed", "disabled", "preview"],
+)
+def test_ar10_unread_targets_on_a_rule_that_cannot_be_credited_keep_the_failed(
+    pattern, state
+):
+    # Reading those targets could not credit the rule, so the Failed stands.
+    findings, _ = _routing_findings(
+        [_rule("unreadable-rule", pattern, state=state)],
+        target_errors={"unreadable-rule": _TARGETS_DENIED},
+    )
+    assert [f["Status"] for f in findings] == ["N/A", "Failed"]
+    assert findings[0]["Finding"].endswith("Incomplete")
 
 
 def test_ar10_rule_listing_access_denied_is_indeterminate():
@@ -1926,32 +2241,87 @@ def test_ar10_two_forwards_to_one_bus_list_that_bus_once():
 
 
 @pytest.mark.parametrize(
-    "audit_rule",
+    ("audit_rule", "statuses"),
     [
-        _rule("audit-opaque", {"source": [{"prefix": "aws."}]}, bus="audit-bus"),
-        _rule(
-            "audit-opaque",
-            {
-                "source": [agent_registry_app.REGISTRY_EVENT_SOURCE],
-                "detail": {"registryId": ["reg-one"]},
-            },
-            bus="audit-bus",
+        (
+            _rule(
+                "audit-opaque",
+                {"source": [{"prefix": "aws.", "suffix": "-registry"}]},
+                bus="audit-bus",
+            ),
+            ["N/A"],
+        ),
+        (
+            _rule(
+                "audit-opaque",
+                {
+                    "source": [agent_registry_app.REGISTRY_EVENT_SOURCE],
+                    "detail": {"registryId": ["reg-one"]},
+                },
+                bus="audit-bus",
+            ),
+            ["N/A", "Failed"],
         ),
     ],
     ids=["content-filter", "narrowed"],
 )
 def test_ar10_a_forwarded_bus_rule_this_check_cannot_decide_is_indeterminate(
-    audit_rule,
+    audit_rule, statuses
 ):
+    # An unreadable pattern may deliver every forwarded transition, so it holds
+    # back the Failed; a narrowed rule was read and delivers only its filter.
     forward, arns = _forward()
     findings, _ = _routing_findings(
         [forward],
         target_arns={**arns, "audit-opaque": [_SNS_TARGET]},
         bus_rules={"audit-bus": [audit_rule]},
     )
-    assert [f["Status"] for f in findings] == ["N/A", "Failed"]
+    assert [f["Status"] for f in findings] == statuses
     assert "'audit-opaque'" in findings[0]["Finding_Details"]
     assert "event bus 'audit-bus'" in findings[0]["Finding_Details"]
+
+
+def test_ar10_a_forwarded_bus_rule_with_a_matching_prefix_is_credited():
+    forward, arns = _forward()
+    findings, _ = _routing_findings(
+        [forward],
+        target_arns={**arns, "audit-prefix": [_SNS_TARGET]},
+        bus_rules={
+            "audit-bus": [
+                _rule("audit-prefix", {"source": [{"prefix": "aws."}]}, bus="audit-bus")
+            ]
+        },
+    )
+    assert [f["Status"] for f in findings] == ["Passed"]
+    assert "rule 'audit-prefix'" in findings[0]["Finding_Details"]
+
+
+def test_ar10_an_unread_forward_holds_back_only_its_own_transitions():
+    # forward-pending reaches a bus whose rules cannot be listed; forward-rest
+    # reaches a bus with no delivering rule, so its transitions stay Failed.
+    approval_types = list(agent_registry_app.REGISTRY_APPROVAL_DETAIL_TYPES)
+    pending, pending_arns = _forward("forward-pending", detail_types=approval_types[:1])
+    rest, rest_arns = _forward(
+        "forward-rest",
+        bus_arn="arn:aws:events:us-east-1:123456789012:event-bus/empty-bus",
+        detail_types=approval_types[1:],
+    )
+    findings, _ = _routing_findings(
+        [pending, rest],
+        target_arns={**pending_arns, **rest_arns},
+        bus_rules={"empty-bus": []},
+        bus_list_errors={
+            "audit-bus": ClientError(
+                {"Error": {"Code": "AccessDeniedException", "Message": "Denied"}},
+                "ListRules",
+            )
+        },
+    )
+    assert [f["Status"] for f in findings] == ["N/A", "Failed", "Failed"]
+    assert findings[0]["Finding"].endswith("Incomplete")
+    for detail_type in approval_types[1:]:
+        assert detail_type in findings[2]["Finding_Details"]
+    assert f"{approval_types[0]}," not in findings[2]["Finding_Details"]
 
 
 def test_ar10_a_forwarded_bus_rule_listing_failure_is_incomplete():
@@ -1966,7 +2336,8 @@ def test_ar10_a_forwarded_bus_rule_listing_failure_is_incomplete():
             )
         },
     )
-    assert [f["Status"] for f in findings] == ["N/A", "Failed"]
+    # The unread leg may deliver every forwarded transition, so none is Failed.
+    assert [f["Status"] for f in findings] == ["N/A"]
     assert findings[0]["Finding"].endswith("Incomplete")
     assert "event bus 'audit-bus'" in findings[0]["Finding_Details"]
     assert "events:ListRules" in findings[0]["Resolution"]
@@ -1989,9 +2360,31 @@ def test_ar10_a_forwarded_bus_rule_target_failure_is_incomplete():
             )
         },
     )
-    assert [f["Status"] for f in findings] == ["N/A", "Failed"]
+    # The unread leg may deliver every forwarded transition, so none is Failed.
+    assert [f["Status"] for f in findings] == ["N/A"]
     assert findings[0]["Finding"].endswith("Incomplete")
     assert "events:ListTargetsByRule" in findings[0]["Resolution"]
+
+
+def test_ar10_a_forwarded_narrowed_rule_with_unread_targets_keeps_the_failed():
+    # Reading the targets could not credit a narrowed rule, so the Failed stands.
+    forward, arns = _forward()
+    findings, _ = _routing_findings(
+        [forward],
+        target_arns=arns,
+        bus_rules={
+            "audit-bus": [
+                _rule(
+                    "audit-narrowed",
+                    {**_approval_pattern(), "detail": {"registryId": ["r1"]}},
+                    bus="audit-bus",
+                )
+            ]
+        },
+        target_errors={"audit-narrowed": _TARGETS_DENIED},
+    )
+    assert [f["Status"] for f in findings] == ["N/A", "Failed"]
+    assert findings[0]["Finding"].endswith("Incomplete")
 
 
 def test_handler_emits_ar10_for_the_assessed_region():

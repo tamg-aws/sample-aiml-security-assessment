@@ -155,21 +155,52 @@ AI_SUBJECT_ROWS = [
     ("AIR-SGM-EP-02", COVERED, None, "sagemaker_assessments", ["SM-02"], "", [], 3),
     ("AIR-SGM-GOV-01", COVERED, None, "sagemaker_assessments", ["SM-22"], "", [], 3),
     ("AIR-SGM-TRN-02", COVERED, None, "sagemaker_assessments", ["SM-03"], "", [], 3),
-    ("AIR-SGM-EP-06", COVERED, None, "sagemaker_assessments", ["SM-31"], "", [], 3),
+    (
+        "AIR-SGM-EP-06",
+        COVERED,
+        None,
+        "sagemaker_assessments",
+        ["SM-23", "SM-31"],
+        "SM-23 fails an InService endpoint with no Model Monitor schedule, or with "
+        "no DataQuality or no ModelQuality schedule, and a schedule that is not "
+        "Scheduled",
+        [],
+        3,
+    ),
     ("AIR-SGM-GOV-10", COVERED, None, "sagemaker_assessments", ["SM-32"], "", [], 3),
-    ("AIR-SGM-TRN-01", COVERED, None, "sagemaker_assessments", ["SM-33"], "", [], 3),
+    (
+        "AIR-SGM-TRN-01",
+        COVERED,
+        None,
+        "sagemaker_assessments",
+        ["SM-33", "SM-34"],
+        "SM-34 is the approved-exception leg: its approved network and no direct "
+        "internet access verdicts require sagemaker:CreateTrainingJob to be bound "
+        "on sagemaker:VpcSubnets or sagemaker:VpcSecurityGroupIds and on "
+        "sagemaker:NetworkIsolation, by a Deny in an attached service control "
+        "policy or by a condition in every identity policy that grants the action",
+        [],
+        3,
+    ),
     ("AIR-SGM-TRN-08", COVERED, None, "sagemaker_assessments", ["SM-34"], "", [], 3),
     (
         "AIR-SGM-EP-03",
-        NOT_IMPL,
+        COVERED,
         None,
-        None,
+        "sagemaker_assessments",
+        ["SM-11", "SM-14"],
+        "SM-11 judges EnableNetworkIsolation and VpcConfig on every model an endpoint "
+        "serves and reads the endpoint config KmsKeyId of each instance-backed "
+        "endpoint, and SM-14 requires RepositoryAccessMode Vpc on each model's image "
+        "config. The one field not read is inter-container traffic encryption, "
+        "because no endpoint API returns it: EnableInterContainerTrafficEncryption "
+        "is a member of DescribeTrainingJob, DescribeProcessingJob and "
+        "DescribeHyperParameterTuningJob, and of none of DescribeEndpointConfig, "
+        "DescribeModel, DescribeEndpoint or DescribeInferenceComponent (botocore "
+        "1.43.85). The AISF slug sagemaker_endpoint_intercontainer_encryption_enabled "
+        "names that absent field and should be fixed in the AISF repo",
         [],
-        "slug names sagemaker_endpoint_intercontainer_encryption_enabled but "
-        "EnableInterContainerTrafficEncryption is absent from DescribeEndpointConfig and present "
-        "only on DescribeTrainingJob; do not port as written, fix in the AISF repo first",
-        [],
-        None,
+        3,
     ),
     # ---------------- ACR: 37 controls, agentcore_assessments ----------------
     (
@@ -277,7 +308,7 @@ AI_SUBJECT_ROWS = [
         COVERED,
         None,
         "agentcore_assessments",
-        ["AC-02", "AC-45"],
+        ["AC-02", "AC-45", "AC-48"],
         "AC-45 reads the execution role of every code interpreter and browser in the "
         "account by value and fails a role whose Allow statements reach every resource "
         "or an unbounded one (arn:aws:s3:::*, table/*, a region or account wildcard), "
@@ -288,7 +319,11 @@ AI_SUBJECT_ROWS = [
         "bedrock-agentcore:InvokeAgentRuntimeCommandShell or "
         "InvokeAgentRuntimeCommand, or that reaches every runtime. AC-02 judges the "
         "same wildcards only over the bedrock-agentcore namespace, so a tool role "
-        "granting s3:* on every bucket is a verdict it cannot reach",
+        "granting s3:* on every bucket is a verdict it cannot reach. AC-48 reads the "
+        "trust policy of every runtime, browser and code interpreter role, fails an "
+        "AWS service principal with no aws:SourceAccount or aws:SourceArn condition "
+        "and an account-root principal, and fails a role that more than one "
+        "AgentCore resource names",
         [],
         4,
     ),
@@ -529,7 +564,7 @@ AI_SUBJECT_ROWS = [
         COVERED,
         None,
         "agentcore_assessments",
-        ["AC-01"],
+        ["AC-01", "AC-49"],
         "AC-01 unions the outbound ranges of every security group attached to a VPC "
         "runtime, code interpreter or browser and fails a resource whose groups "
         "together permit 0.0.0.0/0 or ::/0 egress, so 0.0.0.0/1 plus 128.0.0.0/1 fails "
@@ -542,7 +577,12 @@ AI_SUBJECT_ROWS = [
         "SCP that denies CreateAgentRuntime, UpdateAgentRuntime, CreateCodeInterpreter "
         "and CreateBrowser with a Null true test on bedrock-agentcore:subnets or "
         "bedrock-agentcore:securityGroups, and a second that pins both keys with "
-        "ForAnyValue:StringNotEquals to IDs without wildcards",
+        "ForAnyValue:StringNotEquals to IDs without wildcards. AC-49 is the "
+        "domain-filter leg: for each VPC hosting a runtime, browser or code "
+        "interpreter it walks the Route 53 Resolver DNS Firewall rules in "
+        "evaluation order and passes only when the first rule over * is a BLOCK "
+        "that names no query type and the firewall config has FirewallFailOpen "
+        "DISABLED",
         [],
         4,
     ),
@@ -679,8 +719,10 @@ AI_SUBJECT_ROWS = [
         COVERED,
         None,
         "agentcore_assessments",
-        ["AC-19", "AC-20", "AC-26"],
-        "AC-19 pairs each AgentCore delivery source with its delivery and AC-20 "
+        ["AC-18", "AC-19", "AC-20", "AC-26"],
+        "AC-18 requires a CloudTrail data event selector for "
+        "AWS::BedrockAgentCore::Gateway whenever the region holds a gateway, so "
+        "each gateway call is recorded with its caller. AC-19 pairs each AgentCore delivery source with its delivery and AC-20 "
         "asserts masking plus a customer managed key. AC-26 adds an explicitly "
         "configured retentionInDays and reads each key policy by value: an Allow whose "
         "principal is a wildcard or a NotPrincipal fails unless a condition binds the "
@@ -793,13 +835,14 @@ AI_SUBJECT_ROWS = [
         COVERED,
         None,
         "agentcore_assessments",
-        ["AC-18"],
+        ["AC-18", "AC-19"],
         "AC-18 requires a CloudTrail advanced event selector that logs data events for "
         "AWS::BedrockAgentCore::Memory whenever the region holds a memory resource. A "
         "selector narrowed by readOnly, eventName, resources.ARN or any other field "
         "does not count, nor does a trail that is not logging or that neither spans "
         "all Regions nor is homed in the scanned one. An unreadable trail status is "
-        "N/A",
+        "N/A. AC-19 requires each memory's APPLICATION_LOGS delivery, which carries "
+        "the extraction and consolidation logs of long-term memory processing",
         [],
         4,
     ),
@@ -1541,7 +1584,7 @@ FOUNDATION_ROWS = [
         COVERED,
         None,
         "agentcore_assessments",
-        ["AC-51"],
+        ["AC-51", "AG-39"],
         "AC-51 judges the web ACL on each AgentCore gateway for the AWS "
         "Anti-DDoS managed rule group. Front doors other than AgentCore gateways "
         "(API Gateway, ALB, CloudFront) are not identifiable as AI entry points by "
@@ -1552,7 +1595,8 @@ FOUNDATION_ROWS = [
         "group runs with, API defaults filled in, and does not grade them, since "
         "the control asks for a deliberate choice and names no value. Shield "
         "Advanced enrollment is not judged, because shield:CreateProtection "
-        "accepts no AgentCore gateway ARN",
+        "accepts no AgentCore gateway ARN. AG-39 is the request-rate leg: it fails "
+        "a gateway web ACL with no rate-based rule whose action is Block",
         [],
         6,
     ),
@@ -1942,8 +1986,15 @@ INCUMBENT_NAMES = {
         "SageMaker Notebook VPC Deployment Check",
     ),
     "SM-11": "SageMaker Model Network Isolation Check",
+    # Failed under the first name, Passed and N/A under the second.
+    "SM-14": (
+        "SageMaker Model Platform Repository Access",
+        "SageMaker Model Repository Access Check",
+    ),
     "SM-18": "SageMaker Transform Job Encryption Check",
     "SM-22": "Model Approval Workflow Check",
+    # Failed under the first name, Passed and N/A under the second.
+    "SM-23": ("Model Drift Detection Not Configured", "Model Drift Detection Check"),
     "SM-26": "GuardDuty AI Protection",
     "SM-28": "HyperPod VPC Configuration",
     "SM-31": "Endpoint Inference Data Capture",
