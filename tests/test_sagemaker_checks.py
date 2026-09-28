@@ -7801,6 +7801,359 @@ class TestSM39EksVpcCniNetworkPolicy:
         assert_could_not_assess_finding(rows[0])
 
 
+class TestSM39WorkloadSegmentation:
+    """AIR-SLF-RT-05: strict enforcing mode and per-workload security groups."""
+
+    check = staticmethod(sagemaker_app.check_workload_network_segmentation)
+
+    @pytest.mark.parametrize(
+        ("values", "expected"),
+        [
+            ('{"env": {"NETWORK_POLICY_ENFORCING_MODE": "strict"}}', "strict"),
+            ('{"env": {"NETWORK_POLICY_ENFORCING_MODE": "standard"}}', "standard"),
+            ('{"enableNetworkPolicy": "true"}', None),
+            ('{"env": "x"}', None),
+            ("env:\n  NETWORK_POLICY_ENFORCING_MODE: 'strict'\nx: 1\n", "strict"),
+            ("env:\n  X: 1\nNETWORK_POLICY_ENFORCING_MODE: strict\n", None),
+            ("", None),
+            (None, None),
+        ],
+    )
+    def test_env_value_parser(self, values, expected):
+        assert (
+            sagemaker_app._vpc_cni_env_value(values, "NETWORK_POLICY_ENFORCING_MODE")
+            == expected
+        )
+
+    @staticmethod
+    def _sg(group_id, ingress=None, egress=None):
+        return {
+            "GroupId": group_id,
+            "IpPermissions": ingress or [],
+            "IpPermissionsEgress": (
+                egress
+                if egress is not None
+                else [
+                    {
+                        "IpProtocol": "tcp",
+                        "FromPort": 443,
+                        "ToPort": 443,
+                        "UserIdGroupPairs": [{"GroupId": "sg-dep"}],
+                    }
+                ]
+            ),
+        }
+
+    @staticmethod
+    def _open(cidr="0.0.0.0/0", protocol="-1", port=None, v6=False):
+        rule = {"IpProtocol": protocol}
+        if port is not None:
+            rule.update(FromPort=port, ToPort=port)
+        if v6:
+            rule["Ipv6Ranges"] = [{"CidrIpv6": cidr}]
+        else:
+            rule["IpRanges"] = [{"CidrIp": cidr}]
+        return rule
+
+    def _run(
+        self,
+        services=None,
+        functions=None,
+        groups=None,
+        eks=None,
+        errors=None,
+    ):
+        """services: {cluster: [service dicts]}; eks: {cluster: config string}."""
+        errors = errors or {}
+        by_cluster = services or {}
+        functions = functions or []
+        groups = {g["GroupId"]: g for g in groups or []}
+        eks = eks or {}
+
+        def source(key, pages):
+            def paginate(**kwargs):
+                if key in errors:
+                    raise errors[key]
+                return pages(**kwargs) if callable(pages) else pages
+
+            return paginate
+
+        def factory(service, **kwargs):
+            client = MagicMock()
+            if service == "eks":
+                client.get_paginator.side_effect = _pager(
+                    {
+                        "list_clusters": source("eks", [{"clusters": list(eks)}]),
+                        "list_addons": lambda clusterName: [{"addons": ["vpc-cni"]}],
+                    }
+                )
+                client.describe_cluster.side_effect = lambda name: {"cluster": {}}
+                client.describe_addon.side_effect = lambda clusterName, addonName: {
+                    "addon": {"configurationValues": eks[clusterName]}
+                }
+            elif service == "ecs":
+                client.get_paginator.side_effect = _pager(
+                    {
+                        "list_clusters": source(
+                            "ecs",
+                            [
+                                {
+                                    "clusterArns": [
+                                        f"arn:c/cluster/{c}" for c in by_cluster
+                                    ]
+                                }
+                            ],
+                        ),
+                        "list_services": lambda cluster: [
+                            {
+                                "serviceArns": [
+                                    s["serviceName"]
+                                    for s in by_cluster[cluster.rsplit("/", 1)[-1]]
+                                ]
+                            }
+                        ],
+                    }
+                )
+
+                def describe_services(cluster, services):
+                    by_name = {
+                        s["serviceName"]: s
+                        for s in by_cluster[cluster.rsplit("/", 1)[-1]]
+                    }
+                    return {"services": [by_name[n] for n in services]}
+
+                client.describe_services.side_effect = describe_services
+            elif service == "lambda":
+                client.get_paginator.side_effect = _pager(
+                    {"list_functions": source("lambda", [{"Functions": functions}])}
+                )
+            elif service == "ec2":
+
+                def describe_security_groups(GroupIds):
+                    if "ec2" in errors:
+                        raise errors["ec2"]
+                    return {
+                        "SecurityGroups": [groups[g] for g in GroupIds if g in groups]
+                    }
+
+                client.describe_security_groups.side_effect = describe_security_groups
+            return client
+
+        with patch("sagemaker_app.boto3.client", side_effect=factory):
+            return _rows(self.check(region="us-east-1"))
+
+    @staticmethod
+    def _service(name, groups):
+        service = {"serviceName": name}
+        if groups is not None:
+            service["networkConfiguration"] = {
+                "awsvpcConfiguration": {"securityGroups": groups}
+            }
+        return service
+
+    @staticmethod
+    def _function(name, groups):
+        function = {"FunctionName": name}
+        if groups:
+            function["VpcConfig"] = {"SecurityGroupIds": groups}
+        return function
+
+    @staticmethod
+    def _seg(rows):
+        return [
+            r
+            for r in rows
+            if r["Finding"].startswith(sagemaker_app.WORKLOAD_SEGMENTATION_FINDING)
+        ]
+
+    @staticmethod
+    def _mode(rows):
+        return [
+            r
+            for r in rows
+            if r["Finding"].startswith(sagemaker_app.EKS_POLICY_MODE_FINDING)
+        ]
+
+    def test_scoped_own_groups_pass(self):
+        rows = self._run(
+            services={"agents": [self._service("planner", ["sg-a"])]},
+            functions=[self._function("tool", ["sg-b"])],
+            groups=[
+                self._sg(
+                    "sg-a",
+                    ingress=[
+                        {
+                            "IpProtocol": "tcp",
+                            "FromPort": 8080,
+                            "ToPort": 8080,
+                            "UserIdGroupPairs": [{"GroupId": "sg-alb"}],
+                        }
+                    ],
+                ),
+                self._sg("sg-b"),
+            ],
+        )
+        seg = self._seg(rows)
+        assert [r["Status"] for r in seg] == ["Passed"]
+        assert (
+            "All 2 ECS service(s) and Lambda function(s)" in seg[0]["Finding_Details"]
+        )
+
+    def test_one_open_egress_group_among_scoped_ones_fails(self):
+        rows = self._run(
+            services={
+                "agents": [
+                    self._service("planner", ["sg-a"]),
+                    self._service("executor", ["sg-b"]),
+                ]
+            },
+            groups=[self._sg("sg-a"), self._sg("sg-b", egress=[self._open()])],
+        )
+        seg = self._seg(rows)
+        assert [r["Status"] for r in seg] == ["Failed"]
+        assert "ECS service executor in agents" in seg[0]["Finding_Details"]
+        assert (
+            "sg-b allows egress all traffic to 0.0.0.0/0" in seg[0]["Finding_Details"]
+        )
+
+    def test_vpc_wide_cidr_hides_behind_a_port_scoped_rule(self):
+        # One 443 rule to a whole /16 still reaches every host in the VPC.
+        rows = self._run(
+            services={"agents": [self._service("planner", ["sg-a"])]},
+            groups=[
+                self._sg(
+                    "sg-a",
+                    ingress=[self._open("10.0.0.0/16", "tcp", 443)],
+                    egress=[self._open("10.0.12.0/24", "tcp", 5432)],
+                )
+            ],
+        )
+        seg = self._seg(rows)
+        assert [r["Status"] for r in seg] == ["Failed"]
+        details = seg[0]["Finding_Details"]
+        assert "allows ingress tcp 443 from 10.0.0.0/16" in details
+        assert "10.0.12.0/24" not in details
+
+    def test_ipv6_any_egress_fails(self):
+        seg = self._seg(
+            self._run(
+                functions=[self._function("tool", ["sg-a"])],
+                groups=[self._sg("sg-a", egress=[self._open("::/0", v6=True)])],
+            )
+        )
+        assert [r["Status"] for r in seg] == ["Failed"]
+        assert "to ::/0" in seg[0]["Finding_Details"]
+
+    def test_lambda_ingress_is_not_graded(self):
+        seg = self._seg(
+            self._run(
+                functions=[self._function("tool", ["sg-a"])],
+                groups=[self._sg("sg-a", ingress=[self._open()])],
+            )
+        )
+        assert [r["Status"] for r in seg] == ["Passed"]
+
+    def test_shared_group_fails_for_each_user(self):
+        seg = self._seg(
+            self._run(
+                functions=[
+                    self._function("one", ["sg-a"]),
+                    self._function("two", ["sg-a"]),
+                ],
+                groups=[self._sg("sg-a")],
+            )
+        )
+        assert [r["Status"] for r in seg] == ["Failed", "Failed"]
+        assert "sg-a is shared with 1 other workload(s)" in seg[0]["Finding_Details"]
+
+    def test_bridge_mode_service_and_non_vpc_function_fail(self):
+        seg = self._seg(
+            self._run(
+                services={"agents": [self._service("legacy", None)]},
+                functions=[self._function("edge", None)],
+            )
+        )
+        details = " ".join(r["Finding_Details"] for r in seg)
+        assert {r["Status"] for r in seg} == {"Failed"}
+        assert "legacy in agents has no awsvpc network configuration" in details
+        assert "1 Lambda function(s) run outside a VPC" in details
+
+    def test_security_group_read_denied_is_incomplete_not_passed(self):
+        seg = self._seg(
+            self._run(
+                functions=[self._function("tool", ["sg-a"])],
+                groups=[self._sg("sg-a")],
+                errors={"ec2": _make_client_error("UnauthorizedOperation")},
+            )
+        )
+        assert [r["Status"] for r in seg] == ["N/A"]
+        assert "ec2:DescribeSecurityGroups" in seg[0]["Finding_Details"]
+
+    def test_ecs_list_denied_withholds_passed(self):
+        seg = self._seg(
+            self._run(
+                functions=[self._function("tool", ["sg-a"])],
+                groups=[self._sg("sg-a")],
+                errors={"ecs": _make_client_error("AccessDeniedException")},
+            )
+        )
+        assert [r["Status"] for r in seg] == ["N/A"]
+        assert "ecs:ListClusters" in seg[0]["Finding_Details"]
+
+    def test_lambda_list_denied_withholds_passed(self):
+        seg = self._seg(
+            self._run(
+                services={"agents": [self._service("planner", ["sg-a"])]},
+                groups=[self._sg("sg-a")],
+                errors={"lambda": _make_client_error("AccessDeniedException")},
+            )
+        )
+        assert [r["Status"] for r in seg] == ["N/A"]
+        assert "lambda:ListFunctions" in seg[0]["Finding_Details"]
+
+    def test_no_workloads_is_na(self):
+        assert [r["Status"] for r in self._seg(self._run())] == ["N/A"]
+
+    def test_failed_rows_are_capped_with_a_summary(self):
+        functions = [self._function(f"f{i}", [f"sg-{i}"]) for i in range(25)]
+        groups = [self._sg(f"sg-{i}", egress=[self._open()]) for i in range(25)]
+        seg = self._seg(self._run(functions=functions, groups=groups))
+        assert len(seg) == 21
+        assert "25 workload segmentation gaps" in seg[-1]["Finding_Details"]
+
+    def test_standard_mode_cluster_among_strict_ones_fails(self):
+        mode = self._mode(
+            self._run(
+                eks={
+                    "strict-a": json.dumps(
+                        {
+                            "enableNetworkPolicy": "true",
+                            "env": {
+                                "NETWORK_POLICY_ENFORCING_MODE": "strict",
+                                "ENABLE_POD_ENI": "true",
+                            },
+                        }
+                    ),
+                    "default-b": '{"enableNetworkPolicy": "true"}',
+                    "off-c": '{"enableNetworkPolicy": "false"}',
+                }
+            )
+        )
+        by_status = {r["Status"]: r["Finding_Details"] for r in mode}
+        assert sorted(r["Status"] for r in mode) == ["Failed", "Passed"]
+        assert "'default-b'" in by_status["Failed"]
+        assert "standard (the default)" in by_status["Failed"]
+        assert "strict-a (security groups for pods are enabled)" in by_status["Passed"]
+        assert "off-c" not in " ".join(by_status.values())
+
+    def test_eks_list_denied_is_incomplete(self):
+        mode = self._mode(
+            self._run(errors={"eks": _make_client_error("AccessDeniedException")})
+        )
+        assert [r["Status"] for r in mode] == ["N/A"]
+        assert "eks:ListClusters" in mode[0]["Finding_Details"]
+
+
 class TestSM40SecretsManagerRotation:
     """AIR-SLF-RT-06: automatic rotation that actually happened on schedule."""
 

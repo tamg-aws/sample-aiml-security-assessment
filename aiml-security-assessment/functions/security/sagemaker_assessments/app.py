@@ -1,6 +1,7 @@
 import boto3
 import csv
 import fnmatch
+import ipaddress
 import os
 import logging
 from datetime import datetime, timedelta, timezone
@@ -12572,6 +12573,400 @@ def check_eks_vpc_cni_network_policy(region: str = "") -> Dict[str, Any]:
     return findings
 
 
+EKS_POLICY_MODE_FINDING = "EKS Network Policy Default-Deny Mode"
+EKS_POLICY_MODE_REFERENCE = (
+    "https://docs.aws.amazon.com/eks/latest/userguide/cni-network-policy.html"
+)
+WORKLOAD_SEGMENTATION_FINDING = "Agent Workload Security Group Segmentation"
+WORKLOAD_SEGMENTATION_REFERENCE = (
+    "https://docs.aws.amazon.com/AmazonECS/latest/bestpracticesguide/"
+    "security-network.html"
+)
+BROAD_IPV4_PREFIX = 16
+BROAD_IPV6_PREFIX = 48
+
+
+def _vpc_cni_env_value(configuration_values: Any, key: str) -> Optional[str]:
+    """Return one env entry of a vpc-cni configurationValues JSON or YAML string."""
+    if not isinstance(configuration_values, str) or not configuration_values.strip():
+        return None
+    try:
+        parsed = json.loads(configuration_values)
+        env = parsed.get("env") if isinstance(parsed, dict) else None
+        value = env.get(key) if isinstance(env, dict) else None
+        return None if value is None else str(value)
+    except ValueError:
+        match = re.search(
+            r"^env\s*:\s*\n((?:[ \t]+.*\n?)*)", configuration_values, re.MULTILINE
+        )
+        if not match:
+            return None
+        entry = re.search(
+            rf"^[ \t]+{re.escape(key)}\s*:\s*[\"']?([^\"'\s]+)[\"']?\s*$",
+            match.group(1),
+            re.MULTILINE,
+        )
+        return entry.group(1) if entry else None
+
+
+def _broad_rule_targets(permission: Dict[str, Any]) -> List[str]:
+    """CIDRs in one rule that cover a whole VPC or more."""
+    broad = []
+    for entry in permission.get("IpRanges") or []:
+        cidr = entry.get("CidrIp") or ""
+        try:
+            if ipaddress.ip_network(cidr, strict=False).prefixlen <= BROAD_IPV4_PREFIX:
+                broad.append(cidr)
+        except ValueError:
+            broad.append(cidr or "an unparsed IPv4 range")
+    for entry in permission.get("Ipv6Ranges") or []:
+        cidr = entry.get("CidrIpv6") or ""
+        try:
+            if ipaddress.ip_network(cidr, strict=False).prefixlen <= BROAD_IPV6_PREFIX:
+                broad.append(cidr)
+        except ValueError:
+            broad.append(cidr or "an unparsed IPv6 range")
+    return broad
+
+
+def _rule_ports(permission: Dict[str, Any]) -> str:
+    protocol = str(permission.get("IpProtocol"))
+    if protocol == "-1":
+        return "all traffic"
+    low, high = permission.get("FromPort"), permission.get("ToPort")
+    ports = str(low) if low == high else f"{low}-{high}"
+    return f"{protocol} {ports}"
+
+
+def _security_group_problems(group: Dict[str, Any], check_ingress: bool) -> List[str]:
+    problems = []
+    directions = [("egress", "IpPermissionsEgress", "to")]
+    if check_ingress:
+        directions.insert(0, ("ingress", "IpPermissions", "from"))
+    for direction, key, preposition in directions:
+        for permission in group.get(key) or []:
+            broad = _broad_rule_targets(permission)
+            if broad:
+                problems.append(
+                    f"{group.get('GroupId')} allows {direction} {_rule_ports(permission)} "
+                    f"{preposition} {', '.join(broad[:3])}"
+                )
+    return problems
+
+
+def _eks_policy_mode_findings(region: str) -> List[Dict[str, Any]]:
+    """strict mode denies pod traffic until a NetworkPolicy allows it."""
+    rows = []
+    try:
+        eks_client = boto3.client("eks", config=boto3_config, region_name=region)
+        clusters = []
+        for page in eks_client.get_paginator("list_clusters").paginate():
+            clusters.extend(page.get("clusters", []))
+    except Exception as error:
+        return [
+            _unread_resources_finding(
+                "SM-39",
+                EKS_POLICY_MODE_FINDING,
+                [f"eks:ListClusters ({get_assessment_error_label(error)})"],
+                "no cluster's enforcing mode was read.",
+                EKS_POLICY_MODE_REFERENCE,
+                region,
+            )
+        ]
+    strict, unread = [], []
+    for cluster in clusters:
+        try:
+            detail = eks_client.describe_cluster(name=cluster).get("cluster", {})
+            if (detail.get("computeConfig") or {}).get("enabled") is True:
+                continue
+            addons = []
+            for page in eks_client.get_paginator("list_addons").paginate(
+                clusterName=cluster
+            ):
+                addons.extend(page.get("addons", []))
+            if "vpc-cni" not in addons:
+                continue
+            values = (
+                eks_client.describe_addon(clusterName=cluster, addonName="vpc-cni")
+                .get("addon", {})
+                .get("configurationValues")
+            )
+        except Exception as error:
+            unread.append(f"{cluster} ({get_assessment_error_label(error)})")
+            continue
+        if not _vpc_cni_network_policy_enabled(values):
+            continue
+        mode = _vpc_cni_env_value(values, "NETWORK_POLICY_ENFORCING_MODE")
+        pod_eni = _vpc_cni_env_value(values, "ENABLE_POD_ENI")
+        pod_sg = (
+            "security groups for pods are enabled"
+            if str(pod_eni).lower() == "true"
+            else "security groups for pods are not enabled"
+        )
+        if str(mode).lower() == "strict":
+            strict.append(f"{cluster} ({pod_sg})")
+            continue
+        rows.append(
+            create_finding(
+                check_id="SM-39",
+                finding_name=EKS_POLICY_MODE_FINDING,
+                finding_details=(
+                    f"EKS cluster '{cluster}' enforces network policy in "
+                    f"{mode or 'standard (the default)'} mode, where a pod accepts "
+                    "and sends all traffic until a NetworkPolicy selects it. No AWS "
+                    "API returns the NetworkPolicy objects, so strict mode is the "
+                    f"only readable default-deny. {pod_sg.capitalize()}."
+                ),
+                resolution=(
+                    "Set env.NETWORK_POLICY_ENFORCING_MODE to strict in the vpc-cni "
+                    "add-on configuration and author NetworkPolicy objects for each "
+                    "agent workload's declared dependencies."
+                ),
+                reference=EKS_POLICY_MODE_REFERENCE,
+                severity="Medium",
+                status="Failed",
+                region=region,
+            )
+        )
+    if unread:
+        rows.append(
+            _unread_resources_finding(
+                "SM-39",
+                EKS_POLICY_MODE_FINDING,
+                unread,
+                f"{len(strict)} cluster(s) were read in strict mode.",
+                EKS_POLICY_MODE_REFERENCE,
+                region,
+            )
+        )
+    if strict:
+        rows.append(
+            create_finding(
+                check_id="SM-39",
+                finding_name=EKS_POLICY_MODE_FINDING,
+                finding_details=(
+                    f"{len(strict)} EKS cluster(s) enforce network policy in strict "
+                    f"mode: {', '.join(sorted(strict)[:5])}. Pods are denied traffic "
+                    "until a NetworkPolicy allows it; which policies exist is a "
+                    "Kubernetes-API fact this scan cannot read."
+                ),
+                resolution="No action required",
+                reference=EKS_POLICY_MODE_REFERENCE,
+                severity="Medium",
+                status="Passed",
+                region=region,
+            )
+        )
+    return rows
+
+
+def _segmentation_workloads(region: str) -> Tuple[List[Dict[str, Any]], List[str]]:
+    """ECS services and Lambda functions with the security groups they run in."""
+    workloads, unread = [], []
+    try:
+        ecs_client = boto3.client("ecs", config=boto3_config, region_name=region)
+        clusters = []
+        for page in ecs_client.get_paginator("list_clusters").paginate():
+            clusters.extend(page.get("clusterArns", []))
+        for cluster in clusters:
+            try:
+                arns = []
+                for page in ecs_client.get_paginator("list_services").paginate(
+                    cluster=cluster
+                ):
+                    arns.extend(page.get("serviceArns", []))
+                for start in range(0, len(arns), 10):
+                    response = ecs_client.describe_services(
+                        cluster=cluster, services=arns[start : start + 10]
+                    )
+                    for failure in response.get("failures") or []:
+                        unread.append(
+                            f"ECS service {failure.get('arn')} "
+                            f"({failure.get('reason')})"
+                        )
+                    for service in response.get("services") or []:
+                        awsvpc = (service.get("networkConfiguration") or {}).get(
+                            "awsvpcConfiguration"
+                        ) or {}
+                        workloads.append(
+                            {
+                                "label": (
+                                    f"ECS service {service.get('serviceName')} in "
+                                    f"{str(cluster).rsplit('/', 1)[-1]}"
+                                ),
+                                "groups": awsvpc.get("securityGroups") or [],
+                                "awsvpc": bool(awsvpc),
+                                "ingress": True,
+                            }
+                        )
+            except Exception as error:
+                unread.append(
+                    f"ECS cluster {str(cluster).rsplit('/', 1)[-1]} services "
+                    f"({get_assessment_error_label(error)})"
+                )
+    except Exception as error:
+        unread.append(f"ecs:ListClusters ({get_assessment_error_label(error)})")
+    try:
+        lambda_client = boto3.client("lambda", config=boto3_config, region_name=region)
+        for page in lambda_client.get_paginator("list_functions").paginate():
+            for function in page.get("Functions", []):
+                groups = (function.get("VpcConfig") or {}).get("SecurityGroupIds") or []
+                workloads.append(
+                    {
+                        "label": f"Lambda function {function.get('FunctionName')}",
+                        "groups": groups,
+                        "awsvpc": bool(groups),
+                        "ingress": False,
+                    }
+                )
+    except Exception as error:
+        unread.append(f"lambda:ListFunctions ({get_assessment_error_label(error)})")
+    return workloads, unread
+
+
+def _workload_segmentation_findings(region: str) -> List[Dict[str, Any]]:
+    workloads, unread = _segmentation_workloads(region)
+    group_ids = sorted({g for w in workloads for g in w["groups"]})
+    groups = {}
+    try:
+        ec2_client = boto3.client("ec2", config=boto3_config, region_name=region)
+        for start in range(0, len(group_ids), 100):
+            response = ec2_client.describe_security_groups(
+                GroupIds=group_ids[start : start + 100]
+            )
+            for group in response.get("SecurityGroups", []):
+                groups[group.get("GroupId")] = group
+    except Exception as error:
+        unread.append(
+            f"ec2:DescribeSecurityGroups ({get_assessment_error_label(error)})"
+        )
+        groups = None
+
+    users = {}
+    for workload in workloads:
+        for group in workload["groups"]:
+            users.setdefault(group, []).append(workload["label"])
+    problems = []
+    outside_vpc = []
+    for workload in workloads:
+        if not workload["awsvpc"]:
+            if workload["ingress"]:
+                problems.append(
+                    f"{workload['label']} has no awsvpc network configuration, so "
+                    "its tasks share the host network and no per-task security "
+                    "group applies"
+                )
+            else:
+                outside_vpc.append(workload["label"])
+            continue
+        found = []
+        for group in workload["groups"]:
+            shared = [u for u in users[group] if u != workload["label"]]
+            if shared:
+                found.append(
+                    f"{group} is shared with {len(shared)} other workload(s) "
+                    f"({', '.join(shared[:2])})"
+                )
+            if groups is not None:
+                if group not in groups:
+                    unread.append(f"security group {group}")
+                    continue
+                found.extend(
+                    _security_group_problems(groups[group], workload["ingress"])
+                )
+        if found:
+            problems.append(f"{workload['label']}: {'; '.join(found[:4])}")
+    if outside_vpc:
+        problems.append(
+            f"{len(outside_vpc)} Lambda function(s) run outside a VPC, so no "
+            f"security group bounds their egress: {', '.join(outside_vpc[:5])}"
+        )
+
+    rows = []
+    for problem in problems[:20]:
+        rows.append(
+            create_finding(
+                check_id="SM-39",
+                finding_name=WORKLOAD_SEGMENTATION_FINDING,
+                finding_details=(
+                    f"{problem}. A workload reaches only its declared dependencies "
+                    "when its own security group allows traffic to and from the "
+                    "dependency's security group or prefix list, not a CIDR "
+                    f"of /{BROAD_IPV4_PREFIX} (IPv6 /{BROAD_IPV6_PREFIX}) or wider."
+                ),
+                resolution=(
+                    "Give every agent service and function its own security group, "
+                    "and replace CIDR rules with rules that reference the "
+                    "dependency's security group or a managed prefix list."
+                ),
+                reference=WORKLOAD_SEGMENTATION_REFERENCE,
+                severity="Medium",
+                status="Failed",
+                region=region,
+            )
+        )
+    if len(problems) > 20:
+        rows.append(
+            create_finding(
+                check_id="SM-39",
+                finding_name=WORKLOAD_SEGMENTATION_FINDING,
+                finding_details=(
+                    f"{len(problems)} workload segmentation gaps were found (the "
+                    "first 20 are reported individually above)."
+                ),
+                resolution="Scope each workload's security group to its dependencies.",
+                reference=WORKLOAD_SEGMENTATION_REFERENCE,
+                severity="Medium",
+                status="Failed",
+                region=region,
+            )
+        )
+    if unread:
+        rows.append(
+            _unread_resources_finding(
+                "SM-39",
+                WORKLOAD_SEGMENTATION_FINDING,
+                list(dict.fromkeys(unread)),
+                f"{len(workloads)} ECS service(s) and Lambda function(s) were read.",
+                WORKLOAD_SEGMENTATION_REFERENCE,
+                region,
+            )
+        )
+    elif not problems:
+        rows.append(
+            create_finding(
+                check_id="SM-39",
+                finding_name=WORKLOAD_SEGMENTATION_FINDING,
+                finding_details=(
+                    f"All {len(workloads)} ECS service(s) and Lambda function(s) run "
+                    "in their own security groups with no rule to or from a CIDR "
+                    f"of /{BROAD_IPV4_PREFIX} or wider. Standalone EC2 instances "
+                    "are not read."
+                    if workloads
+                    else "No ECS services or Lambda functions found in this region."
+                ),
+                resolution="No action required",
+                reference=WORKLOAD_SEGMENTATION_REFERENCE,
+                severity="Medium" if workloads else "Informational",
+                status="Passed" if workloads else "N/A",
+                region=region,
+            )
+        )
+    return rows
+
+
+def check_workload_network_segmentation(region: str = "") -> Dict[str, Any]:
+    """
+    SM-39: Read the EKS network-policy enforcing mode and the security groups
+    each ECS service and Lambda function runs in, so a workload that can reach
+    any destination does not pass on the vpc-cni flag alone.
+    """
+    findings = {"csv_data": []}
+    findings["csv_data"].extend(_eks_policy_mode_findings(region))
+    findings["csv_data"].extend(_workload_segmentation_findings(region))
+    return findings
+
+
 SECRET_ROTATION_FINDING = "Secrets Manager Automatic Rotation"
 SECRET_ROTATION_REFERENCE = "https://docs.aws.amazon.com/secretsmanager/latest/userguide/rotate-secrets_schedule.html"
 SECRET_ROTATION_RESOLUTION = (
@@ -13733,6 +14128,7 @@ def lambda_handler(event, context):
 
         logger.info("Running EKS vpc-cni network policy check (SM-39)")
         all_findings.append(check_eks_vpc_cni_network_policy(region=region))
+        all_findings.append(check_workload_network_segmentation(region=region))
 
         logger.info("Running Secrets Manager rotation check (SM-40)")
         all_findings.append(check_secrets_manager_rotation(region=region))

@@ -718,6 +718,11 @@ Resources:
                 - guardduty:GetDetector
                 - guardduty:ListCoverage # SM-38
               Resource: !Sub 'arn:${AWS::Partition}:guardduty:*:${AWS::AccountId}:detector/*'
+            - Sid: EcsServiceRead
+              Effect: Allow
+              Action:
+                - ecs:DescribeServices # SM-39
+              Resource: !Sub 'arn:${AWS::Partition}:ecs:*:${AWS::AccountId}:service/*'
             - Sid: ConfigEvaluationRead
               # SM-32 reads the recorder scope, the rule inventory and each
               # rule's compliance summary. None of these three Config reads

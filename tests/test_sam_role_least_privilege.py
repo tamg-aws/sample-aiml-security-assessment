@@ -210,6 +210,7 @@ _EXPECTED_ACTIONS = {
         "config:DescribeConfigurationRecorders",
         "ec2:DescribeRouteTables",
         "ec2:DescribeSubnets",
+        "ecs:DescribeServices",
         "eks:DescribeAddon",
         "eks:DescribeCluster",
         "eks:ListAddons",
@@ -757,6 +758,13 @@ def test_sagemaker_and_guardduty_resource_reads_are_arn_scoped(template):
     assert "guardduty:ListCoverage" in detector
     assert "guardduty:*:${AWS::AccountId}:detector/*" in detector
     assert not re.search(r"Resource:\s+['\"]\*['\"]", detector)
+
+    ecs_services = _statement_block(
+        template, "SagemakerSecurityAssessmentFunction", "EcsServiceRead"
+    )
+    assert "ecs:DescribeServices" in ecs_services
+    assert "ecs:*:${AWS::AccountId}:service/*" in ecs_services
+    assert not re.search(r"Resource:\s+['\"]\*['\"]", ecs_services)
 
 
 @pytest.mark.parametrize("template", _SAM_TEMPLATES, ids=os.path.basename)
