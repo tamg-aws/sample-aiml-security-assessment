@@ -113,6 +113,18 @@ SCP_NOT_EVALUATED_NOTE = (
 # Registry lifecycle events are delivered to the default event bus in the
 # resource's own account, so a rule on a custom bus never receives them.
 REGISTRY_EVENT_BUS_NAME = "default"
+# The review pipelines a Registry lifecycle event can be routed to: a Lambda
+# function, an SNS topic, an SQS queue or a Step Functions state machine, named
+# by the service segment of the target ARN.
+REVIEW_PIPELINE_SERVICES = {
+    "lambda": "Lambda function",
+    "sns": "SNS topic",
+    "sqs": "SQS queue",
+    "states": "Step Functions state machine",
+}
+REVIEW_PIPELINE_LABEL = (
+    "a Lambda function, SNS topic, SQS queue or Step Functions state machine"
+)
 REGISTRY_EVENT_SOURCE = "aws.agent-registry"
 # The public-preview event source. It stops publishing on the date below, so a
 # rule that matches only this source routes nothing after it.
@@ -1224,17 +1236,17 @@ def _registry_errors(
 def check_agent_registry_approval_governance(
     inventory: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
-    """AR-03: report or require manual Registry record approval."""
+    """AR-03: fail a Registry that approves submitted records automatically.
+
+    GetRegistry documents that submitted records require manual review when
+    ``autoApprovalRules`` is omitted or empty, so a registry that returns no
+    ``approvalConfiguration`` at all reviews manually as well.
+    """
     inventory = inventory or get_agent_registry_inventory()
     finding = "AWS Agent Registry Publication Approval Governance"
     early = _inventory_start(inventory, "AR-03", finding, APPROVAL_REFERENCE_URL)
     if early:
         return early
-    required = os.environ.get("REQUIRE_AGENT_REGISTRY_MANUAL_APPROVAL", "").lower() in {
-        "true",
-        "1",
-        "yes",
-    }
     findings = _registry_errors(inventory, "AR-03", finding, APPROVAL_REFERENCE_URL)
     for item in inventory["items"]:
         registry_id, name, status = _registry_context(item)
@@ -1249,29 +1261,19 @@ def check_agent_registry_approval_governance(
                 )
             )
             continue
-        detail = item["detail"]
-        if "approvalConfiguration" not in detail:
-            findings.append(
-                _na(
-                    "AR-03",
-                    finding,
-                    f"Registry '{name}' ({registry_id}) did not return optional approval configuration.",
-                    APPROVAL_REFERENCE_URL,
-                    "No action required. Retry after the service returns approval configuration metadata.",
-                )
-            )
-        elif (detail.get("approvalConfiguration") or {}).get("autoApprovalRules"):
+        rules = (item["detail"].get("approvalConfiguration") or {}).get(
+            "autoApprovalRules"
+        )
+        if rules:
             findings.append(
                 create_finding(
                     "AR-03",
                     finding,
-                    f"Registry '{name}' ({registry_id}) automatically approves submitted records.",
-                    "Remove auto-approval rules so submitted records require manual review."
-                    if required
-                    else "No action required under the current baseline. Set REQUIRE_AGENT_REGISTRY_MANUAL_APPROVAL=true to require manual review.",
+                    f"Registry '{name}' ({registry_id}) automatically approves submitted records (autoApprovalRules: {', '.join(map(str, rules))}).",
+                    "Remove auto-approval rules so submitted records require manual review.",
                     APPROVAL_REFERENCE_URL,
-                    SeverityEnum.MEDIUM if required else SeverityEnum.INFORMATIONAL,
-                    StatusEnum.FAILED if required else StatusEnum.NA,
+                    SeverityEnum.MEDIUM,
+                    StatusEnum.FAILED,
                 )
             )
         else:
@@ -1279,7 +1281,7 @@ def check_agent_registry_approval_governance(
                 create_finding(
                     "AR-03",
                     finding,
-                    f"Registry '{name}' ({registry_id}) requires manual review for submitted records.",
+                    f"Registry '{name}' ({registry_id}) requires manual review for submitted records: it returns no auto-approval rules.",
                     "No action required",
                     APPROVAL_REFERENCE_URL,
                     SeverityEnum.MEDIUM,
@@ -1870,29 +1872,39 @@ def _event_bus_target(
     }
 
 
+def _is_review_pipeline(target_arn: str) -> bool:
+    parts = target_arn.split(":", 5)
+    return len(parts) == 6 and parts[2] in REVIEW_PIPELINE_SERVICES
+
+
 def _rule_targets(
     rule: Dict[str, Any], bus_name: str
-) -> tuple[Optional[int], List[Dict[str, Any]], Optional[Exception]]:
-    """Count one rule's targets and read which of them are event buses.
+) -> tuple[Optional[int], List[Dict[str, Any]], List[str], Optional[Exception]]:
+    """Count one rule's targets and read which of them are event buses and
+    which are review pipelines.
 
     Isolates a per-rule failure from the sweep.
     """
     rule_name = rule.get("Name")
     if not rule_name:
-        return None, [], ValueError("Missing rule name")
+        return None, [], [], ValueError("Missing rule name")
     try:
         paginator = events_client.get_paginator("list_targets_by_rule")
         targets = 0
         buses = []
+        pipelines = []
         for page in paginator.paginate(Rule=rule_name, EventBusName=bus_name):
             for target in page.get("Targets", []):
                 targets += 1
-                bus = _event_bus_target(rule, target.get("Arn", ""))
+                arn = target.get("Arn", "")
+                bus = _event_bus_target(rule, arn)
                 if bus is not None:
                     buses.append(bus)
-        return targets, buses, None
+                elif _is_review_pipeline(arn):
+                    pipelines.append(arn)
+        return targets, buses, pipelines, None
     except Exception as error:
-        return None, [], error
+        return None, [], [], error
 
 
 def _registry_rule_entries(bus_name: str, inventory: Dict[str, Any]) -> tuple:
@@ -1918,12 +1930,14 @@ def _registry_rule_entries(bus_name: str, inventory: Dict[str, Any]) -> tuple:
                 "classification": classification,
                 "targets": None,
                 "bus_targets": [],
+                "pipeline_targets": [],
                 "target_error": None,
             }
             if classification["kind"] != "unreadable":
                 (
                     entry["targets"],
                     entry["bus_targets"],
+                    entry["pipeline_targets"],
                     entry["target_error"],
                 ) = _rule_targets(rule, bus_name)
             entries.append(entry)
@@ -1931,13 +1945,14 @@ def _registry_rule_entries(bus_name: str, inventory: Dict[str, Any]) -> tuple:
 
 
 def _forwards_only(entry: Dict[str, Any]) -> bool:
-    """Whether an enabled, unfiltered GA-source rule targets only event buses."""
+    """Whether an enabled, unfiltered GA-source rule reaches a review pipeline,
+    if at all, only through the event buses it targets."""
     return (
         entry["classification"]["kind"] == "registry"
         and not entry["classification"]["narrowed_by"]
         and entry["rule"].get("State") != "DISABLED"
-        and bool(entry["targets"])
-        and entry["targets"] == len(entry["bus_targets"])
+        and bool(entry["bus_targets"])
+        and not entry.get("pipeline_targets")
     )
 
 
@@ -2101,7 +2116,7 @@ def _forwarded_routing(
                 undecided.append(hop_name)
                 continue
             # Bus targets on this bus are not followed: the sweep stops at one hop.
-            delivering = (hop["targets"] or 0) - len(hop["bus_targets"])
+            delivering = len(hop.get("pipeline_targets", []))
             if (
                 classification["kind"] != "registry"
                 or hop["rule"].get("State") == "DISABLED"
@@ -2139,8 +2154,8 @@ def _forwarded_routing(
             create_finding(
                 "AR-10",
                 finding,
-                f"EventBridge rule '{name}' forwards the lifecycle events of {scope} only to event bus '{bus['name']}', where no enabled rule matching source '{REGISTRY_EVENT_SOURCE}' has a target other than an event bus, so every forwarded state change is discarded.",
-                f"Add an enabled rule on event bus '{bus['name']}' matching source '{REGISTRY_EVENT_SOURCE}' with a target that records or reviews the events, or give rule '{name}' such a target directly.",
+                f"EventBridge rule '{name}' forwards the lifecycle events of {scope} only to event bus '{bus['name']}', where no enabled rule matching source '{REGISTRY_EVENT_SOURCE}' has a target that is {REVIEW_PIPELINE_LABEL}, so no forwarded state change reaches a review pipeline.",
+                f"Add an enabled rule on event bus '{bus['name']}' matching source '{REGISTRY_EVENT_SOURCE}' with {REVIEW_PIPELINE_LABEL} as a target, or give rule '{name}' such a target directly.",
                 EVENT_ROUTING_REFERENCE_URL,
                 SeverityEnum.MEDIUM,
                 StatusEnum.FAILED,
@@ -2271,7 +2286,21 @@ def check_agent_registry_lifecycle_event_routing(
             covered.update(forwarded["covered"])
             unseen.update(forwarded["unseen"])
             continue
-        routing_labels.append(f"'{name}' ({targets} target(s))")
+        pipelines = len(entry.get("pipeline_targets", []))
+        if not pipelines:
+            findings.append(
+                create_finding(
+                    "AR-10",
+                    finding,
+                    f"EventBridge rule '{name}' routes the lifecycle events of {scope} to {targets} target(s), none of which is {REVIEW_PIPELINE_LABEL}, so no state change reaches a review pipeline.",
+                    f"Add {REVIEW_PIPELINE_LABEL} as a target of the rule, keeping any existing log or stream target as the record.",
+                    EVENT_ROUTING_REFERENCE_URL,
+                    SeverityEnum.MEDIUM,
+                    StatusEnum.FAILED,
+                )
+            )
+            continue
+        routing_labels.append(f"'{name}' ({pipelines} target(s))")
         covered.update(classification["detail_types"])
 
     # A transition forwarded to a bus this check cannot read is neither covered

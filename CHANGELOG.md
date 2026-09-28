@@ -227,10 +227,28 @@ section.
   `generate_iam_access_levels.py`. `AR-09` now counts a bare `*`, a `*:*` and
   a `NotAction` Allow as granting publication and approval, so an
   administrator that `AR-09` passed before now fails it.
+- `AR-03` fails every registry that automatically approves submitted records
+  (a non-empty `autoApprovalRules`) and passes one that returns no
+  auto-approval rules, including one that omits `approvalConfiguration`,
+  which the `GetRegistry` API model defines as manual review (AIR-ACR-REG-02).
+  Before, automatic approval was an informational `N/A` unless the
+  `RequireAgentRegistryManualApproval` parameter was `true`, and an omitted
+  configuration was `N/A`. The parameter is removed.
+- `AR-10` credits a lifecycle-event rule only when it has a Lambda function,
+  SNS topic, SQS queue or Step Functions state machine target, and a
+  forwarded bus only when its rule has one. Before, any target passed, so a
+  rule delivering only to a CloudWatch Logs group or an API destination
+  passed; it now fails.
 
 ### Deployment impact
 
-**CodeBuild run required.** No parameter or deployment-stack change. The AWS
+**Deployment-stack update and CodeBuild run required.** The
+`RequireAgentRegistryManualApproval` parameter is removed from both SAM
+templates, both top-level deployment templates
+(`deployment/2-aiml-security-codebuild.yaml` and
+`deployment/aiml-security-single-account.yaml`) and `buildspec.yml`. A
+stack update that still passes the parameter fails, so drop it from any
+saved parameter file before updating the deployment stack. The AWS
 SAM templates (`aiml-security-assessment/template.yaml` and
 `aiml-security-assessment/template-multi-account.yaml`) add read-only actions
 to the assessment Lambda execution roles for the new checks, among them
@@ -243,8 +261,7 @@ request comes through `bedrock-agentcore` (`kms:ViaService`), so `AC-07` can
 describe a memory encrypted with a customer managed key. A key whose policy
 does not allow the role still denies it. A CodeBuild
 run that redeploys the assessment code and SAM templates applies them. No
-member-role StackSet update and no central or single-account infrastructure
-update are required.
+member-role StackSet update is required.
 
 The `BR-50` to `BR-55` checks and legs above add, in both SAM templates: on the
 Bedrock assessment role, `bedrock:ListProvisionedModelThroughputs`,

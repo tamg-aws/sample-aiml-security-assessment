@@ -413,22 +413,25 @@ AI_SUBJECT_ROWS = [
         None,
         "agent_registry_assessments",
         ["AR-03", "AR-09", "AR-10"],
-        'AR-03 is named "Publication Approval Governance" and covers auto-approval, behind '
-        "the REQUIRE_AGENT_REGISTRY_MANUAL_APPROVAL env gate. AR-09 asserts the separation "
-        "leg: it fails any role or user whose attached and inline policies allow, by an "
-        "action pattern that names the service, both a record write (CreateRegistryRecord, "
-        "UpdateRegistryRecord, SubmitRegistryRecordForApproval) and "
+        'AR-03 is named "Publication Approval Governance" and fails, by default, a '
+        "registry whose approvalConfiguration.autoApprovalRules is non-empty; an omitted "
+        "or empty list is manual review and passes. AR-09 asserts the separation "
+        "leg: it fails any role or user whose attached, inline and group policies allow, "
+        "by any Allow including a bare *, a *:* and a NotAction, both a record write "
+        "(CreateRegistryRecord, UpdateRegistryRecord, SubmitRegistryRecordForApproval) and "
         "UpdateRegistryRecordStatus, the one operation that can set a record to APPROVED, "
         "in either the agent-registry namespace or the public-preview bedrock-agentcore "
-        "spelling of it. A bare * grant is reported under AR-01, and only a Deny with no "
-        "condition on Resource * removes an action. AR-10 asserts the observation leg: an "
+        "spelling of it. A permissions boundary that does not allow an action removes it, "
+        "as does a Deny with no condition on Resource *, and a principal whose policies "
+        "could not be read blocks a Passed. AR-10 asserts the observation leg: an "
         "enabled rule on the default event bus that matches the aws.agent-registry "
-        "Pending Approval, Approved and Rejected state-change events and has a target. A rule that matches only the aws.bedrock-agentcore preview source is "
+        "Pending Approval, Approved and Rejected state-change events and has a Lambda, "
+        "SNS, SQS or Step Functions target. A rule that matches only the aws.bedrock-agentcore preview source is "
         "reported apart, because that source stops routing on 30 October 2026. AWS delivers "
-        "these events to the default bus, so a default-bus rule whose only targets are "
-        "event buses is followed one hop to a bus in the same account and Region and "
-        "credited only if a rule there matches and has a target other than an event bus; "
-        "a forward to another account or Region is reported N/A naming the bus",
+        "these events to the default bus, so a default-bus rule with an event-bus target "
+        "and no review-pipeline target is followed one hop to a bus in the same account "
+        "and Region and credited only if a rule there matches and has a review-pipeline "
+        "target; a forward to another account or Region is reported N/A naming the bus",
         [],
         4,
     ),
