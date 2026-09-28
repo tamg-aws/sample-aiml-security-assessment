@@ -889,7 +889,7 @@
         "AgentCore Online Evaluation Coverage",
         "AgentCore Evaluation Safety Coverage"
       ],
-      "gap": "AC-40 classifies the evaluators each configuration attaches against the account's own catalogue, which marks a service-authored evaluator's category in its description and reports the level it scores at, and fails a configuration attaching no safety evaluator or none at TOOL_CALL level. Evaluators written in this account are named for the owner to classify, because their descriptions are prose no check can verify. AgentCore publishes no evaluation score metric, so an alarm on a falling score is a metric filter over the results log group whose pattern and threshold belong to the workload, and every AC-40 verdict says so",
+      "gap": "AC-40 classifies the evaluators each configuration attaches against the account's own catalogue, which marks a service-authored evaluator's category in its description, and fails a configuration that attaches no safety evaluator, attaches neither Builtin.ToolSelectionAccuracy nor Builtin.ToolParameterAccuracy, or has no CloudWatch alarm with actions on a metric in the namespace its scores are published to. Evaluators written in this account are named for the owner to classify, because their descriptions are prose no check can verify. The dimensions an alarm narrows on are not judged, because the dimension names the service emits are not API fields",
       "extra_iam": [],
       "phase": 4,
       "tier": "ai_subject",

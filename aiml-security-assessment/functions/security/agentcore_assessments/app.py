@@ -14814,7 +14814,10 @@ def _online_evaluation_problems(detail: Dict[str, Any]) -> List[str]:
         )
 
     output = (detail.get("outputConfig") or {}).get("cloudWatchConfig") or {}
-    if not output.get("logGroupName"):
+    # SOURCE_LOG_GROUP writes the results into the input groups and names none.
+    if not output.get("logGroupName") and (
+        output.get("resultDestination") != "SOURCE_LOG_GROUP"
+    ):
         problems.append("writes its results to no log group")
 
     evaluators = detail.get("evaluators") or []
@@ -14949,21 +14952,46 @@ def check_agentcore_online_evaluation_operation() -> List[Dict[str, Any]]:
 # only, because a customer-authored description is prose this check cannot verify.
 EVALUATOR_SAFETY_DESCRIPTION_MARKER = "safety metric"
 SERVICE_AUTHORED_EVALUATOR_TYPES = ("Builtin", "ThirdParty")
-# EvaluatorSummary.level: an evaluator at TOOL_CALL level scores one tool call,
-# which is where a wrong tool choice or a wrong tool argument shows up. The other
-# two levels, TRACE and SESSION, score a whole response or conversation.
+# EvaluatorSummary.level: an evaluator at TOOL_CALL level scores one tool call.
+# The level alone does not name tool choice, because the skill evaluators
+# (Builtin.SkillSelectionAccuracy, Builtin.SkillInstructionFollowing) score at
+# TOOL_CALL level too. The tool-choice leg therefore reads the two built-in
+# evaluators that judge which tool was called and with what arguments.
 EVALUATOR_TOOL_CALL_LEVEL = "TOOL_CALL"
-
-# AgentCore publishes no evaluation score metric of its own, and an evaluation
-# writes its scores to a log group, so alarming on a falling score means a metric
-# filter whose pattern and threshold belong to the workload. Every verdict of
-# AC-40 says so rather than leaving the reader to assume a score is watched.
-EVALUATION_SCORE_ALARM_NOTE = (
-    "A score nobody watches changes nothing: the evaluation writes its results to "
-    "a log group and AgentCore publishes no evaluation score metric, so an alarm "
-    "on a falling score is a metric filter over the results log group whose "
-    "pattern and threshold this check cannot read."
+EVALUATOR_TOOL_CHOICE_IDS = (
+    "Builtin.ToolSelectionAccuracy",
+    "Builtin.ToolParameterAccuracy",
 )
+
+# Evaluation scores are published as CloudWatch metrics in
+# outputConfig.cloudWatchConfig.metricsNamespace. When that is unset the default
+# namespace is spelled two ways in AWS documentation, so both spellings count.
+EVALUATION_DEFAULT_METRICS_NAMESPACES = (
+    "Bedrock-AgentCore/Evaluations",
+    "Bedrock AgentCore/Evaluations",
+)
+EVALUATION_SCORE_ALARM_NOTE = (
+    "A score alarm counts when it reads a metric in the configuration's metrics "
+    "namespace, has ActionsEnabled true and names at least one AlarmActions "
+    "target. The metric dimensions an alarm narrows on are not judged, because "
+    "the dimension names the service emits are not API fields."
+)
+
+
+def _alarm_reads_namespace(alarm: Dict[str, Any], namespaces: Tuple[str, ...]) -> bool:
+    """Return whether a metric alarm reads a metric in one of the namespaces.
+
+    A single-metric alarm names its Namespace; a metric-math alarm names one per
+    MetricStat in Metrics.
+    """
+    if alarm.get("Namespace") in namespaces:
+        return True
+    return any(
+        ((query.get("MetricStat") or {}).get("Metric") or {}).get("Namespace")
+        in namespaces
+        for query in alarm.get("Metrics") or []
+        if isinstance(query, dict)
+    )
 
 
 def check_agentcore_evaluation_safety_coverage() -> List[Dict[str, Any]]:
@@ -14972,10 +15000,11 @@ def check_agentcore_evaluation_safety_coverage() -> List[Dict[str, Any]]:
     AC-17 and AC-39 count the evaluators a configuration attaches without asking
     what any of them scores, so ten answer-quality judges read the same as a
     harmful-content judge. The catalogue answers the question itself: ListEvaluators
-    marks each service-authored evaluator's category in its description and reports
-    the level it scores at, so a configuration attaching neither a safety evaluator
-    nor a tool-call one measures how good the answers are and not whether the agent
-    is safe or reached for the right tool.
+    marks each service-authored evaluator's category in its description, so a
+    configuration passes only when it attaches a safety evaluator and one of
+    EVALUATOR_TOOL_CHOICE_IDS, and a CloudWatch alarm with actions reads a metric
+    in the namespace its scores are published to. A score no alarm reads notifies
+    nobody when it falls.
     """
     if agentcore_client is None:
         return [
@@ -15059,7 +15088,7 @@ def check_agentcore_evaluation_safety_coverage() -> List[Dict[str, Any]]:
         description = str(evaluator.get("description") or "").lower()
         if EVALUATOR_SAFETY_DESCRIPTION_MARKER in description:
             safety_ids.add(evaluator_id)
-        if evaluator.get("level") == EVALUATOR_TOOL_CALL_LEVEL:
+        if evaluator_id in EVALUATOR_TOOL_CHOICE_IDS:
             tool_call_ids.add(evaluator_id)
 
     if not safety_ids or not tool_call_ids:
@@ -15074,8 +15103,8 @@ def check_agentcore_evaluation_safety_coverage() -> List[Dict[str, Any]]:
                     f"The catalogue returned {len(catalogue)} evaluator(s), of which "
                     f"{len(safety_ids)} carry '"
                     f"{EVALUATOR_SAFETY_DESCRIPTION_MARKER}' in a service-authored "
-                    f"description and {len(tool_call_ids)} score at "
-                    f"{EVALUATOR_TOOL_CALL_LEVEL} level. With one of those two "
+                    f"description and {len(tool_call_ids)} are among "
+                    f"{', '.join(EVALUATOR_TOOL_CHOICE_IDS)}. With one of those two "
                     "categories empty the catalogue cannot say which attached "
                     "evaluator scores safety, so no configuration is judged here."
                 ),
@@ -15091,7 +15120,38 @@ def check_agentcore_evaluation_safety_coverage() -> List[Dict[str, Any]]:
         )
         return findings
 
+    alarm_error = None
+    alarms: List[Dict[str, Any]] = []
+    if cloudwatch_client is None:
+        alarm_error = "CloudWatch client not available in this region"
+    else:
+        try:
+            alarms = _paginate_aws_list(
+                cloudwatch_client,
+                "describe_alarms",
+                "MetricAlarms",
+                token_request_key="NextToken",
+                token_response_key="NextToken",
+            )
+        except Exception as error:
+            alarm_error = _assessment_error_label(error)
+
     for label, detail in details:
+        output = (detail.get("outputConfig") or {}).get("cloudWatchConfig") or {}
+        custom_namespace = output.get("metricsNamespace")
+        namespaces = (
+            (custom_namespace,)
+            if custom_namespace
+            else EVALUATION_DEFAULT_METRICS_NAMESPACES
+        )
+        namespace_text = " or ".join(namespaces)
+        watching = sorted(
+            str(alarm.get("AlarmName"))
+            for alarm in alarms
+            if _alarm_reads_namespace(alarm, namespaces)
+            and alarm.get("ActionsEnabled") is True
+            and alarm.get("AlarmActions")
+        )
         attached = [
             str(reference.get("evaluatorId"))
             for reference in detail.get("evaluators") or []
@@ -15117,9 +15177,22 @@ def check_agentcore_evaluation_safety_coverage() -> List[Dict[str, Any]]:
             )
         if not tool_call_attached:
             missing.append(
-                f"attaches no evaluator at {EVALUATOR_TOOL_CALL_LEVEL} level, so a "
-                "wrong tool choice or a wrong tool argument goes unscored"
+                f"attaches neither {' nor '.join(EVALUATOR_TOOL_CHOICE_IDS)}, so a "
+                "wrong tool choice or a wrong tool argument goes unscored (an "
+                f"evaluator at {EVALUATOR_TOOL_CALL_LEVEL} level that scores skills "
+                "does not count)"
             )
+        if not alarm_error and not watching:
+            missing.append(
+                "has no CloudWatch alarm with actions on a metric in "
+                f"{namespace_text}, so a falling score notifies nobody"
+            )
+        alarm_note = (
+            f" CloudWatch alarms could not be read ({alarm_error}), so whether a "
+            "falling score notifies anyone is unknown."
+            if alarm_error
+            else ""
+        )
 
         if missing:
             findings.append(
@@ -15128,16 +15201,37 @@ def check_agentcore_evaluation_safety_coverage() -> List[Dict[str, Any]]:
                     finding_name="AgentCore Evaluation Safety Coverage Incomplete",
                     finding_details=(
                         f"{label} attaches {len(attached)} evaluator(s) and "
-                        f"{' and '.join(missing)}.{owner_note}"
+                        f"{'; and '.join(missing)}.{owner_note}{alarm_note}"
                     ),
                     resolution=(
-                        "Attach a safety evaluator and a tool-call evaluator from "
+                        "Attach a safety evaluator and a tool-choice evaluator from "
                         "the catalogue, or record which of this account's own "
-                        f"evaluators scores each category. {EVALUATION_SCORE_ALARM_NOTE}"
+                        "evaluators scores each category, and set a CloudWatch "
+                        f"alarm with actions on the scores in {namespace_text}. "
+                        f"{EVALUATION_SCORE_ALARM_NOTE}"
                     ),
                     reference=AGENTCORE_EVALUATORS_REFERENCE_URL,
                     severity=SeverityEnum.MEDIUM,
                     status=StatusEnum.FAILED,
+                )
+            )
+        elif alarm_error:
+            findings.append(
+                create_finding(
+                    check_id="AC-40",
+                    finding_name="AgentCore Evaluation Safety Coverage",
+                    finding_details=(
+                        f"{label} scores safety with {', '.join(safety_attached)} and "
+                        f"tool choice with {', '.join(tool_call_attached)}."
+                        f"{owner_note}{alarm_note}"
+                    ),
+                    resolution=(
+                        "Grant cloudwatch:DescribeAlarms and retry. "
+                        f"{EVALUATION_SCORE_ALARM_NOTE}"
+                    ),
+                    reference=AGENTCORE_EVALUATORS_REFERENCE_URL,
+                    severity=SeverityEnum.INFORMATIONAL,
+                    status=StatusEnum.NA,
                 )
             )
         else:
@@ -15147,8 +15241,9 @@ def check_agentcore_evaluation_safety_coverage() -> List[Dict[str, Any]]:
                     finding_name="AgentCore Evaluation Safety Coverage",
                     finding_details=(
                         f"{label} scores safety with {', '.join(safety_attached)} and "
-                        f"tool choice with {', '.join(tool_call_attached)}."
-                        f"{owner_note}"
+                        f"tool choice with {', '.join(tool_call_attached)}, and "
+                        f"alarm(s) {', '.join(watching)} with actions read its "
+                        f"scores in {namespace_text}.{owner_note}"
                     ),
                     resolution=(
                         "No action required for this check. "
@@ -15230,6 +15325,24 @@ def check_agentcore_evaluation_result_protection() -> List[Dict[str, Any]]:
     for label, detail in details:
         output = (detail.get("outputConfig") or {}).get("cloudWatchConfig") or {}
         group_name = output.get("logGroupName")
+        if not group_name and output.get("resultDestination") == "SOURCE_LOG_GROUP":
+            findings.append(
+                create_finding(
+                    check_id="AC-41",
+                    finding_name="AgentCore Evaluation Result Protection",
+                    finding_details=(
+                        f"{label} writes its results to the log groups it reads "
+                        "(resultDestination SOURCE_LOG_GROUP), so the results store "
+                        "is the input log groups. AC-20 and AC-26 judge those under "
+                        "the AgentCore prefixes."
+                    ),
+                    resolution="No action required for this check.",
+                    reference=LOGS_RETENTION_REFERENCE_URL,
+                    severity=SeverityEnum.INFORMATIONAL,
+                    status=StatusEnum.NA,
+                )
+            )
+            continue
         if not group_name:
             findings.append(
                 create_finding(

@@ -1093,6 +1093,11 @@ Resources:
               Condition:
                 StringEquals:
                   cloudwatch:namespace: AIMLSecurity/AgentCore
+            - Sid: EvaluationScoreAlarmRead
+              Effect: Allow
+              Action:
+                - cloudwatch:DescribeAlarms # AC-40
+              Resource: !Sub 'arn:${AWS::Partition}:cloudwatch:*:${AWS::AccountId}:alarm:*'
 
 
   AgentRegistrySecurityAssessmentFunction:

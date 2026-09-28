@@ -299,6 +299,7 @@ _EXPECTED_ACTIONS = {
         "cloudtrail:GetTrail",
         "cloudtrail:GetTrailStatus",
         "cloudtrail:ListTrails",
+        "cloudwatch:DescribeAlarms",
         "cloudwatch:PutMetricData",
         "cognito-idp:DescribeUserPool",
         "cognito-idp:DescribeUserPoolClient",

@@ -395,6 +395,17 @@ section.
     `N/A` with the parameter unset. The parameter now decides only a region
     with no runtime. An unreadable configuration or runtime inventory is
     `N/A`. `AC-39` also reads `logGroupNamePrefixes` as an input source.
+  - `AC-40` counts only `Builtin.ToolSelectionAccuracy` and
+    `Builtin.ToolParameterAccuracy` as tool-choice evaluators, where any
+    `TOOL_CALL` level evaluator counted, so a skill evaluator no longer
+    passes the leg. It also fails a configuration whose scores no CloudWatch
+    alarm with actions reads, matched on the configuration's
+    `metricsNamespace` or the default `Bedrock-AgentCore/Evaluations`.
+    Unreadable alarms are `N/A`, never `Passed`.
+  - `AC-39` accepts `resultDestination` `SOURCE_LOG_GROUP` as an output,
+    which names no log group and failed before. `AC-41` reports such a
+    configuration as `N/A` and names `AC-20` and `AC-26` as the checks that
+    judge the input log groups.
 
 ### Deployment impact
 
@@ -482,6 +493,12 @@ passed before can now fail after the same CodeBuild run.
 only its description changes in both templates. With the default `false`, a
 region with runtimes that online evaluation does not score now reports
 `Failed` rows where it reported `N/A`.
+
+The AgentCore assessment role gains `cloudwatch:DescribeAlarms`, scoped to the
+account's `alarm:*` ARNs, in both SAM templates, so `AC-40` can read the
+alarms on evaluation scores. It is read-only, and the same CodeBuild run
+applies it. Until it runs, `AC-40` rows that meet the evaluator legs report
+`N/A`, and a configuration whose scores no alarm reads now fails.
 
 ## 2.0.0 - 2026-09-18
 

@@ -13547,6 +13547,29 @@ class TestAC39OnlineEvaluationOperation:
     """AC-39: a configuration that exists is judged whatever the scanner was told."""
 
     @patch("agentcore_app.agentcore_client")
+    def test_results_written_to_the_source_log_group_are_an_output(self, mock_ac):
+        _online_evaluation_client(
+            mock_ac,
+            [
+                _online_evaluation_detail(
+                    outputConfig={
+                        "cloudWatchConfig": {"resultDestination": "SOURCE_LOG_GROUP"}
+                    }
+                ),
+                _online_evaluation_detail(
+                    onlineEvaluationConfigId="oec-2",
+                    onlineEvaluationConfigName="no-output",
+                    outputConfig={},
+                ),
+            ],
+        )
+
+        findings = agentcore_app.check_agentcore_online_evaluation_operation()
+
+        assert [finding["Status"] for finding in findings] == ["Passed", "Failed"]
+        assert "no log group" in findings[1]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
     def test_a_running_evaluation_passes(self, mock_ac):
         _online_evaluation_client(mock_ac)
 
@@ -13571,6 +13594,14 @@ class TestAC39OnlineEvaluationOperation:
             ({"rule": {"samplingConfig": {"samplingPercentage": "100"}}}, "above zero"),
             ({"dataSourceConfig": {"cloudWatchLogs": {}}}, "no traffic to read"),
             ({"outputConfig": {}}, "writes its results to no log group"),
+            (
+                {
+                    "outputConfig": {
+                        "cloudWatchConfig": {"resultDestination": "DEDICATED_LOG_GROUP"}
+                    }
+                },
+                "writes its results to no log group",
+            ),
             ({"evaluators": []}, "attaches no evaluator"),
         ],
         ids=[
@@ -13581,6 +13612,7 @@ class TestAC39OnlineEvaluationOperation:
             "string-sampling",
             "no-input",
             "no-output",
+            "dedicated-without-a-group",
             "no-evaluator",
         ],
     )
@@ -13811,8 +13843,275 @@ class TestAC39OnlineEvaluationOperation:
         assert running - {agentcore_app.ONLINE_EVALUATION_RUNNING_STATUS}
 
 
+def _score_alarm(
+    name="eval-score-drop", namespace="Bedrock-AgentCore/Evaluations", **overrides
+):
+    """A metric alarm with actions on an evaluation score namespace."""
+    alarm = {
+        "AlarmName": name,
+        "Namespace": namespace,
+        "MetricName": "Builtin.Harmfulness",
+        "ActionsEnabled": True,
+        "AlarmActions": ["arn:aws:sns:us-east-1:123456789012:eval-alerts"],
+    }
+    alarm.update(overrides)
+    return alarm
+
+
 class TestAC40EvaluationSafetyCoverage:
     """AC-40: what the attached evaluators score, read from the catalogue."""
+
+    @pytest.fixture(autouse=True)
+    def _score_alarms(self):
+        with patch("agentcore_app.cloudwatch_client") as mock_cw:
+            mock_cw.describe_alarms.return_value = {"MetricAlarms": [_score_alarm()]}
+            self.mock_cw = mock_cw
+            yield mock_cw
+
+    @staticmethod
+    def _catalogue_with_skills():
+        return _evaluator_catalogue() + [
+            {
+                "evaluatorId": "Builtin.SkillSelectionAccuracy",
+                "evaluatorType": "Builtin",
+                "level": "TOOL_CALL",
+                "description": "Component Level Metric. Evaluates the skill chosen",
+            },
+            {
+                "evaluatorId": "Builtin.ToolParameterAccuracy",
+                "evaluatorType": "Builtin",
+                "level": "TOOL_CALL",
+                "description": "Component Level Metric. Evaluates the parameters",
+            },
+        ]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_skill_evaluator_at_tool_call_level_is_not_tool_choice(self, mock_ac):
+        _online_evaluation_client(
+            mock_ac,
+            [
+                _online_evaluation_detail(),
+                _online_evaluation_detail(
+                    onlineEvaluationConfigId="oec-2",
+                    onlineEvaluationConfigName="skills",
+                    evaluators=[
+                        {"evaluatorId": "Builtin.Harmfulness"},
+                        {"evaluatorId": "Builtin.SkillSelectionAccuracy"},
+                    ],
+                ),
+            ],
+            catalogue=self._catalogue_with_skills(),
+        )
+
+        findings = agentcore_app.check_agentcore_evaluation_safety_coverage()
+
+        assert [finding["Status"] for finding in findings] == ["Passed", "Failed"]
+        assert "skills" in findings[1]["Finding_Details"]
+        assert "Builtin.ToolSelectionAccuracy nor" in findings[1]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_tool_parameter_accuracy_alone_is_tool_choice(self, mock_ac):
+        _online_evaluation_client(
+            mock_ac,
+            [
+                _online_evaluation_detail(
+                    evaluators=[
+                        {"evaluatorId": "Builtin.Harmfulness"},
+                        {"evaluatorId": "Builtin.ToolParameterAccuracy"},
+                    ]
+                )
+            ],
+            catalogue=self._catalogue_with_skills(),
+        )
+
+        findings = agentcore_app.check_agentcore_evaluation_safety_coverage()
+
+        assert findings[0]["Status"] == "Passed"
+        assert "Builtin.ToolParameterAccuracy" in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_the_passing_alarm_is_named(self, mock_ac):
+        _online_evaluation_client(mock_ac)
+
+        findings = agentcore_app.check_agentcore_evaluation_safety_coverage()
+
+        assert findings[0]["Status"] == "Passed"
+        assert "eval-score-drop" in findings[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "alarms",
+        [
+            [],
+            [_score_alarm(namespace="AWS/Lambda")],
+            [_score_alarm(ActionsEnabled=False)],
+            [_score_alarm(AlarmActions=[])],
+            [_score_alarm(AlarmActions=None)],
+        ],
+        ids=[
+            "no-alarm",
+            "other-namespace",
+            "actions-disabled",
+            "no-actions",
+            "null-actions",
+        ],
+    )
+    @patch("agentcore_app.agentcore_client")
+    def test_scores_no_acting_alarm_reads_fail(self, mock_ac, alarms):
+        _online_evaluation_client(mock_ac)
+        self.mock_cw.describe_alarms.return_value = {
+            "MetricAlarms": alarms + [_score_alarm("lambda", namespace="AWS/Lambda")]
+        }
+
+        findings = agentcore_app.check_agentcore_evaluation_safety_coverage()
+
+        assert len(findings) == 1
+        assert findings[0]["Status"] == "Failed"
+        assert findings[0]["Severity"] == "Medium"
+        assert "notifies nobody" in findings[0]["Finding_Details"]
+        assert "Bedrock-AgentCore/Evaluations" in findings[0]["Finding_Details"]
+        assert "no evaluator the catalogue marks" not in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_the_second_default_namespace_spelling_counts(self, mock_ac):
+        _online_evaluation_client(mock_ac)
+        self.mock_cw.describe_alarms.return_value = {
+            "MetricAlarms": [_score_alarm(namespace="Bedrock AgentCore/Evaluations")]
+        }
+
+        findings = agentcore_app.check_agentcore_evaluation_safety_coverage()
+
+        assert findings[0]["Status"] == "Passed"
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_metric_math_alarm_reads_its_metric_stat_namespace(self, mock_ac):
+        _online_evaluation_client(mock_ac)
+        math_alarm = _score_alarm("math", namespace=None)
+        math_alarm["Metrics"] = [
+            {"Id": "e1", "Expression": "m1 * 100"},
+            {
+                "Id": "m1",
+                "MetricStat": {
+                    "Metric": {
+                        "Namespace": "Bedrock-AgentCore/Evaluations",
+                        "MetricName": "Builtin.Harmfulness",
+                    }
+                },
+            },
+        ]
+        self.mock_cw.describe_alarms.return_value = {"MetricAlarms": [math_alarm]}
+
+        findings = agentcore_app.check_agentcore_evaluation_safety_coverage()
+
+        assert findings[0]["Status"] == "Passed"
+        assert "math" in findings[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        ("alarm_namespace", "verdict"),
+        [("Workload/Evals", "Passed"), ("Bedrock-AgentCore/Evaluations", "Failed")],
+        ids=["on-the-custom-namespace", "on-the-default-namespace"],
+    )
+    @patch("agentcore_app.agentcore_client")
+    def test_a_custom_metrics_namespace_is_the_one_read(
+        self, mock_ac, alarm_namespace, verdict
+    ):
+        _online_evaluation_client(
+            mock_ac,
+            [
+                _online_evaluation_detail(
+                    outputConfig={
+                        "cloudWatchConfig": {
+                            "logGroupName": _EVALUATION_RESULTS_GROUP,
+                            "metricsNamespace": "Workload/Evals",
+                        }
+                    }
+                )
+            ],
+        )
+        self.mock_cw.describe_alarms.return_value = {
+            "MetricAlarms": [_score_alarm(namespace=alarm_namespace)]
+        }
+
+        findings = agentcore_app.check_agentcore_evaluation_safety_coverage()
+
+        assert findings[0]["Status"] == verdict
+        assert "Workload/Evals" in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_each_configuration_is_matched_to_its_own_namespace(self, mock_ac):
+        _online_evaluation_client(
+            mock_ac,
+            [
+                _online_evaluation_detail(),
+                _online_evaluation_detail(
+                    onlineEvaluationConfigId="oec-2",
+                    onlineEvaluationConfigName="custom-ns",
+                    outputConfig={
+                        "cloudWatchConfig": {
+                            "logGroupName": _EVALUATION_RESULTS_GROUP,
+                            "metricsNamespace": "Workload/Evals",
+                        }
+                    },
+                ),
+            ],
+        )
+
+        findings = agentcore_app.check_agentcore_evaluation_safety_coverage()
+
+        assert [finding["Status"] for finding in findings] == ["Passed", "Failed"]
+        assert "custom-ns" in findings[1]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_an_alarm_read_failure_is_never_passed(self, mock_ac):
+        _online_evaluation_client(
+            mock_ac,
+            [
+                _online_evaluation_detail(),
+                _online_evaluation_detail(
+                    onlineEvaluationConfigId="oec-2",
+                    onlineEvaluationConfigName="quality-only",
+                    evaluators=[{"evaluatorId": "Builtin.Helpfulness"}],
+                ),
+            ],
+        )
+        self.mock_cw.describe_alarms.side_effect = _make_client_error(
+            "AccessDenied", "denied"
+        )
+
+        findings = agentcore_app.check_agentcore_evaluation_safety_coverage()
+
+        assert [finding["Status"] for finding in findings] == ["N/A", "Failed"]
+        assert "cloudwatch:DescribeAlarms" in findings[0]["Resolution"]
+        assert "could not be read" in findings[0]["Finding_Details"]
+        assert "could not be read" in findings[1]["Finding_Details"]
+        assert "notifies nobody" not in findings[1]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_no_cloudwatch_client_is_never_passed(self, mock_ac):
+        _online_evaluation_client(mock_ac)
+
+        with patch("agentcore_app.cloudwatch_client", None):
+            findings = agentcore_app.check_agentcore_evaluation_safety_coverage()
+
+        assert findings[0]["Status"] == "N/A"
+        assert "CloudWatch client not available" in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_the_alarms_are_paginated(self, mock_ac):
+        _online_evaluation_client(mock_ac)
+        self.mock_cw.describe_alarms.side_effect = [
+            {
+                "MetricAlarms": [_score_alarm("lambda", namespace="AWS/Lambda")],
+                "NextToken": "page-2",
+            },
+            {"MetricAlarms": [_score_alarm()]},
+        ]
+
+        findings = agentcore_app.check_agentcore_evaluation_safety_coverage()
+
+        assert findings[0]["Status"] == "Passed"
+        assert self.mock_cw.describe_alarms.call_args_list[1].kwargs == {
+            "NextToken": "page-2"
+        }
 
     @patch("agentcore_app.agentcore_client")
     def test_safety_and_tool_call_evaluators_pass(self, mock_ac):
@@ -14098,6 +14397,36 @@ class TestAC41EvaluationResultProtection:
         }
         group.update(overrides)
         return group
+
+    @patch("agentcore_app.logs_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_results_in_the_source_log_group_are_left_to_the_prefix_checks(
+        self, mock_ac, mock_logs
+    ):
+        _online_evaluation_client(
+            mock_ac,
+            [
+                _online_evaluation_detail(
+                    outputConfig={
+                        "cloudWatchConfig": {"resultDestination": "SOURCE_LOG_GROUP"}
+                    }
+                ),
+                _online_evaluation_detail(
+                    onlineEvaluationConfigId="oec-2",
+                    onlineEvaluationConfigName="no-output",
+                    outputConfig={},
+                ),
+            ],
+        )
+
+        findings = agentcore_app.check_agentcore_evaluation_result_protection()
+
+        assert [finding["Status"] for finding in findings] == ["N/A", "N/A"]
+        assert "SOURCE_LOG_GROUP" in findings[0]["Finding_Details"]
+        assert "AC-20 and AC-26" in findings[0]["Finding_Details"]
+        assert "Resolve AC-39" not in findings[0]["Resolution"]
+        assert "AC-39 reports the missing output" in findings[1]["Finding_Details"]
+        mock_logs.describe_log_groups.assert_not_called()
 
     # Each Passed below reads the results key's policy. Before AC-41 read the key
     # policy itself these tests stubbed no KMS client and passed on the key's

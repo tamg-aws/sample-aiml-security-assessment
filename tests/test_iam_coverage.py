@@ -180,6 +180,8 @@ REQUIRED_AGENTCORE_ACTIONS = {
     "cognito-idp:DescribeUserPool",
     "cognito-idp:ListUserPoolClients",
     "cognito-idp:DescribeUserPoolClient",
+    # AC-40 reads the alarms on evaluation scores.
+    "cloudwatch:DescribeAlarms",
 }
 
 REQUIRED_AGENT_REGISTRY_ACTIONS = {
