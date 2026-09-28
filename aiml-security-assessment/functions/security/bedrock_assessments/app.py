@@ -1341,8 +1341,10 @@ def _apply_cache_population_gaps(
     Stop a population-wide Passed verdict from standing over unread principals.
 
     With principal_errors naming a principal of the population, each Passed row
-    becomes N/A and one N/A row names the principals. A version-1 cache keeps its
-    verdicts and says the errors were not recorded.
+    becomes N/A and one N/A row names the principals. The cache keeps whatever
+    policies were read for an errored principal, so it is still judged on them;
+    a Failed row naming one says it may overstate the grant. A version-1 cache
+    keeps its verdicts and says the errors were not recorded.
     """
     errored = _cache_principal_errors(permission_cache, principal_types)
     passed = [row for row in findings["csv_data"] if row.get("Status") == "Passed"]
@@ -1358,14 +1360,44 @@ def _apply_cache_population_gaps(
             f"{row['Finding_Details']} This is not reported as Passed because "
             f"{len(errored)} principal(s) of the population could not be read."
         )
+    errored_names = {
+        str(error.get("name"))
+        for error in permission_cache.get("principal_errors") or []
+        if isinstance(error, dict)
+        and error.get("type") in principal_types
+        and error.get("name")
+    }
+    for row in findings["csv_data"]:
+        if row.get("Status") == "Failed" and any(
+            name in row.get("Finding_Details", "") for name in errored_names
+        ):
+            row["Finding_Details"] = (
+                f"{row['Finding_Details']} A principal named here had a policy "
+                "read fail, so it was judged on the policies that were read and "
+                "this verdict may overstate its grant."
+            )
+    boundary_unknown = [
+        error
+        for error in permission_cache.get("principal_errors") or []
+        if isinstance(error, dict)
+        and error.get("type") in principal_types
+        and error.get("stage") == "permissions_boundary"
+    ]
+    boundary_note = (
+        " For {} of them the permissions boundary is unknown, and it is treated "
+        "as absent, which can only overstate the grant.".format(len(boundary_unknown))
+        if boundary_unknown
+        else ""
+    )
     findings["csv_data"].append(
         create_finding(
             check_id=check_id,
             finding_name=finding_name,
             finding_details=(
                 "The IAM permissions cache records {} principal(s) whose policies "
-                "could not be read, so they were not assessed: {}.".format(
-                    len(errored), "; ".join(errored[:10])
+                "could not be read in full, so each was judged only on the "
+                "policies that were read: {}.{}".format(
+                    len(errored), "; ".join(errored[:10]), boundary_note
                 )
             ),
             resolution=COULD_NOT_ASSESS_RESOLUTION,

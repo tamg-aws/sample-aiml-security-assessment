@@ -22679,6 +22679,124 @@ class TestIamCacheContract:
         assert [f["Status"] for f in findings["csv_data"]] == ["Passed"]
         assert "schema version 1" not in findings["csv_data"][0]["Finding_Details"]
 
+    @staticmethod
+    def _failed(details):
+        return bedrock_app.create_finding(
+            check_id="BR-42",
+            finding_name="Model Allow List",
+            finding_details=details,
+            resolution="None",
+            reference="https://example.com",
+            severity="Medium",
+            status="Failed",
+            region="Global",
+        )
+
+    def test_errored_principals_are_not_described_as_unassessed(self):
+        """The producer keeps an errored principal's read policies, so it is judged."""
+        findings = self._apply(
+            {
+                "cache_schema_version": 2,
+                "principal_errors": [
+                    {
+                        "type": "role",
+                        "name": "BrokenRole",
+                        "stage": "inline_policy",
+                        "error": "Inline AccessDenied",
+                    }
+                ],
+            }
+        )
+
+        note = findings["csv_data"][-1]["Finding_Details"]
+        assert "were not assessed" not in note
+        assert "judged only on the policies that were read" in note
+        assert "permissions boundary is unknown" not in note
+
+    def test_a_failed_boundary_read_says_the_boundary_is_unknown(self):
+        findings = self._apply(
+            {
+                "cache_schema_version": 2,
+                "principal_errors": [
+                    {
+                        "type": "role",
+                        "name": "BoundlessRole",
+                        "stage": "permissions_boundary",
+                        "error": "AccessDenied",
+                    },
+                    {
+                        "type": "user",
+                        "name": "InlineUser",
+                        "stage": "inline_policy",
+                        "error": "Throttling",
+                    },
+                ],
+            }
+        )
+
+        note = findings["csv_data"][-1]["Finding_Details"]
+        assert "For 1 of them the permissions boundary is unknown" in note
+        assert "can only overstate the grant" in note
+
+    def test_only_a_failed_row_naming_an_errored_principal_is_qualified(self):
+        findings = self._findings()
+        findings["csv_data"] = [
+            self._failed("role 'BrokenRole' can invoke any model."),
+            self._failed("role 'CleanRole' can invoke any model."),
+        ]
+        bedrock_app._apply_cache_population_gaps(
+            findings,
+            {
+                "cache_schema_version": 2,
+                "principal_errors": [
+                    {
+                        "type": "role",
+                        "name": "BrokenRole",
+                        "stage": "permissions_boundary",
+                        "error": "AccessDenied",
+                    }
+                ],
+            },
+            "BR-42",
+            "Model Allow List",
+            "https://example.com",
+            "Global",
+        )
+
+        rows = findings["csv_data"]
+        assert [row["Status"] for row in rows] == ["Failed", "Failed", "N/A"]
+        assert "may overstate its grant" in rows[0]["Finding_Details"]
+        assert "may overstate its grant" not in rows[1]["Finding_Details"]
+
+    def test_br10_failed_row_on_a_boundary_unknown_role_is_qualified(self):
+        """End to end: a null boundary plus a permissions_boundary error is unknown."""
+        cache = _br10_cache(
+            roles={"OpenRole": _br10_identity(_br10_allow(sid="Open"))},
+            errors=[
+                {
+                    "type": "role",
+                    "name": "OpenRole",
+                    "stage": "permissions_boundary",
+                    "error": "AccessDenied",
+                }
+            ],
+        )
+        with patch("bedrock_app.boto3.client", return_value=MagicMock()):
+            findings = extract_csv_data(
+                bedrock_app.check_bedrock_guardrail_iam_enforcement(
+                    cache, region="us-east-1"
+                )
+            )
+
+        failed = [row for row in findings if row["Status"] == "Failed"]
+        assert len(failed) == 1
+        assert "may overstate its grant" in failed[0]["Finding_Details"]
+        assert any(
+            "permissions boundary is unknown" in row["Finding_Details"]
+            for row in findings
+            if row["Status"] == "N/A"
+        )
+
     def test_empty_principal_errors_on_version_two_is_clean(self):
         findings = self._apply({"cache_schema_version": 2, "principal_errors": []})
 
