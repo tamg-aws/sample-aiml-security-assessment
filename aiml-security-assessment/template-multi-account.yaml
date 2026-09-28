@@ -656,6 +656,8 @@ Resources:
                 - lambda:GetFunction
                 - lambda:ListFunctionUrlConfigs # BR-54
                 - lambda:GetPolicy # BR-54
+                - lambda:ListAliases # BR-54
+                - lambda:ListVersionsByFunction # BR-54
               Resource: !Sub 'arn:${AWS::Partition}:lambda:*:${AWS::AccountId}:function:*'
             - Sid: EC2Permissions
               Effect: Allow

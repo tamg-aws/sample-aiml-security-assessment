@@ -1370,14 +1370,21 @@ FOUNDATION_ROWS = [
         None,
         "bedrock_assessments",
         ["BR-54"],
-        "BR-54 reads the function URL's AuthType and the resource policy of every "
-        "Lambda function. It fails a function URL with AuthType NONE, and says "
-        "the URL accepts no requests yet when no statement grants public invoke. "
-        'It fails an Allow to Principal "*" on lambda:InvokeFunction* or lambda:* '
-        "with no aws:SourceArn, aws:SourceAccount or aws:PrincipalOrgID "
-        "condition. lambda:FunctionUrlAuthType and lambda:InvokedViaFunctionUrl "
-        "do not clear it, because they describe how the function is called. It "
-        "reports configuration and does not claim the function is reachable",
+        "BR-54 reads the function URL's AuthType and CORS AllowOrigins and the "
+        "resource policy of every Lambda function, alias and published version. "
+        "It fails a function URL with AuthType NONE, and says the URL accepts no "
+        "requests yet when the policy of the URL's own qualifier grants no public "
+        "invoke. It fails a URL whose CORS origins hold a wildcard. It fails an "
+        'Allow to Principal "*" on lambda:InvokeFunction* or lambda:* unless a '
+        "positive, non-IfExists aws:SourceAccount, aws:PrincipalOrgID or "
+        "aws:SourceArn test names one account, organization or source ARN in "
+        "every value. lambda:FunctionUrlAuthType and lambda:InvokedViaFunctionUrl "
+        "do not clear it, because they describe how the function is called. On "
+        "the primary Region it judges the attached service control policies for a "
+        "Deny on lambda:CreateFunctionUrlConfig and lambda:UpdateFunctionUrlConfig "
+        "when lambda:FunctionUrlAuthType is NONE. Partial, ceiling reached: it "
+        "reports configuration and does not claim the function is reachable, and "
+        "a CloudFront or WAF front for a public URL is not read",
         [],
         6,
     ),

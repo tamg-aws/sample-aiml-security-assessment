@@ -22251,7 +22251,6 @@ LAMBDA_PUBLIC_INVOKE_REFERENCE = (
 
 LAMBDA_INVOKE_ACTIONS = ("lambda:invokefunction", "lambda:invokefunctionurl")
 
-# Any one of these on the statement limits the grant to a named source.
 # AddPermission is the only writer of a function policy, and these are its only
 # caller-scoping parameters. lambda:FunctionUrlAuthType and
 # lambda:InvokedViaFunctionUrl, which it also writes, say how the function is
@@ -22262,10 +22261,41 @@ LAMBDA_SOURCE_CONDITION_KEYS = (
     "aws:principalorgid",
 )
 
+# Positive tests only. An IfExists form or a ForAllValues: prefix is true when
+# the key is absent, and a negated test admits every source but the one named,
+# so none of them limits the grant to a named source.
+LAMBDA_SOURCE_BOUNDING_OPERATORS = {
+    "aws:sourceaccount": ("stringequals", "stringlike"),
+    "aws:principalorgid": ("stringequals", "stringlike"),
+    "aws:sourcearn": ("arnequals", "arnlike", "stringequals", "stringlike"),
+}
+
+LAMBDA_ACCOUNT_ID_PATTERN = re.compile(r"\d{12}")
+
+LAMBDA_ORGANIZATION_ID_PATTERN = re.compile(r"o-[a-z0-9]{10,32}")
+
 LAMBDA_CONFIGURATION_NOTE = (
     "This reads configuration only and does not test whether the function can be "
-    "reached; alias and version policies are not read."
+    "reached. The unqualified policy and the policy of every alias and published "
+    "version are read."
 )
+
+LAMBDA_URL_AUTH_TYPE_KEY = "lambda:functionurlauthtype"
+
+LAMBDA_URL_CONFIG_ACTIONS = (
+    "lambda:createfunctionurlconfig",
+    "lambda:updatefunctionurlconfig",
+)
+
+# Stand in for the Region, account and name of a function ARN in each
+# partition; only * or ? can match the placeholder, so a Resource pattern that
+# matches one of them applies to every function in that partition.
+ANY_LAMBDA_FUNCTION_ARNS = tuple(
+    f"arn:{partition}:lambda:\x00:\x00:function:\x00"
+    for partition in ("aws", "aws-cn", "aws-us-gov")
+)
+
+LAMBDA_URL_AUTH_TYPE_SCP_FINDING = "Lambda Function URL Auth Type Preventive Control"
 
 
 def _principal_is_everyone(principal: Any) -> bool:
@@ -22277,8 +22307,58 @@ def _principal_is_everyone(principal: Any) -> bool:
     return False
 
 
+def _lambda_source_arn_is_bounded(value: str) -> bool:
+    """
+    Return True when a source ARN names one account and one resource.
+
+    A wildcard in the partition, service, Region or account segment, or in the
+    resource ID before its first "/", matches sources in other accounts or other
+    resources. An ARN with no account segment, such as an S3 bucket ARN, names
+    no owning account, so it needs aws:SourceAccount beside it. A wildcard after that "/" narrows within the named resource, such
+    as the stage and route of one API.
+    """
+    parts = value.split(":", 5)
+    if len(parts) != 6 or parts[0] != "arn":
+        return False
+    if any("*" in part or "?" in part for part in parts[1:5]):
+        return False
+    if not LAMBDA_ACCOUNT_ID_PATTERN.fullmatch(parts[4]):
+        return False
+    resource_id = parts[5].split("/", 1)[0]
+    return bool(resource_id) and "*" not in resource_id and "?" not in resource_id
+
+
+def _lambda_source_condition_bounds(statement: Dict[str, Any]) -> Optional[str]:
+    """
+    Name the condition that limits a statement to one source, or return None.
+
+    Condition tests are ANDed, so one bounding test is enough. Values within a
+    test are ORed, so the test bounds only when every value names one source.
+    """
+    for operator, key, values in _condition_keys_by_operator(statement):
+        if key not in LAMBDA_SOURCE_BOUNDING_OPERATORS or not values:
+            continue
+        if operator.startswith("forallvalues:"):
+            continue
+        base = _strip_condition_set_operator(operator)
+        if base not in LAMBDA_SOURCE_BOUNDING_OPERATORS[key]:
+            continue
+        texts = [str(value) for value in values]
+        if key == "aws:sourceaccount":
+            bounded = all(LAMBDA_ACCOUNT_ID_PATTERN.fullmatch(text) for text in texts)
+        elif key == "aws:principalorgid":
+            bounded = all(
+                LAMBDA_ORGANIZATION_ID_PATTERN.fullmatch(text) for text in texts
+            )
+        else:
+            bounded = all(_lambda_source_arn_is_bounded(text) for text in texts)
+        if bounded:
+            return f"{operator} {key} {', '.join(texts)}"
+    return None
+
+
 def _lambda_public_invoke_statements(document: Any) -> List[str]:
-    """Describe each Allow that lets any principal invoke with no source condition."""
+    """Describe each Allow that lets any principal invoke with no bounded source condition."""
     public = []
     for statement in _policy_statements(document):
         if str(statement.get("Effect", "")).upper() != "ALLOW":
@@ -22295,22 +22375,215 @@ def _lambda_public_invoke_statements(document: Any) -> List[str]:
         ]
         if not actions:
             continue
-        if any(
-            key in LAMBDA_SOURCE_CONDITION_KEYS
-            for _, key, _ in _condition_keys_by_operator(statement)
-        ):
+        if _lambda_source_condition_bounds(statement):
             continue
         label = statement.get("Sid") or "unnamed statement"
-        public.append(f"statement '{label}' allows {', '.join(actions)} to '*'")
+        present = sorted(
+            {
+                key
+                for _, key, _ in _condition_keys_by_operator(statement)
+                if key in LAMBDA_SOURCE_CONDITION_KEYS
+            }
+        )
+        public.append(
+            "statement '{}' allows {} to '*' with no source condition{}".format(
+                label,
+                ", ".join(actions),
+                " that names one account, organization or source ARN ({} is "
+                "present but its operator or value admits other sources)".format(
+                    ", ".join(present)
+                )
+                if present
+                else "",
+            )
+        )
     return public
 
 
-def check_lambda_public_invoke_configuration(region: str = "") -> Dict[str, Any]:
+def _lambda_url_auth_type_test_denies_none(operator: str, values: List[Any]) -> bool:
+    """Return True when a Deny test on lambda:FunctionUrlAuthType matches NONE."""
+    base = _strip_condition_set_operator(operator)
+    if base.endswith("ifexists"):
+        base = base[: -len("ifexists")]
+    texts = [str(value) for value in values]
+    if not texts:
+        return False
+    if base == "stringequals":
+        return "NONE" in texts
+    if base == "stringequalsignorecase":
+        return "none" in [text.lower() for text in texts]
+    if base == "stringlike":
+        return any(fnmatch.fnmatchcase("NONE", text) for text in texts)
+    if base == "stringnotequals":
+        return "NONE" not in texts
+    if base == "stringnotequalsignorecase":
+        return "none" not in [text.lower() for text in texts]
+    if base == "stringnotlike":
+        return not any(fnmatch.fnmatchcase("NONE", text) for text in texts)
+    return False
+
+
+def _lambda_url_auth_type_scp_controls(statements: List[tuple]) -> Dict[str, Any]:
     """
-    BR-54: Flag Lambda functions whose URL needs no IAM authentication, or whose
-    resource-based policy lets any principal invoke them with no source
-    condition. Every function is read, because a tool an agent calls need not
-    name Bedrock in its configuration.
+    Judge attached service control policy statements against the function URL
+    AuthType NONE Deny, per URL configuration action.
+
+    statements are (policy_name, statement) pairs. A Deny is credited on an
+    action when it applies to every function and either has no condition or
+    tests only lambda:FunctionUrlAuthType in a way that matches NONE.
+    """
+    result = {"denied": {}, "gaps": []}
+    for policy_name, statement in statements:
+        if str(statement.get("Effect", "")).upper() != "DENY":
+            continue
+        actions = [
+            action
+            for action in LAMBDA_URL_CONFIG_ACTIONS
+            if _statement_matches_action(statement, action)
+        ]
+        if not actions:
+            continue
+        label = "policy '{}' statement '{}'".format(
+            policy_name, statement.get("Sid") or "unnamed"
+        )
+        every_function = "NotResource" not in statement and any(
+            isinstance(resource, str)
+            and any(
+                _wildcard_matches(resource.strip().lower(), arn)
+                for arn in ANY_LAMBDA_FUNCTION_ARNS
+            )
+            for resource in _as_list(statement.get("Resource"))
+        )
+        if not every_function:
+            result["gaps"].append(f"{label} does not apply to every function")
+            continue
+        conditions = _condition_keys_by_operator(statement)
+        extra = sorted({key for _, key, _ in conditions} - {LAMBDA_URL_AUTH_TYPE_KEY})
+        if extra:
+            result["gaps"].append(
+                "{} is also conditioned on {}, which narrows it to part of the "
+                "requests".format(label, ", ".join(extra))
+            )
+            continue
+        failing = [
+            f"{operator} {', '.join(str(value) for value in values)}"
+            for operator, _, values in conditions
+            if not _lambda_url_auth_type_test_denies_none(operator, values)
+        ]
+        if failing:
+            result["gaps"].append(
+                "{}: {} does not match AuthType NONE".format(label, "; ".join(failing))
+            )
+            continue
+        for action in actions:
+            result["denied"].setdefault(action, []).append(
+                "{} denies {}{}".format(
+                    label,
+                    action,
+                    " when lambda:FunctionUrlAuthType is NONE" if conditions else "",
+                )
+            )
+    return result
+
+
+def _lambda_url_auth_type_scp_row(scp_inventory: Dict[str, Any]) -> Dict[str, Any]:
+    """Build the BR-54 finding for the organization-wide AuthType NONE Deny."""
+    statements = []
+    read_errors = list(scp_inventory.get("errors") or [])
+    if scp_inventory.get("list_error"):
+        read_errors.append(
+            f"SERVICE_CONTROL_POLICY listing: {scp_inventory['list_error']}"
+        )
+    for item in scp_inventory.get("items") or []:
+        try:
+            statements.extend(
+                (item["name"], statement)
+                for statement in _policy_statements(item.get("content") or "{}")
+            )
+        except (ValueError, TypeError) as error:
+            read_errors.append(f"policy '{item['name']}': {str(error)}")
+    controls = _lambda_url_auth_type_scp_controls(statements)
+    covered = [
+        action for action in LAMBDA_URL_CONFIG_ACTIONS if action in controls["denied"]
+    ]
+    credited = [text for action in covered for text in controls["denied"][action]]
+    management = bool(scp_inventory.get("management_account"))
+    scope_note = _scp_scope_note(scp_inventory)
+    gap_note = (
+        " Statements not credited: {}.".format("; ".join(controls["gaps"][:5]))
+        if controls["gaps"]
+        else ""
+    )
+
+    def scp_row(details, resolution, severity, status):
+        return create_finding(
+            check_id="BR-54",
+            finding_name=LAMBDA_URL_AUTH_TYPE_SCP_FINDING,
+            finding_details=f"{details}{gap_note} {scope_note}",
+            resolution=resolution,
+            reference=LAMBDA_PUBLIC_INVOKE_REFERENCE,
+            severity=severity,
+            status=status,
+            region=GLOBAL_REGION_LABEL,
+        )
+
+    if len(covered) == len(LAMBDA_URL_CONFIG_ACTIONS) and not management:
+        return scp_row(
+            "Service control policies deny a function URL with AuthType NONE on "
+            "both lambda:CreateFunctionUrlConfig and "
+            "lambda:UpdateFunctionUrlConfig: {}.".format("; ".join(credited[:5])),
+            "No action required",
+            "Medium",
+            "Passed",
+        )
+    if read_errors and not management:
+        return scp_row(
+            "A service control policy denying function URLs with AuthType NONE is "
+            "undetermined because organization policies could not be read: "
+            "{}.".format("; ".join(read_errors[:5])),
+            "Grant organizations:ListPolicies, organizations:ListTargetsForPolicy, "
+            "organizations:ListParents and organizations:DescribePolicy and retry "
+            "before concluding that no control exists.",
+            "Informational",
+            "N/A",
+        )
+    return scp_row(
+        "No service control policy attached to this account denies both "
+        "lambda:CreateFunctionUrlConfig and lambda:UpdateFunctionUrlConfig when "
+        "lambda:FunctionUrlAuthType is NONE{}, so a function URL that needs no IAM "
+        "authentication can be created or an existing one loosened.{}".format(
+            " (only {} is covered)".format(", ".join(covered)) if covered else "",
+            " Credited statements exist but do not restrict this account."
+            if management and credited
+            else "",
+        ),
+        "Attach a service control policy that denies "
+        "lambda:CreateFunctionUrlConfig and lambda:UpdateFunctionUrlConfig on "
+        'Resource "*" when lambda:FunctionUrlAuthType is NONE (StringEquals) to '
+        "the root or the OUs that hold agent and tool functions.",
+        "Medium",
+        "Failed",
+    )
+
+
+def _lambda_url_qualifier(url: Dict[str, Any]) -> Optional[str]:
+    """Return the alias a function URL is attached to, or None for the unqualified function."""
+    parts = str(url.get("FunctionArn") or "").split(":")
+    if len(parts) == 8 and parts[7] and parts[7] != "$LATEST":
+        return parts[7]
+    return None
+
+
+def check_lambda_public_invoke_configuration(
+    region: str = "", scp_inventory: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
+    """
+    BR-54: Flag Lambda functions whose URL needs no IAM authentication or allows
+    every CORS origin, or whose unqualified, alias or version resource-based
+    policy lets any principal invoke them with no bounded source condition.
+    Every function is read, because a tool an agent calls need not name Bedrock
+    in its configuration. When scp_inventory is given, the organization-wide
+    Deny on lambda:FunctionUrlAuthType NONE is judged as well.
     """
     logger.debug("Starting check for Lambda public invoke configuration")
     check_name = LAMBDA_PUBLIC_INVOKE_FINDING
@@ -22334,6 +22607,11 @@ def check_lambda_public_invoke_configuration(region: str = "") -> Dict[str, Any]
                 region=region,
             )
 
+        if scp_inventory is not None:
+            scp_finding = _lambda_url_auth_type_scp_row(scp_inventory)
+            if scp_finding["Status"] == "Failed":
+                findings["status"] = "WARN"
+
         lambda_client = boto3.client("lambda", config=boto3_config, region_name=region)
         functions = _list_all_items(
             lambda_client,
@@ -22345,7 +22623,7 @@ def check_lambda_public_invoke_configuration(region: str = "") -> Dict[str, Any]
             max_results=50,
         )
         if not functions:
-            findings["status"] = "N/A"
+            findings["status"] = "N/A" if findings["status"] == "PASS" else "WARN"
             findings["csv_data"].append(
                 row(
                     f"No Lambda function exists in {region or 'this region'}.",
@@ -22354,7 +22632,24 @@ def check_lambda_public_invoke_configuration(region: str = "") -> Dict[str, Any]
                     "N/A",
                 )
             )
+            if scp_inventory is not None:
+                findings["csv_data"].append(scp_finding)
             return findings
+
+        def read_policy(name, qualifier=None):
+            kwargs = {"FunctionName": name}
+            if qualifier:
+                kwargs["Qualifier"] = qualifier
+            try:
+                policy = lambda_client.get_policy(**kwargs).get("Policy")
+            except ClientError as error:
+                if (
+                    error.response.get("Error", {}).get("Code")
+                    != "ResourceNotFoundException"
+                ):
+                    raise
+                return []
+            return _lambda_public_invoke_statements(policy) if policy else []
 
         compliant = []
         indeterminate = []
@@ -22372,45 +22667,73 @@ def check_lambda_public_invoke_configuration(region: str = "") -> Dict[str, Any]
                     max_results=50,
                     FunctionName=name,
                 )
-                open_urls = [
-                    url.get("FunctionUrl", "unknown")
-                    for url in urls
-                    if url.get("AuthType") == "NONE"
-                ]
-                try:
-                    policy = lambda_client.get_policy(FunctionName=name).get("Policy")
-                except ClientError as error:
-                    if (
-                        error.response.get("Error", {}).get("Code")
-                        != "ResourceNotFoundException"
-                    ):
-                        raise
-                    policy = None
-                public = _lambda_public_invoke_statements(policy) if policy else []
+                aliases = _list_all_items(
+                    lambda_client,
+                    "list_aliases",
+                    "Aliases",
+                    max_results_param="MaxItems",
+                    token_param="Marker",
+                    token_response_keys=("NextMarker",),
+                    max_results=50,
+                    FunctionName=name,
+                )
+                versions = _list_all_items(
+                    lambda_client,
+                    "list_versions_by_function",
+                    "Versions",
+                    max_results_param="MaxItems",
+                    token_param="Marker",
+                    token_response_keys=("NextMarker",),
+                    max_results=50,
+                    FunctionName=name,
+                )
+                public = {None: read_policy(name)}
+                for alias in aliases:
+                    if alias.get("Name"):
+                        public[alias["Name"]] = read_policy(name, alias["Name"])
+                for version in versions:
+                    number = version.get("Version")
+                    if number and number != "$LATEST":
+                        public[number] = read_policy(name, number)
             except Exception as error:
                 indeterminate.append(f"{name}: {get_assessment_error_label(error)}")
                 continue
 
-            # With AuthType NONE the resource policy still decides, so a URL
-            # is callable without a signature only when a public statement
-            # also exists.
-            for url in open_urls:
-                if public:
+            # With AuthType NONE the resource policy of the URL's own qualifier
+            # still decides, so a URL is callable without a signature only when
+            # that policy also has a public statement.
+            for url in urls:
+                address = url.get("FunctionUrl", "unknown")
+                origins = [
+                    str(origin)
+                    for origin in _as_list((url.get("Cors") or {}).get("AllowOrigins"))
+                    if "*" in str(origin)
+                ]
+                if origins:
                     problems.append(
-                        f"function URL {url} has AuthType NONE and the "
+                        "function URL {} allows CORS origin {}, so a script on any "
+                        "matching web site can call it from a browser".format(
+                            address, ", ".join(f"'{origin}'" for origin in origins)
+                        )
+                    )
+                if url.get("AuthType") != "NONE":
+                    continue
+                if public.get(_lambda_url_qualifier(url)):
+                    problems.append(
+                        f"function URL {address} has AuthType NONE and the "
                         "resource-based policy grants public access, so "
                         "unauthenticated callers can invoke it"
                     )
                 else:
                     problems.append(
-                        f"function URL {url} has AuthType NONE, which disables IAM "
-                        "authentication; the resource-based policy grants no "
+                        f"function URL {address} has AuthType NONE, which disables "
+                        "IAM authentication; the resource-based policy grants no "
                         "public access today, so the URL does not accept requests "
                         "yet, but one permission granted to '*' would open it"
                     )
-            problems.extend(
-                f"{statement} with no source condition" for statement in public
-            )
+            for qualifier, statements in public.items():
+                prefix = f"qualifier '{qualifier}' " if qualifier else ""
+                problems.extend(f"{prefix}{statement}" for statement in statements)
             if not problems:
                 compliant.append(name)
                 continue
@@ -22418,10 +22741,11 @@ def check_lambda_public_invoke_configuration(region: str = "") -> Dict[str, Any]
             findings["csv_data"].append(
                 row(
                     f"Lambda function '{name}': {'; '.join(problems)}.",
-                    "Set the function URL AuthType to AWS_IAM, and add a source "
-                    "account, source ARN or organization condition to any "
-                    "resource-based policy statement that allows every principal "
-                    "to invoke the function.",
+                    "Set the function URL AuthType to AWS_IAM, list known origins "
+                    "in the URL's CORS AllowOrigins, and add a source account, "
+                    "source ARN or organization condition that names one source to "
+                    "any resource-based policy statement, on the function or any "
+                    "alias or version, that allows every principal to invoke it.",
                     "High",
                     "Failed",
                 )
@@ -22431,8 +22755,10 @@ def check_lambda_public_invoke_configuration(region: str = "") -> Dict[str, Any]
             findings["csv_data"].append(
                 row(
                     "{} of the {} Lambda function(s) read have no function URL with "
-                    "AuthType NONE and no resource-based policy statement letting "
-                    "every principal invoke them without a source condition.".format(
+                    "AuthType NONE or a wildcard CORS origin, and no resource-based "
+                    "policy statement on the function, an alias or a version "
+                    "letting every principal invoke them without a source "
+                    "condition that names one source.".format(
                         len(compliant), len(functions)
                     ),
                     "No action required",
@@ -22452,6 +22778,8 @@ def check_lambda_public_invoke_configuration(region: str = "") -> Dict[str, Any]
                     "N/A",
                 )
             )
+        if scp_inventory is not None:
+            findings["csv_data"].append(scp_finding)
         return findings
 
     except Exception as e:
@@ -24933,7 +25261,12 @@ def lambda_handler(event, context):
         all_findings.append(check_bedrock_resource_owner_tag(region=region))
 
         logger.info("Running Lambda public invoke configuration check (BR-54)")
-        all_findings.append(check_lambda_public_invoke_configuration(region=region))
+        all_findings.append(
+            check_lambda_public_invoke_configuration(
+                region=region,
+                scp_inventory=scp_inventory if is_primary_region else None,
+            )
+        )
 
         logger.info("Running KMS enclave attestation binding check (BR-55)")
         all_findings.append(check_kms_enclave_key_binding(region=region))

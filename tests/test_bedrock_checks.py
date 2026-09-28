@@ -20610,7 +20610,16 @@ class TestBR54LambdaPublicInvoke:
     def _policy_json(*statements):
         return json.dumps(_policy(*statements))
 
-    def _run(self, functions, urls=None, policies=None, function_pages=None):
+    def _run(
+        self,
+        functions,
+        urls=None,
+        policies=None,
+        function_pages=None,
+        aliases=None,
+        versions=None,
+        scp_inventory=None,
+    ):
         lam = MagicMock()
         if function_pages is not None:
             lam.list_functions.side_effect = lambda **kwargs: (
@@ -20629,19 +20638,37 @@ class TestBR54LambdaPublicInvoke:
                 raise outcome
             return {"FunctionUrlConfigs": outcome}
 
-        def get_policy(FunctionName):
-            outcome = policies.get(FunctionName)
+        aliases = aliases or {}
+        versions = versions or {}
+
+        def get_policy(FunctionName, Qualifier=None):
+            key = f"{FunctionName}:{Qualifier}" if Qualifier else FunctionName
+            outcome = policies.get(key)
             if outcome is None:
                 raise _make_client_error("ResourceNotFoundException")
             if isinstance(outcome, Exception):
                 raise outcome
             return {"Policy": outcome}
 
+        def listing(source, result_key, item_key):
+            def list_items(FunctionName, **kwargs):
+                outcome = source.get(FunctionName, [])
+                if isinstance(outcome, Exception):
+                    raise outcome
+                return {result_key: [{item_key: value} for value in outcome]}
+
+            return list_items
+
         lam.list_function_url_configs.side_effect = list_function_url_configs
+        lam.list_aliases.side_effect = listing(aliases, "Aliases", "Name")
+        lam.list_versions_by_function.side_effect = listing(
+            versions, "Versions", "Version"
+        )
         lam.get_policy.side_effect = get_policy
         with patch("boto3.client", return_value=lam):
+            kwargs = {} if scp_inventory is None else {"scp_inventory": scp_inventory}
             result = bedrock_app.check_lambda_public_invoke_configuration(
-                region="us-east-1"
+                region="us-east-1", **kwargs
             )
         return result, extract_csv_data(result), lam
 
@@ -20850,6 +20877,287 @@ class TestBR54LambdaPublicInvoke:
                 bedrock_app.check_lambda_public_invoke_configuration(region="us-east-1")
             )
         assert_could_not_assess_finding(rows[0])
+
+    def test_br54_wildcard_cors_origin_fails_even_with_iam_auth(self):
+        _, rows, _ = self._run(
+            ["a-known", "b-star", "c-pattern"],
+            urls={
+                "a-known": [
+                    {
+                        "FunctionUrl": "https://a",
+                        "AuthType": "AWS_IAM",
+                        "Cors": {"AllowOrigins": ["https://app.example.com"]},
+                    }
+                ],
+                "b-star": [
+                    {
+                        "FunctionUrl": "https://b",
+                        "AuthType": "AWS_IAM",
+                        "Cors": {"AllowOrigins": ["https://app.example.com", "*"]},
+                    }
+                ],
+                "c-pattern": [
+                    {
+                        "FunctionUrl": "https://c",
+                        "AuthType": "AWS_IAM",
+                        "Cors": {"AllowOrigins": ["https://*.example.com"]},
+                    }
+                ],
+            },
+        )
+        assert [r["Status"] for r in rows] == ["Failed", "Failed", "Passed"]
+        assert "'b-star'" in rows[0]["Finding_Details"]
+        assert "allows CORS origin '*'" in rows[0]["Finding_Details"]
+        assert "https://app.example.com" not in rows[0]["Finding_Details"]
+        assert "'https://*.example.com'" in rows[1]["Finding_Details"]
+        assert "1 of the 3 Lambda function(s)" in rows[2]["Finding_Details"]
+
+    def test_br54_alias_and_version_policies_are_read(self):
+        _, rows, lam = self._run(
+            ["a-clean", "b-alias", "c-version"],
+            aliases={"a-clean": ["live"], "b-alias": ["dev", "prod"]},
+            versions={"a-clean": ["$LATEST", "1"], "c-version": ["$LATEST", "1", "2"]},
+            policies={
+                "b-alias:prod": self._policy_json(self.PUBLIC),
+                "c-version:2": self._policy_json(self.PUBLIC),
+            },
+        )
+        assert [r["Status"] for r in rows] == ["Failed", "Failed", "Passed"]
+        assert (
+            "qualifier 'prod' statement 'public' allows lambda:invokefunction"
+            in rows[0]["Finding_Details"]
+        )
+        assert "'dev'" not in rows[0]["Finding_Details"]
+        assert "qualifier '2' statement 'public'" in rows[1]["Finding_Details"]
+        assert "1 of the 3 Lambda function(s)" in rows[2]["Finding_Details"]
+        lam.get_policy.assert_any_call(FunctionName="a-clean", Qualifier="live")
+        lam.get_policy.assert_any_call(FunctionName="a-clean", Qualifier="1")
+        called = [c.kwargs.get("Qualifier") for c in lam.get_policy.call_args_list]
+        assert "$LATEST" not in called
+
+    def test_br54_alias_url_is_judged_on_the_alias_policy(self):
+        _, rows, _ = self._run(
+            ["f"],
+            urls={
+                "f": [
+                    {
+                        "FunctionUrl": "https://f-prod",
+                        "FunctionArn": "arn:aws:lambda:us-east-1:123456789012:function:f:prod",
+                        "AuthType": "NONE",
+                    }
+                ]
+            },
+            aliases={"f": ["prod"]},
+            policies={"f:prod": self._policy_json(self.PUBLIC)},
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert (
+            "function URL https://f-prod has AuthType NONE and the resource-based "
+            "policy grants public access" in rows[0]["Finding_Details"]
+        )
+
+    def test_br54_alias_or_version_read_error_is_na_not_passed(self):
+        _, rows, _ = self._run(
+            ["a-ok", "b-alias-denied", "c-version-policy-denied"],
+            aliases={"b-alias-denied": _make_client_error("AccessDeniedException")},
+            versions={"c-version-policy-denied": ["1"]},
+            policies={
+                "c-version-policy-denied:1": _make_client_error("AccessDeniedException")
+            },
+        )
+        assert [r["Status"] for r in rows] == ["Passed", "N/A"]
+        assert "1 of the 3 Lambda function(s)" in rows[0]["Finding_Details"]
+        assert "2 Lambda function(s) could not be read" in rows[1]["Finding_Details"]
+        assert "b-alias-denied" in rows[1]["Finding_Details"]
+        assert "c-version-policy-denied" in rows[1]["Finding_Details"]
+
+    def test_br54_source_condition_values_are_judged(self):
+        unbounded = {
+            "account-wildcard": {"StringLike": {"aws:SourceAccount": "*"}},
+            "account-short": {"StringEquals": {"aws:SourceAccount": "12345"}},
+            "account-one-of-two-open": {
+                "StringLike": {"aws:SourceAccount": ["123456789012", "*"]}
+            },
+            "org-wildcard": {"StringLike": {"aws:PrincipalOrgID": "o-*"}},
+            "arn-account-wildcard": {
+                "ArnLike": {"aws:SourceArn": "arn:aws:execute-api:us-east-1:*:abc/*"}
+            },
+            "arn-resource-wildcard": {
+                "ArnLike": {"aws:SourceArn": "arn:aws:sns:us-east-1:123456789012:*"}
+            },
+            "arn-no-account": {"ArnLike": {"aws:SourceArn": "arn:aws:s3:::bucket"}},
+            "if-exists": {
+                "StringEqualsIfExists": {"aws:SourceAccount": "123456789012"}
+            },
+            "negated": {"StringNotEquals": {"aws:SourceAccount": "123456789012"}},
+            "for-all-values": {
+                "ForAllValues:StringEquals": {"aws:SourceAccount": "123456789012"}
+            },
+        }
+        bounded = {
+            "z-account": {"StringEquals": {"aws:SourceAccount": "123456789012"}},
+            "z-arn-and-account": {
+                "ArnLike": {"aws:SourceArn": "arn:aws:s3:::bucket"},
+                "StringEquals": {"aws:SourceAccount": "123456789012"},
+            },
+            "z-arn-route": {
+                "ArnLike": {
+                    "aws:SourceArn": "arn:aws:execute-api:us-east-1:123456789012:abc/*/GET/"
+                }
+            },
+            "z-org": {"StringEquals": {"aws:PrincipalOrgID": "o-a1b2c3d4e5"}},
+        }
+        cases = {**unbounded, **bounded}
+        _, rows, _ = self._run(
+            sorted(cases),
+            policies={
+                name: self._policy_json(dict(self.PUBLIC, Condition=condition))
+                for name, condition in cases.items()
+            },
+        )
+        failed = [r for r in rows if r["Status"] == "Failed"]
+        assert len(failed) == len(unbounded)
+        for name in unbounded:
+            assert any(f"'{name}'" in r["Finding_Details"] for r in failed), name
+        for name in bounded:
+            assert not any(f"'{name}'" in r["Finding_Details"] for r in failed), name
+        assert rows[-1]["Status"] == "Passed"
+        assert (
+            f"{len(bounded)} of the {len(cases)} Lambda function(s)"
+            in rows[-1]["Finding_Details"]
+        )
+        account_row = next(
+            r for r in failed if "'account-wildcard'" in r["Finding_Details"]
+        )
+        assert (
+            "aws:sourceaccount is present but its operator or value admits other "
+            "sources" in account_row["Finding_Details"]
+        )
+
+    @staticmethod
+    def _scp_inventory(*statements, management=False, errors=None, list_error=None):
+        return {
+            "items": [
+                {
+                    "name": "url-guard",
+                    "id": "p-1",
+                    "content": json.dumps(_policy(*statements)) if statements else "{}",
+                    "attached_to": ["root r-1"],
+                }
+            ],
+            "errors": list(errors or []),
+            "list_error": list_error,
+            "detached": [],
+            "account": "123456789012",
+            "path": [],
+            "management_account": management,
+        }
+
+    URL_DENY = {
+        "Sid": "DenyPublicUrls",
+        "Effect": "Deny",
+        "Action": ["lambda:CreateFunctionUrlConfig", "lambda:UpdateFunctionUrlConfig"],
+        "Resource": "*",
+        "Condition": {"StringEquals": {"lambda:FunctionUrlAuthType": "NONE"}},
+    }
+
+    def _scp_row(self, inventory):
+        result, rows, _ = self._run(["f"], scp_inventory=inventory)
+        scp = [
+            r
+            for r in rows
+            if r["Finding"] == bedrock_app.LAMBDA_URL_AUTH_TYPE_SCP_FINDING
+        ]
+        assert len(scp) == 1
+        assert scp[0]["Region"] == "Global"
+        return result, scp[0]
+
+    def test_br54_scp_leg_is_absent_without_an_inventory(self):
+        _, rows, _ = self._run(["f"])
+        assert [r["Finding"] for r in rows] == [
+            bedrock_app.LAMBDA_PUBLIC_INVOKE_FINDING
+        ]
+
+    def test_br54_scp_url_auth_type_deny_forms_pass(self):
+        forms = [
+            self.URL_DENY,
+            dict(
+                self.URL_DENY,
+                Condition={
+                    "StringNotEqualsIfExists": {"lambda:FunctionUrlAuthType": "AWS_IAM"}
+                },
+            ),
+            dict(self.URL_DENY, Action="lambda:*FunctionUrlConfig"),
+            dict(
+                self.URL_DENY,
+                Resource="arn:aws:lambda:*:*:function:*",
+                Condition={
+                    "StringEqualsIfExists": {"lambda:FunctionUrlAuthType": "NONE"}
+                },
+            ),
+        ]
+        for statement in forms:
+            result, scp = self._scp_row(self._scp_inventory(statement))
+            assert scp["Status"] == "Passed", statement
+            assert (
+                "policy 'url-guard' statement 'DenyPublicUrls'"
+                in scp["Finding_Details"]
+            )
+
+    def test_br54_scp_that_misses_a_url_action_or_none_fails(self):
+        misses = [
+            dict(self.URL_DENY, Action="lambda:CreateFunctionUrlConfig"),
+            dict(
+                self.URL_DENY,
+                Condition={"StringEquals": {"lambda:FunctionUrlAuthType": "AWS_IAM"}},
+            ),
+            dict(
+                self.URL_DENY,
+                Condition={
+                    "StringEquals": {"lambda:FunctionUrlAuthType": "NONE"},
+                    "StringNotLike": {"aws:PrincipalArn": "arn:aws:iam::*:role/Admin"},
+                },
+            ),
+            dict(self.URL_DENY, Resource="arn:aws:lambda:us-east-1:*:function:*"),
+            dict(self.URL_DENY, Effect="Allow"),
+        ]
+        for statement in misses:
+            result, scp = self._scp_row(self._scp_inventory(statement))
+            assert scp["Status"] == "Failed", statement
+            assert result["status"] == "WARN"
+        _, scp = self._scp_row(self._scp_inventory(misses[0]))
+        assert (
+            "(only lambda:createfunctionurlconfig is covered)" in scp["Finding_Details"]
+        )
+        _, scp = self._scp_row(self._scp_inventory(misses[2]))
+        assert "is also conditioned on aws:principalarn" in scp["Finding_Details"]
+
+    def test_br54_scp_split_across_two_statements_passes(self):
+        _, scp = self._scp_row(
+            self._scp_inventory(
+                dict(
+                    self.URL_DENY, Sid="create", Action="lambda:CreateFunctionUrlConfig"
+                ),
+                dict(
+                    self.URL_DENY, Sid="update", Action="lambda:UpdateFunctionUrlConfig"
+                ),
+            )
+        )
+        assert scp["Status"] == "Passed"
+
+    def test_br54_scp_unread_policies_are_na_not_failed(self):
+        _, scp = self._scp_row(
+            self._scp_inventory(errors=["policy 'other': AccessDenied"])
+        )
+        assert scp["Status"] == "N/A"
+        assert "policy 'other': AccessDenied" in scp["Finding_Details"]
+        _, scp = self._scp_row(self._scp_inventory(list_error="ListParents denied"))
+        assert scp["Status"] == "N/A"
+
+    def test_br54_scp_in_management_account_does_not_pass(self):
+        _, scp = self._scp_row(self._scp_inventory(self.URL_DENY, management=True))
+        assert scp["Status"] == "Failed"
+        assert "do not restrict this account" in scp["Finding_Details"]
 
     def test_br54_rows_pass_the_schema(self):
         _, rows, _ = self._run(
