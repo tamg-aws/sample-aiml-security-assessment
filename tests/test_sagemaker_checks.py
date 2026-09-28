@@ -9875,6 +9875,7 @@ class TestSM02CacheContractOtherLegs:
                         {"name": "SM", "document": _identity_policy("sagemaker:*", "*")}
                     ],
                     "inline_policies": [],
+                    "group_policies": [],
                     "permissions_boundary": None,
                 }
             },
@@ -13786,3 +13787,125 @@ class TestSM27KeyManager:
         )
         assert rows["workers"]["Status"] == "Passed"
         assert "kms:DescribeKey" in rows["workers"]["Finding_Details"]
+
+
+def _user_without_group_policies(document, error=True):
+    """A cached user whose group policies were not read."""
+    user = {
+        "attached_policies": [
+            {
+                "name": "Scoped",
+                "arn": "arn:aws:iam::123456789012:policy/Scoped",
+                "document": document,
+            }
+        ],
+        "inline_policies": [],
+        "permissions_boundary": None,
+    }
+    if error:
+        user["group_policies_error"] = "AccessDenied"
+    return user
+
+
+class TestGroupPoliciesContract:
+    """A user with no group_policies list is unread, never a pass."""
+
+    SCOPED_INVOKE = _identity_policy(
+        "sagemaker:InvokeEndpoint",
+        "arn:aws:sagemaker:us-east-1:123456789012:endpoint/a",
+    )
+
+    @pytest.mark.parametrize("recorded", [True, False])
+    def test_principal_read_errors_names_the_user(self, recorded):
+        errors = (
+            [{"type": "user", "name": "u", "stage": "group_policies"}]
+            if recorded
+            else []
+        )
+        cache = _v2_cache(
+            {},
+            principal_errors=errors,
+            users={"u": _user_without_group_policies(self.SCOPED_INVOKE, recorded)},
+        )
+        assert sagemaker_app._principal_read_errors(cache) == [
+            "user 'u' (group_policies)"
+        ]
+
+    def test_a_cache_without_principal_errors_still_names_the_user(self):
+        cache = _v2_cache(
+            {}, users={"u": _user_without_group_policies(self.SCOPED_INVOKE)}
+        )
+        del cache["principal_errors"]
+        assert sagemaker_app._principal_read_errors(cache) == [
+            "user 'u' (group_policies)"
+        ]
+
+    def test_an_empty_group_list_is_read(self):
+        user = _user_without_group_policies(self.SCOPED_INVOKE, error=False)
+        user["group_policies"] = []
+        assert (
+            sagemaker_app._principal_read_errors(_v2_cache({}, users={"u": user})) == []
+        )
+
+    @pytest.mark.parametrize("recorded", [True, False])
+    def test_endpoint_scoping_does_not_pass(self, recorded):
+        users = {
+            "read": _group_user("InvokeOne", self.SCOPED_INVOKE),
+            "unread": _user_without_group_policies(self.SCOPED_INVOKE, recorded),
+        }
+        rows = _by_finding(
+            _sm02_rows(_v2_cache({}, users=users)),
+            sagemaker_app.ENDPOINT_INVOCATION_SCOPING_FINDING,
+        )
+        assert "Passed" not in [r["Status"] for r in rows]
+        assert any(
+            r["Status"] == "N/A" and "user 'unread'" in r["Finding_Details"]
+            for r in rows
+        )
+
+    def test_invoke_source_network_does_not_pass(self):
+        pinned = _invoke_allow({"StringEquals": {"aws:SourceVpce": "vpce-1"}})
+        cache = _v2_cache(
+            {"R": [("P", pinned)]},
+            users={"unread": _user_without_group_policies(pinned, error=False)},
+        )
+        rows = _rows(
+            {
+                "csv_data": sagemaker_app._invoke_source_network_findings(
+                    cache, {"endpoints": [{"name": "ep-1"}]}, "us-east-1"
+                )
+            }
+        )
+        assert "Passed" not in [r["Status"] for r in rows]
+        assert any("user 'unread'" in r["Finding_Details"] for r in rows)
+
+    def test_creation_leg_is_incomplete(self):
+        users = {
+            "guarded": _group_user("Guarded", {"Statement": GUARDED_CREATE_ALLOWS}),
+            "unread": _user_without_group_policies(
+                {"Statement": GUARDED_CREATE_ALLOWS}, error=False
+            ),
+        }
+        leg = sagemaker_app._creation_identity_leg(
+            _v2_cache({}, users=users),
+            "sagemaker:CreateTrainingJob",
+            ("sagemaker:networkisolation",),
+        )
+        assert leg["state"] == "incomplete"
+        assert leg["principals"] == ["user 'unread' (group_policies)"]
+
+    def test_an_open_grant_still_fails_beside_the_unread_groups(self):
+        leg = sagemaker_app._creation_identity_leg(
+            _v2_cache(
+                {},
+                users={
+                    "open": _user_without_group_policies(
+                        {"Statement": [OPEN_SAGEMAKER_ALLOW]}
+                    )
+                },
+            ),
+            "sagemaker:CreateTrainingJob",
+            ("sagemaker:networkisolation",),
+        )
+        assert leg["state"] == "open"
+        assert leg["principals"] == ["User 'open'"]

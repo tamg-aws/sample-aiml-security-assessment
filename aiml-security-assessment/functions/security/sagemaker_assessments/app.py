@@ -1783,15 +1783,25 @@ def _merged_read_write_grants(permissions: Dict[str, Any]) -> List[str]:
 
 def _principal_read_errors(permission_cache: Dict[str, Any]) -> Optional[List[str]]:
     """Label each principal whose cache read failed, or None for a cache that
-    predates ``principal_errors``."""
+    predates ``principal_errors`` and has no user missing ``group_policies``.
+
+    The cache gives every user either ``group_policies`` or
+    ``group_policies_error``, so a user without a ``group_policies`` list is
+    unread whether or not principal_errors names it.
+    """
     errors = permission_cache.get("principal_errors")
-    if not isinstance(errors, list):
-        return None
     failed: Dict[str, List[str]] = {}
-    for error in errors:
+    for error in errors if isinstance(errors, list) else []:
         if isinstance(error, dict) and error.get("name"):
             label = f"{error.get('type', 'principal')} '{error['name']}'"
             failed.setdefault(label, []).append(str(error.get("stage", "unknown")))
+    for name, permissions in (permission_cache.get("user_permissions") or {}).items():
+        if not isinstance((permissions or {}).get("group_policies"), list):
+            stages = failed.setdefault(f"user '{name}'", [])
+            if "group_policies" not in stages:
+                stages.append("group_policies")
+    if not isinstance(errors, list) and not failed:
+        return None
     return [
         f"{label} ({', '.join(stages)})" for label, stages in sorted(failed.items())
     ]
