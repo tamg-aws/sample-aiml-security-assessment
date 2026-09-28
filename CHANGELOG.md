@@ -12,6 +12,22 @@ section.
 
 ### Added
 
+- Added `SM-43` Model Artifact Integrity, growing the catalog from 275 to 276
+  checks (161 core). It covers AISF `AIR-SLF-CMP-08`, which the ledger had
+  marked `not_implementable`, over the containers every InService endpoint
+  serves, including model package and inference component containers. An
+  image passes when it is pinned by digest or by a tag its ECR repository
+  holds immutable, read through the repository's exclusion filters. When a
+  managed signing rule of the registry covers the repository, the image also
+  needs a `COMPLETE` signing status, read by the digest the endpoint resolved
+  the image to. S3 model data passes when an `ETag`, `ManifestEtag` or
+  `ModelDataETag` is recorded, or when it comes from SageMaker hub content; a
+  bare `ModelDataUrl` fails, and so does an `HF_MODEL_ID` environment key
+  with no model data. Only environment keys are read. Each artifact bucket
+  needs SSE-KMS under a named key. A denied read leaves the endpoint `N/A`
+  naming the permission. The row says an expected value is recorded, never
+  that it was compared at load time, and names weights fetched by startup
+  code, and models loaded on ECS, EKS or EC2, as not read.
 - Added `SM-42` Batch Transform Creation Guardrail, growing the catalog from
   274 to 275 checks (160 core). It runs the `SM-34` legs over `CreateModel`
   and `CreateTransformJob` only, so AISF `AIR-SGM-EP-08` can cite a verdict
@@ -229,6 +245,34 @@ section.
 
 ### Fixed
 
+- `SM-37` endpoint network alerting names, for each alarm a passing endpoint
+  relies on, when the metric alarm last entered `ALARM`, read from its
+  `StateUpdate` history with `cloudwatch:DescribeAlarmHistory`. A denied or
+  empty history is named and does not change the status. A composite alarm's
+  own history is returned only to that action on `*`, which is not granted,
+  so a composite route names its metric alarm's history.
+- `SM-03` reads the encryption of an EFS or FSx for Lustre file system a
+  training job reads through `FileSystemDataSource`. An unencrypted file
+  system fails, an AWS managed key or the Amazon FSx service key of a
+  `SCRATCH` Lustre file system counts as not customer managed, and a
+  customer managed key joins the key-manager leg. A file system that cannot
+  be read, or returns no key, holds back `Passed` and is named.
+- `SM-36` names what stays unread when a Security Hub configuration policy
+  governs the Region: the policy's enabled standards and controls, returned
+  only by `securityhub:GetConfigurationPolicy`, which only the delegated
+  administrator can call from its home Region. The row names the policy id
+  to confirm there.
+- `SM-37` endpoint network alerting credits a metric alarm with no action of
+  its own when a composite alarm with an action names it in an `ALARM()` term
+  joined only by `OR`, including through a nested composite. A rule holding
+  `AND`, `NOT`, `OK()`, `INSUFFICIENT_DATA()`, `TRUE` or `FALSE` credits
+  nothing. Each passing endpoint names the alarm and its current
+  `StateValue`. No IAM grant changes.
+- `SM-34` and `SM-42` no longer say a principal "can call it with no
+  condition on that key" when its Allow or Deny names the key without
+  enforcing it, for example a Null-only Deny or a bare negated operator on a
+  multivalued key. Those principals are named separately as calling it under
+  a condition that does not enforce the key.
 - `AC-04` no longer fails every runtime. It read `loggingConfig` and
   `tracingConfig` from `GetAgentRuntime`, which returns neither, so each
   runtime failed both legs whatever its configuration. It now reports one row
@@ -762,6 +806,21 @@ fail recording browsers that passed before.
 AgentCore role already holds on this account's keys in the
 `PolicyEngineKeyStateRead` Sid. A memory whose key lives in another account
 reads `N/A`.
+
+The SageMaker assessment role gains six read-only actions in both SAM
+templates: `ecr:DescribeRepositories` and `ecr:DescribeImageSigningStatus` on
+the account's repositories (`ModelImageRepositoryRead`, for `SM-43`),
+`cloudwatch:DescribeAlarmHistory` on the account's alarms
+(`FlowLogAlarmHistoryRead`, for `SM-37`), `elasticfilesystem:DescribeFileSystems`
+on the account's file systems (`TrainingFileSystemRead`, for `SM-03`), and
+`ecr:GetSigningConfiguration` and `fsx:DescribeFileSystems` on `*` in
+`ApprovedInventoryWithoutResourceType`, because neither has a resource type
+in the service authorization reference. Until the stack is redeployed,
+`SM-43` reads each tag-pinned image as `N/A` and `SM-03` names each training
+file system as not read. `SM-43` reads artifact bucket encryption through the
+existing `s3:GetEncryptionConfiguration` grant. Inference component
+endpoints read `N/A` under `SM-43`, because
+`sagemaker:ListInferenceComponents` is not granted.
 
 The IAM permissions cache role gains `iam:GetRole` on the account's roles and
 `iam:GetUser` on its users in both SAM templates, because only those calls

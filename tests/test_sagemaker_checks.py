@@ -6945,6 +6945,25 @@ class TestSM36SecurityHubAIStandard:
         assert "securityhub:GetConfigurationPolicy," in row["Finding_Details"]
 
     @patch("sagemaker_app.boto3.client")
+    def test_the_unread_policy_names_the_field_only_the_admin_can_read(
+        self, mock_client
+    ):
+        row = self._association(
+            mock_client,
+            {
+                "ConfigurationPolicyId": "a1b2",
+                "AssociationType": "APPLIED",
+                "AssociationStatus": "SUCCESS",
+            },
+        )
+        details = row["Finding_Details"]
+        assert "enabled standards and controls" in details
+        assert "only the Security Hub delegated administrator can call" in details
+        assert "not granted" not in details
+        assert not row["Resolution"].startswith("Grant")
+        assert "configuration policy a1b2" in row["Resolution"]
+
+    @patch("sagemaker_app.boto3.client")
     def test_association_access_denied_is_incomplete(self, mock_client):
         row = self._association(
             mock_client, _make_client_error("AccessDeniedException")
@@ -7099,8 +7118,13 @@ class TestSM37EndpointFlowLogAlerting:
         filters=None,
         alarms=None,
         errors=None,
+        composites=None,
+        history=None,
     ):
         errors = errors or {}
+        composites = composites or []
+        history = history or {}
+        self.history_calls = []
         endpoints = (
             endpoints
             if endpoints is not None
@@ -7205,11 +7229,27 @@ class TestSM37EndpointFlowLogAlerting:
         def describe_alarms(AlarmTypes):
             if "describe_alarms" in errors:
                 raise errors["describe_alarms"]
-            return [{"MetricAlarms": alarms[:1]}, {"MetricAlarms": alarms[1:]}]
+            pages = [{"MetricAlarms": alarms[:1]}, {"MetricAlarms": alarms[1:]}]
+            if "CompositeAlarm" in AlarmTypes:
+                pages[1]["CompositeAlarms"] = composites
+            return pages
+
+        def describe_alarm_history(AlarmName, HistoryItemType, ScanBy):
+            self.history_calls.append((AlarmName, HistoryItemType, ScanBy))
+            source = history.get(AlarmName, [])
+            if isinstance(source, Exception):
+                raise source
+            return [
+                {"AlarmHistoryItems": source[:1]},
+                {"AlarmHistoryItems": source[1:]},
+            ]
 
         cloudwatch = MagicMock()
         cloudwatch.get_paginator.side_effect = _pager(
-            {"describe_alarms": describe_alarms}
+            {
+                "describe_alarms": describe_alarms,
+                "describe_alarm_history": describe_alarm_history,
+            }
         )
         clients = {
             "sagemaker": sagemaker,
@@ -7467,6 +7507,252 @@ class TestSM37EndpointFlowLogAlerting:
         rows = self._run(mock_client, endpoints={}, models={})
         assert [r["Status"] for r in rows] == ["N/A"]
         assert "No SageMaker endpoints" in rows[0]["Finding_Details"]
+
+    def _composite(self, rule, name="page-oncall", **overrides):
+        composite = {
+            "AlarmName": name,
+            "AlarmRule": rule,
+            "ActionsEnabled": True,
+            "AlarmActions": ["arn:aws:sns:us-east-1:111122223333:alerts"],
+        }
+        composite.update(overrides)
+        return composite
+
+    def _silent_alarm(self):
+        return self._alarm(
+            ActionsEnabled=False,
+            AlarmActions=[],
+            AlarmArn="arn:aws:cloudwatch:us-east-1:111122223333:alarm:egress",
+            StateValue="OK",
+        )
+
+    @pytest.mark.parametrize(
+        "rule",
+        [
+            'ALARM("egress")',
+            "ALARM(egress) OR ALARM(other)",
+            '(ALARM("arn:aws:cloudwatch:us-east-1:111122223333:alarm:egress"))',
+        ],
+    )
+    @patch("sagemaker_app.boto3.client")
+    def test_a_silent_alarm_actioned_by_a_composite_passes(self, mock_client, rule):
+        rows = self._run(
+            mock_client,
+            alarms=[self._silent_alarm()],
+            composites=[self._composite(rule)],
+        )
+        assert [r["Status"] for r in rows] == ["Passed"]
+        details = rows[0]["Finding_Details"]
+        assert (
+            "log group /flow/a, alarm 'egress' in state OK, actioned through "
+            "composite alarm 'page-oncall'"
+        ) in details
+        assert "current StateValue" in details
+
+    @pytest.mark.parametrize(
+        "composite",
+        [
+            {"AlarmRule": "ALARM(egress) AND ALARM(other)"},
+            {"AlarmRule": "NOT ALARM(egress)"},
+            {"AlarmRule": "ALARM(egress) AND NOT ALARM(deploying)"},
+            {"AlarmRule": "(ALARM(egress) OR ALARM(other)) AND OK(network)"},
+            {"AlarmRule": "ALARM(egress) OR TRUE"},
+            {"AlarmRule": "ALARM(egress)", "ActionsEnabled": False},
+            {"AlarmRule": "ALARM(egress)", "AlarmActions": []},
+            {"AlarmRule": "ALARM(egress-other)"},
+        ],
+    )
+    @patch("sagemaker_app.boto3.client")
+    def test_a_composite_that_does_not_carry_the_alarm_fails(
+        self, mock_client, composite
+    ):
+        rows = self._run(
+            mock_client,
+            alarms=[self._silent_alarm()],
+            composites=[self._composite(composite.pop("AlarmRule"), **composite)],
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert (
+            "2 endpoint(s) have no network anomaly alerting"
+            in (rows[0]["Finding_Details"])
+        )
+
+    @patch("sagemaker_app.boto3.client")
+    def test_a_nested_composite_carries_the_action_of_its_parent(self, mock_client):
+        rows = self._run(
+            mock_client,
+            alarms=[self._silent_alarm()],
+            composites=[
+                self._composite("ALARM(page-oncall)", name="top"),
+                self._composite(
+                    "ALARM(egress)",
+                    ActionsEnabled=False,
+                    AlarmActions=[],
+                ),
+            ],
+        )
+        assert [r["Status"] for r in rows] == ["Passed"]
+        assert "actioned through composite alarm 'top'" in rows[0]["Finding_Details"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_a_composite_credits_only_the_endpoint_whose_metric_it_names(
+        self, mock_client
+    ):
+        filter_b = {
+            "logGroupName": "/flow/b",
+            "metricTransformations": [
+                {"metricNamespace": "Flow", "metricName": "EgressB"}
+            ],
+        }
+        rows = self._run(
+            mock_client,
+            flow_logs=[self._flow_log("vpc-1"), self._flow_log("vpc-2", "/flow/b")],
+            filters={
+                "/flow/a": [
+                    {
+                        "logGroupName": "/flow/a",
+                        "metricTransformations": [
+                            {"metricNamespace": "Flow", "metricName": "Egress"}
+                        ],
+                    }
+                ],
+                "/flow/b": [filter_b],
+            },
+            alarms=[
+                self._silent_alarm(),
+                self._alarm("EgressB", AlarmName="egress-b", ActionsEnabled=False),
+            ],
+            composites=[self._composite("ALARM(egress)")],
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        details = rows[0]["Finding_Details"]
+        assert "1 endpoint(s) have no network anomaly alerting" in details
+        assert "endpoint 'ep-2': flow log group(s) /flow/b" in details
+        assert "endpoint 'ep-1'" not in details
+
+    @patch("sagemaker_app.boto3.client")
+    def test_an_alarm_with_its_own_action_names_its_state(self, mock_client):
+        rows = self._run(mock_client, alarms=[self._alarm(StateValue="ALARM")])
+        assert [r["Status"] for r in rows] == ["Passed"]
+        details = rows[0]["Finding_Details"]
+        assert (
+            "log group /flow/a, alarm 'egress' in state ALARM, no entry into ALARM "
+            "in the alarm history CloudWatch returned)"
+        ) in details
+        assert "actioned through" not in details
+
+    def _state_update(self, old, new, timestamp, name="egress"):
+        return {
+            "AlarmName": name,
+            "Timestamp": timestamp,
+            "HistoryItemType": "StateUpdate",
+            "HistoryData": json.dumps(
+                {
+                    "version": "1.0",
+                    "oldState": {"stateValue": old},
+                    "newState": {"stateValue": new},
+                }
+            ),
+        }
+
+    @patch("sagemaker_app.boto3.client")
+    def test_the_last_entry_into_alarm_is_named_from_the_history(self, mock_client):
+        fired = datetime(2026, 9, 22, 2, 22, tzinfo=timezone.utc)
+        rows = self._run(
+            mock_client,
+            history={
+                "egress": [
+                    self._state_update(
+                        "ALARM", "OK", datetime(2026, 9, 22, 2, 27, tzinfo=timezone.utc)
+                    ),
+                    {"AlarmName": "egress", "HistoryData": "not json"},
+                    self._state_update("OK", "ALARM", fired),
+                ]
+            },
+        )
+        assert [r["Status"] for r in rows] == ["Passed"]
+        details = rows[0]["Finding_Details"]
+        assert "last entered ALARM at 2026-09-22T02:22:00+00:00" in details
+        assert "02:27" not in details
+        assert self.history_calls == [("egress", "StateUpdate", "TimestampDescending")]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_a_denied_history_read_is_named_and_does_not_hold_back_passed(
+        self, mock_client
+    ):
+        rows = self._run(
+            mock_client,
+            history={"egress": _make_client_error("AccessDenied")},
+        )
+        assert [r["Status"] for r in rows] == ["Passed"]
+        assert (
+            "alarm history not read (cloudwatch:DescribeAlarmHistory: AccessDenied)"
+        ) in rows[0]["Finding_Details"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_each_endpoint_names_its_own_alarms_history(self, mock_client):
+        filter_b = {
+            "logGroupName": "/flow/b",
+            "metricTransformations": [
+                {"metricNamespace": "Flow", "metricName": "EgressB"}
+            ],
+        }
+        rows = self._run(
+            mock_client,
+            flow_logs=[self._flow_log("vpc-1"), self._flow_log("vpc-2", "/flow/b")],
+            filters={
+                "/flow/a": [
+                    {
+                        "logGroupName": "/flow/a",
+                        "metricTransformations": [
+                            {"metricNamespace": "Flow", "metricName": "Egress"}
+                        ],
+                    }
+                ],
+                "/flow/b": [filter_b],
+            },
+            alarms=[self._alarm(), self._alarm("EgressB", AlarmName="egress-b")],
+            history={
+                "egress": [
+                    self._state_update(
+                        "OK", "ALARM", datetime(2026, 9, 1, tzinfo=timezone.utc)
+                    )
+                ]
+            },
+        )
+        assert [r["Status"] for r in rows] == ["Passed"]
+        details = rows[0]["Finding_Details"]
+        assert (
+            "endpoint 'ep-1' (log group /flow/a, alarm 'egress' in state not "
+            "returned, last entered ALARM at 2026-09-01T00:00:00+00:00)"
+        ) in details
+        assert (
+            "endpoint 'ep-2' (log group /flow/b, alarm 'egress-b' in state not "
+            "returned, no entry into ALARM in the alarm history CloudWatch returned)"
+        ) in details
+        assert sorted(call[0] for call in self.history_calls) == ["egress", "egress-b"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_a_composite_route_reads_the_metric_alarms_own_history(self, mock_client):
+        rows = self._run(
+            mock_client,
+            alarms=[self._silent_alarm()],
+            composites=[self._composite("ALARM(egress)")],
+            history={
+                "egress": [
+                    self._state_update(
+                        "OK", "ALARM", datetime(2026, 9, 2, tzinfo=timezone.utc)
+                    )
+                ],
+                "page-oncall": _make_client_error("AccessDenied"),
+            },
+        )
+        assert [r["Status"] for r in rows] == ["Passed"]
+        assert (
+            "last entered ALARM at 2026-09-02T00:00:00+00:00"
+            in (rows[0]["Finding_Details"])
+        )
+        assert [call[0] for call in self.history_calls] == ["egress"]
 
 
 class TestSM37GuardDutyLambdaNetworkLogs:
@@ -11649,11 +11935,28 @@ def _training_job(output=_CMK, volume=_CMK, bucket="data"):
     }
 
 
-def _sm03_rows(jobs, keys=None, buckets=None, pages=None, notebooks=None):
-    """Run SM-03 over training jobs {name: DescribeTrainingJob or exception}."""
+def _sm03_rows(
+    jobs, keys=None, buckets=None, pages=None, notebooks=None, file_systems=None
+):
+    """Run SM-03 over training jobs {name: DescribeTrainingJob or exception}.
+
+    file_systems maps a file system id to its EFS or FSx description, or an
+    exception; an id it does not name is denied.
+    """
     keys = keys or {}
     buckets = buckets or {}
     notebooks = notebooks or {}
+    file_systems = file_systems or {}
+    file_system_calls = []
+
+    def describe_file_system(file_system_id):
+        file_system_calls.append(file_system_id)
+        value = file_systems.get(
+            file_system_id, _make_client_error("AccessDeniedException")
+        )
+        if isinstance(value, Exception):
+            raise value
+        return {"FileSystems": [dict(value, FileSystemId=file_system_id)]}
 
     def lookup(table, name):
         value = table[name]
@@ -11705,11 +12008,23 @@ def _sm03_rows(jobs, keys=None, buckets=None, pages=None, notebooks=None):
         "encryption", Bucket
     )
     s3.get_bucket_policy.side_effect = lambda Bucket: bucket_part("policy", Bucket)
+    efs = MagicMock()
+    efs.describe_file_systems.side_effect = lambda FileSystemId: describe_file_system(
+        FileSystemId
+    )
+    fsx = MagicMock()
+    fsx.describe_file_systems.side_effect = lambda FileSystemIds: describe_file_system(
+        FileSystemIds[0]
+    )
     with patch("sagemaker_app.boto3.client") as mock_client:
-        mock_client.side_effect = _sm_client_factory(sagemaker=sm, kms=kms, s3=s3)
-        return extract_csv_data(
+        mock_client.side_effect = _sm_client_factory(
+            sagemaker=sm, kms=kms, s3=s3, efs=efs, fsx=fsx
+        )
+        rows = extract_csv_data(
             sagemaker_app.check_sagemaker_data_protection(region="us-east-1")
         )
+    _sm03_rows.file_system_calls = file_system_calls
+    return rows
 
 
 def _plain_job(**resource_config):
@@ -11780,7 +12095,8 @@ class TestSM03InterContainerAndSources:
                         "DirectoryPath": "/d",
                     }
                 },
-                "fsx:DescribeFileSystems is not granted",
+                "whose encryption at rest was not read (fsx:DescribeFileSystems: "
+                "AccessDeniedException)",
             ),
             (
                 {"DatasetSource": {"DatasetArn": "arn:aws:x:::dataset/d"}},
@@ -11797,6 +12113,134 @@ class TestSM03InterContainerAndSources:
         assert len(unread) == 1
         assert "training job 'fs' channel 'extra'" in unread[0]["Finding_Details"]
         assert text in unread[0]["Finding_Details"]
+        assert "'clean'" not in unread[0]["Finding_Details"]
+
+
+def _file_system_job(file_system_id, system_type="EFS"):
+    job = _training_job()
+    job["InputDataConfig"].append(
+        {
+            "ChannelName": "fs",
+            "DataSource": {
+                "FileSystemDataSource": {
+                    "FileSystemId": file_system_id,
+                    "FileSystemType": system_type,
+                    "FileSystemAccessMode": "ro",
+                    "DirectoryPath": "/d",
+                }
+            },
+        }
+    )
+    return job
+
+
+class TestSM03TrainingFileSystemEncryption:
+    """AIR-SGM-TRN-02: an EFS or FSx for Lustre training source is read."""
+
+    @pytest.mark.parametrize(
+        "system_type, description",
+        [
+            ("EFS", {"Encrypted": True, "KmsKeyId": _CMK}),
+            (
+                "FSxLustre",
+                {
+                    "KmsKeyId": _CMK,
+                    "LustreConfiguration": {"DeploymentType": "PERSISTENT_2"},
+                },
+            ),
+        ],
+    )
+    def test_a_file_system_under_a_customer_key_passes(self, system_type, description):
+        rows = _sm03_rows(
+            {"fs": _file_system_job("fs-1", system_type)},
+            file_systems={"fs-1": description},
+        )
+        assert [r["Status"] for r in _by_finding(rows, "Data Protection Check")] == [
+            "Passed"
+        ]
+        assert not [r for r in rows if r["Status"] in ("Failed", "N/A")]
+
+    def test_an_unencrypted_file_system_fails_and_only_it_is_named(self):
+        rows = _sm03_rows(
+            {
+                "good": _file_system_job("fs-good"),
+                "bad": _file_system_job("fs-bad"),
+                "also-bad": _file_system_job("fs-bad"),
+            },
+            file_systems={
+                "fs-good": {"Encrypted": True, "KmsKeyId": _CMK},
+                "fs-bad": {"Encrypted": False},
+            },
+        )
+        missing = _by_finding(rows, "Missing Encryption Configuration")
+        assert [r["Status"] for r in missing] == ["Failed"]
+        details = missing[0]["Finding_Details"]
+        assert "EFS file system 'fs-bad' - Encryption at rest is not enabled" in details
+        assert "training job 'also-bad' channel 'fs'" in details
+        assert "training job 'bad' channel 'fs'" in details
+        assert "fs-good" not in details
+        assert not _by_finding(rows, "Data Protection Check")
+        assert sorted(_sm03_rows.file_system_calls) == ["fs-bad", "fs-good"]
+
+    def test_an_aws_managed_key_on_a_file_system_fails(self):
+        rows = _sm03_rows(
+            {"fs": _file_system_job("fs-1")},
+            keys={_AWS_KEY: "AWS"},
+            file_systems={"fs-1": {"Encrypted": True, "KmsKeyId": _AWS_KEY}},
+        )
+        managed = _by_finding(rows, "AWS Managed Key Usage")
+        assert [r["Status"] for r in managed] == ["Failed"]
+        assert (
+            "EFS file system 'fs-1' uses AWS managed key"
+            in (managed[0]["Finding_Details"])
+        )
+
+    @pytest.mark.parametrize("deployment", ["SCRATCH_1", "SCRATCH_2"])
+    def test_a_scratch_lustre_file_system_uses_the_service_key(self, deployment):
+        rows = _sm03_rows(
+            {"fs": _file_system_job("fs-1", "FSxLustre")},
+            file_systems={
+                "fs-1": {"LustreConfiguration": {"DeploymentType": deployment}}
+            },
+        )
+        managed = _by_finding(rows, "AWS Managed Key Usage")
+        assert [r["Status"] for r in managed] == ["Failed"]
+        assert (
+            "the Amazon FSx service key of the account"
+            in (managed[0]["Finding_Details"])
+        )
+
+    @pytest.mark.parametrize(
+        "system_type, value, text",
+        [
+            (
+                "EFS",
+                _make_client_error("FileSystemNotFound"),
+                "(elasticfilesystem:DescribeFileSystems: FileSystemNotFound)",
+            ),
+            (
+                "EFS",
+                {"Encrypted": True},
+                "(elasticfilesystem:DescribeFileSystems returned no KmsKeyId)",
+            ),
+            (
+                "FSxLustre",
+                {"LustreConfiguration": {"DeploymentType": "PERSISTENT_1"}},
+                "(fsx:DescribeFileSystems returned no KmsKeyId)",
+            ),
+        ],
+    )
+    def test_an_unread_file_system_holds_back_passed(self, system_type, value, text):
+        rows = _sm03_rows(
+            {"clean": _training_job(), "fs": _file_system_job("fs-1", system_type)},
+            file_systems={"fs-1": value},
+        )
+        assert not _by_finding(rows, "Data Protection Check")
+        assert not [r for r in rows if r["Status"] == "Failed"]
+        unread = [r for r in rows if r["Finding"].endswith("Incomplete")]
+        assert len(unread) == 1
+        assert text in unread[0]["Finding_Details"]
+        assert "training job 'fs' channel 'fs'" in unread[0]["Finding_Details"]
         assert "'clean'" not in unread[0]["Finding_Details"]
 
 
@@ -13853,6 +14297,84 @@ class TestSM34ValuePinning:
         assert leg["state"] == "open"
         assert leg["principals"] == ["Role 'Bare'"]
 
+    def _wording_cache(self):
+        bare = _scp_deny(
+            "sagemaker:Create*", "StringNotEquals", "sagemaker:VpcSubnets", ["subnet-1"]
+        )
+        null_only = _scp_deny(
+            "sagemaker:Create*", "Null", "sagemaker:VpcSubnets", "true"
+        )
+        null_allow = {
+            "Effect": "Allow",
+            "Action": "sagemaker:*",
+            "Resource": "*",
+            "Condition": {"Null": {"sagemaker:VpcSubnets": "false"}},
+        }
+        return _creation_cache(
+            {
+                "Open": [OPEN_SAGEMAKER_ALLOW],
+                "Bare": [OPEN_SAGEMAKER_ALLOW, bare],
+                "NullOnly": [OPEN_SAGEMAKER_ALLOW, null_only],
+                "NullAllow": [null_allow],
+            }
+        )
+
+    @pytest.mark.parametrize(
+        "scp_statements, status",
+        [
+            ([], "Failed"),
+            (
+                [
+                    _scp_deny(
+                        "sagemaker:Create*",
+                        "StringEquals",
+                        "sagemaker:VpcSubnets",
+                        "subnet-bad",
+                    )
+                ],
+                "N/A",
+            ),
+        ],
+    )
+    def test_a_principal_with_a_non_enforcing_condition_is_not_called_unconditioned(
+        self, scp_statements, status
+    ):
+        row = self._rows(scp_statements, cache=self._wording_cache())[
+            "approved network"
+        ]
+        details = row["Finding_Details"]
+        assert row["Status"] == status
+        assert "Role 'Open' can call it with no condition on that key" in details
+        assert (
+            "Role 'Bare', Role 'NullOnly', Role 'NullAllow' can call it under a "
+            "condition on that key that does not enforce it"
+        ) in details
+        for name in ("Bare", "NullOnly", "NullAllow"):
+            assert f"Role '{name}' can call it with no condition" not in details
+            assert f"Role '{name}', Role 'Open'" not in details
+        assert "Role 'Open', Role" not in details
+
+    def test_only_conditioned_principals_never_read_as_unconditioned(self):
+        cache = self._wording_cache()
+        del cache["role_permissions"]["Open"]
+        details = self._rows([], cache=cache)["approved network"]["Finding_Details"]
+        assert "with no condition on that key" not in details
+        assert "that does not enforce it" in details
+
+    def test_six_conditioned_principals_are_truncated_with_a_count(self):
+        null_only = _scp_deny(
+            "sagemaker:Create*", "Null", "sagemaker:VpcSubnets", "true"
+        )
+        cache = _creation_cache(
+            {f"R{i}": [OPEN_SAGEMAKER_ALLOW, null_only] for i in range(6)}
+        )
+        details = self._rows([], cache=cache)["approved network"]["Finding_Details"]
+        assert (
+            "Role 'R4' and 1 more can call it under a condition on that key that "
+            "does not enforce it"
+        ) in details
+        assert "Role 'R5'" not in details
+
 
 BATCH_SCP_DENIES = [
     _scp_deny(
@@ -14223,3 +14745,798 @@ class TestGroupPoliciesContract:
         )
         assert leg["state"] == "open"
         assert leg["principals"] == ["User 'open'"]
+
+
+_SM43_ACCOUNT = "111122223333"
+_SM43_DIGEST = "sha256:" + "a" * 64
+
+
+def _sm43_error(code):
+    return ClientError({"Error": {"Code": code, "Message": code}}, "Operation")
+
+
+def _sm43_image(repository="serve", tag="v1", digest=None, account=_SM43_ACCOUNT):
+    image = f"{account}.dkr.ecr.us-east-1.amazonaws.com/{repository}"
+    if tag:
+        image += f":{tag}"
+    if digest:
+        image += f"@{digest}"
+    return image
+
+
+def _sm43_container(image=None, uri="s3://artifacts/m/", etag="e-1", **overrides):
+    container = {"Image": image or _sm43_image()}
+    if uri:
+        source = {"S3Uri": uri, "S3DataType": "S3Prefix"}
+        if etag:
+            source["ETag"] = etag
+        container["ModelDataSource"] = {"S3DataSource": source}
+    container.update(overrides)
+    return container
+
+
+def _sm43_rows(
+    endpoints=None,
+    models=None,
+    packages=None,
+    repositories=None,
+    signing=None,
+    statuses=None,
+    buckets=None,
+    components=None,
+    deployed=None,
+):
+    """
+    Run SM-43 over mocked SageMaker, ECR and S3 clients.
+
+    endpoints maps a name to {"models": [...], "status": ..., "components":
+    [variant names]}. Every other map is keyed by resource name, and an
+    Exception value is raised by the matching call.
+    """
+    endpoints = (
+        endpoints
+        if endpoints is not None
+        else {"ep-1": {"models": ["m-1"]}, "ep-2": {"models": ["m-2"]}}
+    )
+    models = (
+        models
+        if models is not None
+        else {
+            "m-1": {"PrimaryContainer": _sm43_container()},
+            "m-2": {"PrimaryContainer": _sm43_container()},
+        }
+    )
+    packages = packages or {}
+    repositories = (
+        repositories
+        if repositories is not None
+        else {"serve": {"registryId": _SM43_ACCOUNT, "imageTagMutability": "IMMUTABLE"}}
+    )
+    signing = (
+        signing
+        if signing is not None
+        else _sm43_error("SigningConfigurationNotFoundException")
+    )
+    statuses = statuses or {}
+    buckets = buckets or {}
+    components = components or {}
+    deployed = deployed or {}
+    _sm43_rows.signing_calls = []
+
+    sagemaker = MagicMock()
+    names = list(endpoints)
+
+    def list_components(EndpointNameEquals, VariantNameEquals):
+        found = components.get((EndpointNameEquals, VariantNameEquals), [])
+        if isinstance(found, Exception):
+            raise found
+        return [{"InferenceComponents": [{"InferenceComponentName": n} for n in found]}]
+
+    sagemaker.get_paginator.side_effect = _pager(
+        {
+            "list_endpoints": [
+                {
+                    "Endpoints": [
+                        {
+                            "EndpointName": n,
+                            "EndpointStatus": endpoints[n].get("status", "InService"),
+                        }
+                        for n in chunk
+                    ]
+                }
+                for chunk in (names[:1], names[1:])
+            ],
+            "list_inference_components": list_components,
+        }
+    )
+    sagemaker.describe_endpoint.side_effect = lambda EndpointName: {
+        "EndpointConfigName": f"cfg-{EndpointName}",
+        "ProductionVariants": [
+            {
+                "VariantName": "v",
+                "DeployedImages": [
+                    {"SpecifiedImage": specified, "ResolvedImage": resolved}
+                    for specified, resolved in deployed.get(EndpointName, {}).items()
+                ],
+            }
+        ],
+    }
+
+    def describe_endpoint_config(EndpointConfigName):
+        spec = endpoints[EndpointConfigName[len("cfg-") :]]
+        return {
+            "ProductionVariants": [
+                {"VariantName": f"v-{m}", "ModelName": m} for m in spec["models"]
+            ]
+            + [{"VariantName": v} for v in spec.get("components", [])]
+        }
+
+    sagemaker.describe_endpoint_config.side_effect = describe_endpoint_config
+
+    def describe(source, key):
+        def call(**kwargs):
+            value = source[kwargs[key]]
+            if isinstance(value, Exception):
+                raise value
+            return value
+
+        return call
+
+    sagemaker.describe_model.side_effect = describe(models, "ModelName")
+    sagemaker.describe_model_package.side_effect = describe(
+        packages, "ModelPackageName"
+    )
+
+    def describe_inference_component(InferenceComponentName):
+        spec = components[InferenceComponentName]
+        if isinstance(spec, Exception):
+            raise spec
+        return {"Specification": spec}
+
+    sagemaker.describe_inference_component.side_effect = describe_inference_component
+
+    ecr = MagicMock()
+
+    def describe_repositories(registryId, repositoryNames):
+        value = repositories[repositoryNames[0]]
+        if isinstance(value, Exception):
+            raise value
+        return {"repositories": [dict(value, repositoryName=repositoryNames[0])]}
+
+    ecr.describe_repositories.side_effect = describe_repositories
+
+    def get_signing_configuration():
+        if isinstance(signing, Exception):
+            raise signing
+        return signing
+
+    ecr.get_signing_configuration.side_effect = get_signing_configuration
+
+    def describe_image_signing_status(registryId, repositoryName, imageId):
+        _sm43_rows.signing_calls.append((repositoryName, imageId))
+        value = statuses.get(repositoryName, [])
+        if isinstance(value, Exception):
+            raise value
+        return {"signingStatuses": value}
+
+    ecr.describe_image_signing_status.side_effect = describe_image_signing_status
+
+    s3 = MagicMock()
+
+    def get_bucket_encryption(Bucket):
+        value = buckets.get(
+            Bucket,
+            {
+                "Rules": [
+                    {
+                        "ApplyServerSideEncryptionByDefault": {
+                            "SSEAlgorithm": "aws:kms",
+                            "KMSMasterKeyID": "arn:aws:kms:us-east-1:1:key/k",
+                        }
+                    }
+                ]
+            },
+        )
+        if isinstance(value, Exception):
+            raise value
+        return {"ServerSideEncryptionConfiguration": value}
+
+    s3.get_bucket_encryption.side_effect = get_bucket_encryption
+    clients = {"sagemaker": sagemaker, "ecr": ecr, "s3": s3}
+    with patch("sagemaker_app.boto3.client") as mock_client:
+        mock_client.side_effect = lambda service, **_: clients[service]
+        return _rows(
+            sagemaker_app.check_sagemaker_model_artifact_integrity("us-east-1")
+        )
+
+
+def _sm43_statuses(rows):
+    return [r["Status"] for r in rows]
+
+
+class TestSM43ModelArtifactIntegrity:
+    """AIR-SLF-CMP-08: pinned images and recorded model data per endpoint."""
+
+    def test_immutable_tag_and_recorded_etag_pass(self):
+        rows = _sm43_rows()
+        assert _sm43_statuses(rows) == ["Passed"]
+        assert rows[0]["Check_ID"] == "SM-43"
+        assert "2 InService endpoint(s)" in rows[0]["Finding_Details"]
+        assert "ep-1, ep-2" in rows[0]["Finding_Details"]
+        assert "an expected value is recorded" in rows[0]["Finding_Details"]
+        assert "load time is not returned" in rows[0]["Finding_Details"]
+        assert "on ECS, EKS or EC2" in rows[0]["Finding_Details"]
+
+    def test_only_the_second_endpoint_fails_when_its_model_has_a_bare_url(self):
+        rows = _sm43_rows(
+            models={
+                "m-1": {"PrimaryContainer": _sm43_container()},
+                "m-2": {
+                    "PrimaryContainer": {
+                        "Image": _sm43_image(),
+                        "ModelDataUrl": "s3://artifacts/m2/model.tar.gz",
+                    }
+                },
+            }
+        )
+        assert _sm43_statuses(rows) == ["Failed"]
+        details = rows[0]["Finding_Details"]
+        assert details.startswith("Endpoint 'ep-2' serves")
+        assert (
+            "model 'm-2' container 1 loads ModelDataUrl "
+            "s3://artifacts/m2/model.tar.gz with no expected value recorded"
+        ) in details
+        assert "m-1" not in details
+
+    def test_each_failing_endpoint_gets_its_own_row(self):
+        bare = {"PrimaryContainer": _sm43_container(etag=None)}
+        rows = _sm43_rows(models={"m-1": bare, "m-2": bare})
+        assert _sm43_statuses(rows) == ["Failed", "Failed"]
+        assert rows[0]["Finding_Details"].startswith("Endpoint 'ep-1'")
+        assert rows[1]["Finding_Details"].startswith("Endpoint 'ep-2'")
+        assert (
+            "s3://artifacts/m/ records no ETag or ManifestEtag"
+            in (rows[1]["Finding_Details"])
+        )
+
+    def test_a_digest_pin_passes_without_reading_the_repository(self):
+        rows = _sm43_rows(
+            endpoints={"ep-1": {"models": ["m-1"]}},
+            models={
+                "m-1": {
+                    "PrimaryContainer": _sm43_container(
+                        image=_sm43_image(tag=None, digest=_SM43_DIGEST)
+                    )
+                }
+            },
+            repositories={"serve": _sm43_error("AccessDeniedException")},
+        )
+        assert _sm43_statuses(rows) == ["Passed"]
+
+    def test_a_mutable_tag_fails_on_the_second_endpoint_only(self):
+        rows = _sm43_rows(
+            models={
+                "m-1": {"PrimaryContainer": _sm43_container()},
+                "m-2": {
+                    "PrimaryContainer": _sm43_container(
+                        image=_sm43_image(repository="loose", tag="latest")
+                    )
+                },
+            },
+            repositories={
+                "serve": {
+                    "registryId": _SM43_ACCOUNT,
+                    "imageTagMutability": "IMMUTABLE",
+                },
+                "loose": {"registryId": _SM43_ACCOUNT, "imageTagMutability": "MUTABLE"},
+            },
+        )
+        assert _sm43_statuses(rows) == ["Failed"]
+        assert rows[0]["Finding_Details"].startswith("Endpoint 'ep-2'")
+        assert (
+            "image is pinned by tag 'latest' in repository loose, whose "
+            "imageTagMutability MUTABLE lets that tag move"
+        ) in rows[0]["Finding_Details"]
+
+    def test_an_untagged_image_is_read_as_latest(self):
+        rows = _sm43_rows(
+            endpoints={"ep-1": {"models": ["m-1"]}},
+            models={
+                "m-1": {
+                    "PrimaryContainer": _sm43_container(image=_sm43_image(tag=None))
+                }
+            },
+            repositories={
+                "serve": {"registryId": _SM43_ACCOUNT, "imageTagMutability": "MUTABLE"}
+            },
+        )
+        assert "pinned by tag 'latest'" in rows[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "mutability, filters, status",
+        [
+            (
+                "IMMUTABLE_WITH_EXCLUSION",
+                [{"filterType": "WILDCARD", "filter": "dev-*"}],
+                "Passed",
+            ),
+            (
+                "IMMUTABLE_WITH_EXCLUSION",
+                [{"filterType": "WILDCARD", "filter": "v*"}],
+                "Failed",
+            ),
+            (
+                "MUTABLE_WITH_EXCLUSION",
+                [{"filterType": "WILDCARD", "filter": "v*"}],
+                "Passed",
+            ),
+            (
+                "MUTABLE_WITH_EXCLUSION",
+                [{"filterType": "WILDCARD", "filter": "dev-*"}],
+                "Failed",
+            ),
+        ],
+    )
+    def test_an_exclusion_filter_inverts_the_setting_for_its_tags(
+        self, mutability, filters, status
+    ):
+        rows = _sm43_rows(
+            endpoints={"ep-1": {"models": ["m-1"]}},
+            models={"m-1": {"PrimaryContainer": _sm43_container()}},
+            repositories={
+                "serve": {
+                    "registryId": _SM43_ACCOUNT,
+                    "imageTagMutability": mutability,
+                    "imageTagMutabilityExclusionFilters": filters,
+                }
+            },
+        )
+        assert _sm43_statuses(rows) == [status]
+
+    def test_a_denied_repository_read_is_na_naming_the_permission(self):
+        rows = _sm43_rows(
+            endpoints={"ep-1": {"models": ["m-1"]}},
+            models={
+                "m-1": {
+                    "PrimaryContainer": _sm43_container(
+                        image=_sm43_image(account="763104351884")
+                    )
+                }
+            },
+            repositories={"serve": _sm43_error("AccessDeniedException")},
+        )
+        assert _sm43_statuses(rows) == ["N/A"]
+        assert (
+            "image repository serve in account 763104351884 was not read "
+            "(ecr:DescribeRepositories: AccessDeniedException)"
+        ) in rows[0]["Finding_Details"]
+
+    def test_an_unread_endpoint_holds_back_passed_but_not_a_failure(self):
+        rows = _sm43_rows(
+            models={
+                "m-1": _sm43_error("AccessDeniedException"),
+                "m-2": {"PrimaryContainer": _sm43_container(etag=None)},
+            }
+        )
+        assert _sm43_statuses(rows) == ["Failed", "N/A"]
+        assert rows[0]["Finding_Details"].startswith("Endpoint 'ep-2'")
+        assert (
+            "endpoint 'ep-1': model 'm-1' was not read (AccessDeniedException)"
+        ) in rows[1]["Finding_Details"]
+
+    def test_a_non_ecr_tag_is_na_and_a_non_ecr_digest_passes(self):
+        rows = _sm43_rows(
+            models={
+                "m-1": {
+                    "PrimaryContainer": _sm43_container(image="registry.local/serve:v1")
+                },
+                "m-2": {
+                    "PrimaryContainer": _sm43_container(
+                        image=f"registry.local/serve@{_SM43_DIGEST}"
+                    )
+                },
+            }
+        )
+        assert _sm43_statuses(rows) == ["N/A"]
+        details = rows[0]["Finding_Details"]
+        assert (
+            "endpoint 'ep-1': model 'm-1' container 1 image is outside Amazon ECR"
+            in details
+        )
+        assert "endpoint 'ep-2'" not in details.split("For what was read")[0]
+        assert "1 InService endpoint(s)" in details and ": ep-2." in details
+
+    def test_hf_model_id_without_model_data_fails_and_names_no_value(self):
+        rows = _sm43_rows(
+            endpoints={"ep-1": {"models": ["m-1"]}},
+            models={
+                "m-1": {
+                    "PrimaryContainer": _sm43_container(
+                        uri=None,
+                        Environment={
+                            "HF_MODEL_ID": "org/secret-model",
+                            "HF_TOKEN": "t",
+                        },
+                    )
+                }
+            },
+        )
+        assert _sm43_statuses(rows) == ["Failed"]
+        details = rows[0]["Finding_Details"]
+        assert "sets HF_MODEL_ID with no ModelDataUrl or ModelDataSource" in details
+        assert "org/secret-model" not in details
+        assert "HF_TOKEN" not in details
+
+    def test_hf_model_id_beside_recorded_model_data_passes(self):
+        rows = _sm43_rows(
+            endpoints={"ep-1": {"models": ["m-1"]}},
+            models={
+                "m-1": {
+                    "PrimaryContainer": _sm43_container(
+                        Environment={"HF_MODEL_ID": "/opt/ml/model"}
+                    )
+                }
+            },
+        )
+        assert _sm43_statuses(rows) == ["Passed"]
+
+    def test_hub_content_counts_as_a_verified_source(self):
+        container = _sm43_container(etag=None)
+        container["ModelDataSource"]["S3DataSource"]["HubAccessConfig"] = {
+            "HubContentArn": "arn:aws:sagemaker:us-east-1:aws:hub-content/x"
+        }
+        rows = _sm43_rows(
+            endpoints={"ep-1": {"models": ["m-1"]}},
+            models={"m-1": {"PrimaryContainer": container}},
+            buckets={"artifacts": _sm43_error("AccessDeniedException")},
+        )
+        assert _sm43_statuses(rows) == ["Passed"]
+
+    def test_manifest_etag_counts_as_recorded(self):
+        container = _sm43_container(etag=None)
+        container["ModelDataSource"]["S3DataSource"]["ManifestEtag"] = "m-e"
+        rows = _sm43_rows(
+            endpoints={"ep-1": {"models": ["m-1"]}},
+            models={"m-1": {"PrimaryContainer": container}},
+        )
+        assert _sm43_statuses(rows) == ["Passed"]
+
+    def test_the_second_additional_source_without_an_etag_fails(self):
+        container = _sm43_container(
+            AdditionalModelDataSources=[
+                {
+                    "ChannelName": "a",
+                    "S3DataSource": {"S3Uri": "s3://artifacts/a/", "ETag": "x"},
+                },
+                {"ChannelName": "b", "S3DataSource": {"S3Uri": "s3://artifacts/b/"}},
+            ]
+        )
+        rows = _sm43_rows(
+            endpoints={"ep-1": {"models": ["m-1"]}},
+            models={"m-1": {"PrimaryContainer": container}},
+        )
+        assert _sm43_statuses(rows) == ["Failed"]
+        details = rows[0]["Finding_Details"]
+        assert "additional source b s3://artifacts/b/ records no ETag" in details
+        assert "additional source a" not in details
+
+    def test_the_second_pipeline_container_is_judged(self):
+        rows = _sm43_rows(
+            endpoints={"ep-1": {"models": ["m-1"]}},
+            models={
+                "m-1": {
+                    "Containers": [
+                        _sm43_container(ContainerHostname="pre"),
+                        _sm43_container(ContainerHostname="main", etag=None),
+                    ]
+                }
+            },
+        )
+        assert _sm43_statuses(rows) == ["Failed"]
+        assert (
+            "model 'm-1' container main ModelDataSource" in rows[0]["Finding_Details"]
+        )
+        assert "container pre" not in rows[0]["Finding_Details"]
+
+    def test_a_model_package_container_with_model_data_etag_passes(self):
+        rows = _sm43_rows(
+            endpoints={"ep-1": {"models": ["m-1"]}},
+            models={"m-1": {"PrimaryContainer": {"ModelPackageName": "pkg"}}},
+            packages={
+                "pkg": {
+                    "InferenceSpecification": {
+                        "Containers": [
+                            {
+                                "Image": _sm43_image(),
+                                "ModelDataUrl": "s3://artifacts/p/model.tar.gz",
+                                "ModelDataETag": "p-e",
+                            }
+                        ]
+                    }
+                }
+            },
+        )
+        assert _sm43_statuses(rows) == ["Passed"]
+
+    def test_the_second_model_package_container_without_an_etag_fails(self):
+        rows = _sm43_rows(
+            endpoints={"ep-1": {"models": ["m-1"]}},
+            models={"m-1": {"PrimaryContainer": {"ModelPackageName": "pkg"}}},
+            packages={
+                "pkg": {
+                    "InferenceSpecification": {
+                        "Containers": [
+                            {
+                                "Image": _sm43_image(),
+                                "ModelDataUrl": "s3://artifacts/p/one.tar.gz",
+                                "ModelDataETag": "p-e",
+                            },
+                            {
+                                "Image": _sm43_image(),
+                                "ModelDataUrl": "s3://artifacts/p/two.tar.gz",
+                            },
+                        ]
+                    }
+                }
+            },
+        )
+        assert _sm43_statuses(rows) == ["Failed"]
+        details = rows[0]["Finding_Details"]
+        assert (
+            "(model package pkg container 2) loads ModelDataUrl s3://artifacts/p/two.tar.gz"
+            in details
+        )
+        assert "one.tar.gz" not in details
+
+    def test_an_unread_model_package_is_na(self):
+        rows = _sm43_rows(
+            endpoints={"ep-1": {"models": ["m-1"]}},
+            models={"m-1": {"PrimaryContainer": {"ModelPackageName": "pkg"}}},
+            packages={"pkg": _sm43_error("AccessDeniedException")},
+        )
+        assert _sm43_statuses(rows) == ["N/A"]
+        assert (
+            "model package pkg was not read (sagemaker:DescribeModelPackage: "
+            "AccessDeniedException)"
+        ) in rows[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "rules, detail",
+        [
+            (
+                [{"ApplyServerSideEncryptionByDefault": {"SSEAlgorithm": "AES256"}}],
+                "default encryption is not SSE-KMS (AES256)",
+            ),
+            (
+                [{"ApplyServerSideEncryptionByDefault": {"SSEAlgorithm": "aws:kms"}}],
+                "default encryption is SSE-KMS with no KMSMasterKeyID, so it uses "
+                "the AWS managed key aws/s3",
+            ),
+        ],
+    )
+    def test_the_second_bucket_without_a_named_kms_key_fails(self, rules, detail):
+        rows = _sm43_rows(
+            models={
+                "m-1": {"PrimaryContainer": _sm43_container(uri="s3://good/m/")},
+                "m-2": {"PrimaryContainer": _sm43_container(uri="s3://weak/m/")},
+            },
+            buckets={"weak": {"Rules": rules}},
+        )
+        assert _sm43_statuses(rows) == ["Failed"]
+        assert rows[0]["Finding_Details"].startswith("Endpoint 'ep-2'")
+        assert f"artifact bucket weak: {detail}" in rows[0]["Finding_Details"]
+
+    def test_a_bucket_with_no_encryption_configuration_fails(self):
+        rows = _sm43_rows(
+            endpoints={"ep-1": {"models": ["m-1"]}},
+            models={"m-1": {"PrimaryContainer": _sm43_container()}},
+            buckets={
+                "artifacts": _sm43_error(
+                    "ServerSideEncryptionConfigurationNotFoundError"
+                )
+            },
+        )
+        assert _sm43_statuses(rows) == ["Failed"]
+        assert "no default encryption configuration" in rows[0]["Finding_Details"]
+
+    def test_a_denied_bucket_read_is_na(self):
+        rows = _sm43_rows(
+            endpoints={"ep-1": {"models": ["m-1"]}},
+            models={"m-1": {"PrimaryContainer": _sm43_container()}},
+            buckets={"artifacts": _sm43_error("AccessDeniedException")},
+        )
+        assert _sm43_statuses(rows) == ["N/A"]
+        assert (
+            "artifact bucket artifacts encryption was not read "
+            "(s3:GetEncryptionConfiguration: AccessDeniedException)"
+        ) in rows[0]["Finding_Details"]
+
+    def _signing(self, filters=None):
+        rule = {"signingProfileArn": "arn:aws:signer:us-east-1:1:/signing-profiles/p"}
+        if filters is not None:
+            rule["repositoryFilters"] = [
+                {"filterType": "WILDCARD_MATCH", "filter": f} for f in filters
+            ]
+        return {"registryId": _SM43_ACCOUNT, "signingConfiguration": {"rules": [rule]}}
+
+    def test_a_signed_image_passes_and_is_read_by_its_resolved_digest(self):
+        image = _sm43_image()
+        rows = _sm43_rows(
+            endpoints={"ep-1": {"models": ["m-1"]}},
+            models={"m-1": {"PrimaryContainer": _sm43_container(image=image)}},
+            signing=self._signing(),
+            statuses={"serve": [{"status": "COMPLETE"}]},
+            deployed={"ep-1": {image: f"{image.split(':v1')[0]}@{_SM43_DIGEST}"}},
+        )
+        assert _sm43_statuses(rows) == ["Passed"]
+        assert _sm43_rows.signing_calls == [("serve", {"imageDigest": _SM43_DIGEST})]
+
+    def test_an_unsigned_image_under_a_covering_rule_fails(self):
+        rows = _sm43_rows(
+            endpoints={"ep-1": {"models": ["m-1"]}},
+            models={"m-1": {"PrimaryContainer": _sm43_container()}},
+            signing=self._signing(["other", "ser*"]),
+        )
+        assert _sm43_statuses(rows) == ["Failed"]
+        assert (
+            "image has no managed signing status, though a signing rule covers "
+            "repository serve"
+        ) in rows[0]["Finding_Details"]
+        assert _sm43_rows.signing_calls == [("serve", {"imageTag": "v1"})]
+
+    def test_a_failed_signature_names_its_code(self):
+        rows = _sm43_rows(
+            endpoints={"ep-1": {"models": ["m-1"]}},
+            models={"m-1": {"PrimaryContainer": _sm43_container()}},
+            signing=self._signing(),
+            statuses={"serve": [{"status": "FAILED", "failureCode": "KMS_ERROR"}]},
+        )
+        assert "image failed managed signing (KMS_ERROR)" in rows[0]["Finding_Details"]
+
+    def test_a_rule_that_does_not_cover_the_repository_reads_no_status(self):
+        rows = _sm43_rows(
+            endpoints={"ep-1": {"models": ["m-1"]}},
+            models={"m-1": {"PrimaryContainer": _sm43_container()}},
+            signing=self._signing(["prod/*"]),
+        )
+        assert _sm43_statuses(rows) == ["Passed"]
+        assert _sm43_rows.signing_calls == []
+
+    def test_another_registrys_rule_does_not_cover_the_image(self):
+        signing = self._signing()
+        signing["registryId"] = "444455556666"
+        rows = _sm43_rows(
+            endpoints={"ep-1": {"models": ["m-1"]}},
+            models={"m-1": {"PrimaryContainer": _sm43_container()}},
+            signing=signing,
+        )
+        assert _sm43_statuses(rows) == ["Passed"]
+        assert _sm43_rows.signing_calls == []
+
+    @pytest.mark.parametrize(
+        "signing, statuses, detail",
+        [
+            (
+                _sm43_error("AccessDeniedException"),
+                {},
+                "image signing rules were not read (ecr:GetSigningConfiguration: "
+                "AccessDeniedException)",
+            ),
+            (
+                None,
+                {"serve": _sm43_error("AccessDeniedException")},
+                "image signing status was not read (ecr:DescribeImageSigningStatus: "
+                "AccessDeniedException)",
+            ),
+            (
+                None,
+                {"serve": [{"status": "IN_PROGRESS"}]},
+                "image signing is IN_PROGRESS",
+            ),
+        ],
+    )
+    def test_an_unread_signing_leg_is_na(self, signing, statuses, detail):
+        rows = _sm43_rows(
+            endpoints={"ep-1": {"models": ["m-1"]}},
+            models={"m-1": {"PrimaryContainer": _sm43_container()}},
+            signing=signing if signing is not None else self._signing(),
+            statuses=statuses,
+        )
+        assert _sm43_statuses(rows) == ["N/A"]
+        assert detail in rows[0]["Finding_Details"]
+
+    def test_an_inference_component_model_is_judged(self):
+        rows = _sm43_rows(
+            endpoints={"ep-1": {"models": [], "components": ["ic-variant"]}},
+            models={"m-ic": {"PrimaryContainer": _sm43_container(etag=None)}},
+            components={
+                ("ep-1", "ic-variant"): ["ic-1"],
+                "ic-1": {"ModelName": "m-ic"},
+            },
+        )
+        assert _sm43_statuses(rows) == ["Failed"]
+        assert "model 'm-ic' container 1 ModelDataSource" in rows[0]["Finding_Details"]
+
+    def test_an_inference_component_container_artifact_url_fails(self):
+        rows = _sm43_rows(
+            endpoints={"ep-1": {"models": [], "components": ["ic-variant"]}},
+            models={},
+            components={
+                ("ep-1", "ic-variant"): ["ic-1"],
+                "ic-1": {
+                    "Container": {
+                        "DeployedImage": {
+                            "SpecifiedImage": _sm43_image(tag=None, digest=_SM43_DIGEST)
+                        },
+                        "ArtifactUrl": "s3://artifacts/ic/model.tar.gz",
+                    }
+                },
+            },
+        )
+        assert _sm43_statuses(rows) == ["Failed"]
+        assert (
+            "inference component 'ic-1' container loads ModelDataUrl "
+            "s3://artifacts/ic/model.tar.gz with no expected value recorded"
+        ) in rows[0]["Finding_Details"]
+
+    def test_unread_inference_components_are_na(self):
+        rows = _sm43_rows(
+            endpoints={"ep-1": {"models": [], "components": ["ic-variant"]}},
+            models={},
+            components={("ep-1", "ic-variant"): _sm43_error("AccessDeniedException")},
+        )
+        assert _sm43_statuses(rows) == ["N/A"]
+        assert (
+            "inference components of variant ic-variant were not read "
+            "(sagemaker:ListInferenceComponents: AccessDeniedException)"
+        ) in rows[0]["Finding_Details"]
+
+    def test_a_denied_component_describe_names_its_permission(self):
+        rows = _sm43_rows(
+            endpoints={"ep-1": {"models": [], "components": ["ic-variant"]}},
+            models={},
+            components={
+                ("ep-1", "ic-variant"): ["ic-1"],
+                "ic-1": _sm43_error("AccessDeniedException"),
+            },
+        )
+        assert _sm43_statuses(rows) == ["N/A"]
+        assert (
+            "(sagemaker:DescribeInferenceComponent: AccessDeniedException)"
+        ) in rows[0]["Finding_Details"]
+
+    def test_endpoints_not_in_service_are_skipped(self):
+        rows = _sm43_rows(
+            endpoints={"ep-1": {"models": ["m-1"], "status": "Creating"}},
+        )
+        assert _sm43_statuses(rows) == ["N/A"]
+        assert "No InService SageMaker endpoints" in rows[0]["Finding_Details"]
+
+    def test_no_endpoints_is_na(self):
+        rows = _sm43_rows(endpoints={})
+        assert _sm43_statuses(rows) == ["N/A"]
+
+    def test_a_failed_inventory_is_could_not_assess(self):
+        with patch("sagemaker_app.boto3.client") as mock_client:
+            mock_client.return_value.get_paginator.side_effect = _sm43_error(
+                "AccessDeniedException"
+            )
+            rows = _rows(
+                sagemaker_app.check_sagemaker_model_artifact_integrity("us-east-1")
+            )
+        assert _sm43_statuses(rows) == ["N/A"]
+        assert rows[0]["Check_ID"] == "SM-43"
+
+    def test_rows_match_the_schema(self):
+        for row in _sm43_rows(
+            models={
+                "m-1": {"PrimaryContainer": _sm43_container(etag=None)},
+                "m-2": _sm43_error("AccessDeniedException"),
+            }
+        ):
+            assert_finding_schema(row)
+
+    def test_the_handler_runs_sm43(self):
+        source = open(os.path.join(_sm_dir, "app.py")).read()
+        handler = source[source.index("def lambda_handler") :]
+        assert "check_sagemaker_model_artifact_integrity(region=region)" in handler
