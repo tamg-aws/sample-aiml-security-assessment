@@ -909,11 +909,18 @@ def test_ar09_reads_a_wildcard_pattern_as_every_authority_it_reaches():
         pytest.param(["*:*"], id="wildcard-service"),
     ],
 )
-def test_ar09_leaves_a_service_agnostic_grant_to_the_full_access_check(actions):
-    """AR-01 reports an administrator once; AR-09 does not report it again."""
+def test_ar09_reports_a_service_agnostic_grant(actions):
+    """A bare `*` or `*:*` grants publication and approval alike, so the
+    administrator it names is the publisher and curator of the same record."""
     finding = _separation_finding(_separation_cache([_allow(actions)]))
 
-    assert finding["Status"] == "Passed"
+    assert finding["Status"] == "Failed"
+    assert "role 'publisher'" in finding["Finding_Details"]
+    assert _listed_publish_actions(finding) == sorted(
+        f"{namespace}:{action}"
+        for namespace in _REGISTRY_NAMESPACES
+        for action in _PUBLISH_ACTIONS
+    )
 
 
 def _colliding_statements(*extra):
@@ -1888,15 +1895,11 @@ def test_ar10_a_forwarded_rule_is_credited_only_with_both_hops_detail_types():
 def test_ar10_a_rule_with_a_bus_and_a_delivering_target_is_not_followed():
     findings, client = _routing_findings(
         [_rule("mixed-targets", _approval_pattern())],
-        target_arns={
-            "mixed-targets": [
-                _AUDIT_BUS,
-                "arn:aws:events:us-east-1:123456789012:api-destination/review/abc",
-            ]
-        },
+        target_arns={"mixed-targets": [_AUDIT_BUS, _SNS_TARGET]},
     )
     assert [f["Status"] for f in findings] == ["Passed"]
-    assert "'mixed-targets' (2 target(s))" in findings[0]["Finding_Details"]
+    # Only the review-pipeline target is counted, not the event bus.
+    assert "'mixed-targets' (1 target(s))" in findings[0]["Finding_Details"]
     assert client.rule_calls == ["default"]
 
 
@@ -2049,3 +2052,161 @@ def test_handler_emits_ar10_for_the_assessed_region():
     assert rows[0]["Finding"] == "AWS Agent Registry Lifecycle Event Routing"
     assert rows[0]["Region"] == "us-east-1"
     assert events.target_calls == ["registry-approvals"]
+
+
+# ===================================================================
+# AIR-ACR-REG-02: AR-03 fails auto-approval by default, AR-10 credits only a
+# review pipeline
+# ===================================================================
+def _registries(*details):
+    inventory = _registry_inventory()
+    inventory["items"] = [
+        {
+            "summary": {"registryId": f"registry-{index}", "name": f"r{index}"},
+            "detail": {
+                "registryId": f"registry-{index}",
+                "name": f"r{index}",
+                "status": "READY",
+                **detail,
+            },
+        }
+        for index, detail in enumerate(details)
+    ]
+    return inventory
+
+
+_AUTO = {"approvalConfiguration": {"autoApprovalRules": ["APPROVE_ALL"]}}
+
+
+@pytest.mark.parametrize("flag", [None, "false", "true"])
+def test_ar03_auto_approval_fails_whatever_the_retired_flag_says(flag, monkeypatch):
+    if flag is None:
+        monkeypatch.delenv("REQUIRE_AGENT_REGISTRY_MANUAL_APPROVAL", raising=False)
+    else:
+        monkeypatch.setenv("REQUIRE_AGENT_REGISTRY_MANUAL_APPROVAL", flag)
+    findings = agent_registry_app.check_agent_registry_approval_governance(
+        _registries({"approvalConfiguration": {"autoApprovalRules": []}}, _AUTO, {})
+    )
+    assert [f["Status"] for f in findings] == ["Passed", "Failed", "Passed"]
+    failed = findings[1]
+    assert failed["Finding_Details"] == (
+        "Registry 'r1' (registry-1) automatically approves submitted records "
+        "(autoApprovalRules: APPROVE_ALL)."
+    )
+    assert failed["Severity"] == "Medium"
+    assert failed["Resolution"] == (
+        "Remove auto-approval rules so submitted records require manual review."
+    )
+    for finding in findings:
+        assert_finding_schema(finding)
+
+
+@pytest.mark.parametrize(
+    "detail",
+    [
+        pytest.param({}, id="approval-configuration-omitted"),
+        pytest.param({"approvalConfiguration": None}, id="null"),
+        pytest.param({"approvalConfiguration": {}}, id="rules-omitted"),
+        pytest.param({"approvalConfiguration": {"autoApprovalRules": []}}, id="empty"),
+    ],
+)
+def test_ar03_no_auto_approval_rule_is_manual_review(detail):
+    (finding,) = agent_registry_app.check_agent_registry_approval_governance(
+        _registries(detail)
+    )
+    assert finding["Status"] == "Passed"
+    assert finding["Finding_Details"] == (
+        "Registry 'r0' (registry-0) requires manual review for submitted records: "
+        "it returns no auto-approval rules."
+    )
+
+
+_LOG_GROUP = "arn:aws:logs:us-east-1:123456789012:log-group:/aws/events/registry"
+_API_DESTINATION = "arn:aws:events:us-east-1:123456789012:api-destination/review/abc"
+
+
+@pytest.mark.parametrize(
+    "arn",
+    [
+        "arn:aws:lambda:us-east-1:123456789012:function:review",
+        "arn:aws:sns:us-east-1:123456789012:review",
+        "arn:aws:sqs:us-east-1:123456789012:review",
+        "arn:aws:states:us-east-1:123456789012:stateMachine:review",
+    ],
+)
+def test_ar10_each_review_pipeline_service_is_credited(arn):
+    findings, _ = _routing_findings(
+        [_rule("approvals", _approval_pattern())], target_arns={"approvals": [arn]}
+    )
+    assert [f["Status"] for f in findings] == ["Passed"]
+    assert "'approvals' (1 target(s))" in findings[0]["Finding_Details"]
+
+
+@pytest.mark.parametrize("arn", [_LOG_GROUP, _API_DESTINATION])
+def test_ar10_a_rule_with_no_review_pipeline_target_is_not_credited(arn):
+    findings, _ = _routing_findings(
+        [_rule("logged-only", _approval_pattern())],
+        target_arns={"logged-only": [arn]},
+    )
+    assert [f["Status"] for f in findings] == ["Failed", "Failed"]
+    assert findings[0]["Finding_Details"] == (
+        "EventBridge rule 'logged-only' routes the lifecycle events of registry "
+        "'inventory' to 1 target(s), none of which is a Lambda function, SNS "
+        "topic, SQS queue or Step Functions state machine, so no state change "
+        "reaches a review pipeline."
+    )
+    assert "route none of them to a target" in findings[1]["Finding_Details"]
+
+
+def test_ar10_one_unreviewed_rule_beside_a_reviewed_one_is_reported():
+    findings, _ = _routing_findings(
+        [
+            _rule("logged-only", _approval_pattern()),
+            _rule("reviewed", _approval_pattern()),
+        ],
+        target_arns={"logged-only": [_LOG_GROUP], "reviewed": [_SNS_TARGET]},
+    )
+    assert [f["Status"] for f in findings] == ["Failed", "Passed"]
+    assert "'logged-only'" in findings[0]["Finding_Details"]
+    assert "'reviewed' (1 target(s))" in findings[1]["Finding_Details"]
+    assert "logged-only" not in findings[1]["Finding_Details"]
+
+
+def test_ar10_a_bus_beside_a_non_pipeline_target_is_followed():
+    findings, client = _routing_findings(
+        [_rule("mixed", _approval_pattern())],
+        target_arns={
+            "mixed": [_AUDIT_BUS, _LOG_GROUP],
+            "audit-approvals": [
+                "arn:aws:lambda:us-east-1:123456789012:function:review"
+            ],
+        },
+        bus_rules={
+            "audit-bus": [
+                _rule("audit-approvals", _approval_pattern(), bus="audit-bus")
+            ]
+        },
+    )
+    assert client.rule_calls == ["default", "audit-bus"]
+    assert [f["Status"] for f in findings] == ["Passed"]
+    assert (
+        "'mixed' via event bus 'audit-bus' rule 'audit-approvals' (1 target(s))"
+        in findings[0]["Finding_Details"]
+    )
+
+
+def test_ar10_a_forwarded_bus_with_only_a_log_target_is_not_credited():
+    forward, arns = _forward()
+    findings, _ = _routing_findings(
+        [forward],
+        target_arns={**arns, "audit-log": [_LOG_GROUP]},
+        bus_rules={
+            "audit-bus": [_rule("audit-log", _approval_pattern(), bus="audit-bus")]
+        },
+    )
+    assert findings[0]["Status"] == "Failed"
+    assert (
+        "has a target that is a Lambda function, SNS topic, SQS queue or Step "
+        "Functions state machine, so no forwarded state change reaches a review "
+        "pipeline." in findings[0]["Finding_Details"]
+    )

@@ -100,7 +100,9 @@ _EXPECTED_ACTIONS = {
         "iam:GetGroupPolicy",
         "iam:GetPolicy",
         "iam:GetPolicyVersion",
+        "iam:GetRole",
         "iam:GetRolePolicy",
+        "iam:GetUser",
         "iam:GetUserPolicy",
         "iam:ListAttachedGroupPolicies",
         "iam:ListAttachedRolePolicies",
@@ -227,16 +229,19 @@ _EXPECTED_ACTIONS = {
         "tag:GetResources",
     },
     "SagemakerSecurityAssessmentFunction": {
+        "cloudtrail:LookupEvents",
         "config:DescribeComplianceByConfigRule",
         "config:DescribeConfigRules",
         "config:DescribeConfigurationRecorders",
         "ec2:DescribeRouteTables",
         "ec2:DescribeSubnets",
+        "ecs:DescribeServices",
         "eks:DescribeAddon",
         "eks:DescribeCluster",
         "eks:ListAddons",
         "eks:ListClusters",
         "guardduty:GetDetector",
+        "guardduty:ListCoverage",
         "guardduty:ListDetectors",
         "iam:GenerateServiceLastAccessedDetails",
         "iam:GetServiceLastAccessedDetails",
@@ -246,7 +251,9 @@ _EXPECTED_ACTIONS = {
         "organizations:DescribeOrganization",
         "organizations:DescribePolicy",
         "organizations:ListDelegatedAdministrators",
+        "organizations:ListParents",
         "organizations:ListPolicies",
+        "organizations:ListTargetsForPolicy",
         "s3:GetObject",
         "s3:PutObject",
         "sagemaker:DescribeAutoMLJob",
@@ -255,6 +262,7 @@ _EXPECTED_ACTIONS = {
         "sagemaker:DescribeDataQualityJobDefinition",
         "sagemaker:DescribeDomain",
         "sagemaker:DescribeEndpoint",
+        "sagemaker:DescribeEndpointConfig",
         "sagemaker:DescribeFeatureGroup",
         "sagemaker:DescribeHyperParameterTuningJob",
         "sagemaker:DescribeModel",
@@ -288,7 +296,31 @@ _EXPECTED_ACTIONS = {
         "sagemaker:ListTransformJobs",
         "sagemaker:ListTrials",
         "secretsmanager:ListSecrets",
+        "securityhub:DescribeOrganizationConfiguration",
         "securityhub:GetEnabledStandards",
+        "securityhub:ListEnabledProductsForImport",
+        "cloudwatch:DescribeAlarms",
+        "logs:DescribeMetricFilters",
+        "events:ListTargetsByRule",
+        "iot:ListPrincipalThings",
+        "iot:DescribeScheduledAudit",
+        "s3:GetEncryptionConfiguration",
+        "s3:GetBucketPolicy",
+        "kms:DescribeKey",
+        "sagemaker:DescribeUserProfile",
+        "cloudtrail:GetTrailStatus",
+        "cloudtrail:GetEventSelectors",
+        "config:DescribeConfigurationRecorderStatus",
+        "config:DescribeConformancePackCompliance",
+        "sagemaker:DescribeInferenceComponent",
+        "ec2:DescribeVpcEndpoints",
+        "ec2:DescribeFlowLogs",
+        "ec2:DescribeSecurityGroups",
+        "config:DescribeConformancePacks",
+        "iot:DescribeAccountAuditConfiguration",
+        "iot:ListAuditFindings",
+        "inspector2:BatchGetAccountStatus",
+        "lambda:ListFunctions",
     },
     "AgentCoreSecurityAssessmentFunction": {
         "bedrock-agentcore:GetAgentRuntime",
@@ -296,12 +328,15 @@ _EXPECTED_ACTIONS = {
         "bedrock-agentcore:GetCodeInterpreter",
         "bedrock-agentcore:GetGateway",
         "bedrock-agentcore:GetGatewayTarget",
+        "bedrock-agentcore:GetHarness",
         "bedrock-agentcore:GetMemory",
         "bedrock-agentcore:GetOnlineEvaluationConfig",
+        "bedrock-agentcore:GetPaymentManager",
         "bedrock-agentcore:GetPolicyEngine",
         "bedrock-agentcore:GetResourcePolicy",
         "bedrock-agentcore:GetTokenVault",
         "bedrock-agentcore:ListAgentRuntimes",
+        "bedrock-agentcore:ListApiKeyCredentialProviders",
         "bedrock-agentcore:ListBrowsers",
         "bedrock-agentcore:ListCodeInterpreters",
         "bedrock-agentcore:ListEvaluators",
@@ -309,11 +344,17 @@ _EXPECTED_ACTIONS = {
         "bedrock-agentcore:ListGatewayTargets",
         "bedrock-agentcore:ListGateways",
         "bedrock-agentcore:ListMemories",
+        "bedrock-agentcore:ListOauth2CredentialProviders",
+        "bedrock-agentcore:ListPaymentCredentialProviders",
         "bedrock-agentcore:ListOnlineEvaluationConfigs",
         "bedrock-agentcore:ListPolicies",
         "bedrock-agentcore:ListPolicyEngines",
+        "bedrock-agentcore:ListWorkloadIdentities",
         "cloudtrail:GetEventSelectors",
+        "cloudtrail:GetTrail",
+        "cloudtrail:GetTrailStatus",
         "cloudtrail:ListTrails",
+        "cloudwatch:DescribeAlarms",
         "cloudwatch:PutMetricData",
         "cognito-idp:DescribeUserPool",
         "cognito-idp:DescribeUserPoolClient",
@@ -329,7 +370,9 @@ _EXPECTED_ACTIONS = {
         "iam:GetRole",
         "iam:GetServiceLastAccessedDetails",
         "kms:Decrypt",
+        "kms:DescribeKey",
         "kms:GetKeyPolicy",
+        "kms:ListGrants",
         "logs:DescribeAccountPolicies",
         "logs:DescribeDeliveries",
         "logs:DescribeDeliverySources",
@@ -339,11 +382,18 @@ _EXPECTED_ACTIONS = {
         "oam:ListSinks",
         "organizations:DescribePolicy",
         "organizations:ListPolicies",
+        "organizations:ListParents",
+        "organizations:ListTargetsForPolicy",
         "route53resolver:GetFirewallConfig",
         "route53resolver:ListFirewallDomainLists",
         "route53resolver:ListFirewallDomains",
         "route53resolver:ListFirewallRuleGroupAssociations",
         "route53resolver:ListFirewallRules",
+        "s3:GetBucketPolicy",
+        "s3:GetBucketPublicAccessBlock",
+        "s3:GetBucketVersioning",
+        "s3:GetEncryptionConfiguration",
+        "s3:GetLifecycleConfiguration",
         "s3:GetObject",
         "s3:PutObject",
         "wafv2:GetWebACL",
@@ -770,8 +820,16 @@ def test_sagemaker_and_guardduty_resource_reads_are_arn_scoped(template):
         template, "SagemakerSecurityAssessmentFunction", "GuardDutyDetectorRead"
     )
     assert "guardduty:GetDetector" in detector
+    assert "guardduty:ListCoverage" in detector
     assert "guardduty:*:${AWS::AccountId}:detector/*" in detector
     assert not re.search(r"Resource:\s+['\"]\*['\"]", detector)
+
+    ecs_services = _statement_block(
+        template, "SagemakerSecurityAssessmentFunction", "EcsServiceRead"
+    )
+    assert "ecs:DescribeServices" in ecs_services
+    assert "ecs:*:${AWS::AccountId}:service/*" in ecs_services
+    assert not re.search(r"Resource:\s+['\"]\*['\"]", ecs_services)
 
 
 @pytest.mark.parametrize("template", _SAM_TEMPLATES, ids=os.path.basename)
@@ -792,8 +850,28 @@ def test_sagemaker_scope27_reads_wildcard_only_where_iam_has_no_resource_type(
         ),
         (
             "AccountInventoryWithoutResourceType",
-            ("eks:ListClusters", "secretsmanager:ListSecrets", "iot:ListPolicies"),
+            (
+                "eks:ListClusters",
+                "secretsmanager:ListSecrets",
+                "iot:ListPolicies",
+                "cloudtrail:LookupEvents",
+            ),
         ),
+        (
+            "EC2NetworkPostureInventory",
+            (
+                "ec2:DescribeVpcEndpoints",
+                "ec2:DescribeFlowLogs",
+                "ec2:DescribeSecurityGroups",
+            ),
+        ),
+        ("ConformancePackInventory", ("config:DescribeConformancePacks",)),
+        (
+            "IoTDeviceDefenderAuditRead",
+            ("iot:DescribeAccountAuditConfiguration", "iot:ListAuditFindings"),
+        ),
+        ("InspectorAccountStatusRead", ("inspector2:BatchGetAccountStatus",)),
+        ("LambdaFunctionInventory", ("lambda:ListFunctions",)),
     ):
         statement = _statement_block(
             template, "SagemakerSecurityAssessmentFunction", sid
@@ -941,6 +1019,10 @@ def test_agentcore_observability_and_governance_reads_are_scoped_where_iam_allow
             "cloudtrail:GetEventSelectors",
             "cloudtrail:*:${AWS::AccountId}:trail/*",
         ),
+        "AgentCoreIdentityInventory": (
+            "bedrock-agentcore:ListWorkloadIdentities",
+            "bedrock-agentcore:*:${AWS::AccountId}:workload-identity-directory/*",
+        ),
         "LogsDataProtectionPolicyRead": (
             "logs:GetDataProtectionPolicy",
             "logs:*:${AWS::AccountId}:log-group:*",
@@ -951,6 +1033,10 @@ def test_agentcore_observability_and_governance_reads_are_scoped_where_iam_allow
         ),
         "LogEncryptionKeyPolicyRead": (
             "kms:GetKeyPolicy",
+            "kms:*:${AWS::AccountId}:key/*",
+        ),
+        "PolicyEngineKeyStateRead": (
+            "kms:ListGrants",
             "kms:*:${AWS::AccountId}:key/*",
         ),
         "OrganizationsPolicyRead": (
@@ -965,6 +1051,19 @@ def test_agentcore_observability_and_governance_reads_are_scoped_where_iam_allow
         assert action in statement
         assert resource in statement
         assert not re.search(r"Resource:\s+['\"]\*['\"]", statement)
+
+    # AC-18 reads each trail's logging state beside its selectors, on the same
+    # trail ARN, and lists the credential providers in the token vault.
+    trail_read = _statement_block(
+        template, "AgentCoreSecurityAssessmentFunction", "CloudTrailEventSelectorRead"
+    )
+    assert "cloudtrail:GetTrailStatus" in trail_read
+    identity = _statement_block(
+        template, "AgentCoreSecurityAssessmentFunction", "AgentCoreIdentityInventory"
+    )
+    assert "bedrock-agentcore:ListOauth2CredentialProviders" in identity
+    assert "bedrock-agentcore:ListApiKeyCredentialProviders" in identity
+    assert "bedrock-agentcore:*:${AWS::AccountId}:token-vault/*" in identity
 
     # DescribeSecurityGroups has no resource-level authorization either, so it
     # joins the existing EC2 enumeration statement instead of getting a wildcard
@@ -984,6 +1083,23 @@ def test_agentcore_observability_and_governance_reads_are_scoped_where_iam_allow
     assert "iam::${AWS::AccountId}:role/*" in gateway_role
     assert "iam::*:role/" not in gateway_role
     assert not re.search(r"Resource:\s+['\"]\*['\"]", gateway_role)
+
+    # AC-06 reads each recording bucket, whose name the customer chose, so the
+    # grant covers bucket ARNs and nothing wider.
+    recording = _statement_block(
+        template, "AgentCoreSecurityAssessmentFunction", "BrowserRecordingBucketRead"
+    )
+    for action in (
+        "s3:GetEncryptionConfiguration",
+        "s3:GetBucketPublicAccessBlock",
+        "s3:GetBucketPolicy",
+        "s3:GetLifecycleConfiguration",
+        "s3:GetBucketVersioning",
+    ):
+        assert action in recording
+    assert "Resource: !Sub 'arn:${AWS::Partition}:s3:::*'" in recording
+    assert "s3:GetAccountPublicAccessBlock" not in recording
+    assert not re.search(r"Resource:\s+['\"]\*['\"]", recording)
 
 
 @pytest.mark.parametrize("template", _SAM_TEMPLATES, ids=os.path.basename)
