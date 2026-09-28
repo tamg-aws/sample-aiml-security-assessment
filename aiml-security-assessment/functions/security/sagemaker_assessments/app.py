@@ -1362,9 +1362,11 @@ def _endpoint_invocation_scoping_findings(
 
     for identity_type, name, permissions in identities:
         boundary = permissions.get("permissions_boundary")
-        policies = (permissions.get("attached_policies") or []) + (
-            permissions.get("inline_policies") or []
-        )
+        policies = [
+            *(permissions.get("attached_policies") or []),
+            *(permissions.get("inline_policies") or []),
+            *(permissions.get("group_policies") or []),
+        ]
         grants_invocation = False
         wildcard = None
         wildcard_policy = None
@@ -1781,15 +1783,25 @@ def _merged_read_write_grants(permissions: Dict[str, Any]) -> List[str]:
 
 def _principal_read_errors(permission_cache: Dict[str, Any]) -> Optional[List[str]]:
     """Label each principal whose cache read failed, or None for a cache that
-    predates ``principal_errors``."""
+    predates ``principal_errors`` and has no user missing ``group_policies``.
+
+    The cache gives every user either ``group_policies`` or
+    ``group_policies_error``, so a user without a ``group_policies`` list is
+    unread whether or not principal_errors names it.
+    """
     errors = permission_cache.get("principal_errors")
-    if not isinstance(errors, list):
-        return None
     failed: Dict[str, List[str]] = {}
-    for error in errors:
+    for error in errors if isinstance(errors, list) else []:
         if isinstance(error, dict) and error.get("name"):
             label = f"{error.get('type', 'principal')} '{error['name']}'"
             failed.setdefault(label, []).append(str(error.get("stage", "unknown")))
+    for name, permissions in (permission_cache.get("user_permissions") or {}).items():
+        if not isinstance((permissions or {}).get("group_policies"), list):
+            stages = failed.setdefault(f"user '{name}'", [])
+            if "group_policies" not in stages:
+                stages.append("group_policies")
+    if not isinstance(errors, list) and not failed:
+        return None
     return [
         f"{label} ({', '.join(stages)})" for label, stages in sorted(failed.items())
     ]
@@ -2207,9 +2219,11 @@ def check_sagemaker_iam_permissions(
         # Check users' last access to SageMaker
         for user_name, permissions in permission_cache["user_permissions"].items():
             has_sagemaker_access = False
-            for policy in (
-                permissions["attached_policies"] + permissions["inline_policies"]
-            ):
+            for policy in [
+                *permissions["attached_policies"],
+                *permissions["inline_policies"],
+                *(permissions.get("group_policies") or []),
+            ]:
                 if has_sagemaker_permissions(policy["document"]):
                     has_sagemaker_access = True
                     break
@@ -2861,6 +2875,57 @@ TRAINING_VOLUME_ENCRYPTION_RESOLUTION = (
 )
 
 
+TRAINING_FILE_SYSTEM_READ_ACTIONS = {
+    "EFS": "elasticfilesystem:DescribeFileSystems",
+    "FSxLustre": "fsx:DescribeFileSystems",
+}
+
+
+def _training_instance_count(job_details: Dict[str, Any]) -> Optional[int]:
+    """Instances a training job ran on, summed over heterogeneous instance
+    groups, or None when the job does not record it."""
+    resource_config = job_details.get("ResourceConfig") or {}
+    if not isinstance(resource_config, dict):
+        return None
+    groups = resource_config.get("InstanceGroups") or []
+    if groups:
+        counts = [group.get("InstanceCount") for group in groups]
+        if all(isinstance(count, int) for count in counts):
+            return sum(counts)
+        return None
+    count = resource_config.get("InstanceCount")
+    return count if isinstance(count, int) else None
+
+
+def _training_channel_unread_source(
+    job_name: str, channel: Dict[str, Any], data_source: Dict[str, Any]
+) -> List[str]:
+    """
+    Name the non-S3 training sources whose encryption at rest this check does
+    not read: an EFS or FSx for Lustre file system, which the assessment role
+    has no grant to describe, and a dataset ARN.
+    """
+    label = f"training job '{job_name}' channel '{channel.get('ChannelName')}'"
+    file_system = data_source.get("FileSystemDataSource") or {}
+    if file_system:
+        system_type = file_system.get("FileSystemType")
+        action = TRAINING_FILE_SYSTEM_READ_ACTIONS.get(
+            system_type, "the file system's describe action"
+        )
+        return [
+            f"{label} reads {system_type} file system "
+            f"{file_system.get('FileSystemId')}, whose encryption at rest was not "
+            f"read ({action} is not granted to this assessment role)"
+        ]
+    dataset = data_source.get("DatasetSource") or {}
+    if dataset:
+        return [
+            f"{label} reads dataset {dataset.get('DatasetArn')}, whose encryption "
+            "at rest this check does not read"
+        ]
+    return []
+
+
 def _training_volume_encryption_findings(
     jobs_with_volume_key: List[Dict[str, Any]],
     jobs_without_volume_key: List[str],
@@ -3088,10 +3153,12 @@ def check_sagemaker_data_protection(region: str = "") -> Dict[str, Any]:
                         else:
                             note_key("Training Job", job_name, kms_key_id)
 
-                        # Check inter-node encryption for distributed training
+                        # Inter-container encryption protects traffic between
+                        # instances, so a single-instance job has none to protect.
                         if (
                             job_details.get("EnableInterContainerTrafficEncryption")
                             is not True
+                            and _training_instance_count(job_details) != 1
                         ):
                             resources_without_vpc_encryption.append(
                                 {
@@ -3120,12 +3187,16 @@ def check_sagemaker_data_protection(region: str = "") -> Dict[str, Any]:
                         # The source and output buckets are the first and last
                         # stages of the pipeline the recommendation names.
                         for channel in job_details.get("InputDataConfig") or []:
-                            source = (channel.get("DataSource") or {}).get(
-                                "S3DataSource"
-                            ) or {}
+                            data_source = channel.get("DataSource") or {}
+                            source = data_source.get("S3DataSource") or {}
                             bucket = _s3_uri_bucket(source.get("S3Uri"))
                             if bucket:
                                 bucket_users.setdefault(bucket, []).append(job_name)
+                            unread.extend(
+                                _training_channel_unread_source(
+                                    job_name, channel, data_source
+                                )
+                            )
                         bucket = _s3_uri_bucket(output_config.get("S3OutputPath"))
                         if bucket:
                             bucket_users.setdefault(bucket, []).append(job_name)
@@ -5041,7 +5112,7 @@ def _endpoint_config_kms_findings(
             # Serverless variants have no instance storage volume for the key.
             continue
         if config.get("KmsKeyId"):
-            keyed.append(endpoint["name"])
+            keyed.append((endpoint, instance_types))
             continue
         emitted.append(
             create_finding(
@@ -5065,26 +5136,61 @@ def _endpoint_config_kms_findings(
                 region=region,
             )
         )
+    # A KmsKeyId can name an AWS managed key, so each key is resolved with
+    # kms:DescribeKey before the endpoint is credited.
+    managers = _kms_key_managers([e["config"]["KmsKeyId"] for e, _ in keyed], region)
+    customer = []
+    unread = list(inventory["unread"])
+    for endpoint, instance_types in keyed:
+        key_id = endpoint["config"]["KmsKeyId"]
+        manager = managers[key_id]
+        if manager["manager"] == "CUSTOMER":
+            customer.append(endpoint["name"])
+        elif manager["manager"] is None:
+            unread.append(f"kms:DescribeKey {key_id} ({manager['error']})")
+        else:
+            emitted.append(
+                create_finding(
+                    check_id="SM-11",
+                    finding_name=ENDPOINT_CONFIG_KMS_FINDING,
+                    finding_details=(
+                        f"Endpoint '{endpoint['name']}' uses endpoint config "
+                        f"'{endpoint['config_name']}' whose KmsKeyId {key_id} is "
+                        "an AWS managed key, so the storage volume on its "
+                        f"instances ({', '.join(instance_types)}) is not "
+                        "encrypted with a customer managed key."
+                    ),
+                    resolution=(
+                        "Create a new endpoint config with KmsKeyId set to a "
+                        "customer managed key and update the endpoint to use it."
+                    ),
+                    reference=ENDPOINT_CONFIG_KMS_REFERENCE,
+                    severity="Medium",
+                    status="Failed",
+                    region=region,
+                )
+            )
     read_details = (
-        f"{len(keyed)} instance-backed endpoint(s) name a KmsKeyId in their "
-        f"endpoint config: {', '.join(keyed[:10]) or 'none'}. The key covers the "
+        f"{len(customer)} instance-backed endpoint(s) name a customer managed "
+        "KmsKeyId in their endpoint config, as kms:DescribeKey reports: "
+        f"{', '.join(customer[:10]) or 'none'}. The key covers the "
         "attached storage volume; Nitro local instance storage is encrypted by the "
         "instance hardware module, which the field does not record. No endpoint "
         "API field enables inter-container traffic encryption, so that hop was "
         "not read."
     )
-    if inventory["unread"]:
+    if unread:
         emitted.append(
             _unread_resources_finding(
                 "SM-11",
                 ENDPOINT_CONFIG_KMS_FINDING,
-                inventory["unread"],
+                unread,
                 read_details,
                 ENDPOINT_CONFIG_KMS_REFERENCE,
                 region,
             )
         )
-    elif keyed and not emitted:
+    elif customer and not emitted:
         emitted.append(
             create_finding(
                 check_id="SM-11",
@@ -5322,7 +5428,198 @@ def _runtime_private_path_findings(
     ]
 
 
-def check_sagemaker_model_network_isolation(region: str = "") -> Dict[str, Any]:
+INVOKE_SOURCE_NETWORK_FINDING = "SageMaker Endpoint Invocation Source Network"
+INVOKE_SOURCE_NETWORK_KEYS = ("aws:sourcevpce", "aws:sourcevpc")
+INVOKE_SOURCE_NETWORK_RESOLUTION = (
+    "Condition each sagemaker:InvokeEndpoint Allow on aws:SourceVpce (the "
+    "sagemaker.runtime interface endpoint IDs) or aws:SourceVpc with "
+    "StringEquals, or add an identity Deny on sagemaker:InvokeEndpoint for "
+    "every endpoint with StringNotEquals on aws:SourceVpce, so a call from "
+    "outside the private path is refused."
+)
+
+
+def _allow_pins_invoke_source(statement: Dict[str, Any]) -> bool:
+    """
+    Return whether an Allow grants only calls that arrive through a named VPC
+    endpoint or VPC.
+
+    IfExists, negated and Null operators match a call that carries neither key,
+    as does ForAllValues over the empty set; a Like on a wildcard value admits
+    any endpoint.
+    """
+    for operator, key, values in _condition_entries(statement):
+        if key not in INVOKE_SOURCE_NETWORK_KEYS or not values:
+            continue
+        prefix, base, if_exists = _condition_operator_parts(operator)
+        if if_exists or "not" in base or base == "null":
+            continue
+        if prefix == "forallvalues" or _like_values_unbounded(base, values):
+            continue
+        if base in ("stringequals", "stringlike"):
+            return True
+    return False
+
+
+def _deny_pins_invoke_source(statement: Dict[str, Any]) -> bool:
+    """
+    Return whether a Deny refuses every InvokeEndpoint call from outside a
+    named VPC endpoint or VPC.
+
+    The statement must cover every endpoint and hold only the source-network
+    condition: another key makes the Deny fire only when both hold. A negated
+    operator is true for a call that carries no key, except under ForAnyValue.
+    """
+    if str(statement.get("Effect", "")).upper() != "DENY":
+        return False
+    if not any(
+        _statement_names_action(statement, action) for action in ENDPOINT_INVOKE_ACTIONS
+    ):
+        return False
+    if not _deny_covers_every_resource(statement, "endpoint"):
+        return False
+    entries = _condition_entries(statement)
+    if len(entries) != 1:
+        return False
+    operator, key, values = entries[0]
+    prefix, base, _ = _condition_operator_parts(operator)
+    return (
+        key in INVOKE_SOURCE_NETWORK_KEYS
+        and bool(values)
+        and base in ("stringnotequals", "stringnotlike")
+        and prefix != "foranyvalue"
+        and not _like_values_unbounded(base, values)
+    )
+
+
+def _invoke_source_network_findings(
+    permission_cache: Optional[Dict[str, Any]], inventory: Dict[str, Any], region: str
+) -> List[Dict[str, Any]]:
+    """
+    AIR-SGM-EP-01: an interface endpoint gives callers a private path but does
+    not stop a caller elsewhere from using the public runtime endpoint. Only an
+    IAM condition on aws:SourceVpce or aws:SourceVpc does, so each principal
+    that can invoke an endpoint must be held to one.
+    """
+    if not inventory["endpoints"]:
+        return []
+
+    def _row(details, resolution, severity, status, name=None):
+        return create_finding(
+            check_id="SM-11",
+            finding_name=name or INVOKE_SOURCE_NETWORK_FINDING,
+            finding_details=details,
+            resolution=resolution,
+            reference=RUNTIME_PRIVATE_PATH_REFERENCE,
+            severity=severity,
+            status=status,
+            region=region,
+        )
+
+    if permission_cache is None:
+        return [
+            _row(
+                "The IAM permissions cache was not available, so whether "
+                "sagemaker:InvokeEndpoint grants are held to aws:SourceVpce or "
+                "aws:SourceVpc was not read.",
+                COULD_NOT_ASSESS_RESOLUTION,
+                "Informational",
+                "N/A",
+                name=f"{INVOKE_SOURCE_NETWORK_FINDING} Incomplete",
+            )
+        ]
+
+    boundary_unread = _boundary_unread(permission_cache)
+    pinned = []
+    open_principals = []
+    unread = list(_principal_read_errors(permission_cache) or [])
+    for identity_type, cache_key in (
+        ("Role", "role_permissions"),
+        ("User", "user_permissions"),
+    ):
+        for name, permissions in (permission_cache.get(cache_key) or {}).items():
+            label = f"{identity_type} '{name}'"
+            boundary = permissions.get("permissions_boundary")
+            boundary_statements = (
+                _sm_policy_statements(boundary) if boundary is not None else []
+            )
+            if boundary is not None and not any(
+                _statement_invoke_actions(st) for st in boundary_statements
+            ):
+                continue
+            unpinned = []
+            granted = False
+            statements = []
+            for policy in [
+                *(permissions.get("attached_policies") or []),
+                *(permissions.get("inline_policies") or []),
+                *(permissions.get("group_policies") or []),
+            ]:
+                for statement in _sm_policy_statements(policy.get("document")):
+                    statements.append(statement)
+                    if not _statement_invoke_actions(statement):
+                        continue
+                    granted = True
+                    if not _allow_pins_invoke_source(statement):
+                        unpinned.append(policy.get("name") or "inline policy")
+            if not granted:
+                continue
+            boundary_pins = boundary is not None and all(
+                _allow_pins_invoke_source(st)
+                for st in boundary_statements
+                if _statement_invoke_actions(st)
+            )
+            denied = any(_deny_pins_invoke_source(st) for st in statements)
+            if not unpinned or boundary_pins or denied:
+                pinned.append(label)
+            elif boundary is None and (identity_type.lower(), name) in boundary_unread:
+                unread.append(f"{label} (permissions boundary not read)")
+            else:
+                open_principals.append(f"{label} (policy '{sorted(set(unpinned))[0]}')")
+
+    rows = []
+    if open_principals:
+        shown = "; ".join(open_principals[:10])
+        if len(open_principals) > 10:
+            shown += f"; and {len(open_principals) - 10} more"
+        rows.append(
+            _row(
+                f"{len(open_principals)} principal(s) can call "
+                "sagemaker:InvokeEndpoint from any network: no Allow condition "
+                "on aws:SourceVpce or aws:SourceVpc and no identity Deny holds the "
+                f"call to a VPC endpoint or VPC: {shown}. {SCP_NOT_EVALUATED_NOTE}",
+                INVOKE_SOURCE_NETWORK_RESOLUTION,
+                "Medium",
+                "Failed",
+            )
+        )
+    read_details = (
+        f"{len(pinned)} principal(s) that can invoke an endpoint are held to a "
+        "named VPC endpoint or VPC by aws:SourceVpce or aws:SourceVpc"
+        + (f": {', '.join(sorted(pinned)[:10])}." if pinned else ".")
+    )
+    if unread:
+        rows.append(
+            _unread_resources_finding(
+                "SM-11",
+                INVOKE_SOURCE_NETWORK_FINDING,
+                unread,
+                read_details,
+                RUNTIME_PRIVATE_PATH_REFERENCE,
+                region,
+            )
+        )
+    elif not open_principals and pinned:
+        details = read_details
+        if _principal_read_errors(permission_cache) is None:
+            details += " " + UNRECORDED_PRINCIPAL_ERRORS_NOTE
+        rows.append(_row(details, "No action required", "Medium", "Passed"))
+    return rows
+
+
+def check_sagemaker_model_network_isolation(
+    region: str = "", permission_cache: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
     """
     Check if SageMaker hosted models have network isolation enabled.
     Without isolation, model containers can make outbound calls and exfiltrate data.
@@ -5543,6 +5840,9 @@ def check_sagemaker_model_network_isolation(region: str = "") -> Dict[str, Any]:
         )
         findings["csv_data"].extend(_endpoint_config_kms_findings(inventory, region))
         findings["csv_data"].extend(_runtime_private_path_findings(inventory, region))
+        findings["csv_data"].extend(
+            _invoke_source_network_findings(permission_cache, inventory, region)
+        )
 
         return findings
 
@@ -6599,6 +6899,7 @@ def _transform_job_boundary_findings(
                 "removes the container's interface but not the one SageMaker uses "
                 "to move the input and output through S3."
             ),
+            judge_s3_policy=True,
         )
     )
     emitted.extend(
@@ -8950,6 +9251,7 @@ def check_hyperpod_ebs_cmk_encryption(
         )
         return findings
 
+    groups = []
     for item in inventory.get("items", []):
         detail = item["detail"]
         cluster_name = detail.get(
@@ -8965,40 +9267,84 @@ def check_hyperpod_ebs_cmk_encryption(
             root_configs = [
                 config for config in ebs_configs if config.get("RootVolume") is True
             ]
-            unencrypted = {
-                "root volume"
-                for config in root_configs
-                if not config.get("VolumeKmsKeyId")
-            }
-            if not root_configs:
-                unencrypted.add("root volume")
-            unencrypted.update(
-                "secondary volume"
+            volumes = [("root volume", config) for config in root_configs] + [
+                ("secondary volume", config)
                 for config in ebs_configs
                 if config.get("RootVolume") is not True
-                and not config.get("VolumeKmsKeyId")
+            ]
+            groups.append((cluster_name, group_name, bool(root_configs), volumes))
+
+    # A VolumeKmsKeyId can name an AWS managed key, so each key is resolved
+    # with kms:DescribeKey before a volume is credited as customer managed.
+    managers = _kms_key_managers(
+        [
+            config["VolumeKmsKeyId"]
+            for _, _, _, volumes in groups
+            for _, config in volumes
+            if config.get("VolumeKmsKeyId")
+        ],
+        region,
+    )
+    for cluster_name, group_name, has_root, volumes in groups:
+        unencrypted = set() if has_root else {"root volume"}
+        aws_managed = set()
+        unread = set()
+        for volume, config in volumes:
+            key_id = config.get("VolumeKmsKeyId")
+            if not key_id:
+                unencrypted.add(volume)
+            elif managers[key_id]["manager"] == "AWS":
+                aws_managed.add(f"{volume} ({key_id})")
+            elif managers[key_id]["manager"] is None:
+                unread.add(f"kms:DescribeKey {key_id} ({managers[key_id]['error']})")
+        label = f"HyperPod cluster '{cluster_name}' instance group '{group_name}'"
+        problems = []
+        if unencrypted:
+            problems.append(
+                "lacks customer-managed KMS encryption for: "
+                + ", ".join(sorted(unencrypted))
             )
-            compliant = not unencrypted
-            findings["csv_data"].append(
-                create_finding(
-                    check_id="SM-27",
-                    finding_name="HyperPod EBS CMK Encryption",
-                    finding_details=(
-                        f"HyperPod cluster '{cluster_name}' instance group '{group_name}' uses customer-managed KMS keys for all configured EBS volumes."
-                        if compliant
-                        else f"HyperPod cluster '{cluster_name}' instance group '{group_name}' lacks customer-managed KMS encryption for: {', '.join(sorted(unencrypted))}."
-                    ),
-                    resolution=(
-                        "No action required"
-                        if compliant
-                        else "Configure VolumeKmsKeyId for the root volume and every secondary EBS volume in the instance group."
-                    ),
-                    reference="https://aws.amazon.com/about-aws/whats-new/2025/08/sagemaker-hyperpod-customer-managed-kms-ebs-volumes/",
-                    severity="Medium",
-                    status="Passed" if compliant else "Failed",
-                    region=region,
-                )
+        if aws_managed:
+            problems.append(
+                "encrypts with an AWS managed key: " + ", ".join(sorted(aws_managed))
             )
+        not_read = f" Not read: {', '.join(sorted(unread))}." if unread else ""
+        if problems:
+            status = "Failed"
+            details = f"{label} {'; '.join(problems)}.{not_read}"
+            resolution = (
+                "Configure VolumeKmsKeyId with a customer managed key for the root "
+                "volume and every secondary EBS volume in the instance group."
+            )
+            severity = "Medium"
+        elif unread:
+            status = "N/A"
+            details = (
+                f"{label} names a VolumeKmsKeyId on every configured EBS volume, "
+                f"but who manages the key was not read.{not_read}"
+            )
+            resolution = "Grant kms:DescribeKey on the volume keys and retry."
+            severity = "Informational"
+        else:
+            status = "Passed"
+            details = (
+                f"{label} uses customer-managed KMS keys for all configured EBS "
+                "volumes, as kms:DescribeKey reports."
+            )
+            resolution = "No action required"
+            severity = "Medium"
+        findings["csv_data"].append(
+            create_finding(
+                check_id="SM-27",
+                finding_name="HyperPod EBS CMK Encryption",
+                finding_details=details,
+                resolution=resolution,
+                reference="https://aws.amazon.com/about-aws/whats-new/2025/08/sagemaker-hyperpod-customer-managed-kms-ebs-volumes/",
+                severity=severity,
+                status=status,
+                region=region,
+            )
+        )
 
     for item in inventory.get("errors", []):
         findings["csv_data"].append(
@@ -10501,6 +10847,76 @@ TRAINING_REQUIRED_ENDPOINT_SERVICES = (
 )
 
 
+S3_ENDPOINT_PROBE_OBJECT = "arn:aws:s3:::zz-probe-bucket-0/zz-probe"
+S3_ENDPOINT_DATA_ACTIONS = ("s3:getobject", "s3:putobject")
+PRINCIPAL_NARROWING_KEYS = ("aws:principalarn",)
+
+
+def _endpoint_policy_principal_is_anyone(statement: Dict[str, Any]) -> bool:
+    """
+    Return whether an endpoint policy statement admits any principal.
+
+    A Principal element narrows only when every value names a role or user
+    without a wildcard; an account id or :root admits every identity in the
+    account. A positive aws:PrincipalArn condition narrows on the same terms.
+    """
+    principal = statement.get("Principal", "*")
+    values = (
+        _policy_values(principal.get("AWS"))
+        if isinstance(principal, dict)
+        else _policy_values(principal)
+    )
+    if values and all(
+        re.match(r"^arn:aws[a-z-]*:iam::\d{12}:(role|user)/", v)
+        and "*" not in v
+        and "?" not in v
+        for v in values
+    ):
+        return False
+    for operator, key, condition_values in _condition_entries(statement):
+        if key not in PRINCIPAL_NARROWING_KEYS or not condition_values:
+            continue
+        prefix, base, if_exists = _condition_operator_parts(operator)
+        if if_exists or "not" in base or prefix or base == "null":
+            continue
+        if any("*" in v or "?" in v for v in condition_values):
+            continue
+        return False
+    return True
+
+
+def _broad_s3_endpoint_statement(policy: Dict[str, Any]) -> Optional[str]:
+    """
+    Return a description of the first Allow that lets any principal read or
+    write objects in every bucket, which is what the default full-access
+    endpoint policy does. Deny statements are not evaluated.
+    """
+    for statement in _sm_policy_statements(policy):
+        actions = [
+            a
+            for a in S3_ENDPOINT_DATA_ACTIONS
+            if _statement_allows_action(statement, a)
+        ]
+        if not actions:
+            continue
+        if "NotResource" in statement:
+            every_bucket = not any(
+                _iam_action_matches(p, S3_ENDPOINT_PROBE_OBJECT)
+                for p in _policy_values(statement.get("NotResource"))
+            )
+        else:
+            every_bucket = any(
+                fnmatch.fnmatchcase(S3_ENDPOINT_PROBE_OBJECT, p)
+                for p in _policy_values(statement.get("Resource"))
+            )
+        if every_bucket and _endpoint_policy_principal_is_anyone(statement):
+            return (
+                f"statement '{statement.get('Sid') or 'unnamed'}' allows "
+                f"{', '.join(actions)} on every bucket to any principal"
+            )
+    return None
+
+
 def _training_vpc_endpoint_findings(
     jobs_in_vpc: List[Dict[str, Any]],
     region: str,
@@ -10513,13 +10929,16 @@ def _training_vpc_endpoint_findings(
         "S3 and interface endpoints with private DNS for "
         "CloudWatch Logs, the SageMaker API, ecr.api and ecr.dkr."
     ),
+    judge_s3_policy: bool = False,
 ) -> List[Dict[str, Any]]:
     """
     AIR-SGM-TRN-01: every VPC a training job ran in needs an available endpoint
     for each service in TRAINING_REQUIRED_ENDPOINT_SERVICES. An interface
     endpoint counts only with private DNS on, since the job resolves the
     service's default hostname; S3 counts as a gateway or interface endpoint.
-    AIR-SGM-EP-08 calls it for transform job models with S3 only.
+    AIR-SGM-EP-08 calls it for transform job models with S3 only, and with
+    judge_s3_policy each S3 endpoint's policy must not grant object reads and
+    writes on every bucket to any principal.
     """
     subnets = sorted({s for job in jobs_in_vpc for s in job["subnets"] if s})
     if not subnets:
@@ -10537,6 +10956,7 @@ def _training_vpc_endpoint_findings(
                     if subnet.get("SubnetId") in subnets and subnet.get("VpcId"):
                         subnet_vpcs[subnet["SubnetId"]] = subnet["VpcId"]
         present = {vpc_id: set() for vpc_id in subnet_vpcs.values()}
+        s3_endpoints = {vpc_id: [] for vpc_id in present}
         vpce_paginator = ec2_client.get_paginator("describe_vpc_endpoints")
         for chunk in _chunked(sorted(present), SUBNET_LOOKUP_BATCH_SIZE):
             for page in vpce_paginator.paginate(
@@ -10558,6 +10978,8 @@ def _training_vpc_endpoint_findings(
                     ):
                         continue
                     present[vpce["VpcId"]].add(short)
+                    if short == "s3":
+                        s3_endpoints[vpce["VpcId"]].append(vpce)
     except Exception as error:
         logger.warning(f"Error reading training VPC endpoints: {str(error)}")
         return [
@@ -10580,6 +11002,7 @@ def _training_vpc_endpoint_findings(
 
     emitted = []
     complete = []
+    unread = []
     for vpc_id in sorted(present):
         missing = [service for service in services if service not in present[vpc_id]]
         jobs = sorted(
@@ -10589,7 +11012,51 @@ def _training_vpc_endpoint_findings(
                 if any(subnet_vpcs.get(s) == vpc_id for s in job["subnets"])
             }
         )
-        if missing:
+        broad = []
+        policy_unread = []
+        if judge_s3_policy and not missing:
+            for vpce in s3_endpoints[vpc_id]:
+                document = vpce.get("PolicyDocument")
+                try:
+                    policy = (
+                        json.loads(document) if isinstance(document, str) else document
+                    )
+                except ValueError:
+                    policy = None
+                if not isinstance(policy, dict):
+                    policy_unread.append(
+                        f"policy of S3 endpoint {vpce.get('VpcEndpointId')} in "
+                        f"{vpc_id} (not returned or not parsed)"
+                    )
+                    continue
+                statement = _broad_s3_endpoint_statement(policy)
+                if statement:
+                    broad.append(f"{vpce.get('VpcEndpointId')} ({statement})")
+        if broad:
+            emitted.append(
+                create_finding(
+                    check_id=check_id,
+                    finding_name=finding_name,
+                    finding_details=(
+                        f"VPC {vpc_id}, used by {subject}(s) "
+                        f"{', '.join(jobs[:5])}, reaches S3 through endpoint(s) "
+                        f"whose policy is not scoped: {'; '.join(broad)}. Deny "
+                        "statements were not evaluated, so a Deny could narrow it."
+                    ),
+                    resolution=(
+                        "Replace the S3 endpoint policy with one that allows object "
+                        "reads and writes only on the job's input and output "
+                        "buckets, or only to the job's execution role."
+                    ),
+                    reference=TRAINING_NETWORK_BOUNDARY_REFERENCE,
+                    severity="Medium",
+                    status="Failed",
+                    region=region,
+                )
+            )
+        elif policy_unread:
+            unread.extend(policy_unread)
+        elif missing:
             emitted.append(
                 create_finding(
                     check_id=check_id,
@@ -10615,12 +11082,20 @@ def _training_vpc_endpoint_findings(
         f"{len(complete)} VPC(s) used by {subject}s have an endpoint for every "
         f"required service: {', '.join(complete) or 'none'}."
     )
-    if unresolved:
+    if judge_s3_policy:
+        read_details += (
+            " Their S3 endpoint policies do not grant object reads and writes on "
+            "every bucket to any principal; whether the buckets and principals "
+            "they name are the job's own is a workload decision this check does "
+            "not judge."
+        )
+    unread.extend(f"subnet {s} (not found by ec2:DescribeSubnets)" for s in unresolved)
+    if unread:
         emitted.append(
             _unread_resources_finding(
                 check_id,
                 finding_name,
-                [f"subnet {s} (not found by ec2:DescribeSubnets)" for s in unresolved],
+                unread,
                 read_details,
                 TRAINING_NETWORK_BOUNDARY_REFERENCE,
                 region,
@@ -11086,10 +11561,22 @@ CREATION_GUARDRAIL_REFERENCE = (
 )
 
 # The creation actions this control names, with the resource type each creates.
+# A batch transform job takes its network posture from its model, so
+# CreateModel carries the network keys and CreateTransformJob the KMS keys.
 SAGEMAKER_GUARDED_CREATE_ACTIONS = (
     ("sagemaker:CreateTrainingJob", "training-job"),
     ("sagemaker:CreateEndpointConfig", "endpoint-config"),
     ("sagemaker:CreateNotebookInstance", "notebook-instance"),
+    ("sagemaker:CreateModel", "model"),
+    ("sagemaker:CreateTransformJob", "transform-job"),
+)
+# The creation actions that define sagemaker:VpcSubnets and
+# sagemaker:VpcSecurityGroupIds. CreateTransformJob defines neither.
+SAGEMAKER_NETWORK_CREATE_ACTIONS = (
+    "sagemaker:CreateTrainingJob",
+    "sagemaker:CreateEndpointConfig",
+    "sagemaker:CreateNotebookInstance",
+    "sagemaker:CreateModel",
 )
 
 # Each guardrail category as (action, key group) requirements. Every requirement
@@ -11110,13 +11597,15 @@ SAGEMAKER_CREATION_GUARDRAILS = (
             ),
             ("sagemaker:CreateEndpointConfig", ("sagemaker:VolumeKmsKeyArn",)),
             ("sagemaker:CreateNotebookInstance", ("sagemaker:VolumeKmsKeyArn",)),
+            ("sagemaker:CreateTransformJob", ("sagemaker:VolumeKmsKeyArn",)),
+            ("sagemaker:CreateTransformJob", ("sagemaker:OutputKmsKeyArn",)),
         ),
     ),
     (
         "approved network",
         tuple(
             (action, ("sagemaker:VpcSubnets", "sagemaker:VpcSecurityGroupIds"))
-            for action, _ in SAGEMAKER_GUARDED_CREATE_ACTIONS
+            for action in SAGEMAKER_NETWORK_CREATE_ACTIONS
         ),
     ),
     (
@@ -11125,6 +11614,7 @@ SAGEMAKER_CREATION_GUARDRAILS = (
             ("sagemaker:CreateTrainingJob", ("sagemaker:NetworkIsolation",)),
             ("sagemaker:CreateEndpointConfig", ("sagemaker:NetworkIsolation",)),
             ("sagemaker:CreateNotebookInstance", ("sagemaker:DirectInternetAccess",)),
+            ("sagemaker:CreateModel", ("sagemaker:NetworkIsolation",)),
         ),
     ),
 )
@@ -11145,6 +11635,8 @@ CREATION_KEY_NONCOMPLIANT_VALUES = {
     "sagemaker:rootaccess": "enabled",
 }
 CREATION_PROBE_PARTITIONS = ("aws", "aws-cn", "aws-us-gov")
+# The ArrayOfString keys among them, per the sagemaker service-reference JSON.
+MULTIVALUED_CREATION_KEYS = {"sagemaker:vpcsubnets", "sagemaker:vpcsecuritygroupids"}
 
 NOTEBOOK_ACCESS_GUARDRAIL_FINDING = "SageMaker Notebook Access Guardrail"
 NOTEBOOK_ACCESS_GUARDRAIL_REFERENCE = (
@@ -11371,10 +11863,15 @@ def _deny_guard_strength(statement: Dict[str, Any], keys: tuple) -> Optional[str
     Classify how a Deny statement holds one key group.
 
     "enforced": it fires when the key is absent or holds a non-compliant value.
-    "value": it fires only for one named value whose compliance this check does
-    not judge. "absent-open": it does not fire when the request omits the key.
-    "conjunctive": the key shares the statement with other conditions, so the
-    deny fires only when all of them hold. None: the key is not named.
+    "presence": it fires when the key is absent but admits a non-compliant
+    value: a Null test, a negated Like on a wildcard value, or ForAllValues on a
+    multivalued key, which admits a request that mixes an approved value with
+    an unapproved one. "value": it fires only for one named value whose
+    compliance this check does not judge. "absent-open": it fires for a
+    non-compliant value but not when the request omits the key. A "presence"
+    and an "absent-open" Deny together enforce the key. "conjunctive": the key
+    shares the statement with other conditions, so the deny fires only when all
+    of them hold. None: the key is not named.
     """
     entries = _condition_entries(statement)
     matched = [entry for entry in entries if entry[1] in keys]
@@ -11385,11 +11882,17 @@ def _deny_guard_strength(statement: Dict[str, Any], keys: tuple) -> Optional[str
     operator, key, values = matched[0]
     prefix, base, if_exists = _condition_operator_parts(operator)
     if base == "null":
-        return "enforced" if "true" in values else "value"
+        return "presence" if "true" in values else "value"
     if "not" in base:
         # A negated operator is true for an absent key, except under
         # ForAnyValue, which is false over an empty set.
-        return "absent-open" if prefix == "foranyvalue" else "enforced"
+        if _like_values_unbounded(base, values):
+            return "value" if prefix == "foranyvalue" else "presence"
+        if prefix == "foranyvalue":
+            return "absent-open"
+        if prefix == "forallvalues" and key in MULTIVALUED_CREATION_KEYS:
+            return "presence"
+        return "enforced"
     noncompliant = CREATION_KEY_NONCOMPLIANT_VALUES.get(key)
     if noncompliant is not None and noncompliant in values:
         if if_exists or prefix == "forallvalues":
@@ -11398,24 +11901,47 @@ def _deny_guard_strength(statement: Dict[str, Any], keys: tuple) -> Optional[str
     return "value"
 
 
+def _deny_pair_enforces(strengths: set) -> bool:
+    """A Deny that fires on an absent key and one that fires on a
+    non-compliant value together enforce the key."""
+    return "enforced" in strengths or {"presence", "absent-open"} <= strengths
+
+
+def _like_values_unbounded(base: str, values: List[str]) -> bool:
+    """Return whether a Like operator's values hold a wildcard, which admits
+    values beyond any approved list."""
+    return "like" in base and any("*" in v or "?" in v for v in values)
+
+
 def _allow_enforces_key(statement: Dict[str, Any], keys: tuple) -> bool:
     """
     Return whether an Allow grants only requests that carry a compliant key.
 
-    IfExists, ForAllValues and negated operators all match a request that omits
-    the key, so none of them enforces it.
+    IfExists and negated operators match a request that omits the key, so
+    neither enforces it. ForAllValues does too, unless the statement also holds
+    a Null false test on the same key. A Null test and a Like on a wildcard value
+    require only that the key is present. ForAnyValue on a multivalued key
+    admits a request that mixes an approved value with an unapproved one.
     """
-    for operator, key, values in _condition_entries(statement):
+    entries = _condition_entries(statement)
+    required = {
+        key
+        for operator, key, values in entries
+        if _condition_operator_parts(operator)[1] == "null" and values == ["false"]
+    }
+    for operator, key, values in entries:
         if key not in keys:
             continue
         prefix, base, if_exists = _condition_operator_parts(operator)
-        if if_exists or prefix == "forallvalues" or "not" in base:
+        if if_exists or "not" in base:
+            continue
+        if base == "null" or _like_values_unbounded(base, values):
+            continue
+        if prefix == "forallvalues" and key not in required:
+            continue
+        if prefix == "foranyvalue" and key in MULTIVALUED_CREATION_KEYS:
             continue
         compliant = CREATION_KEY_COMPLIANT_VALUES.get(key)
-        if base == "null":
-            if compliant is None and values == ["false"]:
-                return True
-            continue
         if compliant is None or (values and all(v == compliant for v in values)):
             return True
     return False
@@ -11435,12 +11961,14 @@ def _statements_leave_creation_open(
 def _denies_enforce(
     statements: List[Dict[str, Any]], action: str, resource_type: str, keys: tuple
 ) -> bool:
-    return any(
-        str(statement.get("Effect", "")).upper() == "DENY"
-        and _statement_names_action(statement, action)
-        and _deny_covers_every_resource(statement, resource_type)
-        and _deny_guard_strength(statement, keys) == "enforced"
-        for statement in statements
+    return _deny_pair_enforces(
+        {
+            _deny_guard_strength(statement, keys)
+            for statement in statements
+            if str(statement.get("Effect", "")).upper() == "DENY"
+            and _statement_names_action(statement, action)
+            and _deny_covers_every_resource(statement, resource_type)
+        }
     )
 
 
@@ -11463,9 +11991,11 @@ def _creation_identity_leg(
     ):
         for name, permissions in (permission_cache.get(cache_key) or {}).items():
             statements = []
-            for policy in (permissions.get("attached_policies") or []) + (
-                permissions.get("inline_policies") or []
-            ):
+            for policy in [
+                *(permissions.get("attached_policies") or []),
+                *(permissions.get("inline_policies") or []),
+                *(permissions.get("group_policies") or []),
+            ]:
                 statements.extend(_sm_policy_statements(policy.get("document")))
             boundary = permissions.get("permissions_boundary")
             boundary_statements = (
@@ -11501,14 +12031,17 @@ def _creation_scp_leg(scp: Dict[str, Any], action: str, keys: tuple) -> Dict[str
     """
     Report whether an SCP governing this account enforces keys on action.
 
-    Returns a state of "enforced", "unattached", "value", "absent-open",
-    "conjunctive", "attachment-unread", "missing" or the leg-wide state
-    ("none", "unread", "exempt"), with the policy names behind it.
+    Returns a state of "enforced", "unattached", "value", "presence",
+    "absent-open", "conjunctive", "attachment-unread", "missing" or the
+    leg-wide state ("none", "unread", "exempt"), with the policy names behind
+    it. An attached "presence" Deny and an attached "absent-open" Deny that
+    both cover every resource are "enforced" together.
     """
     if scp["state"] != "read":
         return {"state": scp["state"], "policies": []}
     resource_type = GUARDED_ACTION_RESOURCE_TYPES[action]
     found = {}
+    halves = {}
     for item in scp["items"]:
         for statement in _sm_policy_statements(item.get("content")):
             if str(statement.get("Effect", "")).upper() != "DENY":
@@ -11522,23 +12055,53 @@ def _creation_scp_leg(scp: Dict[str, Any], action: str, keys: tuple) -> Dict[str
                 statement, resource_type
             ):
                 strength = "conjunctive"
-            if strength == "enforced":
-                if "targets_error" in item:
-                    strength = "attachment-unread"
-                elif not {
-                    target.get("TargetId") for target in item.get("targets") or []
-                } & set(scp["path"]):
-                    strength = "unattached"
+            if "targets_error" in item:
+                attachment = "attachment-unread"
+            elif not {
+                target.get("TargetId") for target in item.get("targets") or []
+            } & set(scp["path"]):
+                attachment = "unattached"
+            else:
+                attachment = "attached"
+            if strength == "enforced" and attachment != "attached":
+                strength = attachment
+            elif strength in ("presence", "absent-open") and (
+                _deny_covers_every_resource(statement, resource_type)
+            ):
+                halves.setdefault((strength, attachment), [])
+                if item["name"] not in halves[(strength, attachment)]:
+                    halves[(strength, attachment)].append(item["name"])
             found.setdefault(strength, [])
             if item["name"] not in found[strength]:
                 found[strength].append(item["name"])
+    # A presence Deny and a value Deny enforce together, and the pair is only
+    # as attached as its least attached half.
+    admitted = []
+    pair_state = None
+    for state in ("attached", "attachment-unread", "unattached"):
+        admitted.append(state)
+        pair = {
+            strength: names
+            for (strength, attachment), names in halves.items()
+            if attachment in admitted
+        }
+        if "enforced" not in found and _deny_pair_enforces(set(pair)):
+            names = [n for names in pair.values() for n in names]
+            if state == "attached":
+                found["enforced"] = list(dict.fromkeys(names))
+            else:
+                pair_state = {"state": state, "policies": list(dict.fromkeys(names))}
+            break
     if "enforced" not in found and scp.get("unread_policies"):
         return {"state": "documents-unread", "policies": scp["unread_policies"]}
+    if "enforced" not in found and pair_state:
+        return pair_state
     for state in (
         "enforced",
         "attachment-unread",
         "conjunctive",
         "value",
+        "presence",
         "absent-open",
         "unattached",
     ):
@@ -11583,15 +12146,21 @@ def _creation_scp_reason(scp_leg: Dict[str, Any], scp: Dict[str, Any]) -> str:
         return (
             f"service control policy {names} does not deny a request that omits the key"
         )
+    if state == "presence":
+        return (
+            f"service control policy {names} denies only a request that omits "
+            "the key, so it admits any value"
+        )
     return "no service control policy Deny on this action names the key"
 
 
 CREATION_GUARDRAIL_RESOLUTION = (
     "Deny the named create action in a service control policy "
-    "attached above this account when the key is absent (Null true) or "
-    "outside the approved values (ArnNotEquals or StringNotEquals), or "
-    "add an Allow condition on the key to every policy that grants the "
-    "action. Use sagemaker:VolumeKmsKeyArn and "
+    "attached above this account when the key is outside the approved "
+    "values (ArnNotEquals or StringNotEquals, which also fire when the key "
+    "is absent), or add an Allow condition naming the approved values to "
+    "every policy that grants the action. A Null test alone admits any "
+    "value. Use sagemaker:VolumeKmsKeyArn and "
     "sagemaker:OutputKmsKeyArn: the short key names are defined by no "
     "action and enforce nothing."
 )
@@ -11638,6 +12207,7 @@ def _creation_category_finding(
             )
         elif identity["state"] == "open" and scp_leg["state"] in (
             "missing",
+            "presence",
             "absent-open",
             "unattached",
             "none",
@@ -11696,14 +12266,15 @@ def _creation_category_finding(
             finding_details=(
                 f"{len(unresolved)} of {total} {category} requirements could not be "
                 f"established: {'; '.join(unresolved[:3])}. This check recognises "
-                "a Deny that fires when the key is absent (Null true, a negated "
-                "operator or an IfExists form) as the only condition of its "
-                f"statement.{identity_notes}"
+                "a Deny that fires both when the key is absent and when it holds "
+                "a non-compliant value (a negated operator naming the approved "
+                "values, or an IfExists form naming the non-compliant value) as "
+                f"the only condition of its statement.{identity_notes}"
             ),
             resolution=(
-                "Restate the deny so it fires when the key is absent, using Null "
-                "with value true or a negated operator naming the approved values, "
-                "and resolve the unread reads named above."
+                "Restate the deny with a negated operator naming the approved "
+                "values, which also fires when the key is absent, and resolve "
+                "the unread reads named above."
             ),
             reference=reference,
             severity="Informational",
@@ -11943,6 +12514,10 @@ SECURITY_SERVICE_PRINCIPALS = (
     ("AWS Config", "config.amazonaws.com"),
     ("IAM Access Analyzer", "access-analyzer.amazonaws.com"),
     ("AWS CloudTrail", "cloudtrail.amazonaws.com"),
+    ("Amazon Detective", "detective.amazonaws.com"),
+    ("Amazon Security Lake", "securitylake.amazonaws.com"),
+    ("AWS Firewall Manager", "fms.amazonaws.com"),
+    ("AWS Audit Manager", "auditmanager.amazonaws.com"),
 )
 SECURITY_SERVICE_LIST_TEXT = ", ".join(name for name, _ in SECURITY_SERVICE_PRINCIPALS)
 DELEGATED_ADMIN_CONSOLIDATION_FINDING = (
@@ -12190,13 +12765,77 @@ CENTRAL_CONFIGURATION_REFERENCE = (
     "https://docs.aws.amazon.com/securityhub/latest/userguide/"
     "central-configuration-intro.html"
 )
-CENTRAL_CONFIGURATION_ASSOCIATION_NOT_READ = (
-    "The configuration policy associated with this account was not read, so "
-    "whether that policy enables the AI Security Best Practices standard is not "
-    "established. Reading it needs securityhub:GetConfigurationPolicyAssociation, "
-    "which has no IAM resource type and would need a Resource '*' grant that is "
-    "not approved for this assessment."
-)
+SELF_MANAGED_CONFIGURATION_POLICY_ID = "SELF_MANAGED_SECURITY_HUB"
+
+
+def _central_configuration_association_finding(region: str, row) -> Dict[str, Any]:
+    """SM-36: read the configuration policy association of this account.
+
+    GetConfigurationPolicyAssociation answers only for the Security Hub
+    delegated administrator in the home Region, so any other caller reads N/A.
+    Whether an associated policy enables the AI standard is in the policy
+    itself, which only securityhub:GetConfigurationPolicy returns.
+    """
+    try:
+        account_id = boto3.client(
+            "sts", config=boto3_config, region_name=region
+        ).get_caller_identity()["Account"]
+        client = boto3.client("securityhub", config=boto3_config, region_name=region)
+        association = client.get_configuration_policy_association(
+            Target={"AccountId": account_id}
+        )
+    except Exception as error:
+        return row(
+            "Security Hub central configuration is enabled for the organization "
+            "(ConfigurationType CENTRAL, Status ENABLED), but the configuration "
+            "policy associated with this account was not read: "
+            "securityhub:GetConfigurationPolicyAssociation failed. It answers only "
+            "for the Security Hub delegated administrator in the home Region. "
+            + build_could_not_assess_detail(error, region),
+            COULD_NOT_ASSESS_RESOLUTION,
+            "Informational",
+            "N/A",
+            name=f"{CENTRAL_CONFIGURATION_FINDING} Incomplete",
+        )
+    policy_id = str(association.get("ConfigurationPolicyId") or "")
+    status = str(association.get("AssociationStatus") or "")
+    how = str(association.get("AssociationType") or "not returned").lower()
+    if policy_id == SELF_MANAGED_CONFIGURATION_POLICY_ID:
+        return row(
+            f"Under central configuration, this account ({account_id}) is "
+            f"associated ({how}) with self-managed behavior, so the account "
+            "enables its own standards and no configuration policy enforces the "
+            "AI Security Best Practices standard on it.",
+            "From the Security Hub delegated administrator, associate this account "
+            "with a configuration policy that enables the AI Security Best "
+            "Practices standard.",
+            "Medium",
+            "Failed",
+        )
+    if status == "FAILED":
+        return row(
+            f"The association of configuration policy {policy_id or 'not returned'} "
+            f"with this account ({account_id}) is in AssociationStatus FAILED, so "
+            "the policy is not applied: "
+            f"{association.get('AssociationStatusMessage') or 'no status message'}.",
+            "Resolve the association failure from the Security Hub delegated "
+            "administrator.",
+            "Medium",
+            "Failed",
+        )
+    return row(
+        f"This account ({account_id}) is associated ({how}) with configuration "
+        f"policy {policy_id or 'not returned'}, in AssociationStatus "
+        f"{status or 'not returned'}, as securityhub:"
+        "GetConfigurationPolicyAssociation reports. Whether that policy enables "
+        "the AI Security Best Practices standard was not read: it needs "
+        "securityhub:GetConfigurationPolicy, which this role is not granted.",
+        "Grant securityhub:GetConfigurationPolicy on the configuration policy and "
+        "retry.",
+        "Informational",
+        "N/A",
+        name=f"{CENTRAL_CONFIGURATION_FINDING} Incomplete",
+    )
 
 
 def _security_hub_central_configuration_finding(region: str) -> Dict[str, Any]:
@@ -12233,15 +12872,7 @@ def _security_hub_central_configuration_finding(region: str) -> Dict[str, Any]:
     configuration_type = configuration.get("ConfigurationType")
     configuration_status = configuration.get("Status")
     if configuration_type == "CENTRAL" and configuration_status == "ENABLED":
-        return _row(
-            "Security Hub central configuration is enabled for the organization "
-            "(ConfigurationType CENTRAL, Status ENABLED). "
-            + CENTRAL_CONFIGURATION_ASSOCIATION_NOT_READ,
-            COULD_NOT_ASSESS_RESOLUTION,
-            "Informational",
-            "N/A",
-            name=f"{CENTRAL_CONFIGURATION_FINDING} Incomplete",
-        )
+        return _central_configuration_association_finding(region, _row)
     if configuration_type == "CENTRAL":
         return _row(
             "Security Hub central configuration was requested but is in Status "
@@ -12480,10 +13111,42 @@ ENDPOINT_FLOW_LOG_SCOPE_NOTE = (
     "GuardDuty foundational flow-log analysis covers EC2 network interfaces, not "
     "SageMaker endpoints, so the customer flow log is the only network telemetry "
     "for an endpoint. AgentCore Runtime is not read by this module. Whether an "
-    "alarm has fired and been triaged is not recorded by any CloudWatch API and "
-    "was not assessed."
+    "alarm has fired is recorded by cloudwatch:DescribeAlarmHistory, which this "
+    "assessment role is not granted, so no alarm history was read; whether a "
+    "fired alarm was triaged is not recorded by any CloudWatch API."
 )
 FLOW_LOG_ALERTING_TRAFFIC_TYPES = ("ALL", "ACCEPT")
+FLOW_LOG_RECORD_TERM = re.compile(
+    r"^(ACCEPT|REJECT|OK|NODATA|SKIPDATA|\d[\d.:]*|(eni|vpc|subnet|i)-[0-9a-f]+)$"
+)
+
+
+def _filter_pattern_selects_flow_records(metric_filter: Dict[str, Any]) -> bool:
+    """
+    Whether a metric filter's pattern can match a default flow-log record.
+
+    Flow-log records are space-delimited text. An empty pattern matches every
+    record and a bracketed pattern selects its fields; a JSON pattern matches
+    only when the filter runs on transformed logs. A term pattern matches only
+    when every required term, and at least one optional (?) term, is a token a
+    flow-log record carries; exclusion (-) terms never stop a match.
+    """
+    pattern = (metric_filter.get("filterPattern") or "").strip()
+    if not pattern or pattern.startswith("["):
+        return True
+    if pattern.startswith("{"):
+        return bool(metric_filter.get("applyOnTransformedLogs"))
+    required, optional = [], []
+    for term in pattern.split():
+        if term.startswith("-"):
+            continue
+        bucket = optional if term.startswith("?") else required
+        bucket.append(term.lstrip("?").strip('"'))
+    if not required and not optional:
+        return True
+    return all(FLOW_LOG_RECORD_TERM.match(t) for t in required) and (
+        not optional or any(FLOW_LOG_RECORD_TERM.match(t) for t in optional)
+    )
 
 
 def _alarm_metrics(alarm: Dict[str, Any]) -> List[tuple]:
@@ -12617,6 +13280,7 @@ def check_sagemaker_endpoint_flow_log_alerting(region: str = "") -> Dict[str, An
     logs_client = boto3.client("logs", config=boto3_config, region_name=region)
     group_metrics = {}
     group_errors = {}
+    unmatched_filters = {}
     for group in sorted({g for groups in alerting_logs.values() for g in groups}):
         try:
             metrics = set()
@@ -12625,6 +13289,12 @@ def check_sagemaker_endpoint_flow_log_alerting(region: str = "") -> Dict[str, An
             ):
                 for metric_filter in page.get("metricFilters", []):
                     if metric_filter.get("logGroupName") not in (None, group):
+                        continue
+                    if not _filter_pattern_selects_flow_records(metric_filter):
+                        unmatched_filters.setdefault(group, []).append(
+                            f"'{metric_filter.get('filterName')}' "
+                            f"({metric_filter.get('filterPattern')!r})"
+                        )
                         continue
                     for transformation in (
                         metric_filter.get("metricTransformations") or []
@@ -12679,26 +13349,36 @@ def check_sagemaker_endpoint_flow_log_alerting(region: str = "") -> Dict[str, An
             )
             continue
         uncovered = []
-        groups = set()
+        unalarmed = {}
+        alarmed = []
         for subnet in subnets:
             covering = alerting_logs.get(subnet, set()) | alerting_logs.get(
                 subnet_vpc.get(subnet), set()
             )
             if not covering:
                 uncovered.append(subnet)
-            groups |= covering
+                continue
+            hits = [
+                g
+                for g in sorted(covering)
+                if group_metrics.get(g, set()) & alarmed_metrics
+            ]
+            if hits:
+                alarmed.append(hits[0])
+            else:
+                unalarmed[subnet] = covering
         if uncovered:
             failed.append(
                 f"endpoint '{name}': no ACTIVE flow log capturing accepted traffic "
                 f"into CloudWatch Logs covers {', '.join(uncovered)}"
             )
             continue
+        groups = {g for covering in unalarmed.values() for g in covering}
         unread_groups = sorted(g for g in groups if g in group_errors)
-        alarmed = [
-            g for g in sorted(groups) if group_metrics.get(g, set()) & alarmed_metrics
-        ]
-        if alarmed:
-            passed.append(f"endpoint '{name}' (log group {alarmed[0]})")
+        if not unalarmed:
+            passed.append(
+                f"endpoint '{name}' (log group {', '.join(sorted(set(alarmed)))})"
+            )
         elif unread_groups:
             unread.append(
                 f"metric filters of {', '.join(unread_groups)} for endpoint '{name}' "
@@ -12709,9 +13389,21 @@ def check_sagemaker_endpoint_flow_log_alerting(region: str = "") -> Dict[str, An
                 f"alarms for endpoint '{name}' (cloudwatch:DescribeAlarms: {alarm_error})"
             )
         else:
+            unmatched = [
+                f"{g}: {', '.join(unmatched_filters[g])}"
+                for g in sorted(groups)
+                if g in unmatched_filters
+            ]
             failed.append(
                 f"endpoint '{name}': flow log group(s) {', '.join(sorted(groups))} "
-                "have no metric filter whose metric an alarm with an action evaluates"
+                f"covering {', '.join(sorted(unalarmed))} have no metric filter "
+                "whose metric an alarm with an action evaluates"
+                + (
+                    " (filter(s) whose pattern matches no flow-log record: "
+                    f"{'; '.join(unmatched)})"
+                    if unmatched
+                    else ""
+                )
             )
 
     if failed:
@@ -15281,7 +15973,7 @@ def lambda_handler(event, context):
 
         logger.info("Running SageMaker model network isolation check")
         model_isolation_findings = check_sagemaker_model_network_isolation(
-            region=region
+            region=region, permission_cache=permission_cache
         )
         all_findings.append(model_isolation_findings)
 
