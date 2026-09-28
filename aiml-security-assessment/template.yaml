@@ -1074,15 +1074,15 @@ Resources:
               Effect: Allow
               Action:
                 # Formerly IAMServiceLastAccessResults
-                - iam:GetServiceLastAccessedDetails
+                - iam:GetServiceLastAccessedDetails # AC-03
                 # Formerly AgentCoreAccountInventoryPermissions
-                - bedrock-agentcore:ListAgentRuntimes
-                - bedrock-agentcore:ListMemories
-                - bedrock-agentcore:ListGateways
-                - bedrock-agentcore:ListPolicyEngines
-                - bedrock-agentcore:ListCodeInterpreters
-                - bedrock-agentcore:ListBrowsers
-                - bedrock-agentcore:ListOnlineEvaluationConfigs
+                - bedrock-agentcore:ListAgentRuntimes # AC-01, AC-04, AC-08, AC-10, AC-17, AC-19, AC-30, AC-34, AC-45, AC-46, AC-47, AC-48, AC-49, AC-50, AC-52, AC-53
+                - bedrock-agentcore:ListMemories # AC-07, AC-19, AC-48
+                - bedrock-agentcore:ListGateways # AC-08, AC-10, AC-12, AC-13, AC-19, AC-24, AC-25, AC-27, AC-31, AC-34, AC-35, AC-37, AC-38, AC-48, AC-51, AC-52, AC-53
+                - bedrock-agentcore:ListPolicyEngines # AC-11, AC-36, AC-53
+                - bedrock-agentcore:ListCodeInterpreters # AC-01, AC-15, AC-45, AC-48, AC-49
+                - bedrock-agentcore:ListBrowsers # AC-01, AC-06, AC-16, AC-45, AC-48, AC-49
+                - bedrock-agentcore:ListOnlineEvaluationConfigs # AC-17, AC-39, AC-40, AC-41, AC-42, AC-43, AC-44
                 # AC-40 classifies the evaluators an online evaluation attaches
                 # against the account's catalogue. ListEvaluators has no
                 # resource-level authorization: its "Resource types" cell is
@@ -1090,21 +1090,21 @@ Resources:
                 # https://docs.aws.amazon.com/service-authorization/latest/reference/list_bedrock-agentcore.html
                 # while GetEvaluator in the same table carries evaluator*, so an
                 # ARN on this action denies the call.
-                - bedrock-agentcore:ListEvaluators
+                - bedrock-agentcore:ListEvaluators # AC-40
                 # Formerly AgentCoreTokenVaultRead
                 # GetTokenVault authorizes against "*" at runtime despite the
                 # token-vault resource type documented for the action.
-                - bedrock-agentcore:GetTokenVault
+                - bedrock-agentcore:GetTokenVault # AC-14
                 # Formerly EC2Permissions
-                - ec2:DescribeSubnets
-                - ec2:DescribeRouteTables
-                - ec2:DescribeVpcEndpoints
-                - ec2:DescribeVpcs
+                - ec2:DescribeSubnets # AC-01, AC-08, AC-49
+                - ec2:DescribeRouteTables # AC-01, AC-49
+                - ec2:DescribeVpcEndpoints # AC-08
+                - ec2:DescribeVpcs # AC-08
                 # AC-08 reads the inbound rules of each AgentCore endpoint's
                 # security groups, and AC-01 the outbound rules of each VPC
                 # runtime and built-in tool group. DescribeSecurityGroups has no
                 # resource-level authorization.
-                - ec2:DescribeSecurityGroups
+                - ec2:DescribeSecurityGroups # AC-01, AC-08
                 # Formerly DNSFirewallAssociationInventory
                 # ListFirewallRuleGroupAssociations and ListFirewallDomainLists
                 # have no resource-level authorization.
@@ -1117,18 +1117,18 @@ Resources:
                 # takes '*'.
                 - ecr:GetRegistryScanningConfiguration # AC-50
                 # Formerly LogsPermissions
-                - logs:DescribeLogGroups
+                - logs:DescribeLogGroups # AC-04, AC-20, AC-26, AC-41
                 # Formerly CloudTrailTrailInventory
-                - cloudtrail:ListTrails
+                - cloudtrail:ListTrails # AC-18, AC-26
                 # Formerly LogsDeliveryInventory
-                - logs:DescribeDeliverySources
-                - logs:DescribeDeliveries
+                - logs:DescribeDeliverySources # AC-04, AC-19, AC-20, AC-46
+                - logs:DescribeDeliveries # AC-04, AC-19, AC-20, AC-46
                 # Formerly LogsAccountPolicyInventory
-                - logs:DescribeAccountPolicies
+                - logs:DescribeAccountPolicies # AC-20
                 # Formerly ObservabilitySinkInventory
-                - oam:ListSinks
+                - oam:ListSinks # AC-22
                 # Formerly OrganizationsInventoryPermissions
-                - organizations:ListPolicies
+                - organizations:ListPolicies # AC-26, AC-28, AC-29
                 # Formerly AgentCoreCompositeAlarmRead
                 # AC-36, AC-40, AC-45, AC-46 and AC-53 credit an alarm actioned
                 # through a composite alarm. The CloudWatch API reference page
@@ -1370,11 +1370,15 @@ Resources:
               Action:
                 - network-firewall:DescribeFirewall # AC-49
                 - network-firewall:DescribeRuleGroup # AC-49
-                - network-firewall:DescribeFirewallPolicy # AC-49
               Resource:
                 - !Sub 'arn:${AWS::Partition}:network-firewall:*:${AWS::AccountId}:firewall/*'
-                - !Sub 'arn:${AWS::Partition}:network-firewall:*:${AWS::AccountId}:firewall-policy/*'
                 - !Sub 'arn:${AWS::Partition}:network-firewall:*:*:stateful-rulegroup/*'
+            - Sid: FirewallPolicyRead
+              # AC-49 reads the policy each such firewall names, in this account.
+              Effect: Allow
+              Action:
+                - network-firewall:DescribeFirewallPolicy # AC-49
+              Resource: !Sub 'arn:${AWS::Partition}:network-firewall:*:${AWS::AccountId}:firewall-policy/*'
             - Sid: PrefixListEntryRead
               # AC-01 and AC-08 resolve the prefix lists a security group rule
               # names. AWS-managed lists carry the account segment aws, and a

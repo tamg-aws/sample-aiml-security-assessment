@@ -1220,13 +1220,16 @@ def test_agentcore_round2_reads_wildcard_only_enumerations(template):
             (
                 "network-firewall:DescribeFirewall",
                 "network-firewall:DescribeRuleGroup",
-                "network-firewall:DescribeFirewallPolicy",
             ),
             (
                 "network-firewall:*:${AWS::AccountId}:firewall/*",
                 "network-firewall:*:*:stateful-rulegroup/*",
-                "network-firewall:*:${AWS::AccountId}:firewall-policy/*",
             ),
+        ),
+        # Its own statement, so the policy ARN pairs with no other action.
+        "FirewallPolicyRead": (
+            ("network-firewall:DescribeFirewallPolicy",),
+            ("network-firewall:*:${AWS::AccountId}:firewall-policy/*",),
         ),
         "PrefixListEntryRead": (
             ("ec2:GetManagedPrefixListEntries",),
@@ -1263,6 +1266,12 @@ def test_agentcore_round2_reads_wildcard_only_enumerations(template):
         for resource in resources:
             assert resource in statement
         assert not re.search(r"Resource:\s+['\"]\*['\"]", statement)
+
+    firewall = _statement_block(
+        template, "AgentCoreSecurityAssessmentFunction", "NetworkFirewallRead"
+    )
+    assert "firewall-policy/" not in firewall
+    assert "DescribeFirewallPolicy" not in firewall
 
     # Not approved, so the AgentCore role must not hold it.
     agentcore = _actions(template, "AgentCoreSecurityAssessmentFunction")

@@ -911,7 +911,7 @@ read-only grants: `events:ListTargetsByRule` on `rule/*`,
 `bedrock-agentcore:ListAgentRuntimeVersions` on `'*'`, which have no resource
 type. Its fifteen unconditioned `Resource: '*'` statements are folded into one,
 `AgentCoreReadsWithoutResourceType`, with the same set of granted actions, so
-the role renders to 8,480 inline-policy characters in `aws-us-gov`, below the
+the role renders to 8,548 inline-policy characters in `aws-us-gov`, below the
 9,000-character project budget.
 
 **Deployment-stack update and CodeBuild run required.** The
