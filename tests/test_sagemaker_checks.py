@@ -353,6 +353,88 @@ class TestSM04GuardDuty:
             assert_finding_schema(f)
 
 
+class TestSM04SecurityHubRouting:
+    """AIR-FND-DET-02: GuardDuty findings reach Security Hub."""
+
+    GUARDDUTY = (
+        "arn:aws:securityhub:us-east-1:111122223333:product-subscription/aws/guardduty"
+    )
+
+    def _rows(self, mock_client, pages=None, error=None, status="ENABLED"):
+        client = MagicMock()
+        if error is not None:
+            client.get_paginator.side_effect = error
+        else:
+            client.get_paginator.side_effect = _pager(
+                {"list_enabled_products_for_import": pages}
+            )
+        mock_client.return_value = client
+        inventory = {
+            "detector_id": "d-1",
+            "detail": {"Status": status},
+            "error": None,
+        }
+        return extract_csv_data(
+            sagemaker_app.check_guardduty_enabled("us-east-1", inventory)
+        )
+
+    @patch("sagemaker_app.boto3.client")
+    def test_passed_text_claims_only_the_detector_status(self, mock_client):
+        rows = self._rows(mock_client, [{"ProductSubscriptions": [self.GUARDDUTY]}])
+        assert rows[0]["Status"] == "Passed"
+        assert "monitoring for security threats" not in rows[0]["Finding_Details"]
+        assert "Status ENABLED" in rows[0]["Finding_Details"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_guardduty_integration_on_a_later_page_passes(self, mock_client):
+        rows = self._rows(
+            mock_client,
+            [
+                {
+                    "ProductSubscriptions": [
+                        self.GUARDDUTY.replace("aws/guardduty", "aws/inspector")
+                    ]
+                },
+                {"ProductSubscriptions": [self.GUARDDUTY]},
+            ],
+        )
+        assert [r["Finding"] for r in rows] == [
+            "GuardDuty Enabled",
+            sagemaker_app.GUARDDUTY_ROUTING_FINDING,
+        ]
+        assert rows[1]["Status"] == "Passed"
+
+    @patch("sagemaker_app.boto3.client")
+    def test_lookalike_subscription_does_not_count(self, mock_client):
+        rows = self._rows(
+            mock_client,
+            [
+                {
+                    "ProductSubscriptions": [
+                        self.GUARDDUTY.replace("aws/guardduty", "partner/guardduty"),
+                        self.GUARDDUTY + "-archive",
+                    ]
+                }
+            ],
+        )
+        assert rows[1]["Status"] == "Failed"
+        assert "2 enabled product integration(s)" in rows[1]["Finding_Details"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_read_failure_is_incomplete_not_failed_or_passed(self, mock_client):
+        rows = self._rows(
+            mock_client, error=_make_client_error("InvalidAccessException")
+        )
+        assert rows[1]["Status"] == "N/A"
+        assert rows[1]["Finding"].endswith("Incomplete")
+        assert "ListEnabledProductsForImport" in rows[1]["Finding_Details"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_disabled_detector_reads_no_routing(self, mock_client):
+        rows = self._rows(mock_client, [], status="DISABLED")
+        assert [r["Status"] for r in rows] == ["Failed"]
+
+
 class TestProposedSageMakerChecks:
     """SM-26 through SM-30 proposal checks (SM-29 remains reserved/deferred)."""
 
@@ -5546,14 +5628,73 @@ class TestSM36SecurityHubAIStandard:
         "aws-foundational-security-best-practices/v/1.0.0"
     )
 
-    def _run(self, mock_client, pages=None, error=None):
+    def _run(self, mock_client, pages=None, error=None, configuration=None):
         client = MagicMock()
         if error is not None:
             client.get_paginator.side_effect = error
         else:
             client.get_paginator.side_effect = _pager({"get_enabled_standards": pages})
+        if isinstance(configuration, Exception):
+            client.describe_organization_configuration.side_effect = configuration
+        else:
+            client.describe_organization_configuration.return_value = {
+                "OrganizationConfiguration": configuration
+                or {"ConfigurationType": "LOCAL", "Status": "ENABLED"}
+            }
         mock_client.return_value = client
         return _rows(sagemaker_app.check_security_hub_ai_standard(region="us-east-1"))
+
+    def _central(self, mock_client, configuration):
+        rows = self._run(
+            mock_client,
+            [
+                {
+                    "StandardsSubscriptions": [
+                        {"StandardsArn": self.AI_ARN, "StandardsStatus": "READY"}
+                    ]
+                }
+            ],
+            configuration=configuration,
+        )
+        assert rows[0]["Status"] == "Passed"
+        assert len(rows) == 2
+        assert rows[1]["Check_ID"] == "SM-36"
+        return rows[1]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_local_configuration_fails(self, mock_client):
+        row = self._central(
+            mock_client, {"ConfigurationType": "LOCAL", "Status": "ENABLED"}
+        )
+        assert row["Finding"] == sagemaker_app.CENTRAL_CONFIGURATION_FINDING
+        assert row["Status"] == "Failed"
+        assert "ConfigurationType LOCAL" in row["Finding_Details"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_central_enabled_is_incomplete_while_the_association_is_unread(
+        self, mock_client
+    ):
+        row = self._central(
+            mock_client, {"ConfigurationType": "CENTRAL", "Status": "ENABLED"}
+        )
+        assert row["Status"] == "N/A"
+        assert row["Finding"].endswith("Incomplete")
+        assert "GetConfigurationPolicyAssociation" in row["Finding_Details"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_central_not_enabled_fails(self, mock_client):
+        row = self._central(
+            mock_client, {"ConfigurationType": "CENTRAL", "Status": "FAILED"}
+        )
+        assert row["Status"] == "Failed"
+        assert "Status FAILED" in row["Finding_Details"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_configuration_read_failure_is_incomplete(self, mock_client):
+        row = self._central(mock_client, _make_client_error("InvalidAccessException"))
+        assert row["Status"] == "N/A"
+        assert row["Finding"].endswith("Incomplete")
+        assert "delegated administrator" in row["Finding_Details"]
 
     @patch("sagemaker_app.boto3.client")
     def test_ai_standard_on_second_page_after_another_standard_passes(
@@ -5574,9 +5715,10 @@ class TestSM36SecurityHubAIStandard:
                 },
             ],
         )
-        assert [r["Status"] for r in rows] == ["Passed"]
+        assert [r["Status"] for r in rows] == ["Passed", "Failed"]
         assert rows[0]["Check_ID"] == "SM-36"
         assert "status READY" in rows[0]["Finding_Details"]
+        assert rows[1]["Finding"] == sagemaker_app.CENTRAL_CONFIGURATION_FINDING
 
     @patch("sagemaker_app.boto3.client")
     def test_incomplete_passes_with_a_status_reason_note(self, mock_client):

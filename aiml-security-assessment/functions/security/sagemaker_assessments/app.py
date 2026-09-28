@@ -939,7 +939,13 @@ def check_guardduty_enabled(
                 create_finding(
                     check_id="SM-04",
                     finding_name="GuardDuty Enabled",
-                    finding_details="Amazon GuardDuty is properly enabled and monitoring for security threats in SageMaker workloads.",
+                    finding_details=(
+                        "The GuardDuty detector in this region has Status ENABLED. "
+                        "Only the detector status was read here: the AI Protection "
+                        "plan is reported by SM-26, and whether anyone reviews the "
+                        "findings is not recorded by any GuardDuty or Security Hub "
+                        "API."
+                    ),
                     resolution="No action required",
                     reference="https://docs.aws.amazon.com/guardduty/latest/ug/ai-protection.html",
                     severity="Medium",
@@ -947,6 +953,7 @@ def check_guardduty_enabled(
                     region=region,
                 )
             )
+            findings["csv_data"].append(_guardduty_security_hub_routing_finding(region))
         else:
             findings["csv_data"].append(
                 create_finding(
@@ -988,6 +995,65 @@ def check_guardduty_enabled(
         )
 
     return findings
+
+
+GUARDDUTY_ROUTING_FINDING = "GuardDuty Findings Routed to Security Hub"
+GUARDDUTY_ROUTING_REFERENCE = (
+    "https://docs.aws.amazon.com/securityhub/latest/userguide/"
+    "securityhub-internal-providers.html"
+)
+GUARDDUTY_PRODUCT_SUBSCRIPTION_SUFFIX = ":product-subscription/aws/guardduty"
+
+
+def _guardduty_security_hub_routing_finding(region: str) -> Dict[str, Any]:
+    """SM-04: GuardDuty findings reach Security Hub only through its integration."""
+
+    def _row(details, resolution, severity, status, name=GUARDDUTY_ROUTING_FINDING):
+        return create_finding(
+            check_id="SM-04",
+            finding_name=name,
+            finding_details=details,
+            resolution=resolution,
+            reference=GUARDDUTY_ROUTING_REFERENCE,
+            severity=severity,
+            status=status,
+            region=region,
+        )
+
+    try:
+        client = boto3.client("securityhub", config=boto3_config, region_name=region)
+        subscriptions = []
+        for page in client.get_paginator("list_enabled_products_for_import").paginate():
+            subscriptions.extend(page.get("ProductSubscriptions", []))
+    except Exception as error:
+        return _row(
+            "Whether GuardDuty findings are imported into Security Hub was not "
+            "read: ListEnabledProductsForImport failed. "
+            + build_could_not_assess_detail(error, region),
+            COULD_NOT_ASSESS_RESOLUTION,
+            "Informational",
+            "N/A",
+            name=f"{GUARDDUTY_ROUTING_FINDING} Incomplete",
+        )
+    if any(
+        str(arn).endswith(GUARDDUTY_PRODUCT_SUBSCRIPTION_SUFFIX)
+        for arn in subscriptions
+    ):
+        return _row(
+            "Security Hub in this region imports GuardDuty findings (product "
+            "subscription aws/guardduty is enabled).",
+            "No action required",
+            "Medium",
+            "Passed",
+        )
+    return _row(
+        f"Security Hub in this region has {len(subscriptions)} enabled product "
+        "integration(s), none of them GuardDuty, so GuardDuty findings do not "
+        "reach the Security Hub view.",
+        "Enable the GuardDuty integration in Security Hub for this region.",
+        "Medium",
+        "Failed",
+    )
 
 
 def check_guardduty_ai_protection(
@@ -8566,6 +8632,84 @@ AI_SECURITY_STANDARD_RESOLUTION = (
 )
 
 
+CENTRAL_CONFIGURATION_FINDING = "Security Hub Central Configuration"
+CENTRAL_CONFIGURATION_REFERENCE = (
+    "https://docs.aws.amazon.com/securityhub/latest/userguide/"
+    "central-configuration-intro.html"
+)
+CENTRAL_CONFIGURATION_ASSOCIATION_NOT_READ = (
+    "The configuration policy associated with this account was not read, so "
+    "whether that policy enables the AI Security Best Practices standard is not "
+    "established. Reading it needs securityhub:GetConfigurationPolicyAssociation, "
+    "which has no IAM resource type and would need a Resource '*' grant that is "
+    "not approved for this assessment."
+)
+
+
+def _security_hub_central_configuration_finding(region: str) -> Dict[str, Any]:
+    """SM-36: Security Hub standards are enforced org-wide only under CENTRAL."""
+
+    def _row(details, resolution, severity, status, name=CENTRAL_CONFIGURATION_FINDING):
+        return create_finding(
+            check_id="SM-36",
+            finding_name=name,
+            finding_details=details,
+            resolution=resolution,
+            reference=CENTRAL_CONFIGURATION_REFERENCE,
+            severity=severity,
+            status=status,
+            region=region,
+        )
+
+    try:
+        client = boto3.client("securityhub", config=boto3_config, region_name=region)
+        configuration = client.describe_organization_configuration().get(
+            "OrganizationConfiguration", {}
+        )
+    except Exception as error:
+        return _row(
+            "Security Hub central configuration was not read: "
+            "DescribeOrganizationConfiguration failed. It can be called from the "
+            "Security Hub delegated administrator account, so a run in any other "
+            "account cannot read it. " + build_could_not_assess_detail(error, region),
+            COULD_NOT_ASSESS_RESOLUTION,
+            "Informational",
+            "N/A",
+            name=f"{CENTRAL_CONFIGURATION_FINDING} Incomplete",
+        )
+    configuration_type = configuration.get("ConfigurationType")
+    configuration_status = configuration.get("Status")
+    if configuration_type == "CENTRAL" and configuration_status == "ENABLED":
+        return _row(
+            "Security Hub central configuration is enabled for the organization "
+            "(ConfigurationType CENTRAL, Status ENABLED). "
+            + CENTRAL_CONFIGURATION_ASSOCIATION_NOT_READ,
+            COULD_NOT_ASSESS_RESOLUTION,
+            "Informational",
+            "N/A",
+            name=f"{CENTRAL_CONFIGURATION_FINDING} Incomplete",
+        )
+    if configuration_type == "CENTRAL":
+        return _row(
+            "Security Hub central configuration was requested but is in Status "
+            f"{configuration_status}, so no configuration policy is being applied.",
+            "Resolve the central configuration StatusMessage from the Security Hub "
+            "delegated administrator.",
+            "Medium",
+            "Failed",
+        )
+    return _row(
+        f"Security Hub uses ConfigurationType {configuration_type or 'not returned'}, "
+        "so each account and region enables its own standards and nothing "
+        "enforces the AI Security Best Practices standard across the organization.",
+        "From the Security Hub delegated administrator, turn on central "
+        "configuration and associate a configuration policy that enables the AI "
+        "Security Best Practices standard with every AI workload account.",
+        "Medium",
+        "Failed",
+    )
+
+
 def check_security_hub_ai_standard(region: str = "") -> Dict[str, Any]:
     """SM-36: Verify the Security Hub AI Security Best Practices standard is on."""
     logger.debug("Starting check for the Security Hub AI security standard")
@@ -8668,6 +8812,7 @@ def check_security_hub_ai_standard(region: str = "") -> Dict[str, Any]:
                 "Failed",
             )
         )
+    findings["csv_data"].append(_security_hub_central_configuration_finding(region))
     return findings
 
 

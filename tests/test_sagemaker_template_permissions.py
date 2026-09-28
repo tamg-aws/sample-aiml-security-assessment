@@ -45,6 +45,8 @@ SCOPED_SAGEMAKER_GRANTS = {
     "sagemaker:DescribeEndpointConfig": ":endpoint-config/*'",
     "organizations:ListTargetsForPolicy": ":policy/o-*/service_control_policy/p-*'",
     "organizations:ListParents": ":account/o-*/${AWS::AccountId}'",
+    "securityhub:DescribeOrganizationConfiguration": ":hub/default'",
+    "securityhub:ListEnabledProductsForImport": ":hub/default'",
 }
 
 

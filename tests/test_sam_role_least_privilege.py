@@ -269,7 +269,9 @@ _EXPECTED_ACTIONS = {
         "sagemaker:ListTransformJobs",
         "sagemaker:ListTrials",
         "secretsmanager:ListSecrets",
+        "securityhub:DescribeOrganizationConfiguration",
         "securityhub:GetEnabledStandards",
+        "securityhub:ListEnabledProductsForImport",
     },
     "AgentCoreSecurityAssessmentFunction": {
         "bedrock-agentcore:GetAgentRuntime",

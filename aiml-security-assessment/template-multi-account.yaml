@@ -769,6 +769,8 @@ Resources:
               Effect: Allow
               Action:
                 - securityhub:GetEnabledStandards # SM-36
+                - securityhub:DescribeOrganizationConfiguration # SM-36
+                - securityhub:ListEnabledProductsForImport # SM-04
               Resource: !Sub 'arn:${AWS::Partition}:securityhub:*:${AWS::AccountId}:hub/default'
             - Sid: AccountInventoryWithoutResourceType
               # SM-39, SM-40 and SM-41 enumerate clusters, secrets and IoT policies.
