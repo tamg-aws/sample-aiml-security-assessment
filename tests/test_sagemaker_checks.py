@@ -6775,8 +6775,16 @@ class TestSM36SecurityHubAIStandard:
         "aws-foundational-security-best-practices/v/1.0.0"
     )
 
-    def _run(self, mock_client, pages=None, error=None, configuration=None):
+    def _run(
+        self, mock_client, pages=None, error=None, configuration=None, association=None
+    ):
         client = MagicMock()
+        if association is not None:
+            client.get_caller_identity.return_value = {"Account": "123456789012"}
+            if isinstance(association, Exception):
+                client.get_configuration_policy_association.side_effect = association
+            else:
+                client.get_configuration_policy_association.return_value = association
         if error is not None:
             client.get_paginator.side_effect = error
         else:
@@ -6791,7 +6799,7 @@ class TestSM36SecurityHubAIStandard:
         mock_client.return_value = client
         return _rows(sagemaker_app.check_security_hub_ai_standard(region="us-east-1"))
 
-    def _central(self, mock_client, configuration):
+    def _central(self, mock_client, configuration, association=None):
         rows = self._run(
             mock_client,
             [
@@ -6802,6 +6810,7 @@ class TestSM36SecurityHubAIStandard:
                 }
             ],
             configuration=configuration,
+            association=association,
         )
         assert rows[0]["Status"] == "Passed"
         assert len(rows) == 2
@@ -6827,6 +6836,71 @@ class TestSM36SecurityHubAIStandard:
         assert row["Status"] == "N/A"
         assert row["Finding"].endswith("Incomplete")
         assert "GetConfigurationPolicyAssociation" in row["Finding_Details"]
+
+    def _association(self, mock_client, association):
+        row = self._central(
+            mock_client,
+            {"ConfigurationType": "CENTRAL", "Status": "ENABLED"},
+            association=association,
+        )
+        call = mock_client.return_value.get_configuration_policy_association
+        assert call.call_args.kwargs == {"Target": {"AccountId": "123456789012"}}
+        return row
+
+    @pytest.mark.parametrize("how", ["APPLIED", "INHERITED"])
+    @patch("sagemaker_app.boto3.client")
+    def test_self_managed_association_fails(self, mock_client, how):
+        row = self._association(
+            mock_client,
+            {
+                "ConfigurationPolicyId": "SELF_MANAGED_SECURITY_HUB",
+                "AssociationType": how,
+                "AssociationStatus": "SUCCESS",
+            },
+        )
+        assert row["Status"] == "Failed"
+        assert "self-managed" in row["Finding_Details"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_failed_association_fails(self, mock_client):
+        row = self._association(
+            mock_client,
+            {
+                "ConfigurationPolicyId": "a1b2",
+                "AssociationType": "APPLIED",
+                "AssociationStatus": "FAILED",
+                "AssociationStatusMessage": "boom",
+            },
+        )
+        assert row["Status"] == "Failed"
+        assert "AssociationStatus FAILED" in row["Finding_Details"]
+        assert "boom" in row["Finding_Details"]
+
+    @pytest.mark.parametrize("status", ["SUCCESS", "PENDING"])
+    @patch("sagemaker_app.boto3.client")
+    def test_policy_association_names_the_unread_policy(self, mock_client, status):
+        row = self._association(
+            mock_client,
+            {
+                "ConfigurationPolicyId": "a1b2",
+                "AssociationType": "INHERITED",
+                "AssociationStatus": status,
+            },
+        )
+        assert row["Status"] == "N/A"
+        assert row["Finding"].endswith("Incomplete")
+        assert "configuration policy a1b2" in row["Finding_Details"]
+        assert "securityhub:GetConfigurationPolicy," in row["Finding_Details"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_association_access_denied_is_incomplete(self, mock_client):
+        row = self._association(
+            mock_client, _make_client_error("AccessDeniedException")
+        )
+        assert row["Status"] == "N/A"
+        assert row["Finding"].endswith("Incomplete")
+        assert "GetConfigurationPolicyAssociation failed" in row["Finding_Details"]
+        assert "AccessDeniedException" in row["Finding_Details"]
 
     @patch("sagemaker_app.boto3.client")
     def test_central_not_enabled_fails(self, mock_client):

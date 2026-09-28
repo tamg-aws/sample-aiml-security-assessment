@@ -12765,13 +12765,77 @@ CENTRAL_CONFIGURATION_REFERENCE = (
     "https://docs.aws.amazon.com/securityhub/latest/userguide/"
     "central-configuration-intro.html"
 )
-CENTRAL_CONFIGURATION_ASSOCIATION_NOT_READ = (
-    "The configuration policy associated with this account was not read, so "
-    "whether that policy enables the AI Security Best Practices standard is not "
-    "established. Reading it needs securityhub:GetConfigurationPolicyAssociation, "
-    "which has no IAM resource type and would need a Resource '*' grant that is "
-    "not approved for this assessment."
-)
+SELF_MANAGED_CONFIGURATION_POLICY_ID = "SELF_MANAGED_SECURITY_HUB"
+
+
+def _central_configuration_association_finding(region: str, row) -> Dict[str, Any]:
+    """SM-36: read the configuration policy association of this account.
+
+    GetConfigurationPolicyAssociation answers only for the Security Hub
+    delegated administrator in the home Region, so any other caller reads N/A.
+    Whether an associated policy enables the AI standard is in the policy
+    itself, which only securityhub:GetConfigurationPolicy returns.
+    """
+    try:
+        account_id = boto3.client(
+            "sts", config=boto3_config, region_name=region
+        ).get_caller_identity()["Account"]
+        client = boto3.client("securityhub", config=boto3_config, region_name=region)
+        association = client.get_configuration_policy_association(
+            Target={"AccountId": account_id}
+        )
+    except Exception as error:
+        return row(
+            "Security Hub central configuration is enabled for the organization "
+            "(ConfigurationType CENTRAL, Status ENABLED), but the configuration "
+            "policy associated with this account was not read: "
+            "securityhub:GetConfigurationPolicyAssociation failed. It answers only "
+            "for the Security Hub delegated administrator in the home Region. "
+            + build_could_not_assess_detail(error, region),
+            COULD_NOT_ASSESS_RESOLUTION,
+            "Informational",
+            "N/A",
+            name=f"{CENTRAL_CONFIGURATION_FINDING} Incomplete",
+        )
+    policy_id = str(association.get("ConfigurationPolicyId") or "")
+    status = str(association.get("AssociationStatus") or "")
+    how = str(association.get("AssociationType") or "not returned").lower()
+    if policy_id == SELF_MANAGED_CONFIGURATION_POLICY_ID:
+        return row(
+            f"Under central configuration, this account ({account_id}) is "
+            f"associated ({how}) with self-managed behavior, so the account "
+            "enables its own standards and no configuration policy enforces the "
+            "AI Security Best Practices standard on it.",
+            "From the Security Hub delegated administrator, associate this account "
+            "with a configuration policy that enables the AI Security Best "
+            "Practices standard.",
+            "Medium",
+            "Failed",
+        )
+    if status == "FAILED":
+        return row(
+            f"The association of configuration policy {policy_id or 'not returned'} "
+            f"with this account ({account_id}) is in AssociationStatus FAILED, so "
+            "the policy is not applied: "
+            f"{association.get('AssociationStatusMessage') or 'no status message'}.",
+            "Resolve the association failure from the Security Hub delegated "
+            "administrator.",
+            "Medium",
+            "Failed",
+        )
+    return row(
+        f"This account ({account_id}) is associated ({how}) with configuration "
+        f"policy {policy_id or 'not returned'}, in AssociationStatus "
+        f"{status or 'not returned'}, as securityhub:"
+        "GetConfigurationPolicyAssociation reports. Whether that policy enables "
+        "the AI Security Best Practices standard was not read: it needs "
+        "securityhub:GetConfigurationPolicy, which this role is not granted.",
+        "Grant securityhub:GetConfigurationPolicy on the configuration policy and "
+        "retry.",
+        "Informational",
+        "N/A",
+        name=f"{CENTRAL_CONFIGURATION_FINDING} Incomplete",
+    )
 
 
 def _security_hub_central_configuration_finding(region: str) -> Dict[str, Any]:
@@ -12808,15 +12872,7 @@ def _security_hub_central_configuration_finding(region: str) -> Dict[str, Any]:
     configuration_type = configuration.get("ConfigurationType")
     configuration_status = configuration.get("Status")
     if configuration_type == "CENTRAL" and configuration_status == "ENABLED":
-        return _row(
-            "Security Hub central configuration is enabled for the organization "
-            "(ConfigurationType CENTRAL, Status ENABLED). "
-            + CENTRAL_CONFIGURATION_ASSOCIATION_NOT_READ,
-            COULD_NOT_ASSESS_RESOLUTION,
-            "Informational",
-            "N/A",
-            name=f"{CENTRAL_CONFIGURATION_FINDING} Incomplete",
-        )
+        return _central_configuration_association_finding(region, _row)
     if configuration_type == "CENTRAL":
         return _row(
             "Security Hub central configuration was requested but is in Status "

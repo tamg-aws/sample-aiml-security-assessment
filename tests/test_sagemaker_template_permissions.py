@@ -97,6 +97,16 @@ APPROVED_WILDCARD_SAGEMAKER_GRANTS = {
     "iot:ListAuditFindings": "IoTDeviceDefenderAuditRead",
     "inspector2:BatchGetAccountStatus": "InspectorAccountStatusRead",
     "lambda:ListFunctions": "LambdaFunctionInventory",
+    "cloudtrail:DescribeTrails": "ApprovedInventoryWithoutResourceType",
+    "config:ListConfigurationRecorders": "ApprovedInventoryWithoutResourceType",
+    "ecs:DescribeTaskDefinition": "ApprovedInventoryWithoutResourceType",
+    "ecs:ListClusters": "ApprovedInventoryWithoutResourceType",
+    "ecs:ListServices": "ApprovedInventoryWithoutResourceType",
+    "events:ListRules": "ApprovedInventoryWithoutResourceType",
+    "inspector2:ListCoverage": "ApprovedInventoryWithoutResourceType",
+    "iot:ListScheduledAudits": "ApprovedInventoryWithoutResourceType",
+    "ram:ListResources": "ApprovedInventoryWithoutResourceType",
+    "securityhub:GetConfigurationPolicyAssociation": "ApprovedInventoryWithoutResourceType",
 }
 
 # Reads the SageMaker legs call that are not approved. Each leg reports "not
@@ -108,17 +118,7 @@ UNAPPROVED_SAGEMAKER_READS = [
     "sagemaker:ListUserProfiles",
     "sagemaker:ListMonitoringExecutions",
     "guardduty:ListMembers",
-    "config:ListConfigurationRecorders",
-    "iot:ListScheduledAudits",
-    "inspector2:ListCoverage",
     "organizations:ListAccounts",
-    "events:ListRules",
-    "securityhub:GetConfigurationPolicyAssociation",
-    "cloudtrail:DescribeTrails",
-    "ram:ListResources",
-    "ecs:ListClusters",
-    "ecs:ListServices",
-    "ecs:DescribeTaskDefinition",
     "s3:GetObjectAttributes",
 ]
 
