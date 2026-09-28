@@ -6388,7 +6388,16 @@ class TestAC27GatewayPolicyConditions:
                             "aws:SourceVpce": "vpce-1",
                         }
                     },
-                }
+                },
+                # The Allow's aws:SourceVpce binds only the callers it admits,
+                # so the network leg now needs this Deny to pass.
+                {
+                    "Effect": "Deny",
+                    "Principal": "*",
+                    "Action": "bedrock-agentcore:InvokeGateway",
+                    "Resource": "*",
+                    "Condition": {"StringNotEquals": {"aws:SourceVpce": "vpce-1"}},
+                },
             ]
         }
     )
@@ -13724,13 +13733,20 @@ class TestAC47RuntimeInvocationPath:
         for finding in findings:
             assert_finding_schema(finding)
 
+    # The address keys now carry an address range: "vpce-123" is not one, and a
+    # value that does not parse as a range bounds nothing.
     @pytest.mark.parametrize(
-        "condition_key",
-        ["aws:SourceVpc", "aws:SourceVpce", "aws:VpcSourceIp", "aws:SourceIp"],
+        ("condition_key", "value"),
+        [
+            ("aws:SourceVpc", "vpc-123"),
+            ("aws:SourceVpce", "vpce-123"),
+            ("aws:VpcSourceIp", "10.0.0.0/16"),
+            ("aws:SourceIp", "203.0.113.0/24"),
+        ],
     )
     @patch("agentcore_app.agentcore_client")
     def test_a_deny_network_condition_passes_the_network_leg(
-        self, mock_ac, condition_key
+        self, mock_ac, condition_key, value
     ):
         # "Deny unless aws:SourceVpce is the approved endpoint" is the documented
         # form of this restriction. Reading Allow statements only would report
@@ -13745,7 +13761,7 @@ class TestAC47RuntimeInvocationPath:
                         "Action": "bedrock-agentcore:InvokeAgentRuntime",
                         "Resource": "*",
                         "Condition": {
-                            "StringNotEquals": {condition_key: "vpce-123"},
+                            "StringNotEquals": {condition_key: value},
                         },
                     }
                 ]
@@ -13779,7 +13795,10 @@ class TestAC47RuntimeInvocationPath:
         legs = self._legs(agentcore_app.check_agentcore_runtime_invocation_path())
 
         assert legs["Network Path Unrestricted"]["Status"] == "Failed"
-        assert legs["Caller Scope"]["Status"] == "Passed"
+        # Stricter than before: an Allow naming the gateway role used to pass
+        # the caller leg, but it does not stop a same-account caller whose own
+        # identity policy grants the call.
+        assert legs["Caller Unrestricted"]["Status"] == "Failed"
 
     @pytest.mark.parametrize(
         "allowed",
@@ -13828,7 +13847,10 @@ class TestAC47RuntimeInvocationPath:
         assert legs["Caller Unrestricted"]["Status"] == "Failed"
 
     @patch("agentcore_app.agentcore_client")
-    def test_a_named_principal_passes_the_caller_leg(self, mock_ac):
+    def test_an_allow_naming_a_principal_does_not_restrict_the_caller(self, mock_ac):
+        # Stricter than before: this used to pass as a caller restriction. An
+        # Allow grants access and never stops a same-account caller whose own
+        # identity policy allows the invocation.
         self._wire(
             mock_ac,
             policy={
@@ -13845,8 +13867,11 @@ class TestAC47RuntimeInvocationPath:
 
         legs = self._legs(agentcore_app.check_agentcore_runtime_invocation_path())
 
-        assert legs["Caller Scope"]["Status"] == "Passed"
-        assert "1 principal" in legs["Caller Scope"]["Finding_Details"]
+        assert legs["Caller Unrestricted"]["Status"] == "Failed"
+        assert (
+            "arn:aws:iam::123456789012:role/gw"
+            in legs["Caller Unrestricted"]["Finding_Details"]
+        )
 
     @patch("agentcore_app.agentcore_client")
     def test_a_wildcard_principal_fails_the_caller_leg(self, mock_ac):
@@ -13987,6 +14012,366 @@ class TestAC47RuntimeInvocationPath:
         ]
         assert set(allowed.members) == {"hostingEnvironments", "workloadIdentities"}
         assert "GetResourcePolicy" in model.operation_names
+
+
+def _deny_invoke(condition, action="bedrock-agentcore:InvokeAgentRuntime", **extra):
+    """Return one Deny statement on every principal under `condition`."""
+    return {
+        "Effect": "Deny",
+        "Principal": "*",
+        "Action": action,
+        "Resource": "*",
+        "Condition": condition,
+        **extra,
+    }
+
+
+class TestAC47DenyForm:
+    """AC-47 and AC-27 accept a network or caller restriction only as a bounded Deny."""
+
+    def _legs(self, findings):
+        return {
+            finding["Finding"].replace("AgentCore Runtime ", ""): finding
+            for finding in findings
+        }
+
+    def _judge(self, mock_ac, statements, **detail):
+        summary, runtime = _vpc_runtime(**detail)
+        _wire_runtimes(mock_ac, [(summary, runtime)])
+        mock_ac.get_resource_policy.return_value = {
+            "policy": json.dumps({"Statement": statements})
+        }
+        return self._legs(agentcore_app.check_agentcore_runtime_invocation_path())
+
+    def test_the_network_value_predicate_discriminates(self):
+        bounded = agentcore_app._network_values_are_bounded
+        assert bounded("aws:sourcevpce", ["vpce-1"])
+        assert bounded("aws:sourcevpc", ["vpc-1", "vpc-2"])
+        assert not bounded("aws:sourcevpce", ["vpce-*"])
+        assert not bounded("aws:sourcevpc", ["vpc-?"])
+        # One wildcard value among bounded ones widens the whole entry.
+        assert not bounded("aws:sourcevpce", ["vpce-1", "*"])
+        assert not bounded("aws:sourcevpce", [])
+        assert bounded("aws:sourceip", ["10.0.0.0/8", "203.0.113.0/24"])
+        assert bounded("aws:vpcsourceip", ["2001:db8::/32"])
+        assert not bounded("aws:sourceip", ["0.0.0.0/0"])
+        assert not bounded("aws:vpcsourceip", ["::/0"])
+        # Two halves together cover every address, as one /0 does.
+        assert not bounded("aws:sourceip", ["0.0.0.0/1", "128.0.0.0/1"])
+        assert not bounded("aws:sourceip", ["10.0.0.0/8", "::/1", "8000::/1"])
+        assert not bounded("aws:sourceip", ["not-a-range"])
+
+    @pytest.mark.parametrize(
+        "operator",
+        ["StringNotEquals", "StringNotEqualsIfExists", "StringNotLike"],
+    )
+    @patch("agentcore_app.agentcore_client")
+    def test_a_negated_deny_on_a_bounded_value_passes(self, mock_ac, operator):
+        # IfExists on a negated Deny still denies a request without the key.
+        legs = self._judge(
+            mock_ac, [_deny_invoke({operator: {"aws:SourceVpce": "vpce-1"}})]
+        )
+
+        assert legs["Network Path Scope"]["Status"] == "Passed"
+        assert "aws:sourcevpce" in legs["Network Path Scope"]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        ("condition", "reason"),
+        [
+            ({"StringEquals": {"aws:SourceVpce": "vpce-1"}}, "denies only the values"),
+            (
+                {"ForAnyValue:StringNotEquals": {"aws:SourceVpce": "vpce-1"}},
+                "denies only the values",
+            ),
+            ({"StringNotLike": {"aws:SourceVpce": "vpce-*"}}, "admits every path"),
+            (
+                {"NotIpAddress": {"aws:SourceIp": ["0.0.0.0/1", "128.0.0.0/1"]}},
+                "admits every path",
+            ),
+            (
+                {
+                    "StringNotEquals": {
+                        "aws:SourceVpce": "vpce-1",
+                        "aws:PrincipalAccount": "123456789012",
+                    }
+                },
+                "also requires aws:principalaccount",
+            ),
+        ],
+        ids=["positive", "for-any-value", "wildcard", "split-range", "anded-key"],
+    )
+    @patch("agentcore_app.agentcore_client")
+    def test_a_deny_that_leaves_a_path_open_fails(self, mock_ac, condition, reason):
+        legs = self._judge(mock_ac, [_deny_invoke(condition)])
+
+        assert legs["Network Path Unrestricted"]["Status"] == "Failed"
+        assert reason in legs["Network Path Unrestricted"]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        ("statement", "reason"),
+        [
+            (
+                _deny_invoke(
+                    {"StringNotEquals": {"aws:SourceVpce": "vpce-1"}},
+                    Principal={"AWS": "arn:aws:iam::123456789012:role/one"},
+                ),
+                "names specific principals",
+            ),
+            (
+                _deny_invoke(
+                    {"StringNotEquals": {"aws:SourceVpce": "vpce-1"}},
+                    action="bedrock-agentcore:GetAgentRuntime",
+                ),
+                "does not reach",
+            ),
+            (
+                _deny_invoke(
+                    {"StringNotEquals": {"aws:SourceVpce": "vpce-1"}},
+                    Resource=_runtime_arn("rt-other"),
+                ),
+                "does not name this resource",
+            ),
+        ],
+        ids=["named-principal", "other-action", "other-resource"],
+    )
+    @patch("agentcore_app.agentcore_client")
+    def test_a_deny_that_misses_this_call_fails(self, mock_ac, statement, reason):
+        legs = self._judge(mock_ac, [statement])
+
+        assert legs["Network Path Unrestricted"]["Status"] == "Failed"
+        assert reason in legs["Network Path Unrestricted"]["Finding_Details"]
+
+    @pytest.mark.parametrize("action", ["*", "bedrock-agentcore:Invoke*"])
+    @patch("agentcore_app.agentcore_client")
+    def test_a_deny_pattern_reaching_invoke_passes(self, mock_ac, action):
+        legs = self._judge(
+            mock_ac,
+            [
+                _deny_invoke(
+                    {"StringNotEquals": {"aws:SourceVpce": "vpce-1"}}, action=action
+                )
+            ],
+        )
+
+        assert legs["Network Path Scope"]["Status"] == "Passed"
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_not_action_deny_exempting_invoke_fails(self, mock_ac):
+        statement = _deny_invoke({"StringNotEquals": {"aws:SourceVpce": "vpce-1"}})
+        del statement["Action"]
+        statement["NotAction"] = "bedrock-agentcore:InvokeAgentRuntime"
+
+        legs = self._judge(mock_ac, [statement])
+
+        assert legs["Network Path Unrestricted"]["Status"] == "Failed"
+
+    @patch("agentcore_app.agentcore_client")
+    def test_an_allow_network_condition_alone_fails(self, mock_ac):
+        # Before the Deny form was required, this Allow passed the network leg
+        # on key presence. A same-account identity-policy caller is not bound by it.
+        legs = self._judge(
+            mock_ac,
+            [
+                {
+                    "Effect": "Allow",
+                    "Principal": {"AWS": "arn:aws:iam::123456789012:role/gw"},
+                    "Action": "bedrock-agentcore:InvokeAgentRuntime",
+                    "Resource": "*",
+                    "Condition": {"StringEquals": {"aws:SourceVpce": "vpce-1"}},
+                }
+            ],
+        )
+
+        details = legs["Network Path Unrestricted"]["Finding_Details"]
+        assert legs["Network Path Unrestricted"]["Status"] == "Failed"
+        assert "an Allow statement binds aws:sourcevpce" in details
+
+    @patch("agentcore_app.agentcore_client")
+    def test_one_bounded_deny_passes_beside_an_open_one(self, mock_ac):
+        legs = self._judge(
+            mock_ac,
+            [
+                _deny_invoke({"StringNotLike": {"aws:SourceVpce": "*"}}),
+                _deny_invoke({"NotIpAddress": {"aws:SourceIp": "203.0.113.0/24"}}),
+            ],
+        )
+
+        assert legs["Network Path Scope"]["Status"] == "Passed"
+        assert "aws:sourceip" in legs["Network Path Scope"]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_every_runtime_is_judged_on_its_own_deny(self, mock_ac):
+        denied = _deny_invoke({"StringNotEquals": {"aws:SourceVpce": "vpce-1"}})
+        allowed = {
+            "Effect": "Allow",
+            "Principal": {"AWS": "arn:aws:iam::123456789012:root"},
+            "Action": "bedrock-agentcore:InvokeAgentRuntime",
+            "Resource": "*",
+            "Condition": {"StringEquals": {"aws:SourceVpce": "vpce-1"}},
+        }
+        _wire_runtimes(mock_ac, [_vpc_runtime("rt-good"), _vpc_runtime("rt-bad")])
+        mock_ac.get_resource_policy.side_effect = lambda resourceArn: {
+            "policy": json.dumps(
+                {"Statement": [denied if resourceArn.endswith("rt-good") else allowed]}
+            )
+        }
+
+        findings = agentcore_app.check_agentcore_runtime_invocation_path()
+        network = {
+            ("rt-good" in finding["Finding_Details"], finding["Status"])
+            for finding in findings
+            if "Network Path" in finding["Finding"]
+        }
+
+        assert network == {(True, "Passed"), (False, "Failed")}
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_bounded_principal_arn_deny_passes_the_caller_leg(self, mock_ac):
+        legs = self._judge(
+            mock_ac,
+            [
+                _deny_invoke(
+                    {
+                        "ArnNotEquals": {
+                            "aws:PrincipalArn": "arn:aws:iam::123456789012:role/gw"
+                        }
+                    }
+                )
+            ],
+        )
+
+        assert legs["Caller Scope"]["Status"] == "Passed"
+        assert "aws:PrincipalArn" in legs["Caller Scope"]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "value",
+        ["arn:aws:iam::*:role/gw", "arn:aws:iam::123456789012:role/*", "*"],
+    )
+    @patch("agentcore_app.agentcore_client")
+    def test_an_unbounded_principal_arn_deny_fails_the_caller_leg(self, mock_ac, value):
+        legs = self._judge(
+            mock_ac,
+            [
+                _deny_invoke(
+                    {
+                        "ArnNotLike": {
+                            "aws:PrincipalArn": [
+                                "arn:aws:iam::123456789012:role/gw",
+                                value,
+                            ]
+                        }
+                    }
+                )
+            ],
+        )
+
+        assert legs["Caller Unrestricted"]["Status"] == "Failed"
+        assert "admits every" in legs["Caller Unrestricted"]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_an_account_root_allow_fails_the_caller_leg(self, mock_ac):
+        legs = self._judge(
+            mock_ac,
+            [
+                {
+                    "Effect": "Allow",
+                    "Principal": {"AWS": "arn:aws:iam::111122223333:root"},
+                    "Action": "bedrock-agentcore:InvokeAgentRuntime",
+                    "Resource": "*",
+                }
+            ],
+        )
+
+        assert legs["Caller Unrestricted"]["Status"] == "Failed"
+        assert (
+            "arn:aws:iam::111122223333:root"
+            in legs["Caller Unrestricted"]["Finding_Details"]
+        )
+
+    @patch("agentcore_app.agentcore_client")
+    def test_every_runtime_is_judged_on_its_own_caller_deny(self, mock_ac):
+        denied = _deny_invoke(
+            {"ArnNotEquals": {"aws:PrincipalArn": "arn:aws:iam::123456789012:role/gw"}}
+        )
+        root = {
+            "Effect": "Allow",
+            "Principal": {"AWS": "123456789012"},
+            "Action": "bedrock-agentcore:InvokeAgentRuntime",
+            "Resource": "*",
+        }
+        _wire_runtimes(mock_ac, [_vpc_runtime("rt-good"), _vpc_runtime("rt-bad")])
+        mock_ac.get_resource_policy.side_effect = lambda resourceArn: {
+            "policy": json.dumps(
+                {"Statement": [denied if resourceArn.endswith("rt-good") else root]}
+            )
+        }
+
+        findings = agentcore_app.check_agentcore_runtime_invocation_path()
+        caller = {
+            ("rt-good" in finding["Finding_Details"], finding["Status"])
+            for finding in findings
+            if "Caller" in finding["Finding"]
+        }
+
+        assert caller == {(True, "Passed"), (False, "Failed")}
+
+    @patch("agentcore_app.iam_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_the_gateway_network_leg_needs_a_bounded_deny(self, mock_ac, mock_iam):
+        policies = {
+            "gw-deny": [
+                _deny_invoke(
+                    {"StringNotEquals": {"aws:SourceVpce": "vpce-1"}},
+                    action="bedrock-agentcore:InvokeGateway",
+                )
+            ],
+            "gw-wild": [
+                _deny_invoke(
+                    {"StringNotLike": {"aws:SourceVpce": "vpce-*"}},
+                    action="bedrock-agentcore:InvokeGateway",
+                )
+            ],
+            "gw-allow": [
+                {
+                    "Effect": "Allow",
+                    "Principal": {"AWS": "arn:aws:iam::123456789012:role/caller"},
+                    "Action": "bedrock-agentcore:InvokeGateway",
+                    "Resource": "*",
+                    "Condition": {"StringEquals": {"aws:SourceVpce": "vpce-1"}},
+                }
+            ],
+        }
+        mock_ac.list_gateways.return_value = {
+            "items": [{"gatewayId": name, "name": name} for name in policies]
+        }
+        mock_ac.get_gateway.side_effect = lambda gatewayIdentifier: {
+            "gatewayArn": (
+                "arn:aws:bedrock-agentcore:us-east-1:123456789012:gateway/"
+                f"{gatewayIdentifier}"
+            ),
+            "roleArn": "arn:aws:iam::123456789012:role/GuardedRole",
+        }
+        mock_ac.get_resource_policy.side_effect = lambda resourceArn: {
+            "policy": json.dumps(
+                {"Statement": policies[resourceArn.rsplit("/", 1)[-1]]}
+            )
+        }
+        mock_iam.get_role.return_value = {
+            "Role": {"AssumeRolePolicyDocument": _GUARDED_TRUST}
+        }
+
+        findings = agentcore_app.check_agentcore_gateway_policy_conditions()
+        network = {
+            finding["Finding_Details"].split("'")[1]: finding
+            for finding in findings
+            if "Network Path" in finding["Finding"]
+        }
+
+        assert network["gw-deny"]["Status"] == "Passed"
+        assert network["gw-wild"]["Status"] == "Failed"
+        assert "admits every path" in network["gw-wild"]["Finding_Details"]
+        assert network["gw-allow"]["Status"] == "Failed"
+        assert "an Allow statement" in network["gw-allow"]["Finding_Details"]
 
 
 class TestRuntimeIsolationCheckRegistration:

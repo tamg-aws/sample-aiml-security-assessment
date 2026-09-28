@@ -934,6 +934,16 @@ _VERIFIED_REMEDIATION_IAM_ACTIONS |= {
     "bedrock-agentcore:InvokeAgentRuntimeCommand",
 }
 
+# Verified on 2026-09-27 with one IDENTITY_POLICY validate-policy run for the
+# AC-27 and AC-47 Deny-form legs, three names in one Action list.
+# bedrock-agentcore:InvokeGateway at action index 0 and
+# bedrock-agentcore:InvokeAgentRuntime at index 1 were not reported. The negative
+# control bedrock-agentcore:InvokeGatewayz came back INVALID_ACTION at index 2.
+_VERIFIED_REMEDIATION_IAM_ACTIONS |= {
+    "bedrock-agentcore:InvokeGateway",
+    "bedrock-agentcore:InvokeAgentRuntime",
+}
+
 _NON_IAM_REMEDIATION_TOKENS = {
     # SM-41 names the AWS IoT Core policy variables
     # ${iot:Connection.Thing.ThingName} and iot:Connection.Thing.IsAttached, and

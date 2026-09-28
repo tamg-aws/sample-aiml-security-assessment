@@ -276,6 +276,18 @@ section.
     in an `N/A` row, and the gateway role's grant counts after its own Deny
     and boundary. A readable grant beside an unparseable policy no longer
     passes.
+  - `AC-27` and `AC-47` pass the network leg only on a resource policy Deny
+    that refuses the invoke action to every principal outside a bounded
+    `aws:SourceVpc`, `aws:SourceVpce`, `aws:VpcSourceIp` or `aws:SourceIp`
+    value. A Deny form now passes on `AC-27`, which read Allow statements only.
+    An Allow condition alone, a positive or `ForAnyValue` operator, a
+    wildcard endpoint, an address list covering every address (the split
+    `0.0.0.0/1` plus `128.0.0.0/1` included), and a Deny that ANDs in
+    another key or names specific principals now fail, and the finding names
+    the reason. The `AC-47` caller leg no longer passes on an Allow naming
+    principals, account root included, because an Allow does not stop a
+    same-account caller. It passes on `allowedWorkloadConfiguration` or a
+    Deny refusing every principal outside a bounded `aws:PrincipalArn` list.
 
 ### Deployment impact
 
