@@ -351,6 +351,15 @@ section.
   - `AC-38` reads each event pattern of a temporal policy and fails one with
     no `eventResource` as `Session Rule Resource Unscoped`. A temporal policy
     with no readable event pattern is `N/A` and no longer passes.
+  - `AC-18` requires every data-event type in use, where one selected type
+    used to pass its family. Runtimes need `RuntimeEndpoint` as well as
+    `Runtime`, the AWS-managed code interpreter and browser need the
+    unsuffixed types, and gateways, identity (workload identities and
+    credential providers) and policy engines are new families. A selector
+    narrowed by `readOnly`, `eventName`, `resources.ARN` or any other field no
+    longer counts, nor does a trail that is not logging or that neither spans
+    all Regions nor is homed in the scanned one. An unreadable trail status is
+    `N/A`.
 
 ### Deployment impact
 
@@ -416,6 +425,15 @@ account's `trail/*` ARNs, in both SAM templates, so `AC-26` can read log file
 validation. It is read-only, and the same CodeBuild run applies it. The new
 `AC-01` and `AC-26` service control policy legs use the Organizations grants
 added for `AC-28` and `AC-29`.
+
+The AgentCore assessment role gains `cloudtrail:GetTrailStatus`, scoped to the
+account's `trail/*` ARNs, and `bedrock-agentcore:ListWorkloadIdentities`,
+`bedrock-agentcore:ListOauth2CredentialProviders` and
+`bedrock-agentcore:ListApiKeyCredentialProviders`, scoped to the account's
+`workload-identity-directory/*` and `token-vault/*` ARNs, in both SAM
+templates, so `AC-18` can read each trail's logging state and count the
+identity resources. All are read-only, and the same CodeBuild run applies
+them. Until it runs, the `AC-18` identity family reports `N/A`.
 
 ## 2.0.0 - 2026-09-18
 

@@ -4424,6 +4424,19 @@ def _empty_agentcore_inventory(mock_ac):
     mock_ac.list_code_interpreters.return_value = {"codeInterpreterSummaries": []}
     mock_ac.list_browsers.return_value = {"browserSummaries": []}
     mock_ac.list_gateways.return_value = {"items": []}
+    mock_ac.list_workload_identities.return_value = {"workloadIdentities": []}
+    mock_ac.list_oauth2_credential_providers.return_value = {"credentialProviders": []}
+    mock_ac.list_api_key_credential_providers.return_value = {"credentialProviders": []}
+    mock_ac.list_policy_engines.return_value = {"policyEngines": []}
+
+
+def _logging_trail(mock_ct, multi_region=True, home_region="us-east-1", logging=True):
+    """Stub GetTrail and GetTrailStatus for every trail AC-18 reads."""
+    mock_ct.meta.region_name = "us-east-1"
+    mock_ct.get_trail.return_value = {
+        "Trail": {"IsMultiRegionTrail": multi_region, "HomeRegion": home_region}
+    }
+    mock_ct.get_trail_status.return_value = {"IsLogging": logging}
 
 
 def _family_finding(findings, label):
@@ -4447,6 +4460,7 @@ class TestAC18CloudTrailDataEvents:
     @patch("agentcore_app.cloudtrail_client")
     def test_memory_data_events_selected_passes(self, mock_ct, mock_ac):
         mock_ct.list_trails.return_value = {"Trails": [self._TRAIL]}
+        _logging_trail(mock_ct)
         mock_ct.get_event_selectors.return_value = {
             "AdvancedEventSelectors": [
                 _data_event_selector("AWS::BedrockAgentCore::Memory")
@@ -4497,9 +4511,13 @@ class TestAC18CloudTrailDataEvents:
     @patch("agentcore_app.cloudtrail_client")
     def test_each_family_gets_its_own_verdict(self, mock_ct, mock_ac):
         mock_ct.list_trails.return_value = {"Trails": [self._TRAIL]}
+        _logging_trail(mock_ct)
         mock_ct.get_event_selectors.return_value = {
             "AdvancedEventSelectors": [
-                _data_event_selector("AWS::BedrockAgentCore::Runtime")
+                _data_event_selector(
+                    "AWS::BedrockAgentCore::Runtime",
+                    "AWS::BedrockAgentCore::RuntimeEndpoint",
+                )
             ]
         }
         _empty_agentcore_inventory(mock_ac)
@@ -4518,14 +4536,17 @@ class TestAC18CloudTrailDataEvents:
     @patch("agentcore_app.cloudtrail_client")
     def test_a_tool_inventory_spans_both_list_apis(self, mock_ct, mock_ac):
         mock_ct.list_trails.return_value = {"Trails": [self._TRAIL]}
+        _logging_trail(mock_ct)
         mock_ct.get_event_selectors.return_value = {
             "AdvancedEventSelectors": [
                 _data_event_selector("AWS::BedrockAgentCore::BrowserCustom")
             ]
         }
         _empty_agentcore_inventory(mock_ac)
-        mock_ac.list_browsers.return_value = {
-            "browserSummaries": [{"browserId": "b-1"}]
+        mock_ac.list_browsers.side_effect = lambda **kwargs: {
+            "browserSummaries": (
+                [{"browserId": "b-1"}] if kwargs.get("type") == "CUSTOM" else []
+            )
         }
 
         findings = agentcore_app.check_agentcore_cloudtrail_data_events()
@@ -4586,6 +4607,7 @@ class TestAC18CloudTrailDataEvents:
                 ]
             },
         ]
+        _logging_trail(mock_ct)
         _empty_agentcore_inventory(mock_ac)
         mock_ac.list_memories.return_value = {"memories": [{"id": "mem-1"}]}
 
@@ -4628,6 +4650,406 @@ class TestAC18CloudTrailDataEvents:
             f for f in findings if "could not be inventoried" in f["Finding_Details"]
         ]
         assert memory[0]["Status"] == "N/A"
+
+
+_RUNTIME_TYPES = (
+    "AWS::BedrockAgentCore::Runtime",
+    "AWS::BedrockAgentCore::RuntimeEndpoint",
+)
+
+
+def _narrowed_selector(*resource_types, field="readOnly", value="false"):
+    """A Data selector on resource types that keeps only some of their events."""
+    selector = _data_event_selector(*resource_types)
+    selector["FieldSelectors"].append({"Field": field, "Equals": [value]})
+    return selector
+
+
+def _trail(name, region="us-east-1"):
+    return {
+        "Name": name,
+        "TrailARN": f"arn:aws:cloudtrail:{region}:123456789012:trail/{name}",
+    }
+
+
+class TestAC18WholePopulation:
+    """AC-18: every in-use type, every family, and only trails that record here."""
+
+    @staticmethod
+    def _selectors_per_trail(mock_ct, per_trail):
+        mock_ct.list_trails.return_value = {
+            "Trails": [_trail(name) for name in per_trail]
+        }
+        by_arn = {_trail(name)["TrailARN"]: sel for name, sel in per_trail.items()}
+        mock_ct.get_event_selectors.side_effect = lambda TrailName: {
+            "AdvancedEventSelectors": by_arn[TrailName]
+        }
+
+    @patch("agentcore_app.agentcore_client")
+    @patch("agentcore_app.cloudtrail_client")
+    def test_a_runtime_without_its_endpoint_type_fails(self, mock_ct, mock_ac):
+        self._selectors_per_trail(
+            mock_ct, {"t1": [_data_event_selector("AWS::BedrockAgentCore::Runtime")]}
+        )
+        _logging_trail(mock_ct)
+        _empty_agentcore_inventory(mock_ac)
+        mock_ac.list_agent_runtimes.return_value = {
+            "agentRuntimes": [{"agentRuntimeId": "rt-1"}, {"agentRuntimeId": "rt-2"}]
+        }
+
+        runtime = _family_finding(
+            agentcore_app.check_agentcore_cloudtrail_data_events(), "Runtime"
+        )
+
+        assert runtime["Status"] == "Failed"
+        assert (
+            "AWS::BedrockAgentCore::RuntimeEndpoint whole" in runtime["Finding_Details"]
+        )
+        assert "AWS::BedrockAgentCore::Runtime is covered" in runtime["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    @patch("agentcore_app.cloudtrail_client")
+    def test_types_split_across_two_trails_pass(self, mock_ct, mock_ac):
+        self._selectors_per_trail(
+            mock_ct,
+            {
+                "t1": [_data_event_selector("AWS::BedrockAgentCore::Runtime")],
+                "t2": [_data_event_selector("AWS::BedrockAgentCore::RuntimeEndpoint")],
+            },
+        )
+        _logging_trail(mock_ct)
+        _empty_agentcore_inventory(mock_ac)
+        mock_ac.list_agent_runtimes.return_value = {
+            "agentRuntimes": [{"agentRuntimeId": "rt-1"}]
+        }
+
+        runtime = _family_finding(
+            agentcore_app.check_agentcore_cloudtrail_data_events(), "Runtime"
+        )
+
+        assert runtime["Status"] == "Passed"
+        assert "t1" in runtime["Finding_Details"]
+        assert "t2" in runtime["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "selected, verdict",
+        [(("AWS::BedrockAgentCore::Gateway",), "Passed"), (_RUNTIME_TYPES, "Failed")],
+    )
+    @patch("agentcore_app.agentcore_client")
+    @patch("agentcore_app.cloudtrail_client")
+    def test_gateways_are_a_family(self, mock_ct, mock_ac, selected, verdict):
+        self._selectors_per_trail(mock_ct, {"t1": [_data_event_selector(*selected)]})
+        _logging_trail(mock_ct)
+        _empty_agentcore_inventory(mock_ac)
+        mock_ac.list_gateways.return_value = {
+            "items": [{"gatewayId": "gw-1"}, {"gatewayId": "gw-2"}]
+        }
+
+        gateway = _family_finding(
+            agentcore_app.check_agentcore_cloudtrail_data_events(), "Gateway"
+        )
+
+        assert gateway["Status"] == verdict
+
+    @patch("agentcore_app.agentcore_client")
+    @patch("agentcore_app.cloudtrail_client")
+    def test_a_workload_identity_needs_its_directory_type(self, mock_ct, mock_ac):
+        self._selectors_per_trail(
+            mock_ct,
+            {"t1": [_data_event_selector("AWS::BedrockAgentCore::WorkloadIdentity")]},
+        )
+        _logging_trail(mock_ct)
+        _empty_agentcore_inventory(mock_ac)
+        mock_ac.list_workload_identities.return_value = {
+            "workloadIdentities": [{"name": "wi-1"}]
+        }
+
+        identity = _family_finding(
+            agentcore_app.check_agentcore_cloudtrail_data_events(), "Identity"
+        )
+
+        assert identity["Status"] == "Failed"
+        assert "WorkloadIdentityDirectory" in identity["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    @patch("agentcore_app.cloudtrail_client")
+    def test_identity_types_without_resources_are_not_required(self, mock_ct, mock_ac):
+        self._selectors_per_trail(
+            mock_ct,
+            {
+                "t1": [
+                    _data_event_selector(
+                        "AWS::BedrockAgentCore::APIKeyCredentialProvider",
+                        "AWS::BedrockAgentCore::TokenVault",
+                    )
+                ]
+            },
+        )
+        _logging_trail(mock_ct)
+        _empty_agentcore_inventory(mock_ac)
+        mock_ac.list_api_key_credential_providers.return_value = {
+            "credentialProviders": [{"name": "key-1"}]
+        }
+
+        identity = _family_finding(
+            agentcore_app.check_agentcore_cloudtrail_data_events(), "Identity"
+        )
+
+        assert identity["Status"] == "Passed"
+
+    @patch("agentcore_app.agentcore_client")
+    @patch("agentcore_app.cloudtrail_client")
+    def test_an_oauth_provider_needs_its_own_type(self, mock_ct, mock_ac):
+        self._selectors_per_trail(
+            mock_ct,
+            {
+                "t1": [
+                    _data_event_selector(
+                        "AWS::BedrockAgentCore::APIKeyCredentialProvider",
+                        "AWS::BedrockAgentCore::TokenVault",
+                    )
+                ]
+            },
+        )
+        _logging_trail(mock_ct)
+        _empty_agentcore_inventory(mock_ac)
+        mock_ac.list_api_key_credential_providers.return_value = {
+            "credentialProviders": [{"name": "key-1"}]
+        }
+        mock_ac.list_oauth2_credential_providers.return_value = {
+            "credentialProviders": [{"name": "oauth-1"}]
+        }
+
+        identity = _family_finding(
+            agentcore_app.check_agentcore_cloudtrail_data_events(), "Identity"
+        )
+
+        assert identity["Status"] == "Failed"
+        assert "OAuth2CredentialProvider whole" in identity["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    @patch("agentcore_app.cloudtrail_client")
+    def test_a_policy_on_the_second_engine_puts_policy_in_scope(self, mock_ct, mock_ac):
+        self._selectors_per_trail(
+            mock_ct,
+            {"t1": [_data_event_selector("AWS::BedrockAgentCore::PolicyEngine")]},
+        )
+        _logging_trail(mock_ct)
+        _empty_agentcore_inventory(mock_ac)
+        mock_ac.list_policy_engines.return_value = {
+            "policyEngines": [{"policyEngineId": "pe-1"}, {"policyEngineId": "pe-2"}]
+        }
+        mock_ac.list_policies.side_effect = lambda **kwargs: {
+            "policies": [{"policyId": "p-1"}]
+            if kwargs["policyEngineId"] == "pe-2"
+            else []
+        }
+
+        policy = _family_finding(
+            agentcore_app.check_agentcore_cloudtrail_data_events(), "Policy"
+        )
+
+        assert policy["Status"] == "Failed"
+        assert "AWS::BedrockAgentCore::Policy whole" in policy["Finding_Details"]
+        assert {
+            call.kwargs["policyEngineId"]
+            for call in mock_ac.list_policies.call_args_list
+        } == {"pe-1", "pe-2"}
+
+    @patch("agentcore_app.agentcore_client")
+    @patch("agentcore_app.cloudtrail_client")
+    def test_engines_without_policies_need_only_the_engine_type(self, mock_ct, mock_ac):
+        self._selectors_per_trail(
+            mock_ct,
+            {"t1": [_data_event_selector("AWS::BedrockAgentCore::PolicyEngine")]},
+        )
+        _logging_trail(mock_ct)
+        _empty_agentcore_inventory(mock_ac)
+        mock_ac.list_policy_engines.return_value = {
+            "policyEngines": [{"policyEngineId": "pe-1"}]
+        }
+        mock_ac.list_policies.return_value = {"policies": []}
+
+        policy = _family_finding(
+            agentcore_app.check_agentcore_cloudtrail_data_events(), "Policy"
+        )
+
+        assert policy["Status"] == "Passed"
+
+    @patch("agentcore_app.agentcore_client")
+    @patch("agentcore_app.cloudtrail_client")
+    def test_the_managed_tools_need_the_unsuffixed_types(self, mock_ct, mock_ac):
+        self._selectors_per_trail(
+            mock_ct,
+            {
+                "t1": [
+                    _data_event_selector(
+                        "AWS::BedrockAgentCore::CodeInterpreterCustom",
+                        "AWS::BedrockAgentCore::BrowserCustom",
+                    )
+                ]
+            },
+        )
+        _logging_trail(mock_ct)
+        _empty_agentcore_inventory(mock_ac)
+        mock_ac.list_code_interpreters.side_effect = lambda **kwargs: {
+            "codeInterpreterSummaries": [
+                {"codeInterpreterId": f"aws.codeinterpreter.v1-{kwargs['type']}"}
+            ]
+        }
+
+        tools = _family_finding(
+            agentcore_app.check_agentcore_cloudtrail_data_events(), "Tool"
+        )
+
+        assert tools["Status"] == "Failed"
+        assert (
+            "AWS::BedrockAgentCore::CodeInterpreter whole" in tools["Finding_Details"]
+        )
+        assert {
+            call.kwargs.get("type")
+            for call in mock_ac.list_code_interpreters.call_args_list
+        } == {"SYSTEM", "CUSTOM"}
+
+    @pytest.mark.parametrize(
+        "field", ["readOnly", "eventName", "resources.ARN", "userIdentity.arn"]
+    )
+    @patch("agentcore_app.agentcore_client")
+    @patch("agentcore_app.cloudtrail_client")
+    def test_a_narrowed_selector_does_not_cover_the_type(self, mock_ct, mock_ac, field):
+        self._selectors_per_trail(
+            mock_ct,
+            {"t1": [_narrowed_selector("AWS::BedrockAgentCore::Memory", field=field)]},
+        )
+        _logging_trail(mock_ct)
+        _empty_agentcore_inventory(mock_ac)
+        mock_ac.list_memories.return_value = {"memories": [{"id": "mem-1"}]}
+
+        memory = _family_finding(
+            agentcore_app.check_agentcore_cloudtrail_data_events(), "Memory"
+        )
+
+        assert memory["Status"] == "Failed"
+        assert f"only where {field} match" in memory["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    @patch("agentcore_app.cloudtrail_client")
+    def test_a_whole_selector_on_another_trail_covers_a_narrowed_one(
+        self, mock_ct, mock_ac
+    ):
+        self._selectors_per_trail(
+            mock_ct,
+            {
+                "t1": [_narrowed_selector("AWS::BedrockAgentCore::Memory")],
+                "t2": [_data_event_selector("AWS::BedrockAgentCore::Memory")],
+            },
+        )
+        _logging_trail(mock_ct)
+        _empty_agentcore_inventory(mock_ac)
+        mock_ac.list_memories.return_value = {"memories": [{"id": "mem-1"}]}
+
+        memory = _family_finding(
+            agentcore_app.check_agentcore_cloudtrail_data_events(), "Memory"
+        )
+
+        assert memory["Status"] == "Passed"
+        assert "t2" in memory["Finding_Details"]
+        assert "trail/t1" not in memory["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    @patch("agentcore_app.cloudtrail_client")
+    def test_a_stopped_trail_does_not_count(self, mock_ct, mock_ac):
+        self._selectors_per_trail(
+            mock_ct,
+            {
+                "t1": [_data_event_selector("AWS::S3::Object")],
+                "stopped": [_data_event_selector("AWS::BedrockAgentCore::Memory")],
+            },
+        )
+        _logging_trail(mock_ct)
+        mock_ct.get_trail_status.side_effect = lambda Name: {
+            "IsLogging": not Name.endswith("/stopped")
+        }
+        _empty_agentcore_inventory(mock_ac)
+        mock_ac.list_memories.return_value = {"memories": [{"id": "mem-1"}]}
+
+        memory = _family_finding(
+            agentcore_app.check_agentcore_cloudtrail_data_events(), "Memory"
+        )
+
+        assert memory["Status"] == "Failed"
+        assert "trail/stopped is not logging" in memory["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "multi_region, home_region, verdict",
+        [
+            (False, "us-west-2", "Failed"),
+            (False, "us-east-1", "Passed"),
+            (True, "us-west-2", "Passed"),
+        ],
+    )
+    @patch("agentcore_app.agentcore_client")
+    @patch("agentcore_app.cloudtrail_client")
+    def test_a_trail_must_record_this_region(
+        self, mock_ct, mock_ac, multi_region, home_region, verdict
+    ):
+        self._selectors_per_trail(
+            mock_ct, {"t1": [_data_event_selector("AWS::BedrockAgentCore::Memory")]}
+        )
+        _logging_trail(mock_ct, multi_region=multi_region, home_region=home_region)
+        _empty_agentcore_inventory(mock_ac)
+        mock_ac.list_memories.return_value = {"memories": [{"id": "mem-1"}]}
+
+        memory = _family_finding(
+            agentcore_app.check_agentcore_cloudtrail_data_events(), "Memory"
+        )
+
+        assert memory["Status"] == verdict
+        if verdict == "Failed":
+            assert "records nothing here" in memory["Finding_Details"]
+
+    @pytest.mark.parametrize("unreadable_call", ["get_trail", "get_trail_status"])
+    @patch("agentcore_app.agentcore_client")
+    @patch("agentcore_app.cloudtrail_client")
+    def test_an_unreadable_trail_status_is_na_not_passed(
+        self, mock_ct, mock_ac, unreadable_call
+    ):
+        self._selectors_per_trail(
+            mock_ct, {"t1": [_data_event_selector("AWS::BedrockAgentCore::Memory")]}
+        )
+        _logging_trail(mock_ct)
+        getattr(mock_ct, unreadable_call).side_effect = _make_client_error(
+            "AccessDeniedException", "denied"
+        )
+        _empty_agentcore_inventory(mock_ac)
+        mock_ac.list_memories.return_value = {"memories": [{"id": "mem-1"}]}
+
+        memory = _family_finding(
+            agentcore_app.check_agentcore_cloudtrail_data_events(), "Memory"
+        )
+
+        assert memory["Status"] == "N/A"
+        assert "trail/t1" in memory["Finding_Details"]
+        assert "cloudtrail:GetTrailStatus" in memory["Resolution"]
+
+    @patch("agentcore_app.agentcore_client")
+    @patch("agentcore_app.cloudtrail_client")
+    def test_trails_selecting_no_agentcore_type_are_not_described(
+        self, mock_ct, mock_ac
+    ):
+        self._selectors_per_trail(
+            mock_ct, {"t1": [_data_event_selector("AWS::S3::Object")]}
+        )
+        _empty_agentcore_inventory(mock_ac)
+        mock_ac.list_memories.return_value = {"memories": [{"id": "mem-1"}]}
+
+        memory = _family_finding(
+            agentcore_app.check_agentcore_cloudtrail_data_events(), "Memory"
+        )
+
+        assert memory["Status"] == "Failed"
+        mock_ct.get_trail.assert_not_called()
+        mock_ct.get_trail_status.assert_not_called()
 
 
 # ===================================================================
@@ -5679,7 +6101,7 @@ class TestObservabilityCheckRegistration:
 
     def test_data_event_families_cover_runtime_memory_and_tools(self):
         keys = {family["key"] for family in agentcore_app.AGENTCORE_DATA_EVENT_FAMILIES}
-        assert keys == {"runtime", "memory", "tools"}
+        assert keys == {"runtime", "memory", "tools", "gateway", "identity", "policy"}
         memory = next(
             family
             for family in agentcore_app.AGENTCORE_DATA_EVENT_FAMILIES
@@ -5694,7 +6116,19 @@ class TestObservabilityCheckRegistration:
             "aws_secret_access_key": "testing",  # pragma: allowlist secret - synthetic test credential
         }
         expected = {
-            "cloudtrail": ["ListTrails", "GetEventSelectors"],
+            "cloudtrail": [
+                "ListTrails",
+                "GetEventSelectors",
+                "GetTrail",
+                "GetTrailStatus",
+            ],
+            "bedrock-agentcore-control": [
+                "ListWorkloadIdentities",
+                "ListOauth2CredentialProviders",
+                "ListApiKeyCredentialProviders",
+                "ListPolicyEngines",
+                "ListPolicies",
+            ],
             "logs": [
                 "DescribeLogGroups",
                 "DescribeAccountPolicies",

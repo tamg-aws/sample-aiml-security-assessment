@@ -167,6 +167,13 @@ REQUIRED_AGENTCORE_ACTIONS = {
     "bedrock-agentcore:ListGatewayRateLimits",
     "bedrock-agentcore:ListGatewayTargets",
     "bedrock-agentcore:GetGatewayTarget",
+    # AC-18 counts the identity resources and reads each trail's region and
+    # logging state.
+    "bedrock-agentcore:ListWorkloadIdentities",
+    "bedrock-agentcore:ListOauth2CredentialProviders",
+    "bedrock-agentcore:ListApiKeyCredentialProviders",
+    "cloudtrail:GetTrail",
+    "cloudtrail:GetTrailStatus",
     # AC-50 reads the registry scanning configuration.
     "ecr:GetRegistryScanningConfiguration",
     # AC-52 reads the Cognito user pools AgentCore JWT authorizers name.
@@ -960,6 +967,17 @@ _VERIFIED_REMEDIATION_IAM_ACTIONS |= {
 # cloudtrail:GetTrailz came back INVALID_ACTION at index 1.
 _VERIFIED_REMEDIATION_IAM_ACTIONS |= {
     "cloudtrail:GetTrail",
+}
+
+# Verified on 2026-09-27 with one IDENTITY_POLICY validate-policy run for the
+# AC-18 trail status and identity inventory legs. cloudtrail:GetTrailStatus,
+# cloudtrail:GetTrail, bedrock-agentcore:ListWorkloadIdentities,
+# bedrock-agentcore:ListOauth2CredentialProviders and
+# bedrock-agentcore:ListApiKeyCredentialProviders were not reported. The
+# negative controls bedrock-agentcore:ListNotARealThing and
+# cloudtrail:GetTrailStatusAndStuff came back INVALID_ACTION.
+_VERIFIED_REMEDIATION_IAM_ACTIONS |= {
+    "cloudtrail:GetTrailStatus",
 }
 
 _NON_IAM_REMEDIATION_TOKENS = {

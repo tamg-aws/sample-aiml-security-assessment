@@ -579,13 +579,24 @@ AGENTCORE_DATA_EVENT_FAMILIES = (
             "AWS::BedrockAgentCore::Runtime",
             "AWS::BedrockAgentCore::RuntimeEndpoint",
         ),
-        "inventory": (("list_agent_runtimes", ("agentRuntimes",), {}),),
+        # Every runtime carries a DEFAULT endpoint, so a listed runtime puts both
+        # types in scope.
+        "inventory": {
+            "AWS::BedrockAgentCore::Runtime": (
+                ("list_agent_runtimes", ("agentRuntimes",), {}),
+            ),
+            "AWS::BedrockAgentCore::RuntimeEndpoint": (
+                ("list_agent_runtimes", ("agentRuntimes",), {}),
+            ),
+        },
     },
     {
         "key": "memory",
         "label": "Memory",
         "resource_types": ("AWS::BedrockAgentCore::Memory",),
-        "inventory": (("list_memories", ("memories",), {}),),
+        "inventory": {
+            "AWS::BedrockAgentCore::Memory": (("list_memories", ("memories",), {}),),
+        },
     },
     {
         "key": "tools",
@@ -596,16 +607,94 @@ AGENTCORE_DATA_EVENT_FAMILIES = (
             "AWS::BedrockAgentCore::Browser",
             "AWS::BedrockAgentCore::BrowserCustom",
         ),
-        "inventory": (
-            (
-                "list_code_interpreters",
-                ("codeInterpreterSummaries",),
-                {"type": "CUSTOM"},
+        # The AWS-managed tools are listed as SYSTEM and recorded under the
+        # unsuffixed types; a customer's own tools are CUSTOM.
+        "inventory": {
+            "AWS::BedrockAgentCore::CodeInterpreter": (
+                (
+                    "list_code_interpreters",
+                    ("codeInterpreterSummaries",),
+                    {"type": "SYSTEM"},
+                ),
             ),
-            ("list_browsers", ("browserSummaries",), {"type": "CUSTOM"}),
+            "AWS::BedrockAgentCore::CodeInterpreterCustom": (
+                (
+                    "list_code_interpreters",
+                    ("codeInterpreterSummaries",),
+                    {"type": "CUSTOM"},
+                ),
+            ),
+            "AWS::BedrockAgentCore::Browser": (
+                ("list_browsers", ("browserSummaries",), {"type": "SYSTEM"}),
+            ),
+            "AWS::BedrockAgentCore::BrowserCustom": (
+                ("list_browsers", ("browserSummaries",), {"type": "CUSTOM"}),
+            ),
+        },
+    },
+    {
+        "key": "gateway",
+        "label": "Gateway",
+        "resource_types": ("AWS::BedrockAgentCore::Gateway",),
+        "inventory": {
+            "AWS::BedrockAgentCore::Gateway": (
+                ("list_gateways", ("items", "gateways"), {}),
+            ),
+        },
+    },
+    {
+        "key": "identity",
+        "label": "Identity",
+        "resource_types": (
+            "AWS::BedrockAgentCore::WorkloadIdentity",
+            "AWS::BedrockAgentCore::WorkloadIdentityDirectory",
+            "AWS::BedrockAgentCore::OAuth2CredentialProvider",
+            "AWS::BedrockAgentCore::APIKeyCredentialProvider",
+            "AWS::BedrockAgentCore::TokenVault",
         ),
+        # A workload identity lives in a directory and a credential provider in
+        # a token vault, so a listed identity or provider puts its container type
+        # in scope too.
+        "inventory": {
+            "AWS::BedrockAgentCore::WorkloadIdentity": (
+                ("list_workload_identities", ("workloadIdentities",), {}),
+            ),
+            "AWS::BedrockAgentCore::WorkloadIdentityDirectory": (
+                ("list_workload_identities", ("workloadIdentities",), {}),
+            ),
+            "AWS::BedrockAgentCore::OAuth2CredentialProvider": (
+                ("list_oauth2_credential_providers", ("credentialProviders",), {}),
+            ),
+            "AWS::BedrockAgentCore::APIKeyCredentialProvider": (
+                ("list_api_key_credential_providers", ("credentialProviders",), {}),
+            ),
+            "AWS::BedrockAgentCore::TokenVault": (
+                ("list_oauth2_credential_providers", ("credentialProviders",), {}),
+                ("list_api_key_credential_providers", ("credentialProviders",), {}),
+            ),
+        },
+    },
+    {
+        "key": "policy",
+        "label": "Policy",
+        "resource_types": (
+            "AWS::BedrockAgentCore::PolicyEngine",
+            "AWS::BedrockAgentCore::Policy",
+        ),
+        # ListPolicies is per engine, so the Policy count walks every engine.
+        "inventory": {
+            "AWS::BedrockAgentCore::PolicyEngine": (
+                ("list_policy_engines", ("policyEngines",), {}),
+            ),
+            "AWS::BedrockAgentCore::Policy": (("list_policies", ("policies",), {}),),
+        },
     },
 )
+
+# Advanced event selector fields that decide which events of a selected type are
+# kept. Any other field (eventName, readOnly, resources.ARN, userIdentity.arn and
+# so on) drops some of the type's events.
+DATA_EVENT_SELECTOR_SCOPE_FIELDS = ("eventCategory", "resources.type")
 
 # Log groups AgentCore writes to: the service-managed prefix and the vended-log
 # prefix used by memory and gateway log delivery.
@@ -6538,44 +6627,64 @@ def check_agentcore_gateway_configuration() -> List[Dict[str, Any]]:
     return findings
 
 
-def _advanced_selector_data_resource_types(selector: Dict[str, Any]) -> Set[str]:
+def _advanced_selector_data_resource_types(
+    selector: Dict[str, Any],
+) -> Tuple[Set[str], List[str]]:
     """Read resources.type values from a Data-category advanced event selector.
 
-    Management-category selectors carry no resources.type, and a selector that
-    omits eventCategory Data does not log data events, so its resource types are
-    not evidence of data-event coverage.
+    Returns the selected types and the fields beyond eventCategory and
+    resources.type that narrow the selector, so a selector that keeps only some
+    of a type's events is not read as covering the type. Management-category
+    selectors carry no resources.type, and a selector that omits eventCategory
+    Data does not log data events, so its resource types are not evidence of
+    data-event coverage.
     """
     field_selectors = selector.get("FieldSelectors")
     if not isinstance(field_selectors, list):
-        return set()
+        return set(), []
 
     logs_data_events = False
     resource_types: Set[str] = set()
+    narrowing: List[str] = []
 
     for field_selector in field_selectors:
         if not isinstance(field_selector, dict):
             continue
+        field = field_selector.get("Field")
+        if field not in DATA_EVENT_SELECTOR_SCOPE_FIELDS:
+            narrowing.append(str(field))
+            continue
         equals = field_selector.get("Equals")
         if not isinstance(equals, list):
             continue
-        field = field_selector.get("Field")
         if field == "eventCategory" and "Data" in equals:
             logs_data_events = True
         elif field == "resources.type":
             resource_types.update(value for value in equals if isinstance(value, str))
 
-    return resource_types if logs_data_events else set()
+    if not logs_data_events:
+        return set(), []
+    return resource_types, sorted(set(narrowing))
 
 
-def _cloudtrail_data_event_resource_types() -> Tuple[Set[str], List[str]]:
-    """Collect every resources.type any trail selects for data events.
+def _cloudtrail_data_event_resource_types() -> Dict[str, Any]:
+    """Collect the AgentCore resource types each logging trail selects whole.
 
-    Returns the selected types and the trails whose selectors could not be read,
-    so a family with no matching type can be reported as unknown instead of
-    uncovered when the evidence is incomplete.
+    A trail counts only when it records this region (multi-region, or homed
+    here) and GetTrailStatus reports IsLogging true: a stopped trail or one homed
+    elsewhere writes no event for this region's resources.
+
+    Returns `whole` (type to the trails selecting every one of its data events),
+    `narrowed` (type to notes naming the trail and the fields that drop some of
+    its events), `excluded` (notes on trails that select a type but do not
+    count) and `unreadable` (trails whose selectors, detail or status could not
+    be read), so a type no counted trail selects can be reported as unknown
+    instead of uncovered when the evidence is incomplete.
     """
-    selected_types: Set[str] = set()
-    unreadable_trails: List[str] = []
+    whole: Dict[str, List[str]] = {}
+    narrowed: Dict[str, List[str]] = {}
+    excluded: List[str] = []
+    unreadable: List[str] = []
 
     trails = _paginate_aws_list(
         cloudtrail_client,
@@ -6584,6 +6693,7 @@ def _cloudtrail_data_event_resource_types() -> Tuple[Set[str], List[str]]:
         token_request_key="NextToken",
         token_response_key="NextToken",
     )
+    region = cloudtrail_client.meta.region_name
 
     for trail in trails:
         # The ARN, not the name: a name resolves only in the trail's home region,
@@ -6601,36 +6711,120 @@ def _cloudtrail_data_event_resource_types() -> Tuple[Set[str], List[str]]:
                 f"Could not read event selectors for {trail_identifier}: "
                 f"{type(error).__name__}"
             )
-            unreadable_trails.append(trail_identifier)
+            unreadable.append(trail_identifier)
             continue
 
         advanced_selectors = selectors.get("AdvancedEventSelectors")
         if not isinstance(advanced_selectors, list):
             continue
 
+        trail_whole: Set[str] = set()
+        trail_narrowed: Dict[str, Set[str]] = {}
         for selector in advanced_selectors:
-            if isinstance(selector, dict):
-                selected_types.update(_advanced_selector_data_resource_types(selector))
+            if not isinstance(selector, dict):
+                continue
+            types, narrowing = _advanced_selector_data_resource_types(selector)
+            for resource_type in types:
+                if not resource_type.startswith("AWS::BedrockAgentCore::"):
+                    continue
+                if narrowing:
+                    trail_narrowed.setdefault(resource_type, set()).update(narrowing)
+                else:
+                    trail_whole.add(resource_type)
+        if not trail_whole and not trail_narrowed:
+            continue
 
-    return selected_types, unreadable_trails
+        try:
+            detail = (
+                cloudtrail_client.get_trail(Name=trail_identifier).get("Trail") or {}
+            )
+            status = cloudtrail_client.get_trail_status(Name=trail_identifier)
+        except Exception as error:
+            logger.warning(
+                f"Could not read trail detail or status for {trail_identifier}: "
+                f"{type(error).__name__}"
+            )
+            unreadable.append(trail_identifier)
+            continue
+        if detail.get("IsMultiRegionTrail") is not True and (
+            detail.get("HomeRegion") != region
+        ):
+            excluded.append(
+                f"trail {trail_identifier} is homed in "
+                f"{detail.get('HomeRegion', 'another region')} and is not "
+                "multi-region, so it records nothing here"
+            )
+            continue
+        if status.get("IsLogging") is not True:
+            excluded.append(
+                f"trail {trail_identifier} is not logging (IsLogging is "
+                f"{status.get('IsLogging')})"
+            )
+            continue
+
+        for resource_type in trail_whole:
+            whole.setdefault(resource_type, []).append(trail_identifier)
+        for resource_type, fields in trail_narrowed.items():
+            narrowed.setdefault(resource_type, []).append(
+                f"trail {trail_identifier} selects {resource_type} only where "
+                f"{', '.join(sorted(fields))} match"
+            )
+
+    return {
+        "whole": whole,
+        "narrowed": narrowed,
+        "excluded": excluded,
+        "unreadable": unreadable,
+    }
 
 
-def _agentcore_family_resource_count(family: Dict[str, Any]) -> int:
-    """Count this region's resources for one AgentCore data-event family."""
-    count = 0
-    for operation_name, result_keys, list_kwargs in family["inventory"]:
-        count += len(
-            _agentcore_list_all(operation_name, list(result_keys), **list_kwargs)
-        )
-    return count
+def _agentcore_family_inventory(family: Dict[str, Any]) -> Tuple[Dict[str, int], int]:
+    """Count this region's resources per data-event type of one AgentCore family.
+
+    Returns the count for each resource type and the number of distinct
+    resources listed, reading each list API once.
+    """
+    listed: Dict[Tuple[str, Tuple[Tuple[str, Any], ...]], List[Dict[str, Any]]] = {}
+
+    def read(
+        operation_name: str, result_keys: Tuple[str, ...], list_kwargs: Dict[str, Any]
+    ) -> List[Dict[str, Any]]:
+        key = (operation_name, tuple(sorted(list_kwargs.items())))
+        if key not in listed:
+            if operation_name == "list_policies":
+                engines = read("list_policy_engines", ("policyEngines",), {})
+                listed[key] = [
+                    policy
+                    for engine in engines
+                    for policy in _agentcore_list_all(
+                        "list_policies",
+                        list(result_keys),
+                        policyEngineId=engine.get("policyEngineId"),
+                    )
+                ]
+            else:
+                listed[key] = _agentcore_list_all(
+                    operation_name, list(result_keys), **list_kwargs
+                )
+        return listed[key]
+
+    type_counts = {
+        resource_type: sum(len(read(*operation)) for operation in operations)
+        for resource_type, operations in family["inventory"].items()
+    }
+    return type_counts, sum(len(items) for items in listed.values())
 
 
 def check_agentcore_cloudtrail_data_events() -> List[Dict[str, Any]]:
     """AC-18: Report CloudTrail data-event coverage per AgentCore service family.
 
     Management events record that a runtime or memory was created. Only a
-    Data-category advanced event selector on the family's resources.type records
-    the invocations and the memory record reads and writes that follow.
+    Data-category advanced event selector on the resources.type records the
+    invocations and the memory record reads and writes that follow. A family
+    passes only when every one of its types that has a resource in this region
+    is selected, with no narrowing field, by a trail that is logging and records
+    this region. CloudTrail Lake event data stores are not read, so data events
+    collected only there read as uncovered.
     """
     if cloudtrail_client is None:
         return [
@@ -6646,7 +6840,7 @@ def check_agentcore_cloudtrail_data_events() -> List[Dict[str, Any]]:
         ]
 
     try:
-        selected_types, unreadable_trails = _cloudtrail_data_event_resource_types()
+        coverage = _cloudtrail_data_event_resource_types()
     except Exception as error:
         return [
             create_finding(
@@ -6662,6 +6856,7 @@ def check_agentcore_cloudtrail_data_events() -> List[Dict[str, Any]]:
             )
         ]
 
+    unreadable_trails = coverage["unreadable"]
     findings = []
     for family in AGENTCORE_DATA_EVENT_FAMILIES:
         label = family["label"]
@@ -6669,7 +6864,7 @@ def check_agentcore_cloudtrail_data_events() -> List[Dict[str, Any]]:
         type_list = ", ".join(resource_types)
 
         try:
-            resource_count = _agentcore_family_resource_count(family)
+            type_counts, resource_count = _agentcore_family_inventory(family)
         except Exception as error:
             findings.append(
                 create_finding(
@@ -6691,8 +6886,6 @@ def check_agentcore_cloudtrail_data_events() -> List[Dict[str, Any]]:
             )
             continue
 
-        covered_types = sorted(set(resource_types) & selected_types)
-
         if resource_count == 0:
             findings.append(
                 create_finding(
@@ -6710,20 +6903,23 @@ def check_agentcore_cloudtrail_data_events() -> List[Dict[str, Any]]:
             )
             continue
 
-        if covered_types:
+        present = [t for t in resource_types if type_counts.get(t)]
+        missing = [t for t in present if not coverage["whole"].get(t)]
+
+        if not missing:
+            trails = sorted({trail for t in present for trail in coverage["whole"][t]})
             findings.append(
                 create_finding(
                     check_id="AC-18",
                     finding_name="AgentCore CloudTrail Data Event Coverage",
                     finding_details=(
                         f"{resource_count} AgentCore {label} resource(s) are "
-                        f"covered by a CloudTrail data-event selector on "
-                        f"{', '.join(covered_types)}."
+                        f"covered: every type in use here, {', '.join(present)}, "
+                        "is selected for data events with no narrowing field by "
+                        "a trail that is logging and records this region: "
+                        f"{', '.join(trails)}."
                     ),
-                    resolution=(
-                        "No action required. Confirm the trail's selector matches "
-                        "the resources in scope and that the trail is logging."
-                    ),
+                    resolution="No action required.",
                     reference=CLOUDTRAIL_DATA_EVENTS_REFERENCE_URL,
                     severity=SeverityEnum.MEDIUM,
                     status=StatusEnum.PASSED,
@@ -6738,12 +6934,15 @@ def check_agentcore_cloudtrail_data_events() -> List[Dict[str, Any]]:
                     finding_name="AgentCore CloudTrail Data Event Coverage",
                     finding_details=(
                         f"{resource_count} AgentCore {label} resource(s) found, and "
-                        f"no readable trail selects {type_list} for data events, but "
-                        f"{len(unreadable_trails)} trail(s) could not be read."
+                        "no readable, logging trail recording this region selects "
+                        f"{', '.join(missing)} whole for data events, but "
+                        f"{len(unreadable_trails)} trail(s) could not be read: "
+                        f"{', '.join(unreadable_trails)}."
                     ),
                     resolution=(
-                        "Grant cloudtrail:GetEventSelectors on every trail and "
-                        "retry so the coverage verdict is decided on all trails."
+                        "Grant cloudtrail:GetEventSelectors, cloudtrail:GetTrail "
+                        "and cloudtrail:GetTrailStatus on every trail and retry so "
+                        "the coverage verdict is decided on all trails."
                     ),
                     reference=CLOUDTRAIL_DATA_EVENTS_REFERENCE_URL,
                     severity=SeverityEnum.INFORMATIONAL,
@@ -6752,18 +6951,31 @@ def check_agentcore_cloudtrail_data_events() -> List[Dict[str, Any]]:
             )
             continue
 
+        notes = [
+            note for t in missing for note in coverage["narrowed"].get(t, [])
+        ] + coverage["excluded"]
+        note_text = f" {'; '.join(notes)}." if notes else ""
+        covered = [t for t in present if t not in missing]
+        covered_text = (
+            f" {', '.join(covered)} {'is' if len(covered) == 1 else 'are'} covered."
+            if covered
+            else ""
+        )
         findings.append(
             create_finding(
                 check_id="AC-18",
                 finding_name="AgentCore CloudTrail Data Event Coverage",
                 finding_details=(
                     f"{resource_count} AgentCore {label} resource(s) found, and no "
-                    f"trail selects {type_list} for data events, so "
-                    f"{label.lower()} invocations are not in the audit trail."
+                    "logging trail recording this region selects "
+                    f"{', '.join(missing)} whole for data events, so those "
+                    f"{label.lower()} calls are not all in the audit trail."
+                    f"{covered_text}{note_text}"
                 ),
                 resolution=(
                     "Add a CloudTrail advanced event selector with eventCategory "
-                    f"Data and resources.type set to {type_list}."
+                    f"Data and resources.type set to {', '.join(missing)}, with no "
+                    "other field, on a multi-Region trail that is logging."
                 ),
                 reference=CLOUDTRAIL_DATA_EVENTS_REFERENCE_URL,
                 severity=SeverityEnum.MEDIUM,

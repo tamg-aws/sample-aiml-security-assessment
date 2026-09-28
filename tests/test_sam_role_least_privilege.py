@@ -282,6 +282,7 @@ _EXPECTED_ACTIONS = {
         "bedrock-agentcore:GetResourcePolicy",
         "bedrock-agentcore:GetTokenVault",
         "bedrock-agentcore:ListAgentRuntimes",
+        "bedrock-agentcore:ListApiKeyCredentialProviders",
         "bedrock-agentcore:ListBrowsers",
         "bedrock-agentcore:ListCodeInterpreters",
         "bedrock-agentcore:ListEvaluators",
@@ -289,11 +290,14 @@ _EXPECTED_ACTIONS = {
         "bedrock-agentcore:ListGatewayTargets",
         "bedrock-agentcore:ListGateways",
         "bedrock-agentcore:ListMemories",
+        "bedrock-agentcore:ListOauth2CredentialProviders",
         "bedrock-agentcore:ListOnlineEvaluationConfigs",
         "bedrock-agentcore:ListPolicies",
         "bedrock-agentcore:ListPolicyEngines",
+        "bedrock-agentcore:ListWorkloadIdentities",
         "cloudtrail:GetEventSelectors",
         "cloudtrail:GetTrail",
+        "cloudtrail:GetTrailStatus",
         "cloudtrail:ListTrails",
         "cloudwatch:PutMetricData",
         "cognito-idp:DescribeUserPool",
@@ -910,6 +914,10 @@ def test_agentcore_observability_and_governance_reads_are_scoped_where_iam_allow
             "cloudtrail:GetEventSelectors",
             "cloudtrail:*:${AWS::AccountId}:trail/*",
         ),
+        "AgentCoreIdentityInventory": (
+            "bedrock-agentcore:ListWorkloadIdentities",
+            "bedrock-agentcore:*:${AWS::AccountId}:workload-identity-directory/*",
+        ),
         "LogsDataProtectionPolicyRead": (
             "logs:GetDataProtectionPolicy",
             "logs:*:${AWS::AccountId}:log-group:*",
@@ -934,6 +942,19 @@ def test_agentcore_observability_and_governance_reads_are_scoped_where_iam_allow
         assert action in statement
         assert resource in statement
         assert not re.search(r"Resource:\s+['\"]\*['\"]", statement)
+
+    # AC-18 reads each trail's logging state beside its selectors, on the same
+    # trail ARN, and lists the credential providers in the token vault.
+    trail_read = _statement_block(
+        template, "AgentCoreSecurityAssessmentFunction", "CloudTrailEventSelectorRead"
+    )
+    assert "cloudtrail:GetTrailStatus" in trail_read
+    identity = _statement_block(
+        template, "AgentCoreSecurityAssessmentFunction", "AgentCoreIdentityInventory"
+    )
+    assert "bedrock-agentcore:ListOauth2CredentialProviders" in identity
+    assert "bedrock-agentcore:ListApiKeyCredentialProviders" in identity
+    assert "bedrock-agentcore:*:${AWS::AccountId}:token-vault/*" in identity
 
     # DescribeSecurityGroups has no resource-level authorization either, so it
     # joins the existing EC2 enumeration statement instead of getting a wildcard
