@@ -489,10 +489,12 @@
         "sagemaker_assessments"
       ],
       "incumbents": [
-        "SM-18"
+        "SM-18",
+        "SM-42"
       ],
       "incumbent_names": [
-        "SageMaker Transform Job Encryption Check"
+        "SageMaker Transform Job Encryption Check",
+        "SageMaker Batch Transform Creation Guardrail"
       ],
       "gap": "",
       "extra_iam": [],

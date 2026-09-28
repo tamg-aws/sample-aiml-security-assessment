@@ -101,6 +101,14 @@ Passed)`), so a failing resource cannot be hidden behind a later `Passed` row
 from the same check. BR-20 emits its summary `Passed` row after its per-resource
 rows, which is the order that made this concrete.
 
+A source check that runs once per account, on the primary Region, reports under
+the `Global` Region. `SM-09` and `BR-37` each have such a leg. An account-wide
+verdict holds in every Region, so each `Global` row is aggregated into every
+regional key of the same account, and `Finding_Details` says so. The `Global`
+key gets its own `AISF-` rows only for an account with no regional key.
+Otherwise a `Global` `Failed` would sit beside a regional `Passed` for the same
+control.
+
 `AISF-00` is a report-completeness marker, not an AISF control. It lists every
 derived control that had no source check for that account and region, so an
 incomplete scan reads as unassessed instead of silently omitting rows.
@@ -131,7 +139,7 @@ itself. A row with `Status=N/A` always reports `Informational`.
 | AISF-04 | AIR-BDR-GRD-03 | High | `BR-26` |
 | AISF-05 | AIR-BDR-KB-03 | High | `BR-20` |
 | AISF-06 | AIR-BDR-MDL-10 | High | `BR-37` |
-| AISF-07 | AIR-SGM-EP-08 | High | `SM-18` |
+| AISF-07 | AIR-SGM-EP-08 | High | `SM-18`, `SM-42` |
 | AISF-08 | AIR-SGM-TRN-05 | Medium | `SM-09`, `SM-01`, `SM-03` |
 
 ### AISF-01 AIR-ACR-GW-01 Gateway Inbound Authorization
@@ -210,6 +218,7 @@ private-network and encryption standard as real-time inference?
 | Source | Signal |
 | -------- | -------- |
 | SM-18 | SageMaker Transform Job Encryption Check (model VPC/isolation config plus job KMS configuration) |
+| SM-42 | SageMaker Batch Transform Creation Guardrail (SCP and identity guardrails on `CreateModel` and `CreateTransformJob` for encryption, approved network and no direct internet access) |
 
 Reference: <https://docs.aws.amazon.com/sagemaker/latest/dg/batch-vpc.html>
 
@@ -240,8 +249,8 @@ contributes to, so a reader of `bedrock_security_report_*.csv` can trace a row
 back to the framework. The `Status` column still carries the verdict.
 
 Measured by `check_ledger.py` gate 14, which prints each of these figures on
-every run: 163 check-control pairs over 109 tagged checks in 4 modules, naming 101
-distinct controls. Tagged checks per module are bedrock 33, sagemaker 24,
+every run: 164 check-control pairs over 110 tagged checks in 4 modules, naming 101
+distinct controls. Tagged checks per module are bedrock 33, sagemaker 25,
 agentcore 48, agent_registry 4.
 
 ### The qualifier is what makes a `tighten` control safe to name
@@ -258,8 +267,8 @@ trusting the literal in the file:
 | `AISF AIR-SGM-TRN-05 (1 of 3 checks)` | the control is covered, but jointly, so no single leg asserts it |
 | `AISF <control> (partial)` | the check asserts less than the control requires, and the gap is open in the ledger |
 
-Census at the current head, also printed by gate 14: 60 bare, 0 `(partial)`, 103
-joint. The 60 bare tags plus the 41 jointly covered controls account for the 101
+Census at the current head, also printed by gate 14: 59 bare, 0 `(partial)`, 105
+joint. The 59 bare tags plus the 42 jointly covered controls account for the 101
 `covered` controls. A `(partial)` tag sits on a `tighten` control, one per
 incumbent, and with 0 `tighten` controls open none is emitted. A bare tag on a `tighten` row, a `(partial)` on a `covered` row, or a
 dropped `(1 of N)`, fails gate 14 with the row's verdict and incumbent count

@@ -223,7 +223,10 @@ def test_two_producers_in_one_interpreter_keep_their_own_maps(schemas):
     bedrock = schemas["bedrock_assessments"]
     sagemaker = schemas["sagemaker_assessments"]
     assert _finding(bedrock, "BR-10")["Compliance_Frameworks"] == "AISF AIR-BDR-GRD-01"
-    assert _finding(sagemaker, "SM-18")["Compliance_Frameworks"] == "AISF AIR-SGM-EP-08"
+    assert (
+        _finding(sagemaker, "SM-18")["Compliance_Frameworks"]
+        == "AISF AIR-SGM-EP-08 (1 of 2 checks)"
+    )
     # And neither answers for the other's ids.
     assert _finding(bedrock, "SM-18")["Compliance_Frameworks"] == ""
     assert _finding(sagemaker, "BR-10")["Compliance_Frameworks"] == ""
