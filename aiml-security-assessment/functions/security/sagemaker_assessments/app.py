@@ -1213,6 +1213,21 @@ def _granted_actions(
     return granted
 
 
+def _boundary_unread(permission_cache: Dict[str, Any]) -> set:
+    """Return (type, name) for each principal whose permissions boundary the
+    cache failed to read. The cache stores a null boundary both when none is
+    set and when the read failed, so only the error entry tells them apart,
+    and such a principal is left unassessed: a boundary could remove the grant.
+    """
+    return {
+        (str(error.get("type", "")).lower(), error["name"])
+        for error in permission_cache.get("principal_errors") or []
+        if isinstance(error, dict)
+        and error.get("name")
+        and error.get("stage") == "permissions_boundary"
+    }
+
+
 def _merged_resources(statement: Dict[str, Any]) -> List[str]:
     """Lowercase Resource patterns of one statement. A NotResource statement
     reads as "*", which can only over-report."""
@@ -1422,11 +1437,16 @@ def _service_wide_grant_findings(
     violations = []
     unreadable = []
     policies_read = 0
+    boundary_unread = _boundary_unread(permission_cache)
     for identity_type, cache_key in (
         ("Role", "role_permissions"),
         ("User", "user_permissions"),
     ):
         for name, permissions in (permission_cache.get(cache_key) or {}).items():
+            if (identity_type.lower(), name) in boundary_unread and (
+                permissions.get("permissions_boundary") is None
+            ):
+                continue
             policies = [
                 policy
                 for policy in [
@@ -1565,6 +1585,7 @@ def _merged_read_write_findings(
 ) -> List[Dict[str, Any]]:
     """AIR-FND-IAM-09 leg of SM-02: a grant that cannot tell read from write,
     read over every policy of every cached role and user, AWS managed included."""
+    boundary_unread = _boundary_unread(permission_cache)
     identities = [
         (identity_type, name, permissions)
         for identity_type, cache_key in (
@@ -1572,6 +1593,8 @@ def _merged_read_write_findings(
             ("User", "user_permissions"),
         )
         for name, permissions in (permission_cache.get(cache_key) or {}).items()
+        if (identity_type.lower(), name) not in boundary_unread
+        or permissions.get("permissions_boundary") is not None
     ]
     flagged, unreadable = [], []
     for identity_type, name, permissions in identities:

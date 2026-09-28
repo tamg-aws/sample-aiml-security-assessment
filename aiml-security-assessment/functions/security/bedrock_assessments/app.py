@@ -1083,6 +1083,21 @@ def _granted_actions(
     return granted
 
 
+def _boundary_unread(permission_cache: Dict[str, Any]) -> set:
+    """Return (type, name) for each principal whose permissions boundary the
+    cache failed to read. The cache stores a null boundary both when none is
+    set and when the read failed, so only the error entry tells them apart,
+    and such a principal is left unassessed: a boundary could remove the grant.
+    """
+    return {
+        (str(error.get("type", "")).lower(), error["name"])
+        for error in permission_cache.get("principal_errors") or []
+        if isinstance(error, dict)
+        and error.get("name")
+        and error.get("stage") == "permissions_boundary"
+    }
+
+
 def _boundary_leaves_bedrock(permissions: Dict[str, Any]) -> bool:
     """Whether the identity is granted any Bedrock action once its boundary and
     account-wide Denies apply. A policy that cannot be parsed keeps the grant."""
@@ -1245,12 +1260,16 @@ def _merged_read_write_findings(
 ) -> List[Dict[str, Any]]:
     """AIR-FND-IAM-09 leg of BR-01: a grant that cannot tell read from write,
     read over every policy of every cached role and user, AWS managed included."""
+    boundary_unread = _boundary_unread(permission_cache)
     identities = [
-        ("Role", name, permissions)
-        for name, permissions in permission_cache["role_permissions"].items()
-    ] + [
-        ("User", name, permissions)
-        for name, permissions in permission_cache["user_permissions"].items()
+        (identity_type, name, permissions)
+        for identity_type, cache_key in (
+            ("Role", "role_permissions"),
+            ("User", "user_permissions"),
+        )
+        for name, permissions in permission_cache[cache_key].items()
+        if (identity_type.lower(), name) not in boundary_unread
+        or permissions.get("permissions_boundary") is not None
     ]
     flagged, unreadable = [], []
     for identity_type, name, permissions in identities:
@@ -1424,12 +1443,16 @@ def _bedrock_wildcard_action_findings(
     rows = []
     failures = 0
     unreadable = []
+    boundary_unread = _boundary_unread(permission_cache)
     identities = [
-        ("Role", name, permissions)
-        for name, permissions in permission_cache["role_permissions"].items()
-    ] + [
-        ("User", name, permissions)
-        for name, permissions in permission_cache["user_permissions"].items()
+        (identity_type, name, permissions)
+        for identity_type, cache_key in (
+            ("Role", "role_permissions"),
+            ("User", "user_permissions"),
+        )
+        for name, permissions in permission_cache[cache_key].items()
+        if (identity_type.lower(), name) not in boundary_unread
+        or permissions.get("permissions_boundary") is not None
     ]
     for identity_type, name, permissions in identities:
         if permissions.get("group_policies_error"):
