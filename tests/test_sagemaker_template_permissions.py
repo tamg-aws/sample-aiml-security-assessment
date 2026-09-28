@@ -84,3 +84,63 @@ def test_new_sagemaker_grants_are_resource_scoped_on_the_sagemaker_function():
             assert len(holding) == 1, f"{template_path.name}: {action} not granted once"
             assert resource in holding[0], f"{template_path.name}: {action} scope"
             assert "Resource: '*'" not in holding[0], f"{template_path.name}: {action}"
+
+
+# Approved reads with no IAM resource type, each with the statement that holds
+# it on '*'.
+APPROVED_WILDCARD_SAGEMAKER_GRANTS = {
+    "ec2:DescribeVpcEndpoints": "EC2NetworkPostureInventory",
+    "ec2:DescribeFlowLogs": "EC2NetworkPostureInventory",
+    "ec2:DescribeSecurityGroups": "EC2NetworkPostureInventory",
+    "config:DescribeConformancePacks": "ConformancePackInventory",
+    "iot:DescribeAccountAuditConfiguration": "IoTDeviceDefenderAuditRead",
+    "iot:ListAuditFindings": "IoTDeviceDefenderAuditRead",
+    "inspector2:BatchGetAccountStatus": "InspectorAccountStatusRead",
+    "lambda:ListFunctions": "LambdaFunctionInventory",
+}
+
+# Reads the SageMaker legs call that are not approved. Each leg reports "not
+# read" on AccessDenied, so none may be granted.
+UNAPPROVED_SAGEMAKER_READS = [
+    "ec2:DescribeVpcs",
+    "ec2:DescribeDhcpOptions",
+    "sagemaker:ListInferenceComponents",
+    "sagemaker:ListUserProfiles",
+    "sagemaker:ListMonitoringExecutions",
+    "guardduty:ListMembers",
+    "config:ListConfigurationRecorders",
+    "iot:ListScheduledAudits",
+    "inspector2:ListCoverage",
+    "organizations:ListAccounts",
+    "events:ListRules",
+    "securityhub:GetConfigurationPolicyAssociation",
+    "cloudtrail:DescribeTrails",
+    "ram:ListResources",
+    "ecs:ListClusters",
+    "ecs:ListServices",
+    "ecs:DescribeTaskDefinition",
+    "s3:GetObjectAttributes",
+]
+
+
+def test_approved_wildcard_grants_sit_in_their_named_statement():
+    for template_path in TEMPLATE_PATHS:
+        statements = _sagemaker_function_statements(
+            template_path.read_text(encoding="utf-8")
+        )
+        for action, sid in APPROVED_WILDCARD_SAGEMAKER_GRANTS.items():
+            holding = [s for s in statements if re.search(rf"- {action}\b", s)]
+            assert len(holding) == 1, f"{template_path.name}: {action} not granted once"
+            assert holding[0].split()[0] == sid, f"{template_path.name}: {action} sid"
+            assert "Resource: '*'" in holding[0], f"{template_path.name}: {action}"
+
+
+def test_unapproved_reads_are_not_granted_to_the_sagemaker_function():
+    for template_path in TEMPLATE_PATHS:
+        statements = _sagemaker_function_statements(
+            template_path.read_text(encoding="utf-8")
+        )
+        for action in UNAPPROVED_SAGEMAKER_READS:
+            assert not [s for s in statements if re.search(rf"- {action}\b", s)], (
+                f"{template_path.name}: {action} is granted without approval"
+            )
