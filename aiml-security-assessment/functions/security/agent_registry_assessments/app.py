@@ -415,6 +415,21 @@ def _granted_actions(permissions: Dict[str, Any], actions: Iterable[str]) -> set
     return granted
 
 
+def _boundary_unread(permission_cache: Dict[str, Any]) -> set:
+    """Return (type, name) for each principal whose permissions boundary the
+    cache failed to read. The cache stores a null boundary both when none is
+    set and when the read failed, so only the error entry tells them apart,
+    and such a principal is left unassessed: a boundary could remove the grant.
+    """
+    return {
+        (str(error.get("type", "")).lower(), error["name"])
+        for error in permission_cache.get("principal_errors") or []
+        if isinstance(error, dict)
+        and error.get("name")
+        and error.get("stage") == "permissions_boundary"
+    }
+
+
 def _has_registry_access(permissions: Dict[str, Any], wildcard_only: bool) -> bool:
     if not _granted_actions(
         permissions,
@@ -671,8 +686,13 @@ def check_agent_registry_full_access(
                 )
             ],
         )
-    identities = [("role", name, perms) for name, perms in roles.items()] + [
-        ("user", name, perms) for name, perms in users.items()
+    boundary_unread = _boundary_unread(permission_cache)
+    identities = [
+        (kind, name, perms)
+        for kind, entries in (("role", roles), ("user", users))
+        for name, perms in entries.items()
+        if (kind, name) not in boundary_unread
+        or perms.get("permissions_boundary") is not None
     ]
     full_access, wildcard = [], []
     for kind, name, permissions in identities:
@@ -790,11 +810,16 @@ def check_agent_registry_stale_access(
         ]
 
     principals = []
+    boundary_unread = _boundary_unread(permission_cache)
     for principal_type, entries, arn_prefix in (
         ("role", roles, "role"),
         ("user", users, "user"),
     ):
         for name, permissions in entries.items():
+            if (principal_type, name) in boundary_unread and (
+                permissions.get("permissions_boundary") is None
+            ):
+                continue
             if _has_registry_access(permissions, wildcard_only=False):
                 principals.append(
                     {
@@ -1053,9 +1078,19 @@ def check_agent_registry_approval_separation(
                 APPROVAL_SEPARATION_REFERENCE_URL,
             )
         ]
+    boundary_unread = _boundary_unread(permission_cache)
     collisions = [
-        *_registry_approval_collisions(roles, "role"),
-        *_registry_approval_collisions(users, "user"),
+        label
+        for kind, entries in (("role", roles), ("user", users))
+        for label in _registry_approval_collisions(
+            {
+                name: perms
+                for name, perms in entries.items()
+                if (kind, name) not in boundary_unread
+                or perms.get("permissions_boundary") is not None
+            },
+            kind,
+        )
     ]
     if collisions:
         findings = [

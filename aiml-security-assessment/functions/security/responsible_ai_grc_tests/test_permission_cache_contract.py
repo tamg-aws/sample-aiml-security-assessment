@@ -254,3 +254,56 @@ class TestFS07CacheContract:
         row = _only_row(app.check_bedrock_agent_action_boundaries(cache))
         assert row["Status"] == "Passed"
         assert row["Finding_Details"].endswith(app.UNRECORDED_PRINCIPAL_ERRORS_NOTE)
+
+
+class TestUnreadBoundary:
+    """A null boundary with a permissions_boundary error means the boundary was
+    not read. A boundary could remove the grant, so the role is named as not
+    read and never reported Failed."""
+
+    def test_fs22_fails_only_the_role_whose_boundary_was_read(self):
+        cache = _cache(
+            {"open": _role(_allow("bedrock:*")), "unread": _role(_allow("bedrock:*"))},
+            errors=[_error("unread", stage="permissions_boundary")],
+        )
+        row = _only_row(app.check_knowledge_base_iam_least_privilege(cache))
+        assert row["Status"] == "Failed"
+        assert "- Role 'open' allows 'bedrock:*'" in row["Finding_Details"]
+        assert "Role 'unread' allows" not in row["Finding_Details"]
+        assert "their grants are unknown: 'unread'." in row["Finding_Details"]
+
+    def test_fs22_an_unread_boundary_alone_is_not_failed(self):
+        cache = _cache(
+            {"unread": _role(_allow("bedrock:*")), "clean": _role(SAFE)},
+            errors=[_error("unread", stage="permissions_boundary")],
+        )
+        row = _only_row(app.check_knowledge_base_iam_least_privilege(cache))
+        assert row["Status"] == "N/A"
+        assert "their grants are unknown: 'unread'." in row["Finding_Details"]
+
+    @patch("finserv_app.boto3.client")
+    def test_fs07_fails_only_the_role_whose_boundary_was_read(self, mock_client):
+        mock_client.return_value = _agents_client({"a1": "Open", "a2": "Unread"})
+        cache = _cache(
+            {"Open": _role(_allow("iam:*")), "Unread": _role(_allow("iam:*"))},
+            errors=[_error("Unread", stage="permissions_boundary")],
+        )
+        row = _only_row(app.check_bedrock_agent_action_boundaries(cache))
+        assert row["Status"] == "Failed"
+        assert "Agent 'a1' role 'Open' allows 'iam:*'" in row["Finding_Details"]
+        assert "role 'Unread' allows" not in row["Finding_Details"]
+        assert (
+            "agent 'a2' role 'Unread' (cache read failed at permissions_boundary)"
+            in row["Finding_Details"]
+        )
+
+    @patch("finserv_app.boto3.client")
+    def test_fs07_an_unread_boundary_alone_is_not_failed(self, mock_client):
+        mock_client.return_value = _agents_client({"a1": "Unread"})
+        cache = _cache(
+            {"Unread": _role(_allow("*"))},
+            errors=[_error("Unread", stage="permissions_boundary")],
+        )
+        row = _only_row(app.check_bedrock_agent_action_boundaries(cache))
+        assert row["Status"] == "N/A"
+        assert row["Finding"] == "Agent Action Boundary Check Incomplete"

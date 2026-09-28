@@ -406,3 +406,84 @@ class TestAR02CacheContract:
             for c in iam.generate_service_last_accessed_details.call_args_list
         ]
         assert arns == ["arn:aws:iam::123456789012:role/used"]
+
+
+class TestUnreadBoundary:
+    """A null boundary with a permissions_boundary error means the boundary was
+    not read. A boundary could remove the grant, so AR-01, AR-02 and AR-09
+    name the principal as not read and never report it Failed."""
+
+    def test_ar01_fails_only_the_principal_whose_boundary_was_read(self):
+        findings = _ar01(
+            _cache(
+                roles={
+                    "open": _identity(_allow("agent-registry:*")),
+                    "unread": _identity(_allow("agent-registry:*")),
+                },
+                errors=[_error("unread", stage="permissions_boundary")],
+            )
+        )
+        failed = [f for f in findings if f["Status"] == "Failed"]
+        assert failed
+        assert all("unread" not in f["Finding_Details"] for f in failed)
+        assert any("open" in f["Finding_Details"] for f in failed)
+        assert "role 'unread' (permissions_boundary)" in findings[-1]["Finding_Details"]
+        assert findings[-1]["Status"] == "N/A"
+
+    def test_ar01_an_unread_boundary_alone_is_not_failed(self):
+        (finding,) = _ar01(
+            _cache(
+                users={"unread": _identity(_allow("*"))},
+                errors=[_error("unread", "user", "permissions_boundary")],
+            )
+        )
+        assert finding["Status"] == "N/A"
+        assert "user 'unread' (permissions_boundary)" in finding["Finding_Details"]
+
+    def test_ar09_an_unread_boundary_is_not_a_collision(self):
+        (finding,) = _ar09(
+            _cache(
+                roles={
+                    "unread": _identity(PUBLISH_AND_APPROVE),
+                    "reader": _identity(SCOPED_READ),
+                },
+                errors=[_error("unread", stage="permissions_boundary")],
+            )
+        )
+        assert finding["Status"] == "N/A"
+        assert "role 'unread' (permissions_boundary)" in finding["Finding_Details"]
+
+    def test_ar09_keeps_the_collision_whose_boundary_was_read(self):
+        findings = _ar09(
+            _cache(
+                roles={
+                    "open": _identity(PUBLISH_AND_APPROVE),
+                    "unread": _identity(PUBLISH_AND_APPROVE),
+                },
+                errors=[_error("unread", stage="permissions_boundary")],
+            )
+        )
+        assert [f["Status"] for f in findings] == ["Failed", "N/A"]
+        assert "role 'open'" in findings[0]["Finding_Details"]
+        assert "'unread'" not in findings[0]["Finding_Details"]
+
+    def test_ar02_does_not_query_a_principal_whose_boundary_was_not_read(self):
+        findings, iam = _ar02(
+            _cache(
+                roles={
+                    "unread": _identity(_allow("agent-registry:GetRegistry")),
+                    "used": _identity(_allow("agent-registry:GetRegistry")),
+                },
+                errors=[_error("unread", stage="permissions_boundary")],
+            )
+        )
+        arns = [
+            c.kwargs["Arn"]
+            for c in iam.generate_service_last_accessed_details.call_args_list
+        ]
+        assert arns == ["arn:aws:iam::123456789012:role/used"]
+        assert "Failed" not in [f["Status"] for f in findings]
+        assert any(
+            "role 'unread' (permissions_boundary)" in f["Finding_Details"]
+            for f in findings
+        )

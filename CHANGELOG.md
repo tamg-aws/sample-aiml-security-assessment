@@ -270,6 +270,15 @@ section.
   names an unread principal, and `AC-02`'s incomplete row names the
   principals whose policies it could not parse. `iam_access_levels.json`
   now carries each resource type's ARN formats.
+- A principal whose permissions boundary the cache could not read is no
+  longer reported `Failed` by a leg that applies the boundary. The cache
+  writes `null` both for no boundary and for a failed read, and only a
+  `permissions_boundary` entry in `principal_errors` tells them apart, so the
+  leg read the principal as unbounded and could fail a grant the boundary
+  removes. The wildcard and merged read and write rows of `BR-01`, `SM-02`
+  and `AC-02`, every `AR-01` row, `AR-09`, `FS-07` and `FS-22` now skip that
+  principal, and `AR-02` leaves it out of its population. The `N/A` row
+  names it.
 
 ### Deployment impact
 

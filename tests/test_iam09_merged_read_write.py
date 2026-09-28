@@ -364,6 +364,58 @@ class TestPermissionsBoundary:
         assert _merged(pkg, rows) == []
 
 
+class TestUnreadBoundary:
+    """A null boundary with a permissions_boundary error means the boundary was
+    not read, and a boundary could remove the grant, so the principal is named
+    as not read and never reported Failed."""
+
+    def test_only_the_principal_whose_boundary_was_read_is_failed(self, pkg):
+        rows = _rows(
+            pkg,
+            _cache(
+                roles={
+                    "open": _identity(_allow(pkg.partial)),
+                    "unread": _identity(_allow(pkg.partial)),
+                },
+                errors=[_error("unread", stage="permissions_boundary")],
+            ),
+        )
+        (merged,) = _merged(pkg, rows)
+        assert merged["Status"] == "Failed"
+        assert merged["Finding_Details"].startswith("Role 'open': ")
+        assert any(
+            row["Status"] == "N/A"
+            and "role 'unread' (permissions_boundary)" in row["Finding_Details"]
+            for row in rows
+        )
+
+    def test_an_unread_boundary_on_a_wildcard_grant_is_not_failed(self, pkg):
+        rows = _rows(
+            pkg,
+            _cache(
+                users={"unread": _identity(_allow("*"))},
+                errors=[_error("unread", "user", "permissions_boundary")],
+            ),
+        )
+        leg = [row for row in rows if row["Finding"] in pkg.iam09_findings]
+        assert [row for row in leg if row["Status"] in ("Failed", "Passed")] == []
+        assert any(
+            row["Status"] == "N/A"
+            and "user 'unread' (permissions_boundary)" in row["Finding_Details"]
+            for row in rows
+        )
+
+    def test_another_stage_error_keeps_the_boundary_as_read(self, pkg):
+        rows = _rows(
+            pkg,
+            _cache(
+                roles={"wide": _identity(_allow(pkg.partial))},
+                errors=[_error("wide", stage="inline_policy")],
+            ),
+        )
+        assert [row["Status"] for row in _merged(pkg, rows)] == ["Failed"]
+
+
 class TestBedrockDataStores:
     def _rows(self, *statements):
         return extract_csv_data(

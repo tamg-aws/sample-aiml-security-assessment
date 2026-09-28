@@ -1682,6 +1682,10 @@ def check_bedrock_agent_action_boundaries(permission_cache) -> Dict[str, Any]:
                 )
             role_perms = role_permissions.get(role_name) or {}
             boundary = role_perms.get("permissions_boundary")
+            if boundary is None and "permissions_boundary" in (
+                (read_errors or {}).get(role_name, [])
+            ):
+                continue
             for policy in role_perms.get("attached_policies", []) + role_perms.get(
                 "inline_policies", []
             ):
@@ -2970,6 +2974,10 @@ def check_knowledge_base_iam_least_privilege(permission_cache) -> Dict[str, Any]
             if not isinstance(perms, dict):
                 continue
             boundary = perms.get("permissions_boundary")
+            if boundary is None and "permissions_boundary" in (
+                (read_errors or {}).get(role_name, [])
+            ):
+                continue
             for policy in (perms.get("attached_policies", []) or []) + (
                 perms.get("inline_policies", []) or []
             ):
