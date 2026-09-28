@@ -208,6 +208,11 @@ section.
 
 ### Fixed
 
+- `AC-51` requires a rate-based rule whose action is `Block` beside the
+  Anti-DDoS managed rule group, and keeps the gateways it judged when a
+  gateway or web ACL read fails below the API. A web ACL with the group and no
+  per-caller rate cap passed, and a transport error on one gateway discarded
+  every gateway's finding.
 - `AC-26` requires the log tamper SCP to deny `logs:DeleteLogStream` on each
   group's `:log-stream:*` ARN, and to reach the Bedrock model invocation log
   group, reporting `N/A` naming `bedrock:GetModelInvocationLoggingConfiguration`

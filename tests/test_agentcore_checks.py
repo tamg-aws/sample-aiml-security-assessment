@@ -24,7 +24,7 @@ import textwrap
 from unittest.mock import patch, MagicMock
 
 import pytest
-from botocore.exceptions import ClientError
+from botocore.exceptions import ClientError, EndpointConnectionError
 
 sys.path.insert(0, "aiml-security-assessment/functions/security/agentcore_assessments")
 from tests.test_helpers import extract_csv_data, assert_finding_schema
@@ -27484,7 +27484,10 @@ class TestAC51GatewayAntiDdos:
             mock_waf,
             {"gw-1": "blocking", "gw-2": "counted"},
             {
-                "blocking": {"Name": "blocking", "Rules": [_anti_ddos_rule()]},
+                "blocking": {
+                    "Name": "blocking",
+                    "Rules": [_anti_ddos_rule(), _rate_rule()],
+                },
                 "counted": {
                     "Name": "counted",
                     "Rules": [{**_anti_ddos_rule(), "OverrideAction": {"Count": {}}}],
@@ -27524,7 +27527,12 @@ class TestAC51GatewayAntiDdos:
             mock_ac,
             mock_waf,
             {"gw-1": "blocking", "gw-2": None},
-            {"blocking": {"Name": "blocking", "Rules": [_anti_ddos_rule()]}},
+            {
+                "blocking": {
+                    "Name": "blocking",
+                    "Rules": [_anti_ddos_rule(), _rate_rule()],
+                }
+            },
         )
 
         findings = agentcore_app.check_agentcore_web_acl_anti_ddos()
@@ -27544,7 +27552,12 @@ class TestAC51GatewayAntiDdos:
                 "gw-1": _make_client_error("AccessDeniedException", "no"),
                 "gw-2": "blocking",
             },
-            {"blocking": {"Name": "blocking", "Rules": [_anti_ddos_rule()]}},
+            {
+                "blocking": {
+                    "Name": "blocking",
+                    "Rules": [_anti_ddos_rule(), _rate_rule()],
+                }
+            },
         )
 
         findings = agentcore_app.check_agentcore_web_acl_anti_ddos()
@@ -27619,7 +27632,12 @@ class TestAC51GatewayAntiDdos:
             mock_ac,
             mock_waf,
             {"gw-1": "acl"},
-            {"acl": {"Name": "acl", "Rules": [_anti_ddos_rule(**group_overrides)]}},
+            {
+                "acl": {
+                    "Name": "acl",
+                    "Rules": [_anti_ddos_rule(**group_overrides), _rate_rule()],
+                }
+            },
         )
 
         findings = agentcore_app.check_agentcore_web_acl_anti_ddos()
@@ -27665,12 +27683,12 @@ class TestAC51GatewayAntiDdos:
             {
                 "pre": {
                     "Name": "pre",
-                    "Rules": [],
+                    "Rules": [_rate_rule()],
                     "PreProcessFirewallManagerRuleGroups": [fms_group],
                 },
                 "post": {
                     "Name": "post",
-                    "Rules": [],
+                    "Rules": [_rate_rule()],
                     "PostProcessFirewallManagerRuleGroups": [fms_group],
                 },
             },
@@ -27716,7 +27734,12 @@ class TestAC51GatewayAntiDdos:
                 "gw-2": None,
                 "gw-3": _make_client_error("AccessDeniedException", "no"),
             },
-            {"blocking": {"Name": "blocking", "Rules": [_anti_ddos_rule()]}},
+            {
+                "blocking": {
+                    "Name": "blocking",
+                    "Rules": [_anti_ddos_rule(), _rate_rule()],
+                }
+            },
         )
 
         findings = agentcore_app.check_agentcore_web_acl_anti_ddos()
@@ -27738,7 +27761,12 @@ class TestAC51GatewayAntiDdos:
             mock_ac,
             mock_waf,
             {"gw-1": "blocking"},
-            {"blocking": {"Name": "blocking", "Rules": [_anti_ddos_rule()]}},
+            {
+                "blocking": {
+                    "Name": "blocking",
+                    "Rules": [_anti_ddos_rule(), _rate_rule()],
+                }
+            },
         )
 
         agentcore_app.check_agentcore_web_acl_anti_ddos()
@@ -27770,7 +27798,10 @@ class TestAC51AntiDdosSettings:
             {
                 "acl": {
                     "Name": "acl",
-                    "Rules": [_anti_ddos_rule(ManagedRuleGroupConfigs=configs)],
+                    "Rules": [
+                        _anti_ddos_rule(ManagedRuleGroupConfigs=configs),
+                        _rate_rule(),
+                    ],
                 }
             },
         )
@@ -27862,10 +27893,14 @@ class TestAC51AntiDdosSettings:
                             ManagedRuleGroupConfigs=[
                                 _anti_ddos_config(block="HIGH", challenge="MEDIUM")
                             ]
-                        )
+                        ),
+                        _rate_rule(),
                     ],
                 },
-                "untuned": {"Name": "untuned", "Rules": [_anti_ddos_rule()]},
+                "untuned": {
+                    "Name": "untuned",
+                    "Rules": [_anti_ddos_rule(), _rate_rule()],
+                },
             },
         )
 
@@ -27884,7 +27919,7 @@ class TestAC51AntiDdosSettings:
             mock_ac,
             mock_waf,
             {"gw-1": "acl", "gw-2": None},
-            {"acl": {"Name": "acl", "Rules": [_anti_ddos_rule()]}},
+            {"acl": {"Name": "acl", "Rules": [_anti_ddos_rule(), _rate_rule()]}},
         )
 
         findings = agentcore_app.check_agentcore_web_acl_anti_ddos()
@@ -27926,6 +27961,181 @@ class TestAC51AntiDdosSettings:
         ]
         assert "cloudfront" in resource_arn.documentation
         assert "bedrock-agentcore" not in resource_arn.documentation
+
+
+class TestAC51RateBasedRule:
+    """AC-51 pairs the Anti-DDoS group with a rate-based rule that blocks."""
+
+    @patch("agentcore_app.wafv2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_the_group_without_a_rate_rule_fails(self, mock_ac, mock_waf):
+        _gateway_stub(
+            mock_ac,
+            mock_waf,
+            {"gw-1": "acl"},
+            {"acl": {"Name": "acl", "Rules": [_anti_ddos_rule()]}},
+        )
+
+        findings = agentcore_app.check_agentcore_web_acl_anti_ddos()
+
+        assert [finding["Status"] for finding in findings] == ["Failed"]
+        assert (
+            "no rate-based rule whose action is Block"
+            in (findings[0]["Finding_Details"])
+        )
+        assert "rate-based rule whose action is Block" in findings[0]["Resolution"]
+        assert findings[0]["Severity"] == "Medium"
+
+    @patch("agentcore_app.wafv2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_each_gateway_is_judged_on_its_own_rate_rule(self, mock_ac, mock_waf):
+        _gateway_stub(
+            mock_ac,
+            mock_waf,
+            {"gw-1": "capped", "gw-2": "bare", "gw-3": "counted", "gw-4": "challenged"},
+            {
+                "capped": {
+                    "Name": "capped",
+                    "Rules": [_anti_ddos_rule(), _rate_rule()],
+                },
+                "bare": {"Name": "bare", "Rules": [_anti_ddos_rule()]},
+                "counted": {
+                    "Name": "counted",
+                    "Rules": [_anti_ddos_rule(), _rate_rule(Action={"Count": {}})],
+                },
+                "challenged": {
+                    "Name": "challenged",
+                    "Rules": [_anti_ddos_rule(), _rate_rule(Action={"Challenge": {}})],
+                },
+            },
+        )
+
+        findings = agentcore_app.check_agentcore_web_acl_anti_ddos()
+
+        assert [finding["Status"] for finding in findings] == [
+            "Passed",
+            "Failed",
+            "Failed",
+            "Failed",
+        ]
+        for gateway_id, finding in zip(("gw-1", "gw-2", "gw-3", "gw-4"), findings):
+            assert f"({gateway_id})" in finding["Finding_Details"]
+
+    @patch("agentcore_app.wafv2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_pass_names_the_rate_rule_and_what_was_not_judged(
+        self, mock_ac, mock_waf
+    ):
+        _gateway_stub(
+            mock_ac,
+            mock_waf,
+            {"gw-1": "acl"},
+            {"acl": {"Name": "acl", "Rules": [_anti_ddos_rule(), _rate_rule("cap")]}},
+        )
+
+        findings = agentcore_app.check_agentcore_web_acl_anti_ddos()
+
+        details = findings[0]["Finding_Details"]
+        assert "the rate-based rule in rule 'cap', whose action is Block" in details
+        assert "limit and scope-down statement were not judged" in details
+
+    @patch("agentcore_app.wafv2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_an_unread_rule_group_leaves_the_rate_leg_unjudged(self, mock_ac, mock_waf):
+        referenced = {
+            "Name": "shared",
+            "OverrideAction": {"None": {}},
+            "Statement": {
+                "RuleGroupReferenceStatement": {
+                    "ARN": "arn:aws:wafv2:us-east-1:123456789012:regional/rulegroup/g/id"
+                }
+            },
+        }
+        _gateway_stub(
+            mock_ac,
+            mock_waf,
+            {"gw-1": "opaque", "gw-2": "bare"},
+            {
+                "opaque": {"Name": "opaque", "Rules": [_anti_ddos_rule(), referenced]},
+                "bare": {"Name": "bare", "Rules": [_anti_ddos_rule()]},
+            },
+        )
+
+        findings = agentcore_app.check_agentcore_web_acl_anti_ddos()
+
+        assert [finding["Status"] for finding in findings] == ["N/A", "Failed"]
+        assert "rulegroup/g/id" in findings[0]["Finding_Details"]
+        assert "rate leg was not judged" in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.wafv2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_missing_group_names_the_rate_rule_only_when_it_is_absent(
+        self, mock_ac, mock_waf
+    ):
+        _gateway_stub(
+            mock_ac,
+            mock_waf,
+            {"gw-1": "nothing", "gw-2": "rate-only"},
+            {
+                "nothing": {"Name": "nothing", "Rules": []},
+                "rate-only": {"Name": "rate-only", "Rules": [_rate_rule()]},
+            },
+        )
+
+        findings = agentcore_app.check_agentcore_web_acl_anti_ddos()
+
+        assert [finding["Status"] for finding in findings] == ["Failed", "Failed"]
+        assert "no rate-based rule" in findings[0]["Finding_Details"]
+        assert "Add a rate-based rule" in findings[0]["Resolution"]
+        assert "no rate-based rule" not in findings[1]["Finding_Details"]
+        assert "Add a rate-based rule" not in findings[1]["Resolution"]
+
+
+class TestAC51TransportErrors:
+    """AC-51 keeps the gateways it judged when a read fails below the API."""
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_transport_error_listing_gateways_is_incomplete(self, mock_ac):
+        mock_ac.list_gateways.side_effect = EndpointConnectionError(
+            endpoint_url="https://bedrock-agentcore-control.us-east-1.amazonaws.com"
+        )
+
+        findings = agentcore_app.check_agentcore_web_acl_anti_ddos()
+
+        assert [finding["Status"] for finding in findings] == ["N/A"]
+        assert findings[0]["Check_ID"] == "AC-51"
+        assert findings[0]["Finding"] == (
+            "AgentCore Gateway Anti-DDoS Protection Incomplete"
+        )
+
+    @patch("agentcore_app.wafv2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_transport_error_on_one_gateway_keeps_the_others(self, mock_ac, mock_waf):
+        _gateway_stub(
+            mock_ac,
+            mock_waf,
+            {
+                "gw-1": EndpointConnectionError(endpoint_url="https://example.invalid"),
+                "gw-2": "capped",
+                "gw-3": "unreachable",
+            },
+            {
+                "capped": {
+                    "Name": "capped",
+                    "Rules": [_anti_ddos_rule(), _rate_rule()],
+                },
+                "unreachable": EndpointConnectionError(
+                    endpoint_url="https://wafv2.example.invalid"
+                ),
+            },
+        )
+
+        findings = agentcore_app.check_agentcore_web_acl_anti_ddos()
+
+        assert [finding["Status"] for finding in findings] == ["N/A", "Passed", "N/A"]
+        assert "(gw-1)" in findings[0]["Finding_Details"]
+        assert "bedrock-agentcore:GetGateway" in findings[0]["Resolution"]
+        assert "wafv2:GetWebACL" in findings[2]["Resolution"]
 
 
 class TestEcrScanningAndAntiDdosCheckRegistration:

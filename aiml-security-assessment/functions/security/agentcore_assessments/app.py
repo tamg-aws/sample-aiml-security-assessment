@@ -20,7 +20,7 @@ from urllib.parse import parse_qsl, urlsplit
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 from botocore.config import Config
-from botocore.exceptions import ClientError, EndpointConnectionError
+from botocore.exceptions import BotoCoreError, ClientError, EndpointConnectionError
 
 from schema import create_finding, SeverityEnum, StatusEnum
 
@@ -24357,6 +24357,12 @@ def check_agentcore_web_acl_anti_ddos() -> List[Dict[str, Any]]:
     that mitigation off. A passing gateway's finding names the Block and
     Challenge sensitivities the group runs with. Shield Advanced enrollment is
     not read, because CreateProtection accepts no AgentCore gateway ARN.
+
+    The group is paired with a rate-based rule whose action is Block, which caps
+    the request rate per caller and so the inference spend a flood runs up. The
+    rule's limit and scope-down statement are not judged. A web ACL with no such
+    rule among the rules this check reads, and a rule group whose rules live in
+    another resource, is not judged on that leg.
     """
     finding_name = "AgentCore Gateway Anti-DDoS Protection"
 
@@ -24385,7 +24391,7 @@ def check_agentcore_web_acl_anti_ddos() -> List[Dict[str, Any]]:
 
     try:
         gateways = _agentcore_list_all("list_gateways", ["items", "gateways"])
-    except (AttributeError, ClientError) as error:
+    except (AttributeError, BotoCoreError, ClientError) as error:
         return [
             _incomplete_check_finding(
                 check_id="AC-51",
@@ -24412,7 +24418,7 @@ def check_agentcore_web_acl_anti_ddos() -> List[Dict[str, Any]]:
 
         try:
             gateway_details = agentcore_client.get_gateway(gatewayIdentifier=gateway_id)
-        except ClientError as error:
+        except (BotoCoreError, ClientError) as error:
             findings.append(
                 finding(
                     f"Could not read which web ACL {label} is associated with: "
@@ -24456,7 +24462,7 @@ def check_agentcore_web_acl_anti_ddos() -> List[Dict[str, Any]]:
             web_acl = (wafv2_client.get_web_acl(ARN=web_acl_arn) or {}).get(
                 "WebACL"
             ) or {}
-        except ClientError as error:
+        except (BotoCoreError, ClientError) as error:
             findings.append(
                 finding(
                     f"{label} is associated with web ACL {web_acl_arn}, whose rules "
@@ -24470,18 +24476,63 @@ def check_agentcore_web_acl_anti_ddos() -> List[Dict[str, Any]]:
 
         coverage = _waf_rule_coverage(_web_acl_with_firewall_manager_rules(web_acl))
         acl_name = web_acl.get("Name") or web_acl_arn
+        rate_resolution = (
+            "Add a rate-based rule whose action is Block to the web ACL, with a "
+            "limit that caps the request rate a single caller can send to the "
+            "gateway."
+        )
+        no_rate = (
+            " It applies no rate-based rule whose action is Block, so no rule "
+            "caps the request rate of a single caller."
+        )
+        opaque_rate = (
+            " It applies no rate-based rule whose action is Block in the rules "
+            f"this check reads, and delegates to {len(coverage['opaque'])} rule "
+            f"group(s) whose rules live in another resource: "
+            f"{'; '.join(coverage['opaque'])}. Those groups may carry one, so the "
+            "rate leg was not judged."
+        )
         if coverage["anti_ddos"]:
-            findings.append(
-                finding(
-                    f"{label} is associated with web ACL {acl_name}, which runs "
-                    f"{WAF_ANTI_DDOS_RULE_GROUP} from "
-                    f"{coverage['evidence']['anti_ddos']}. "
-                    f"{_anti_ddos_settings_text(coverage['anti_ddos_config'])}",
-                    "No action required.",
-                    SeverityEnum.MEDIUM,
-                    StatusEnum.PASSED,
-                )
+            runs = (
+                f"{label} is associated with web ACL {acl_name}, which runs "
+                f"{WAF_ANTI_DDOS_RULE_GROUP} from "
+                f"{coverage['evidence']['anti_ddos']}. "
+                f"{_anti_ddos_settings_text(coverage['anti_ddos_config'])}"
             )
+            if coverage["rate"]:
+                findings.append(
+                    finding(
+                        f"{runs} It caps the request rate with the rate-based rule "
+                        f"in {coverage['evidence']['rate']}, whose action is Block; "
+                        "that rule's limit and scope-down statement were not "
+                        "judged.",
+                        "No action required.",
+                        SeverityEnum.MEDIUM,
+                        StatusEnum.PASSED,
+                    )
+                )
+            elif coverage["opaque"]:
+                findings.append(
+                    finding(
+                        f"{runs}{opaque_rate}",
+                        "Read the named rule groups and confirm one applies a "
+                        "rate-based rule whose action is Block, or add one to the "
+                        "web ACL itself.",
+                        SeverityEnum.INFORMATIONAL,
+                        StatusEnum.NA,
+                    )
+                )
+            else:
+                findings.append(
+                    finding(
+                        f"{runs}{no_rate} A flood from one caller runs up inference "
+                        "spend below the level the Anti-DDoS group treats as an "
+                        "event.",
+                        rate_resolution,
+                        SeverityEnum.MEDIUM,
+                        StatusEnum.FAILED,
+                    )
+                )
             continue
 
         not_credited = (
@@ -24494,10 +24545,12 @@ def check_agentcore_web_acl_anti_ddos() -> List[Dict[str, Any]]:
             finding(
                 f"{label} is associated with web ACL {acl_name}, which does not "
                 f"run {WAF_ANTI_DDOS_RULE_GROUP}, so a request flood spread across "
-                f"many clients reaches the gateway unmitigated.{not_credited}",
+                f"many clients reaches the gateway unmitigated.{not_credited}"
+                f"{'' if coverage['rate'] or coverage['opaque'] else no_rate}",
                 f"Add the AWS managed rule group {WAF_ANTI_DDOS_RULE_GROUP} to the "
                 "web ACL with no Count override on the group and no rule inside it "
-                "overridden to Count or Allow.",
+                "overridden to Count or Allow."
+                + ("" if coverage["rate"] else f" {rate_resolution}"),
                 SeverityEnum.MEDIUM,
                 StatusEnum.FAILED,
             )
