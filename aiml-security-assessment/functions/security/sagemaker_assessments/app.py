@@ -632,6 +632,24 @@ def _cache_unread_principals(permission_cache: Dict[str, Any]) -> Optional[List[
     return labels
 
 
+def _cache_boundary_unread(
+    permission_cache: Dict[str, Any], identity_type: str, name: str
+) -> bool:
+    """
+    Return whether the cache failed to read this principal's permissions boundary.
+
+    The cache stores a null boundary both when none is set and when the read
+    failed, so only the permissions_boundary error entry tells them apart.
+    """
+    return any(
+        isinstance(error, dict)
+        and str(error.get("type", "")).lower() == identity_type.lower()
+        and error.get("name") == name
+        and error.get("stage") == "permissions_boundary"
+        for error in permission_cache.get("principal_errors") or []
+    )
+
+
 def _cache_population_finding(
     permission_cache: Dict[str, Any],
     check_id: str,
@@ -1440,6 +1458,7 @@ def _endpoint_invocation_scoping_findings(
     """Report the AIR-SGM-EP-02 leg of SM-02, per identity."""
     unscoped = []
     scoped = []
+    boundary_unknown = []
 
     identities = []
     for identity_type, cache_key in (
@@ -1474,6 +1493,13 @@ def _endpoint_invocation_scoping_findings(
             continue
         if wildcard is None:
             scoped.append(f"{identity_type} '{name}'")
+        elif boundary is None and _cache_boundary_unread(
+            permission_cache, identity_type, name
+        ):
+            boundary_unknown.append(
+                f"{identity_type} '{name}' (policy '{wildcard_policy}' allows "
+                "every endpoint; its permissions boundary was not read)"
+            )
         else:
             unscoped.append(
                 {
@@ -1552,6 +1578,18 @@ def _endpoint_invocation_scoping_findings(
                 region=region,
             )
         )
+    if unscoped and boundary_unknown:
+        emitted.append(
+            _unread_resources_finding(
+                "SM-02",
+                ENDPOINT_INVOCATION_SCOPING_FINDING,
+                boundary_unknown,
+                f"{len(unscoped)} identity/identities are reported above.",
+                ENDPOINT_INVOCATION_SCOPING_REFERENCE,
+                region,
+            )
+        )
+
     # With no invocation grant at all the leg emits nothing, unless a principal
     # could not be read and might hold one.
     if not unscoped and (scoped or _cache_unread_principals(permission_cache)):
@@ -3348,7 +3386,16 @@ def _environment_role_findings(
                 unread.append(f"{label} role {role_arn} (not in the IAM cache)")
                 continue
             reason = _broad_role_grant(cached[name])
-            if reason:
+            if (
+                reason
+                and cached[name].get("permissions_boundary") is None
+                and _cache_boundary_unread(permission_cache, "Role", name)
+            ):
+                unread.append(
+                    f"{label} role {role_arn} ({reason}; its permissions boundary "
+                    "was not read)"
+                )
+            elif reason:
                 broad.append(f"{label} runs as role '{name}', which holds {reason}")
             elif any(p.startswith(f"Role '{name}' ") for p in unread_principals):
                 unread.append(f"{label} role {role_arn} (IAM cache read error)")
@@ -10616,6 +10663,12 @@ def _creation_identity_leg(
                 continue
             if boundary is not None and not _statements_leave_creation_open(
                 boundary_statements, action, keys
+            ):
+                continue
+            # An unread boundary may close the call; the principal is already
+            # named among the cache's unread principals.
+            if boundary is None and _cache_boundary_unread(
+                permission_cache, identity_type, name
             ):
                 continue
             open_principals.append(f"{identity_type} '{name}'")

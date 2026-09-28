@@ -12057,3 +12057,158 @@ class TestSM32UnevaluatedRules:
             self.RULES,
         )
         assert [r["Status"] for r in rows] == ["Passed"]
+
+
+# ===================================================================
+# IAM cache v2: a null boundary with a permissions_boundary read error is
+# unknown, so the principal is not read, never Failed (SM-02, SM-09, SM-34)
+# ===================================================================
+def _boundary_error(name, identity_type="role", stage="permissions_boundary"):
+    return {
+        "type": identity_type,
+        "name": name,
+        "stage": stage,
+        "error": "AccessDenied",
+    }
+
+
+_ACCOUNT_WIDE_INVOKE = _identity_policy(
+    "sagemaker:InvokeEndpoint", "arn:aws:sagemaker:us-east-1:123456789012:*"
+)
+_WIDE_ROLE_ARN = "arn:aws:iam::123456789012:role/wide-role"
+_OTHER_WIDE_ROLE_ARN = "arn:aws:iam::123456789012:role/other-wide-role"
+_FULL_ACCESS = (
+    "AmazonSageMakerFullAccess",
+    "arn:aws:iam::aws:policy/AmazonSageMakerFullAccess",
+    [],
+)
+
+
+class TestCacheV2BoundaryUnread:
+    def _sm02_scoping(self, cache):
+        return _by_finding(
+            _sm02_rows(cache), sagemaker_app.ENDPOINT_INVOCATION_SCOPING_FINDING
+        )
+
+    def test_sm02_unread_boundary_is_not_read_not_failed(self):
+        cache = _v2_cache(
+            {"Hidden": [("InvokeAccount", _ACCOUNT_WIDE_INVOKE)]},
+            principal_errors=[_boundary_error("Hidden")],
+        )
+        rows = self._sm02_scoping(cache)
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert rows[0]["Finding"].endswith("Incomplete")
+        assert "Role 'Hidden'" in rows[0]["Finding_Details"]
+
+    def test_sm02_one_read_and_one_unknown_boundary(self):
+        cache = _v2_cache(
+            {
+                "Open": [("InvokeAccount", _ACCOUNT_WIDE_INVOKE)],
+                "Hidden": [("InvokeAccount", _ACCOUNT_WIDE_INVOKE)],
+            },
+            principal_errors=[_boundary_error("Hidden")],
+        )
+        rows = self._sm02_scoping(cache)
+        failed = [r for r in rows if r["Status"] == "Failed"]
+        unread = [r for r in rows if r["Status"] == "N/A"]
+        assert len(failed) == 1
+        assert "Role 'Open'" in failed[0]["Finding_Details"]
+        assert "Hidden" not in failed[0]["Finding_Details"]
+        assert len(unread) == 1
+        assert "Role 'Hidden'" in unread[0]["Finding_Details"]
+        assert "permissions boundary was not read" in unread[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            _boundary_error("Hidden", stage="list_attached_policies"),
+            _boundary_error("SomeoneElse"),
+            _boundary_error("Hidden", identity_type="user"),
+        ],
+    )
+    def test_sm02_error_elsewhere_does_not_hide_a_read_boundary(self, error):
+        # Only this role's own boundary error makes its null boundary unknown.
+        cache = _v2_cache(
+            {"Hidden": [("InvokeAccount", _ACCOUNT_WIDE_INVOKE)]},
+            principal_errors=[error],
+        )
+        rows = self._sm02_scoping(cache)
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "Role 'Hidden'" in rows[0]["Finding_Details"]
+
+    def _sm09_role_rows(self, cache, notebooks):
+        return _by_finding(
+            _sm09_rows(notebooks=notebooks, cache=cache),
+            sagemaker_app.NOTEBOOK_ROLE_PRIVILEGE_FINDING,
+        )
+
+    def test_sm09_unread_boundary_is_not_read_not_failed(self):
+        cache = _environment_cache({"wide-role": [_FULL_ACCESS]})
+        cache["principal_errors"] = [_boundary_error("wide-role")]
+        rows = self._sm09_role_rows(
+            cache, {"nb": {"RootAccess": "Disabled", "RoleArn": _WIDE_ROLE_ARN}}
+        )
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert "wide-role" in rows[0]["Finding_Details"]
+        assert "permissions boundary was not read" in rows[0]["Finding_Details"]
+
+    def test_sm09_one_read_and_one_unknown_boundary(self):
+        cache = _environment_cache(
+            {"wide-role": [_FULL_ACCESS], "other-wide-role": [_FULL_ACCESS]}
+        )
+        cache["principal_errors"] = [_boundary_error("other-wide-role")]
+        rows = self._sm09_role_rows(
+            cache,
+            {
+                "bad": {"RootAccess": "Disabled", "RoleArn": _WIDE_ROLE_ARN},
+                "unknown": {"RootAccess": "Disabled", "RoleArn": _OTHER_WIDE_ROLE_ARN},
+            },
+        )
+        failed = [r for r in rows if r["Status"] == "Failed"]
+        unread = [r for r in rows if r["Status"] == "N/A"]
+        assert len(failed) == 1
+        assert "'wide-role'" in failed[0]["Finding_Details"]
+        assert "other-wide-role" not in failed[0]["Finding_Details"]
+        assert len(unread) == 1
+        assert "other-wide-role" in unread[0]["Finding_Details"]
+
+    def test_sm09_error_for_another_role_does_not_hide_a_broad_grant(self):
+        cache = _environment_cache({"wide-role": [_FULL_ACCESS]})
+        cache["principal_errors"] = [_boundary_error("other-wide-role")]
+        rows = self._sm09_role_rows(
+            cache, {"nb": {"RootAccess": "Disabled", "RoleArn": _WIDE_ROLE_ARN}}
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "'wide-role'" in rows[0]["Finding_Details"]
+
+    def _sm34(self, cache):
+        suite = TestSM34CreationGuardrails()
+        return suite._run(suite._inventory(), cache=cache)
+
+    def test_sm34_unread_boundary_is_not_read_not_failed(self):
+        cache = _creation_cache(
+            {"Admin": [OPEN_SAGEMAKER_ALLOW]},
+            principal_errors=[_boundary_error("Admin")],
+        )
+        findings = self._sm34(cache)
+        assert [f["Status"] for f in findings] == ["N/A", "N/A", "N/A"]
+        assert "Role 'Admin'" in findings[0]["Finding_Details"]
+
+    def test_sm34_one_read_and_one_unknown_boundary(self):
+        cache = _creation_cache(
+            {"Admin": [OPEN_SAGEMAKER_ALLOW], "Hidden": [OPEN_SAGEMAKER_ALLOW]},
+            principal_errors=[_boundary_error("Hidden")],
+        )
+        findings = self._sm34(cache)
+        assert [f["Status"] for f in findings] == ["Failed", "Failed", "Failed"]
+        assert "Role 'Admin'" in findings[0]["Finding_Details"]
+        assert "Role 'Hidden'" not in findings[0]["Finding_Details"]
+
+    def test_sm34_error_for_another_principal_does_not_hide_an_open_one(self):
+        cache = _creation_cache(
+            {"Admin": [OPEN_SAGEMAKER_ALLOW]},
+            principal_errors=[_boundary_error("SomeoneElse")],
+        )
+        findings = self._sm34(cache)
+        assert [f["Status"] for f in findings] == ["Failed", "Failed", "Failed"]
+        assert "Role 'Admin'" in findings[0]["Finding_Details"]
