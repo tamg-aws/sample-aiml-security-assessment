@@ -128,6 +128,9 @@ _EXPECTED_ACTIONS = {
         "bedrock-agentcore:GetAgentRuntime",
         "bedrock-agentcore:ListAgentRuntimeEndpoints",
         "bedrock-agentcore:ListAgentRuntimes",
+        "bedrock-agentcore:ListBrowsers",
+        "bedrock-agentcore:ListGateways",
+        "bedrock-agentcore:ListMemories",
         "bedrock:GetAccountDataRetention",
         "bedrock:GetAgent",
         "bedrock:GetAgentActionGroup",
@@ -175,11 +178,17 @@ _EXPECTED_ACTIONS = {
         "cloudtrail:LookupEvents",
         "cloudwatch:DescribeAlarms",
         "comprehend:ListPiiEntitiesDetectionJobs",
+        "ec2:DescribeInstances",
         "ec2:DescribeRouteTables",
         "ec2:DescribeSubnets",
         "ec2:DescribeVpcEndpoints",
         "ec2:DescribeVpcs",
+        "ecs:DescribeServices",
+        "ecs:DescribeTaskDefinition",
+        "ecs:ListClusters",
+        "ecs:ListServices",
         "es:DescribeDomain",
+        "events:ListRules",
         "iam:GenerateServiceLastAccessedDetails",
         "iam:GetInstanceProfile",
         "iam:GetLoginProfile",
@@ -189,6 +198,7 @@ _EXPECTED_ACTIONS = {
         "iam:ListMFADevices",
         "iam:ListServiceSpecificCredentials",
         "inspector2:BatchGetAccountStatus",
+        "inspector2:ListCoverage",
         "kms:DescribeKey",
         "kms:GetKeyPolicy",
         "kms:ListGrants",
@@ -198,6 +208,7 @@ _EXPECTED_ACTIONS = {
         "lambda:ListAliases",
         "lambda:ListFunctionUrlConfigs",
         "lambda:ListFunctions",
+        "lambda:ListTags",
         "lambda:ListVersionsByFunction",
         "logs:DescribeLogGroups",
         "logs:DescribeMetricFilters",
@@ -227,11 +238,17 @@ _EXPECTED_ACTIONS = {
         "s3vectors:GetIndex",
         "s3vectors:GetVectorBucket",
         "s3vectors:GetVectorBucketPolicy",
+        "sagemaker:DescribeNotebookInstance",
+        "sagemaker:ListEndpoints",
+        "sagemaker:ListModels",
+        "sagemaker:ListNotebookInstances",
         "secretsmanager:DescribeSecret",
         "servicequotas:GetAWSDefaultServiceQuota",
         "servicequotas:GetServiceQuota",
         "servicequotas:ListServiceQuotas",
+        "sso:GetInlinePolicyForPermissionSet",
         "sso:ListInstances",
+        "sso:ListPermissionSets",
         "tag:GetResources",
     },
     "SagemakerSecurityAssessmentFunction": {
@@ -679,7 +696,14 @@ def test_service_last_access_generation_is_identity_scoped(template, logical_id)
     assert "arn:${AWS::Partition}:iam::${AWS::AccountId}:user/*" in generation
     assert not re.search(r"Resource:\s+['\"]\*['\"]", generation)
 
-    results = _statement_block(template, logical_id, "IAMServiceLastAccessResults")
+    # The Bedrock role folds its unconditioned '*' reads into one statement to
+    # stay under the inline policy budget.
+    results_sid = (
+        "AccountReadsOnWildcard"
+        if logical_id == "BedrockSecurityAssessmentFunction"
+        else "IAMServiceLastAccessResults"
+    )
+    results = _statement_block(template, logical_id, results_sid)
     assert "iam:GetServiceLastAccessedDetails" in results
     assert re.search(r"Resource:\s+['\"]\*['\"]", results)
 
@@ -690,7 +714,7 @@ def test_bedrock_resource_level_actions_are_arn_scoped(template):
     inventory = _statement_block(
         template,
         "BedrockSecurityAssessmentFunction",
-        "BedrockAccountInventoryPermissions",
+        "AccountReadsOnWildcard",
     )
     assert re.search(r"Resource:\s+['\"]\*['\"]", inventory)
     # Account-level enumerations with no resource-level authorization support
@@ -754,7 +778,7 @@ def test_bedrock_organizations_policy_target_read_is_arn_scoped(template):
     inventory = _statement_block(
         template,
         "BedrockSecurityAssessmentFunction",
-        "OrganizationsInventoryPermissions",
+        "AccountReadsOnWildcard",
     )
     assert "organizations:ListPolicies" in inventory
     assert "organizations:ListTargetsForPolicy" not in inventory
@@ -791,7 +815,7 @@ def test_bedrock_quota_and_alarm_reads_are_arn_scoped(template):
     assert not re.search(r"Resource:\s+['\"]\*['\"]", quota)
 
     alarms = _statement_block(
-        template, "BedrockSecurityAssessmentFunction", "CloudWatchPermissions"
+        template, "BedrockSecurityAssessmentFunction", "AccountReadsOnWildcard"
     )
     # API_DescribeAlarms returns composite alarms only to a grant scoped to
     # '*', and BR-32 credits an acting composite, so alarm:* would hide them.
@@ -799,7 +823,15 @@ def test_bedrock_quota_and_alarm_reads_are_arn_scoped(template):
     assert re.search(r"Resource:\s+['\"]\*['\"]", alarms)
     assert "cloudwatch:*:${AWS::AccountId}:alarm:*" not in alarms
     assert "composite alarms if your" in alarms
-    assert re.findall(r"-\s+([a-z0-9-]+:[A-Za-z0-9]+)", alarms) == [
+    assert [
+        action
+        for action in re.findall(r"-\s+([a-z0-9-]+:[A-Za-z0-9]+)", alarms)
+        if action.startswith("cloudwatch:")
+    ] == ["cloudwatch:DescribeAlarms"]
+    # The folded statement holds other services' reads, so pin the whole role:
+    # DescribeAlarms is its only CloudWatch action and it appears only once.
+    role = _resource_block(template, "BedrockSecurityAssessmentFunction")
+    assert re.findall(r"-\s+(cloudwatch:[A-Za-z0-9]+)", role) == [
         "cloudwatch:DescribeAlarms"
     ]
 
@@ -1141,36 +1173,41 @@ def test_aisf_phase5_reads_wildcard_only_where_iam_has_no_resource_type(template
     another account through AWS RAM.
     """
     wildcard = {
-        ("BedrockSecurityAssessmentFunction", "MaciePermissions"): (
+        # The Bedrock role folds every unconditioned '*' read into one
+        # statement: former Sids MaciePermissions, EC2Permissions,
+        # BedrockAccountInventoryPermissions, CloudTrailPermissions,
+        # LambdaInventoryPermissions, KMSKeyInventory, BackupVaultInventory,
+        # ResourceTagRead and CloudTrailEventHistoryRead.
+        ("BedrockSecurityAssessmentFunction", "AccountReadsOnWildcard"): (
             "macie2:ListClassificationJobs",
-        ),
-        ("BedrockSecurityAssessmentFunction", "EC2Permissions"): (
             "ec2:DescribeSubnets",
             "ec2:DescribeRouteTables",
-        ),
-        (
-            "BedrockSecurityAssessmentFunction",
-            "BedrockAccountInventoryPermissions",
-        ): (
             "bedrock:ListModelCustomizationJobs",
             "aoss:BatchGetCollection",
             "comprehend:ListPiiEntitiesDetectionJobs",
             "sso:ListInstances",
             "bedrock-agentcore:ListAgentRuntimes",
             "bedrock-agentcore:ListAgentRuntimeEndpoints",
-        ),
-        ("BedrockSecurityAssessmentFunction", "CloudTrailPermissions"): (
             "cloudtrail:ListEventDataStores",
-        ),
-        ("BedrockSecurityAssessmentFunction", "LambdaInventoryPermissions"): (
             "lambda:ListFunctions",
             "inspector2:BatchGetAccountStatus",
-        ),
-        ("BedrockSecurityAssessmentFunction", "KMSKeyInventory"): ("kms:ListKeys",),
-        ("BedrockSecurityAssessmentFunction", "BackupVaultInventory"): (
+            "kms:ListKeys",
             "backup:ListBackupVaults",
+            "tag:GetResources",
+            "cloudtrail:LookupEvents",
+            "inspector2:ListCoverage",
+            "events:ListRules",
+            "ec2:DescribeInstances",
+            "ecs:ListClusters",
+            "ecs:ListServices",
+            "ecs:DescribeTaskDefinition",
+            "sagemaker:ListNotebookInstances",
+            "sagemaker:ListEndpoints",
+            "sagemaker:ListModels",
+            "bedrock-agentcore:ListMemories",
+            "bedrock-agentcore:ListGateways",
+            "bedrock-agentcore:ListBrowsers",
         ),
-        ("BedrockSecurityAssessmentFunction", "ResourceTagRead"): ("tag:GetResources",),
         ("SagemakerSecurityAssessmentFunction", "EC2SubnetExposureInventory"): (
             "ec2:DescribeSubnets",
             "ec2:DescribeRouteTables",
@@ -1184,9 +1221,6 @@ def test_aisf_phase5_reads_wildcard_only_where_iam_has_no_resource_type(template
         ),
         ("AgentCoreSecurityAssessmentFunction", "ECRRegistryScanningRead"): (
             "ecr:GetRegistryScanningConfiguration",
-        ),
-        ("BedrockSecurityAssessmentFunction", "CloudTrailEventHistoryRead"): (
-            "cloudtrail:LookupEvents",
         ),
     }
     for (logical_id, sid), actions in wildcard.items():
@@ -1206,6 +1240,7 @@ def test_aisf_phase5_reads_wildcard_only_where_iam_has_no_resource_type(template
         ),
         ("BedrockSecurityAssessmentFunction", "LambdaPermissions"): (
             "lambda:GetPolicy",
+            "lambda:ListTags",
             "lambda:*:${AWS::AccountId}:function:*",
         ),
         ("BedrockSecurityAssessmentFunction", "BedrockApiKeyInventoryRead"): (
@@ -1227,6 +1262,22 @@ def test_aisf_phase5_reads_wildcard_only_where_iam_has_no_resource_type(template
         ("BedrockSecurityAssessmentFunction", "OrganizationsEffectivePolicyRead"): (
             "organizations:DescribeEffectivePolicy",
             "organizations::*:account/o-*/${AWS::AccountId}",
+        ),
+        ("BedrockSecurityAssessmentFunction", "ECSServiceRead"): (
+            "ecs:DescribeServices",
+            "ecs:*:${AWS::AccountId}:service/*",
+        ),
+        ("BedrockSecurityAssessmentFunction", "SageMakerNotebookRead"): (
+            "sagemaker:DescribeNotebookInstance",
+            "sagemaker:*:${AWS::AccountId}:notebook-instance/*",
+        ),
+        ("BedrockSecurityAssessmentFunction", "SSOPermissionSetList"): (
+            "sso:ListPermissionSets",
+            "sso:::instance/*",
+        ),
+        ("BedrockSecurityAssessmentFunction", "SSOPermissionSetRead"): (
+            "sso:GetInlinePolicyForPermissionSet",
+            "sso:::permissionSet/*/*",
         ),
         ("AgentCoreSecurityAssessmentFunction", "AgentCoreGatewayWebACLRead"): (
             "wafv2:GetWebACL",
@@ -1253,9 +1304,10 @@ def test_aisf_phase5_reads_wildcard_only_where_iam_has_no_resource_type(template
             "cognito-idp:*:${AWS::AccountId}:userpool/*",
         ),
     }
-    for (logical_id, sid), (action, resource) in scoped.items():
+    for (logical_id, sid), (*actions, resource) in scoped.items():
         statement = _statement_block(template, logical_id, sid)
-        assert action in statement
+        for action in actions:
+            assert action in statement
         assert resource in statement
         assert not re.search(r"Resource:\s+['\"]\*['\"]", statement)
 

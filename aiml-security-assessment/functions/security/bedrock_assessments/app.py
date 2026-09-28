@@ -2507,17 +2507,205 @@ def _granted_bedrock_surfaces(
 WORKLOAD_CONNECTIVITY_FINDING = "Bedrock Workload Private Connectivity"
 
 WORKLOAD_CONNECTIVITY_CEILING = (
-    "ECS tasks, EKS pods, SageMaker notebooks and endpoints are not read: the "
-    "Bedrock role holds no ecs:ListServices, ecs:DescribeServices or "
-    "sagemaker:ListNotebookInstances. AgentCore runtimes are judged by AC-08. "
-    "Endpoints reached from another VPC through a shared private hosted zone are "
-    "not read."
+    "Lambda functions, EC2 instances, ECS services and SageMaker notebook "
+    "instances are read. EKS pods and SageMaker endpoints are not read, and an "
+    "ECS task started outside a service is not listed. AgentCore runtimes are "
+    "judged by AC-08. Endpoints reached from another VPC through a shared private "
+    "hosted zone are not read."
 )
+
+
+def _subnet_vpcs(
+    ec2_client, subnet_ids: List[str], cache: Dict[str, Optional[str]]
+) -> Dict[str, Optional[str]]:
+    """Return the VPC of each subnet, reading only the subnets not yet cached."""
+    wanted = sorted({subnet for subnet in subnet_ids if subnet} - set(cache))
+    if wanted:
+        for page in ec2_client.get_paginator("describe_subnets").paginate(
+            SubnetIds=wanted
+        ):
+            for subnet in page.get("Subnets", []):
+                cache[subnet.get("SubnetId")] = subnet.get("VpcId")
+    return {subnet: cache.get(subnet) for subnet in subnet_ids if subnet}
+
+
+def _ecs_service_workloads(region: str, inventory: Dict[str, Any]) -> None:
+    """
+    Add every ECS service in every cluster, with the VPC of its awsvpc subnets
+    and the task role of its task definition, to ``inventory``.
+    """
+    ecs_client = boto3.client("ecs", config=boto3_config, region_name=region)
+    ec2_client = boto3.client("ec2", config=boto3_config, region_name=region)
+    try:
+        clusters = _list_all_items(ecs_client, "list_clusters", "clusterArns")
+    except (ClientError, BotoCoreError, TypeError) as error:
+        inventory["errors"].append(
+            "ECS clusters were not listed with ecs:ListClusters "
+            f"({get_assessment_error_label(error)}), so only the default "
+            "cluster's services were read"
+        )
+        clusters = [None]
+    subnet_cache: Dict[str, Optional[str]] = {}
+    task_roles: Dict[str, Any] = {}
+    for cluster in clusters:
+        cluster_kwargs = {"cluster": cluster} if cluster else {}
+        cluster_label = cluster or "the default cluster"
+        try:
+            service_arns = _list_all_items(
+                ecs_client, "list_services", "serviceArns", **cluster_kwargs
+            )
+        except (ClientError, BotoCoreError, TypeError) as error:
+            inventory["errors"].append(
+                f"ECS services in {cluster_label} were not listed with "
+                f"ecs:ListServices ({get_assessment_error_label(error)})"
+            )
+            continue
+        for start in range(0, len(service_arns), 10):
+            batch = service_arns[start : start + 10]
+            try:
+                services = ecs_client.describe_services(
+                    services=batch, **cluster_kwargs
+                ).get("services", [])
+            except (ClientError, BotoCoreError) as error:
+                inventory["errors"].append(
+                    "ECS service(s) {} were not described with "
+                    "ecs:DescribeServices ({})".format(
+                        ", ".join(batch), get_assessment_error_label(error)
+                    )
+                )
+                continue
+            for service in services:
+                label = "ECS service '{}'".format(
+                    service.get("serviceName") or service.get("serviceArn")
+                )
+                task_definition = service.get("taskDefinition")
+                if task_definition and task_definition not in task_roles:
+                    try:
+                        task_roles[task_definition] = (
+                            ecs_client.describe_task_definition(
+                                taskDefinition=task_definition
+                            )
+                            .get("taskDefinition", {})
+                            .get("taskRoleArn")
+                        )
+                    except (ClientError, BotoCoreError) as error:
+                        task_roles[task_definition] = error
+                task_role = task_roles.get(task_definition)
+                if not task_definition or isinstance(task_role, Exception):
+                    inventory["errors"].append(
+                        f"{label} has a task role that was not read with "
+                        "ecs:DescribeTaskDefinition ({})".format(
+                            get_assessment_error_label(task_role)
+                            if isinstance(task_role, Exception)
+                            else "no task definition returned"
+                        )
+                    )
+                    continue
+                subnets = (
+                    (service.get("networkConfiguration") or {}).get(
+                        "awsvpcConfiguration"
+                    )
+                    or {}
+                ).get("subnets") or []
+                if not subnets:
+                    inventory["errors"].append(
+                        f"{label} uses no awsvpc subnets, so the VPC of the "
+                        "container instances its tasks run on was not read"
+                    )
+                    continue
+                try:
+                    vpcs = _subnet_vpcs(ec2_client, subnets, subnet_cache)
+                except (ClientError, BotoCoreError) as error:
+                    inventory["errors"].append(
+                        f"the subnets of {label} were not read with "
+                        f"ec2:DescribeSubnets ({get_assessment_error_label(error)})"
+                    )
+                    continue
+                role = str(task_role or "").rsplit("/", 1)[-1] or None
+                for vpc_id in sorted({vpc for vpc in vpcs.values() if vpc}):
+                    inventory["workloads"].append(
+                        {
+                            "kind": "ECS service",
+                            "name": service.get("serviceName") or "unnamed",
+                            "vpc_id": vpc_id,
+                            "role": role,
+                        }
+                    )
+                if not any(vpcs.values()):
+                    inventory["errors"].append(
+                        f"the subnets of {label} were not returned by "
+                        "ec2:DescribeSubnets"
+                    )
+
+
+def _notebook_workloads(region: str, inventory: Dict[str, Any]) -> None:
+    """Add every SageMaker notebook instance, with its subnet's VPC and role."""
+    sagemaker_client = boto3.client(
+        "sagemaker", config=boto3_config, region_name=region
+    )
+    ec2_client = boto3.client("ec2", config=boto3_config, region_name=region)
+    try:
+        notebooks = _list_all_items(
+            sagemaker_client,
+            "list_notebook_instances",
+            "NotebookInstances",
+            max_results_param="MaxResults",
+            token_param="NextToken",
+            token_response_keys=("NextToken",),
+        )
+    except (ClientError, BotoCoreError, TypeError) as error:
+        inventory["errors"].append(
+            "SageMaker notebook instances were not read with "
+            f"sagemaker:ListNotebookInstances ({get_assessment_error_label(error)})"
+        )
+        return
+    subnet_cache: Dict[str, Optional[str]] = {}
+    for notebook in notebooks:
+        name = notebook.get("NotebookInstanceName") or "unnamed"
+        label = f"SageMaker notebook instance '{name}'"
+        try:
+            detail = sagemaker_client.describe_notebook_instance(
+                NotebookInstanceName=name
+            )
+        except (ClientError, BotoCoreError) as error:
+            inventory["errors"].append(
+                f"{label} was not described with "
+                "sagemaker:DescribeNotebookInstance "
+                f"({get_assessment_error_label(error)})"
+            )
+            continue
+        vpc_id = None
+        subnet = detail.get("SubnetId")
+        if subnet:
+            try:
+                vpc_id = _subnet_vpcs(ec2_client, [subnet], subnet_cache).get(subnet)
+            except (ClientError, BotoCoreError) as error:
+                inventory["errors"].append(
+                    f"the subnet of {label} was not read with ec2:DescribeSubnets "
+                    f"({get_assessment_error_label(error)})"
+                )
+                continue
+            if not vpc_id:
+                inventory["errors"].append(
+                    f"subnet {subnet} of {label} was not returned by "
+                    "ec2:DescribeSubnets"
+                )
+                continue
+        role_arn = str(detail.get("RoleArn") or "")
+        inventory["workloads"].append(
+            {
+                "kind": "SageMaker notebook instance",
+                "name": name,
+                "vpc_id": vpc_id,
+                "role": role_arn.rsplit("/", 1)[-1] if role_arn else None,
+            }
+        )
 
 
 def get_bedrock_vpc_workload_inventory(region: str = "") -> Dict[str, Any]:
     """
-    List Lambda functions and EC2 instances with the VPC and role each runs as.
+    List Lambda functions, ECS services, SageMaker notebook instances and EC2
+    instances with the VPC and role each runs as.
 
     A listing that fails is named in ``errors`` so the population is never
     reported complete without it.
@@ -2543,6 +2731,9 @@ def get_bedrock_vpc_workload_inventory(region: str = "") -> Dict[str, Any]:
             "Lambda functions were not read with lambda:ListFunctions "
             f"({get_assessment_error_label(error)})"
         )
+
+    _ecs_service_workloads(region, inventory)
+    _notebook_workloads(region, inventory)
 
     try:
         ec2_client = boto3.client("ec2", config=boto3_config, region_name=region)
@@ -2744,11 +2935,7 @@ def _workload_connectivity_findings(
                 "read, so the Bedrock surfaces they call were not judged: {}.".format(
                     len(unread), "; ".join(unread[:10])
                 ),
-                resolution=(
-                    "Grant lambda:ListFunctions, ec2:DescribeInstances and "
-                    "iam:GetInstanceProfile, refresh the IAM permissions cache and "
-                    "retry."
-                ),
+                resolution=COULD_NOT_ASSESS_RESOLUTION,
                 reference=VPC_ENDPOINT_REFERENCE,
                 severity="Informational",
                 status="N/A",
@@ -2762,7 +2949,8 @@ def _workload_connectivity_findings(
                 finding_name=WORKLOAD_CONNECTIVITY_FINDING,
                 finding_details=(
                     "No Lambda function or EC2 instance runs as a role granted a "
-                    f"Bedrock or AgentCore surface. {scope}"
+                    "Bedrock or AgentCore surface, and neither does any ECS "
+                    f"service or SageMaker notebook instance. {scope}"
                 ),
                 resolution="No action required",
                 reference=VPC_ENDPOINT_REFERENCE,
@@ -3956,23 +4144,24 @@ AGENTCORE_MEMORY_EXPIRY_FINDING = "AgentCore Memory Event Retention"
 def _agentcore_memory_expiry_finding(region: str) -> Dict[str, Any]:
     """Report the AgentCore Memory retention leg of AIR-FND-DAT-08 as unread.
 
-    Each memory's eventExpiryDuration sets how long its events are kept, and
-    the Bedrock assessment role holds neither bedrock-agentcore:ListMemories
-    nor bedrock-agentcore:GetMemory, so no memory in the account is judged.
+    Each memory's eventExpiryDuration sets how long its events are kept. Only
+    GetMemory returns it, and the Bedrock assessment role holds
+    bedrock-agentcore:ListMemories (for BR-53) but not
+    bedrock-agentcore:GetMemory, so no memory in the account is judged.
     """
     return create_finding(
         check_id="BR-04",
         finding_name=AGENTCORE_MEMORY_EXPIRY_FINDING,
         finding_details=(
             "AgentCore Memory event retention was not read: each memory's "
-            "eventExpiryDuration is returned by GetMemory, and the assessment "
-            "role holds neither bedrock-agentcore:ListMemories nor "
-            "bedrock-agentcore:GetMemory, so no memory in this account was "
-            "judged on how long it keeps session events."
+            "eventExpiryDuration is returned only by GetMemory, and the "
+            "assessment role does not hold bedrock-agentcore:GetMemory, so no "
+            "memory in this account was judged on how long it keeps session "
+            "events."
         ),
         resolution=(
-            "Grant the Bedrock assessment role bedrock-agentcore:ListMemories and "
-            "bedrock-agentcore:GetMemory, then re-run the assessment."
+            "Grant the Bedrock assessment role bedrock-agentcore:GetMemory, then "
+            "re-run the assessment."
         ),
         reference=(
             "https://docs.aws.amazon.com/bedrock-agentcore-control/latest/APIReference/"
@@ -16285,13 +16474,110 @@ def _lambda_has_bedrock_indicator(function_config: Dict[str, Any]) -> bool:
 INSPECTOR_LAMBDA_EXCLUSION_TAG = ("inspectorexclusion", "lambdastandardscanning")
 
 INSPECTOR_LAMBDA_CEILING = (
-    "Per-function coverage (inspector2:ListCoverage, coveredResources[].scanStatus) "
-    "is not read, so a function neither invoked nor updated in 90 days, or on an "
-    "unsupported runtime, is not told apart from a scanned one; container-image "
-    "functions are scanned through ECR and judged by AC-50; an EventBridge rule "
-    "that gates deployment on Inspector severity is not read (events:ListRules is "
+    "Container-image functions are scanned through ECR and judged by AC-50. No AWS "
+    "API records whether a deployment pipeline blocks on an Inspector finding, and "
+    "the targets of an EventBridge rule are not read (events:ListTargetsByRule is "
     "not granted). Partial, ceiling reached."
 )
+
+# ListCoverage scan types Inspector reports for a Lambda function: PACKAGE is
+# standard scanning and CODE is code scanning.
+INSPECTOR_LAMBDA_SCAN_TYPES = ("PACKAGE", "CODE")
+
+
+def _inspector_lambda_coverage(
+    region: str, functions: List[Dict[str, Any]], skip: set
+) -> Dict[str, List[str]]:
+    """
+    Read every Lambda coverage record and name each in-scope zip function whose
+    $LATEST PACKAGE or CODE record is missing or not ACTIVE. Functions in
+    ``skip`` are already reported as not scanned.
+    """
+    try:
+        records = _list_all_items(
+            boto3.client("inspector2", config=boto3_config, region_name=region),
+            "list_coverage",
+            "coveredResources",
+            max_results=200,
+            filterCriteria={
+                "resourceType": [
+                    {"comparison": "EQUALS", "value": "AWS_LAMBDA_FUNCTION"}
+                ]
+            },
+        )
+    except (ClientError, BotoCoreError, TypeError) as error:
+        return {
+            "inactive": [],
+            "unread": [
+                "per-function coverage (inspector2:ListCoverage, "
+                f"{get_assessment_error_label(error)})"
+            ],
+        }
+    status = {}
+    for record in records:
+        resource_id = str(record.get("resourceId") or "")
+        function_arn, _, qualifier = resource_id.rpartition(":")
+        if qualifier != "$LATEST":
+            continue
+        scan_status = record.get("scanStatus") or {}
+        status[(function_arn, record.get("scanType"))] = (
+            scan_status.get("statusCode"),
+            scan_status.get("reason"),
+        )
+    inactive = []
+    for function in functions:
+        name = function.get("FunctionName") or "unnamed"
+        if name in skip or function.get("PackageType") == "Image":
+            continue
+        problems = []
+        for scan_type in INSPECTOR_LAMBDA_SCAN_TYPES:
+            code, reason = status.get(
+                (function.get("FunctionArn"), scan_type), (None, None)
+            )
+            if code is None:
+                problems.append(f"no {scan_type} coverage record")
+            elif code != "ACTIVE":
+                problems.append(f"{scan_type} scan {code} ({reason or 'no reason'})")
+        if problems:
+            inactive.append("'{}' is not scanned: {}".format(name, ", ".join(problems)))
+    return {"inactive": inactive, "unread": []}
+
+
+def _inspector_finding_rules(region: str) -> str:
+    """Name the ENABLED default-bus EventBridge rules that match Inspector events."""
+    try:
+        rules = _list_all_items(
+            boto3.client("events", config=boto3_config, region_name=region),
+            "list_rules",
+            "Rules",
+            max_results_param="Limit",
+            token_param="NextToken",
+            token_response_keys=("NextToken",),
+        )
+    except (ClientError, BotoCoreError, TypeError) as error:
+        return (
+            "EventBridge rules were not read (events:ListRules, "
+            f"{get_assessment_error_label(error)})."
+        )
+    matching = []
+    for rule in rules:
+        if rule.get("State") != "ENABLED":
+            continue
+        try:
+            pattern = json.loads(rule.get("EventPattern") or "{}")
+        except (TypeError, ValueError):
+            continue
+        sources = pattern.get("source") if isinstance(pattern, dict) else None
+        if "aws.inspector2" in _as_list(sources):
+            matching.append(str(rule.get("Name")))
+    if not matching:
+        return (
+            "No ENABLED EventBridge rule on the default event bus matches source "
+            "aws.inspector2, so no Inspector finding is routed automatically."
+        )
+    return "ENABLED EventBridge rule(s) matching source aws.inspector2: {}.".format(
+        ", ".join(sorted(matching)[:10])
+    )
 
 
 def _list_bedrock_related_lambdas(
@@ -16355,10 +16641,12 @@ def _inspector_lambda_exclusions(
     """
     lambda_client = boto3.client("lambda", config=boto3_config, region_name=region)
     excluded = []
+    excluded_names = set()
     unread = []
     for function in functions:
         name = function.get("FunctionName") or "unnamed"
         if function.get("KMSKeyArn"):
+            excluded_names.add(name)
             excluded.append(
                 "'{}' is encrypted with customer managed key {}, which Inspector "
                 "does not scan".format(name, function["KMSKeyArn"])
@@ -16384,10 +16672,11 @@ def _inspector_lambda_exclusions(
             (str(key).lower(), str(value).lower()) == INSPECTOR_LAMBDA_EXCLUSION_TAG
             for key, value in tags.items()
         ):
+            excluded_names.add(name)
             excluded.append(
                 f"'{name}' carries InspectorExclusion=LambdaStandardScanning"
             )
-    return {"excluded": excluded, "unread": unread}
+    return {"excluded": excluded, "excluded_names": excluded_names, "unread": unread}
 
 
 def check_inspector_lambda_code_scanning(
@@ -16589,6 +16878,12 @@ def check_inspector_lambda_code_scanning(
 
         if lambda_enabled and lambda_code_enabled:
             legs = _inspector_lambda_exclusions(region, bedrock_related_lambdas)
+            coverage = _inspector_lambda_coverage(
+                region, bedrock_related_lambdas, legs["excluded_names"]
+            )
+            legs["excluded"] = legs["excluded"] + coverage["inactive"]
+            legs["unread"] = legs["unread"] + coverage["unread"]
+            rules_note = _inspector_finding_rules(region)
             if legs["excluded"]:
                 findings["status"] = "FAIL"
                 findings["csv_data"].append(
@@ -16597,17 +16892,19 @@ def check_inspector_lambda_code_scanning(
                         finding_name="Amazon Inspector Lambda Code Scanning Check",
                         finding_details=(
                             "Inspector Lambda scanning is ENABLED in {}, but {} of the "
-                            "{} in-scope function(s) are not scanned: {}.".format(
+                            "{} in-scope function(s) are not scanned: {}. {}".format(
                                 region,
                                 len(legs["excluded"]),
                                 len(bedrock_related_lambdas),
                                 "; ".join(legs["excluded"][:10]),
+                                rules_note,
                             )
                         ),
                         resolution=(
-                            "Remove the InspectorExclusion tag, or scan a function "
+                            "Remove the InspectorExclusion tag, scan a function "
                             "encrypted with a customer managed key in CI, since "
-                            "Inspector cannot read it."
+                            "Inspector cannot read it, and update or invoke a "
+                            "function whose scan eligibility expired after 90 days."
                         ),
                         reference=reference,
                         severity="Medium",
@@ -16626,10 +16923,7 @@ def check_inspector_lambda_code_scanning(
                                 len(unread), "; ".join(unread[:10])
                             )
                         ),
-                        resolution=(
-                            "Grant lambda:ListTags on the account's functions to the "
-                            "Bedrock assessment role, and refresh the IAM cache."
-                        ),
+                        resolution=COULD_NOT_ASSESS_RESOLUTION,
                         reference=reference,
                         severity="Informational",
                         status="N/A",
@@ -16647,8 +16941,10 @@ def check_inspector_lambda_code_scanning(
                             f"code scanning are both ENABLED in {region}, and none of "
                             f"the {len(bedrock_related_lambdas)} in-scope Lambda "
                             "function(s) is encrypted with a customer managed key or "
-                            f"tagged for exclusion: {sample_functions}"
-                            f"{more_functions}. {INSPECTOR_LAMBDA_CEILING}"
+                            "tagged for exclusion, and each zip function has ACTIVE "
+                            "$LATEST PACKAGE and CODE coverage records in "
+                            f"inspector2:ListCoverage: {sample_functions}"
+                            f"{more_functions}. {rules_note} {INSPECTOR_LAMBDA_CEILING}"
                             + (
                                 " This is not reported as Passed because "
                                 f"{len(unread)} function(s) could not be judged."
@@ -21953,9 +22249,11 @@ AI_USER_MFA_REFERENCE = (
 AI_USER_MFA_SCOPE_NOTE = (
     "IAM users and the trust policies of IAM roles are read. People who sign in "
     "through IAM Identity Center are not covered: the sso-admin API publishes no "
-    "operation that returns an instance's MFA settings, and permission-set "
-    "policies need sso:ListPermissionSets and "
-    "sso:GetInlinePolicyForPermissionSet, which are not granted."
+    "operation that returns an instance's MFA settings. Permission-set inline "
+    "policies are read to name the permission sets that grant AI writes; the "
+    "managed and customer managed policies attached to a permission set are not "
+    "read (sso:ListManagedPoliciesInPermissionSet and "
+    "sso:ListCustomerManagedPolicyReferencesInPermissionSet are not granted)."
 )
 
 IDENTITY_CENTER_MFA_REFERENCE = (
@@ -21977,10 +22275,16 @@ def _identity_center_instances(region: str) -> Dict[str, Any]:
     except (ClientError, BotoCoreError, TypeError) as error:
         return {
             "instances": [],
+            "arns": [],
             "error": f"sso:ListInstances in {region} "
             f"({get_assessment_error_label(error)})",
         }
     return {
+        "arns": sorted(
+            instance["InstanceArn"]
+            for instance in instances
+            if instance.get("InstanceArn")
+        ),
         "instances": sorted(
             "{} (owner {})".format(
                 instance.get("InstanceArn") or "unknown",
@@ -21990,6 +22294,62 @@ def _identity_center_instances(region: str) -> Dict[str, Any]:
         ),
         "error": None,
     }
+
+
+def _identity_center_ai_permission_sets(
+    instance_arns: List[str], region: str
+) -> Dict[str, List[str]]:
+    """
+    Name each permission set whose inline policy grants a non-read Bedrock,
+    SageMaker AI or AgentCore action, across every page of every instance.
+    """
+    client = boto3.client("sso-admin", config=boto3_config, region_name=region)
+    granting = []
+    unread = []
+    for instance_arn in instance_arns:
+        try:
+            permission_sets = _list_all_items(
+                client,
+                "list_permission_sets",
+                "PermissionSets",
+                max_results_param="MaxResults",
+                token_param="NextToken",
+                token_response_keys=("NextToken",),
+                InstanceArn=instance_arn,
+            )
+        except (ClientError, BotoCoreError, TypeError) as error:
+            unread.append(
+                f"sso:ListPermissionSets on {instance_arn} "
+                f"({get_assessment_error_label(error)})"
+            )
+            continue
+        for permission_set_arn in permission_sets:
+            try:
+                document = client.get_inline_policy_for_permission_set(
+                    InstanceArn=instance_arn, PermissionSetArn=permission_set_arn
+                ).get("InlinePolicy")
+                services = (
+                    _ai_write_services({"inline_policies": [{"document": document}]})
+                    if document
+                    else []
+                )
+            except (ClientError, BotoCoreError) as error:
+                unread.append(
+                    f"sso:GetInlinePolicyForPermissionSet on {permission_set_arn} "
+                    f"({get_assessment_error_label(error)})"
+                )
+                continue
+            except (TypeError, ValueError) as error:
+                unread.append(
+                    f"the inline policy of {permission_set_arn} could not be "
+                    f"parsed ({get_assessment_error_label(error)})"
+                )
+                continue
+            if services:
+                granting.append(
+                    "{} ({})".format(permission_set_arn, ", ".join(services))
+                )
+    return {"granting": granting, "unread": unread}
 
 
 MFA_PRESENT_CONDITION_KEY = "aws:multifactorauthpresent"
@@ -22387,12 +22747,33 @@ def check_bedrock_ai_user_console_mfa(
                 )
                 status, severity = "N/A", "Informational"
             elif identity_center["instances"]:
+                permission_sets = _identity_center_ai_permission_sets(
+                    identity_center["arns"], sso_region
+                )
+                if permission_sets["granting"]:
+                    sets_note = (
+                        " {} permission set(s) grant AI writes in their inline "
+                        "policy: {}.".format(
+                            len(permission_sets["granting"]),
+                            "; ".join(permission_sets["granting"][:10]),
+                        )
+                    )
+                else:
+                    sets_note = (
+                        " No permission set inline policy that was read grants "
+                        "AI writes."
+                    )
+                if permission_sets["unread"]:
+                    sets_note += " These reads failed: {}.".format(
+                        "; ".join(permission_sets["unread"][:5])
+                    )
                 sso_note = (
                     "IAM Identity Center instance(s) {} are visible to this "
                     "account, and the people who sign in through them are judged "
-                    "by no row. Partial, ceiling reached: the instance's MFA "
+                    "by no row.{} Partial, ceiling reached: the instance's MFA "
                     "settings are returned by no sso-admin operation ({}).".format(
                         ", ".join(identity_center["instances"][:5]),
+                        sets_note,
                         IDENTITY_CENTER_MFA_REFERENCE,
                     )
                 )
@@ -24447,6 +24828,16 @@ def _backup_vault_lock_evidence(region: str, now: datetime) -> str:
     )
 
 
+def _backup_grant_ceiling(error: Exception, action: str) -> str:
+    """Name the ungranted AWS Backup read behind an AccessDenied."""
+    if not _is_access_denied_client_error(error):
+        return ""
+    return (
+        f"; {action} is not granted to the Bedrock assessment role. Partial, "
+        "ceiling reached"
+    )
+
+
 def _bucket_backup_lock(
     backup_client, bucket: str, vault_cache: Dict[str, Any], now: datetime
 ) -> Dict[str, str]:
@@ -24475,6 +24866,7 @@ def _bucket_backup_lock(
                 "its AWS Backup recovery points were not read "
                 f"(backup:ListRecoveryPointsByResource: "
                 f"{get_assessment_error_label(error)})"
+                + _backup_grant_ceiling(error, "backup:ListRecoveryPointsByResource")
             ),
         }
     usable = [
@@ -24539,6 +24931,7 @@ def _bucket_backup_lock(
                 "the lock date, so its own retention decides how long it is kept, "
                 "but it was not read (backup:DescribeRecoveryPoint: "
                 f"{get_assessment_error_label(error)})"
+                + _backup_grant_ceiling(error, "backup:DescribeRecoveryPoint")
             ),
         }
     delete_at = (point.get("CalculatedLifecycle") or {}).get("DeleteAt")
@@ -25162,13 +25555,106 @@ RESOURCE_OWNER_SWEEP_SERVICES = (
     ("bedrock-agentcore", "AgentCore"),
 )
 
-# The list actions that would enumerate SageMaker and AgentCore resources that
-# were never tagged. The Bedrock role holds none of them. Agent runtimes are
-# enumerated with bedrock-agentcore:ListAgentRuntimes, which it holds.
-RESOURCE_OWNER_SWEEP_UNGRANTED = (
-    "sagemaker:ListEndpoints, sagemaker:ListModels, sagemaker:ListNotebookInstances, "
-    "bedrock-agentcore:ListGateways and bedrock-agentcore:ListMemories"
+# List reads that enumerate resources GetResources misses because they were
+# never tagged: (GetResources filter, label, noun, client, operation, result
+# key, summary field, IAM action, extra kwargs). A gateway summary carries no ARN, so
+# gatewayId is matched against the gateway/<id> resource segment.
+RESOURCE_OWNER_SWEEP_LISTS = (
+    (
+        "sagemaker",
+        "SageMaker",
+        "endpoint",
+        "sagemaker",
+        "list_endpoints",
+        "Endpoints",
+        "EndpointArn",
+        "sagemaker:ListEndpoints",
+        {},
+    ),
+    (
+        "sagemaker",
+        "SageMaker",
+        "model",
+        "sagemaker",
+        "list_models",
+        "Models",
+        "ModelArn",
+        "sagemaker:ListModels",
+        {},
+    ),
+    (
+        "sagemaker",
+        "SageMaker",
+        "notebook instance",
+        "sagemaker",
+        "list_notebook_instances",
+        "NotebookInstances",
+        "NotebookInstanceArn",
+        "sagemaker:ListNotebookInstances",
+        {},
+    ),
+    (
+        "bedrock-agentcore",
+        "AgentCore",
+        "agent runtime",
+        "bedrock-agentcore-control",
+        "list_agent_runtimes",
+        "agentRuntimes",
+        "agentRuntimeArn",
+        "bedrock-agentcore:ListAgentRuntimes",
+        {},
+    ),
+    (
+        "bedrock-agentcore",
+        "AgentCore",
+        "memory",
+        "bedrock-agentcore-control",
+        "list_memories",
+        "memories",
+        "arn",
+        "bedrock-agentcore:ListMemories",
+        {},
+    ),
+    (
+        "bedrock-agentcore",
+        "AgentCore",
+        "gateway",
+        "bedrock-agentcore-control",
+        "list_gateways",
+        "items",
+        "gatewayId",
+        "bedrock-agentcore:ListGateways",
+        {},
+    ),
+    (
+        "bedrock-agentcore",
+        "AgentCore",
+        "custom browser",
+        "bedrock-agentcore-control",
+        "list_browsers",
+        "browserSummaries",
+        "browserArn",
+        "bedrock-agentcore:ListBrowsers",
+        {"type": "CUSTOM"},
+    ),
 )
+
+# Resource types the list reads above do not enumerate, so one never tagged is
+# still invisible to this check.
+RESOURCE_OWNER_SWEEP_CEILING = (
+    "SageMaker and AgentCore resource types other than endpoints, models, "
+    "notebook instances, agent runtimes, memories, gateways and custom browsers "
+    "(for example SageMaker domains and training jobs, and AgentCore code "
+    "interpreters) are listed only by GetResources, which returns only resources "
+    "that are or were tagged, so a resource never tagged is not listed "
+    "(https://docs.aws.amazon.com/resourcegroupstagging/latest/APIReference/"
+    "API_GetResources.html). Partial, ceiling reached."
+)
+
+
+def _arn_resource_segment(arn: str) -> str:
+    """Return the resource segment of an ARN, lower-cased for matching."""
+    return str(arn).split(":", 5)[-1].lower()
 
 
 def check_ai_resource_owner_tag_sweep(region: str = "") -> Dict[str, Any]:
@@ -25238,39 +25724,64 @@ def check_ai_resource_owner_tag_sweep(region: str = "") -> Dict[str, Any]:
             else:
                 unowned.append((label, arn, tags, rejections))
 
-    runtime_note = ""
-    if "bedrock-agentcore" in read_filters:
+    # SageMaker lower-cases the names in its ARNs, so segments are compared
+    # lower-cased.
+    returned_segments = {_arn_resource_segment(arn) for arn in returned_arns}
+    list_notes = []
+    for (
+        type_filter,
+        label,
+        noun,
+        service,
+        operation,
+        result_key,
+        field,
+        action,
+        extra,
+    ) in RESOURCE_OWNER_SWEEP_LISTS:
+        if type_filter not in read_filters:
+            continue
         try:
-            runtimes = _list_all_items(
-                boto3.client(
-                    "bedrock-agentcore-control", config=boto3_config, region_name=region
+            items = _list_all_items(
+                boto3.client(service, config=boto3_config, region_name=region),
+                operation,
+                result_key,
+                **(
+                    {
+                        "max_results_param": "MaxResults",
+                        "token_param": "NextToken",
+                        "token_response_keys": ("NextToken",),
+                    }
+                    if service == "sagemaker"
+                    else {}
                 ),
-                "list_agent_runtimes",
-                "agentRuntimes",
+                **extra,
             )
         except (ClientError, BotoCoreError, TypeError) as error:
             unread.append(
-                "bedrock-agentcore:ListAgentRuntimes "
-                f"({get_assessment_error_label(error)}), so agent runtimes never "
-                "tagged are not listed"
+                f"{action} ({get_assessment_error_label(error)}), so {noun}s "
+                "never tagged are not listed"
             )
-        else:
-            untagged = sorted(
-                {
-                    runtime["agentRuntimeArn"]
-                    for runtime in runtimes
-                    if runtime.get("agentRuntimeArn")
-                    and runtime["agentRuntimeArn"] not in returned_arns
-                }
+            continue
+        untagged = set()
+        for item in items:
+            value = item.get(field) if isinstance(item, dict) else None
+            if not value:
+                continue
+            segment = (
+                f"gateway/{value}".lower()
+                if field == "gatewayId"
+                else _arn_resource_segment(value)
             )
-            for arn in untagged:
-                unowned.append(("AgentCore", arn, None, []))
-            runtime_note = (
-                " bedrock-agentcore:ListAgentRuntimes listed {} agent runtime(s), "
-                "{} of them absent from GetResources and so never tagged.".format(
-                    len(runtimes), len(untagged)
-                )
-            )
+            if segment not in returned_segments:
+                untagged.add(f"gateway {value}" if field == "gatewayId" else str(value))
+        for arn in sorted(untagged):
+            unowned.append((label, arn, action, []))
+        list_notes.append(
+            f" {action} listed {len(items)} {noun}(s), {len(untagged)} of them "
+            "absent from GetResources and so never tagged."
+        )
+    list_note = "".join(list_notes)
 
     for label, arn, tags, rejections in unowned[:MAX_REPORTED_UNOWNED_RESOURCES]:
         findings["csv_data"].append(
@@ -25278,9 +25789,9 @@ def check_ai_resource_owner_tag_sweep(region: str = "") -> Dict[str, Any]:
                 "{} resource {} has no owner tag whose value names someone ({}).{}".format(
                     label,
                     arn,
-                    "listed by bedrock-agentcore:ListAgentRuntimes and not returned "
-                    "by tag:GetResources, so it was never tagged"
-                    if tags is None
+                    f"listed by {tags} and not returned by tag:GetResources, so it "
+                    "was never tagged"
+                    if isinstance(tags, str)
                     else "no tags returned"
                     if not tags
                     else "tag keys: "
@@ -25318,14 +25829,12 @@ def check_ai_resource_owner_tag_sweep(region: str = "") -> Dict[str, Any]:
     findings["csv_data"].append(
         row(
             "{} of the {} SageMaker and AgentCore resource(s) GetResources returned "
-            "carry an owner tag with a non-placeholder value. GetResources returns "
-            "only resources that are or were tagged, so a resource never tagged is "
-            "not listed, and the Bedrock role holds none of {} to enumerate them."
-            "{} This is not a verdict on every SageMaker or AgentCore resource.{}".format(
+            "carry an owner tag with a non-placeholder value.{} {} This is not a "
+            "verdict on every SageMaker or AgentCore resource.{}".format(
                 owned,
                 returned,
-                RESOURCE_OWNER_SWEEP_UNGRANTED,
-                runtime_note,
+                list_note,
+                RESOURCE_OWNER_SWEEP_CEILING,
                 unread_note,
             ),
             COULD_NOT_ASSESS_RESOLUTION,

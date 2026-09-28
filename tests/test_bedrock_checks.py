@@ -901,6 +901,15 @@ class TestBR02VPCEndpointHardening:
         assert endpoint["policy"] == self._OPEN_POLICY
 
 
+def _empty_ecs_and_sagemaker():
+    """ECS and SageMaker clients that list no clusters, services or notebooks."""
+    ecs = MagicMock()
+    ecs.list_clusters.return_value = {"clusterArns": []}
+    sagemaker = MagicMock()
+    sagemaker.list_notebook_instances.return_value = {"NotebookInstances": []}
+    return {"ecs": ecs, "sagemaker": sagemaker}
+
+
 class TestBR02WorkloadConnectivity:
     """
     BR-02 workload leg: each Bedrock surface a workload's role is granted needs
@@ -1095,19 +1104,26 @@ class TestBR02WorkloadConnectivity:
         assert [row["Status"] for row in rows] == ["Failed"]
         assert "is not attached to a VPC" in rows[0]["Finding_Details"]
 
-    def test_br02_ceiling_names_the_ungranted_compute_reads(self):
+    def test_br02_ceiling_names_the_compute_it_does_not_read(self):
         rows = self._run(
             self._cache({"InvokeRole": self._role(["bedrock:InvokeModel"])}),
             [self._endpoint("bedrock-runtime")],
             [self._function("summarize", "InvokeRole")],
         )
 
+        detail = rows[0]["Finding_Details"]
+        assert (
+            "Lambda functions, EC2 instances, ECS services and SageMaker notebook "
+            "instances are read." in detail
+        )
+        assert "EKS pods and SageMaker endpoints are not read" in detail
+        assert "an ECS task started outside a service is not listed" in detail
         for action in (
             "ecs:ListServices",
             "ecs:DescribeServices",
             "sagemaker:ListNotebookInstances",
         ):
-            assert action in rows[0]["Finding_Details"]
+            assert action not in detail
 
     def test_br02_endpoint_with_private_dns_off_does_not_cover_the_workload(self):
         rows = self._run(
@@ -1227,9 +1243,11 @@ class TestBR02WorkloadConnectivity:
         )
 
         def client(service, **_):
-            return {"lambda": lambda_client, "ec2": ec2_client}.get(
-                service, MagicMock()
-            )
+            return {
+                "lambda": lambda_client,
+                "ec2": ec2_client,
+                **_empty_ecs_and_sagemaker(),
+            }.get(service, MagicMock())
 
         with patch("bedrock_app.boto3.client", side_effect=client):
             inventory = bedrock_app.get_bedrock_vpc_workload_inventory(self.REGION)
@@ -1290,9 +1308,12 @@ class TestBR02WorkloadConnectivity:
         }
 
         def client(service, **_):
-            return {"lambda": lambda_client, "ec2": ec2_client, "iam": iam_client}[
-                service
-            ]
+            return {
+                "lambda": lambda_client,
+                "ec2": ec2_client,
+                "iam": iam_client,
+                **_empty_ecs_and_sagemaker(),
+            }[service]
 
         with patch("bedrock_app.boto3.client", side_effect=client):
             inventory = bedrock_app.get_bedrock_vpc_workload_inventory(self.REGION)
@@ -1305,6 +1326,307 @@ class TestBR02WorkloadConnectivity:
         iam_client.get_instance_profile.assert_called_once_with(
             InstanceProfileName="app"
         )
+
+    CLUSTER_A = "arn:aws:ecs:us-east-1:123456789012:cluster/a"
+    CLUSTER_B = "arn:aws:ecs:us-east-1:123456789012:cluster/b"
+
+    @staticmethod
+    def _service(name, task_definition, subnets=("subnet-1",)):
+        service = {"serviceName": name, "taskDefinition": task_definition}
+        if subnets is not None:
+            service["networkConfiguration"] = {
+                "awsvpcConfiguration": {"subnets": list(subnets)}
+            }
+        return service
+
+    def _inventory(
+        self,
+        clusters=None,
+        services=None,
+        task_roles=None,
+        notebooks=None,
+        notebook_details=None,
+        subnets=None,
+    ):
+        """Run the inventory with Lambda and EC2 empty and ECS/SageMaker wired."""
+        lambda_client = MagicMock()
+        lambda_client.get_paginator.return_value.paginate.return_value = [
+            {"Functions": []}
+        ]
+        subnets = subnets if subnets is not None else {"subnet-1": "vpc-1"}
+        ec2_client = MagicMock()
+        subnet_calls = []
+
+        def paginator(name):
+            pager = MagicMock()
+            if name == "describe_subnets":
+
+                def paginate(SubnetIds):
+                    subnet_calls.append(list(SubnetIds))
+                    return [
+                        {
+                            "Subnets": [
+                                {"SubnetId": s, "VpcId": subnets[s]}
+                                for s in SubnetIds
+                                if s in subnets
+                            ]
+                        }
+                    ]
+
+                pager.paginate.side_effect = paginate
+            else:
+                pager.paginate.return_value = [{"Reservations": []}]
+            return pager
+
+        ec2_client.get_paginator.side_effect = paginator
+        ecs = MagicMock()
+        if isinstance(clusters, Exception):
+            ecs.list_clusters.side_effect = clusters
+        else:
+            ecs.list_clusters.return_value = {"clusterArns": list(clusters or [])}
+        services = services or {}
+
+        def list_services(**kwargs):
+            outcome = services.get(kwargs.get("cluster"), [])
+            if isinstance(outcome, Exception):
+                raise outcome
+            return {"serviceArns": [f"arn:svc/{s['serviceName']}" for s in outcome]}
+
+        def describe_services(**kwargs):
+            by_arn = {
+                f"arn:svc/{s['serviceName']}": s
+                for listed in services.values()
+                if isinstance(listed, list)
+                for s in listed
+            }
+            return {"services": [by_arn[arn] for arn in kwargs["services"]]}
+
+        ecs.list_services.side_effect = list_services
+        ecs.describe_services.side_effect = describe_services
+        task_roles = task_roles or {}
+
+        def describe_task_definition(taskDefinition):
+            outcome = task_roles.get(taskDefinition)
+            if isinstance(outcome, Exception):
+                raise outcome
+            return {"taskDefinition": {"taskRoleArn": outcome}}
+
+        ecs.describe_task_definition.side_effect = describe_task_definition
+        sagemaker = MagicMock()
+        if isinstance(notebooks, Exception):
+            sagemaker.list_notebook_instances.side_effect = notebooks
+        else:
+            sagemaker.list_notebook_instances.side_effect = list(
+                notebooks or [{"NotebookInstances": []}]
+            )
+        notebook_details = notebook_details or {}
+
+        def describe_notebook(NotebookInstanceName):
+            outcome = notebook_details[NotebookInstanceName]
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+
+        sagemaker.describe_notebook_instance.side_effect = describe_notebook
+        clients = {
+            "lambda": lambda_client,
+            "ec2": ec2_client,
+            "iam": MagicMock(),
+            "ecs": ecs,
+            "sagemaker": sagemaker,
+        }
+        with patch(
+            "bedrock_app.boto3.client",
+            side_effect=lambda service, **_: clients[service],
+        ):
+            inventory = bedrock_app.get_bedrock_vpc_workload_inventory(self.REGION)
+        self.ecs, self.sagemaker, self.subnet_calls = ecs, sagemaker, subnet_calls
+        return inventory
+
+    @staticmethod
+    def _names(inventory):
+        return [
+            (w["kind"], w["name"], w["vpc_id"], w["role"])
+            for w in inventory["workloads"]
+        ]
+
+    def test_br02_ecs_services_in_every_cluster_carry_their_task_role_and_vpc(
+        self,
+    ):
+        inventory = self._inventory(
+            clusters=[self.CLUSTER_A, self.CLUSTER_B],
+            services={
+                self.CLUSTER_A: [self._service("api", "td-api:1")],
+                self.CLUSTER_B: [
+                    self._service("worker", "td-worker:3", subnets=("subnet-2",))
+                ],
+            },
+            task_roles={
+                "td-api:1": "arn:aws:iam::123456789012:role/ApiTask",
+                "td-worker:3": "arn:aws:iam::123456789012:role/path/WorkerTask",
+            },
+            subnets={"subnet-1": "vpc-1", "subnet-2": "vpc-2"},
+        )
+        assert inventory["errors"] == []
+        assert self._names(inventory) == [
+            ("ECS service", "api", "vpc-1", "ApiTask"),
+            ("ECS service", "worker", "vpc-2", "WorkerTask"),
+        ]
+        assert [c.kwargs for c in self.ecs.list_services.call_args_list] == [
+            {"cluster": self.CLUSTER_A, "maxResults": 100},
+            {"cluster": self.CLUSTER_B, "maxResults": 100},
+        ]
+
+    def test_br02_an_unread_task_role_is_named_and_the_other_service_judged(self):
+        inventory = self._inventory(
+            clusters=[self.CLUSTER_A],
+            services={
+                self.CLUSTER_A: [
+                    self._service("api", "td-api:1"),
+                    self._service("hidden", "td-hidden:1"),
+                ]
+            },
+            task_roles={
+                "td-api:1": "arn:aws:iam::123456789012:role/ApiTask",
+                "td-hidden:1": _make_client_error("AccessDeniedException"),
+            },
+        )
+        assert self._names(inventory) == [("ECS service", "api", "vpc-1", "ApiTask")]
+        assert inventory["errors"] == [
+            "ECS service 'hidden' has a task role that was not read with "
+            "ecs:DescribeTaskDefinition (AccessDeniedException)"
+        ]
+
+    def test_br02_denied_cluster_list_falls_back_to_the_default_cluster(self):
+        inventory = self._inventory(
+            clusters=_make_client_error("AccessDeniedException"),
+            services={None: [self._service("api", "td-api:1")]},
+            task_roles={"td-api:1": "arn:aws:iam::123456789012:role/ApiTask"},
+        )
+        assert self._names(inventory) == [("ECS service", "api", "vpc-1", "ApiTask")]
+        assert len(inventory["errors"]) == 1
+        assert "ecs:ListClusters (AccessDeniedException)" in inventory["errors"][0]
+        assert (
+            "only the default cluster's services were read" in (inventory["errors"][0])
+        )
+        self.ecs.list_services.assert_called_once_with(maxResults=100)
+
+    def test_br02_ecs_services_are_described_ten_at_a_time(self):
+        listed = [self._service(f"s{i:02d}", "td:1") for i in range(11)]
+        inventory = self._inventory(
+            clusters=[self.CLUSTER_A],
+            services={self.CLUSTER_A: listed},
+            task_roles={"td:1": "arn:aws:iam::123456789012:role/Task"},
+        )
+        assert [
+            len(c.kwargs["services"]) for c in self.ecs.describe_services.call_args_list
+        ] == [10, 1]
+        assert len(inventory["workloads"]) == 11
+        self.ecs.describe_task_definition.assert_called_once_with(taskDefinition="td:1")
+        assert self.subnet_calls == [["subnet-1"]]
+
+    def test_br02_a_service_without_awsvpc_subnets_is_not_read_as_covered(self):
+        inventory = self._inventory(
+            clusters=[self.CLUSTER_A],
+            services={
+                self.CLUSTER_A: [
+                    self._service("api", "td-api:1"),
+                    self._service("bridge", "td-api:1", subnets=None),
+                ]
+            },
+            task_roles={"td-api:1": "arn:aws:iam::123456789012:role/ApiTask"},
+        )
+        assert self._names(inventory) == [("ECS service", "api", "vpc-1", "ApiTask")]
+        assert inventory["errors"] == [
+            "ECS service 'bridge' uses no awsvpc subnets, so the VPC of the "
+            "container instances its tasks run on was not read"
+        ]
+
+    def test_br02_notebooks_on_every_page_carry_their_vpc_and_role(self):
+        inventory = self._inventory(
+            notebooks=[
+                {
+                    "NotebookInstances": [{"NotebookInstanceName": "in-vpc"}],
+                    "NextToken": "p2",
+                },
+                {"NotebookInstances": [{"NotebookInstanceName": "public"}]},
+            ],
+            notebook_details={
+                "in-vpc": {
+                    "SubnetId": "subnet-1",
+                    "RoleArn": "arn:aws:iam::123456789012:role/service-role/NbRole",
+                },
+                "public": {"RoleArn": "arn:aws:iam::123456789012:role/NbRole"},
+            },
+        )
+        assert inventory["errors"] == []
+        assert self._names(inventory) == [
+            ("SageMaker notebook instance", "in-vpc", "vpc-1", "NbRole"),
+            ("SageMaker notebook instance", "public", None, "NbRole"),
+        ]
+        assert self.sagemaker.list_notebook_instances.call_count == 2
+
+    def test_br02_an_undescribed_notebook_is_named_and_the_other_kept(self):
+        inventory = self._inventory(
+            notebooks=[
+                {
+                    "NotebookInstances": [
+                        {"NotebookInstanceName": "ok"},
+                        {"NotebookInstanceName": "denied"},
+                    ]
+                }
+            ],
+            notebook_details={
+                "ok": {
+                    "SubnetId": "subnet-1",
+                    "RoleArn": "arn:aws:iam::123456789012:role/NbRole",
+                },
+                "denied": _make_client_error("AccessDeniedException"),
+            },
+        )
+        assert self._names(inventory) == [
+            ("SageMaker notebook instance", "ok", "vpc-1", "NbRole")
+        ]
+        assert inventory["errors"] == [
+            "SageMaker notebook instance 'denied' was not described with "
+            "sagemaker:DescribeNotebookInstance (AccessDeniedException)"
+        ]
+
+    def test_br02_unlisted_notebooks_block_the_population(self):
+        inventory = self._inventory(
+            notebooks=_make_client_error("AccessDeniedException")
+        )
+        assert inventory["errors"] == [
+            "SageMaker notebook instances were not read with "
+            "sagemaker:ListNotebookInstances (AccessDeniedException)"
+        ]
+
+    def test_br02_notebook_outside_a_vpc_fails_beside_a_covered_ecs_service(self):
+        rows = self._run(
+            self._cache({"InvokeRole": self._role(["bedrock:InvokeModel"])}),
+            [self._endpoint("bedrock-runtime")],
+            [
+                {
+                    "kind": "ECS service",
+                    "name": "api",
+                    "vpc_id": "vpc-1",
+                    "role": "InvokeRole",
+                },
+                {
+                    "kind": "SageMaker notebook instance",
+                    "name": "public",
+                    "vpc_id": None,
+                    "role": "InvokeRole",
+                },
+            ],
+        )
+        assert [row["Status"] for row in rows] == ["Failed", "Passed"]
+        assert (
+            "SageMaker notebook instance 'public' (role 'InvokeRole') is not "
+            "attached to a VPC" in rows[0]["Finding_Details"]
+        )
+        assert "ECS service 'api'" not in rows[0]["Finding_Details"]
+        assert "ECS service 'api' in vpc-1" in rows[1]["Finding_Details"]
 
     def test_br02_endpoint_listing_failure_is_not_read_as_no_endpoints(
         self, permission_cache_compliant
@@ -17506,6 +17828,15 @@ class TestBR33InspectorLambdaCodeScanning:
             ]
         }
 
+    @staticmethod
+    def _coverage(function_arn, scan_type, status="ACTIVE", reason="SUCCESSFUL"):
+        return {
+            "resourceType": "AWS_LAMBDA_FUNCTION",
+            "resourceId": f"{function_arn}:$LATEST",
+            "scanType": scan_type,
+            "scanStatus": {"statusCode": status, "reason": reason},
+        }
+
     def _bedrock_lambda(self, name="bedrock-chat-handler"):
         return {
             "FunctionName": name,
@@ -17523,6 +17854,10 @@ class TestBR33InspectorLambdaCodeScanning:
         inspector_response=None,
         inspector_error=None,
         tags=None,
+        coverage=None,
+        coverage_error=None,
+        rules=(),
+        rules_error=None,
     ):
         lambda_client = MagicMock()
         tags = tags or {}
@@ -17549,12 +17884,34 @@ class TestBR33InspectorLambdaCodeScanning:
                 if inspector_response is not None
                 else self._inspector_response("ENABLED", "ENABLED")
             )
+        if coverage_error is not None:
+            inspector_client.list_coverage.side_effect = coverage_error
+        else:
+            if coverage is None:
+                functions = (
+                    lambda_functions
+                    if lambda_functions is not None
+                    else [self._bedrock_lambda()]
+                )
+                coverage = [
+                    self._coverage(function.get("FunctionArn"), scan_type)
+                    for function in functions
+                    for scan_type in ("PACKAGE", "CODE")
+                ]
+            inspector_client.list_coverage.return_value = {"coveredResources": coverage}
+        events_client = MagicMock()
+        if rules_error is not None:
+            events_client.list_rules.side_effect = rules_error
+        else:
+            events_client.list_rules.return_value = {"Rules": list(rules)}
 
         def client(service_name, *args, **kwargs):
             if service_name == "lambda":
                 return lambda_client
             if service_name == "inspector2":
                 return inspector_client
+            if service_name == "events":
+                return events_client
             return MagicMock()
 
         mock_client.side_effect = client
@@ -17883,6 +18240,207 @@ class TestBR33InspectorLambdaCodeScanning:
         assert findings[0]["Check_ID"] == "BR-33"
         assert findings[0]["Status"] == "N/A"
         assert findings[0]["Severity"] == "Informational"
+
+    def _br33(self, mock_client, functions, **wiring):
+        _, inspector_client = self._wire_clients(
+            mock_client, lambda_functions=functions, **wiring
+        )
+        findings = extract_csv_data(
+            bedrock_app.check_inspector_lambda_code_scanning(
+                region="us-east-1", permission_cache=self._cache({})
+            )
+        )
+        return findings, inspector_client
+
+    @patch("bedrock_app.boto3.client")
+    def test_br33_expired_scan_fails_one_function_among_active_ones(self, mock_client):
+        ok = self._bedrock_lambda("bedrock-ok")
+        stale = self._bedrock_lambda("bedrock-stale")
+        findings, inspector_client = self._br33(
+            mock_client,
+            [ok, stale],
+            coverage=[
+                self._coverage(ok["FunctionArn"], "PACKAGE"),
+                self._coverage(ok["FunctionArn"], "CODE"),
+                self._coverage(stale["FunctionArn"], "PACKAGE"),
+                self._coverage(
+                    stale["FunctionArn"],
+                    "CODE",
+                    status="INACTIVE",
+                    reason="SCAN_ELIGIBILITY_EXPIRED",
+                ),
+            ],
+        )
+
+        assert [row["Status"] for row in findings] == ["Failed"]
+        detail = findings[0]["Finding_Details"]
+        assert "1 of the 2 in-scope" in detail
+        assert (
+            "'bedrock-stale' is not scanned: CODE scan INACTIVE "
+            "(SCAN_ELIGIBILITY_EXPIRED)" in detail
+        )
+        assert "bedrock-ok" not in detail
+        kwargs = inspector_client.list_coverage.call_args.kwargs
+        assert kwargs["filterCriteria"] == {
+            "resourceType": [{"comparison": "EQUALS", "value": "AWS_LAMBDA_FUNCTION"}]
+        }
+
+    @patch("bedrock_app.boto3.client")
+    def test_br33_missing_coverage_record_fails_the_function(self, mock_client):
+        ok = self._bedrock_lambda("bedrock-ok")
+        findings, _ = self._br33(
+            mock_client,
+            [ok, self._bedrock_lambda("bedrock-unlisted")],
+            coverage=[
+                self._coverage(ok["FunctionArn"], "PACKAGE"),
+                self._coverage(ok["FunctionArn"], "CODE"),
+            ],
+        )
+
+        assert [row["Status"] for row in findings] == ["Failed"]
+        assert (
+            "'bedrock-unlisted' is not scanned: no PACKAGE coverage record, "
+            "no CODE coverage record" in findings[0]["Finding_Details"]
+        )
+
+    @patch("bedrock_app.boto3.client")
+    def test_br33_an_active_version_record_does_not_hide_an_inactive_latest(
+        self, mock_client
+    ):
+        fn = self._bedrock_lambda("bedrock-versioned")
+        version = {
+            **self._coverage(fn["FunctionArn"], "CODE"),
+            "resourceId": f"{fn['FunctionArn']}:7",
+        }
+        findings, _ = self._br33(
+            mock_client,
+            [fn],
+            coverage=[
+                version,
+                self._coverage(fn["FunctionArn"], "PACKAGE"),
+                self._coverage(
+                    fn["FunctionArn"], "CODE", status="INACTIVE", reason="EXCLUDED"
+                ),
+            ],
+        )
+
+        assert [row["Status"] for row in findings] == ["Failed"]
+        assert "CODE scan INACTIVE (EXCLUDED)" in findings[0]["Finding_Details"]
+
+    @patch("bedrock_app.boto3.client")
+    def test_br33_every_coverage_page_is_read(self, mock_client):
+        first = self._bedrock_lambda("bedrock-first")
+        second = self._bedrock_lambda("bedrock-second")
+        _, inspector_client = self._wire_clients(
+            mock_client, lambda_functions=[first, second]
+        )
+        inspector_client.list_coverage.side_effect = [
+            {
+                "coveredResources": [
+                    self._coverage(first["FunctionArn"], "PACKAGE"),
+                    self._coverage(first["FunctionArn"], "CODE"),
+                ],
+                "nextToken": "page-2",
+            },
+            {
+                "coveredResources": [
+                    self._coverage(second["FunctionArn"], "PACKAGE"),
+                    self._coverage(
+                        second["FunctionArn"],
+                        "CODE",
+                        status="INACTIVE",
+                        reason="UNSUPPORTED_RUNTIME",
+                    ),
+                ]
+            },
+        ]
+
+        findings = extract_csv_data(
+            bedrock_app.check_inspector_lambda_code_scanning(
+                region="us-east-1", permission_cache=self._cache({})
+            )
+        )
+
+        assert [row["Status"] for row in findings] == ["Failed"]
+        assert "'bedrock-second' is not scanned" in findings[0]["Finding_Details"]
+        assert inspector_client.list_coverage.call_count == 2
+
+    @patch("bedrock_app.boto3.client")
+    def test_br33_container_image_function_is_left_to_ac50(self, mock_client):
+        image = {**self._bedrock_lambda("bedrock-image"), "PackageType": "Image"}
+        ok = self._bedrock_lambda("bedrock-ok")
+        findings, _ = self._br33(
+            mock_client,
+            [ok, image],
+            coverage=[
+                self._coverage(ok["FunctionArn"], "PACKAGE"),
+                self._coverage(ok["FunctionArn"], "CODE"),
+            ],
+        )
+
+        assert [row["Status"] for row in findings] == ["Passed"]
+        assert "judged by AC-50" in findings[0]["Finding_Details"]
+
+    @patch("bedrock_app.boto3.client")
+    def test_br33_coverage_read_denied_blocks_a_pass(self, mock_client):
+        findings, _ = self._br33(
+            mock_client,
+            [self._bedrock_lambda("bedrock-ok")],
+            coverage_error=_make_client_error("AccessDeniedException"),
+        )
+
+        assert [row["Status"] for row in findings] == ["N/A", "N/A"]
+        assert (
+            "per-function coverage (inspector2:ListCoverage, AccessDeniedException)"
+            in findings[1]["Finding_Details"]
+        )
+
+    @patch("bedrock_app.boto3.client")
+    def test_br33_names_enabled_inspector_rules_only(self, mock_client):
+        findings, _ = self._br33(
+            mock_client,
+            [self._bedrock_lambda("bedrock-ok")],
+            rules=[
+                {
+                    "Name": "route-findings",
+                    "State": "ENABLED",
+                    "EventPattern": '{"source": ["aws.inspector2"]}',
+                },
+                {
+                    "Name": "disabled-findings",
+                    "State": "DISABLED",
+                    "EventPattern": '{"source": ["aws.inspector2"]}',
+                },
+                {
+                    "Name": "ec2-state",
+                    "State": "ENABLED",
+                    "EventPattern": '{"source": ["aws.ec2"]}',
+                },
+            ],
+        )
+
+        detail = findings[0]["Finding_Details"]
+        assert findings[0]["Status"] == "Passed"
+        assert "matching source aws.inspector2: route-findings." in detail
+        assert "disabled-findings" not in detail
+        assert "ec2-state" not in detail
+
+    @patch("bedrock_app.boto3.client")
+    def test_br33_no_rule_and_unread_rules_are_said_apart(self, mock_client):
+        findings, _ = self._br33(mock_client, [self._bedrock_lambda("bedrock-ok")])
+        assert "No ENABLED EventBridge rule" in findings[0]["Finding_Details"]
+
+        findings, _ = self._br33(
+            mock_client,
+            [self._bedrock_lambda("bedrock-ok")],
+            rules_error=_make_client_error("AccessDeniedException"),
+        )
+        detail = findings[0]["Finding_Details"]
+        assert (
+            "EventBridge rules were not read (events:ListRules, "
+            "AccessDeniedException)." in detail
+        )
+        assert "No ENABLED EventBridge rule" not in detail
 
     @patch("bedrock_app.boto3.client")
     def test_br33_schema_valid(self, mock_client):
@@ -23396,9 +23954,30 @@ class TestBR51AIUserConsoleMFA:
         mfa_error=None,
         keys=None,
         instances=None,
+        permission_sets=None,
+        inline=None,
     ):
         iam = MagicMock()
         login = login or {}
+        permission_sets = permission_sets or {}
+        inline = inline or {}
+
+        def list_permission_sets(InstanceArn, **kwargs):
+            outcome = permission_sets.get(InstanceArn, [])
+            if isinstance(outcome, Exception):
+                raise outcome
+            if isinstance(outcome, dict):
+                return outcome[kwargs.get("NextToken")]
+            return {"PermissionSets": outcome}
+
+        def get_inline_policy(InstanceArn, PermissionSetArn):
+            outcome = inline.get(PermissionSetArn, "")
+            if isinstance(outcome, Exception):
+                raise outcome
+            return {"InlinePolicy": outcome}
+
+        iam.list_permission_sets.side_effect = list_permission_sets
+        iam.get_inline_policy_for_permission_set.side_effect = get_inline_policy
         if isinstance(instances, Exception):
             iam.list_instances.side_effect = instances
         else:
@@ -23480,6 +24059,100 @@ class TestBR51AIUserConsoleMFA:
         assert "userguide/mfa-configure.html" in details
         assert "IAM Identity Center are not covered" in details
         assert rows[0]["Severity"] == "Informational"
+
+    INSTANCE = "arn:aws:sso:::instance/ssoins-1"
+    PS_WRITE = "arn:aws:sso:::permissionSet/ssoins-1/ps-write"
+    PS_READ = "arn:aws:sso:::permissionSet/ssoins-1/ps-read"
+    PS_LATE = "arn:aws:sso:::permissionSet/ssoins-1/ps-late"
+
+    @staticmethod
+    def _policy(*actions):
+        return json.dumps(
+            {
+                "Version": "2012-10-17",
+                "Statement": [
+                    {"Effect": "Allow", "Action": list(actions), "Resource": "*"}
+                ],
+            }
+        )
+
+    def _run_sets(self, **kwargs):
+        return self._run(
+            _ai_user_cache(),
+            login={"alice": "yes"},
+            devices={"alice": [{"SerialNumber": "s"}]},
+            instances=[{"Instances": [{"InstanceArn": self.INSTANCE}]}],
+            **kwargs,
+        )
+
+    def test_br51_names_the_permission_set_granting_ai_writes_beside_a_read_one(
+        self,
+    ):
+        _, rows = self._run_sets(
+            permission_sets={
+                self.INSTANCE: {
+                    None: {
+                        "PermissionSets": [self.PS_READ, self.PS_WRITE],
+                        "NextToken": "p2",
+                    },
+                    "p2": {"PermissionSets": [self.PS_LATE]},
+                }
+            },
+            inline={
+                self.PS_READ: self._policy("bedrock:ListFoundationModels"),
+                self.PS_WRITE: self._policy("bedrock:CreateGuardrail"),
+                self.PS_LATE: self._policy("sagemaker:CreateEndpoint"),
+            },
+        )
+        assert [r["Status"] for r in rows] == ["N/A"]
+        details = rows[0]["Finding_Details"]
+        assert "2 permission set(s) grant AI writes in their inline policy" in details
+        assert f"{self.PS_WRITE} (bedrock)" in details
+        assert f"{self.PS_LATE} (sagemaker)" in details
+        assert self.PS_READ not in details
+        assert "Partial, ceiling reached" in details
+        self.iam.list_permission_sets.assert_has_calls(
+            [
+                call(InstanceArn=self.INSTANCE, MaxResults=100),
+                call(InstanceArn=self.INSTANCE, MaxResults=100, NextToken="p2"),
+            ]
+        )
+
+    def test_br51_no_granting_permission_set_still_is_not_passed(self):
+        _, rows = self._run_sets(
+            permission_sets={self.INSTANCE: [self.PS_READ]},
+            inline={self.PS_READ: self._policy("bedrock:Get*")},
+        )
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert (
+            "No permission set inline policy that was read grants AI writes."
+            in rows[0]["Finding_Details"]
+        )
+
+    def test_br51_an_unread_inline_policy_is_named_not_read_as_clean(self):
+        _, rows = self._run_sets(
+            permission_sets={self.INSTANCE: [self.PS_READ, self.PS_WRITE]},
+            inline={
+                self.PS_READ: self._policy("bedrock:Get*"),
+                self.PS_WRITE: _make_client_error("AccessDeniedException"),
+            },
+        )
+        details = rows[0]["Finding_Details"]
+        assert (
+            f"sso:GetInlinePolicyForPermissionSet on {self.PS_WRITE} "
+            "(AccessDeniedException)" in details
+        )
+
+    def test_br51_denied_permission_set_list_is_named(self):
+        _, rows = self._run_sets(
+            permission_sets={self.INSTANCE: _make_client_error("AccessDeniedException")}
+        )
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert (
+            f"sso:ListPermissionSets on {self.INSTANCE} (AccessDeniedException)"
+            in rows[0]["Finding_Details"]
+        )
+        self.iam.get_inline_policy_for_permission_set.assert_not_called()
 
     def test_br51_unlisted_identity_center_stops_passed(self):
         _, rows = self._run(
@@ -24057,6 +24730,40 @@ class TestBR52DataPathObjectLock:
         assert "backup:ListRecoveryPointsByResource" in rows[1]["Finding_Details"]
         assert "b (kb)" in rows[1]["Finding_Details"]
 
+    def test_br52_denied_backup_reads_name_the_missing_grant_and_the_ceiling(self):
+        _, rows = self._run(
+            {"a": ["kb"], "b": ["kb"]},
+            {"a": self.GOVERNED, "b": self.GOVERNED},
+            recovery_points={
+                "a": _make_client_error("AccessDeniedException"),
+                "b": _make_client_error("ThrottlingException"),
+            },
+        )
+        assert [r["Status"] for r in rows] == ["Failed", "Failed"]
+        denied, throttled = rows[0]["Finding_Details"], rows[1]["Finding_Details"]
+        assert "Bucket a" in denied
+        assert (
+            "backup:ListRecoveryPointsByResource is not granted to the Bedrock "
+            "assessment role. Partial, ceiling reached" in denied
+        )
+        assert "Bucket b" in throttled
+        assert "is not granted" not in throttled
+        assert "ceiling reached" not in throttled
+
+    def test_br52_denied_recovery_point_describe_names_the_missing_grant(self):
+        _, rows = self._run(
+            {"a": ["kb"]},
+            {"a": self.GOVERNED},
+            recovery_points={"a": [self._point("vault-c", 20)]},
+            vault_details={"vault-c": self._vault(lock_days_ago=1)},
+            point_details={"vault-c": _make_client_error("AccessDeniedException")},
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert (
+            "backup:DescribeRecoveryPoint is not granted to the Bedrock assessment "
+            "role. Partial, ceiling reached" in rows[0]["Finding_Details"]
+        )
+
     def test_br52_locked_backup_clears_a_bucket_whose_object_lock_is_unreadable(self):
         _, rows = self._run(
             {"a": ["kb"], "b": ["kb"]},
@@ -24175,7 +24882,16 @@ class TestBR53OwnerTagSweep:
     SM_LATE = "arn:aws:sagemaker:us-east-1:123456789012:model/late"
     AC_BARE = "arn:aws:bedrock-agentcore:us-east-1:123456789012:runtime/rt-1"
 
-    def _run(self, pages, errors=None, runtimes=None):
+    LIST_KEYS = {
+        "list_endpoints": "Endpoints",
+        "list_models": "Models",
+        "list_notebook_instances": "NotebookInstances",
+        "list_memories": "memories",
+        "list_gateways": "items",
+        "list_browsers": "browserSummaries",
+    }
+
+    def _run(self, pages, errors=None, runtimes=None, lists=None):
         errors = errors or {}
         tagging = MagicMock()
         if isinstance(runtimes, Exception):
@@ -24184,6 +24900,14 @@ class TestBR53OwnerTagSweep:
             tagging.list_agent_runtimes.side_effect = list(
                 runtimes or [{"agentRuntimes": []}]
             )
+        lists = lists or {}
+        for operation, key in self.LIST_KEYS.items():
+            value = lists.get(operation, [])
+            method = getattr(tagging, operation)
+            if isinstance(value, Exception) or callable(value):
+                method.side_effect = value
+            else:
+                method.return_value = {key: value}
 
         def get_resources(**kwargs):
             (type_filter,) = kwargs["ResourceTypeFilters"]
@@ -24254,6 +24978,9 @@ class TestBR53OwnerTagSweep:
         details = rows[0]["Finding_Details"]
         assert "1 of the 1 SageMaker and AgentCore" in details
         assert "a resource never tagged is not listed" in details
+        assert "APIReference/API_GetResources.html). Partial, ceiling reached." in (
+            details
+        )
         assert "bedrock-agentcore:ListAgentRuntimes" in details
 
     def test_an_unowned_resource_on_a_later_page_is_failed(self):
@@ -24356,6 +25083,118 @@ class TestBR53OwnerTagSweep:
             )[1]
         )
         tagging.list_agent_runtimes.assert_not_called()
+
+    SM_NB_TAGGED = "arn:aws:sagemaker:us-east-1:123456789012:notebook-instance/nb-a"
+    SM_NB_NEVER = "arn:aws:sagemaker:us-east-1:123456789012:notebook-instance/nb-b"
+    AC_GW_TAGGED = "arn:aws:bedrock-agentcore:us-east-1:123456789012:gateway/gw-a"
+    AC_BROWSER = "arn:aws:bedrock-agentcore:us-east-1:123456789012:browser-custom/br-1"
+    AC_MEMORY = "arn:aws:bedrock-agentcore:us-east-1:123456789012:memory/mem-1"
+
+    def _owned(self, arn):
+        return {"ResourceARN": arn, "Tags": [{"Key": "Owner", "Value": "ml"}]}
+
+    def test_each_list_names_its_never_tagged_resource_beside_a_tagged_one(self):
+        _, rows, tagging = self._run(
+            {
+                "sagemaker": [[self._owned(self.SM_NB_TAGGED)]],
+                "bedrock-agentcore": [[self._owned(self.AC_GW_TAGGED)]],
+            },
+            lists={
+                "list_notebook_instances": [
+                    {"NotebookInstanceArn": self.SM_NB_TAGGED},
+                    {"NotebookInstanceArn": self.SM_NB_NEVER},
+                ],
+                "list_endpoints": [{"EndpointArn": self.SM_OWNED}],
+                "list_models": [{"ModelArn": self.SM_LATE}],
+                "list_gateways": [{"gatewayId": "gw-a"}, {"gatewayId": "gw-b"}],
+                "list_memories": [{"arn": self.AC_MEMORY}],
+                "list_browsers": [{"browserArn": self.AC_BROWSER}],
+            },
+        )
+        failed = [r["Finding_Details"] for r in rows if r["Status"] == "Failed"]
+        named = {
+            self.SM_OWNED: "sagemaker:ListEndpoints",
+            self.SM_LATE: "sagemaker:ListModels",
+            self.SM_NB_NEVER: "sagemaker:ListNotebookInstances",
+            "gateway gw-b": "bedrock-agentcore:ListGateways",
+            self.AC_MEMORY: "bedrock-agentcore:ListMemories",
+            self.AC_BROWSER: "bedrock-agentcore:ListBrowsers",
+        }
+        assert len(failed) == len(named)
+        for resource, action in named.items():
+            assert any(
+                f"resource {resource} " in d and f"listed by {action} and not" in d
+                for d in failed
+            ), resource
+        assert not any(self.SM_NB_TAGGED in d for d in failed)
+        assert not any("gw-a" in d for d in failed)
+        summary = rows[-1]["Finding_Details"]
+        assert rows[-1]["Status"] == "N/A"
+        assert (
+            "sagemaker:ListNotebookInstances listed 2 notebook instance(s), 1 of "
+            "them absent from GetResources and so never tagged." in summary
+        )
+        assert (
+            "bedrock-agentcore:ListGateways listed 2 gateway(s), 1 of them absent"
+            in summary
+        )
+        assert "Partial, ceiling reached" in summary
+        tagging.list_browsers.assert_called_once_with(maxResults=100, type="CUSTOM")
+        tagging.list_endpoints.assert_called_once_with(MaxResults=100)
+
+    def test_sagemaker_arn_case_does_not_fake_a_never_tagged_resource(self):
+        _, rows, _ = self._run(
+            {"sagemaker": [[self._owned(self.SM_NB_TAGGED)]]},
+            lists={
+                "list_notebook_instances": [
+                    {"NotebookInstanceArn": self.SM_NB_TAGGED.replace("nb-a", "NB-A")}
+                ]
+            },
+        )
+        assert [r["Status"] for r in rows] == ["N/A"]
+
+    def test_a_never_tagged_notebook_on_a_later_page_is_failed(self):
+        def pages(**kwargs):
+            if kwargs.get("NextToken") == "p2":
+                return {
+                    "NotebookInstances": [{"NotebookInstanceArn": self.SM_NB_NEVER}]
+                }
+            return {
+                "NotebookInstances": [{"NotebookInstanceArn": self.SM_NB_TAGGED}],
+                "NextToken": "p2",
+            }
+
+        _, rows, tagging = self._run(
+            {"sagemaker": [[self._owned(self.SM_NB_TAGGED)]]},
+            lists={"list_notebook_instances": pages},
+        )
+        assert [r["Status"] for r in rows] == ["Failed", "N/A"]
+        assert self.SM_NB_NEVER in rows[0]["Finding_Details"]
+        assert tagging.list_notebook_instances.call_count == 2
+
+    def test_a_failed_list_names_the_action_and_the_other_lists_still_judge(self):
+        _, rows, _ = self._run(
+            {"sagemaker": [[]], "bedrock-agentcore": [[]]},
+            lists={
+                "list_models": _make_client_error("AccessDeniedException"),
+                "list_memories": [{"arn": self.AC_MEMORY}],
+            },
+        )
+        assert [r["Status"] for r in rows] == ["Failed", "N/A"]
+        assert self.AC_MEMORY in rows[0]["Finding_Details"]
+        assert (
+            "sagemaker:ListModels (AccessDeniedException), so models never tagged "
+            "are not listed" in rows[1]["Finding_Details"]
+        )
+
+    def test_an_unread_sagemaker_filter_skips_its_lists(self):
+        _, rows, tagging = self._run(
+            {},
+            errors={"sagemaker": _make_client_error("AccessDeniedException")},
+            lists={"list_endpoints": [{"EndpointArn": self.SM_OWNED}]},
+        )
+        assert [r["Status"] for r in rows] == ["N/A"]
+        tagging.list_endpoints.assert_not_called()
 
 
 class TestBR53ResourceOwnerTag:
@@ -26075,6 +26914,9 @@ def test_handler_reports_agentcore_memory_retention_as_unread():
     assert [(r["Check_ID"], r["Status"]) for r in rows] == [("BR-04", "N/A")]
     assert "eventExpiryDuration" in rows[0]["Finding_Details"]
     assert "bedrock-agentcore:GetMemory" in rows[0]["Finding_Details"]
+    # ListMemories is granted for BR-53, so the row must not call it missing.
+    assert "ListMemories" not in rows[0]["Finding_Details"]
+    assert "ListMemories" not in rows[0]["Resolution"]
 
 
 _cache_spec = importlib.util.spec_from_file_location(

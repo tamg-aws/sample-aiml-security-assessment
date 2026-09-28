@@ -14,7 +14,7 @@ _KMS_ACTIONS = {"kms:DescribeKey"}  # BR-40
 _SECTION_CHECKS = [
     {
         "path": os.path.join(_REPO_ROOT, "aiml-security-assessment", "template.yaml"),
-        "start": "- Sid: BedrockAccountInventoryPermissions",
+        "start": "- Sid: AccountReadsOnWildcard",
         "end": "- Sid: S3BucketEncryptionPermissions",
         "required": {
             "bedrock:GetModelInvocationLoggingConfiguration",
@@ -38,14 +38,14 @@ _SECTION_CHECKS = [
     {
         "path": os.path.join(_REPO_ROOT, "aiml-security-assessment", "template.yaml"),
         "start": "- Sid: S3BucketEncryptionPermissions",
-        "end": "- Sid: CloudTrailPermissions",
+        "end": "- Sid: BackupVaultLockRead",
         "required": {"s3:GetEncryptionConfiguration"},
     },
     {
         "path": os.path.join(
             _REPO_ROOT, "aiml-security-assessment", "template-multi-account.yaml"
         ),
-        "start": "- Sid: BedrockAccountInventoryPermissions",
+        "start": "- Sid: AccountReadsOnWildcard",
         "end": "- Sid: S3BucketEncryptionPermissions",
         "required": {
             "bedrock:GetModelInvocationLoggingConfiguration",
@@ -71,7 +71,7 @@ _SECTION_CHECKS = [
             _REPO_ROOT, "aiml-security-assessment", "template-multi-account.yaml"
         ),
         "start": "- Sid: S3BucketEncryptionPermissions",
-        "end": "- Sid: CloudTrailPermissions",
+        "end": "- Sid: BackupVaultLockRead",
         "required": {"s3:GetEncryptionConfiguration"},
     },
     # OWASP native checks (OW-11 / OW-12) run on the dedicated

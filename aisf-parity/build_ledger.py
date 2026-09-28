@@ -1196,10 +1196,11 @@ AI_SUBJECT_ROWS = [
         "Resource '*', and an Allow a positive test that is not IfExists. BR-02 also fails "
         "a Lambda function whose role is granted a Bedrock or AgentCore surface (the "
         "AgentCore data plane, control plane and Gateway each count) with no private-DNS "
-        "endpoint for that surface in the function's VPC. EC2 instances, ECS tasks, EKS "
-        "pods and SageMaker notebooks and endpoints are not read, because the Bedrock role "
-        "holds no ec2:DescribeInstances, ecs:ListServices, ecs:DescribeServices or "
-        "sagemaker:ListNotebookInstances",
+        "endpoint for that surface in the function's VPC, and does the same for EC2 "
+        "instances, ECS services (every cluster, awsvpc subnets, task definition role) "
+        "and SageMaker notebook instances, failing a notebook with no subnet. Ceiling: "
+        "EKS pods, SageMaker endpoints and ECS tasks started outside a service are not "
+        "read",
         [],
         5,
     ),
@@ -1387,8 +1388,8 @@ FOUNDATION_ROWS = [
         "default retention beside the rule fails, since Lifecycle does not delete a "
         "retained version. A replicated log bucket is N/A, because per-object "
         "ReplicationStatus needs s3:GetObject, which is not granted, and AgentCore "
-        "Memory eventExpiryDuration is N/A naming bedrock-agentcore:ListMemories and "
-        "GetMemory",
+        "Memory eventExpiryDuration is N/A naming bedrock-agentcore:GetMemory, the "
+        "only operation that returns it",
         [],
         6,
     ),
@@ -1507,9 +1508,12 @@ FOUNDATION_ROWS = [
         "granted a Bedrock or AgentCore action, and it fails a function encrypted "
         "with a customer managed key, which Inspector does not scan, or tagged "
         "InspectorExclusion=LambdaStandardScanning. Tags come back only to a "
-        "caller allowed lambda:ListTags, which the Bedrock role lacks, so a "
-        "function whose tags were withheld is Not Applicable. Per-function "
-        "coverage (inspector2:ListCoverage) is not read. AC-50 covers the images: it reads "
+        "caller allowed lambda:ListTags, which the Bedrock role holds; a "
+        "function whose tags were still withheld is Not Applicable. It reads "
+        "every inspector2:ListCoverage page and fails a zip function whose "
+        "$LATEST PACKAGE or CODE record is missing or not ACTIVE, naming the "
+        "reason, and names the enabled EventBridge rules that match Inspector "
+        "findings without reading their targets. AC-50 covers the images: it reads "
         "GetRegistryScanningConfiguration and passes when scanType is ENHANCED "
         "and a CONTINUOUS_SCAN rule has wildcard filters that match every ECR "
         "repository an AgentCore runtime's containerUri names, and every one "
@@ -1575,7 +1579,11 @@ FOUNDATION_ROWS = [
         "compliance mode past its LockDate grace period with a minimum retention, "
         "and a point created before the LockDate must itself be kept at least that "
         "long. Governance mode, a grace period and an unread recovery point list do "
-        "not clear a bucket",
+        "not clear a bucket. The Bedrock role holds neither "
+        "backup:ListRecoveryPointsByResource nor backup:DescribeRecoveryPoint, so "
+        "a bucket without the Object Lock stays Failed and its row says whether a "
+        "backup covers it is unknown, naming the action as not granted, partial, "
+        "ceiling reached",
         [],
         6,
     ),
@@ -1631,12 +1639,13 @@ FOUNDATION_ROWS = [
         "GetResources returns only resources that are or were tagged, so a sweep "
         "omits the resources that most need an owner. SageMaker and AgentCore "
         "resources are read through a ResourceTypeFilters sweep: each returned "
-        "resource without an owner tag fails, and the sweep never passes. Agent "
-        "runtimes listed by bedrock-agentcore:ListAgentRuntimes and absent from "
-        "the sweep fail as never tagged. Ceiling: any other SageMaker or AgentCore "
-        "resource that was never tagged, which only sagemaker:ListEndpoints, "
-        "bedrock-agentcore:ListGateways and the other list APIs the Bedrock role "
-        "does not hold return",
+        "resource without an owner tag fails, and the sweep never passes. SageMaker "
+        "endpoints, models and notebook instances, and agent runtimes, memories, "
+        "gateways and custom browsers, listed by their SageMaker and AgentCore list "
+        "APIs and absent from the sweep, fail as never tagged. Ceiling: any other "
+        "SageMaker or AgentCore resource type, such as domains, training jobs and "
+        "code interpreters, is read only through the sweep, so one never tagged is "
+        "not seen",
         [],
         6,
     ),
@@ -1653,7 +1662,10 @@ FOUNDATION_ROWS = [
         "IAM Identity Center users are outside it: no sso-admin operation returns "
         "an instance's MFA settings, and the finding says so. When "
         "sso:ListInstances in the primary scan Region returns an instance or "
-        "cannot be read, the Passed row is N/A, partial, ceiling reached",
+        "cannot be read, the Passed row is N/A, partial, ceiling reached. That row "
+        "names each permission set whose inline policy grants an AI write "
+        "(sso:ListPermissionSets, sso:GetInlinePolicyForPermissionSet); managed "
+        "policies attached to a permission set are not read",
         [],
         6,
     ),

@@ -308,6 +308,26 @@ section.
   primary scan Region returns an instance, or cannot be read.
 - `BR-53` fails an AgentCore agent runtime that `ListAgentRuntimes` lists and
   `GetResources` does not return, since such a runtime was never tagged.
+- `BR-53` compares `GetResources` with SageMaker endpoints, models and
+  notebook instances, and AgentCore memories, gateways and custom browsers,
+  as well as agent runtimes, and fails each listed resource it did not return
+  as never tagged. The summary row names the resource types still listed only
+  by `GetResources` and cites its API reference.
+- `BR-33` reads per-function Inspector coverage (`inspector2:ListCoverage`)
+  and fails a zip function whose `$LATEST` `PACKAGE` or `CODE` record is
+  missing or not `ACTIVE`, naming the reason; it used to pass on account
+  status alone. The rows name each enabled EventBridge rule on the default bus
+  that matches Inspector findings. An unread coverage list makes the `Passed`
+  row `N/A`.
+- `BR-02` reads ECS services and SageMaker notebook instances alongside
+  Lambda functions, and its EC2 leg now runs. A notebook instance with no
+  subnet fails as outside a VPC, and an ECS service with no `awsvpc` subnets
+  is named as not read.
+- `BR-51` names the IAM Identity Center permission sets whose inline policy
+  grants an AI write. The row stays `N/A` with its ceiling.
+- `BR-52` names `backup:ListRecoveryPointsByResource` or
+  `backup:DescribeRecoveryPoint` as not granted, "Partial, ceiling reached",
+  when the read is denied.
 - `BR-20` reads OpenSearch Serverless collections with
   `aoss:BatchGetCollection`, now granted, and names the action when the read
   fails.
@@ -814,6 +834,24 @@ and `bedrock-agentcore:ListAgentRuntimeEndpoints` (`BR-57`). Its
 `*`, because DescribeAlarms returns composite alarms only to a `*` grant
 (`BR-32`). `inspector2:BatchGetAccountStatus` moves from its own statement
 into the `LambdaInventoryPermissions` statement, still on `*`. All are
+read-only, and the same CodeBuild run applies them.
+
+The Bedrock assessment role gains, in both SAM templates, on `*` because none
+has a resource type in the IAM service authorization reference:
+`inspector2:ListCoverage` and `events:ListRules` (`BR-33`),
+`ec2:DescribeInstances`, `ecs:ListClusters`, `ecs:ListServices` and
+`ecs:DescribeTaskDefinition` (`BR-02`), `sagemaker:ListNotebookInstances`
+(`BR-02`, `BR-53`), `sagemaker:ListEndpoints`, `sagemaker:ListModels`,
+`bedrock-agentcore:ListMemories`, `bedrock-agentcore:ListGateways` and
+`bedrock-agentcore:ListBrowsers` (`BR-53`). It also gains `lambda:ListTags` on
+the account's `function:*` ARNs (`BR-33`), `ecs:DescribeServices` on
+`service/*` (`BR-02`), `sagemaker:DescribeNotebookInstance` on
+`notebook-instance/*` (`BR-02`), `sso:ListPermissionSets` on Identity Center
+`instance/*` ARNs, and `sso:GetInlinePolicyForPermissionSet` on `instance/*`
+and `permissionSet/*/*` ARNs (`BR-51`). Every unconditioned `*` statement of
+the role is folded into one `AccountReadsOnWildcard` statement, which keeps
+the rendered inline policy under 9000 characters; the folded statement grants
+exactly the actions the former statements did, plus the new ones. All are
 read-only, and the same CodeBuild run applies them.
 
 The AgentCore assessment role gains `bedrock-agentcore:GetPaymentManager` and
