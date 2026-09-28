@@ -1,0 +1,869 @@
+{
+ "services": {
+  "sagemaker": {
+   "action": {
+    "read": [
+     "DescribeAction",
+     "ListTags"
+    ],
+    "write": [
+     "AddAssociation",
+     "CreateAction",
+     "DeleteAction",
+     "DeleteAssociation",
+     "UpdateAction"
+    ]
+   },
+   "ai-benchmark-job": {
+    "read": [
+     "DescribeAIBenchmarkJob",
+     "ListTags"
+    ],
+    "write": [
+     "CreateAIBenchmarkJob",
+     "DeleteAIBenchmarkJob",
+     "StopAIBenchmarkJob"
+    ]
+   },
+   "ai-recommendation-job": {
+    "read": [
+     "DescribeAIRecommendationJob",
+     "ListTags"
+    ],
+    "write": [
+     "CreateAIRecommendationJob",
+     "DeleteAIRecommendationJob",
+     "StopAIRecommendationJob"
+    ]
+   },
+   "ai-workload-config": {
+    "read": [
+     "DescribeAIWorkloadConfig",
+     "ListTags"
+    ],
+    "write": [
+     "CreateAIWorkloadConfig",
+     "DeleteAIWorkloadConfig"
+    ]
+   },
+   "algorithm": {
+    "read": [
+     "DescribeAlgorithm",
+     "ListTags"
+    ],
+    "write": [
+     "CreateAlgorithm",
+     "DeleteAlgorithm"
+    ]
+   },
+   "app": {
+    "read": [
+     "DescribeApp",
+     "ListTags"
+    ],
+    "write": [
+     "CreateApp",
+     "DeleteApp"
+    ]
+   },
+   "app-image-config": {
+    "read": [
+     "DescribeAppImageConfig",
+     "ListTags"
+    ],
+    "write": [
+     "CreateAppImageConfig",
+     "DeleteAppImageConfig",
+     "UpdateAppImageConfig"
+    ]
+   },
+   "artifact": {
+    "read": [
+     "DescribeArtifact",
+     "ListTags"
+    ],
+    "write": [
+     "AddAssociation",
+     "CreateArtifact",
+     "DeleteArtifact",
+     "DeleteAssociation",
+     "UpdateArtifact"
+    ]
+   },
+   "automl-job": {
+    "read": [
+     "DescribeAutoMLJob",
+     "DescribeAutoMLJobV2",
+     "ListTags"
+    ],
+    "write": [
+     "CreateAutoMLJob",
+     "CreateAutoMLJobV2",
+     "StopAutoMLJob"
+    ]
+   },
+   "cluster": {
+    "read": [
+     "DescribeCluster",
+     "DescribeClusterEvent",
+     "DescribeClusterInference",
+     "DescribeClusterNode",
+     "ListClusterEvents",
+     "ListClusterNodes",
+     "ListTags"
+    ],
+    "write": [
+     "AttachClusterNodeNetworkInterface",
+     "AttachClusterNodeVolume",
+     "BatchAddClusterNodes",
+     "BatchDeleteClusterNodes",
+     "BatchRebootClusterNodes",
+     "BatchReplaceClusterNodes",
+     "CreateCluster",
+     "CreateClusterSchedulerConfig",
+     "CreateComputeQuota",
+     "DeleteCluster",
+     "DetachClusterNodeVolume",
+     "StartClusterHealthCheck",
+     "UpdateCluster",
+     "UpdateClusterInference",
+     "UpdateClusterSoftware"
+    ]
+   },
+   "cluster-scheduler-config": {
+    "read": [
+     "DescribeClusterSchedulerConfig",
+     "ListTags"
+    ],
+    "write": [
+     "CreateClusterSchedulerConfig",
+     "DeleteClusterSchedulerConfig",
+     "UpdateClusterSchedulerConfig"
+    ]
+   },
+   "code-repository": {
+    "read": [
+     "DescribeCodeRepository",
+     "ListTags"
+    ],
+    "write": [
+     "CreateCodeRepository",
+     "DeleteCodeRepository",
+     "UpdateCodeRepository"
+    ]
+   },
+   "compilation-job": {
+    "read": [
+     "DescribeCompilationJob",
+     "ListTags"
+    ],
+    "write": [
+     "CreateCompilationJob",
+     "DeleteCompilationJob",
+     "StopCompilationJob"
+    ]
+   },
+   "compute-quota": {
+    "read": [
+     "DescribeComputeQuota",
+     "ListTags"
+    ],
+    "write": [
+     "CreateComputeQuota",
+     "DeleteComputeQuota",
+     "UpdateComputeQuota"
+    ]
+   },
+   "context": {
+    "read": [
+     "DescribeContext",
+     "ListTags"
+    ],
+    "write": [
+     "AddAssociation",
+     "CreateContext",
+     "DeleteAssociation",
+     "DeleteContext",
+     "UpdateContext"
+    ]
+   },
+   "data-quality-job-definition": {
+    "read": [
+     "DescribeDataQualityJobDefinition",
+     "ListTags"
+    ],
+    "write": [
+     "CreateDataQualityJobDefinition",
+     "DeleteDataQualityJobDefinition"
+    ]
+   },
+   "device": {
+    "read": [
+     "DescribeDevice",
+     "GetDeployments",
+     "GetDeviceRegistration",
+     "ListTags"
+    ],
+    "write": [
+     "DeregisterDevices",
+     "RegisterDevices",
+     "SendHeartbeat",
+     "UpdateDevices"
+    ]
+   },
+   "device-fleet": {
+    "read": [
+     "DescribeDeviceFleet",
+     "GetDeviceFleetReport",
+     "ListTags"
+    ],
+    "write": [
+     "CreateDeviceFleet",
+     "DeleteDeviceFleet",
+     "UpdateDeviceFleet"
+    ]
+   },
+   "domain": {
+    "read": [
+     "DescribeDomain",
+     "ListTags"
+    ],
+    "write": [
+     "CreateDomain",
+     "DeleteDomain",
+     "UpdateDomain"
+    ]
+   },
+   "edge-deployment-plan": {
+    "read": [
+     "DescribeEdgeDeploymentPlan",
+     "ListTags"
+    ],
+    "write": [
+     "CreateEdgeDeploymentPlan",
+     "CreateEdgeDeploymentStage",
+     "DeleteEdgeDeploymentPlan",
+     "DeleteEdgeDeploymentStage",
+     "StartEdgeDeploymentStage",
+     "StopEdgeDeploymentStage"
+    ]
+   },
+   "edge-packaging-job": {
+    "read": [
+     "DescribeEdgePackagingJob",
+     "ListTags"
+    ],
+    "write": [
+     "CreateEdgePackagingJob",
+     "StopEdgePackagingJob"
+    ]
+   },
+   "endpoint": {
+    "read": [
+     "DescribeEndpoint",
+     "InvokeEndpoint",
+     "InvokeEndpointAsync",
+     "InvokeEndpointWithResponseStream",
+     "ListTags"
+    ],
+    "write": [
+     "CreateEndpoint",
+     "CreateInferenceComponent",
+     "DeleteEndpoint",
+     "UpdateEndpoint",
+     "UpdateEndpointWeightsAndCapacities"
+    ]
+   },
+   "endpoint-config": {
+    "read": [
+     "DescribeEndpointConfig",
+     "ListTags"
+    ],
+    "write": [
+     "CreateEndpoint",
+     "CreateEndpointConfig",
+     "DeleteEndpointConfig",
+     "UpdateEndpoint"
+    ]
+   },
+   "experiment": {
+    "read": [
+     "DescribeExperiment",
+     "ListTags"
+    ],
+    "write": [
+     "AddAssociation",
+     "CreateExperiment",
+     "CreateTrial",
+     "DeleteAssociation",
+     "DeleteExperiment",
+     "UpdateExperiment"
+    ]
+   },
+   "experiment-trial": {
+    "read": [
+     "DescribeTrial",
+     "ListTags"
+    ],
+    "write": [
+     "AssociateTrialComponent",
+     "CreateTrial",
+     "DeleteTrial",
+     "DisassociateTrialComponent",
+     "UpdateTrial"
+    ]
+   },
+   "experiment-trial-component": {
+    "read": [
+     "BatchGetMetrics",
+     "DescribeTrialComponent",
+     "ListTags"
+    ],
+    "write": [
+     "AddAssociation",
+     "AssociateTrialComponent",
+     "BatchPutMetrics",
+     "CreateTrialComponent",
+     "DeleteAssociation",
+     "DeleteTrialComponent",
+     "DisassociateTrialComponent",
+     "UpdateTrialComponent"
+    ]
+   },
+   "feature-group": {
+    "read": [
+     "BatchGetRecord",
+     "DescribeFeatureGroup",
+     "DescribeFeatureMetadata",
+     "GetRecord",
+     "ListRecords",
+     "ListTags"
+    ],
+    "write": [
+     "BatchWriteRecord",
+     "CreateFeatureGroup",
+     "DeleteFeatureGroup",
+     "DeleteRecord",
+     "PutRecord",
+     "UpdateFeatureGroup",
+     "UpdateFeatureMetadata"
+    ]
+   },
+   "flow-definition": {
+    "read": [
+     "DescribeFlowDefinition",
+     "ListTags"
+    ],
+    "write": [
+     "CreateFlowDefinition",
+     "DeleteFlowDefinition",
+     "StartHumanLoop"
+    ]
+   },
+   "hub": {
+    "read": [
+     "CreateHubContentPresignedUrls",
+     "DescribeHub",
+     "DescribeHubContent",
+     "ListHubContentVersions",
+     "ListHubContents",
+     "ListTags"
+    ],
+    "write": [
+     "CreateHub",
+     "CreateHubContentReference",
+     "DeleteHub",
+     "DeleteHubContent",
+     "DeleteHubContentReference",
+     "DeployHubModel",
+     "ImportHubContent",
+     "TrainHubModel",
+     "UpdateHub",
+     "UpdateHubContent",
+     "UpdateHubContentReference"
+    ]
+   },
+   "hub-content": {
+    "read": [
+     "CreateHubContentPresignedUrls",
+     "DescribeHubContent",
+     "ListHubContentVersions",
+     "ListTags"
+    ],
+    "write": [
+     "CreateHubContentReference",
+     "DeleteHubContent",
+     "DeleteHubContentReference",
+     "DeployHubModel",
+     "ImportHubContent",
+     "TrainHubModel",
+     "UpdateHubContent",
+     "UpdateHubContentReference"
+    ]
+   },
+   "human-loop": {
+    "read": [
+     "DescribeHumanLoop"
+    ],
+    "write": [
+     "DeleteHumanLoop",
+     "StopHumanLoop"
+    ]
+   },
+   "human-task-ui": {
+    "read": [
+     "DescribeHumanTaskUi",
+     "ListTags"
+    ],
+    "write": [
+     "CreateHumanTaskUi",
+     "DeleteHumanTaskUi"
+    ]
+   },
+   "hyper-parameter-tuning-job": {
+    "read": [
+     "DescribeHyperParameterTuningJob",
+     "ListTags",
+     "ListTrainingJobsForHyperParameterTuningJob"
+    ],
+    "write": [
+     "CreateHyperParameterTuningJob",
+     "DeleteHyperParameterTuningJob",
+     "StopHyperParameterTuningJob"
+    ]
+   },
+   "image": {
+    "read": [
+     "DescribeImage",
+     "ListAliases",
+     "ListImageVersions",
+     "ListTags"
+    ],
+    "write": [
+     "CreateImage",
+     "CreateImageVersion",
+     "DeleteImage",
+     "UpdateImage"
+    ]
+   },
+   "image-version": {
+    "read": [
+     "DescribeImageVersion",
+     "ListAliases"
+    ],
+    "write": [
+     "DeleteImageVersion",
+     "UpdateImageVersion"
+    ]
+   },
+   "inference-component": {
+    "read": [
+     "DescribeInferenceComponent",
+     "InvokeEndpoint",
+     "InvokeEndpointWithResponseStream",
+     "ListTags"
+    ],
+    "write": [
+     "CreateInferenceComponent",
+     "DeleteInferenceComponent",
+     "UpdateInferenceComponent",
+     "UpdateInferenceComponentRuntimeConfig"
+    ]
+   },
+   "inference-experiment": {
+    "read": [
+     "DescribeInferenceExperiment"
+    ],
+    "write": [
+     "CreateInferenceExperiment",
+     "DeleteInferenceExperiment",
+     "StartInferenceExperiment",
+     "StopInferenceExperiment",
+     "UpdateInferenceExperiment"
+    ]
+   },
+   "inference-recommendations-job": {
+    "read": [
+     "DescribeInferenceRecommendationsJob",
+     "GetScalingConfigurationRecommendation",
+     "ListTags"
+    ],
+    "write": [
+     "CreateInferenceRecommendationsJob",
+     "StopInferenceRecommendationsJob"
+    ]
+   },
+   "job": {
+    "read": [
+     "DescribeJob",
+     "ListTags"
+    ],
+    "write": [
+     "CompleteRollout",
+     "CreateJob",
+     "DeleteJob",
+     "Sample",
+     "SampleWithResponseStream",
+     "StopJob",
+     "UpdateReward"
+    ]
+   },
+   "labeling-job": {
+    "read": [
+     "DescribeLabelingJob",
+     "ListTags"
+    ],
+    "write": [
+     "CreateLabelingJob",
+     "StopLabelingJob"
+    ]
+   },
+   "mlflow-app": {
+    "read": [
+     "DescribeMlflowApp",
+     "ListTags"
+    ],
+    "write": [
+     "CallMlflowAppApi",
+     "CreateMlflowApp",
+     "CreatePresignedMlflowAppUrl",
+     "DeleteMlflowApp",
+     "UpdateMlflowApp"
+    ]
+   },
+   "mlflow-tracking-server": {
+    "read": [
+     "DescribeMlflowTrackingServer",
+     "ListTags"
+    ],
+    "write": [
+     "CreateMlflowTrackingServer",
+     "CreatePresignedMlflowTrackingServerUrl",
+     "DeleteMlflowTrackingServer",
+     "StartMlflowTrackingServer",
+     "StopMlflowTrackingServer",
+     "UpdateMlflowTrackingServer"
+    ]
+   },
+   "model": {
+    "read": [
+     "DescribeModel",
+     "ListTags"
+    ],
+    "write": [
+     "CreateModel",
+     "DeleteModel"
+    ]
+   },
+   "model-bias-job-definition": {
+    "read": [
+     "DescribeModelBiasJobDefinition",
+     "ListTags"
+    ],
+    "write": [
+     "CreateModelBiasJobDefinition",
+     "DeleteModelBiasJobDefinition"
+    ]
+   },
+   "model-card": {
+    "read": [
+     "DescribeModelCard",
+     "ListModelCardExportJobs",
+     "ListModelCardVersions",
+     "ListTags"
+    ],
+    "write": [
+     "CreateModelCard",
+     "CreateModelCardExportJob",
+     "DeleteModelCard",
+     "UpdateModelCard"
+    ]
+   },
+   "model-explainability-job-definition": {
+    "read": [
+     "DescribeModelExplainabilityJobDefinition",
+     "ListTags"
+    ],
+    "write": [
+     "CreateModelExplainabilityJobDefinition",
+     "DeleteModelExplainabilityJobDefinition"
+    ]
+   },
+   "model-package": {
+    "read": [
+     "AccessModelPackage",
+     "BatchDescribeModelPackage",
+     "DescribeModelPackage",
+     "ListModelPackages",
+     "ListTags"
+    ],
+    "write": [
+     "CreateModelPackage",
+     "DeleteModelPackage",
+     "UpdateModelPackage"
+    ]
+   },
+   "model-package-group": {
+    "read": [
+     "DescribeModelPackageGroup",
+     "GetModelPackageGroupPolicy",
+     "ListTags"
+    ],
+    "write": [
+     "CreateModelPackageGroup",
+     "DeleteModelPackageGroup",
+     "DeleteModelPackageGroupPolicy",
+     "PutModelPackageGroupPolicy"
+    ]
+   },
+   "model-quality-job-definition": {
+    "read": [
+     "DescribeModelQualityJobDefinition",
+     "ListTags"
+    ],
+    "write": [
+     "CreateModelQualityJobDefinition",
+     "DeleteModelQualityJobDefinition"
+    ]
+   },
+   "monitoring-schedule": {
+    "read": [
+     "DescribeMonitoringSchedule",
+     "ListTags"
+    ],
+    "write": [
+     "CreateMonitoringSchedule",
+     "DeleteMonitoringSchedule",
+     "StartMonitoringSchedule",
+     "StopMonitoringSchedule",
+     "UpdateMonitoringAlert",
+     "UpdateMonitoringSchedule"
+    ]
+   },
+   "notebook-instance": {
+    "read": [
+     "DescribeNotebookInstance",
+     "ListTags"
+    ],
+    "write": [
+     "CreateNotebookInstance",
+     "CreatePresignedNotebookInstanceUrl",
+     "DeleteNotebookInstance",
+     "StartNotebookInstance",
+     "StopNotebookInstance",
+     "UpdateNotebookInstance"
+    ]
+   },
+   "notebook-instance-lifecycle-config": {
+    "read": [
+     "DescribeNotebookInstanceLifecycleConfig",
+     "ListTags"
+    ],
+    "write": [
+     "CreateNotebookInstanceLifecycleConfig",
+     "DeleteNotebookInstanceLifecycleConfig",
+     "UpdateNotebookInstanceLifecycleConfig"
+    ]
+   },
+   "optimization-job": {
+    "read": [
+     "DescribeOptimizationJob",
+     "ListTags"
+    ],
+    "write": [
+     "CreateOptimizationJob",
+     "DeleteOptimizationJob",
+     "StopOptimizationJob"
+    ]
+   },
+   "partner-app": {
+    "read": [
+     "DescribePartnerApp",
+     "ListTags"
+    ],
+    "write": [
+     "CallPartnerAppApi",
+     "CreatePartnerApp",
+     "CreatePartnerAppPresignedUrl",
+     "DeletePartnerApp",
+     "UpdatePartnerApp"
+    ]
+   },
+   "pipeline": {
+    "read": [
+     "DescribePipeline",
+     "ListPipelineExecutions",
+     "ListPipelineVersions",
+     "ListTags"
+    ],
+    "write": [
+     "CreatePipeline",
+     "DeletePipeline",
+     "StartPipelineExecution",
+     "UpdatePipeline",
+     "UpdatePipelineVersion"
+    ]
+   },
+   "pipeline-execution": {
+    "read": [
+     "DescribePipelineDefinitionForExecution",
+     "DescribePipelineExecution",
+     "ListPipelineExecutionSteps",
+     "ListPipelineParametersForExecution",
+     "ListTags"
+    ],
+    "write": [
+     "RetryPipelineExecution",
+     "SendPipelineExecutionStepFailure",
+     "SendPipelineExecutionStepSuccess",
+     "StopPipelineExecution",
+     "UpdatePipelineExecution"
+    ]
+   },
+   "processing-job": {
+    "read": [
+     "DescribeProcessingJob",
+     "ListTags"
+    ],
+    "write": [
+     "CreateProcessingJob",
+     "DeleteProcessingJob",
+     "DisassociateTrialComponent",
+     "StopProcessingJob"
+    ]
+   },
+   "project": {
+    "read": [
+     "DescribeProject",
+     "ListTags"
+    ],
+    "write": [
+     "CreateProject",
+     "DeleteProject",
+     "UpdateProject"
+    ]
+   },
+   "reserved-capacity": {
+    "read": [
+     "DescribeReservedCapacity",
+     "ListTags",
+     "ListUltraServersByReservedCapacity"
+    ],
+    "write": [
+     "CreateCluster",
+     "CreateReservedCapacity",
+     "CreateTrainingJob",
+     "UpdateCluster"
+    ]
+   },
+   "shared-model": {
+    "read": [
+     "DescribeSharedModel",
+     "ListSharedModelVersions"
+    ],
+    "write": [
+     "CreateSharedModel",
+     "UpdateSharedModel"
+    ]
+   },
+   "space": {
+    "read": [
+     "DescribeSpace",
+     "ListTags"
+    ],
+    "write": [
+     "CreateSpace",
+     "DeleteSpace",
+     "StartSession",
+     "UpdateSpace"
+    ]
+   },
+   "studio-lifecycle-config": {
+    "read": [
+     "DescribeStudioLifecycleConfig",
+     "ListTags"
+    ],
+    "write": [
+     "CreateStudioLifecycleConfig",
+     "DeleteStudioLifecycleConfig"
+    ]
+   },
+   "training-job": {
+    "read": [
+     "BatchGetMetrics",
+     "DescribeTrainingJob",
+     "ListTags"
+    ],
+    "write": [
+     "BatchPutMetrics",
+     "CreateTrainingJob",
+     "DeleteTrainingJob",
+     "StopTrainingJob",
+     "UpdateTrainingJob"
+    ]
+   },
+   "training-plan": {
+    "read": [
+     "DescribeTrainingPlan",
+     "DescribeTrainingPlanExtensionHistory",
+     "ListTags"
+    ],
+    "write": [
+     "CreateCluster",
+     "CreateTrainingJob",
+     "CreateTrainingPlan",
+     "UpdateCluster"
+    ]
+   },
+   "transform-job": {
+    "read": [
+     "DescribeTransformJob",
+     "ListTags"
+    ],
+    "write": [
+     "CreateTransformJob",
+     "StopTransformJob"
+    ]
+   },
+   "user-profile": {
+    "read": [
+     "DescribeUserProfile",
+     "ListTags"
+    ],
+    "write": [
+     "CreatePresignedDomainUrl",
+     "CreateUserProfile",
+     "DeleteUserProfile",
+     "UpdateUserProfile"
+    ]
+   },
+   "workforce": {
+    "read": [
+     "DescribeWorkforce"
+    ],
+    "write": [
+     "CreateWorkforce",
+     "DeleteWorkforce",
+     "UpdateWorkforce"
+    ]
+   },
+   "workteam": {
+    "read": [
+     "DescribeSubscribedWorkteam",
+     "DescribeWorkteam",
+     "ListLabelingJobsForWorkteam",
+     "ListTags"
+    ],
+    "write": [
+     "CreateWorkteam",
+     "DeleteWorkteam",
+     "UpdateWorkteam"
+    ]
+   }
+  }
+ },
+ "source": "https://servicereference.us-east-1.amazonaws.com/v1/<service>/<service>.json",
+ "versions": {
+  "sagemaker": "v1.4"
+ }
+}

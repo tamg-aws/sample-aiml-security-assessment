@@ -1,0 +1,469 @@
+{
+ "services": {
+  "bedrock-agentcore": {
+   "ab-test": {
+    "read": [
+     "GetABTest"
+    ],
+    "write": [
+     "DeleteABTest",
+     "UpdateABTest"
+    ]
+   },
+   "apikeycredentialprovider": {
+    "read": [
+     "GetApiKeyCredentialProvider",
+     "GetResourceApiKey",
+     "ListApiKeyCredentialProviders",
+     "ListTagsForResource"
+    ],
+    "write": [
+     "CreateApiKeyCredentialProvider",
+     "DeleteApiKeyCredentialProvider",
+     "UpdateApiKeyCredentialProvider"
+    ]
+   },
+   "batch-evaluate": {
+    "read": [
+     "GetBatchEvaluation"
+    ],
+    "write": [
+     "DeleteBatchEvaluation",
+     "StopBatchEvaluation"
+    ]
+   },
+   "browser": {
+    "read": [
+     "GetBrowserSession"
+    ],
+    "write": [
+     "SaveBrowserSessionProfile",
+     "StartBrowserSession",
+     "StopBrowserSession",
+     "UpdateBrowserStream"
+    ]
+   },
+   "browser-custom": {
+    "read": [
+     "GetBrowser",
+     "GetBrowserSession",
+     "ListTagsForResource"
+    ],
+    "write": [
+     "DeleteBrowser",
+     "SaveBrowserSessionProfile",
+     "StartBrowserSession",
+     "StopBrowserSession",
+     "UpdateBrowserStream"
+    ]
+   },
+   "browser-profile": {
+    "read": [
+     "GetBrowserProfile",
+     "ListTagsForResource"
+    ],
+    "write": [
+     "DeleteBrowserProfile",
+     "SaveBrowserSessionProfile",
+     "StartBrowserSession"
+    ]
+   },
+   "capacity-provider": {
+    "read": [
+     "GetCapacityProvider",
+     "ListTagsForResource"
+    ],
+    "write": [
+     "DeleteCapacityProvider",
+     "DeleteCapacityProviderSession",
+     "PassCapacityProvider",
+     "PutSystemLogEvents",
+     "UpdateCapacityProvider"
+    ]
+   },
+   "code-interpreter": {
+    "read": [
+     "GetCodeInterpreterSession",
+     "ListCodeInterpreterSessions"
+    ],
+    "write": [
+     "InvokeCodeInterpreter",
+     "StartCodeInterpreterSession",
+     "StopCodeInterpreterSession"
+    ]
+   },
+   "code-interpreter-custom": {
+    "read": [
+     "GetCodeInterpreter",
+     "GetCodeInterpreterSession",
+     "ListCodeInterpreterSessions",
+     "ListTagsForResource"
+    ],
+    "write": [
+     "DeleteCodeInterpreter",
+     "InvokeCodeInterpreter",
+     "StartCodeInterpreterSession",
+     "StopCodeInterpreterSession"
+    ]
+   },
+   "configuration-bundle": {
+    "read": [
+     "GetConfigurationBundle",
+     "GetConfigurationBundleVersion",
+     "ListConfigurationBundleVersions"
+    ],
+    "write": [
+     "DeleteConfigurationBundle",
+     "UpdateConfigurationBundle"
+    ]
+   },
+   "consent-portal": {
+    "read": [
+     "GetConsentPortal"
+    ],
+    "write": [
+     "CreateConsentPortal",
+     "DeleteConsentPortal",
+     "UpdateConsentPortal"
+    ]
+   },
+   "dataset": {
+    "read": [
+     "GetDataset",
+     "ListDatasetExamples",
+     "ListDatasetVersions"
+    ],
+    "write": [
+     "AddDatasetExamples",
+     "CreateDatasetVersion",
+     "DeleteDataset",
+     "DeleteDatasetExamples",
+     "UpdateDataset",
+     "UpdateDatasetExamples"
+    ]
+   },
+   "evaluator": {
+    "read": [
+     "GetEvaluator",
+     "ListTagsForResource"
+    ],
+    "write": [
+     "DeleteEvaluator",
+     "Evaluate",
+     "UpdateEvaluator"
+    ]
+   },
+   "gateway": {
+    "read": [
+     "GatewayGetWebACLForResource",
+     "GetGateway",
+     "GetGatewayRateLimit",
+     "GetGatewayRule",
+     "GetGatewayTarget",
+     "GetResourcePolicy",
+     "ListGatewayRateLimits",
+     "ListGatewayRules",
+     "ListGatewayTargets",
+     "ListTagsForResource"
+    ],
+    "write": [
+     "AuthorizeAction",
+     "BatchPutGatewayRateLimits",
+     "CreateGatewayRateLimit",
+     "CreateGatewayRule",
+     "CreateGatewayTarget",
+     "DeleteGateway",
+     "DeleteGatewayRateLimit",
+     "DeleteGatewayRule",
+     "DeleteGatewayTarget",
+     "DeleteResourcePolicy",
+     "GatewayAssociateWebACL",
+     "GatewayDisassociateWebACL",
+     "InvokeGateway",
+     "ManageResourceScopedPolicy",
+     "PartiallyAuthorizeActions",
+     "PutResourcePolicy",
+     "SynchronizeGatewayTargets",
+     "UpdateGateway",
+     "UpdateGatewayRateLimit",
+     "UpdateGatewayRule",
+     "UpdateGatewayTarget"
+    ]
+   },
+   "harness": {
+    "read": [
+     "GetHarness",
+     "GetHarnessEndpoint",
+     "ListTagsForResource"
+    ],
+    "write": [
+     "CreateHarnessEndpoint",
+     "DeleteHarness",
+     "DeleteHarnessEndpoint",
+     "InvokeHarness",
+     "UpdateHarness",
+     "UpdateHarnessEndpoint"
+    ]
+   },
+   "harness-endpoint": {
+    "read": [
+     "GetHarnessEndpoint"
+    ],
+    "write": [
+     "DeleteHarnessEndpoint",
+     "InvokeHarness",
+     "UpdateHarnessEndpoint"
+    ]
+   },
+   "memory": {
+    "read": [
+     "GetEvent",
+     "GetMemory",
+     "GetMemoryRecord",
+     "ListActors",
+     "ListEvents",
+     "ListMemoryExtractionJobs",
+     "ListMemoryRecords",
+     "ListSessions",
+     "ListTagsForResource",
+     "RetrieveMemoryRecords"
+    ],
+    "write": [
+     "AllowVendedLogDeliveryForResource",
+     "BatchCreateMemoryRecords",
+     "BatchDeleteMemoryRecords",
+     "BatchUpdateMemoryRecords",
+     "CreateEvent",
+     "DeleteEvent",
+     "DeleteMemory",
+     "DeleteMemoryRecord",
+     "StartMemoryExtractionJob",
+     "UpdateMemory"
+    ]
+   },
+   "oauth2credentialprovider": {
+    "read": [
+     "CompleteResourceTokenAuth",
+     "GetOauth2CredentialProvider",
+     "GetResourceOauth2Token",
+     "ListOauth2CredentialProviders",
+     "ListTagsForResource"
+    ],
+    "write": [
+     "CreateOauth2CredentialProvider",
+     "DeleteOauth2CredentialProvider",
+     "UpdateOauth2CredentialProvider"
+    ]
+   },
+   "online-evaluation-config": {
+    "read": [
+     "GetOnlineEvaluationConfig",
+     "ListTagsForResource"
+    ],
+    "write": [
+     "DeleteOnlineEvaluationConfig",
+     "UpdateOnlineEvaluationConfig"
+    ]
+   },
+   "payment-manager": {
+    "read": [
+     "GetPaymentConnector",
+     "GetPaymentInstrument",
+     "GetPaymentInstrumentBalance",
+     "GetPaymentManager",
+     "GetPaymentSession",
+     "ListPaymentConnectors",
+     "ListPaymentInstruments",
+     "ListPaymentSessions",
+     "ListTagsForResource"
+    ],
+    "write": [
+     "AllowVendedLogDeliveryForResource",
+     "CreatePaymentConnector",
+     "CreatePaymentInstrument",
+     "CreatePaymentSession",
+     "DeletePaymentConnector",
+     "DeletePaymentInstrument",
+     "DeletePaymentManager",
+     "DeletePaymentSession",
+     "ProcessPayment",
+     "UpdatePaymentConnector",
+     "UpdatePaymentManager"
+    ]
+   },
+   "paymentcredentialprovider": {
+    "read": [
+     "GetPaymentCredentialProvider",
+     "GetResourcePaymentToken",
+     "ListPaymentCredentialProviders",
+     "ListTagsForResource"
+    ],
+    "write": [
+     "CreatePaymentCredentialProvider",
+     "DeletePaymentCredentialProvider",
+     "UpdatePaymentCredentialProvider"
+    ]
+   },
+   "policy": {
+    "read": [
+     "GetPolicy",
+     "GetPolicySummary"
+    ],
+    "write": [
+     "DeletePolicy",
+     "UpdatePolicy"
+    ]
+   },
+   "policy-engine": {
+    "read": [
+     "GetPolicy",
+     "GetPolicyEngine",
+     "GetPolicyEngineSummary",
+     "GetPolicyGeneration",
+     "GetPolicyGenerationSummary",
+     "GetPolicySummary",
+     "ListPolicies",
+     "ListPolicyGenerationAssets",
+     "ListPolicyGenerationSummaries",
+     "ListPolicyGenerations",
+     "ListPolicySummaries",
+     "ListTagsForResource"
+    ],
+    "write": [
+     "AuthorizeAction",
+     "CreatePolicy",
+     "DeletePolicy",
+     "DeletePolicyEngine",
+     "PartiallyAuthorizeActions",
+     "StartPolicyGeneration",
+     "UpdatePolicy",
+     "UpdatePolicyEngine"
+    ]
+   },
+   "recommendation": {
+    "read": [
+     "GetRecommendation"
+    ],
+    "write": [
+     "DeleteRecommendation"
+    ]
+   },
+   "runtime": {
+    "read": [
+     "GetAgentCard",
+     "GetAgentRuntime",
+     "GetAgentRuntimeEndpoint",
+     "GetResourcePolicy",
+     "ListTagsForResource"
+    ],
+    "write": [
+     "CreateAgentRuntimeEndpoint",
+     "DeleteAgentRuntime",
+     "DeleteAgentRuntimeEndpoint",
+     "DeleteResourcePolicy",
+     "InvokeAgentRuntime",
+     "InvokeAgentRuntimeCommand",
+     "InvokeAgentRuntimeCommandShell",
+     "InvokeAgentRuntimeForUser",
+     "InvokeAgentRuntimeWithWebSocketStream",
+     "InvokeAgentRuntimeWithWebSocketStreamForUser",
+     "PutResourcePolicy",
+     "StopRuntimeSession",
+     "UpdateAgentRuntime",
+     "UpdateAgentRuntimeEndpoint"
+    ]
+   },
+   "runtime-endpoint": {
+    "read": [
+     "GetAgentCard",
+     "GetAgentRuntimeEndpoint",
+     "GetResourcePolicy",
+     "ListTagsForResource"
+    ],
+    "write": [
+     "DeleteAgentRuntimeEndpoint",
+     "DeleteResourcePolicy",
+     "InvokeAgentRuntime",
+     "InvokeAgentRuntimeCommand",
+     "InvokeAgentRuntimeCommandShell",
+     "InvokeAgentRuntimeForUser",
+     "InvokeAgentRuntimeWithWebSocketStream",
+     "InvokeAgentRuntimeWithWebSocketStreamForUser",
+     "PutResourcePolicy",
+     "StopRuntimeSession",
+     "UpdateAgentRuntimeEndpoint"
+    ]
+   },
+   "token-vault": {
+    "read": [
+     "CompleteResourceTokenAuth",
+     "GetApiKeyCredentialProvider",
+     "GetOauth2CredentialProvider",
+     "GetPaymentCredentialProvider",
+     "GetResourceApiKey",
+     "GetResourceOauth2Token",
+     "GetResourcePaymentToken",
+     "GetTokenVault",
+     "ListApiKeyCredentialProviders",
+     "ListOauth2CredentialProviders",
+     "ListPaymentCredentialProviders",
+     "ListTagsForResource"
+    ],
+    "write": [
+     "CreateApiKeyCredentialProvider",
+     "CreateOauth2CredentialProvider",
+     "CreatePaymentCredentialProvider",
+     "DeleteApiKeyCredentialProvider",
+     "DeleteOauth2CredentialProvider",
+     "DeletePaymentCredentialProvider",
+     "SetTokenVaultCMK",
+     "UpdateApiKeyCredentialProvider",
+     "UpdateOauth2CredentialProvider",
+     "UpdatePaymentCredentialProvider"
+    ]
+   },
+   "workload-identity": {
+    "read": [
+     "CompleteResourceTokenAuth",
+     "GetResourceApiKey",
+     "GetResourceOauth2Token",
+     "GetResourcePaymentToken",
+     "GetWorkloadIdentity",
+     "ListTagsForResource",
+     "ListWorkloadIdentities"
+    ],
+    "write": [
+     "CreateWorkloadIdentity",
+     "DeleteWorkloadIdentity",
+     "GetWorkloadAccessToken",
+     "GetWorkloadAccessTokenForJWT",
+     "GetWorkloadAccessTokenForUserId",
+     "UpdateWorkloadIdentity"
+    ]
+   },
+   "workload-identity-directory": {
+    "read": [
+     "CompleteResourceTokenAuth",
+     "GetResourceApiKey",
+     "GetResourceOauth2Token",
+     "GetResourcePaymentToken",
+     "GetWorkloadIdentity",
+     "ListTagsForResource",
+     "ListWorkloadIdentities"
+    ],
+    "write": [
+     "CreateWorkloadIdentity",
+     "DeleteWorkloadIdentity",
+     "GetWorkloadAccessToken",
+     "GetWorkloadAccessTokenForJWT",
+     "GetWorkloadAccessTokenForUserId",
+     "UpdateWorkloadIdentity"
+    ]
+   }
+  }
+ },
+ "source": "https://servicereference.us-east-1.amazonaws.com/v1/<service>/<service>.json",
+ "versions": {
+  "bedrock-agentcore": "v1.4"
+ }
+}

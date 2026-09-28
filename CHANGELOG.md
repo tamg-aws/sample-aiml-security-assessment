@@ -210,6 +210,23 @@ section.
   `permissions_boundary` document (or `null`) for every role and user. It
   now reads every page of each role's and user's attached and inline policy
   lists; before, it read only the first page of each.
+- `FS-07`, `FS-22`, `AR-01`, `AR-02` and `AR-09` read that cache contract. A
+  role or user named in `principal_errors` turns a `Passed` row into `N/A`
+  that names the principal and the failed stage, and a failing row is kept
+  beside that `N/A` row. A permissions boundary removes an action it does
+  not allow. A cache written before version 2 keeps its verdict and says the
+  per-principal errors were not recorded. `FS-07` also reports an agent whose
+  `GetAgent` call failed, or whose role is missing from the cache, as not
+  read; before, it skipped the agent and could pass.
+- `AR-01` now reads users and their group policies as well as roles, and
+  fails any identity holding a wildcard or `NotAction` grant that allows both
+  a read and a write action on one AWS Agent Registry resource type, under
+  either the `agent-registry` or the `bedrock-agentcore` namespace
+  (AIR-FND-IAM-09). The read and write split per resource type comes from the
+  AWS service authorization reference, written to `iam_access_levels.json` by
+  `generate_iam_access_levels.py`. `AR-09` now counts a bare `*`, a `*:*` and
+  a `NotAction` Allow as granting publication and approval, so an
+  administrator that `AR-09` passed before now fails it.
 
 ### Deployment impact
 

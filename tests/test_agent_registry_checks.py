@@ -909,11 +909,18 @@ def test_ar09_reads_a_wildcard_pattern_as_every_authority_it_reaches():
         pytest.param(["*:*"], id="wildcard-service"),
     ],
 )
-def test_ar09_leaves_a_service_agnostic_grant_to_the_full_access_check(actions):
-    """AR-01 reports an administrator once; AR-09 does not report it again."""
+def test_ar09_reports_a_service_agnostic_grant(actions):
+    """A bare `*` or `*:*` grants publication and approval alike, so the
+    administrator it names is the publisher and curator of the same record."""
     finding = _separation_finding(_separation_cache([_allow(actions)]))
 
-    assert finding["Status"] == "Passed"
+    assert finding["Status"] == "Failed"
+    assert "role 'publisher'" in finding["Finding_Details"]
+    assert _listed_publish_actions(finding) == sorted(
+        f"{namespace}:{action}"
+        for namespace in _REGISTRY_NAMESPACES
+        for action in _PUBLISH_ACTIONS
+    )
 
 
 def _colliding_statements(*extra):
