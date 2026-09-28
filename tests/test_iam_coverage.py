@@ -913,6 +913,15 @@ _VERIFIED_REMEDIATION_IAM_ACTIONS |= {
 
 _VERIFIED_REMEDIATION_CONDITION_KEYS |= {"aws:PrincipalAccount"}
 
+# Verified on 2026-09-27 with one IDENTITY_POLICY validate-policy run for the
+# AC-23 remediation, one statement per key. aws:PrincipalTag/userId at index 0
+# and as a policy variable inside bedrock-agentcore:namespace at index 2, and
+# bedrock-agentcore:actorId and sessionId at index 3, were not reported. The
+# negative controls aws:PrincipalTagz/userId came back
+# INVALID_GLOBAL_CONDITION_KEY at index 1 and bedrock-agentcore:actorIdz came
+# back INVALID_SERVICE_CONDITION_KEY at index 4.
+_VERIFIED_REMEDIATION_CONDITION_KEYS |= {"aws:PrincipalTag"}
+
 _NON_IAM_REMEDIATION_TOKENS = {
     # SM-41 names the AWS IoT Core policy variables
     # ${iot:Connection.Thing.ThingName} and iot:Connection.Thing.IsAttached, and

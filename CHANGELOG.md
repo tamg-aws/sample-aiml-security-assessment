@@ -230,6 +230,22 @@ section.
     population, withholds the sharing `Passed` when any family could not be
     listed, and clears an account-root trust only when its condition names
     the calling principal.
+  - `AC-03`, `AC-21` and `AC-23` count a bare `Action: "*"`, any pattern or
+    `NotAction` that reaches the action, and group policies on users, and
+    drop a grant the principal's own Deny or boundary removes. A policy that
+    cannot be parsed is named in an `N/A` row. Rows that passed before can now
+    fail.
+  - `AC-03` pages through the last-accessed report and names every principal
+    whose report failed, was throttled or errored, instead of passing
+    without it.
+  - `AC-21` treats a log group resource as unbounded only when the group name
+    is wildcard-only or a wider ARN segment is a wildcard.
+  - `AC-23` judges each read by the key that action carries: `namespace` for
+    record reads, `actorId` or `sessionId` for event reads. A `strategyId`
+    condition alone, an `IfExists`, `ForAllValues` or negated operator, and a
+    wildcard-only value no longer pass. A scoped principal is reported as
+    bound to the caller when every value carries a policy variable, and as
+    fixed otherwise.
 
 ### Deployment impact
 

@@ -663,6 +663,40 @@ MEMORY_SCOPE_CONDITION_KEYS = {
 }
 MEMORY_SCOPE_CONDITION_KEY_PREFIXES = ("bedrock-agentcore:namespacevariable/",)
 
+# The keys that partition each scopable read by actor, from the service
+# authorization reference's condition keys per action. strategyId narrows a
+# record read to one strategy but every actor's records sit under it, so it
+# does not partition. namespacePath and namespaceVariable/ are counted with
+# namespace for the reason given above MEMORY_SCOPE_CONDITION_KEYS.
+MEMORY_NAMESPACE_PARTITION_KEYS = frozenset(
+    {"bedrock-agentcore:namespace", "bedrock-agentcore:namespacepath"}
+)
+MEMORY_READ_PARTITION_KEYS = {
+    "retrievememoryrecords": MEMORY_NAMESPACE_PARTITION_KEYS,
+    "listmemoryrecords": MEMORY_NAMESPACE_PARTITION_KEYS,
+    "listevents": frozenset(
+        {"bedrock-agentcore:actorid", "bedrock-agentcore:sessionid"}
+    ),
+    "getevent": frozenset({"bedrock-agentcore:actorid", "bedrock-agentcore:sessionid"}),
+    "listsessions": frozenset({"bedrock-agentcore:actorid"}),
+}
+# Every bedrock-agentcore key each read action carries. A positive condition on
+# a key the action does not carry never matches, so that Allow grants nothing
+# for the action.
+MEMORY_READ_ACTION_KEYS = {
+    "retrievememoryrecords": MEMORY_NAMESPACE_PARTITION_KEYS
+    | {"bedrock-agentcore:strategyid"},
+    "listmemoryrecords": MEMORY_NAMESPACE_PARTITION_KEYS
+    | {"bedrock-agentcore:strategyid"},
+    "listevents": MEMORY_READ_PARTITION_KEYS["listevents"],
+    "getevent": MEMORY_READ_PARTITION_KEYS["getevent"],
+    "listsessions": MEMORY_READ_PARTITION_KEYS["listsessions"],
+}
+# Operators under which a partition condition binds the read. IfExists passes
+# when the key is absent and ForAllValues passes on an empty set, so neither
+# binds; a negated operator admits every other partition.
+MEMORY_PARTITION_OPERATORS = {"stringequals", "stringequalsignorecase", "stringlike"}
+
 # A gateway rate limit carries one or more entries, and each entry may bound
 # requests, tokens or connections. `dimensions` is the only required member of an
 # entry, so a limit can exist with dimensions and no ceiling at all; the presence
@@ -2347,51 +2381,6 @@ def _is_agent_platform_action(action: str) -> bool:
     return len(action_parts) == 2 and action_parts[0] in AGENT_PLATFORM_IAM_NAMESPACES
 
 
-def _not_action_excludes_namespace(pattern: str, namespace: str) -> bool:
-    """Return whether one NotAction pattern excludes every action in a service."""
-    if pattern == "*":
-        return True
-    pattern_parts = pattern.split(":", 1)
-    if len(pattern_parts) != 2:
-        return False
-    service_pattern, action_pattern = pattern_parts
-    return action_pattern == "*" and fnmatchcase(namespace, service_pattern)
-
-
-def _not_action_targets_agent_platform(exclusions: List[str]) -> bool:
-    """Return whether NotAction exclusions name an agent platform namespace."""
-    for pattern in exclusions:
-        pattern_parts = pattern.split(":", 1)
-        if len(pattern_parts) != 2:
-            continue
-        service_pattern = pattern_parts[0]
-        if any(
-            fnmatchcase(namespace, service_pattern)
-            for namespace in AGENT_PLATFORM_IAM_NAMESPACES
-        ):
-            return True
-    return False
-
-
-def _not_action_allows_agent_platform_access(statement: Dict[str, Any]) -> bool:
-    """Return whether an Allow/NotAction statement still grants platform access."""
-    if "NotAction" not in statement:
-        return False
-    exclusions = _statement_not_actions(statement)
-    if not _not_action_targets_agent_platform(exclusions):
-        # The exclusions name no agent platform namespace, so this is a
-        # service-agnostic administrator-style grant rather than an
-        # AgentCore-specific one. These checks scope themselves to explicit
-        # platform namespaces, the same reason a bare `Action: "*"` is ignored.
-        return False
-    return any(
-        not any(
-            _not_action_excludes_namespace(pattern, namespace) for pattern in exclusions
-        )
-        for namespace in AGENT_PLATFORM_IAM_NAMESPACES
-    )
-
-
 def _platform_reach(pattern: str) -> str:
     """Clip one action pattern to the part of it inside the agent platform.
 
@@ -2449,20 +2438,44 @@ def _permissions_include_agent_platform_access(
     permissions: Dict[str, Any],
     principal_label: str,
 ) -> bool:
-    """Inspect attached and inline policies for AgentCore access."""
-    attached_policies = permissions.get("attached_policies", [])
-    inline_policies = permissions.get("inline_policies", [])
+    """Return whether one cached principal holds any AgentCore action.
 
-    for policy in [*attached_policies, *inline_policies]:
+    Every identity policy counts, group policies included. An Action pattern
+    counts when it reaches a platform action, so a bare `Action: "*"` and
+    `bedrock-*:*` count, and a NotAction counts when its exclusions leave any
+    platform action granted. A grant counts only if it survives the
+    principal's own unconditioned Deny statements and permissions boundary. A
+    policy document that cannot be parsed raises ValueError naming the
+    principal, because the principal cannot then be placed in or out of the
+    population.
+    """
+    for policy in _principal_policies(permissions):
         try:
-            for statement in _allow_statements(policy):
-                if _not_action_allows_agent_platform_access(statement) or any(
-                    _is_agent_platform_action(action)
-                    for action in _statement_actions(statement)
+            statements = list(_allow_statements(policy))
+        except (TypeError, ValueError) as error:
+            raise ValueError(
+                f"{principal_label} policy {policy.get('name', '')}: {error}"
+            ) from error
+        for statement in statements:
+            reaches: List[str] = []
+            if "Action" not in statement and "NotAction" in statement:
+                exclusions = _statement_not_actions(statement)
+                reaches.extend(
+                    f"{namespace}:*"
+                    for namespace in sorted(AGENT_PLATFORM_IAM_NAMESPACES)
+                    if not any(
+                        _action_pattern_covers(excluded, f"{namespace}:*")
+                        for excluded in exclusions
+                    )
+                )
+            for action in _statement_actions(statement):
+                if any(
+                    _action_patterns_overlap(action, f"{namespace}:*")
+                    for namespace in AGENT_PLATFORM_IAM_NAMESPACES
                 ):
-                    return True
-        except Exception as error:
-            logger.warning(f"Error parsing policy for {principal_label}: {error}")
+                    reaches.append(_platform_reach(action))
+            if any(_grant_survives(permissions, reach) for reach in reaches):
+                return True
 
     return False
 
@@ -3361,6 +3374,11 @@ def check_stale_agentcore_access(
     - Principals that haven't accessed AgentCore in 60+ days
     - Principals with permissions but never accessed AgentCore
 
+    The population is every cached role and user holding any AgentCore action
+    after its own Deny statements and permissions boundary. A principal whose
+    policies or access history could not be read is named in an Incomplete row
+    and withholds Passed.
+
     Args:
         permission_cache: Cached IAM permissions data
 
@@ -3368,6 +3386,7 @@ def check_stale_agentcore_access(
         List of findings
     """
     findings = []
+    reference = "https://docs.aws.amazon.com/IAM/latest/UserGuide/access_policies_last-accessed.html"
 
     try:
         logger.info("Checking for stale AgentCore access")
@@ -3380,6 +3399,10 @@ def check_stale_agentcore_access(
 
         role_permissions = permission_cache.get("role_permissions", {})
         user_permissions = permission_cache.get("user_permissions", {})
+        gap_rows, v1_note = _cache_read_gap_findings(
+            permission_cache, "AC-03", "AgentCore Stale Access Check", reference
+        )
+        findings.extend(gap_rows)
 
         if not role_permissions and not user_permissions:
             logger.info("No IAM permissions in cache")
@@ -3396,34 +3419,64 @@ def check_stale_agentcore_access(
             )
             return findings
 
-        # Identify principals with AgentCore permissions
+        # Identify principals with AgentCore permissions. A principal whose
+        # policy cannot be parsed is neither in nor out, so it is named as
+        # unread instead of being dropped.
         agentcore_principals = []
+        unread_principals: List[str] = []
 
-        # Check roles - iterate over dict
-        for role_name, permissions in role_permissions.items():
-            # Build role ARN from role name
-            role_arn = f"arn:{partition}:iam::{account_id}:role/{role_name}"
-            has_agentcore_permission = _permissions_include_agent_platform_access(
-                permissions, f"role {role_name}"
-            )
+        for principal_type, permissions_by_name in (
+            ("role", role_permissions),
+            ("user", user_permissions),
+        ):
+            for principal_name, permissions in permissions_by_name.items():
+                if not isinstance(permissions, dict):
+                    continue
+                try:
+                    has_agentcore_permission = (
+                        _permissions_include_agent_platform_access(
+                            permissions, f"{principal_type} {principal_name}"
+                        )
+                    )
+                except ValueError as error:
+                    logger.warning(f"Unreadable policy: {error}")
+                    unread_principals.append(
+                        f"{principal_type} {principal_name} (policy parse: {error})"
+                    )
+                    continue
+                if has_agentcore_permission:
+                    agentcore_principals.append(
+                        {
+                            "type": principal_type,
+                            "name": principal_name,
+                            "arn": (
+                                f"arn:{partition}:iam::{account_id}:"
+                                f"{principal_type}/{principal_name}"
+                            ),
+                        }
+                    )
 
-            if has_agentcore_permission and role_arn:
-                agentcore_principals.append(
-                    {"type": "role", "name": role_name, "arn": role_arn}
+        if unread_principals:
+            findings.append(
+                create_finding(
+                    check_id="AC-03",
+                    finding_name="AgentCore Stale Access Check Incomplete",
+                    finding_details=(
+                        f"{len(unread_principals)} IAM principal(s) could not be "
+                        "judged for AgentCore access, so no Passed result is "
+                        f"reported: {'; '.join(sorted(unread_principals))}."
+                    ),
+                    resolution=(
+                        "No action is required on the assessed workload based on "
+                        "this result. Correct the named read and rerun the "
+                        "assessment."
+                    ),
+                    reference=reference,
+                    severity=SeverityEnum.INFORMATIONAL,
+                    status=StatusEnum.NA,
                 )
-
-        # Check users - iterate over dict
-        for user_name, permissions in user_permissions.items():
-            # Build user ARN from user name
-            user_arn = f"arn:{partition}:iam::{account_id}:user/{user_name}"
-            has_agentcore_permission = _permissions_include_agent_platform_access(
-                permissions, f"user {user_name}"
             )
-
-            if has_agentcore_permission and user_arn:
-                agentcore_principals.append(
-                    {"type": "user", "name": user_name, "arn": user_arn}
-                )
+            unread_principals = []
 
         if not agentcore_principals:
             logger.info("No principals with AgentCore permissions found")
@@ -3431,7 +3484,9 @@ def check_stale_agentcore_access(
                 create_finding(
                     check_id="AC-03",
                     finding_name="AgentCore Stale Access Check",
-                    finding_details="No IAM principals with AgentCore permissions found",
+                    finding_details=(
+                        f"No IAM principals with AgentCore permissions found{v1_note}"
+                    ),
                     resolution="No action required",
                     reference="https://docs.aws.amazon.com/IAM/latest/UserGuide/access_policies_last-accessed.html",
                     severity=SeverityEnum.INFORMATIONAL,
@@ -3513,8 +3568,15 @@ def check_stale_agentcore_access(
                     job_status = get_response["JobStatus"]
 
                     if job_status == "COMPLETED":
-                        # Check for AgentCore service access
-                        services = get_response.get("ServicesLastAccessed", [])
+                        # Check for AgentCore service access across every page
+                        # of the report.
+                        services = list(get_response.get("ServicesLastAccessed", []))
+                        page = get_response
+                        while page.get("IsTruncated") and page.get("Marker"):
+                            page = iam_client.get_service_last_accessed_details(
+                                JobId=job_id, Marker=page["Marker"]
+                            )
+                            services.extend(page.get("ServicesLastAccessed", []))
 
                         matching_services = []
                         for service in services:
@@ -3588,6 +3650,11 @@ def check_stale_agentcore_access(
                         logger.error(
                             f"Job failed for {principal_type} {principal_name}"
                         )
+                        job_error = get_response.get("Error") or {}
+                        unread_principals.append(
+                            f"{principal_type} {principal_name} (last-accessed job "
+                            f"FAILED: {job_error.get('Code', 'no error code')})"
+                        )
                         break
 
                 if lambda_timeout_approaching:
@@ -3650,11 +3717,39 @@ def check_stale_agentcore_access(
                     logger.error(
                         f"Error checking {principal_type} {principal_name}: {e}"
                     )
+                    unread_principals.append(
+                        f"{principal_type} {principal_name} ({error_code})"
+                    )
 
             except Exception as e:
                 logger.error(
                     f"Unexpected error checking {principal_type} {principal_name}: {e}"
                 )
+                unread_principals.append(
+                    f"{principal_type} {principal_name} ({type(e).__name__})"
+                )
+
+        if unread_principals:
+            findings.append(
+                create_finding(
+                    check_id="AC-03",
+                    finding_name="AgentCore Stale Access Check Incomplete",
+                    finding_details=(
+                        "The service last accessed report could not be read for "
+                        f"{len(unread_principals)} IAM principal(s), so no Passed "
+                        f"result is reported: {'; '.join(unread_principals)}."
+                    ),
+                    resolution=(
+                        "No action is required on the assessed workload based on "
+                        "this result. Grant iam:GenerateServiceLastAccessedDetails "
+                        "and iam:GetServiceLastAccessedDetails for the named "
+                        "principals, or rerun the assessment."
+                    ),
+                    reference=reference,
+                    severity=SeverityEnum.INFORMATIONAL,
+                    status=StatusEnum.NA,
+                )
+            )
 
         # Generate findings for stale access
         if stale_principals:
@@ -3699,7 +3794,11 @@ def check_stale_agentcore_access(
                 create_finding(
                     check_id="AC-03",
                     finding_name="AgentCore Stale Access Check",
-                    finding_details=f"All {len(agentcore_principals)} principals with AgentCore permissions have accessed the service within the last 60 days",
+                    finding_details=(
+                        f"All {len(agentcore_principals)} principals with "
+                        "AgentCore permissions have accessed the service within "
+                        f"the last 60 days.{v1_note}"
+                    ),
                     resolution="No action required",
                     reference="https://docs.aws.amazon.com/IAM/latest/UserGuide/access_policies_last-accessed.html",
                     severity=SeverityEnum.LOW,
@@ -7109,62 +7208,99 @@ def check_agentcore_log_group_data_protection() -> List[Dict[str, Any]]:
     return findings
 
 
+LOGS_UNMASK_ACTION = "logs:unmask"
+
+
+def _logs_resource_is_unbounded(resource: str) -> bool:
+    """Return whether one logs Resource pattern reaches every log group.
+
+    A log group name may contain `/`, so the generic ARN rule would read the
+    prefix `log-group:/aws/bedrock-agentcore/*` as a whole resource type. Here
+    the name after `log-group:` is one component: it is unbounded only when it
+    is made of wildcards alone. A wildcard in the partition, service, region or
+    account segment, or in the resource type, is unbounded as it is elsewhere.
+    """
+    resource = str(resource).strip()
+    parts = resource.split(":", 5)
+    if len(parts) < 6 or parts[0].lower() != "arn":
+        return any(wildcard in resource for wildcard in ("*", "?"))
+    _, partition, service, region, account, resource_part = parts
+    if any(
+        wildcard in segment
+        for segment in (partition, service, region, account)
+        for wildcard in ("*", "?")
+    ):
+        return True
+    resource_type, _, name = resource_part.partition(":")
+    if any(wildcard in resource_type for wildcard in ("*", "?")):
+        return True
+    if resource_type != "log-group":
+        return False
+    name = name.split(":log-stream", 1)[0]
+    return not name or set(name) <= {"*", "?"}
+
+
 def _principals_granting_logs_unmask(
     permissions_by_name: Dict[str, Any],
     principal_kind: str,
-) -> Tuple[List[str], List[str]]:
+) -> Tuple[List[str], List[str], List[str]]:
     """Split principals holding logs:Unmask into unscoped and scoped grants.
 
-    Only an action in the ``logs`` namespace counts. A bare ``Action: "*"`` is a
-    service-agnostic administrator grant, so counting it here would fail every
-    account that has an administrator role; AC-21 reports the grants that name
-    the logs namespace and leaves administrator scope to the IAM checks.
+    Any Action pattern reaching logs:Unmask counts, a bare ``Action: "*"`` and
+    ``logs:*`` included, and so does a NotAction that leaves it in. A grant is
+    unscoped when a resource reaches every log group
+    (``_logs_resource_is_unbounded``) or it is written with NotResource, so
+    ``log-group:*`` counts as ``*`` does. A grant counts only if it survives the principal's own unconditioned
+    Deny statements and permissions boundary. The third list names principals
+    whose policy could not be parsed.
     """
     unscoped: List[str] = []
     scoped: List[str] = []
+    unreadable: List[str] = []
 
     for principal_name, permissions in permissions_by_name.items():
         if not isinstance(permissions, dict):
             continue
         label = f"{principal_kind} {principal_name}"
-        attached_policies = permissions.get("attached_policies", [])
-        inline_policies = permissions.get("inline_policies", [])
-        if not isinstance(attached_policies, list):
-            attached_policies = []
-        if not isinstance(inline_policies, list):
-            inline_policies = []
+        if not _grant_survives(permissions, LOGS_UNMASK_ACTION):
+            continue
 
         holds_unmask = False
         holds_unscoped_unmask = False
 
-        for policy in [*attached_policies, *inline_policies]:
+        for policy in _principal_policies(permissions):
             try:
-                for statement in _allow_statements(policy):
-                    grants_unmask = False
-                    for action in _statement_actions(statement):
-                        action_parts = action.split(":", 1)
-                        if len(action_parts) != 2:
-                            continue
-                        service_namespace, action_pattern = action_parts
-                        if service_namespace == "logs" and fnmatchcase(
-                            "unmask", action_pattern
-                        ):
-                            grants_unmask = True
-                            break
-                    if not grants_unmask:
-                        continue
-                    holds_unmask = True
-                    if "*" in _statement_resources(statement):
-                        holds_unscoped_unmask = True
-            except Exception as error:
+                statements = list(_allow_statements(policy))
+            except (TypeError, ValueError) as error:
                 logger.warning(f"Error parsing policy for {label}: {error}")
+                unreadable.append(f"{label} (policy {policy.get('name', '')})")
+                continue
+            for statement in statements:
+                if "Action" not in statement and "NotAction" in statement:
+                    grants_unmask = not any(
+                        _action_pattern_covers(excluded, LOGS_UNMASK_ACTION)
+                        for excluded in _statement_not_actions(statement)
+                    )
+                else:
+                    grants_unmask = any(
+                        _action_patterns_overlap(action, LOGS_UNMASK_ACTION)
+                        for action in _statement_actions(statement)
+                    )
+                if not grants_unmask:
+                    continue
+                holds_unmask = True
+                if "NotResource" in statement or any(
+                    _logs_resource_is_unbounded(resource)
+                    for resource in _statement_resources(statement)
+                ):
+                    holds_unscoped_unmask = True
 
         if holds_unscoped_unmask:
             unscoped.append(label)
         elif holds_unmask:
             scoped.append(label)
 
-    return unscoped, scoped
+    return unscoped, scoped, unreadable
 
 
 def check_agentcore_log_unmask_restriction(
@@ -7180,9 +7316,16 @@ def check_agentcore_log_unmask_restriction(
     try:
         role_permissions = permission_cache.get("role_permissions", {})
         user_permissions = permission_cache.get("user_permissions", {})
+        gap_rows, v1_note = _cache_read_gap_findings(
+            permission_cache,
+            "AC-21",
+            "AgentCore Log Unmask Restriction",
+            LOGS_DATA_PROTECTION_REFERENCE_URL,
+            region=GLOBAL_REGION_LABEL,
+        )
 
         if not role_permissions and not user_permissions:
-            return [
+            return gap_rows + [
                 create_finding(
                     check_id="AC-21",
                     finding_name="AgentCore Log Unmask Restriction",
@@ -7195,14 +7338,38 @@ def check_agentcore_log_unmask_restriction(
                 )
             ]
 
-        unscoped_roles, scoped_roles = _principals_granting_logs_unmask(
-            role_permissions, "role"
+        unscoped_roles, scoped_roles, unreadable_roles = (
+            _principals_granting_logs_unmask(role_permissions, "role")
         )
-        unscoped_users, scoped_users = _principals_granting_logs_unmask(
-            user_permissions, "user"
+        unscoped_users, scoped_users, unreadable_users = (
+            _principals_granting_logs_unmask(user_permissions, "user")
         )
         unscoped = sorted(unscoped_roles + unscoped_users)
         scoped = sorted(scoped_roles + scoped_users)
+        unreadable = sorted(unreadable_roles + unreadable_users)
+        findings.extend(gap_rows)
+        if unreadable:
+            findings.append(
+                create_finding(
+                    check_id="AC-21",
+                    finding_name="AgentCore Log Unmask Restriction Incomplete",
+                    finding_details=(
+                        "A policy of these principals could not be parsed, so "
+                        "their logs:Unmask grant was not judged and no Passed "
+                        "result is reported for the population: "
+                        f"{', '.join(unreadable)}."
+                    ),
+                    resolution=(
+                        "No action is required on the assessed workload based on "
+                        "this result. Correct the named policy documents and "
+                        "rerun the assessment."
+                    ),
+                    reference=LOGS_DATA_PROTECTION_REFERENCE_URL,
+                    severity=SeverityEnum.INFORMATIONAL,
+                    status=StatusEnum.NA,
+                    region=GLOBAL_REGION_LABEL,
+                )
+            )
 
         if unscoped:
             findings.append(
@@ -7211,7 +7378,8 @@ def check_agentcore_log_unmask_restriction(
                     finding_name="AgentCore Log Unmask Restriction",
                     finding_details=(
                         "The following principals can unmask any log group's "
-                        f"masked values: {', '.join(unscoped)}."
+                        f"masked values: {', '.join(unscoped)}. "
+                        f"{IAM_CACHE_SCP_NOTE}"
                     ),
                     resolution=(
                         "Scope logs:Unmask to the log groups whose masked values "
@@ -7245,14 +7413,16 @@ def check_agentcore_log_unmask_restriction(
                 )
             )
 
-        if not unscoped and not scoped:
+        if not unscoped and not scoped and not gap_rows and not unreadable:
             findings.append(
                 create_finding(
                     check_id="AC-21",
                     finding_name="AgentCore Log Unmask Restriction",
                     finding_details=(
-                        "No cached IAM role or user grants logs:Unmask, so masked "
-                        "log values cannot be read back through IAM policy."
+                        "No cached IAM role or user grants logs:Unmask, after "
+                        "each principal's own Deny statements and permissions "
+                        "boundary, so masked log values cannot be read back "
+                        f"through IAM policy.{v1_note}"
                     ),
                     resolution="No action required.",
                     reference=LOGS_DATA_PROTECTION_REFERENCE_URL,
@@ -7546,78 +7716,133 @@ def _statement_condition_keys(statement: Dict[str, Any]) -> List[str]:
     return keys
 
 
-def _statement_scopes_memory_records(statement: Dict[str, Any]) -> bool:
-    """Return whether one statement binds a memory read to one actor or namespace."""
-    for condition_key in _statement_condition_keys(statement):
-        if condition_key in MEMORY_SCOPE_CONDITION_KEYS:
-            return True
-        if condition_key.startswith(MEMORY_SCOPE_CONDITION_KEY_PREFIXES):
-            return True
-    return False
+def _memory_partition_key(key: str, action: str) -> bool:
+    """Return whether one condition key partitions one memory read by actor."""
+    if key in MEMORY_READ_PARTITION_KEYS[action]:
+        return True
+    return MEMORY_READ_PARTITION_KEYS[action] is MEMORY_NAMESPACE_PARTITION_KEYS and (
+        key.startswith(MEMORY_SCOPE_CONDITION_KEY_PREFIXES)
+    )
 
 
-def _statement_grants_memory_record_read(statement: Dict[str, Any]) -> bool:
-    """Return whether one statement grants a scopable memory read action."""
-    for action in _statement_actions(statement):
-        action_parts = action.split(":", 1)
-        if len(action_parts) != 2:
+def _memory_read_scope(statement: Dict[str, Any], action: str) -> str:
+    """Return how one Allow statement scopes one memory read action.
+
+    The result is "none" when the statement never grants the action, because a
+    positive condition names a bedrock-agentcore key the action does not carry.
+    Otherwise it is "unscoped" unless a partition key for the action sits under
+    a binding operator with every value naming something narrower than a
+    wildcard. A scoped read is "bound" when every such value carries a policy
+    variable, which resolves per caller, and "fixed" when a value is a literal
+    that every caller of the principal shares.
+    """
+    conditions = statement.get("Condition")
+    if not isinstance(conditions, dict):
+        return "unscoped"
+    partition_values: List[str] = []
+    for operator, block in conditions.items():
+        if not isinstance(block, dict):
             continue
-        service_namespace, action_pattern = action_parts
-        if service_namespace not in AGENT_PLATFORM_IAM_NAMESPACES:
-            continue
+        operator_name = str(operator).strip().lower()
+        if operator_name.startswith("foranyvalue:"):
+            operator_name = operator_name[len("foranyvalue:") :]
+        binding = operator_name in MEMORY_PARTITION_OPERATORS
+        for key, values in block.items():
+            key_name = str(key).strip().lower()
+            if not key_name.startswith("bedrock-agentcore:"):
+                continue
+            known = key_name in MEMORY_READ_ACTION_KEYS[action] or (
+                _memory_partition_key(key_name, action)
+            )
+            if binding and not known:
+                return "none"
+            if binding and _memory_partition_key(key_name, action):
+                if isinstance(values, str):
+                    values = [values]
+                if not isinstance(values, list) or not values:
+                    return "unscoped"
+                partition_values.extend(str(value) for value in values)
+    if not partition_values:
+        return "unscoped"
+    if any(
+        set(value.replace("/", "")) <= {"*", "?"} or not value
+        for value in partition_values
+    ):
+        return "unscoped"
+    if all("${" in value for value in partition_values):
+        return "bound"
+    return "fixed"
+
+
+def _statement_memory_reads(statement: Dict[str, Any]) -> List[str]:
+    """Return the scopable memory read actions one Allow statement reaches."""
+    if "Action" not in statement and "NotAction" in statement:
+        exclusions = _statement_not_actions(statement)
+        return [
+            read
+            for read in MEMORY_RECORD_READ_ACTIONS
+            if not any(
+                _action_pattern_covers(excluded, f"bedrock-agentcore:{read}")
+                for excluded in exclusions
+            )
+        ]
+    return [
+        read
+        for read in MEMORY_RECORD_READ_ACTIONS
         if any(
-            fnmatchcase(read_action, action_pattern)
-            for read_action in MEMORY_RECORD_READ_ACTIONS
-        ):
-            return True
-    return False
+            _action_patterns_overlap(action, f"bedrock-agentcore:{read}")
+            for action in _statement_actions(statement)
+        )
+    ]
 
 
 def _principals_reading_memory_records(
     permissions_by_name: Dict[str, Any],
     principal_kind: str,
-) -> Tuple[List[str], List[str]]:
-    """Split principals reading memory records into unscoped and scoped grants.
+) -> Tuple[List[str], List[str], List[str], List[str]]:
+    """Split principals reading memory records by how the read is partitioned.
 
     The only resource type these actions accept is the whole memory, so naming a
     memory ARN still reads every actor's records inside it. A condition on the
-    namespace, strategy, actor or session is the one way a policy narrows the
-    read, which is why the resource element is not consulted here.
+    namespace, actor or session is the one way a policy narrows the read, which
+    is why the resource element is not consulted here. Any action pattern
+    reaching a read counts, a bare `Action: "*"` included, and a read counts
+    only if it survives the principal's own unconditioned Deny statements and
+    permissions boundary. The lists are unscoped, fixed-value, caller-bound and
+    unreadable principals.
     """
     unscoped: List[str] = []
-    scoped: List[str] = []
+    fixed: List[str] = []
+    bound: List[str] = []
+    unreadable: List[str] = []
 
     for principal_name, permissions in permissions_by_name.items():
         if not isinstance(permissions, dict):
             continue
         label = f"{principal_kind} {principal_name}"
-        attached_policies = permissions.get("attached_policies", [])
-        inline_policies = permissions.get("inline_policies", [])
-        if not isinstance(attached_policies, list):
-            attached_policies = []
-        if not isinstance(inline_policies, list):
-            inline_policies = []
+        scopes: set = set()
 
-        reads_records = False
-        reads_records_unscoped = False
-
-        for policy in [*attached_policies, *inline_policies]:
+        for policy in _principal_policies(permissions):
             try:
-                for statement in _allow_statements(policy):
-                    if not _statement_grants_memory_record_read(statement):
-                        continue
-                    reads_records = True
-                    if not _statement_scopes_memory_records(statement):
-                        reads_records_unscoped = True
-            except Exception as error:
+                statements = list(_allow_statements(policy))
+            except (TypeError, ValueError) as error:
                 logger.warning(f"Error parsing policy for {label}: {error}")
+                unreadable.append(f"{label} (policy {policy.get('name', '')})")
+                continue
+            for statement in statements:
+                for read in _statement_memory_reads(statement):
+                    if not _grant_survives(permissions, f"bedrock-agentcore:{read}"):
+                        continue
+                    scopes.add(_memory_read_scope(statement, read))
 
-        if reads_records_unscoped:
+        if "unscoped" in scopes:
             unscoped.append(label)
-        elif reads_records:
-            scoped.append(label)
+        elif "fixed" in scopes:
+            fixed.append(label)
+        elif "bound" in scopes:
+            bound.append(label)
 
-    return unscoped, scoped
+    return unscoped, fixed, bound, unreadable
 
 
 def check_agentcore_memory_record_access_scope(
@@ -7635,9 +7860,16 @@ def check_agentcore_memory_record_access_scope(
     try:
         role_permissions = permission_cache.get("role_permissions", {})
         user_permissions = permission_cache.get("user_permissions", {})
+        gap_rows, v1_note = _cache_read_gap_findings(
+            permission_cache,
+            "AC-23",
+            "AgentCore Memory Record Access Scope",
+            AGENTCORE_MEMORY_NAMESPACE_REFERENCE_URL,
+            region=GLOBAL_REGION_LABEL,
+        )
 
         if not role_permissions and not user_permissions:
-            return [
+            return gap_rows + [
                 create_finding(
                     check_id="AC-23",
                     finding_name="AgentCore Memory Record Access Scope",
@@ -7650,14 +7882,43 @@ def check_agentcore_memory_record_access_scope(
                 )
             ]
 
-        unscoped_roles, scoped_roles = _principals_reading_memory_records(
-            role_permissions, "role"
-        )
-        unscoped_users, scoped_users = _principals_reading_memory_records(
-            user_permissions, "user"
-        )
-        unscoped = sorted(unscoped_roles + unscoped_users)
-        scoped = sorted(scoped_roles + scoped_users)
+        unscoped: List[str] = []
+        fixed: List[str] = []
+        bound: List[str] = []
+        unreadable: List[str] = []
+        for kind, permissions_by_name in (
+            ("role", role_permissions),
+            ("user", user_permissions),
+        ):
+            split = _principals_reading_memory_records(permissions_by_name, kind)
+            for target, labels in zip((unscoped, fixed, bound, unreadable), split):
+                target.extend(labels)
+        unscoped.sort()
+        fixed.sort()
+        bound.sort()
+        unreadable.sort()
+        findings.extend(gap_rows)
+        if unreadable:
+            findings.append(
+                create_finding(
+                    check_id="AC-23",
+                    finding_name="AgentCore Memory Record Access Scope Incomplete",
+                    finding_details=(
+                        "A policy of these principals could not be parsed, so "
+                        "their memory reads were not judged and no Passed result "
+                        f"is reported for the population: {', '.join(unreadable)}."
+                    ),
+                    resolution=(
+                        "No action is required on the assessed workload based on "
+                        "this result. Correct the named policy documents and "
+                        "rerun the assessment."
+                    ),
+                    reference=AGENTCORE_MEMORY_NAMESPACE_REFERENCE_URL,
+                    severity=SeverityEnum.INFORMATIONAL,
+                    status=StatusEnum.NA,
+                    region=GLOBAL_REGION_LABEL,
+                )
+            )
 
         if unscoped:
             findings.append(
@@ -7665,16 +7926,21 @@ def check_agentcore_memory_record_access_scope(
                     check_id="AC-23",
                     finding_name="AgentCore Memory Record Access Scope",
                     finding_details=(
-                        "The following principals can read memory records and "
-                        "events without a namespace, strategy, actor or session "
-                        "condition, so one call returns every actor's stored "
-                        f"records: {', '.join(unscoped)}."
+                        "The following principals can read memory records or "
+                        "events without a namespace condition on record reads or "
+                        "an actorId or sessionId condition on event reads, under "
+                        "StringEquals or StringLike with a value narrower than a "
+                        "wildcard, so one call returns every actor's stored "
+                        f"records: {', '.join(unscoped)}. A strategyId condition "
+                        "alone, an IfExists or negated operator, and a "
+                        f"wildcard-only value do not partition. {IAM_CACHE_SCP_NOTE}"
                     ),
                     resolution=(
-                        "Add a bedrock-agentcore:namespace, strategyId, actorId or "
-                        "sessionId condition that binds the read to the caller, for "
-                        "example by matching the actor id against the session tag "
-                        "carried by the agent identity."
+                        "Add a StringEquals or StringLike condition on "
+                        "bedrock-agentcore:namespace for RetrieveMemoryRecords and "
+                        "ListMemoryRecords, and on bedrock-agentcore:actorId or "
+                        "sessionId for the event reads, that binds the read to the "
+                        "caller, for example ${aws:PrincipalTag/userId}."
                     ),
                     reference=AGENTCORE_MEMORY_NAMESPACE_REFERENCE_URL,
                     severity=SeverityEnum.HIGH,
@@ -7683,20 +7949,23 @@ def check_agentcore_memory_record_access_scope(
                 )
             )
 
-        if scoped:
+        if fixed:
             findings.append(
                 create_finding(
                     check_id="AC-23",
                     finding_name="AgentCore Memory Record Access Scope",
                     finding_details=(
                         "The following principals read memory records only under a "
-                        "namespace, strategy, actor or session condition: "
-                        f"{', '.join(scoped)}."
+                        "partition condition, and at least one value is a fixed "
+                        "literal with no policy variable, so every caller of the "
+                        "principal reads the same partition. The assessment cannot "
+                        "tell whether one actor or many use the principal: "
+                        f"{', '.join(fixed)}."
                     ),
                     resolution=(
-                        "No action required. Confirm the condition resolves to the "
-                        "end user the caller is acting for rather than to a fixed "
-                        "value shared by every session."
+                        "No action required if the principal serves one actor. "
+                        "Otherwise bind the value to the caller, for example "
+                        "${aws:PrincipalTag/userId}."
                     ),
                     reference=AGENTCORE_MEMORY_NAMESPACE_REFERENCE_URL,
                     severity=SeverityEnum.HIGH,
@@ -7705,15 +7974,38 @@ def check_agentcore_memory_record_access_scope(
                 )
             )
 
-        if not unscoped and not scoped:
+        if bound:
+            findings.append(
+                create_finding(
+                    check_id="AC-23",
+                    finding_name="AgentCore Memory Record Access Scope",
+                    finding_details=(
+                        "The following principals read memory records only under a "
+                        "partition condition whose every value carries a policy "
+                        "variable, so the partition resolves per caller: "
+                        f"{', '.join(bound)}."
+                    ),
+                    resolution=(
+                        "No action required. Confirm the variable carries the end "
+                        "user the caller is acting for."
+                    ),
+                    reference=AGENTCORE_MEMORY_NAMESPACE_REFERENCE_URL,
+                    severity=SeverityEnum.HIGH,
+                    status=StatusEnum.PASSED,
+                    region=GLOBAL_REGION_LABEL,
+                )
+            )
+
+        if not unscoped and not fixed and not bound and not gap_rows and not unreadable:
             findings.append(
                 create_finding(
                     check_id="AC-23",
                     finding_name="AgentCore Memory Record Access Scope",
                     finding_details=(
                         "No cached IAM role or user grants a memory record or event "
-                        "read action, so no principal reads stored memory through "
-                        "IAM policy."
+                        "read action after its own Deny statements and permissions "
+                        "boundary, so no principal reads stored memory through "
+                        f"IAM policy.{v1_note}"
                     ),
                     resolution="No action required.",
                     reference=AGENTCORE_MEMORY_NAMESPACE_REFERENCE_URL,

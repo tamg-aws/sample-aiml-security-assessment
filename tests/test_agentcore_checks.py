@@ -2331,11 +2331,21 @@ class TestAC03StaleAccess:
 
     @patch("agentcore_app.boto3.client")
     @patch("agentcore_app.iam_client")
-    def test_ac03_ignores_not_action_that_names_no_platform_namespace(
+    def test_ac03_includes_not_action_that_names_no_platform_namespace(
         self, mock_iam, mock_boto_client
     ):
+        # This test asserted the principal was outside the population before the
+        # whole-population change. An allow-except that leaves AgentCore in
+        # grants every AgentCore action, so the principal's history is read.
         mock_boto_client.return_value.get_caller_identity.return_value = {
             "Account": "123456789012"
+        }
+        mock_iam.generate_service_last_accessed_details.return_value = {
+            "JobId": "job-1"
+        }
+        mock_iam.get_service_last_accessed_details.return_value = {
+            "JobStatus": "COMPLETED",
+            "ServicesLastAccessed": [],
         }
         permission_cache = {
             "role_permissions": {
@@ -2361,8 +2371,11 @@ class TestAC03StaleAccess:
         findings = agentcore_app.check_stale_agentcore_access(permission_cache)
 
         assert len(findings) == 1
-        assert findings[0]["Status"] == "N/A"
-        mock_iam.generate_service_last_accessed_details.assert_not_called()
+        assert findings[0]["Finding"] == "AgentCore Unused Permissions"
+        assert "role 'AllowExceptRole'" in findings[0]["Finding_Details"]
+        mock_iam.generate_service_last_accessed_details.assert_called_once_with(
+            Arn="arn:aws:iam::123456789012:role/AllowExceptRole"
+        )
 
     @patch("agentcore_app.boto3.client")
     @patch("agentcore_app.iam_client")
@@ -2404,11 +2417,20 @@ class TestAC03StaleAccess:
 
     @patch("agentcore_app.boto3.client")
     @patch("agentcore_app.iam_client")
-    def test_ac03_ignores_service_agnostic_wildcard_actions(
+    def test_ac03_includes_service_agnostic_wildcard_actions(
         self, mock_iam, mock_boto_client
     ):
+        # This test asserted `Action: "*"` was outside the population before the
+        # whole-population change. It grants every AgentCore action.
         mock_boto_client.return_value.get_caller_identity.return_value = {
             "Account": "123456789012"
+        }
+        mock_iam.generate_service_last_accessed_details.return_value = {
+            "JobId": "job-1"
+        }
+        mock_iam.get_service_last_accessed_details.return_value = {
+            "JobStatus": "COMPLETED",
+            "ServicesLastAccessed": [],
         }
         permission_cache = {
             "role_permissions": {
@@ -2434,12 +2456,11 @@ class TestAC03StaleAccess:
         findings = agentcore_app.check_stale_agentcore_access(permission_cache)
 
         assert len(findings) == 1
-        assert findings[0]["Status"] == "N/A"
-        assert (
-            findings[0]["Finding_Details"]
-            == "No IAM principals with AgentCore permissions found"
+        assert findings[0]["Finding"] == "AgentCore Unused Permissions"
+        assert "role 'Administrator'" in findings[0]["Finding_Details"]
+        mock_iam.generate_service_last_accessed_details.assert_called_once_with(
+            Arn="arn:aws:iam::123456789012:role/Administrator"
         )
-        mock_iam.generate_service_last_accessed_details.assert_not_called()
 
     @pytest.mark.parametrize(
         ("policy_name", "statement"),
@@ -2491,9 +2512,10 @@ class TestAC03StaleAccess:
 
         assert len(findings) == 1
         assert findings[0]["Status"] == "N/A"
-        assert (
-            findings[0]["Finding_Details"]
-            == "No IAM principals with AgentCore permissions found"
+        # A version 1 cache names no principal errors, and the row says so.
+        assert findings[0]["Finding_Details"] == (
+            "No IAM principals with AgentCore permissions found "
+            f"{agentcore_app.IAM_CACHE_V1_NOTE}"
         )
         mock_iam.generate_service_last_accessed_details.assert_not_called()
 
@@ -5116,12 +5138,14 @@ class TestAC21LogUnmaskRestriction:
         assert [f["Status"] for f in findings] == ["Passed"]
         assert "No cached IAM role or user" in findings[0]["Finding_Details"]
 
-    def test_bare_wildcard_action_is_ignored(self):
+    def test_bare_wildcard_action_is_detected(self):
+        # This test asserted Passed before the whole-population change. A bare
+        # `Action: "*"` on every resource grants logs:Unmask on every log group.
         findings = agentcore_app.check_agentcore_log_unmask_restriction(
             self._cache(["*"])
         )
-        assert [f["Status"] for f in findings] == ["Passed"]
-        assert "No cached IAM role or user" in findings[0]["Finding_Details"]
+        assert [f["Status"] for f in findings] == ["Failed"]
+        assert "role analyst-role" in findings[0]["Finding_Details"]
 
     def test_logs_namespace_wildcard_is_detected(self):
         findings = agentcore_app.check_agentcore_log_unmask_restriction(
@@ -5195,7 +5219,10 @@ class TestAC21LogUnmaskRestriction:
 
         findings = agentcore_app.check_agentcore_log_unmask_restriction(cache)
 
-        assert [f["Status"] for f in findings] == ["Failed"]
+        # Before the cache contract change this asserted a lone Failed row. The
+        # unreadable policy is now named as well.
+        assert [f["Status"] for f in findings] == ["N/A", "Failed"]
+        assert "role analyst-role (policy broken)" in findings[0]["Finding_Details"]
 
 
 # ===================================================================
@@ -5475,12 +5502,14 @@ class TestAC23MemoryRecordAccessScope:
         )
         assert [f["Status"] for f in findings] == ["Failed"]
 
-    def test_bare_wildcard_action_is_ignored(self):
+    def test_bare_wildcard_action_is_detected(self):
+        # Stricter than before: this asserted Passed with "No cached IAM role
+        # or user", reading an Action "*" grant as no memory read at all.
         findings = agentcore_app.check_agentcore_memory_record_access_scope(
             self._cache(["*"])
         )
-        assert [f["Status"] for f in findings] == ["Passed"]
-        assert "No cached IAM role or user" in findings[0]["Finding_Details"]
+        assert [f["Status"] for f in findings] == ["Failed"]
+        assert "role agent-role" in findings[0]["Finding_Details"]
 
     def test_actions_iam_cannot_scope_are_not_assessed(self):
         # IAM publishes no namespace, actor, session or strategy condition key
@@ -5597,7 +5626,10 @@ class TestAC23MemoryRecordAccessScope:
 
         findings = agentcore_app.check_agentcore_memory_record_access_scope(cache)
 
-        assert [f["Status"] for f in findings] == ["Failed"]
+        # Stricter than before: this asserted ["Failed"] alone, so the unread
+        # policy went unreported.
+        assert [f["Status"] for f in findings] == ["N/A", "Failed"]
+        assert "role agent-role (policy broken)" in findings[0]["Finding_Details"]
 
     def test_unusable_cache_is_reported_incomplete(self):
         findings = agentcore_app.check_agentcore_memory_record_access_scope(None)
@@ -18477,3 +18509,711 @@ class TestAC02PaymentRetrievalRoleTrust:
         assert source.index(
             "check_agentcore_payment_retrieval_role_trust"
         ) < source.index("check_agentcore_vpc_configuration(browser_inventory)")
+
+
+class TestAC03WholePopulation:
+    """AC-03 reads every principal holding AgentCore and never passes an unread one."""
+
+    _RECENT = {
+        "ServiceName": "Amazon Bedrock AgentCore",
+        "ServiceNamespace": "bedrock-agentcore",
+    }
+
+    def _recent(self):
+        return dict(
+            self._RECENT, LastAuthenticated=agentcore_app.get_current_utc_date()
+        )
+
+    @staticmethod
+    def _cache(**principals):
+        return {
+            "cache_schema_version": 2,
+            "principal_errors": [],
+            "role_permissions": {
+                name: {
+                    "attached_policies": [
+                        _agent_platform_policy(
+                            f"{name}Policy", "bedrock-agentcore:ListAgentRuntimes"
+                        )
+                    ],
+                    "inline_policies": [],
+                    "permissions_boundary": boundary,
+                }
+                for name, boundary in principals.items()
+            },
+            "user_permissions": {},
+        }
+
+    @staticmethod
+    def _identity(mock_boto_client):
+        mock_boto_client.return_value.get_caller_identity.return_value = {
+            "Account": "123456789012"
+        }
+
+    @patch("agentcore_app.time.sleep")
+    @patch("agentcore_app.boto3.client")
+    @patch("agentcore_app.iam_client")
+    def test_a_failed_job_for_one_of_two_principals_withholds_passed(
+        self, mock_iam, mock_boto_client, _sleep
+    ):
+        self._identity(mock_boto_client)
+        mock_iam.generate_service_last_accessed_details.side_effect = lambda Arn: {
+            "JobId": Arn.rsplit("/", 1)[-1]
+        }
+        responses = {
+            "Good": {
+                "JobStatus": "COMPLETED",
+                "ServicesLastAccessed": [self._recent()],
+            },
+            "Broken": {"JobStatus": "FAILED", "Error": {"Code": "InternalError"}},
+        }
+        mock_iam.get_service_last_accessed_details.side_effect = lambda JobId, **_: (
+            responses[JobId]
+        )
+
+        findings = agentcore_app.check_stale_agentcore_access(
+            self._cache(Good=None, Broken=None)
+        )
+
+        assert "Passed" not in [f["Status"] for f in findings]
+        incomplete = [
+            f
+            for f in findings
+            if f["Finding"] == "AgentCore Stale Access Check Incomplete"
+        ]
+        assert len(incomplete) == 1
+        assert (
+            "role Broken (last-accessed job FAILED: InternalError)"
+            in (incomplete[0]["Finding_Details"])
+        )
+        assert "Good" not in incomplete[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            _make_client_error("Throttling", "Rate exceeded"),
+            RuntimeError("boom"),
+        ],
+        ids=["throttled", "unexpected"],
+    )
+    @patch("agentcore_app.time.sleep")
+    @patch("agentcore_app.boto3.client")
+    @patch("agentcore_app.iam_client")
+    def test_a_failed_read_is_named_not_dropped(
+        self, mock_iam, mock_boto_client, _sleep, error
+    ):
+        self._identity(mock_boto_client)
+
+        def generate(Arn):
+            if Arn.endswith("/Broken"):
+                raise error
+            return {"JobId": "good"}
+
+        mock_iam.generate_service_last_accessed_details.side_effect = generate
+        mock_iam.get_service_last_accessed_details.return_value = {
+            "JobStatus": "COMPLETED",
+            "ServicesLastAccessed": [self._recent()],
+        }
+
+        findings = agentcore_app.check_stale_agentcore_access(
+            self._cache(Good=None, Broken=None)
+        )
+
+        assert [f["Status"] for f in findings] == ["N/A"]
+        assert "role Broken" in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.time.sleep")
+    @patch("agentcore_app.boto3.client")
+    @patch("agentcore_app.iam_client")
+    def test_the_last_accessed_report_is_paginated(
+        self, mock_iam, mock_boto_client, _sleep
+    ):
+        self._identity(mock_boto_client)
+        mock_iam.generate_service_last_accessed_details.return_value = {"JobId": "j"}
+        pages = {
+            None: {
+                "JobStatus": "COMPLETED",
+                "ServicesLastAccessed": [
+                    {"ServiceName": "Amazon S3", "ServiceNamespace": "s3"}
+                ],
+                "IsTruncated": True,
+                "Marker": "page-2",
+            },
+            "page-2": {
+                "JobStatus": "COMPLETED",
+                "ServicesLastAccessed": [self._recent()],
+                "IsTruncated": False,
+            },
+        }
+        mock_iam.get_service_last_accessed_details.side_effect = (
+            lambda JobId, Marker=None: pages[Marker]
+        )
+
+        findings = agentcore_app.check_stale_agentcore_access(self._cache(Reader=None))
+
+        assert [f["Status"] for f in findings] == ["Passed"]
+        mock_iam.get_service_last_accessed_details.assert_any_call(
+            JobId="j", Marker="page-2"
+        )
+
+    @patch("agentcore_app.time.sleep")
+    @patch("agentcore_app.boto3.client")
+    @patch("agentcore_app.iam_client")
+    def test_a_boundary_that_removes_agentcore_leaves_the_principal_out(
+        self, mock_iam, mock_boto_client, _sleep
+    ):
+        self._identity(mock_boto_client)
+        mock_iam.generate_service_last_accessed_details.return_value = {"JobId": "j"}
+        mock_iam.get_service_last_accessed_details.return_value = {
+            "JobStatus": "COMPLETED",
+            "ServicesLastAccessed": [],
+        }
+        s3_only = {
+            "Statement": [{"Effect": "Allow", "Action": "s3:*", "Resource": "*"}]
+        }
+
+        findings = agentcore_app.check_stale_agentcore_access(
+            self._cache(Bounded=s3_only, Open=None)
+        )
+
+        mock_iam.generate_service_last_accessed_details.assert_called_once_with(
+            Arn="arn:aws:iam::123456789012:role/Open"
+        )
+        assert findings[0]["Finding"] == "AgentCore Unused Permissions"
+        assert "Bounded" not in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.time.sleep")
+    @patch("agentcore_app.boto3.client")
+    @patch("agentcore_app.iam_client")
+    def test_a_user_holding_agentcore_through_a_group_is_read(
+        self, mock_iam, mock_boto_client, _sleep
+    ):
+        self._identity(mock_boto_client)
+        mock_iam.generate_service_last_accessed_details.return_value = {"JobId": "j"}
+        mock_iam.get_service_last_accessed_details.return_value = {
+            "JobStatus": "COMPLETED",
+            "ServicesLastAccessed": [],
+        }
+        cache = {
+            "cache_schema_version": 2,
+            "principal_errors": [],
+            "role_permissions": {},
+            "user_permissions": {
+                "grouped": {
+                    "attached_policies": [],
+                    "inline_policies": [],
+                    "group_policies": [
+                        _agent_platform_policy("Team", "bedrock-agentcore:*")
+                    ],
+                },
+                "plain": {"attached_policies": [], "inline_policies": []},
+            },
+        }
+
+        findings = agentcore_app.check_stale_agentcore_access(cache)
+
+        mock_iam.generate_service_last_accessed_details.assert_called_once_with(
+            Arn="arn:aws:iam::123456789012:user/grouped"
+        )
+        assert "user 'grouped'" in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.time.sleep")
+    @patch("agentcore_app.boto3.client")
+    @patch("agentcore_app.iam_client")
+    def test_principal_errors_and_unparseable_policies_withhold_passed(
+        self, mock_iam, mock_boto_client, _sleep
+    ):
+        self._identity(mock_boto_client)
+        mock_iam.generate_service_last_accessed_details.return_value = {"JobId": "j"}
+        mock_iam.get_service_last_accessed_details.return_value = {
+            "JobStatus": "COMPLETED",
+            "ServicesLastAccessed": [self._recent()],
+        }
+        cache = self._cache(Good=None)
+        cache["principal_errors"] = [
+            {
+                "type": "role",
+                "name": "Hidden",
+                "stage": "list_attached_role_policies",
+                "error": "AccessDenied",
+            }
+        ]
+        cache["role_permissions"]["Garbled"] = {
+            "attached_policies": [{"name": "Bad", "document": "{not json"}],
+            "inline_policies": [],
+        }
+
+        findings = agentcore_app.check_stale_agentcore_access(cache)
+
+        assert "Passed" not in [f["Status"] for f in findings]
+        details = " ".join(f["Finding_Details"] for f in findings)
+        assert "role Hidden (list_attached_role_policies: AccessDenied)" in details
+        assert "role Garbled (policy parse:" in details
+
+    @patch("agentcore_app.time.sleep")
+    @patch("agentcore_app.boto3.client")
+    @patch("agentcore_app.iam_client")
+    def test_a_v2_cache_passes_without_the_v1_note(
+        self, mock_iam, mock_boto_client, _sleep
+    ):
+        self._identity(mock_boto_client)
+        mock_iam.generate_service_last_accessed_details.return_value = {"JobId": "j"}
+        mock_iam.get_service_last_accessed_details.return_value = {
+            "JobStatus": "COMPLETED",
+            "ServicesLastAccessed": [self._recent()],
+        }
+
+        v2 = agentcore_app.check_stale_agentcore_access(self._cache(A=None, B=None))
+        v1_cache = self._cache(A=None, B=None)
+        del v1_cache["cache_schema_version"]
+        v1 = agentcore_app.check_stale_agentcore_access(v1_cache)
+
+        assert [f["Status"] for f in v2] == ["Passed"]
+        assert agentcore_app.IAM_CACHE_V1_NOTE not in v2[0]["Finding_Details"]
+        assert [f["Status"] for f in v1] == ["Passed"]
+        assert v1[0]["Finding_Details"].endswith(agentcore_app.IAM_CACHE_V1_NOTE)
+
+
+class TestAC21WholePopulation:
+    """AC-21 reads every grant of logs:Unmask by value, after Deny and boundary."""
+
+    _LG = "arn:aws:logs:us-east-1:123456789012:log-group:"
+
+    @staticmethod
+    def _principal(statements, boundary=None, key="attached_policies"):
+        permissions = {"attached_policies": [], "inline_policies": []}
+        permissions[key] = [{"name": "p", "document": {"Statement": statements}}]
+        if boundary is not None:
+            permissions["permissions_boundary"] = boundary
+        return permissions
+
+    @classmethod
+    def _run(cls, **roles):
+        return agentcore_app.check_agentcore_log_unmask_restriction(
+            {
+                "cache_schema_version": 2,
+                "principal_errors": [],
+                "role_permissions": roles,
+                "user_permissions": {},
+            }
+        )
+
+    @pytest.mark.parametrize(
+        "resource",
+        [
+            "arn:aws:logs:us-east-1:123456789012:log-group:*",
+            "arn:aws:logs:*:123456789012:log-group:/aws/bedrock-agentcore/*",
+            "arn:aws:logs:us-east-1:*:log-group:/aws/bedrock-agentcore/*",
+            "arn:aws:logs:us-east-1:123456789012:*",
+            "arn:aws:*:us-east-1:123456789012:log-group:/x",
+        ],
+        ids=[
+            "every-group",
+            "every-region",
+            "every-account",
+            "type-wildcard",
+            "service",
+        ],
+    )
+    def test_a_resource_reaching_every_log_group_fails_only_that_role(self, resource):
+        findings = self._run(
+            wide=self._principal(
+                [{"Effect": "Allow", "Action": "logs:Unmask", "Resource": resource}]
+            ),
+            narrow=self._principal(
+                [
+                    {
+                        "Effect": "Allow",
+                        "Action": "logs:Unmask",
+                        "Resource": self._LG + "/aws/bedrock-agentcore/*",
+                    }
+                ]
+            ),
+        )
+
+        failed = [f for f in findings if f["Status"] == "Failed"]
+        assert len(failed) == 1
+        assert "role wide" in failed[0]["Finding_Details"]
+        assert "narrow" not in failed[0]["Finding_Details"]
+        assert agentcore_app.IAM_CACHE_SCP_NOTE in failed[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "statement",
+        [
+            {"Effect": "Allow", "Action": "logs:Un*", "Resource": "*"},
+            {"Effect": "Allow", "Action": "*:unmask", "Resource": "*"},
+            {"Effect": "Allow", "NotAction": "iam:*", "Resource": "*"},
+            {
+                "Effect": "Allow",
+                "Action": "logs:Unmask",
+                "NotResource": "arn:aws:logs:us-east-1:123456789012:log-group:/x",
+            },
+        ],
+        ids=["prefix", "any-service", "not-action", "not-resource"],
+    )
+    def test_patterns_that_reach_unmask_are_counted(self, statement):
+        findings = self._run(role=self._principal([statement]))
+        assert [f["Status"] for f in findings] == ["Failed"]
+
+    @pytest.mark.parametrize(
+        ("statements", "boundary"),
+        [
+            (
+                [
+                    {"Effect": "Allow", "Action": "logs:*", "Resource": "*"},
+                    {"Effect": "Deny", "Action": "logs:Unmask", "Resource": "*"},
+                ],
+                None,
+            ),
+            (
+                [{"Effect": "Allow", "Action": "logs:*", "Resource": "*"}],
+                {
+                    "Statement": [
+                        {"Effect": "Allow", "Action": "logs:Get*", "Resource": "*"}
+                    ]
+                },
+            ),
+            (
+                [{"Effect": "Allow", "NotAction": "logs:Unmask", "Resource": "*"}],
+                None,
+            ),
+        ],
+        ids=["deny", "boundary", "not-action-excludes"],
+    )
+    def test_a_grant_removed_by_deny_or_boundary_is_not_counted(
+        self, statements, boundary
+    ):
+        findings = self._run(
+            removed=self._principal(statements, boundary),
+            other=self._principal(
+                [{"Effect": "Allow", "Action": "logs:Describe*", "Resource": "*"}]
+            ),
+        )
+        assert [f["Status"] for f in findings] == ["Passed"]
+        assert "No cached IAM role or user" in findings[0]["Finding_Details"]
+
+    def test_a_conditioned_deny_does_not_remove_the_grant(self):
+        findings = self._run(
+            role=self._principal(
+                [
+                    {"Effect": "Allow", "Action": "logs:Unmask", "Resource": "*"},
+                    {
+                        "Effect": "Deny",
+                        "Action": "logs:Unmask",
+                        "Resource": "*",
+                        "Condition": {"Bool": {"aws:ViaAWSService": "true"}},
+                    },
+                ]
+            )
+        )
+        assert [f["Status"] for f in findings] == ["Failed"]
+
+    def test_a_group_grant_on_a_user_is_counted(self):
+        cache = {
+            "cache_schema_version": 2,
+            "principal_errors": [],
+            "role_permissions": {},
+            "user_permissions": {
+                "analyst": self._principal(
+                    [{"Effect": "Allow", "Action": "logs:Unmask", "Resource": "*"}],
+                    key="group_policies",
+                ),
+                "viewer": self._principal(
+                    [{"Effect": "Allow", "Action": "logs:Get*", "Resource": "*"}]
+                ),
+            },
+        }
+        findings = agentcore_app.check_agentcore_log_unmask_restriction(cache)
+        assert [f["Status"] for f in findings] == ["Failed"]
+        assert "user analyst" in findings[0]["Finding_Details"]
+
+    def test_a_principal_error_withholds_the_population_pass(self):
+        cache = {
+            "cache_schema_version": 2,
+            "principal_errors": [
+                {
+                    "type": "user",
+                    "name": "hidden",
+                    "stage": "list_user_policies",
+                    "error": "AccessDenied",
+                }
+            ],
+            "role_permissions": {
+                "reader": self._principal(
+                    [{"Effect": "Allow", "Action": "logs:Get*", "Resource": "*"}]
+                )
+            },
+            "user_permissions": {},
+        }
+
+        findings = agentcore_app.check_agentcore_log_unmask_restriction(cache)
+
+        assert [f["Status"] for f in findings] == ["N/A"]
+        assert (
+            "user hidden (list_user_policies: AccessDenied)"
+            in (findings[0]["Finding_Details"])
+        )
+
+    def test_a_v1_cache_pass_says_errors_were_not_recorded(self):
+        findings = agentcore_app.check_agentcore_log_unmask_restriction(
+            {
+                "role_permissions": {
+                    "reader": self._principal(
+                        [{"Effect": "Allow", "Action": "logs:Get*", "Resource": "*"}]
+                    )
+                },
+                "user_permissions": {},
+            }
+        )
+        assert [f["Status"] for f in findings] == ["Passed"]
+        assert findings[0]["Finding_Details"].endswith(agentcore_app.IAM_CACHE_V1_NOTE)
+
+
+class TestAC23WholePopulation:
+    """AC-23 judges each read by the partition key that action carries."""
+
+    _RETRIEVE = "bedrock-agentcore:RetrieveMemoryRecords"
+    _BOUND = {
+        "StringLike": {
+            "bedrock-agentcore:namespace": "/actors/${aws:PrincipalTag/actorId}/*"
+        }
+    }
+
+    @staticmethod
+    def _principal(statements, boundary=None, key="attached_policies"):
+        permissions = {"attached_policies": [], "inline_policies": []}
+        permissions[key] = [{"name": "p", "document": {"Statement": statements}}]
+        if boundary is not None:
+            permissions["permissions_boundary"] = boundary
+        return permissions
+
+    @classmethod
+    def _allow(cls, action, condition=None):
+        statement = {"Effect": "Allow", "Action": action, "Resource": "*"}
+        if condition is not None:
+            statement["Condition"] = condition
+        return statement
+
+    @classmethod
+    def _run(cls, **roles):
+        return agentcore_app.check_agentcore_memory_record_access_scope(
+            {
+                "cache_schema_version": 2,
+                "principal_errors": [],
+                "role_permissions": roles,
+                "user_permissions": {},
+            }
+        )
+
+    @pytest.mark.parametrize(
+        ("action", "condition"),
+        [
+            (
+                _RETRIEVE,
+                {"StringLikeIfExists": {"bedrock-agentcore:namespace": "/a/*"}},
+            ),
+            (_RETRIEVE, {"StringLike": {"bedrock-agentcore:namespace": "*"}}),
+            (_RETRIEVE, {"StringLike": {"bedrock-agentcore:namespace": "/*"}}),
+            (_RETRIEVE, {"StringEquals": {"bedrock-agentcore:strategyId": "s-1"}}),
+            (_RETRIEVE, {"StringNotEquals": {"bedrock-agentcore:namespace": "/a"}}),
+            (
+                _RETRIEVE,
+                {"ForAllValues:StringEquals": {"bedrock-agentcore:namespace": "/a"}},
+            ),
+            (
+                "bedrock-agentcore:ListEvents",
+                {"StringEqualsIfExists": {"bedrock-agentcore:actorId": "a-1"}},
+            ),
+        ],
+        ids=[
+            "if-exists",
+            "wildcard-only",
+            "slash-wildcard",
+            "strategy-only",
+            "negated",
+            "for-all-values",
+            "event-if-exists",
+        ],
+    )
+    def test_a_condition_that_does_not_partition_fails_only_that_role(
+        self, action, condition
+    ):
+        findings = self._run(
+            wide=self._principal([self._allow(action, condition)]),
+            narrow=self._principal([self._allow(self._RETRIEVE, self._BOUND)]),
+        )
+
+        failed = [f for f in findings if f["Status"] == "Failed"]
+        assert len(failed) == 1
+        assert "role wide" in failed[0]["Finding_Details"]
+        assert "role narrow" not in failed[0]["Finding_Details"]
+        assert agentcore_app.IAM_CACHE_SCP_NOTE in failed[0]["Finding_Details"]
+        passed = [f for f in findings if f["Status"] == "Passed"]
+        assert len(passed) == 1
+        assert "role narrow" in passed[0]["Finding_Details"]
+
+    def test_a_namespace_condition_does_not_scope_an_event_read(self):
+        # ListEvents carries actorId and sessionId, not namespace, so the
+        # positive namespace condition never matches and the Allow grants
+        # nothing for it; the record read under the same statement is scoped.
+        findings = self._run(
+            role=self._principal(
+                [
+                    self._allow(
+                        [self._RETRIEVE, "bedrock-agentcore:ListEvents"], self._BOUND
+                    )
+                ]
+            )
+        )
+        assert [f["Status"] for f in findings] == ["Passed"]
+
+    def test_a_record_condition_on_a_wildcard_statement_still_fails_the_event_leg(
+        self,
+    ):
+        # A strategyId condition applies to record reads but ListEvents does not
+        # carry it, so the statement grants no event read; the record read under
+        # strategyId alone is unscoped.
+        findings = self._run(
+            role=self._principal(
+                [
+                    self._allow(
+                        "bedrock-agentcore:*",
+                        {"StringEquals": {"bedrock-agentcore:strategyId": "s-1"}},
+                    )
+                ]
+            )
+        )
+        assert [f["Status"] for f in findings] == ["Failed"]
+
+    def test_caller_bound_and_fixed_values_are_reported_apart(self):
+        findings = self._run(
+            bound=self._principal([self._allow(self._RETRIEVE, self._BOUND)]),
+            fixed=self._principal(
+                [
+                    self._allow(
+                        self._RETRIEVE,
+                        {"StringEquals": {"bedrock-agentcore:namespace": "/tenant-a"}},
+                    )
+                ]
+            ),
+        )
+
+        assert [f["Status"] for f in findings] == ["Passed", "Passed"]
+        fixed_row, bound_row = findings
+        assert "role fixed" in fixed_row["Finding_Details"]
+        assert "fixed literal" in fixed_row["Finding_Details"]
+        assert "bound" not in fixed_row["Finding_Details"]
+        assert "role bound" in bound_row["Finding_Details"]
+        assert "resolves per caller" in bound_row["Finding_Details"]
+
+    def test_one_fixed_value_among_bound_values_is_fixed(self):
+        findings = self._run(
+            role=self._principal(
+                [
+                    self._allow(
+                        self._RETRIEVE,
+                        {
+                            "StringLike": {
+                                "bedrock-agentcore:namespace": [
+                                    "/actors/${aws:userid}/*",
+                                    "/shared/*",
+                                ]
+                            }
+                        },
+                    )
+                ]
+            )
+        )
+        assert [f["Status"] for f in findings] == ["Passed"]
+        assert "fixed literal" in findings[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        ("statements", "boundary"),
+        [
+            (
+                [
+                    {
+                        "Effect": "Allow",
+                        "Action": "bedrock-agentcore:*",
+                        "Resource": "*",
+                    },
+                    {
+                        "Effect": "Deny",
+                        "Action": [
+                            "bedrock-agentcore:RetrieveMemoryRecords",
+                            "bedrock-agentcore:ListMemoryRecords",
+                            "bedrock-agentcore:List*",
+                            "bedrock-agentcore:GetEvent",
+                        ],
+                        "Resource": "*",
+                    },
+                ],
+                None,
+            ),
+            (
+                [{"Effect": "Allow", "Action": "*", "Resource": "*"}],
+                {"Statement": [{"Effect": "Allow", "Action": "s3:*", "Resource": "*"}]},
+            ),
+        ],
+        ids=["deny", "boundary"],
+    )
+    def test_a_read_removed_by_deny_or_boundary_is_not_counted(
+        self, statements, boundary
+    ):
+        findings = self._run(removed=self._principal(statements, boundary))
+        assert [f["Status"] for f in findings] == ["Passed"]
+        assert "No cached IAM role or user" in findings[0]["Finding_Details"]
+
+    def test_a_group_grant_on_a_user_is_counted(self):
+        cache = {
+            "cache_schema_version": 2,
+            "principal_errors": [],
+            "role_permissions": {},
+            "user_permissions": {
+                "analyst": self._principal(
+                    [self._allow(self._RETRIEVE)], key="group_policies"
+                ),
+                "viewer": self._principal([self._allow("s3:GetObject")]),
+            },
+        }
+        findings = agentcore_app.check_agentcore_memory_record_access_scope(cache)
+        assert [f["Status"] for f in findings] == ["Failed"]
+        assert "user analyst" in findings[0]["Finding_Details"]
+        assert "viewer" not in findings[0]["Finding_Details"]
+
+    def test_a_principal_error_withholds_the_population_pass(self):
+        cache = {
+            "cache_schema_version": 2,
+            "principal_errors": [
+                {
+                    "type": "role",
+                    "name": "hidden",
+                    "stage": "list_attached_role_policies",
+                    "error": "Throttling",
+                }
+            ],
+            "role_permissions": {
+                "reader": self._principal([self._allow("s3:GetObject")])
+            },
+            "user_permissions": {},
+        }
+
+        findings = agentcore_app.check_agentcore_memory_record_access_scope(cache)
+
+        assert [f["Status"] for f in findings] == ["N/A"]
+        assert (
+            "role hidden (list_attached_role_policies: Throttling)"
+            in findings[0]["Finding_Details"]
+        )
+
+    def test_a_v1_cache_pass_says_errors_were_not_recorded(self):
+        findings = agentcore_app.check_agentcore_memory_record_access_scope(
+            {
+                "role_permissions": {
+                    "reader": self._principal([self._allow("s3:GetObject")])
+                },
+                "user_permissions": {},
+            }
+        )
+        assert [f["Status"] for f in findings] == ["Passed"]
+        assert findings[0]["Finding_Details"].endswith(agentcore_app.IAM_CACHE_V1_NOTE)
