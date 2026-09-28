@@ -231,6 +231,12 @@ section.
   source-account links were not read. The assessment roles hold no
   `oam:ListLinks` grant, so the row is `N/A` naming that action until it is
   added.
+- `AC-46` judges runtime spend on a new `AgentCore Runtime Cost Anomaly
+  Alerting` row: the account needs a Cost Anomaly Detection subscription that
+  notifies someone about a monitor for every AWS service. The check reported
+  that no cost limit could be read. The AgentCore assessment role holds no
+  `ce:GetAnomalySubscriptions` or `ce:GetAnomalyMonitors` grant, so the row is
+  `N/A` naming them until they are added.
 - `AC-45` judges each AgentCore runtime's own execution role by the rules it
   applies to a tool role. No check read a runtime role outside the AgentCore
   namespace, so one granting `s3:*` or every foundation model passed.

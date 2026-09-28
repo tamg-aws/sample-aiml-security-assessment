@@ -51,6 +51,7 @@ cognito_client = None
 events_client = None
 bedrock_client = None
 xray_client = None
+ce_client = None
 
 # Environment variables
 BUCKET_NAME = os.environ.get("AIML_ASSESSMENT_BUCKET_NAME")
@@ -244,6 +245,10 @@ AGENTCORE_RUNTIME_LIFECYCLE_REFERENCE_URL = (
     "https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/"
     "runtime-lifecycle-settings.html"
 )
+COST_ANOMALY_DETECTION_REFERENCE_URL = (
+    "https://docs.aws.amazon.com/cost-management/latest/userguide/manage-ad.html"
+)
+AGENTCORE_COST_ANOMALY_FINDING = "AgentCore Runtime Cost Anomaly Alerting"
 AGENTCORE_VPC_INTERFACE_ENDPOINT_REFERENCE_URL = (
     "https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/"
     "vpc-interface-endpoints.html"
@@ -22417,6 +22422,150 @@ def _agentcore_session_count_alarms() -> List[str]:
     )
 
 
+def _agentcore_cost_anomaly_finding() -> Dict[str, Any]:
+    """Judge whether a runaway runtime's spend reaches someone.
+
+    The control plane carries no per-session cost limit, so the account must
+    hold a Cost Anomaly Detection subscription with a subscriber that has not
+    declined, on a monitor that watches every AWS service. A CUSTOM monitor's
+    specification is not judged, so it withholds Passed.
+    """
+    retry = "Grant ce:GetAnomalySubscriptions and ce:GetAnomalyMonitors and retry."
+
+    def unread(detail: str, resolution: str = retry) -> Dict[str, Any]:
+        return create_finding(
+            check_id="AC-46",
+            finding_name=AGENTCORE_COST_ANOMALY_FINDING,
+            finding_details=(
+                "Whether the account alerts on anomalous spend, which is the only "
+                f"cost bound on an AgentCore runtime session, was not established: "
+                f"{detail}."
+            ),
+            resolution=resolution,
+            reference=COST_ANOMALY_DETECTION_REFERENCE_URL,
+            severity=SeverityEnum.INFORMATIONAL,
+            status=StatusEnum.NA,
+        )
+
+    if ce_client is None:
+        return unread("no Cost Explorer client was available")
+    try:
+        subscriptions = _paginate_aws_list(
+            ce_client,
+            "get_anomaly_subscriptions",
+            "AnomalySubscriptions",
+            token_request_key="NextPageToken",
+            token_response_key="NextPageToken",
+        )
+    except (BotoCoreError, ClientError) as error:
+        return unread(
+            f"ce:GetAnomalySubscriptions failed with {_assessment_error_label(error)}"
+        )
+    live = [
+        subscription
+        for subscription in subscriptions
+        if any(
+            subscriber.get("Status") != "DECLINED"
+            for subscriber in subscription.get("Subscribers") or []
+        )
+    ]
+    if not live:
+        return create_finding(
+            check_id="AC-46",
+            finding_name=AGENTCORE_COST_ANOMALY_FINDING,
+            finding_details=(
+                f"The account has {len(subscriptions)} Cost Anomaly Detection "
+                "subscription(s) and none with a subscriber that has not declined, "
+                "so anomalous spend by a runaway AgentCore session notifies nobody."
+            ),
+            resolution=(
+                "Create a Cost Anomaly Detection monitor for AWS services and a "
+                "subscription that notifies an email address or SNS topic."
+            ),
+            reference=COST_ANOMALY_DETECTION_REFERENCE_URL,
+            severity=SeverityEnum.MEDIUM,
+            status=StatusEnum.FAILED,
+        )
+    monitor_arns = sorted(
+        {
+            arn
+            for subscription in live
+            for arn in subscription.get("MonitorArnList") or []
+        }
+    )
+    monitors: List[Dict[str, Any]] = []
+    if monitor_arns:
+        try:
+            monitors = _paginate_aws_list(
+                ce_client,
+                "get_anomaly_monitors",
+                "AnomalyMonitors",
+                token_request_key="NextPageToken",
+                token_response_key="NextPageToken",
+                MonitorArnList=monitor_arns,
+            )
+        except (BotoCoreError, ClientError) as error:
+            return unread(
+                f"ce:GetAnomalyMonitors failed with {_assessment_error_label(error)}"
+            )
+    all_services = {
+        monitor.get("MonitorArn")
+        for monitor in monitors
+        if monitor.get("MonitorType") == "DIMENSIONAL"
+        and monitor.get("MonitorDimension") == "SERVICE"
+    }
+    covering = sorted(
+        subscription.get("SubscriptionName") or subscription.get("SubscriptionArn", "")
+        for subscription in live
+        if all_services & set(subscription.get("MonitorArnList") or [])
+    )
+    if covering:
+        return create_finding(
+            check_id="AC-46",
+            finding_name=AGENTCORE_COST_ANOMALY_FINDING,
+            finding_details=(
+                f"Cost Anomaly Detection subscription {', '.join(covering)} "
+                "notifies a subscriber that has not declined about a monitor that "
+                "watches every AWS service, AgentCore included. Its alert "
+                "threshold is not judged."
+            ),
+            resolution=(
+                "No action required for this check. Confirm the threshold is low "
+                "enough to catch one runaway session."
+            ),
+            reference=COST_ANOMALY_DETECTION_REFERENCE_URL,
+            severity=SeverityEnum.MEDIUM,
+            status=StatusEnum.PASSED,
+        )
+    custom = sorted(
+        monitor.get("MonitorName") or monitor.get("MonitorArn", "")
+        for monitor in monitors
+        if monitor.get("MonitorType") == "CUSTOM"
+    )
+    if custom:
+        return unread(
+            f"the subscribed monitors watching more than one service are CUSTOM "
+            f"monitor(s) {', '.join(custom)}, whose specification is not judged",
+            resolution=(
+                "Confirm the custom monitor covers AgentCore spend, or subscribe "
+                "to a monitor for AWS services."
+            ),
+        )
+    return create_finding(
+        check_id="AC-46",
+        finding_name=AGENTCORE_COST_ANOMALY_FINDING,
+        finding_details=(
+            f"The {len(live)} Cost Anomaly Detection subscription(s) with a live "
+            "subscriber watch no monitor for every AWS service, so anomalous "
+            "AgentCore spend is not alerted on."
+        ),
+        resolution=("Subscribe to a Cost Anomaly Detection monitor for AWS services."),
+        reference=COST_ANOMALY_DETECTION_REFERENCE_URL,
+        severity=SeverityEnum.MEDIUM,
+        status=StatusEnum.FAILED,
+    )
+
+
 def check_agentcore_runtime_session_limits() -> List[Dict[str, Any]]:
     """AC-46: Judge the per-session limits and usage monitoring of each runtime.
 
@@ -22437,6 +22586,7 @@ def check_agentcore_runtime_session_limits() -> List[Dict[str, Any]]:
     which carry per-session resource consumption, and the region must hold an
     alarm with actions on the runtime's ActiveSessionCount. A delivery or alarm
     inventory that could not be read withholds Passed and never hides a Failed.
+    Spend is judged by check_agentcore_runtime_cost_alerting.
     """
     if agentcore_client is None:
         return [
@@ -22714,6 +22864,23 @@ def check_agentcore_runtime_session_limits() -> List[Dict[str, Any]]:
             )
 
     return findings
+
+
+def check_agentcore_runtime_cost_alerting() -> List[Dict[str, Any]]:
+    """AC-46: Judge the account's cost anomaly alerting when runtimes run here.
+
+    The session limits check reports an unavailable client or an unlistable
+    region, so this returns nothing in either case.
+    """
+    if agentcore_client is None:
+        return []
+    try:
+        runtimes = _agentcore_list_all("list_agent_runtimes", ["agentRuntimes"])
+    except (BotoCoreError, ClientError):
+        return []
+    if not runtimes:
+        return []
+    return [_agentcore_cost_anomaly_finding()]
 
 
 def _runtime_invoke_restriction(
@@ -26090,7 +26257,7 @@ def lambda_handler(event, context):
     global cloudwatch_client, cloudtrail_client, oam_client, agentcore_client
     global kms_client, organizations_client
     global wafv2_client, route53resolver_client, cognito_client, events_client
-    global bedrock_client, xray_client
+    global bedrock_client, xray_client, ce_client
     start_time = time.time()
 
     try:
@@ -26138,6 +26305,9 @@ def lambda_handler(event, context):
         )
         # AC-19 reads where this region's trace segments go.
         xray_client = boto3.client("xray", config=boto3_config, region_name=region)
+        # AC-46 reads the account's cost anomaly alerting. Cost Explorer has
+        # one global endpoint, which botocore resolves from any region.
+        ce_client = boto3.client("ce", config=boto3_config, region_name=region)
 
         # Collect all findings
         all_findings = []
@@ -26656,6 +26826,11 @@ def lambda_handler(event, context):
                 ["AC-46"],
                 "Runtime Session Limits",
                 check_agentcore_runtime_session_limits,
+            ),
+            (
+                ["AC-46"],
+                "Runtime Cost Anomaly Alerting",
+                check_agentcore_runtime_cost_alerting,
             ),
             (
                 ["AC-47"],

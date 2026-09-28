@@ -35251,3 +35251,216 @@ class TestAC22TelemetryLinks:
         ]
         findings = agentcore_app.check_agentcore_telemetry_sink_scope()
         assert [f["Status"] for f in findings] == ["Passed", "Failed"]
+
+
+class TestAC46CostAnomalyAlerting:
+    """AIR-ACR-RT-04: spend is the one per-session limit AgentCore does not carry,
+    so the account must alert on anomalous spend across AWS services."""
+
+    _SERVICES = "arn:aws:ce::111122223333:anomalymonitor/services"
+    _CUSTOM = "arn:aws:ce::111122223333:anomalymonitor/custom"
+    _ACCOUNT = "arn:aws:ce::111122223333:anomalymonitor/account"
+
+    _MONITORS = {
+        _SERVICES: {
+            "MonitorArn": _SERVICES,
+            "MonitorName": "services",
+            "MonitorType": "DIMENSIONAL",
+            "MonitorDimension": "SERVICE",
+        },
+        _CUSTOM: {
+            "MonitorArn": _CUSTOM,
+            "MonitorName": "team-tag",
+            "MonitorType": "CUSTOM",
+        },
+        _ACCOUNT: {
+            "MonitorArn": _ACCOUNT,
+            "MonitorName": "linked",
+            "MonitorType": "DIMENSIONAL",
+            "MonitorDimension": "LINKED_ACCOUNT",
+        },
+    }
+
+    @staticmethod
+    def _subscription(name, monitors, statuses=("CONFIRMED",)):
+        return {
+            "SubscriptionArn": f"arn:aws:ce::111122223333:anomalysubscription/{name}",
+            "SubscriptionName": name,
+            "MonitorArnList": list(monitors),
+            "Subscribers": [
+                {"Address": f"ops{i}@example.com", "Type": "EMAIL", "Status": status}
+                for i, status in enumerate(statuses)
+            ],
+        }
+
+    def _run(self, mock_ac, mock_ce, subscriptions, runtimes=1):
+        _wire_runtimes(
+            mock_ac, [_bounded_runtime(f"rt-{i}") for i in range(1, runtimes + 1)]
+        )
+        if isinstance(subscriptions, Exception):
+            mock_ce.get_anomaly_subscriptions.side_effect = subscriptions
+        else:
+            mock_ce.get_anomaly_subscriptions.return_value = {
+                "AnomalySubscriptions": subscriptions
+            }
+        mock_ce.get_anomaly_monitors.side_effect = lambda MonitorArnList, **_: {
+            "AnomalyMonitors": [
+                self._MONITORS[arn] for arn in MonitorArnList if arn in self._MONITORS
+            ]
+        }
+        findings = agentcore_app.check_agentcore_runtime_cost_alerting()
+        for finding in findings:
+            assert finding["Check_ID"] == "AC-46"
+            assert finding["Finding"] == "AgentCore Runtime Cost Anomaly Alerting"
+            assert_finding_schema(finding)
+        return findings
+
+    @patch("agentcore_app.ce_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_confirmed_subscription_on_a_services_monitor_passes(
+        self, mock_ac, mock_ce
+    ):
+        (finding,) = self._run(
+            mock_ac,
+            mock_ce,
+            [
+                self._subscription("tagged", [self._CUSTOM]),
+                self._subscription("all-services", [self._SERVICES]),
+            ],
+            runtimes=3,
+        )
+        assert finding["Status"] == "Passed"
+        assert "all-services" in finding["Finding_Details"]
+        assert "tagged" not in finding["Finding_Details"]
+        assert "threshold is not judged" in finding["Finding_Details"]
+
+    @patch("agentcore_app.ce_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_no_subscription_fails(self, mock_ac, mock_ce):
+        (finding,) = self._run(mock_ac, mock_ce, [])
+        assert finding["Status"] == "Failed"
+        assert finding["Severity"] == "Medium"
+
+    @patch("agentcore_app.ce_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_every_subscriber_declined_fails(self, mock_ac, mock_ce):
+        (finding,) = self._run(
+            mock_ac,
+            mock_ce,
+            [
+                self._subscription("a", [self._SERVICES], ("DECLINED", "DECLINED")),
+                self._subscription("b", [self._SERVICES], ()),
+            ],
+        )
+        assert finding["Status"] == "Failed"
+        assert "2 Cost Anomaly Detection subscription(s)" in finding["Finding_Details"]
+        mock_ce.get_anomaly_monitors.assert_not_called()
+
+    @patch("agentcore_app.ce_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_one_live_subscriber_beside_a_declined_one_counts(self, mock_ac, mock_ce):
+        (finding,) = self._run(
+            mock_ac,
+            mock_ce,
+            [self._subscription("a", [self._SERVICES], ("DECLINED", "CONFIRMED"))],
+        )
+        assert finding["Status"] == "Passed"
+
+    @patch("agentcore_app.ce_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_monitor_on_another_dimension_fails(self, mock_ac, mock_ce):
+        (finding,) = self._run(
+            mock_ac, mock_ce, [self._subscription("linked", [self._ACCOUNT])]
+        )
+        assert finding["Status"] == "Failed"
+        assert "no monitor for every AWS service" in finding["Finding_Details"]
+
+    @patch("agentcore_app.ce_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_custom_monitor_is_na_not_passed(self, mock_ac, mock_ce):
+        (finding,) = self._run(
+            mock_ac, mock_ce, [self._subscription("tagged", [self._CUSTOM])]
+        )
+        assert finding["Status"] == "N/A"
+        assert "team-tag" in finding["Finding_Details"]
+
+    @patch("agentcore_app.ce_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_services_monitor_on_a_declined_subscription_does_not_count(
+        self, mock_ac, mock_ce
+    ):
+        (finding,) = self._run(
+            mock_ac,
+            mock_ce,
+            [
+                self._subscription("dead", [self._SERVICES], ("DECLINED",)),
+                self._subscription("linked", [self._ACCOUNT]),
+            ],
+        )
+        assert finding["Status"] == "Failed"
+
+    @pytest.mark.parametrize(
+        "operation,action",
+        [
+            ("get_anomaly_subscriptions", "ce:GetAnomalySubscriptions"),
+            ("get_anomaly_monitors", "ce:GetAnomalyMonitors"),
+        ],
+    )
+    @patch("agentcore_app.ce_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_denied_read_is_na_naming_the_action(
+        self, mock_ac, mock_ce, operation, action
+    ):
+        _wire_runtimes(mock_ac, [_bounded_runtime()])
+        mock_ce.get_anomaly_subscriptions.return_value = {
+            "AnomalySubscriptions": [self._subscription("a", [self._SERVICES])]
+        }
+        getattr(mock_ce, operation).side_effect = _make_client_error(
+            "AccessDeniedException", "denied"
+        )
+        (finding,) = agentcore_app.check_agentcore_runtime_cost_alerting()
+        assert finding["Status"] == "N/A"
+        assert (
+            f"{action} failed with AccessDeniedException" in finding["Finding_Details"]
+        )
+        assert (
+            "ce:GetAnomalySubscriptions and ce:GetAnomalyMonitors"
+            in finding["Resolution"]
+        )
+
+    @patch("agentcore_app.ce_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_subscriptions_are_read_across_pages(self, mock_ac, mock_ce):
+        _wire_runtimes(mock_ac, [_bounded_runtime()])
+        mock_ce.get_anomaly_subscriptions.side_effect = [
+            {
+                "AnomalySubscriptions": [self._subscription("a", [self._ACCOUNT])],
+                "NextPageToken": "t",
+            },
+            {"AnomalySubscriptions": [self._subscription("b", [self._SERVICES])]},
+        ]
+        mock_ce.get_anomaly_monitors.side_effect = lambda MonitorArnList, **_: {
+            "AnomalyMonitors": [self._MONITORS[arn] for arn in MonitorArnList]
+        }
+        (finding,) = agentcore_app.check_agentcore_runtime_cost_alerting()
+        assert finding["Status"] == "Passed"
+        assert "b" == finding["Finding_Details"].split("subscription ")[1].split(" ")[0]
+
+    @patch("agentcore_app.ce_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_no_runtime_reads_no_cost_configuration(self, mock_ac, mock_ce):
+        _wire_runtimes(mock_ac, [])
+        assert agentcore_app.check_agentcore_runtime_cost_alerting() == []
+        mock_ce.get_anomaly_subscriptions.assert_not_called()
+
+    @patch("agentcore_app.ce_client", None)
+    @patch("agentcore_app.agentcore_client")
+    def test_no_cost_explorer_client_is_na(self, mock_ac):
+        _wire_runtimes(mock_ac, [_bounded_runtime()])
+        (finding,) = agentcore_app.check_agentcore_runtime_cost_alerting()
+        assert finding["Status"] == "N/A"
+
+    def test_the_handler_runs_the_cost_leg_under_ac_46(self):
+        source = textwrap.dedent(inspect.getsource(agentcore_app.lambda_handler))
+        assert source.count("check_agentcore_runtime_cost_alerting") == 1
+        assert 'ce_client = boto3.client("ce"' in source
