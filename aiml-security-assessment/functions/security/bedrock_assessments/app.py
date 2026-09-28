@@ -2679,7 +2679,9 @@ def _principal_is_bounded(principal: Any) -> bool:
         values = [str(item).strip() for item in _as_list(principal)]
 
     values = [value for value in values if value]
-    return bool(values) and all(value != "*" for value in values)
+    return bool(values) and all(
+        "*" not in value and "?" not in value for value in values
+    )
 
 
 def _vpc_endpoint_policy_scope(document: Any) -> Dict[str, Any]:
@@ -2713,18 +2715,37 @@ def _vpc_endpoint_policy_scope(document: Any) -> Dict[str, Any]:
     for statement in statements:
         if str(statement.get("Effect", "")).upper() != "DENY":
             continue
-        for operator, key, _values in _condition_keys_by_operator(statement):
-            # Only a negated or Null test denies the principals outside the
-            # scope; StringEquals on a Deny would reject the scoped principal
-            # and leave everyone else allowed.
-            if _is_endpoint_scope_condition_key(key) and (
-                "not" in operator or operator == "null"
-            ):
-                return {
-                    "readable": True,
-                    "scoped": True,
-                    "detail": f"a Deny statement rejects every request outside {key}",
-                }
+        conditions = _condition_keys_by_operator(statement)
+        # Only a negated test on exact values denies the principals outside the
+        # scope; StringEquals on a Deny would reject the scoped principal and
+        # leave everyone else allowed, a wildcard value leaves every principal
+        # it matches allowed, and a second condition key or a narrowed
+        # Resource makes the Deny fire for part of the requests only.
+        if (
+            len(conditions) != 1
+            or "NotResource" in statement
+            or any(
+                str(resource).strip() != "*"
+                for resource in _as_list(statement.get("Resource", "*"))
+            )
+            or not _statement_matches_action(statement, "bedrock:invokemodel")
+        ):
+            continue
+        operator, key, values = conditions[0]
+        if (
+            _is_endpoint_scope_condition_key(key)
+            and "not" in _strip_condition_set_operator(operator)
+            and not operator.startswith("foranyvalue:")
+            and _condition_values_are_exact(values)
+        ):
+            return {
+                "readable": True,
+                "scoped": True,
+                "detail": (
+                    f"a Deny statement rejects every request outside {key} "
+                    f"{', '.join(map(str, values))}"
+                ),
+            }
 
     unbounded: List[str] = []
     bounded: List[str] = []
@@ -2734,11 +2755,19 @@ def _vpc_endpoint_policy_scope(document: Any) -> Dict[str, Any]:
             continue
 
         label = statement.get("Sid") or f"#{index + 1}"
+        # A scope key bounds the Allow only when a positive test pins it to
+        # exact values: a negated test admits everyone it does not name, an
+        # IfExists test admits a request without the key, and a wildcard value
+        # admits every principal or network it matches.
         scope_keys = sorted(
             {
                 key
-                for _operator, key, _values in _condition_keys_by_operator(statement)
+                for operator, key, values in _condition_keys_by_operator(statement)
                 if _is_endpoint_scope_condition_key(key)
+                and "not" not in _strip_condition_set_operator(operator)
+                and not _strip_condition_set_operator(operator).endswith("ifexists")
+                and _strip_condition_set_operator(operator) != "null"
+                and _condition_values_are_exact(values)
             }
         )
 
@@ -3506,16 +3535,18 @@ def _judge_log_bucket_retention(
             f"{describe_api_error(error, 's3:GetBucketObjectLockConfiguration', region)}"
         )
         return
-    lock_note = (
-        f"; Object Lock default retention ({lock}) holds each version until it "
-        "ends, so lifecycle deletion waits for the longer of the two periods"
-        if lock
-        else ""
-    )
-    retained.append(
-        f"{label} '{bucket_name}' lifecycle: "
-        f"{'; '.join(lifecycle['expirations'])}{lock_note}"
-    )
+    if lock:
+        unretained.append(
+            f"{label} '{bucket_name}' has an Object Lock default retention "
+            f"({lock}) beside its lifecycle rule ({'; '.join(lifecycle['expirations'])}). "
+            "S3 Lifecycle does not delete an object version while Object Lock "
+            "retains it, so the lifecycle period is not the period the record is "
+            "kept, and the write-once record shares a bucket with the expiring one"
+        )
+    else:
+        retained.append(
+            f"{label} '{bucket_name}' lifecycle: {'; '.join(lifecycle['expirations'])}"
+        )
 
     try:
         replicas = _replica_buckets(s3_client, bucket_name)
@@ -3525,6 +3556,16 @@ def _judge_log_bucket_retention(
             f"{describe_api_error(error, 's3:GetReplicationConfiguration', region)}"
         )
         return
+    if replicas:
+        undetermined.append(
+            f"{label} '{bucket_name}': an enabled replication rule copies it to "
+            f"{', '.join(repr(r) for r in replicas)}, and S3 Lifecycle takes no "
+            "action on an object whose replication status is PENDING or FAILED. "
+            "That status is returned per object only by HeadObject "
+            "(ReplicationStatus), which needs s3:GetObject on the bucket, and the "
+            "assessment role holds s3:GetObject only on its own report bucket, so "
+            "whether any log object is held back from expiry was not read"
+        )
     for replica in replicas:
         replica_label = f"Replica S3 bucket (copied from '{bucket_name}')"
         try:
@@ -3613,7 +3654,8 @@ def _invocation_log_retention_findings(
                 check_id="BR-04",
                 finding_name=INVOCATION_LOG_RETENTION_FINDING,
                 finding_details=(
-                    f"Invocation logs have no stated retention period: {deficiency}."
+                    "Invocation log retention is not set by a lifecycle rule "
+                    f"alone: {deficiency}."
                 ),
                 resolution=INVOCATION_LOG_RETENTION_RESOLUTION,
                 reference=INVOCATION_LOG_RETENTION_REFERENCE,
@@ -3653,9 +3695,8 @@ def _invocation_log_retention_findings(
                     f"Invocation log retention could not be assessed: {gap}."
                 ),
                 resolution=(
-                    "Grant the assessment role logs:DescribeLogGroups and "
-                    "s3:GetLifecycleConfiguration on the invocation-log "
-                    "destinations, then re-run the assessment."
+                    "Grant the assessment role the action named above on the "
+                    "invocation-log destinations, then re-run the assessment."
                 ),
                 reference=INVOCATION_LOG_RETENTION_REFERENCE,
                 severity="Informational",
@@ -3665,6 +3706,40 @@ def _invocation_log_retention_findings(
         )
 
     return retention_findings
+
+
+AGENTCORE_MEMORY_EXPIRY_FINDING = "AgentCore Memory Event Retention"
+
+
+def _agentcore_memory_expiry_finding(region: str) -> Dict[str, Any]:
+    """Report the AgentCore Memory retention leg of AIR-FND-DAT-08 as unread.
+
+    Each memory's eventExpiryDuration sets how long its events are kept, and
+    the Bedrock assessment role holds neither bedrock-agentcore:ListMemories
+    nor bedrock-agentcore:GetMemory, so no memory in the account is judged.
+    """
+    return create_finding(
+        check_id="BR-04",
+        finding_name=AGENTCORE_MEMORY_EXPIRY_FINDING,
+        finding_details=(
+            "AgentCore Memory event retention was not read: each memory's "
+            "eventExpiryDuration is returned by GetMemory, and the assessment "
+            "role holds neither bedrock-agentcore:ListMemories nor "
+            "bedrock-agentcore:GetMemory, so no memory in this account was "
+            "judged on how long it keeps session events."
+        ),
+        resolution=(
+            "Grant the Bedrock assessment role bedrock-agentcore:ListMemories and "
+            "bedrock-agentcore:GetMemory, then re-run the assessment."
+        ),
+        reference=(
+            "https://docs.aws.amazon.com/bedrock-agentcore-control/latest/APIReference/"
+            "API_GetMemory.html"
+        ),
+        severity="Informational",
+        status="N/A",
+        region=region,
+    )
 
 
 INVOCATION_LOG_COVERAGE_FINDING = "Bedrock Invocation Log Data Coverage"
@@ -3967,7 +4042,13 @@ def check_bedrock_logging_configuration(region: str = "") -> Dict[str, Any]:
                     create_finding(
                         check_id="BR-04",
                         finding_name="Bedrock Model Invocation Logging Check",
-                        finding_details=f"Model invocation logging is properly configured with delivery to: {', '.join(enabled_destinations)}",
+                        finding_details=(
+                            "Model invocation logging names delivery to: "
+                            f"{', '.join(enabled_destinations)}. This row records "
+                            "the configured destinations only; the data types "
+                            "delivered and each destination's retention and "
+                            "encryption are judged in their own rows."
+                        ),
                         resolution="No action required",
                         reference="https://docs.aws.amazon.com/bedrock/latest/userguide/model-invocation-logging.html",
                         severity="Medium",
@@ -4757,9 +4838,13 @@ def _prompt_numbered_versions(bedrock_client: Any, prompt_id: str) -> Dict[str, 
 
 
 def _prompt_version_encryption_key(
-    bedrock_client: Any, prompt_id: str, version: str
+    bedrock_client: Any, prompt_id: str, version: str, region: str = ""
 ) -> Dict[str, Any]:
-    """Read customerEncryptionKeyArn from one numbered prompt version."""
+    """
+    Read customerEncryptionKeyArn from one numbered prompt version and judge
+    the key it names with kms:DescribeKey: an ARN alone does not say the key is
+    customer managed or enabled.
+    """
     try:
         detail = bedrock_client.get_prompt(
             promptIdentifier=prompt_id, promptVersion=version
@@ -4769,12 +4854,18 @@ def _prompt_version_encryption_key(
             "readable": False,
             "error": get_assessment_error_label(error),
             "key_arn": "",
+            "key_status": "",
+            "key_text": "",
         }
     prompt = detail.get("prompt", detail)
+    key_arn = str(prompt.get("customerEncryptionKeyArn") or "")
+    key_status, key_text = _kms_key_verdict(key_arn, region) if key_arn else ("", "")
     return {
         "readable": True,
         "error": "",
-        "key_arn": str(prompt.get("customerEncryptionKeyArn") or ""),
+        "key_arn": key_arn,
+        "key_status": key_status,
+        "key_text": key_text,
     }
 
 
@@ -4809,6 +4900,10 @@ def _flow_prompt_node_references(definition: Dict[str, Any]) -> List[Dict[str, s
                 references.append(
                     {"node": node.get("name") or "unnamed", "arn": str(prompt_arn)}
                 )
+            elif source.get("inline"):
+                # An inline prompt is text in the flow definition itself: no
+                # Prompt management version pins it and no prompt key encrypts it.
+                references.append({"node": node.get("name") or "unnamed", "arn": ""})
     return references
 
 
@@ -4829,6 +4924,7 @@ def _flow_prompt_version_references(bedrock_client: Any) -> Dict[str, Any]:
         "error": "",
         "pinned": [],
         "unpinned": [],
+        "inline": [],
         "unreadable_flows": [],
     }
 
@@ -4904,6 +5000,9 @@ def _flow_prompt_version_references(bedrock_client: Any) -> Dict[str, Any]:
                 flow_info.get("definition") or {}
             ):
                 entry = {"flow": flow_name, "flow_version": flow_version, **reference}
+                if not reference["arn"]:
+                    result["inline"].append(entry)
+                    continue
                 version = _flow_prompt_arn_version(reference["arn"])
                 if version:
                     result["pinned"].append({**entry, "version": version})
@@ -5018,12 +5117,29 @@ def _prompt_version_findings(
         for state in versioned
     ]
     aws_owned = [(state, keys) for state, keys in aws_owned if keys]
+    wrong_key = [
+        (
+            state,
+            versions_where(
+                state,
+                lambda key: key["readable"] and key.get("key_status") == "Failed",
+            ),
+        )
+        for state in versioned
+    ]
+    wrong_key = [(state, keys) for state, keys in wrong_key if keys]
     unreadable_key = [
-        (state, versions_where(state, lambda key: not key["readable"]))
+        (
+            state,
+            versions_where(
+                state,
+                lambda key: not key["readable"] or key.get("key_status") == "N/A",
+            ),
+        )
         for state in versioned
     ]
     unreadable_key = [(state, keys) for state, keys in unreadable_key if keys]
-    failed_names = {state["name"] for state, _ in aws_owned}
+    failed_names = {state["name"] for state, _ in aws_owned + wrong_key}
     unread_names = {state["name"] for state, _ in unreadable_key}
     encrypted = [
         state
@@ -5057,6 +5173,34 @@ def _prompt_version_findings(
             )
         )
 
+    if wrong_key:
+        rows.append(
+            create_finding(
+                check_id="BR-07",
+                finding_name=PROMPT_VERSION_ENCRYPTION_FINDING,
+                finding_details=(
+                    "{} of {} versioned prompt(s) have a numbered version whose "
+                    "customerEncryptionKeyArn kms:DescribeKey does not report as an "
+                    "enabled customer managed key: {}.".format(
+                        len(wrong_key),
+                        len(versioned),
+                        "; ".join(
+                            "{} version {}: {}".format(
+                                state["name"], key["version"], key["key_text"]
+                            )
+                            for state, keys in wrong_key[:MAX_REPORTED_PROMPTS]
+                            for key in keys
+                        ),
+                    )
+                ),
+                resolution="Recreate each named prompt with an enabled customer managed KMS key in customerEncryptionKeyArn, create the version to be referenced, and delete the numbered versions that carry the other key with DeletePrompt.",
+                reference=PROMPT_MANAGEMENT_REFERENCE,
+                severity="Medium",
+                status="Failed",
+                region=region,
+            )
+        )
+
     if encrypted:
         rows.append(
             create_finding(
@@ -5064,7 +5208,8 @@ def _prompt_version_findings(
                 finding_name=PROMPT_VERSION_ENCRYPTION_FINDING,
                 finding_details=(
                     "{} of {} versioned prompt(s) encrypt every numbered version with "
-                    "a customer-managed KMS key: {}.".format(
+                    "a KMS key that kms:DescribeKey reports as customer managed and "
+                    "Enabled: {}.".format(
                         len(encrypted),
                         len(versioned),
                         ", ".join(
@@ -5089,20 +5234,23 @@ def _prompt_version_findings(
                 check_id="BR-07",
                 finding_name=PROMPT_VERSION_ENCRYPTION_FINDING,
                 finding_details=(
-                    "A numbered version of {} of {} versioned prompt(s) could not be "
-                    "read, so its encryption key is unknown: {}.".format(
+                    "A numbered version of {} of {} versioned prompt(s) or the KMS "
+                    "key it names could not be read, so whether it is encrypted "
+                    "with a customer managed key is unknown: {}.".format(
                         len(unreadable_key),
                         len(versioned),
                         "; ".join(
                             "{} version {} ({})".format(
-                                state["name"], key["version"], key["error"]
+                                state["name"],
+                                key["version"],
+                                key["error"] or key.get("key_text"),
                             )
                             for state, keys in unreadable_key[:MAX_REPORTED_PROMPTS]
                             for key in keys
                         ),
                     )
                 ),
-                resolution="Grant bedrock:GetPrompt on each prompt version and re-run the assessment.",
+                resolution="Grant bedrock:GetPrompt on each prompt version and kms:DescribeKey on the key it names, then re-run the assessment.",
                 reference=PROMPT_MANAGEMENT_REFERENCE,
                 severity="Informational",
                 status="N/A",
@@ -5137,7 +5285,39 @@ def _flow_prompt_version_findings(
         ]
 
     rows = []
-    total = len(references["pinned"]) + len(references["unpinned"])
+    total = (
+        len(references["pinned"])
+        + len(references["unpinned"])
+        + len(references.get("inline") or [])
+    )
+
+    if references.get("inline"):
+        rows.append(
+            create_finding(
+                check_id="BR-07",
+                finding_name=FLOW_PROMPT_VERSION_FINDING,
+                finding_details=(
+                    "{} of {} prompt node(s) in the flow definitions read define "
+                    "their prompt inline instead of referencing a Prompt management "
+                    "version, so no numbered prompt version pins the text and no "
+                    "prompt encryption key covers it: {}.".format(
+                        len(references["inline"]),
+                        total,
+                        "; ".join(
+                            "{} node '{}'".format(
+                                _flow_reference_label(entry), entry["node"]
+                            )
+                            for entry in references["inline"][:MAX_REPORTED_PROMPTS]
+                        ),
+                    )
+                ),
+                resolution="Move each named inline prompt into Prompt management, create a numbered version, and point the node at that version's promptArn.",
+                reference=PROMPT_FLOWS_REFERENCE,
+                severity="Medium",
+                status="Failed",
+                region=region,
+            )
+        )
 
     if references["unpinned"]:
         rows.append(
@@ -5226,7 +5406,135 @@ def _flow_prompt_version_findings(
     return rows
 
 
-def check_bedrock_prompt_management(region: str = "") -> Dict[str, Any]:
+PROMPT_WRITE_ACTIONS = ("bedrock:updateprompt", "bedrock:createpromptversion")
+
+PROMPT_WRITE_SCOPE_FINDING = "Bedrock Prompt Change Permission Scope"
+
+
+def _resource_has_wildcard(resource: Any) -> bool:
+    """A * or ? in any segment of a Resource entry leaves it unbounded."""
+    return not isinstance(resource, str) or "*" in resource or "?" in resource
+
+
+def _prompt_write_scope_findings(
+    permission_cache: Optional[Dict[str, Any]], region: str
+) -> List[Dict[str, Any]]:
+    """
+    Judge which roles and users may change a prompt or publish a new version of
+    it, and whether each such grant names specific prompts.
+    """
+    if permission_cache is None:
+        return [
+            create_finding(
+                check_id="BR-07",
+                finding_name=PROMPT_WRITE_SCOPE_FINDING,
+                finding_details=(
+                    "The IAM permissions cache is unavailable, so which principals "
+                    "may call bedrock:UpdatePrompt or bedrock:CreatePromptVersion "
+                    "was not read."
+                ),
+                resolution=COULD_NOT_ASSESS_RESOLUTION,
+                reference=PROMPT_MANAGEMENT_REFERENCE,
+                severity="Informational",
+                status="N/A",
+                region=region,
+            )
+        ]
+    unbounded = []
+    scoped = []
+    for collection, kind in (
+        ("role_permissions", "role"),
+        ("user_permissions", "user"),
+    ):
+        for name, permissions in (permission_cache.get(collection) or {}).items():
+            statements = _identity_statements(permissions)
+            gaps = []
+            granted = False
+            for action in PROMPT_WRITE_ACTIONS:
+                if _boundary_allowance(permissions, action) == "denied":
+                    continue
+                if any(_merged_account_wide_deny(st, action) for st in statements):
+                    continue
+                for statement in statements:
+                    if str(
+                        statement.get("Effect", "")
+                    ).upper() != "ALLOW" or not _merged_statement_matches(
+                        statement, action
+                    ):
+                        continue
+                    granted = True
+                    if "NotResource" in statement:
+                        gaps.append(f"{action} through NotResource")
+                        continue
+                    wide = [
+                        str(resource)
+                        for resource in _as_list(statement.get("Resource"))
+                        if _resource_has_wildcard(resource)
+                    ]
+                    if wide:
+                        gaps.append(f"{action} on {', '.join(wide)}")
+            if gaps:
+                unbounded.append(f"{kind} '{name}' ({'; '.join(sorted(set(gaps)))})")
+            elif granted:
+                scoped.append(f"{kind} '{name}'")
+
+    findings: Dict[str, Any] = {"status": "PASS", "csv_data": []}
+    if unbounded:
+        findings["csv_data"].append(
+            create_finding(
+                check_id="BR-07",
+                finding_name=PROMPT_WRITE_SCOPE_FINDING,
+                finding_details=(
+                    "{} role(s) or user(s) may change prompts or publish prompt "
+                    "versions on a Resource with a wildcard in it, so they can "
+                    "alter any prompt the pattern reaches: {}. {}".format(
+                        len(unbounded),
+                        "; ".join(unbounded[:MAX_REPORTED_PROMPTS]),
+                        SCP_NOT_EVALUATED_NOTE,
+                    )
+                ),
+                resolution="Scope bedrock:UpdatePrompt and bedrock:CreatePromptVersion to the ARNs of the prompts each principal owns, with no wildcard in any segment.",
+                reference=PROMPT_MANAGEMENT_REFERENCE,
+                severity="Medium",
+                status="Failed",
+                region=region,
+            )
+        )
+    else:
+        findings["csv_data"].append(
+            create_finding(
+                check_id="BR-07",
+                finding_name=PROMPT_WRITE_SCOPE_FINDING,
+                finding_details=(
+                    "{} role(s) or user(s) may change prompts or publish prompt "
+                    "versions, and each such grant names prompt ARNs with no "
+                    "wildcard{}.".format(
+                        len(scoped),
+                        ": " + "; ".join(scoped[:MAX_REPORTED_PROMPTS])
+                        if scoped
+                        else "",
+                    )
+                ),
+                resolution="No action required.",
+                reference=PROMPT_MANAGEMENT_REFERENCE,
+                severity="Medium",
+                status="Passed",
+                region=region,
+            )
+        )
+    return _apply_cache_population_gaps(
+        findings,
+        permission_cache,
+        "BR-07",
+        PROMPT_WRITE_SCOPE_FINDING,
+        PROMPT_MANAGEMENT_REFERENCE,
+        region,
+    )["csv_data"]
+
+
+def check_bedrock_prompt_management(
+    region: str = "", permission_cache: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
     """
     Check if Amazon Bedrock Prompt Management feature is being used
 
@@ -5322,7 +5630,7 @@ def check_bedrock_prompt_management(region: str = "") -> Dict[str, Any]:
                         {
                             "version": version,
                             **_prompt_version_encryption_key(
-                                bedrock_client, prompt_id, version
+                                bedrock_client, prompt_id, version, region
                             ),
                         }
                         for version in listing["versions"]
@@ -5339,11 +5647,6 @@ def check_bedrock_prompt_management(region: str = "") -> Dict[str, Any]:
                     )
 
                 version_rows = _prompt_version_findings(version_states, region)
-                version_rows.extend(
-                    _flow_prompt_version_findings(
-                        _flow_prompt_version_references(bedrock_client), region
-                    )
-                )
                 if any(row["Status"] == "Failed" for row in version_rows):
                     findings["status"] = "WARN"
                 findings["csv_data"].extend(version_rows)
@@ -5386,6 +5689,16 @@ def check_bedrock_prompt_management(region: str = "") -> Dict[str, Any]:
                     region=region,
                 )
             )
+
+        # A flow can run an inline or unpinned prompt with no Prompt management
+        # prompt in the Region, so the flow and permission legs run either way.
+        later_rows = _flow_prompt_version_findings(
+            _flow_prompt_version_references(bedrock_client), region
+        )
+        later_rows.extend(_prompt_write_scope_findings(permission_cache, region))
+        if any(row["Status"] == "Failed" for row in later_rows):
+            findings["status"] = "WARN"
+        findings["csv_data"].extend(later_rows)
 
         return findings
 
@@ -6689,11 +7002,11 @@ def _invocation_log_bucket_encryption_rows(
                 create_finding(
                     check_id="BR-12",
                     finding_name="Bedrock Invocation Log Encryption Missing",
-                    finding_details=f"{label} '{bucket_name}' has NO encryption configured. Logs containing prompts and responses are stored unencrypted.",
-                    resolution="Enable SSE-KMS encryption with a customer-managed key on the S3 bucket immediately",
+                    finding_details=f"GetBucketEncryption on {label.lower()} '{bucket_name}' returned ServerSideEncryptionConfigurationNotFoundError, so the bucket has no default encryption rule and no customer managed KMS key encrypts the prompts and responses written to it. Whether S3 applied its own SSE-S3 encryption to each object was not read.",
+                    resolution="Set default encryption on the bucket to SSE-KMS with a customer managed key.",
                     reference=INVOCATION_LOG_ENCRYPTION_REFERENCE,
-                    severity="Informational",
-                    status="N/A",
+                    severity="High",
+                    status="Failed",
                     region=region,
                 )
             ], "FAIL"
@@ -8953,6 +9266,7 @@ def check_bedrock_custom_model_kms_encryption(region: str = "") -> Dict[str, Any
 
             models_with_aws_keys = []
             models_with_customer_keys = []
+            models_with_wrong_keys = []
             models_unknown = []
 
             for model in custom_models:
@@ -8974,12 +9288,18 @@ def check_bedrock_custom_model_kms_encryption(region: str = "") -> Dict[str, Any
                         models_with_aws_keys.append(
                             {"name": model_name, "arn": model_arn}
                         )
-                    elif kms_key_id.startswith("arn:aws:kms"):
-                        # Customer-managed KMS key
-                        models_with_customer_keys.append(model_name)
                     else:
-                        # Unknown key format
-                        models_unknown.append(model_name)
+                        # An ARN names a key; only DescribeKey says who manages
+                        # it and whether it is enabled.
+                        key_status, key_text = _kms_key_verdict(kms_key_id, region)
+                        if key_status == "Passed":
+                            models_with_customer_keys.append(model_name)
+                        elif key_status == "Failed":
+                            models_with_wrong_keys.append(
+                                {"name": model_name, "text": key_text}
+                            )
+                        else:
+                            models_unknown.append(f"{model_name} ({key_text})")
 
                 except ClientError as detail_error:
                     error_code = detail_error.response.get("Error", {}).get("Code", "")
@@ -8987,7 +9307,10 @@ def check_bedrock_custom_model_kms_encryption(region: str = "") -> Dict[str, Any
                         logger.warning(
                             f"Could not get details for model {model_name}: {error_code}"
                         )
-                    models_unknown.append(model_name)
+                    models_unknown.append(
+                        f"{model_name} (GetCustomModel: "
+                        f"{get_assessment_error_label(detail_error)})"
+                    )
 
             if models_with_aws_keys:
                 findings["status"] = "WARN"
@@ -9009,12 +9332,41 @@ def check_bedrock_custom_model_kms_encryption(region: str = "") -> Dict[str, Any
                         )
                     )
 
+            for model_info in models_with_wrong_keys:
+                findings["status"] = "WARN"
+                findings["csv_data"].append(
+                    create_finding(
+                        check_id="BR-17",
+                        finding_name="Custom Model Customer-Managed KMS Encryption Check",
+                        finding_details=f"Custom model '{model_info['name']}' names a KMS key that is not an enabled customer managed key: {model_info['text']}.",
+                        resolution="Retrain the model with customizationConfig.kmsKeyArn set to an enabled customer managed KMS key, then delete the model that carries the other key.",
+                        reference="https://docs.aws.amazon.com/bedrock/latest/userguide/encryption-custom-job.html",
+                        severity="High",
+                        status="Failed",
+                        region=region,
+                    )
+                )
+
+            if models_unknown:
+                findings["csv_data"].append(
+                    create_finding(
+                        check_id="BR-17",
+                        finding_name="Custom Model Customer-Managed KMS Encryption Check",
+                        finding_details=f"The encryption key of {len(models_unknown)} of {len(custom_models)} custom model(s) could not be judged, so whether each uses a customer managed key is unknown: {'; '.join(models_unknown[:10])}.",
+                        resolution="Grant bedrock:GetCustomModel on each model and kms:DescribeKey on the key it names, then re-run the assessment.",
+                        reference="https://docs.aws.amazon.com/bedrock/latest/userguide/encryption-custom-job.html",
+                        severity="Informational",
+                        status="N/A",
+                        region=region,
+                    )
+                )
+
             if models_with_customer_keys:
                 findings["csv_data"].append(
                     create_finding(
                         check_id="BR-17",
                         finding_name="Custom Model Customer-Managed KMS Encryption Check",
-                        finding_details=f"{len(models_with_customer_keys)} custom models are using customer-managed KMS keys for encryption",
+                        finding_details=f"{len(models_with_customer_keys)} of {len(custom_models)} custom model(s) are encrypted with a KMS key that kms:DescribeKey reports as customer managed and Enabled",
                         resolution="No action required. Continue using customer-managed keys for new custom models.",
                         reference="https://docs.aws.amazon.com/bedrock/latest/userguide/encryption-custom-job.html",
                         severity="Medium",
@@ -9784,11 +10136,15 @@ def _assess_s3_vectors_store(
     sse_type = encryption.get("sseType") or "AES256 (service default)"
     kms_key_arn = encryption.get("kmsKeyArn") or ""
     encryption_ok = encryption.get("sseType") == "aws:kms" and bool(kms_key_arn)
+    key_unreadable = ""
     if encryption_ok:
-        encryption_detail = (
-            f"vector bucket encryption is SSE-KMS with customer-managed key "
-            f"{kms_key_arn}"
-        )
+        # kmsKeyArn names a key; DescribeKey says who manages it and its state.
+        key_status, key_text = _kms_key_verdict(kms_key_arn, bucket_region)
+        encryption_detail = f"vector bucket encryption is SSE-KMS and {key_text}"
+        if key_status == "Failed":
+            encryption_ok = False
+        elif key_status == "N/A":
+            key_unreadable = key_text
     else:
         encryption_detail = (
             f"vector bucket encryption is sseType={sse_type}"
@@ -9860,10 +10216,17 @@ def _assess_s3_vectors_store(
                     "encryptionConfiguration of its own and inherits the bucket's"
                 )
             elif index_sse == "aws:kms" and index_kms_key_arn:
-                index_detail = (
-                    f"vector index '{index_label}' encryption is SSE-KMS with "
-                    f"customer-managed key {index_kms_key_arn}"
+                index_key_status, index_key_text = _kms_key_verdict(
+                    index_kms_key_arn, bucket_region
                 )
+                index_detail = (
+                    f"vector index '{index_label}' encryption is SSE-KMS and "
+                    f"{index_key_text}"
+                )
+                if index_key_status == "Failed":
+                    index_failed = True
+                elif index_key_status == "N/A":
+                    key_unreadable = index_key_text
             else:
                 index_failed = True
                 index_detail = (
@@ -9938,7 +10301,7 @@ def _assess_s3_vectors_store(
             "detail": detail,
             "resolution": S3_VECTORS_RESOLUTION,
         }
-    if index_unreadable or policy_unreadable:
+    if index_unreadable or policy_unreadable or key_unreadable:
         return {
             "status": "N/A",
             "severity": "Informational",
@@ -14002,6 +14365,8 @@ def check_bedrock_imported_model_kms_encryption(region: str = "") -> Dict[str, A
 
             models_with_aws_keys = []
             models_with_customer_keys = []
+            models_with_wrong_keys = []
+            models_unknown = []
 
             for model in imported_models:
                 model_arn = model.get("modelArn")
@@ -14014,12 +14379,20 @@ def check_bedrock_imported_model_kms_encryption(region: str = "") -> Dict[str, A
                     # GetImportedModel reports the encryption key as modelKmsKeyArn.
                     kms_key_arn = model_detail.get("modelKmsKeyArn")
 
-                    if kms_key_arn and kms_key_arn.startswith("arn:aws:kms"):
-                        models_with_customer_keys.append(model_name)
-                    else:
+                    if not kms_key_arn:
                         models_with_aws_keys.append(
                             {"name": model_name, "arn": model_arn}
                         )
+                    else:
+                        key_status, key_text = _kms_key_verdict(kms_key_arn, region)
+                        if key_status == "Passed":
+                            models_with_customer_keys.append(model_name)
+                        elif key_status == "Failed":
+                            models_with_wrong_keys.append(
+                                {"name": model_name, "text": key_text}
+                            )
+                        else:
+                            models_unknown.append(f"{model_name} ({key_text})")
 
                 except ClientError as detail_error:
                     error_code = detail_error.response.get("Error", {}).get("Code", "")
@@ -14027,6 +14400,10 @@ def check_bedrock_imported_model_kms_encryption(region: str = "") -> Dict[str, A
                         logger.warning(
                             f"Could not get details for imported model {model_name}: {error_code}"
                         )
+                    models_unknown.append(
+                        f"{model_name} (GetImportedModel: "
+                        f"{get_assessment_error_label(detail_error)})"
+                    )
 
             if models_with_aws_keys:
                 findings["status"] = "WARN"
@@ -14048,12 +14425,41 @@ def check_bedrock_imported_model_kms_encryption(region: str = "") -> Dict[str, A
                         )
                     )
 
+            for model_info in models_with_wrong_keys:
+                findings["status"] = "WARN"
+                findings["csv_data"].append(
+                    create_finding(
+                        check_id="BR-30",
+                        finding_name="Imported Model Customer-Managed KMS Encryption Check",
+                        finding_details=f"Imported model '{model_info['name']}' names a KMS key that is not an enabled customer managed key: {model_info['text']}.",
+                        resolution="Re-import the model specifying an enabled customer managed KMS key (modelKmsKeyArn), then delete the model that carries the other key.",
+                        reference="https://docs.aws.amazon.com/bedrock/latest/userguide/model-customization-import-model.html",
+                        severity="High",
+                        status="Failed",
+                        region=region,
+                    )
+                )
+
+            if models_unknown:
+                findings["csv_data"].append(
+                    create_finding(
+                        check_id="BR-30",
+                        finding_name="Imported Model Customer-Managed KMS Encryption Check",
+                        finding_details=f"The encryption key of {len(models_unknown)} of {len(imported_models)} imported model(s) could not be judged, so whether each uses a customer managed key is unknown: {'; '.join(models_unknown[:10])}.",
+                        resolution="Grant bedrock:GetImportedModel on each model and kms:DescribeKey on the key it names, then re-run the assessment.",
+                        reference="https://docs.aws.amazon.com/bedrock/latest/userguide/model-customization-import-model.html",
+                        severity="Informational",
+                        status="N/A",
+                        region=region,
+                    )
+                )
+
             if models_with_customer_keys:
                 findings["csv_data"].append(
                     create_finding(
                         check_id="BR-30",
                         finding_name="Imported Model Customer-Managed KMS Encryption Check",
-                        finding_details=f"{len(models_with_customer_keys)} imported models are using customer-managed KMS keys for encryption",
+                        finding_details=f"{len(models_with_customer_keys)} of {len(imported_models)} imported model(s) are encrypted with a KMS key that kms:DescribeKey reports as customer managed and Enabled",
                         resolution="No action required. Continue using customer-managed keys for imported models.",
                         reference="https://docs.aws.amazon.com/bedrock/latest/userguide/model-customization-import-model.html",
                         severity="Medium",
@@ -15579,23 +15985,26 @@ def check_bedrock_automated_reasoning_policy_encryption(
             try:
                 detail = client.get_automated_reasoning_policy(policyArn=policy_arn)
                 kms_key = detail.get("kmsKeyArn")
+                if kms_key:
+                    key_status, key_text = _kms_key_verdict(kms_key, region)
+                else:
+                    key_status = "Failed"
+                    key_text = "no kmsKeyArn is set, so an AWS owned key encrypts it"
                 findings["csv_data"].append(
                     create_finding(
                         check_id="BR-38",
                         finding_name="Automated Reasoning Policy CMK Encryption",
-                        finding_details=(
-                            f"Automated Reasoning policy '{policy_name}' uses customer-managed KMS key {kms_key}."
-                            if kms_key
-                            else f"Automated Reasoning policy '{policy_name}' does not use a customer-managed KMS key."
-                        ),
+                        finding_details=f"Automated Reasoning policy '{policy_name}': {key_text}.",
                         resolution=(
                             "No action required"
-                            if kms_key
-                            else "Recreate or update the policy to use a customer-managed KMS key."
+                            if key_status == "Passed"
+                            else "Grant kms:DescribeKey on the key and retry."
+                            if key_status == "N/A"
+                            else "Recreate or update the policy to use an enabled customer managed KMS key."
                         ),
                         reference=reference,
-                        severity="Medium",
-                        status="Passed" if kms_key else "Failed",
+                        severity="Medium" if key_status != "N/A" else "Informational",
+                        status=key_status,
                         region=region,
                     )
                 )
@@ -17224,10 +17633,19 @@ def check_bedrock_model_allow_list(
 
 REGION_CONDITION_KEY = "aws:requestedregion"
 
+# Every IAM action that sends a prompt to a model: Converse and ConverseStream
+# authorize as InvokeModel and InvokeModelWithResponseStream, agents, flows and
+# RetrieveAndGenerate invoke a model on the caller's behalf, and an AgentCore
+# runtime is invoked through bedrock-agentcore:InvokeAgentRuntime.
 REGION_CONTROL_ACTIONS = (
     "bedrock:invokemodel",
     "bedrock:invokemodelwithresponsestream",
     "bedrock:createmodelinvocationjob",
+    "bedrock:invokeagent",
+    "bedrock:invokeinlineagent",
+    "bedrock:invokeflow",
+    "bedrock:retrieveandgenerate",
+    "bedrock-agentcore:invokeagentruntime",
 )
 
 GLOBAL_INFERENCE_REGION_VALUE = "unspecified"
@@ -17402,9 +17820,28 @@ def _scp_region_controls(
                 continue
             base = _strip_condition_set_operator(operator)
             if key in REGION_DENY_EXEMPTION_KEYS and "not" in base:
-                exemptions.append(
-                    "{} {} {}".format(operator, key, ", ".join(map(str, values)))
+                exemption = "{} {} {}".format(
+                    operator, key, ", ".join(map(str, values))
                 )
+                # An SCP governs only this account's principals, so a wildcard
+                # partition or account segment still names this account; the
+                # resource segment (role/ or user/ path and name) must be exact.
+                patterns = [
+                    str(value)
+                    for value in values
+                    if _resource_has_wildcard(str(value).split(":", 5)[-1])
+                    or len(str(value).split(":", 5)) < 6
+                ]
+                if patterns or not values:
+                    gaps.append(
+                        "its {} exemption {} has a wildcard in its role or user "
+                        "name, or is not an ARN, so every principal whose ARN "
+                        "matches it, including one created later, is exempt".format(
+                            key, ", ".join(patterns) or "(no value)"
+                        )
+                    )
+                else:
+                    exemptions.append(exemption)
             elif key == GLOBAL_PROFILE_CONDITION_KEY and "not" not in base:
                 profile_scope.extend(str(value) for value in values)
             else:
@@ -17412,7 +17849,20 @@ def _scp_region_controls(
                     f"it also requires {operator} on {key}, so it denies only when "
                     "that test holds too"
                 )
-        if "NotResource" in statement or any(
+        # A NotResource Deny still denies every resource of a service none of
+        # its values can name, so it narrows only the actions of a service
+        # whose ARNs one of the values matches.
+        covered_services = {action.split(":", 1)[0] for action in covered}
+        narrowing_not_resource = "NotResource" in statement and any(
+            not isinstance(value, str)
+            or len(value.split(":")) < 3
+            or any(
+                _wildcard_matches(value.split(":")[2].lower(), service)
+                for service in covered_services
+            )
+            for value in _as_list(statement.get("NotResource"))
+        )
+        if narrowing_not_resource or any(
             str(resource).strip() != "*"
             for resource in _as_list(statement.get("Resource", "*"))
         ):
@@ -17456,8 +17906,7 @@ def _scp_region_controls(
                 every = [
                     value
                     for value in regions
-                    if _wildcard_matches(value, GLOBAL_INFERENCE_REGION_VALUE)
-                    and _wildcard_matches(value, UNLISTED_REGION_PROBE)
+                    if _wildcard_matches(value, UNLISTED_REGION_PROBE)
                 ]
                 if every:
                     control["gaps"].append(
@@ -17656,6 +18105,9 @@ def check_bedrock_region_invocation_control(
         global_open = bool(unbounded_profiles) and not all(
             action in summary["global_closed"] for action in MODEL_INVOKE_ACTIONS
         )
+        routing_errors = sorted(
+            name for name, routing in routings.items() if routing["error"]
+        )
 
         outside_profiles = 0
         outside_regions = set()
@@ -17686,7 +18138,28 @@ def check_bedrock_region_invocation_control(
             )
         )
 
-        if allow_listed and not uncovered and not global_open:
+        if allow_listed and not uncovered and not global_open and routing_errors:
+            findings["csv_data"].append(
+                row(
+                    "{} service control policy statement(s) condition Bedrock "
+                    "invocation on the request Region: {}, but the inference "
+                    "profiles available in {} could not be listed, so whether a "
+                    "global profile routes past the allow-list, or a geographic "
+                    "profile routes to a Region it does not name, was not read. "
+                    "Observed routing: {}.{}".format(
+                        len(described),
+                        "; ".join(described[:5]),
+                        ", ".join(routing_errors),
+                        routing_text,
+                        notes,
+                    ),
+                    "Grant the assessment role bedrock:ListInferenceProfiles in "
+                    "every assessed Region, then re-run the assessment.",
+                    "Informational",
+                    "N/A",
+                )
+            )
+        elif allow_listed and not uncovered and not global_open:
             findings["details"] = "Bedrock invocation is constrained by Region"
             findings["csv_data"].append(
                 row(
@@ -17721,9 +18194,9 @@ def check_bedrock_region_invocation_control(
                         destination_text,
                         notes,
                     ),
-                    "Extend the Region allow-list Deny to bedrock:InvokeModel, "
-                    "bedrock:InvokeModelWithResponseStream and "
-                    "bedrock:CreateModelInvocationJob.",
+                    "Extend the Region allow-list Deny to {}.".format(
+                        ", ".join(uncovered)
+                    ),
                     "Medium",
                     "Failed",
                 )
@@ -19389,6 +19862,51 @@ def _days_between(start: Any, end: Any) -> Optional[float]:
     return (last - first).total_seconds() / 86400
 
 
+def _bedrock_api_key_iam_age_caps(permission_cache: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Judge the age cap in the identity policies of each cached principal that is
+    granted iam:CreateServiceSpecificCredential. A Deny in a principal's own
+    policies or permissions boundary binds that principal only, so the leg is
+    credited only when every such principal carries one. errored is None for a
+    version-1 cache, which records no read errors.
+    """
+    capped, uncapped = [], []
+    for principal_type, key in (
+        ("role", "role_permissions"),
+        ("user", "user_permissions"),
+    ):
+        for name, permissions in (permission_cache.get(key) or {}).items():
+            label = f"{principal_type} '{name}'"
+            try:
+                statements = _identity_statements(permissions)
+                if not _granted_actions(
+                    permissions, statements, {BEDROCK_CREDENTIAL_CREATE_ACTION}
+                ):
+                    continue
+                pairs = [
+                    (policy.get("name") or source, statement)
+                    for source, policy in _cached_identity_policies(permissions)
+                    for statement in _policy_statements(policy.get("document"))
+                ]
+                pairs += [
+                    ("permissions boundary", statement)
+                    for statement in _policy_statements(_boundary_document(permissions))
+                ]
+            except (ValueError, TypeError, AttributeError):
+                uncapped.append(f"{label} (a policy could not be parsed)")
+                continue
+            own = _bedrock_api_key_scp_controls(pairs)
+            if own["age"] or (own["null_age"] and own["age_needs_null"]):
+                capped.append(label)
+            else:
+                uncapped.append(label)
+    return {
+        "capped": capped,
+        "uncapped": uncapped,
+        "errored": _cache_principal_errors(permission_cache),
+    }
+
+
 def check_bedrock_api_key_governance(
     permission_cache,
     region: str = "",
@@ -19649,11 +20167,14 @@ def check_bedrock_api_key_governance(
                 for text in controls["age_needs_null"]
             )
         token_actions = sorted(controls["token"])
-        tokens_blocked = len(token_actions) == len(BEDROCK_BEARER_TOKEN_ACTIONS)
-        preventive = age_controls + [
+        management = bool(inventory.get("management_account"))
+        tokens_blocked = (
+            len(token_actions) == len(BEDROCK_BEARER_TOKEN_ACTIONS) and not management
+        )
+        scp_age = bool(age_controls) and not management
+        token_texts = [
             text for action in token_actions for text in controls["token"][action]
         ]
-        management = bool(inventory.get("management_account"))
 
         read_errors = list(inventory["errors"])
         if inventory["list_error"]:
@@ -19667,20 +20188,92 @@ def check_bedrock_api_key_governance(
             else ""
         )
 
-        if (age_controls or tokens_blocked) and not management:
+        # An age cap can also sit in the identity policies of every principal
+        # allowed to create the credential. The bearer token leg is read from
+        # service control policies only.
+        iam_caps = _bedrock_api_key_iam_age_caps(permission_cache)
+        iam_age = (
+            not scp_age
+            and bool(iam_caps["capped"])
+            and not iam_caps["uncapped"]
+            and not iam_caps["errored"]
+        )
+        iam_age_note = ""
+        if iam_age:
+            iam_age_note = (
+                " Each of the {} principal(s) the IAM permissions cache grants "
+                "iam:CreateServiceSpecificCredential carries its own Deny capping "
+                "the key age ({}); that Deny binds those principals only, so a "
+                "principal granted the action later without it is uncapped.{}".format(
+                    len(iam_caps["capped"]),
+                    ", ".join(iam_caps["capped"][:5]),
+                    ""
+                    if iam_caps["errored"] is not None
+                    else " " + UNRECORDED_PRINCIPAL_ERRORS_NOTE,
+                )
+            )
+        elif not scp_age:
+            if iam_caps["uncapped"]:
+                iam_age_note = (
+                    " Of the {} principal(s) the IAM permissions cache grants "
+                    "iam:CreateServiceSpecificCredential, {} carry no credited "
+                    "age-cap Deny in their own policies: {}.".format(
+                        len(iam_caps["capped"]) + len(iam_caps["uncapped"]),
+                        len(iam_caps["uncapped"]),
+                        ", ".join(iam_caps["uncapped"][:5]),
+                    )
+                )
+            elif not iam_caps["capped"]:
+                iam_age_note = (
+                    " No principal in the IAM permissions cache is granted "
+                    "iam:CreateServiceSpecificCredential, which is not a cap: a "
+                    "principal granted it later is uncapped."
+                )
+        age_ok = scp_age or iam_age
+        # Principals the cache could not read may hold the only identity-policy
+        # cap, so the age leg is unknown, not absent, while they stay unread.
+        age_unread = (
+            not age_ok and not iam_caps["uncapped"] and bool(iam_caps["errored"])
+        )
+        if age_unread:
+            read_errors.append(
+                "the IAM permissions cache could not read {}".format(
+                    "; ".join(iam_caps["errored"][:5])
+                )
+            )
+        age_texts = age_controls if scp_age else []
+        preventive = age_texts + (token_texts if not management else [])
+
+        missing = []
+        if not age_ok:
+            missing.append(
+                "no credited Deny caps iam:ServiceSpecificCredentialAgeDays at {} "
+                "days on iam:CreateServiceSpecificCredential, so a Bedrock API key "
+                "can be created with no expiry".format(BEDROCK_API_KEY_MAX_AGE_DAYS)
+            )
+        if not tokens_blocked:
+            missing.append(
+                "no credited Deny covers the LONG_TERM bearer token type on both "
+                "bedrock:CallWithBearerToken and bedrock-mantle:CallWithBearerToken"
+                "{}, so a long-term key can be used".format(
+                    " (only {} is covered)".format(", ".join(token_actions))
+                    if token_actions and not management
+                    else ""
+                )
+            )
+
+        if age_ok and tokens_blocked:
             findings["csv_data"].append(
                 create_finding(
                     check_id="BR-45",
                     finding_name=BEDROCK_API_KEY_PREVENTION_FINDING,
                     finding_details=(
-                        "{} service control policy statement(s) restrict Bedrock API "
-                        "key creation or use: {}.{}{} {}".format(
+                        "Bedrock API keys are capped in age and LONG_TERM bearer "
+                        "tokens are denied on both endpoints by {} statement(s): "
+                        "{}.{}{} {}".format(
                             len(preventive),
                             "; ".join(preventive[:5]),
-                            ""
-                            if age_controls
-                            else " No age cap is credited; LONG_TERM tokens are "
-                            "denied on both bearer token actions.",
+                            iam_age_note,
                             gap_note,
                             scope_note,
                         )
@@ -19699,8 +20292,17 @@ def check_bedrock_api_key_governance(
                     finding_name=BEDROCK_API_KEY_PREVENTION_FINDING,
                     finding_details=(
                         "A preventive control on Bedrock API keys is undetermined "
-                        "because organization policies could not be read: "
-                        f"{'; '.join(read_errors[:5])}.{gap_note} {scope_note}"
+                        "because {} and the policies that could hold it were not "
+                        "all read: {}.{}{}{} {}".format(
+                            "; ".join(missing),
+                            "; ".join(read_errors[:5]),
+                            " Credited: {}.".format("; ".join(preventive[:5]))
+                            if preventive
+                            else "",
+                            iam_age_note,
+                            gap_note,
+                            scope_note,
+                        )
                     ),
                     resolution="Grant organizations:ListPolicies and organizations:DescribePolicy and retry before concluding that no control exists.",
                     reference=BEDROCK_API_KEY_REFERENCE,
@@ -19716,22 +20318,18 @@ def check_bedrock_api_key_governance(
                     check_id="BR-45",
                     finding_name=BEDROCK_API_KEY_PREVENTION_FINDING,
                     finding_details=(
-                        "None of the {} service control policy document(s) read caps "
-                        "iam:ServiceSpecificCredentialAgeDays at {} days on "
-                        "iam:CreateServiceSpecificCredential or denies the LONG_TERM "
-                        "bearer token type on both bedrock:CallWithBearerToken and "
-                        "bedrock-mantle:CallWithBearerToken{}, so a long-term Bedrock "
-                        "API key can be created with no expiry and used.{}{} "
-                        "{}".format(
+                        "Of the {} service control policy document(s) read, {}.{}{}"
+                        "{}{} {}".format(
                             len(inventory["items"]),
-                            BEDROCK_API_KEY_MAX_AGE_DAYS,
-                            " (only {} is covered)".format(", ".join(token_actions))
-                            if token_actions
+                            "; and ".join(missing),
+                            " Credited: {}.".format("; ".join(preventive[:5]))
+                            if preventive
                             else "",
                             " Credited statements exist but do not restrict this "
                             "account."
-                            if management and preventive
+                            if management and (age_controls or token_texts)
                             else "",
+                            iam_age_note,
                             gap_note,
                             scope_note,
                         )
@@ -19747,7 +20345,9 @@ def check_bedrock_api_key_governance(
                         "bedrock:BearerTokenType LONG_TERM and "
                         "bedrock-mantle:CallWithBearerToken on "
                         "bedrock-mantle:BearerTokenType LONG_TERM in production "
-                        "accounts, each action with its own key."
+                        "accounts, each action with its own key. Both are needed: "
+                        "the cap bounds a key's life and the token Deny stops a "
+                        "long-term key that already exists."
                     ),
                     reference=BEDROCK_API_KEY_REFERENCE,
                     severity="High",
@@ -23404,12 +24004,21 @@ ENCLAVE_SENSITIVE_ACTIONS = (
 
 
 # The Nitro Enclave measurements that bind the deployment and not only the image:
-# PCR3 is the parent instance's IAM role, PCR4 its instance ID and PCR8 the
-# image signing certificate. The EIF is not secret, so an image pin alone is
-# met by the same image launched from any parent.
+# PCR3 is the parent instance's IAM role and PCR4 its instance ID. The EIF is
+# not secret, so an image pin alone is met by the same image launched from any
+# parent. PCR8, the image signing certificate, names who signed the image and
+# not where it runs, so it binds no deployment.
 ENCLAVE_DEPLOYMENT_KEYS = (
     ATTESTATION_CONDITION_PREFIX + "pcr3",
     ATTESTATION_CONDITION_PREFIX + "pcr4",
+)
+
+# The measurements that name the enclave image: ImageSha384 and its equivalent
+# PCR0, or PCR8, the certificate that signed it, which AWS pairs with PCR3. A
+# deployment pin alone is met by any image launched from that parent.
+ENCLAVE_IMAGE_KEYS = (
+    ATTESTATION_CONDITION_PREFIX + "imagesha384",
+    ATTESTATION_CONDITION_PREFIX + "pcr0",
     ATTESTATION_CONDITION_PREFIX + "pcr8",
 )
 
@@ -23574,6 +24183,7 @@ def _enclave_key_assessment(document: Any) -> Dict[str, Any]:
 
     denied = set()
     deployment_denied = set()
+    image_denied = set()
     pinned = False
     for statement in statements:
         if str(statement.get("Effect", "")).upper() != "DENY":
@@ -23582,10 +24192,15 @@ def _enclave_key_assessment(document: Any) -> Dict[str, Any]:
         if test:
             denied.update(_statement_covers_kms_actions(statement))
             pinned = pinned or test == "pins"
-            if test == "pins" and _exact_attestation_keys(
-                statement, negated=True
-            ) & set(ENCLAVE_DEPLOYMENT_KEYS):
+            deny_keys = (
+                _exact_attestation_keys(statement, negated=True)
+                if test == "pins"
+                else set()
+            )
+            if deny_keys & set(ENCLAVE_DEPLOYMENT_KEYS):
                 deployment_denied.update(_statement_covers_kms_actions(statement))
+            if deny_keys & set(ENCLAVE_IMAGE_KEYS):
+                image_denied.update(_statement_covers_kms_actions(statement))
 
     bypasses = []
     deployment_gaps = []
@@ -23604,18 +24219,24 @@ def _enclave_key_assessment(document: Any) -> Dict[str, Any]:
             if own_keys
             else "Nitro Enclave" in families
         )
-        if (
-            (statement_pins or not open_actions)
-            and enclave_bound
-            and not own_keys & set(ENCLAVE_DEPLOYMENT_KEYS)
-        ):
+        releases_attested = (statement_pins or not open_actions) and enclave_bound
+        if releases_attested and not own_keys & set(ENCLAVE_DEPLOYMENT_KEYS):
             unbound = [a for a in actions if a not in deployment_denied]
             if unbound:
                 deployment_gaps.append(
                     f"statement '{label}' releases {', '.join(unbound)} with no "
-                    "exact PCR3 (parent IAM role), PCR4 (parent instance ID) or "
-                    "PCR8 (signing certificate) value, so an enclave launched "
-                    "from any parent instance satisfies it"
+                    "exact PCR3 (parent IAM role) or PCR4 (parent instance ID) "
+                    "value, so an enclave launched from any parent instance "
+                    "satisfies it"
+                )
+        if releases_attested and not own_keys & set(ENCLAVE_IMAGE_KEYS):
+            unbound = [a for a in actions if a not in image_denied]
+            if unbound:
+                deployment_gaps.append(
+                    f"statement '{label}' releases {', '.join(unbound)} with no "
+                    "exact ImageSha384 or PCR0 (enclave image) or PCR8 (signing "
+                    "certificate) value, so any enclave image launched from the "
+                    "pinned parent satisfies it"
                 )
         if statement_pins:
             pinned = True
@@ -23779,8 +24400,8 @@ def check_kms_enclave_key_binding(region: str = "") -> Dict[str, Any]:
                     "stay unconditioned, add a Deny statement for every "
                     "principal on those operations with a Null condition that "
                     "is true on the RecipientAttestation key, so a request "
-                    "without attestation is refused. Pin PCR3 or PCR4, or PCR8, "
-                    "beside the image measurement, and retire any grant of "
+                    "without attestation is refused. Pin PCR3 or PCR4 "
+                    "beside the ImageSha384, PCR0 or PCR8 image measurement, and retire any grant of "
                     "those operations the Deny does not cover.",
                     "High",
                     "Failed",
@@ -23791,8 +24412,8 @@ def check_kms_enclave_key_binding(region: str = "") -> Dict[str, Any]:
             findings["csv_data"].append(
                 row(
                     "{} attestation-bound KMS key(s) pin an attestation measurement, "
-                    "bind a Nitro Enclave pin to its deployment through PCR3, PCR4 "
-                    "or PCR8, and allow decryption, shared secret derivation and "
+                    "bind a Nitro Enclave pin to its image through ImageSha384, "
+                    "PCR0 or PCR8 and to its deployment through PCR3 or PCR4, and allow decryption, shared secret derivation and "
                     "data key generation only with attestation, through the key "
                     "policy and every grant: {}.".format(
                         len(passed), ", ".join(passed[:5])
@@ -24683,9 +25304,11 @@ AI_SERVICES_OPT_OUT_POLICY_TYPE = "AISERVICES_OPT_OUT_POLICY"
 # and uses "default" for the section that applies to every AI service.
 AI_OPT_OUT_DEFAULT_SERVICE = "default"
 
-AI_OPT_OUT_VALUE = "optout"
+# The policy syntax spells the values optOut and optIn; they are compared
+# exactly, so a value in any other case is reported as unreadable.
+AI_OPT_OUT_VALUE = "optOut"
 
-AI_OPT_IN_VALUE = "optin"
+AI_OPT_IN_VALUE = "optIn"
 
 # The child-override operator list sits beside the value in the source document.
 # Any of these being delegated lets a child OU or account re-enable a service the
@@ -24717,11 +25340,11 @@ def _ai_services_opt_out_value(node: Any) -> Dict[str, Any]:
     caller cannot mistake a source document for an effective one.
     """
     if isinstance(node, str):
-        return {"value": node.strip().lower(), "wrapped": False}
+        return {"value": node, "wrapped": False}
     if isinstance(node, dict):
         for key, value in node.items():
             if str(key).startswith("@@") and isinstance(value, str):
-                return {"value": value.strip().lower(), "wrapped": True}
+                return {"value": value, "wrapped": True}
     return {"value": "", "wrapped": False}
 
 
@@ -24990,8 +25613,9 @@ def _collect_child_operator_delegations(
 def check_bedrock_ai_services_opt_out(region: str = "") -> Dict[str, Any]:
     """
     BR-48: Verify an AWS Organizations AI services opt-out policy resolves for
-    this account, so prompts and completions are not retained or used to improve
-    the service.
+    this account, so content handled by the AI services the policy type governs
+    is not stored or used to improve those services. The policy type does not
+    govern Amazon Bedrock, so the verdict says nothing about Bedrock content.
 
     The verdict comes from DescribeEffectivePolicy because that is what actually
     applies to the account: it is the merged result of every policy from the root
@@ -25023,9 +25647,12 @@ def check_bedrock_ai_services_opt_out(region: str = "") -> Dict[str, Any]:
                         finding_name=check_name,
                         finding_details=(
                             "No AI services opt-out policy resolves for this account "
-                            f"({code}), so every AI service including Amazon Bedrock "
+                            f"({code}), so every AI service the policy type governs "
                             "runs under the opted-in default and content may be "
-                            "stored and used for service improvement."
+                            "stored and used for service improvement. Amazon "
+                            "Bedrock is not among the services this policy type "
+                            "governs, so this row does not establish how Bedrock "
+                            "handles content."
                         ),
                         resolution=(
                             "Enable the AISERVICES_OPT_OUT_POLICY type on the "
@@ -25218,10 +25845,13 @@ def check_bedrock_ai_services_opt_out(region: str = "") -> Dict[str, Any]:
                     check_id="BR-48",
                     finding_name=check_name,
                     finding_details=(
-                        "{}, so Amazon Bedrock content is not stored or used for "
-                        "service improvement. {} sets "
+                        "{}, so content handled by the AI services this policy "
+                        "type governs is not stored or used for service "
+                        "improvement. {} sets "
                         '["@@none"] at {}, so no policy attached below it can opt a '
-                        "service back in.".format(
+                        "service back in. Amazon Bedrock is not among the services "
+                        "this policy type governs, so this row does not establish "
+                        "how Bedrock handles content.".format(
                             effective_clause,
                             " and ".join(overrides["locking"][:3]),
                             lock_placements,
@@ -26053,6 +26683,11 @@ def lambda_handler(event, context):
 
         logger.info("Running Bedrock logging findings check")
         bedrock_logging_findings = check_bedrock_logging_configuration(region=region)
+        # AIR-FND-DAT-08 also covers AgentCore Memory retention, which this
+        # role cannot read, so BR-04 carries that leg as its own N/A row.
+        bedrock_logging_findings["csv_data"].append(
+            _agentcore_memory_expiry_finding(region)
+        )
         all_findings.append(bedrock_logging_findings)
 
         logger.info("Running Bedrock Guardrails check")
@@ -26065,7 +26700,7 @@ def lambda_handler(event, context):
 
         logger.info("Running Bedrock Prompt Management check")
         bedrock_prompt_management_findings = check_bedrock_prompt_management(
-            region=region
+            region=region, permission_cache=permission_cache
         )
         all_findings.append(bedrock_prompt_management_findings)
 

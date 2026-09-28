@@ -118,15 +118,19 @@ AI_SUBJECT_ROWS = [
         " is Not Applicable) and now the production-version leg as well. For each prompt it"
         " calls ListPrompts(promptIdentifier=...) for the numbered versions, fails a prompt"
         " that has only its DRAFT, and reads GetPrompt(promptVersion=N) on every "
-        "numbered version for customerEncryptionKeyArn, which PromptSummary does not carry. For flows it reads "
+        "numbered version for customerEncryptionKeyArn, which PromptSummary does not carry, and "
+        "judges that key by DescribeKey as customer managed and Enabled. For flows it reads "
         "the prompt node's resource.promptArn in the working draft and in every flow "
         "version an alias routes to (ListFlowAliases, GetFlowVersion), and fails a node that pins no version suffix,"
-        " since an unversioned ARN resolves to the working draft. A version != DRAFT test "
+        " since an unversioned ARN resolves to the working draft, and a node that defines "
+        "its prompt inline, which no version pins. The flow leg runs even with no prompt "
+        "in the Region. A role or user allowed bedrock:UpdatePrompt or "
+        "bedrock:CreatePromptVersion on a Resource with a wildcard fails. A version != DRAFT test "
         "on bare ListPrompts or on a GetPrompt with no promptVersion would have failed "
         "every prompt in every account, because both return the draft. Partial, ceiling "
         "reached: a prompt held in application code has no AWS record, and no AWS field "
-        "names the role approved to release a version, so the IAM split between release "
-        "and RenderPrompt roles is not judged",
+        "names the role approved to release a version, so which of the scoped roles "
+        "should release a version, beside the RenderPrompt roles, is not judged",
         [],
         4,
     ),
@@ -932,7 +936,7 @@ AI_SUBJECT_ROWS = [
         "exists, and each data source's transient data key; BR-11 the custom model's "
         "modelKmsKeyArn, else the customization job's outputModelKmsKeyArn, judged by "
         "DescribeKey, and the default encryption of every training, validation, "
-        "invocation log source and output bucket the model names; BR-17 the custom model's own modelKmsKeyArn; SM-03 the training output "
+        "invocation log source and output bucket the model names; BR-17 the custom model's own modelKmsKeyArn, judged by DescribeKey; SM-03 the training output "
         "and volume keys. BR-11 used to read outputDataConfig.kmsKeyId, which the API never"
         " returns, so every custom model read as needing review until the documented field "
         "was read. FS-65 is not an incumbent: its finding is about S3 event notifications "
@@ -998,7 +1002,9 @@ AI_SUBJECT_ROWS = [
         'optOut and sets ["@@none"] at services, services.default and '
         "services.default.opt_out_policy. A lock on the value alone lets a child add a "
         "service section that opts back in, so it fails, and an unread path or policy "
-        "is N/A",
+        "is N/A. optOut and optIn are compared exactly, as the policy syntax spells "
+        "them. The policy type does not govern Amazon Bedrock, and every row says it "
+        "does not establish how Bedrock handles content",
         [],
         5,
     ),
@@ -1016,7 +1022,8 @@ AI_SUBJECT_ROWS = [
         "fails, since that modality's prompts and completions go unlogged, and an absent "
         "flag is Not Applicable. An S3-only configuration is not failed on the "
         "large-payload field, which sits on CloudWatchConfig. BR-12 asserts a "
-        "customer-managed key on the S3 destination bucket and reports a CloudWatch-only "
+        "customer-managed key, judged by DescribeKey, on the S3 destination bucket, fails a "
+        "bucket with no default encryption, and reports a CloudWatch-only "
         "configuration as Not Applicable",
         [],
         5,
@@ -1107,7 +1114,9 @@ AI_SUBJECT_ROWS = [
         "in the same VPCs, so an endpoint left on the default full-access policy is "
         "reported. BR-02 reads "
         "private DNS and the endpoint policy on the Bedrock endpoints, where it used to "
-        "report only that an endpoint existed",
+        "report only that an endpoint existed. An endpoint policy counts as scoped only "
+        "on exact principal or network values: a Deny needs one negated condition and "
+        "Resource '*', and an Allow a positive test that is not IfExists",
         [],
         5,
     ),
@@ -1192,7 +1201,10 @@ FOUNDATION_ROWS = [
         "half of a data-residency requirement. Which Regions are approved is the "
         "customer's decision, so BR-43 asserts that an enforcing Deny exists and "
         "reports the Region values it found, and never judges whether that list "
-        "is the right one",
+        "is the right one. The Deny must cover agent, flow, RetrieveAndGenerate and "
+        "AgentCore runtime invocation too, an aws:PrincipalArn exemption with a "
+        "wildcard role or user name is not credited, and an unread inference profile "
+        "list makes the row N/A",
         [],
         6,
     ),
@@ -1262,7 +1274,9 @@ FOUNDATION_ROWS = [
         "Model Control', passes when an attached service control policy denies "
         "bedrock:InvokeModel and bedrock:InvokeModelWithResponseStream outside a "
         "named list of foundation-model or inference-profile ARNs, given as a "
-        "NotResource or as a negated condition. Converse and ConverseStream have "
+        "NotResource or as a negated condition. Its Region leg covers agent, flow, "
+        "RetrieveAndGenerate and AgentCore runtime invocation and credits no "
+        "wildcard aws:PrincipalArn exemption. Converse and ConverseStream have "
         "no IAM action of their own and are authorized by those two, so the leg "
         "matches only them. A Deny written with NotAction is read as covering "
         "those actions, and arn:aws:bedrock:*::foundation-model/* counts as no "
@@ -1286,7 +1300,12 @@ FOUNDATION_ROWS = [
         "NoncurrentVersionExpiration.NoncurrentDays over that prefix, and fails "
         "the bucket without one, because each expired object leaves a noncurrent "
         "version that is never deleted. A missing Status means the bucket was "
-        "never versioned, and the Expiration rule alone decides it",
+        "never versioned, and the Expiration rule alone decides it. An Object Lock "
+        "default retention beside the rule fails, since Lifecycle does not delete a "
+        "retained version. A replicated log bucket is N/A, because per-object "
+        "ReplicationStatus needs s3:GetObject, which is not granted, and AgentCore "
+        "Memory eventExpiryDuration is N/A naming bedrock-agentcore:ListMemories and "
+        "GetMemory",
         [],
         6,
     ),
@@ -1489,9 +1508,10 @@ FOUNDATION_ROWS = [
         "carries an attestation pin or that Deny is present. A Null Deny alone "
         "refuses a missing attestation but admits any image, so a key with no "
         "exact pin still fails. A Nitro Enclave image pin alone fails too: every "
-        "releasing statement also needs an exact PCR3, PCR4 or PCR8 value, in "
-        "itself or through a single-test Deny, because the image file is not "
-        "secret. A Deny narrowed by another condition key is not credited. Every "
+        "releasing statement needs an exact image value (ImageSha384, PCR0 or "
+        "PCR8) and an exact deployment value (PCR3 or PCR4), each in itself or "
+        "through a single-test Deny, because the image file is not secret, so a "
+        "PCR3-only pin fails. A Deny narrowed by another condition key is not credited. Every "
         "grant is read, and a grant of the four operations fails the key unless a "
         "Deny covers it; unread grants are N/A. Which workloads must be "
         "enclave-bound is the customer's decision, and no API records it, so a key "
@@ -1853,6 +1873,7 @@ INCUMBENT_NAMES = {
         "Bedrock Model Invocation Logging Check",
         "Bedrock Logging Configuration Check",
         "Bedrock Invocation Log Retention",
+        "AgentCore Memory Event Retention",
     ),
     "BR-06": "Bedrock CloudTrail Logging Check",
     # BR-07 publishes its Failed line under a different name than its Passed and

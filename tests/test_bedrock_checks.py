@@ -713,6 +713,134 @@ class TestBR02VPCEndpointHardening:
         assert "vpce-scoped" not in failed[0]["Finding_Details"]
         assert "vpce-scoped" in passed[0]["Finding_Details"]
 
+    @staticmethod
+    def _open_allow_with(*extra):
+        return json.dumps(
+            {
+                "Statement": [
+                    {
+                        "Sid": "default",
+                        "Effect": "Allow",
+                        "Principal": "*",
+                        "Action": "*",
+                        "Resource": "*",
+                    },
+                    *extra,
+                ]
+            }
+        )
+
+    @staticmethod
+    def _scope_deny(condition, **fields):
+        statement = {
+            "Sid": "OutsideOrg",
+            "Effect": "Deny",
+            "Principal": "*",
+            "Action": "*",
+            "Resource": "*",
+            "Condition": condition,
+        }
+        statement.update(fields)
+        return statement
+
+    def test_br02_scope_deny_is_credited_only_by_its_values(
+        self, permission_cache_compliant
+    ):
+        exact = {"StringNotEquals": {"aws:PrincipalOrgID": "o-abc123"}}
+        loose = [
+            (
+                "wildcard",
+                self._scope_deny({"StringNotLike": {"aws:PrincipalArn": "*"}}),
+            ),
+            (
+                "anded",
+                self._scope_deny(
+                    dict(exact, StringEquals={"aws:RequestedRegion": "us-east-1"})
+                ),
+            ),
+            (
+                "narrowed",
+                self._scope_deny(exact, Resource="arn:aws:bedrock:*:*:agent/*"),
+            ),
+            ("notresource", self._scope_deny(exact, Resource=None, NotResource="x")),
+            ("null", self._scope_deny({"Null": {"aws:SourceVpc": "true"}})),
+        ]
+        endpoints = [
+            self._endpoint(
+                endpoint_id="vpce-exact",
+                policy=self._open_allow_with(self._scope_deny(exact)),
+            )
+        ] + [
+            self._endpoint(
+                endpoint_id=f"vpce-{name}",
+                policy=self._open_allow_with(
+                    {k: v for k, v in deny.items() if v is not None}
+                ),
+            )
+            for name, deny in loose
+        ]
+        findings = self._run(endpoints, permission_cache_compliant)
+
+        policy_rows = self._policy_rows(findings)
+        assert sorted(r["Status"] for r in policy_rows) == ["Failed", "Passed"]
+        failed = [r for r in policy_rows if r["Status"] == "Failed"][0]
+        passed = [r for r in policy_rows if r["Status"] == "Passed"][0]
+        assert f"{len(loose)} of {len(loose) + 1}" in failed["Finding_Details"]
+        for name, _ in loose:
+            assert f"vpce-{name}" in failed["Finding_Details"], name
+        assert "vpce-exact" in passed["Finding_Details"]
+        assert "aws:principalorgid o-abc123" in passed["Finding_Details"]
+
+    def test_br02_allow_scope_key_is_credited_only_by_its_values(
+        self, permission_cache_compliant
+    ):
+        def allow(condition=None, principal="*"):
+            statement = {
+                "Sid": "Scoped",
+                "Effect": "Allow",
+                "Principal": principal,
+                "Action": "bedrock:InvokeModel",
+                "Resource": "*",
+            }
+            if condition:
+                statement["Condition"] = condition
+            return json.dumps({"Statement": [statement]})
+
+        endpoints = [
+            self._endpoint(
+                endpoint_id="vpce-exact",
+                policy=allow({"StringEquals": {"aws:PrincipalOrgID": "o-abc123"}}),
+            ),
+            self._endpoint(
+                endpoint_id="vpce-wild",
+                policy=allow(
+                    {"StringLike": {"aws:PrincipalArn": "arn:aws:iam::*:role/*"}}
+                ),
+            ),
+            self._endpoint(
+                endpoint_id="vpce-negated",
+                policy=allow({"StringNotEquals": {"aws:SourceVpc": "vpc-1"}}),
+            ),
+            self._endpoint(
+                endpoint_id="vpce-ifexists",
+                policy=allow({"StringEqualsIfExists": {"aws:SourceVpc": "vpc-1"}}),
+            ),
+            self._endpoint(
+                endpoint_id="vpce-starprincipal",
+                policy=allow(principal={"AWS": "arn:aws:iam::*:root"}),
+            ),
+        ]
+        findings = self._run(endpoints, permission_cache_compliant)
+
+        policy_rows = self._policy_rows(findings)
+        failed = [r for r in policy_rows if r["Status"] == "Failed"][0]
+        passed = [r for r in policy_rows if r["Status"] == "Passed"][0]
+        assert "4 of 5" in failed["Finding_Details"]
+        for name in ("wild", "negated", "ifexists", "starprincipal"):
+            assert f"vpce-{name}" in failed["Finding_Details"], name
+        assert "vpce-exact" in passed["Finding_Details"]
+        assert "vpce-wild" not in passed["Finding_Details"]
+
     def test_br02_hardening_rows_pass_the_finding_schema(
         self, permission_cache_compliant
     ):
@@ -2575,6 +2703,7 @@ class TestBR07PromptProductionVersion:
         flows_error=None,
         flow_aliases=None,
         flow_versions=None,
+        keys=None,
     ):
         """
         A bedrock-agent client whose ListPrompts answers per promptIdentifier.
@@ -2654,6 +2783,18 @@ class TestBR07PromptProductionVersion:
             return entry or {}
 
         client.get_flow_version.side_effect = get_flow_version
+
+        # The same mock answers kms:DescribeKey. Every key is an enabled
+        # customer managed key unless ``keys`` says otherwise.
+        keys = keys or {}
+
+        def describe_key(KeyId):
+            entry = keys.get(KeyId, {"KeyManager": "CUSTOMER", "KeyState": "Enabled"})
+            if isinstance(entry, Exception):
+                raise entry
+            return {"KeyMetadata": {"Arn": KeyId, **entry}}
+
+        client.describe_key.side_effect = describe_key
         return client
 
     @staticmethod
@@ -2665,9 +2806,13 @@ class TestBR07PromptProductionVersion:
             ],
         }
 
-    def _run(self, client):
+    _EMPTY_CACHE = {"cache_schema_version": 2, "role_permissions": {}}
+
+    def _run(self, client, permission_cache=_EMPTY_CACHE):
         with patch("boto3.client", return_value=client):
-            self.result = bedrock_app.check_bedrock_prompt_management("us-east-1")
+            self.result = bedrock_app.check_bedrock_prompt_management(
+                "us-east-1", permission_cache=permission_cache
+            )
         return extract_csv_data(self.result)
 
     @staticmethod
@@ -3106,7 +3251,11 @@ class TestBR07PromptProductionVersion:
             )
         )
 
-        assert self._flow_rows(findings) == []
+        # Round 2: an inline prompt is text no Prompt management version pins,
+        # so the node now fails instead of being skipped.
+        rows = self._flow_rows(findings)
+        assert [row["Status"] for row in rows] == ["Failed"]
+        assert "flow 'support' node 'inline'" in rows[0]["Finding_Details"]
 
     def test_br07_five_digit_version_suffix_is_pinned(self):
         rows = self._flow_rows(
@@ -3348,6 +3497,7 @@ class TestBR07PromptProductionVersion:
             "Passed",
             "Passed",
             "Passed",
+            "Passed",
         ]
 
     def test_br07_version_rows_pass_the_finding_schema(self):
@@ -3387,6 +3537,251 @@ class TestBR07PromptProductionVersion:
             assert_finding_schema(finding)
             assert finding["Check_ID"] == "BR-07"
             assert finding["Region"] == "us-east-1"
+
+    # Round 2: the key a prompt version names is judged with kms:DescribeKey.
+
+    _AWS_KEY_ARN = "arn:aws:kms:us-east-1:123456789012:key/aws-managed"
+
+    def test_br07_aws_managed_key_fails_the_encryption_leg(self):
+        rows = self._encryption_rows(
+            self._run(
+                self._client(
+                    prompts=[self._summary("p1", "DRAFT")],
+                    versions={"p1": [self._summary("p1", "1")]},
+                    version_details={
+                        ("p1", "1"): {"customerEncryptionKeyArn": self._AWS_KEY_ARN}
+                    },
+                    keys={
+                        self._AWS_KEY_ARN: {"KeyManager": "AWS", "KeyState": "Enabled"}
+                    },
+                )
+            )
+        )
+
+        assert [row["Status"] for row in rows] == ["Failed"]
+        assert "managed by AWS" in rows[0]["Finding_Details"]
+
+    def test_br07_one_prompt_on_a_disabled_key_fails_beside_one_that_passes(self):
+        disabled = "arn:aws:kms:us-east-1:123456789012:key/disabled"
+        rows = self._encryption_rows(
+            self._run(
+                self._client(
+                    prompts=[
+                        self._summary("p1", "DRAFT", name="good"),
+                        self._summary("p2", "DRAFT", name="bad"),
+                    ],
+                    versions={
+                        "p1": [self._summary("p1", "1")],
+                        "p2": [self._summary("p2", "1"), self._summary("p2", "2")],
+                    },
+                    version_details={
+                        ("p1", "1"): {"customerEncryptionKeyArn": self._CMK_ARN},
+                        ("p2", "1"): {"customerEncryptionKeyArn": self._CMK_ARN},
+                        ("p2", "2"): {"customerEncryptionKeyArn": disabled},
+                    },
+                    keys={disabled: {"KeyManager": "CUSTOMER", "KeyState": "Disabled"}},
+                )
+            )
+        )
+
+        by_status = {row["Status"]: row["Finding_Details"] for row in rows}
+        assert sorted(by_status) == ["Failed", "Passed"]
+        assert "bad version 2" in by_status["Failed"]
+        assert "Disabled" in by_status["Failed"]
+        assert "good" in by_status["Passed"] and "bad" not in by_status["Passed"]
+
+    def test_br07_undescribable_key_is_not_passed(self):
+        rows = self._encryption_rows(
+            self._run(
+                self._client(
+                    prompts=[self._summary("p1", "DRAFT")],
+                    versions={"p1": [self._summary("p1", "1")]},
+                    version_details={
+                        ("p1", "1"): {"customerEncryptionKeyArn": self._CMK_ARN}
+                    },
+                    keys={
+                        self._CMK_ARN: _client_error(
+                            "AccessDeniedException", "no", "DescribeKey"
+                        )
+                    },
+                )
+            )
+        )
+
+        assert [row["Status"] for row in rows] == ["N/A"]
+        assert "kms:DescribeKey" in rows[0]["Finding_Details"]
+
+    def test_br07_flow_leg_runs_when_the_region_has_no_prompt(self):
+        rows = self._flow_rows(
+            self._run(
+                self._client(
+                    flows=[{"id": "f1", "name": "support"}],
+                    flow_definitions={
+                        "f1": self._flow(
+                            [self._prompt_node("classify", self._PROMPT_ARN)]
+                        )
+                    },
+                )
+            )
+        )
+
+        assert [row["Status"] for row in rows] == ["Failed"]
+        assert self.result["status"] == "WARN"
+
+    def test_br07_inline_node_fails_beside_a_pinned_node(self):
+        inline_node = {
+            "name": "inline",
+            "type": "Prompt",
+            "configuration": {
+                "prompt": {"sourceConfiguration": {"inline": {"templateType": "TEXT"}}}
+            },
+        }
+        rows = self._flow_rows(
+            self._run(
+                self._flow_client(
+                    [{"id": "f1", "name": "support"}],
+                    {
+                        "f1": self._flow(
+                            [
+                                self._prompt_node("classify", f"{self._PROMPT_ARN}:1"),
+                                inline_node,
+                            ]
+                        )
+                    },
+                )
+            )
+        )
+
+        by_status = {row["Status"]: row["Finding_Details"] for row in rows}
+        assert sorted(by_status) == ["Failed", "Passed"]
+        assert "1 of 2 prompt node(s)" in by_status["Failed"]
+        assert "node 'inline'" in by_status["Failed"]
+
+    # Round 2: who may change a prompt or publish a version of it.
+
+    @staticmethod
+    def _grant(actions, resources, effect="Allow"):
+        return {
+            "policy_name": "prompts",
+            "document": {
+                "Statement": [
+                    {"Effect": effect, "Action": actions, "Resource": resources}
+                ]
+            },
+        }
+
+    def _scope_rows(self, permission_cache):
+        return self._rows(
+            self._run(self._client(), permission_cache=permission_cache),
+            bedrock_app.PROMPT_WRITE_SCOPE_FINDING,
+        )
+
+    def test_br07_update_prompt_on_every_prompt_fails(self):
+        rows = self._scope_rows(
+            {
+                "cache_schema_version": 2,
+                "role_permissions": {
+                    "editor": {
+                        "inline_policies": [
+                            self._grant(
+                                "bedrock:UpdatePrompt",
+                                "arn:aws:bedrock:us-east-1:123456789012:prompt/*",
+                            )
+                        ]
+                    }
+                },
+            }
+        )
+
+        assert [row["Status"] for row in rows] == ["Failed"]
+        assert "role 'editor'" in rows[0]["Finding_Details"]
+
+    def test_br07_one_wide_editor_fails_beside_one_scoped_editor(self):
+        rows = self._scope_rows(
+            {
+                "cache_schema_version": 2,
+                "role_permissions": {
+                    "scoped": {
+                        "inline_policies": [
+                            self._grant(
+                                ["bedrock:UpdatePrompt", "bedrock:CreatePromptVersion"],
+                                self._PROMPT_ARN,
+                            )
+                        ]
+                    },
+                    "wide": {
+                        "attached_policies": [
+                            self._grant("bedrock:CreatePromptVersion", "*")
+                        ]
+                    },
+                },
+            }
+        )
+
+        assert [row["Status"] for row in rows] == ["Failed"]
+        assert "role 'wide'" in rows[0]["Finding_Details"]
+        assert "role 'scoped'" not in rows[0]["Finding_Details"]
+
+    def test_br07_prefix_wildcard_prompt_arn_is_not_scoped(self):
+        rows = self._scope_rows(
+            {
+                "cache_schema_version": 2,
+                "role_permissions": {
+                    "editor": {
+                        "inline_policies": [
+                            self._grant(
+                                "bedrock:UpdatePrompt",
+                                "arn:aws:bedrock:us-east-1:123456789012:prompt/prod-*",
+                            )
+                        ]
+                    }
+                },
+            }
+        )
+
+        assert [row["Status"] for row in rows] == ["Failed"]
+        assert "prompt/prod-*" in rows[0]["Finding_Details"]
+
+    def test_br07_group_policy_grant_reaches_the_scope_leg(self):
+        rows = self._scope_rows(
+            {
+                "cache_schema_version": 2,
+                "role_permissions": {},
+                "user_permissions": {
+                    "alice": {
+                        "group_policies": [
+                            {"group": "editors", **self._grant("bedrock:*", "*")}
+                        ]
+                    }
+                },
+            }
+        )
+
+        assert [row["Status"] for row in rows] == ["Failed"]
+        assert "user 'alice'" in rows[0]["Finding_Details"]
+
+    def test_br07_scoped_editors_pass_and_errored_principal_holds_it_back(self):
+        cache = {
+            "cache_schema_version": 2,
+            "role_permissions": {
+                "scoped": {
+                    "inline_policies": [
+                        self._grant("bedrock:UpdatePrompt", self._PROMPT_ARN)
+                    ]
+                }
+            },
+        }
+        assert [row["Status"] for row in self._scope_rows(cache)] == ["Passed"]
+
+        cache["principal_errors"] = [
+            {"type": "role", "name": "hidden", "stage": "inline_policy", "error": "x"}
+        ]
+        assert [row["Status"] for row in self._scope_rows(cache)] == ["N/A", "N/A"]
+
+    def test_br07_no_permission_cache_is_not_passed(self):
+        rows = self._scope_rows(None)
+
+        assert [row["Status"] for row in rows] == ["N/A"]
 
 
 # ===================================================================
@@ -4287,6 +4682,68 @@ class TestBR12InvocationLogEncryption:
         assert len(findings) >= 1
         assert findings[0]["Status"] == "Failed"
         assert findings[0]["Severity"] == "Medium"
+
+    @patch("boto3.client")
+    def test_br12_bucket_without_default_encryption_fails_beside_a_cmk_bucket(
+        self, mock_client
+    ):
+        # Round 2: no default encryption rule is a Failed, not an N/A, and the
+        # text says what GetBucketEncryption returned.
+        mock_bedrock = MagicMock()
+        mock_s3 = MagicMock()
+        mock_kms = MagicMock()
+        mock_kms.describe_key.return_value = {
+            "KeyMetadata": {"KeyManager": "CUSTOMER", "KeyState": "Enabled"}
+        }
+        mock_client.side_effect = lambda service, **kwargs: {
+            "bedrock": mock_bedrock,
+            "kms": mock_kms,
+        }.get(service, mock_s3)
+        mock_bedrock.get_model_invocation_logging_configuration.return_value = {
+            "loggingConfig": {
+                "s3Config": {"bucketName": "plain-bucket"},
+                "cloudWatchConfig": {
+                    "largeDataDeliveryS3Config": {"bucketName": "cmk-bucket"}
+                },
+            }
+        }
+
+        def get_bucket_encryption(Bucket):
+            if Bucket == "plain-bucket":
+                raise ClientError(
+                    {
+                        "Error": {
+                            "Code": "ServerSideEncryptionConfigurationNotFoundError"
+                        }
+                    },
+                    "GetBucketEncryption",
+                )
+            return {
+                "ServerSideEncryptionConfiguration": {
+                    "Rules": [
+                        {
+                            "ApplyServerSideEncryptionByDefault": {
+                                "SSEAlgorithm": "aws:kms",
+                                "KMSMasterKeyID": "arn:aws:kms:us-east-1:123456789012:key/k",
+                            }
+                        }
+                    ]
+                }
+            }
+
+        mock_s3.get_bucket_encryption.side_effect = get_bucket_encryption
+        findings = extract_csv_data(
+            bedrock_app.check_bedrock_invocation_log_encryption(region="us-east-1")
+        )
+        plain = [f for f in findings if "'plain-bucket'" in f["Finding_Details"]]
+        assert [f["Status"] for f in plain] == ["Failed"]
+        assert (
+            "ServerSideEncryptionConfigurationNotFoundError"
+            in (plain[0]["Finding_Details"])
+        )
+        assert "stored unencrypted" not in plain[0]["Finding_Details"]
+        cmk = [f for f in findings if "'cmk-bucket'" in f["Finding_Details"]]
+        assert [f["Status"] for f in cmk] == ["Passed"]
 
     @patch("boto3.client")
     def test_br12_exception_returns_error_finding(self, mock_client):
@@ -7145,6 +7602,11 @@ class TestBR43RegionInvocationControl:
         "bedrock:InvokeModel",
         "bedrock:InvokeModelWithResponseStream",
         "bedrock:CreateModelInvocationJob",
+        "bedrock:InvokeAgent",
+        "bedrock:InvokeInlineAgent",
+        "bedrock:InvokeFlow",
+        "bedrock:RetrieveAndGenerate",
+        "bedrock-agentcore:InvokeAgentRuntime",
     ]
 
     @staticmethod
@@ -7518,11 +7980,16 @@ class TestBR43RegionInvocationControl:
             ),
         )
 
-        assert [f["Status"] for f in findings] == ["Passed"]
+        assert [f["Status"] for f in findings] == ["N/A"]
         assert (
             "could not be listed (AccessDeniedException), so the default routing "
             "behavior was not observed" in findings[0]["Finding_Details"]
         )
+        assert (
+            "whether a global profile routes past the allow-list"
+            in (findings[0]["Finding_Details"])
+        )
+        assert "ApprovedRegions" in findings[0]["Finding_Details"]
 
     def test_br43_no_region_condition_names_the_default_routing(self):
         findings = self._run(
@@ -7600,6 +8067,7 @@ class TestBR43RegionInvocationControl:
     def _statement(**fields):
         statement = {"Effect": "Deny", "Resource": "*"}
         statement.update(fields)
+        statement = {k: v for k, v in statement.items() if v is not None}
         return {"Version": "2012-10-17", "Statement": [statement]}
 
     def test_br43_control_tower_not_action_region_deny_is_credited(self):
@@ -7746,7 +8214,185 @@ class TestBR43RegionInvocationControl:
             )
         )
 
+        assert [f["Status"] for f in findings] == ["Failed"]
+        assert (
+            "no credited allow-list covers bedrock:invokeagent, "
+            "bedrock:invokeinlineagent, bedrock:invokeflow, "
+            "bedrock:retrieveandgenerate, bedrock-agentcore:invokeagentruntime"
+            in findings[0]["Finding_Details"]
+        )
+
+    def test_br43_three_policies_cover_every_invoking_action_together(self):
+        findings = self._run(
+            self._inventory(
+                [
+                    (
+                        "Invoke",
+                        self._region_scp(
+                            "StringNotEquals",
+                            ["us-east-1", "unspecified"],
+                            action=self.ALL_REGION_ACTIONS[:2],
+                        ),
+                    ),
+                    (
+                        "Batch",
+                        self._region_scp(
+                            "StringNotEquals",
+                            ["us-east-1"],
+                            action=self.ALL_REGION_ACTIONS[2:7],
+                        ),
+                    ),
+                    (
+                        "AgentCore",
+                        self._region_scp(
+                            "StringNotEquals",
+                            ["us-east-1"],
+                            action="bedrock-agentcore:InvokeAgentRuntime",
+                        ),
+                    ),
+                ]
+            )
+        )
+
         assert [f["Status"] for f in findings] == ["Passed"]
+
+    def test_br43_allow_list_missing_agentcore_runtime_fails(self):
+        findings = self._run(
+            self._inventory(
+                [
+                    (
+                        "BedrockOnly",
+                        self._region_scp(
+                            "StringNotEquals",
+                            ["us-east-1", "unspecified"],
+                            action=["bedrock:*"],
+                        ),
+                    )
+                ]
+            )
+        )
+
+        assert [f["Status"] for f in findings] == ["Failed"]
+        assert (
+            "no credited allow-list covers bedrock-agentcore:invokeagentruntime"
+            in findings[0]["Finding_Details"]
+        )
+        assert "bedrock-agentcore:invokeagentruntime" in findings[0]["Resolution"]
+
+    def _exempting(self, *principals):
+        return self._statement(
+            NotAction=["iam:*", "organizations:*", "sts:*"],
+            Condition={
+                "StringNotEquals": {
+                    "aws:RequestedRegion": ["us-east-1", "unspecified"]
+                },
+                "ArnNotLike": {"aws:PrincipalArn": list(principals)},
+            },
+        )
+
+    def test_br43_wildcard_principal_exemption_is_not_credited(self):
+        exact = "arn:aws:iam::*:role/AWSControlTowerExecution"
+        for wide in (
+            "arn:aws:iam::*:role/*",
+            "arn:aws:iam::123456789012:role/prod-*",
+            "arn:aws:iam::123456789012:user/admins/*",
+            "*",
+        ):
+            findings = self._run(
+                self._inventory([("RegionDeny", self._exempting(exact, wide))])
+            )
+            assert [f["Status"] for f in findings] == ["Failed"], wide
+            detail = findings[0]["Finding_Details"]
+            assert (
+                f"its aws:principalarn exemption {wide} has a wildcard in its "
+                "role or user name" in detail
+            ), wide
+            assert "none is an allow-list" in detail, wide
+
+    def test_br43_exact_principal_exemptions_stay_credited(self):
+        findings = self._run(
+            self._inventory(
+                [
+                    (
+                        "RegionDeny",
+                        self._exempting(
+                            "arn:aws:iam::*:role/AWSControlTowerExecution",
+                            "arn:aws:iam::123456789012:role/breakglass",
+                        ),
+                    )
+                ]
+            )
+        )
+        assert [f["Status"] for f in findings] == ["Passed"]
+        assert "role/breakglass" in findings[0]["Finding_Details"]
+
+    def test_br43_every_region_hyphen_pattern_is_not_an_allow_list(self):
+        for pattern in ("*-*", "??-*", "*-*-*"):
+            findings = self._run(
+                self._inventory(
+                    [
+                        (
+                            "Loose",
+                            self._region_scp(
+                                "StringNotLike", ["us-east-1", pattern, "unspecified"]
+                            ),
+                        )
+                    ]
+                )
+            )
+            assert [f["Status"] for f in findings] == ["Failed"], pattern
+            assert (
+                f"its allowed value {pattern} matches every Region"
+                in (findings[0]["Finding_Details"])
+            ), pattern
+
+    def test_br43_not_resource_outside_the_invoked_services_is_credited(self):
+        findings = self._run(
+            self._inventory(
+                [
+                    (
+                        "RegionDeny",
+                        self._statement(
+                            Action=self.ALL_REGION_ACTIONS,
+                            Resource=None,
+                            NotResource=["arn:aws:s3:::audit-logs/*"],
+                            Condition={
+                                "StringNotEquals": {
+                                    "aws:RequestedRegion": ["us-east-1", "unspecified"]
+                                }
+                            },
+                        ),
+                    )
+                ]
+            )
+        )
+        assert [f["Status"] for f in findings] == ["Passed"]
+
+    def test_br43_not_resource_naming_a_model_narrows_the_deny(self):
+        findings = self._run(
+            self._inventory(
+                [
+                    (
+                        "RegionDeny",
+                        self._statement(
+                            Action=self.ALL_REGION_ACTIONS,
+                            Resource=None,
+                            NotResource=[
+                                "arn:aws:s3:::audit-logs/*",
+                                "arn:aws:bedrock:*::foundation-model/*",
+                            ],
+                            Condition={
+                                "StringNotEquals": {
+                                    "aws:RequestedRegion": ["us-east-1", "unspecified"]
+                                }
+                            },
+                        ),
+                    )
+                ]
+            )
+        )
+        assert [f["Status"] for f in findings] == ["Failed"]
+        assert "it applies only to" in findings[0]["Finding_Details"]
 
     def test_br43_streaming_left_out_of_the_allow_list_fails(self):
         findings = self._run(
@@ -8848,6 +9494,7 @@ class TestBR45ApiKeyGovernance:
         account="123456789012",
         users=None,
         all_users=False,
+        cache=None,
     ):
         """credentials: {user_name: [credential dicts]}.
 
@@ -8890,9 +9537,10 @@ class TestBR45ApiKeyGovernance:
         sts_client = MagicMock()
         sts_client.get_caller_identity.return_value = {"Account": account}
 
-        cache = _identity_cache(
-            users={name: [] for name in (users or credentials.keys())}
-        )
+        if cache is None:
+            cache = _identity_cache(
+                users={name: [] for name in (users or credentials.keys())}
+            )
         with patch(
             "bedrock_app.boto3.client",
             side_effect=lambda service, **kwargs: {
@@ -9182,9 +9830,37 @@ class TestBR45ApiKeyGovernance:
         }
     }
 
-    def _prevention(self, inventory):
-        _, findings = self._run({}, inventory=inventory)
+    def _prevention(self, inventory, cache=None):
+        _, findings = self._run({}, inventory=inventory, cache=cache)
         return self._by_name(findings, self.PREVENTION_FINDING)
+
+    @classmethod
+    def _token_denies(cls):
+        return [
+            cls._deny(
+                "bedrock:CallWithBearerToken",
+                {"StringEquals": {"bedrock:BearerTokenType": "LONG_TERM"}},
+                sid="Bedrock",
+            ),
+            cls._deny(
+                "bedrock-mantle:CallWithBearerToken",
+                {"StringEquals": {"bedrock-mantle:BearerTokenType": "LONG_TERM"}},
+                sid="Mantle",
+            ),
+        ]
+
+    @classmethod
+    def _if_exists_cap(cls, sid="Cap"):
+        return cls._deny(
+            "iam:CreateServiceSpecificCredential",
+            dict(
+                cls.BEDROCK_SERVICE,
+                NumericGreaterThanIfExists={
+                    "iam:ServiceSpecificCredentialAgeDays": "90"
+                },
+            ),
+            sid=sid,
+        )
 
     def test_br45_all_users_listing_reads_users_outside_the_cache(self):
         iam_client, findings = self._run(
@@ -9331,21 +10007,19 @@ class TestBR45ApiKeyGovernance:
         details = " ".join(f["Finding_Details"] for f in rows)
         assert "AllUsers" in details and "Hidden" in details
 
-    def test_br45_if_exists_age_cap_passes(self):
-        prevention = self._prevention(
-            self._scp_items(
-                self._deny(
-                    "iam:CreateServiceSpecificCredential",
-                    dict(
-                        self.BEDROCK_SERVICE,
-                        NumericGreaterThanIfExists={
-                            "iam:ServiceSpecificCredentialAgeDays": "90"
-                        },
-                    ),
-                )
-            )
-        )
+    def test_br45_if_exists_age_cap_alone_fails_and_passes_beside_the_token_deny(
+        self,
+    ):
+        # The cap bounds a new key's life but leaves a long-term key that
+        # already exists usable, so the cap alone is half the control.
+        alone = self._prevention(self._scp_items(self._if_exists_cap()))
+        assert [f["Status"] for f in alone] == ["Failed"]
+        assert "LONG_TERM bearer token type" in alone[0]["Finding_Details"]
+        assert "above 90 days" in alone[0]["Finding_Details"]
 
+        prevention = self._prevention(
+            self._scp_items(self._if_exists_cap(), *self._token_denies())
+        )
         assert [f["Status"] for f in prevention] == ["Passed"]
         assert "above 90 days" in prevention[0]["Finding_Details"]
         assert "attached to the root" in prevention[0]["Finding_Details"]
@@ -9367,6 +10041,7 @@ class TestBR45ApiKeyGovernance:
                     {"Null": {"iam:ServiceSpecificCredentialAgeDays": "true"}},
                     sid="NoExpiry",
                 ),
+                *self._token_denies(),
             )
         )
 
@@ -9434,8 +10109,11 @@ class TestBR45ApiKeyGovernance:
                 ),
             )
         )
-        assert [f["Status"] for f in paired] == ["Passed"]
-        assert "No age cap is credited" in paired[0]["Finding_Details"]
+        # Both endpoints are covered, but with no age cap a key created with no
+        # expiry stands; the token Deny alone is half the control.
+        assert [f["Status"] for f in paired] == ["Failed"]
+        assert "no credited Deny caps" in paired[0]["Finding_Details"]
+        assert "LONG_TERM bearer token type" not in paired[0]["Finding_Details"]
 
         shared = self._prevention(
             self._scp_items(
@@ -9467,12 +10145,124 @@ class TestBR45ApiKeyGovernance:
         )
         assert [f["Status"] for f in short_only] == ["Failed"]
 
-    def test_br45_unconditioned_bearer_token_deny_passes(self):
-        prevention = self._prevention(
+    def test_br45_unconditioned_bearer_token_deny_passes_beside_a_cap(self):
+        alone = self._prevention(
             self._scp_items(self._deny("bedrock*:CallWithBearerToken"))
+        )
+        assert [f["Status"] for f in alone] == ["Failed"]
+
+        prevention = self._prevention(
+            self._scp_items(
+                self._deny("bedrock*:CallWithBearerToken"), self._if_exists_cap()
+            )
+        )
+        assert [f["Status"] for f in prevention] == ["Passed"]
+
+    CREATE_KEYS = {
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Effect": "Allow",
+                "Action": "iam:CreateServiceSpecificCredential",
+                "Resource": "arn:aws:iam::123456789012:user/*",
+            }
+        ],
+    }
+
+    def _capped_policy(self):
+        return {
+            "Version": "2012-10-17",
+            "Statement": [self._if_exists_cap(sid="OwnCap")],
+        }
+
+    def test_br45_identity_policy_cap_is_credited_only_on_every_creator(self):
+        inventory = self._scp_items(*self._token_denies())
+        mixed = _identity_cache(
+            roles={
+                "KeyAdmin": [
+                    ("CreateKeys", self.CREATE_KEYS),
+                    ("OwnCap", self._capped_policy()),
+                ],
+                "OtherAdmin": [("CreateKeys", self.CREATE_KEYS)],
+                "Reader": [],
+            }
+        )
+        mixed["cache_schema_version"] = 2
+        mixed["principal_errors"] = []
+        prevention = self._prevention(inventory, cache=mixed)
+        assert [f["Status"] for f in prevention] == ["Failed"]
+        details = prevention[0]["Finding_Details"]
+        assert "Of the 2 principal(s)" in details
+        assert "role 'OtherAdmin'" in details
+        assert "role 'KeyAdmin'" not in details
+        assert "role 'Reader'" not in details
+
+        every = _identity_cache(
+            roles={
+                "KeyAdmin": [
+                    ("CreateKeys", self.CREATE_KEYS),
+                    ("OwnCap", self._capped_policy()),
+                ],
+                "OtherAdmin": [
+                    ("CreateKeys", self.CREATE_KEYS),
+                    ("OwnCap", self._capped_policy()),
+                ],
+            }
+        )
+        every["cache_schema_version"] = 2
+        every["principal_errors"] = []
+        prevention = self._prevention(inventory, cache=every)
+        assert [f["Status"] for f in prevention] == ["Passed"]
+        assert "binds those principals only" in prevention[0]["Finding_Details"]
+
+    def test_br45_no_cached_creator_is_not_an_age_cap(self):
+        prevention = self._prevention(self._scp_items(*self._token_denies()))
+
+        assert [f["Status"] for f in prevention] == ["Failed"]
+        assert "which is not a cap" in prevention[0]["Finding_Details"]
+
+    def test_br45_identity_policy_cap_over_an_unread_principal_is_not_passed(self):
+        cache = _identity_cache(
+            roles={
+                "KeyAdmin": [
+                    ("CreateKeys", self.CREATE_KEYS),
+                    ("OwnCap", self._capped_policy()),
+                ]
+            }
+        )
+        cache["cache_schema_version"] = 2
+        cache["principal_errors"] = [
+            {
+                "type": "role",
+                "name": "Hidden",
+                "stage": "inline_policy",
+                "error": "Throttling",
+            }
+        ]
+        prevention = self._prevention(
+            self._scp_items(*self._token_denies()), cache=cache
+        )
+
+        assert [f["Status"] for f in prevention] == ["N/A"]
+        assert "Hidden" in prevention[0]["Finding_Details"]
+
+    def test_br45_identity_policy_cap_from_a_v1_cache_says_errors_were_unrecorded(
+        self,
+    ):
+        cache = _identity_cache(
+            roles={
+                "KeyAdmin": [
+                    ("CreateKeys", self.CREATE_KEYS),
+                    ("OwnCap", self._capped_policy()),
+                ]
+            }
+        )
+        prevention = self._prevention(
+            self._scp_items(*self._token_denies()), cache=cache
         )
 
         assert [f["Status"] for f in prevention] == ["Passed"]
+        assert "schema version 2" in prevention[0]["Finding_Details"]
 
     def test_br45_management_account_is_not_credited(self):
         inventory = self._scp_items(
@@ -10652,6 +11442,10 @@ class TestBR17CustomModelKMSEncryption:
         bedrock_client.get_custom_model.return_value = {
             "modelKmsKeyArn": "arn:aws:kms:us-east-1:123456789012:key/abc-123"
         }
+        # Round 2: the key must also be described as customer managed.
+        bedrock_client.describe_key.return_value = {
+            "KeyMetadata": {"KeyManager": "CUSTOMER", "KeyState": "Enabled"}
+        }
         mock_client.return_value = bedrock_client
 
         result = check(region="us-east-1")
@@ -10720,6 +11514,82 @@ class TestBR17CustomModelKMSEncryption:
 
         for f in extract_csv_data(result):
             assert_finding_schema(f)
+
+    # Round 2: a key ARN is judged with kms:DescribeKey, not by its prefix.
+
+    @staticmethod
+    def _models_client(details, keys):
+        client = MagicMock()
+        paginator = MagicMock()
+        paginator.paginate.return_value = [
+            {
+                "modelSummaries": [
+                    {"modelArn": f"arn:model/{name}", "modelName": name}
+                    for name in details
+                ]
+            }
+        ]
+        client.get_paginator.return_value = paginator
+
+        def get_model(modelIdentifier):
+            entry = details[modelIdentifier.split("/")[-1]]
+            if isinstance(entry, Exception):
+                raise entry
+            return entry
+
+        client.get_custom_model.side_effect = get_model
+        client.get_imported_model.side_effect = get_model
+
+        def describe_key(KeyId):
+            entry = keys[KeyId]
+            if isinstance(entry, Exception):
+                raise entry
+            return {"KeyMetadata": {"Arn": KeyId, **entry}}
+
+        client.describe_key.side_effect = describe_key
+        return client
+
+    _GOOD = "arn:aws:kms:us-east-1:123456789012:key/good"
+    _AWS = "arn:aws:kms:us-east-1:123456789012:key/aws-managed"
+
+    def _statuses(self, check, details, keys):
+        with patch("bedrock_app.boto3.client") as mock_client:
+            mock_client.return_value = self._models_client(details, keys)
+            rows = extract_csv_data(check(region="us-east-1"))
+        return {row["Status"]: row["Finding_Details"] for row in rows}
+
+    def test_br17_aws_managed_key_arn_fails_beside_a_customer_key(self):
+        rows = self._statuses(
+            bedrock_app.check_bedrock_custom_model_kms_encryption,
+            {
+                "good": {"modelKmsKeyArn": self._GOOD},
+                "bad": {"modelKmsKeyArn": self._AWS},
+            },
+            {
+                self._GOOD: {"KeyManager": "CUSTOMER", "KeyState": "Enabled"},
+                self._AWS: {"KeyManager": "AWS", "KeyState": "Enabled"},
+            },
+        )
+
+        assert sorted(rows) == ["Failed", "Passed"]
+        assert "'bad'" in rows["Failed"] and "managed by AWS" in rows["Failed"]
+        assert rows["Passed"].startswith("1 of 2 custom model(s)")
+
+    def test_br17_undescribable_key_and_unread_model_are_reported_na(self):
+        rows = self._statuses(
+            bedrock_app.check_bedrock_custom_model_kms_encryption,
+            {
+                "hidden": {"modelKmsKeyArn": self._GOOD},
+                "closed": _client_error(
+                    "AccessDeniedException", "no", "GetCustomModel"
+                ),
+            },
+            {self._GOOD: _client_error("AccessDeniedException", "no", "DescribeKey")},
+        )
+
+        assert sorted(rows) == ["N/A"]
+        assert "2 of 2 custom model(s)" in rows["N/A"]
+        assert "hidden" in rows["N/A"] and "closed" in rows["N/A"]
 
 
 # ===================================================================
@@ -11219,7 +12089,7 @@ class TestBR20S3VectorsStore:
         }
 
     @staticmethod
-    def _agent_client_for(bodies):
+    def _agent_client_for(bodies, keys=None):
         """bodies: {kb_id: knowledgeBase body}, answered per knowledgeBaseId.
 
         These knowledge bases hold no data source, which is what keeps the
@@ -11235,14 +12105,17 @@ class TestBR20S3VectorsStore:
         agent_client.get_knowledge_base.side_effect = lambda **kwargs: {
             "knowledgeBase": bodies[kwargs["knowledgeBaseId"]]
         }
-        # Only a MANAGED knowledge base reads its key through DescribeKey here.
-        agent_client.describe_key.side_effect = lambda KeyId: {
-            "KeyMetadata": {
-                "Arn": KeyId,
-                "KeyManager": "CUSTOMER",
-                "KeyState": "Enabled",
-            }
-        }
+        # DescribeKey answers every key as an enabled customer managed key
+        # unless ``keys`` names it.
+        keys = keys or {}
+
+        def describe_key(KeyId):
+            entry = keys.get(KeyId, {"KeyManager": "CUSTOMER", "KeyState": "Enabled"})
+            if isinstance(entry, Exception):
+                raise entry
+            return {"KeyMetadata": {"Arn": KeyId, **entry}}
+
+        agent_client.describe_key.side_effect = describe_key
         return agent_client
 
     @staticmethod
@@ -11341,7 +12214,7 @@ class TestBR20S3VectorsStore:
         )
         return extract_csv_data(result), clients_built
 
-    def _run_population(self, mock_client, stores):
+    def _run_population(self, mock_client, stores, keys=None):
         """Run BR-20 over several S3 Vectors knowledge bases at once.
 
         `stores` is an ordered list of (kb_id, bucket_arn, encryption, policy),
@@ -11376,7 +12249,8 @@ class TestBR20S3VectorsStore:
         vectors_client.get_vector_bucket_policy.side_effect = get_policy
         mock_client.side_effect = self._by_service(
             self._agent_client_for(
-                {kb: self._s3_vectors_kb_body(arn) for kb, arn, _, _ in stores}
+                {kb: self._s3_vectors_kb_body(arn) for kb, arn, _, _ in stores},
+                keys=keys,
             ),
             vectors_client,
             [],
@@ -11449,7 +12323,10 @@ class TestBR20S3VectorsStore:
         )
         assert [f["Status"] for f in findings] == ["Failed"]
         assert findings[0]["Severity"] == "High"
-        assert "customer-managed key" in findings[0]["Finding_Details"]
+        # Round 2: the key is now described, and the text says what DescribeKey
+        # returned instead of naming the ARN as customer managed.
+        assert "customer managed KMS key" in findings[0]["Finding_Details"]
+        assert "is Enabled" in findings[0]["Finding_Details"]
         assert "NotFoundException" in findings[0]["Finding_Details"]
 
     @patch("bedrock_app.boto3.client")
@@ -11987,10 +12864,75 @@ class TestBR20S3VectorsStore:
         for f in findings:
             assert_finding_schema(f)
 
+    # Round 2: the vector bucket key is judged with kms:DescribeKey.
+
+    @patch("bedrock_app.boto3.client")
+    def test_br20_s3_vectors_aws_managed_key_fails_beside_a_customer_key(
+        self, mock_client
+    ):
+        good = "arn:aws:s3vectors:us-east-1:123456789012:bucket/good"
+        bad = "arn:aws:s3vectors:us-east-1:123456789012:bucket/bad"
+        aws_key = "arn:aws:kms:us-east-1:123456789012:key/aws-managed"
+        missing = self._client_error("NotFoundException", "GetVectorBucketPolicy")
+        findings = self._run_population(
+            mock_client,
+            [
+                ("kbgood", good, self._CMK, missing),
+                ("kbbad", bad, {"sseType": "aws:kms", "kmsKeyArn": aws_key}, missing),
+            ],
+            keys={aws_key: {"KeyManager": "AWS", "KeyState": "Enabled"}},
+        )
+        bad_rows = [f for f in findings if "kbbad" in f["Finding_Details"]]
+        assert [f["Status"] for f in bad_rows] == ["Failed"]
+        assert "managed by AWS" in bad_rows[0]["Finding_Details"]
+        good_rows = [f for f in findings if "kbgood" in f["Finding_Details"]]
+        assert "managed by AWS" not in good_rows[0]["Finding_Details"]
+
+    @patch("bedrock_app.boto3.client")
+    def test_br20_s3_vectors_undescribable_key_is_not_passed(self, mock_client):
+        mock_client.side_effect = self._by_service(
+            self._agent_client_for(
+                {"kb1": self._s3_vectors_kb_body(self._BUCKET_ARN)},
+                keys={
+                    self._CMK["kmsKeyArn"]: self._client_error(
+                        "AccessDeniedException", "DescribeKey"
+                    )
+                },
+            ),
+            self._vectors_client(
+                encryption=self._CMK,
+                policy=json.dumps(
+                    {
+                        "Statement": [
+                            {
+                                "Effect": "Deny",
+                                "Principal": "*",
+                                "Action": "s3vectors:*",
+                                "Resource": "*",
+                                "Condition": {
+                                    "StringNotEquals": {
+                                        "aws:PrincipalArn": "arn:aws:iam::123456789012:role/kb"
+                                    }
+                                },
+                            }
+                        ]
+                    }
+                ),
+            ),
+            [],
+        )
+        findings = extract_csv_data(
+            bedrock_app.check_bedrock_knowledge_base_kms_encryption(region="us-east-1")
+        )
+        assert [f["Status"] for f in findings] == ["N/A"]
+        assert "kms:DescribeKey" in findings[0]["Finding_Details"]
+
 
 # ===================================================================
 # BR-21: check_bedrock_agent_action_group_iam
 # ===================================================================
+
+
 class TestBR21AgentActionGroupIAM:
     """BR-21: Verify action-group Lambda roles follow least privilege."""
 
@@ -13739,6 +14681,10 @@ class TestBR30ImportedModelKMS:
             [{"modelArn": "arn:model:1", "modelName": "imported-1"}],
             {"modelKmsKeyArn": "arn:aws:kms:us-east-1:123:key/abc"},
         )
+        # Round 2: the key must also be described as customer managed.
+        mock_client.return_value.describe_key.return_value = {
+            "KeyMetadata": {"KeyManager": "CUSTOMER", "KeyState": "Enabled"}
+        }
 
         result = check(region="us-east-1")
         findings = extract_csv_data(result)
@@ -13807,6 +14753,49 @@ class TestBR30ImportedModelKMS:
 
         for f in extract_csv_data(result):
             assert_finding_schema(f)
+
+    def test_br30_aws_managed_key_arn_fails_beside_a_customer_key(self):
+        rows = TestBR17CustomModelKMSEncryption()._statuses(
+            bedrock_app.check_bedrock_imported_model_kms_encryption,
+            {
+                "good": {"modelKmsKeyArn": TestBR17CustomModelKMSEncryption._GOOD},
+                "bad": {"modelKmsKeyArn": TestBR17CustomModelKMSEncryption._AWS},
+            },
+            {
+                TestBR17CustomModelKMSEncryption._GOOD: {
+                    "KeyManager": "CUSTOMER",
+                    "KeyState": "Enabled",
+                },
+                TestBR17CustomModelKMSEncryption._AWS: {
+                    "KeyManager": "AWS",
+                    "KeyState": "Enabled",
+                },
+            },
+        )
+
+        assert sorted(rows) == ["Failed", "Passed"]
+        assert "'bad'" in rows["Failed"]
+        assert rows["Passed"].startswith("1 of 2 imported model(s)")
+
+    def test_br30_unread_model_is_na_not_dropped(self):
+        rows = TestBR17CustomModelKMSEncryption()._statuses(
+            bedrock_app.check_bedrock_imported_model_kms_encryption,
+            {
+                "good": {"modelKmsKeyArn": TestBR17CustomModelKMSEncryption._GOOD},
+                "closed": _client_error(
+                    "AccessDeniedException", "no", "GetImportedModel"
+                ),
+            },
+            {
+                TestBR17CustomModelKMSEncryption._GOOD: {
+                    "KeyManager": "CUSTOMER",
+                    "KeyState": "Enabled",
+                }
+            },
+        )
+
+        assert sorted(rows) == ["N/A", "Passed"]
+        assert "closed" in rows["N/A"]
 
 
 # ===================================================================
@@ -15615,11 +16604,50 @@ class TestProposedBedrockChecks:
         client.get_automated_reasoning_policy.return_value = {
             "kmsKeyArn": "arn:aws:kms:us-east-1:123456789012:key/key-1"
         }
+        # Round 2: the key must also be described as customer managed.
+        client.describe_key.return_value = {
+            "KeyMetadata": {"KeyManager": "CUSTOMER", "KeyState": "Enabled"}
+        }
         mock_client.return_value = client
         finding = extract_csv_data(
             bedrock_app.check_bedrock_automated_reasoning_policy_encryption("us-east-1")
         )[0]
         assert finding["Status"] == "Passed"
+
+    @patch("bedrock_app.boto3.client")
+    def test_br38_aws_managed_key_fails_and_undescribable_key_is_na(self, mock_client):
+        client = MagicMock()
+        client.list_automated_reasoning_policies.return_value = {
+            "automatedReasoningPolicySummaries": [
+                {"policyArn": f"arn:policy/{name}", "policyId": name, "name": name}
+                for name in ("aws-key", "hidden-key", "good-key")
+            ]
+        }
+        client.get_automated_reasoning_policy.side_effect = lambda policyArn: {
+            "kmsKeyArn": "arn:aws:kms:us-east-1:123456789012:key/"
+            + policyArn.split("/")[-1]
+        }
+
+        def describe_key(KeyId):
+            name = KeyId.split("/")[-1]
+            if name == "hidden-key":
+                raise _client_error("AccessDeniedException", "no", "DescribeKey")
+            manager = "AWS" if name == "aws-key" else "CUSTOMER"
+            return {"KeyMetadata": {"KeyManager": manager, "KeyState": "Enabled"}}
+
+        client.describe_key.side_effect = describe_key
+        mock_client.return_value = client
+        rows = extract_csv_data(
+            bedrock_app.check_bedrock_automated_reasoning_policy_encryption("us-east-1")
+        )
+        by_policy = {
+            row["Finding_Details"].split("'")[1]: row["Status"] for row in rows
+        }
+        assert by_policy == {
+            "aws-key": "Failed",
+            "hidden-key": "N/A",
+            "good-key": "Passed",
+        }
 
     def test_br39_and_br40_share_marketplace_inventory(self):
         kms_client = MagicMock()
@@ -17012,6 +18040,13 @@ class TestBR48AIServicesOptOut:
             "opts back in" in findings[0]["Finding_Details"]
         )
         assert "o-a1b2c3d4e5" in findings[0]["Finding_Details"]
+        # The policy type does not govern Amazon Bedrock, so a Passed row must
+        # not claim Bedrock content is kept out of service improvement.
+        assert "Amazon Bedrock content" not in findings[0]["Finding_Details"]
+        assert (
+            "does not establish how Bedrock handles content"
+            in findings[0]["Finding_Details"]
+        )
         assert (
             "'ai-lock' (attached to root r-root) sets [\"@@none\"] at services, "
             "services.default, services.default.opt_out_policy, so no policy "
@@ -17019,6 +18054,47 @@ class TestBR48AIServicesOptOut:
             in findings[0]["Finding_Details"]
         )
         assert_finding_schema(findings[0])
+
+    def test_br48_opt_out_value_is_compared_case_sensitively(self):
+        findings = self._run(
+            effective_content={
+                "services": {
+                    "default": {"opt_out_policy": "optout"},
+                    "lex": {"opt_out_policy": "optOut"},
+                    "polly": {"opt_out_policy": "OPTIN"},
+                }
+            },
+            source_policies=[{"Id": "p-lock", "Name": "ai-lock"}],
+            source_documents={"p-lock": self.LOCKED},
+        )
+
+        assert [f["Status"] for f in findings] == ["Failed", "N/A"]
+        assert (
+            "services.default.opt_out_policy is optout"
+            in (findings[0]["Finding_Details"])
+        )
+        assert "opt out individually: lex" in findings[0]["Finding_Details"]
+        assert (
+            "default carries opt_out_policy 'optout'"
+            in (findings[1]["Finding_Details"])
+        )
+        assert (
+            "polly carries opt_out_policy 'OPTIN'" in (findings[1]["Finding_Details"])
+        )
+
+    def test_br48_absent_policy_does_not_claim_bedrock_is_governed(self):
+        findings = self._run(
+            effective_error=_client_error(
+                "EffectivePolicyNotFoundException", operation="DescribeEffectivePolicy"
+            )
+        )
+
+        assert [f["Status"] for f in findings] == ["Failed"]
+        assert "including Amazon Bedrock" not in findings[0]["Finding_Details"]
+        assert (
+            "Amazon Bedrock is not among the services"
+            in (findings[0]["Finding_Details"])
+        )
 
     def test_br48_no_source_policy_to_lock_the_default_fails(self):
         """The default read optOut, but nothing stops a child adding lex: optIn."""
@@ -17357,9 +18433,10 @@ class TestBR48AIServicesOptOut:
     @pytest.mark.parametrize(
         ("node", "expected"),
         [
-            ("optOut", {"value": "optout", "wrapped": False}),
-            ({"@@assign": "optOut"}, {"value": "optout", "wrapped": True}),
-            ({"@@append": "optIn"}, {"value": "optin", "wrapped": True}),
+            ("optOut", {"value": "optOut", "wrapped": False}),
+            ({"@@assign": "optOut"}, {"value": "optOut", "wrapped": True}),
+            ({"@@append": "optIn"}, {"value": "optIn", "wrapped": True}),
+            ("optout", {"value": "optout", "wrapped": False}),
             (None, {"value": "", "wrapped": False}),
             ({}, {"value": "", "wrapped": False}),
         ],
@@ -21508,8 +22585,11 @@ class TestBR55EnclaveKeyBinding:
 
     PCR3 = "kms:RecipientAttestation:PCR3"
     DEPLOYMENT_GAP = (
-        "with no exact PCR3 (parent IAM role), PCR4 (parent instance ID) or PCR8 "
-        "(signing certificate) value"
+        "with no exact PCR3 (parent IAM role) or PCR4 (parent instance ID) value"
+    )
+    IMAGE_GAP = (
+        "with no exact ImageSha384 or PCR0 (enclave image) or PCR8 (signing "
+        "certificate) value"
     )
 
     def _enclave_allow(
@@ -21537,6 +22617,65 @@ class TestBR55EnclaveKeyBinding:
             "Resource": "*",
             "Condition": {"StringNotEqualsIgnoreCase": {self.PCR3: self.DIGEST}},
         }
+
+    def _image_deny(self):
+        return dict(
+            self._deployment_deny(),
+            Sid="DenyOtherImages",
+            Condition={
+                "StringNotEqualsIgnoreCase": {
+                    "kms:RecipientAttestation:ImageSha384": self.DIGEST
+                }
+            },
+        )
+
+    def test_br55_pcr3_only_pin_fails_beside_an_image_and_parent_pin(self):
+        """AIR-FND-DAT-10: a parent pin with no image pin admits any image."""
+        _, rows, _ = self._run(
+            {
+                "a-pcr3-only": [self._enclave_allow(key=self.PCR3, deployment=False)],
+                "b-pcr4-only": [
+                    self._enclave_allow(
+                        key="kms:RecipientAttestation:PCR4", deployment=False
+                    )
+                ],
+                "c-both": [self._enclave_allow()],
+            }
+        )
+        assert [r["Status"] for r in rows] == ["Failed", "Failed", "Passed"]
+        for row, key in zip(rows[:2], ("a-pcr3-only", "b-pcr4-only")):
+            assert f"arn:k/{key}" in row["Finding_Details"]
+            assert (
+                "statement 'EnclaveDecrypt' releases kms:decrypt, kms:generatedatakey "
+                f"{self.IMAGE_GAP}" in row["Finding_Details"]
+            )
+            assert self.DEPLOYMENT_GAP not in row["Finding_Details"]
+        assert "arn:k/c-both (Nitro Enclave)" in rows[2]["Finding_Details"]
+        assert "pcr3-only" not in rows[2]["Finding_Details"]
+
+    def test_br55_pcr8_with_an_image_pin_binds_no_parent(self):
+        """PCR8 names the signer, not the parent, so it is no deployment pin."""
+        _, rows, _ = self._run(
+            {
+                "a-image-and-pcr8": [
+                    self._enclave_allow(
+                        condition={
+                            "StringEqualsIgnoreCase": {
+                                "kms:RecipientAttestation:ImageSha384": self.DIGEST,
+                                "kms:RecipientAttestation:PCR8": self.DIGEST,
+                            }
+                        }
+                    )
+                ],
+                "b-pcr8-and-pcr3": [
+                    self._enclave_allow(key="kms:RecipientAttestation:PCR8")
+                ],
+            }
+        )
+        assert [r["Status"] for r in rows] == ["Failed", "Passed"]
+        assert "arn:k/a-image-and-pcr8" in rows[0]["Finding_Details"]
+        assert self.DEPLOYMENT_GAP in rows[0]["Finding_Details"]
+        assert "arn:k/b-pcr8-and-pcr3 (Nitro Enclave)" in rows[1]["Finding_Details"]
 
     def _assert_root_closed_but_unbound(self, row):
         """The Deny closed the unattested root path; only the parent is open."""
@@ -22001,7 +23140,10 @@ class TestBR55EnclaveKeyBinding:
                 "statement 'EnclaveDecrypt' releases kms:decrypt, kms:generatedatakey "
                 f"{self.DEPLOYMENT_GAP}" in row["Finding_Details"]
             )
-            assert "Pin PCR3 or PCR4, or PCR8" in row["Resolution"]
+            assert (
+                "Pin PCR3 or PCR4 beside the ImageSha384, PCR0 or PCR8"
+                in (row["Resolution"])
+            )
         assert "arn:k/c-pcr4 (Nitro Enclave)" in rows[2]["Finding_Details"]
         assert "arn:k/d-pcr8 (Nitro Enclave)" in rows[2]["Finding_Details"]
 
@@ -22036,12 +23178,27 @@ class TestBR55EnclaveKeyBinding:
                     self._null_deny(),
                     self._deployment_deny(),
                 ],
+                "c-image-too": [
+                    self.ROOT,
+                    self._enclave_allow(),
+                    self._null_deny(),
+                    self._deployment_deny(),
+                    self._image_deny(),
+                ],
             }
         )
-        assert [r["Status"] for r in rows] == ["Failed", "Passed"]
+        assert [r["Status"] for r in rows] == ["Failed", "Failed", "Passed"]
         assert "arn:k/a-narrowed" in rows[0]["Finding_Details"]
         assert "to the account" in rows[0]["Finding_Details"]
         assert "arn:k/b-whole" in rows[1]["Finding_Details"]
+        assert (
+            "statement 'Enable IAM User Permissions' releases kms:decrypt, "
+            "kms:derivesharedsecret, kms:generatedatakey, kms:generatedatakeypair "
+            f"{self.IMAGE_GAP}" in rows[1]["Finding_Details"]
+        )
+        assert self.DEPLOYMENT_GAP not in rows[1]["Finding_Details"]
+        assert "arn:k/c-image-too" in rows[2]["Finding_Details"]
+        assert "arn:k/b-whole" not in rows[2]["Finding_Details"]
 
     def test_br55_deny_testing_two_measurements_pins_neither(self):
         """Two negated keys are ANDed: a right image with a wrong parent escapes."""
@@ -22168,6 +23325,37 @@ def test_handler_reports_br50_and_br51_unassessed_without_a_cache():
     }
     assert sorted(rows) == ["BR-50", "BR-51"]
     assert all(r["Status"] == "N/A" for r in rows.values())
+
+
+def test_handler_reports_agentcore_memory_retention_as_unread():
+    test_client = MagicMock()
+    test_client.get_model_invocation_logging_configuration.side_effect = (
+        _make_client_error("ValidationException")
+    )
+    captured = {}
+
+    def fake_csv(findings):
+        captured["findings"] = findings
+        return "csv"
+
+    with (
+        patch.object(bedrock_app.boto3, "client", return_value=test_client),
+        patch.object(bedrock_app, "get_permissions_cache", return_value=None),
+        patch.object(bedrock_app, "generate_csv_report", side_effect=fake_csv),
+        patch.object(bedrock_app, "write_to_s3", return_value="s3://b/r.csv"),
+    ):
+        bedrock_app.lambda_handler(
+            _bedrock_event(region="us-east-1", region_index=0), None
+        )
+    rows = [
+        r
+        for f in captured["findings"]
+        for r in f.get("csv_data", [])
+        if r["Finding"] == "AgentCore Memory Event Retention"
+    ]
+    assert [(r["Check_ID"], r["Status"]) for r in rows] == [("BR-04", "N/A")]
+    assert "eventExpiryDuration" in rows[0]["Finding_Details"]
+    assert "bedrock-agentcore:GetMemory" in rows[0]["Finding_Details"]
 
 
 _cache_spec = importlib.util.spec_from_file_location(
@@ -23011,9 +24199,9 @@ class TestBR04RetentionDepth:
             },
             replication={"logs": self._replicates("replica")},
         )
-        assert sorted(r["Status"] for r in rows) == ["N/A", "Passed"]
-        na = [r for r in rows if r["Status"] == "N/A"][0]
-        assert "'replica'" in na["Finding_Details"]
+        assert sorted(r["Status"] for r in rows) == ["N/A", "N/A", "Passed"]
+        na = [r for r in rows if r["Status"] == "N/A"]
+        assert any("'replica':" in r["Finding_Details"] for r in na)
 
     def test_unreadable_replication_is_not_judged(self):
         rows, _ = self._rows(
@@ -23027,26 +24215,71 @@ class TestBR04RetentionDepth:
         assert len(na) == 1
         assert "s3:GetReplicationConfiguration" in na[0]["Finding_Details"]
 
+    LOCKED = {
+        "ObjectLockConfiguration": {
+            "ObjectLockEnabled": "Enabled",
+            "Rule": {"DefaultRetention": {"Mode": "COMPLIANCE", "Days": 400}},
+        }
+    }
+
     def test_object_lock_default_retention_is_stated(self):
         rows, _ = self._rows(
             {"s3Config": {"bucketName": "logs"}},
             {"logs": EXPIRING},
-            locks={
-                "logs": {
-                    "ObjectLockConfiguration": {
-                        "ObjectLockEnabled": "Enabled",
-                        "Rule": {
-                            "DefaultRetention": {"Mode": "COMPLIANCE", "Days": 400}
-                        },
-                    }
-                }
-            },
+            locks={"logs": self.LOCKED},
         )
-        assert [r["Status"] for r in rows] == ["Passed"]
+        assert [r["Status"] for r in rows] == ["Failed"]
         assert (
-            "Object Lock default retention (COMPLIANCE mode for 400 day(s)) holds "
-            "each version until it ends" in rows[0]["Finding_Details"]
+            "Object Lock default retention (COMPLIANCE mode for 400 day(s)) beside "
+            "its lifecycle rule" in rows[0]["Finding_Details"]
         )
+
+    def test_object_lock_on_one_log_bucket_fails_it_beside_an_unlocked_one(self):
+        rows, _ = self._rows(
+            self.LARGE,
+            {"logs": EXPIRING, "large": EXPIRING},
+            locks={"large": self.LOCKED},
+        )
+        assert sorted(r["Status"] for r in rows) == ["Failed", "Passed"]
+        failed = [r for r in rows if r["Status"] == "Failed"][0]
+        passed = [r for r in rows if r["Status"] == "Passed"][0]
+        assert (
+            "Large-data S3 bucket 'large' has an Object Lock"
+            in (failed["Finding_Details"])
+        )
+        assert "does not delete an object version" in failed["Finding_Details"]
+        assert "'large'" not in passed["Finding_Details"]
+        assert "S3 bucket 'logs' lifecycle" in passed["Finding_Details"]
+
+    def test_enabled_replication_leaves_the_replication_status_unread(self):
+        rows, _ = self._rows(
+            {"s3Config": {"bucketName": "logs"}},
+            {"logs": EXPIRING, "replica": EXPIRING},
+            replication={"logs": self._replicates("replica")},
+        )
+        assert sorted(r["Status"] for r in rows) == ["N/A", "Passed"]
+        na = [r for r in rows if r["Status"] == "N/A"][0]
+        assert (
+            "S3 bucket 'logs': an enabled replication rule copies it to 'replica'"
+            in (na["Finding_Details"])
+        )
+        assert "HeadObject" in na["Finding_Details"]
+        assert "s3:GetObject" in na["Finding_Details"]
+        assert "action named above" in na["Resolution"]
+
+    def test_a_bucket_without_replication_adds_no_replication_gap(self):
+        rows, _ = self._rows(
+            self.LARGE,
+            {"logs": EXPIRING, "large": EXPIRING, "replica": EXPIRING},
+            replication={"large": self._replicates("replica")},
+        )
+        na = [r for r in rows if r["Status"] == "N/A"]
+        assert len(na) == 1
+        assert (
+            "Large-data S3 bucket 'large': an enabled replication"
+            in (na[0]["Finding_Details"])
+        )
+        assert "'logs'" not in na[0]["Finding_Details"]
 
     def test_object_lock_without_default_retention_adds_nothing(self):
         rows, _ = self._rows(

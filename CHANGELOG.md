@@ -208,6 +208,25 @@ section.
 
 ### Fixed
 
+- Bedrock checks judge values that they used to credit on presence. `BR-07`,
+  `BR-17`, `BR-20` (S3 Vectors), `BR-30` and `BR-38` describe each named KMS
+  key and pass only an enabled customer managed key. `BR-07` also fails inline
+  flow prompt nodes, runs its flow leg with no prompt in the Region, and adds
+  `Bedrock Prompt Change Permission Scope` for wildcard `bedrock:UpdatePrompt`
+  and `bedrock:CreatePromptVersion` grants. `BR-12` fails a log bucket with
+  no default encryption where it used to report `N/A`. `BR-04` fails Object
+  Lock beside a lifecycle rule, reports a replicated log bucket and AgentCore
+  Memory retention as `N/A` naming the reads the role lacks, and its logging
+  row no longer calls the configuration proper. `BR-55` needs an image pin
+  (`ImageSha384`, `PCR0` or `PCR8`) and a deployment pin (`PCR3` or `PCR4`),
+  so a `PCR3`-only pin fails. `BR-43` covers agent, flow,
+  RetrieveAndGenerate and AgentCore runtime invocation, rejects wildcard
+  `aws:PrincipalArn` exemptions and every-Region patterns such as `*-*`, and
+  reports `N/A` when an inference profile listing failed. `BR-45` needs both
+  the age cap and the `LONG_TERM` bearer token Deny, and reads the age cap
+  from identity policies when no SCP carries it. `BR-48` compares `optOut`
+  exactly and no longer says the policy covers Amazon Bedrock. `BR-02`
+  credits an endpoint policy scope only on exact values under one condition.
 - `AC-04` no longer fails every runtime. It read `loggingConfig` and
   `tracingConfig` from `GetAgentRuntime`, which returns neither, so each
   runtime failed both legs whatever its configuration. It now reports one row

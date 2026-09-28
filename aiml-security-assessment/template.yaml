@@ -464,7 +464,7 @@ Resources:
             - Sid: KMSPermissions
               Effect: Allow
               Action:
-                - kms:DescribeKey # BR-40, BR-55, BR-12, BR-20, BR-11
+                - kms:DescribeKey # BR-40, BR-55, BR-12, BR-20, BR-11, BR-07, BR-17, BR-30, BR-38
                 - kms:GetKeyPolicy # BR-55
                 - kms:ListGrants # BR-55
               Resource: !Sub 'arn:${AWS::Partition}:kms:*:${AWS::AccountId}:key/*'
