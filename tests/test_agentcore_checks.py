@@ -29316,6 +29316,81 @@ class TestAC48WidenedPopulation:
 
     @patch("agentcore_app.iam_client")
     @patch("agentcore_app.agentcore_client")
+    def test_only_the_second_of_two_harness_roles_fails(self, mock_ac, mock_iam):
+        inventory = self._wire(
+            mock_ac,
+            mock_iam,
+            trust={"OpenHarnessRole": _UNGUARDED_TRUST},
+        )
+        mock_ac.list_harnesses.return_value = {
+            "harnesses": [{"harnessId": "h-1"}, {"harnessId": "h-2"}]
+        }
+        roles = {"h-1": "GoodHarnessRole", "h-2": "OpenHarnessRole"}
+        mock_ac.get_harness.side_effect = lambda harnessId: {
+            "harness": {
+                "executionRoleArn": f"arn:aws:iam::{_ACCOUNT}:role/{roles[harnessId]}"
+            }
+        }
+
+        findings = agentcore_app.check_agentcore_execution_role_trust_and_sharing(
+            inventory
+        )
+
+        failed = [
+            f
+            for f in findings
+            if f["Finding"] == "AgentCore Execution Role Trust Guard Missing"
+        ]
+        assert len(failed) == 1
+        assert "OpenHarnessRole" in failed[0]["Finding_Details"]
+        assert "(h-2)" in failed[0]["Finding_Details"]
+        assert "GoodHarnessRole" not in failed[0]["Finding_Details"]
+        assert any(
+            f["Status"] == "Passed" and "GoodHarnessRole" in f["Finding_Details"]
+            for f in findings
+        )
+
+    @patch("agentcore_app.iam_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_only_the_second_of_two_payment_manager_roles_fails(
+        self, mock_ac, mock_iam
+    ):
+        inventory = self._wire(
+            mock_ac,
+            mock_iam,
+            trust={"OpenPaymentRole": _UNGUARDED_TRUST},
+        )
+        mock_ac.list_payment_managers.return_value = {
+            "paymentManagers": [
+                {
+                    "paymentManagerId": f"pm-{i}",
+                    "name": f"pm-{i}",
+                    "roleArn": f"arn:aws:iam::{_ACCOUNT}:role/{role}",
+                }
+                for i, role in enumerate(("GoodPaymentRole", "OpenPaymentRole"))
+            ]
+        }
+
+        findings = agentcore_app.check_agentcore_execution_role_trust_and_sharing(
+            inventory
+        )
+
+        failed = [
+            f
+            for f in findings
+            if f["Finding"] == "AgentCore Execution Role Trust Guard Missing"
+        ]
+        assert len(failed) == 1
+        assert "OpenPaymentRole" in failed[0]["Finding_Details"]
+        assert "(pm-1)" in failed[0]["Finding_Details"]
+        assert "GoodPaymentRole" not in failed[0]["Finding_Details"]
+        assert any(
+            f["Status"] == "Passed" and "GoodPaymentRole" in f["Finding_Details"]
+            for f in findings
+        )
+
+    @patch("agentcore_app.iam_client")
+    @patch("agentcore_app.agentcore_client")
     def test_payment_managers_name_their_retrieval_role(self, mock_ac, mock_iam):
         inventory = self._wire(mock_ac, mock_iam)
         mock_ac.list_payment_managers.return_value = {
