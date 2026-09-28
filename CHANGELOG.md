@@ -442,6 +442,20 @@ section.
     key to carry a separate management and evaluation grant bound to the
     engine ARN, read with `kms:ListGrants` across every page. A key whose
     grants could not be listed is `N/A`, where it passed.
+  - `AC-14` judges every token vault a credential provider ARN names, read
+    from the OAuth2, API key and payment provider lists across every page,
+    beside the configured vault, where only the configured vault was read.
+    The vault key must be customer managed and `Enabled` by `kms:DescribeKey`,
+    where any named key passed. A vault that returns not found while a
+    provider names it, a rejected vault id, and a provider list that could not
+    be read are `N/A` naming what was not read, where the first two read
+    `N/A` with "No action required".
+  - `AC-34` scans gateway targets and harnesses as well as runtimes, over
+    every field those APIs model as sensitive, and fails a URL carrying a
+    password or a credential-named query value. A base64 string of 40 or
+    more characters now fails under a credential name even when it holds a
+    slash, where every slashed value read as a secret name. A region with
+    targets or harnesses and no runtime is scanned, where it read `N/A`.
 
 ### Deployment impact
 
@@ -554,6 +568,16 @@ under the new Sid `PolicyEngineKeyStateRead`. Redeploy the stack before the
 next scan: without the grants every policy engine reads as `N/A` in `AC-11`
 and `AC-36`. A key policy missing the guide's service-use statements, and a
 key missing either engine grant, now fail where they passed.
+
+`AC-14` adds `bedrock-agentcore:ListPaymentCredentialProviders` to the
+`AgentCoreIdentityInventory` Sid in both templates, scoped to the
+`token-vault/*` ARN beside the two provider lists already there, and reads the
+vault key with the `kms:DescribeKey` grant above. Redeploy before the next
+scan: without it `AC-14` reads the payment provider list as unread and reports
+`N/A`. `AC-34` adds no grant. Its gateway leg uses `ListGatewayTargets` and
+`GetGatewayTarget`, already on the role. Its harness leg calls
+`bedrock-agentcore:ListHarnesses`, which the role does not hold pending
+approval, so harnesses read `N/A` and are never reported clean.
 
 ## 2.0.0 - 2026-09-18
 

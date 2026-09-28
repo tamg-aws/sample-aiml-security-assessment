@@ -911,6 +911,19 @@ _VERIFIED_REMEDIATION_CONDITION_KEYS |= {
 }
 
 # Verified on 2026-09-28 with one IDENTITY_POLICY validate-policy run for the
+# AC-14 vault population, one statement per name on a token-vault ARN.
+# bedrock-agentcore:ListOauth2CredentialProviders,
+# ListApiKeyCredentialProviders and ListPaymentCredentialProviders at indexes 0
+# to 2 were not reported. The negative controls
+# bedrock-agentcore:ListOauth2CredentialProvider and
+# ListPaymentCredentialProviderz came back INVALID_ACTION at indexes 3 and 4.
+_VERIFIED_REMEDIATION_IAM_ACTIONS |= {
+    "bedrock-agentcore:ListOauth2CredentialProviders",
+    "bedrock-agentcore:ListApiKeyCredentialProviders",
+    "bedrock-agentcore:ListPaymentCredentialProviders",
+}
+
+# Verified on 2026-09-28 with one IDENTITY_POLICY validate-policy run for the
 # AC-11 and AC-36 key legs, one statement per name on a key ARN.
 # kms:ListGrants at index 0, kms:DescribeKey at index 1 and
 # kms:GrantConstraintType on kms:CreateGrant at index 2 were not reported. The

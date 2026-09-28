@@ -881,15 +881,17 @@ Resources:
                 - bedrock-agentcore:GetTokenVault
               Resource: '*'
             # AC-18 counts workload identities and credential providers to decide
-            # which identity data-event types are in use. The service
-            # authorization reference lists workload-identity-directory for
-            # ListWorkloadIdentities and token-vault for the two provider lists.
+            # which identity data-event types are in use, and AC-14 reads the
+            # token vault each provider ARN names. The service authorization
+            # reference lists workload-identity-directory for
+            # ListWorkloadIdentities and token-vault for the three provider lists.
             - Sid: AgentCoreIdentityInventory
               Effect: Allow
               Action:
                 - bedrock-agentcore:ListWorkloadIdentities
                 - bedrock-agentcore:ListOauth2CredentialProviders
                 - bedrock-agentcore:ListApiKeyCredentialProviders
+                - bedrock-agentcore:ListPaymentCredentialProviders
               Resource:
                 - !Sub 'arn:${AWS::Partition}:bedrock-agentcore:*:${AWS::AccountId}:workload-identity-directory/*'
                 - !Sub 'arn:${AWS::Partition}:bedrock-agentcore:*:${AWS::AccountId}:token-vault/*'
@@ -1053,9 +1055,9 @@ Resources:
               Action:
                 - kms:GetKeyPolicy
               Resource: !Sub 'arn:${AWS::Partition}:kms:*:${AWS::AccountId}:key/*'
-            # AC-11 reads a policy engine key's manager and state, and AC-36
-            # lists the key's grants to find the engine's management and
-            # evaluation grants.
+            # AC-11 and AC-14 read a policy engine or token vault key's manager
+            # and state, and AC-36 lists the key's grants to find the engine's
+            # management and evaluation grants.
             - Sid: PolicyEngineKeyStateRead
               Effect: Allow
               Action:

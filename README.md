@@ -323,7 +323,7 @@ enforced by default.
 | `RequireAgentCoreOnlineEvaluation` | `false` | AC-17 | When `true`, a region with no AgentCore runtime fails unless a running online evaluation configuration exists. When `false`, that region is informational. Every runtime is judged either way. |
 | `RequireAgentRegistryManualApproval` | `false` | AR-03 | When `true`, Agent Registry instances configured to approve all submitted records fail. When `false`, automatic approval is reported as an informational governance advisory. |
 | `RequireAgentRegistryCMK` | `false` | AR-05 | When `true`, registries using the default AWS owned encryption key fail. When `false`, AWS owned key encryption is reported as an informational hardening advisory; registries with a customer-managed KMS key pass. |
-| `AgentCoreTokenVaultId` | `default` | AC-14 | Selects the regional AgentCore Identity token vault whose customer-managed KMS encryption is assessed. |
+| `AgentCoreTokenVaultId` | `default` | AC-14 | Names a regional AgentCore Identity token vault whose customer-managed KMS encryption is assessed, beside every vault a credential provider ARN names. |
 | `ApprovedExternalAccountIds` | Empty | SM-30 | Comma-separated 12-digit AWS account IDs approved to receive SageMaker Model Registry access. Accounts outside the configured boundary fail. |
 | `ApprovedOrganizationIds` | Empty | SM-30 | Comma-separated AWS Organizations IDs approved to receive SageMaker Model Registry access. Organizations outside the configured boundary fail. |
 

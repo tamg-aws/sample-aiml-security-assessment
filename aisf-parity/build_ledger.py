@@ -348,12 +348,19 @@ AI_SUBJECT_ROWS = [
         None,
         "agentcore_assessments",
         ["AC-14", "AC-34"],
-        "AC-14 has the token vault CMK leg; AC-34 adds the secret-scan leg, reading "
-        "GetAgentRuntime.environmentVariables and failing a runtime whose definition holds an "
-        "access key id or a PEM private key inline. Only variable names reach the finding "
-        "because the API models the map as sensitive, and the resolution states the blind "
-        "spot: a value holding a slash reads as a secret name, so the remaining values are "
-        "the reader's to confirm",
+        "AC-14 has the token vault CMK leg: the population is the configured vault plus every "
+        "vault an OAuth2, API key or payment credential provider ARN names, and the vault key "
+        "must be customer managed and Enabled by kms:DescribeKey. AC-34 adds the secret-scan "
+        "leg over every definition that can carry a credential: GetAgentRuntime."
+        "environmentVariables, the sensitive GetGatewayTarget fields (static query parameters, "
+        "OAuth custom parameters, inline schema payloads) and the sensitive GetHarness fields "
+        "(environment variables, remote MCP headers and URLs, OAuth custom parameters, the "
+        "system prompt, model parameters). A value holding a slash reads as a secret name "
+        "unless it is a base64 string of 40 or more characters. No API reads the rest: there "
+        "is no ListTokenVaults, so a vault no provider names and that is not configured is not "
+        "read, and the agent's code and container image are not readable through any "
+        "AgentCore API. The vault key policy's trust is not graded, and the harness leg reads "
+        "N/A until bedrock-agentcore:ListHarnesses is granted",
         [],
         4,
     ),
@@ -1533,7 +1540,11 @@ INCUMBENT_NAMES = {
     "AC-31": "AgentCore Gateway Inbound Allow Lists",
     "AC-32": "AgentCore Inbound JWT Issuer Conditions",
     "AC-33": "AgentCore Token Issuance Scope",
-    "AC-34": "AgentCore Runtime Inline Credentials",
+    "AC-34": (
+        "AgentCore Runtime Inline Credentials",
+        "AgentCore Gateway Target Inline Credentials",
+        "AgentCore Harness Inline Credentials",
+    ),
     "AC-35": "AgentCore Policy Tool Scope",
     "AC-36": "AgentCore Policy Engine Key Scope",
     "AC-37": "AgentCore Policy Guardrail Wiring",

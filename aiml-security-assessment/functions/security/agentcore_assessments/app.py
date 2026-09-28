@@ -15,6 +15,7 @@ import re
 import time
 from fnmatch import fnmatchcase
 from io import StringIO
+from urllib.parse import parse_qsl, urlsplit
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 from botocore.config import Config
@@ -4689,13 +4690,33 @@ def check_browser_tool_recording(
     return findings
 
 
+# Credential provider ARNs embed the vault that stores their secrets:
+# arn:...:token-vault/{TokenVaultId}/{type}credentialprovider/{Name}.
+TOKEN_VAULT_PROVIDER_LISTS = (
+    ("list_oauth2_credential_providers", "ListOauth2CredentialProviders"),
+    ("list_api_key_credential_providers", "ListApiKeyCredentialProviders"),
+    ("list_payment_credential_providers", "ListPaymentCredentialProviders"),
+)
+TOKEN_VAULT_ID_PATTERN = re.compile(r":token-vault/([A-Za-z0-9_-]+)/")
+
+
 def check_agentcore_token_vault_encryption() -> List[Dict[str, Any]]:
-    """AC-14: Verify the default regional Identity token vault uses a CMK."""
+    """AC-14: Require every Identity token vault in use to use a usable CMK.
+
+    There is no ListTokenVaults, so the population is the configured vault
+    (AGENTCORE_TOKEN_VAULT_ID, default "default") and every vault an OAuth2, API
+    key or payment credential provider ARN names. A vault's key must be customer
+    managed and Enabled by kms:DescribeKey: a disabled key leaves the stored
+    credentials undecryptable. A vault that could not be read, and a provider
+    list that could not be read, are N/A and never Passed. Whether agent code
+    or configuration also embeds a credential is AC-34's leg.
+    """
+    finding_name = "AgentCore Identity Token Vault CMK Encryption"
     if agentcore_client is None:
         return [
             create_finding(
                 check_id="AC-14",
-                finding_name="AgentCore Identity Token Vault CMK Encryption",
+                finding_name=finding_name,
                 finding_details="AgentCore client not available in this region",
                 resolution="No action required unless AgentCore Identity is expected in this region.",
                 reference=AGENTCORE_IDENTITY_REFERENCE_URL,
@@ -4704,72 +4725,189 @@ def check_agentcore_token_vault_encryption() -> List[Dict[str, Any]]:
             )
         ]
 
-    token_vault_id = os.environ.get("AGENTCORE_TOKEN_VAULT_ID", "default")
-    try:
-        detail = agentcore_client.get_token_vault(tokenVaultId=token_vault_id)
-        kms_config = detail.get("kmsConfiguration") or {}
-        uses_cmk = kms_config.get("keyType") == "CustomerManagedKey" and bool(
-            kms_config.get("kmsKeyArn")
-        )
-        return [
+    configured_vault = os.environ.get("AGENTCORE_TOKEN_VAULT_ID", "default")
+    providers_by_vault: Dict[str, List[str]] = {configured_vault: []}
+    unlisted: List[str] = []
+    for method_name, api_name in TOKEN_VAULT_PROVIDER_LISTS:
+        try:
+            providers = _agentcore_list_all(method_name, ["credentialProviders"])
+        except Exception as error:
+            logger.warning(f"Could not call {api_name}: {error}")
+            unlisted.append(f"{api_name} ({_assessment_error_label(error)})")
+            continue
+        for provider in providers:
+            arn = str(provider.get("credentialProviderArn") or "")
+            match = TOKEN_VAULT_ID_PATTERN.search(arn)
+            if match:
+                providers_by_vault.setdefault(match.group(1), []).append(
+                    provider.get("name") or arn
+                )
+
+    findings = []
+    if unlisted:
+        findings.append(
             create_finding(
                 check_id="AC-14",
-                finding_name="AgentCore Identity Token Vault CMK Encryption",
+                finding_name="AgentCore Identity Token Vault CMK Encryption Incomplete",
                 finding_details=(
-                    f"AgentCore token vault '{token_vault_id}' uses customer-managed KMS key "
-                    f"{kms_config.get('kmsKeyArn')}."
-                    if uses_cmk
-                    else f"AgentCore token vault '{token_vault_id}' uses a service-managed or AWS-owned key."
+                    "The token vaults in use are read from the credential providers "
+                    "that name them, and these provider lists could not be read: "
+                    f"{', '.join(unlisted)}. A vault only those providers name was "
+                    "not assessed."
                 ),
                 resolution=(
-                    "No action required"
-                    if uses_cmk
-                    else "Configure the AgentCore Identity token vault with a customer-managed KMS key."
+                    "Grant bedrock-agentcore:ListOauth2CredentialProviders, "
+                    "bedrock-agentcore:ListApiKeyCredentialProviders and "
+                    "bedrock-agentcore:ListPaymentCredentialProviders and retry."
                 ),
-                reference=AGENTCORE_IDENTITY_REFERENCE_URL,
-                severity=SeverityEnum.HIGH,
-                status=StatusEnum.PASSED if uses_cmk else StatusEnum.FAILED,
-            )
-        ]
-    except ClientError as error:
-        code = error.response.get("Error", {}).get("Code", "")
-        not_configured = code in {
-            "ResourceNotFoundException",
-            "ValidationException",
-        }
-        if not_configured or _is_access_denied_client_error(error):
-            return [
-                create_finding(
-                    check_id="AC-14",
-                    finding_name="AgentCore Identity Token Vault CMK Encryption",
-                    finding_details=(
-                        "No assessable AgentCore Identity token vault was found."
-                        if not_configured
-                        else "Could not assess the AgentCore Identity token vault because access was denied."
-                    ),
-                    resolution=(
-                        "No action required"
-                        if not_configured
-                        else "Grant bedrock-agentcore:GetTokenVault and retry."
-                    ),
-                    reference=AGENTCORE_IDENTITY_REFERENCE_URL,
-                    severity=SeverityEnum.INFORMATIONAL,
-                    status=StatusEnum.NA,
-                )
-            ]
-        raise
-    except Exception as error:
-        return [
-            create_finding(
-                check_id="AC-14",
-                finding_name="AgentCore Identity Token Vault CMK Encryption",
-                finding_details=f"Could not assess the token vault: {type(error).__name__}.",
-                resolution="Resolve the assessment prerequisite or regional API availability issue and retry.",
                 reference=AGENTCORE_IDENTITY_REFERENCE_URL,
                 severity=SeverityEnum.INFORMATIONAL,
                 status=StatusEnum.NA,
             )
-        ]
+        )
+
+    key_metadata_cache: Dict[str, Any] = {}
+    for vault_id in sorted(providers_by_vault):
+        provider_names = providers_by_vault[vault_id]
+        label = f"AgentCore token vault '{vault_id}'"
+        if provider_names:
+            label += (
+                f", which stores {len(provider_names)} credential provider(s) "
+                f"({', '.join(sorted(provider_names))}),"
+            )
+
+        def incomplete(details: str, resolution: str) -> Dict[str, Any]:
+            return create_finding(
+                check_id="AC-14",
+                finding_name=f"{finding_name} Incomplete",
+                finding_details=details,
+                resolution=resolution,
+                reference=AGENTCORE_IDENTITY_REFERENCE_URL,
+                severity=SeverityEnum.INFORMATIONAL,
+                status=StatusEnum.NA,
+            )
+
+        try:
+            detail = agentcore_client.get_token_vault(tokenVaultId=vault_id)
+        except ClientError as error:
+            code = error.response.get("Error", {}).get("Code", "")
+            if code == "ResourceNotFoundException" and not provider_names:
+                findings.append(
+                    create_finding(
+                        check_id="AC-14",
+                        finding_name=finding_name,
+                        finding_details=(
+                            f"{label} does not exist and no credential provider "
+                            "names a vault, so no credential is stored to protect."
+                        ),
+                        resolution="No action required",
+                        reference=AGENTCORE_IDENTITY_REFERENCE_URL,
+                        severity=SeverityEnum.INFORMATIONAL,
+                        status=StatusEnum.NA,
+                    )
+                )
+                continue
+            logger.warning(f"Could not read token vault {vault_id}: {error}")
+            findings.append(
+                incomplete(
+                    f"{label} could not be read by GetTokenVault: "
+                    f"{_assessment_error_label(error)}, so its encryption is "
+                    "unknown.",
+                    "Grant bedrock-agentcore:GetTokenVault, check that "
+                    "AGENTCORE_TOKEN_VAULT_ID names a vault in this region, and "
+                    "retry.",
+                )
+            )
+            continue
+        except Exception as error:
+            findings.append(
+                incomplete(
+                    f"{label} could not be read: {type(error).__name__}.",
+                    "Resolve the assessment prerequisite or regional API "
+                    "availability issue and retry.",
+                )
+            )
+            continue
+
+        kms_config = detail.get("kmsConfiguration") or {}
+        key_arn = kms_config.get("kmsKeyArn")
+        if kms_config.get("keyType") != "CustomerManagedKey" or not key_arn:
+            findings.append(
+                create_finding(
+                    check_id="AC-14",
+                    finding_name=finding_name,
+                    finding_details=(
+                        f"{label} uses a service-managed or AWS-owned key "
+                        f"(keyType {kms_config.get('keyType') or 'absent'})."
+                    ),
+                    resolution="Configure the AgentCore Identity token vault with a customer-managed KMS key.",
+                    reference=AGENTCORE_IDENTITY_REFERENCE_URL,
+                    severity=SeverityEnum.HIGH,
+                    status=StatusEnum.FAILED,
+                )
+            )
+            continue
+
+        if key_arn not in key_metadata_cache:
+            try:
+                key_metadata_cache[key_arn] = (
+                    kms_client.describe_key(KeyId=key_arn).get("KeyMetadata") or {}
+                )
+            except Exception as error:
+                logger.warning(f"Could not describe key {key_arn}: {error}")
+                key_metadata_cache[key_arn] = error
+        metadata = key_metadata_cache[key_arn]
+        if isinstance(metadata, Exception):
+            findings.append(
+                incomplete(
+                    f"{label} names customer managed key {key_arn}, whose state "
+                    "could not be read by kms:DescribeKey: "
+                    f"{_assessment_error_label(metadata)}.",
+                    "Grant kms:DescribeKey on the key and retry.",
+                )
+            )
+            continue
+        if metadata.get("KeyManager") != "CUSTOMER" or (
+            metadata.get("KeyState") != "Enabled"
+        ):
+            findings.append(
+                create_finding(
+                    check_id="AC-14",
+                    finding_name=finding_name,
+                    finding_details=(
+                        f"{label} names key {key_arn}, which kms:DescribeKey "
+                        f"reports as managed by {metadata.get('KeyManager') or 'an unknown party'} "
+                        f"in state {metadata.get('KeyState') or 'unknown'}. A key "
+                        "that is not a customer managed key in state Enabled "
+                        "either gives the organization no control of the key or "
+                        "leaves the stored credentials undecryptable."
+                    ),
+                    resolution=(
+                        "Re-enable the key or cancel its scheduled deletion, or set "
+                        "an Enabled customer managed key on the vault with "
+                        "SetTokenVaultCMK."
+                    ),
+                    reference=AGENTCORE_IDENTITY_REFERENCE_URL,
+                    severity=SeverityEnum.HIGH,
+                    status=StatusEnum.FAILED,
+                )
+            )
+            continue
+        findings.append(
+            create_finding(
+                check_id="AC-14",
+                finding_name=finding_name,
+                finding_details=(
+                    f"{label} uses customer-managed KMS key {key_arn}, which "
+                    "kms:DescribeKey reports as Enabled."
+                ),
+                resolution="No action required",
+                reference=AGENTCORE_IDENTITY_REFERENCE_URL,
+                severity=SeverityEnum.HIGH,
+                status=StatusEnum.PASSED,
+            )
+        )
+    return findings
 
 
 def check_agentcore_code_interpreter_isolation() -> List[Dict[str, Any]]:
@@ -13293,8 +13431,36 @@ AWS_ACCESS_KEY_ID_PREFIXES = ("AKIA", "ASIA")
 AWS_ACCESS_KEY_ID_LENGTH = 20
 
 
+# Header names that carry a credential although no fragment above matches them:
+# an Authorization header holds the bearer token itself. Hyphens read as
+# underscores, as in _name_names_a_credential.
+CREDENTIAL_HEADER_NAMES = ("authorization", "proxy_authorization", "cookie")
+
+# A base64 string of at least the 40 characters an AWS secret access key carries.
+# Such a value can hold a slash and still be the credential.
+BASE64_CREDENTIAL_PATTERN = re.compile(r"[A-Za-z0-9+/]{40,}={0,2}")
+
+# Credential material found anywhere in free text, such as an inline schema or a
+# system prompt: an access key id or a PEM private key header.
+CREDENTIAL_TEXT_PATTERN = re.compile(
+    r"(?<![A-Z0-9])(?:AKIA|ASIA)[A-Z0-9]{16}(?![A-Z0-9])"
+    r"|-----BEGIN [A-Z ]*PRIVATE KEY-----"
+)
+
+# What every passing AC-34 finding states it could not read.
+AC34_CODE_CEILING = (
+    "The agent's code and container image are not readable through any "
+    "AgentCore API and were not scanned."
+)
+
+
 def _value_is_a_credential_literal(value: str) -> bool:
-    """Return whether a value is credential material on its own shape alone."""
+    """Return whether a value is credential material on its own shape alone.
+
+    An access key id, a PEM private key, and a URL that carries a password in its
+    user info or a credential-named query parameter all qualify, whatever the
+    variable holding them is called.
+    """
     if len(value) == AWS_ACCESS_KEY_ID_LENGTH and value.startswith(
         AWS_ACCESS_KEY_ID_PREFIXES
     ):
@@ -13303,7 +13469,36 @@ def _value_is_a_credential_literal(value: str) -> bool:
             for character in value[len(AWS_ACCESS_KEY_ID_PREFIXES[0]) :]
         ):
             return True
+    if value.lower().startswith(("http://", "https://")):
+        return _url_carries_a_credential(value)
     return value.startswith("-----BEGIN") and "PRIVATE KEY" in value
+
+
+def _url_carries_a_credential(url: str) -> bool:
+    """Return whether a URL holds a password or a credential-named query value."""
+    try:
+        parts = urlsplit(url)
+        password = parts.password
+    except ValueError:
+        return False
+    if password:
+        return True
+    for name, value in parse_qsl(parts.query, keep_blank_values=False):
+        if _name_names_a_credential(name) and not _value_points_at_a_credential_store(
+            value
+        ):
+            return True
+    return False
+
+
+def _value_is_base64_shaped(value: str) -> bool:
+    """Return whether a value reads as a base64 credential and not a path."""
+    return (
+        BASE64_CREDENTIAL_PATTERN.fullmatch(value) is not None
+        and any(character.isupper() for character in value)
+        and any(character.islower() for character in value)
+        and any(character.isdigit() for character in value)
+    )
 
 
 def _value_points_at_a_credential_store(value: str) -> bool:
@@ -13312,35 +13507,55 @@ def _value_points_at_a_credential_store(value: str) -> bool:
     An ARN, a Parameter Store path, a URL and a Secrets Manager secret name are
     all pointers. A decimal number or a boolean configures behaviour and is not a
     credential, which is what keeps TOKEN_TTL=3600 out of the finding. A secret
-    name is a slash-separated path, so any value holding a slash reads as a
-    pointer: a base64 credential containing a slash is the scan's blind spot and
-    the passing finding says so.
+    name is a slash-separated path, so a value holding a slash reads as a pointer
+    unless it is a base64 string of at least the 40 characters an AWS secret
+    access key carries. A shorter base64 credential holding a slash, or one that
+    starts with a slash, is the scan's blind spot and the passing finding says so.
     """
     lowered = value.lower()
     if lowered.startswith(("arn:", "/", "http://", "https://")):
         return True
     if "/" in value:
-        return True
+        return not _value_is_base64_shaped(value)
     if lowered in ("true", "false"):
         return True
     return value.isdigit()
 
 
-def _runtime_credential_variables(
-    environment_variables: Dict[str, Any],
+def _name_names_a_credential(name: str, header_names: Tuple[str, ...] = ()) -> bool:
+    """Return whether a variable, parameter or header name names a credential.
+
+    Hyphens read as underscores, so the header X-Api-Key hits the api_key
+    fragment the way the variable X_API_KEY does.
+    """
+    normalized = name.lower().replace("-", "_")
+    if normalized in header_names:
+        return True
+    return any(
+        fragment in normalized for fragment in CREDENTIAL_VARIABLE_NAME_FRAGMENTS
+    )
+
+
+def _credential_entries(
+    entries: Dict[str, Any], header_names: Tuple[str, ...] = ()
 ) -> Tuple[List[str], List[str]]:
-    """Split environment-variable names into inline credentials and pointers."""
+    """Split a name-to-value map into inline credentials and pointers.
+
+    A value holding credential material on its shape alone is inline whatever
+    its name. A credential-named entry is inline unless its value points at a
+    credential store. `header_names` adds names such as Authorization that carry
+    a credential although no fragment matches them.
+    """
     literals: List[str] = []
     pointers: List[str] = []
 
-    for name, raw_value in sorted(environment_variables.items()):
+    for name, raw_value in sorted(entries.items(), key=lambda item: str(item[0])):
+        name = str(name)
         value = (raw_value if isinstance(raw_value, str) else str(raw_value)).strip()
         if _value_is_a_credential_literal(value):
             literals.append(name)
             continue
-        if not any(
-            fragment in name.lower() for fragment in CREDENTIAL_VARIABLE_NAME_FRAGMENTS
-        ):
+        if not _name_names_a_credential(name, header_names):
             continue
         if not value or _value_points_at_a_credential_store(value):
             pointers.append(name)
@@ -13350,27 +13565,155 @@ def _runtime_credential_variables(
     return literals, pointers
 
 
-def check_agentcore_runtime_inline_credentials() -> List[Dict[str, Any]]:
-    """AC-34: Scan each runtime's environment variables for inline credentials.
+def _text_holds_a_credential(text: str) -> bool:
+    """Return whether free text, such as a schema or a prompt, embeds a credential."""
+    return CREDENTIAL_TEXT_PATTERN.search(text) is not None
 
-    AC-14 judges the token vault's own encryption. This is the other half of the
-    control: a credential pasted into the agent's definition never reaches the
-    vault, and every process in the microVM reads the variable. Only names are
-    reported, never values, because environmentVariables is modelled sensitive.
+
+def _inline_payloads(node: Any, path: str) -> Iterable[Tuple[str, str]]:
+    """Yield the path and text of every inlinePayload under a target configuration.
+
+    The Lambda tool schema's payload is a list of structures, so a payload that
+    is not a string is scanned as its JSON text.
     """
-    if agentcore_client is None:
-        return [
-            create_finding(
-                check_id="AC-34",
-                finding_name="AgentCore Runtime Inline Credentials",
-                finding_details="AgentCore client not available in this region.",
-                resolution="No action required unless AgentCore runs in this region.",
-                reference=AGENTCORE_RUNTIME_SECRET_REFERENCE_URL,
-                severity=SeverityEnum.INFORMATIONAL,
-                status=StatusEnum.NA,
-            )
-        ]
+    if isinstance(node, dict):
+        for key, value in node.items():
+            child = f"{path}.{key}" if path else str(key)
+            if key == "inlinePayload":
+                yield (
+                    child,
+                    (
+                        value
+                        if isinstance(value, str)
+                        else json.dumps(value, default=str)
+                    ),
+                )
+            else:
+                yield from _inline_payloads(value, child)
+    elif isinstance(node, list):
+        for index, value in enumerate(node):
+            yield from _inline_payloads(value, f"{path}[{index}]")
 
+
+def _gateway_target_inline_credentials(
+    detail: Dict[str, Any],
+) -> Tuple[List[str], int]:
+    """Name each place a gateway target's definition holds a credential inline.
+
+    Reads every field GetGatewayTarget models as sensitive: the passthrough
+    target's staticQueryParameters, each OAuth provider's customParameters, and
+    each inlinePayload schema. Returns the places found and how many fields were
+    scanned.
+    """
+    found: List[str] = []
+    scanned = 0
+    configuration = detail.get("targetConfiguration") or {}
+
+    passthrough = (configuration.get("http") or {}).get("passthrough") or {}
+    static_parameters = passthrough.get("staticQueryParameters") or {}
+    if isinstance(static_parameters, dict) and static_parameters:
+        scanned += 1
+        literals, _ = _credential_entries(static_parameters)
+        found.extend(f"static query parameter {name}" for name in literals)
+
+    for index, provider_configuration in enumerate(
+        detail.get("credentialProviderConfigurations") or []
+    ):
+        if not isinstance(provider_configuration, dict):
+            continue
+        oauth = (provider_configuration.get("credentialProvider") or {}).get(
+            "oauthCredentialProvider"
+        ) or {}
+        custom_parameters = oauth.get("customParameters") or {}
+        if isinstance(custom_parameters, dict) and custom_parameters:
+            scanned += 1
+            literals, _ = _credential_entries(custom_parameters)
+            found.extend(
+                f"OAuth custom parameter {name} on credential provider {index}"
+                for name in literals
+            )
+
+    for payload_path, text in _inline_payloads(configuration, "targetConfiguration"):
+        scanned += 1
+        if _text_holds_a_credential(text):
+            found.append(f"the inline payload at {payload_path}")
+
+    return found, scanned
+
+
+def _harness_inline_credentials(harness: Dict[str, Any]) -> Tuple[List[str], int]:
+    """Name each place a harness definition holds a credential inline.
+
+    Reads every field GetHarness models as sensitive: the environment variables,
+    each remote MCP tool's headers and URL, each gateway tool's OAuth custom
+    parameters, the system prompt, and the LiteLLM apiBase URL, plus each model
+    configuration's additionalParams. The model API keys are ARNs by design.
+    Returns the places found and how many fields were scanned.
+    """
+    found: List[str] = []
+    scanned = 0
+
+    environment_variables = harness.get("environmentVariables") or {}
+    if isinstance(environment_variables, dict) and environment_variables:
+        scanned += 1
+        literals, _ = _credential_entries(environment_variables)
+        found.extend(f"environment variable {name}" for name in literals)
+
+    for index, tool in enumerate(harness.get("tools") or []):
+        if not isinstance(tool, dict):
+            continue
+        tool_label = f"tool '{tool.get('name') or index}'"
+        config = tool.get("config") or {}
+        remote_mcp = config.get("remoteMcp") or {}
+        headers = remote_mcp.get("headers") or {}
+        if isinstance(headers, dict) and headers:
+            scanned += 1
+            literals, _ = _credential_entries(headers, CREDENTIAL_HEADER_NAMES)
+            found.extend(f"header {name} on {tool_label}" for name in literals)
+        url = remote_mcp.get("url")
+        if isinstance(url, str) and url:
+            scanned += 1
+            if _value_is_a_credential_literal(url.strip()):
+                found.append(f"the remote MCP URL on {tool_label}")
+        oauth = ((config.get("agentCoreGateway") or {}).get("outboundAuth") or {}).get(
+            "oauth"
+        ) or {}
+        custom_parameters = oauth.get("customParameters") or {}
+        if isinstance(custom_parameters, dict) and custom_parameters:
+            scanned += 1
+            literals, _ = _credential_entries(custom_parameters)
+            found.extend(
+                f"OAuth custom parameter {name} on {tool_label}" for name in literals
+            )
+
+    for index, block in enumerate(harness.get("systemPrompt") or []):
+        text = block.get("text") if isinstance(block, dict) else None
+        if isinstance(text, str) and text:
+            scanned += 1
+            if _text_holds_a_credential(text):
+                found.append(f"system prompt block {index}")
+
+    for provider, model_config in sorted((harness.get("model") or {}).items()):
+        if not isinstance(model_config, dict):
+            continue
+        api_base = model_config.get("apiBase")
+        if isinstance(api_base, str) and api_base:
+            scanned += 1
+            if _value_is_a_credential_literal(api_base.strip()):
+                found.append(f"the {provider} apiBase URL")
+        additional = model_config.get("additionalParams") or {}
+        if isinstance(additional, dict) and additional:
+            scanned += 1
+            literals, _ = _credential_entries(additional)
+            found.extend(
+                f"{provider} additionalParams entry {name}" for name in literals
+            )
+
+    return found, scanned
+
+
+def _agentcore_runtime_credential_findings() -> List[Dict[str, Any]]:
+    """AC-34's runtime leg: one finding per runtime's environment variables."""
     try:
         runtimes = _agentcore_list_all("list_agent_runtimes", ["agentRuntimes"])
     except Exception as error:
@@ -13380,19 +13723,6 @@ def check_agentcore_runtime_inline_credentials() -> List[Dict[str, Any]]:
                 finding_name="AgentCore Runtime Inline Credentials",
                 error=error,
                 reference=AGENTCORE_RUNTIME_SECRET_REFERENCE_URL,
-            )
-        ]
-
-    if not runtimes:
-        return [
-            create_finding(
-                check_id="AC-34",
-                finding_name="AgentCore Runtime Inline Credentials",
-                finding_details="No AgentCore runtimes found in this region.",
-                resolution="No action required.",
-                reference=AGENTCORE_RUNTIME_SECRET_REFERENCE_URL,
-                severity=SeverityEnum.INFORMATIONAL,
-                status=StatusEnum.NA,
             )
         ]
 
@@ -13434,7 +13764,7 @@ def check_agentcore_runtime_inline_credentials() -> List[Dict[str, Any]]:
                         f"{label} carries no environment variables, so its "
                         "definition holds no inline credential."
                     ),
-                    resolution="No action required.",
+                    resolution=f"No action required. {AC34_CODE_CEILING}",
                     reference=AGENTCORE_RUNTIME_SECRET_REFERENCE_URL,
                     severity=SeverityEnum.HIGH,
                     status=StatusEnum.PASSED,
@@ -13442,7 +13772,7 @@ def check_agentcore_runtime_inline_credentials() -> List[Dict[str, Any]]:
             )
             continue
 
-        literals, pointers = _runtime_credential_variables(environment_variables)
+        literals, pointers = _credential_entries(environment_variables)
 
         if literals:
             findings.append(
@@ -13483,8 +13813,10 @@ def check_agentcore_runtime_inline_credentials() -> List[Dict[str, Any]]:
                 ),
                 resolution=(
                     "No action required. This scan reads variable names and value "
-                    "shapes: a value containing a slash reads as a secret name, so "
-                    "confirm the remaining values are references and not literals."
+                    "shapes: a value containing a slash reads as a secret name "
+                    "unless it is a base64 string of 40 or more characters, so "
+                    "confirm the remaining values are references and not literals. "
+                    f"{AC34_CODE_CEILING}"
                 ),
                 reference=AGENTCORE_RUNTIME_SECRET_REFERENCE_URL,
                 severity=SeverityEnum.HIGH,
@@ -13493,6 +13825,266 @@ def check_agentcore_runtime_inline_credentials() -> List[Dict[str, Any]]:
         )
 
     return findings
+
+
+def _agentcore_gateway_target_credential_findings() -> List[Dict[str, Any]]:
+    """AC-34's gateway leg: one finding per target on every gateway."""
+    finding_name = "AgentCore Gateway Target Inline Credentials"
+    try:
+        gateways = _agentcore_list_all("list_gateways", ["items", "gateways"])
+    except Exception as error:
+        return [
+            _incomplete_check_finding(
+                check_id="AC-34",
+                finding_name=finding_name,
+                error=error,
+                reference=AGENTCORE_RUNTIME_SECRET_REFERENCE_URL,
+            )
+        ]
+
+    findings = []
+    for gateway in gateways:
+        gateway_id = gateway.get("gatewayId", "unknown")
+        gateway_name = gateway.get("name", gateway_id)
+
+        try:
+            targets = _agentcore_list_all(
+                "list_gateway_targets",
+                ["items", "targets"],
+                gatewayIdentifier=gateway_id,
+            )
+        except Exception as error:
+            findings.append(
+                create_finding(
+                    check_id="AC-34",
+                    finding_name=f"{finding_name} Incomplete",
+                    finding_details=(
+                        f"Gateway '{gateway_name}' ({gateway_id}) targets could not "
+                        f"be listed, so their definitions were not scanned: "
+                        f"{_assessment_error_label(error)}."
+                    ),
+                    resolution="Grant bedrock-agentcore:ListGatewayTargets and retry.",
+                    reference=AGENTCORE_RUNTIME_SECRET_REFERENCE_URL,
+                    severity=SeverityEnum.INFORMATIONAL,
+                    status=StatusEnum.NA,
+                )
+            )
+            continue
+
+        for target in targets:
+            target_id = target.get("targetId")
+            if not target_id:
+                continue
+            label = (
+                f"Target '{target.get('name', target_id)}' ({target_id}) on "
+                f"gateway '{gateway_name}' ({gateway_id})"
+            )
+            try:
+                detail = agentcore_client.get_gateway_target(
+                    gatewayIdentifier=gateway_id, targetId=target_id
+                )
+            except Exception as error:
+                findings.append(
+                    create_finding(
+                        check_id="AC-34",
+                        finding_name=f"{finding_name} Incomplete",
+                        finding_details=(
+                            f"{label} could not be read, so its definition was "
+                            f"not scanned: {_assessment_error_label(error)}."
+                        ),
+                        resolution="Grant bedrock-agentcore:GetGatewayTarget and retry.",
+                        reference=AGENTCORE_RUNTIME_SECRET_REFERENCE_URL,
+                        severity=SeverityEnum.INFORMATIONAL,
+                        status=StatusEnum.NA,
+                    )
+                )
+                continue
+
+            found, scanned = _gateway_target_inline_credentials(detail)
+            if found:
+                findings.append(
+                    create_finding(
+                        check_id="AC-34",
+                        finding_name="AgentCore Gateway Target Inline Credential Found",
+                        finding_details=(
+                            f"{label} holds credential material inline in "
+                            f"{', '.join(found)}, which every principal allowed "
+                            "GetGatewayTarget reads. The values are withheld from "
+                            "this report."
+                        ),
+                        resolution=(
+                            "Store the credential in an AgentCore Identity "
+                            "credential provider, attach it to the target through "
+                            "credentialProviderConfigurations, and rotate the "
+                            "exposed credential."
+                        ),
+                        reference=AGENTCORE_RUNTIME_SECRET_REFERENCE_URL,
+                        severity=SeverityEnum.HIGH,
+                        status=StatusEnum.FAILED,
+                    )
+                )
+                continue
+
+            findings.append(
+                create_finding(
+                    check_id="AC-34",
+                    finding_name=finding_name,
+                    finding_details=(
+                        f"{label} was scanned across {scanned} sensitive field(s) "
+                        "(static query parameters, OAuth custom parameters and "
+                        "inline schema payloads), and none holds credential "
+                        "material inline."
+                    ),
+                    resolution=(
+                        "No action required. An inline schema is searched only "
+                        "for access key ids and PEM private keys. "
+                        f"{AC34_CODE_CEILING}"
+                    ),
+                    reference=AGENTCORE_RUNTIME_SECRET_REFERENCE_URL,
+                    severity=SeverityEnum.HIGH,
+                    status=StatusEnum.PASSED,
+                )
+            )
+
+    return findings
+
+
+def _agentcore_harness_credential_findings() -> List[Dict[str, Any]]:
+    """AC-34's harness leg: one finding per harness definition."""
+    finding_name = "AgentCore Harness Inline Credentials"
+    try:
+        harnesses = _agentcore_list_all("list_harnesses", ["harnesses"])
+    except Exception as error:
+        return [
+            create_finding(
+                check_id="AC-34",
+                finding_name=f"{finding_name} Incomplete",
+                finding_details=(
+                    "AgentCore harnesses could not be listed, so no harness "
+                    "definition was scanned for inline credentials: "
+                    f"{_assessment_error_label(error)}."
+                ),
+                resolution="Grant bedrock-agentcore:ListHarnesses and retry.",
+                reference=AGENTCORE_RUNTIME_SECRET_REFERENCE_URL,
+                severity=SeverityEnum.INFORMATIONAL,
+                status=StatusEnum.NA,
+            )
+        ]
+
+    findings = []
+    for harness in harnesses:
+        harness_id = harness.get("harnessId") or "unknown"
+        label = f"Harness '{harness.get('harnessName') or harness_id}' ({harness_id})"
+        try:
+            detail = agentcore_client.get_harness(harnessId=harness_id).get(
+                "harness", {}
+            )
+        except Exception as error:
+            findings.append(
+                create_finding(
+                    check_id="AC-34",
+                    finding_name=f"{finding_name} Incomplete",
+                    finding_details=(
+                        f"{label} could not be read, so its definition was not "
+                        f"scanned: {_assessment_error_label(error)}."
+                    ),
+                    resolution="Grant bedrock-agentcore:GetHarness and retry.",
+                    reference=AGENTCORE_RUNTIME_SECRET_REFERENCE_URL,
+                    severity=SeverityEnum.INFORMATIONAL,
+                    status=StatusEnum.NA,
+                )
+            )
+            continue
+
+        found, scanned = _harness_inline_credentials(detail)
+        if found:
+            findings.append(
+                create_finding(
+                    check_id="AC-34",
+                    finding_name="AgentCore Harness Inline Credential Found",
+                    finding_details=(
+                        f"{label} holds credential material inline in "
+                        f"{', '.join(found)}. The values are withheld from this "
+                        "report."
+                    ),
+                    resolution=(
+                        "Move each value into the AgentCore Identity token vault "
+                        "or AWS Secrets Manager, reference it by ARN, and rotate "
+                        "the exposed credential."
+                    ),
+                    reference=AGENTCORE_RUNTIME_SECRET_REFERENCE_URL,
+                    severity=SeverityEnum.HIGH,
+                    status=StatusEnum.FAILED,
+                )
+            )
+            continue
+
+        findings.append(
+            create_finding(
+                check_id="AC-34",
+                finding_name=finding_name,
+                finding_details=(
+                    f"{label} was scanned across {scanned} sensitive field(s) "
+                    "(environment variables, remote MCP headers and URLs, OAuth "
+                    "custom parameters, the system prompt and model parameters), "
+                    "and none holds credential material inline."
+                ),
+                resolution=f"No action required. {AC34_CODE_CEILING}",
+                reference=AGENTCORE_RUNTIME_SECRET_REFERENCE_URL,
+                severity=SeverityEnum.HIGH,
+                status=StatusEnum.PASSED,
+            )
+        )
+
+    return findings
+
+
+def check_agentcore_runtime_inline_credentials() -> List[Dict[str, Any]]:
+    """AC-34: Scan every AgentCore definition that can carry a credential inline.
+
+    AC-14 judges the token vault's own encryption. This is the other half of the
+    control: a credential pasted into a definition never reaches the vault. Three
+    definitions are read: each runtime's environment variables, each gateway
+    target's sensitive fields, and each harness's sensitive fields. Only names
+    and field paths are reported, never values, because the APIs model these
+    fields as sensitive. The agent's code and container image are not readable
+    through any AgentCore API and are the ceiling.
+    """
+    if agentcore_client is None:
+        return [
+            create_finding(
+                check_id="AC-34",
+                finding_name="AgentCore Runtime Inline Credentials",
+                finding_details="AgentCore client not available in this region.",
+                resolution="No action required unless AgentCore runs in this region.",
+                reference=AGENTCORE_RUNTIME_SECRET_REFERENCE_URL,
+                severity=SeverityEnum.INFORMATIONAL,
+                status=StatusEnum.NA,
+            )
+        ]
+
+    findings = (
+        _agentcore_runtime_credential_findings()
+        + _agentcore_gateway_target_credential_findings()
+        + _agentcore_harness_credential_findings()
+    )
+    if findings:
+        return findings
+
+    return [
+        create_finding(
+            check_id="AC-34",
+            finding_name="AgentCore Runtime Inline Credentials",
+            finding_details=(
+                "No AgentCore runtimes, gateway targets or harnesses found in this "
+                "region."
+            ),
+            resolution="No action required.",
+            reference=AGENTCORE_RUNTIME_SECRET_REFERENCE_URL,
+            severity=SeverityEnum.INFORMATIONAL,
+            status=StatusEnum.NA,
+        )
+    ]
 
 
 # The three Cedar scope positions, in the order they appear in a policy head.

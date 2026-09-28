@@ -291,6 +291,7 @@ _EXPECTED_ACTIONS = {
         "bedrock-agentcore:ListGateways",
         "bedrock-agentcore:ListMemories",
         "bedrock-agentcore:ListOauth2CredentialProviders",
+        "bedrock-agentcore:ListPaymentCredentialProviders",
         "bedrock-agentcore:ListOnlineEvaluationConfigs",
         "bedrock-agentcore:ListPolicies",
         "bedrock-agentcore:ListPolicyEngines",

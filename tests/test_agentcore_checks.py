@@ -4236,11 +4236,263 @@ class TestAgenticAgentCoreMapping:
             assert actual_by_source[source_check_id]["Check_ID"] == expected_ag_id
 
 
+def _provider(name, vault="default", kind="oauth2credentialprovider"):
+    return {
+        "name": name,
+        "credentialProviderArn": (
+            f"arn:aws:bedrock-agentcore:us-east-1:123456789012:token-vault/{vault}/"
+            f"{kind}/{name}"
+        ),
+    }
+
+
+class TestAC14TokenVaultPopulation:
+    """AC-14 reads every vault a credential provider names, and the key's state."""
+
+    _KEY = "arn:aws:kms:us-east-1:123456789012:key/vault-key"
+
+    @staticmethod
+    def _empty_lists(mock_ac):
+        mock_ac.list_oauth2_credential_providers.return_value = {
+            "credentialProviders": []
+        }
+        mock_ac.list_api_key_credential_providers.return_value = {
+            "credentialProviders": []
+        }
+        mock_ac.list_payment_credential_providers.return_value = {
+            "credentialProviders": []
+        }
+
+    @staticmethod
+    def _enabled(mock_kms, state="Enabled", manager="CUSTOMER"):
+        mock_kms.describe_key.return_value = {
+            "KeyMetadata": {"KeyState": state, "KeyManager": manager}
+        }
+
+    def _vaults(self, mock_ac, configs):
+        def get(tokenVaultId):
+            config = configs[tokenVaultId]
+            if isinstance(config, Exception):
+                raise config
+            return {"tokenVaultId": tokenVaultId, "kmsConfiguration": config}
+
+        mock_ac.get_token_vault.side_effect = get
+
+    def _cmk(self):
+        return {"keyType": "CustomerManagedKey", "kmsKeyArn": self._KEY}
+
+    @staticmethod
+    def _by_vault(findings):
+        return {
+            f["Finding_Details"].split("token vault '")[1].split("'")[0]: f
+            for f in findings
+            if "token vault '" in f["Finding_Details"]
+        }
+
+    @patch("agentcore_app.kms_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_vault_named_only_by_a_provider_is_read(self, mock_ac, mock_kms):
+        self._empty_lists(mock_ac)
+        mock_ac.list_api_key_credential_providers.return_value = {
+            "credentialProviders": [
+                _provider("github", "team-vault", "apikeycredentialprovider")
+            ]
+        }
+        self._vaults(
+            mock_ac,
+            {"default": self._cmk(), "team-vault": {"keyType": "ServiceManagedKey"}},
+        )
+        self._enabled(mock_kms)
+
+        by_vault = self._by_vault(
+            agentcore_app.check_agentcore_token_vault_encryption()
+        )
+
+        assert set(by_vault) == {"default", "team-vault"}
+        assert by_vault["default"]["Status"] == "Passed"
+        assert by_vault["team-vault"]["Status"] == "Failed"
+        assert "github" in by_vault["team-vault"]["Finding_Details"]
+        assert "keyType ServiceManagedKey" in by_vault["team-vault"]["Finding_Details"]
+
+    @patch("agentcore_app.kms_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_payment_provider_puts_its_vault_in_scope(self, mock_ac, mock_kms):
+        self._empty_lists(mock_ac)
+        mock_ac.list_payment_credential_providers.return_value = {
+            "credentialProviders": [
+                _provider("wallet", "pay-vault", "paymentcredentialprovider")
+            ]
+        }
+        self._vaults(mock_ac, {"default": self._cmk(), "pay-vault": {}})
+        self._enabled(mock_kms)
+
+        by_vault = self._by_vault(
+            agentcore_app.check_agentcore_token_vault_encryption()
+        )
+
+        assert by_vault["pay-vault"]["Status"] == "Failed"
+        assert "keyType absent" in by_vault["pay-vault"]["Finding_Details"]
+
+    @patch("agentcore_app.kms_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_provider_lists_are_read_from_every_page(self, mock_ac, mock_kms):
+        self._empty_lists(mock_ac)
+        mock_ac.list_oauth2_credential_providers.return_value = None
+        mock_ac.list_oauth2_credential_providers.side_effect = [
+            {"credentialProviders": [_provider("okta")], "nextToken": "page-2"},
+            {"credentialProviders": [_provider("entra", "vault-b")]},
+        ]
+        self._vaults(
+            mock_ac,
+            {"default": self._cmk(), "vault-b": {"keyType": "ServiceManagedKey"}},
+        )
+        self._enabled(mock_kms)
+
+        by_vault = self._by_vault(
+            agentcore_app.check_agentcore_token_vault_encryption()
+        )
+
+        assert mock_ac.list_oauth2_credential_providers.call_count == 2
+        assert by_vault["vault-b"]["Status"] == "Failed"
+        assert "okta" in by_vault["default"]["Finding_Details"]
+
+    @patch("agentcore_app.kms_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_an_unreadable_provider_list_is_reported_incomplete(
+        self, mock_ac, mock_kms
+    ):
+        self._empty_lists(mock_ac)
+        mock_ac.list_api_key_credential_providers.side_effect = _make_client_error(
+            "AccessDeniedException", "denied"
+        )
+        self._vaults(mock_ac, {"default": self._cmk()})
+        self._enabled(mock_kms)
+
+        findings = agentcore_app.check_agentcore_token_vault_encryption()
+
+        statuses = sorted(f["Status"] for f in findings)
+        assert statuses == ["N/A", "Passed"]
+        incomplete = next(f for f in findings if f["Status"] == "N/A")
+        assert incomplete["Finding"].endswith("Incomplete")
+        assert "ListApiKeyCredentialProviders" in incomplete["Finding_Details"]
+        assert "ListOauth2CredentialProviders (" not in incomplete["Finding_Details"]
+
+    @patch("agentcore_app.kms_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_malformed_vault_id_is_incomplete_not_unconfigured(
+        self, mock_ac, mock_kms
+    ):
+        self._empty_lists(mock_ac)
+        self._vaults(
+            mock_ac, {"default": _make_client_error("ValidationException", "pattern")}
+        )
+
+        findings = agentcore_app.check_agentcore_token_vault_encryption()
+
+        assert [f["Status"] for f in findings] == ["N/A"]
+        assert findings[0]["Finding"].endswith("Incomplete")
+        assert (
+            "'default' could not be read by GetTokenVault"
+            in (findings[0]["Finding_Details"])
+        )
+        assert "AGENTCORE_TOKEN_VAULT_ID" in findings[0]["Resolution"]
+
+    @patch("agentcore_app.kms_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_missing_vault_that_a_provider_names_is_incomplete(
+        self, mock_ac, mock_kms
+    ):
+        self._empty_lists(mock_ac)
+        mock_ac.list_oauth2_credential_providers.return_value = {
+            "credentialProviders": [_provider("okta")]
+        }
+        self._vaults(
+            mock_ac,
+            {"default": _make_client_error("ResourceNotFoundException", "missing")},
+        )
+
+        findings = agentcore_app.check_agentcore_token_vault_encryption()
+
+        assert [f["Status"] for f in findings] == ["N/A"]
+        assert findings[0]["Finding"].endswith("Incomplete")
+        assert "okta" in findings[0]["Finding_Details"]
+        assert "no credential is stored" not in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.kms_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_missing_vault_with_no_providers_is_not_applicable(
+        self, mock_ac, mock_kms
+    ):
+        self._empty_lists(mock_ac)
+        self._vaults(
+            mock_ac,
+            {"default": _make_client_error("ResourceNotFoundException", "missing")},
+        )
+
+        findings = agentcore_app.check_agentcore_token_vault_encryption()
+
+        assert [f["Status"] for f in findings] == ["N/A"]
+        assert "no credential is stored to protect" in findings[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "state, manager",
+        [("Disabled", "CUSTOMER"), ("PendingDeletion", "CUSTOMER"), ("Enabled", "AWS")],
+    )
+    @patch("agentcore_app.kms_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_key_that_is_not_an_enabled_customer_key_fails(
+        self, mock_ac, mock_kms, state, manager
+    ):
+        self._empty_lists(mock_ac)
+        self._vaults(mock_ac, {"default": self._cmk()})
+        self._enabled(mock_kms, state=state, manager=manager)
+
+        findings = agentcore_app.check_agentcore_token_vault_encryption()
+
+        assert [f["Status"] for f in findings] == ["Failed"]
+        assert (
+            f"managed by {manager} in state {state}" in findings[0]["Finding_Details"]
+        )
+
+    @patch("agentcore_app.kms_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_an_undescribable_key_is_na_not_passed(self, mock_ac, mock_kms):
+        self._empty_lists(mock_ac)
+        self._vaults(mock_ac, {"default": self._cmk()})
+        mock_kms.describe_key.side_effect = _make_client_error(
+            "AccessDeniedException", "denied"
+        )
+
+        findings = agentcore_app.check_agentcore_token_vault_encryption()
+
+        assert [f["Status"] for f in findings] == ["N/A"]
+        assert "kms:DescribeKey" in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.kms_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_shared_key_is_described_once(self, mock_ac, mock_kms):
+        self._empty_lists(mock_ac)
+        mock_ac.list_oauth2_credential_providers.return_value = {
+            "credentialProviders": [_provider("okta", "vault-b")]
+        }
+        self._vaults(mock_ac, {"default": self._cmk(), "vault-b": self._cmk()})
+        self._enabled(mock_kms)
+
+        findings = agentcore_app.check_agentcore_token_vault_encryption()
+
+        assert [f["Status"] for f in findings] == ["Passed", "Passed"]
+        assert mock_kms.describe_key.call_count == 1
+
+
 class TestProposedAgentCoreChecks:
     """AC-14 through AC-17 and the AC-06 correction."""
 
+    @patch("agentcore_app.kms_client")
     @patch("agentcore_app.agentcore_client")
-    def test_ac14_customer_managed_token_vault_passes(self, mock_ac):
+    def test_ac14_customer_managed_token_vault_passes(self, mock_ac, mock_kms):
+        mock_kms.describe_key.return_value = {
+            "KeyMetadata": {"KeyState": "Enabled", "KeyManager": "CUSTOMER"}
+        }
         mock_ac.get_token_vault.return_value = {
             "tokenVaultId": "default",
             "kmsConfiguration": {
@@ -4257,8 +4509,12 @@ class TestProposedAgentCoreChecks:
         {"AGENTCORE_TOKEN_VAULT_ID": "team-security-vault"},
         clear=False,
     )
+    @patch("agentcore_app.kms_client")
     @patch("agentcore_app.agentcore_client")
-    def test_ac14_uses_configured_non_default_token_vault(self, mock_ac):
+    def test_ac14_uses_configured_non_default_token_vault(self, mock_ac, mock_kms):
+        mock_kms.describe_key.return_value = {
+            "KeyMetadata": {"KeyState": "Enabled", "KeyManager": "CUSTOMER"}
+        }
         mock_ac.get_token_vault.return_value = {
             "tokenVaultId": "team-security-vault",
             "kmsConfiguration": {
@@ -11469,6 +11725,548 @@ class TestAC34RuntimeInlineCredentials:
         findings = agentcore_app.check_agentcore_runtime_inline_credentials()
         assert findings[0]["Status"] == "N/A"
         assert findings[0]["Check_ID"] == "AC-34"
+
+
+_AWS_EXAMPLE_SECRET_KEY = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"  # pragma: allowlist secret - AWS's documented example secret key
+_ACCESS_KEY_ID = (
+    "AKIAIOSFODNN7EXAMPLE"  # pragma: allowlist secret - AWS's documented example id
+)
+
+
+def _ac34_gateways(mock_ac, targets_by_gateway, details):
+    """Serve gateways, their targets, and each target's detail by target id."""
+    mock_ac.list_agent_runtimes.return_value = {"agentRuntimes": []}
+    mock_ac.list_gateways.return_value = {
+        "items": [{"gatewayId": gateway_id} for gateway_id in targets_by_gateway]
+    }
+    mock_ac.list_gateway_targets.side_effect = lambda gatewayIdentifier, **kw: {
+        "items": [{"targetId": t} for t in targets_by_gateway[gatewayIdentifier]]
+    }
+    mock_ac.get_gateway_target.side_effect = lambda gatewayIdentifier, targetId: (
+        details[targetId]
+    )
+
+
+def _ac34_harnesses(mock_ac, details):
+    """Serve harnesses and each harness's detail by harness id."""
+    mock_ac.list_agent_runtimes.return_value = {"agentRuntimes": []}
+    mock_ac.list_harnesses.return_value = {
+        "harnesses": [{"harnessId": harness_id} for harness_id in details]
+    }
+    mock_ac.get_harness.side_effect = lambda harnessId: {"harness": details[harnessId]}
+
+
+def _ac34_by_resource(findings, marker):
+    return [finding for finding in findings if marker in finding["Finding_Details"]]
+
+
+class TestAC34ValueShapes:
+    """AC-34: the slash rule and URL values, judged on the runtime leg."""
+
+    @pytest.mark.parametrize(
+        "name,value,status",
+        [
+            # A 40-character base64 secret key holding slashes is the credential,
+            # not a secret name. HEAD read every slash as a pointer.
+            ("CLIENT_SECRET", _AWS_EXAMPLE_SECRET_KEY, "Failed"),
+            ("AWS_SECRET_ACCESS_KEY", _AWS_EXAMPLE_SECRET_KEY, "Failed"),
+            # One character short of the length bound, and a path with hyphens,
+            # stay pointers.
+            ("CLIENT_SECRET", _AWS_EXAMPLE_SECRET_KEY[:39], "Passed"),
+            (
+                "CLIENT_SECRET_NAME",
+                "prod/agentcore/team-alpha/client-secret-v2",
+                "Passed",
+            ),
+            # Long, slashed and alphanumeric, but one case only: a secret name.
+            (
+                "CLIENT_SECRET_NAME",
+                "prod/agentcore/teamalpha/clientsecretname",
+                "Passed",
+            ),
+            # A leading slash is a Parameter Store path whatever follows.
+            ("DB_PASSWORD_PARAM", "/" + _AWS_EXAMPLE_SECRET_KEY, "Passed"),
+            # A URL is judged on what it carries.
+            ("TOKEN_ENDPOINT", "https://svc:hunter2@idp.example/token", "Failed"),
+            ("TOKEN_ENDPOINT", "https://svc@idp.example/token", "Passed"),
+            ("WEBHOOK_URL", "https://hooks.example/x?api_key=abc123", "Failed"),
+            ("WEBHOOK_URL", "https://hooks.example/x?client_id=abc123", "Passed"),
+            ("WEBHOOK_URL", "https://hooks.example/x?token_ttl=3600", "Passed"),
+        ],
+    )
+    @patch("agentcore_app.agentcore_client")
+    def test_a_value_is_judged_on_its_shape(self, mock_ac, name, value, status):
+        mock_ac.list_agent_runtimes.return_value = {
+            "agentRuntimes": [{"agentRuntimeId": "rt-1"}]
+        }
+        mock_ac.get_agent_runtime.return_value = {"environmentVariables": {name: value}}
+
+        findings = agentcore_app.check_agentcore_runtime_inline_credentials()
+
+        assert [finding["Status"] for finding in findings] == [status]
+        for finding in findings:
+            assert value not in str(finding.values())
+
+    @patch("agentcore_app.agentcore_client")
+    def test_one_slashed_secret_among_two_runtimes_fails_only_its_own(self, mock_ac):
+        mock_ac.list_agent_runtimes.return_value = {
+            "agentRuntimes": [
+                {"agentRuntimeId": "rt-name"},
+                {"agentRuntimeId": "rt-key"},
+            ]
+        }
+        mock_ac.get_agent_runtime.side_effect = lambda agentRuntimeId: {
+            "environmentVariables": {
+                "CLIENT_SECRET": "prod/agent/client-secret"
+                if agentRuntimeId == "rt-name"
+                else _AWS_EXAMPLE_SECRET_KEY
+            }
+        }
+
+        findings = agentcore_app.check_agentcore_runtime_inline_credentials()
+
+        assert [finding["Status"] for finding in findings] == ["Passed", "Failed"]
+        assert "rt-key" in findings[1]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_the_passing_resolution_names_the_code_ceiling(self, mock_ac):
+        mock_ac.list_agent_runtimes.return_value = {
+            "agentRuntimes": [{"agentRuntimeId": "rt-1"}, {"agentRuntimeId": "rt-2"}]
+        }
+        mock_ac.get_agent_runtime.side_effect = lambda agentRuntimeId: (
+            {"environmentVariables": {"LOG_LEVEL": "INFO"}}
+            if agentRuntimeId == "rt-1"
+            else {}
+        )
+
+        findings = agentcore_app.check_agentcore_runtime_inline_credentials()
+
+        assert [finding["Status"] for finding in findings] == ["Passed", "Passed"]
+        for finding in findings:
+            assert "container image" in finding["Resolution"]
+        assert "40 or more characters" in findings[0]["Resolution"]
+
+
+class TestAC34GatewayTargets:
+    """AC-34: every gateway target's sensitive fields are scanned too."""
+
+    _CLEAN = {
+        "targetConfiguration": {
+            "mcp": {"openApiSchema": {"inlinePayload": '{"openapi": "3.0.0"}'}}
+        },
+        "credentialProviderConfigurations": [
+            {
+                "credentialProviderType": "OAUTH",
+                "credentialProvider": {
+                    "oauthCredentialProvider": {
+                        "providerArn": "arn:aws:bedrock-agentcore:us-east-1:"
+                        "123456789012:token-vault/default/oauth2credentialprovider/p",
+                        "customParameters": {"audience": "api.example"},
+                    }
+                },
+            }
+        ],
+    }
+
+    @pytest.mark.parametrize(
+        "bad_detail,place",
+        [
+            (
+                {
+                    "targetConfiguration": {
+                        "http": {
+                            "passthrough": {
+                                "staticQueryParameters": {"api_key": "abc123def"}
+                            }
+                        }
+                    }
+                },
+                "static query parameter api_key",
+            ),
+            (
+                {
+                    "credentialProviderConfigurations": [
+                        {
+                            "credentialProvider": {
+                                "oauthCredentialProvider": {
+                                    "customParameters": {"client_secret": "s3cr3t"}
+                                }
+                            }
+                        }
+                    ]
+                },
+                "OAuth custom parameter client_secret",
+            ),
+            (
+                {
+                    "targetConfiguration": {
+                        "mcp": {
+                            "smithyModel": {
+                                "inlinePayload": f'{{"auth": "{_ACCESS_KEY_ID}"}}'
+                            }
+                        }
+                    }
+                },
+                "targetConfiguration.mcp.smithyModel.inlinePayload",
+            ),
+            (
+                {
+                    "targetConfiguration": {
+                        "mcp": {
+                            "lambda": {
+                                "toolSchema": {
+                                    "inlinePayload": [
+                                        {"name": "ok", "description": "clean"},
+                                        {
+                                            "name": "leak",
+                                            "description": "-----BEGIN PRIVATE "
+                                            "KEY-----",
+                                        },
+                                    ]
+                                }
+                            }
+                        }
+                    }
+                },
+                "targetConfiguration.mcp.lambda.toolSchema.inlinePayload",
+            ),
+        ],
+    )
+    @patch("agentcore_app.agentcore_client")
+    def test_one_bad_target_among_two_gateways_fails(self, mock_ac, bad_detail, place):
+        _ac34_gateways(
+            mock_ac,
+            {"gw-1": ["tg-clean"], "gw-2": ["tg-bad"]},
+            {"tg-clean": self._CLEAN, "tg-bad": bad_detail},
+        )
+
+        findings = agentcore_app.check_agentcore_runtime_inline_credentials()
+
+        assert [finding["Status"] for finding in findings] == ["Passed", "Failed"]
+        assert "tg-clean" in findings[0]["Finding_Details"]
+        assert "tg-bad" in findings[1]["Finding_Details"]
+        assert place in findings[1]["Finding_Details"]
+        for finding in findings:
+            assert finding["Check_ID"] == "AC-34"
+            assert_finding_schema(finding)
+            for value in ("abc123def", "s3cr3t", _ACCESS_KEY_ID):
+                assert value not in str(finding.values())
+
+    @patch("agentcore_app.agentcore_client")
+    def test_targets_on_a_later_page_are_scanned(self, mock_ac):
+        _ac34_gateways(
+            mock_ac,
+            {"gw-1": []},
+            {
+                "tg-1": self._CLEAN,
+                "tg-2": {
+                    "targetConfiguration": {
+                        "http": {
+                            "passthrough": {"staticQueryParameters": {"token": "x1"}}
+                        }
+                    }
+                },
+            },
+        )
+        mock_ac.list_gateway_targets.side_effect = [
+            {"items": [{"targetId": "tg-1"}], "nextToken": "page-2"},
+            {"items": [{"targetId": "tg-2"}]},
+        ]
+
+        findings = agentcore_app.check_agentcore_runtime_inline_credentials()
+
+        assert [finding["Status"] for finding in findings] == ["Passed", "Failed"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_targets_are_scanned_when_no_runtime_exists(self, mock_ac):
+        # HEAD returned a lone N/A for an empty runtime list, so a target
+        # holding a credential in a runtime-free region went unreported.
+        _ac34_gateways(
+            mock_ac,
+            {"gw-1": ["tg-bad"]},
+            {
+                "tg-bad": {
+                    "credentialProviderConfigurations": [
+                        {
+                            "credentialProvider": {
+                                "oauthCredentialProvider": {
+                                    "customParameters": {"client_secret": "s3cr3t"}
+                                }
+                            }
+                        }
+                    ]
+                }
+            },
+        )
+
+        findings = agentcore_app.check_agentcore_runtime_inline_credentials()
+
+        assert [finding["Status"] for finding in findings] == ["Failed"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_an_unreadable_target_is_na_and_the_other_is_judged(self, mock_ac):
+        _ac34_gateways(
+            mock_ac,
+            {"gw-1": ["tg-denied", "tg-clean"]},
+            {"tg-clean": self._CLEAN},
+        )
+
+        def detail(gatewayIdentifier, targetId):
+            if targetId == "tg-denied":
+                raise _make_client_error("AccessDeniedException", "denied")
+            return self._CLEAN
+
+        mock_ac.get_gateway_target.side_effect = detail
+
+        findings = agentcore_app.check_agentcore_runtime_inline_credentials()
+
+        assert [finding["Status"] for finding in findings] == ["N/A", "Passed"]
+        assert "GetGatewayTarget" in findings[0]["Resolution"]
+        assert "tg-denied" in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_an_unlistable_gateway_is_na_and_names_the_list(self, mock_ac):
+        _ac34_gateways(mock_ac, {"gw-denied": [], "gw-2": ["tg-clean"]}, {})
+        mock_ac.get_gateway_target.side_effect = lambda **kw: self._CLEAN
+
+        def targets(gatewayIdentifier, **kw):
+            if gatewayIdentifier == "gw-denied":
+                raise _make_client_error("AccessDeniedException", "denied")
+            return {"items": [{"targetId": "tg-clean"}]}
+
+        mock_ac.list_gateway_targets.side_effect = targets
+
+        findings = agentcore_app.check_agentcore_runtime_inline_credentials()
+
+        assert [finding["Status"] for finding in findings] == ["N/A", "Passed"]
+        assert "ListGatewayTargets" in findings[0]["Resolution"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_gateway_list_failure_is_incomplete(self, mock_ac):
+        mock_ac.list_agent_runtimes.return_value = {"agentRuntimes": []}
+        mock_ac.list_gateways.side_effect = _make_client_error(
+            "ThrottlingException", "slow down"
+        )
+
+        findings = agentcore_app.check_agentcore_runtime_inline_credentials()
+
+        assert [finding["Status"] for finding in findings] == ["N/A"]
+        assert findings[0]["Finding"] == (
+            "AgentCore Gateway Target Inline Credentials Incomplete"
+        )
+
+
+class TestAC34Harnesses:
+    """AC-34: every harness's sensitive fields are scanned too."""
+
+    _CLEAN = {
+        "environmentVariables": {"LOG_LEVEL": "INFO"},
+        "model": {
+            "openAiModelConfig": {
+                "modelId": "gpt",
+                "apiKeyArn": "arn:aws:bedrock-agentcore:us-east-1:123456789012:"
+                "token-vault/default/apikeycredentialprovider/openai",
+            }
+        },
+        "tools": [
+            {
+                "name": "search",
+                "config": {
+                    "remoteMcp": {
+                        "url": "https://mcp.example/sse",
+                        "headers": {"Content-Type": "application/json"},
+                    }
+                },
+            }
+        ],
+        "systemPrompt": [{"text": "You are a helpful agent."}],
+    }
+
+    @pytest.mark.parametrize(
+        "bad_detail,place",
+        [
+            (
+                {"environmentVariables": {"API_KEY": "abc123def"}},
+                "environment variable API_KEY",
+            ),
+            (
+                {
+                    "tools": [
+                        {"name": "ok", "config": {"remoteMcp": {"headers": {}}}},
+                        {
+                            "name": "search",
+                            "config": {
+                                "remoteMcp": {
+                                    "headers": {"Authorization": "Bearer abc123def"}
+                                }
+                            },
+                        },
+                    ]
+                },
+                "header Authorization on tool 'search'",
+            ),
+            (
+                {
+                    "tools": [
+                        {
+                            "name": "search",
+                            "config": {
+                                "remoteMcp": {"headers": {"X-Api-Key": "abc123def"}}
+                            },
+                        }
+                    ]
+                },
+                "header X-Api-Key on tool 'search'",
+            ),
+            (
+                {
+                    "tools": [
+                        {
+                            "name": "search",
+                            "config": {
+                                "remoteMcp": {
+                                    "url": "https://mcp.example/sse?api_key=abc123def"
+                                }
+                            },
+                        }
+                    ]
+                },
+                "the remote MCP URL on tool 'search'",
+            ),
+            (
+                {
+                    "tools": [
+                        {
+                            "name": "gw",
+                            "config": {
+                                "agentCoreGateway": {
+                                    "outboundAuth": {
+                                        "oauth": {
+                                            "customParameters": {
+                                                "client_secret": "abc123def"
+                                            }
+                                        }
+                                    }
+                                }
+                            },
+                        }
+                    ]
+                },
+                "OAuth custom parameter client_secret on tool 'gw'",
+            ),
+            (
+                {
+                    "systemPrompt": [
+                        {"text": "Be brief."},
+                        {"text": f"Use key {_ACCESS_KEY_ID} for S3."},
+                    ]
+                },
+                "system prompt block 1",
+            ),
+            (
+                {
+                    "model": {
+                        "liteLlmModelConfig": {
+                            "apiBase": "https://llm:abc123def@proxy.example"
+                        }
+                    }
+                },
+                "the liteLlmModelConfig apiBase URL",
+            ),
+            (
+                {
+                    "model": {
+                        "bedrockModelConfig": {
+                            "additionalParams": {"api_key": "abc123def"}
+                        }
+                    }
+                },
+                "bedrockModelConfig additionalParams entry api_key",
+            ),
+        ],
+    )
+    @patch("agentcore_app.agentcore_client")
+    def test_one_bad_harness_among_two_fails(self, mock_ac, bad_detail, place):
+        _ac34_harnesses(mock_ac, {"h-clean": self._CLEAN, "h-bad": bad_detail})
+
+        findings = agentcore_app.check_agentcore_runtime_inline_credentials()
+
+        assert [finding["Status"] for finding in findings] == ["Passed", "Failed"]
+        assert "h-clean" in findings[0]["Finding_Details"]
+        assert "h-bad" in findings[1]["Finding_Details"]
+        assert place in findings[1]["Finding_Details"]
+        for finding in findings:
+            assert finding["Check_ID"] == "AC-34"
+            assert_finding_schema(finding)
+            assert "abc123def" not in str(finding.values())
+            assert _ACCESS_KEY_ID not in str(finding.values())
+
+    @patch("agentcore_app.agentcore_client")
+    def test_the_clean_harness_credits_what_it_scanned(self, mock_ac):
+        _ac34_harnesses(mock_ac, {"h-clean": self._CLEAN})
+
+        findings = agentcore_app.check_agentcore_runtime_inline_credentials()
+
+        assert [finding["Status"] for finding in findings] == ["Passed"]
+        # Environment variables, one header map, one URL and one prompt block.
+        assert "across 4 sensitive field(s)" in findings[0]["Finding_Details"]
+        assert "container image" in findings[0]["Resolution"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_harnesses_on_a_later_page_are_scanned(self, mock_ac):
+        _ac34_harnesses(
+            mock_ac,
+            {
+                "h-1": self._CLEAN,
+                "h-2": {"environmentVariables": {"DB_PASSWORD": "hunter2"}},
+            },
+        )
+        mock_ac.list_harnesses.side_effect = [
+            {"harnesses": [{"harnessId": "h-1"}], "nextToken": "page-2"},
+            {"harnesses": [{"harnessId": "h-2"}]},
+        ]
+
+        findings = agentcore_app.check_agentcore_runtime_inline_credentials()
+
+        assert [finding["Status"] for finding in findings] == ["Passed", "Failed"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_harness_list_failure_is_na_beside_a_passing_runtime(self, mock_ac):
+        # The deployed role is not granted ListHarnesses yet, so this is the
+        # production shape: the runtime verdict stands and the harness leg is
+        # reported as not read, never as clean.
+        mock_ac.list_agent_runtimes.return_value = {
+            "agentRuntimes": [{"agentRuntimeId": "rt-1"}]
+        }
+        mock_ac.get_agent_runtime.return_value = {}
+        mock_ac.list_harnesses.side_effect = _make_client_error(
+            "AccessDeniedException", "denied"
+        )
+
+        findings = agentcore_app.check_agentcore_runtime_inline_credentials()
+
+        assert [finding["Status"] for finding in findings] == ["Passed", "N/A"]
+        assert (
+            findings[1]["Finding"] == "AgentCore Harness Inline Credentials Incomplete"
+        )
+        assert "ListHarnesses" in findings[1]["Resolution"]
+        assert "no harness definition was scanned" in findings[1]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_an_unreadable_harness_is_na_and_the_other_is_judged(self, mock_ac):
+        _ac34_harnesses(mock_ac, {"h-denied": {}, "h-bad": {}})
+
+        def detail(harnessId):
+            if harnessId == "h-denied":
+                raise _make_client_error("AccessDeniedException", "denied")
+            return {"harness": {"environmentVariables": {"API_TOKEN": "abc123def"}}}
+
+        mock_ac.get_harness.side_effect = detail
+
+        findings = agentcore_app.check_agentcore_runtime_inline_credentials()
+
+        assert [finding["Status"] for finding in findings] == ["N/A", "Failed"]
+        assert "GetHarness" in findings[0]["Resolution"]
 
 
 class TestAC34CheckRegistration:
