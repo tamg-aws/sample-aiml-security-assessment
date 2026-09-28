@@ -3096,6 +3096,9 @@ class TestSM03TrainingVolumeEncryption:
         mock_sm.describe_training_job.side_effect = lambda TrainingJobName: jobs[
             TrainingJobName
         ]
+        # One mock stands in for every service, so kms:DescribeKey answers
+        # for the customer managed keys these fixtures name.
+        mock_sm.describe_key.return_value = {"KeyMetadata": {"KeyManager": "CUSTOMER"}}
         return mock_sm
 
     @patch("sagemaker_app.boto3.client")
@@ -8818,3 +8821,237 @@ class TestSM18BucketProtection:
             "arn:aws:s3:::other/*", arn
         )
         assert not sagemaker_app._s3_resource_covers_objects("arn:aws:s3:::target", arn)
+
+
+# ===================================================================
+# AIR-SGM-TRN-02: SM-03 key managers, unread legs and training buckets
+# ===================================================================
+def _training_job(output=_CMK, volume=_CMK, bucket="data"):
+    return {
+        "OutputDataConfig": {"KmsKeyId": output, "S3OutputPath": f"s3://{bucket}/out/"},
+        "EnableInterContainerTrafficEncryption": True,
+        "ResourceConfig": {"InstanceType": "ml.m5.large", "VolumeKmsKeyId": volume},
+        "InputDataConfig": [
+            {
+                "ChannelName": "train",
+                "DataSource": {"S3DataSource": {"S3Uri": f"s3://{bucket}/in/"}},
+            }
+        ],
+    }
+
+
+def _sm03_rows(jobs, keys=None, buckets=None, pages=None, notebooks=None):
+    """Run SM-03 over training jobs {name: DescribeTrainingJob or exception}."""
+    keys = keys or {}
+    buckets = buckets or {}
+    notebooks = notebooks or {}
+
+    def lookup(table, name):
+        value = table[name]
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+    def describe_key(KeyId):
+        value = keys.get(KeyId, "CUSTOMER")
+        if isinstance(value, Exception):
+            raise value
+        return {"KeyMetadata": {"KeyId": KeyId, "KeyManager": value}}
+
+    def bucket_part(part, Bucket):
+        value = buckets.get(Bucket, {}).get(part)
+        if value is None:
+            value = (
+                _KMS_BUCKET if part == "encryption" else {"Policy": _tls_policy(Bucket)}
+            )
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+    listing = {
+        "list_training_jobs": [
+            {"TrainingJobSummaries": [{"TrainingJobName": n} for n in jobs]}
+        ],
+        "list_notebook_instances": [
+            {"NotebookInstances": [{"NotebookInstanceName": n} for n in notebooks]}
+        ],
+        "list_domains": [{"Domains": []}],
+    }
+    listing.update(pages or {})
+    sm = _pages_client(
+        listing,
+        describe_training_job=MagicMock(
+            side_effect=lambda TrainingJobName: lookup(jobs, TrainingJobName)
+        ),
+        describe_notebook_instance=MagicMock(
+            side_effect=lambda NotebookInstanceName: lookup(
+                notebooks, NotebookInstanceName
+            )
+        ),
+    )
+    kms = MagicMock()
+    kms.describe_key.side_effect = describe_key
+    s3 = MagicMock()
+    s3.get_bucket_encryption.side_effect = lambda Bucket: bucket_part(
+        "encryption", Bucket
+    )
+    s3.get_bucket_policy.side_effect = lambda Bucket: bucket_part("policy", Bucket)
+    with patch("sagemaker_app.boto3.client") as mock_client:
+        mock_client.side_effect = _sm_client_factory(sagemaker=sm, kms=kms, s3=s3)
+        return extract_csv_data(
+            sagemaker_app.check_sagemaker_data_protection(region="us-east-1")
+        )
+
+
+class TestSM03KeyManagerAndUnreadLegs:
+    """A key ARN's manager is read, and a failed read never yields Passed."""
+
+    def test_clean_jobs_pass(self):
+        rows = _sm03_rows({"a": _training_job(), "b": _training_job()})
+        assert [r["Status"] for r in _by_finding(rows, "Data Protection Check")] == [
+            "Passed"
+        ]
+        assert not [r for r in rows if r["Status"] in ("Failed", "N/A")]
+
+    @pytest.mark.parametrize("leg", ["output", "volume"])
+    def test_aws_managed_key_named_by_arn_fails_on_one_job(self, leg):
+        # The ARN does not contain aws/sagemaker; only DescribeKey tells.
+        bad = _training_job(**{leg: _AWS_KEY})
+        rows = _sm03_rows({"good": _training_job(), "bad": bad}, keys={_AWS_KEY: "AWS"})
+        managed = _by_finding(rows, "AWS Managed Key Usage")
+        assert len(managed) == 1
+        assert "'bad'" in managed[0]["Finding_Details"]
+        assert _AWS_KEY in managed[0]["Finding_Details"]
+        assert not _by_finding(rows, "Data Protection Check")
+
+    def test_aws_managed_volume_key_is_not_listed_as_a_passing_volume(self):
+        rows = _sm03_rows(
+            {"good": _training_job(), "bad": _training_job(volume=_AWS_KEY)},
+            keys={_AWS_KEY: "AWS"},
+        )
+        volume = _by_finding(rows, sagemaker_app.TRAINING_VOLUME_ENCRYPTION_FINDING)
+        passed = [r for r in volume if r["Status"] == "Passed"]
+        assert passed and all("bad" not in r["Finding_Details"] for r in passed)
+
+    def test_unreadable_key_manager_is_incomplete_not_passed(self):
+        rows = _sm03_rows(
+            {"a": _training_job()},
+            keys={_CMK: _make_client_error("AccessDeniedException")},
+        )
+        incomplete = _by_finding(rows, "SageMaker Data Protection Check Incomplete")
+        assert [r["Status"] for r in incomplete] == ["N/A"]
+        assert "kms:DescribeKey" in incomplete[0]["Finding_Details"]
+        assert not _by_finding(rows, "Data Protection Check")
+        volume = _by_finding(rows, sagemaker_app.TRAINING_VOLUME_ENCRYPTION_FINDING)
+        assert not [r for r in volume if r["Status"] == "Passed"]
+
+    def test_one_describe_error_does_not_end_the_sweep(self):
+        rows = _sm03_rows(
+            {
+                "broken": _make_client_error("ThrottlingException"),
+                "bad": _training_job(output=_AWS_KEY),
+            },
+            keys={_AWS_KEY: "AWS"},
+        )
+        incomplete = _by_finding(rows, "SageMaker Data Protection Check Incomplete")
+        assert (
+            "sagemaker:DescribeTrainingJob broken" in incomplete[0]["Finding_Details"]
+        )
+        assert (
+            "'bad'" in _by_finding(rows, "AWS Managed Key Usage")[0]["Finding_Details"]
+        )
+        assert not _by_finding(rows, "Data Protection Check")
+
+    @pytest.mark.parametrize(
+        "operation", ["list_training_jobs", "list_notebook_instances", "list_domains"]
+    )
+    def test_list_error_is_incomplete_and_withholds_passed(self, operation):
+        rows = _sm03_rows(
+            {"a": _training_job()},
+            pages={operation: _make_client_error("AccessDeniedException")},
+        )
+        incomplete = _by_finding(rows, "SageMaker Data Protection Check Incomplete")
+        assert [r["Status"] for r in incomplete] == ["N/A"]
+        assert not _by_finding(rows, "Data Protection Check")
+
+    def test_notebook_describe_error_is_incomplete(self):
+        rows = _sm03_rows(
+            {"a": _training_job()},
+            notebooks={"nb": _make_client_error("AccessDeniedException")},
+        )
+        incomplete = _by_finding(rows, "SageMaker Data Protection Check Incomplete")
+        assert (
+            "sagemaker:DescribeNotebookInstance nb" in incomplete[0]["Finding_Details"]
+        )
+        assert not _by_finding(rows, "Data Protection Check")
+
+
+class TestSM03TrainingBucketProtection:
+    """Training source and output buckets: SSE-KMS with a CMK and TLS-only."""
+
+    def test_clean_buckets_pass(self):
+        rows = _sm03_rows(
+            {"a": _training_job(bucket="one"), "b": _training_job(bucket="two")}
+        )
+        bucket = _by_finding(rows, sagemaker_app.TRAINING_BUCKET_FINDING)
+        assert [r["Status"] for r in bucket] == ["Passed"]
+
+    def test_one_aes256_bucket_fails_and_withholds_aggregate(self):
+        rows = _sm03_rows(
+            {"a": _training_job(bucket="clean"), "b": _training_job(bucket="plain")},
+            buckets={
+                "plain": {
+                    "encryption": {
+                        "ServerSideEncryptionConfiguration": {
+                            "Rules": [
+                                {
+                                    "ApplyServerSideEncryptionByDefault": {
+                                        "SSEAlgorithm": "AES256"
+                                    }
+                                }
+                            ]
+                        }
+                    }
+                }
+            },
+        )
+        bucket = _by_finding(rows, sagemaker_app.TRAINING_BUCKET_FINDING)
+        failed = [r for r in bucket if r["Status"] == "Failed"]
+        assert len(failed) == 1
+        assert "plain" in failed[0]["Finding_Details"]
+        assert "clean" not in failed[0]["Finding_Details"]
+        assert not [r for r in bucket if r["Status"] == "Passed"]
+        assert not _by_finding(rows, "Data Protection Check")
+
+    def test_bucket_without_tls_policy_fails(self):
+        rows = _sm03_rows(
+            {"a": _training_job(bucket="open")},
+            buckets={"open": {"policy": _make_client_error("NoSuchBucketPolicy")}},
+        )
+        bucket = _by_finding(rows, sagemaker_app.TRAINING_BUCKET_FINDING)
+        assert [r["Status"] for r in bucket] == ["Failed"]
+
+    def test_unreadable_bucket_is_incomplete(self):
+        rows = _sm03_rows(
+            {"a": _training_job(bucket="hidden")},
+            buckets={"hidden": {"encryption": _make_client_error("AccessDenied")}},
+        )
+        bucket = _by_finding(rows, sagemaker_app.TRAINING_BUCKET_FINDING)
+        assert [r["Status"] for r in bucket] == ["N/A"]
+        assert not _by_finding(rows, "Data Protection Check")
+
+    def test_input_channel_bucket_is_read_even_when_output_bucket_differs(self):
+        job = _training_job(bucket="out")
+        job["InputDataConfig"][0]["DataSource"]["S3DataSource"]["S3Uri"] = (
+            "s3://source/in/"
+        )
+        rows = _sm03_rows(
+            {"a": job},
+            buckets={"source": {"policy": _make_client_error("NoSuchBucketPolicy")}},
+        )
+        failed = [
+            r
+            for r in _by_finding(rows, sagemaker_app.TRAINING_BUCKET_FINDING)
+            if r["Status"] == "Failed"
+        ]
+        assert len(failed) == 1 and "source" in failed[0]["Finding_Details"]

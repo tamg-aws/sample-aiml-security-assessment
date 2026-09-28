@@ -2288,6 +2288,7 @@ def _bucket_protection_findings(
 
 
 TRAINING_VOLUME_ENCRYPTION_FINDING = "Training Job Volume Encryption"
+TRAINING_BUCKET_FINDING = "Training Job Data Bucket Protection"
 TRAINING_VOLUME_ENCRYPTION_REFERENCE = (
     "https://docs.aws.amazon.com/sagemaker/latest/dg/train-encrypt.html"
 )
@@ -2395,6 +2396,14 @@ def check_sagemaker_data_protection(region: str = "") -> Dict[str, Any]:
         training_jobs_with_volume_key = []
         training_jobs_without_volume_key = []
         total_resources_checked = 0
+        # AIR-SGM-TRN-02: a failed list or describe is named in an Incomplete
+        # row, and the aggregate Passed row is withheld while any is unread.
+        unread = []
+        keyed = []
+        bucket_users: Dict[str, List[str]] = {}
+
+        def note_key(resource_type, name, key_id):
+            keyed.append({"type": resource_type, "name": name, "key_id": key_id})
 
         # Check Notebook Instances
         try:
@@ -2403,9 +2412,18 @@ def check_sagemaker_data_protection(region: str = "") -> Dict[str, Any]:
                 for instance in page.get("NotebookInstances", []):
                     instance_name = instance.get("NotebookInstanceName")
                     if instance_name:
-                        instance_details = sagemaker_client.describe_notebook_instance(
-                            NotebookInstanceName=instance_name
-                        )
+                        try:
+                            instance_details = (
+                                sagemaker_client.describe_notebook_instance(
+                                    NotebookInstanceName=instance_name
+                                )
+                            )
+                        except Exception as e:
+                            unread.append(
+                                f"sagemaker:DescribeNotebookInstance {instance_name} "
+                                f"({get_assessment_error_label(e)})"
+                            )
+                            continue
                         total_resources_checked += 1
 
                         # Check KMS key usage
@@ -2418,16 +2436,13 @@ def check_sagemaker_data_protection(region: str = "") -> Dict[str, Any]:
                                     "issue": "No KMS key configured",
                                 }
                             )
-                        elif "aws/sagemaker" in kms_key_id:
-                            resources_with_aws_managed_keys.append(
-                                {
-                                    "type": "Notebook Instance",
-                                    "name": instance_name,
-                                    "key_id": kms_key_id,
-                                }
-                            )
+                        else:
+                            note_key("Notebook Instance", instance_name, kms_key_id)
         except Exception as e:
             logger.error(f"Error checking notebook instances encryption: {str(e)}")
+            unread.append(
+                f"sagemaker:ListNotebookInstances ({get_assessment_error_label(e)})"
+            )
 
         # Check SageMaker Domains
         try:
@@ -2436,9 +2451,16 @@ def check_sagemaker_data_protection(region: str = "") -> Dict[str, Any]:
                 for domain in page.get("Domains", []):
                     domain_id = domain.get("DomainId")
                     if domain_id:
-                        domain_details = sagemaker_client.describe_domain(
-                            DomainId=domain_id
-                        )
+                        try:
+                            domain_details = sagemaker_client.describe_domain(
+                                DomainId=domain_id
+                            )
+                        except Exception as e:
+                            unread.append(
+                                f"sagemaker:DescribeDomain {domain_id} "
+                                f"({get_assessment_error_label(e)})"
+                            )
+                            continue
                         total_resources_checked += 1
 
                         # Check KMS key usage for domain
@@ -2451,13 +2473,11 @@ def check_sagemaker_data_protection(region: str = "") -> Dict[str, Any]:
                                     "issue": "No KMS key configured",
                                 }
                             )
-                        elif "aws/sagemaker" in kms_key_id:
-                            resources_with_aws_managed_keys.append(
-                                {
-                                    "type": "Domain",
-                                    "name": domain_details.get("DomainName", domain_id),
-                                    "key_id": kms_key_id,
-                                }
+                        else:
+                            note_key(
+                                "Domain",
+                                domain_details.get("DomainName", domain_id),
+                                kms_key_id,
                             )
 
                         # Check VPC configuration
@@ -2473,6 +2493,7 @@ def check_sagemaker_data_protection(region: str = "") -> Dict[str, Any]:
                             )
         except Exception as e:
             logger.error(f"Error checking domain encryption: {str(e)}")
+            unread.append(f"sagemaker:ListDomains ({get_assessment_error_label(e)})")
 
         # Check Training Jobs encryption
         try:
@@ -2481,9 +2502,16 @@ def check_sagemaker_data_protection(region: str = "") -> Dict[str, Any]:
                 for job in page.get("TrainingJobSummaries", []):
                     job_name = job.get("TrainingJobName")
                     if job_name:
-                        job_details = sagemaker_client.describe_training_job(
-                            TrainingJobName=job_name
-                        )
+                        try:
+                            job_details = sagemaker_client.describe_training_job(
+                                TrainingJobName=job_name
+                            )
+                        except Exception as e:
+                            unread.append(
+                                f"sagemaker:DescribeTrainingJob {job_name} "
+                                f"({get_assessment_error_label(e)})"
+                            )
+                            continue
                         total_resources_checked += 1
 
                         # Check output encryption
@@ -2498,14 +2526,8 @@ def check_sagemaker_data_protection(region: str = "") -> Dict[str, Any]:
                                     "issue": "No output encryption configured",
                                 }
                             )
-                        elif "aws/sagemaker" in kms_key_id:
-                            resources_with_aws_managed_keys.append(
-                                {
-                                    "type": "Training Job",
-                                    "name": job_name,
-                                    "key_id": kms_key_id,
-                                }
-                            )
+                        else:
+                            note_key("Training Job", job_name, kms_key_id)
 
                         # Check inter-node encryption for distributed training
                         if (
@@ -2535,8 +2557,64 @@ def check_sagemaker_data_protection(region: str = "") -> Dict[str, Any]:
                             )
                         else:
                             training_jobs_without_volume_key.append(job_name)
+
+                        # The source and output buckets are the first and last
+                        # stages of the pipeline the recommendation names.
+                        for channel in job_details.get("InputDataConfig") or []:
+                            source = (channel.get("DataSource") or {}).get(
+                                "S3DataSource"
+                            ) or {}
+                            bucket = _s3_uri_bucket(source.get("S3Uri"))
+                            if bucket:
+                                bucket_users.setdefault(bucket, []).append(job_name)
+                        bucket = _s3_uri_bucket(output_config.get("S3OutputPath"))
+                        if bucket:
+                            bucket_users.setdefault(bucket, []).append(job_name)
         except Exception as e:
             logger.error(f"Error checking training jobs encryption: {str(e)}")
+            unread.append(
+                f"sagemaker:ListTrainingJobs ({get_assessment_error_label(e)})"
+            )
+
+        # A key named on a resource can still be an AWS managed key, and the
+        # key ARN does not say so; kms:DescribeKey returns its KeyManager.
+        managers = _kms_key_managers(
+            [item["key_id"] for item in keyed]
+            + [job["key_id"] for job in training_jobs_with_volume_key],
+            region,
+        )
+        for item in keyed:
+            manager = managers[str(item["key_id"])]
+            if manager["manager"] == "AWS":
+                resources_with_aws_managed_keys.append(item)
+            elif manager["manager"] is None:
+                unread.append(
+                    f"kms:DescribeKey {item['key_id']} for {item['type']} "
+                    f"'{item['name']}' ({manager['error']})"
+                )
+        volume_keys_read = []
+        for job in training_jobs_with_volume_key:
+            manager = managers[str(job["key_id"])]
+            if manager["manager"] == "CUSTOMER":
+                volume_keys_read.append(job)
+            elif manager["manager"] == "AWS":
+                resources_with_aws_managed_keys.append(
+                    {
+                        "type": "Training Job volume",
+                        "name": job["name"],
+                        "key_id": job["key_id"],
+                    }
+                )
+            else:
+                unread.append(
+                    f"kms:DescribeKey {job['key_id']} for the volume of training "
+                    f"job '{job['name']}' ({manager['error']})"
+                )
+        training_jobs_with_volume_key = volume_keys_read
+
+        bucket_findings = _bucket_protection_findings(
+            "SM-03", TRAINING_BUCKET_FINDING, bucket_users, region
+        )
 
         # Generate findings. The volume-key list is part of this guard so the
         # aggregate "all resources use appropriate encryption" row cannot be
@@ -2546,6 +2624,8 @@ def check_sagemaker_data_protection(region: str = "") -> Dict[str, Any]:
             or resources_with_aws_managed_keys
             or resources_without_vpc_encryption
             or training_jobs_without_volume_key
+            or unread
+            or any(row["Status"] != "Passed" for row in bucket_findings)
         ):
             # Resources without encryption
             for resource in resources_without_encryption:
@@ -2620,6 +2700,18 @@ def check_sagemaker_data_protection(region: str = "") -> Dict[str, Any]:
                     )
                 )
 
+        if unread:
+            findings["csv_data"].append(
+                _unread_resources_finding(
+                    "SM-03",
+                    "SageMaker Data Protection Check",
+                    unread,
+                    f"{total_resources_checked} resource(s) were described.",
+                    "https://docs.aws.amazon.com/sagemaker/latest/dg/security.html",
+                    region,
+                )
+            )
+
         findings["csv_data"].extend(
             _training_volume_encryption_findings(
                 training_jobs_with_volume_key,
@@ -2627,6 +2719,7 @@ def check_sagemaker_data_protection(region: str = "") -> Dict[str, Any]:
                 region,
             )
         )
+        findings["csv_data"].extend(bucket_findings)
 
         return findings
 
