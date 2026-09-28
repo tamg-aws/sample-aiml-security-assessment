@@ -582,6 +582,7 @@ _VERIFIED_REMEDIATION_IAM_ACTIONS = {
     "macie2:GetAutomatedDiscoveryConfiguration",
     "macie2:GetMacieSession",
     "organizations:DescribeOrganization",
+    "organizations:ListParents",
     "organizations:ListPolicies",
     "organizations:ListRoots",
     "organizations:ListTargetsForPolicy",

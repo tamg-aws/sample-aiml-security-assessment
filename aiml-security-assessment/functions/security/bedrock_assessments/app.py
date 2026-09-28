@@ -942,6 +942,171 @@ def _cached_identity_policies(permissions: Dict[str, Any]) -> List[tuple]:
     return policies
 
 
+# cache_schema_version 2 adds principal_errors, permissions_boundary and full
+# policy-list pagination to the IAM permissions cache. A version-1 cache has
+# none of them, so it cannot say which principals went unread.
+IAM_CACHE_SCHEMA_VERSION = 2
+
+IAM_CACHE_V1_NOTE = (
+    "The IAM permissions cache is schema version 1, which does not record "
+    "principal read errors, so a role or user whose policies failed to read "
+    "would be absent from this population without notice."
+)
+
+SCP_NOT_EVALUATED_NOTE = (
+    "Service control policies are not evaluated per principal; one could deny "
+    "what an identity policy allows, so a Failed row here may overstate the "
+    "effective grant."
+)
+
+
+def _cache_principal_errors(
+    permission_cache: Dict[str, Any], principal_types: tuple = ("role", "user")
+) -> Optional[List[str]]:
+    """
+    Name the principals of the given types whose cache read failed.
+
+    Returns None for a version-1 cache, which records no read errors.
+    """
+    version = permission_cache.get("cache_schema_version")
+    if not isinstance(version, int) or version < IAM_CACHE_SCHEMA_VERSION:
+        return None
+    names = []
+    for error in permission_cache.get("principal_errors") or []:
+        if not isinstance(error, dict) or error.get("type") not in principal_types:
+            continue
+        names.append(
+            "{} '{}' ({}: {})".format(
+                error.get("type"),
+                error.get("name") or "unnamed",
+                error.get("stage") or "read",
+                error.get("error") or "unknown error",
+            )
+        )
+    return names
+
+
+def _apply_cache_population_gaps(
+    findings: Dict[str, Any],
+    permission_cache: Dict[str, Any],
+    check_id: str,
+    finding_name: str,
+    reference: str,
+    region: str,
+    principal_types: tuple = ("role", "user"),
+) -> Dict[str, Any]:
+    """
+    Stop a population-wide Passed verdict from standing over unread principals.
+
+    With principal_errors naming a principal of the population, each Passed row
+    becomes N/A and one N/A row names the principals. A version-1 cache keeps its
+    verdicts and says the errors were not recorded.
+    """
+    errored = _cache_principal_errors(permission_cache, principal_types)
+    passed = [row for row in findings["csv_data"] if row.get("Status") == "Passed"]
+    if errored is None:
+        for row in passed:
+            row["Finding_Details"] = f"{row['Finding_Details']} {IAM_CACHE_V1_NOTE}"
+        return findings
+    if not errored:
+        return findings
+    for row in passed:
+        row["Status"] = "N/A"
+        row["Finding_Details"] = (
+            f"{row['Finding_Details']} This is not reported as Passed because "
+            f"{len(errored)} principal(s) of the population could not be read."
+        )
+    findings["csv_data"].append(
+        create_finding(
+            check_id=check_id,
+            finding_name=finding_name,
+            finding_details=(
+                "The IAM permissions cache records {} principal(s) whose policies "
+                "could not be read, so they were not assessed: {}.".format(
+                    len(errored), "; ".join(errored[:10])
+                )
+            ),
+            resolution=COULD_NOT_ASSESS_RESOLUTION,
+            reference=reference,
+            severity="Informational",
+            status="N/A",
+            region=region,
+        )
+    )
+    if findings.get("status") == "PASS":
+        findings["status"] = "N/A"
+    return findings
+
+
+def _boundary_document(permissions: Dict[str, Any]) -> Any:
+    """Return the cached permissions boundary document of a principal, or None."""
+    boundary = permissions.get("permissions_boundary")
+    if isinstance(boundary, dict) and "document" in boundary:
+        boundary = boundary.get("document")
+    return boundary or None
+
+
+def _boundary_allowance(permissions: Dict[str, Any], action: str) -> str:
+    """
+    Say how a principal's permissions boundary treats one lowercase action.
+
+    Returns "none" when no boundary is set, "denied" when the boundary allows the
+    action nowhere or denies it outright, "scoped" when every allowing boundary
+    statement names specific resources, and "unscoped" otherwise. A boundary is
+    an intersection with the identity policy, so "denied" removes the grant and
+    "scoped" bounds its resources. Conditioned boundary statements are taken as
+    applying, which can only keep a grant in the population.
+    """
+    document = _boundary_document(permissions)
+    if document is None:
+        return "none"
+    statements = _policy_statements(document)
+    for statement in statements:
+        if str(statement.get("Effect", "")).upper() != "DENY":
+            continue
+        if statement.get("Condition") or "NotResource" in statement:
+            continue
+        if not any(
+            str(resource).strip() == "*"
+            for resource in _as_list(statement.get("Resource"))
+        ):
+            continue
+        if _statement_matches_action(statement, action):
+            return "denied"
+    allowing = [
+        statement
+        for statement in statements
+        if str(statement.get("Effect", "")).upper() == "ALLOW"
+        and _statement_matches_action(statement, action)
+    ]
+    if not allowing:
+        return "denied"
+    if any(
+        "NotResource" in statement
+        or any(
+            _resource_is_unscoped(resource)
+            for resource in _as_list(statement.get("Resource"))
+        )
+        for statement in allowing
+    ):
+        return "unscoped"
+    return "scoped"
+
+
+def _statement_matches_action(statement: Dict[str, Any], action: str) -> bool:
+    """Return True when a statement's Action or NotAction element covers an action."""
+    if "NotAction" in statement:
+        return not any(
+            isinstance(pattern, str)
+            and _wildcard_matches(pattern.strip().lower(), action)
+            for pattern in _as_list(statement.get("NotAction"))
+        )
+    return any(
+        isinstance(pattern, str) and _wildcard_matches(pattern.strip().lower(), action)
+        for pattern in _as_list(statement.get("Action"))
+    )
+
+
 def _action_covers_every_bedrock_action(pattern: Any) -> bool:
     """Return True when an Action entry matches every bedrock: action but not every service."""
     if not isinstance(pattern, str):
@@ -5192,56 +5357,181 @@ def _action_pattern_covers(pattern: str, action: str) -> bool:
     return pattern.endswith("*") and action.startswith(pattern[:-1])
 
 
-def _scp_requires_approved_guardrail(document: Any) -> bool:
+# Negated string and ARN tests deny a request whose guardrail is absent or not
+# named, including their IfExists forms. ForAnyValue: over a negated test is
+# false when the key is absent, so it lets a request with no guardrail through.
+GUARDRAIL_NEGATED_OPERATORS = (
+    "stringnotequals",
+    "stringnotequalsignorecase",
+    "stringnotlike",
+    "arnnotequals",
+    "arnnotlike",
+)
+
+
+def _scp_guardrail_controls(document: Any) -> Dict[str, Any]:
     """
-    Return True if a service control policy denies model invocation unless the
-    request carries an approved bedrock:GuardrailIdentifier.
+    Describe how each Deny in a service control policy requires an approved
+    bedrock:GuardrailIdentifier on model invocation.
 
-    Only a negated or Null condition test enforces: StringEquals on a Deny would
-    reject the approved guardrail and allow every other one.
+    A statement enforces only when it denies over every model, tests the key
+    with a negated operator whose values each name one guardrail with no
+    wildcard, and carries no other condition key that narrows the Deny. Null on
+    its own requires some guardrail, not the approved one, so it is recorded
+    as a gap. ``actions`` is the set of invoke actions an enforcing statement
+    covers; the caller requires the union to reach every invoke action.
     """
-    try:
-        if isinstance(document, str):
-            document = json.loads(document)
-        if not isinstance(document, dict):
-            return False
-
-        statements = document.get("Statement", [])
-        if isinstance(statements, dict):
-            statements = [statements]
-
-        for statement in statements:
-            if not isinstance(statement, dict):
-                continue
-            if str(statement.get("Effect", "")).upper() != "DENY":
-                continue
-
-            actions = statement.get("Action", [])
-            if isinstance(actions, str):
-                actions = [actions]
-            if not any(
-                _action_pattern_covers(action, invoke_action)
-                for action in actions
-                for invoke_action in GUARDRAIL_INVOKE_ACTIONS
+    observed = {"actions": set(), "enforcing": [], "gaps": []}
+    for statement in _policy_statements(document):
+        if str(statement.get("Effect", "")).upper() != "DENY":
+            continue
+        covered = [
+            action
+            for action in GUARDRAIL_INVOKE_ACTIONS
+            if _statement_matches_action(statement, action)
+        ]
+        conditions = _condition_keys_by_operator(statement)
+        guardrail_tests = [
+            (operator, values)
+            for operator, key, values in conditions
+            if key == GUARDRAIL_CONDITION_KEY
+        ]
+        if not covered or not guardrail_tests:
+            continue
+        label = (
+            f"statement '{statement['Sid']}'" if statement.get("Sid") else "a statement"
+        )
+        reasons = []
+        resources = _as_list(statement.get("Resource"))
+        if "NotResource" in statement or not any(
+            isinstance(resource, str)
+            and (resource.strip() == "*" or _pattern_covers_every_model(resource))
+            for resource in resources
+        ):
+            reasons.append(
+                "its Resource does not cover every model ({})".format(
+                    ", ".join(str(resource) for resource in resources) or "NotResource"
+                )
+            )
+        other_keys = sorted(
+            {key for _, key, _ in conditions if key != GUARDRAIL_CONDITION_KEY}
+        )
+        if other_keys:
+            reasons.append(
+                "it is also conditioned on {}, which narrows the Deny to part of "
+                "the requests".format(", ".join(other_keys))
+            )
+        test_ok = False
+        for operator, values in guardrail_tests:
+            base = _strip_condition_set_operator(operator)
+            if base.endswith("ifexists"):
+                base = base[: -len("ifexists")]
+            if operator.startswith("foranyvalue:"):
+                reasons.append(
+                    f"{operator} is false when the key is absent, so a request "
+                    "with no guardrail is not denied"
+                )
+            elif base == "null":
+                reasons.append(
+                    "Null requires that some guardrail is named but not the "
+                    "approved one"
+                )
+            elif base not in GUARDRAIL_NEGATED_OPERATORS:
+                reasons.append(
+                    f"{operator} on {GUARDRAIL_CONDITION_KEY} denies the named "
+                    "guardrail and allows every other"
+                )
+            elif not values or any(
+                "*" in str(value) or "?" in str(value) for value in values
             ):
-                continue
+                reasons.append(
+                    "its approved value {} carries a wildcard, which leaves the "
+                    "guardrail unbounded".format(
+                        ", ".join(str(value) for value in values) or "is empty and"
+                    )
+                )
+            else:
+                test_ok = True
+        if test_ok and not reasons:
+            observed["actions"].update(covered)
+            observed["enforcing"].append(
+                "{} denies {} unless {} is {}".format(
+                    label,
+                    ", ".join(covered),
+                    GUARDRAIL_CONDITION_KEY,
+                    ", ".join(
+                        str(value) for _, values in guardrail_tests for value in values
+                    ),
+                )
+            )
+        else:
+            observed["gaps"].append(f"{label}: {'; '.join(reasons)}")
+    return observed
 
-            condition = statement.get("Condition", {})
-            if not isinstance(condition, dict):
-                continue
-            for operator, condition_keys in condition.items():
-                operator = str(operator).lower()
-                if "not" not in operator and operator != "null":
-                    continue
-                if isinstance(condition_keys, dict) and any(
-                    GUARDRAIL_CONDITION_KEY in str(key).lower()
-                    for key in condition_keys
-                ):
-                    return True
-        return False
-    except Exception as e:
-        logger.warning(f"Error parsing service control policy: {str(e)}")
-        return False
+
+def _assessed_regions(primary_region: str = "") -> List[str]:
+    """Return the Regions this assessment scans, as resolve_regions does."""
+    configured = os.environ.get("TARGET_REGIONS", "").strip()
+    if configured and configured.lower() != "all":
+        return [region for region in re.split(r"[,\s]+", configured) if region]
+    return [primary_region or os.environ.get("AWS_REGION", "us-east-1")]
+
+
+GUARDRAIL_SHARE_ACTION = "bedrock:applyguardrail"
+
+GUARDRAIL_ORG_CONDITION_KEYS = {
+    "aws:principalorgid": "aws:PrincipalOrgID",
+    "aws:principalorgpaths": "aws:PrincipalOrgPaths",
+}
+
+
+def _guardrail_share_grants(document: Any, owner_account: str) -> Dict[str, Any]:
+    """
+    Describe how a guardrail resource policy shares the guardrail with other
+    accounts through bedrock:ApplyGuardrail.
+
+    An Allow counts when it is scoped to the organization by aws:PrincipalOrgID
+    or aws:PrincipalOrgPaths, or names principals in other accounts. A '*'
+    principal with neither key shares the guardrail with every AWS account.
+    """
+    observed = {"shared": [], "unbounded": []}
+    for statement in _policy_statements(document):
+        if str(statement.get("Effect", "")).upper() != "ALLOW":
+            continue
+        if not _statement_matches_action(statement, GUARDRAIL_SHARE_ACTION):
+            continue
+        principal = statement.get("Principal")
+        if isinstance(principal, dict):
+            principals = [str(item) for item in _as_list(principal.get("AWS"))]
+        else:
+            principals = [str(item) for item in _as_list(principal)]
+        org_scopes = [
+            "{} {}".format(
+                GUARDRAIL_ORG_CONDITION_KEYS[key],
+                ", ".join(str(value) for value in values),
+            )
+            for operator, key, values in _condition_keys_by_operator(statement)
+            if key in GUARDRAIL_ORG_CONDITION_KEYS and "not" not in operator
+        ]
+        others = [
+            item
+            for item in principals
+            if item != "*" and owner_account and owner_account not in item
+        ]
+        if org_scopes:
+            observed["shared"].append(
+                "an Allow of bedrock:ApplyGuardrail scoped by " + "; ".join(org_scopes)
+            )
+        elif "*" in principals:
+            observed["unbounded"].append(
+                "an Allow of bedrock:ApplyGuardrail to every principal with no "
+                "aws:PrincipalOrgID or aws:PrincipalOrgPaths condition"
+            )
+        elif others:
+            observed["shared"].append(
+                "an Allow of bedrock:ApplyGuardrail to " + ", ".join(others[:5])
+            )
+    return observed
 
 
 # The includedModels member pattern in the bedrock service model is
@@ -5339,6 +5629,96 @@ def _account_enforced_guardrail_scope(config: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _guardrail_share_finding(
+    guardrail_arn: str, caller_account: str, reference: str, region: str
+) -> Dict[str, Any]:
+    """
+    Judge whether a centrally enforced guardrail is shared with member accounts.
+
+    The resource policy is readable only by the guardrail's owner, so a run in
+    another account reports the share as not read.
+    """
+    parts = guardrail_arn.split(":")
+    owner = parts[4] if len(parts) > 4 else ""
+    guardrail_region = parts[3] if len(parts) > 3 else ""
+
+    def row(details, resolution, severity, status):
+        return create_finding(
+            check_id="BR-41",
+            finding_name="Central Guardrail Cross-Account Share",
+            finding_details=details,
+            resolution=resolution,
+            reference=reference,
+            severity=severity,
+            status=status,
+            region=region,
+        )
+
+    if owner != caller_account:
+        return row(
+            f"Guardrail {guardrail_arn} is owned by account {owner}, and its "
+            "resource policy is readable only there, so whether it is shared with "
+            "the member accounts that enforce it was not read from account "
+            f"{caller_account or 'unknown'}.",
+            "Run the assessment in the guardrail's owning account to read the share.",
+            "Informational",
+            "N/A",
+        )
+    try:
+        client = boto3.client(
+            "bedrock", config=boto3_config, region_name=guardrail_region or None
+        )
+        response = client.get_resource_policy(resourceArn=guardrail_arn)
+        observed = _guardrail_share_grants(
+            response.get("resourcePolicy") or "{}", owner
+        )
+    except ClientError as error:
+        code = error.response.get("Error", {}).get("Code", "")
+        if code == "ResourceNotFoundException":
+            observed = {"shared": [], "unbounded": []}
+        else:
+            return row(
+                f"The resource policy of guardrail {guardrail_arn} could not be "
+                f"read ({get_assessment_error_label(error)}), so whether member "
+                "accounts can apply it is undetermined.",
+                "Grant bedrock:GetResourcePolicy on the guardrail and retry.",
+                "Informational",
+                "N/A",
+            )
+    except (ValueError, TypeError, AttributeError) as error:
+        return row(
+            f"The resource policy of guardrail {guardrail_arn} could not be "
+            f"parsed ({str(error)}), so whether member accounts can apply it is "
+            "undetermined.",
+            COULD_NOT_ASSESS_RESOLUTION,
+            "Informational",
+            "N/A",
+        )
+    if observed["shared"] and not observed["unbounded"]:
+        return row(
+            f"Guardrail {guardrail_arn} is shared with member accounts through "
+            f"{'; '.join(observed['shared'][:3])}.",
+            "No action required",
+            "Medium",
+            "Passed",
+        )
+    return row(
+        f"Guardrail {guardrail_arn} is enforced centrally but its resource policy "
+        "{}, so member accounts {}.".format(
+            "; ".join(observed["unbounded"])
+            if observed["unbounded"]
+            else "grants no other account bedrock:ApplyGuardrail",
+            "outside the organization can also apply it"
+            if observed["unbounded"]
+            else "cannot apply the guardrail the policy names",
+        ),
+        "Put a resource policy on the guardrail that allows bedrock:ApplyGuardrail "
+        "to principals whose aws:PrincipalOrgID is the organization.",
+        "High",
+        "Failed",
+    )
+
+
 def check_bedrock_central_guardrail_enforcement(
     region: str = "",
     api_region: str = "",
@@ -5370,71 +5750,94 @@ def check_bedrock_central_guardrail_enforcement(
             "csv_data": [],
         }
 
-        enforcing_mechanisms = []
+        org_mechanisms = []
+        region_mechanisms = {}
         narrowed_configs = []
         deficient_policies = []
         policy_errors = []
+        region_errors = {}
+        share_rows = []
 
-        account_configs = []
-        try:
-            bedrock_client = boto3.client(
-                "bedrock",
-                config=boto3_config,
-                region_name=api_region or os.environ.get("AWS_REGION", "us-east-1"),
-            )
-            paginator = bedrock_client.get_paginator(
-                "list_enforced_guardrails_configuration"
-            )
-            for page in paginator.paginate():
-                account_configs.extend(page.get("guardrailsConfig", []))
-        except Exception as error:
-            policy_errors.append(
-                "account-enforced guardrail configurations could not be read "
-                f"({get_assessment_error_label(error)}), so bedrock:"
-                "ListEnforcedGuardrailsConfiguration may be missing"
-            )
-
-        for config in account_configs:
-            scope = _account_enforced_guardrail_scope(config)
-            if scope["enforced"]:
-                enforcing_mechanisms.append(
-                    "account-enforced {} applying to {} with {}".format(
-                        scope["label"], scope["model_scope"], scope["guarding_scope"]
+        regions = _assessed_regions(api_region)
+        for scan_region in regions:
+            try:
+                bedrock_client = boto3.client(
+                    "bedrock", config=boto3_config, region_name=scan_region
+                )
+                paginator = bedrock_client.get_paginator(
+                    "list_enforced_guardrails_configuration"
+                )
+                configs = []
+                for page in paginator.paginate():
+                    configs.extend(page.get("guardrailsConfig", []))
+            except Exception as error:
+                region_errors[scan_region] = (
+                    f"account-enforced guardrail configurations in {scan_region} "
+                    f"could not be read ({get_assessment_error_label(error)}), so "
+                    "bedrock:ListEnforcedGuardrailsConfiguration may be missing"
+                )
+                continue
+            for config in configs:
+                scope = _account_enforced_guardrail_scope(config)
+                if scope["enforced"]:
+                    region_mechanisms.setdefault(scan_region, []).append(
+                        "account-enforced {} in {} applying to {} with {}".format(
+                            scope["label"],
+                            scan_region,
+                            scope["model_scope"],
+                            scope["guarding_scope"],
+                        )
                     )
-                )
-            else:
-                narrowed_configs.append(scope)
+                else:
+                    scope["region"] = scan_region
+                    narrowed_configs.append(scope)
 
-        organizations_in_use = True
-        organizations_readable = True
+        context = _organization_policy_context()
+        organizations_in_use = context.get("in_use", True)
         orgs_client = boto3.client("organizations", config=boto3_config)
-        try:
-            org_info = orgs_client.describe_organization()
-            master_account_id = org_info["Organization"]["MasterAccountId"]
-            sts_client = boto3.client("sts", config=boto3_config)
-            current_account = sts_client.get_caller_identity()["Account"]
-            if current_account != master_account_id:
-                organizations_readable = False
-                policy_errors.append(
-                    "organization policy documents are readable only from the "
-                    f"management account and this assessment ran in account "
-                    f"{current_account}, so an inherited policy could not be read"
-                )
-        except ClientError as e:
-            organizations_readable = False
-            error_code = e.response.get("Error", {}).get("Code", "")
-            if error_code == "AWSOrganizationsNotInUseException":
-                # Not an error: no organization exists, so no organization policy
-                # can enforce a guardrail and the account leg alone decides.
-                organizations_in_use = False
-            elif error_code in ACCESS_DENIED_ERROR_CODES:
-                policy_errors.append(
-                    describe_api_error(e, "Organizations policy content check", region)
-                )
-            else:
-                raise
+        caller_account = context.get("account", "")
 
-        if organizations_readable:
+        # The effective Bedrock policy is what Organizations applies to this
+        # account after inheritance, so it is the only Bedrock-policy evidence
+        # that is credited. A member account can read its own.
+        effective = None
+        if organizations_in_use:
+            try:
+                response = orgs_client.describe_effective_policy(
+                    PolicyType="BEDROCK_POLICY"
+                )
+                effective = _summarize_guardrail_policy_document(
+                    response["EffectivePolicy"]["PolicyContent"] or "{}"
+                )
+            except ClientError as error:
+                code = error.response.get("Error", {}).get("Code", "")
+                if code == "AWSOrganizationsNotInUseException":
+                    organizations_in_use = False
+                elif code not in AI_OPT_OUT_ABSENT_CODES:
+                    policy_errors.append(
+                        "the effective Bedrock policy could not be read "
+                        f"({get_assessment_error_label(error)})"
+                    )
+            except Exception as error:
+                policy_errors.append(
+                    f"the effective Bedrock policy could not be read ({str(error)})"
+                )
+
+        attached_bedrock_policies = {}
+        if context["readable"]:
+            try:
+                path_ids = {
+                    target["Id"]
+                    for target in _organization_account_path(
+                        orgs_client, caller_account
+                    )
+                }
+            except Exception as error:
+                path_ids = set()
+                policy_errors.append(
+                    "the account's organization path could not be read "
+                    f"({get_assessment_error_label(error)})"
+                )
             try:
                 bedrock_policies = _list_all_items(
                     orgs_client,
@@ -5512,37 +5915,95 @@ def check_bedrock_central_guardrail_enforcement(
                             ),
                         }
                     )
-                else:
-                    enforcing_mechanisms.append(
-                        "Bedrock policy '{}' attached to {} enforcing {} at version {}".format(
-                            policy_name,
-                            ", ".join(target_names),
-                            ", ".join(summary["guardrail_arns"]),
-                            ", ".join(summary["versions"]) or "unspecified",
+                elif any(target.get("TargetId") in path_ids for target in targets):
+                    attached_bedrock_policies[policy_name] = target_names
+
+        if effective and effective["guardrail_arns"]:
+            if effective["draft_versions"]:
+                deficient_policies.append(
+                    {
+                        "name": "effective Bedrock policy",
+                        "id": caller_account or "this account",
+                        "reason": "the policy Organizations applies to this account enforces the DRAFT guardrail version",
+                        "observed": ", ".join(effective["guardrail_arns"]),
+                    }
+                )
+            else:
+                sources = "; ".join(
+                    "Bedrock policy '{}' attached to {}".format(name, ", ".join(names))
+                    for name, names in sorted(attached_bedrock_policies.items())
+                )
+                org_mechanisms.append(
+                    "the effective Bedrock policy of account {} enforcing {} at "
+                    "version {}{}".format(
+                        caller_account or "unknown",
+                        ", ".join(effective["guardrail_arns"]),
+                        ", ".join(effective["versions"]) or "unspecified",
+                        f" ({sources})" if sources else "",
+                    )
+                )
+                for guardrail_arn in effective["guardrail_arns"]:
+                    share_rows.append(
+                        _guardrail_share_finding(
+                            guardrail_arn, caller_account, reference, region
                         )
                     )
 
-        # The service control policy fallback is read only when nothing else
-        # enforces, because it costs one DescribePolicy per SCP.
-        if not enforcing_mechanisms and organizations_in_use:
+        # The service control policy leg is read only when no organization-wide
+        # mechanism enforces, because it costs one DescribePolicy per SCP.
+        scp_note = ""
+        if not org_mechanisms and organizations_in_use and not context["readable"]:
+            policy_errors.append(context["detail"])
+        elif not org_mechanisms and organizations_in_use:
             scps = (
                 scp_inventory
                 if scp_inventory is not None
                 else get_service_control_policy_inventory()
             )
+            scp_note = " " + _scp_scope_note(scps)
             if scps["list_error"]:
                 policy_errors.append(
                     f"SERVICE_CONTROL_POLICY listing: {scps['list_error']}"
                 )
             policy_errors.extend(scps["errors"])
+            scp_actions = set()
+            scp_enforcing = []
             for item in scps["items"]:
-                if item["content"] and _scp_requires_approved_guardrail(
-                    item["content"]
-                ):
-                    enforcing_mechanisms.append(
-                        f"service control policy '{item['name']}' denying model "
-                        "invocation without an approved bedrock:GuardrailIdentifier"
+                try:
+                    controls = _scp_guardrail_controls(item["content"] or "{}")
+                except (ValueError, TypeError) as error:
+                    policy_errors.append(f"policy '{item['name']}': {str(error)}")
+                    continue
+                scp_actions.update(controls["actions"])
+                scp_enforcing.extend(
+                    f"service control policy '{item['name']}' {control}"
+                    for control in controls["enforcing"]
+                )
+                for gap in controls["gaps"]:
+                    deficient_policies.append(
+                        {
+                            "name": item["name"],
+                            "id": item["id"],
+                            "reason": "its guardrail Deny does not enforce the approved guardrail",
+                            "observed": gap,
+                        }
                     )
+            missing = [a for a in GUARDRAIL_INVOKE_ACTIONS if a not in scp_actions]
+            if scp_enforcing and not missing:
+                org_mechanisms.extend(scp_enforcing)
+            elif scp_enforcing:
+                deficient_policies.append(
+                    {
+                        "name": ", ".join(
+                            sorted({text.split("'")[1] for text in scp_enforcing})
+                        ),
+                        "id": "service control policy",
+                        "reason": "no attached statement also covers {}, so that action runs without the approved guardrail".format(
+                            ", ".join(missing)
+                        ),
+                        "observed": "; ".join(scp_enforcing[:3]),
+                    }
+                )
 
         for policy in deficient_policies:
             findings["status"] = "WARN"
@@ -5550,13 +6011,13 @@ def check_bedrock_central_guardrail_enforcement(
                 create_finding(
                     check_id="BR-41",
                     finding_name=check_name,
-                    finding_details="Organizations Bedrock policy '{}' (ID: {}) does not enforce a published guardrail because {} (observed: {}).".format(
+                    finding_details="Organizations policy '{}' (ID: {}) does not enforce a published guardrail because {} (observed: {}).".format(
                         policy["name"],
                         policy["id"],
                         policy["reason"],
                         policy["observed"],
                     ),
-                    resolution="Attach the policy to the root, an organizational unit, or an account, and name a published numeric guardrail version instead of DRAFT.",
+                    resolution="Attach the policy to the root, an organizational unit, or an account, name a published numeric guardrail version instead of DRAFT, and deny both invoke actions over every model unless bedrock:GuardrailIdentifier names the approved guardrail ARN without a wildcard.",
                     reference=reference,
                     severity="High",
                     status="Failed",
@@ -5564,52 +6025,85 @@ def check_bedrock_central_guardrail_enforcement(
                 )
             )
 
-        # A configuration scoped to all models makes a narrower sibling harmless,
-        # so a narrowed configuration is a finding only when nothing else
-        # enforces. That keeps a Failed row from contradicting the Passed row.
-        if not enforcing_mechanisms:
-            for scope in narrowed_configs[:MAX_REPORTED_ENFORCED_CONFIGS]:
-                findings["status"] = "WARN"
-                findings["csv_data"].append(
-                    create_finding(
-                        check_id="BR-41",
-                        finding_name=check_name,
-                        finding_details="Account-enforced {} does not cover every invocation: {}. It currently applies to {} ({}).".format(
-                            scope["label"],
-                            "; ".join(scope["narrowings"]),
-                            scope["model_scope"],
-                            scope["guarding_scope"],
-                        ),
-                        resolution="Call PutEnforcedGuardrailConfiguration with includedModels set to ALL, excludedModels empty, and both selectiveContentGuarding modes COMPREHENSIVE, so no model can be invoked without the approved guardrail.",
-                        reference=reference,
-                        severity="High",
-                        status="Failed",
-                        region=region,
-                    )
-                )
-            if len(narrowed_configs) > MAX_REPORTED_ENFORCED_CONFIGS:
-                findings["csv_data"].append(
-                    create_finding(
-                        check_id="BR-41",
-                        finding_name=check_name,
-                        finding_details="{} further account-enforced guardrail configuration(s), beyond the {} reported individually, also cover only part of the account's invocations.".format(
-                            len(narrowed_configs) - MAX_REPORTED_ENFORCED_CONFIGS,
-                            MAX_REPORTED_ENFORCED_CONFIGS,
-                        ),
-                        resolution="Call PutEnforcedGuardrailConfiguration with includedModels set to ALL, excludedModels empty, and both selectiveContentGuarding modes COMPREHENSIVE on every enforced configuration.",
-                        reference=reference,
-                        severity="High",
-                        status="Failed",
-                        region=region,
-                    )
-                )
+        uncovered = [
+            scan_region
+            for scan_region in regions
+            if not org_mechanisms and scan_region not in region_mechanisms
+        ]
+        unread = [
+            scan_region for scan_region in uncovered if scan_region in region_errors
+        ]
+        unenforced = [
+            scan_region for scan_region in uncovered if scan_region not in region_errors
+        ]
 
-        if enforcing_mechanisms:
-            mechanism_text = "; ".join(enforcing_mechanisms[:5])
-            if len(enforcing_mechanisms) > 5:
+        # A configuration scoped to all models makes a narrower sibling in the
+        # same Region harmless, so a narrowed configuration is a finding only
+        # where nothing else enforces. That keeps a Failed row from
+        # contradicting the Passed row.
+        narrowed_gaps = [
+            scope for scope in narrowed_configs if scope["region"] in unenforced
+        ]
+        for scope in narrowed_gaps[:MAX_REPORTED_ENFORCED_CONFIGS]:
+            findings["status"] = "WARN"
+            findings["csv_data"].append(
+                create_finding(
+                    check_id="BR-41",
+                    finding_name=check_name,
+                    finding_details="Account-enforced {} in {} does not cover every invocation: {}. It currently applies to {} ({}).".format(
+                        scope["label"],
+                        scope["region"],
+                        "; ".join(scope["narrowings"]),
+                        scope["model_scope"],
+                        scope["guarding_scope"],
+                    ),
+                    resolution="Call PutEnforcedGuardrailConfiguration with includedModels set to ALL, excludedModels empty, and both selectiveContentGuarding modes COMPREHENSIVE, so no model can be invoked without the approved guardrail.",
+                    reference=reference,
+                    severity="High",
+                    status="Failed",
+                    region=region,
+                )
+            )
+        if len(narrowed_gaps) > MAX_REPORTED_ENFORCED_CONFIGS:
+            findings["csv_data"].append(
+                create_finding(
+                    check_id="BR-41",
+                    finding_name=check_name,
+                    finding_details="{} further account-enforced guardrail configuration(s), beyond the {} reported individually, also cover only part of the account's invocations.".format(
+                        len(narrowed_gaps) - MAX_REPORTED_ENFORCED_CONFIGS,
+                        MAX_REPORTED_ENFORCED_CONFIGS,
+                    ),
+                    resolution="Call PutEnforcedGuardrailConfiguration with includedModels set to ALL, excludedModels empty, and both selectiveContentGuarding modes COMPREHENSIVE on every enforced configuration.",
+                    reference=reference,
+                    severity="High",
+                    status="Failed",
+                    region=region,
+                )
+            )
+
+        # A share the owning account shows is part of the enforcement verdict,
+        # so it is folded into that row; a gap or an unread share stands alone.
+        share_passed = [row for row in share_rows if row["Status"] == "Passed"]
+        for row in share_rows:
+            if row["Status"] != "Passed":
+                findings["csv_data"].append(row)
+                if row["Status"] == "Failed":
+                    findings["status"] = "WARN"
+
+        if not uncovered and any(row["Status"] == "Failed" for row in share_rows):
+            return findings
+
+        if not uncovered:
+            mechanisms = org_mechanisms + [
+                text
+                for scan_region in regions
+                for text in region_mechanisms.get(scan_region, [])
+            ]
+            mechanism_text = "; ".join(mechanisms[:5])
+            if len(mechanisms) > 5:
                 mechanism_text += (
                     " (and {} further mechanism(s) not listed here)".format(
-                        len(enforcing_mechanisms) - 5
+                        len(mechanisms) - 5
                     )
                 )
             findings["details"] = "Central guardrail enforcement is configured"
@@ -5617,8 +6111,13 @@ def check_bedrock_central_guardrail_enforcement(
                 create_finding(
                     check_id="BR-41",
                     finding_name=check_name,
-                    finding_details="A published guardrail is enforced for every model by {} mechanism(s): {}. Confirm the guardrail is shared with member accounts through a resource policy scoped by aws:PrincipalOrgID.".format(
-                        len(enforcing_mechanisms), mechanism_text
+                    finding_details="A published guardrail is enforced for every model in the {} assessed Region(s) ({}) by {} mechanism(s): {}.{}".format(
+                        len(regions),
+                        ", ".join(regions),
+                        len(mechanisms),
+                        mechanism_text,
+                        "".join(" " + row["Finding_Details"] for row in share_passed)
+                        + (scp_note if not region_mechanisms else ""),
                     ),
                     resolution="No action required. Re-publish and re-point the configuration whenever the approved guardrail changes.",
                     reference=reference,
@@ -5629,20 +6128,37 @@ def check_bedrock_central_guardrail_enforcement(
             )
             return findings
 
-        if narrowed_configs or deficient_policies:
-            return findings
-
-        # Nothing enforces and nothing is misconfigured, so the account either has
-        # no enforcement at all or the evidence was unreadable.
-        if policy_errors:
+        if unread:
             findings["csv_data"].append(
                 create_finding(
                     check_id="BR-41",
                     finding_name=check_name,
-                    finding_details="No account-enforced guardrail configuration covers this account and central enforcement is undetermined: {}. An inherited Organizations Bedrock policy is not returned by ListEnforcedGuardrailsConfiguration, whose owner field reports ACCOUNT only.".format(
-                        "; ".join(policy_errors[:5])
+                    finding_details="No account-enforced guardrail configuration or organization policy was shown to cover {} and central enforcement there is undetermined: {}. An inherited Organizations Bedrock policy is not returned by ListEnforcedGuardrailsConfiguration, whose owner field reports ACCOUNT only.".format(
+                        ", ".join(unread),
+                        "; ".join(
+                            ([region_errors[r] for r in unread] + policy_errors)[:5]
+                        ),
                     ),
-                    resolution="Grant bedrock:ListEnforcedGuardrailsConfiguration, organizations:ListPolicies, organizations:ListTargetsForPolicy, and organizations:DescribePolicy, or run the assessment from the management account, and retry before concluding that no enforcement exists.",
+                    resolution="Grant bedrock:ListEnforcedGuardrailsConfiguration, organizations:DescribeEffectivePolicy, organizations:ListPolicies, organizations:ListTargetsForPolicy, organizations:ListParents, and organizations:DescribePolicy, or run the assessment from the management account or a delegated administrator, and retry before concluding that no enforcement exists.",
+                    reference=reference,
+                    severity="Informational",
+                    status="N/A",
+                    region=region,
+                )
+            )
+
+        if not unenforced or narrowed_gaps:
+            return findings
+
+        if policy_errors and not deficient_policies:
+            findings["csv_data"].append(
+                create_finding(
+                    check_id="BR-41",
+                    finding_name=check_name,
+                    finding_details="No account-enforced guardrail configuration covers {} and central enforcement is undetermined: {}. An inherited Organizations Bedrock policy is not returned by ListEnforcedGuardrailsConfiguration, whose owner field reports ACCOUNT only.".format(
+                        ", ".join(unenforced), "; ".join(policy_errors[:5])
+                    ),
+                    resolution="Grant bedrock:ListEnforcedGuardrailsConfiguration, organizations:DescribeEffectivePolicy, organizations:ListPolicies, organizations:ListTargetsForPolicy, organizations:ListParents, and organizations:DescribePolicy, or run the assessment from the management account or a delegated administrator, and retry before concluding that no enforcement exists.",
                     reference=reference,
                     severity="Informational",
                     status="N/A",
@@ -5651,16 +6167,21 @@ def check_bedrock_central_guardrail_enforcement(
             )
             return findings
 
+        if deficient_policies:
+            return findings
+
         findings["status"] = "WARN"
         findings["details"] = "No central guardrail enforcement found"
         findings["csv_data"].append(
             create_finding(
                 check_id="BR-41",
                 finding_name=check_name,
-                finding_details="No account-enforced guardrail configuration exists{}, so each application chooses its own guardrail and a request that names none is still served.".format(
+                finding_details="No account-enforced guardrail configuration exists in {}{}, so each application chooses its own guardrail and a request that names none is still served.{}".format(
+                    ", ".join(unenforced),
                     ", AWS Organizations is not in use, so no organization policy can enforce one"
                     if not organizations_in_use
-                    else f", no Organizations Bedrock policy names a guardrail, and none of the organization's service control policies deny bedrock:InvokeModel without an approved {GUARDRAIL_CONDITION_KEY}"
+                    else f", no effective Organizations Bedrock policy names a guardrail, and no service control policy attached to this account's path denies both invoke actions without an approved {GUARDRAIL_CONDITION_KEY}",
+                    scp_note,
                 ),
                 resolution="Call PutEnforcedGuardrailConfiguration with includedModels ALL to enforce a published guardrail account-wide, or create a Bedrock policy that auto-applies a published guardrail version, or an SCP denying bedrock:InvokeModel and bedrock:InvokeModelWithResponseStream unless bedrock:GuardrailIdentifier matches the approved guardrail ARN.",
                 reference=reference,
@@ -11324,7 +11845,14 @@ def _organization_policy_context() -> Dict[str, Any]:
     delegated administrator, so a member-account run has to report the control as
     unassessed instead of reporting the policy as absent.
     """
-    context = {"readable": False, "detail": "", "resolution": "", "account": ""}
+    context = {
+        "readable": False,
+        "detail": "",
+        "resolution": "",
+        "account": "",
+        "management_account": False,
+        "in_use": True,
+    }
 
     orgs_client = boto3.client("organizations", config=boto3_config)
     try:
@@ -11336,6 +11864,7 @@ def _organization_policy_context() -> Dict[str, Any]:
     except ClientError as error:
         error_code = error.response.get("Error", {}).get("Code", "")
         if error_code == "AWSOrganizationsNotInUseException":
+            context["in_use"] = False
             context["detail"] = (
                 "AWS Organizations is not in use for this account, so no service "
                 "control policy can exist to enforce this control"
@@ -11359,31 +11888,108 @@ def _organization_policy_context() -> Dict[str, Any]:
             return context
         raise
 
-    if context["account"] != master_account_id:
-        context["detail"] = (
-            "service control policy documents are readable only from the "
-            "organization management account or a delegated administrator, and "
-            f"this assessment ran in account {context['account']}"
-        )
-        context["resolution"] = (
-            "Run the assessment from the organization management account to "
-            "assess this preventive control."
-        )
-        return context
+    context["management_account"] = context["account"] == master_account_id
+    if not context["management_account"]:
+        # A delegated administrator for policy management reads policies from a
+        # member account, so the read itself decides and not the account id.
+        try:
+            orgs_client.list_policies(Filter="SERVICE_CONTROL_POLICY", MaxResults=1)
+        except ClientError as error:
+            context["detail"] = (
+                "service control policy documents are readable only from the "
+                "organization management account or a delegated administrator, "
+                f"and this assessment ran in account {context['account']}, where "
+                f"ListPolicies returned {get_assessment_error_label(error)}"
+            )
+            context["resolution"] = (
+                "Run the assessment from the organization management account or a "
+                "delegated administrator for Organizations policy management to "
+                "assess this preventive control."
+            )
+            return context
 
     context["readable"] = True
     return context
 
 
+# Organizations nests OUs at most five deep under the root, so a walk from an
+# account reaches the root in six ListParents calls.
+MAX_ORGANIZATION_PATH_DEPTH = 6
+
+
+def _organization_account_path(orgs_client, account_id: str) -> List[Dict[str, str]]:
+    """
+    Return the account, each OU above it and the root, nearest first.
+
+    Only a policy attached to one of these targets applies to the account.
+    """
+    path = [{"Id": account_id, "Type": "ACCOUNT"}]
+    child_id = account_id
+    for _ in range(MAX_ORGANIZATION_PATH_DEPTH):
+        parents = _list_all_items(
+            orgs_client,
+            "list_parents",
+            "Parents",
+            max_results_param="MaxResults",
+            token_param="NextToken",
+            token_response_keys=("NextToken",),
+            max_results=20,
+            ChildId=child_id,
+        )
+        if not parents:
+            raise ValueError(f"ListParents returned no parent for {child_id}")
+        parent = parents[0]
+        path.append({"Id": parent.get("Id", ""), "Type": parent.get("Type", "")})
+        if parent.get("Type") == "ROOT":
+            return path
+        child_id = parent.get("Id", "")
+    raise ValueError(
+        f"no root was reached within {MAX_ORGANIZATION_PATH_DEPTH} levels above "
+        f"account {account_id}"
+    )
+
+
 def get_service_control_policy_inventory() -> Dict[str, Any]:
     """
-    Read every service control policy document once.
+    Read the service control policies that apply to this account, once.
 
     BR-41, BR-43 and BR-45 test different predicates against the same corpus, so
-    the ListPolicies and per-policy DescribePolicy pass is made once and shared.
+    the ListPolicies, ListTargetsForPolicy and DescribePolicy pass is made once
+    and shared. ``items`` holds only policies attached to the root, an OU in the
+    account's path or the account itself, because a policy attached elsewhere
+    does not restrict this account. A policy whose targets could not be read is
+    recorded in ``errors`` and never credited.
     """
-    inventory = {"items": [], "errors": [], "list_error": None}
+    inventory = {
+        "items": [],
+        "errors": [],
+        "list_error": None,
+        "detached": [],
+        "account": "",
+        "path": [],
+        "management_account": False,
+    }
     orgs_client = boto3.client("organizations", config=boto3_config)
+
+    try:
+        inventory["account"] = boto3.client(
+            "sts", config=boto3_config
+        ).get_caller_identity()["Account"]
+        organization = orgs_client.describe_organization().get("Organization", {})
+        inventory["management_account"] = (
+            organization.get("MasterAccountId") == inventory["account"]
+        )
+        inventory["path"] = _organization_account_path(
+            orgs_client, inventory["account"]
+        )
+    except Exception as error:
+        inventory["list_error"] = (
+            "the account's position in the organization could not be read "
+            f"with organizations:ListParents ({get_assessment_error_label(error)}), "
+            "so no service control policy attachment could be established"
+        )
+        return inventory
+    path_ids = {target["Id"] for target in inventory["path"]}
 
     try:
         policies = _list_all_items(
@@ -11406,6 +12012,33 @@ def get_service_control_policy_inventory() -> Dict[str, Any]:
             continue
         policy_name = policy.get("Name") or policy_id
         try:
+            targets = _list_all_items(
+                orgs_client,
+                "list_targets_for_policy",
+                "Targets",
+                max_results_param="MaxResults",
+                token_param="NextToken",
+                token_response_keys=("NextToken",),
+                max_results=20,
+                PolicyId=policy_id,
+            )
+        except Exception as error:
+            inventory["errors"].append(
+                f"policy '{policy_name}' targets: {get_assessment_error_label(error)}"
+            )
+            continue
+        attached_to = [
+            "{} {}".format(
+                str(target.get("Type", "target")).lower().replace("_", " "),
+                target.get("TargetId"),
+            )
+            for target in targets
+            if target.get("TargetId") in path_ids
+        ]
+        if not attached_to:
+            inventory["detached"].append(policy_name)
+            continue
+        try:
             policy_detail = orgs_client.describe_policy(PolicyId=policy_id)
             content = (
                 policy_detail.get("Policy", {}).get("Content")
@@ -11416,10 +12049,35 @@ def get_service_control_policy_inventory() -> Dict[str, Any]:
             inventory["errors"].append(f"policy '{policy_name}': {str(error)}")
             continue
         inventory["items"].append(
-            {"name": policy_name, "id": policy_id, "content": content}
+            {
+                "name": policy_name,
+                "id": policy_id,
+                "content": content,
+                "attached_to": attached_to,
+            }
         )
 
     return inventory
+
+
+def _scp_scope_note(inventory: Dict[str, Any]) -> str:
+    """Describe which service control policies were read, for finding text."""
+    note = (
+        "Only service control policies attached to the root, an organizational "
+        "unit in the path of account {} or the account itself are credited; {} "
+        "attached elsewhere {} not counted.".format(
+            inventory.get("account") or "unknown",
+            len(inventory.get("detached") or []),
+            "was" if len(inventory.get("detached") or []) == 1 else "were",
+        )
+    )
+    if inventory.get("management_account"):
+        note += (
+            " This is the management account, which service control policies "
+            "never restrict, so a credited policy governs the member accounts "
+            "under the same targets and not this account."
+        )
+    return note
 
 
 def _policy_statements(document: Any) -> List[Dict[str, Any]]:

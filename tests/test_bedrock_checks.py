@@ -3565,13 +3565,32 @@ class TestBR41CentralGuardrailEnforcement:
         account_configs,
         account_pages,
         account_error,
+        effective=None,
+        share_policy=None,
+        list_policies_error=None,
     ):
         org_client = MagicMock()
         org_client.describe_organization.return_value = {
             "Organization": {"MasterAccountId": "123456789012"}
         }
+        # The account sits directly under the root, so a policy attached to
+        # r-abc123 or to the account applies and one on an OU does not.
+        org_client.list_parents.return_value = {
+            "Parents": [{"Id": "r-abc123", "Type": "ROOT"}]
+        }
+        if effective is None:
+            org_client.describe_effective_policy.side_effect = ClientError(
+                {"Error": {"Code": "EffectivePolicyNotFoundException"}},
+                "DescribeEffectivePolicy",
+            )
+        else:
+            org_client.describe_effective_policy.return_value = {
+                "EffectivePolicy": {"PolicyContent": json.dumps(effective)}
+            }
 
         def list_policies(**kwargs):
+            if list_policies_error is not None:
+                raise list_policies_error
             if kwargs.get("Filter") == "BEDROCK_POLICY":
                 return {"Policies": list(bedrock_policies)}
             return {"Policies": list(scps)}
@@ -3597,6 +3616,14 @@ class TestBR41CentralGuardrailEnforcement:
                 else [{"guardrailsConfig": list(account_configs)}]
             )
 
+        bedrock_client.get_resource_policy.return_value = {
+            "resourcePolicy": json.dumps(
+                share_policy
+                if share_policy is not None
+                else TestBR41CentralGuardrailEnforcement.ORG_SHARE_POLICY
+            )
+        }
+
         return (
             org_client,
             bedrock_client,
@@ -3606,6 +3633,21 @@ class TestBR41CentralGuardrailEnforcement:
                 "bedrock": bedrock_client,
             }[service],
         )
+
+    ORG_SHARE_POLICY = {
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Effect": "Allow",
+                "Principal": "*",
+                "Action": ["bedrock:ApplyGuardrail", "bedrock:GetGuardrail"],
+                "Resource": "*",
+                "Condition": {"StringEquals": {"aws:PrincipalOrgID": "o-a1b2c3d4e5"}},
+            }
+        ],
+    }
+
+    ROOT_TARGET = [{"TargetId": "r-abc123", "Type": "ROOT"}]
 
     def _run_clients(
         self,
@@ -3617,6 +3659,9 @@ class TestBR41CentralGuardrailEnforcement:
         account_configs=(),
         account_pages=None,
         account_error=None,
+        effective=None,
+        share_policy=None,
+        list_policies_error=None,
     ):
         org_client, bedrock_client, factory = self._client_factory(
             bedrock_policies,
@@ -3627,6 +3672,9 @@ class TestBR41CentralGuardrailEnforcement:
             account_configs,
             account_pages,
             account_error,
+            effective,
+            share_policy,
+            list_policies_error,
         )
         with patch("bedrock_app.boto3.client", side_effect=factory):
             result = bedrock_app.check_bedrock_central_guardrail_enforcement(
@@ -3640,6 +3688,7 @@ class TestBR41CentralGuardrailEnforcement:
 
     def test_br41_draft_version_fails_while_published_version_passes(self):
         org_client, findings = self._run(
+            effective=self._bedrock_policy_document(self.GUARDRAIL_ARN, "3"),
             bedrock_policies=[
                 {"Id": "p-published", "Name": "PublishedGuardrail"},
                 {"Id": "p-draft", "Name": "DraftGuardrail"},
@@ -3710,6 +3759,10 @@ class TestBR41CentralGuardrailEnforcement:
                 {"Id": "p-unrelated", "Name": "DenyRegions"},
                 {"Id": "p-guardrail", "Name": "RequireGuardrail"},
             ],
+            targets={
+                "p-unrelated": self.ROOT_TARGET,
+                "p-guardrail": self.ROOT_TARGET,
+            },
             contents={
                 "p-unrelated": {
                     "Version": "2012-10-17",
@@ -3736,6 +3789,7 @@ class TestBR41CentralGuardrailEnforcement:
     def test_br41_stringequals_deny_is_not_enforcement(self):
         _, findings = self._run(
             scps=[{"Id": "p-backwards", "Name": "BackwardsGuardrailDeny"}],
+            targets={"p-backwards": self.ROOT_TARGET},
             contents={
                 "p-backwards": self._deny_without_guardrail(
                     "StringEquals", self.GUARDRAIL_ARN
@@ -3748,17 +3802,23 @@ class TestBR41CentralGuardrailEnforcement:
         assert "bedrock:guardrailidentifier" in failed[0]["Finding_Details"]
         assert not [f for f in findings if f["Status"] == "Passed"]
 
-    def test_br41_null_condition_on_wildcard_action_is_enforcement(self):
+    def test_br41_null_condition_alone_is_not_enforcement(self):
+        # Null requires that some guardrail is named, so a request carrying an
+        # unapproved guardrail passes the Deny. The wildcard action still counts
+        # as covering both invoke actions.
         document = self._deny_without_guardrail("Null", "true")
         document["Statement"][0]["Action"] = "bedrock:Invoke*"
         _, findings = self._run(
             scps=[{"Id": "p-null", "Name": "RequireGuardrailPresent"}],
+            targets={"p-null": self.ROOT_TARGET},
             contents={"p-null": document},
         )
 
-        passed = [f for f in findings if f["Status"] == "Passed"]
-        assert len(passed) == 1
-        assert "RequireGuardrailPresent" in passed[0]["Finding_Details"]
+        assert not [f for f in findings if f["Status"] == "Passed"]
+        failed = [f for f in findings if f["Status"] == "Failed"]
+        assert len(failed) == 1
+        assert "RequireGuardrailPresent" in failed[0]["Finding_Details"]
+        assert "Null requires that some guardrail" in failed[0]["Finding_Details"]
 
     def test_br41_no_policy_of_either_kind_returns_failed(self):
         _, findings = self._run()
@@ -3819,6 +3879,16 @@ class TestBR41CentralGuardrailEnforcement:
         org_client.list_targets_for_policy.side_effect = lambda **kwargs: {
             "Targets": [{"TargetId": "r-abc123", "Type": "ROOT"}]
         }
+        org_client.list_parents.return_value = {
+            "Parents": [{"Id": "r-abc123", "Type": "ROOT"}]
+        }
+        org_client.describe_effective_policy.return_value = {
+            "EffectivePolicy": {
+                "PolicyContent": json.dumps(
+                    self._bedrock_policy_document(self.GUARDRAIL_ARN, "4")
+                )
+            }
+        }
         org_client.describe_policy.side_effect = lambda **kwargs: {
             "Policy": {
                 "Content": json.dumps(
@@ -3835,6 +3905,9 @@ class TestBR41CentralGuardrailEnforcement:
         bedrock_client.get_paginator.return_value.paginate.return_value = [
             {"guardrailsConfig": []}
         ]
+        bedrock_client.get_resource_policy.return_value = {
+            "resourcePolicy": json.dumps(self.ORG_SHARE_POLICY)
+        }
 
         with patch(
             "bedrock_app.boto3.client",
@@ -3856,12 +3929,317 @@ class TestBR41CentralGuardrailEnforcement:
         assert [f["Status"] for f in findings].count("Passed") == 1
 
     def test_br41_member_account_returns_na(self):
-        _, findings = self._run(account="222222222222")
+        # A member account that is not a delegated administrator is refused
+        # ListPolicies, which is what decides the organization view.
+        _, findings = self._run(
+            account="222222222222",
+            list_policies_error=ClientError(
+                {"Error": {"Code": "AccessDeniedException"}}, "ListPolicies"
+            ),
+        )
 
         assert len(findings) == 1
         assert findings[0]["Status"] == "N/A"
         assert "222222222222" in findings[0]["Finding_Details"]
         assert "management account" in findings[0]["Finding_Details"]
+
+    def _scp_run(self, documents, targets=None, **kwargs):
+        """documents: {policy_id: document}; every policy is attached to the root
+        unless targets says otherwise."""
+        scps = [{"Id": pid, "Name": f"Scp-{pid}"} for pid in documents]
+        return self._run(
+            scps=scps,
+            targets=targets
+            if targets is not None
+            else {pid: self.ROOT_TARGET for pid in documents},
+            contents=documents,
+            **kwargs,
+        )
+
+    def test_br41_scp_attached_to_an_ou_outside_the_path_is_not_credited(self):
+        # Two policies with the enforcing shape; one sits on the root and covers
+        # only InvokeModel, the other covers both actions but is attached to an OU
+        # the account is not under. The union of attached policies misses the
+        # streaming action, so nothing passes.
+        partial = self._deny_without_guardrail("StringNotEquals", self.GUARDRAIL_ARN)
+        partial["Statement"][0]["Action"] = "bedrock:InvokeModel"
+        full = self._deny_without_guardrail("StringNotEquals", self.GUARDRAIL_ARN)
+        _, findings = self._scp_run(
+            {"p-root": partial, "p-elsewhere": full},
+            targets={
+                "p-root": self.ROOT_TARGET,
+                "p-elsewhere": [
+                    {"TargetId": "ou-abc1-zzzzzzzz", "Type": "ORGANIZATIONAL_UNIT"}
+                ],
+            },
+        )
+
+        assert not [f for f in findings if f["Status"] == "Passed"]
+        failed = [f for f in findings if f["Status"] == "Failed"]
+        assert any(
+            "bedrock:invokemodelwithresponsestream" in f["Finding_Details"].lower()
+            for f in failed
+        )
+        assert not any("Scp-p-elsewhere" in f["Finding_Details"] for f in findings)
+
+    def test_br41_scp_covering_one_invoke_action_fails_and_names_the_other(self):
+        document = self._deny_without_guardrail("StringNotEquals", self.GUARDRAIL_ARN)
+        document["Statement"][0]["Action"] = "bedrock:InvokeModel"
+        _, findings = self._scp_run({"p-one": document})
+
+        assert [f["Status"] for f in findings] == ["Failed"]
+        assert "Scp-p-one" in findings[0]["Finding_Details"]
+        assert (
+            "bedrock:invokemodelwithresponsestream"
+            in findings[0]["Finding_Details"].lower()
+        )
+
+    def test_br41_two_attached_scps_whose_union_covers_both_actions_pass(self):
+        first = self._deny_without_guardrail("StringNotEquals", self.GUARDRAIL_ARN)
+        first["Statement"][0]["Action"] = "bedrock:InvokeModel"
+        second = self._deny_without_guardrail("StringNotEquals", self.GUARDRAIL_ARN)
+        second["Statement"][0]["Action"] = "bedrock:InvokeModelWithResponseStream"
+        _, findings = self._scp_run({"p-a": first, "p-b": second})
+
+        assert [f["Status"] for f in findings] == ["Passed"]
+        assert "Scp-p-a" in findings[0]["Finding_Details"]
+        assert "Scp-p-b" in findings[0]["Finding_Details"]
+
+    def test_br41_wildcard_guardrail_value_is_not_enforcement(self):
+        _, findings = self._scp_run(
+            {
+                "p-wild": self._deny_without_guardrail(
+                    "StringNotLike", "arn:aws:bedrock:*:123456789012:guardrail/*"
+                )
+            }
+        )
+
+        assert not [f for f in findings if f["Status"] == "Passed"]
+        assert any(
+            "Scp-p-wild" in f["Finding_Details"] and f["Status"] == "Failed"
+            for f in findings
+        )
+
+    def test_br41_extra_condition_key_is_not_enforcement(self):
+        document = self._deny_without_guardrail("StringNotEquals", self.GUARDRAIL_ARN)
+        document["Statement"][0]["Condition"]["StringEquals"] = {
+            "aws:PrincipalTag/team": "ml"
+        }
+        _, findings = self._scp_run({"p-extra": document})
+
+        assert not [f for f in findings if f["Status"] == "Passed"]
+        assert any(
+            "Scp-p-extra" in f["Finding_Details"] and f["Status"] == "Failed"
+            for f in findings
+        )
+
+    def test_br41_for_any_value_negated_test_is_not_enforcement(self):
+        # ForAnyValue over a missing key evaluates false, so a request with no
+        # guardrail at all escapes the Deny.
+        _, findings = self._scp_run(
+            {
+                "p-anyvalue": self._deny_without_guardrail(
+                    "ForAnyValue:StringNotEquals", self.GUARDRAIL_ARN
+                )
+            }
+        )
+
+        assert not [f for f in findings if f["Status"] == "Passed"]
+        assert any(
+            "Scp-p-anyvalue" in f["Finding_Details"] and f["Status"] == "Failed"
+            for f in findings
+        )
+
+    def test_br41_if_exists_negated_test_is_enforcement(self):
+        _, findings = self._scp_run(
+            {
+                "p-ifexists": self._deny_without_guardrail(
+                    "StringNotEqualsIfExists", self.GUARDRAIL_ARN
+                )
+            }
+        )
+
+        assert [f["Status"] for f in findings] == ["Passed"]
+        assert "Scp-p-ifexists" in findings[0]["Finding_Details"]
+        assert "attached elsewhere" in findings[0]["Finding_Details"]
+
+    def test_br41_scp_resource_scoped_to_one_model_is_not_enforcement(self):
+        document = self._deny_without_guardrail("StringNotEquals", self.GUARDRAIL_ARN)
+        document["Statement"][0]["Resource"] = (
+            "arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-v2"
+        )
+        _, findings = self._scp_run({"p-onemodel": document})
+
+        assert not [f for f in findings if f["Status"] == "Passed"]
+
+    def test_br41_delegated_administrator_member_credits_the_scp(self):
+        # A member account whose ListPolicies call succeeds is a delegated
+        # administrator, so the organization view is readable from it.
+        _, findings = self._scp_run(
+            {
+                "p-guardrail": self._deny_without_guardrail(
+                    "StringNotEquals", self.GUARDRAIL_ARN
+                )
+            },
+            account="222222222222",
+        )
+
+        assert [f["Status"] for f in findings] == ["Passed"]
+        assert "222222222222" in findings[0]["Finding_Details"]
+        assert "management account" not in findings[0]["Finding_Details"]
+
+    def test_br41_effective_draft_policy_fails(self):
+        _, findings = self._run(
+            effective=self._bedrock_policy_document(self.GUARDRAIL_ARN, "DRAFT")
+        )
+
+        assert not [f for f in findings if f["Status"] == "Passed"]
+        failed = [f for f in findings if f["Status"] == "Failed"]
+        assert any("effective Bedrock policy" in f["Finding_Details"] for f in failed)
+
+    def test_br41_bedrock_policy_outside_the_path_without_an_effective_policy_fails(
+        self,
+    ):
+        # The Bedrock policy is well formed and attached, but to an OU the account
+        # is not under, and no effective policy reaches the account.
+        _, findings = self._run(
+            bedrock_policies=[{"Id": "p-ou", "Name": "OuGuardrail"}],
+            targets={
+                "p-ou": [
+                    {"TargetId": "ou-abc1-zzzzzzzz", "Type": "ORGANIZATIONAL_UNIT"}
+                ]
+            },
+            contents={"p-ou": self._bedrock_policy_document(self.GUARDRAIL_ARN, "3")},
+        )
+
+        assert not [f for f in findings if f["Status"] == "Passed"]
+        assert [f["Status"] for f in findings] == ["Failed"]
+
+    def test_br41_missing_guardrail_share_fails(self):
+        _, findings = self._run(
+            effective=self._bedrock_policy_document(self.GUARDRAIL_ARN, "3"),
+            share_policy={"Version": "2012-10-17", "Statement": []},
+        )
+
+        assert not [f for f in findings if f["Status"] == "Passed"]
+        share = [
+            f
+            for f in findings
+            if f["Finding"] == "Central Guardrail Cross-Account Share"
+        ]
+        assert [f["Status"] for f in share] == ["Failed"]
+        assert "grants no other account" in share[0]["Finding_Details"]
+
+    def test_br41_share_to_every_principal_fails(self):
+        _, findings = self._run(
+            effective=self._bedrock_policy_document(self.GUARDRAIL_ARN, "3"),
+            share_policy={
+                "Version": "2012-10-17",
+                "Statement": [
+                    {
+                        "Effect": "Allow",
+                        "Principal": "*",
+                        "Action": "bedrock:ApplyGuardrail",
+                        "Resource": "*",
+                    }
+                ],
+            },
+        )
+
+        assert not [f for f in findings if f["Status"] == "Passed"]
+        assert any(
+            "outside the organization" in f["Finding_Details"]
+            for f in findings
+            if f["Status"] == "Failed"
+        )
+
+    def test_br41_share_of_a_guardrail_owned_elsewhere_is_not_read(self):
+        foreign = "arn:aws:bedrock:us-east-1:999988887777:guardrail/central0001"
+        _, bedrock_client, findings = self._run_clients(
+            effective=self._bedrock_policy_document(foreign, "2")
+        )
+
+        bedrock_client.get_resource_policy.assert_not_called()
+        passed = [f for f in findings if f["Status"] == "Passed"]
+        share = [f for f in findings if f["Status"] == "N/A"]
+        assert len(passed) == 1
+        assert len(share) == 1
+        assert "999988887777" in share[0]["Finding_Details"]
+
+    def _run_regions(self, per_region):
+        """per_region: {region: configs list, or an exception to raise}."""
+        org_client, _, _ = self._client_factory(
+            (), (), {}, {}, "123456789012", (), None, None
+        )
+        sts_client = MagicMock()
+        sts_client.get_caller_identity.return_value = {"Account": "123456789012"}
+
+        def bedrock_for(region_name):
+            client = MagicMock()
+            outcome = per_region[region_name]
+            if isinstance(outcome, Exception):
+                client.get_paginator.side_effect = outcome
+            else:
+                client.get_paginator.return_value.paginate.return_value = [
+                    {"guardrailsConfig": list(outcome)}
+                ]
+            return client
+
+        def factory(service, **kwargs):
+            if service == "bedrock":
+                return bedrock_for(kwargs.get("region_name"))
+            return {"organizations": org_client, "sts": sts_client}[service]
+
+        with (
+            patch.dict(os.environ, {"TARGET_REGIONS": ",".join(per_region)}),
+            patch("bedrock_app.boto3.client", side_effect=factory),
+        ):
+            return extract_csv_data(
+                bedrock_app.check_bedrock_central_guardrail_enforcement(
+                    region="Global", api_region="us-east-1"
+                )
+            )
+
+    def test_br41_config_in_one_of_two_regions_fails_and_names_the_other(self):
+        findings = self._run_regions(
+            {"us-east-1": [self._account_config("cfg-1")], "eu-west-1": []}
+        )
+
+        assert not [f for f in findings if f["Status"] == "Passed"]
+        failed = [f for f in findings if f["Status"] == "Failed"]
+        assert len(failed) == 1
+        assert "eu-west-1" in failed[0]["Finding_Details"]
+        assert (
+            "us-east-1" not in failed[0]["Finding_Details"].split("exists in")[1][:20]
+        )
+
+    def test_br41_config_in_every_region_passes_and_counts_them(self):
+        findings = self._run_regions(
+            {
+                "us-east-1": [self._account_config("cfg-1")],
+                "eu-west-1": [self._account_config("cfg-2")],
+            }
+        )
+
+        assert [f["Status"] for f in findings] == ["Passed"]
+        assert (
+            "2 assessed Region(s) (us-east-1, eu-west-1)"
+            in findings[0]["Finding_Details"]
+        )
+
+    def test_br41_unread_region_is_na_not_passed(self):
+        findings = self._run_regions(
+            {
+                "us-east-1": [self._account_config("cfg-1")],
+                "eu-west-1": ClientError(
+                    {"Error": {"Code": "AccessDeniedException"}},
+                    "ListEnforcedGuardrailsConfiguration",
+                ),
+            }
+        )
+
+        assert [f["Status"] for f in findings] == ["N/A"]
+        assert "eu-west-1" in findings[0]["Finding_Details"]
 
     def _run_without_organizations(self, account_configs):
         """A standalone account: DescribeOrganization fails, so the account-enforced
@@ -4385,6 +4763,12 @@ class TestBR43RegionInvocationControl:
         org_client.describe_organization.return_value = {
             "Organization": {"MasterAccountId": "123456789012"}
         }
+        if account != "123456789012":
+            # A member account that is not a delegated administrator is refused
+            # ListPolicies, which is what decides the organization view.
+            org_client.list_policies.side_effect = _client_error(
+                "AccessDeniedException", operation="ListPolicies"
+            )
         sts_client = MagicMock()
         sts_client.get_caller_identity.return_value = {"Account": account}
         bedrock_client = MagicMock()
@@ -4538,6 +4922,12 @@ class TestBR43RegionInvocationControl:
         }
         org_client.list_policies.return_value = {
             "Policies": [{"Id": "p-1", "Name": "ApprovedRegions"}]
+        }
+        org_client.list_parents.return_value = {
+            "Parents": [{"Id": "r-abc123", "Type": "ROOT"}]
+        }
+        org_client.list_targets_for_policy.return_value = {
+            "Targets": [{"TargetId": "r-abc123", "Type": "ROOT"}]
         }
         org_client.describe_policy.return_value = {
             "Policy": {
@@ -5029,6 +5419,12 @@ class TestBR45ApiKeyGovernance:
         org_client.describe_organization.return_value = {
             "Organization": {"MasterAccountId": "123456789012"}
         }
+        if account != "123456789012":
+            # A member account that is not a delegated administrator is refused
+            # ListPolicies, which is what decides the organization view.
+            org_client.list_policies.side_effect = _client_error(
+                "AccessDeniedException", operation="ListPolicies"
+            )
         sts_client = MagicMock()
         sts_client.get_caller_identity.return_value = {"Account": account}
 
@@ -10859,6 +11255,9 @@ class TestBR48AIServicesOptOut:
         findings = self._run(
             effective_content={"services": {"default": {"opt_out_policy": "optOut"}}},
             caller_account="111122223333",
+            list_policies_error=_client_error(
+                "AccessDeniedException", operation="ListPolicies"
+            ),
         )
 
         assert [f["Status"] for f in findings] == ["Passed"]
@@ -14747,3 +15146,270 @@ class TestBedrockLlmJackingActivity:
         assert result["status"] == "ERROR"
         assert rows[0]["Status"] == "N/A"
         assert "AccessDenied" in rows[0]["Finding_Details"]
+
+
+# ===================================================================
+# Shared service control policy inventory and IAM cache contract
+# ===================================================================
+class TestServiceControlPolicyInventory:
+    """Only a policy attached to the account's path is read and credited."""
+
+    def _run(
+        self, policies, targets, parents, target_errors=None, account="222222222222"
+    ):
+        org_client = MagicMock()
+        org_client.describe_organization.return_value = {
+            "Organization": {"MasterAccountId": "123456789012"}
+        }
+        org_client.list_parents.side_effect = lambda ChildId, **kwargs: {
+            "Parents": parents.get(ChildId, [])
+        }
+        org_client.list_policies.return_value = {"Policies": policies}
+
+        def list_targets(PolicyId, **kwargs):
+            if target_errors and PolicyId in target_errors:
+                raise target_errors[PolicyId]
+            return {"Targets": targets.get(PolicyId, [])}
+
+        org_client.list_targets_for_policy.side_effect = list_targets
+        org_client.describe_policy.side_effect = lambda PolicyId: {
+            "Policy": {"Content": json.dumps({"Id": PolicyId})}
+        }
+        sts_client = MagicMock()
+        sts_client.get_caller_identity.return_value = {"Account": account}
+        with patch(
+            "bedrock_app.boto3.client",
+            side_effect=lambda service, **kwargs: {
+                "organizations": org_client,
+                "sts": sts_client,
+            }[service],
+        ):
+            return org_client, bedrock_app.get_service_control_policy_inventory()
+
+    PARENTS = {
+        "222222222222": [{"Id": "ou-abc1-inner", "Type": "ORGANIZATIONAL_UNIT"}],
+        "ou-abc1-inner": [{"Id": "ou-abc1-outer", "Type": "ORGANIZATIONAL_UNIT"}],
+        "ou-abc1-outer": [{"Id": "r-abc1", "Type": "ROOT"}],
+    }
+
+    def test_only_policies_on_the_account_path_are_read(self):
+        org_client, inventory = self._run(
+            policies=[
+                {"Id": "p-root", "Name": "OnRoot"},
+                {"Id": "p-outer", "Name": "OnOuterOu"},
+                {"Id": "p-account", "Name": "OnAccount"},
+                {"Id": "p-sibling", "Name": "OnSiblingOu"},
+                {"Id": "p-none", "Name": "Unattached"},
+            ],
+            targets={
+                "p-root": [{"TargetId": "r-abc1", "Type": "ROOT"}],
+                "p-outer": [
+                    {"TargetId": "ou-abc1-outer", "Type": "ORGANIZATIONAL_UNIT"}
+                ],
+                "p-account": [{"TargetId": "222222222222", "Type": "ACCOUNT"}],
+                "p-sibling": [
+                    {"TargetId": "ou-abc1-sibling", "Type": "ORGANIZATIONAL_UNIT"}
+                ],
+            },
+            parents=self.PARENTS,
+        )
+
+        assert inventory["list_error"] is None
+        assert [item["name"] for item in inventory["items"]] == [
+            "OnRoot",
+            "OnOuterOu",
+            "OnAccount",
+        ]
+        assert inventory["items"][1]["attached_to"] == [
+            "organizational unit ou-abc1-outer"
+        ]
+        assert inventory["detached"] == ["OnSiblingOu", "Unattached"]
+        assert [target["Id"] for target in inventory["path"]] == [
+            "222222222222",
+            "ou-abc1-inner",
+            "ou-abc1-outer",
+            "r-abc1",
+        ]
+        described = {
+            c.kwargs["PolicyId"] for c in org_client.describe_policy.call_args_list
+        }
+        assert described == {"p-root", "p-outer", "p-account"}
+
+    def test_unreadable_targets_are_an_error_not_a_credit(self):
+        _, inventory = self._run(
+            policies=[
+                {"Id": "p-root", "Name": "OnRoot"},
+                {"Id": "p-denied", "Name": "TargetsDenied"},
+            ],
+            targets={"p-root": [{"TargetId": "r-abc1", "Type": "ROOT"}]},
+            parents=self.PARENTS,
+            target_errors={
+                "p-denied": _client_error(
+                    "AccessDeniedException", operation="ListTargetsForPolicy"
+                )
+            },
+        )
+
+        assert [item["name"] for item in inventory["items"]] == ["OnRoot"]
+        assert len(inventory["errors"]) == 1
+        assert "TargetsDenied" in inventory["errors"][0]
+        assert inventory["detached"] == []
+
+    def test_unreadable_path_reads_no_policy(self):
+        org_client, inventory = self._run(
+            policies=[{"Id": "p-root", "Name": "OnRoot"}],
+            targets={"p-root": [{"TargetId": "r-abc1", "Type": "ROOT"}]},
+            parents={},
+        )
+
+        assert inventory["items"] == []
+        assert "organizations:ListParents" in inventory["list_error"]
+        org_client.list_policies.assert_not_called()
+
+    def test_scope_note_names_the_detached_count_and_the_management_account(self):
+        note = bedrock_app._scp_scope_note(
+            {
+                "account": "123456789012",
+                "detached": ["a", "b"],
+                "management_account": True,
+            }
+        )
+
+        assert "2 attached elsewhere were not counted" in note
+        assert "management account" in note
+
+
+class TestIamCacheContract:
+    """The consumer side of cache_schema_version 2."""
+
+    def _findings(self):
+        return {
+            "check_name": "x",
+            "status": "PASS",
+            "details": "",
+            "csv_data": [
+                bedrock_app.create_finding(
+                    check_id="BR-42",
+                    finding_name="Model Allow List",
+                    finding_details="Every principal is scoped.",
+                    resolution="None",
+                    reference="https://example.com",
+                    severity="Medium",
+                    status="Passed",
+                    region="Global",
+                )
+            ],
+        }
+
+    def _apply(self, cache, principal_types=("role", "user")):
+        findings = self._findings()
+        bedrock_app._apply_cache_population_gaps(
+            findings,
+            cache,
+            "BR-42",
+            "Model Allow List",
+            "https://example.com",
+            "Global",
+            principal_types,
+        )
+        return findings
+
+    def test_version_one_cache_keeps_passed_and_says_errors_were_not_recorded(self):
+        findings = self._apply({"role_permissions": {}})
+
+        assert [f["Status"] for f in findings["csv_data"]] == ["Passed"]
+        assert "schema version 1" in findings["csv_data"][0]["Finding_Details"]
+        assert findings["status"] == "PASS"
+
+    def test_principal_errors_turn_passed_into_na_and_name_the_principals(self):
+        findings = self._apply(
+            {
+                "cache_schema_version": 2,
+                "principal_errors": [
+                    {
+                        "type": "role",
+                        "name": "BrokenRole",
+                        "stage": "list_attached_role_policies",
+                        "error": "AccessDenied",
+                    },
+                    {
+                        "type": "user",
+                        "name": "BrokenUser",
+                        "stage": "get_user_policy",
+                        "error": "Throttling",
+                    },
+                ],
+            }
+        )
+
+        assert [f["Status"] for f in findings["csv_data"]] == ["N/A", "N/A"]
+        assert "BrokenRole" in findings["csv_data"][1]["Finding_Details"]
+        assert "BrokenUser" in findings["csv_data"][1]["Finding_Details"]
+        assert findings["status"] == "N/A"
+
+    def test_errors_outside_the_population_leave_passed_alone(self):
+        findings = self._apply(
+            {
+                "cache_schema_version": 2,
+                "principal_errors": [
+                    {"type": "role", "name": "BrokenRole", "stage": "x", "error": "y"}
+                ],
+            },
+            principal_types=("user",),
+        )
+
+        assert [f["Status"] for f in findings["csv_data"]] == ["Passed"]
+        assert "schema version 1" not in findings["csv_data"][0]["Finding_Details"]
+
+    def test_empty_principal_errors_on_version_two_is_clean(self):
+        findings = self._apply({"cache_schema_version": 2, "principal_errors": []})
+
+        assert [f["Status"] for f in findings["csv_data"]] == ["Passed"]
+        assert (
+            findings["csv_data"][0]["Finding_Details"] == "Every principal is scoped."
+        )
+
+    @pytest.mark.parametrize(
+        ("boundary", "expected"),
+        [
+            (None, "none"),
+            (_allow(["bedrock:*"], "*"), "unscoped"),
+            (
+                _allow(
+                    ["bedrock:InvokeModel"],
+                    "arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-v2",
+                ),
+                "scoped",
+            ),
+            (_allow(["s3:GetObject"], "*"), "denied"),
+            (
+                {
+                    "Statement": [
+                        {"Effect": "Allow", "Action": "*", "Resource": "*"},
+                        {
+                            "Effect": "Deny",
+                            "Action": "bedrock:Invoke*",
+                            "Resource": "*",
+                        },
+                    ]
+                },
+                "denied",
+            ),
+            (
+                {
+                    "Statement": [
+                        {"Effect": "Allow", "NotAction": "s3:*", "Resource": "*"}
+                    ]
+                },
+                "unscoped",
+            ),
+            ({"document": _allow(["s3:GetObject"], "*")}, "denied"),
+        ],
+    )
+    def test_boundary_allowance(self, boundary, expected):
+        assert (
+            bedrock_app._boundary_allowance(
+                {"permissions_boundary": boundary}, "bedrock:invokemodel"
+            )
+            == expected
+        )

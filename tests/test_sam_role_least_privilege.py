@@ -135,6 +135,7 @@ _EXPECTED_ACTIONS = {
         "bedrock:GetModelCustomizationJob",
         "bedrock:GetModelInvocationLoggingConfiguration",
         "bedrock:GetPrompt",
+        "bedrock:GetResourcePolicy",
         "bedrock:ListAgentActionGroups",
         "bedrock:ListAgents",
         "bedrock:ListAutomatedReasoningPolicies",
@@ -186,6 +187,7 @@ _EXPECTED_ACTIONS = {
         "organizations:DescribeEffectivePolicy",
         "organizations:DescribeOrganization",
         "organizations:DescribePolicy",
+        "organizations:ListParents",
         "organizations:ListPolicies",
         "organizations:ListRoots",
         "organizations:ListTargetsForPolicy",
@@ -670,6 +672,16 @@ def test_bedrock_organizations_policy_target_read_is_arn_scoped(template):
     assert "organizations::*:policy/*/*/*" in policy_targets
     assert "organizations::aws:policy/*/*" in policy_targets
     assert not re.search(r"Resource:\s+['\"]\*['\"]", policy_targets)
+
+    account_path = _statement_block(
+        template,
+        "BedrockSecurityAssessmentFunction",
+        "OrganizationsAccountPathRead",
+    )
+    assert "organizations:ListParents" in account_path
+    assert "organizations::*:account/o-*/${AWS::AccountId}" in account_path
+    assert "organizations::*:ou/o-*/ou-*" in account_path
+    assert not re.search(r"Resource:\s+['\"]\*['\"]", account_path)
 
 
 @pytest.mark.parametrize("template", _SAM_TEMPLATES, ids=os.path.basename)
