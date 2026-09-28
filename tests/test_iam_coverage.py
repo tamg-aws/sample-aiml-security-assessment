@@ -1093,6 +1093,12 @@ _VERIFIED_REMEDIATION_IAM_ACTIONS |= {
     "sagemaker:ListNotebookInstances",
     "sagemaker:DescribeNotebookInstance",
 }
+# Verified on 2026-09-28 with one IDENTITY_POLICY validate-policy run for
+# AC-08's endpoint inbound-scope leg, which reads each VPC's CIDR blocks. The
+# negative control ec2:DescribeVpc came back INVALID_ACTION at statement index
+# 1, and index 0 drew nothing. DescribeVpcs is also listed in the ec2 service
+# reference JSON.
+_VERIFIED_REMEDIATION_IAM_ACTIONS |= {"ec2:DescribeVpcs"}
 
 _NON_IAM_REMEDIATION_TOKENS = {
     # SM-41 names the AWS IoT Core policy variables

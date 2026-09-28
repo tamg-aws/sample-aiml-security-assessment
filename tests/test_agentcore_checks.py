@@ -1710,6 +1710,38 @@ class TestAC02WholePopulation:
         assert "Scoped" not in details
         assert "Passed" not in [f["Status"] for f in findings]
 
+    def test_a_narrow_pattern_is_reported_with_only_the_writes_it_reaches(self):
+        # The text said every listed principal could create, change and delete
+        # evaluators and configurations alike, though DeleteEval* reaches only
+        # the delete. Each principal now names the writes its patterns reach.
+        cache = {
+            "role_permissions": {
+                "Deleter": self._principal(
+                    {
+                        "Effect": "Allow",
+                        "Action": "bedrock-agentcore:DeleteEval*",
+                        "Resource": "*",
+                    }
+                ),
+                "Admin": self._principal(
+                    {"Effect": "Allow", "Action": "*", "Resource": self._CONFIG_ARN}
+                ),
+            },
+            "user_permissions": {},
+        }
+
+        findings = agentcore_app.check_agentcore_full_access_roles(cache)
+
+        details = self._finding(
+            findings, "AgentCore Evaluation Administration Wildcard"
+        )["Finding_Details"]
+        assert "role Admin (*) reaching all six writes" in details
+        assert (
+            "role Admin (*) reaching all six writes; role Deleter "
+            "(bedrock-agentcore:deleteeval*) reaching DeleteEvaluator. " in details
+        )
+        assert "create, change and delete" not in details
+
     def test_the_wildcard_leg_reads_users_and_their_group_policies(self):
         grant = {"Effect": "Allow", "Action": "bedrock-agentcore:*", "Resource": "*"}
         cache = {
@@ -5297,6 +5329,11 @@ class TestAgenticGatewaySecurity:
             },
             "webAclArn": "arn:aws:wafv2:us-east-1:123456789012:regional/webacl/test/abc",
         }
+        # AG-24 now takes an AUTHENTICATE_ONLY gateway's verdict from AG-25's
+        # reading of the engine's policies, so the engine needs a scoped permit.
+        mock_ac.list_policies.return_value = {
+            "policies": [_cedar_policy("p-1", _SCOPED_PERMIT)]
+        }
 
         findings = agentcore_app.check_agentcore_gateway_agentic_security()
         ag24 = [f for f in findings if f["Check_ID"] == "AG-24"]
@@ -5304,6 +5341,60 @@ class TestAgenticGatewaySecurity:
         assert ag24
         assert ag24[0]["Status"] == "Passed"
         assert "policy engine" in ag24[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "policies, status",
+        [
+            ([("p-1", "permit(principal, action, resource);", "ACTIVE")], "Failed"),
+            ([("p-1", "permit(principal, action, resource);", "INACTIVE")], "Failed"),
+            ([("p-1", "", "ACTIVE")], "N/A"),
+        ],
+        ids=["allow-all", "no-enforcing-policy", "unreadable"],
+    )
+    @patch("agentcore_app.agentcore_client")
+    def test_authenticate_only_follows_what_the_engine_denies(
+        self, mock_ac, policies, status
+    ):
+        mock_ac.list_gateways.return_value = {
+            "items": [
+                {"gatewayId": "gw-1", "name": "Scoped"},
+                {"gatewayId": "gw-2", "name": "Open"},
+            ]
+        }
+        mock_ac.get_gateway.side_effect = lambda gatewayIdentifier: {
+            "gatewayId": gatewayIdentifier,
+            "authorizerType": "AUTHENTICATE_ONLY",
+            "policyEngineConfiguration": {
+                "arn": (
+                    "arn:aws:bedrock-agentcore:us-east-1:123456789012:"
+                    f"policy-engine/pe-{gatewayIdentifier}"
+                ),
+                "mode": "ENFORCE",
+            },
+        }
+        engines = {
+            "pe-gw-1": [_cedar_policy("p-0", _SCOPED_PERMIT)],
+            "pe-gw-2": [
+                _cedar_policy(name, text, enforcement_mode=mode)
+                for name, text, mode in policies
+            ],
+        }
+        mock_ac.list_policies.side_effect = lambda policyEngineId, **_: {
+            "policies": engines[policyEngineId]
+        }
+
+        findings = agentcore_app.check_agentcore_gateway_agentic_security()
+        ag24 = {
+            f["Finding_Details"].split("(")[1].split(")")[0]: f
+            for f in findings
+            if f["Check_ID"] == "AG-24"
+        }
+
+        assert ag24["gw-1"]["Status"] == "Passed"
+        assert ag24["gw-2"]["Status"] == status
+        assert "AG-25" in ag24["gw-2"]["Finding_Details"]
+        for finding in ag24.values():
+            assert_finding_schema(finding)
 
     @patch("agentcore_app.agentcore_client")
     def test_gateway_detail_access_denied_returns_na(self, mock_ac):
@@ -8294,7 +8385,14 @@ _GUARDED_TRUST = {
             "Effect": "Allow",
             "Principal": {"Service": "bedrock-agentcore.amazonaws.com"},
             "Action": "sts:AssumeRole",
-            "Condition": {"StringEquals": {"aws:SourceAccount": "123456789012"}},
+            "Condition": {
+                "StringEquals": {"aws:SourceAccount": "123456789012"},
+                "ArnLike": {
+                    "aws:SourceArn": (
+                        "arn:aws:bedrock-agentcore:us-east-1:123456789012:gateway/*"
+                    )
+                },
+            },
         }
     ],
 }
@@ -8351,14 +8449,23 @@ class TestAC08SurfaceEndpoints:
         mock_ac.list_gateways.return_value = {
             "items": [{"gatewayId": f"gw-{i}"} for i in range(gateways)]
         }
-        mock_ec2.describe_vpcs.return_value = {"Vpcs": [{"VpcId": "vpc-1"}]}
+        mock_ec2.describe_vpcs.return_value = {
+            "Vpcs": [{"VpcId": "vpc-1", "CidrBlock": "172.31.0.0/16"}]
+        }
         mock_ec2.describe_vpc_endpoints.return_value = {"VpcEndpoints": endpoints}
         mock_ec2.describe_security_groups.return_value = {
             "SecurityGroups": groups
             or [
                 {
                     "GroupId": "sg-closed",
-                    "IpPermissions": [{"IpRanges": [{"CidrIp": "10.0.0.0/16"}]}],
+                    "IpPermissions": [
+                        {
+                            "IpProtocol": "tcp",
+                            "FromPort": 443,
+                            "ToPort": 443,
+                            "IpRanges": [{"CidrIp": "10.0.0.0/16"}],
+                        }
+                    ],
                 }
             ]
         }
@@ -8395,7 +8502,10 @@ class TestAC08SurfaceEndpoints:
         self._wire(
             mock_ac,
             mock_ec2,
-            [_ac08_endpoint("vpce-gw", "bedrock-agentcore.gateway")],
+            [
+                _ac08_endpoint("vpce-gw", "bedrock-agentcore.gateway"),
+                _ac08_endpoint("vpce-control", "bedrock-agentcore-control"),
+            ],
             runtimes=0,
             gateways=1,
         )
@@ -8433,6 +8543,7 @@ class TestAC08SurfaceEndpoints:
             [
                 _ac08_endpoint("vpce-rt", "bedrock-agentcore"),
                 _ac08_endpoint("vpce-gw", "bedrock-agentcore.gateway", state="pending"),
+                _ac08_endpoint("vpce-control", "bedrock-agentcore-control"),
             ],
             runtimes=1,
             gateways=1,
@@ -8453,6 +8564,7 @@ class TestAC08SurfaceEndpoints:
             [
                 _ac08_endpoint("vpce-rt", "bedrock-agentcore"),
                 _ac08_endpoint("vpce-gw", "bedrock-agentcore.gateway"),
+                _ac08_endpoint("vpce-control", "bedrock-agentcore-control"),
             ],
             runtimes=1,
             gateways=1,
@@ -8461,6 +8573,37 @@ class TestAC08SurfaceEndpoints:
         presence = self._presence(agentcore_app.check_agentcore_vpc_endpoints())
 
         assert presence["Status"] == "Passed"
+
+    @pytest.mark.parametrize(("runtimes", "gateways"), [(1, 0), (0, 2), (2, 1)])
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_the_control_plane_endpoint_is_required_beside_the_surfaces(
+        self, mock_ac, mock_ec2, runtimes, gateways
+    ):
+        self._wire(
+            mock_ac,
+            mock_ec2,
+            [
+                _ac08_endpoint("vpce-rt", "bedrock-agentcore"),
+                _ac08_endpoint("vpce-gw", "bedrock-agentcore.gateway"),
+                _ac08_endpoint(
+                    "vpce-control", "bedrock-agentcore-control", state="pending"
+                ),
+            ],
+            runtimes=runtimes,
+            gateways=gateways,
+        )
+
+        presence = self._presence(agentcore_app.check_agentcore_vpc_endpoints())
+
+        assert presence["Status"] == "Failed"
+        assert presence["Finding"] == "AgentCore VPC Endpoints Missing"
+        assert (
+            f"{runtimes + gateways} runtime(s) and gateway(s) are managed through "
+            "com.amazonaws.<region>.bedrock-agentcore-control"
+        ) in presence["Finding_Details"]
+        assert "bedrock-agentcore-control" in presence["Resolution"]
+        assert "bedrock-agentcore.gateway" not in presence["Resolution"]
 
     @patch("agentcore_app.ec2_client")
     @patch("agentcore_app.agentcore_client")
@@ -8501,7 +8644,14 @@ class TestAC08SurfaceEndpoints:
                 },
                 {
                     "GroupId": "sg-closed",
-                    "IpPermissions": [{"IpRanges": [{"CidrIp": "10.0.0.0/8"}]}],
+                    "IpPermissions": [
+                        {
+                            "IpProtocol": "tcp",
+                            "FromPort": 443,
+                            "ToPort": 443,
+                            "IpRanges": [{"CidrIp": "10.0.0.0/8"}],
+                        }
+                    ],
                 },
             ],
         )
@@ -8534,6 +8684,412 @@ class TestAC08SurfaceEndpoints:
 
         assert "2 VPC(s)" in presence["Finding_Details"]
         mock_ec2.describe_vpcs.assert_any_call(NextToken="page-2")
+
+
+def _ac08_https_rule(*cidrs):
+    return {
+        "IpProtocol": "tcp",
+        "FromPort": 443,
+        "ToPort": 443,
+        "IpRanges": [{"CidrIp": cidr} for cidr in cidrs],
+    }
+
+
+class TestAC08EndpointInboundBreadth:
+    """AC-08 fails an endpoint whose inbound rules admit the whole VPC or a port
+    other than TCP 443, and cannot pass one whose VPC CIDR is unknown."""
+
+    @staticmethod
+    def _network(findings):
+        return {
+            finding["Finding_Details"].split(" endpoint ")[1].split(" ")[0]: finding
+            for finding in findings
+            if "Network Scope" in finding["Finding"]
+        }
+
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_rule_naming_the_vpc_cidr_fails_beside_a_tight_endpoint(
+        self, mock_ac, mock_ec2
+    ):
+        TestAC08SurfaceEndpoints._wire(
+            mock_ac,
+            mock_ec2,
+            [
+                _ac08_endpoint("vpce-wide", "bedrock-agentcore", groups=("sg-vpc",)),
+                _ac08_endpoint("vpce-tight", "bedrock-agentcore", groups=("sg-app",)),
+            ],
+            groups=[
+                {
+                    "GroupId": "sg-vpc",
+                    "IpPermissions": [_ac08_https_rule("172.31.0.0/16")],
+                },
+                {
+                    "GroupId": "sg-app",
+                    "IpPermissions": [_ac08_https_rule("172.31.4.0/24")],
+                },
+            ],
+        )
+
+        network = self._network(agentcore_app.check_agentcore_vpc_endpoints())
+
+        wide = network["vpce-wide"]
+        assert wide["Status"] == "Failed"
+        assert wide["Finding"] == "AgentCore VPC Endpoint Network Scope Too Wide"
+        assert "whole VPC CIDR 172.31.0.0/16" in wide["Finding_Details"]
+        assert network["vpce-tight"]["Status"] == "Passed"
+        assert (
+            network["vpce-tight"]["Finding"] == "AgentCore VPC Endpoint Network Scope"
+        )
+
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_halves_on_two_groups_cover_the_vpc(self, mock_ac, mock_ec2):
+        TestAC08SurfaceEndpoints._wire(
+            mock_ac,
+            mock_ec2,
+            [
+                _ac08_endpoint(
+                    "vpce-split", "bedrock-agentcore", groups=("sg-a", "sg-b")
+                ),
+                _ac08_endpoint("vpce-half", "bedrock-agentcore", groups=("sg-a",)),
+            ],
+            groups=[
+                {
+                    "GroupId": "sg-a",
+                    "IpPermissions": [_ac08_https_rule("172.31.0.0/17")],
+                },
+                {
+                    "GroupId": "sg-b",
+                    "IpPermissions": [_ac08_https_rule("172.31.128.0/17")],
+                },
+            ],
+        )
+
+        network = self._network(agentcore_app.check_agentcore_vpc_endpoints())
+
+        assert network["vpce-split"]["Status"] == "Failed"
+        assert "172.31.0.0/16" in network["vpce-split"]["Finding_Details"]
+        assert network["vpce-half"]["Status"] == "Passed"
+
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_secondary_vpc_cidr_is_judged_too(self, mock_ac, mock_ec2):
+        TestAC08SurfaceEndpoints._wire(
+            mock_ac,
+            mock_ec2,
+            [_ac08_endpoint("vpce-2nd", "bedrock-agentcore", groups=("sg-2nd",))],
+            groups=[
+                {
+                    "GroupId": "sg-2nd",
+                    "IpPermissions": [_ac08_https_rule("10.1.0.0/16")],
+                }
+            ],
+        )
+        mock_ec2.describe_vpcs.return_value = {
+            "Vpcs": [
+                {
+                    "VpcId": "vpc-1",
+                    "CidrBlock": "172.31.0.0/16",
+                    "CidrBlockAssociationSet": [
+                        {"CidrBlock": "172.31.0.0/16"},
+                        {"CidrBlock": "10.1.0.0/16"},
+                    ],
+                }
+            ]
+        }
+
+        network = self._network(agentcore_app.check_agentcore_vpc_endpoints())
+
+        assert network["vpce-2nd"]["Status"] == "Failed"
+        assert "10.1.0.0/16" in network["vpce-2nd"]["Finding_Details"]
+        assert "172.31.0.0/16" not in network["vpce-2nd"]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        ("protocol", "low", "high", "named"),
+        [
+            ("-1", None, None, "sg-extra all traffic"),
+            ("tcp", 22, 22, "sg-extra tcp 22-22"),
+            ("tcp", 0, 65535, "sg-extra tcp 0-65535"),
+            ("udp", 443, 443, "sg-extra udp 443-443"),
+        ],
+    )
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_port_other_than_https_fails_that_endpoint(
+        self, mock_ac, mock_ec2, protocol, low, high, named
+    ):
+        rule = {"IpProtocol": protocol, "IpRanges": [{"CidrIp": "172.31.4.0/24"}]}
+        if low is not None:
+            rule.update(FromPort=low, ToPort=high)
+        TestAC08SurfaceEndpoints._wire(
+            mock_ac,
+            mock_ec2,
+            [
+                _ac08_endpoint(
+                    "vpce-ports", "bedrock-agentcore", groups=("sg-app", "sg-extra")
+                ),
+                _ac08_endpoint("vpce-https", "bedrock-agentcore", groups=("sg-app",)),
+            ],
+            groups=[
+                {
+                    "GroupId": "sg-app",
+                    "IpPermissions": [_ac08_https_rule("172.31.4.0/24")],
+                },
+                {"GroupId": "sg-extra", "IpPermissions": [rule]},
+            ],
+        )
+
+        network = self._network(agentcore_app.check_agentcore_vpc_endpoints())
+
+        assert network["vpce-ports"]["Status"] == "Failed"
+        assert named in network["vpce-ports"]["Finding_Details"]
+        assert "whole VPC CIDR" not in network["vpce-ports"]["Finding_Details"]
+        assert network["vpce-https"]["Status"] == "Passed"
+
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_an_unknown_vpc_cidr_cannot_pass(self, mock_ac, mock_ec2):
+        TestAC08SurfaceEndpoints._wire(
+            mock_ac,
+            mock_ec2,
+            [
+                _ac08_endpoint("vpce-a", "bedrock-agentcore", groups=("sg-app",)),
+                _ac08_endpoint("vpce-b", "bedrock-agentcore", groups=("sg-app",)),
+            ],
+            groups=[
+                {
+                    "GroupId": "sg-app",
+                    "IpPermissions": [_ac08_https_rule("172.31.4.0/24")],
+                }
+            ],
+        )
+        mock_ec2.describe_vpcs.return_value = {"Vpcs": [{"VpcId": "vpc-1"}]}
+
+        network = self._network(agentcore_app.check_agentcore_vpc_endpoints())
+
+        assert {finding["Status"] for finding in network.values()} == {"N/A"}
+        assert set(network) == {"vpce-a", "vpce-b"}
+        assert "DescribeVpcs" in network["vpce-a"]["Finding_Details"]
+
+
+class TestAC08RuntimeVpcEndpoint:
+    """AC-08 requires a bedrock-agentcore endpoint in each VPC-mode runtime's VPC."""
+
+    _SUBNET_VPCS = {"subnet-a": "vpc-1", "subnet-b": "vpc-2", "subnet-c": "vpc-2"}
+
+    def _wire(self, mock_ac, mock_ec2, runtimes, endpoint_vpcs, subnet_error=None):
+        mock_ac.list_agent_runtimes.return_value = {
+            "agentRuntimes": [
+                {"agentRuntimeId": runtime_id, "agentRuntimeName": runtime_id}
+                for runtime_id in runtimes
+            ]
+        }
+        mock_ac.list_gateways.return_value = {"items": []}
+
+        def get_agent_runtime(agentRuntimeId):
+            network = runtimes[agentRuntimeId]
+            if isinstance(network, Exception):
+                raise network
+            return {"agentRuntimeId": agentRuntimeId, "networkConfiguration": network}
+
+        mock_ac.get_agent_runtime.side_effect = get_agent_runtime
+
+        def describe_subnets(SubnetIds, **_):
+            if subnet_error is not None:
+                raise subnet_error
+            unknown = [s for s in SubnetIds if s not in self._SUBNET_VPCS]
+            if unknown:
+                raise _make_client_error("InvalidSubnetID.NotFound", "missing")
+            return {
+                "Subnets": [
+                    {"SubnetId": s, "VpcId": self._SUBNET_VPCS[s]} for s in SubnetIds
+                ]
+            }
+
+        mock_ec2.describe_subnets.side_effect = describe_subnets
+        mock_ec2.describe_vpcs.return_value = {
+            "Vpcs": [
+                {"VpcId": "vpc-1", "CidrBlock": "172.31.0.0/16"},
+                {"VpcId": "vpc-2", "CidrBlock": "172.32.0.0/16"},
+            ]
+        }
+        endpoints = []
+        for index, (vpc_id, state) in enumerate(endpoint_vpcs):
+            endpoint = _ac08_endpoint(f"vpce-{index}", "bedrock-agentcore", state=state)
+            endpoint["VpcId"] = vpc_id
+            endpoints.append(endpoint)
+        endpoints.append(_ac08_endpoint("vpce-control", "bedrock-agentcore-control"))
+        mock_ec2.describe_vpc_endpoints.return_value = {"VpcEndpoints": endpoints}
+        mock_ec2.describe_security_groups.return_value = {
+            "SecurityGroups": [
+                {
+                    "GroupId": "sg-closed",
+                    "IpPermissions": [_ac08_https_rule("172.31.4.0/24")],
+                }
+            ]
+        }
+
+    @staticmethod
+    def _vpc(*subnets):
+        return {"networkMode": "VPC", "networkModeConfig": {"subnets": list(subnets)}}
+
+    @staticmethod
+    def _leg(findings):
+        return [
+            finding
+            for finding in findings
+            if finding["Finding"].startswith("AgentCore Runtime VPC Endpoint")
+        ]
+
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_an_endpoint_in_another_vpc_does_not_serve_the_runtime(
+        self, mock_ac, mock_ec2
+    ):
+        self._wire(
+            mock_ac,
+            mock_ec2,
+            {"rt-a": self._vpc("subnet-a"), "rt-b": self._vpc("subnet-b")},
+            [("vpc-1", "available")],
+        )
+
+        findings = agentcore_app.check_agentcore_vpc_endpoints()
+        leg = self._leg(findings)
+
+        assert [finding["Status"] for finding in leg] == ["Failed"]
+        assert leg[0]["Finding"] == "AgentCore Runtime VPC Endpoint Missing"
+        assert "Runtime 'rt-b' (rt-b) in vpc-2" in leg[0]["Finding_Details"]
+        assert "rt-a" not in leg[0]["Finding_Details"]
+        # The account-wide leg still reads an endpoint for the runtime service.
+        presence = next(
+            f for f in findings if f["Finding"] == "AgentCore VPC Endpoints Check"
+        )
+        assert presence["Status"] == "Passed"
+
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_runtime_spanning_two_vpcs_needs_an_endpoint_in_each(
+        self, mock_ac, mock_ec2
+    ):
+        self._wire(
+            mock_ac,
+            mock_ec2,
+            {"rt-a": self._vpc("subnet-a", "subnet-c")},
+            [("vpc-1", "available"), ("vpc-2", "pending")],
+        )
+
+        leg = self._leg(agentcore_app.check_agentcore_vpc_endpoints())
+
+        assert [finding["Status"] for finding in leg] == ["Failed"]
+        assert "Runtime 'rt-a' (rt-a) in vpc-2" in leg[0]["Finding_Details"]
+        assert "vpc-1" not in leg[0]["Finding_Details"]
+
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_every_runtime_vpc_covered_passes_and_public_runtimes_are_skipped(
+        self, mock_ac, mock_ec2
+    ):
+        self._wire(
+            mock_ac,
+            mock_ec2,
+            {
+                "rt-a": self._vpc("subnet-a"),
+                "rt-b": self._vpc("subnet-b", "subnet-c"),
+                "rt-pub": {"networkMode": "PUBLIC"},
+            },
+            [("vpc-1", "available"), ("vpc-2", "available")],
+        )
+
+        leg = self._leg(agentcore_app.check_agentcore_vpc_endpoints())
+
+        assert [finding["Status"] for finding in leg] == ["Passed"]
+        details = leg[0]["Finding_Details"]
+        assert "Each of the 2 VPC-mode runtime(s)" in details
+        assert "Runtime 'rt-a' (rt-a) in vpc-1" in details
+        assert "Runtime 'rt-b' (rt-b) in vpc-2" in details
+        assert "rt-pub" not in details
+
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_no_vpc_mode_runtime_reports_nothing(self, mock_ac, mock_ec2):
+        self._wire(
+            mock_ac,
+            mock_ec2,
+            {"rt-pub": {"networkMode": "PUBLIC"}},
+            [("vpc-1", "available")],
+        )
+
+        assert self._leg(agentcore_app.check_agentcore_vpc_endpoints()) == []
+        mock_ec2.describe_subnets.assert_not_called()
+
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_an_unreadable_runtime_holds_back_the_pass(self, mock_ac, mock_ec2):
+        self._wire(
+            mock_ac,
+            mock_ec2,
+            {
+                "rt-a": self._vpc("subnet-a"),
+                "rt-x": _make_client_error("AccessDeniedException", "denied"),
+            },
+            [("vpc-1", "available")],
+        )
+
+        leg = self._leg(agentcore_app.check_agentcore_vpc_endpoints())
+
+        assert [finding["Status"] for finding in leg] == ["N/A"]
+        assert leg[0]["Finding"] == "AgentCore Runtime VPC Endpoint Coverage Incomplete"
+        assert (
+            "Runtime 'rt-x' (rt-x): AccessDeniedException on "
+            "bedrock-agentcore:GetAgentRuntime"
+        ) in leg[0]["Finding_Details"]
+        assert "rt-a" not in leg[0]["Finding_Details"]
+
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_missing_subnet_or_empty_subnet_list_is_not_passed(
+        self, mock_ac, mock_ec2
+    ):
+        self._wire(
+            mock_ac,
+            mock_ec2,
+            {
+                "rt-a": self._vpc("subnet-a", "subnet-gone"),
+                "rt-e": self._vpc(),
+                "rt-b": self._vpc("subnet-b"),
+            },
+            [("vpc-1", "available")],
+        )
+
+        leg = self._leg(agentcore_app.check_agentcore_vpc_endpoints())
+
+        by_status = {finding["Status"]: finding for finding in leg}
+        assert set(by_status) == {"Failed", "N/A"}
+        assert (
+            "Runtime 'rt-b' (rt-b) in vpc-2" in by_status["Failed"]["Finding_Details"]
+        )
+        incomplete = by_status["N/A"]["Finding_Details"]
+        assert "Runtime 'rt-a' (rt-a): subnet(s) subnet-gone not returned" in incomplete
+        assert "Runtime 'rt-e' (rt-e): VPC mode with no subnets reported" in incomplete
+
+    @patch("agentcore_app.ec2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_an_unreadable_subnet_list_names_describe_subnets(self, mock_ac, mock_ec2):
+        self._wire(
+            mock_ac,
+            mock_ec2,
+            {"rt-a": self._vpc("subnet-a"), "rt-b": self._vpc("subnet-b")},
+            [("vpc-1", "available"), ("vpc-2", "available")],
+            subnet_error=_make_client_error("UnauthorizedOperation", "denied"),
+        )
+
+        leg = self._leg(agentcore_app.check_agentcore_vpc_endpoints())
+
+        assert [finding["Status"] for finding in leg] == ["N/A"]
+        details = leg[0]["Finding_Details"]
+        assert "The VPC of 2 runtime(s)" in details
+        assert "UnauthorizedOperation on ec2:DescribeSubnets" in details
 
 
 class TestAC08EndpointScope:
@@ -8585,7 +9141,9 @@ class TestAC08EndpointScope:
         ]
 
     def _wire(self, mock_ec2):
-        mock_ec2.describe_vpcs.return_value = {"Vpcs": [{"VpcId": "vpc-1"}]}
+        mock_ec2.describe_vpcs.return_value = {
+            "Vpcs": [{"VpcId": "vpc-1", "CidrBlock": "172.31.0.0/16"}]
+        }
         mock_ec2.describe_vpc_endpoints.return_value = {
             "VpcEndpoints": self._endpoints()
         }
@@ -8600,7 +9158,14 @@ class TestAC08EndpointScope:
                 },
                 {
                     "GroupId": "sg-closed",
-                    "IpPermissions": [{"IpRanges": [{"CidrIp": "10.0.0.0/16"}]}],
+                    "IpPermissions": [
+                        {
+                            "IpProtocol": "tcp",
+                            "FromPort": 443,
+                            "ToPort": 443,
+                            "IpRanges": [{"CidrIp": "10.0.0.0/16"}],
+                        }
+                    ],
                 },
             ]
         }
@@ -18084,7 +18649,15 @@ class TestAC43EvaluationRoleTrust:
                 "Effect": "Allow",
                 "Principal": {"Service": "bedrock-agentcore.amazonaws.com"},
                 "Action": "sts:AssumeRole",
-                "Condition": {"StringEquals": {"aws:SourceAccount": "123456789012"}},
+                "Condition": {
+                    "StringEquals": {"aws:SourceAccount": "123456789012"},
+                    "ArnLike": {
+                        "aws:SourceArn": [
+                            "arn:aws:bedrock-agentcore:us-east-1:123456789012:evaluator/*",
+                            "arn:aws:bedrock-agentcore:us-east-1:123456789012:online-evaluation-config/*",
+                        ]
+                    },
+                },
             }
         ],
     }
@@ -25507,7 +26080,16 @@ class TestAC27GatewayRoleTrustByValue:
             mock_ac,
             mock_iam,
             [
-                _service_trust({"StringEquals": {"aws:SourceAccount": _ACCOUNT}}),
+                _service_trust(
+                    {
+                        "StringEquals": {"aws:SourceAccount": _ACCOUNT},
+                        "ArnLike": {
+                            "aws:SourceArn": (
+                                f"arn:aws:bedrock-agentcore:us-east-1:{_ACCOUNT}:gateway/*"
+                            )
+                        },
+                    }
+                ),
                 _service_trust({"StringEquals": {"aws:SourceAccount": _OTHER_ACCOUNT}}),
             ],
         )
@@ -25557,6 +26139,58 @@ class TestAC27GatewayRoleTrustByValue:
         assert "lambda.amazonaws.com" in scope[0]["Finding_Details"]
         assert_finding_schema(scope[0])
 
+    @patch("agentcore_app.iam_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_source_arn_open_across_regions_and_resources_fails_that_gateway(
+        self, mock_ac, mock_iam
+    ):
+        findings = self._run(
+            mock_ac,
+            mock_iam,
+            [
+                _service_trust(
+                    {
+                        "ArnLike": {
+                            "aws:SourceArn": (
+                                f"arn:aws:bedrock-agentcore:us-east-1:{_ACCOUNT}:gateway/*"
+                            )
+                        }
+                    }
+                ),
+                _service_trust(
+                    {
+                        "ArnLike": {
+                            "aws:SourceArn": f"arn:aws:bedrock-agentcore:*:{_ACCOUNT}:*"
+                        }
+                    }
+                ),
+                _service_trust({"StringEquals": {"aws:SourceAccount": _ACCOUNT}}),
+            ],
+        )
+
+        unscoped = [
+            f
+            for f in findings
+            if f["Finding"] == "AgentCore Gateway Role Trust Source ARN Not Scoped"
+        ]
+        assert len(unscoped) == 2
+        assert {f["Status"] for f in unscoped} == {"Failed"}
+        assert "(gw-1)" in unscoped[0]["Finding_Details"]
+        assert "(gw-2)" in unscoped[1]["Finding_Details"]
+        assert "a Region and a resource type" in unscoped[0]["Finding_Details"]
+        assert_finding_schema(unscoped[0])
+        assert not any(
+            f["Finding"] == "AgentCore Gateway Role Trust Confused Deputy Guard Missing"
+            for f in findings
+        )
+        passed = [
+            f
+            for f in findings
+            if f["Finding"] == "AgentCore Gateway Role Trust Confused Deputy Guard"
+        ]
+        assert len(passed) == 1
+        assert "(gw-0)" in passed[0]["Finding_Details"]
+
 
 class TestAC43EvaluationRoleTrustByValue:
     """AC-43 fails the evaluation role whose guard names another account."""
@@ -25582,7 +26216,14 @@ class TestAC43EvaluationRoleTrustByValue:
         }
         documents = {
             "Eval-oec-0": _service_trust(
-                {"StringEquals": {"aws:SourceAccount": _ACCOUNT}}
+                {
+                    "StringEquals": {"aws:SourceAccount": _ACCOUNT},
+                    "ArnLike": {
+                        "aws:SourceArn": (
+                            f"arn:aws:bedrock-agentcore:us-east-1:{_ACCOUNT}:evaluator/*"
+                        )
+                    },
+                }
             ),
             "Eval-oec-1": _service_trust(
                 {"StringEqualsIfExists": {"aws:SourceAccount": _ACCOUNT}}
@@ -25598,6 +26239,58 @@ class TestAC43EvaluationRoleTrustByValue:
         passed = [f for f in findings if f["Status"] == "Passed"]
         assert len(failed) == 1
         assert "Eval-oec-1" in failed[0]["Finding_Details"]
+        assert len(passed) == 1
+        assert "Eval-oec-0" in passed[0]["Finding_Details"]
+
+    @patch("agentcore_app.iam_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_an_account_wide_source_arn_fails_beside_the_documented_form(
+        self, mock_ac, mock_iam
+    ):
+        configs = [
+            {
+                "onlineEvaluationConfigId": f"oec-{i}",
+                "onlineEvaluationConfigName": f"oec-{i}",
+            }
+            for i in range(2)
+        ]
+        mock_ac.list_online_evaluation_configs.return_value = {
+            "onlineEvaluationConfigs": configs
+        }
+        mock_ac.get_online_evaluation_config.side_effect = lambda **kwargs: {
+            "onlineEvaluationConfigId": kwargs["onlineEvaluationConfigId"],
+            "evaluationExecutionRoleArn": (
+                f"arn:aws:iam::{_ACCOUNT}:role/Eval-{kwargs['onlineEvaluationConfigId']}"
+            ),
+        }
+        prefix = f"arn:aws:bedrock-agentcore:us-east-1:{_ACCOUNT}"
+        documents = {
+            "Eval-oec-0": _service_trust(
+                {
+                    "ArnLike": {
+                        "aws:SourceArn": [
+                            f"{prefix}:evaluator/*",
+                            f"{prefix}:online-evaluation-config/*",
+                        ]
+                    }
+                }
+            ),
+            "Eval-oec-1": _service_trust({"ArnLike": {"aws:SourceArn": f"{prefix}:*"}}),
+        }
+        mock_iam.get_role.side_effect = lambda RoleName: {
+            "Role": {"AssumeRolePolicyDocument": documents[RoleName]}
+        }
+
+        findings = agentcore_app.check_agentcore_evaluation_role_trust()
+
+        failed = [f for f in findings if f["Status"] == "Failed"]
+        passed = [f for f in findings if f["Status"] == "Passed"]
+        assert len(failed) == 1
+        assert "Eval-oec-1" in failed[0]["Finding_Details"]
+        assert failed[0]["Finding"] == (
+            "AgentCore Evaluation Role Trust Source ARN Not Scoped"
+        )
+        assert "a Region and a resource type" in failed[0]["Finding_Details"]
         assert len(passed) == 1
         assert "Eval-oec-0" in passed[0]["Finding_Details"]
 

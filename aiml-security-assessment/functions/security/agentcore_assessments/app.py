@@ -2949,8 +2949,10 @@ AGENTCORE_FULL_ACCESS_POLICY_MARKERS = (
 )
 
 
-def _evaluation_admin_wildcard_actions(policy: Dict[str, Any]) -> List[str]:
-    """Return each wildcard Action pattern reaching an evaluation write.
+def _evaluation_admin_wildcard_actions(
+    policy: Dict[str, Any],
+) -> List[Tuple[str, str]]:
+    """Return each (wildcard Action pattern, evaluation write it reaches) pair.
 
     The wildcard leg above only reads statements whose Resource is unbounded, so
     `bedrock-agentcore:*` narrowed to one evaluation ARN is invisible to it while
@@ -2962,24 +2964,24 @@ def _evaluation_admin_wildcard_actions(policy: Dict[str, Any]) -> List[str]:
     written with NotAction whose exclusions leave one of them, which is reported
     as `NotAction`.
     """
-    reaching: List[str] = []
+    reaching: Set[Tuple[str, str]] = set()
     for statement in _allow_statements(policy):
         if "Action" not in statement and "NotAction" in statement:
-            if any(
-                _statement_matches_action(statement, admin_action.lower())
+            reaching.update(
+                ("NotAction", admin_action)
                 for admin_action in EVALUATION_ADMINISTRATION_ACTIONS
-            ):
-                reaching.append("NotAction")
+                if _statement_matches_action(statement, admin_action.lower())
+            )
             continue
         for action in _statement_actions(statement):
             if not any(wildcard in action for wildcard in ("*", "?")):
                 continue
-            if any(
-                fnmatchcase(admin_action.lower(), action)
+            reaching.update(
+                (action, admin_action)
                 for admin_action in EVALUATION_ADMINISTRATION_ACTIONS
-            ):
-                reaching.append(action)
-    return sorted(set(reaching))
+                if fnmatchcase(admin_action.lower(), action)
+            )
+    return sorted(reaching)
 
 
 def _evaluation_admin_wildcard_principals(
@@ -2988,14 +2990,16 @@ def _evaluation_admin_wildcard_principals(
 ) -> List[str]:
     """Return each principal reaching an evaluation write through a wildcard.
 
-    A principal whose own Deny or permissions boundary removes every evaluation
-    write is left out, because the wildcard grants it none of them.
+    Each label names the patterns and the writes they reach, because a narrow
+    pattern such as `DeleteEval*` reaches only the deletes. A write the
+    principal's own Deny or permissions boundary removes is left out, and a
+    principal left with none is not reported.
     """
     labels: List[str] = []
     for principal_name, permissions in permissions_by_name.items():
         if not isinstance(permissions, dict):
             continue
-        patterns: List[str] = []
+        patterns: List[Tuple[str, str]] = []
         for policy in _principal_policies(permissions):
             try:
                 patterns.extend(_evaluation_admin_wildcard_actions(policy))
@@ -3007,15 +3011,23 @@ def _evaluation_admin_wildcard_principals(
                     f"Error parsing policy for {principal_kind} "
                     f"{principal_name}: {error}"
                 )
-        if not patterns:
-            continue
-        if not any(
-            _grant_survives(permissions, admin_action.lower())
+        reached = [
+            admin_action
             for admin_action in EVALUATION_ADMINISTRATION_ACTIONS
-        ):
+            if any(write == admin_action for _, write in patterns)
+            and _grant_survives(permissions, admin_action.lower())
+        ]
+        if not reached:
             continue
+        writes = (
+            "all six writes"
+            if len(reached) == len(EVALUATION_ADMINISTRATION_ACTIONS)
+            else ", ".join(action.split(":", 1)[1] for action in reached)
+        )
         labels.append(
-            f"{principal_kind} {principal_name} ({', '.join(sorted(set(patterns)))})"
+            f"{principal_kind} {principal_name} "
+            f"({', '.join(sorted({pattern for pattern, _ in patterns}))}) "
+            f"reaching {writes}"
         )
     return sorted(labels)
 
@@ -4039,13 +4051,13 @@ def check_agentcore_full_access_roles(
                     check_id="AC-02",
                     finding_name="AgentCore Evaluation Administration Wildcard",
                     finding_details=(
-                        "The following principals reach an AgentCore evaluation "
-                        "write action through a wildcard action pattern, a bare "
-                        '"*" or NotAction, so they can create, change and delete '
-                        "evaluators and online evaluation configurations alike: "
-                        f"{', '.join(evaluation_admins)}. A principal that can "
-                        "delete an evaluation can stop the measurement of the agent "
-                        f"it is watching. {IAM_CACHE_SCP_NOTE}"
+                        "The following principals reach AgentCore evaluation "
+                        "write actions through a wildcard action pattern, a bare "
+                        '"*" or NotAction, each listed with the writes its '
+                        f"patterns reach: {'; '.join(evaluation_admins)}. A "
+                        "principal that can delete or update an evaluation can "
+                        "stop or change the measurement of the agent it is "
+                        f"watching. {IAM_CACHE_SCP_NOTE}"
                     ),
                     resolution=(
                         "Name the evaluation actions each principal needs, from "
@@ -7204,6 +7216,109 @@ def _security_groups_open_ranges(
     return open_ranges
 
 
+def _security_groups_inbound_permissions(
+    security_groups: List[Dict[str, Any]],
+) -> List[Tuple[str, Dict[str, Any]]]:
+    """Return (group id, permission) for every inbound rule that names a source."""
+    permissions = []
+    for security_group in security_groups:
+        for permission in security_group.get("IpPermissions") or []:
+            if isinstance(permission, dict) and any(
+                permission.get(key)
+                for key in (
+                    "IpRanges",
+                    "Ipv6Ranges",
+                    "UserIdGroupPairs",
+                    "PrefixListIds",
+                )
+            ):
+                permissions.append((security_group.get("GroupId"), permission))
+    return permissions
+
+
+def _endpoint_inbound_ports_beyond_https(
+    security_groups: List[Dict[str, Any]],
+) -> List[str]:
+    """Describe each inbound rule that opens a port other than TCP 443.
+
+    An interface endpoint answers on HTTPS only, so a rule for any other port or
+    protocol admits nothing the endpoint needs and everything else on the ENI.
+    """
+    extra = []
+    for group_id, permission in _security_groups_inbound_permissions(security_groups):
+        protocol = str(permission.get("IpProtocol", "")).lower()
+        low, high = permission.get("FromPort"), permission.get("ToPort")
+        if protocol in ("-1", "all"):
+            extra.append(f"{group_id} all traffic")
+        elif protocol in ("tcp", "6") and (low, high) == (443, 443):
+            continue
+        else:
+            extra.append(f"{group_id} {protocol} {low}-{high}")
+    return extra
+
+
+def _endpoint_inbound_vpc_wide_ranges(
+    security_groups: List[Dict[str, Any]], vpc_networks: List[Any]
+) -> List[str]:
+    """Return the VPC CIDR blocks the groups' inbound ranges together cover.
+
+    A rule naming the whole VPC CIDR admits every host in the VPC, and ranges
+    pieced together from narrower blocks cover it the same way.
+    """
+    networks = []
+    for _, permission in _security_groups_inbound_permissions(security_groups):
+        for ranges, field in (("IpRanges", "CidrIp"), ("Ipv6Ranges", "CidrIpv6")):
+            for ip_range in permission.get(ranges) or []:
+                if not isinstance(ip_range, dict):
+                    continue
+                try:
+                    networks.append(
+                        ipaddress.ip_network(
+                            str(ip_range.get(field) or "").strip(), strict=False
+                        )
+                    )
+                except ValueError:
+                    continue
+    covered = []
+    for vpc_network in vpc_networks:
+        family = [
+            network for network in networks if network.version == vpc_network.version
+        ]
+        if any(
+            vpc_network.subnet_of(network)
+            for network in ipaddress.collapse_addresses(family)
+        ):
+            covered.append(str(vpc_network))
+    return covered
+
+
+def _vpc_cidr_networks(vpcs: List[Dict[str, Any]]) -> Dict[str, List[Any]]:
+    """Return the IPv4 and IPv6 CIDR blocks of each described VPC by id."""
+    blocks: Dict[str, List[Any]] = {}
+    for vpc in vpcs:
+        cidrs = [vpc.get("CidrBlock")]
+        cidrs += [
+            association.get("CidrBlock")
+            for association in vpc.get("CidrBlockAssociationSet") or []
+            if isinstance(association, dict)
+        ]
+        cidrs += [
+            association.get("Ipv6CidrBlock")
+            for association in vpc.get("Ipv6CidrBlockAssociationSet") or []
+            if isinstance(association, dict)
+        ]
+        networks = []
+        for cidr in cidrs:
+            try:
+                network = ipaddress.ip_network(str(cidr or "").strip(), strict=False)
+            except ValueError:
+                continue
+            if network not in networks:
+                networks.append(network)
+        blocks[vpc.get("VpcId")] = networks
+    return blocks
+
+
 # The AgentCore service endpoints. The runtime, control-plane and gateway
 # endpoint service names all carry "agentcore", which is what AC-08 matched on
 # before the data-path endpoints below were added.
@@ -7226,11 +7341,20 @@ AGENTCORE_DATA_PATH_ENDPOINT_SUFFIXES = (
 
 # The endpoint service each AgentCore surface is called through: a runtime is
 # invoked on the data-plane service and a gateway on its own gateway service, so
-# an endpoint for one does not carry the other's traffic.
+# an endpoint for one does not carry the other's traffic. Both are created,
+# updated and deleted through the control-plane service, which a region holding
+# either needs as well.
 AGENTCORE_SURFACE_ENDPOINT_SUFFIXES = (
     ("runtime", ".bedrock-agentcore"),
     ("gateway", ".bedrock-agentcore.gateway"),
+    ("control", ".bedrock-agentcore-control"),
 )
+
+AGENTCORE_SURFACE_ENDPOINT_CALLERS = {
+    "runtime": "runtime(s) are called through",
+    "gateway": "gateway(s) are called through",
+    "control": "runtime(s) and gateway(s) are managed through",
+}
 
 
 def _is_agentcore_service_endpoint(service_name: str) -> bool:
@@ -7248,6 +7372,7 @@ def _is_agentcore_data_path_endpoint(service_name: str) -> bool:
 
 def _agentcore_endpoint_scope_findings(
     endpoints: List[Dict[str, Any]],
+    vpc_networks: Dict[str, List[Any]] = None,
 ) -> List[Dict[str, Any]]:
     """Judge each AgentCore VPC endpoint's policy and inbound network scope.
 
@@ -7257,10 +7382,11 @@ def _agentcore_endpoint_scope_findings(
     legs are reported per endpoint, so an account holding one hardened endpoint
     and one default endpoint does not read as uniformly compliant.
 
-    Which principals and which ports a given workload needs is a workload
-    decision, so the assertions here are the workload-independent ones: the
-    policy is not the default allow-everything document, and the inbound rules
-    do not name the whole internet.
+    Which principals a given workload needs is a workload decision, so the
+    assertions here are the workload-independent ones: the policy is not the
+    default allow-everything document, and the inbound rules name neither the
+    whole internet nor the whole VPC and open no port other than TCP 443, the
+    only port an interface endpoint answers on.
 
     The endpoints judged here are the AgentCore service endpoints and the
     data-path endpoints in the same VPCs, so the wording names the endpoint's own
@@ -7466,14 +7592,25 @@ def _agentcore_endpoint_scope_findings(
             for group in groups
             if group["GroupId"] not in security_groups
         ]
-        open_ranges = _security_groups_open_ranges(
-            [
-                security_groups[group["GroupId"]]
-                for group in groups
-                if group["GroupId"] in security_groups
-            ],
-            "IpPermissions",
-        )
+        read_groups = [
+            security_groups[group["GroupId"]]
+            for group in groups
+            if group["GroupId"] in security_groups
+        ]
+        open_ranges = _security_groups_open_ranges(read_groups, "IpPermissions")
+        vpc_blocks = (vpc_networks or {}).get(entry["vpc_id"])
+        breadth = []
+        if vpc_blocks:
+            vpc_wide = _endpoint_inbound_vpc_wide_ranges(read_groups, vpc_blocks)
+            if vpc_wide:
+                breadth.append(
+                    f"its inbound ranges cover the whole VPC CIDR {', '.join(vpc_wide)}"
+                )
+        extra_ports = _endpoint_inbound_ports_beyond_https(read_groups)
+        if extra_ports:
+            breadth.append(
+                "it opens ports other than TCP 443: " + "; ".join(extra_ports)
+            )
 
         if open_ranges:
             findings.append(
@@ -7488,7 +7625,7 @@ def _agentcore_endpoint_scope_findings(
                     ),
                     resolution=(
                         "Restrict the endpoint security group's inbound rules to "
-                        "the VPC CIDR ranges or the security groups of the "
+                        "TCP 443 from the security groups or subnets of the "
                         "workloads that use this endpoint."
                     ),
                     reference=VPC_ENDPOINT_POLICY_REFERENCE_URL,
@@ -7496,17 +7633,48 @@ def _agentcore_endpoint_scope_findings(
                     status=StatusEnum.FAILED,
                 )
             )
-        elif unreadable:
+        elif breadth:
+            findings.append(
+                create_finding(
+                    check_id="AC-08",
+                    finding_name="AgentCore VPC Endpoint Network Scope Too Wide",
+                    finding_details=(
+                        f"AgentCore VPC {label} admits more than the workloads "
+                        f"that call it: {'; '.join(breadth)}. Any host in the "
+                        "VPC, or any service on the endpoint's network "
+                        "interfaces, is reachable through these rules."
+                    ),
+                    resolution=(
+                        "Allow inbound TCP 443 only, from the security groups of "
+                        "the workloads that use this endpoint or from their "
+                        "subnets, and remove the other rules."
+                    ),
+                    reference=VPC_ENDPOINT_POLICY_REFERENCE_URL,
+                    severity=SeverityEnum.MEDIUM,
+                    status=StatusEnum.FAILED,
+                )
+            )
+        elif unreadable or not vpc_blocks:
+            missing = (
+                f"references security group(s) {', '.join(unreadable)} that were "
+                "not returned"
+                if unreadable
+                else "sits in a VPC whose CIDR blocks were not returned by "
+                "DescribeVpcs, so whether its inbound ranges cover the VPC could "
+                "not be judged"
+            )
             findings.append(
                 create_finding(
                     check_id="AC-08",
                     finding_name="AgentCore VPC Endpoint Network Scope",
                     finding_details=(
-                        f"AgentCore VPC {label} references security group(s) "
-                        f"{', '.join(unreadable)} that were not returned, so the "
-                        "inbound scope is unknown."
+                        f"AgentCore VPC {label} {missing}, so the inbound scope "
+                        "is unknown."
                     ),
-                    resolution="Grant ec2:DescribeSecurityGroups and retry.",
+                    resolution=(
+                        "Grant ec2:DescribeSecurityGroups and ec2:DescribeVpcs "
+                        "and retry."
+                    ),
                     reference=VPC_ENDPOINT_POLICY_REFERENCE_URL,
                     severity=SeverityEnum.INFORMATIONAL,
                     status=StatusEnum.NA,
@@ -7518,9 +7686,10 @@ def _agentcore_endpoint_scope_findings(
                     check_id="AC-08",
                     finding_name="AgentCore VPC Endpoint Network Scope",
                     finding_details=(
-                        f"AgentCore VPC {label} accepts no inbound traffic from "
-                        "0.0.0.0/0 or ::/0, alone or pieced together from "
-                        f"narrower ranges, on its {len(groups)} security group(s)."
+                        f"AgentCore VPC {label} accepts inbound traffic on TCP "
+                        "443 only, and from no range covering 0.0.0.0/0, ::/0 or "
+                        "the VPC CIDR, alone or pieced together from narrower "
+                        f"ranges, on its {len(groups)} security group(s)."
                     ),
                     resolution=(
                         "No action required. Confirm the inbound rules name only "
@@ -7532,6 +7701,148 @@ def _agentcore_endpoint_scope_findings(
                 )
             )
 
+    return findings
+
+
+def _agentcore_runtime_vpc_endpoint_findings(
+    runtimes: List[Dict[str, Any]],
+    agentcore_endpoints: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Require an available bedrock-agentcore endpoint in each runtime's own VPC.
+
+    A VPC-mode runtime reaches the AgentCore data plane from the subnets it runs
+    in, so an endpoint in some other VPC of the region carries none of its calls.
+    Each runtime's subnets are resolved to their VPC through DescribeSubnets. A
+    runtime in PUBLIC mode runs in no customer VPC and is judged by AC-01. A
+    runtime or subnet that cannot be read is reported N/A by name, and the leg
+    passes only when every VPC-mode runtime was resolved and covered.
+    """
+    covered_vpcs = {
+        entry["vpc_id"]
+        for entry in agentcore_endpoints
+        if entry["state"] == "available"
+        and str(entry["service"]).lower().endswith(".bedrock-agentcore")
+    }
+    runtime_subnets: List[Tuple[str, List[str]]] = []
+    unresolved: List[str] = []
+    for runtime in runtimes:
+        runtime_id = runtime.get("agentRuntimeId") or "unknown"
+        label = (
+            f"Runtime '{runtime.get('agentRuntimeName') or runtime_id}' ({runtime_id})"
+        )
+        try:
+            detail = agentcore_client.get_agent_runtime(agentRuntimeId=runtime_id)
+        except Exception as error:
+            logger.warning(f"Could not read runtime {runtime_id}: {error}")
+            unresolved.append(
+                f"{label}: {_assessment_error_label(error)} on "
+                "bedrock-agentcore:GetAgentRuntime"
+            )
+            continue
+        network = detail.get("networkConfiguration") or {}
+        if network.get("networkMode") != "VPC":
+            continue
+        subnets = [
+            subnet
+            for subnet in (network.get("networkModeConfig") or {}).get("subnets") or []
+            if isinstance(subnet, str) and subnet
+        ]
+        if not subnets:
+            unresolved.append(f"{label}: VPC mode with no subnets reported")
+            continue
+        runtime_subnets.append((label, subnets))
+
+    subnet_vpcs: Dict[str, str] = {}
+    if runtime_subnets:
+        subnet_ids = sorted({s for _, subnets in runtime_subnets for s in subnets})
+        try:
+            described, _ = _describe_subnets_reporting_missing(subnet_ids)
+            subnet_vpcs = {
+                subnet.get("SubnetId"): subnet.get("VpcId") for subnet in described
+            }
+        except Exception as error:
+            logger.warning(f"Could not describe runtime subnets: {error}")
+            unresolved.extend(
+                f"{label}: {_assessment_error_label(error)} on ec2:DescribeSubnets"
+                for label, _ in runtime_subnets
+            )
+            runtime_subnets = []
+
+    uncovered: List[str] = []
+    covered: List[str] = []
+    for label, subnets in runtime_subnets:
+        missing = [subnet for subnet in subnets if not subnet_vpcs.get(subnet)]
+        if missing:
+            unresolved.append(
+                f"{label}: subnet(s) {', '.join(missing)} not returned by "
+                "ec2:DescribeSubnets"
+            )
+        vpcs = sorted({subnet_vpcs[s] for s in subnets if subnet_vpcs.get(s)})
+        bare = [vpc_id for vpc_id in vpcs if vpc_id not in covered_vpcs]
+        if bare:
+            uncovered.append(f"{label} in {', '.join(bare)}")
+        elif vpcs and not missing:
+            covered.append(f"{label} in {', '.join(vpcs)}")
+
+    findings: List[Dict[str, Any]] = []
+    reference = AGENTCORE_VPC_INTERFACE_ENDPOINT_REFERENCE_URL
+    if uncovered:
+        findings.append(
+            create_finding(
+                check_id="AC-08",
+                finding_name="AgentCore Runtime VPC Endpoint Missing",
+                finding_details=(
+                    f"{len(uncovered)} VPC-mode runtime(s) run in a VPC with no "
+                    "available com.amazonaws.<region>.bedrock-agentcore endpoint: "
+                    f"{'; '.join(uncovered)}. Their AgentCore calls leave the VPC "
+                    "for the public service endpoint, because an endpoint in "
+                    "another VPC carries none of them."
+                ),
+                resolution=(
+                    "Create an interface endpoint for "
+                    "com.amazonaws.<region>.bedrock-agentcore in each VPC named, "
+                    "with private DNS enabled."
+                ),
+                reference=reference,
+                severity=SeverityEnum.HIGH,
+                status=StatusEnum.FAILED,
+            )
+        )
+    if unresolved:
+        findings.append(
+            create_finding(
+                check_id="AC-08",
+                finding_name="AgentCore Runtime VPC Endpoint Coverage Incomplete",
+                finding_details=(
+                    f"The VPC of {len(unresolved)} runtime(s) could not be "
+                    f"resolved: {'; '.join(unresolved)}. Whether an endpoint "
+                    "serves those runtimes is unknown."
+                ),
+                resolution=(
+                    "Grant the actions named and retry, or correct the runtime's "
+                    "network configuration."
+                ),
+                reference=reference,
+                severity=SeverityEnum.INFORMATIONAL,
+                status=StatusEnum.NA,
+            )
+        )
+    if covered and not uncovered and not unresolved:
+        findings.append(
+            create_finding(
+                check_id="AC-08",
+                finding_name="AgentCore Runtime VPC Endpoint Coverage",
+                finding_details=(
+                    f"Each of the {len(covered)} VPC-mode runtime(s) runs in a VPC "
+                    "holding an available com.amazonaws.<region>.bedrock-agentcore "
+                    f"endpoint: {'; '.join(covered)}."
+                ),
+                resolution="No action required.",
+                reference=reference,
+                severity=SeverityEnum.HIGH,
+                status=StatusEnum.PASSED,
+            )
+        )
     return findings
 
 
@@ -7573,7 +7884,11 @@ def check_agentcore_vpc_endpoints() -> List[Dict[str, Any]]:
 
         runtimes = _agentcore_list_all("list_agent_runtimes", ["agentRuntimes"])
         gateways = _agentcore_list_all("list_gateways", ["items", "gateways"])
-        surface_counts = {"runtime": len(runtimes), "gateway": len(gateways)}
+        surface_counts = {
+            "runtime": len(runtimes),
+            "gateway": len(gateways),
+            "control": len(runtimes) + len(gateways),
+        }
 
         if not runtimes and not gateways:
             findings.append(
@@ -7677,7 +7992,8 @@ def check_agentcore_vpc_endpoints() -> List[Dict[str, Any]]:
 
             if missing_surfaces:
                 missing_text = "; ".join(
-                    f"{surface_counts[surface]} {surface}(s) are called through "
+                    f"{surface_counts[surface]} "
+                    f"{AGENTCORE_SURFACE_ENDPOINT_CALLERS[surface]} "
                     f"com.amazonaws.<region>{suffix} and no available endpoint in "
                     f"{len(vpc_ids)} VPC(s) serves it"
                     for surface, suffix in missing_surfaces
@@ -7750,8 +8066,14 @@ def check_agentcore_vpc_endpoints() -> List[Dict[str, Any]]:
         ]
 
         findings.extend(
+            _agentcore_runtime_vpc_endpoint_findings(
+                runtimes, found_agentcore_endpoints
+            )
+        )
+        findings.extend(
             _agentcore_endpoint_scope_findings(
-                found_agentcore_endpoints + data_path_endpoints
+                found_agentcore_endpoints + data_path_endpoints,
+                _vpc_cidr_networks(vpcs),
             )
         )
 
@@ -11970,6 +12292,73 @@ def _confused_deputy_guard_account(statement: Dict[str, Any], account_id: str) -
     return False
 
 
+def _source_arn_names_resource_type(value: str, account_id: str) -> bool:
+    """Return whether an aws:SourceArn value names `account_id` and fixes every
+    segment up to the resource type.
+
+    `arn:aws:bedrock-agentcore:*:111122223333:*` names the account yet matches
+    every AgentCore resource in every Region, so it scopes no more than
+    aws:SourceAccount does. The documented trust policy form,
+    `arn:aws:bedrock-agentcore:us-east-1:111122223333:evaluator/*`, is read as
+    scoped: only the resource id is a pattern.
+    """
+    parts = value.split(":", 5)
+    if len(parts) != 6 or parts[0] != "arn" or parts[4] != account_id:
+        return False
+    if any("*" in part or "?" in part for part in parts[1:4]):
+        return False
+    resource_type = re.split(r"[/:]", parts[5], maxsplit=1)[0]
+    return bool(resource_type) and "*" not in resource_type and "?" not in resource_type
+
+
+def _statement_scopes_source_arn(statement: Dict[str, Any], account_id: str) -> bool:
+    """Return whether the statement carries an aws:SourceArn entry whose every
+    value names this account, a Region and a resource type with no wildcard.
+
+    The operators are the confused-deputy guard operators, so an IfExists or
+    ForAllValues form, which matches when the key is absent, scopes nothing.
+    """
+    conditions = statement.get("Condition")
+    if not account_id or not isinstance(conditions, dict):
+        return False
+    for operator, entries in conditions.items():
+        if not isinstance(entries, dict):
+            continue
+        name = str(operator).strip().lower()
+        if name.startswith("foranyvalue:"):
+            name = name[len("foranyvalue:") :]
+        if name not in CONFUSED_DEPUTY_GUARD_OPERATORS:
+            continue
+        for key, raw in entries.items():
+            values = _condition_values(raw)
+            if (
+                values
+                and str(key).strip().lower() == "aws:sourcearn"
+                and all(
+                    _source_arn_names_resource_type(value.strip(), account_id)
+                    for value in values
+                )
+            ):
+                return True
+    return False
+
+
+def _statements_without_scoped_source_arn(
+    statements: List[Dict[str, Any]], account_id: str
+) -> List[Dict[str, Any]]:
+    """Return the Allow statements trusting a service or `*` whose aws:SourceArn
+    is absent or open across Regions or resource types."""
+    return [
+        statement
+        for statement in statements
+        if any(
+            principal == "*" or principal.endswith(".amazonaws.com")
+            for principal in _statement_principals(statement)
+        )
+        and not _statement_scopes_source_arn(statement, account_id)
+    ]
+
+
 def _statement_is_confused_deputy_exposed(
     statement: Dict[str, Any], account_id: str
 ) -> bool:
@@ -12385,6 +12774,35 @@ def _gateway_role_trust_findings(
             )
         ]
 
+    unscoped = _statements_without_scoped_source_arn(statements, account_id)
+    if unscoped:
+        return findings + [
+            create_finding(
+                check_id="AC-27",
+                finding_name="AgentCore Gateway Role Trust Source ARN Not Scoped",
+                finding_details=(
+                    f"{label} uses execution role {role_name}, which has "
+                    f"{len(unscoped)} of {len(statements)} Allow statement(s) "
+                    "trusting an AWS service principal or every principal whose "
+                    "guard names account "
+                    f"{account_id} but carries no aws:SourceArn condition whose "
+                    "every value names that account, a Region and a resource "
+                    "type with no wildcard. The service can assume the role for "
+                    "any AgentCore resource in the account, in any Region, not "
+                    "only for this gateway."
+                ),
+                resolution=(
+                    "Add an ArnLike aws:SourceArn condition naming this gateway's "
+                    "ARN, or at least arn:aws:bedrock-agentcore:<region>:"
+                    f"{account_id}:gateway/*, to every statement of the trust "
+                    "policy."
+                ),
+                reference=CONFUSED_DEPUTY_REFERENCE_URL,
+                severity=SeverityEnum.MEDIUM,
+                status=StatusEnum.FAILED,
+            )
+        ]
+
     return findings + [
         create_finding(
             check_id="AC-27",
@@ -12392,13 +12810,13 @@ def _gateway_role_trust_findings(
             finding_details=(
                 f"{label} uses execution role {role_name}, whose "
                 f"{len(statements)} Allow statement(s) each carry an "
-                "aws:SourceAccount or aws:SourceArn condition whose every value "
-                f"names account {account_id}, or name no service or wildcard "
-                "principal."
+                "aws:SourceArn condition whose every value names account "
+                f"{account_id}, a Region and a resource type with no wildcard, "
+                "or name no service or wildcard principal."
             ),
             resolution=(
                 "No action required. Confirm the aws:SourceArn pattern names this "
-                "gateway rather than every AgentCore resource in the account."
+                "gateway rather than every gateway in the account."
             ),
             reference=CONFUSED_DEPUTY_REFERENCE_URL,
             severity=SeverityEnum.HIGH,
@@ -18776,6 +19194,36 @@ def check_agentcore_evaluation_role_trust() -> List[Dict[str, Any]]:
                     status=StatusEnum.FAILED,
                 )
             )
+            continue
+
+        unscoped = _statements_without_scoped_source_arn(statements, account_id)
+        if unscoped:
+            findings.append(
+                create_finding(
+                    check_id="AC-43",
+                    finding_name="AgentCore Evaluation Role Trust Source ARN Not Scoped",
+                    finding_details=(
+                        f"{label} runs as {role_name}, which has {len(unscoped)} of "
+                        f"{len(statements)} Allow statement(s) trusting an AWS "
+                        "service principal or every principal whose guard names "
+                        f"account {account_id} but carries no aws:SourceArn "
+                        "condition whose every value names that account, a Region "
+                        "and a resource type with no wildcard. The service can "
+                        "assume the role for any AgentCore resource in the "
+                        "account, in any Region, not only for an evaluation."
+                    ),
+                    resolution=(
+                        "Add an ArnLike aws:SourceArn condition naming "
+                        f"arn:aws:bedrock-agentcore:<region>:{account_id}:evaluator/* "
+                        f"and arn:aws:bedrock-agentcore:<region>:{account_id}:"
+                        "online-evaluation-config/* to every statement of the "
+                        "trust policy."
+                    ),
+                    reference=CONFUSED_DEPUTY_REFERENCE_URL,
+                    severity=SeverityEnum.MEDIUM,
+                    status=StatusEnum.FAILED,
+                )
+            )
         else:
             findings.append(
                 create_finding(
@@ -18783,14 +19231,15 @@ def check_agentcore_evaluation_role_trust() -> List[Dict[str, Any]]:
                     finding_name="AgentCore Evaluation Role Trust",
                     finding_details=(
                         f"{label} runs as {role_name}, whose {len(statements)} Allow "
-                        "statement(s) each carry an aws:SourceAccount or "
-                        "aws:SourceArn condition whose every value names account "
-                        f"{account_id}, or name no service or wildcard principal."
+                        "statement(s) each carry an aws:SourceArn condition whose "
+                        f"every value names account {account_id}, a Region and a "
+                        "resource type with no wildcard, or name no service or "
+                        "wildcard principal."
                     ),
                     resolution=(
                         "No action required. Confirm the aws:SourceArn pattern names "
-                        "this account's evaluation resources rather than every "
-                        "AgentCore resource in the account."
+                        "this account's evaluator and online-evaluation-config "
+                        "resources rather than other AgentCore resource types."
                     ),
                     reference=CONFUSED_DEPUTY_REFERENCE_URL,
                     severity=SeverityEnum.HIGH,
@@ -22894,6 +23343,7 @@ def check_agentcore_gateway_agentic_security() -> List[Dict[str, Any]]:
             or (policy_engine_arn or "").rsplit("/", 1)[-1]
         )
 
+        delegates_to_engine = False
         if authorizer_type == "CUSTOM_JWT":
             findings.append(
                 _gateway_jwt_authorization_finding(
@@ -22918,17 +23368,9 @@ def check_agentcore_gateway_agentic_security() -> List[Dict[str, Any]]:
             and policy_engine_mode == "ENFORCE"
             and policy_engine_arn
         ):
-            findings.append(
-                create_finding(
-                    check_id="AG-24",
-                    finding_name="Agentic AI Gateway Inbound Authorization",
-                    finding_details=f"Gateway '{gateway_name}' ({gateway_id}) uses authorizerType AUTHENTICATE_ONLY and delegates authorization to policy engine {policy_engine_arn} in ENFORCE mode.",
-                    resolution="No action required. Continue validating policy coverage for all exposed gateway targets.",
-                    reference=AGENTCORE_GATEWAY_API_REFERENCE_URL,
-                    severity=SeverityEnum.HIGH,
-                    status=StatusEnum.PASSED,
-                )
-            )
+            # The engine makes the only authorization decision, so the verdict
+            # waits for the AG-25 reading of its policies below.
+            delegates_to_engine = True
         elif authorizer_type == "AUTHENTICATE_ONLY":
             findings.append(
                 create_finding(
@@ -23093,6 +23535,50 @@ def check_agentcore_gateway_agentic_security() -> List[Dict[str, Any]]:
                         finding_details=f"Gateway '{gateway_name}' policy enforcement could not be fully assessed: {type(error).__name__}.",
                         resolution="Grant bedrock-agentcore:ListPolicies and retry the assessment.",
                         reference=AGENTCORE_POLICY_ENGINE_REFERENCE_URL,
+                        severity=SeverityEnum.INFORMATIONAL,
+                        status=StatusEnum.NA,
+                    )
+                )
+
+        if delegates_to_engine:
+            engine_finding = next(
+                finding
+                for finding in reversed(findings)
+                if finding.get("Check_ID") == "AG-25"
+            )
+            engine_status = engine_finding.get("Status")
+            if engine_status == StatusEnum.PASSED.value:
+                findings.append(
+                    create_finding(
+                        check_id="AG-24",
+                        finding_name="Agentic AI Gateway Inbound Authorization",
+                        finding_details=f"Gateway '{gateway_name}' ({gateway_id}) uses authorizerType AUTHENTICATE_ONLY and delegates authorization to policy engine {policy_engine_arn} in ENFORCE mode, whose enforcing policies AG-25 read and found none that permits every action unconditioned.",
+                        resolution="No action required. Continue validating policy coverage for all exposed gateway targets.",
+                        reference=AGENTCORE_GATEWAY_API_REFERENCE_URL,
+                        severity=SeverityEnum.HIGH,
+                        status=StatusEnum.PASSED,
+                    )
+                )
+            elif engine_status == StatusEnum.FAILED.value:
+                findings.append(
+                    create_finding(
+                        check_id="AG-24",
+                        finding_name="Agentic AI Gateway Authenticate-Only Authorization",
+                        finding_details=f"Gateway '{gateway_name}' ({gateway_id}) uses authorizerType AUTHENTICATE_ONLY and delegates authorization to policy engine {policy_engine_arn} in ENFORCE mode, but AG-25 reports '{engine_finding.get('Finding')}': the engine denies no tool call, and AgentCore Gateway makes no authorization decision of its own for this authorizer type.",
+                        resolution="Fix the AG-25 finding on the policy engine, or use AWS_IAM or CUSTOM_JWT for gateway-enforced authorization.",
+                        reference=AGENTCORE_GATEWAY_API_REFERENCE_URL,
+                        severity=SeverityEnum.HIGH,
+                        status=StatusEnum.FAILED,
+                    )
+                )
+            else:
+                findings.append(
+                    create_finding(
+                        check_id="AG-24",
+                        finding_name="Agentic AI Gateway Inbound Authorization Incomplete",
+                        finding_details=f"Gateway '{gateway_name}' ({gateway_id}) uses authorizerType AUTHENTICATE_ONLY and delegates authorization to policy engine {policy_engine_arn} in ENFORCE mode, but AG-25 could not read the engine's policies ('{engine_finding.get('Finding')}'), so whether the engine denies any tool call is unknown.",
+                        resolution="Resolve the AG-25 N/A and rerun the assessment.",
+                        reference=AGENTCORE_GATEWAY_API_REFERENCE_URL,
                         severity=SeverityEnum.INFORMATIONAL,
                         status=StatusEnum.NA,
                     )

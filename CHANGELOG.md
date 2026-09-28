@@ -208,6 +208,28 @@ section.
 
 ### Fixed
 
+- `AC-08` requires an available `bedrock-agentcore` endpoint in the VPC of
+  each VPC-mode runtime, resolved from its subnets, where an endpoint in any
+  VPC of the region counted before. It also requires the
+  `bedrock-agentcore-control` endpoint whenever a runtime or gateway exists.
+- `AC-08` fails an endpoint whose security group inbound ranges cover the
+  VPC CIDR, alone or pieced together, or that open any protocol or port other
+  than TCP 443. Both passed before, because only `0.0.0.0/0` and `::/0` were
+  compared. An endpoint whose VPC CIDR is unknown is `N/A`.
+- `AG-24` takes an `AUTHENTICATE_ONLY` gateway's verdict from `AG-25`. It
+  passed whenever a policy engine was attached in `ENFORCE` mode, even when
+  that engine held no enforcing policy or an unconditioned permit over every
+  action, so no tool call was denied by anyone.
+- `AC-27` and `AC-43` fail an execution role trust statement whose
+  `aws:SourceArn` is absent or open across Regions or resource types, as
+  `Source ARN Not Scoped`. A trust guarded by `aws:SourceAccount` alone, or by
+  `arn:aws:bedrock-agentcore:*:<account>:*`, passed, though the service could
+  assume the role for any AgentCore resource in the account. The documented
+  form, a fixed Region and resource type with a wildcard resource id, passes.
+- `AC-02` lists, beside each principal granted AgentCore evaluation writes
+  through a wildcard pattern, the writes its patterns reach. The finding said
+  every such principal could create, change and delete evaluations, though
+  `bedrock-agentcore:DeleteEval*` reaches only `DeleteEvaluator` of the six.
 - `AC-23` fails a memory read conditioned on a `StringLike` namespace that
   spans callers. `/users/*` read as one fixed partition and passed, though it
   matches every user's records; so did `/actors/*` and a partial wildcard
