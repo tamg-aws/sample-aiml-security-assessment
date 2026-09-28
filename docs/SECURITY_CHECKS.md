@@ -372,7 +372,7 @@ inventory is never treated as evidence of compliance.
 ### BR-06: AWS CloudTrail Logging
 
 - **Severity:** Medium
-- **Description:** Validates AWS CloudTrail logging for Bedrock API calls.
+- **Description:** Validates AWS CloudTrail logging for Bedrock API calls on logging multi-region trails, judging every selector field. The management row credits a basic selector with `IncludeManagementEvents` and `ReadWriteType` `All` that does not exclude `bedrock.amazonaws.com`, or an advanced `eventCategory` `Management` selector with no field that drops Bedrock (`readOnly`, or an `eventSource` that leaves it out). `WriteOnly` is not credited because `InvokeModel` is a read-only management event. A `NetworkActivity` selector is not management coverage. The data-event rows credit a resource type only from a selector whose sole other field is `eventCategory` `Data`; a type named only beside `eventName`, `readOnly`, `resources.ARN` or any other field is reported as narrowed. The knowledge base row needs `AWS::Bedrock::KnowledgeBase` and enabled model invocation logging. The inference row needs `AWS::Bedrock::Model`, `AWS::Bedrock::AsyncInvoke`, `AWS::Bedrock::AgentAlias` and `AWS::Bedrock::InlineAgent`. `Bedrock Inference Forensic Record` needs invocation logging with `textDataDeliveryEnabled` and every destination under an enabled customer managed KMS key. A trail that cannot be read makes a row without coverage `N/A`. The check is scoped by use as BR-04 is. Not read: the `bedrock-mantle` endpoint's CloudTrail events, RetrieveAndGenerate citations, and CloudTrail Lake or Athena centralization.
 
 ### BR-07: Prompt Management
 

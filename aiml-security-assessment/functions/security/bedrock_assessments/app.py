@@ -3273,7 +3273,11 @@ def _bedrock_inference_observed(region: str = "") -> Optional[bool]:
     return None if unread else False
 
 
-def _bedrock_usage_na_detail(region: str = "") -> Optional[str]:
+def _bedrock_usage_na_detail(
+    region: str = "",
+    purpose: str = "to monitor with invocation logging",
+    unjudged: str = "invocation logging is off and is not reported as Failed or as out of scope.",
+) -> Optional[str]:
     """
     Return N/A text when the Region shows no Bedrock use, or None when it does:
     a Bedrock resource, or an inference call in event history.
@@ -3289,7 +3293,7 @@ def _bedrock_usage_na_detail(region: str = "") -> Optional[str]:
             "No regional Bedrock resources found, and this Region's event history "
             "holds no InvokeModel, InvokeModelWithResponseStream, Converse or "
             "ConverseStream call from the last 90 days, so there is no model use "
-            "to monitor with invocation logging."
+            f"{purpose}."
         )
     unread = []
     if footprint is None:
@@ -3298,8 +3302,7 @@ def _bedrock_usage_na_detail(region: str = "") -> Optional[str]:
         unread.append("cloudtrail:LookupEvents for the four inference calls")
     return (
         "Whether this Region uses Bedrock could not be determined, because "
-        f"{' and '.join(unread)} could not be read; invocation logging is off and "
-        "is not reported as Failed or as out of scope."
+        f"{' and '.join(unread)} could not be read; {unjudged}"
     )
 
 
@@ -3473,38 +3476,215 @@ BEDROCK_KNOWLEDGE_BASE_DATA_EVENT_TYPE = "AWS::Bedrock::KnowledgeBase"
 
 BEDROCK_MODEL_DATA_EVENT_TYPE = "AWS::Bedrock::Model"
 
-CLOUDTRAIL_DATA_EVENT_RESOLUTION = (
-    "Add an advanced event selector with resources.type Equals {} to a "
-    "multi-region trail. Bedrock data events are not logged by default, so "
-    "management events alone do not record individual requests."
+# The four data-event resource types AIR-BDR-MDL-07 names for the inference
+# paths CloudTrail does not log by default: InvokeModelWithBidirectionalStream,
+# StartAsyncInvoke, GetAsyncInvoke, InvokeAgent and InvokeInlineAgent.
+BEDROCK_INFERENCE_DATA_EVENT_TYPES = (
+    BEDROCK_MODEL_DATA_EVENT_TYPE,
+    "AWS::Bedrock::AsyncInvoke",
+    "AWS::Bedrock::AgentAlias",
+    "AWS::Bedrock::InlineAgent",
 )
 
+BEDROCK_EVENT_SOURCE = "bedrock.amazonaws.com"
 
-def _advanced_selector_resource_types(advanced_selectors: Any) -> List[str]:
-    """Collect every resources.type value named in advanced event selectors.
+CLOUDTRAIL_DATA_EVENT_RESOLUTION = (
+    "Add an advanced event selector with resources.type Equals {} to a "
+    "multi-region trail, with no other field than eventCategory Equals Data. "
+    "Bedrock data events are not logged by default, so management events alone "
+    "do not record individual requests."
+)
 
-    Bedrock data events (Retrieve, RetrieveAndGenerate, InvokeModel) are
-    expressible only through advanced event selectors, so this is the whole
-    surface on which a data-event claim can be made.
+INFERENCE_FORENSIC_RECORD_FINDING = "Bedrock Inference Forensic Record"
+
+
+def _selector_field_map(selector: Any) -> Dict[str, Dict[str, Any]]:
+    """Map each Field of one advanced event selector to its field selector."""
+    fields: Dict[str, Dict[str, Any]] = {}
+    if not isinstance(selector, dict):
+        return fields
+    for field in selector.get("FieldSelectors") or []:
+        if isinstance(field, dict) and field.get("Field"):
+            fields[str(field["Field"])] = field
+    return fields
+
+
+def _event_source_admits_bedrock(field: Dict[str, Any]) -> bool:
+    """Whether an eventSource field selector leaves bedrock.amazonaws.com in."""
+    operators = {key for key in field if key != "Field"}
+    if operators - {"Equals", "NotEquals"}:
+        return False
+    equals = field.get("Equals") or []
+    if equals and BEDROCK_EVENT_SOURCE not in equals:
+        return False
+    return BEDROCK_EVENT_SOURCE not in (field.get("NotEquals") or [])
+
+
+def _trail_bedrock_management_coverage(
+    event_selectors: Dict[str, Any],
+) -> Tuple[bool, List[str]]:
     """
-    resource_types = set()
-    if not isinstance(advanced_selectors, list):
-        return []
-    for selector in advanced_selectors:
-        if not isinstance(selector, dict):
+    Whether one trail records every Bedrock management event, read and write.
+
+    InvokeModel is recorded as a read-only management event, so a selector
+    that keeps write events only records no inference.
+    """
+    gaps = []
+    for selector in event_selectors.get("EventSelectors") or []:
+        if not isinstance(selector, dict) or not selector.get(
+            "IncludeManagementEvents"
+        ):
             continue
-        for field in selector.get("FieldSelectors", []) or []:
-            if not isinstance(field, dict) or field.get("Field") != "resources.type":
+        if BEDROCK_EVENT_SOURCE in (
+            selector.get("ExcludeManagementEventSources") or []
+        ):
+            gaps.append(f"excludes {BEDROCK_EVENT_SOURCE} from its management events")
+            continue
+        read_write = selector.get("ReadWriteType")
+        if read_write == "All":
+            return True, []
+        gaps.append(
+            f"records ReadWriteType {read_write or 'unset'} management events only, "
+            "and InvokeModel is a read-only management event"
+            if read_write != "ReadOnly"
+            else "records ReadWriteType ReadOnly management events only, so no "
+            "Bedrock write call is recorded"
+        )
+    for selector in event_selectors.get("AdvancedEventSelectors") or []:
+        fields = _selector_field_map(selector)
+        if "Management" not in (
+            (fields.get("eventCategory") or {}).get("Equals") or []
+        ):
+            continue
+        narrowing = []
+        for name, field in sorted(fields.items()):
+            if name == "eventCategory":
                 continue
-            values = field.get("Equals") or []
-            if isinstance(values, list):
-                resource_types.update(str(value) for value in values)
-    return sorted(resource_types)
+            if name == "eventSource" and _event_source_admits_bedrock(field):
+                continue
+            narrowing.append(name)
+        if not narrowing:
+            return True, []
+        label = selector.get("Name") or "unnamed"
+        gaps.append(
+            f"narrows its management selector '{label}' by {', '.join(narrowing)}"
+        )
+    return False, gaps
+
+
+def _trail_data_event_coverage(
+    advanced_selectors: Any,
+) -> Tuple[List[str], Dict[str, List[str]]]:
+    """
+    Split the data-event resource types one trail names into those it records
+    in full and those a further field narrows.
+
+    Bedrock data events are expressible only through advanced event selectors.
+    Any field beside eventCategory and resources.type (eventName, readOnly,
+    resources.ARN, userIdentity.arn and the rest) records a subset of the
+    calls, so the type is reported as narrowed and not credited.
+    """
+    credited = set()
+    narrowed: Dict[str, List[str]] = {}
+    if not isinstance(advanced_selectors, list):
+        return [], narrowed
+    for selector in advanced_selectors:
+        fields = _selector_field_map(selector)
+        if "Data" not in ((fields.get("eventCategory") or {}).get("Equals") or []):
+            continue
+        types = (fields.get("resources.type") or {}).get("Equals") or []
+        if not isinstance(types, list):
+            continue
+        extra = sorted(
+            name for name in fields if name not in ("eventCategory", "resources.type")
+        )
+        for resource_type in types:
+            if extra:
+                narrowed.setdefault(str(resource_type), []).extend(extra)
+            else:
+                credited.add(str(resource_type))
+    return sorted(credited), narrowed
+
+
+def _invocation_record_state(region: str) -> Dict[str, Any]:
+    """
+    Read whether invocation logging records the prompt and response of each
+    inference, and whether every destination is under an enabled customer
+    managed KMS key (AIR-BDR-MDL-07).
+    """
+    state: Dict[str, Any] = {"logging": None, "gaps": [], "unread": []}
+    try:
+        bedrock_client = boto3.client(
+            "bedrock", config=boto3_config, region_name=region
+        )
+        config = (
+            bedrock_client.get_model_invocation_logging_configuration().get(
+                "loggingConfig"
+            )
+            or {}
+        )
+    except (ClientError, BotoCoreError) as error:
+        state["unread"].append(
+            "bedrock:GetModelInvocationLoggingConfiguration "
+            f"({get_assessment_error_label(error)})"
+        )
+        return state
+    bucket_name = _extract_s3_bucket_name(config.get("s3Config"))
+    cloudwatch_config = config.get("cloudWatchConfig") or {}
+    log_group_name = cloudwatch_config.get("logGroupName")
+    large_data_bucket = _extract_s3_bucket_name(
+        cloudwatch_config.get("largeDataDeliveryS3Config")
+    )
+    if not bucket_name and not log_group_name:
+        state["logging"] = False
+        state["gaps"].append(
+            "model invocation logging is off, so no prompt or response is recorded"
+        )
+        return state
+    state["logging"] = True
+    if config.get("textDataDeliveryEnabled") is not True:
+        state["gaps"].append(
+            "textDataDeliveryEnabled is not true, so text prompts and responses "
+            "are not delivered"
+        )
+    buckets = []
+    if bucket_name:
+        buckets.append((bucket_name, "S3 bucket for invocation logs"))
+    if large_data_bucket and large_data_bucket != bucket_name:
+        buckets.append(
+            (large_data_bucket, "Large-data delivery S3 bucket for invocation logs")
+        )
+    s3_client = boto3.client("s3", config=boto3_config, region_name=region)
+    for name, label in buckets:
+        try:
+            rows, roll_up = _invocation_log_bucket_encryption_rows(
+                name, label, s3_client, region
+            )
+        except (ClientError, BotoCoreError) as error:
+            state["unread"].append(
+                f"s3:GetEncryptionConfiguration on '{name}' "
+                f"({get_assessment_error_label(error)})"
+            )
+            continue
+        if roll_up == "FAIL":
+            state["gaps"].append(rows[0]["Finding_Details"])
+        elif roll_up != "PASS":
+            state["unread"].append(rows[0]["Finding_Details"])
+    if log_group_name:
+        group_row = _invocation_log_group_encryption_rows(log_group_name, region)[0]
+        if group_row["Status"] == "Failed":
+            state["gaps"].append(group_row["Finding_Details"])
+        elif group_row["Status"] != "Passed":
+            state["unread"].append(group_row["Finding_Details"])
+    return state
 
 
 def _bedrock_data_event_findings(
     data_event_trails: Dict[str, List[str]],
+    narrowed_types: Dict[str, List[str]],
+    unread_trails: List[str],
     knowledge_base_count: Optional[int],
+    record: Dict[str, Any],
     region: str,
 ) -> List[Dict[str, Any]]:
     """
@@ -3512,6 +3692,14 @@ def _bedrock_data_event_findings(
     (AIR-BDR-KB-06) and end-to-end inference traceability (AIR-BDR-MDL-07).
     """
     observed = ", ".join(sorted(data_event_trails)) or "none"
+    narrowed_note = "".join(
+        f" {resource_type} is named only in selector(s) narrowed by "
+        f"{', '.join(sorted(set(fields)))}, which record a subset of its calls."
+        for resource_type, fields in sorted(narrowed_types.items())
+    )
+    unread_note = (
+        f" Trail(s) not read: {'; '.join(unread_trails)}." if unread_trails else ""
+    )
     data_event_findings = []
 
     kb_trails = data_event_trails.get(BEDROCK_KNOWLEDGE_BASE_DATA_EVENT_TYPE, [])
@@ -3520,12 +3708,12 @@ def _bedrock_data_event_findings(
         if knowledge_base_count
         else ""
     )
-    if kb_trails:
+    if kb_trails and record["logging"] is True:
         data_event_findings.append(
             create_finding(
                 check_id="BR-06",
                 finding_name="Bedrock Knowledge Base Retrieval Data Event Logging",
-                finding_details=f"Trail(s) {', '.join(sorted(set(kb_trails)))} name {BEDROCK_KNOWLEDGE_BASE_DATA_EVENT_TYPE} in a resources.type field selector, so each Retrieve and RetrieveAndGenerate call is recorded with the knowledge base that served it.{kb_inventory}",
+                finding_details=f"Trail(s) {', '.join(sorted(set(kb_trails)))} name {BEDROCK_KNOWLEDGE_BASE_DATA_EVENT_TYPE} in a resources.type field selector with no narrowing field, so each Retrieve and RetrieveAndGenerate call is recorded with the knowledge base that served it, and model invocation logging records the response it informed. The citations that tie a response to a source chunk are returned in the RetrieveAndGenerate response and are not read by this check.{kb_inventory}",
                 resolution="No action required. Retain the data events long enough to answer which source document informed a past response.",
                 reference="https://docs.aws.amazon.com/bedrock/latest/userguide/logging-using-cloudtrail.html",
                 severity="Medium",
@@ -3547,32 +3735,81 @@ def _bedrock_data_event_findings(
             )
         )
     else:
-        data_event_findings.append(
-            create_finding(
-                check_id="BR-06",
-                finding_name="Bedrock Knowledge Base Retrieval Data Event Logging",
-                finding_details=f"No logging multi-region trail names {BEDROCK_KNOWLEDGE_BASE_DATA_EVENT_TYPE} in a resources.type field selector, so a retrieved chunk cannot be traced back to the knowledge base and source document that produced it (observed data-event resource types: {observed}).{kb_inventory}",
-                resolution=CLOUDTRAIL_DATA_EVENT_RESOLUTION.format(
-                    BEDROCK_KNOWLEDGE_BASE_DATA_EVENT_TYPE
-                ),
-                reference="https://docs.aws.amazon.com/bedrock/latest/userguide/logging-using-cloudtrail.html",
-                severity="Medium",
-                status="Failed",
-                region=region,
+        kb_gaps = []
+        if not kb_trails and not unread_trails:
+            kb_gaps.append(
+                f"no logging multi-region trail names {BEDROCK_KNOWLEDGE_BASE_DATA_EVENT_TYPE} in a resources.type field selector with no narrowing field, so a retrieved chunk cannot be traced back to the knowledge base that produced it"
             )
-        )
+        if record["logging"] is False:
+            kb_gaps.append(
+                "model invocation logging is off, so the response a retrieval informed is not recorded"
+            )
+        unread = list(unread_trails) if not kb_trails else []
+        if record["logging"] is None:
+            unread.extend(record["unread"])
+        if kb_gaps:
+            kb_detail = "; ".join(kb_gaps)
+            data_event_findings.append(
+                create_finding(
+                    check_id="BR-06",
+                    finding_name="Bedrock Knowledge Base Retrieval Data Event Logging",
+                    finding_details=f"{kb_detail[0].upper()}{kb_detail[1:]} (observed data-event resource types: {observed}).{narrowed_note}{kb_inventory}",
+                    resolution=CLOUDTRAIL_DATA_EVENT_RESOLUTION.format(
+                        BEDROCK_KNOWLEDGE_BASE_DATA_EVENT_TYPE
+                    )
+                    + " Enable model invocation logging.",
+                    reference="https://docs.aws.amazon.com/bedrock/latest/userguide/logging-using-cloudtrail.html",
+                    severity="Medium",
+                    status="Failed",
+                    region=region,
+                )
+            )
+        else:
+            data_event_findings.append(
+                create_finding(
+                    check_id="BR-06",
+                    finding_name="Bedrock Knowledge Base Retrieval Data Event Logging",
+                    finding_details=f"Knowledge base retrieval traceability could not be assessed because these were not read: {'; '.join(unread)}.{kb_inventory}",
+                    resolution=COULD_NOT_ASSESS_RESOLUTION,
+                    reference="https://docs.aws.amazon.com/bedrock/latest/userguide/logging-using-cloudtrail.html",
+                    severity="Informational",
+                    status="N/A",
+                    region=region,
+                )
+            )
 
-    model_trails = data_event_trails.get(BEDROCK_MODEL_DATA_EVENT_TYPE, [])
-    if model_trails:
+    missing = [
+        resource_type
+        for resource_type in BEDROCK_INFERENCE_DATA_EVENT_TYPES
+        if not data_event_trails.get(resource_type)
+    ]
+    if not missing:
+        coverage = "; ".join(
+            f"{resource_type} by {', '.join(sorted(set(data_event_trails[resource_type])))}"
+            for resource_type in BEDROCK_INFERENCE_DATA_EVENT_TYPES
+        )
         data_event_findings.append(
             create_finding(
                 check_id="BR-06",
                 finding_name="Bedrock Model Invocation Data Event Logging",
-                finding_details=f"Trail(s) {', '.join(sorted(set(model_trails)))} name {BEDROCK_MODEL_DATA_EVENT_TYPE} in a resources.type field selector, so each invocation is attributable to the calling identity and the model it invoked.",
+                finding_details=f"Every inference data-event resource type is selected with no narrowing field ({coverage}), so bidirectional streaming, asynchronous, agent and inline agent invocations are attributable to the calling identity. Calls to the bedrock-mantle endpoint are not read by this check.",
                 resolution="No action required. Continue retaining Bedrock data events for forensic reconstruction.",
                 reference="https://docs.aws.amazon.com/bedrock/latest/userguide/logging-using-cloudtrail.html",
                 severity="Medium",
                 status="Passed",
+                region=region,
+            )
+        )
+    elif unread_trails:
+        data_event_findings.append(
+            create_finding(
+                check_id="BR-06",
+                finding_name="Bedrock Model Invocation Data Event Logging",
+                finding_details=f"No read trail selects {', '.join(missing)}, and not every trail was read, so inference data-event coverage could not be assessed.{unread_note}",
+                resolution=COULD_NOT_ASSESS_RESOLUTION,
+                reference="https://docs.aws.amazon.com/bedrock/latest/userguide/logging-using-cloudtrail.html",
+                severity="Informational",
+                status="N/A",
                 region=region,
             )
         )
@@ -3581,13 +3818,51 @@ def _bedrock_data_event_findings(
             create_finding(
                 check_id="BR-06",
                 finding_name="Bedrock Model Invocation Data Event Logging",
-                finding_details=f"No logging multi-region trail names {BEDROCK_MODEL_DATA_EVENT_TYPE} in a resources.type field selector, so an individual inference cannot be traced from the invoking identity to the model that answered it (observed data-event resource types: {observed}).",
-                resolution=CLOUDTRAIL_DATA_EVENT_RESOLUTION.format(
-                    BEDROCK_MODEL_DATA_EVENT_TYPE
-                ),
+                finding_details=f"No logging multi-region trail names {', '.join(missing)} in a resources.type field selector with no narrowing field, so an inference on those paths cannot be traced from the invoking identity to the model or agent that answered it (observed data-event resource types: {observed}).{narrowed_note}",
+                resolution=CLOUDTRAIL_DATA_EVENT_RESOLUTION.format(", ".join(missing)),
                 reference="https://docs.aws.amazon.com/bedrock/latest/userguide/logging-using-cloudtrail.html",
                 severity="Medium",
                 status="Failed",
+                region=region,
+            )
+        )
+
+    if record["gaps"]:
+        data_event_findings.append(
+            create_finding(
+                check_id="BR-06",
+                finding_name=INFERENCE_FORENSIC_RECORD_FINDING,
+                finding_details=f"The invocation log record that pairs with a CloudTrail event is incomplete: {'; '.join(record['gaps'])}",
+                resolution="Enable model invocation logging with textDataDeliveryEnabled, and encrypt every destination (S3 bucket, large-data bucket and log group) with an enabled customer managed KMS key.",
+                reference="https://docs.aws.amazon.com/bedrock/latest/userguide/model-invocation-logging.html",
+                severity="Medium",
+                status="Failed",
+                region=region,
+            )
+        )
+    elif record["unread"]:
+        data_event_findings.append(
+            create_finding(
+                check_id="BR-06",
+                finding_name=INFERENCE_FORENSIC_RECORD_FINDING,
+                finding_details=f"The invocation log record could not be assessed because these were not read: {'; '.join(record['unread'])}",
+                resolution=COULD_NOT_ASSESS_RESOLUTION,
+                reference="https://docs.aws.amazon.com/bedrock/latest/userguide/model-invocation-logging.html",
+                severity="Informational",
+                status="N/A",
+                region=region,
+            )
+        )
+    else:
+        data_event_findings.append(
+            create_finding(
+                check_id="BR-06",
+                finding_name=INFERENCE_FORENSIC_RECORD_FINDING,
+                finding_details="Model invocation logging delivers text prompts and responses, and every destination is under an enabled customer managed KMS key. Whether the CloudTrail events and invocation logs are centralized in CloudTrail Lake or queried together in Athena is not read by this check.",
+                resolution="No action required",
+                reference="https://docs.aws.amazon.com/bedrock/latest/userguide/model-invocation-logging.html",
+                severity="Medium",
+                status="Passed",
                 region=region,
             )
         )
@@ -3614,18 +3889,23 @@ def check_bedrock_cloudtrail_logging(region: str = "") -> Dict[str, Any]:
             "csv_data": [],
         }
 
-        bedrock_footprint_found = detect_bedrock_regional_footprint(region=region)
-        if bedrock_footprint_found is not True:
-            findings["details"] = bedrock_footprint_na_detail(bedrock_footprint_found)
+        usage_na = _bedrock_usage_na_detail(
+            region,
+            purpose="to audit with Bedrock-specific CloudTrail coverage",
+            unjudged="Bedrock CloudTrail coverage is not reported as Failed or as out of scope.",
+        )
+        if usage_na is not None:
+            findings["details"] = usage_na
             findings["csv_data"].append(
                 create_finding(
                     check_id="BR-06",
                     finding_name="Bedrock CloudTrail Logging Check",
-                    finding_details=bedrock_footprint_na_detail(
-                        bedrock_footprint_found,
-                        "to audit with Bedrock-specific CloudTrail coverage",
+                    finding_details=usage_na,
+                    resolution=(
+                        COULD_NOT_ASSESS_RESOLUTION
+                        if usage_na.startswith("Whether")
+                        else "No action required"
                     ),
-                    resolution="No action required",
                     reference="https://docs.aws.amazon.com/bedrock/latest/userguide/logging-using-cloudtrail.html",
                     severity="Informational",
                     status="N/A",
@@ -3649,67 +3929,49 @@ def check_bedrock_cloudtrail_logging(region: str = "") -> Dict[str, Any]:
                 token_response_keys=("NextToken",),
             )
 
-            bedrock_logging_enabled = False
             logging_trails = []
+            management_gaps = []
+            unread_trails = []
             data_event_trails: Dict[str, List[str]] = {}
+            narrowed_types: Dict[str, List[str]] = {}
 
             for trail in trails:
                 trail_arn = trail["TrailARN"]
                 trail_name = trail["Name"]
 
-                # Get trail configuration
-                trail_config = cloudtrail_client.get_trail(Name=trail_arn)
-
-                # Get trail runtime status (IsLogging is only in get_trail_status)
-                trail_status = cloudtrail_client.get_trail_status(Name=trail_arn)
-
-                # Check if trail is enabled and multi-region
-                if trail_config["Trail"].get("IsMultiRegionTrail") and trail_status.get(
-                    "IsLogging", False
-                ):
-                    # Get event selectors
+                try:
+                    trail_config = cloudtrail_client.get_trail(Name=trail_arn)
+                    # IsLogging is only in get_trail_status
+                    trail_status = cloudtrail_client.get_trail_status(Name=trail_arn)
+                    if not (
+                        trail_config["Trail"].get("IsMultiRegionTrail")
+                        and trail_status.get("IsLogging", False)
+                    ):
+                        continue
                     event_selectors = cloudtrail_client.get_event_selectors(
                         TrailName=trail_arn
                     )
-
-                    # Check advanced event selectors if they exist
-                    advanced_selectors = event_selectors.get(
-                        "AdvancedEventSelectors", []
+                except ClientError as error:
+                    unread_trails.append(
+                        f"{trail_name} ({get_assessment_error_label(error)})"
                     )
-                    basic_selectors = event_selectors.get("EventSelectors", [])
+                    continue
 
-                    # Record which Bedrock data-event resource types this trail
-                    # names, for the knowledge base and model traceability legs.
-                    for resource_type in _advanced_selector_resource_types(
-                        advanced_selectors
-                    ):
-                        data_event_trails.setdefault(resource_type, []).append(
-                            trail_name
-                        )
+                covered, gaps = _trail_bedrock_management_coverage(event_selectors)
+                if covered:
+                    logging_trails.append(trail_name)
+                else:
+                    management_gaps.extend(f"{trail_name} {gap}" for gap in gaps)
 
-                    # Check if Bedrock events are being logged
-                    for selector in advanced_selectors:
-                        field_selectors = selector.get("FieldSelectors", [])
-                        for field in field_selectors:
-                            if (
-                                field.get("Field") == "eventSource"
-                                and "bedrock" in str(field.get("Equals", [])).lower()
-                            ):
-                                bedrock_logging_enabled = True
-                                logging_trails.append(trail_name)
-                                break
+                credited, narrowed = _trail_data_event_coverage(
+                    event_selectors.get("AdvancedEventSelectors", [])
+                )
+                for resource_type in credited:
+                    data_event_trails.setdefault(resource_type, []).append(trail_name)
+                for resource_type, fields in narrowed.items():
+                    narrowed_types.setdefault(resource_type, []).extend(fields)
 
-                    # If no advanced selectors, check if logging all management events
-                    if not bedrock_logging_enabled and basic_selectors:
-                        for selector in basic_selectors:
-                            if selector.get(
-                                "IncludeManagementEvents", False
-                            ) and selector.get("ReadWriteType", "") in ["All", "Write"]:
-                                bedrock_logging_enabled = True
-                                logging_trails.append(trail_name)
-                                break
-
-            if bedrock_logging_enabled:
+            if logging_trails:
                 findings["details"] = (
                     f"CloudTrail logging enabled for Bedrock in trails: {', '.join(logging_trails)}"
                 )
@@ -3717,11 +3979,26 @@ def check_bedrock_cloudtrail_logging(region: str = "") -> Dict[str, Any]:
                     create_finding(
                         check_id="BR-06",
                         finding_name="Bedrock CloudTrail Logging Check",
-                        finding_details=f"CloudTrail is properly configured to log Bedrock API activity in trails: {', '.join(logging_trails)}",
+                        finding_details=f"Trail(s) {', '.join(logging_trails)} record every Bedrock management event, read and write, including InvokeModel, InvokeModelWithResponseStream, Converse and ConverseStream.",
                         resolution="No action required. Continue monitoring CloudTrail logs for Bedrock activity.",
                         reference="https://docs.aws.amazon.com/bedrock/latest/userguide/logging-using-cloudtrail.html",
                         severity="Medium",
                         status="Passed",
+                        region=region,
+                    )
+                )
+            elif unread_trails:
+                findings["status"] = "WARN"
+                findings["details"] = "Not every CloudTrail trail could be read"
+                findings["csv_data"].append(
+                    create_finding(
+                        check_id="BR-06",
+                        finding_name="Bedrock CloudTrail Logging Check",
+                        finding_details=f"No read trail records every Bedrock management event, and these trails were not read: {'; '.join(unread_trails)}.",
+                        resolution=COULD_NOT_ASSESS_RESOLUTION,
+                        reference="https://docs.aws.amazon.com/bedrock/latest/userguide/logging-using-cloudtrail.html",
+                        severity="Informational",
+                        status="N/A",
                         region=region,
                     )
                 )
@@ -3730,14 +4007,19 @@ def check_bedrock_cloudtrail_logging(region: str = "") -> Dict[str, Any]:
                 findings["details"] = (
                     "No CloudTrail trails configured to log Bedrock activity"
                 )
+                gap_note = (
+                    f" Trails not credited: {'; '.join(management_gaps)}."
+                    if management_gaps
+                    else ""
+                )
                 findings["csv_data"].append(
                     create_finding(
                         check_id="BR-06",
                         finding_name="Bedrock CloudTrail Logging Check",
-                        finding_details="CloudTrail is not configured to log Amazon Bedrock API calls. This limits your ability to audit and monitor Bedrock usage.",
-                        resolution="Enable CloudTrail logging for Bedrock by :\n"
-                        + "1. Configuring an advanced event selector for Bedrock events \n"
-                        + "2. Enabling management events logging in a multi-region trail",
+                        finding_details=f"No logging multi-region trail records every Bedrock management event, read and write. This limits your ability to audit and monitor Bedrock usage.{gap_note}",
+                        resolution="Enable CloudTrail logging for Bedrock on a multi-region trail with either:\n"
+                        + "1. A basic event selector with IncludeManagementEvents true and ReadWriteType All \n"
+                        + "2. An advanced event selector with eventCategory Equals Management and no readOnly field",
                         reference="https://docs.aws.amazon.com/bedrock/latest/userguide/logging-using-cloudtrail.html",
                         severity="High",
                         status="Failed",
@@ -3767,7 +4049,12 @@ def check_bedrock_cloudtrail_logging(region: str = "") -> Dict[str, Any]:
 
             findings["csv_data"].extend(
                 _bedrock_data_event_findings(
-                    data_event_trails, knowledge_base_count, region
+                    data_event_trails,
+                    narrowed_types,
+                    unread_trails,
+                    knowledge_base_count,
+                    _invocation_record_state(region),
+                    region,
                 )
             )
 

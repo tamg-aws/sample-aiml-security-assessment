@@ -1667,6 +1667,15 @@ class TestBR05Guardrails:
 class TestBR06CloudTrailLogging:
     """BR-06: Check CloudTrail logging for Bedrock."""
 
+    @pytest.fixture(autouse=True)
+    def _invocation_record_complete(self):
+        with patch(
+            "bedrock_app._invocation_record_state",
+            create=True,
+            return_value={"logging": True, "gaps": [], "unread": []},
+        ):
+            yield
+
     @patch("boto3.client")
     @patch("bedrock_app.detect_bedrock_regional_footprint", return_value=True)
     def test_br06_trail_is_logging_returns_passed(self, mock_footprint, mock_client):
@@ -1760,17 +1769,25 @@ class TestBR06CloudTrailLogging:
         assert len(findings) >= 1
         assert findings[0]["Status"] == "Failed"
 
+    @patch("bedrock_app._bedrock_inference_observed", create=True, return_value=False)
     @patch("boto3.client")
     @patch("bedrock_app.detect_bedrock_regional_footprint", return_value=False)
-    def test_br06_no_regional_footprint_returns_na(self, mock_footprint, mock_client):
+    def test_br06_no_regional_footprint_returns_na(
+        self, mock_footprint, mock_client, mock_observed
+    ):
         check = bedrock_app.check_bedrock_cloudtrail_logging
         result = check(region="eu-west-1")
         findings = extract_csv_data(result)
         assert len(findings) >= 1
         assert findings[0]["Status"] == "N/A"
-        assert findings[0]["Finding_Details"] == (
-            "No regional Bedrock resources found to audit with Bedrock-specific CloudTrail coverage"
+        assert findings[0]["Finding_Details"].startswith(
+            "No regional Bedrock resources found, and this Region's event history "
+            "holds no InvokeModel"
         )
+        assert findings[0]["Finding_Details"].endswith(
+            "to audit with Bedrock-specific CloudTrail coverage."
+        )
+        mock_observed.assert_called_once_with("eu-west-1")
         mock_client.assert_not_called()
 
     @patch("boto3.client")
@@ -1858,7 +1875,11 @@ class TestBR06CloudTrailLogging:
                 },
                 "model-trail": {
                     "logging": True,
-                    "selectors": [self._data_event_selector([self.MODEL_TYPE])],
+                    "selectors": [
+                        self._data_event_selector(
+                            bedrock_app.BEDROCK_INFERENCE_DATA_EVENT_TYPES
+                        )
+                    ],
                 },
             },
             knowledge_bases=[{"knowledgeBaseId": "kb-1"}, {"knowledgeBaseId": "kb-2"}],
@@ -1984,6 +2005,433 @@ class TestBR06CloudTrailLogging:
             )
         for finding in findings:
             assert_finding_schema(finding)
+
+
+INFERENCE_TYPES = (
+    "AWS::Bedrock::Model",
+    "AWS::Bedrock::AsyncInvoke",
+    "AWS::Bedrock::AgentAlias",
+    "AWS::Bedrock::InlineAgent",
+)
+KB_DATA_TYPE = "AWS::Bedrock::KnowledgeBase"
+COMPLETE_RECORD = {"logging": True, "gaps": [], "unread": []}
+
+
+def _management(name="management", **extra_fields):
+    fields = [{"Field": "eventCategory", "Equals": ["Management"]}]
+    fields += [{"Field": key, **value} for key, value in extra_fields.items()]
+    return {"Name": name, "FieldSelectors": fields}
+
+
+def _data(types, **extra_fields):
+    fields = [
+        {"Field": "eventCategory", "Equals": ["Data"]},
+        {"Field": "resources.type", "Equals": list(types)},
+    ]
+    fields += [{"Field": key, **value} for key, value in extra_fields.items()]
+    return {"Name": "data", "FieldSelectors": fields}
+
+
+class TestBR06SelectorValues:
+    """AIR-BDR-KB-06 and AIR-BDR-MDL-07: selectors are judged by every field."""
+
+    @staticmethod
+    def _run(trails, record=None, knowledge_bases=({"knowledgeBaseId": "kb-1"},)):
+        """trails: {name: {"advanced": [...], "basic": [...], "error": code}}."""
+
+        def name_of(arn):
+            return arn.rsplit("/", 1)[-1]
+
+        def selectors(TrailName):
+            trail = trails[name_of(TrailName)]
+            if trail.get("error"):
+                raise ClientError(
+                    {"Error": {"Code": trail["error"], "Message": "x"}},
+                    "GetEventSelectors",
+                )
+            return {
+                "EventSelectors": trail.get("basic", []),
+                "AdvancedEventSelectors": trail.get("advanced", []),
+            }
+
+        client = MagicMock()
+        client.list_trails.return_value = {
+            "Trails": [
+                {"TrailARN": f"arn:aws:cloudtrail:us-east-1:123:trail/{n}", "Name": n}
+                for n in trails
+            ]
+        }
+        client.get_trail.side_effect = lambda Name: {
+            "Trail": {"IsMultiRegionTrail": True}
+        }
+        client.get_trail_status.side_effect = lambda Name: {"IsLogging": True}
+        client.get_event_selectors.side_effect = selectors
+        client.list_knowledge_bases.return_value = {
+            "knowledgeBaseSummaries": list(knowledge_bases)
+        }
+        with (
+            patch("boto3.client", return_value=client),
+            patch("bedrock_app.detect_bedrock_regional_footprint", return_value=True),
+            patch(
+                "bedrock_app._invocation_record_state",
+                create=True,
+                return_value=record or COMPLETE_RECORD,
+            ),
+        ):
+            findings = extract_csv_data(
+                bedrock_app.check_bedrock_cloudtrail_logging(region="us-east-1")
+            )
+        for finding in findings:
+            assert_finding_schema(finding)
+        return {f["Finding"]: f for f in findings}
+
+    def test_advanced_management_selector_is_coverage(self):
+        rows = self._run({"org": {"advanced": [_management()]}})
+        assert rows["Bedrock CloudTrail Logging Check"]["Status"] == "Passed"
+        assert "org" in rows["Bedrock CloudTrail Logging Check"]["Finding_Details"]
+
+    def test_network_activity_selector_on_bedrock_is_not_coverage(self):
+        network = {
+            "Name": "vpce",
+            "FieldSelectors": [
+                {"Field": "eventCategory", "Equals": ["NetworkActivity"]},
+                {"Field": "eventSource", "Equals": ["bedrock.amazonaws.com"]},
+            ],
+        }
+        rows = self._run({"net": {"advanced": [network]}})
+        assert rows["Bedrock CloudTrail Logging Check"]["Status"] == "Failed"
+
+    def test_write_only_basic_selector_misses_inference(self):
+        rows = self._run(
+            {
+                "writes": {
+                    "basic": [
+                        {"IncludeManagementEvents": True, "ReadWriteType": "WriteOnly"}
+                    ]
+                }
+            }
+        )
+        row = rows["Bedrock CloudTrail Logging Check"]
+        assert row["Status"] == "Failed"
+        assert (
+            "writes records ReadWriteType WriteOnly management events only, and "
+            "InvokeModel is a read-only management event" in row["Finding_Details"]
+        )
+
+    def test_excluded_bedrock_source_is_not_coverage(self):
+        rows = self._run(
+            {
+                "trail": {
+                    "basic": [
+                        {
+                            "IncludeManagementEvents": True,
+                            "ReadWriteType": "All",
+                            "ExcludeManagementEventSources": ["bedrock.amazonaws.com"],
+                        }
+                    ]
+                }
+            }
+        )
+        row = rows["Bedrock CloudTrail Logging Check"]
+        assert row["Status"] == "Failed"
+        assert "excludes bedrock.amazonaws.com" in row["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "extra, credited",
+        [
+            ({"readOnly": {"Equals": ["false"]}}, False),
+            ({"eventSource": {"NotEquals": ["bedrock.amazonaws.com"]}}, False),
+            ({"eventSource": {"Equals": ["s3.amazonaws.com"]}}, False),
+            ({"eventSource": {"StartsWith": ["bedrock"]}}, False),
+            ({"eventSource": {"NotEquals": ["kms.amazonaws.com"]}}, True),
+            (
+                {
+                    "eventSource": {
+                        "Equals": ["s3.amazonaws.com", "bedrock.amazonaws.com"]
+                    }
+                },
+                True,
+            ),
+        ],
+    )
+    def test_management_selector_fields_are_judged(self, extra, credited):
+        rows = self._run({"trail": {"advanced": [_management("mgmt", **extra)]}})
+        row = rows["Bedrock CloudTrail Logging Check"]
+        assert row["Status"] == ("Passed" if credited else "Failed")
+        if not credited:
+            assert "narrows its management selector 'mgmt'" in row["Finding_Details"]
+
+    def test_one_covering_trail_is_enough_and_only_it_is_named(self):
+        rows = self._run(
+            {
+                "narrow": {"advanced": [_management(readOnly={"Equals": ["true"]})]},
+                "full": {"advanced": [_management()]},
+            }
+        )
+        row = rows["Bedrock CloudTrail Logging Check"]
+        assert row["Status"] == "Passed"
+        assert "full" in row["Finding_Details"]
+        assert "narrow" not in row["Finding_Details"]
+
+    def test_unread_trail_without_coverage_is_not_failed(self):
+        rows = self._run(
+            {
+                "denied": {"error": "AccessDeniedException"},
+                "empty": {"advanced": []},
+            }
+        )
+        for name in (
+            "Bedrock CloudTrail Logging Check",
+            "Bedrock Knowledge Base Retrieval Data Event Logging",
+            "Bedrock Model Invocation Data Event Logging",
+        ):
+            assert rows[name]["Status"] == "N/A", name
+            assert "denied (AccessDeniedException)" in rows[name]["Finding_Details"]
+
+    def test_unread_trail_beside_a_covering_trail_still_passes(self):
+        rows = self._run(
+            {
+                "denied": {"error": "AccessDeniedException"},
+                "full": {
+                    "advanced": [
+                        _management(),
+                        _data(INFERENCE_TYPES + (KB_DATA_TYPE,)),
+                    ]
+                },
+            }
+        )
+        assert rows["Bedrock CloudTrail Logging Check"]["Status"] == "Passed"
+        assert rows["Bedrock Model Invocation Data Event Logging"]["Status"] == "Passed"
+        assert (
+            rows["Bedrock Knowledge Base Retrieval Data Event Logging"]["Status"]
+            == "Passed"
+        )
+
+    @pytest.mark.parametrize(
+        "field",
+        [
+            {
+                "resources.ARN": {
+                    "StartsWith": ["arn:aws:bedrock:us-east-1:123:knowledge-base/kb-1"]
+                }
+            },
+            {"eventName": {"Equals": ["Retrieve"]}},
+            {"readOnly": {"Equals": ["false"]}},
+        ],
+    )
+    def test_narrowed_knowledge_base_selector_is_not_coverage(self, field):
+        rows = self._run(
+            {"trail": {"advanced": [_management(), _data([KB_DATA_TYPE], **field)]}}
+        )
+        row = rows["Bedrock Knowledge Base Retrieval Data Event Logging"]
+        assert row["Status"] == "Failed"
+        assert (
+            f"{KB_DATA_TYPE} is named only in selector(s) narrowed by {next(iter(field))}"
+            in row["Finding_Details"]
+        )
+
+    def test_every_inference_type_is_required(self):
+        rows = self._run(
+            {
+                "a": {"advanced": [_data(INFERENCE_TYPES[:2])]},
+                "b": {"advanced": [_data(INFERENCE_TYPES[3:])]},
+            }
+        )
+        row = rows["Bedrock Model Invocation Data Event Logging"]
+        assert row["Status"] == "Failed"
+        assert "AWS::Bedrock::AgentAlias" in row["Finding_Details"]
+        assert "AWS::Bedrock::Model," not in row["Finding_Details"].split("(")[0]
+        assert "AWS::Bedrock::AgentAlias" in row["Resolution"]
+
+    def test_inference_types_across_trails_pass(self):
+        rows = self._run(
+            {
+                "a": {"advanced": [_data(INFERENCE_TYPES[:2])]},
+                "b": {"advanced": [_data(INFERENCE_TYPES[2:])]},
+            }
+        )
+        row = rows["Bedrock Model Invocation Data Event Logging"]
+        assert row["Status"] == "Passed"
+        assert "AWS::Bedrock::Model by a" in row["Finding_Details"]
+        assert "AWS::Bedrock::InlineAgent by b" in row["Finding_Details"]
+        assert "bedrock-mantle endpoint are not read" in row["Finding_Details"]
+
+    def test_model_only_selector_misses_three_inference_paths(self):
+        rows = self._run({"a": {"advanced": [_data(["AWS::Bedrock::Model"])]}})
+        row = rows["Bedrock Model Invocation Data Event Logging"]
+        assert row["Status"] == "Failed"
+        for missing in INFERENCE_TYPES[1:]:
+            assert missing in row["Finding_Details"]
+
+    def test_knowledge_base_events_without_invocation_logging_fail(self):
+        rows = self._run(
+            {"a": {"advanced": [_data([KB_DATA_TYPE])]}},
+            record={
+                "logging": False,
+                "gaps": ["model invocation logging is off"],
+                "unread": [],
+            },
+        )
+        row = rows["Bedrock Knowledge Base Retrieval Data Event Logging"]
+        assert row["Status"] == "Failed"
+        assert row["Finding_Details"].startswith(
+            "Model invocation logging is off, so the response a retrieval informed"
+        )
+
+    def test_knowledge_base_events_with_unread_logging_are_not_judged(self):
+        rows = self._run(
+            {"a": {"advanced": [_data([KB_DATA_TYPE])]}},
+            record={
+                "logging": None,
+                "gaps": [],
+                "unread": [
+                    "bedrock:GetModelInvocationLoggingConfiguration (Throttling)"
+                ],
+            },
+        )
+        row = rows["Bedrock Knowledge Base Retrieval Data Event Logging"]
+        assert row["Status"] == "N/A"
+        assert "GetModelInvocationLoggingConfiguration" in row["Finding_Details"]
+        assert rows["Bedrock Inference Forensic Record"]["Status"] == "N/A"
+
+    def test_forensic_record_gaps_fail(self):
+        rows = self._run(
+            {"a": {"advanced": [_management()]}},
+            record={
+                "logging": True,
+                "gaps": [
+                    "group key is aws managed",
+                    "textDataDeliveryEnabled is not true",
+                ],
+                "unread": ["bucket key unread"],
+            },
+        )
+        row = rows["Bedrock Inference Forensic Record"]
+        assert row["Status"] == "Failed"
+        assert (
+            "group key is aws managed; textDataDeliveryEnabled"
+            in row["Finding_Details"]
+        )
+
+    def test_complete_forensic_record_passes(self):
+        rows = self._run({"a": {"advanced": [_management()]}})
+        assert rows["Bedrock Inference Forensic Record"]["Status"] == "Passed"
+
+    def test_on_demand_use_without_resources_is_judged(self):
+        client = MagicMock()
+        client.list_trails.return_value = {"Trails": []}
+        client.list_knowledge_bases.return_value = {"knowledgeBaseSummaries": []}
+        with (
+            patch("boto3.client", return_value=client),
+            patch("bedrock_app.detect_bedrock_regional_footprint", return_value=False),
+            patch(
+                "bedrock_app._bedrock_inference_observed",
+                create=True,
+                return_value=True,
+            ),
+            patch(
+                "bedrock_app._invocation_record_state",
+                create=True,
+                return_value=COMPLETE_RECORD,
+            ),
+        ):
+            findings = extract_csv_data(
+                bedrock_app.check_bedrock_cloudtrail_logging(region="us-east-1")
+            )
+        assert findings[0]["Status"] == "Failed"
+
+
+class TestInvocationRecordState:
+    """The invocation log half of AIR-BDR-MDL-07's forensic record."""
+
+    @staticmethod
+    def _state(config, bucket_rollups=None, group_status="Passed", config_error=None):
+        bedrock = MagicMock()
+        if config_error:
+            bedrock.get_model_invocation_logging_configuration.side_effect = (
+                ClientError(
+                    {"Error": {"Code": config_error, "Message": "x"}},
+                    "GetModelInvocationLoggingConfiguration",
+                )
+            )
+        else:
+            bedrock.get_model_invocation_logging_configuration.return_value = {
+                "loggingConfig": config
+            }
+        judged = []
+
+        def bucket_rows(name, label, s3_client, region):
+            judged.append(name)
+            roll_up = (bucket_rollups or {}).get(name, "PASS")
+            return [{"Finding_Details": f"{name} is {roll_up}"}], roll_up
+
+        with (
+            patch("boto3.client", return_value=bedrock),
+            patch(
+                "bedrock_app._invocation_log_bucket_encryption_rows",
+                side_effect=bucket_rows,
+            ),
+            patch(
+                "bedrock_app._invocation_log_group_encryption_rows",
+                return_value=[
+                    {"Status": group_status, "Finding_Details": f"group {group_status}"}
+                ],
+            ),
+        ):
+            return bedrock_app._invocation_record_state("us-east-1"), judged
+
+    def test_logging_off_is_a_gap(self):
+        state, _ = self._state({})
+        assert state["logging"] is False
+        assert state["gaps"] == [
+            "model invocation logging is off, so no prompt or response is recorded"
+        ]
+
+    def test_unread_config_is_unread(self):
+        state, _ = self._state({}, config_error="AccessDeniedException")
+        assert state["logging"] is None
+        assert state["gaps"] == []
+        assert "AccessDeniedException" in state["unread"][0]
+
+    def test_text_delivery_must_be_true(self):
+        state, _ = self._state({"s3Config": {"bucketName": "logs"}})
+        assert any("textDataDeliveryEnabled" in gap for gap in state["gaps"])
+
+    def test_every_destination_is_judged(self):
+        state, judged = self._state(
+            {
+                "textDataDeliveryEnabled": True,
+                "s3Config": {"bucketName": "logs"},
+                "cloudWatchConfig": {
+                    "logGroupName": "/bedrock/invocations",
+                    "largeDataDeliveryS3Config": {"bucketName": "large"},
+                },
+            },
+            bucket_rollups={"logs": "PASS", "large": "FAIL"},
+            group_status="N/A",
+        )
+        assert judged == ["logs", "large"]
+        assert state["gaps"] == ["large is FAIL"]
+        assert state["unread"] == ["group N/A"]
+
+    def test_clean_record_has_no_gap(self):
+        state, _ = self._state(
+            {
+                "textDataDeliveryEnabled": True,
+                "cloudWatchConfig": {"logGroupName": "/bedrock/invocations"},
+            }
+        )
+        assert state == {"logging": True, "gaps": [], "unread": []}
+
+    def test_a_failed_log_group_is_a_gap(self):
+        state, _ = self._state(
+            {
+                "textDataDeliveryEnabled": True,
+                "cloudWatchConfig": {"logGroupName": "/bedrock/invocations"},
+            },
+            group_status="Failed",
+        )
+        assert state["gaps"] == ["group Failed"]
 
 
 # ===================================================================
