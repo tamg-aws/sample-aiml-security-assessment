@@ -14522,6 +14522,10 @@ class TestPermissionCacheGroupPolicies:
                     ]
 
                 paginator.paginate.side_effect = paginate
+            elif name == "list_attached_user_policies":
+                paginator.paginate.return_value = [{"AttachedPolicies": []}]
+            elif name == "list_user_policies":
+                paginator.paginate.return_value = [{"PolicyNames": []}]
             else:
                 paginator.paginate.side_effect = lambda GroupName: pages[name][
                     GroupName
@@ -14529,8 +14533,7 @@ class TestPermissionCacheGroupPolicies:
             return paginator
 
         iam.get_paginator.side_effect = get_paginator
-        iam.list_attached_user_policies.return_value = {"AttachedPolicies": []}
-        iam.list_user_policies.return_value = {"PolicyNames": []}
+        iam.get_user.return_value = {"User": {}}
         iam.get_policy.return_value = {"Policy": {"DefaultVersionId": "v1"}}
         iam.get_policy_version.return_value = {
             "PolicyVersion": {"Document": self.GROUP_DOC}

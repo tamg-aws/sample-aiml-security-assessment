@@ -203,6 +203,13 @@ section.
   `ResourceNotFoundException` still suggests a memory deleted mid-assessment.
   The AgentCore assessment role gains that `kms:Decrypt` grant, and a
   remaining denial names the key policy, which must also allow the role.
+- The IAM permissions cache no longer drops a principal's policies silently
+  when a read fails. It writes `cache_schema_version: 2`, a top-level
+  `principal_errors` list naming each role or user whose attached, inline,
+  group or permissions-boundary read failed and at which stage, and a
+  `permissions_boundary` document (or `null`) for every role and user. It
+  now reads every page of each role's and user's attached and inline policy
+  lists; before, it read only the first page of each.
 
 ### Deployment impact
 
@@ -247,6 +254,11 @@ role, `cognito-idp:DescribeUserPool`, `cognito-idp:ListUserPoolClients` and
 `cognito-idp:DescribeUserPoolClient`, scoped to the account's user pools. All
 are read-only, and the same CodeBuild run applies them. No parameter,
 deployment-stack or member-role StackSet change is required.
+
+The IAM permissions cache role gains `iam:GetRole` on the account's roles and
+`iam:GetUser` on its users in both SAM templates, because only those calls
+return a principal's permissions boundary. Both are read-only, and the same
+CodeBuild run applies them.
 
 ## 2.0.0 - 2026-09-18
 
