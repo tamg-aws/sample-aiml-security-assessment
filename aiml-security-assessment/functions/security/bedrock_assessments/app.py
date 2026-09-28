@@ -4328,8 +4328,18 @@ def _flow_prompt_node_references(definition: Dict[str, Any]) -> List[Dict[str, s
     return references
 
 
+def _flow_reference_label(entry: Dict[str, str]) -> str:
+    """Name the flow definition a prompt reference was read from."""
+    if entry.get("flow_version"):
+        return "flow '{}' version {}".format(entry["flow"], entry["flow_version"])
+    return "flow '{}'".format(entry["flow"])
+
+
 def _flow_prompt_version_references(bedrock_client: Any) -> Dict[str, Any]:
-    """Group the prompt references of every flow's current definition."""
+    """
+    Group the prompt references of every flow's working draft and of every
+    flow version an alias routes to.
+    """
     result: Dict[str, Any] = {
         "readable": True,
         "error": "",
@@ -4354,24 +4364,67 @@ def _flow_prompt_version_references(bedrock_client: Any) -> Dict[str, Any]:
             continue
         flow_name = flow.get("name") or flow_id
 
+        definitions = []
         try:
             detail = bedrock_client.get_flow(flowIdentifier=flow_id)
+            definitions.append(("", detail.get("flow", detail)))
         except ClientError as error:
             result["unreadable_flows"].append(
                 {"flow": flow_name, "error": get_assessment_error_label(error)}
             )
-            continue
 
-        flow_info = detail.get("flow", detail)
-        for reference in _flow_prompt_node_references(
-            flow_info.get("definition") or {}
-        ):
-            entry = {"flow": flow_name, **reference}
-            version = _flow_prompt_arn_version(reference["arn"])
-            if version:
-                result["pinned"].append({**entry, "version": version})
-            else:
-                result["unpinned"].append(entry)
+        # An alias serves a numbered flow version, a snapshot that can pin a
+        # different prompt from the working draft GetFlow returns.
+        try:
+            aliases = _list_all_items(
+                bedrock_client,
+                "list_flow_aliases",
+                "flowAliasSummaries",
+                flowIdentifier=flow_id,
+            )
+            routed = {
+                str(route.get("flowVersion"))
+                for alias in aliases
+                for route in alias.get("routingConfiguration") or []
+                if route.get("flowVersion")
+            } - {GUARDRAIL_DRAFT_VERSION}
+        except ClientError as error:
+            routed = set()
+            result["unreadable_flows"].append(
+                {
+                    "flow": flow_name,
+                    "error": "aliases not listed with ListFlowAliases: {}".format(
+                        get_assessment_error_label(error)
+                    ),
+                }
+            )
+        for flow_version in sorted(routed, key=lambda value: (len(value), value)):
+            try:
+                version_detail = bedrock_client.get_flow_version(
+                    flowIdentifier=flow_id, flowVersion=flow_version
+                )
+            except ClientError as error:
+                result["unreadable_flows"].append(
+                    {
+                        "flow": flow_name,
+                        "error": "version {} not read with GetFlowVersion: {}".format(
+                            flow_version, get_assessment_error_label(error)
+                        ),
+                    }
+                )
+                continue
+            definitions.append((flow_version, version_detail))
+
+        for flow_version, flow_info in definitions:
+            for reference in _flow_prompt_node_references(
+                flow_info.get("definition") or {}
+            ):
+                entry = {"flow": flow_name, "flow_version": flow_version, **reference}
+                version = _flow_prompt_arn_version(reference["arn"])
+                if version:
+                    result["pinned"].append({**entry, "version": version})
+                else:
+                    result["unpinned"].append(entry)
 
     return result
 
@@ -4462,13 +4515,37 @@ def _prompt_version_findings(
             )
         )
 
-    encrypted = [
-        state for state in versioned if state["key_readable"] and state["key_arn"]
-    ]
+    # Any numbered version stays invocable by ARN, so each one is judged, not
+    # only the latest.
+    def versions_where(state: Dict[str, Any], test: Any) -> List[Dict[str, Any]]:
+        return [key for key in state["version_keys"] if test(key)]
+
+    def name_versions(state: Dict[str, Any], keys: List[Dict[str, Any]]) -> str:
+        label = "version" if len(keys) == 1 else "versions"
+        return "{} ({} {})".format(
+            state["name"], label, ", ".join(key["version"] for key in keys)
+        )
+
     aws_owned = [
-        state for state in versioned if state["key_readable"] and not state["key_arn"]
+        (
+            state,
+            versions_where(state, lambda key: key["readable"] and not key["key_arn"]),
+        )
+        for state in versioned
     ]
-    unreadable_key = [state for state in versioned if not state["key_readable"]]
+    aws_owned = [(state, keys) for state, keys in aws_owned if keys]
+    unreadable_key = [
+        (state, versions_where(state, lambda key: not key["readable"]))
+        for state in versioned
+    ]
+    unreadable_key = [(state, keys) for state, keys in unreadable_key if keys]
+    failed_names = {state["name"] for state, _ in aws_owned}
+    unread_names = {state["name"] for state, _ in unreadable_key}
+    encrypted = [
+        state
+        for state in versioned
+        if state["name"] not in failed_names and state["name"] not in unread_names
+    ]
 
     if aws_owned:
         rows.append(
@@ -4476,18 +4553,19 @@ def _prompt_version_findings(
                 check_id="BR-07",
                 finding_name=PROMPT_VERSION_ENCRYPTION_FINDING,
                 finding_details=(
-                    "{} of {} versioned prompt(s) report no customerEncryptionKeyArn "
-                    "on their latest version, so the prompt text is held under an AWS "
-                    "owned key that no key policy of yours can restrict: {}.".format(
+                    "{} of {} versioned prompt(s) have a numbered version that reports "
+                    "no customerEncryptionKeyArn, so the prompt text of that version "
+                    "is held under an AWS owned key that no key policy of yours can "
+                    "restrict: {}.".format(
                         len(aws_owned),
                         len(versioned),
                         ", ".join(
-                            "{} (version {})".format(state["name"], state["latest"])
-                            for state in aws_owned[:MAX_REPORTED_PROMPTS]
+                            name_versions(state, keys)
+                            for state, keys in aws_owned[:MAX_REPORTED_PROMPTS]
                         ),
                     )
                 ),
-                resolution="Recreate each named prompt with a customer-managed KMS key in customerEncryptionKeyArn, then create the version to be referenced.",
+                resolution="Recreate each named prompt with a customer-managed KMS key in customerEncryptionKeyArn, create the version to be referenced, and delete the numbered versions that carry no key with DeletePrompt.",
                 reference=PROMPT_MANAGEMENT_REFERENCE,
                 severity="Medium",
                 status="Failed",
@@ -4501,12 +4579,14 @@ def _prompt_version_findings(
                 check_id="BR-07",
                 finding_name=PROMPT_VERSION_ENCRYPTION_FINDING,
                 finding_details=(
-                    "{} of {} versioned prompt(s) encrypt their latest version with a "
-                    "customer-managed KMS key: {}.".format(
+                    "{} of {} versioned prompt(s) encrypt every numbered version with "
+                    "a customer-managed KMS key: {}.".format(
                         len(encrypted),
                         len(versioned),
                         ", ".join(
-                            "{} (version {})".format(state["name"], state["latest"])
+                            "{} ({} version(s) read)".format(
+                                state["name"], len(state["version_keys"])
+                            )
                             for state in encrypted[:MAX_REPORTED_PROMPTS]
                         ),
                     )
@@ -4525,15 +4605,16 @@ def _prompt_version_findings(
                 check_id="BR-07",
                 finding_name=PROMPT_VERSION_ENCRYPTION_FINDING,
                 finding_details=(
-                    "The latest version of {} of {} versioned prompt(s) could not be "
+                    "A numbered version of {} of {} versioned prompt(s) could not be "
                     "read, so its encryption key is unknown: {}.".format(
                         len(unreadable_key),
                         len(versioned),
                         "; ".join(
                             "{} version {} ({})".format(
-                                state["name"], state["latest"], state["key_error"]
+                                state["name"], key["version"], key["error"]
                             )
-                            for state in unreadable_key[:MAX_REPORTED_PROMPTS]
+                            for state, keys in unreadable_key[:MAX_REPORTED_PROMPTS]
+                            for key in keys
                         ),
                     )
                 ),
@@ -4580,14 +4661,17 @@ def _flow_prompt_version_findings(
                 check_id="BR-07",
                 finding_name=FLOW_PROMPT_VERSION_FINDING,
                 finding_details=(
-                    "{} of {} prompt reference(s) in the current flow definitions "
+                    "{} of {} prompt reference(s) in the flow definitions read (each "
+                    "flow's working draft and every version an alias routes to) "
                     "carry no version suffix, so the flow runs whatever the DRAFT "
                     "holds at invocation time: {}.".format(
                         len(references["unpinned"]),
                         total,
                         "; ".join(
-                            "flow '{}' node '{}' references {}".format(
-                                entry["flow"], entry["node"], entry["arn"]
+                            "{} node '{}' references {}".format(
+                                _flow_reference_label(entry),
+                                entry["node"],
+                                entry["arn"],
                             )
                             for entry in references["unpinned"][:MAX_REPORTED_PROMPTS]
                         ),
@@ -4607,13 +4691,16 @@ def _flow_prompt_version_findings(
                 check_id="BR-07",
                 finding_name=FLOW_PROMPT_VERSION_FINDING,
                 finding_details=(
-                    "{} of {} prompt reference(s) in the current flow definitions pin "
+                    "{} of {} prompt reference(s) in the flow definitions read (each "
+                    "flow's working draft and every version an alias routes to) pin "
                     "a numbered prompt version: {}.".format(
                         len(references["pinned"]),
                         total,
                         "; ".join(
-                            "flow '{}' node '{}' pins version {}".format(
-                                entry["flow"], entry["node"], entry["version"]
+                            "{} node '{}' pins version {}".format(
+                                _flow_reference_label(entry),
+                                entry["node"],
+                                entry["version"],
                             )
                             for entry in references["pinned"][:MAX_REPORTED_PROMPTS]
                         ),
@@ -4633,8 +4720,8 @@ def _flow_prompt_version_findings(
                 check_id="BR-07",
                 finding_name=FLOW_PROMPT_VERSION_FINDING,
                 finding_details=(
-                    "The definition of {} flow(s) could not be read, so the prompt "
-                    "versions they run are unknown: {}.".format(
+                    "{} flow definition(s) or alias list(s) could not be read, so "
+                    "the prompt versions they run are unknown: {}.".format(
                         len(references["unreadable_flows"]),
                         "; ".join(
                             "{} ({})".format(entry["flow"], entry["error"])
@@ -4644,7 +4731,7 @@ def _flow_prompt_version_findings(
                         ),
                     )
                 ),
-                resolution="Grant bedrock:GetFlow on each named flow and re-run the assessment.",
+                resolution="Grant bedrock:GetFlow, bedrock:ListFlowAliases and bedrock:GetFlowVersion on each named flow and re-run the assessment.",
                 reference=PROMPT_FLOWS_REFERENCE,
                 severity="Informational",
                 status="N/A",
@@ -4661,8 +4748,9 @@ def check_bedrock_prompt_management(region: str = "") -> Dict[str, Any]:
 
     AIR-BDR-MDL-08 asks for the prompt that production runs to be a pinned,
     encrypted artifact, so three further legs judge the prompts that exist: each
-    prompt's numbered versions, the encryption key of the latest of them, and
-    whether the flows of the Region reference a version or the mutable DRAFT.
+    prompt's numbered versions, the encryption key of every one of them, and
+    whether the flows of the Region, in their draft and in every version an
+    alias routes to, reference a version or the mutable DRAFT.
     """
     logger.debug("Starting check for Bedrock Prompt Management usage")
     try:
@@ -4723,16 +4811,17 @@ def check_bedrock_prompt_management(region: str = "") -> Dict[str, Any]:
                         )
 
                 if prompts_without_variants:
-                    findings["status"] = "WARN"
+                    # Variant count is a prompt-tuning practice, so it is
+                    # advisory and stays out of the versioning verdict.
                     findings["csv_data"].append(
                         create_finding(
                             check_id="BR-07",
                             finding_name="Bedrock Prompt Variants Check",
-                            finding_details=f"Found {len(prompts_without_variants)} prompts without multiple variants. Testing different prompt variants helps optimize responses.",
+                            finding_details=f"Advisory, outside the prompt versioning verdict: found {len(prompts_without_variants)} prompts without multiple variants. Testing different prompt variants helps optimize responses.",
                             resolution="Create and test multiple variants for your prompts to find the most effective configurations.",
                             reference="https://docs.aws.amazon.com/bedrock/latest/userguide/prompt-management.html",
-                            severity="Low",
-                            status="Failed",
+                            severity="Informational",
+                            status="N/A",
                             region=region,
                         )
                     )
@@ -4745,13 +4834,15 @@ def check_bedrock_prompt_management(region: str = "") -> Dict[str, Any]:
 
                     listing = _prompt_numbered_versions(bedrock_client, prompt_id)
                     latest = listing["versions"][-1] if listing["versions"] else ""
-                    key = (
-                        _prompt_version_encryption_key(
-                            bedrock_client, prompt_id, latest
-                        )
-                        if latest
-                        else {"readable": True, "error": "", "key_arn": ""}
-                    )
+                    version_keys = [
+                        {
+                            "version": version,
+                            **_prompt_version_encryption_key(
+                                bedrock_client, prompt_id, version
+                            ),
+                        }
+                        for version in listing["versions"]
+                    ]
                     version_states.append(
                         {
                             "name": prompt.get("name") or prompt_id,
@@ -4759,9 +4850,7 @@ def check_bedrock_prompt_management(region: str = "") -> Dict[str, Any]:
                             "readable": listing["readable"],
                             "error": listing["error"],
                             "latest": latest,
-                            "key_readable": key["readable"],
-                            "key_error": key["error"],
-                            "key_arn": key["key_arn"],
+                            "version_keys": version_keys,
                         }
                     )
 

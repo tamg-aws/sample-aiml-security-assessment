@@ -117,12 +117,16 @@ AI_SUBJECT_ROWS = [
         "BR-07 holds the catalog leg (ListPrompts non-empty is its Passed row, zero prompts"
         " is Not Applicable) and now the production-version leg as well. For each prompt it"
         " calls ListPrompts(promptIdentifier=...) for the numbered versions, fails a prompt"
-        " that has only its DRAFT, and reads GetPrompt(promptVersion=N) on the highest "
+        " that has only its DRAFT, and reads GetPrompt(promptVersion=N) on every "
         "numbered version for customerEncryptionKeyArn, which PromptSummary does not carry. For flows it reads "
-        "the prompt node's resource.promptArn and fails a node that pins no version suffix,"
+        "the prompt node's resource.promptArn in the working draft and in every flow "
+        "version an alias routes to (ListFlowAliases, GetFlowVersion), and fails a node that pins no version suffix,"
         " since an unversioned ARN resolves to the working draft. A version != DRAFT test "
         "on bare ListPrompts or on a GetPrompt with no promptVersion would have failed "
-        "every prompt in every account, because both return the draft",
+        "every prompt in every account, because both return the draft. Partial, ceiling "
+        "reached: a prompt held in application code has no AWS record, and no AWS field "
+        "names the role approved to release a version, so the IAM split between release "
+        "and RenderPrompt roles is not judged",
         [],
         4,
     ),

@@ -405,8 +405,8 @@ Resources:
               Effect: Allow
               Action:
                 - bedrock:GetFlow
-                - bedrock:ListFlowAliases # BR-26, BR-27, BR-34
-                - bedrock:GetFlowVersion # BR-26, BR-27, BR-34
+                - bedrock:ListFlowAliases # BR-07, BR-26, BR-27, BR-34
+                - bedrock:GetFlowVersion # BR-07, BR-26, BR-27, BR-34
               Resource: !Sub 'arn:${AWS::Partition}:bedrock:*:${AWS::AccountId}:flow/*'
             - Sid: BedrockKnowledgeBaseRead
               Effect: Allow

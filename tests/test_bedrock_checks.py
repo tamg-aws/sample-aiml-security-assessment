@@ -2573,6 +2573,8 @@ class TestBR07PromptProductionVersion:
         flows=(),
         flow_definitions=None,
         flows_error=None,
+        flow_aliases=None,
+        flow_versions=None,
     ):
         """
         A bedrock-agent client whose ListPrompts answers per promptIdentifier.
@@ -2584,6 +2586,8 @@ class TestBR07PromptProductionVersion:
         versions = versions or {}
         version_details = version_details or {}
         flow_definitions = flow_definitions or {}
+        flow_aliases = flow_aliases or {}
+        flow_versions = flow_versions or {}
 
         def list_prompts_pages(**kwargs):
             identifier = kwargs.get("promptIdentifier")
@@ -2628,7 +2632,38 @@ class TestBR07PromptProductionVersion:
             return entry or {}
 
         client.get_flow.side_effect = get_flow
+
+        def list_flow_aliases(flowIdentifier, **kwargs):
+            entry = flow_aliases.get(flowIdentifier, [])
+            if isinstance(entry, Exception):
+                raise entry
+            # A tuple of lists is a paged answer, one list per page.
+            pages = entry if isinstance(entry, tuple) else (entry,)
+            index = int(kwargs.get("nextToken") or 0)
+            page = {"flowAliasSummaries": list(pages[index])}
+            if index + 1 < len(pages):
+                page["nextToken"] = str(index + 1)
+            return page
+
+        client.list_flow_aliases.side_effect = list_flow_aliases
+
+        def get_flow_version(flowIdentifier, flowVersion):
+            entry = flow_versions.get((flowIdentifier, flowVersion))
+            if isinstance(entry, Exception):
+                raise entry
+            return entry or {}
+
+        client.get_flow_version.side_effect = get_flow_version
         return client
+
+    @staticmethod
+    def _alias(*flow_versions):
+        return {
+            "id": "alias-" + "-".join(flow_versions),
+            "routingConfiguration": [
+                {"flowVersion": version} for version in flow_versions
+            ],
+        }
 
     def _run(self, client):
         with patch("boto3.client", return_value=client):
@@ -2794,9 +2829,10 @@ class TestBR07PromptProductionVersion:
         assert "greeting (version 4)" in rows[0]["Finding_Details"]
         assert self.result["status"] == "WARN"
 
-    def test_br07_encryption_leg_reads_the_latest_version_only(self):
+    def test_br07_encryption_leg_reads_every_numbered_version(self):
+        """An older version stays invocable by ARN, so a keyless one fails."""
         client = self._client(
-            prompts=[self._summary("p1", "DRAFT")],
+            prompts=[self._summary("p1", "DRAFT", name="greeting")],
             versions={"p1": [self._summary("p1", "1"), self._summary("p1", "2")]},
             version_details={
                 ("p1", "1"): {},
@@ -2805,11 +2841,128 @@ class TestBR07PromptProductionVersion:
         )
         rows = self._encryption_rows(self._run(client))
 
-        assert [row["Status"] for row in rows] == ["Passed"]
+        assert [row["Status"] for row in rows] == ["Failed"]
+        assert "greeting (version 1)" in rows[0]["Finding_Details"]
         assert client.get_prompt.call_args_list == [
             call(promptIdentifier="p1"),
+            call(promptIdentifier="p1", promptVersion="1"),
             call(promptIdentifier="p1", promptVersion="2"),
         ]
+        assert self.result["status"] == "WARN"
+
+    def test_br07_every_version_keyed_passes_and_counts_the_versions(self):
+        rows = self._encryption_rows(
+            self._run(
+                self._client(
+                    prompts=[
+                        self._summary("p1", "DRAFT", name="greeting"),
+                        self._summary("p2", "DRAFT", name="triage"),
+                    ],
+                    versions={
+                        "p1": [self._summary("p1", "1"), self._summary("p1", "2")],
+                        "p2": [self._summary("p2", "1")],
+                    },
+                    version_details={
+                        ("p1", "1"): {"customerEncryptionKeyArn": self._CMK_ARN},
+                        ("p1", "2"): {"customerEncryptionKeyArn": self._CMK_ARN},
+                        ("p2", "1"): {"customerEncryptionKeyArn": self._CMK_ARN},
+                    },
+                )
+            )
+        )
+
+        assert [row["Status"] for row in rows] == ["Passed"]
+        details = rows[0]["Finding_Details"]
+        assert "2 of 2 versioned prompt(s) encrypt every numbered version" in details
+        assert "greeting (2 version(s) read)" in details
+        assert "triage (1 version(s) read)" in details
+
+    def test_br07_two_keyless_versions_of_one_prompt_are_both_named(self):
+        rows = self._encryption_rows(
+            self._run(
+                self._client(
+                    prompts=[
+                        self._summary("p1", "DRAFT", name="greeting"),
+                        self._summary("p2", "DRAFT", name="triage"),
+                    ],
+                    versions={
+                        "p1": [
+                            self._summary("p1", "1"),
+                            self._summary("p1", "2"),
+                            self._summary("p1", "4"),
+                        ],
+                        "p2": [self._summary("p2", "1")],
+                    },
+                    version_details={
+                        ("p1", "1"): {},
+                        ("p1", "2"): {"customerEncryptionKeyArn": self._CMK_ARN},
+                        ("p1", "4"): {},
+                        ("p2", "1"): {"customerEncryptionKeyArn": self._CMK_ARN},
+                    },
+                )
+            )
+        )
+
+        assert [row["Status"] for row in rows] == ["Failed", "Passed"]
+        assert "1 of 2 versioned prompt(s)" in rows[0]["Finding_Details"]
+        assert "greeting (versions 1, 4)" in rows[0]["Finding_Details"]
+        assert "triage" not in rows[0]["Finding_Details"]
+        assert "triage (1 version(s) read)" in rows[1]["Finding_Details"]
+        assert "greeting" not in rows[1]["Finding_Details"]
+
+    def test_br07_an_unread_older_version_is_na_not_passed(self):
+        rows = self._encryption_rows(
+            self._run(
+                self._client(
+                    prompts=[self._summary("p1", "DRAFT", name="greeting")],
+                    versions={
+                        "p1": [self._summary("p1", "1"), self._summary("p1", "2")]
+                    },
+                    version_details={
+                        ("p1", "1"): _client_error(
+                            "AccessDeniedException", "no", "GetPrompt"
+                        ),
+                        ("p1", "2"): {"customerEncryptionKeyArn": self._CMK_ARN},
+                    },
+                )
+            )
+        )
+
+        assert [row["Status"] for row in rows] == ["N/A"]
+        assert "greeting version 1 (" in rows[0]["Finding_Details"]
+        assert "AccessDeniedException" in rows[0]["Finding_Details"]
+
+    def test_br07_variants_row_is_advisory_and_moves_no_status(self):
+        findings = self._run(
+            self._client(
+                prompts=[self._summary("p1", "DRAFT")],
+                versions={"p1": [self._summary("p1", "1")]},
+                version_details={
+                    ("p1", "1"): {"customerEncryptionKeyArn": self._CMK_ARN}
+                },
+            )
+        )
+        variants = self._rows(findings, "Bedrock Prompt Variants Check")
+        assert variants == []
+
+        client = self._client(
+            prompts=[self._summary("p1", "DRAFT")],
+            versions={"p1": [self._summary("p1", "1")]},
+            version_details={("p1", "1"): {"customerEncryptionKeyArn": self._CMK_ARN}},
+        )
+        client.get_prompt.side_effect = lambda **kwargs: (
+            {"variants": ["only"]}
+            if kwargs.get("promptVersion") is None
+            else {"customerEncryptionKeyArn": self._CMK_ARN}
+        )
+        findings = self._run(client)
+        variants = self._rows(findings, "Bedrock Prompt Variants Check")
+
+        assert [row["Status"] for row in variants] == ["N/A"]
+        assert variants[0]["Severity"] == "Informational"
+        assert variants[0]["Finding_Details"].startswith("Advisory")
+        assert "Failed" not in {row["Status"] for row in findings}
+        assert self.result["status"] == "PASS"
 
     def test_br07_get_prompt_error_on_the_version_is_na_not_unencrypted(self):
         rows = self._encryption_rows(
@@ -3007,6 +3160,136 @@ class TestBR07PromptProductionVersion:
         assert [row["Status"] for row in rows] == ["Passed", "N/A"]
         assert "closed" in rows[1]["Finding_Details"]
         assert "bedrock:GetFlow" in rows[1]["Resolution"]
+
+    def test_br07_alias_routed_flow_version_with_an_unpinned_prompt_fails(self):
+        """The draft can pin a version while the version an alias serves does not."""
+        client = self._flow_client(
+            [{"id": "f1", "name": "support"}],
+            {
+                "f1": self._flow(
+                    [self._prompt_node("classify", f"{self._PROMPT_ARN}:3")]
+                )
+            },
+            flow_aliases={"f1": [self._alias("2")]},
+            flow_versions={
+                ("f1", "2"): self._flow(
+                    [self._prompt_node("classify", self._PROMPT_ARN)]
+                )
+            },
+        )
+        rows = self._flow_rows(self._run(client))
+
+        assert [row["Status"] for row in rows] == ["Failed", "Passed"]
+        assert "flow 'support' version 2 node 'classify'" in rows[0]["Finding_Details"]
+        assert (
+            "flow 'support' node 'classify' pins version 3"
+            in rows[1]["Finding_Details"]
+        )
+        assert [
+            kwargs["flowIdentifier"]
+            for _, kwargs in client.list_flow_aliases.call_args_list
+        ] == ["f1"]
+        client.get_flow_version.assert_called_once_with(
+            flowIdentifier="f1", flowVersion="2"
+        )
+        assert self.result["status"] == "WARN"
+
+    def test_br07_every_routed_version_of_every_flow_is_read(self):
+        client = self._flow_client(
+            [{"id": "f1", "name": "support"}, {"id": "f2", "name": "billing"}],
+            {"f1": self._flow([]), "f2": self._flow([])},
+            flow_aliases={
+                "f1": [self._alias("1", "2"), self._alias("2"), self._alias("DRAFT")],
+                "f2": [self._alias("5")],
+            },
+            flow_versions={
+                ("f1", "1"): self._flow(
+                    [self._prompt_node("a", f"{self._PROMPT_ARN}:1")]
+                ),
+                ("f1", "2"): self._flow(
+                    [self._prompt_node("b", f"{self._PROMPT_ARN}:2")]
+                ),
+                ("f2", "5"): self._flow([self._prompt_node("c", self._PROMPT_ARN)]),
+            },
+        )
+        rows = self._flow_rows(self._run(client))
+
+        assert [row["Status"] for row in rows] == ["Failed", "Passed"]
+        assert "flow 'billing' version 5 node 'c'" in rows[0]["Finding_Details"]
+        assert "2 of 3 prompt reference(s)" in rows[1]["Finding_Details"]
+        assert "flow 'support' version 1 node 'a'" in rows[1]["Finding_Details"]
+        assert "flow 'support' version 2 node 'b'" in rows[1]["Finding_Details"]
+        assert client.get_flow_version.call_args_list == [
+            call(flowIdentifier="f1", flowVersion="1"),
+            call(flowIdentifier="f1", flowVersion="2"),
+            call(flowIdentifier="f2", flowVersion="5"),
+        ]
+
+    def test_br07_alias_on_the_second_page_is_read(self):
+        client = self._flow_client(
+            [{"id": "f1", "name": "support"}],
+            {"f1": self._flow([])},
+            flow_aliases={"f1": ([self._alias("1")], [self._alias("2")])},
+            flow_versions={
+                ("f1", "1"): self._flow(
+                    [self._prompt_node("a", f"{self._PROMPT_ARN}:1")]
+                ),
+                ("f1", "2"): self._flow([self._prompt_node("b", self._PROMPT_ARN)]),
+            },
+        )
+        rows = self._flow_rows(self._run(client))
+
+        assert [row["Status"] for row in rows] == ["Failed", "Passed"]
+        assert "flow 'support' version 2 node 'b'" in rows[0]["Finding_Details"]
+        assert client.list_flow_aliases.call_count == 2
+
+    def test_br07_alias_list_error_is_na_not_pinned(self):
+        rows = self._flow_rows(
+            self._run(
+                self._flow_client(
+                    [{"id": "f1", "name": "support"}],
+                    {
+                        "f1": self._flow(
+                            [self._prompt_node("classify", f"{self._PROMPT_ARN}:3")]
+                        )
+                    },
+                    flow_aliases={
+                        "f1": _client_error(
+                            "AccessDeniedException", "no", "ListFlowAliases"
+                        )
+                    },
+                )
+            )
+        )
+
+        assert [row["Status"] for row in rows] == ["Passed", "N/A"]
+        assert "support" in rows[1]["Finding_Details"]
+        assert "ListFlowAliases" in rows[1]["Finding_Details"]
+        assert "bedrock:ListFlowAliases" in rows[1]["Resolution"]
+
+    def test_br07_flow_version_read_error_is_na_not_pinned(self):
+        rows = self._flow_rows(
+            self._run(
+                self._flow_client(
+                    [{"id": "f1", "name": "support"}],
+                    {
+                        "f1": self._flow(
+                            [self._prompt_node("classify", f"{self._PROMPT_ARN}:3")]
+                        )
+                    },
+                    flow_aliases={"f1": [self._alias("2")]},
+                    flow_versions={
+                        ("f1", "2"): _client_error(
+                            "AccessDeniedException", "no", "GetFlowVersion"
+                        )
+                    },
+                )
+            )
+        )
+
+        assert [row["Status"] for row in rows] == ["Passed", "N/A"]
+        assert "version 2 not read with GetFlowVersion" in rows[1]["Finding_Details"]
+        assert "bedrock:GetFlowVersion" in rows[1]["Resolution"]
 
     def test_br07_two_flow_nodes_reach_both_reference_verdicts(self):
         rows = self._flow_rows(

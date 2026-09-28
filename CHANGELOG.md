@@ -331,6 +331,14 @@ Upgrading is not a single step and is not fully backward compatible:
 
 ### Changed
 
+- `BR-07` now reads the encryption key of every numbered prompt version, so an
+  older version with no `customerEncryptionKeyArn` fails even when the latest
+  version carries a customer managed key, and an unread version is `N/A`. Its
+  flow leg reads each flow version an alias routes to (`ListFlowAliases`,
+  `GetFlowVersion`) as well as the working draft, so a deployed version that
+  references an unversioned prompt fails. The `Bedrock Prompt Variants Check`
+  row is now an Informational `N/A` advisory and no longer sets the check
+  status to `WARN`.
 - Hardened assessment deployment roles. `AIMLSecurityMemberRole` now contains
   only cross-account deployment, Step Functions polling, and report-retrieval
   permissions; assessment APIs remain exclusively on the SAM-created Lambda

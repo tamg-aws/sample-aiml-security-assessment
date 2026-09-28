@@ -377,7 +377,7 @@ inventory is never treated as evidence of compliance.
 ### BR-07: Prompt Management
 
 - **Severity:** Low
-- **Description:** Validates Bedrock Prompt template usage and variants.
+- **Description:** Reports whether Prompt Management is in use, then judges the prompts it holds. A prompt with only a DRAFT fails `Bedrock Prompt Production Version` (Medium). `Bedrock Prompt Version Encryption` reads `GetPrompt(promptVersion=N)` for every numbered version, since any version stays invocable by its ARN, and fails a prompt when any version reports no `customerEncryptionKeyArn`; an unread version is `N/A` naming the version. The flow leg walks the prompt nodes of each flow's working draft and of every flow version an alias routes to, including nodes inside DoWhile loops, and fails a `promptArn` with no version suffix; a flow, alias list or flow version that cannot be read is `N/A`. The `Bedrock Prompt Variants Check` row is an Informational `N/A` advisory outside these verdicts. Prompts held in application code, and the IAM split between the roles that release a version and the roles that call `RenderPrompt`, are not judged.
 
 ### BR-08: Agent AWS IAM Configuration
 
