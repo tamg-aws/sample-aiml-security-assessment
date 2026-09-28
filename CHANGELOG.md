@@ -195,6 +195,13 @@ section.
 
 ### Fixed
 
+- `AC-04` no longer fails every runtime. It read `loggingConfig` and
+  `tracingConfig` from `GetAgentRuntime`, which returns neither, so each
+  runtime failed both legs whatever its configuration. It now reports one row
+  per runtime from the runtime's log groups under
+  `/aws/bedrock-agentcore/runtimes/<runtimeId>-` and a `bedrock-agentcore`
+  `TRACES` delivery source with a delivery, the reads `AC-19` uses. A read
+  that fails leaves the runtime `N/A`. No IAM grant changes.
 - `AC-07` names the fix that matches the `GetMemory` error for a memory it
   cannot describe. `AccessDeniedException` now names `kms:Decrypt` on the
   memory's customer managed key as well as `bedrock-agentcore:GetMemory`,
@@ -203,6 +210,82 @@ section.
   `ResourceNotFoundException` still suggests a memory deleted mid-assessment.
   The AgentCore assessment role gains that `kms:Decrypt` grant, and a
   remaining denial names the key policy, which must also allow the role.
+- The IAM permissions cache no longer drops a principal's policies silently
+  when a read fails. It writes `cache_schema_version: 2`, a top-level
+  `principal_errors` list naming each role or user whose attached, inline,
+  group or permissions-boundary read failed and at which stage, and a
+  `permissions_boundary` document (or `null`) for every role and user. It
+  now reads every page of each role's and user's attached and inline policy
+  lists; before, it read only the first page of each.
+- `FS-07`, `FS-22`, `AR-01`, `AR-02` and `AR-09` read that cache contract. A
+  role or user named in `principal_errors` turns a `Passed` row into `N/A`
+  that names the principal and the failed stage, and a failing row is kept
+  beside that `N/A` row. A permissions boundary removes an action it does
+  not allow. A cache written before version 2 keeps its verdict and says the
+  per-principal errors were not recorded. `FS-07` also reports an agent whose
+  `GetAgent` call failed, or whose role is missing from the cache, as not
+  read; before, it skipped the agent and could pass.
+- `AR-01` now reads users and their group policies as well as roles, and
+  fails any identity holding a wildcard or `NotAction` grant that allows both
+  a read and a write action on one AWS Agent Registry resource type, under
+  either the `agent-registry` or the `bedrock-agentcore` namespace
+  (AIR-FND-IAM-09). The read and write split per resource type comes from the
+  AWS service authorization reference, written to `iam_access_levels.json` by
+  `generate_iam_access_levels.py`. `AR-09` now counts a bare `*`, a `*:*` and
+  a `NotAction` Allow as granting publication and approval, so an
+  administrator that `AR-09` passed before now fails it.
+- `AR-03` fails every registry that automatically approves submitted records
+  (a non-empty `autoApprovalRules`) and passes one that returns no
+  auto-approval rules, including one that omits `approvalConfiguration`,
+  which the `GetRegistry` API model defines as manual review (AIR-ACR-REG-02).
+  Before, automatic approval was an informational `N/A` unless the
+  `RequireAgentRegistryManualApproval` parameter was `true`, and an omitted
+  configuration was `N/A`. The parameter is removed.
+- `AR-10` credits a lifecycle-event rule only when it has a Lambda function,
+  SNS topic, SQS queue or Step Functions state machine target, and a
+  forwarded bus only when its rule has one. Before, any target passed, so a
+  rule delivering only to a CloudWatch Logs group or an API destination
+  passed; it now fails.
+- `AC-01`, `SM-10`, `SM-33` and `BR-39` read more of the AI compute
+  population for AIR-FND-NET-01. `AC-01` fails a custom Code Interpreter or
+  Browser in a subnet whose route table routes to an internet gateway, fails a
+  VPC-mode runtime reporting `requireServiceS3Endpoint` `true`, and reports a
+  runtime that omits the field, or names no subnet, as `N/A` where it passed
+  before. `SM-10` fails a Studio domain whose `AppNetworkAccessType` is
+  `PublicInternetOnly` or unset, fails a `VpcOnly` domain in a public subnet,
+  and no longer reports `Passed` or "none found" after a notebook read error.
+  `SM-33` reads every processing job's `NetworkConfig` and every training job,
+  where it read only the 50 most recent. `BR-39` describes every named subnet
+  in batches of 50, where it stopped after 50 and reported the rest `N/A`.
+- `BR-01`, `SM-02` and `AC-02` each gain a finding that fails a wildcard or
+  `NotAction` Allow granting both a read and a write action on one resource
+  type of the service (AIR-FND-IAM-09): `Bedrock or Data Store Read and Write
+  Merged in One Grant`, `SageMaker Read and Write Merged in One Grant` and
+  `AgentCore Read and Write Merged in One Grant`. They read every attached,
+  inline and group policy of every cached role and user, AWS managed
+  included, apply account-wide Denies and the permissions boundary, and drop
+  resource types the statement's `Resource` entries cannot name. `BR-01` also
+  reads the `s3`, `dynamodb` and `s3vectors` namespaces for an identity
+  granted a Bedrock action. A bare `*`, a `*:*`, a partial pattern such as
+  `bedrock:*Guardrail*` and `bedrock-agentcore:Get*` (which reaches
+  `GetWorkloadAccessToken`) now fail where they passed before. The
+  `Bedrock Wildcard Action Grant` and `SageMaker Service-Wide Grant in
+  Customer Policy` findings now count a bare `*` and skip an identity whose
+  permissions boundary allows no action of the service; the SageMaker one
+  also reads group policies and reports a policy it cannot parse as `N/A`.
+  All three checks hold a `Passed` row as `N/A` while `principal_errors`
+  names an unread principal, and `AC-02`'s incomplete row names the
+  principals whose policies it could not parse. `iam_access_levels.json`
+  now carries each resource type's ARN formats.
+- A principal whose permissions boundary the cache could not read is no
+  longer reported `Failed` by a leg that applies the boundary. The cache
+  writes `null` both for no boundary and for a failed read, and only a
+  `permissions_boundary` entry in `principal_errors` tells them apart, so the
+  leg read the principal as unbounded and could fail a grant the boundary
+  removes. The wildcard and merged read and write rows of `BR-01`, `SM-02`
+  and `AC-02`, every `AR-01` row, `AR-09`, `FS-07` and `FS-22` now skip that
+  principal, and `AR-02` leaves it out of its population. The `N/A` row
+  names it.
 
 - AgentCore checks that read the IAM permissions cache, trust policies and
   resource policies now judge the values they read and the whole population
@@ -485,7 +568,13 @@ section.
 
 ### Deployment impact
 
-**CodeBuild run required.** No parameter or deployment-stack change. The AWS
+**Deployment-stack update and CodeBuild run required.** The
+`RequireAgentRegistryManualApproval` parameter is removed from both SAM
+templates, both top-level deployment templates
+(`deployment/2-aiml-security-codebuild.yaml` and
+`deployment/aiml-security-single-account.yaml`) and `buildspec.yml`. A
+stack update that still passes the parameter fails, so drop it from any
+saved parameter file before updating the deployment stack. The AWS
 SAM templates (`aiml-security-assessment/template.yaml` and
 `aiml-security-assessment/template-multi-account.yaml`) add read-only actions
 to the assessment Lambda execution roles for the new checks, among them
@@ -498,8 +587,7 @@ request comes through `bedrock-agentcore` (`kms:ViaService`), so `AC-07` can
 describe a memory encrypted with a customer managed key. A key whose policy
 does not allow the role still denies it. A CodeBuild
 run that redeploys the assessment code and SAM templates applies them. No
-member-role StackSet update and no central or single-account infrastructure
-update are required.
+member-role StackSet update is required.
 
 The `BR-50` to `BR-55` checks and legs above add, in both SAM templates: on the
 Bedrock assessment role, `bedrock:ListProvisionedModelThroughputs`,
@@ -624,6 +712,11 @@ fail recording browsers that passed before.
 AgentCore role already holds on this account's keys in the
 `PolicyEngineKeyStateRead` Sid. A memory whose key lives in another account
 reads `N/A`.
+
+The IAM permissions cache role gains `iam:GetRole` on the account's roles and
+`iam:GetUser` on its users in both SAM templates, because only those calls
+return a principal's permissions boundary. Both are read-only, and the same
+CodeBuild run applies them.
 
 ## 2.0.0 - 2026-09-18
 

@@ -9,6 +9,7 @@ import boto3
 import csv
 import ipaddress
 import json
+from functools import lru_cache
 import logging
 import os
 import re
@@ -215,6 +216,10 @@ IAM_PASS_ROLE_REFERENCE_URL = (
 )
 AGENTCORE_VPC_SECURITY_GROUP_REFERENCE_URL = (
     "https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/agentcore-vpc.html"
+)
+AGENTCORE_VPC_CONFIG_API_REFERENCE_URL = (
+    "https://docs.aws.amazon.com/bedrock-agentcore-control/latest/APIReference/"
+    "API_VpcConfig.html"
 )
 AGENTCORE_CODE_INTERPRETER_NETWORK_REFERENCE_URL = (
     "https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/"
@@ -1862,9 +1867,168 @@ def _agentcore_tool_read_findings(
     ]
 
 
+AGENTCORE_TOOL_SUBNET_FINDING = "AgentCore Tool Subnet Internet Exposure"
+AGENTCORE_SERVICE_S3_GATEWAY_FINDING = "AgentCore Runtime Service-Managed S3 Gateway"
+
+
+def _agentcore_subnet_internet_route(
+    subnet: Dict[str, Any],
+) -> Tuple[bool, Optional[Tuple[str, Dict[str, Any]]]]:
+    """Return (route table found, (route table id, igw route) or None).
+
+    A subnet with no explicit association uses its VPC's main route table. A
+    blackhole route names a deleted gateway and carries no traffic.
+    """
+    route_tables = ec2_client.describe_route_tables(
+        Filters=[{"Name": "association.subnet-id", "Values": [subnet["SubnetId"]]}]
+    ).get("RouteTables", [])
+    if not route_tables:
+        route_tables = ec2_client.describe_route_tables(
+            Filters=[
+                {"Name": "vpc-id", "Values": [subnet.get("VpcId")]},
+                {"Name": "association.main", "Values": ["true"]},
+            ]
+        ).get("RouteTables", [])
+    for table in route_tables:
+        for route in table.get("Routes", []):
+            if route.get("State") != "blackhole" and str(
+                route.get("GatewayId") or ""
+            ).startswith("igw-"):
+                return True, (table.get("RouteTableId") or "unknown", route)
+    return bool(route_tables), None
+
+
+def _agentcore_tool_subnet_findings(
+    tool_details: List[Tuple[str, Dict[str, Any]]],
+    tool_errors: List[Tuple[str, Exception, str]],
+) -> List[Dict[str, Any]]:
+    """AC-01 route leg for custom Code Interpreters and Browsers (AIR-FND-NET-01).
+
+    A VPC-mode tool reports its subnets under networkConfiguration.vpcConfig.
+    Each subnet's route table decides whether the tool sits in a public subnet.
+    PUBLIC and SANDBOX tools attach no customer subnet; the egress leg reports
+    them.
+    """
+    findings = _agentcore_tool_read_findings(
+        "AC-01",
+        AGENTCORE_TOOL_SUBNET_FINDING,
+        tool_errors,
+        AGENTCORE_VPC_SECURITY_GROUP_REFERENCE_URL,
+    )
+    private_tools: List[str] = []
+
+    def not_judged(label: str, reason: str, resolution: str) -> Dict[str, Any]:
+        return create_finding(
+            check_id="AC-01",
+            finding_name=AGENTCORE_TOOL_SUBNET_FINDING,
+            finding_details=(
+                f"{label} {reason}, so whether it reaches an internet gateway "
+                "was not judged."
+            ),
+            resolution=resolution,
+            reference=AGENTCORE_VPC_SECURITY_GROUP_REFERENCE_URL,
+            severity=SeverityEnum.INFORMATIONAL,
+            status=StatusEnum.NA,
+        )
+
+    for label, detail in tool_details:
+        network = detail.get("networkConfiguration") or {}
+        if str(network.get("networkMode") or "") != "VPC":
+            continue
+        subnet_ids = (network.get("vpcConfig") or {}).get("subnets") or []
+        if not subnet_ids:
+            findings.append(
+                not_judged(
+                    label,
+                    "reported VPC network mode with no subnets",
+                    "Grant bedrock-agentcore:GetCodeInterpreter and "
+                    "bedrock-agentcore:GetBrowser and retry.",
+                )
+            )
+            continue
+
+        try:
+            described, missing = _describe_subnets_reporting_missing(subnet_ids)
+            exposed = []
+            unresolved = list(missing)
+            for subnet in described:
+                found, route = _agentcore_subnet_internet_route(subnet)
+                if route is not None:
+                    exposed.append((subnet["SubnetId"], route))
+                elif not found:
+                    unresolved.append(subnet["SubnetId"])
+        except ClientError as error:
+            findings.append(
+                not_judged(
+                    label,
+                    "has subnets whose route tables could not be read: "
+                    f"{_assessment_error_label(error)}",
+                    "Grant ec2:DescribeSubnets and ec2:DescribeRouteTables and retry.",
+                )
+            )
+            continue
+
+        if exposed:
+            described_routes = "; ".join(
+                f"{subnet_id} routes "
+                f"{route.get('DestinationCidrBlock') or route.get('DestinationIpv6CidrBlock') or 'a destination'} "
+                f"to {route.get('GatewayId')} through route table {table_id}"
+                for subnet_id, (table_id, route) in exposed
+            )
+            findings.append(
+                create_finding(
+                    check_id="AC-01",
+                    finding_name=AGENTCORE_TOOL_SUBNET_FINDING,
+                    finding_details=(
+                        f"{label} runs in a public subnet: {described_routes}."
+                    ),
+                    resolution=(
+                        "Move the tool to private subnets whose route tables have "
+                        "no internet gateway route."
+                    ),
+                    reference=AGENTCORE_VPC_SECURITY_GROUP_REFERENCE_URL,
+                    severity=SeverityEnum.MEDIUM,
+                    status=StatusEnum.FAILED,
+                )
+            )
+        elif unresolved:
+            findings.append(
+                not_judged(
+                    label,
+                    f"names subnet(s) {', '.join(unresolved)} that are not present "
+                    "in this account and Region or have no route table",
+                    "Update the tool's network configuration to name subnets that "
+                    "exist, then retry.",
+                )
+            )
+        else:
+            private_tools.append(label)
+
+    if private_tools:
+        findings.append(
+            create_finding(
+                check_id="AC-01",
+                finding_name=AGENTCORE_TOOL_SUBNET_FINDING,
+                finding_details=(
+                    f"{len(private_tools)} VPC-mode custom tool(s) run only in "
+                    "subnets whose route tables have no route to an internet "
+                    f"gateway: {', '.join(private_tools)}."
+                ),
+                resolution="No action required",
+                reference=AGENTCORE_VPC_SECURITY_GROUP_REFERENCE_URL,
+                severity=SeverityEnum.MEDIUM,
+                status=StatusEnum.PASSED,
+            )
+        )
+    return findings
+
+
 def _agentcore_egress_findings(
     runtime_targets: List[Tuple[str, str, List[str]]],
     browser_inventory: Dict[str, Any] = None,
+    tool_read: Optional[
+        Tuple[List[Tuple[str, Dict[str, Any]]], List[Tuple[str, Exception, str]]]
+    ] = None,
 ) -> List[Dict[str, Any]]:
     """AC-01 egress leg: judge what each agent resource may reach outbound.
 
@@ -1879,7 +2043,7 @@ def _agentcore_egress_findings(
     assertion is the workload-independent one: the outbound rules do not name
     every address on the internet.
     """
-    details, errors = _agentcore_tool_details(browser_inventory)
+    details, errors = tool_read or _agentcore_tool_details(browser_inventory)
     findings = _agentcore_tool_read_findings(
         "AC-01",
         AGENTCORE_EGRESS_FINDING_NAME,
@@ -2094,17 +2258,23 @@ def check_agentcore_vpc_configuration(
     Check VPC configuration for AgentCore Runtimes, Code Interpreters, and Browser Tools.
 
     Validates:
-    - VPC configuration exists
-    - Subnets are private (not public)
-    - Required VPC endpoints exist
-    - NAT gateway configuration
+    - Each runtime runs in VPC network mode
+    - The route table of every runtime, custom Code Interpreter and custom
+      Browser subnet has no route to an internet gateway
+    - Each VPC-mode runtime reports requireServiceS3Endpoint false, so no
+      service-managed Amazon S3 gateway sits outside its VPC configuration
     - What the security groups of each VPC-mode resource permit outbound
+
+    VPC endpoints are judged by AC-08. NAT gateways are not read: a NAT route
+    gives no inbound path, and what the workload reaches through it is the
+    security group egress leg's question.
 
     Returns:
         List of findings
     """
     findings = []
     egress_targets: List[Tuple[str, str, List[str]]] = []
+    private_runtimes: List[str] = []
 
     if agentcore_client is None:
         logger.error("AgentCore client not available")
@@ -2176,6 +2346,64 @@ def check_agentcore_vpc_configuration(
                                 )
                             )
 
+                            # AIR-FND-NET-01: a runtime created before the
+                            # 2026-05-05 rollout keeps a service-managed S3
+                            # gateway outside its VPC configuration until
+                            # requireServiceS3Endpoint is set false. An absent
+                            # field is not read as either answer.
+                            require_s3 = (
+                                network_config.get("networkModeConfig") or {}
+                            ).get("requireServiceS3Endpoint")
+                            if require_s3 is True:
+                                findings.append(
+                                    create_finding(
+                                        check_id="AC-01",
+                                        finding_name=AGENTCORE_SERVICE_S3_GATEWAY_FINDING,
+                                        finding_details=(
+                                            f"Runtime '{runtime_name}' ({runtime_id}) "
+                                            "runs in VPC mode with "
+                                            "requireServiceS3Endpoint true, so a "
+                                            "service-managed Amazon S3 gateway "
+                                            "outside its VPC configuration carries "
+                                            "its S3 traffic."
+                                        ),
+                                        resolution=(
+                                            "Confirm the VPC gives the runtime the "
+                                            "Amazon S3 access it needs at startup, "
+                                            "then set requireServiceS3Endpoint to "
+                                            "false through UpdateAgentRuntime."
+                                        ),
+                                        reference=AGENTCORE_VPC_CONFIG_API_REFERENCE_URL,
+                                        severity=SeverityEnum.MEDIUM,
+                                        status=StatusEnum.FAILED,
+                                    )
+                                )
+                            elif require_s3 is not False:
+                                findings.append(
+                                    create_finding(
+                                        check_id="AC-01",
+                                        finding_name=AGENTCORE_SERVICE_S3_GATEWAY_FINDING,
+                                        finding_details=(
+                                            f"Runtime '{runtime_name}' ({runtime_id}) "
+                                            "runs in VPC mode but GetAgentRuntime "
+                                            "did not report requireServiceS3Endpoint, "
+                                            "so whether a service-managed Amazon S3 "
+                                            "gateway sits outside its VPC "
+                                            "configuration was not established."
+                                        ),
+                                        resolution=(
+                                            "Read the runtime with GetAgentRuntime. "
+                                            "A runtime created before the rollout "
+                                            "keeps the gateway until "
+                                            "requireServiceS3Endpoint is set false "
+                                            "through UpdateAgentRuntime."
+                                        ),
+                                        reference=AGENTCORE_VPC_CONFIG_API_REFERENCE_URL,
+                                        severity=SeverityEnum.INFORMATIONAL,
+                                        status=StatusEnum.NA,
+                                    )
+                                )
+
                             # Validate VPC configuration. The runtime's subnets live
                             # in the same networkModeConfig the security groups above
                             # come from, spelled "subnets". Bedrock's VpcConfig spells
@@ -2185,7 +2413,30 @@ def check_agentcore_vpc_configuration(
                                 network_config.get("networkModeConfig") or {}
                             ).get("subnets") or []
 
-                            if subnet_ids:
+                            if not subnet_ids:
+                                findings.append(
+                                    create_finding(
+                                        check_id="AC-01",
+                                        finding_name="AgentCore Runtime VPC Configuration",
+                                        finding_details=(
+                                            f"Runtime '{runtime_name}' ({runtime_id}) "
+                                            f"reported network mode '{network_mode}' "
+                                            "with no subnets, so whether it reaches "
+                                            "an internet gateway was not judged."
+                                        ),
+                                        resolution=(
+                                            "Grant bedrock-agentcore:GetAgentRuntime "
+                                            "and retry."
+                                        ),
+                                        reference=AGENTCORE_VPC_REFERENCE_URL,
+                                        severity=SeverityEnum.INFORMATIONAL,
+                                        status=StatusEnum.NA,
+                                    )
+                                )
+                            else:
+                                private_runtimes.append(
+                                    f"'{runtime_name}' ({runtime_id})"
+                                )
                                 # Check if subnets are private
                                 try:
                                     (
@@ -2326,21 +2577,38 @@ def check_agentcore_vpc_configuration(
                 logger.error(f"Error listing runtimes: {e}")
                 raise
 
-        # Return appropriate status based on whether resources were found
+        tool_details, tool_errors = _agentcore_tool_details(browser_inventory)
+
+        # Return appropriate status based on whether resources were found. Any
+        # runtime finding above, of any status, withholds the Passed.
         if not findings:
-            if resources_found:
+            if resources_found and private_runtimes:
+                named = ", ".join(private_runtimes[:5])
+                remainder = (
+                    f" and {len(private_runtimes) - 5} more"
+                    if len(private_runtimes) > 5
+                    else ""
+                )
                 findings.append(
                     create_finding(
                         check_id="AC-01",
                         finding_name="AgentCore VPC Configuration Check",
-                        finding_details="All AgentCore resources have proper VPC configuration",
+                        finding_details=(
+                            f"All {len(private_runtimes)} AgentCore runtime(s) run "
+                            "in VPC mode on subnets whose route tables have no "
+                            "route to an internet gateway, and report "
+                            "requireServiceS3Endpoint false: "
+                            f"{named}{remainder}. Custom Code Interpreters and "
+                            "Browsers are reported under "
+                            f"'{AGENTCORE_TOOL_SUBNET_FINDING}'."
+                        ),
                         resolution="No action required",
                         reference=AGENTCORE_VPC_REFERENCE_URL,
                         severity=SeverityEnum.HIGH,
                         status=StatusEnum.PASSED,
                     )
                 )
-            else:
+            elif not resources_found and not tool_details and not tool_errors:
                 findings.append(
                     create_finding(
                         check_id="AC-01",
@@ -2353,7 +2621,12 @@ def check_agentcore_vpc_configuration(
                     )
                 )
 
-        findings.extend(_agentcore_egress_findings(egress_targets, browser_inventory))
+        findings.extend(_agentcore_tool_subnet_findings(tool_details, tool_errors))
+        findings.extend(
+            _agentcore_egress_findings(
+                egress_targets, browser_inventory, (tool_details, tool_errors)
+            )
+        )
 
     except Exception as e:
         logger.error(f"Error in VPC configuration check: {e}")
@@ -3184,6 +3457,415 @@ def check_agentcore_payment_retrieval_role_trust() -> List[Dict[str, Any]]:
     return findings
 
 
+# Per resource type, the actions that read it and the actions that write it, as
+# the service authorization reference publishes them, generated by
+# generate_iam_access_levels.py.
+with open(
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "iam_access_levels.json"),
+    encoding="utf-8",
+) as _levels:
+    IAM_ACCESS_LEVELS: Dict[str, Dict[str, Dict[str, List[str]]]] = json.load(_levels)[
+        "services"
+    ]
+IAM_ACCESS_LEVEL_ACTIONS = frozenset(
+    f"{namespace}:{action}".lower()
+    for namespace, types in IAM_ACCESS_LEVELS.items()
+    for levels in types.values()
+    for action in levels["read"] + levels["write"]
+)
+UNRECORDED_PRINCIPAL_ERRORS_NOTE = (
+    "The IAM permissions cache predates schema version 2 and did not record "
+    "per-principal read errors, so a principal whose policies could not be read "
+    "looks the same as one with no policies."
+)
+SCP_NOT_EVALUATED_NOTE = (
+    "Service control policies were not evaluated per principal. They only remove "
+    "permissions, so an SCP can make this finding a false Failed but cannot hide "
+    "a grant it reports."
+)
+
+
+def _merged_patterns(value: Any) -> List[str]:
+    if isinstance(value, str):
+        return [value.strip().lower()]
+    if isinstance(value, list):
+        return [str(item).strip().lower() for item in value]
+    return []
+
+
+def _merged_statements(document: Any) -> List[Dict[str, Any]]:
+    """Statements of one policy document. A document that is not JSON raises
+    ValueError, so the caller reports it as unread instead of as no grant."""
+    if isinstance(document, str):
+        document = json.loads(document)
+    if document is None:
+        return []
+    if not isinstance(document, dict):
+        raise ValueError("policy document is not a JSON object")
+    statements = document.get("Statement", [])
+    if isinstance(statements, dict):
+        statements = [statements]
+    return [statement for statement in statements if isinstance(statement, dict)]
+
+
+def _identity_statements(permissions: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Attached, inline and group policy statements of one cached identity."""
+    return [
+        statement
+        for policy in [
+            *(permissions.get("attached_policies") or []),
+            *(permissions.get("inline_policies") or []),
+            *(permissions.get("group_policies") or []),
+        ]
+        for statement in _merged_statements(policy.get("document"))
+    ]
+
+
+def _merged_statement_matches(statement: Dict[str, Any], action: str) -> bool:
+    """Whether one statement's Action or NotAction covers a lowercase action."""
+    if "Action" in statement:
+        return any(
+            fnmatchcase(action, pattern)
+            for pattern in _merged_patterns(statement.get("Action"))
+        )
+    return "NotAction" in statement and not any(
+        fnmatchcase(action, pattern)
+        for pattern in _merged_patterns(statement.get("NotAction"))
+    )
+
+
+def _merged_account_wide_deny(statement: Dict[str, Any], action: str) -> bool:
+    """Whether a Deny removes the action everywhere: no condition, Resource "*".
+
+    A narrower Deny is read as removing nothing, which can only over-report.
+    """
+    return (
+        str(statement.get("Effect", "")).upper() == "DENY"
+        and not statement.get("Condition")
+        and "*" in _merged_patterns(statement.get("Resource"))
+        and _merged_statement_matches(statement, action)
+    )
+
+
+def _granted_actions(
+    permissions: Dict[str, Any], statements: List[Dict[str, Any]], actions: Any
+) -> set:
+    """Return the lowercase ``actions`` one identity is granted.
+
+    An action counts when an identity-policy Allow covers it, no account-wide
+    Deny removes it, and the permissions boundary, when there is one, allows it
+    too: the effective grant is the intersection of the two. A conditioned or
+    resource-scoped boundary Allow still counts as allowing, so an uncertain
+    case keeps the grant and can only over-report.
+    """
+    boundary = permissions.get("permissions_boundary")
+    boundary_statements = None if boundary is None else _merged_statements(boundary)
+    allows = [s for s in statements if str(s.get("Effect", "")).upper() == "ALLOW"]
+    granted = set()
+    for action in actions:
+        if not any(_merged_statement_matches(s, action) for s in allows):
+            continue
+        if any(_merged_account_wide_deny(s, action) for s in statements):
+            continue
+        if boundary_statements is not None and (
+            any(_merged_account_wide_deny(s, action) for s in boundary_statements)
+            or not any(
+                str(s.get("Effect", "")).upper() == "ALLOW"
+                and _merged_statement_matches(s, action)
+                for s in boundary_statements
+            )
+        ):
+            continue
+        granted.add(action)
+    return granted
+
+
+def _boundary_unread(permission_cache: Dict[str, Any]) -> set:
+    """Return (type, name) for each principal whose permissions boundary the
+    cache failed to read. The cache stores a null boundary both when none is
+    set and when the read failed, so only the error entry tells them apart,
+    and such a principal is left unassessed: a boundary could remove the grant.
+    """
+    return {
+        (str(error.get("type", "")).lower(), error["name"])
+        for error in permission_cache.get("principal_errors") or []
+        if isinstance(error, dict)
+        and error.get("name")
+        and error.get("stage") == "permissions_boundary"
+    }
+
+
+def _merged_resources(statement: Dict[str, Any]) -> List[str]:
+    """Lowercase Resource patterns of one statement. A NotResource statement
+    reads as "*", which can only over-report."""
+    if "Resource" not in statement:
+        return ["*"]
+    return [
+        str(item).strip().lower()
+        for item in _merged_patterns_any(statement["Resource"])
+    ]
+
+
+def _merged_patterns_any(value: Any) -> List[Any]:
+    if isinstance(value, list):
+        return value
+    return [value] if value is not None else []
+
+
+@lru_cache(maxsize=None)
+def _globs_overlap(left: str, right: str) -> bool:
+    """Whether some string matches both IAM glob patterns ("*" and "?")."""
+
+    @lru_cache(maxsize=None)
+    def overlap(i: int, j: int) -> bool:
+        if i == len(left):
+            return all(char == "*" for char in right[j:])
+        if j == len(right):
+            return all(char == "*" for char in left[i:])
+        if left[i] == "*":
+            return overlap(i + 1, j) or overlap(i, j + 1)
+        if right[j] == "*":
+            return overlap(i, j + 1) or overlap(i + 1, j)
+        if "?" in (left[i], right[j]) or left[i] == right[j]:
+            return overlap(i + 1, j + 1)
+        return False
+
+    return overlap(0, 0)
+
+
+def _merged_reaches_type(resources: List[str], arns: List[str]) -> bool:
+    """Whether a Resource entry can name an ARN of the resource type. A
+    variable such as ${aws:username} reads as "*"."""
+    return any(
+        _globs_overlap(re.sub(r"\$\{[^}]*\}", "*", resource), arn.lower())
+        for resource in resources
+        for arn in arns
+    )
+
+
+def _merged_read_write_grants(permissions: Dict[str, Any]) -> List[str]:
+    """Describe each wildcard or NotAction Allow that grants both a read and a
+    write action on one resource type.
+
+    An explicit action list separates read from write however long it is; a
+    pattern or a NotAction cannot, because it grants whatever it matches, a
+    bare "*" and a partial pattern among them. Only actions the identity is
+    granted after Denies and its permissions boundary count. A condition on the Allow applies to the read and the write alike, so
+    it is not read. The Resource entries are read only to drop the resource
+    types none of them can name.
+    """
+    statements = _identity_statements(permissions)
+    triggers = []
+    for statement in statements:
+        if str(statement.get("Effect", "")).upper() != "ALLOW":
+            continue
+        if "Action" in statement:
+            triggers += [
+                (
+                    f"Action '{pattern}'",
+                    {"Action": pattern},
+                    _merged_resources(statement),
+                )
+                for pattern in _merged_patterns(statement.get("Action"))
+                if "*" in pattern or "?" in pattern
+            ]
+        elif "NotAction" in statement:
+            triggers.append(
+                (
+                    f"NotAction {_merged_patterns(statement.get('NotAction'))}",
+                    {"NotAction": statement.get("NotAction")},
+                    _merged_resources(statement),
+                )
+            )
+    if not triggers:
+        return []
+    effective = _granted_actions(
+        permissions,
+        statements,
+        {
+            action
+            for action in IAM_ACCESS_LEVEL_ACTIONS
+            if any(_merged_statement_matches(t, action) for _, t, _ in triggers)
+        },
+    )
+    grants = []
+    for label, trigger, resources in triggers:
+        for namespace, types in IAM_ACCESS_LEVELS.items():
+            merged = []
+            for resource_type, levels in types.items():
+                if not _merged_reaches_type(resources, levels["arns"]):
+                    continue
+                reads, writes = (
+                    [
+                        f"{namespace}:{action}"
+                        for action in levels[level]
+                        if f"{namespace}:{action}".lower() in effective
+                        and _merged_statement_matches(
+                            trigger, f"{namespace}:{action}".lower()
+                        )
+                    ]
+                    for level in ("read", "write")
+                )
+                if reads and writes:
+                    merged.append((resource_type, reads, writes))
+            if not merged:
+                continue
+            resource_type, reads, writes = max(
+                merged,
+                key=lambda item: any(
+                    w.split(":", 1)[1].startswith("Delete") for w in item[2]
+                ),
+            )
+            write = next(
+                (w for w in writes if w.split(":", 1)[1].startswith("Delete")),
+                writes[0],
+            )
+            grants.append(
+                f"{label} grants read and write on {len(merged)} {namespace} "
+                f"resource type(s), for example {reads[0]} and {write} on "
+                f"{resource_type}"
+            )
+    return grants
+
+
+def _principal_read_errors(permission_cache: Dict[str, Any]) -> Optional[List[str]]:
+    """Label each principal whose cache read failed, or None for a cache that
+    predates ``principal_errors`` and records no group read error either. A
+    version 1 producer already set group_policies_error on a user."""
+    errors = permission_cache.get("principal_errors")
+    failed: Dict[str, List[str]] = {}
+    for error in errors if isinstance(errors, list) else []:
+        if isinstance(error, dict) and error.get("name"):
+            label = f"{error.get('type', 'principal')} '{error['name']}'"
+            failed.setdefault(label, []).append(str(error.get("stage", "unknown")))
+    users = permission_cache.get("user_permissions")
+    for name, permissions in (users if isinstance(users, dict) else {}).items():
+        if isinstance(permissions, dict) and permissions.get("group_policies_error"):
+            stages = failed.setdefault(f"user '{name}'", [])
+            if "group_policies" not in stages:
+                stages.append("group_policies")
+    if not isinstance(errors, list) and not failed:
+        return None
+    return [
+        f"{label} ({', '.join(stages)})" for label, stages in sorted(failed.items())
+    ]
+
+
+def _unread_principals_detail(unread: List[str]) -> str:
+    shown = ", ".join(unread[:10])
+    if len(unread) > 10:
+        shown += f" and {len(unread) - 10} more"
+    return (
+        f"{len(unread)} principal(s) could not be fully read into the IAM "
+        f"permissions cache, so their grants are unknown: {shown}."
+    )
+
+
+AC02_REFERENCE = (
+    "https://docs.aws.amazon.com/bedrock/latest/userguide/security-iam-awsmanpol.html"
+)
+MERGED_READ_WRITE_FINDING = "AgentCore Read and Write Merged in One Grant"
+
+
+def _merged_read_write_findings(
+    identities: List[tuple],
+) -> Tuple[List[Dict[str, Any]], List[str]]:
+    """AIR-FND-IAM-09 leg of AC-02: a grant that cannot tell read from write,
+    read over every policy of every cached role and user, AWS managed included.
+    Registry resource types are left to AR-01. Returns the rows and the
+    identities whose cached policies could not be parsed."""
+    flagged, unreadable = [], []
+    for kind, name, permissions in identities:
+        try:
+            grants = _merged_read_write_grants(permissions)
+        except (ValueError, TypeError, AttributeError):
+            unreadable.append(f"{kind} '{name}'")
+            continue
+        if grants:
+            flagged.append((kind, name, grants))
+    resolution = (
+        "Replace the wildcard or NotAction grant with the specific AgentCore read "
+        "actions the identity needs, and grant create, update and delete actions "
+        "separately to the principals that make those changes."
+    )
+    rows = [
+        create_finding(
+            check_id="AC-02",
+            finding_name=MERGED_READ_WRITE_FINDING,
+            finding_details=(
+                f"{kind.capitalize()} '{name}': {'; '.join(grants[:5])}. An "
+                "explicit action list is the only form that grants the read "
+                "without the write; a condition or resource scope applies to both "
+                "alike. " + SCP_NOT_EVALUATED_NOTE
+            ),
+            resolution=resolution,
+            reference=AC02_REFERENCE,
+            severity=SeverityEnum.HIGH,
+            status=StatusEnum.FAILED,
+        )
+        for kind, name, grants in flagged[:20]
+    ]
+    if len(flagged) > 20:
+        rows.append(
+            create_finding(
+                check_id="AC-02",
+                finding_name=MERGED_READ_WRITE_FINDING,
+                finding_details=(
+                    f"{len(flagged)} principals hold a grant that merges AgentCore "
+                    "read and write (the first 20 are reported individually)."
+                ),
+                resolution=resolution,
+                reference=AC02_REFERENCE,
+                severity=SeverityEnum.HIGH,
+                status=StatusEnum.FAILED,
+            )
+        )
+    return rows, unreadable
+
+
+def _hold_passed_for_unread_principals(
+    permission_cache: Dict[str, Any], rows: List[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+    """Hold back a Passed AC-02 row while the cache names an unread principal.
+
+    Each Passed row becomes N/A naming the principals; a failing row is kept
+    beside one incomplete row. A cache without ``principal_errors`` keeps its
+    verdict and says the errors were not recorded.
+    """
+    unread = _principal_read_errors(permission_cache)
+    if unread is None:
+        for row in rows:
+            if row["Status"] == StatusEnum.PASSED.value:
+                row["Finding_Details"] += " " + UNRECORDED_PRINCIPAL_ERRORS_NOTE
+        return rows
+    if not unread:
+        return rows
+    detail = _unread_principals_detail(unread)
+
+    def incomplete(name: str, details: str) -> Dict[str, Any]:
+        return create_finding(
+            check_id="AC-02",
+            finding_name=f"{name} Incomplete",
+            finding_details=details,
+            resolution=(
+                "Grant the IAM Permission Caching task read access to the listed "
+                "principals, then re-run the assessment."
+            ),
+            reference="https://docs.aws.amazon.com/IAM/latest/UserGuide/access_policies.html",
+            severity=SeverityEnum.INFORMATIONAL,
+            status=StatusEnum.NA,
+        )
+
+    kept = [row for row in rows if row["Status"] != StatusEnum.PASSED.value]
+    passed = [row for row in rows if row["Status"] == StatusEnum.PASSED.value]
+    if passed:
+        return kept + [
+            incomplete(row["Finding"], f"{row['Finding_Details']} {detail}")
+            for row in passed
+        ]
+    return kept + [incomplete("AgentCore IAM Full Access Check", detail)]
+
+
 def check_agentcore_full_access_roles(
     permission_cache: Dict[str, Any],
 ) -> List[Dict[str, Any]]:
@@ -3198,6 +3880,8 @@ def check_agentcore_full_access_roles(
     - Evaluator authors with no principal that only reads evaluators
     - Roles and users holding both AgentCore payment authorities at once
     - Payment-manager writers whose iam:PassRole is not scoped
+    - Roles and users whose wildcard or NotAction grant merges AgentCore read
+      and write on one resource type
 
     Every grant is read after the principal's own unconditioned Deny statements
     and its permissions boundary. Service control policies are not evaluated.
@@ -3216,16 +3900,9 @@ def check_agentcore_full_access_roles(
 
         role_permissions = permission_cache.get("role_permissions", {})
         user_permissions = permission_cache.get("user_permissions", {})
-        gap_rows, v1_note = _cache_read_gap_findings(
-            permission_cache,
-            "AC-02",
-            "AgentCore IAM Full Access Check",
-            reference,
-        )
 
         if not role_permissions and not user_permissions:
             logger.info("No role or user permissions in cache")
-            findings.extend(gap_rows)
             findings.append(
                 create_finding(
                     check_id="AC-02",
@@ -3237,7 +3914,7 @@ def check_agentcore_full_access_roles(
                     status=StatusEnum.NA,
                 )
             )
-            return findings
+            return _hold_passed_for_unread_principals(permission_cache, findings)
 
         principals: List[Tuple[str, Dict[str, Any]]] = [
             (f"{kind} {name}", permissions)
@@ -3469,7 +4146,50 @@ def check_agentcore_full_access_roles(
                 )
             )
 
-        if policy_parse_errors:
+        boundary_unread = _boundary_unread(permission_cache)
+        merged_rows, merged_unreadable = _merged_read_write_findings(
+            [
+                (kind, name, perms)
+                for kind, principals in (
+                    ("role", role_permissions),
+                    ("user", user_permissions),
+                )
+                for name, perms in principals.items()
+                if isinstance(perms, dict)
+                and (
+                    (kind, name) not in boundary_unread
+                    or perms.get("permissions_boundary") is not None
+                )
+            ]
+        )
+        findings.extend(merged_rows)
+
+        if merged_unreadable:
+            findings.append(
+                create_finding(
+                    check_id="AC-02",
+                    finding_name="AgentCore IAM Full Access Check Incomplete",
+                    finding_details=(
+                        "The cached policies of "
+                        f"{', '.join(merged_unreadable[:10])}"
+                        + (
+                            f" and {len(merged_unreadable) - 10} more"
+                            if len(merged_unreadable) > 10
+                            else ""
+                        )
+                        + " could not be parsed, so their AgentCore grants were "
+                        "not assessed."
+                    ),
+                    resolution=(
+                        "Review the IAM Permission Caching task output, then rerun "
+                        "the assessment."
+                    ),
+                    reference="https://docs.aws.amazon.com/bedrock/latest/userguide/security-iam-awsmanpol.html",
+                    severity=SeverityEnum.INFORMATIONAL,
+                    status=StatusEnum.NA,
+                )
+            )
+        elif policy_parse_errors:
             findings.append(
                 _incomplete_check_finding(
                     check_id="AC-02",
@@ -3478,8 +4198,6 @@ def check_agentcore_full_access_roles(
                     reference=reference,
                 )
             )
-
-        findings.extend(gap_rows)
 
         # If no issues found - principals were evaluated and none were problematic
         if not findings:
@@ -3492,9 +4210,10 @@ def check_agentcore_full_access_roles(
                         "holds an AgentCore full-access policy, a wildcard, bare "
                         '"*" or allow-except AgentCore grant on an unbounded '
                         "resource, a wildcard reaching an evaluation write, both "
-                        "payment authorities, or an unscoped iam:PassRole beside a "
-                        "payment-manager write, after each principal's own Deny "
-                        f"statements and permissions boundary.{v1_note}"
+                        "payment authorities, an unscoped iam:PassRole beside a "
+                        "payment-manager write, or a grant that merges AgentCore "
+                        "read and write actions on one resource type, after each "
+                        "principal's own Deny statements and permissions boundary."
                     ),
                     resolution="No action required",
                     reference=reference,
@@ -3514,7 +4233,7 @@ def check_agentcore_full_access_roles(
             )
         )
 
-    return findings
+    return _hold_passed_for_unread_principals(permission_cache, findings)
 
 
 def check_stale_agentcore_access(
@@ -3973,14 +4692,146 @@ def check_stale_agentcore_access(
     return findings
 
 
+def _runtime_observability_finding(
+    runtime: Dict[str, Any],
+    delivery_configuration: Optional[Tuple[Dict[str, Dict[str, List[str]]], Set[str]]],
+    delivery_error: Optional[Exception],
+) -> Dict[str, Any]:
+    """Build one AC-04 row from a runtime's log groups and trace delivery.
+
+    GetAgentRuntime returns no logging or tracing configuration, so both legs
+    are read where AgentCore puts them: the log groups named
+    /aws/bedrock-agentcore/runtimes/<runtimeId>-<endpoint>, and a
+    bedrock-agentcore TRACES delivery source naming the runtime with a delivery
+    to a destination. A leg that could not be read leaves the row N/A unless
+    the other leg already fails it.
+    """
+    runtime_id = runtime.get("agentRuntimeId", "unknown")
+    runtime_name = runtime.get("agentRuntimeName", runtime_id)
+    runtime_label = f"Runtime '{runtime_name}' ({runtime_id})"
+    group_stem = f"{AGENTCORE_RUNTIME_LOG_GROUP_PREFIX}{runtime_id}-"
+
+    observed: List[str] = []
+    problems: List[str] = []
+    unread: List[str] = []
+
+    try:
+        log_groups = _paginate_aws_list(
+            logs_client,
+            "describe_log_groups",
+            "logGroups",
+            logGroupNamePrefix=group_stem,
+        )
+    except Exception as error:
+        unread.append(
+            f"its log groups under {group_stem} could not be listed "
+            f"({type(error).__name__})"
+        )
+    else:
+        group_names = sorted(
+            group["logGroupName"]
+            for group in log_groups
+            if isinstance(group, dict)
+            and isinstance(group.get("logGroupName"), str)
+            and group["logGroupName"].startswith(group_stem)
+        )
+        if group_names:
+            observed.append(f"writes logs to {', '.join(group_names)}")
+        else:
+            problems.append(
+                f"has no log group under {group_stem}, so none of its service "
+                "logs are stored in this region"
+            )
+
+    if delivery_configuration is None:
+        unread.append(
+            f"its trace delivery could not be read ({type(delivery_error).__name__})"
+        )
+    else:
+        arn_sources, delivered_source_names = delivery_configuration
+        source_names = _delivery_source_names_for(
+            f":runtime/{runtime_id}", arn_sources, AGENTCORE_VENDED_TRACE_TYPE
+        )
+        delivered = sorted(
+            name for name in source_names if name in delivered_source_names
+        )
+        if delivered:
+            observed.append(f"delivers traces through {', '.join(delivered)}")
+        elif source_names:
+            problems.append(
+                f"has TRACES delivery source {', '.join(sorted(source_names))} "
+                "but no delivery to a destination, so its traces are not stored"
+            )
+        else:
+            problems.append(
+                "has no bedrock-agentcore TRACES delivery source, so its traces "
+                "are not collected"
+            )
+
+    sentences = []
+    if problems:
+        sentences.append(f"{runtime_label} {'; it '.join(problems)}.")
+    elif not unread:
+        sentences.append(f"{runtime_label} {' and '.join(observed)}.")
+    else:
+        sentences.append(f"{runtime_label} observability is not fully read.")
+    if problems and observed:
+        sentences.append(f"It {' and '.join(observed)}.")
+    if unread:
+        sentences.append(f"Not read: {'; '.join(unread)}.")
+    details = " ".join(sentences)
+
+    if problems:
+        return create_finding(
+            check_id="AC-04",
+            finding_name="AgentCore Runtime Observability",
+            finding_details=details,
+            resolution=(
+                "Invoke the runtime endpoint so AgentCore creates its log group, "
+                "and create a TRACES delivery source for the runtime with a "
+                "delivery to X-Ray. Tracing needs CloudWatch Transaction Search "
+                "on in the account."
+            ),
+            reference=AGENTCORE_OBSERVABILITY_CONFIGURE_REFERENCE_URL,
+            severity=SeverityEnum.MEDIUM,
+            status=StatusEnum.FAILED,
+        )
+    if unread:
+        return create_finding(
+            check_id="AC-04",
+            finding_name="AgentCore Runtime Observability",
+            finding_details=details,
+            resolution=(
+                "Grant logs:DescribeLogGroups, logs:DescribeDeliverySources and "
+                "logs:DescribeDeliveries and retry."
+            ),
+            reference=AGENTCORE_OBSERVABILITY_CONFIGURE_REFERENCE_URL,
+            severity=SeverityEnum.INFORMATIONAL,
+            status=StatusEnum.NA,
+        )
+    return create_finding(
+        check_id="AC-04",
+        finding_name="AgentCore Runtime Observability",
+        finding_details=details,
+        resolution=(
+            "No action required. Confirm the log retention and the Transaction "
+            "Search setting meet the workload's requirements."
+        ),
+        reference=AGENTCORE_OBSERVABILITY_CONFIGURE_REFERENCE_URL,
+        severity=SeverityEnum.MEDIUM,
+        status=StatusEnum.PASSED,
+    )
+
+
 def check_agentcore_observability() -> List[Dict[str, Any]]:
     """
-    Check observability configuration for AgentCore resources.
+    AC-04: Report each AgentCore runtime's log groups and trace delivery.
 
-    Validates:
-    - CloudWatch Logs configuration
-    - X-Ray tracing enabled
-    - CloudWatch custom metrics published
+    GetAgentRuntime has no logging or tracing member, so a runtime passes when
+    at least one log group under /aws/bedrock-agentcore/runtimes/<runtimeId>-
+    exists and a bedrock-agentcore TRACES delivery source names it with a
+    delivery to a destination. Whether CloudWatch Transaction Search is on is
+    not read, and custom CloudWatch metrics are not assessed.
 
     Returns:
         List of findings
@@ -4003,121 +4854,53 @@ def check_agentcore_observability() -> List[Dict[str, Any]]:
 
     try:
         logger.info("Checking AgentCore observability configuration")
-        resources_found = False
+        runtimes = _agentcore_list_all("list_agent_runtimes", ["agentRuntimes"])
 
-        # Check Runtimes for logging and tracing
+        if not runtimes:
+            findings.append(
+                create_finding(
+                    check_id="AC-04",
+                    finding_name="AgentCore Observability Check",
+                    finding_details="No AgentCore runtimes found in this region.",
+                    resolution="No action required",
+                    reference=AGENTCORE_OBSERVABILITY_REFERENCE_URL,
+                    severity=SeverityEnum.INFORMATIONAL,
+                    status=StatusEnum.NA,
+                )
+            )
+            return findings
+
+        if logs_client is None:
+            findings.append(
+                create_finding(
+                    check_id="AC-04",
+                    finding_name="AgentCore Observability Check",
+                    finding_details=(
+                        f"The log groups and trace delivery of {len(runtimes)} "
+                        "runtime(s) are not read: the CloudWatch Logs client is "
+                        "not available in this region."
+                    ),
+                    resolution="Retry in a region where CloudWatch Logs is available.",
+                    reference=AGENTCORE_OBSERVABILITY_CONFIGURE_REFERENCE_URL,
+                    severity=SeverityEnum.INFORMATIONAL,
+                    status=StatusEnum.NA,
+                )
+            )
+            return findings
+
+        delivery_configuration = None
+        delivery_error: Optional[Exception] = None
         try:
-            runtimes = _agentcore_list_all("list_agent_runtimes", ["agentRuntimes"])
+            delivery_configuration = _agentcore_delivery_configuration()
+        except Exception as error:
+            delivery_error = error
 
-            if not runtimes:
-                logger.info("No AgentCore Runtimes found")
-            else:
-                resources_found = True
-                logger.info(f"Found {len(runtimes)} AgentCore Runtimes")
-
-                for runtime in runtimes:
-                    runtime_id = runtime.get("agentRuntimeId", "unknown")
-                    runtime_name = runtime.get("agentRuntimeName", runtime_id)
-
-                    try:
-                        runtime_details = agentcore_client.get_agent_runtime(
-                            agentRuntimeId=runtime_id
-                        )
-
-                        # Check CloudWatch Logs configuration
-                        logging_config = runtime_details.get("loggingConfig", {})
-                        cloudwatch_logs_config = logging_config.get(
-                            "cloudWatchLogsConfig"
-                        )
-
-                        if not cloudwatch_logs_config:
-                            findings.append(
-                                create_finding(
-                                    check_id="AC-04",
-                                    finding_name="AgentCore Runtime CloudWatch Logs",
-                                    finding_details=f"Runtime '{runtime_name}' ({runtime_id}) does not have CloudWatch Logs configured",
-                                    resolution="Enable CloudWatch Logs for monitoring and troubleshooting",
-                                    reference=AGENTCORE_OBSERVABILITY_REFERENCE_URL,
-                                    severity=SeverityEnum.MEDIUM,
-                                    status=StatusEnum.FAILED,
-                                )
-                            )
-                        else:
-                            # Verify log group exists
-                            log_group_name = cloudwatch_logs_config.get("logGroupName")
-                            if log_group_name:
-                                try:
-                                    logs_client.describe_log_groups(
-                                        logGroupNamePrefix=log_group_name, limit=1
-                                    )
-                                except ClientError as e:
-                                    if (
-                                        e.response["Error"]["Code"]
-                                        == "ResourceNotFoundException"
-                                    ):
-                                        findings.append(
-                                            create_finding(
-                                                check_id="AC-04",
-                                                finding_name="AgentCore Runtime Log Group Missing",
-                                                finding_details=f"Runtime '{runtime_name}' has CloudWatch Logs configured but log group '{log_group_name}' does not exist",
-                                                resolution="Create the log group or update runtime configuration",
-                                                reference=AGENTCORE_OBSERVABILITY_REFERENCE_URL,
-                                                severity=SeverityEnum.MEDIUM,
-                                                status=StatusEnum.FAILED,
-                                            )
-                                        )
-
-                        # Check X-Ray tracing configuration
-                        tracing_config = runtime_details.get("tracingConfig", {})
-                        tracing_enabled = tracing_config.get("enabled", False)
-
-                        if not tracing_enabled:
-                            findings.append(
-                                create_finding(
-                                    check_id="AC-04",
-                                    finding_name="AgentCore Runtime X-Ray Tracing",
-                                    finding_details=f"Runtime '{runtime_name}' ({runtime_id}) does not have X-Ray tracing enabled",
-                                    resolution="Enable X-Ray tracing for distributed tracing and performance analysis",
-                                    reference=AGENTCORE_OBSERVABILITY_REFERENCE_URL,
-                                    severity=SeverityEnum.MEDIUM,
-                                    status=StatusEnum.FAILED,
-                                )
-                            )
-
-                    except ClientError as e:
-                        if e.response["Error"]["Code"] != "ResourceNotFoundException":
-                            logger.error(f"Error describing runtime {runtime_id}: {e}")
-
-        except ClientError as e:
-            if e.response["Error"]["Code"] != "ResourceNotFoundException":
-                logger.error(f"Error listing runtimes: {e}")
-
-        # Return appropriate status based on whether resources were found
-        if not findings:
-            if resources_found:
-                findings.append(
-                    create_finding(
-                        check_id="AC-04",
-                        finding_name="AgentCore Observability Check",
-                        finding_details="All AgentCore resources have proper observability configuration",
-                        resolution="No action required",
-                        reference=AGENTCORE_OBSERVABILITY_REFERENCE_URL,
-                        severity=SeverityEnum.MEDIUM,
-                        status=StatusEnum.PASSED,
-                    )
+        for runtime in runtimes:
+            findings.append(
+                _runtime_observability_finding(
+                    runtime, delivery_configuration, delivery_error
                 )
-            else:
-                findings.append(
-                    create_finding(
-                        check_id="AC-04",
-                        finding_name="AgentCore Observability Check",
-                        finding_details="No AgentCore resources found",
-                        resolution="No action required",
-                        reference=AGENTCORE_OBSERVABILITY_REFERENCE_URL,
-                        severity=SeverityEnum.INFORMATIONAL,
-                        status=StatusEnum.NA,
-                    )
-                )
+            )
 
     except Exception as e:
         logger.error(f"Error in observability check: {e}")
