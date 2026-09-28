@@ -7,12 +7,12 @@
     "fnd_ai_subject": 11,
     "foundation": 27,
     "total": 105,
-    "covered": 100,
+    "covered": 102,
     "tighten": 0,
     "tighten_extend": 0,
     "tighten_new_id": 0,
     "new": 0,
-    "not_implementable": 5,
+    "not_implementable": 3,
     "unassessed": 0,
     "new_check_functions": 0,
     "extensions": 0,
@@ -490,10 +490,12 @@
         "sagemaker_assessments"
       ],
       "incumbents": [
-        "SM-18"
+        "SM-18",
+        "SM-42"
       ],
       "incumbent_names": [
-        "SageMaker Transform Job Encryption Check"
+        "SageMaker Transform Job Encryption Check",
+        "SageMaker Batch Transform Creation Guardrail"
       ],
       "gap": "",
       "extra_iam": [],
@@ -633,12 +635,15 @@
         "sagemaker_assessments"
       ],
       "incumbents": [
+        "SM-23",
         "SM-31"
       ],
       "incumbent_names": [
+        "Model Drift Detection Not Configured",
+        "Model Drift Detection Check",
         "Endpoint Inference Data Capture"
       ],
-      "gap": "",
+      "gap": "SM-23 fails an InService endpoint with no Model Monitor schedule, or with no DataQuality or no ModelQuality schedule, and a schedule that is not Scheduled",
       "extra_iam": [],
       "phase": 3,
       "tier": "ai_subject",
@@ -680,12 +685,14 @@
         "sagemaker_assessments"
       ],
       "incumbents": [
-        "SM-33"
+        "SM-33",
+        "SM-34"
       ],
       "incumbent_names": [
-        "Training Job Network Boundary"
+        "Training Job Network Boundary",
+        "SageMaker Creation Guardrail"
       ],
-      "gap": "",
+      "gap": "SM-34 is the approved-exception leg: its approved network and no direct internet access verdicts require sagemaker:CreateTrainingJob to be bound on sagemaker:VpcSubnets or sagemaker:VpcSecurityGroupIds and on sagemaker:NetworkIsolation, by a Deny in an attached service control policy or by a condition in every identity policy that grants the action",
       "extra_iam": [],
       "phase": 3,
       "tier": "ai_subject",
@@ -720,14 +727,23 @@
       "question": "Is traffic to and from inference endpoints encrypted end-to-end, including any inter-container traffic for multi-container deployments?",
       "assert": "Encryption configuration including inter-container traffic",
       "workload_agnostic": true,
-      "verdict": "not_implementable",
+      "verdict": "covered",
       "disposition": null,
-      "target_modules": [],
-      "incumbents": [],
-      "incumbent_names": [],
-      "gap": "slug names sagemaker_endpoint_intercontainer_encryption_enabled but EnableInterContainerTrafficEncryption is absent from DescribeEndpointConfig and present only on DescribeTrainingJob; do not port as written, fix in the AISF repo first",
+      "target_modules": [
+        "sagemaker_assessments"
+      ],
+      "incumbents": [
+        "SM-11",
+        "SM-14"
+      ],
+      "incumbent_names": [
+        "SageMaker Model Network Isolation Check",
+        "SageMaker Model Platform Repository Access",
+        "SageMaker Model Repository Access Check"
+      ],
+      "gap": "SM-11 judges EnableNetworkIsolation and VpcConfig on every model an endpoint serves and reads the endpoint config KmsKeyId of each instance-backed endpoint, and SM-14 requires RepositoryAccessMode Vpc on each model's image config. The one field not read is inter-container traffic encryption, because no endpoint API returns it: EnableInterContainerTrafficEncryption is a member of DescribeTrainingJob, DescribeProcessingJob and DescribeHyperParameterTuningJob, and of none of DescribeEndpointConfig, DescribeModel, DescribeEndpoint or DescribeInferenceComponent (botocore 1.43.85). The AISF slug sagemaker_endpoint_intercontainer_encryption_enabled names that absent field and should be fixed in the AISF repo",
       "extra_iam": [],
-      "phase": null,
+      "phase": 3,
       "tier": "ai_subject",
       "source": "controls/ai-specific/sagemaker-endpoints.yaml"
     },
@@ -859,13 +875,15 @@
       ],
       "incumbents": [
         "AC-02",
-        "AC-45"
+        "AC-45",
+        "AC-48"
       ],
       "incumbent_names": [
         "AgentCore IAM Full Access Check",
-        "AgentCore Tool Execution Role Scope"
+        "AgentCore Tool Execution Role Scope",
+        "AgentCore Execution Role Trust"
       ],
-      "gap": "AC-45 reads the execution role of every code interpreter and browser in the account by value and fails a role whose Allow statements reach every resource or an unbounded one (arn:aws:s3:::*, table/*, a region or account wildcard), name a NotResource, carry a service-wide, bare or pattern action wildcard such as s3:Get*, or are written with NotAction. On the primary region a Global row names every principal that can run a command or open a shell in a runtime session through a grant that does not name bedrock-agentcore:InvokeAgentRuntimeCommandShell or InvokeAgentRuntimeCommand, or that reaches every runtime. AC-02 judges the same wildcards only over the bedrock-agentcore namespace, so a tool role granting s3:* on every bucket is a verdict it cannot reach",
+      "gap": "AC-45 reads the execution role of every code interpreter and browser in the account by value and fails a role whose Allow statements reach every resource or an unbounded one (arn:aws:s3:::*, table/*, a region or account wildcard), name a NotResource, carry a service-wide, bare or pattern action wildcard such as s3:Get*, or are written with NotAction. On the primary region a Global row names every principal that can run a command or open a shell in a runtime session through a grant that does not name bedrock-agentcore:InvokeAgentRuntimeCommandShell or InvokeAgentRuntimeCommand, or that reaches every runtime. AC-02 judges the same wildcards only over the bedrock-agentcore namespace, so a tool role granting s3:* on every bucket is a verdict it cannot reach. AC-48 reads the trust policy of every runtime, browser and code interpreter role, fails an AWS service principal with no aws:SourceAccount or aws:SourceArn condition and an account-root principal, and fails a role that more than one AgentCore resource names",
       "extra_iam": [],
       "phase": 4,
       "tier": "ai_subject",
@@ -1191,16 +1209,18 @@
         "agentcore_assessments"
       ],
       "incumbents": [
-        "AC-01"
+        "AC-01",
+        "AC-49"
       ],
       "incumbent_names": [
         "AgentCore VPC Configuration Check",
         "AgentCore Runtime VPC Configuration",
         "AgentCore Runtime Public Subnet",
         "AgentCore Egress Unrestricted",
-        "AgentCore Egress Filtering"
+        "AgentCore Egress Filtering",
+        "AgentCore DNS Egress Control"
       ],
-      "gap": "AC-01 unions the outbound ranges of every security group attached to a VPC runtime, code interpreter or browser and fails a resource whose groups together permit 0.0.0.0/0 or ::/0 egress, so 0.0.0.0/1 plus 128.0.0.0/1 fails as 0.0.0.0/0 does. A tool in PUBLIC network mode fails without a describe call, because the service grants it open internet egress by configuration, and a tool in SANDBOX fails at Medium, because no customer security group names what it reaches. A group the describe did not return and a denied ec2:DescribeSecurityGroups are both reported N/A on their own line, so an unread group is never counted as closed. A Global leg requires an attached SCP that denies CreateAgentRuntime, UpdateAgentRuntime, CreateCodeInterpreter and CreateBrowser with a Null true test on bedrock-agentcore:subnets or bedrock-agentcore:securityGroups, and a second that pins both keys with ForAnyValue:StringNotEquals to IDs without wildcards",
+      "gap": "AC-01 unions the outbound ranges of every security group attached to a VPC runtime, code interpreter or browser and fails a resource whose groups together permit 0.0.0.0/0 or ::/0 egress, so 0.0.0.0/1 plus 128.0.0.0/1 fails as 0.0.0.0/0 does. A tool in PUBLIC network mode fails without a describe call, because the service grants it open internet egress by configuration, and a tool in SANDBOX fails at Medium, because no customer security group names what it reaches. A group the describe did not return and a denied ec2:DescribeSecurityGroups are both reported N/A on their own line, so an unread group is never counted as closed. A Global leg requires an attached SCP that denies CreateAgentRuntime, UpdateAgentRuntime, CreateCodeInterpreter and CreateBrowser with a Null true test on bedrock-agentcore:subnets or bedrock-agentcore:securityGroups, and a second that pins both keys with ForAnyValue:StringNotEquals to IDs without wildcards. AC-49 is the domain-filter leg: for each VPC hosting a runtime, browser or code interpreter it walks the Route 53 Resolver DNS Firewall rules in evaluation order and passes only when the first rule over * is a BLOCK that names no query type and the firewall config has FirewallFailOpen DISABLED",
       "extra_iam": [],
       "phase": 4,
       "tier": "ai_subject",
@@ -1361,17 +1381,19 @@
         "agentcore_assessments"
       ],
       "incumbents": [
+        "AC-18",
         "AC-19",
         "AC-20",
         "AC-26"
       ],
       "incumbent_names": [
+        "AgentCore CloudTrail Data Event Coverage",
         "AgentCore Log Delivery Configuration",
         "AgentCore Log Data Protection",
         "AgentCore Log Retention and Key Scope",
         "AgentCore Span Log Deletion Protection"
       ],
-      "gap": "AC-19 pairs each AgentCore delivery source with its delivery and AC-20 asserts masking plus a customer managed key. AC-26 adds an explicitly configured retentionInDays and reads each key policy by value: an Allow whose principal is a wildcard or a NotPrincipal fails unless a condition binds the caller's account, organization, principal ARN or source with a bounded value under a positive operator, and kms:ViaService alone, IfExists, ForAllValues and a wildcard account do not count. A grant to the CloudWatch Logs service principal fails unless it binds the account or the kms:EncryptionContext:aws:logs:arn value, because it serves log groups in any account. A Global leg requires an attached SCP denying logs:DeleteLogGroup, logs:PutRetentionPolicy, logs:PutLogGroupDeletionProtection and logs:DeleteSubscriptionFilter on the AgentCore log groups and aws/spans, and a regional leg fails a trail that records the Region with log file validation off",
+      "gap": "AC-18 requires a CloudTrail data event selector for AWS::BedrockAgentCore::Gateway whenever the region holds a gateway, so each gateway call is recorded with its caller. AC-19 pairs each AgentCore delivery source with its delivery and AC-20 asserts masking plus a customer managed key. AC-26 adds an explicitly configured retentionInDays and reads each key policy by value: an Allow whose principal is a wildcard or a NotPrincipal fails unless a condition binds the caller's account, organization, principal ARN or source with a bounded value under a positive operator, and kms:ViaService alone, IfExists, ForAllValues and a wildcard account do not count. A grant to the CloudWatch Logs service principal fails unless it binds the account or the kms:EncryptionContext:aws:logs:arn value, because it serves log groups in any account. A Global leg requires an attached SCP denying logs:DeleteLogGroup, logs:PutRetentionPolicy, logs:PutLogGroupDeletionProtection and logs:DeleteSubscriptionFilter on the AgentCore log groups and aws/spans, and a regional leg fails a trail that records the Region with log file validation off",
       "extra_iam": [],
       "phase": 4,
       "tier": "ai_subject",
@@ -1459,7 +1481,7 @@
       "target_modules": [],
       "incumbents": [],
       "incumbent_names": [],
-      "gap": "the only retention field AgentCore Memory exposes is required, and it bounds a different thing from the one this control asks about. eventExpiryDuration is Required: Yes on CreateMemory, 3 to 365 days, and comes back on the Memory shape GetMemory returns, so a presence check over it passes for every memory that exists, which is worse than no check. It also bounds the wrong subject: the create page calls it event retention for raw events in short-term memory and applies it per event at write time, so updating it moves only later events, while what this control asks to bound is the long-term cross-session records extracted from those events, and neither CreateMemory nor Memory carries any retention field for those. Which value is short enough is the workload owner's judgment in any case, and this row will not invent a ceiling. What is readable is the namespace partitioning, already asserted under AIR-ACR-MEM-01 by AC-07 and AC-23 on {actorId}; session partitioning cannot join it, because AWS documents /summaries/{actorId}/{sessionId}/ for a summary strategy and /users/{actorId}/preferences/ for a user-preference strategy, so failing the absence of {sessionId} would fail a documented configuration. The log-retention clause asks for a compliance schedule only the workload owner can name",
+      "gap": "the only retention field AgentCore Memory exposes, eventExpiryDuration, is required on a standalone Memory and defaults to 30 days on harness-managed memory, and in both it bounds raw events only, a different thing from the one this control asks about. eventExpiryDuration is Required: Yes on CreateMemory, 3 to 365 days, and comes back on the Memory shape GetMemory returns, so a presence check over it passes for every memory that exists, which is worse than no check. It also bounds the wrong subject: the create page calls it event retention for raw events in short-term memory and applies it per event at write time, so updating it moves only later events, while what this control asks to bound is the long-term cross-session records extracted from those events, and neither CreateMemory nor Memory carries any retention field for those. Which value is short enough is the workload owner's judgment in any case, and this row will not invent a ceiling. What is readable is the namespace partitioning, already asserted under AIR-ACR-MEM-01 by AC-07 and AC-23 on {actorId}; session partitioning cannot join it, because AWS documents /summaries/{actorId}/{sessionId}/ for a summary strategy and /users/{actorId}/preferences/ for a user-preference strategy, so failing the absence of {sessionId} would fail a documented configuration. The log-retention clause is readable only as far as a period being set: AC-26 fails any log group under the AgentCore prefixes, /aws/vendedlogs/bedrock-agentcore/ included, that has no retentionInDays, and it is cited under other controls, not this one. Log retention bounds how long an operator can read what the agent logged, not what the agent can recall, so it cannot stand in for the bound this control asks about, and whether a period meets a compliance schedule is the workload owner's judgment. The Memory shape also carries namespaceKeys, whose entries can restrict a namespace key to allowedValues or a regexPattern. That narrows which namespaces records are written to, not how many records accumulate or how long they are kept, so it is not a limit either",
       "extra_iam": [],
       "phase": null,
       "tier": "ai_subject",
@@ -1477,12 +1499,14 @@
         "agentcore_assessments"
       ],
       "incumbents": [
-        "AC-18"
+        "AC-18",
+        "AC-19"
       ],
       "incumbent_names": [
-        "AgentCore CloudTrail Data Event Coverage"
+        "AgentCore CloudTrail Data Event Coverage",
+        "AgentCore Log Delivery Configuration"
       ],
-      "gap": "AC-18 requires a CloudTrail advanced event selector that logs data events for AWS::BedrockAgentCore::Memory whenever the region holds a memory resource. A selector narrowed by readOnly, eventName, resources.ARN or any other field does not count, nor does a trail that is not logging or that neither spans all Regions nor is homed in the scanned one. An unreadable trail status is N/A",
+      "gap": "AC-18 requires a CloudTrail advanced event selector that logs data events for AWS::BedrockAgentCore::Memory whenever the region holds a memory resource. A selector narrowed by readOnly, eventName, resources.ARN or any other field does not count, nor does a trail that is not logging or that neither spans all Regions nor is homed in the scanned one. An unreadable trail status is N/A. AC-19 requires each memory's APPLICATION_LOGS delivery, which carries the extraction and consolidation logs of long-term memory processing",
       "extra_iam": [],
       "phase": 4,
       "tier": "ai_subject",
@@ -2438,12 +2462,14 @@
         "agentcore_assessments"
       ],
       "incumbents": [
-        "AC-51"
+        "AC-51",
+        "AG-39"
       ],
       "incumbent_names": [
-        "AgentCore Gateway Anti-DDoS Protection"
+        "AgentCore Gateway Anti-DDoS Protection",
+        "Agentic AI Gateway WAF Rule Coverage"
       ],
-      "gap": "AC-51 judges the web ACL on each AgentCore gateway for the AWS Anti-DDoS managed rule group. Front doors other than AgentCore gateways (API Gateway, ALB, CloudFront) are not identifiable as AI entry points by any API, so they are not judged. The gateway's web ACL comes from the lookup AG-27 and AG-39 already make, and the ACL passes when its rules include AWSManagedRulesAntiDDoSRuleSet with an override action other than Count. A passing finding names the Block and Challenge sensitivities the group runs with, API defaults filled in, and does not grade them, since the control asks for a deliberate choice and names no value. Shield Advanced enrollment is not judged, because shield:CreateProtection accepts no AgentCore gateway ARN",
+      "gap": "AC-51 judges the web ACL on each AgentCore gateway for the AWS Anti-DDoS managed rule group. Front doors other than AgentCore gateways (API Gateway, ALB, CloudFront) are not identifiable as AI entry points by any API, so they are not judged. The gateway's web ACL comes from the lookup AG-27 and AG-39 already make, and the ACL passes when its rules include AWSManagedRulesAntiDDoSRuleSet with an override action other than Count. A passing finding names the Block and Challenge sensitivities the group runs with, API defaults filled in, and does not grade them, since the control asks for a deliberate choice and names no value. Shield Advanced enrollment is not judged, because shield:CreateProtection accepts no AgentCore gateway ARN. AG-39 is the request-rate leg: it fails a gateway web ACL with no rate-based rule whose action is Block",
       "extra_iam": [],
       "phase": 6,
       "tier": "foundation",
@@ -2565,6 +2591,29 @@
       "source": "controls/ai-specific/selfhosted-agent.yaml"
     },
     {
+      "control": "AIR-SLF-CMP-08",
+      "area": "SLF",
+      "question": "For self-hosted models, are the model weights obtained from a verified source and integrity-checked before they are loaded, rather than pulled from a public hub and trusted on arrival?",
+      "assert": "Recorded expected digest for each deployed model + the load-time verification step that compares against it, plus the KMS key protecting the artifact at rest",
+      "workload_agnostic": false,
+      "verdict": "covered",
+      "disposition": null,
+      "target_modules": [
+        "sagemaker_assessments"
+      ],
+      "incumbents": [
+        "SM-43"
+      ],
+      "incumbent_names": [
+        "SageMaker Model Artifact Integrity"
+      ],
+      "gap": "SM-43 judges every serving container of each InService endpoint, including model package containers and inference components. An image passes when it is pinned by an @sha256 digest, or by a tag its ECR repository holds immutable, and a mutable tag fails. When a managed signing rule read with ecr:GetSigningConfiguration covers the repository, a failed or absent DescribeImageSigningStatus result fails. Model data named by ModelDataUrl fails without a ModelDataETag, which only a model package container can record, so a plain model records its expected value through ModelDataSource.S3DataSource.ETag instead. An S3 ModelDataSource or additional model data source fails without an ETag or ManifestEtag unless it is SageMaker hub content. A container with an HF_MODEL_ID environment key and no model data fails. Each artifact bucket must default to aws:kms or aws:kms:dsse with a named key. An endpoint with an unread repository, signing status, model or bucket reports N/A, never Passed. Partial, ceiling reached: a recorded ETag says an expected value is recorded, and no AWS API returns whether SageMaker or the container compared it with the object at load time. Weights fetched by container startup code, and models loaded on ECS, EKS or EC2, are not read",
+      "extra_iam": [],
+      "phase": 6,
+      "tier": "foundation",
+      "source": "controls/ai-specific/selfhosted-compute.yaml"
+    },
+    {
       "control": "AIR-FND-DET-10",
       "area": "FND",
       "question": "Are coordination-level metrics for multi-agent workflows \u2014 inter-agent message rates, per-agent-pair error rates, workflow execution frequency, and communication topology \u2014 baselined and alarmed on, rather than only each agent's own health and error metrics?",
@@ -2592,28 +2641,11 @@
       "target_modules": [],
       "incumbents": [],
       "incumbent_names": [],
-      "gap": "The review queue and its backlog metrics are customer-built and customer-named, and no AWS API identifies which queue holds agent decisions awaiting review.",
+      "gap": "The review queue and its backlog metrics are customer-built and customer-named, and no AWS API identifies which queue holds agent decisions awaiting review. Amazon Augmented AI (A2I), the AWS service for human review of model output, cannot carry the control either. A flow definition's HumanLoopConfig names a work team, a task count and time limits but has no priority field. ListHumanLoops and DescribeHumanLoop return a loop's status, flow definition and output location, so a backlog of InProgress loops can be counted, but they return no reviewer and no review-quality field. Nothing on a flow definition marks it as holding agent decisions.",
       "extra_iam": [],
       "phase": null,
       "tier": "foundation",
       "source": "controls/baseline/governance-compliance.yaml"
-    },
-    {
-      "control": "AIR-SLF-CMP-08",
-      "area": "SLF",
-      "question": "For self-hosted models, are the model weights obtained from a verified source and integrity-checked before they are loaded, rather than pulled from a public hub and trusted on arrival?",
-      "assert": "Recorded expected digest for each deployed model + the load-time verification step that compares against it, plus the KMS key protecting the artifact at rest",
-      "workload_agnostic": false,
-      "verdict": "not_implementable",
-      "disposition": null,
-      "target_modules": [],
-      "incumbents": [],
-      "incumbent_names": [],
-      "gap": "The digest check runs inside the workload's own startup code, and no AWS API records the expected digest or whether it was verified before the weights loaded.",
-      "extra_iam": [],
-      "phase": null,
-      "tier": "foundation",
-      "source": "controls/ai-specific/selfhosted-compute.yaml"
     }
   ]
 }

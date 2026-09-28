@@ -536,8 +536,37 @@ class TestSeverityCollapseDisclosure(unittest.TestCase):
         self.assertIn("keep four levels", methodology)
 
 
+class TestBatchGuardrailLeg(unittest.TestCase):
+    """AISF-07 needs SM-42 beside SM-18.
+
+    SM-18 reads the transform jobs that exist. SM-42 reads the preventive
+    guardrail on CreateModel and CreateTransformJob, which the control's
+    resolution asks for across both actions. A job-only verdict published
+    Passed for an account whose guardrail was absent.
+    """
+
+    def _ai07(self, statuses):
+        rows = aisf_mappings.derive_aisf_findings(
+            [_source_row(cid, status) for cid, status in statuses.items()]
+        )
+        return _derived_by_id(rows)["AISF-07"]
+
+    def test_a_failed_guardrail_fails_the_control(self):
+        row = self._ai07({"SM-18": "Passed", "SM-42": "Failed"})
+        self.assertEqual(row["Status"], "Failed")
+
+    def test_jobs_alone_do_not_publish_a_pass(self):
+        row = self._ai07({"SM-18": "Passed"})
+        self.assertEqual(row["Status"], "N/A")
+        self.assertIn("SM-42", row["Finding_Details"])
+
+    def test_both_legs_passed_is_passed(self):
+        row = self._ai07({"SM-18": "Passed", "SM-42": "Passed"})
+        self.assertEqual(row["Status"], "Passed")
+
+
 class TestMultiLegAggregation(unittest.TestCase):
-    """AISF-08 is the only multi-leg mapping: SM-09, SM-01 and SM-03."""
+    """AISF-08, the three-leg mapping: SM-09, SM-01 and SM-03."""
 
     LEGS = ("SM-09", "SM-01", "SM-03")
 
@@ -696,6 +725,106 @@ class TestNotApplicableSeverity(unittest.TestCase):
         by_account = {r["Account_ID"]: r for r in rows if r["Check_ID"] == "AISF-03"}
         self.assertEqual(by_account["111122223333"]["Status"], "Passed")
         self.assertEqual(by_account["444455556666"]["Status"], "Failed")
+
+
+class TestGlobalSourceRows(unittest.TestCase):
+    """A source check's `Global` rows are account-wide and reach every Region.
+
+    `BR-37` and `SM-09` each emit one leg once per account under `Global` and
+    another per Region. The live run `ed125508` produced a `Global` Failed plus
+    a `us-east-1` Passed for `BR-37`, so a join on the literal Region published
+    `AISF-06` as Passed for `us-east-1`.
+    """
+
+    def _by_key(self, rows, check_id):
+        return {
+            (r["Account_ID"], r["Region"]): r for r in rows if r["Check_ID"] == check_id
+        }
+
+    def test_a_global_failure_fails_the_regional_verdict(self):
+        rows = aisf_mappings.derive_aisf_findings(
+            [
+                _source_row("BR-37", "Failed", region="Global"),
+                _source_row("BR-37", "Passed", region="us-east-1"),
+            ]
+        )
+        row = self._by_key(rows, "AISF-06")[("111122223333", "us-east-1")]
+        self.assertEqual(row["Status"], "Failed")
+        self.assertIn("BR-37 (2 findings: 1 Failed, 1 Passed)", row["Finding_Details"])
+        self.assertIn("reported under Global", row["Finding_Details"])
+
+    def test_the_global_row_reaches_every_region_of_the_account(self):
+        rows = aisf_mappings.derive_aisf_findings(
+            [
+                _source_row("BR-37", "Passed", region="us-east-1"),
+                _source_row("BR-37", "Failed", region="Global"),
+                _source_row("BR-37", "Passed", region="eu-west-1"),
+            ]
+        )
+        by_key = self._by_key(rows, "AISF-06")
+        self.assertEqual(by_key[("111122223333", "us-east-1")]["Status"], "Failed")
+        self.assertEqual(by_key[("111122223333", "eu-west-1")]["Status"], "Failed")
+
+    def test_a_global_pass_leaves_a_regional_failure_failed(self):
+        rows = aisf_mappings.derive_aisf_findings(
+            [
+                _source_row("BR-37", "Passed", region="Global"),
+                _source_row("BR-37", "Failed", region="us-east-1"),
+                _source_row("BR-37", "Passed", region="eu-west-1"),
+            ]
+        )
+        by_key = self._by_key(rows, "AISF-06")
+        self.assertEqual(by_key[("111122223333", "us-east-1")]["Status"], "Failed")
+        self.assertEqual(by_key[("111122223333", "eu-west-1")]["Status"], "Passed")
+
+    def test_a_global_leg_completes_a_multi_leg_control(self):
+        """The live AISF-08 shape: SM-09 in both, SM-01 and SM-03 regional."""
+        rows = aisf_mappings.derive_aisf_findings(
+            [
+                _source_row("SM-09", "Failed", region="Global"),
+                _source_row("SM-09", "Passed"),
+                _source_row("SM-01", "Passed"),
+                _source_row("SM-03", "Passed"),
+            ]
+        )
+        by_key = self._by_key(rows, "AISF-08")
+        self.assertEqual(by_key[("111122223333", "us-east-1")]["Status"], "Failed")
+
+    def test_no_global_key_beside_a_regional_one(self):
+        rows = aisf_mappings.derive_aisf_findings(
+            [
+                _source_row("SM-09", "Failed", region="Global"),
+                _source_row("SM-01", "Passed"),
+                _source_row("SM-03", "Passed"),
+            ]
+        )
+        self.assertNotIn("Global", {r["Region"] for r in rows})
+        row = self._by_key(rows, "AISF-08")[("111122223333", "us-east-1")]
+        self.assertEqual(row["Status"], "Failed")
+
+    def test_an_account_with_only_global_rows_keeps_its_global_key(self):
+        rows = aisf_mappings.derive_aisf_findings(
+            [_source_row("BR-37", "Failed", region="Global")]
+        )
+        row = self._by_key(rows, "AISF-06")[("111122223333", "Global")]
+        self.assertEqual(row["Status"], "Failed")
+        self.assertNotIn("reported under Global", row["Finding_Details"])
+
+    def test_a_global_row_does_not_cross_accounts(self):
+        rows = aisf_mappings.derive_aisf_findings(
+            [
+                _source_row("BR-37", "Failed", region="Global", account="111122223333"),
+                _source_row("BR-37", "Passed", account="111122223333"),
+                _source_row("BR-37", "Passed", account="444455556666"),
+            ]
+        )
+        by_key = self._by_key(rows, "AISF-06")
+        self.assertEqual(by_key[("111122223333", "us-east-1")]["Status"], "Failed")
+        self.assertEqual(by_key[("444455556666", "us-east-1")]["Status"], "Passed")
+        self.assertNotIn(
+            "reported under Global",
+            by_key[("444455556666", "us-east-1")]["Finding_Details"],
+        )
 
 
 def _listbucket_prefix_patterns():

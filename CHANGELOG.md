@@ -12,6 +12,33 @@ section.
 
 ### Added
 
+- Added `SM-43` Model Artifact Integrity, growing the catalog from 275 to 276
+  checks (161 core). It covers AISF `AIR-SLF-CMP-08`, which the ledger had
+  marked `not_implementable`, over the containers every InService endpoint
+  serves, including model package and inference component containers. An
+  image passes when it is pinned by digest or by a tag its ECR repository
+  holds immutable, read through the repository's exclusion filters. When a
+  managed signing rule of the registry covers the repository, the image also
+  needs a `COMPLETE` signing status, read by the digest the endpoint resolved
+  the image to. S3 model data passes when an `ETag`, `ManifestEtag` or
+  `ModelDataETag` is recorded, or when it comes from SageMaker hub content; a
+  bare `ModelDataUrl` fails, and so does an `HF_MODEL_ID` environment key
+  with no model data. Only environment keys are read. Each artifact bucket
+  needs SSE-KMS under a named key. A denied read leaves the endpoint `N/A`
+  naming the permission. The row says an expected value is recorded, never
+  that it was compared at load time, and names weights fetched by startup
+  code, and models loaded on ECS, EKS or EC2, as not read.
+- Added `SM-42` Batch Transform Creation Guardrail, growing the catalog from
+  274 to 275 checks (160 core). It runs the `SM-34` legs over `CreateModel`
+  and `CreateTransformJob` only, so AISF `AIR-SGM-EP-08` can cite a verdict
+  that a training or notebook gap does not fail. It runs in each scanned
+  Region, so its rows join the `SM-18` transform job rows on account and
+  Region.
+- `SM-34`, `SM-42` and `SM-09` give no credit to a negated condition operator
+  on `sagemaker:VpcSubnets` or `sagemaker:VpcSecurityGroupIds` with no
+  `ForAllValues` or `ForAnyValue` prefix, or to an Allow on either key with no
+  set operator. IAM defines a multivalued key only under a set operator, and
+  the row names the operator as undefined.
 - Added `BR-57` Agent Handoff Source Identity, growing the catalog from 273
   to 274 checks (159 core). It covers AISF `AIR-SLF-AGT-05`, which the ledger
   had marked `not_implementable`. It fails a Bedrock collaborator that runs as
@@ -59,6 +86,16 @@ section.
   The 19 foundation controls that waited on those checks and legs are
   `covered`, and the new check ids carry their AISF control in the
   `Compliance_Frameworks` column.
+- `AIR-SGM-EP-03` moves from `not_implementable` to `covered` by `SM-11` and
+  `SM-14`, bringing the ledger to 101 `covered` and 4 `not_implementable`.
+  Its one unread field, inter-container traffic encryption, is named in the
+  ledger gap: `EnableInterContainerTrafficEncryption` is on the training,
+  processing and tuning job APIs and on no endpoint API. Seven checks that
+  already asserted part of a covered control now carry it in the
+  `Compliance_Frameworks` column: `SM-23` on `AIR-SGM-EP-06`, `SM-34` on
+  `AIR-SGM-TRN-01`, `AC-48` on `AIR-ACR-RT-03`, `AC-49` on `AIR-ACR-RT-08`,
+  `AG-39` on `AIR-FND-NET-08`, `AC-18` on `AIR-ACR-GW-10` and `AC-19` on
+  `AIR-ACR-MEM-12`. No check logic or IAM grant changes.
 - Added `AC-50` and `AC-51`, and extended `AC-26`. The assessment role gains
   one read-only permission, `ecr:GetRegistryScanningConfiguration`.
   - `AC-50` fails an AgentCore image repository that Amazon Inspector enhanced
@@ -293,6 +330,44 @@ section.
   from identity policies when no SCP carries it. `BR-48` compares `optOut`
   exactly and no longer says the policy covers Amazon Bedrock. `BR-02`
   credits an endpoint policy scope only on exact values under one condition.
+- `SM-37` endpoint network alerting names, for each alarm a passing endpoint
+  relies on, when the metric alarm last entered `ALARM`, read from its
+  `StateUpdate` history with `cloudwatch:DescribeAlarmHistory`. A denied or
+  empty history is named and does not change the status. A composite route
+  also names when the composite alarm that carries the action last entered
+  `ALARM`, read with the `CompositeAlarm` alarm type.
+- `SM-03` reads the encryption of an EFS or FSx for Lustre file system a
+  training job reads through `FileSystemDataSource`. An unencrypted file
+  system fails, an AWS managed key or the Amazon FSx service key of a
+  `SCRATCH` Lustre file system counts as not customer managed, and a
+  customer managed key joins the key-manager leg. A file system that cannot
+  be read, or returns no key, holds back `Passed` and is named.
+- `SM-36` names what stays unread when a Security Hub configuration policy
+  governs the Region: the policy's enabled standards and controls, returned
+  only by `securityhub:GetConfigurationPolicy`, which only the delegated
+  administrator can call from its home Region. The row names the policy id
+  to confirm there.
+- `SM-37` endpoint network alerting credits a metric alarm with no action of
+  its own when a composite alarm with an action names it in an `ALARM()` term
+  joined only by `OR`, including through a nested composite. A rule holding
+  `AND`, `NOT`, `OK()`, `INSUFFICIENT_DATA()`, `TRUE` or `FALSE` credits
+  nothing. Each passing endpoint names the alarm and its current
+  `StateValue`. CloudWatch returns composite alarms only to
+  `cloudwatch:DescribeAlarms` on `*`, so this credit takes effect once the
+  grant change under Deployment impact is deployed; before that no composite
+  is returned and a composite route reads as unactioned.
+- `SM-43` judges every specification of an inference component created with
+  several (`Specifications`), where `DescribeInferenceComponent` returns no
+  `Specification`. It judges only `InService` components hosted on the
+  endpoint, and a component that returns no model name, image or artifact URL
+  holds back `Passed` and is named. The resolution says a component whose
+  container names an S3 `ArtifactUrl` has no ETag field, so the component
+  should reference a model whose `ModelDataSource` records the ETag.
+- `SM-34` and `SM-42` no longer say a principal "can call it with no
+  condition on that key" when its Allow or Deny names the key without
+  enforcing it, for example a Null-only Deny or a bare negated operator on a
+  multivalued key. Those principals are named separately as calling it under
+  a condition that does not enforce the key.
 - `AC-04` no longer fails every runtime. It read `loggingConfig` and
   `tracingConfig` from `GetAgentRuntime`, which returns neither, so each
   runtime failed both legs whatever its configuration. It now reports one row
@@ -344,6 +419,22 @@ section.
   forwarded bus only when its rule has one. Before, any target passed, so a
   rule delivering only to a CloudWatch Logs group or an API destination
   passed; it now fails.
+- `AR-10` evaluates the `prefix`, `suffix`, `wildcard`, `equals-ignore-case`,
+  `anything-but`, `exists` and `numeric` matchers on `source` and
+  `detail-type`. Before, any content matcher made a rule `N/A`, so a rule on
+  `{"prefix": "aws.s3"}` was reported as undecidable, and one on
+  `{"prefix": "aws.agent-"}` that routes every approval event was not
+  credited. A rule that stays undecidable, now one using `$or` or a matcher
+  the check does not evaluate, or one whose targets cannot be read, no longer
+  leaves a `Failed` beside its `N/A` saying no rule routes the approval
+  events. The same applies on a forwarded bus whose rules cannot be listed.
+  No IAM grant changes.
+- `AR-01` fails a wildcard `agent-registry` action on a resource ARN with a
+  wildcard in any segment, such as `arn:aws:agent-registry:*:*:*` or
+  `registry/*`, and on a `NotResource`. Before, only a literal `Resource: "*"`
+  counted, so `agent-registry:Get*` on `arn:aws:agent-registry:*:*:*` passed
+  with a finding saying no principal held a wildcard grant on all resources.
+  No IAM grant changes.
 - `AC-01`, `SM-10`, `SM-33` and `BR-39` read more of the AI compute
   population for AIR-FND-NET-01. `AC-01` fails a custom Code Interpreter or
   Browser in a subnet whose route table routes to an internet gateway, fails a
@@ -822,6 +913,25 @@ fail recording browsers that passed before.
 AgentCore role already holds on this account's keys in the
 `PolicyEngineKeyStateRead` Sid. A memory whose key lives in another account
 reads `N/A`.
+
+The SageMaker assessment role gains seven read-only actions in both SAM
+templates: `ecr:DescribeRepositories` and `ecr:DescribeImageSigningStatus` on
+the account's repositories (`ModelImageRepositoryRead`, for `SM-43`),
+`elasticfilesystem:DescribeFileSystems` on the account's file systems
+(`TrainingFileSystemRead`, for `SM-03`), `ecr:GetSigningConfiguration`,
+`fsx:DescribeFileSystems` and `sagemaker:ListInferenceComponents` (for
+`SM-43` and `SM-03`) on `*` in `ApprovedInventoryWithoutResourceType`,
+because none has a resource type in the service authorization reference, and
+`cloudwatch:DescribeAlarmHistory` (for `SM-37`) on `*` in the new
+`CompositeAlarmRead` Sid. The role's `cloudwatch:DescribeAlarms` grant (for
+`SM-23`, `SM-31` and `SM-37`) moves from the account's alarms to `*` in the
+same Sid, which replaces `FlowLogAlarmRead`. The CloudWatch API reference for
+both actions says composite alarm information is returned only when the
+permission is scoped to `*`. Until the stack is redeployed, `SM-43` reads
+each tag-pinned image and each inference component endpoint as `N/A`, `SM-03`
+names each training file system as not read, and `SM-37` receives no
+composite alarms. `SM-43` reads artifact bucket encryption through the
+existing `s3:GetEncryptionConfiguration` grant.
 
 The IAM permissions cache role gains `iam:GetRole` on the account's roles and
 `iam:GetUser` on its users in both SAM templates, because only those calls
