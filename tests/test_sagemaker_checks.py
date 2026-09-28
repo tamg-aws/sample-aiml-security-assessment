@@ -7099,8 +7099,10 @@ class TestSM37EndpointFlowLogAlerting:
         filters=None,
         alarms=None,
         errors=None,
+        composites=None,
     ):
         errors = errors or {}
+        composites = composites or []
         endpoints = (
             endpoints
             if endpoints is not None
@@ -7205,7 +7207,10 @@ class TestSM37EndpointFlowLogAlerting:
         def describe_alarms(AlarmTypes):
             if "describe_alarms" in errors:
                 raise errors["describe_alarms"]
-            return [{"MetricAlarms": alarms[:1]}, {"MetricAlarms": alarms[1:]}]
+            pages = [{"MetricAlarms": alarms[:1]}, {"MetricAlarms": alarms[1:]}]
+            if "CompositeAlarm" in AlarmTypes:
+                pages[1]["CompositeAlarms"] = composites
+            return pages
 
         cloudwatch = MagicMock()
         cloudwatch.get_paginator.side_effect = _pager(
@@ -7467,6 +7472,136 @@ class TestSM37EndpointFlowLogAlerting:
         rows = self._run(mock_client, endpoints={}, models={})
         assert [r["Status"] for r in rows] == ["N/A"]
         assert "No SageMaker endpoints" in rows[0]["Finding_Details"]
+
+    def _composite(self, rule, name="page-oncall", **overrides):
+        composite = {
+            "AlarmName": name,
+            "AlarmRule": rule,
+            "ActionsEnabled": True,
+            "AlarmActions": ["arn:aws:sns:us-east-1:111122223333:alerts"],
+        }
+        composite.update(overrides)
+        return composite
+
+    def _silent_alarm(self):
+        return self._alarm(
+            ActionsEnabled=False,
+            AlarmActions=[],
+            AlarmArn="arn:aws:cloudwatch:us-east-1:111122223333:alarm:egress",
+            StateValue="OK",
+        )
+
+    @pytest.mark.parametrize(
+        "rule",
+        [
+            'ALARM("egress")',
+            "ALARM(egress) OR ALARM(other)",
+            '(ALARM("arn:aws:cloudwatch:us-east-1:111122223333:alarm:egress"))',
+        ],
+    )
+    @patch("sagemaker_app.boto3.client")
+    def test_a_silent_alarm_actioned_by_a_composite_passes(self, mock_client, rule):
+        rows = self._run(
+            mock_client,
+            alarms=[self._silent_alarm()],
+            composites=[self._composite(rule)],
+        )
+        assert [r["Status"] for r in rows] == ["Passed"]
+        details = rows[0]["Finding_Details"]
+        assert (
+            "log group /flow/a, alarm 'egress' in state OK, actioned through "
+            "composite alarm 'page-oncall'"
+        ) in details
+        assert "current StateValue" in details
+
+    @pytest.mark.parametrize(
+        "composite",
+        [
+            {"AlarmRule": "ALARM(egress) AND ALARM(other)"},
+            {"AlarmRule": "NOT ALARM(egress)"},
+            {"AlarmRule": "ALARM(egress) AND NOT ALARM(deploying)"},
+            {"AlarmRule": "(ALARM(egress) OR ALARM(other)) AND OK(network)"},
+            {"AlarmRule": "ALARM(egress) OR TRUE"},
+            {"AlarmRule": "ALARM(egress)", "ActionsEnabled": False},
+            {"AlarmRule": "ALARM(egress)", "AlarmActions": []},
+            {"AlarmRule": "ALARM(egress-other)"},
+        ],
+    )
+    @patch("sagemaker_app.boto3.client")
+    def test_a_composite_that_does_not_carry_the_alarm_fails(
+        self, mock_client, composite
+    ):
+        rows = self._run(
+            mock_client,
+            alarms=[self._silent_alarm()],
+            composites=[self._composite(composite.pop("AlarmRule"), **composite)],
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert (
+            "2 endpoint(s) have no network anomaly alerting"
+            in (rows[0]["Finding_Details"])
+        )
+
+    @patch("sagemaker_app.boto3.client")
+    def test_a_nested_composite_carries_the_action_of_its_parent(self, mock_client):
+        rows = self._run(
+            mock_client,
+            alarms=[self._silent_alarm()],
+            composites=[
+                self._composite("ALARM(page-oncall)", name="top"),
+                self._composite(
+                    "ALARM(egress)",
+                    ActionsEnabled=False,
+                    AlarmActions=[],
+                ),
+            ],
+        )
+        assert [r["Status"] for r in rows] == ["Passed"]
+        assert "actioned through composite alarm 'top'" in rows[0]["Finding_Details"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_a_composite_credits_only_the_endpoint_whose_metric_it_names(
+        self, mock_client
+    ):
+        filter_b = {
+            "logGroupName": "/flow/b",
+            "metricTransformations": [
+                {"metricNamespace": "Flow", "metricName": "EgressB"}
+            ],
+        }
+        rows = self._run(
+            mock_client,
+            flow_logs=[self._flow_log("vpc-1"), self._flow_log("vpc-2", "/flow/b")],
+            filters={
+                "/flow/a": [
+                    {
+                        "logGroupName": "/flow/a",
+                        "metricTransformations": [
+                            {"metricNamespace": "Flow", "metricName": "Egress"}
+                        ],
+                    }
+                ],
+                "/flow/b": [filter_b],
+            },
+            alarms=[
+                self._silent_alarm(),
+                self._alarm("EgressB", AlarmName="egress-b", ActionsEnabled=False),
+            ],
+            composites=[self._composite("ALARM(egress)")],
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        details = rows[0]["Finding_Details"]
+        assert "1 endpoint(s) have no network anomaly alerting" in details
+        assert "endpoint 'ep-2': flow log group(s) /flow/b" in details
+        assert "endpoint 'ep-1'" not in details
+
+    @patch("sagemaker_app.boto3.client")
+    def test_an_alarm_with_its_own_action_names_its_state(self, mock_client):
+        rows = self._run(mock_client, alarms=[self._alarm(StateValue="ALARM")])
+        assert [r["Status"] for r in rows] == ["Passed"]
+        details = rows[0]["Finding_Details"]
+        assert "log group /flow/a, alarm 'egress' in state ALARM)" in details
+        assert "actioned through" not in details
 
 
 class TestSM37GuardDutyLambdaNetworkLogs:
@@ -13852,6 +13987,84 @@ class TestSM34ValuePinning:
         )
         assert leg["state"] == "open"
         assert leg["principals"] == ["Role 'Bare'"]
+
+    def _wording_cache(self):
+        bare = _scp_deny(
+            "sagemaker:Create*", "StringNotEquals", "sagemaker:VpcSubnets", ["subnet-1"]
+        )
+        null_only = _scp_deny(
+            "sagemaker:Create*", "Null", "sagemaker:VpcSubnets", "true"
+        )
+        null_allow = {
+            "Effect": "Allow",
+            "Action": "sagemaker:*",
+            "Resource": "*",
+            "Condition": {"Null": {"sagemaker:VpcSubnets": "false"}},
+        }
+        return _creation_cache(
+            {
+                "Open": [OPEN_SAGEMAKER_ALLOW],
+                "Bare": [OPEN_SAGEMAKER_ALLOW, bare],
+                "NullOnly": [OPEN_SAGEMAKER_ALLOW, null_only],
+                "NullAllow": [null_allow],
+            }
+        )
+
+    @pytest.mark.parametrize(
+        "scp_statements, status",
+        [
+            ([], "Failed"),
+            (
+                [
+                    _scp_deny(
+                        "sagemaker:Create*",
+                        "StringEquals",
+                        "sagemaker:VpcSubnets",
+                        "subnet-bad",
+                    )
+                ],
+                "N/A",
+            ),
+        ],
+    )
+    def test_a_principal_with_a_non_enforcing_condition_is_not_called_unconditioned(
+        self, scp_statements, status
+    ):
+        row = self._rows(scp_statements, cache=self._wording_cache())[
+            "approved network"
+        ]
+        details = row["Finding_Details"]
+        assert row["Status"] == status
+        assert "Role 'Open' can call it with no condition on that key" in details
+        assert (
+            "Role 'Bare', Role 'NullOnly', Role 'NullAllow' can call it under a "
+            "condition on that key that does not enforce it"
+        ) in details
+        for name in ("Bare", "NullOnly", "NullAllow"):
+            assert f"Role '{name}' can call it with no condition" not in details
+            assert f"Role '{name}', Role 'Open'" not in details
+        assert "Role 'Open', Role" not in details
+
+    def test_only_conditioned_principals_never_read_as_unconditioned(self):
+        cache = self._wording_cache()
+        del cache["role_permissions"]["Open"]
+        details = self._rows([], cache=cache)["approved network"]["Finding_Details"]
+        assert "with no condition on that key" not in details
+        assert "that does not enforce it" in details
+
+    def test_six_conditioned_principals_are_truncated_with_a_count(self):
+        null_only = _scp_deny(
+            "sagemaker:Create*", "Null", "sagemaker:VpcSubnets", "true"
+        )
+        cache = _creation_cache(
+            {f"R{i}": [OPEN_SAGEMAKER_ALLOW, null_only] for i in range(6)}
+        )
+        details = self._rows([], cache=cache)["approved network"]["Finding_Details"]
+        assert (
+            "Role 'R4' and 1 more can call it under a condition on that key that "
+            "does not enforce it"
+        ) in details
+        assert "Role 'R5'" not in details
 
 
 BATCH_SCP_DENIES = [
