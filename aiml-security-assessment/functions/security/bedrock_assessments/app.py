@@ -7,7 +7,7 @@ import time
 from typing import Dict, List, Any, Optional
 from io import StringIO
 from botocore.config import Config
-from botocore.exceptions import ClientError, EndpointConnectionError
+from botocore.exceptions import BotoCoreError, ClientError, EndpointConnectionError
 import random
 import re
 import json
@@ -3894,189 +3894,525 @@ def check_bedrock_knowledge_base_encryption(region: str = "") -> Dict[str, Any]:
         }
 
 
+GUARDRAIL_IAM_REFERENCE = "https://docs.aws.amazon.com/bedrock/latest/userguide/guardrails-permissions-id.html"
+
+# Positive tests that bind an Allow to the guardrails they name. An absent key
+# never matches them, so a request with no guardrail is not allowed. IfExists
+# and ForAllValues: are true when the key is absent, so they bind nothing.
+GUARDRAIL_ALLOW_OPERATORS = (
+    "stringequals",
+    "stringequalsignorecase",
+    "stringlike",
+    "arnequals",
+    "arnlike",
+)
+
+MAX_GUARDRAIL_VERSION_READS = 20
+
+
+def _guardrail_allow_binding(statement: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Say whether an Allow statement requires one of a named set of guardrails.
+
+    Returns {"bound": bool, "values": [...], "reason": str}. The statement is
+    bound only when some bedrock:GuardrailIdentifier test uses a positive
+    operator with no IfExists or ForAllValues: form and every value names one
+    guardrail with no wildcard.
+    """
+    reasons = []
+    for operator, key, values in _condition_keys_by_operator(statement):
+        if key != GUARDRAIL_CONDITION_KEY:
+            continue
+        base = _strip_condition_set_operator(operator)
+        if operator.startswith("forallvalues:"):
+            reasons.append(
+                f"{operator} is true when the key is absent, so a request with "
+                "no guardrail is allowed"
+            )
+        elif base.endswith("ifexists"):
+            reasons.append(
+                f"{operator} is true when the key is absent, so a request with "
+                "no guardrail is allowed"
+            )
+        elif base not in GUARDRAIL_ALLOW_OPERATORS:
+            reasons.append(
+                f"{operator} on {GUARDRAIL_CONDITION_KEY} allows every guardrail "
+                "it does not name, and a request with none"
+            )
+        elif not values or any(
+            not isinstance(value, str) or "*" in value or "?" in value
+            for value in values
+        ):
+            reasons.append(
+                "its guardrail value {} carries a wildcard, which leaves the "
+                "guardrail unbounded".format(
+                    ", ".join(str(value) for value in values) or "is empty and"
+                )
+            )
+        else:
+            return {
+                "bound": True,
+                "values": [value.strip() for value in values],
+                "reason": "",
+            }
+    return {
+        "bound": False,
+        "values": [],
+        "reason": "; ".join(reasons)
+        or f"it carries no {GUARDRAIL_CONDITION_KEY} condition",
+    }
+
+
+def _parse_guardrail_reference(value: str, region: str) -> Dict[str, str]:
+    """Split a guardrail condition value into Region, identifier and version."""
+    if value.startswith("arn:"):
+        parts = value.split(":")
+        resource = parts[5] if len(parts) > 5 else ""
+        return {
+            "region": parts[3] if len(parts) > 3 else "",
+            "identifier": ":".join(parts[:6]),
+            "version": parts[6].strip() if len(parts) > 6 else "",
+            "id": resource.split("/", 1)[1] if "/" in resource else resource,
+        }
+    identifier, _, version = value.partition(":")
+    return {
+        "region": region,
+        "identifier": identifier,
+        "version": version.strip(),
+        "id": identifier,
+    }
+
+
+def _guardrail_directions(detail: Dict[str, Any]) -> Dict[str, bool]:
+    """
+    Say whether a guardrail version evaluates the input and the output.
+
+    Each content filter, denied topic, word, managed word list, PII entity and
+    regex carries inputEnabled and outputEnabled, which default to enabled when
+    absent. Contextual grounding and Automated Reasoning evaluate the response
+    only.
+    """
+    elements = []
+    content = detail.get("contentPolicy") or {}
+    elements += content.get("filters") or []
+    topics = detail.get("topicPolicy") or {}
+    elements += topics.get("topics") or []
+    words = detail.get("wordPolicy") or {}
+    elements += words.get("words") or []
+    elements += words.get("managedWordLists") or []
+    sensitive = detail.get("sensitiveInformationPolicy") or {}
+    elements += sensitive.get("piiEntities") or []
+    elements += sensitive.get("regexes") or []
+    elements = [element for element in elements if isinstance(element, dict)]
+    grounding = [
+        grounding_filter
+        for grounding_filter in (detail.get("contextualGroundingPolicy") or {}).get(
+            "filters"
+        )
+        or []
+        if isinstance(grounding_filter, dict)
+        and grounding_filter.get("enabled") is not False
+    ]
+    return {
+        "input": any(element.get("inputEnabled") is not False for element in elements),
+        "output": any(element.get("outputEnabled") is not False for element in elements)
+        or bool(grounding)
+        or bool(detail.get("automatedReasoningPolicy")),
+    }
+
+
+def _read_guardrail_directions(
+    value: str, region: str, clients: Dict[str, Any]
+) -> Dict[str, Any]:
+    """
+    Read every version a guardrail condition value lets a caller name, and say
+    which of them skip the input or the output.
+
+    A value with no version lets the caller name the working draft or any
+    published version, so each is read.
+    """
+    reference = _parse_guardrail_reference(value, region)
+    target_region = reference["region"] or region
+    if target_region not in clients:
+        clients[target_region] = boto3.client(
+            "bedrock", config=boto3_config, region_name=target_region
+        )
+    client = clients[target_region]
+    result = {"value": value, "missing": False, "unread": "", "gaps": []}
+    versions = [reference["version"]] if reference["version"] else []
+    try:
+        if not versions:
+            summaries = _list_all_items(
+                client,
+                "list_guardrails",
+                "guardrails",
+                guardrailIdentifier=reference["identifier"],
+            )
+            versions = sorted(
+                {
+                    str(summary.get("version"))
+                    for summary in summaries
+                    if isinstance(summary, dict) and summary.get("version")
+                }
+                | {GUARDRAIL_DRAFT_VERSION}
+            )
+        if len(versions) > MAX_GUARDRAIL_VERSION_READS:
+            result["unread"] = (
+                f"{len(versions)} versions exceed the read cap of "
+                f"{MAX_GUARDRAIL_VERSION_READS}"
+            )
+            return result
+        for version in versions:
+            detail = client.get_guardrail(
+                guardrailIdentifier=reference["identifier"],
+                guardrailVersion=version,
+            )
+            directions = _guardrail_directions(detail)
+            skipped = [side for side in ("input", "output") if not directions[side]]
+            if skipped:
+                result["gaps"].append(
+                    "version {} evaluates no {}".format(
+                        version, " and no ".join(skipped)
+                    )
+                )
+    except ClientError as error:
+        if error.response.get("Error", {}).get("Code") == "ResourceNotFoundException":
+            result["missing"] = True
+        else:
+            result["unread"] = get_assessment_error_label(error)
+    except BotoCoreError as error:
+        result["unread"] = get_assessment_error_label(error)
+    return result
+
+
 def check_bedrock_guardrail_iam_enforcement(
     permission_cache, region: str = ""
 ) -> Dict[str, Any]:
     """
-    Check if IAM policies enforce the use of specific guardrails via
-    the bedrock:GuardrailIdentifier condition key
+    BR-10: Verify every role and user that can invoke a model must name an
+    approved guardrail, and that each guardrail it may name evaluates both the
+    input and the output.
+
+    Each Allow statement granting bedrock:InvokeModel or
+    bedrock:InvokeModelWithResponseStream (which also authorize Converse and
+    ConverseStream) is judged on its own: a guardrail condition on one statement
+    does not bound another. A statement is bound when it tests
+    bedrock:GuardrailIdentifier with a positive operator whose values each name
+    one guardrail, or when a Deny on the identity or its permissions boundary
+    requires a named guardrail, or when the boundary allows the action only under
+    such a test. Group policies and permissions boundaries are read with the
+    role and user policies.
     """
     logger.debug("Starting check for Bedrock Guardrail IAM enforcement")
+    check_name = "Bedrock Guardrail IAM Enforcement Check"
     try:
         findings = {
-            "check_name": "Bedrock Guardrail IAM Enforcement Check",
+            "check_name": check_name,
             "status": "PASS",
             "details": "",
             "csv_data": [],
         }
 
-        bedrock_client = boto3.client(
-            "bedrock", config=boto3_config, region_name=region
-        )
-
-        # First check if any guardrails exist
-        try:
-            guardrails = _list_all_items(
-                bedrock_client, "list_guardrails", "guardrails"
-            )
-
-            if not guardrails:
-                findings["csv_data"].append(
-                    create_finding(
-                        check_id="BR-10",
-                        finding_name="Bedrock Guardrail IAM Enforcement Check",
-                        finding_details="No guardrails configured - IAM enforcement check not applicable",
-                        resolution="Configure Bedrock Guardrails first, then enforce their use via IAM policies",
-                        reference="https://docs.aws.amazon.com/bedrock/latest/userguide/guardrails-permissions-id.html",
-                        severity="Informational",
-                        status="N/A",
-                        region=region,
-                    )
-                )
-                return findings
-
-        except Exception as e:
-            logger.warning(f"Error listing guardrails: {str(e)}")
-
-        # Check IAM policies for guardrail enforcement
-        roles_without_enforcement = []
-        roles_with_enforcement = []
-
-        for role_name, permissions in permission_cache.get(
-            "role_permissions", {}
-        ).items():
-            has_bedrock_invoke = False
-            has_guardrail_condition = False
-
-            all_policies = permissions.get("attached_policies", []) + permissions.get(
-                "inline_policies", []
-            )
-
-            for policy in all_policies:
-                policy_doc = policy.get("document", {})
-
+        clients = {
+            region: boto3.client("bedrock", config=boto3_config, region_name=region)
+        }
+        unbound = []
+        bound = []
+        unparsed = []
+        named_values = {}
+        for collection, kind in (
+            ("role_permissions", "role"),
+            ("user_permissions", "user"),
+        ):
+            for name, permissions in (permission_cache.get(collection) or {}).items():
+                label = f"{kind} '{name}'"
+                policies = _cached_identity_policies(permissions)
+                boundary = _boundary_document(permissions)
+                deny_documents = [policy.get("document") for _, policy in policies]
+                if boundary is not None:
+                    deny_documents.append(boundary)
+                denied_unless_named = set()
+                identity_values = []
                 try:
-                    if isinstance(policy_doc, str):
-                        policy_doc = json.loads(policy_doc)
-
-                    if not policy_doc:
+                    for document in deny_documents:
+                        for statement in _policy_statements(document):
+                            actions = _scp_guardrail_controls(
+                                {"Statement": [statement]}
+                            )["actions"]
+                            if not actions:
+                                continue
+                            denied_unless_named.update(actions)
+                            identity_values.extend(
+                                str(value).strip()
+                                for _, key, values in _condition_keys_by_operator(
+                                    statement
+                                )
+                                if key == GUARDRAIL_CONDITION_KEY
+                                for value in values
+                            )
+                except (ValueError, TypeError) as error:
+                    unparsed.append(f"{label} ({get_assessment_error_label(error)})")
+                    continue
+                gaps = []
+                invocable = False
+                for action in GUARDRAIL_INVOKE_ACTIONS:
+                    if _boundary_allowance(permissions, action) == "denied":
                         continue
-
-                    statements = policy_doc.get("Statement", [])
-                    if isinstance(statements, dict):
-                        statements = [statements]
-
-                    for statement in statements:
-                        if statement.get("Effect", "").upper() != "ALLOW":
-                            continue
-
-                        actions = statement.get("Action", [])
-                        if isinstance(actions, str):
-                            actions = [actions]
-
-                        # Check if policy allows InvokeModel or InvokeModelWithResponseStream
-                        for action in actions:
-                            if any(
-                                invoke_action in action.lower()
-                                for invoke_action in [
-                                    "bedrock:invokemodel",
-                                    "bedrock:*",
-                                    "bedrock:invoke*",
-                                ]
+                    allowing = []
+                    for source, policy in policies:
+                        policy_label = "{} '{}'".format(
+                            source,
+                            policy.get("policy_name")
+                            or policy.get("name")
+                            or "unnamed",
+                        )
+                        for statement in _policy_statements(policy.get("document")):
+                            if str(
+                                statement.get("Effect", "")
+                            ).upper() == "ALLOW" and _statement_matches_action(
+                                statement, action
                             ):
-                                has_bedrock_invoke = True
-
-                                # Check for guardrail condition
-                                conditions = statement.get("Condition", {})
-                                for (
-                                    condition_operator,
-                                    condition_keys,
-                                ) in conditions.items():
-                                    if isinstance(condition_keys, dict):
-                                        for key in condition_keys.keys():
-                                            if (
-                                                "bedrock:guardrailidentifier"
-                                                in key.lower()
-                                            ):
-                                                has_guardrail_condition = True
-                                                break
-
-                except Exception as e:
-                    logger.warning(
-                        f"Error parsing policy for role {role_name}: {str(e)}"
-                    )
-
-            if has_bedrock_invoke:
-                if has_guardrail_condition:
-                    roles_with_enforcement.append(role_name)
+                                allowing.append((policy_label, statement))
+                    if not allowing:
+                        continue
+                    invocable = True
+                    if action in denied_unless_named:
+                        continue
+                    boundary_bindings = [
+                        _guardrail_allow_binding(statement)
+                        for statement in _policy_statements(boundary)
+                        if str(statement.get("Effect", "")).upper() == "ALLOW"
+                        and _statement_matches_action(statement, action)
+                    ]
+                    if boundary_bindings and all(
+                        binding["bound"] for binding in boundary_bindings
+                    ):
+                        for binding in boundary_bindings:
+                            identity_values.extend(binding["values"])
+                        continue
+                    for policy_label, statement in allowing:
+                        binding = _guardrail_allow_binding(statement)
+                        if binding["bound"]:
+                            identity_values.extend(binding["values"])
+                            continue
+                        statement_label = (
+                            f"statement '{statement['Sid']}'"
+                            if statement.get("Sid")
+                            else "a statement"
+                        )
+                        gaps.append(
+                            f"{statement_label} in {policy_label} allows {action}: "
+                            f"{binding['reason']}"
+                        )
+                if not invocable:
+                    continue
+                if gaps:
+                    unbound.append((label, gaps))
                 else:
-                    roles_without_enforcement.append(role_name)
+                    bound.append(label)
+                    for value in identity_values:
+                        named_values.setdefault(value, set()).add(label)
 
-        if roles_without_enforcement:
+        if unparsed:
+            findings["csv_data"].append(
+                create_finding(
+                    check_id="BR-10",
+                    finding_name=check_name,
+                    finding_details=(
+                        "{} identity/identities hold a policy document that could "
+                        "not be parsed, so their invoke grants were not judged: "
+                        "{}.".format(len(unparsed), "; ".join(unparsed[:5]))
+                    ),
+                    resolution=(
+                        "Review the IAM Permission Caching task output for these "
+                        "policies, then rerun the assessment."
+                    ),
+                    reference=GUARDRAIL_IAM_REFERENCE,
+                    severity="Informational",
+                    status="N/A",
+                    region=region,
+                )
+            )
+
+        if not unbound and not bound and not unparsed:
+            findings["csv_data"].append(
+                create_finding(
+                    check_id="BR-10",
+                    finding_name=check_name,
+                    finding_details=(
+                        "No cached role or user policy allows bedrock:InvokeModel or "
+                        "bedrock:InvokeModelWithResponseStream, so there is no "
+                        "identity whose guardrail enforcement can be assessed."
+                    ),
+                    resolution="No action required",
+                    reference=GUARDRAIL_IAM_REFERENCE,
+                    severity="Informational",
+                    status="N/A",
+                    region=region,
+                )
+            )
+            return _apply_cache_population_gaps(
+                findings,
+                permission_cache,
+                "BR-10",
+                check_name,
+                GUARDRAIL_IAM_REFERENCE,
+                region,
+            )
+
+        if unbound:
             findings["status"] = "WARN"
             findings["details"] = (
-                f"Found {len(roles_without_enforcement)} roles with Bedrock invoke permissions but no guardrail enforcement"
+                f"Found {len(unbound)} identities with Bedrock invoke permissions "
+                "but no guardrail enforcement"
             )
-
             findings["csv_data"].append(
                 create_finding(
                     check_id="BR-10",
                     finding_name="Bedrock Guardrail IAM Enforcement Missing",
-                    finding_details=f"The following roles can invoke Bedrock models without enforced guardrails: {', '.join(roles_without_enforcement[:10])}{'...' if len(roles_without_enforcement) > 10 else ''}",
-                    resolution="Add IAM policy conditions to enforce guardrail usage:\n"
-                    + "1. Use 'bedrock:GuardrailIdentifier' condition key\n"
-                    + "2. Specify required guardrail ARN or ID\n"
-                    + '3. Example: "Condition": {"StringEquals": {"bedrock:GuardrailIdentifier": "arn:aws:bedrock:region:account:guardrail/guardrail-id"}}',
-                    reference="https://docs.aws.amazon.com/bedrock/latest/userguide/guardrails-permissions-id.html",
+                    finding_details=(
+                        "{} of {} identity/identities that can invoke a model may do "
+                        "so without naming an approved guardrail: {}{}. {}".format(
+                            len(unbound),
+                            len(unbound) + len(bound),
+                            "; ".join(
+                                "{} ({})".format(label, "; ".join(gaps[:3]))
+                                for label, gaps in unbound[:10]
+                            ),
+                            "; and {} more".format(len(unbound) - 10)
+                            if len(unbound) > 10
+                            else "",
+                            SCP_NOT_EVALUATED_NOTE,
+                        )
+                    ),
+                    resolution=(
+                        "Condition every Allow on bedrock:InvokeModel and "
+                        "bedrock:InvokeModelWithResponseStream on the approved "
+                        'guardrail, for example "Condition": {"StringEquals": '
+                        '{"bedrock:GuardrailIdentifier": '
+                        '"arn:aws:bedrock:region:account:guardrail/guardrail-id:1"}}, '
+                        "or deny both actions unless the request names it with "
+                        "StringNotEquals."
+                    ),
+                    reference=GUARDRAIL_IAM_REFERENCE,
                     severity="High",
                     status="Failed",
                     region=region,
                 )
             )
-        else:
-            if not roles_with_enforcement:
-                # No roles with Bedrock invoke permissions - N/A (nothing to check)
-                findings["csv_data"].append(
-                    create_finding(
-                        check_id="BR-10",
-                        finding_name="Bedrock Guardrail IAM Enforcement Check",
-                        finding_details="No roles with Bedrock invoke permissions found",
-                        resolution="No action required",
-                        reference="https://docs.aws.amazon.com/bedrock/latest/userguide/guardrails-permissions-id.html",
-                        severity="Informational",
-                        status="N/A",
-                        region=region,
-                    )
-                )
-            else:
-                # Roles exist and all have guardrail enforcement - Passed
-                findings["csv_data"].append(
-                    create_finding(
-                        check_id="BR-10",
-                        finding_name="Bedrock Guardrail IAM Enforcement Check",
-                        finding_details=f"All {len(roles_with_enforcement)} roles with Bedrock invoke permissions have guardrail enforcement",
-                        resolution="No action required",
-                        reference="https://docs.aws.amazon.com/bedrock/latest/userguide/guardrails-permissions-id.html",
-                        severity="Medium",
-                        status="Passed",
-                        region=region,
+
+        direction_gaps = []
+        missing = []
+        unread = []
+        for value in sorted(named_values):
+            reading = _read_guardrail_directions(value, region, clients)
+            holders = ", ".join(sorted(named_values[value])[:3])
+            if reading["unread"]:
+                unread.append(f"{value} ({reading['unread']})")
+            elif reading["missing"]:
+                missing.append(value)
+            elif reading["gaps"]:
+                direction_gaps.append(
+                    "{} named by {}: {}".format(
+                        value, holders, "; ".join(reading["gaps"])
                     )
                 )
 
-        return findings
+        if direction_gaps:
+            findings["status"] = "WARN"
+            findings["csv_data"].append(
+                create_finding(
+                    check_id="BR-10",
+                    finding_name="Bedrock Guardrail IAM Enforcement Missing",
+                    finding_details=(
+                        "{} guardrail(s) that IAM requires on invocation skip the "
+                        "input or the output path, so content in that direction "
+                        "reaches the model or the caller unevaluated: {}.".format(
+                            len(direction_gaps), "; ".join(direction_gaps[:5])
+                        )
+                    ),
+                    resolution=(
+                        "Enable input and output evaluation on at least one policy "
+                        "of each version the identities may name, or pin the "
+                        "condition to a version that evaluates both."
+                    ),
+                    reference=GUARDRAIL_IAM_REFERENCE,
+                    severity="High",
+                    status="Failed",
+                    region=region,
+                )
+            )
+
+        if unread:
+            findings["csv_data"].append(
+                create_finding(
+                    check_id="BR-10",
+                    finding_name=check_name,
+                    finding_details=(
+                        "{} guardrail(s) named by an IAM condition could not be "
+                        "read, so whether they evaluate input and output is not "
+                        "known: {}.".format(len(unread), "; ".join(unread[:5]))
+                    ),
+                    resolution=COULD_NOT_ASSESS_RESOLUTION,
+                    reference=GUARDRAIL_IAM_REFERENCE,
+                    severity="Informational",
+                    status="N/A",
+                    region=region,
+                )
+            )
+
+        if bound and not direction_gaps:
+            findings["csv_data"].append(
+                create_finding(
+                    check_id="BR-10",
+                    finding_name=check_name,
+                    finding_details=(
+                        "{} of {} identity/identities that can invoke a model must "
+                        "name an approved guardrail on every invoke grant: {}. Each "
+                        "guardrail version they may name evaluates both input and "
+                        "output{}.{} {}".format(
+                            len(bound),
+                            len(bound) + len(unbound),
+                            ", ".join(bound[:10]),
+                            " among those read" if unread else "",
+                            " {} named guardrail(s) do not exist, so the grants "
+                            "naming them cannot be exercised: {}.".format(
+                                len(missing), ", ".join(missing[:5])
+                            )
+                            if missing
+                            else "",
+                            SCP_NOT_EVALUATED_NOTE,
+                        )
+                    ),
+                    resolution="No action required",
+                    reference=GUARDRAIL_IAM_REFERENCE,
+                    severity="Medium",
+                    status="N/A" if unread or unparsed else "Passed",
+                    region=region,
+                )
+            )
+
+        return _apply_cache_population_gaps(
+            findings,
+            permission_cache,
+            "BR-10",
+            check_name,
+            GUARDRAIL_IAM_REFERENCE,
+            region,
+        )
 
     except Exception as e:
         logger.error(
             f"Error in check_bedrock_guardrail_iam_enforcement: {str(e)}", exc_info=True
         )
         return {
-            "check_name": "Bedrock Guardrail IAM Enforcement Check",
+            "check_name": check_name,
             "status": "ERROR",
             "details": f"Error during check: {str(e)}",
             "csv_data": [
                 create_finding(
                     check_id="BR-10",
-                    finding_name="Bedrock Guardrail IAM Enforcement Check",
+                    finding_name=check_name,
                     finding_details=build_could_not_assess_detail(e, region),
                     resolution=COULD_NOT_ASSESS_RESOLUTION,
                     reference="https://docs.aws.amazon.com/bedrock/latest/userguide/security.html",
@@ -18750,12 +19086,13 @@ def _statement_requires_guardrail_identifier(statement: Dict[str, Any]) -> bool:
     approved guardrail and permits every other value, and a negated operator
     matches when the key is absent, which is what blocks an unguarded call.
     ``Null`` has to be true for the same reason: Null false denies exactly the
-    requests that do name a guardrail.
+    requests that do name a guardrail. ForAnyValue: over a negated test is false
+    when the key is absent, so it denies nothing unguarded.
     """
     for operator, key, values in _condition_keys_by_operator(statement):
-        operator = _strip_condition_set_operator(operator)
-        if GUARDRAIL_CONDITION_KEY not in key:
+        if key != GUARDRAIL_CONDITION_KEY or operator.startswith("foranyvalue:"):
             continue
+        operator = _strip_condition_set_operator(operator)
         if operator == "null":
             if values and all(str(value).strip().lower() == "true" for value in values):
                 return True
@@ -18766,29 +19103,50 @@ def _statement_requires_guardrail_identifier(statement: Dict[str, Any]) -> bool:
 
 
 def _statement_invoke_actions(statement: Dict[str, Any]) -> List[str]:
-    """Return the guardrail-capable invoke actions one statement's Action covers."""
-    actions = _as_list(statement.get("Action"))
+    """Return the guardrail-capable invoke actions a statement's Action or NotAction covers."""
     return [
         invoke_action
         for invoke_action in GUARDRAIL_ENFORCED_INVOKE_ACTIONS
-        if any(
-            _action_pattern_covers(action, invoke_action.lower()) for action in actions
-        )
+        if _statement_matches_action(statement, invoke_action.lower())
     ]
 
 
-def _identity_guardrail_deny_coverage(policies: List[Dict[str, Any]]) -> Dict[str, Any]:
+def _identity_guardrail_deny_coverage(
+    policies: List[Dict[str, Any]], permissions: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
     """
     Describe how far an identity's policies deny unguarded model invocation.
 
     ``allowed`` is what the identity may invoke and ``denied`` is what a
     conditioned Deny takes back, so the gap between them is the set of actions
-    the identity can still call with no guardrail attached.
+    the identity can still call with no guardrail attached. When
+    ``permissions`` carries a permissions boundary, an action the boundary does
+    not allow is not granted, and a Deny in the boundary counts as a Deny.
     """
     allowed = set()
     denied = set()
     uncredited = []
     unreadable = []
+    boundary = _boundary_document(permissions or {})
+    boundary_denied = {
+        action
+        for action in GUARDRAIL_ENFORCED_INVOKE_ACTIONS
+        if boundary is not None
+        and _boundary_allowance(permissions, action.lower()) == "denied"
+    }
+    if boundary is not None:
+        policies = list(policies) + [
+            {
+                "name": "permissions boundary",
+                "document": {
+                    "Statement": [
+                        statement
+                        for statement in _policy_statements(boundary)
+                        if str(statement.get("Effect", "")).upper() == "DENY"
+                    ]
+                },
+            }
+        ]
 
     for policy in policies:
         document = policy.get("document")
@@ -18810,11 +19168,27 @@ def _identity_guardrail_deny_coverage(policies: List[Dict[str, Any]]) -> Dict[st
 
             effect = str(statement.get("Effect", "")).upper()
             if effect == "ALLOW":
-                allowed.update(covered)
+                allowed.update(set(covered) - boundary_denied)
                 continue
             if effect != "DENY":
                 continue
             if not _statement_requires_guardrail_identifier(statement):
+                continue
+
+            other_keys = sorted(
+                {
+                    key
+                    for _, key, _ in _condition_keys_by_operator(statement)
+                    if key != GUARDRAIL_CONDITION_KEY
+                }
+            )
+            if other_keys:
+                uncredited.append(
+                    "a Deny on {} is also conditioned on {}, which narrows it to "
+                    "part of the requests".format(
+                        ", ".join(covered), ", ".join(other_keys)
+                    )
+                )
                 continue
 
             resources = _as_list(statement.get("Resource"))
@@ -18876,8 +19250,11 @@ def check_bedrock_guardrail_invocation_deny(
                 identities.append(
                     (
                         f"{kind} '{name}'",
-                        (permissions.get("attached_policies") or [])
-                        + (permissions.get("inline_policies") or []),
+                        [
+                            policy
+                            for _, policy in _cached_identity_policies(permissions)
+                        ],
+                        permissions,
                     )
                 )
 
@@ -18885,12 +19262,14 @@ def check_bedrock_guardrail_invocation_deny(
         guarded = []
         notes = []
         unread_surfaces = (
-            "Group policies, permissions boundaries and service control policies "
-            "(SCPs) are not read, so a Deny placed in one of them is not credited."
+            "Group policies and permissions boundaries are read with the role and "
+            "user policies; service control policies are not evaluated per "
+            "principal, so a Deny placed in one is not credited here and BR-41 "
+            "assesses it."
         )
 
-        for label, policies in identities:
-            coverage = _identity_guardrail_deny_coverage(policies)
+        for label, policies, permissions in identities:
+            coverage = _identity_guardrail_deny_coverage(policies, permissions)
             notes.extend(f"{label}: {note}" for note in coverage["unreadable"])
             if not coverage["allowed"]:
                 continue
@@ -18925,7 +19304,14 @@ def check_bedrock_guardrail_invocation_deny(
                     region=region,
                 )
             )
-            return findings
+            return _apply_cache_population_gaps(
+                findings,
+                permission_cache,
+                "BR-49",
+                check_name,
+                GUARDRAIL_DENY_REFERENCE,
+                region,
+            )
 
         for entry in unguarded[:MAX_REPORTED_UNGUARDED_IDENTITIES]:
             coverage = entry["coverage"]
@@ -19039,7 +19425,14 @@ def check_bedrock_guardrail_invocation_deny(
                 )
             )
 
-        return findings
+        return _apply_cache_population_gaps(
+            findings,
+            permission_cache,
+            "BR-49",
+            check_name,
+            GUARDRAIL_DENY_REFERENCE,
+            region,
+        )
 
     except Exception as e:
         logger.error(

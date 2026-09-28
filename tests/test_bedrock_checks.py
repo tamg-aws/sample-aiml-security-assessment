@@ -2436,6 +2436,399 @@ class TestBR10GuardrailIAMEnforcement:
             assert_finding_schema(f)
 
 
+GR_ARN = "arn:aws:bedrock:us-east-1:123456789012:guardrail/abc123"
+_INVOKE_BOTH = ["bedrock:InvokeModel", "bedrock:InvokeModelWithResponseStream"]
+
+
+def _br10_allow(condition=None, sid=None, actions=None, not_action=None):
+    statement = {"Effect": "Allow", "Resource": "*"}
+    if not_action is not None:
+        statement["NotAction"] = not_action
+    else:
+        statement["Action"] = actions or _INVOKE_BOTH
+    if condition is not None:
+        statement["Condition"] = condition
+    if sid:
+        statement["Sid"] = sid
+    return statement
+
+
+def _br10_bound(value=GR_ARN, operator="StringEquals", **kwargs):
+    return _br10_allow(
+        condition={operator: {"bedrock:GuardrailIdentifier": value}}, **kwargs
+    )
+
+
+def _br10_identity(*statements, boundary=None, groups=None):
+    identity = {
+        "attached_policies": [
+            {
+                "name": "Invoke",
+                "arn": "arn:aws:iam::123456789012:policy/Invoke",
+                "document": {"Version": "2012-10-17", "Statement": list(statements)},
+            }
+        ],
+        "inline_policies": [],
+    }
+    if boundary is not None:
+        identity["permissions_boundary"] = {
+            "arn": "arn:aws:iam::123456789012:policy/Boundary",
+            "document": {"Version": "2012-10-17", "Statement": boundary},
+        }
+    if groups is not None:
+        identity["group_policies"] = groups
+    return identity
+
+
+def _br10_cache(roles=None, users=None, errors=None):
+    cache = {"role_permissions": roles or {}, "user_permissions": users or {}}
+    if errors is not None:
+        cache["cache_schema_version"] = 2
+        cache["principal_errors"] = errors
+    return cache
+
+
+_BOTH_DIRECTIONS = {"contentPolicy": {"filters": [{"type": "PROMPT_ATTACK"}]}}
+
+
+class TestBR10GuardrailBinding:
+    """BR-10 judges each invoke grant of every role and user on its value."""
+
+    def _run(self, cache, guardrail=None, versions=None, client=None):
+        bedrock_client = client or MagicMock()
+        if client is None:
+            bedrock_client.get_guardrail.return_value = guardrail or _BOTH_DIRECTIONS
+            bedrock_client.list_guardrails.return_value = {
+                "guardrails": [{"id": "abc123", "version": v} for v in versions or []]
+            }
+        with patch("bedrock_app.boto3.client", return_value=bedrock_client):
+            result = bedrock_app.check_bedrock_guardrail_iam_enforcement(
+                cache, region="us-east-1"
+            )
+        findings = extract_csv_data(result)
+        for finding in findings:
+            assert_finding_schema(finding)
+        return findings, bedrock_client
+
+    def test_user_with_unbound_invoke_fails_beside_a_bound_role(self):
+        findings, _ = self._run(
+            _br10_cache(
+                roles={"BoundRole": _br10_identity(_br10_bound())},
+                users={"OpenUser": _br10_identity(_br10_allow())},
+            )
+        )
+
+        assert [f["Status"] for f in findings] == ["Failed", "Passed"]
+        assert "user 'OpenUser'" in findings[0]["Finding_Details"]
+        assert "1 of 2 identity/identities" in findings[0]["Finding_Details"]
+        assert "role 'BoundRole'" in findings[1]["Finding_Details"]
+        assert "role 'BoundRole'" not in findings[0]["Finding_Details"]
+
+    def test_group_policy_grant_on_a_user_is_judged(self):
+        findings, _ = self._run(
+            _br10_cache(
+                users={
+                    "GroupUser": _br10_identity(
+                        _br10_bound(),
+                        groups=[
+                            {
+                                "group": "Builders",
+                                "name": "GroupInvoke",
+                                "arn": "arn:aws:iam::123456789012:policy/GroupInvoke",
+                                "document": {"Statement": [_br10_allow(sid="Open")]},
+                            }
+                        ],
+                    )
+                }
+            )
+        )
+
+        assert [f["Status"] for f in findings] == ["Failed"]
+        assert (
+            "statement 'Open' in policy attached to group 'Builders'"
+            in findings[0]["Finding_Details"]
+        )
+
+    def test_one_bound_statement_does_not_excuse_another(self):
+        findings, _ = self._run(
+            _br10_cache(
+                roles={
+                    "MixedRole": _br10_identity(
+                        _br10_bound(sid="Bound"), _br10_allow(sid="Unbound")
+                    ),
+                    "BoundRole": _br10_identity(_br10_bound()),
+                }
+            )
+        )
+
+        assert [f["Status"] for f in findings] == ["Failed", "Passed"]
+        details = findings[0]["Finding_Details"]
+        assert "role 'MixedRole'" in details
+        assert "statement 'Unbound'" in details
+        assert "statement 'Bound'" not in details
+        assert "role 'BoundRole'" in findings[1]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "operator,value,reason",
+        [
+            ("StringNotEquals", GR_ARN, "allows every guardrail it does not name"),
+            ("StringEqualsIfExists", GR_ARN, "is true when the key is absent"),
+            ("ForAllValues:StringEquals", GR_ARN, "is true when the key is absent"),
+            ("StringLike", "arn:aws:bedrock:us-east-1:*:guardrail/abc123", "wildcard"),
+            ("StringEquals", ["*"], "wildcard"),
+        ],
+    )
+    def test_a_condition_that_does_not_bind_the_guardrail_fails(
+        self, operator, value, reason
+    ):
+        findings, _ = self._run(
+            _br10_cache(
+                roles={
+                    "LooseRole": _br10_identity(_br10_bound(value, operator)),
+                    "BoundRole": _br10_identity(_br10_bound()),
+                }
+            )
+        )
+
+        assert [f["Status"] for f in findings] == ["Failed", "Passed"]
+        assert "role 'LooseRole'" in findings[0]["Finding_Details"]
+        assert reason in findings[0]["Finding_Details"]
+
+    def test_not_action_allow_is_an_invoke_grant(self):
+        findings, _ = self._run(
+            _br10_cache(
+                roles={"NotActionRole": _br10_identity(_br10_allow(not_action="s3:*"))}
+            )
+        )
+
+        assert [f["Status"] for f in findings] == ["Failed"]
+        assert "role 'NotActionRole'" in findings[0]["Finding_Details"]
+
+    def test_a_deny_naming_the_guardrail_binds_an_unconditioned_allow(self):
+        deny = {
+            "Effect": "Deny",
+            "Action": _INVOKE_BOTH,
+            "Resource": "*",
+            "Condition": {"StringNotEquals": {"bedrock:GuardrailIdentifier": GR_ARN}},
+        }
+        null_deny = dict(
+            deny, Condition={"Null": {"bedrock:GuardrailIdentifier": "true"}}
+        )
+        findings, client = self._run(
+            _br10_cache(
+                roles={
+                    "DenyRole": _br10_identity(_br10_allow(), deny),
+                    "NullRole": _br10_identity(_br10_allow(), null_deny),
+                }
+            )
+        )
+
+        assert [f["Status"] for f in findings] == ["Failed", "Passed"]
+        assert "role 'NullRole'" in findings[0]["Finding_Details"]
+        assert "role 'DenyRole'" in findings[1]["Finding_Details"]
+        client.list_guardrails.assert_called_once()
+        assert client.get_guardrail.call_args.kwargs["guardrailIdentifier"] == GR_ARN
+
+    def test_a_boundary_that_binds_the_guardrail_bounds_the_grant(self):
+        findings, _ = self._run(
+            _br10_cache(
+                roles={
+                    "BoundaryRole": _br10_identity(
+                        _br10_allow(), boundary=[_br10_bound()]
+                    ),
+                    "OpenBoundaryRole": _br10_identity(
+                        _br10_allow(), boundary=[_br10_allow()]
+                    ),
+                }
+            )
+        )
+
+        assert [f["Status"] for f in findings] == ["Failed", "Passed"]
+        assert "role 'OpenBoundaryRole'" in findings[0]["Finding_Details"]
+        assert "role 'BoundaryRole'" in findings[1]["Finding_Details"]
+
+    def test_a_boundary_that_grants_no_invoke_removes_the_identity(self):
+        findings, _ = self._run(
+            _br10_cache(
+                roles={
+                    "ReadOnlyRole": _br10_identity(
+                        _br10_allow(),
+                        boundary=[
+                            {
+                                "Effect": "Allow",
+                                "Action": "bedrock:List*",
+                                "Resource": "*",
+                            }
+                        ],
+                    )
+                }
+            )
+        )
+
+        assert [f["Status"] for f in findings] == ["N/A"]
+        assert (
+            "no identity whose guardrail enforcement" in findings[0]["Finding_Details"]
+        )
+
+    def test_a_guardrail_that_skips_the_output_fails(self):
+        guardrail = {
+            "contentPolicy": {
+                "filters": [
+                    {"type": "PROMPT_ATTACK", "outputEnabled": False},
+                    {"type": "HATE", "inputEnabled": True, "outputEnabled": False},
+                ]
+            }
+        }
+        findings, _ = self._run(
+            _br10_cache(
+                roles={"BoundRole": _br10_identity(_br10_bound(GR_ARN + ":1"))}
+            ),
+            guardrail=guardrail,
+        )
+
+        assert [f["Status"] for f in findings] == ["Failed"]
+        assert "version 1 evaluates no output" in findings[0]["Finding_Details"]
+        assert "role 'BoundRole'" in findings[0]["Finding_Details"]
+
+    def test_output_only_grounding_does_not_cover_the_input(self):
+        guardrail = {
+            "contextualGroundingPolicy": {
+                "filters": [{"type": "GROUNDING", "threshold": 0.8}]
+            }
+        }
+        findings, _ = self._run(
+            _br10_cache(
+                roles={"BoundRole": _br10_identity(_br10_bound(GR_ARN + ":2"))}
+            ),
+            guardrail=guardrail,
+        )
+
+        assert [f["Status"] for f in findings] == ["Failed"]
+        assert "version 2 evaluates no input" in findings[0]["Finding_Details"]
+
+    def test_an_unversioned_value_reads_every_version(self):
+        client = MagicMock()
+        client.list_guardrails.return_value = {
+            "guardrails": [
+                {"id": "abc123", "version": "1"},
+                {"id": "abc123", "version": "2"},
+            ]
+        }
+
+        def get_guardrail(guardrailIdentifier, guardrailVersion):
+            if guardrailVersion == "2":
+                return {
+                    "topicPolicy": {"topics": [{"name": "t", "inputEnabled": False}]}
+                }
+            return _BOTH_DIRECTIONS
+
+        client.get_guardrail.side_effect = get_guardrail
+        findings, _ = self._run(
+            _br10_cache(
+                roles={
+                    "OpenVersionRole": _br10_identity(_br10_bound()),
+                    "PinnedRole": _br10_identity(_br10_bound(GR_ARN + ":1")),
+                }
+            ),
+            client=client,
+        )
+
+        assert [f["Status"] for f in findings] == ["Failed"]
+        details = findings[0]["Finding_Details"]
+        assert "version 2 evaluates no input" in details
+        assert "role 'OpenVersionRole'" in details
+        assert "PinnedRole" not in details
+        read = sorted(
+            c.kwargs["guardrailVersion"] for c in client.get_guardrail.call_args_list
+        )
+        assert read == ["1", "1", "2", "DRAFT"]
+
+    def test_an_unreadable_guardrail_leaves_no_passed_row(self):
+        client = MagicMock()
+        client.get_guardrail.side_effect = ClientError(
+            {"Error": {"Code": "AccessDeniedException", "Message": "no"}},
+            "GetGuardrail",
+        )
+        findings, _ = self._run(
+            _br10_cache(
+                roles={"BoundRole": _br10_identity(_br10_bound(GR_ARN + ":1"))}
+            ),
+            client=client,
+        )
+
+        assert [f["Status"] for f in findings] == ["N/A", "N/A"]
+        assert GR_ARN + ":1" in findings[0]["Finding_Details"]
+        assert "could not be read" in findings[0]["Finding_Details"]
+
+    def test_a_missing_guardrail_is_named_but_not_failed(self):
+        client = MagicMock()
+        client.get_guardrail.side_effect = ClientError(
+            {"Error": {"Code": "ResourceNotFoundException", "Message": "no"}},
+            "GetGuardrail",
+        )
+        findings, _ = self._run(
+            _br10_cache(
+                roles={"BoundRole": _br10_identity(_br10_bound(GR_ARN + ":1"))}
+            ),
+            client=client,
+        )
+
+        assert [f["Status"] for f in findings] == ["Passed"]
+        assert "do not exist" in findings[0]["Finding_Details"]
+
+    def test_a_guardrail_in_another_region_is_read_there(self):
+        other = "arn:aws:bedrock:eu-west-1:123456789012:guardrail/xyz:3"
+        client = MagicMock()
+        client.get_guardrail.return_value = _BOTH_DIRECTIONS
+        with patch("bedrock_app.boto3.client", return_value=client) as factory:
+            bedrock_app.check_bedrock_guardrail_iam_enforcement(
+                _br10_cache(roles={"BoundRole": _br10_identity(_br10_bound(other))}),
+                region="us-east-1",
+            )
+
+        regions = [c.kwargs.get("region_name") for c in factory.call_args_list]
+        assert regions == ["us-east-1", "eu-west-1"]
+
+    def test_principal_errors_turn_a_passed_row_into_na(self):
+        findings, _ = self._run(
+            _br10_cache(
+                roles={"BoundRole": _br10_identity(_br10_bound())},
+                errors=[
+                    {
+                        "type": "user",
+                        "name": "Unread",
+                        "stage": "list_attached_user_policies",
+                        "error": "AccessDenied",
+                    }
+                ],
+            )
+        )
+
+        assert [f["Status"] for f in findings] == ["N/A", "N/A"]
+        assert "user 'Unread'" in findings[1]["Finding_Details"]
+
+    def test_a_version_one_cache_says_errors_were_not_recorded(self):
+        findings, _ = self._run(
+            _br10_cache(roles={"BoundRole": _br10_identity(_br10_bound())})
+        )
+
+        assert [f["Status"] for f in findings] == ["Passed"]
+        assert bedrock_app.IAM_CACHE_V1_NOTE in findings[0]["Finding_Details"]
+        assert bedrock_app.SCP_NOT_EVALUATED_NOTE in findings[0]["Finding_Details"]
+
+    def test_an_unparseable_policy_blocks_a_clean_pass(self):
+        broken = _br10_identity(_br10_bound())
+        broken["inline_policies"] = [{"name": "Broken", "document": "{not json"}]
+        findings, _ = self._run(
+            _br10_cache(
+                roles={"BrokenRole": broken, "BoundRole": _br10_identity(_br10_bound())}
+            )
+        )
+
+        assert [f["Status"] for f in findings] == ["N/A", "N/A"]
+        assert "role 'BrokenRole'" in findings[0]["Finding_Details"]
+
+
 # ===================================================================
 # BR-11: check_bedrock_custom_model_encryption
 # ===================================================================
@@ -12845,6 +13238,9 @@ class TestBR49GuardrailInvocationDeny:
         bedrock_client.list_guardrails.return_value = {
             "guardrails": [{"id": "gr-1", "name": "TestGuardrail"}]
         }
+        bedrock_client.get_guardrail.return_value = {
+            "contentPolicy": {"filters": [{"type": "PROMPT_ATTACK"}]}
+        }
         with patch("bedrock_app.boto3.client", return_value=bedrock_client):
             br10 = extract_csv_data(
                 bedrock_app.check_bedrock_guardrail_iam_enforcement(
@@ -13085,6 +13481,160 @@ class TestBR49GuardrailInvocationDeny:
             "may deny unguarded invocation in a statement this check did not read"
             in findings[1]["Finding_Details"]
         )
+
+    def test_br49_group_policy_allow_is_judged(self):
+        cache = _invoke_cache(
+            {
+                "Effect": "Allow",
+                "Action": "bedrock:ListFoundationModels",
+                "Resource": "*",
+            },
+            users={
+                "GroupUser": {
+                    "attached_policies": [],
+                    "inline_policies": [],
+                    "group_policies": [
+                        {
+                            "group": "Builders",
+                            "name": "GroupOpen",
+                            "document": {"Statement": [_ALLOW_ALL_BEDROCK]},
+                        }
+                    ],
+                },
+                "GuardedUser": {
+                    "attached_policies": [],
+                    "inline_policies": [],
+                    "group_policies": [
+                        {
+                            "group": "Guarded",
+                            "name": "GroupGuarded",
+                            "document": {
+                                "Statement": [
+                                    _ALLOW_ALL_BEDROCK,
+                                    _guardrail_deny_statement(),
+                                ]
+                            },
+                        }
+                    ],
+                },
+            },
+        )
+
+        findings = self._run(cache)
+
+        assert [f["Status"] for f in findings] == ["Failed", "Passed"]
+        assert "user 'GroupUser'" in findings[0]["Finding_Details"]
+        assert "user 'GuardedUser'" in findings[1]["Finding_Details"]
+
+    def test_br49_boundary_deny_is_credited(self):
+        cache = _invoke_cache(_ALLOW_ALL_BEDROCK)
+        cache["role_permissions"]["AppRole"]["permissions_boundary"] = {
+            "document": {"Statement": [_ALLOW_ALL_BEDROCK, _guardrail_deny_statement()]}
+        }
+        cache["role_permissions"]["OpenRole"] = {
+            "attached_policies": [
+                {"name": "Open", "document": {"Statement": [_ALLOW_ALL_BEDROCK]}}
+            ],
+            "inline_policies": [],
+            "permissions_boundary": {"document": {"Statement": [_ALLOW_ALL_BEDROCK]}},
+        }
+
+        findings = self._run(cache)
+
+        assert [f["Status"] for f in findings] == ["Failed", "Passed"]
+        assert "role 'OpenRole'" in findings[0]["Finding_Details"]
+        assert "role 'AppRole'" in findings[1]["Finding_Details"]
+
+    def test_br49_boundary_without_invoke_removes_the_grant(self):
+        cache = _invoke_cache(_ALLOW_ALL_BEDROCK)
+        cache["role_permissions"]["AppRole"]["permissions_boundary"] = {
+            "document": {
+                "Statement": [
+                    {"Effect": "Allow", "Action": "bedrock:List*", "Resource": "*"}
+                ]
+            }
+        }
+
+        findings = self._run(cache)
+
+        assert [f["Status"] for f in findings] == ["N/A"]
+
+    def test_br49_not_action_allow_and_deny_are_read(self):
+        not_action_allow = {"Effect": "Allow", "NotAction": "s3:*", "Resource": "*"}
+        not_action_deny = dict(_guardrail_deny_statement())
+        not_action_deny.pop("Action")
+        not_action_deny["NotAction"] = "s3:*"
+        cache = _invoke_cache(not_action_allow, not_action_deny)
+        cache["role_permissions"]["OpenRole"] = {
+            "attached_policies": [
+                {"name": "Open", "document": {"Statement": [not_action_allow]}}
+            ],
+            "inline_policies": [],
+        }
+
+        findings = self._run(cache)
+
+        assert [f["Status"] for f in findings] == ["Failed", "Passed"]
+        assert "role 'OpenRole'" in findings[0]["Finding_Details"]
+        assert "role 'AppRole'" in findings[1]["Finding_Details"]
+
+    def test_br49_a_deny_narrowed_by_another_key_is_not_credited(self):
+        narrowed = _guardrail_deny_statement()
+        narrowed["Condition"]["StringEquals"] = {"aws:RequestedRegion": "us-east-1"}
+        cache = _invoke_cache(_ALLOW_ALL_BEDROCK, narrowed)
+        cache["role_permissions"]["GuardedRole"] = {
+            "attached_policies": [
+                {
+                    "name": "Guarded",
+                    "document": {
+                        "Statement": [_ALLOW_ALL_BEDROCK, _guardrail_deny_statement()]
+                    },
+                }
+            ],
+            "inline_policies": [],
+        }
+
+        findings = self._run(cache)
+
+        assert [f["Status"] for f in findings] == ["Failed", "Passed"]
+        assert "role 'AppRole'" in findings[0]["Finding_Details"]
+        assert (
+            "also conditioned on aws:requestedregion" in findings[0]["Finding_Details"]
+        )
+        assert "role 'GuardedRole'" in findings[1]["Finding_Details"]
+
+    def test_br49_for_any_value_negated_deny_is_not_credited(self):
+        findings = self._run(
+            _invoke_cache(
+                _ALLOW_ALL_BEDROCK,
+                _guardrail_deny_statement(
+                    operator="ForAnyValue:StringNotEquals",
+                    value=["arn:aws:bedrock:us-east-1:123456789012:guardrail/abc123"],
+                ),
+            )
+        )
+
+        assert [f["Status"] for f in findings] == ["Failed"]
+
+    def test_br49_principal_errors_turn_a_passed_row_into_na(self):
+        cache = _invoke_cache(_ALLOW_ALL_BEDROCK, _guardrail_deny_statement())
+        cache["cache_schema_version"] = 2
+        cache["principal_errors"] = [
+            {"type": "role", "name": "Unread", "stage": "get_role_policy", "error": "x"}
+        ]
+
+        findings = self._run(cache)
+
+        assert [f["Status"] for f in findings] == ["N/A", "N/A"]
+        assert "role 'Unread'" in findings[1]["Finding_Details"]
+
+    def test_br49_failed_row_says_scps_are_not_evaluated_per_principal(self):
+        findings = self._run(_invoke_cache(_ALLOW_ALL_BEDROCK))
+
+        details = findings[0]["Finding_Details"]
+        assert "Group policies and permissions boundaries are read" in details
+        assert "not evaluated per principal" in details
+        assert "are not read" not in details
 
     def test_br49_exception_returns_could_not_assess(self):
         findings = self._run({"role_permissions": "not-a-dict"})
