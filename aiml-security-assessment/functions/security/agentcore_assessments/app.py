@@ -152,6 +152,10 @@ LOGS_RETENTION_REFERENCE_URL = (
     "https://docs.aws.amazon.com/AmazonCloudWatch/latest/logs/"
     "Working-with-log-groups-and-streams.html"
 )
+AGENTCORE_GATEWAY_ENCRYPTION_REFERENCE_URL = (
+    "https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/"
+    "gateway-encryption.html"
+)
 KMS_KEY_POLICY_REFERENCE_URL = (
     "https://docs.aws.amazon.com/kms/latest/developerguide/key-policies.html"
 )
@@ -8802,6 +8806,118 @@ def check_agentcore_policy_engine_encryption() -> List[Dict[str, Any]]:
     return findings
 
 
+# gateway-encryption.html: the example key policy allows the gateway service
+# role kms:Decrypt and kms:GenerateDataKey only through the AgentCore endpoint of
+# the gateway's region and only for the gateway's encryption context, and
+# kms:CreateGrant only through that endpoint for grants constrained by
+# encryption context.
+GATEWAY_ENCRYPTION_CONTEXT_KEY = (
+    "kms:encryptioncontext:aws:bedrock-agentcore-gateway:arn"
+)
+GATEWAY_KEY_CONTEXT_BOUND_ACTIONS = ("kms:Decrypt", "kms:GenerateDataKey")
+
+
+def _condition_binds_gateway_arn(
+    statement: Dict[str, Any], key: str, gateway_arn: str
+) -> bool:
+    """Return whether a positive condition limits `key` to this gateway's ARN.
+
+    Every value has to match the gateway ARN, and name its partition, service,
+    region, account and resource type without a wildcard, so `gateway/*` in
+    this account binds and `arn:aws:bedrock-agentcore:<region>:<account>:*` does
+    not. IfExists and ForAllValues
+    forms are true when the key is absent and do not bind.
+    """
+    condition = statement.get("Condition")
+    if not isinstance(condition, dict):
+        return False
+    target = gateway_arn.lower()
+    for operator, entries in condition.items():
+        if not isinstance(entries, dict):
+            continue
+        name = str(operator).strip().lower()
+        if name.startswith("forallvalues:") or name.endswith("ifexists"):
+            continue
+        if _normalized_condition_operator(name) not in CONDITION_EQUALS_OPERATORS:
+            continue
+        for entry_key, raw in entries.items():
+            if str(entry_key).strip().lower() != key:
+                continue
+            values = [value.strip().lower() for value in _condition_values(raw)]
+            if values and all(
+                len(value.split(":", 5)) == 6
+                and not any(
+                    wildcard in segment
+                    for segment in value.split(":", 5)[:5]
+                    + [value.split(":", 5)[5].split("/", 1)[0]]
+                    for wildcard in "*?"
+                )
+                and fnmatchcase(target, value)
+                for value in values
+            ):
+                return True
+    return False
+
+
+def _gateway_key_policy_gaps(policy_document: Any, gateway_arn: str) -> List[str]:
+    """Return the service-use scoping a gateway's key policy is missing.
+
+    kms:ViaService and kms:GrantConstraintType are absent from a request made
+    outside AgentCore or for an unconstrained grant, so their IfExists forms
+    scope nothing. A statement granting the same actions with no condition, such
+    as the account-root kms:* statement, is not subtracted.
+    """
+    via_service = f"bedrock-agentcore.{_arn_region(gateway_arn)}.amazonaws.com"
+    statements = _document_statements(policy_document, effect="Allow")
+
+    def via_agentcore(statement: Dict[str, Any]) -> bool:
+        return _condition_pins_value(
+            statement, "kms:viaservice", via_service, if_exists_counts=False
+        )
+
+    gaps: List[str] = []
+    unbound = [
+        action
+        for action in GATEWAY_KEY_CONTEXT_BOUND_ACTIONS
+        if not any(
+            _statement_matches_action(statement, action.lower())
+            and via_agentcore(statement)
+            and _condition_binds_gateway_arn(
+                statement, GATEWAY_ENCRYPTION_CONTEXT_KEY, gateway_arn
+            )
+            for statement in statements
+        )
+    ]
+    if unbound:
+        gaps.append(
+            f"has no statement allowing {', '.join(unbound)} only with "
+            f"kms:ViaService {via_service} and "
+            "kms:EncryptionContext:aws:bedrock-agentcore-gateway:arn naming "
+            f"{gateway_arn}"
+        )
+    if not any(
+        _statement_matches_action(statement, "kms:creategrant")
+        and via_agentcore(statement)
+        and _condition_pins_value(
+            statement,
+            "kms:grantconstrainttype",
+            "EncryptionContextSubset",
+            if_exists_counts=False,
+        )
+        for statement in statements
+    ):
+        gaps.append(
+            "has no statement allowing kms:CreateGrant only with kms:ViaService "
+            f"{via_service} and kms:GrantConstraintType EncryptionContextSubset"
+        )
+    if _kms_key_policy_allows_open_decrypt(policy_document):
+        gaps.append(
+            "lets every principal decrypt with no condition binding the caller's "
+            "account, organization, principal ARN or source"
+        )
+    return gaps
+
+
 def check_agentcore_gateway_encryption() -> List[Dict[str, Any]]:
     """
     Check if AgentCore Gateways are encrypted with customer-managed KMS keys.
@@ -8850,6 +8966,11 @@ def check_agentcore_gateway_encryption() -> List[Dict[str, Any]]:
 
             gateways_without_cmk = []
             gateways_with_cmk = []
+            gateways_key_unusable = []
+            gateways_key_unscoped = []
+            gateways_unreadable = []
+            key_metadata_cache: Dict[str, Any] = {}
+            key_policy_cache: Dict[str, Any] = {}
 
             for gateway in gateways:
                 gateway_id = gateway.get("gatewayId", "unknown")
@@ -8859,22 +8980,91 @@ def check_agentcore_gateway_encryption() -> List[Dict[str, Any]]:
                     gateway_details = agentcore_client.get_gateway(
                         gatewayIdentifier=gateway_id
                     )
-
-                    # Check for customer-managed KMS key
-                    encryption_key_arn = gateway_details.get(
-                        "kmsKeyArn"
-                    ) or gateway_details.get("encryptionKeyArn")
-
-                    if encryption_key_arn:
-                        gateways_with_cmk.append(gateway_name)
-                    else:
-                        gateways_without_cmk.append(
-                            {"name": gateway_name, "id": gateway_id}
-                        )
-
                 except ClientError as e:
-                    if e.response["Error"]["Code"] != "ResourceNotFoundException":
-                        logger.warning(f"Error getting gateway {gateway_id}: {e}")
+                    logger.warning(f"Error getting gateway {gateway_id}: {e}")
+                    gateways_unreadable.append(
+                        f"'{gateway_name}' (GetGateway: {_assessment_error_label(e)})"
+                    )
+                    continue
+
+                encryption_key_arn = gateway_details.get("kmsKeyArn")
+                if not encryption_key_arn:
+                    gateways_without_cmk.append(
+                        {"name": gateway_name, "id": gateway_id}
+                    )
+                    continue
+
+                if encryption_key_arn not in key_metadata_cache:
+                    try:
+                        key_metadata_cache[encryption_key_arn] = (
+                            kms_client.describe_key(KeyId=encryption_key_arn).get(
+                                "KeyMetadata"
+                            )
+                            or {}
+                        )
+                    except Exception as error:
+                        logger.warning(
+                            f"Could not describe key {encryption_key_arn}: {error}"
+                        )
+                        key_metadata_cache[encryption_key_arn] = error
+                metadata = key_metadata_cache[encryption_key_arn]
+                if isinstance(metadata, Exception):
+                    gateways_unreadable.append(
+                        f"'{gateway_name}' (kms:DescribeKey on {encryption_key_arn}: "
+                        f"{_assessment_error_label(metadata)})"
+                    )
+                    continue
+                if metadata.get("KeyManager") != "CUSTOMER":
+                    gateways_without_cmk.append(
+                        {
+                            "name": f"{gateway_name} (key {encryption_key_arn} is "
+                            f"managed by {metadata.get('KeyManager') or 'an unknown party'})",
+                            "id": gateway_id,
+                        }
+                    )
+                    continue
+                if metadata.get("KeyState") != "Enabled":
+                    gateways_key_unusable.append(
+                        f"'{gateway_name}' (key {encryption_key_arn} is "
+                        f"{metadata.get('KeyState') or 'in an unknown state'})"
+                    )
+                    continue
+
+                gateway_arn = gateway_details.get("gatewayArn")
+                if not gateway_arn:
+                    gateways_unreadable.append(
+                        f"'{gateway_name}' (GetGateway returned no gatewayArn, so "
+                        "the key policy's encryption context binding was not read)"
+                    )
+                    continue
+                if encryption_key_arn not in key_policy_cache:
+                    try:
+                        key_policy_cache[encryption_key_arn] = (
+                            kms_client.get_key_policy(KeyId=encryption_key_arn)[
+                                "Policy"
+                            ]
+                        )
+                    except Exception as error:
+                        logger.warning(
+                            f"Could not read key policy for {encryption_key_arn}: "
+                            f"{error}"
+                        )
+                        key_policy_cache[encryption_key_arn] = error
+                key_policy = key_policy_cache[encryption_key_arn]
+                if isinstance(key_policy, Exception):
+                    gateways_unreadable.append(
+                        f"'{gateway_name}' (kms:GetKeyPolicy on {encryption_key_arn}: "
+                        f"{_assessment_error_label(key_policy)})"
+                    )
+                    continue
+                gaps = _gateway_key_policy_gaps(key_policy, gateway_arn)
+                if gaps:
+                    gateways_key_unscoped.append(
+                        f"'{gateway_name}' (key {encryption_key_arn} "
+                        f"{' and '.join(gaps)})"
+                    )
+                else:
+                    gateways_with_cmk.append(gateway_name)
 
             if gateways_without_cmk:
                 gateway_list = ", ".join(
@@ -8894,14 +9084,97 @@ def check_agentcore_gateway_encryption() -> List[Dict[str, Any]]:
                     )
                 )
 
+            if gateways_key_unusable:
+                findings.append(
+                    create_finding(
+                        check_id="AC-12",
+                        finding_name="AgentCore Gateway Key Unusable",
+                        finding_details=(
+                            "The following Gateways are encrypted with a customer "
+                            "managed key that is not Enabled: "
+                            f"{', '.join(gateways_key_unusable)}. The gateway "
+                            "cannot decrypt its configuration, so its encrypted "
+                            "data is inaccessible."
+                        ),
+                        resolution=(
+                            "Re-enable the key or cancel its scheduled deletion, "
+                            "then confirm with kms:DescribeKey that its state is "
+                            "Enabled."
+                        ),
+                        reference=AGENTCORE_GATEWAY_ENCRYPTION_REFERENCE_URL,
+                        severity=SeverityEnum.HIGH,
+                        status=StatusEnum.FAILED,
+                    )
+                )
+
+            if gateways_key_unscoped:
+                findings.append(
+                    create_finding(
+                        check_id="AC-12",
+                        finding_name="AgentCore Gateway Key Policy Unscoped",
+                        finding_details=(
+                            "The key policy behind these Gateways does not confine "
+                            "the key to AgentCore's use for the gateway: "
+                            f"{'; '.join(gateways_key_unscoped)}."
+                        ),
+                        resolution=(
+                            "Allow kms:Decrypt and kms:GenerateDataKey only with "
+                            "kms:ViaService bedrock-agentcore.<region>.amazonaws.com "
+                            "and "
+                            "kms:EncryptionContext:aws:bedrock-agentcore-gateway:arn "
+                            "naming the gateway, and kms:CreateGrant only with that "
+                            "kms:ViaService and kms:GrantConstraintType "
+                            "EncryptionContextSubset, as the example key policy in "
+                            "the gateway encryption guide shows. Remove any decrypt "
+                            "grant to a wildcard principal that no condition binds."
+                        ),
+                        reference=AGENTCORE_GATEWAY_ENCRYPTION_REFERENCE_URL,
+                        severity=SeverityEnum.MEDIUM,
+                        status=StatusEnum.FAILED,
+                    )
+                )
+
+            if gateways_unreadable:
+                findings.append(
+                    create_finding(
+                        check_id="AC-12",
+                        finding_name="AgentCore Gateway Encryption Incomplete",
+                        finding_details=(
+                            "The encryption of these Gateways could not be read: "
+                            f"{'; '.join(gateways_unreadable)}."
+                        ),
+                        resolution=(
+                            "Grant the action named on the gateway or its key and "
+                            "retry. A gateway deleted during the assessment reads "
+                            "as ResourceNotFoundException and clears on the next run."
+                        ),
+                        reference=AGENTCORE_GATEWAY_ENCRYPTION_REFERENCE_URL,
+                        severity=SeverityEnum.INFORMATIONAL,
+                        status=StatusEnum.NA,
+                    )
+                )
+
             if gateways_with_cmk:
                 findings.append(
                     create_finding(
                         check_id="AC-12",
                         finding_name="AgentCore Gateway Encryption Check",
-                        finding_details=f"Gateways with CMK encryption: {', '.join(gateways_with_cmk)}",
+                        finding_details=(
+                            "Gateways encrypted with a customer managed key whose "
+                            "state kms:DescribeKey reports as Enabled, and whose key "
+                            "policy allows kms:Decrypt and kms:GenerateDataKey "
+                            "through AgentCore in the gateway's region only for "
+                            "this account's gateway encryption context, allows "
+                            "kms:CreateGrant through AgentCore only for grants "
+                            "constrained by encryption context, and lets no "
+                            "unbounded principal decrypt: "
+                            f"{', '.join(gateways_with_cmk)}. A statement granting "
+                            "the same actions with no condition, such as the "
+                            "account-root kms:* statement, is not subtracted, so "
+                            "IAM policy remains a path to the key."
+                        ),
                         resolution="No action required",
-                        reference="https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/data-encryption.html",
+                        reference=AGENTCORE_GATEWAY_ENCRYPTION_REFERENCE_URL,
                         severity=SeverityEnum.MEDIUM,
                         status=StatusEnum.PASSED,
                     )

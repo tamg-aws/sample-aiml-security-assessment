@@ -715,7 +715,7 @@ inventory is never treated as evidence of compliance.
 ### AC-12: Gateway Encryption
 
 - **Severity:** Medium
-- **Description:** Verifies gateway encryption settings.
+- **Description:** Reads each gateway's `kmsKeyArn` and describes the key. A gateway with no key, or with a key `kms:DescribeKey` reports as not `CUSTOMER` managed, fails `AgentCore Gateway Encryption Missing`, and one whose customer managed key is not `Enabled` fails `AgentCore Gateway Key Unusable`. The key policy is then read against the example in the gateway encryption guide: `kms:Decrypt` and `kms:GenerateDataKey` have to be allowed with `kms:ViaService` `bedrock-agentcore.<region>.amazonaws.com` and `kms:EncryptionContext:aws:bedrock-agentcore-gateway:arn` naming the gateway, `kms:CreateGrant` with that `kms:ViaService` and `kms:GrantConstraintType` `EncryptionContextSubset`, and no unbounded principal may decrypt. An encryption context value binds when it names the partition, service, region, account and resource type literally, so `gateway/*` in the account binds. IfExists forms do not count. A gap fails `AgentCore Gateway Key Policy Unscoped`. A gateway whose `GetGateway`, `kms:DescribeKey` or `kms:GetKeyPolicy` read fails, a gateway deleted during the run included, is `N/A` by name and is not counted in the `Passed` row. A statement granting the same actions with no condition, such as the account-root `kms:*` statement, is not subtracted.
 
 ### AC-13: Gateway Configuration
 

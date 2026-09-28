@@ -208,6 +208,11 @@ section.
 
 ### Fixed
 
+- `AC-12` describes each gateway's key and reads its key policy. It passed
+  any gateway that named a key ARN, AWS managed or disabled keys included,
+  and dropped a gateway whose `GetGateway` call failed without a trace. A key
+  policy that does not bind decrypt to `kms:ViaService` and the gateway's
+  encryption context now fails, and every unread leg is `N/A` by name.
 - `AC-08` requires an available `bedrock-agentcore` endpoint in the VPC of
   each VPC-mode runtime, resolved from its subnets, where an endpoint in any
   VPC of the region counted before. It also requires the

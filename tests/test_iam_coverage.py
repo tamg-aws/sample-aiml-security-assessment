@@ -1099,6 +1099,12 @@ _VERIFIED_REMEDIATION_IAM_ACTIONS |= {
 # 1, and index 0 drew nothing. DescribeVpcs is also listed in the ec2 service
 # reference JSON.
 _VERIFIED_REMEDIATION_IAM_ACTIONS |= {"ec2:DescribeVpcs"}
+# Verified on 2026-09-28 against the kms service reference JSON, which lists the
+# condition key kms:EncryptionContext:${EncryptionContextKey}. AC-12 names it
+# with the gateway context key aws:bedrock-agentcore-gateway:arn from the
+# gateway encryption guide's example key policy, and the token scan stops at
+# the second colon.
+_VERIFIED_REMEDIATION_CONDITION_KEYS |= {"kms:EncryptionContext"}
 
 _NON_IAM_REMEDIATION_TOKENS = {
     # SM-41 names the AWS IoT Core policy variables

@@ -5113,6 +5113,60 @@ class TestAC11PolicyEngineKeyState:
 # ===================================================================
 # AC-12: check_agentcore_gateway_encryption
 # ===================================================================
+def _ac12_gateway_arn(gateway_id):
+    return f"arn:aws:bedrock-agentcore:us-east-1:123456789012:gateway/{gateway_id}"
+
+
+def _ac12_key_policy(
+    context_value,
+    via="bedrock-agentcore.us-east-1.amazonaws.com",
+    via_operator="StringEquals",
+    grant_constraint=True,
+):
+    """The example key policy in gateway-encryption.html, with knobs."""
+    role = {"AWS": "arn:aws:iam::123456789012:role/GatewayServiceRole"}
+    grant_condition = {via_operator: {"kms:ViaService": [via]}}
+    if grant_constraint:
+        grant_condition[via_operator]["kms:GrantConstraintType"] = (
+            "EncryptionContextSubset"
+        )
+    return {
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Sid": "Root",
+                "Effect": "Allow",
+                "Principal": {"AWS": "arn:aws:iam::123456789012:root"},
+                "Action": "kms:*",
+                "Resource": "*",
+            },
+            {
+                "Sid": "AllowServiceRoleDecryptKey",
+                "Effect": "Allow",
+                "Principal": role,
+                "Action": ["kms:Decrypt", "kms:GenerateDataKey"],
+                "Resource": "*",
+                "Condition": {
+                    via_operator: {"kms:ViaService": [via]},
+                    "StringLike": {
+                        "kms:EncryptionContext:aws:bedrock-agentcore-gateway:arn": (
+                            context_value
+                        )
+                    },
+                },
+            },
+            {
+                "Sid": "AllowServiceRoleCreateGrant",
+                "Effect": "Allow",
+                "Principal": role,
+                "Action": "kms:CreateGrant",
+                "Resource": "*",
+                "Condition": grant_condition,
+            },
+        ],
+    }
+
+
 class TestAC12GatewayEncryption:
     """AC-12: Check gateway encryption."""
 
@@ -5130,15 +5184,24 @@ class TestAC12GatewayEncryption:
         findings = extract_csv_data(result)
         assert len(findings) >= 1
 
+    @patch("agentcore_app.kms_client")
     @patch("agentcore_app.agentcore_client")
-    def test_ac12_gateway_with_kms_key_returns_passed(self, mock_ac):
+    def test_ac12_gateway_with_kms_key_returns_passed(self, mock_ac, mock_kms):
         mock_ac.list_gateways.return_value = {
             "items": [{"gatewayId": "gw-1", "name": "TestGateway"}]
         }
         mock_ac.get_gateway.return_value = {
             "gatewayId": "gw-1",
+            "gatewayArn": _ac12_gateway_arn("gw-1"),
             "name": "TestGateway",
             "kmsKeyArn": "arn:aws:kms:us-east-1:123:key/abc",
+        }
+        # The key is described and its policy read before a Passed is given.
+        mock_kms.describe_key.return_value = {
+            "KeyMetadata": {"KeyManager": "CUSTOMER", "KeyState": "Enabled"}
+        }
+        mock_kms.get_key_policy.return_value = {
+            "Policy": json.dumps(_ac12_key_policy(_ac12_gateway_arn("gw-1")))
         }
         result = agentcore_app.check_agentcore_gateway_encryption()
         findings = extract_csv_data(result)
@@ -5160,6 +5223,277 @@ class TestAC12GatewayEncryption:
         result = agentcore_app.check_agentcore_gateway_encryption()
         for f in extract_csv_data(result):
             assert_finding_schema(f)
+
+
+class TestAC12GatewayKeyScope:
+    """AC-12 describes each gateway's key and reads its key policy."""
+
+    _KEYS = {
+        "gw-good": "arn:aws:kms:us-east-1:123456789012:key/good",
+        "gw-open": "arn:aws:kms:us-east-1:123456789012:key/open",
+        "gw-aws": "arn:aws:kms:us-east-1:123456789012:key/aws",
+        "gw-off": "arn:aws:kms:us-east-1:123456789012:key/off",
+    }
+
+    def _wire(self, mock_ac, mock_kms, gateway_ids, policies=None, metadata=None):
+        mock_ac.list_gateways.return_value = {
+            "items": [{"gatewayId": g, "name": g} for g in gateway_ids]
+        }
+
+        def get_gateway(gatewayIdentifier):
+            if gatewayIdentifier == "gw-denied":
+                raise _make_client_error("AccessDeniedException", "denied")
+            return {
+                "gatewayId": gatewayIdentifier,
+                "gatewayArn": _ac12_gateway_arn(gatewayIdentifier),
+                "kmsKeyArn": self._KEYS.get(
+                    gatewayIdentifier,
+                    "arn:aws:kms:us-east-1:123456789012:key/"
+                    + gatewayIdentifier.removeprefix("gw-"),
+                ),
+            }
+
+        mock_ac.get_gateway.side_effect = get_gateway
+        metadata = metadata or {}
+
+        def describe_key(KeyId):
+            value = metadata.get(
+                KeyId, {"KeyManager": "CUSTOMER", "KeyState": "Enabled"}
+            )
+            if isinstance(value, Exception):
+                raise value
+            return {"KeyMetadata": value}
+
+        mock_kms.describe_key.side_effect = describe_key
+        policies = policies or {}
+
+        def get_key_policy(KeyId):
+            value = policies.get(KeyId)
+            if isinstance(value, Exception):
+                raise value
+            if value is None:
+                gateway_id = KeyId.rsplit("/", 1)[1]
+                value = _ac12_key_policy(_ac12_gateway_arn(f"gw-{gateway_id}"))
+            return {"Policy": json.dumps(value)}
+
+        mock_kms.get_key_policy.side_effect = get_key_policy
+
+    @staticmethod
+    def _by_name(findings):
+        by_name = {}
+        for finding in findings:
+            assert finding["Check_ID"] == "AC-12"
+            assert_finding_schema(finding)
+            by_name.setdefault(finding["Finding"], []).append(finding)
+        return by_name
+
+    @patch("agentcore_app.kms_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_the_documented_key_policy_passes_beside_an_open_one(
+        self, mock_ac, mock_kms
+    ):
+        self._wire(
+            mock_ac,
+            mock_kms,
+            ["gw-good", "gw-open"],
+            policies={
+                self._KEYS["gw-open"]: _ac12_key_policy(
+                    "arn:aws:bedrock-agentcore:*:*:*"
+                )
+            },
+        )
+
+        by_name = self._by_name(agentcore_app.check_agentcore_gateway_encryption())
+
+        passed = by_name["AgentCore Gateway Encryption Check"]
+        assert [f["Status"] for f in passed] == ["Passed"]
+        assert "gw-good" in passed[0]["Finding_Details"]
+        assert "gw-open" not in passed[0]["Finding_Details"]
+        unscoped = by_name["AgentCore Gateway Key Policy Unscoped"]
+        assert [f["Status"] for f in unscoped] == ["Failed"]
+        details = unscoped[0]["Finding_Details"]
+        assert "'gw-open'" in details
+        assert "gw-good" not in details
+        assert "kms:Decrypt, kms:GenerateDataKey" in details
+
+    @pytest.mark.parametrize(
+        ("policy", "gap"),
+        [
+            (
+                _ac12_key_policy("arn:aws:bedrock-agentcore:us-east-1:123456789012:*"),
+                "kms:EncryptionContext:aws:bedrock-agentcore-gateway:arn naming",
+            ),
+            (
+                _ac12_key_policy(_ac12_gateway_arn("gw-other")),
+                "kms:EncryptionContext:aws:bedrock-agentcore-gateway:arn naming",
+            ),
+            (
+                _ac12_key_policy(
+                    _ac12_gateway_arn("gw-x"), via="bedrock-agentcore.*.amazonaws.com"
+                ),
+                "kms:ViaService bedrock-agentcore.us-east-1.amazonaws.com",
+            ),
+            (
+                _ac12_key_policy(
+                    _ac12_gateway_arn("gw-x"), via_operator="StringEqualsIfExists"
+                ),
+                "kms:ViaService bedrock-agentcore.us-east-1.amazonaws.com",
+            ),
+            (
+                _ac12_key_policy(_ac12_gateway_arn("gw-x"), grant_constraint=False),
+                "kms:CreateGrant only with",
+            ),
+        ],
+    )
+    @patch("agentcore_app.kms_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_each_missing_binding_fails_the_gateway(
+        self, mock_ac, mock_kms, policy, gap
+    ):
+        key = "arn:aws:kms:us-east-1:123456789012:key/x"
+        self._wire(mock_ac, mock_kms, ["gw-x", "gw-good"], policies={key: policy})
+
+        by_name = self._by_name(agentcore_app.check_agentcore_gateway_encryption())
+
+        unscoped = by_name["AgentCore Gateway Key Policy Unscoped"]
+        assert "'gw-x'" in unscoped[0]["Finding_Details"]
+        assert gap in unscoped[0]["Finding_Details"]
+        assert (
+            "gw-x"
+            not in by_name["AgentCore Gateway Encryption Check"][0]["Finding_Details"]
+        )
+
+    @patch("agentcore_app.kms_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_gateway_wide_context_in_this_account_binds(self, mock_ac, mock_kms):
+        key = "arn:aws:kms:us-east-1:123456789012:key/x"
+        self._wire(
+            mock_ac,
+            mock_kms,
+            ["gw-x"],
+            policies={
+                key: _ac12_key_policy(
+                    "arn:aws:bedrock-agentcore:us-east-1:123456789012:gateway/*"
+                )
+            },
+        )
+
+        by_name = self._by_name(agentcore_app.check_agentcore_gateway_encryption())
+
+        assert set(by_name) == {"AgentCore Gateway Encryption Check"}
+        assert by_name["AgentCore Gateway Encryption Check"][0]["Status"] == "Passed"
+
+    @patch("agentcore_app.kms_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_an_open_decrypt_grant_fails_even_with_the_bindings(
+        self, mock_ac, mock_kms
+    ):
+        key = "arn:aws:kms:us-east-1:123456789012:key/x"
+        policy = _ac12_key_policy(_ac12_gateway_arn("gw-x"))
+        policy["Statement"].append(
+            {
+                "Effect": "Allow",
+                "Principal": "*",
+                "Action": "kms:Decrypt",
+                "Resource": "*",
+            }
+        )
+        self._wire(mock_ac, mock_kms, ["gw-x"], policies={key: policy})
+
+        by_name = self._by_name(agentcore_app.check_agentcore_gateway_encryption())
+
+        assert "AgentCore Gateway Encryption Check" not in by_name
+        details = by_name["AgentCore Gateway Key Policy Unscoped"][0]["Finding_Details"]
+        assert "lets every principal decrypt" in details
+
+    @patch("agentcore_app.kms_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_an_aws_managed_or_disabled_key_is_not_passed(self, mock_ac, mock_kms):
+        self._wire(
+            mock_ac,
+            mock_kms,
+            ["gw-aws", "gw-off", "gw-good"],
+            metadata={
+                self._KEYS["gw-aws"]: {"KeyManager": "AWS", "KeyState": "Enabled"},
+                self._KEYS["gw-off"]: {
+                    "KeyManager": "CUSTOMER",
+                    "KeyState": "PendingDeletion",
+                },
+            },
+        )
+
+        by_name = self._by_name(agentcore_app.check_agentcore_gateway_encryption())
+
+        missing = by_name["AgentCore Gateway Encryption Missing"][0]
+        assert missing["Status"] == "Failed"
+        assert "gw-aws (key" in missing["Finding_Details"]
+        assert "managed by AWS" in missing["Finding_Details"]
+        unusable = by_name["AgentCore Gateway Key Unusable"][0]
+        assert unusable["Status"] == "Failed"
+        assert "'gw-off'" in unusable["Finding_Details"]
+        assert "PendingDeletion" in unusable["Finding_Details"]
+        passed = by_name["AgentCore Gateway Encryption Check"][0]["Finding_Details"]
+        assert "gw-good" in passed
+        assert "gw-aws" not in passed and "gw-off" not in passed
+
+    @patch("agentcore_app.kms_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_every_unread_leg_is_named_and_withheld_from_the_pass(
+        self, mock_ac, mock_kms
+    ):
+        describe_key_denied = "arn:aws:kms:us-east-1:123456789012:key/nodescribe"
+        policy_denied = "arn:aws:kms:us-east-1:123456789012:key/nopolicy"
+        self._wire(
+            mock_ac,
+            mock_kms,
+            ["gw-denied", "gw-nodescribe", "gw-nopolicy", "gw-good"],
+            metadata={
+                describe_key_denied: _make_client_error(
+                    "AccessDeniedException", "denied"
+                )
+            },
+            policies={
+                policy_denied: _make_client_error("AccessDeniedException", "denied")
+            },
+        )
+
+        by_name = self._by_name(agentcore_app.check_agentcore_gateway_encryption())
+
+        incomplete = by_name["AgentCore Gateway Encryption Incomplete"]
+        assert [f["Status"] for f in incomplete] == ["N/A"]
+        details = incomplete[0]["Finding_Details"]
+        assert "'gw-denied' (GetGateway: AccessDeniedException)" in details
+        assert (
+            f"'gw-nodescribe' (kms:DescribeKey on {describe_key_denied}: "
+            "AccessDeniedException)"
+        ) in details
+        assert (
+            f"'gw-nopolicy' (kms:GetKeyPolicy on {policy_denied}: "
+            "AccessDeniedException)"
+        ) in details
+        passed = by_name["AgentCore Gateway Encryption Check"][0]["Finding_Details"]
+        assert "gw-good" in passed
+        for name in ("gw-denied", "gw-nodescribe", "gw-nopolicy"):
+            assert name not in passed
+
+    @patch("agentcore_app.kms_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_gateway_deleted_mid_run_is_recorded(self, mock_ac, mock_kms):
+        self._wire(mock_ac, mock_kms, ["gw-good"])
+        mock_ac.list_gateways.return_value = {
+            "items": [{"gatewayId": "gw-gone", "name": "gw-gone"}]
+        }
+        mock_ac.get_gateway.side_effect = _make_client_error(
+            "ResourceNotFoundException", "gone"
+        )
+
+        by_name = self._by_name(agentcore_app.check_agentcore_gateway_encryption())
+
+        assert set(by_name) == {"AgentCore Gateway Encryption Incomplete"}
+        assert (
+            "ResourceNotFoundException"
+            in by_name["AgentCore Gateway Encryption Incomplete"][0]["Finding_Details"]
+        )
 
 
 # ===================================================================
