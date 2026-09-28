@@ -5868,3 +5868,377 @@ class TestScope27HandlerWiring:
                 "detector_inventory=guardduty_inventory"
                 in handler[call_at : call_at + 200]
             )
+
+
+# ===================================================================
+# IAM permissions cache contract (schema version 2) on the SM-02 legs
+# ===================================================================
+def _v2_cache(roles, principal_errors=None, boundaries=None, users=None):
+    """Build a version-2 cache from {role: [(policy_name, document)]}."""
+    cache = _role_cache(roles)
+    for name, entry in cache["role_permissions"].items():
+        entry["permissions_boundary"] = (boundaries or {}).get(name)
+    cache["user_permissions"] = users or {}
+    cache["principal_errors"] = list(principal_errors or [])
+    cache["cache_schema_version"] = 2
+    return cache
+
+
+def _sm02_rows(cache):
+    with patch("sagemaker_app.boto3.client") as mock_client:
+        mock_client.return_value.get_service_last_accessed_details.return_value = {
+            "JobStatus": "COMPLETED",
+            "ServicesLastAccessed": [],
+        }
+        return _rows(
+            sagemaker_app.check_sagemaker_iam_permissions(cache, region="Global")
+        )
+
+
+def _by_finding(rows, name):
+    return [r for r in rows if r["Finding"].startswith(name)]
+
+
+_ROLE_ERROR = {
+    "type": "role",
+    "name": "UnreadRole",
+    "stage": "list_attached_policies",
+    "error": "AccessDenied",
+}
+
+
+class TestSM02EndpointInvocationScopingFullGrade:
+    """AIR-SGM-EP-02: wildcard segments, NotAction, NotResource, tags, boundary."""
+
+    @pytest.mark.parametrize(
+        "resource",
+        [
+            "arn:aws:sagemaker:us-east-1:123456789012:*",
+            "arn:aws:sagemaker:*:*:endpoint/prod",
+            "arn:aws:sagemaker:us-east-1:123456789012:end*",
+            "arn:aws:sagemaker:*",
+            "arn:aws:sage*:us-east-1:123456789012:endpoint/prod",
+        ],
+    )
+    def test_wildcard_in_any_segment_is_unscoped(self, resource):
+        # Before the fix, only a wildcard inside the endpoint name failed.
+        assert sagemaker_app._resource_scopes_endpoint(resource) is False
+
+    @pytest.mark.parametrize(
+        "resource",
+        [
+            "arn:aws:sagemaker:us-east-1:123456789012:endpoint/prod",
+            "arn:aws:sagemaker:us-east-1:123456789012:model/*",
+            "arn:aws:sagemaker:us-east-1:123456789012:endpoint-config/*",
+            "arn:aws:s3:::bucket/*",
+            "arn:aws:sagemaker-geospatial:us-east-1:123456789012:*",
+        ],
+    )
+    def test_resources_that_name_or_miss_endpoints_are_scoped(self, resource):
+        assert sagemaker_app._resource_scopes_endpoint(resource) is True
+
+    def test_account_wide_sagemaker_arn_fails_and_named_role_passes(self):
+        cache = _v2_cache(
+            {
+                "NamedRole": [
+                    (
+                        "InvokeOne",
+                        _identity_policy(
+                            "sagemaker:InvokeEndpoint",
+                            "arn:aws:sagemaker:us-east-1:123456789012:endpoint/a",
+                        ),
+                    )
+                ],
+                "AccountWideRole": [
+                    (
+                        "InvokeAccount",
+                        _identity_policy(
+                            "sagemaker:InvokeEndpoint",
+                            "arn:aws:sagemaker:us-east-1:123456789012:*",
+                        ),
+                    )
+                ],
+            }
+        )
+        rows = _by_finding(
+            _sm02_rows(cache), sagemaker_app.ENDPOINT_INVOCATION_SCOPING_FINDING
+        )
+        failed = [r for r in rows if r["Status"] == "Failed"]
+        assert len(failed) == 1
+        assert "AccountWideRole" in failed[0]["Finding_Details"]
+        assert "NamedRole" not in failed[0]["Finding_Details"]
+        assert (
+            "Service control policies were not evaluated"
+            in (failed[0]["Finding_Details"])
+        )
+
+    def test_notaction_allow_reaches_invocation(self):
+        statement = {"Effect": "Allow", "NotAction": "s3:*", "Resource": "*"}
+        cache = _v2_cache({"NotActionRole": [("Broad", {"Statement": [statement]})]})
+        rows = _by_finding(
+            _sm02_rows(cache), sagemaker_app.ENDPOINT_INVOCATION_SCOPING_FINDING
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "NotActionRole" in rows[0]["Finding_Details"]
+
+    def test_notaction_listing_invoke_does_not_reach_invocation(self):
+        statement = {
+            "Effect": "Allow",
+            "NotAction": "sagemaker:Invoke*",
+            "Resource": "*",
+        }
+        cache = _v2_cache({"Excluded": [("Broad", {"Statement": [statement]})]})
+        rows = _by_finding(
+            _sm02_rows(cache), sagemaker_app.ENDPOINT_INVOCATION_SCOPING_FINDING
+        )
+        assert rows == []
+
+    def test_notresource_allow_is_unscoped(self):
+        statement = {
+            "Effect": "Allow",
+            "Action": "sagemaker:InvokeEndpoint",
+            "NotResource": "arn:aws:sagemaker:us-east-1:123456789012:endpoint/x",
+        }
+        cache = _v2_cache({"NotResourceRole": [("Inv", {"Statement": [statement]})]})
+        rows = _by_finding(
+            _sm02_rows(cache), sagemaker_app.ENDPOINT_INVOCATION_SCOPING_FINDING
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "NotResource" in rows[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "operator",
+        ["StringEqualsIfExists", "StringNotEquals", "ForAllValues:StringEquals"],
+    )
+    def test_tag_condition_that_passes_untagged_endpoints_does_not_scope(
+        self, operator
+    ):
+        policy = _identity_policy(
+            "sagemaker:InvokeEndpoint",
+            "*",
+            condition={operator: {"aws:ResourceTag/team": "fraud"}},
+        )
+        cache = _v2_cache({"TagRole": [("Inv", policy)]})
+        rows = _by_finding(
+            _sm02_rows(cache), sagemaker_app.ENDPOINT_INVOCATION_SCOPING_FINDING
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+
+    def test_string_equals_tag_condition_scopes(self):
+        policy = _identity_policy(
+            "sagemaker:InvokeEndpoint",
+            "*",
+            condition={"StringEquals": {"aws:ResourceTag/team": "fraud"}},
+        )
+        cache = _v2_cache({"TagRole": [("Inv", policy)]})
+        rows = _by_finding(
+            _sm02_rows(cache), sagemaker_app.ENDPOINT_INVOCATION_SCOPING_FINDING
+        )
+        assert [r["Status"] for r in rows] == ["Passed"]
+
+    def test_boundary_on_named_endpoint_scopes_a_wildcard_grant(self):
+        boundary = _identity_policy(
+            "sagemaker:InvokeEndpoint",
+            "arn:aws:sagemaker:us-east-1:123456789012:endpoint/a",
+        )
+        cache = _v2_cache(
+            {
+                "BoundedRole": [
+                    ("Inv", _identity_policy("sagemaker:InvokeEndpoint", "*"))
+                ],
+                "UnboundedRole": [
+                    ("Inv", _identity_policy("sagemaker:InvokeEndpoint", "*"))
+                ],
+            },
+            boundaries={"BoundedRole": boundary},
+        )
+        rows = _by_finding(
+            _sm02_rows(cache), sagemaker_app.ENDPOINT_INVOCATION_SCOPING_FINDING
+        )
+        failed = [r for r in rows if r["Status"] == "Failed"]
+        assert len(failed) == 1
+        assert "UnboundedRole" in failed[0]["Finding_Details"]
+        passed = [r for r in rows if r["Status"] == "Passed"]
+        assert len(passed) == 1 and "BoundedRole" in passed[0]["Finding_Details"]
+
+    def test_boundary_without_invoke_removes_the_grant(self):
+        boundary = _identity_policy("s3:GetObject", "*")
+        cache = _v2_cache(
+            {"BoundedRole": [("Inv", _identity_policy("sagemaker:*", "*"))]},
+            boundaries={"BoundedRole": boundary},
+        )
+        rows = _by_finding(
+            _sm02_rows(cache), sagemaker_app.ENDPOINT_INVOCATION_SCOPING_FINDING
+        )
+        assert rows == []
+
+    def test_boundary_allowing_everything_keeps_the_wildcard_failed(self):
+        boundary = _identity_policy("*", "*")
+        cache = _v2_cache(
+            {"BoundedRole": [("Inv", _identity_policy("sagemaker:Invoke*", "*"))]},
+            boundaries={"BoundedRole": boundary},
+        )
+        rows = _by_finding(
+            _sm02_rows(cache), sagemaker_app.ENDPOINT_INVOCATION_SCOPING_FINDING
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "permissions boundary also allows" in rows[0]["Finding_Details"]
+
+    def test_principal_error_blocks_the_scoped_pass_and_names_the_principal(self):
+        cache = _v2_cache(
+            {
+                "NamedRole": [
+                    (
+                        "InvokeOne",
+                        _identity_policy(
+                            "sagemaker:InvokeEndpoint",
+                            "arn:aws:sagemaker:us-east-1:123456789012:endpoint/a",
+                        ),
+                    )
+                ]
+            },
+            principal_errors=[_ROLE_ERROR],
+        )
+        rows = _by_finding(
+            _sm02_rows(cache), sagemaker_app.ENDPOINT_INVOCATION_SCOPING_FINDING
+        )
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert "UnreadRole" in rows[0]["Finding_Details"]
+        assert "list_attached_policies" in rows[0]["Finding_Details"]
+
+    def test_principal_error_with_no_grant_read_still_reports_incomplete(self):
+        cache = _v2_cache(
+            {"ReadOnly": [("R", _identity_policy("s3:GetObject", "*"))]},
+            principal_errors=[_ROLE_ERROR],
+        )
+        rows = _by_finding(
+            _sm02_rows(cache), sagemaker_app.ENDPOINT_INVOCATION_SCOPING_FINDING
+        )
+        assert [r["Status"] for r in rows] == ["N/A"]
+
+    def test_version_one_cache_passes_and_says_errors_were_not_recorded(self):
+        cache = _role_cache(
+            {
+                "NamedRole": [
+                    (
+                        "InvokeOne",
+                        _identity_policy(
+                            "sagemaker:InvokeEndpoint",
+                            "arn:aws:sagemaker:us-east-1:123456789012:endpoint/a",
+                        ),
+                    )
+                ]
+            }
+        )
+        rows = _by_finding(
+            _sm02_rows(cache), sagemaker_app.ENDPOINT_INVOCATION_SCOPING_FINDING
+        )
+        assert [r["Status"] for r in rows] == ["Passed"]
+        assert "schema version 1" in rows[0]["Finding_Details"]
+
+    def test_version_two_cache_without_errors_omits_the_version_note(self):
+        cache = _v2_cache(
+            {
+                "NamedRole": [
+                    (
+                        "InvokeOne",
+                        _identity_policy(
+                            "sagemaker:InvokeEndpoint",
+                            "arn:aws:sagemaker:us-east-1:123456789012:endpoint/a",
+                        ),
+                    )
+                ]
+            }
+        )
+        rows = _by_finding(
+            _sm02_rows(cache), sagemaker_app.ENDPOINT_INVOCATION_SCOPING_FINDING
+        )
+        assert [r["Status"] for r in rows] == ["Passed"]
+        assert "schema version 1" not in rows[0]["Finding_Details"]
+
+
+class TestSM02CacheContractOtherLegs:
+    """The service-wide and full-access legs honor errors and boundaries."""
+
+    def test_service_wide_pass_is_incomplete_when_a_user_was_not_read(self):
+        cache = _v2_cache(
+            {"ReadOnly": [("R", _identity_policy("sagemaker:Describe*", "*"))]},
+            principal_errors=[
+                {
+                    "type": "user",
+                    "name": "alice",
+                    "stage": "inline_policy",
+                    "error": "x",
+                }
+            ],
+        )
+        rows = _by_finding(_sm02_rows(cache), sagemaker_app.SERVICE_WIDE_GRANT_FINDING)
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert "alice" in rows[0]["Finding_Details"]
+
+    def test_service_wide_grant_narrowed_by_boundary_is_not_failed(self):
+        cache = _v2_cache(
+            {
+                "Bounded": [("All", _identity_policy("sagemaker:*", "*"))],
+                "Unbounded": [("All", _identity_policy("sagemaker:*", "*"))],
+            },
+            boundaries={"Bounded": _identity_policy("sagemaker:Describe*", "*")},
+        )
+        rows = _by_finding(_sm02_rows(cache), sagemaker_app.SERVICE_WIDE_GRANT_FINDING)
+        failed = [r for r in rows if r["Status"] == "Failed"]
+        assert len(failed) == 1
+        assert "Unbounded" in failed[0]["Finding_Details"]
+
+    def test_boundary_with_notaction_listing_sagemaker_narrows(self):
+        boundary = {
+            "Statement": [
+                {"Effect": "Allow", "NotAction": "sagemaker:Delete*", "Resource": "*"}
+            ]
+        }
+        assert sagemaker_app._boundary_allows_every_sagemaker_action(boundary) is False
+        broad = {
+            "Statement": [{"Effect": "Allow", "NotAction": "s3:*", "Resource": "*"}]
+        }
+        assert sagemaker_app._boundary_allows_every_sagemaker_action(broad) is True
+
+    def test_full_access_role_under_narrow_boundary_is_not_failed(self):
+        cache = _v2_cache(
+            {
+                "Bounded": [("AmazonSageMakerFullAccess", {"Statement": []})],
+                "Unbounded": [("AmazonSageMakerFullAccess", {"Statement": []})],
+            },
+            boundaries={"Bounded": _identity_policy("sagemaker:Describe*", "*")},
+        )
+        rows = _by_finding(_sm02_rows(cache), "SageMaker Full Access Policy Used")
+        assert len(rows) == 1
+        assert "Unbounded" in rows[0]["Finding_Details"]
+
+    def test_iam_permissions_pass_is_incomplete_when_a_role_was_not_read(self):
+        cache = _v2_cache({}, principal_errors=[_ROLE_ERROR])
+        rows = _by_finding(_sm02_rows(cache), "SageMaker IAM Permissions Check")
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert "UnreadRole" in rows[0]["Finding_Details"]
+
+    def test_stale_access_read_error_blocks_the_pass(self):
+        cache = _v2_cache(
+            {},
+            users={
+                "bob": {
+                    "attached_policies": [
+                        {"name": "SM", "document": _identity_policy("sagemaker:*", "*")}
+                    ],
+                    "inline_policies": [],
+                    "permissions_boundary": None,
+                }
+            },
+        )
+        with patch("sagemaker_app.boto3.client") as mock_client:
+            mock_client.return_value.generate_service_last_accessed_details.side_effect = _make_client_error(
+                "AccessDenied"
+            )
+            rows = _rows(
+                sagemaker_app.check_sagemaker_iam_permissions(cache, region="Global")
+            )
+        summary = _by_finding(rows, "SageMaker IAM Permissions Check")
+        assert [r["Status"] for r in summary] == ["N/A"]
+        assert "bob" in summary[0]["Finding_Details"]

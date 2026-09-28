@@ -559,6 +559,155 @@ def _permission_cache_unavailable_result(region: str) -> Dict[str, Any]:
     }
 
 
+IAM_CACHE_V1_NOTE = (
+    "The IAM permissions cache is schema version 1, which does not record "
+    "per-principal read errors, so a principal whose policies failed to read "
+    "cannot be told apart from one with no grant."
+)
+SCP_NOT_EVALUATED_NOTE = (
+    "Service control policies were not evaluated per principal. An SCP can only "
+    "remove a permission, so this result can overstate the grant but not miss one."
+)
+IAM_CACHE_INCOMPLETE_RESOLUTION = (
+    "Resolve the read errors the IAM Permission Caching task recorded for the "
+    "named principals, then rerun the assessment."
+)
+
+
+def _cache_unread_principals(permission_cache: Dict[str, Any]) -> Optional[List[str]]:
+    """
+    Return the principals the IAM cache recorded read errors for.
+
+    None means a version-1 cache, which did not record them at all.
+    """
+    version = permission_cache.get("cache_schema_version")
+    if not isinstance(version, int) or version < 2:
+        return None
+    labels = []
+    for error in permission_cache.get("principal_errors") or []:
+        if not isinstance(error, dict):
+            continue
+        principal_type = str(error.get("type", "")).lower()
+        if principal_type not in ("role", "user"):
+            continue
+        label = (
+            f"{principal_type.capitalize()} '{error.get('name')}' "
+            f"({error.get('stage')})"
+        )
+        if label not in labels:
+            labels.append(label)
+    return labels
+
+
+def _cache_population_finding(
+    permission_cache: Dict[str, Any],
+    check_id: str,
+    finding_name: str,
+    passed_details: str,
+    reference: str,
+    severity: str,
+    region: str,
+    extra_unread: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """
+    Emit a population-wide IAM claim as Passed only when every principal was read.
+
+    A principal the cache could not read, or one this check could not read
+    itself (extra_unread), makes the claim incomplete, and the row names them.
+    """
+    unread = _cache_unread_principals(permission_cache)
+    missing = list(unread or []) + list(extra_unread or [])
+    if missing:
+        shown = ", ".join(missing[:10])
+        if len(missing) > 10:
+            shown += f" and {len(missing) - 10} more"
+        return create_finding(
+            check_id=check_id,
+            finding_name=f"{finding_name} Incomplete",
+            finding_details=(
+                f"{len(missing)} principal read(s) failed, so this claim was not "
+                f"established for them: {shown}. For the principals that were "
+                f"read: {passed_details}"
+            ),
+            resolution=IAM_CACHE_INCOMPLETE_RESOLUTION,
+            reference=reference,
+            severity="Informational",
+            status="N/A",
+            region=region,
+        )
+    details = passed_details
+    if unread is None:
+        details = f"{passed_details} {IAM_CACHE_V1_NOTE}"
+    return create_finding(
+        check_id=check_id,
+        finding_name=finding_name,
+        finding_details=details,
+        resolution="No action required",
+        reference=reference,
+        severity=severity,
+        status="Passed",
+        region=region,
+    )
+
+
+def _iam_action_matches(pattern: str, action: str) -> bool:
+    """Return whether an IAM action pattern (with * and ?) matches an action."""
+    return fnmatch.fnmatchcase(action.lower(), pattern.strip().lower())
+
+
+def _statement_allows_action(statement: Dict[str, Any], action: str) -> bool:
+    """Return whether an Allow statement's Action or NotAction reaches action."""
+    if str(statement.get("Effect", "")).upper() != "ALLOW":
+        return False
+    if "Action" in statement:
+        return any(
+            _iam_action_matches(p, action) for p in _policy_values(statement["Action"])
+        )
+    if "NotAction" in statement:
+        return not any(
+            _iam_action_matches(p, action)
+            for p in _policy_values(statement["NotAction"])
+        )
+    return False
+
+
+def _boundary_allows_every_sagemaker_action(boundary: Any) -> bool:
+    """
+    Return whether a permissions boundary leaves every SageMaker action granted.
+
+    A boundary is an intersection with the identity policy. No boundary leaves
+    the identity policy as it is. Boundary Deny statements are ignored, which can
+    only overstate a grant.
+    """
+    if boundary is None:
+        return True
+    for statement in _sm_policy_statements(boundary):
+        if str(statement.get("Effect", "")).upper() != "ALLOW":
+            continue
+        if any(
+            _pattern_covers_all_sagemaker_actions(p)
+            for p in _policy_values(statement.get("Action"))
+        ):
+            return True
+        if "NotAction" in statement and not any(
+            _pattern_may_match_sagemaker(p)
+            for p in _policy_values(statement.get("NotAction"))
+        ):
+            return True
+    return False
+
+
+def _literal_prefix(pattern: str) -> str:
+    """Return the part of an IAM pattern before its first wildcard, lowercased."""
+    return re.split(r"[*?]", pattern.strip().lower(), maxsplit=1)[0]
+
+
+def _pattern_may_match_sagemaker(pattern: str) -> bool:
+    """Return whether an action pattern can match at least one sagemaker: action."""
+    prefix = _literal_prefix(pattern)
+    return "sagemaker:".startswith(prefix) or prefix.startswith("sagemaker:")
+
+
 def check_sagemaker_internet_access(region: str = "") -> Dict[str, Any]:
     """
     Check if SageMaker notebook instances and domains have direct internet access
@@ -910,50 +1059,67 @@ def _sm_policy_statements(document: Any) -> List[Dict[str, Any]]:
     return [statement for statement in statements if isinstance(statement, dict)]
 
 
+def _statement_invoke_actions(statement: Dict[str, Any]) -> List[str]:
+    """Return the endpoint invocation actions an Allow statement reaches."""
+    return [
+        action
+        for action in ENDPOINT_INVOKE_ACTIONS
+        if _statement_allows_action(statement, action)
+    ]
+
+
 def _statement_grants_endpoint_invocation(statement: Dict[str, Any]) -> bool:
     """Return whether an Allow statement reaches sagemaker:InvokeEndpoint."""
-    if str(statement.get("Effect", "")).upper() != "ALLOW":
-        return False
-    for action in _policy_values(statement.get("Action")):
-        normalized = action.lower()
-        if normalized in ENDPOINT_INVOKE_ACTIONS:
-            return True
-        if normalized in ("*", "sagemaker:*"):
-            return True
-        if normalized.startswith("sagemaker:invokeendpoint") and normalized.endswith(
-            "*"
-        ):
-            return True
-    return False
+    return bool(_statement_invoke_actions(statement))
+
+
+def _segment_may_match(value: str, literal: str, exact: bool) -> bool:
+    """Return whether one lowercased ARN segment pattern can match literal."""
+    if "*" not in value and "?" not in value:
+        return value == literal if exact else value.startswith(literal)
+    prefix = _literal_prefix(value)
+    return literal.startswith(prefix) or (not exact and prefix.startswith(literal))
 
 
 def _resource_scopes_endpoint(resource: str) -> bool:
     """
     Return whether one Resource element stops short of every endpoint.
 
-    An element that is not a SageMaker endpoint ARN authorizes no invocation, so
-    it is not a wildcard grant either.
+    An element that cannot match a SageMaker endpoint ARN authorizes no
+    invocation, so it is not a wildcard grant either. In an element that can
+    match one, a wildcard in any segment is unbounded.
     """
-    if resource == "*":
-        return False
-    match = re.fullmatch(
-        r"arn:[^:]*:sagemaker:[^:]*:[^:]*:endpoint/(.+)", resource, re.IGNORECASE
-    )
-    if not match:
+    normalized = resource.strip().lower()
+    wildcard = "*" in normalized or "?" in normalized
+    parts = normalized.split(":", 5)
+    if len(parts) >= 3 and not _segment_may_match(parts[2], "sagemaker", True):
         return True
-    endpoint_name = match.group(1)
-    return "*" not in endpoint_name and "?" not in endpoint_name
+    if len(parts) == 6 and not _segment_may_match(parts[5], "endpoint/", False):
+        return True
+    return not wildcard
 
 
 def _statement_has_resource_tag_condition(statement: Dict[str, Any]) -> bool:
-    """Return whether a statement narrows its resources by tag."""
+    """
+    Return whether a statement narrows its resources by tag.
+
+    An IfExists or ForAllValues operator passes a resource that lacks the tag,
+    and a negated operator passes every resource without the named value, so
+    none of them narrows the grant.
+    """
     condition = statement.get("Condition", {})
     if not isinstance(condition, dict):
         return False
     for operator, condition_keys in condition.items():
         if not isinstance(condition_keys, dict):
             continue
-        if str(operator).lower().endswith("null"):
+        normalized = str(operator).lower()
+        if (
+            normalized.endswith("null")
+            or normalized.endswith("ifexists")
+            or normalized.startswith("forallvalues:")
+            or "not" in normalized
+        ):
             continue
         for key in condition_keys:
             if str(key).lower().startswith("aws:resourcetag/"):
@@ -969,16 +1135,40 @@ def _unscoped_endpoint_invocation_statement(
 
     AIR-SGM-EP-02 is workload-specific: which endpoints an identity should reach
     is a workload decision. The workload-independent invariant is that the grant
-    names its endpoints at all, so only the wildcard is reported.
+    names its endpoints at all, so only the wildcard is reported. A NotResource
+    Allow reaches every endpoint it does not list.
     """
     if not _statement_grants_endpoint_invocation(statement):
         return None
     if _statement_has_resource_tag_condition(statement):
         return None
+    if "NotResource" in statement:
+        return f"NotResource {_policy_values(statement.get('NotResource'))}"
     for resource in _policy_values(statement.get("Resource")):
         if not _resource_scopes_endpoint(resource):
             return resource
     return None
+
+
+def _boundary_invocation_reach(boundary: Any, actions: List[str]) -> str:
+    """
+    Return how far a permissions boundary lets the given invoke actions reach.
+
+    "unbounded" when there is no boundary or it allows one of the actions on
+    every endpoint, "scoped" when it allows them only on named endpoints, and
+    "none" when it allows none of them. Boundary Deny statements are ignored,
+    which can only overstate a grant.
+    """
+    if boundary is None:
+        return "unbounded"
+    reach = "none"
+    for statement in _sm_policy_statements(boundary):
+        if not any(_statement_allows_action(statement, a) for a in actions):
+            continue
+        if _unscoped_endpoint_invocation_statement(statement):
+            return "unbounded"
+        reach = "scoped"
+    return reach
 
 
 def _endpoint_invocation_scoping_findings(
@@ -997,6 +1187,7 @@ def _endpoint_invocation_scoping_findings(
             identities.append((identity_type, name, permissions))
 
     for identity_type, name, permissions in identities:
+        boundary = permissions.get("permissions_boundary")
         policies = (permissions.get("attached_policies") or []) + (
             permissions.get("inline_policies") or []
         )
@@ -1005,11 +1196,15 @@ def _endpoint_invocation_scoping_findings(
         wildcard_policy = None
         for policy in policies:
             for statement in _sm_policy_statements(policy.get("document")):
-                if not _statement_grants_endpoint_invocation(statement):
+                actions = _statement_invoke_actions(statement)
+                if not actions:
+                    continue
+                reach = _boundary_invocation_reach(boundary, actions)
+                if reach == "none":
                     continue
                 grants_invocation = True
                 resource = _unscoped_endpoint_invocation_statement(statement)
-                if resource and wildcard is None:
+                if resource and reach == "unbounded" and wildcard is None:
                     wildcard = resource
                     wildcard_policy = policy.get("name") or "inline policy"
         if not grants_invocation:
@@ -1022,11 +1217,17 @@ def _endpoint_invocation_scoping_findings(
                     "label": f"{identity_type} '{name}'",
                     "policy": wildcard_policy,
                     "resource": wildcard,
+                    "boundary": boundary is not None,
                 }
             )
 
     emitted = []
     for entry in unscoped[:20]:
+        boundary_text = (
+            " Its permissions boundary also allows invocation on every endpoint."
+            if entry["boundary"]
+            else " It has no permissions boundary."
+        )
         emitted.append(
             create_finding(
                 check_id="SM-02",
@@ -1036,6 +1237,7 @@ def _endpoint_invocation_scoping_findings(
                     f"account: policy '{entry['policy']}' allows endpoint "
                     f"invocation on resource '{entry['resource']}' with no "
                     "endpoint ARN and no aws:ResourceTag condition."
+                    f"{boundary_text} {SCP_NOT_EVALUATED_NOTE}"
                 ),
                 resolution=ENDPOINT_INVOCATION_SCOPING_RESOLUTION,
                 reference=ENDPOINT_INVOCATION_SCOPING_REFERENCE,
@@ -1062,18 +1264,20 @@ def _endpoint_invocation_scoping_findings(
             )
         )
 
-    if scoped:
+    scoped_details = (
+        f"{len(scoped)} identity/identities that can invoke a SageMaker "
+        "endpoint name the endpoints, select them by tag, or are held to "
+        "named endpoints by a permissions boundary: "
+        f"{', '.join(sorted(scoped)[:5])}. Whether those are the "
+        "endpoints each caller should reach is a workload decision the "
+        "owner still has to confirm."
+    )
+    if unscoped and scoped:
         emitted.append(
             create_finding(
                 check_id="SM-02",
                 finding_name=ENDPOINT_INVOCATION_SCOPING_FINDING,
-                finding_details=(
-                    f"{len(scoped)} identity/identities that can invoke a SageMaker "
-                    "endpoint name the endpoints or select them by tag: "
-                    f"{', '.join(sorted(scoped)[:5])}. Whether those are the "
-                    "endpoints each caller should reach is a workload decision the "
-                    "owner still has to confirm."
-                ),
+                finding_details=scoped_details,
                 resolution=(
                     "No action required on the wildcard. Confirm with the workload "
                     "owner that each named endpoint belongs in that identity's "
@@ -1082,6 +1286,27 @@ def _endpoint_invocation_scoping_findings(
                 reference=ENDPOINT_INVOCATION_SCOPING_REFERENCE,
                 severity="High",
                 status="Passed",
+                region=region,
+            )
+        )
+    # With no invocation grant at all the leg emits nothing, unless a principal
+    # could not be read and might hold one.
+    if not unscoped and (scoped or _cache_unread_principals(permission_cache)):
+        if scoped:
+            passed_details = scoped_details
+        else:
+            passed_details = (
+                f"None of the {len(identities)} roles and users read holds a "
+                "grant to invoke a SageMaker endpoint."
+            )
+        emitted.append(
+            _cache_population_finding(
+                permission_cache,
+                check_id="SM-02",
+                finding_name=ENDPOINT_INVOCATION_SCOPING_FINDING,
+                passed_details=passed_details,
+                reference=ENDPOINT_INVOCATION_SCOPING_REFERENCE,
+                severity="High",
                 region=region,
             )
         )
@@ -1147,8 +1372,15 @@ def _service_wide_grant_findings(
                 for policy in permissions.get("attached_policies") or []
                 if ":iam::aws:policy/" not in (policy.get("arn") or "")
             ] + list(permissions.get("inline_policies") or [])
+            # A boundary that does not allow every SageMaker action leaves the
+            # identity without a service-wide grant, whatever its policies say.
+            bounded = not _boundary_allows_every_sagemaker_action(
+                permissions.get("permissions_boundary")
+            )
             for policy in policies:
                 policies_read += 1
+                if bounded:
+                    continue
                 for statement in _sm_policy_statements(policy.get("document")):
                     reason = _service_wide_sagemaker_grant(statement)
                     if reason:
@@ -1171,7 +1403,8 @@ def _service_wide_grant_findings(
                     f"{entry['label']} holds every SageMaker action through "
                     f"customer policy '{entry['policy']}': an Allow statement "
                     f"with {entry['reason']} makes read and delete permissions "
-                    "on the same resource inseparable."
+                    "on the same resource inseparable, and no permissions "
+                    f"boundary narrows it. {SCP_NOT_EVALUATED_NOTE}"
                 ),
                 resolution=SERVICE_WIDE_GRANT_RESOLUTION,
                 reference=SERVICE_WIDE_GRANT_REFERENCE,
@@ -1199,20 +1432,20 @@ def _service_wide_grant_findings(
         )
     if not violations:
         emitted.append(
-            create_finding(
+            _cache_population_finding(
+                permission_cache,
                 check_id="SM-02",
                 finding_name=SERVICE_WIDE_GRANT_FINDING,
-                finding_details=(
+                passed_details=(
                     f"None of the {policies_read} customer-managed or inline "
                     "policies read grants sagemaker:* or reaches SageMaker "
-                    "through a NotAction Allow. Whether each identity's action "
-                    "list matches its role is a workload decision this check "
-                    "does not make."
+                    "through a NotAction Allow that a permissions boundary "
+                    "leaves in force. Whether each identity's action list "
+                    "matches its role is a workload decision this check does "
+                    "not make."
                 ),
-                resolution="No action required",
                 reference=SERVICE_WIDE_GRANT_REFERENCE,
                 severity="High",
-                status="Passed",
                 region=region,
             )
         )
@@ -1238,6 +1471,10 @@ def check_sagemaker_iam_permissions(
         # Check for roles with SageMaker full access
         roles_with_full_access = []
         for role_name, permissions in permission_cache["role_permissions"].items():
+            if not _boundary_allows_every_sagemaker_action(
+                permissions.get("permissions_boundary")
+            ):
+                continue
             for policy in permissions["attached_policies"]:
                 if policy["name"] == "AmazonSageMakerFullAccess":
                     roles_with_full_access.append(role_name)
@@ -1246,6 +1483,7 @@ def check_sagemaker_iam_permissions(
         # Check for stale access. IAM is a global service, so the client is not
         # region-scoped (region is used only for finding tags).
         stale_users = []
+        unread_users = []
         iam_client = boto3.client("iam", config=boto3_config)
         account_id = None
         partition = None
@@ -1276,11 +1514,13 @@ def check_sagemaker_iam_permissions(
 
                     # Wait for job completion
                     waiter_time = 0
+                    completed = False
                     while waiter_time < 10:
                         details = iam_client.get_service_last_accessed_details(
                             JobId=job_id
                         )
                         if details["JobStatus"] == "COMPLETED":
+                            completed = True
                             for service in details["ServicesLastAccessed"]:
                                 if service["ServiceName"] == "Amazon SageMaker":
                                     last_accessed = service.get("LastAuthenticated")
@@ -1294,9 +1534,17 @@ def check_sagemaker_iam_permissions(
                             break
                         time.sleep(1)  # nosemgrep: arbitrary-sleep
                         waiter_time += 1
+                    if not completed:
+                        unread_users.append(
+                            f"User '{user_name}' (last-accessed job not complete)"
+                        )
                 except Exception as e:
                     logger.error(
                         f"Error checking last access for user {user_name}: {str(e)}"
+                    )
+                    unread_users.append(
+                        f"User '{user_name}' (last accessed: "
+                        f"{get_assessment_error_label(e)})"
                     )
 
         # Generate findings
@@ -1308,7 +1556,11 @@ def check_sagemaker_iam_permissions(
                         create_finding(
                             check_id="SM-02",
                             finding_name="SageMaker Full Access Policy Used",
-                            finding_details=f"Role '{role_name}' has AmazonSageMakerFullAccess policy attached",
+                            finding_details=(
+                                f"Role '{role_name}' has AmazonSageMakerFullAccess "
+                                "policy attached and no permissions boundary "
+                                f"narrows it. {SCP_NOT_EVALUATED_NOTE}"
+                            ),
                             resolution="Replace AmazonSageMakerFullAccess with more restrictive custom policies that follow the principle of least privilege",
                             reference="https://docs.aws.amazon.com/sagemaker-unified-studio/latest/adminguide/security-iam.html",
                             severity="High",
@@ -1334,15 +1586,19 @@ def check_sagemaker_iam_permissions(
                     )
         else:
             findings["csv_data"].append(
-                create_finding(
+                _cache_population_finding(
+                    permission_cache,
                     check_id="SM-02",
                     finding_name="SageMaker IAM Permissions Check",
-                    finding_details="No issues found with IAM permissions and no stale access detected",
-                    resolution="No action required",
+                    passed_details=(
+                        "No role holds AmazonSageMakerFullAccess outside a "
+                        "narrowing permissions boundary, and no user with a "
+                        "SageMaker grant is stale by 60 days."
+                    ),
                     reference="https://docs.aws.amazon.com/sagemaker-unified-studio/latest/adminguide/security-iam.html",
                     severity="High",
-                    status="Passed",
                     region=region,
+                    extra_unread=unread_users,
                 )
             )
 
