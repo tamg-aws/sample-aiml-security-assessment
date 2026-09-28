@@ -219,6 +219,17 @@ section.
 
 ### Fixed
 
+- `SM-37` endpoint network alerting credits a metric alarm with no action of
+  its own when a composite alarm with an action names it in an `ALARM()` term
+  joined only by `OR`, including through a nested composite. A rule holding
+  `AND`, `NOT`, `OK()`, `INSUFFICIENT_DATA()`, `TRUE` or `FALSE` credits
+  nothing. Each passing endpoint names the alarm and its current
+  `StateValue`. No IAM grant changes.
+- `SM-34` and `SM-42` no longer say a principal "can call it with no
+  condition on that key" when its Allow or Deny names the key without
+  enforcing it, for example a Null-only Deny or a bare negated operator on a
+  multivalued key. Those principals are named separately as calling it under
+  a condition that does not enforce the key.
 - `AC-04` no longer fails every runtime. It read `loggingConfig` and
   `tracingConfig` from `GetAgentRuntime`, which returns neither, so each
   runtime failed both legs whatever its configuration. It now reports one row

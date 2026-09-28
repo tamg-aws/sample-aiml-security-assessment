@@ -11994,6 +11994,43 @@ def _denies_enforce(
     )
 
 
+def _statements_condition_key(
+    statements: List[Dict[str, Any]], action: str, keys: tuple
+) -> bool:
+    """Return whether an Allow or Deny reaching action has a condition on keys."""
+    for statement in statements:
+        effect = str(statement.get("Effect", "")).upper()
+        if effect == "ALLOW" and not _statement_allows_action(statement, action):
+            continue
+        if effect == "DENY" and not _statement_names_action(statement, action):
+            continue
+        if any(key in keys for _, key, _ in _condition_entries(statement)):
+            return True
+    return False
+
+
+def _open_principals_text(identity: Dict[str, Any]) -> str:
+    """Name the open principals, split by whether any condition names the key."""
+    groups = []
+    for principals, verb in (
+        (
+            [p for p in identity["principals"] if p not in identity["conditioned"]],
+            "can call it with no condition on that key",
+        ),
+        (
+            identity["conditioned"],
+            "can call it under a condition on that key that does not enforce it",
+        ),
+    ):
+        if not principals:
+            continue
+        shown = ", ".join(principals[:5])
+        if len(principals) > 5:
+            shown += f" and {len(principals) - 5} more"
+        groups.append(f"{shown} {verb}")
+    return ", and ".join(groups)
+
+
 def _creation_identity_leg(
     permission_cache: Optional[Dict[str, Any]], action: str, keys: tuple
 ) -> Dict[str, Any]:
@@ -12007,6 +12044,7 @@ def _creation_identity_leg(
         return {"state": "unread", "principals": [], "v1": False}
     resource_type = GUARDED_ACTION_RESOURCE_TYPES[action]
     open_principals = []
+    conditioned = []
     for identity_type, cache_key in (
         ("Role", "role_permissions"),
         ("User", "user_permissions"),
@@ -12041,9 +12079,18 @@ def _creation_identity_leg(
             ) in _boundary_unread(permission_cache):
                 continue
             open_principals.append(f"{identity_type} '{name}'")
+            if _statements_condition_key(
+                statements + boundary_statements, action, keys
+            ):
+                conditioned.append(f"{identity_type} '{name}'")
     unread = _principal_read_errors(permission_cache)
     if open_principals:
-        return {"state": "open", "principals": open_principals, "v1": unread is None}
+        return {
+            "state": "open",
+            "principals": open_principals,
+            "conditioned": conditioned,
+            "v1": unread is None,
+        }
     if unread:
         return {"state": "incomplete", "principals": unread, "v1": False}
     return {"state": "guarded", "principals": [], "v1": unread is None}
@@ -12243,17 +12290,12 @@ def _creation_category_finding(
             "none",
             "exempt",
         ):
-            shown = ", ".join(identity["principals"][:5])
-            if len(identity["principals"]) > 5:
-                shown += f" and {len(identity['principals']) - 5} more"
             failed.append(
-                f"{label}: {scp_reason}, and {shown} can call it with no condition "
-                "on that key"
+                f"{label}: {scp_reason}, and {_open_principals_text(identity)}"
             )
         elif identity["state"] == "open":
             unresolved.append(
-                f"{label}: {scp_reason}, and {', '.join(identity['principals'][:5])} "
-                "can call it with no condition on that key"
+                f"{label}: {scp_reason}, and {_open_principals_text(identity)}"
             )
         elif identity["state"] == "incomplete":
             unresolved.append(
@@ -13201,8 +13243,9 @@ ENDPOINT_FLOW_LOG_ALERTING_RESOLUTION = (
 ENDPOINT_FLOW_LOG_SCOPE_NOTE = (
     "GuardDuty foundational flow-log analysis covers EC2 network interfaces, not "
     "SageMaker endpoints, so the customer flow log is the only network telemetry "
-    "for an endpoint. AgentCore Runtime is not read by this module. Whether an "
-    "alarm has fired is recorded by cloudwatch:DescribeAlarmHistory, which this "
+    "for an endpoint. AgentCore Runtime is not read by this module. The state "
+    "named for each alarm is its current StateValue. Whether an alarm has fired "
+    "before is recorded by cloudwatch:DescribeAlarmHistory, which this "
     "assessment role is not granted, so no alarm history was read; whether a "
     "fired alarm was triaged is not recorded by any CloudWatch API."
 )
@@ -13238,6 +13281,56 @@ def _filter_pattern_selects_flow_records(metric_filter: Dict[str, Any]) -> bool:
     return all(FLOW_LOG_RECORD_TERM.match(t) for t in required) and (
         not optional or any(FLOW_LOG_RECORD_TERM.match(t) for t in optional)
     )
+
+
+COMPOSITE_ALARM_TERM = re.compile(r'\bALARM\(\s*"?([^")]+?)"?\s*\)')
+
+
+def _composite_rule_alarms(rule: str) -> List[str]:
+    """
+    The alarms whose ALARM state alone puts a composite alarm in ALARM.
+
+    Only a rule that joins ALARM() terms with OR credits them. A rule holding
+    AND, NOT, OK(), INSUFFICIENT_DATA(), TRUE or FALSE credits none, because a
+    child in ALARM can leave that composite out of ALARM.
+    """
+    names = COMPOSITE_ALARM_TERM.findall(rule or "")
+    rest = COMPOSITE_ALARM_TERM.sub(" ", rule or "").replace("(", " ").replace(")", " ")
+    if not names or any(token != "OR" for token in rest.split()):
+        return []
+    return [name.strip() for name in names]
+
+
+def _actioned_alarms(
+    metric_alarms: List[Dict[str, Any]], composite_alarms: List[Dict[str, Any]]
+) -> Dict[str, Optional[str]]:
+    """
+    Map each alarm whose ALARM state reaches an alarm action to the composite
+    alarm that carries the action, or None when the alarm carries its own.
+    """
+    names = {}
+    for alarm in metric_alarms + composite_alarms:
+        names[alarm.get("AlarmName")] = alarm.get("AlarmName")
+        if alarm.get("AlarmArn"):
+            names[alarm["AlarmArn"]] = alarm.get("AlarmName")
+    actioned = {
+        alarm.get("AlarmName"): None
+        for alarm in metric_alarms + composite_alarms
+        if alarm.get("ActionsEnabled") and alarm.get("AlarmActions")
+    }
+    changed = True
+    while changed:
+        changed = False
+        for composite in composite_alarms:
+            parent = composite.get("AlarmName")
+            if parent not in actioned:
+                continue
+            for reference in _composite_rule_alarms(composite.get("AlarmRule")):
+                child = names.get(reference, reference)
+                if child not in actioned:
+                    actioned[child] = actioned[parent] or parent
+                    changed = True
+    return actioned
 
 
 def _alarm_metrics(alarm: Dict[str, Any]) -> List[tuple]:
@@ -13400,19 +13493,32 @@ def check_sagemaker_endpoint_flow_log_alerting(region: str = "") -> Dict[str, An
         except Exception as error:
             group_errors[group] = get_assessment_error_label(error)
 
-    alarmed_metrics = set()
+    alarmed_metrics = {}
     alarm_error = None
     if any(group_metrics.values()):
         try:
             cloudwatch_client = boto3.client(
                 "cloudwatch", config=boto3_config, region_name=region
             )
+            metric_alarms = []
+            composite_alarms = []
             for page in cloudwatch_client.get_paginator("describe_alarms").paginate(
-                AlarmTypes=["MetricAlarm"]
+                AlarmTypes=["MetricAlarm", "CompositeAlarm"]
             ):
-                for alarm in page.get("MetricAlarms", []):
-                    if alarm.get("ActionsEnabled") and alarm.get("AlarmActions"):
-                        alarmed_metrics.update(_alarm_metrics(alarm))
+                metric_alarms.extend(page.get("MetricAlarms", []))
+                composite_alarms.extend(page.get("CompositeAlarms", []))
+            actioned = _actioned_alarms(metric_alarms, composite_alarms)
+            for alarm in metric_alarms:
+                if alarm.get("AlarmName") not in actioned:
+                    continue
+                composite = actioned[alarm["AlarmName"]]
+                label = f"alarm '{alarm['AlarmName']}' in state " + str(
+                    alarm.get("StateValue") or "not returned"
+                )
+                if composite:
+                    label += f", actioned through composite alarm '{composite}'"
+                for metric in _alarm_metrics(alarm):
+                    alarmed_metrics.setdefault(metric, label)
         except Exception as error:
             alarm_error = get_assessment_error_label(error)
 
@@ -13450,9 +13556,10 @@ def check_sagemaker_endpoint_flow_log_alerting(region: str = "") -> Dict[str, An
                 uncovered.append(subnet)
                 continue
             hits = [
-                g
+                (g, alarmed_metrics[metric])
                 for g in sorted(covering)
-                if group_metrics.get(g, set()) & alarmed_metrics
+                for metric in sorted(group_metrics.get(g, set()), key=str)
+                if metric in alarmed_metrics
             ]
             if hits:
                 alarmed.append(hits[0])
@@ -13468,7 +13575,12 @@ def check_sagemaker_endpoint_flow_log_alerting(region: str = "") -> Dict[str, An
         unread_groups = sorted(g for g in groups if g in group_errors)
         if not unalarmed:
             passed.append(
-                f"endpoint '{name}' (log group {', '.join(sorted(set(alarmed)))})"
+                f"endpoint '{name}' ("
+                + "; ".join(
+                    f"log group {group}, {label}"
+                    for group, label in sorted(set(alarmed))
+                )
+                + ")"
             )
         elif unread_groups:
             unread.append(
