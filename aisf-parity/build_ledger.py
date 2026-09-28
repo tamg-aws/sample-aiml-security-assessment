@@ -1410,9 +1410,10 @@ FOUNDATION_ROWS = [
         "BR-45 ('Bedrock API Key Inventory') covers the Bedrock API keys, which "
         "are one kind of long-lived credential. BR-50 covers the other, IAM user "
         "access keys: it reads ListAccessKeys for each cached IAM user whose "
-        "attached, inline or group policies grant a non-read bedrock:, "
-        "sagemaker: or bedrock-agentcore: action, fails each Active key and "
-        "reports its age from CreateDate. Inactive keys do not count",
+        "attached, inline or group policies grant any bedrock:, sagemaker: or "
+        "bedrock-agentcore: action, reads included, and whose permissions boundary "
+        "allows one too, fails each Active key and reports its age from CreateDate. "
+        "Inactive keys do not count",
         [],
         6,
     ),
@@ -1557,11 +1558,16 @@ FOUNDATION_ROWS = [
         "alone or with a closed list of qualifiers, so previous_owner is not "
         "credited, and a placeholder value such as TBD is not credited. Whether a "
         "value resolves to a person is not verified, and no API marks a resource "
-        "as production. SageMaker and AgentCore resources belong to their own "
-        "modules. The "
+        "as production. The Bedrock "
         "population is the inventory, never a ResourceTypeFilters sweep, because "
         "GetResources returns only resources that are or were tagged, so a sweep "
-        "omits the resources that most need an owner",
+        "omits the resources that most need an owner. SageMaker and AgentCore "
+        "resources are read through a ResourceTypeFilters sweep, since the Bedrock "
+        "role holds no list action for either service: each returned resource "
+        "without an owner tag fails, and the sweep never passes. Ceiling: a "
+        "SageMaker or AgentCore resource that was never tagged, which only "
+        "sagemaker:ListEndpoints, bedrock-agentcore:ListAgentRuntimes and the "
+        "other list APIs return",
         [],
         6,
     ),

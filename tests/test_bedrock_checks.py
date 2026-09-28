@@ -5632,6 +5632,7 @@ class TestBedrockHandlerMultiRegion:
         "check_inspector_lambda_code_scanning": "BR-33",
         "check_bedrock_data_path_object_lock": "BR-52",
         "check_bedrock_resource_owner_tag": "BR-53",
+        "check_ai_resource_owner_tag_sweep": "BR-53",
         "check_lambda_public_invoke_configuration": "BR-54",
         "check_kms_enclave_key_binding": "BR-55",
         "check_bedrock_llm_jacking_activity": "BR-56",
@@ -22754,9 +22755,9 @@ class TestBR50AIUserAccessKeys:
             not in rows[0]["Finding_Details"]
         )
         assert "day(s) old" in rows[0]["Finding_Details"]
-        assert "1 of the 2 in-scope IAM user(s)" in rows[1]["Finding_Details"]
+        assert "2 of the 3 in-scope IAM user(s)" in rows[1]["Finding_Details"]
         assert "alice" in rows[1]["Finding_Details"]
-        assert "reader" not in json.dumps(rows)
+        assert "reader" in rows[1]["Finding_Details"]
         assert result["status"] == "WARN"
 
     def test_br50_second_page_of_keys_is_read(self):
@@ -22788,7 +22789,7 @@ class TestBR50AIUserAccessKeys:
         _, rows, _ = self._run(
             _ai_user_cache(), error=_make_client_error("AccessDenied")
         )
-        assert [r["Status"] for r in rows] == ["N/A", "N/A"]
+        assert [r["Status"] for r in rows] == ["N/A", "N/A", "N/A"]
         assert "iam:ListAccessKeys" in rows[0]["Finding_Details"]
 
     def test_br50_empty_population_is_na(self, empty_permission_cache):
@@ -22805,11 +22806,11 @@ class TestBR50AIUserAccessKeys:
             "'hidden' was not placed in or out of scope" in rows[0]["Finding_Details"]
         )
 
-    def test_br50_boundary_without_ai_writes_takes_the_user_out_of_scope(self):
+    def test_br50_boundary_without_ai_actions_takes_the_user_out_of_scope(self):
         cache = _ai_user_cache()
         cache["user_permissions"]["bob"]["permissions_boundary"] = {
             "document": _policy(
-                {"Effect": "Allow", "Action": "sagemaker:List*", "Resource": "*"}
+                {"Effect": "Allow", "Action": "s3:List*", "Resource": "*"}
             )
         }
         key = {
@@ -22823,6 +22824,47 @@ class TestBR50AIUserAccessKeys:
         assert len(failed) == 1
         assert "IAM user 'alice'" in failed[0]["Finding_Details"]
         assert "bob" not in json.dumps(rows)
+
+    def test_br50_read_only_ai_user_with_an_active_key_fails(self):
+        key = {
+            "AccessKeyId": "AKIAEXAMPLEREADER001",  # pragma: allowlist secret - fake test key id
+            "Status": "Active",
+            "CreateDate": "2024-01-01T00:00:00Z",
+        }
+        cache = _ai_user_cache()
+        cache["user_permissions"]["storage"] = _identity(
+            attached=[
+                _customer_policy(
+                    "S3Read",
+                    {"Effect": "Allow", "Action": "s3:Get*", "Resource": "*"},
+                )
+            ]
+        )
+        _, rows, _ = self._run(cache, {"reader": [key], "storage": [key]})
+
+        failed = [r for r in rows if r["Status"] == "Failed"]
+        assert len(failed) == 1
+        assert "IAM user 'reader'" in failed[0]["Finding_Details"]
+        assert "allows bedrock:Get*" in failed[0]["Finding_Details"]
+        assert "reads included" in failed[0]["Finding_Details"]
+        assert "storage" not in json.dumps(rows)
+
+    def test_br50_boundary_allowing_only_ai_reads_keeps_the_user_in_scope(self):
+        cache = _ai_user_cache()
+        cache["user_permissions"]["bob"]["permissions_boundary"] = {
+            "document": _policy(
+                {"Effect": "Allow", "Action": "sagemaker:List*", "Resource": "*"}
+            )
+        }
+        key = {
+            "AccessKeyId": "AKIAEXAMPLEACTIVE123",  # pragma: allowlist secret - fake test key id
+            "Status": "Active",
+            "CreateDate": "2024-01-01T00:00:00Z",
+        }
+        _, rows, _ = self._run(cache, {"bob": [key]})
+
+        failed = [r for r in rows if r["Status"] == "Failed"]
+        assert [f["Finding_Details"].split("'")[1] for f in failed] == ["bob"]
 
     def test_br50_unread_principal_stops_a_passed_row(self):
         cache = _ai_user_cache()
@@ -23547,6 +23589,125 @@ class TestBR52DataPathObjectLock:
         for finding in rows:
             assert_finding_schema(finding)
             assert finding["Check_ID"] == "BR-52"
+
+
+class TestBR53OwnerTagSweep:
+    """AIR-FND-GOV-02: SageMaker and AgentCore resources the Bedrock lists miss."""
+
+    SM_OWNED = "arn:aws:sagemaker:us-east-1:123456789012:endpoint/owned"
+    SM_TBD = "arn:aws:sagemaker:us-east-1:123456789012:endpoint/tbd"
+    SM_LATE = "arn:aws:sagemaker:us-east-1:123456789012:model/late"
+    AC_BARE = "arn:aws:bedrock-agentcore:us-east-1:123456789012:runtime/rt-1"
+
+    def _run(self, pages, errors=None):
+        errors = errors or {}
+        tagging = MagicMock()
+
+        def get_resources(**kwargs):
+            (type_filter,) = kwargs["ResourceTypeFilters"]
+            if type_filter in errors:
+                raise errors[type_filter]
+            service_pages = pages.get(type_filter, [[]])
+            index = int(kwargs.get("PaginationToken") or 0)
+            response = {"ResourceTagMappingList": service_pages[index]}
+            response["PaginationToken"] = (
+                str(index + 1) if index + 1 < len(service_pages) else ""
+            )
+            return response
+
+        tagging.get_resources.side_effect = get_resources
+        with patch("boto3.client", return_value=tagging):
+            result = bedrock_app.check_ai_resource_owner_tag_sweep(region="us-east-1")
+        rows = extract_csv_data(result)
+        for row in rows:
+            assert_finding_schema(row)
+            assert row["Check_ID"] == "BR-53"
+            assert row["Finding"] == "AI Resource Owner Tag Outside Bedrock"
+        return result, rows, tagging
+
+    def test_one_unowned_resource_per_service_fails_beside_an_owned_one(self):
+        result, rows, tagging = self._run(
+            {
+                "sagemaker": [
+                    [
+                        {
+                            "ResourceARN": self.SM_OWNED,
+                            "Tags": [{"Key": "Owner", "Value": "ml-platform"}],
+                        },
+                        {
+                            "ResourceARN": self.SM_TBD,
+                            "Tags": [{"Key": "owner", "Value": "TBD"}],
+                        },
+                    ]
+                ],
+                "bedrock-agentcore": [[{"ResourceARN": self.AC_BARE, "Tags": []}]],
+            }
+        )
+        assert [r["Status"] for r in rows] == ["Failed", "Failed", "N/A"]
+        assert f"SageMaker resource {self.SM_TBD}" in rows[0]["Finding_Details"]
+        assert "placeholder 'TBD'" in rows[0]["Finding_Details"]
+        assert f"AgentCore resource {self.AC_BARE}" in rows[1]["Finding_Details"]
+        assert "no tags returned" in rows[1]["Finding_Details"]
+        assert "1 of the 3 SageMaker and AgentCore" in rows[2]["Finding_Details"]
+        assert result["status"] == "WARN"
+        assert [
+            c.kwargs["ResourceTypeFilters"]
+            for c in tagging.get_resources.call_args_list
+        ] == [["sagemaker"], ["bedrock-agentcore"]]
+
+    def test_every_returned_resource_owned_still_does_not_pass(self):
+        _, rows, _ = self._run(
+            {
+                "sagemaker": [
+                    [
+                        {
+                            "ResourceARN": self.SM_OWNED,
+                            "Tags": [{"Key": "Owner", "Value": "ml-platform"}],
+                        }
+                    ]
+                ]
+            }
+        )
+        assert [r["Status"] for r in rows] == ["N/A"]
+        details = rows[0]["Finding_Details"]
+        assert "1 of the 1 SageMaker and AgentCore" in details
+        assert "a resource never tagged is not listed" in details
+        assert "bedrock-agentcore:ListAgentRuntimes" in details
+
+    def test_an_unowned_resource_on_a_later_page_is_failed(self):
+        _, rows, _ = self._run(
+            {
+                "sagemaker": [
+                    [
+                        {
+                            "ResourceARN": self.SM_OWNED,
+                            "Tags": [{"Key": "Owner", "Value": "ml-platform"}],
+                        }
+                    ],
+                    [
+                        {
+                            "ResourceARN": self.SM_LATE,
+                            "Tags": [{"Key": "env", "Value": "x"}],
+                        }
+                    ],
+                ]
+            }
+        )
+        assert [r["Status"] for r in rows] == ["Failed", "N/A"]
+        assert self.SM_LATE in rows[0]["Finding_Details"]
+        assert "1 of the 2 SageMaker and AgentCore" in rows[1]["Finding_Details"]
+
+    def test_an_unread_service_is_named_and_the_other_is_still_judged(self):
+        _, rows, _ = self._run(
+            {"sagemaker": [[{"ResourceARN": self.SM_TBD, "Tags": []}]]},
+            errors={"bedrock-agentcore": _make_client_error("AccessDeniedException")},
+        )
+        assert [r["Status"] for r in rows] == ["Failed", "N/A"]
+        assert self.SM_TBD in rows[0]["Finding_Details"]
+        assert (
+            "tag:GetResources for ResourceTypeFilters bedrock-agentcore"
+            in rows[1]["Finding_Details"]
+        )
 
 
 class TestBR53ResourceOwnerTag:

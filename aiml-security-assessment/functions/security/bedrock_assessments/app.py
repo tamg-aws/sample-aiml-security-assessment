@@ -21323,9 +21323,22 @@ AI_USER_SCOPE_NOTE = (
     "counted."
 )
 
+# BR-50 asks whether anyone reaches an AI service with a long-term key, so a
+# user allowed only reads is in its population.
+AI_ACCESS_SCOPE_NOTE = (
+    "The population is IAM users whose attached, inline or group policies allow any "
+    "Bedrock, SageMaker AI or AgentCore action, reads included, and whose "
+    "permissions boundary, if set, allows one too. Deny statements and service "
+    "control policies are not evaluated per principal, so a user they block can "
+    "still be counted."
+)
 
-def _action_grants_ai_write(pattern: Any) -> List[str]:
-    """Return the AI services in which one Action entry allows a non-read action."""
+
+def _action_grants_ai_write(pattern: Any, include_reads: bool = False) -> List[str]:
+    """
+    Return the AI services in which one Action entry allows a non-read action,
+    or any action when include_reads is set.
+    """
     if not isinstance(pattern, str):
         return []
     pattern = pattern.strip().lower()
@@ -21334,7 +21347,7 @@ def _action_grants_ai_write(pattern: Any) -> List[str]:
     if ":" not in pattern:
         return []
     service_pattern, action_pattern = pattern.split(":", 1)
-    if action_pattern.startswith(AI_READ_ACTION_VERBS):
+    if not include_reads and action_pattern.startswith(AI_READ_ACTION_VERBS):
         return []
     return [
         service
@@ -21343,8 +21356,8 @@ def _action_grants_ai_write(pattern: Any) -> List[str]:
     ]
 
 
-def _policy_ai_write_grants(document: Any) -> List[str]:
-    """Describe each Allow in a policy that grants a non-read AI action."""
+def _policy_ai_write_grants(document: Any, include_reads: bool = False) -> List[str]:
+    """Describe each Allow in a policy that grants a non-read (or any) AI action."""
     grants = []
     for statement in _policy_statements(document):
         if str(statement.get("Effect", "")).upper() != "ALLOW":
@@ -21369,18 +21382,21 @@ def _policy_ai_write_grants(document: Any) -> List[str]:
                 )
             continue
         for action in _as_list(statement.get("Action")):
-            if _action_grants_ai_write(action):
+            if _action_grants_ai_write(action, include_reads):
                 grants.append(f"allows {action}")
     return grants
 
 
 def _ai_write_users(
-    permission_cache: Dict[str, Any], cache_key: str = "user_permissions"
+    permission_cache: Dict[str, Any],
+    cache_key: str = "user_permissions",
+    include_reads: bool = False,
 ) -> Dict[str, Any]:
     """
     Select the cached IAM users (or, with cache_key "role_permissions", roles)
-    that hold a non-read Bedrock, SageMaker AI or AgentCore permission, with the
-    grants that put each one in scope.
+    that hold a non-read Bedrock, SageMaker AI or AgentCore permission (any such
+    permission when include_reads is set), with the grants that put each one in
+    scope.
 
     A permissions boundary is an intersection, so an identity whose boundary
     allows no non-read AI action is out of scope. ``unreadable`` lists
@@ -21398,7 +21414,7 @@ def _ai_write_users(
         boundary = _boundary_document(permissions)
         if boundary is not None:
             try:
-                if not _policy_ai_write_grants(boundary):
+                if not _policy_ai_write_grants(boundary, include_reads):
                     continue
             except (ValueError, TypeError, AttributeError):
                 unreadable[user_name] = ["the permissions boundary could not be parsed"]
@@ -21406,7 +21422,7 @@ def _ai_write_users(
         for source, policy in _cached_identity_policies(permissions):
             policy_name = policy.get("name") or "unnamed policy"
             try:
-                grants = _policy_ai_write_grants(policy.get("document"))
+                grants = _policy_ai_write_grants(policy.get("document"), include_reads)
             except (ValueError, TypeError, AttributeError):
                 gaps.append(f"{source} '{policy_name}' could not be parsed")
                 continue
@@ -21425,6 +21441,7 @@ def _ai_user_unread_findings(
     finding_name: str,
     reference: str,
     region: str,
+    scope_note: str = AI_USER_SCOPE_NOTE,
 ) -> List[Dict[str, Any]]:
     """Emit an N/A row for each user whose policies were not all readable."""
     return [
@@ -21433,7 +21450,7 @@ def _ai_user_unread_findings(
             finding_name=finding_name,
             finding_details=(
                 f"IAM user '{user_name}' was not placed in or out of scope because "
-                f"{'; '.join(gaps)}. {AI_USER_SCOPE_NOTE}"
+                f"{'; '.join(gaps)}. {scope_note}"
             ),
             resolution=COULD_NOT_ASSESS_RESOLUTION,
             reference=reference,
@@ -21470,9 +21487,9 @@ def check_bedrock_ai_user_access_keys(
     permission_cache, region: str = ""
 ) -> Dict[str, Any]:
     """
-    BR-50: Flag active long-term access keys on IAM users that can change
-    Bedrock, SageMaker AI or AgentCore resources. Inactive keys cannot sign a
-    request and are not counted.
+    BR-50: Flag active long-term access keys on IAM users allowed any Bedrock,
+    SageMaker AI or AgentCore action, reads included. Inactive keys cannot sign
+    a request and are not counted.
     """
     logger.debug("Starting check for AI user long-term access keys")
     try:
@@ -21495,7 +21512,7 @@ def check_bedrock_ai_user_access_keys(
                 region=region,
             )
 
-        population = _ai_write_users(permission_cache)
+        population = _ai_write_users(permission_cache, include_reads=True)
         findings["csv_data"].extend(
             _ai_user_unread_findings(
                 population["unreadable"],
@@ -21503,15 +21520,16 @@ def check_bedrock_ai_user_access_keys(
                 AI_USER_ACCESS_KEY_FINDING,
                 AI_USER_ACCESS_KEY_REFERENCE,
                 region,
+                AI_ACCESS_SCOPE_NOTE,
             )
         )
         if not population["users"]:
             findings["status"] = "N/A"
             findings["csv_data"].append(
                 row(
-                    "No IAM user in the permissions cache holds a non-read "
+                    "No IAM user in the permissions cache holds any "
                     f"Bedrock, SageMaker AI or AgentCore permission. "
-                    f"{AI_USER_SCOPE_NOTE}",
+                    f"{AI_ACCESS_SCOPE_NOTE}",
                     "No action required",
                     "Informational",
                     "N/A",
@@ -21566,7 +21584,7 @@ def check_bedrock_ai_user_access_keys(
                         f"ending '{key_id[-4:]}', created {key.get('CreateDate')}"
                         f"{f' ({age} day(s) old)' if age is not None else ''}. The "
                         f"user is in scope because {evidence[0]}. "
-                        f"{AI_USER_SCOPE_NOTE}",
+                        f"{AI_ACCESS_SCOPE_NOTE}",
                         "Replace the access key with temporary credentials from an "
                         "IAM role or IAM Identity Center, then deactivate and "
                         "delete the key.",
@@ -21583,7 +21601,7 @@ def check_bedrock_ai_user_access_keys(
                         len(without_keys),
                         len(population["users"]),
                         ", ".join(without_keys[:10]),
-                        AI_USER_SCOPE_NOTE,
+                        AI_ACCESS_SCOPE_NOTE,
                     ),
                     "No action required",
                     "High",
@@ -24762,6 +24780,145 @@ def check_bedrock_resource_owner_tag(region: str = "") -> Dict[str, Any]:
                 )
             ],
         }
+
+
+RESOURCE_OWNER_SWEEP_FINDING = "AI Resource Owner Tag Outside Bedrock"
+
+# GetResources ResourceTypeFilters values for the AI services whose resources
+# the Bedrock list APIs above do not return.
+RESOURCE_OWNER_SWEEP_SERVICES = (
+    ("sagemaker", "SageMaker"),
+    ("bedrock-agentcore", "AgentCore"),
+)
+
+# The list actions that would enumerate SageMaker and AgentCore resources that
+# were never tagged. The Bedrock role holds none of them.
+RESOURCE_OWNER_SWEEP_UNGRANTED = (
+    "sagemaker:ListEndpoints, sagemaker:ListModels, sagemaker:ListNotebookInstances, "
+    "bedrock-agentcore:ListAgentRuntimes, bedrock-agentcore:ListGateways and "
+    "bedrock-agentcore:ListMemories"
+)
+
+
+def check_ai_resource_owner_tag_sweep(region: str = "") -> Dict[str, Any]:
+    """
+    BR-53 SageMaker and AgentCore leg: fail each resource GetResources returns
+    for those services with no owner tag whose value names someone. GetResources
+    returns only resources that are or were tagged, so this never passes.
+    """
+    findings = {"check_name": RESOURCE_OWNER_SWEEP_FINDING, "csv_data": []}
+
+    def row(details, resolution, severity, status):
+        return create_finding(
+            check_id="BR-53",
+            finding_name=RESOURCE_OWNER_SWEEP_FINDING,
+            finding_details=details,
+            resolution=resolution,
+            reference=RESOURCE_OWNER_REFERENCE,
+            severity=severity,
+            status=status,
+            region=region,
+        )
+
+    tagging_client = boto3.client(
+        "resourcegroupstaggingapi", config=boto3_config, region_name=region
+    )
+    returned = 0
+    owned = 0
+    unowned = []
+    unread = []
+    for type_filter, label in RESOURCE_OWNER_SWEEP_SERVICES:
+        try:
+            mappings = _list_all_items(
+                tagging_client,
+                "get_resources",
+                "ResourceTagMappingList",
+                max_results_param=None,
+                token_param="PaginationToken",
+                token_response_keys=("PaginationToken",),
+                ResourceTypeFilters=[type_filter],
+            )
+        except Exception as error:
+            unread.append(
+                f"tag:GetResources for ResourceTypeFilters {type_filter} "
+                f"({get_assessment_error_label(error)})"
+            )
+            continue
+        for mapping in mappings:
+            arn = mapping.get("ResourceARN")
+            if not arn:
+                continue
+            returned += 1
+            tags = mapping.get("Tags") or []
+            rejections = []
+            credited = False
+            for tag in tags:
+                rejection = _owner_tag_rejection(tag)
+                if rejection == "":
+                    credited = True
+                elif rejection:
+                    rejections.append(rejection)
+            if credited:
+                owned += 1
+            else:
+                unowned.append((label, arn, tags, rejections))
+
+    for label, arn, tags, rejections in unowned[:MAX_REPORTED_UNOWNED_RESOURCES]:
+        findings["csv_data"].append(
+            row(
+                "{} resource {} has no owner tag whose value names someone ({}).{}".format(
+                    label,
+                    arn,
+                    "no tags returned"
+                    if not tags
+                    else "tag keys: "
+                    + ", ".join(str(tag.get("Key")) for tag in tags[:10]),
+                    " Not credited: {}.".format("; ".join(rejections[:5]))
+                    if rejections
+                    else "",
+                ),
+                "Tag the resource with an owner key naming the accountable "
+                "team or person, and require the tag at creation.",
+                "Low",
+                "Failed",
+            )
+        )
+    if len(unowned) > MAX_REPORTED_UNOWNED_RESOURCES:
+        findings["csv_data"].append(
+            row(
+                "{} further SageMaker or AgentCore resource(s) have no owner tag "
+                "beyond the {} reported individually: {}.".format(
+                    len(unowned) - MAX_REPORTED_UNOWNED_RESOURCES,
+                    MAX_REPORTED_UNOWNED_RESOURCES,
+                    ", ".join(
+                        arn
+                        for _, arn, _, _ in unowned[MAX_REPORTED_UNOWNED_RESOURCES:][
+                            :20
+                        ]
+                    ),
+                ),
+                "Tag each of these resources with an owner key.",
+                "Low",
+                "Failed",
+            )
+        )
+    unread_note = " These reads failed: {}.".format("; ".join(unread)) if unread else ""
+    findings["csv_data"].append(
+        row(
+            "{} of the {} SageMaker and AgentCore resource(s) GetResources returned "
+            "carry an owner tag with a non-placeholder value. GetResources returns "
+            "only resources that are or were tagged, so a resource never tagged is "
+            "not listed, and the Bedrock role holds none of {} to enumerate them. "
+            "This is not a verdict on every SageMaker or AgentCore resource.{}".format(
+                owned, returned, RESOURCE_OWNER_SWEEP_UNGRANTED, unread_note
+            ),
+            COULD_NOT_ASSESS_RESOLUTION,
+            "Informational",
+            "N/A",
+        )
+    )
+    findings["status"] = "WARN" if unowned else "N/A"
+    return findings
 
 
 LAMBDA_PUBLIC_INVOKE_FINDING = "Lambda Function Public Invoke Configuration"
@@ -28372,6 +28529,7 @@ def lambda_handler(event, context):
 
         logger.info("Running Bedrock resource owner tag check (BR-53)")
         all_findings.append(check_bedrock_resource_owner_tag(region=region))
+        all_findings.append(check_ai_resource_owner_tag_sweep(region=region))
 
         logger.info("Running Lambda public invoke configuration check (BR-54)")
         all_findings.append(

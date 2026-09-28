@@ -245,6 +245,11 @@ section.
 - `BR-34` fails a Region whose model invocation logging is off or does not
   deliver text, so a guardrail intervention leaves no record. `AIR-FND-DET-04`
   now also counts `SM-26`, which reads GuardDuty AI Protection.
+- `BR-53` also fails SageMaker and AgentCore resources that the Resource
+  Groups Tagging API returns without an owner tag, and never passes that
+  population, since a resource never tagged is not returned.
+- `BR-50` counts IAM users allowed only to read Bedrock, SageMaker AI or
+  AgentCore, so a long-term key used for reads is no longer out of scope.
 - Bedrock checks judge values that they used to credit on presence. `BR-07`,
   `BR-17`, `BR-20` (S3 Vectors), `BR-30` and `BR-38` describe each named KMS
   key and pass only an enabled customer managed key. `BR-07` also fails inline
