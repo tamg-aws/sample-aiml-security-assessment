@@ -11458,17 +11458,40 @@ def check_bedrock_inference_profile_governance(
     return findings
 
 
+DATA_RETENTION_REFERENCE = (
+    "https://docs.aws.amazon.com/bedrock/latest/userguide/data-retention.html"
+)
+
+# bedrock-mantle publishes the account mode and a per-project override behind
+# its own endpoint, and botocore has no client for it, so the scanner cannot
+# read either value. The finding text names this ceiling.
+DATA_RETENTION_MANTLE_CEILING = (
+    "The bedrock-mantle account mode, its per-project overrides and each "
+    "model's allowed_modes were not read: botocore has no bedrock-mantle client "
+    "and the bedrock API returns no allowed_modes field."
+)
+
+# Each retention write action and the condition key it publishes. The mantle
+# actions do not carry bedrock:DataRetentionMode, so a Deny keyed on it never
+# matches a mantle request.
+DATA_RETENTION_WRITE_ACTIONS = {
+    "bedrock:putaccountdataretention": "bedrock:dataretentionmode",
+    "bedrock-mantle:putaccountdataretention": "bedrock-mantle:dataretentionmode",
+    "bedrock-mantle:createproject": "bedrock-mantle:dataretentionmode",
+    "bedrock-mantle:updateproject": "bedrock-mantle:dataretentionmode",
+}
+DATA_RETENTION_APPROVED_MODE = "none"
+
+
 def check_bedrock_account_data_retention(region: str = "") -> Dict[str, Any]:
-    """BR-37: Assess the regional Bedrock account data-retention mode."""
+    """
+    BR-37: Assess the regional Bedrock account data-retention mode.
+
+    Only none passes. default applies each model's own retention and inherit
+    records no decision at this scope, so both fail.
+    """
     findings = {"csv_data": []}
-    reference = (
-        "https://docs.aws.amazon.com/bedrock/latest/userguide/data-retention.html"
-    )
-    require_zdr = os.environ.get("REQUIRE_BEDROCK_ZERO_DATA_RETENTION", "").lower() in {
-        "1",
-        "true",
-        "yes",
-    }
+    reference = DATA_RETENTION_REFERENCE
     try:
         client = boto3.client("bedrock", config=boto3_config, region_name=region)
         mode = client.get_account_data_retention().get("mode")
@@ -11486,16 +11509,20 @@ def check_bedrock_account_data_retention(region: str = "") -> Dict[str, Any]:
             detail = "Bedrock account data retention is configured as none."
             resolution = "No action required"
         elif mode in {"default", "inherit"}:
-            status = "Failed" if require_zdr else "N/A"
-            severity = "High" if require_zdr else "Informational"
+            status = "Failed"
+            severity = "High"
             detail = (
-                f"Bedrock account data retention is {mode}; this does not establish "
-                "an explicit account-level zero-data-retention setting."
+                f"Bedrock account data retention is {mode}; "
+                + (
+                    "each model's own retention behavior applies, "
+                    if mode == "default"
+                    else "no mode is set at the account scope, "
+                )
+                + "so the account has not pinned zero data retention."
             )
             resolution = (
-                "Set the account data-retention mode to none."
-                if require_zdr
-                else "Review the inherited/default retention behavior against organizational policy."
+                "Set the account data-retention mode to none with "
+                "bedrock:PutAccountDataRetention."
             )
         else:
             status = "N/A"
@@ -11507,7 +11534,7 @@ def check_bedrock_account_data_retention(region: str = "") -> Dict[str, Any]:
             create_finding(
                 check_id="BR-37",
                 finding_name="Bedrock Account Data Retention",
-                finding_details=detail,
+                finding_details=f"{detail} {DATA_RETENTION_MANTLE_CEILING}",
                 resolution=resolution,
                 reference=reference,
                 severity=severity,
@@ -11528,6 +11555,176 @@ def check_bedrock_account_data_retention(region: str = "") -> Dict[str, Any]:
                 region=region,
             )
         )
+    return findings
+
+
+def _data_retention_deny_binding(
+    statement: Dict[str, Any], action: str
+) -> Dict[str, Any]:
+    """
+    Judge whether one Deny statement pins the retention mode of one write action.
+
+    Credited forms are an unconditioned Deny and a Deny whose only test is
+    StringNotEquals (or its IgnoreCase or IfExists form) on the action's own key
+    with none as the only approved value. A missing key makes StringNotEquals
+    true, so the Deny also blocks a write that names no mode.
+    """
+    own_key = DATA_RETENTION_WRITE_ACTIONS[action]
+    if not _deny_applies_to_every_resource(statement):
+        return {"bound": False, "reason": 'does not apply to Resource "*"'}
+    conditions = _condition_keys_by_operator(statement)
+    if not conditions:
+        return {"bound": True, "detail": "denies the write outright"}
+    other_keys = sorted({key for _, key, _ in conditions if key != own_key})
+    if other_keys:
+        return {
+            "bound": False,
+            "reason": (
+                "is conditioned on {}, which narrows the Deny to part of the "
+                "requests; the retention key for {} is {}".format(
+                    ", ".join(other_keys), action, own_key
+                )
+            ),
+        }
+    for operator, _, values in conditions:
+        base = operator
+        if base.startswith(("forallvalues:", "foranyvalue:")):
+            return {
+                "bound": False,
+                "reason": f"uses {operator} on the single-valued key {own_key}",
+            }
+        if base.endswith("ifexists"):
+            base = base[: -len("ifexists")]
+        if base not in ("stringnotequals", "stringnotequalsignorecase"):
+            return {
+                "bound": False,
+                "reason": f"tests {own_key} with {operator}, not StringNotEquals",
+            }
+        allowed = sorted({str(value).strip().lower() for value in values})
+        if allowed != [DATA_RETENTION_APPROVED_MODE]:
+            return {
+                "bound": False,
+                "reason": "approves {} for {}, not none alone".format(
+                    ", ".join(allowed) or "no value", own_key
+                ),
+            }
+    return {"bound": True, "detail": f"denies every {own_key} other than none"}
+
+
+def check_bedrock_data_retention_scp(
+    region: str = "", scp_inventory: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
+    """
+    BR-37: Verify an attached service control policy pins the data-retention
+    mode on the bedrock and bedrock-mantle write actions.
+
+    Every action in DATA_RETENTION_WRITE_ACTIONS needs a credited Deny, each on
+    its own condition key, because the mantle project actions override the
+    account setting.
+    """
+    findings = {"csv_data": []}
+    finding_name = "Bedrock Data Retention Service Control Policy"
+    inventory = scp_inventory or {}
+    note = _scp_scope_note(inventory)
+    unread = []
+    if inventory.get("list_error"):
+        unread.append(str(inventory["list_error"]))
+    unread.extend(inventory.get("errors") or [])
+
+    covered = {action: [] for action in DATA_RETENTION_WRITE_ACTIONS}
+    gaps = []
+    for item in inventory.get("items") or []:
+        try:
+            statements = _policy_statements(item.get("content") or "{}")
+        except (ValueError, TypeError) as error:
+            unread.append(
+                f"policy '{item.get('name')}': {get_assessment_error_label(error)}"
+            )
+            continue
+        for statement in statements:
+            if str(statement.get("Effect", "")).upper() != "DENY":
+                continue
+            label = "policy '{}' statement '{}'".format(
+                item.get("name"), statement.get("Sid") or "unnamed"
+            )
+            for action in DATA_RETENTION_WRITE_ACTIONS:
+                if not _statement_matches_action(statement, action):
+                    continue
+                binding = _data_retention_deny_binding(statement, action)
+                if binding["bound"]:
+                    covered[action].append(f"{label} {binding['detail']}")
+                else:
+                    gaps.append(f"{label} on {action} {binding['reason']}")
+
+    missing = [action for action, sources in covered.items() if not sources]
+    gap_note = (
+        (" Deny statements not credited: " + "; ".join(gaps) + ".") if gaps else ""
+    )
+    if scp_inventory is None:
+        status, severity = "N/A", "Informational"
+        detail = "The service control policy inventory was not read."
+        resolution = COULD_NOT_ASSESS_RESOLUTION
+    elif not missing and inventory.get("management_account"):
+        status, severity = "Failed", "Medium"
+        detail = (
+            "Attached service control policies pin the retention mode on all {} "
+            "write actions, but this is the management account, which service "
+            "control policies never restrict.".format(len(covered))
+        )
+        resolution = (
+            "Restrict bedrock:PutAccountDataRetention and the bedrock-mantle "
+            "retention and project actions in the management account through IAM."
+        )
+    elif not missing:
+        status, severity = "Passed", "Medium"
+        detail = "Attached service control policies pin the retention mode to none: {}.".format(
+            "; ".join(
+                "{} by {}".format(action, ", ".join(sources))
+                for action, sources in covered.items()
+            )
+        )
+        resolution = "No action required"
+    elif unread:
+        status, severity = "N/A", "Informational"
+        detail = (
+            "No readable attached service control policy pins the retention mode "
+            "on {}, and these reads failed: {}.".format(
+                ", ".join(missing), "; ".join(unread)
+            )
+        )
+        resolution = (
+            "Grant organizations:ListPolicies, ListTargetsForPolicy, ListParents "
+            "and DescribePolicy and retry."
+        )
+    else:
+        status, severity = "Failed", "Medium"
+        detail = (
+            "No attached service control policy pins the retention mode on {}.".format(
+                ", ".join(missing)
+            )
+        )
+        resolution = (
+            "Attach a service control policy that Denies bedrock:PutAccountDataRetention "
+            "on StringNotEquals bedrock:DataRetentionMode none, and Denies "
+            "bedrock-mantle:PutAccountDataRetention, CreateProject and UpdateProject "
+            "on StringNotEquals bedrock-mantle:DataRetentionMode none."
+        )
+    if unread and status != "N/A":
+        detail += " These service control policy reads failed: {}.".format(
+            "; ".join(unread)
+        )
+    findings["csv_data"].append(
+        create_finding(
+            check_id="BR-37",
+            finding_name=finding_name,
+            finding_details=f"{detail}{gap_note} {note}",
+            resolution=resolution,
+            reference=DATA_RETENTION_REFERENCE,
+            severity=severity,
+            status=status,
+            region=region,
+        )
+    )
     return findings
 
 
@@ -20734,6 +20931,13 @@ def lambda_handler(event, context):
                     permission_cache,
                     region=GLOBAL_REGION_LABEL,
                     scp_inventory=scp_inventory,
+                )
+            )
+
+            logger.info("Running data retention service control policy check (BR-37)")
+            all_findings.append(
+                check_bedrock_data_retention_scp(
+                    region=GLOBAL_REGION_LABEL, scp_inventory=scp_inventory
                 )
             )
 

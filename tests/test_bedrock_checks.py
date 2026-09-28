@@ -12097,7 +12097,7 @@ class TestProposedBedrockChecks:
         clear=False,
     )
     @patch("bedrock_app.boto3.client")
-    def test_br37_default_retention_is_advisory_na(self, mock_client):
+    def test_br37_default_retention_fails_without_the_baseline(self, mock_client):
         mock_client.return_value.get_account_data_retention.return_value = {
             "mode": "default"
         }
@@ -12106,9 +12106,268 @@ class TestProposedBedrockChecks:
             bedrock_app.check_bedrock_account_data_retention("us-east-1")
         )[0]
 
-        assert finding["Status"] == "N/A"
-        assert finding["Severity"] == "Informational"
-        assert finding["Resolution"].startswith("Review the inherited/default")
+        assert finding["Status"] == "Failed"
+        assert finding["Severity"] == "High"
+        assert finding["Resolution"].startswith(
+            "Set the account data-retention mode to none"
+        )
+        assert (
+            "each model's own retention behavior applies" in finding["Finding_Details"]
+        )
+
+    @patch("bedrock_app.boto3.client")
+    def test_br37_inherit_retention_fails_as_no_decision(self, mock_client):
+        mock_client.return_value.get_account_data_retention.return_value = {
+            "mode": "inherit"
+        }
+
+        finding = extract_csv_data(
+            bedrock_app.check_bedrock_account_data_retention("us-east-1")
+        )[0]
+
+        assert finding["Status"] == "Failed"
+        assert "no mode is set at the account scope" in finding["Finding_Details"]
+
+    @patch("bedrock_app.boto3.client")
+    def test_br37_zero_retention_names_the_mantle_ceiling(self, mock_client):
+        mock_client.return_value.get_account_data_retention.return_value = {
+            "mode": "none"
+        }
+
+        finding = extract_csv_data(
+            bedrock_app.check_bedrock_account_data_retention("us-east-1")
+        )[0]
+
+        assert finding["Status"] == "Passed"
+        assert "per-project overrides" in finding["Finding_Details"]
+        assert "were not read" in finding["Finding_Details"]
+
+    @staticmethod
+    def _retention_inventory(*policies, errors=None, management=False):
+        return {
+            "items": [
+                {
+                    "name": name,
+                    "id": f"p-{index}",
+                    "content": json.dumps(
+                        {"Version": "2012-10-17", "Statement": list(statements)}
+                    ),
+                    "attached_to": ["root r-root"],
+                }
+                for index, (name, statements) in enumerate(policies)
+            ],
+            "errors": errors or [],
+            "list_error": None,
+            "detached": [],
+            "account": "111122223333",
+            "path": [],
+            "management_account": management,
+        }
+
+    @staticmethod
+    def _retention_deny(actions, key, values=("none",), operator="StringNotEquals"):
+        return {
+            "Sid": "PinRetention",
+            "Effect": "Deny",
+            "Action": list(actions),
+            "Resource": "*",
+            "Condition": {operator: {key: list(values)}},
+        }
+
+    MANTLE_RETENTION_ACTIONS = (
+        "bedrock-mantle:PutAccountDataRetention",
+        "bedrock-mantle:CreateProject",
+        "bedrock-mantle:UpdateProject",
+    )
+
+    def _retention_scp(self, inventory):
+        return extract_csv_data(
+            bedrock_app.check_bedrock_data_retention_scp(
+                region="global", scp_inventory=inventory
+            )
+        )
+
+    def test_br37_scp_pins_both_endpoints_across_two_policies(self):
+        findings = self._retention_scp(
+            self._retention_inventory(
+                (
+                    "BedrockPin",
+                    [
+                        self._retention_deny(
+                            ["bedrock:PutAccountDataRetention"],
+                            "bedrock:DataRetentionMode",
+                        )
+                    ],
+                ),
+                (
+                    "MantlePin",
+                    [
+                        self._retention_deny(
+                            self.MANTLE_RETENTION_ACTIONS,
+                            "bedrock-mantle:DataRetentionMode",
+                        )
+                    ],
+                ),
+            )
+        )
+
+        assert [finding["Status"] for finding in findings] == ["Passed"]
+        assert findings[0]["Check_ID"] == "BR-37"
+        assert "policy 'MantlePin'" in findings[0]["Finding_Details"]
+        assert "bedrock-mantle:updateproject" in findings[0]["Finding_Details"]
+
+    def test_br37_scp_on_the_bedrock_action_alone_fails_the_mantle_leg(self):
+        findings = self._retention_scp(
+            self._retention_inventory(
+                (
+                    "BedrockPin",
+                    [
+                        self._retention_deny(
+                            ["bedrock:PutAccountDataRetention"],
+                            "bedrock:DataRetentionMode",
+                        )
+                    ],
+                )
+            )
+        )
+
+        assert [finding["Status"] for finding in findings] == ["Failed"]
+        detail = findings[0]["Finding_Details"]
+        assert "bedrock-mantle:createproject" in detail
+        assert "bedrock-mantle:putaccountdataretention" in detail
+
+    def test_br37_scp_mantle_deny_on_the_bedrock_key_is_not_credited(self):
+        findings = self._retention_scp(
+            self._retention_inventory(
+                (
+                    "Pin",
+                    [
+                        self._retention_deny(
+                            ("bedrock:PutAccountDataRetention",)
+                            + self.MANTLE_RETENTION_ACTIONS,
+                            "bedrock:DataRetentionMode",
+                        )
+                    ],
+                )
+            )
+        )
+
+        assert [finding["Status"] for finding in findings] == ["Failed"]
+        assert (
+            "the retention key for bedrock-mantle:createproject is "
+            "bedrock-mantle:dataretentionmode"
+        ) in findings[0]["Finding_Details"]
+
+    def test_br37_scp_approving_provider_sharing_is_not_credited(self):
+        findings = self._retention_scp(
+            self._retention_inventory(
+                (
+                    "Loose",
+                    [
+                        self._retention_deny(
+                            ["bedrock:PutAccountDataRetention"],
+                            "bedrock:DataRetentionMode",
+                            values=("none", "provider_data_share"),
+                        ),
+                        self._retention_deny(
+                            self.MANTLE_RETENTION_ACTIONS,
+                            "bedrock-mantle:DataRetentionMode",
+                        ),
+                    ],
+                )
+            )
+        )
+
+        assert [finding["Status"] for finding in findings] == ["Failed"]
+        assert "approves none, provider_data_share" in findings[0]["Finding_Details"]
+
+    def test_br37_scp_set_operator_or_scoped_resource_is_not_credited(self):
+        scoped = self._retention_deny(
+            self.MANTLE_RETENTION_ACTIONS, "bedrock-mantle:DataRetentionMode"
+        )
+        scoped["Resource"] = (
+            "arn:aws:bedrock-mantle:us-east-1:111122223333:project/prod-*"
+        )
+        findings = self._retention_scp(
+            self._retention_inventory(
+                (
+                    "Pin",
+                    [
+                        self._retention_deny(
+                            ["bedrock:PutAccountDataRetention"],
+                            "bedrock:DataRetentionMode",
+                            operator="ForAnyValue:StringNotEquals",
+                        ),
+                        scoped,
+                    ],
+                )
+            )
+        )
+
+        assert [finding["Status"] for finding in findings] == ["Failed"]
+        detail = findings[0]["Finding_Details"]
+        assert "uses foranyvalue:stringnotequals" in detail
+        assert 'does not apply to Resource "*"' in detail
+
+    def test_br37_scp_unconditioned_deny_and_ifexists_pin_the_mode(self):
+        findings = self._retention_scp(
+            self._retention_inventory(
+                (
+                    "Pin",
+                    [
+                        {
+                            "Effect": "Deny",
+                            "Action": "bedrock-mantle:*",
+                            "Resource": "*",
+                        },
+                        self._retention_deny(
+                            ["bedrock:PutAccountDataRetention"],
+                            "bedrock:DataRetentionMode",
+                            operator="StringNotEqualsIfExists",
+                        ),
+                    ],
+                )
+            )
+        )
+
+        assert [finding["Status"] for finding in findings] == ["Passed"]
+        assert "denies the write outright" in findings[0]["Finding_Details"]
+
+    def test_br37_scp_unread_policy_is_not_a_clean_failure(self):
+        findings = self._retention_scp(
+            self._retention_inventory(errors=["policy 'Hidden': AccessDenied"])
+        )
+
+        assert [finding["Status"] for finding in findings] == ["N/A"]
+        assert "policy 'Hidden': AccessDenied" in findings[0]["Finding_Details"]
+
+    def test_br37_scp_in_the_management_account_fails(self):
+        findings = self._retention_scp(
+            self._retention_inventory(
+                (
+                    "Pin",
+                    [
+                        {
+                            "Effect": "Deny",
+                            "Action": [
+                                "bedrock:PutAccountDataRetention",
+                                *self.MANTLE_RETENTION_ACTIONS,
+                            ],
+                            "Resource": "*",
+                        }
+                    ],
+                ),
+                management=True,
+            )
+        )
+
+        assert [finding["Status"] for finding in findings] == ["Failed"]
+        assert "management account" in findings[0]["Finding_Details"]
+
+    def test_br37_scp_without_an_inventory_is_not_assessed(self):
+        findings = self._retention_scp(None)
+
+        assert [finding["Status"] for finding in findings] == ["N/A"]
 
     @patch.dict(
         os.environ,

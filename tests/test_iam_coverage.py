@@ -619,6 +619,9 @@ _VERIFIED_REMEDIATION_IAM_ACTIONS |= {
     "aws-marketplace:Unsubscribe",
     "bedrock:CallWithBearerToken",
     "bedrock-mantle:CallWithBearerToken",
+    # The two PutAccountDataRetention actions: same method, 2026-09-27.
+    "bedrock-mantle:PutAccountDataRetention",
+    "bedrock:PutAccountDataRetention",
     "iam:CreateServiceSpecificCredential",
     "iam:ListServiceSpecificCredentials",
     "logs:DescribeLogGroups",
@@ -793,6 +796,9 @@ _VERIFIED_REMEDIATION_CONDITION_KEYS |= {
     "aws:RequestedRegion",
     "bedrock:BearerTokenType",
     "bedrock-mantle:BearerTokenType",
+    # The two DataRetentionMode keys: same method, 2026-09-27.
+    "bedrock-mantle:DataRetentionMode",
+    "bedrock:DataRetentionMode",
     "bedrock:ModelArn",
     "iam:ServiceSpecificCredentialAgeDays",
     "iam:ServiceSpecificCredentialServiceName",

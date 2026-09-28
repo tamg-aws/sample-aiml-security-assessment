@@ -546,8 +546,8 @@ inventory is never treated as evidence of compliance.
 
 ### BR-37: Bedrock Account Data Retention
 
-- **Severity:** High for provider sharing or an explicitly required zero-data-retention violation
-- **Description:** Fails `provider_data_share`, passes `none`, and reports `default`/`inherit` as informational unless the `RequireBedrockZeroDataRetention` deployment parameter is `true` (`REQUIRE_BEDROCK_ZERO_DATA_RETENTION` in the Lambda), in which case those modes fail.
+- **Severity:** High for the regional mode, Medium for the service control policy
+- **Description:** Passes the regional `GetAccountDataRetention` mode only when it is `none`; `default`, `inherit` and `provider_data_share` fail. A second, organization-wide row passes only when attached service control policies Deny `bedrock:PutAccountDataRetention` on `StringNotEquals bedrock:DataRetentionMode` and `bedrock-mantle:PutAccountDataRetention`, `CreateProject` and `UpdateProject` on `StringNotEquals bedrock-mantle:DataRetentionMode`, each with `none` as the only approved value. The bedrock-mantle account mode, its project overrides and per-model `allowed_modes` are not read because botocore has no bedrock-mantle client. The `RequireBedrockZeroDataRetention` parameter is no longer read.
 
 ### BR-38: Automated Reasoning Policy CMK Encryption
 
