@@ -8109,6 +8109,59 @@ class TestAC23MemoryRecordAccessScope:
 
         assert {finding["Status"] for finding in findings} == {"Failed", "Passed"}
 
+    @pytest.mark.parametrize(
+        "namespace,status",
+        [
+            ("/users/*", "Failed"),
+            ("/actors/*", "Failed"),
+            ("/strategies/s-1/actors/*", "Failed"),
+            ("/sessions/*", "Failed"),
+            ("/*", "Failed"),
+            ("/actors/a-*/*", "Failed"),
+            ("/actors/alice*", "Failed"),
+            ("/actors/a-?", "Failed"),
+            ("/actors/a-1/*", "Passed"),
+            ("/actors/a-1/sessions/*", "Passed"),
+            ("/users/alice/*", "Passed"),
+            ("/actors/a-1/sessions/s-1", "Passed"),
+        ],
+    )
+    def test_a_stringlike_namespace_that_spans_callers_is_unscoped(
+        self, namespace, status
+    ):
+        # '/users/*' was read as a fixed partition and passed, though it
+        # matches every user's records.
+        findings = agentcore_app.check_agentcore_memory_record_access_scope(
+            self._cache(
+                ["bedrock-agentcore:RetrieveMemoryRecords"],
+                condition={"StringLike": {"bedrock-agentcore:namespace": namespace}},
+            )
+        )
+        assert [f["Status"] for f in findings] == [status]
+
+    def test_a_users_wildcard_role_fails_beside_a_scoped_role(self):
+        cache = self._cache(
+            ["bedrock-agentcore:RetrieveMemoryRecords"],
+            condition={"StringLike": {"bedrock-agentcore:namespace": "/users/*"}},
+            principal="wide-role",
+        )
+        cache["role_permissions"].update(
+            self._cache(
+                ["bedrock-agentcore:RetrieveMemoryRecords"],
+                condition={
+                    "StringLike": {"bedrock-agentcore:namespace": "/actors/a-1/*"}
+                },
+                principal="scoped-role",
+            )["role_permissions"]
+        )
+
+        findings = agentcore_app.check_agentcore_memory_record_access_scope(cache)
+
+        failed = [f for f in findings if f["Status"] == "Failed"]
+        assert len(failed) == 1
+        assert "role wide-role" in failed[0]["Finding_Details"]
+        assert "scoped-role" not in failed[0]["Finding_Details"]
+
     def test_findings_are_tagged_global(self):
         findings = agentcore_app.check_agentcore_memory_record_access_scope(
             self._cache(["bedrock-agentcore:RetrieveMemoryRecords"])
@@ -10005,6 +10058,96 @@ class TestAC28GatewayAuthorizerSCP:
         assert findings[0]["Check_ID"] == "AC-28"
         assert findings[0]["Status"] == "N/A"
 
+    @pytest.mark.parametrize(
+        "change",
+        [
+            {
+                "Condition": {
+                    "StringEquals": {"bedrock-agentcore:GatewayAuthorizerType": "NONE"},
+                    "ArnNotLike": {"aws:PrincipalArn": "arn:aws:iam::*:role/Admin"},
+                }
+            },
+            {
+                "Condition": {
+                    "StringEquals": {
+                        "bedrock-agentcore:GatewayAuthorizerType": "NONE",
+                        "aws:ResourceTag/env": "prod",
+                    }
+                }
+            },
+            {"Resource": "arn:aws:bedrock-agentcore:*:*:gateway/prod-*"},
+            {"Resource": "arn:aws:bedrock-agentcore:us-east-1:*:*"},
+            {"NotResource": "arn:aws:bedrock-agentcore:*:*:gateway/legacy"},
+        ],
+        ids=[
+            "principal-exemption",
+            "tag-and",
+            "resource-id",
+            "one-region",
+            "not-resource",
+        ],
+    )
+    @patch("agentcore_app.organizations_client")
+    def test_a_deny_narrowed_by_another_key_or_resource_is_not_coverage(
+        self, mock_orgs, change
+    ):
+        # An ANDed second key or a narrowed Resource lets every request outside
+        # it through, and such a Deny was credited as covering the writes.
+        statement = {
+            "Effect": "Deny",
+            "Action": _GATEWAY_WRITE,
+            "Resource": "*",
+            "Condition": {
+                "StringEquals": {"bedrock-agentcore:GatewayAuthorizerType": "NONE"}
+            },
+        }
+        statement.update(change)
+        if "NotResource" in change:
+            del statement["Resource"]
+        self._wire(mock_orgs, {"Narrowed": [statement]})
+
+        findings = agentcore_app.check_agentcore_gateway_authorizer_scp()
+
+        assert [f["Status"] for f in findings] == ["Failed"]
+
+    @patch("agentcore_app.organizations_client")
+    def test_a_whole_deny_passes_beside_a_narrowed_one(self, mock_orgs):
+        self._wire(
+            mock_orgs,
+            {
+                "Narrowed": [
+                    {
+                        "Effect": "Deny",
+                        "Action": _GATEWAY_WRITE,
+                        "Resource": "arn:aws:bedrock-agentcore:*:*:gateway/prod-*",
+                        "Condition": {
+                            "StringEquals": {
+                                "bedrock-agentcore:GatewayAuthorizerType": "NONE"
+                            }
+                        },
+                    }
+                ],
+                "Whole": [
+                    {
+                        "Effect": "Deny",
+                        "Action": _GATEWAY_WRITE,
+                        "Resource": "arn:aws:bedrock-agentcore:*:*:gateway/*",
+                        "Condition": {
+                            "StringEquals": {
+                                "bedrock-agentcore:GatewayAuthorizerType": "NONE"
+                            }
+                        },
+                    }
+                ],
+            },
+        )
+
+        findings = agentcore_app.check_agentcore_gateway_authorizer_scp()
+
+        assert [f["Status"] for f in findings] == ["Passed"]
+        assert "Whole" in findings[0]["Finding_Details"]
+        assert "Narrowed" not in findings[0]["Finding_Details"]
+
 
 class TestGatewayCheckRegistration:
     """AC-24..AC-27 must reach the backfill paths, and the API must answer them."""
@@ -10562,6 +10705,86 @@ class TestAC29RuntimeAuthorizerSCP:
 
         assert [finding["Status"] for finding in findings] == ["N/A", "Passed"]
         assert "Unreadable" in findings[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "change",
+        [
+            {
+                "Condition": {
+                    "StringEquals": {_RUNTIME_KEY: "AWS_IAM"},
+                    "ArnNotLike": {"aws:PrincipalArn": "arn:aws:iam::*:role/Admin"},
+                }
+            },
+            {
+                "Condition": {
+                    "StringEquals": {
+                        _RUNTIME_KEY: "AWS_IAM",
+                        "aws:ResourceTag/env": "prod",
+                    }
+                }
+            },
+            {"Resource": "arn:aws:bedrock-agentcore:*:*:runtime/prod-*"},
+            {"Resource": "arn:aws:bedrock-agentcore:us-east-1:*:*"},
+            {"NotResource": "arn:aws:bedrock-agentcore:*:*:runtime/legacy"},
+        ],
+        ids=[
+            "principal-exemption",
+            "tag-and",
+            "resource-id",
+            "one-region",
+            "not-resource",
+        ],
+    )
+    @patch("agentcore_app.organizations_client")
+    def test_a_deny_narrowed_by_another_key_or_resource_is_not_coverage(
+        self, mock_orgs, change
+    ):
+        # An ANDed second key or a narrowed Resource lets every request outside
+        # it through, and such a Deny was credited as covering the writes.
+        statement = {
+            "Effect": "Deny",
+            "Action": _RUNTIME_WRITE,
+            "Resource": "*",
+            "Condition": {"StringEquals": {_RUNTIME_KEY: "AWS_IAM"}},
+        }
+        statement.update(change)
+        if "NotResource" in change:
+            del statement["Resource"]
+        self._wire(mock_orgs, {"Narrowed": [statement]})
+
+        findings = agentcore_app.check_agentcore_runtime_authorizer_scp()
+
+        assert [f["Status"] for f in findings] == ["Failed"]
+
+    @patch("agentcore_app.organizations_client")
+    def test_a_whole_deny_passes_beside_a_narrowed_one(self, mock_orgs):
+        self._wire(
+            mock_orgs,
+            {
+                "Narrowed": [
+                    {
+                        "Effect": "Deny",
+                        "Action": _RUNTIME_WRITE,
+                        "Resource": "arn:aws:bedrock-agentcore:*:*:runtime/prod-*",
+                        "Condition": {"StringEquals": {_RUNTIME_KEY: "AWS_IAM"}},
+                    }
+                ],
+                "Whole": [
+                    {
+                        "Effect": "Deny",
+                        "Action": _RUNTIME_WRITE,
+                        "Resource": "arn:aws:bedrock-agentcore:*:*:runtime/*",
+                        "Condition": {"StringEquals": {_RUNTIME_KEY: "AWS_IAM"}},
+                    }
+                ],
+            },
+        )
+
+        findings = agentcore_app.check_agentcore_runtime_authorizer_scp()
+
+        assert [f["Status"] for f in findings] == ["Passed"]
+        assert "Whole" in findings[0]["Finding_Details"]
+        assert "Narrowed" not in findings[0]["Finding_Details"]
 
 
 def _gateway_guard(operator="StringEquals", value="NONE", action=None):
@@ -12270,6 +12493,59 @@ class TestAC32InboundJwtIssuerConditions:
 
         assert [f["Status"] for f in findings] == ["N/A"]
         assert findings[0]["Finding"].endswith("Incomplete")
+
+    @pytest.mark.parametrize(
+        "value,status",
+        [
+            ("https://cognito-idp.*.amazonaws.com/*", "Failed"),
+            ("https://cognito-idp.us-east-1.amazonaws.com/us-east-1_*", "Failed"),
+            ("https://idp.example/tenant-?", "Failed"),
+            ("https://idp.example/", "Passed"),
+        ],
+    )
+    def test_a_partial_wildcard_under_stringlike_is_not_a_pin(self, value, status):
+        # A StringLike issuer with a wildcard inside it passed as pinned,
+        # though it admits every user pool or tenant the pattern spans.
+        findings = agentcore_app.check_agentcore_inbound_jwt_issuer_conditions(
+            self._cache(
+                ["bedrock-agentcore:GetWorkloadAccessTokenForJWT"],
+                condition={
+                    "StringLike": {"bedrock-agentcore:InboundJwtClaim/iss": value}
+                },
+            )
+        )
+        assert [f["Status"] for f in findings] == [status]
+
+    def test_a_wildcard_issuer_role_fails_beside_a_pinned_role(self):
+        cache = self._cache(
+            ["bedrock-agentcore:GetWorkloadAccessTokenForJWT"],
+            condition={
+                "StringLike": {
+                    "bedrock-agentcore:InboundJwtClaim/iss": (
+                        "https://cognito-idp.*.amazonaws.com/*"
+                    )
+                }
+            },
+            principal="wide-role",
+        )
+        cache["role_permissions"].update(
+            self._cache(
+                ["bedrock-agentcore:GetWorkloadAccessTokenForJWT"],
+                condition={
+                    "StringEquals": {
+                        "bedrock-agentcore:InboundJwtClaim/iss": "https://idp.example/"
+                    }
+                },
+                principal="pinned-role",
+            )["role_permissions"]
+        )
+
+        findings = agentcore_app.check_agentcore_inbound_jwt_issuer_conditions(cache)
+
+        failed = [f for f in findings if f["Status"] == "Failed"]
+        assert len(failed) == 1
+        assert "role wide-role" in failed[0]["Finding_Details"]
+        assert "pinned-role" not in failed[0]["Finding_Details"]
 
 
 class TestAC32CheckRegistration:
@@ -19244,6 +19520,64 @@ class TestAC45ToolExecutionRoleScope:
         assert [finding["Status"] for finding in findings] == ["N/A", "Failed"]
         assert "ListCodeInterpreters" in findings[0]["Resolution"]
 
+    @patch("agentcore_app.agentcore_client")
+    def test_a_role_from_another_account_is_not_judged_by_a_local_namesake(
+        self, mock_ac
+    ):
+        # A foreign ToolRole was judged by the local ToolRole's scoped policy.
+        # Both tool kinds carry their ARN under a different key, so one of each
+        # is assessed, beside a local interpreter that keeps its Passed.
+        arn = "arn:aws:bedrock-agentcore:us-east-1:123456789012:{}/{}"
+        foreign_role = "arn:aws:iam::444455556666:role/ToolRole"
+        _wire_tools(
+            mock_ac,
+            interpreters=[
+                _code_interpreter(
+                    "ci-local",
+                    executionRoleArn=self._ROLE_ARN,
+                    codeInterpreterArn=arn.format("code-interpreter", "ci-local"),
+                ),
+                _code_interpreter(
+                    "ci-foreign",
+                    executionRoleArn=foreign_role,
+                    codeInterpreterArn=arn.format("code-interpreter", "ci-foreign"),
+                ),
+            ],
+            browsers=[
+                _browser(
+                    "br-foreign",
+                    executionRoleArn=foreign_role,
+                    browserArn=arn.format("browser", "br-foreign"),
+                )
+            ],
+        )
+        cache = _tool_cache(
+            "ToolRole",
+            [],
+            inline=[
+                _tool_policy(
+                    "ToolInline",
+                    self._statement("s3:GetObject", "arn:aws:s3:::app-bucket/*"),
+                )
+            ],
+        )
+
+        findings = agentcore_app.check_agentcore_tool_execution_role_scope(cache)
+
+        statuses = {
+            tool: [f["Status"] for f in findings if tool in f["Finding_Details"]]
+            for tool in ("ci-local", "ci-foreign", "br-foreign")
+        }
+        assert statuses == {
+            "ci-local": ["Passed"],
+            "ci-foreign": ["N/A"],
+            "br-foreign": ["N/A"],
+        }
+        for finding in findings:
+            if finding["Status"] == "N/A":
+                assert "from account 444455556666" in finding["Finding_Details"]
+                assert_finding_schema(finding)
+
 
 class TestAC46RuntimeSessionLimits:
     """AC-46: how long one runtime session can hold its microVM."""
@@ -19331,9 +19665,10 @@ class TestAC46RuntimeSessionLimits:
     @patch("agentcore_app.cloudwatch_client")
     @patch("agentcore_app.logs_client")
     @patch("agentcore_app.agentcore_client")
-    def test_one_second_below_the_ceiling_passes(self, mock_ac, mock_logs, mock_cw):
-        # The assertion is the service ceiling itself, not a duration this
-        # check would prefer: a shorter limit is the workload's decision.
+    def test_one_second_below_the_ceiling_fails(self, mock_ac, mock_logs, mock_cw):
+        # Stricter than before: this was test_one_second_below_the_ceiling_passes
+        # and asserted Passed, so 1209599 seconds read as bounded while 1209600
+        # failed.
         _wire_runtimes(
             mock_ac,
             self._lifecycle(
@@ -19345,7 +19680,37 @@ class TestAC46RuntimeSessionLimits:
 
         findings = agentcore_app.check_agentcore_runtime_session_limits()
 
-        assert findings[0]["Status"] == "Passed"
+        assert [f["Status"] for f in findings] == ["Failed"]
+        assert findings[0]["Finding"].endswith("Above Default")
+        assert (
+            "maximum session lifetime above the 28800-second"
+            in (findings[0]["Finding_Details"])
+        )
+
+    @pytest.mark.parametrize(
+        "idle,lifetime,status",
+        [
+            (900, 28800, "Passed"),
+            (900, 28801, "Failed"),
+            (28801, 28801, "Failed"),
+            (28800, 28800, "Passed"),
+        ],
+    )
+    @patch("agentcore_app.cloudwatch_client")
+    @patch("agentcore_app.logs_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_the_bound_is_the_default_maximum_lifetime(
+        self, mock_ac, mock_logs, mock_cw, idle, lifetime, status
+    ):
+        _wire_runtimes(
+            mock_ac,
+            self._lifecycle(idleRuntimeSessionTimeout=idle, maxLifetime=lifetime),
+        )
+        _wire_session_monitoring(mock_logs, mock_cw)
+
+        findings = agentcore_app.check_agentcore_runtime_session_limits()
+
+        assert [f["Status"] for f in findings] == [status]
 
     @patch("agentcore_app.agentcore_client")
     def test_an_absent_lifecycle_block_is_na(self, mock_ac):
@@ -19403,6 +19768,39 @@ class TestAC46RuntimeSessionLimits:
         findings = agentcore_app.check_agentcore_runtime_session_limits()
 
         assert [finding["Status"] for finding in findings] == ["Passed", "Failed"]
+
+    @patch("agentcore_app.cloudwatch_client")
+    @patch("agentcore_app.logs_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_a_near_ceiling_runtime_fails_beside_a_bounded_one(
+        self, mock_ac, mock_logs, mock_cw
+    ):
+        runtimes = []
+        for runtime_id, lifetime in (
+            ("rt-bounded", 3600),
+            ("rt-long", agentcore_app.AGENTCORE_LIFECYCLE_CEILING_SECONDS - 1),
+            ("rt-ceiling", agentcore_app.AGENTCORE_LIFECYCLE_CEILING_SECONDS),
+        ):
+            summary, detail = _vpc_runtime(runtime_id)
+            detail["lifecycleConfiguration"] = {
+                "idleRuntimeSessionTimeout": 900,
+                "maxLifetime": lifetime,
+            }
+            runtimes.append((summary, detail))
+        _wire_runtimes(mock_ac, runtimes)
+        _wire_session_monitoring(
+            mock_logs,
+            mock_cw,
+            delivered_ids=("rt-bounded", "rt-long", "rt-ceiling"),
+        )
+
+        findings = agentcore_app.check_agentcore_runtime_session_limits()
+
+        assert [(f["Status"], f["Finding"].rsplit(" ", 2)[-2:]) for f in findings] == [
+            ("Passed", ["Session", "Limits"]),
+            ("Failed", ["Above", "Default"]),
+            ("Failed", ["Limit", "Unbounded"]),
+        ]
 
     def test_the_ceiling_is_the_one_the_api_models(self):
         # A ceiling that drifts from the service would either fail every
@@ -27269,8 +27667,12 @@ class TestAC45WholePopulation:
             ("*", True),
             ("arn:aws:s3:::*", True),
             ("arn:aws:s3:::app-bucket/*", False),
-            ("arn:aws:s3:::prod-*", False),
+            # Formerly False: a partial wildcard reaches every bucket it matches.
+            ("arn:aws:s3:::prod-*", True),
+            ("arn:aws:s3:::prod-bucket?", True),
             ("arn:aws:dynamodb:us-east-1:123456789012:table/*", True),
+            ("arn:aws:dynamodb:us-east-1:123456789012:table/prod-*", True),
+            ("arn:aws:bedrock:us-east-1::foundation-model/anthropic.*", True),
             ("arn:aws:dynamodb:us-east-1:123456789012:table/orders", False),
             ("arn:aws:dynamodb:*:123456789012:table/orders", True),
             ("arn:aws:dynamodb:us-east-1:*:table/orders", True),
@@ -28440,14 +28842,49 @@ class TestAC24RateLimitDimension:
             "$.context.iam.sourceIdentity",
             "$.context.jwt.sub",
             "$.context.jwt.client_id",
-            # A claim whose name only starts like a per-token one is not one.
-            "$.context.jwt.jtix",
         ],
     )
     def test_the_caller_and_aggregate_dimensions_stay_bounded(self, dimension):
         assert agentcore_app._gateway_rate_limit_is_bounded(
             _keyed_rate_limit("rl", dimension)
         )
+
+    @pytest.mark.parametrize(
+        "dimension",
+        [
+            "$.context.jwt.nonce",
+            "$.context.jwt.session_nonce",
+            # Formerly read as bounded because it only starts like jti; a claim
+            # not known to stay the same per caller no longer bounds a limit.
+            "$.context.jwt.jtix",
+        ],
+    )
+    def test_a_claim_not_known_to_stay_the_same_per_caller_is_not_bounded(
+        self, dimension
+    ):
+        assert not agentcore_app._gateway_rate_limit_is_bounded(
+            _keyed_rate_limit("rl", dimension)
+        )
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_nonce_keyed_limit_beside_a_sub_keyed_one_passes_on_the_sub_only(
+        self, mock_ac
+    ):
+        mock_ac.list_gateways.return_value = {
+            "items": [{"gatewayId": "gw-1", "name": "gateway-1"}]
+        }
+        mock_ac.list_gateway_rate_limits.return_value = {
+            "rateLimits": [
+                _keyed_rate_limit("rl-nonce", "$.context.jwt.nonce"),
+                _keyed_rate_limit("rl-sub", "$.context.jwt.sub"),
+            ]
+        }
+
+        findings = agentcore_app.check_agentcore_gateway_rate_limiting()
+
+        assert findings[0]["Status"] == "Passed"
+        assert "rl-sub" in findings[0]["Finding_Details"]
+        assert "rl-nonce" not in findings[0]["Finding_Details"]
 
 
 class TestAG27WafFailureMode:
@@ -28801,6 +29238,45 @@ class TestAC25GatewayRoleScope:
     def test_the_leg_is_registered_under_ac25(self):
         source = inspect.getsource(agentcore_app.lambda_handler)
         assert "check_agentcore_gateway_role_scope(permission_cache)" in source
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_role_from_another_account_is_not_judged_by_a_local_namesake(
+        self, mock_ac
+    ):
+        # The cache keys roles by name and reads only this account, so a
+        # foreign role that shares a local role's name was judged by the local
+        # role's scoped policy and passed. The local gateway beside it keeps
+        # its verdict.
+        gateway_arn = "arn:aws:bedrock-agentcore:us-east-1:123456789012:gateway/{}"
+        roles = {
+            "gw-local": "arn:aws:iam::123456789012:role/GwRole",
+            "gw-foreign": "arn:aws:iam::444455556666:role/GwRole",
+        }
+        mock_ac.list_gateways.return_value = {
+            "items": [{"gatewayId": g, "name": f"name-{g}"} for g in roles]
+        }
+        mock_ac.get_gateway.side_effect = lambda gatewayIdentifier, **kwargs: {
+            "roleArn": roles[gatewayIdentifier],
+            "gatewayArn": gateway_arn.format(gatewayIdentifier),
+        }
+        cache = _gateway_role_cache(
+            {
+                "GwRole": [
+                    _gateway_role_policy("lambda:InvokeFunction", _SCOPED_FUNCTION)
+                ]
+            }
+        )
+
+        findings = agentcore_app.check_agentcore_gateway_role_scope(cache)
+
+        by_gateway = self._by_gateway(findings, ["gw-local", "gw-foreign"])
+        assert len(findings) == 2
+        assert by_gateway["gw-local"]["Status"] == "Passed"
+        assert by_gateway["gw-foreign"]["Status"] == "N/A"
+        assert by_gateway["gw-foreign"]["Finding"].endswith("Incomplete")
+        assert (
+            "from account 444455556666" in by_gateway["gw-foreign"]["Finding_Details"]
+        )
 
 
 _CALLER_WIDE_PERMIT = (
@@ -29301,6 +29777,62 @@ class TestAC38EventResource:
         findings = self._run(mock_ac, {"gw-1": [statement]})
 
         assert "Passed" not in [f["Status"] for f in findings]
+
+    @pytest.mark.parametrize(
+        "fields,status",
+        [
+            (
+                'eventPrincipal: principal, eventResource: AgentCore::Gateway::"other"',
+                "Failed",
+            ),
+            ("eventPrincipal: principal, eventResource: resourceGroup", "Failed"),
+            ("eventPrincipal: principal, eventResource: context.target", "Failed"),
+            ("eventResource: resource, eventPrincipal: principal", "Passed"),
+            ("eventPrincipal: principal, eventResource:resource", "Passed"),
+        ],
+    )
+    @patch("agentcore_app.agentcore_client")
+    def test_event_resource_has_to_name_the_request_resource(
+        self, mock_ac, fields, status
+    ):
+        # Any non-space value after eventResource passed, so a pattern counting
+        # events on another entity read as scoped to this gateway's resource.
+        findings = self._run(
+            mock_ac,
+            {"gw-1": [_temporal_statement(("verifyPayee", "response", fields))]},
+        )
+
+        assert [f["Status"] for f in findings] == [status]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_every_temporal_statement_in_one_policy_is_read(self, mock_ac):
+        # Only the first temporal statement of a policy was judged, so an
+        # unscoped second statement in the same policy text passed.
+        findings = self._run(
+            mock_ac,
+            {
+                "gw-scoped": [
+                    _temporal_statement(_SCOPED_EVENT)
+                    + "\n"
+                    + _temporal_statement(_SCOPED_EVENT)
+                ],
+                "gw-mixed": [
+                    _temporal_statement(_SCOPED_EVENT)
+                    + "\n"
+                    + _temporal_statement(_UNSCOPED_EVENT)
+                ],
+            },
+        )
+
+        by_gateway = {
+            gateway_id: [
+                f["Status"]
+                for f in findings
+                if f"({gateway_id})" in f["Finding_Details"]
+            ]
+            for gateway_id in ("gw-scoped", "gw-mixed")
+        }
+        assert by_gateway == {"gw-scoped": ["Passed"], "gw-mixed": ["Failed"]}
 
 
 def _net01_ec2(mock_ec2, public=("subnet-public",)):

@@ -836,12 +836,32 @@ MEMORY_PARTITION_OPERATORS = {"stringequals", "stringequalsignorecase", "stringl
 # of one of these members is what makes the limit bound anything.
 GATEWAY_RATE_LIMIT_VALUE_KEYS = ("requests", "tokens", "connections")
 
-# The DimensionKey pattern admits any $.context.jwt.<claim>. These registered
-# JWT claims (RFC 7519 section 4.1) take a new value with every token the issuer
-# mints, so a limit keyed on one counts each token apart and a caller who
-# presents a fresh token starts a fresh count.
-GATEWAY_RATE_LIMIT_PER_TOKEN_DIMENSIONS = {
-    f"$.context.jwt.{claim}" for claim in ("jti", "iat", "exp", "nbf")
+# The DimensionKey pattern admits any $.context.jwt.<claim>, so a limit can be
+# keyed on a claim that takes a new value with every token the issuer mints (jti,
+# iat, nonce, or any custom claim), and a caller who presents a fresh token
+# starts a fresh count. Only dimensions that stay the same across one caller's
+# tokens are read as bounding: the non-JWT keys the pattern names, and the JWT
+# claims that name the caller, its client, its tenant or its issuer.
+GATEWAY_RATE_LIMIT_STABLE_DIMENSIONS = {
+    "targetname",
+    "toolname",
+    "qualifiedmodelid",
+    "$.context.iam.principal",
+    "$.context.iam.sourceidentity",
+} | {
+    f"$.context.jwt.{claim}"
+    for claim in (
+        "aud",
+        "azp",
+        "client_id",
+        "cognito:username",
+        "email",
+        "iss",
+        "oid",
+        "sub",
+        "tid",
+        "username",
+    )
 }
 
 # Outbound credential provider types a gateway target can declare. The member is
@@ -10193,6 +10213,39 @@ def _memory_partition_key(key: str, action: str) -> bool:
     )
 
 
+# Namespace segments that name a collection of partitions, so a wildcard right
+# after one reads every member (`/users/*`, `/strategies/s1/actors/*`).
+MEMORY_COLLECTION_SEGMENTS = {"actors", "sessions", "strategies", "users"}
+
+
+def _memory_value_widens(value: str) -> bool:
+    """Whether a StringLike partition value matches other callers' partitions.
+
+    A wildcard after the last policy variable stays inside the caller's own
+    partition. Without a variable, only a whole trailing `*` segment under a
+    named partition (`/actors/a-1/*`, `/actors/a-1/sessions/*`) stays inside
+    one partition: a wildcard in any earlier segment, a partial wildcard such
+    as `alice*`, a `*` with no fixed identifier after the first `actors` or
+    `users` segment (`/users/*`, `/strategies/s-1/actors/*`), or a path of
+    collection segments alone (`/sessions/*`) reaches partitions the caller
+    does not own.
+    """
+    if "${" in value:
+        fixed_part = re.sub(r"\$\{[^}]*\}", "", value[: value.rfind("}") + 1])
+        return "*" in fixed_part or "?" in fixed_part
+    if "*" not in value and "?" not in value:
+        return False
+    segments = value.rstrip("/").split("/")
+    head, last = segments[:-1], segments[-1]
+    if last != "*" or any("*" in part or "?" in part for part in head):
+        return True
+    named = [part.lower() for part in head if part]
+    for index, part in enumerate(named):
+        if part in ("actors", "users"):
+            return index + 1 == len(named)
+    return all(part in MEMORY_COLLECTION_SEGMENTS for part in named)
+
+
 def _memory_read_scope(statement: Dict[str, Any], action: str) -> str:
     """Return how one Allow statement scopes one memory read action.
 
@@ -10202,12 +10255,15 @@ def _memory_read_scope(statement: Dict[str, Any], action: str) -> str:
     a binding operator with every value naming something narrower than a
     wildcard. A scoped read is "bound" when every such value carries a policy
     variable, which resolves per caller, and "fixed" when a value is a literal
-    that every caller of the principal shares.
+    that every caller of the principal shares. Under StringLike a `*` or `?`
+    ahead of the last policy variable, or in a value with none, matches other
+    actors' partitions (`/users/*` reads every user's), so it is "unscoped".
     """
     conditions = statement.get("Condition")
     if not isinstance(conditions, dict):
         return "unscoped"
     partition_values: List[str] = []
+    widened = False
     for operator, block in conditions.items():
         if not isinstance(block, dict):
             continue
@@ -10230,7 +10286,11 @@ def _memory_read_scope(statement: Dict[str, Any], action: str) -> str:
                 if not isinstance(values, list) or not values:
                     return "unscoped"
                 partition_values.extend(str(value) for value in values)
-    if not partition_values:
+                if operator_name == "stringlike":
+                    widened = widened or any(
+                        _memory_value_widens(str(value)) for value in values
+                    )
+    if not partition_values or widened:
         return "unscoped"
     if any(
         set(value.replace("/", "")) <= {"*", "?"} or not value
@@ -10530,11 +10590,11 @@ def _gateway_rate_limit_is_bounded(rate_limit: Dict[str, Any]) -> bool:
 
 
 def _gateway_rate_limit_per_token_dimensions(rate_limit: Dict[str, Any]) -> List[str]:
-    """Return the dimension keys of a limit that take a new value with every token."""
+    """Return the dimension keys of a limit not known to stay the same per caller."""
     return [
         str(key)
         for key in rate_limit.get("dimensionKeys") or []
-        if str(key).lower() in GATEWAY_RATE_LIMIT_PER_TOKEN_DIMENSIONS
+        if str(key).lower() not in GATEWAY_RATE_LIMIT_STABLE_DIMENSIONS
     ]
 
 
@@ -10676,9 +10736,9 @@ def check_agentcore_gateway_rate_limiting() -> List[Dict[str, Any]]:
                 if _gateway_rate_limit_per_token_dimensions(rate_limit)
             ]
             per_token_note = (
-                f" Limit {'; '.join(per_token)}, a claim that takes a new value "
-                "with every token, so a caller who presents a fresh token starts "
-                "a fresh count."
+                f" Limit {'; '.join(per_token)}, a claim not known to stay the "
+                "same across one caller's tokens, so a caller who presents a "
+                "fresh token can start a fresh count."
                 if per_token
                 else ""
             )
@@ -11021,6 +11081,31 @@ def check_agentcore_gateway_role_scope(
             )
             continue
 
+        foreign_account = _role_outside_cached_account(
+            role_arn, detail.get("gatewayArn")
+        )
+        if foreign_account:
+            findings.append(
+                create_finding(
+                    check_id="AC-25",
+                    finding_name="AgentCore Gateway Role Scope Incomplete",
+                    finding_details=(
+                        f"{label} uses execution role {role_arn} from account "
+                        f"{foreign_account}, and the IAM permission cache reads only "
+                        "the account that owns the gateway, so the role's "
+                        "policies were not judged."
+                    ),
+                    resolution=(
+                        "No action is required on the assessed workload based on "
+                        "this result. Review the role's policies in the account "
+                        "that owns it."
+                    ),
+                    reference=AGENTCORE_GATEWAY_API_REFERENCE_URL,
+                    severity=SeverityEnum.INFORMATIONAL,
+                    status=StatusEnum.NA,
+                )
+            )
+            continue
         role_name = str(role_arn).rsplit("/", 1)[-1]
         if role_name in unread_roles:
             findings.append(
@@ -11834,6 +11919,20 @@ def _arn_account(arn: Any) -> str:
     return parts[4] if len(parts) == 6 and parts[0] == "arn" else ""
 
 
+def _role_outside_cached_account(role_arn: Any, resource_arn: Any) -> str:
+    """Return the role's account when it differs from the resource's account.
+
+    The IAM permission cache reads only the assessed account and keys roles by
+    name, so a role from another account that shares a name with a local role
+    would otherwise be judged by the local role's policies.
+    """
+    role_account = _arn_account(role_arn)
+    resource_account = _arn_account(resource_arn)
+    if role_account and resource_account and role_account != resource_account:
+        return role_account
+    return ""
+
+
 def _confused_deputy_guard_account(statement: Dict[str, Any], account_id: str) -> bool:
     """Return whether the statement pins aws:SourceAccount or aws:SourceArn to
     `account_id` by value.
@@ -12408,14 +12507,20 @@ def _condition_values(raw: Any) -> List[str]:
 def _statement_condition_denies_value(
     statement: Dict[str, Any], key: str, value: str
 ) -> bool:
-    """Return whether a Deny statement's condition fires for one key value."""
+    """Return whether a Deny statement's condition fires for one key value.
+
+    Every condition entry is ANDed, so each must be `key` and each must fire for
+    `value`: a second key (an aws:PrincipalArn exemption, a tag test) lets a
+    request that fails it through, and the Deny is not credited.
+    """
     condition = statement.get("Condition")
-    if not isinstance(condition, dict):
+    if not isinstance(condition, dict) or not condition:
         return False
 
+    fires = False
     for operator, entries in condition.items():
-        if not isinstance(entries, dict):
-            continue
+        if not isinstance(entries, dict) or not entries:
+            return False
         name = str(operator).strip().lower()
         for prefix in SCP_SET_OPERATOR_PREFIXES:
             if name.startswith(prefix):
@@ -12427,19 +12532,53 @@ def _statement_condition_denies_value(
             name = name[: -len("ifexists")]
         for entry_key, raw in entries.items():
             if str(entry_key).strip().lower() != key:
-                continue
+                return False
             values = {entry.strip().upper() for entry in _condition_values(raw)}
-            if name in SCP_DENY_VALUE_INCLUDES_OPERATORS:
-                if value in values:
-                    return True
-            elif name in SCP_DENY_VALUE_EXCLUDES_OPERATORS:
-                if value not in values:
-                    return True
+            if name in SCP_DENY_VALUE_INCLUDES_OPERATORS and value in values:
+                fires = True
+            elif name in SCP_DENY_VALUE_EXCLUDES_OPERATORS and value not in values:
+                fires = True
+            else:
+                return False
+    return fires
+
+
+def _scp_deny_reaches_every_resource(
+    statement: Dict[str, Any], resource_type: str
+) -> bool:
+    """Return whether an SCP Deny names every `resource_type` in every Region.
+
+    A NotResource exempts what it lists, and a Resource narrowed by Region,
+    account or resource id (`gateway/prod-*`) leaves the rest undenied, so only
+    `*` or an ARN pattern whose Region, account and resource segments are all
+    wildcards counts.
+    """
+    if "NotResource" in statement:
+        return False
+    resources = statement.get("Resource")
+    if isinstance(resources, str):
+        resources = [resources]
+    if not isinstance(resources, list):
+        return False
+    for pattern in resources:
+        pattern = str(pattern).strip()
+        if pattern == "*":
+            return True
+        parts = pattern.split(":", 5)
+        if (
+            len(parts) == 6
+            and parts[0] == "arn"
+            and parts[2] in ("bedrock-agentcore", "*")
+            and parts[3] == "*"
+            and parts[4] == "*"
+            and parts[5] in ("*", f"{resource_type}/*")
+        ):
+            return True
     return False
 
 
 def _scp_authorizer_deny_coverage(
-    document: Any, actions: Dict[str, str], key: str, value: str
+    document: Any, actions: Dict[str, str], key: str, value: str, resource_type: str
 ) -> Tuple[Set[str], bool]:
     """Return which of `actions` one SCP denies for `key` = `value`, and whether
     the policy conditions on the key at all.
@@ -12454,6 +12593,8 @@ def _scp_authorizer_deny_coverage(
         if key in _statement_condition_keys(statement):
             names_key = True
         if not _statement_condition_denies_value(statement, key, value):
+            continue
+        if not _scp_deny_reaches_every_resource(statement, resource_type):
             continue
         for action in actions:
             if _statement_matches_action(statement, action):
@@ -12779,6 +12920,7 @@ def check_agentcore_gateway_authorizer_scp() -> List[Dict[str, Any]]:
             GATEWAY_WRITE_ACTIONS,
             GATEWAY_AUTHORIZER_CONDITION_KEY,
             GATEWAY_AUTHORIZER_UNAUTHENTICATED_VALUE,
+            "gateway",
         )
         if covered:
             coverage[policy["Id"]] = (policy_name, covered)
@@ -13042,12 +13184,14 @@ def check_agentcore_runtime_authorizer_scp() -> List[Dict[str, Any]]:
             RUNTIME_WRITE_ACTIONS,
             RUNTIME_AUTHORIZER_CONDITION_KEY,
             RUNTIME_AUTHORIZER_UNVERIFIED_USER_VALUE,
+            "runtime",
         )
         inverted, _ = _scp_authorizer_deny_coverage(
             content,
             RUNTIME_WRITE_ACTIONS,
             RUNTIME_AUTHORIZER_CONDITION_KEY,
             RUNTIME_AUTHORIZER_VERIFIED_USER_VALUE,
+            "runtime",
         )
         if covered:
             coverage[policy["Id"]] = (policy_name, covered)
@@ -14347,7 +14491,8 @@ def _statement_pins_inbound_jwt_issuer(statement: Dict[str, Any]) -> bool:
 
     The claim must sit under StringEquals or StringLike, optionally qualified
     with ForAnyValue, and every value must name something narrower than a
-    wildcard.
+    wildcard. Under StringLike any `*` or `?` fails the pin, because a pattern
+    such as `https://cognito-idp.*.amazonaws.com/*` admits every user pool.
     """
     conditions = statement.get("Condition")
     if not isinstance(conditions, dict):
@@ -14368,7 +14513,13 @@ def _statement_pins_inbound_jwt_issuer(statement: Dict[str, Any]) -> bool:
             if not isinstance(values, list) or not values:
                 continue
             if all(
-                str(value) and not set(str(value)) <= {"*", "?"} for value in values
+                str(value)
+                and not set(str(value)) <= {"*", "?"}
+                and not (
+                    operator_name == "stringlike"
+                    and ("*" in str(value) or "?" in str(value))
+                )
+                for value in values
             ):
                 return True
     return False
@@ -17131,22 +17282,36 @@ def check_agentcore_policy_session_binding() -> List[Dict[str, Any]]:
         unjudged: List[str] = []
         for policy in policies:
             policy_name = policy.get("name") or policy.get("policyId") or "unnamed"
+            temporal = unscoped = incomplete = False
             for effect, _, conditions in _cedar_policies(
                 _policy_statement_text(policy)
             ):
                 if effect not in CEDAR_AUTHORIZING_EFFECTS:
                     continue
-                if CEDAR_TEMPORAL_QUALIFIER in _cedar_condition_qualifiers(conditions):
-                    temporal_policies.append(policy_name)
-                    patterns, complete = _temporal_event_patterns(conditions)
-                    if any(
-                        not re.search(r"\beventResource\s*:\s*\S", body)
-                        for body in patterns
-                    ):
-                        resource_unscoped.append(policy_name)
-                    elif not patterns or not complete:
-                        unjudged.append(policy_name)
-                    break
+                if CEDAR_TEMPORAL_QUALIFIER not in _cedar_condition_qualifiers(
+                    conditions
+                ):
+                    continue
+                # Every temporal statement is read, and eventResource has to
+                # name the request's own resource: a pattern that sets it to
+                # another entity counts events on that entity instead.
+                temporal = True
+                patterns, complete = _temporal_event_patterns(conditions)
+                if any(
+                    not re.search(
+                        r"(?<![\w.])eventResource\s*:\s*resource\s*(?:,|$)", body
+                    )
+                    for body in patterns
+                ):
+                    unscoped = True
+                elif not patterns or not complete:
+                    incomplete = True
+            if temporal:
+                temporal_policies.append(policy_name)
+            if unscoped:
+                resource_unscoped.append(policy_name)
+            elif incomplete:
+                unjudged.append(policy_name)
 
         authorizer_type = detail.get("authorizerType") or gateway.get("authorizerType")
 
@@ -17184,8 +17349,9 @@ def check_agentcore_policy_session_binding() -> List[Dict[str, Any]]:
                     finding_details=(
                         f"{label} enforces temporal policy "
                         f"{', '.join(sorted(set(resource_unscoped)))}, which "
-                        "matches a recorded event with no eventResource, so the "
-                        "rule is not tied to events on this gateway's resource."
+                        "matches a recorded event whose eventResource is absent or "
+                        "names something other than resource, so the rule is not "
+                        "tied to events on the resource the request targets."
                     ),
                     resolution=(
                         "Add eventResource: resource to every event pattern a "
@@ -18978,9 +19144,10 @@ def _tool_resource_is_unbounded(resource: str) -> bool:
     the resource name sits: first for S3, whose ARN carries the bucket name and
     no type, and after the type for every other service. A name made only of
     wildcards, such as `arn:aws:s3:::*` or `table/*`, reaches every resource of
-    that kind, and a wildcard in the partition, service, account or type does
-    too. A wildcard after the name, such as `arn:aws:s3:::app-bucket/*`, stays
-    inside one named resource. A region wildcard reaches the same name in every
+    that kind, a partial wildcard such as `table/prod-*` reaches every resource
+    whose name it matches, and a wildcard in the partition, service, account or
+    type does too. A wildcard after the name, such as `arn:aws:s3:::app-bucket/*`,
+    stays inside one named resource. A region wildcard reaches the same name in every
     region, except on Amazon Bedrock, where a model or inference profile id names
     the same model in every region and cross-Region inference needs the grant in
     each destination.
@@ -19004,7 +19171,7 @@ def _tool_resource_is_unbounded(resource: str) -> bool:
     ):
         return True
     name = next((component for component in components[name_index:] if component), "")
-    return bool(name) and set(name) <= {"*", "?"}
+    return bool(name) and ("*" in name or "?" in name)
 
 
 def _tool_execution_role_problems(
@@ -19352,6 +19519,31 @@ def check_agentcore_tool_execution_role_scope(
             )
             continue
 
+        foreign_account = _role_outside_cached_account(
+            role_arn, detail.get("codeInterpreterArn") or detail.get("browserArn")
+        )
+        if foreign_account:
+            findings.append(
+                create_finding(
+                    check_id="AC-45",
+                    finding_name="AgentCore Tool Execution Role Scope Incomplete",
+                    finding_details=(
+                        f"{label} uses execution role {role_arn} from account "
+                        f"{foreign_account}, and the IAM permission cache reads only "
+                        "the account that owns the tool, so the role's "
+                        "policies were not judged."
+                    ),
+                    resolution=(
+                        "No action is required on the assessed workload based on "
+                        "this result. Review the role's policies in the account "
+                        "that owns it."
+                    ),
+                    reference=AGENTCORE_TOOL_EXECUTION_ROLE_REFERENCE_URL,
+                    severity=SeverityEnum.INFORMATIONAL,
+                    status=StatusEnum.NA,
+                )
+            )
+            continue
         role_name = str(role_arn).rsplit("/", 1)[-1]
         permissions = role_permissions.get(role_name)
         if role_name in unread_roles:
@@ -19472,11 +19664,13 @@ def check_agentcore_tool_execution_role_scope(
 
 
 # Both lifecycle fields accept 60 to 1209600 seconds. A value at the ceiling is
-# 14 days, which for a per-session microVM is the same as no limit, and it is the
-# one value that is over-broad whatever the workload does: the defaults, 900 for
-# the idle timeout and 28800 for the maximum lifetime, are AWS's own
-# recommendation and a shorter setting is the workload's business.
+# 14 days, which for a per-session microVM is the same as no limit. A ceiling
+# test alone passed 1209599, so the bound judged is the 28800-second maximum
+# lifetime AWS applies when none is set: a field above it lengthens a session
+# past what the service would allow by default. A shorter setting is the
+# workload's business.
 AGENTCORE_LIFECYCLE_CEILING_SECONDS = 1209600
+AGENTCORE_LIFECYCLE_DEFAULT_MAX_SECONDS = 28800
 AGENTCORE_LIFECYCLE_FIELDS = (
     ("idleRuntimeSessionTimeout", "idle session timeout"),
     ("maxLifetime", "maximum session lifetime"),
@@ -19669,6 +19863,14 @@ def check_agentcore_runtime_session_limits() -> List[Dict[str, Any]]:
             for field, name in AGENTCORE_LIFECYCLE_FIELDS
             if field in values and values[field] >= AGENTCORE_LIFECYCLE_CEILING_SECONDS
         ]
+        above_default = [
+            name
+            for field, name in AGENTCORE_LIFECYCLE_FIELDS
+            if field in values
+            and AGENTCORE_LIFECYCLE_DEFAULT_MAX_SECONDS
+            < values[field]
+            < AGENTCORE_LIFECYCLE_CEILING_SECONDS
+        ]
         reported = ", ".join(
             f"{name} {values[field]}s"
             for field, name in AGENTCORE_LIFECYCLE_FIELDS
@@ -19681,9 +19883,19 @@ def check_agentcore_runtime_session_limits() -> List[Dict[str, Any]]:
                 f"session holds its microVM, its filesystem and its accumulated "
                 f"context for two weeks ({reported})"
             )
+        if above_default:
+            problems.append(
+                f"sets its {' and '.join(above_default)} above the "
+                f"{AGENTCORE_LIFECYCLE_DEFAULT_MAX_SECONDS}-second (8 hour) "
+                "maximum lifetime AWS applies when none is set, so one session "
+                "holds its microVM, its filesystem and its accumulated context "
+                f"longer than the service default allows ({reported})"
+            )
+        if at_ceiling or above_default:
             fixes.append(
                 "Set idleRuntimeSessionTimeout and maxLifetime to the longest a "
-                "single task in this workload legitimately runs."
+                "single task in this workload legitimately runs, or record why a "
+                "session has to outlive 8 hours."
             )
 
         usage_note = ""
@@ -19755,6 +19967,14 @@ def check_agentcore_runtime_session_limits() -> List[Dict[str, Any]]:
                         **failed,
                     )
                 )
+            elif above_default:
+                findings.append(
+                    create_finding(
+                        check_id="AC-46",
+                        finding_name="AgentCore Runtime Session Limit Above Default",
+                        **failed,
+                    )
+                )
             else:
                 findings.append(
                     create_finding(
@@ -19784,8 +20004,9 @@ def check_agentcore_runtime_session_limits() -> List[Dict[str, Any]]:
                     check_id="AC-46",
                     finding_name="AgentCore Runtime Session Limits",
                     finding_details=(
-                        f"{label} bounds each session below the service ceiling of "
-                        f"{AGENTCORE_LIFECYCLE_CEILING_SECONDS} seconds ({reported}), "
+                        f"{label} bounds each session at or under the "
+                        f"{AGENTCORE_LIFECYCLE_DEFAULT_MAX_SECONDS}-second default "
+                        f"maximum lifetime ({reported}), "
                         f"{usage_note}, and alarm {', '.join(alarm_names)} reads "
                         f"{AGENTCORE_SESSION_ALARM_LABEL}. GetAgentRuntime reports "
                         "900 and 28800 seconds for a runtime that sets neither "

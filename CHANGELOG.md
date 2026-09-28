@@ -208,6 +208,35 @@ section.
 
 ### Fixed
 
+- `AC-23` fails a memory read conditioned on a `StringLike` namespace that
+  spans callers. `/users/*` read as one fixed partition and passed, though it
+  matches every user's records; so did `/actors/*` and a partial wildcard
+  such as `/actors/alice*`. A trailing `*` under a fixed identifier
+  (`/actors/a-1/*`) and a wildcard after a policy variable still pass.
+- `AC-32` no longer reads a `StringLike` issuer, audience or client id that
+  holds a `*` or `?` as pinned. `https://cognito-idp.*.amazonaws.com/*`
+  passed, though it admits every Cognito user pool.
+- `AC-28` and `AC-29` credit a service control policy Deny only when the
+  authorizer type is its sole condition key and its `Resource` reaches every
+  gateway or runtime. A Deny with an ANDed `aws:PrincipalArn` exemption or tag
+  test, a `NotResource`, or a `Resource` narrowed to one Region or to
+  `gateway/prod-*` counted as covering both writes.
+- `AC-24` counts a rate limit only when it is keyed on a dimension the caller
+  cannot renew with a fresh token. A deny-list of `jti`, `iat`, `exp` and
+  `nbf` passed `nonce` and any other per-token claim; an allow-list of the
+  tool, model, IAM principal and stable JWT identity claims replaces it.
+- `AC-45` reads a resource ARN with a partial wildcard, such as
+  `arn:aws:s3:::prod-*`, as every resource, and `AC-25` and `AC-45` report a
+  role from another account as `N/A`. The permission cache reads only the
+  assessed account and keys roles by name, so a foreign role that shared a
+  local role's name was judged by the local role's policies.
+- `AC-46` fails a lifecycle field above the 28,800-second maximum lifetime
+  AWS applies by default, as `Session Limit Above Default`. Only the
+  1,209,600-second ceiling failed, so 1,209,599 seconds passed.
+- `AC-38` requires every temporal event pattern to carry
+  `eventResource: resource`. Any value passed, so a pattern counting events on
+  another entity read as scoped, and only the first temporal statement of each
+  policy was read.
 - `AC-04` no longer fails every runtime. It read `loggingConfig` and
   `tracingConfig` from `GetAgentRuntime`, which returns neither, so each
   runtime failed both legs whatever its configuration. It now reports one row
