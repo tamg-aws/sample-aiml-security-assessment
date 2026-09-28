@@ -31577,6 +31577,378 @@ def shell_alarm():
         yield
 
 
+_EVAL_KEY = (
+    "arn:aws:kms:us-east-1:123456789012:key/11111111-2222-3333-4444-555555555555"
+)
+_BATCH_KEY = (
+    "arn:aws:kms:us-east-1:123456789012:key/66666666-7777-8888-9999-000000000000"
+)
+
+
+def _key_metadata(manager="CUSTOMER", state="Enabled"):
+    return {"KeyMetadata": {"KeyManager": manager, "KeyState": state}}
+
+
+class TestAC41EvaluationKeyProtection:
+    """AC-41: custom evaluator and batch evaluation keys, and batch results groups."""
+
+    def _run(self, mock_ac, evaluators, batches=None, batch_details=None, kms=None):
+        _ac44_custom(mock_ac, evaluators)
+        data = MagicMock()
+        if isinstance(batches, Exception):
+            data.list_batch_evaluations.side_effect = batches
+        else:
+            data.list_batch_evaluations.return_value = {
+                "batchEvaluations": batches or []
+            }
+        data.get_batch_evaluation.side_effect = lambda batchEvaluationId: (
+            batch_details or {}
+        )[batchEvaluationId]
+        if kms is None:
+            kms = MagicMock()
+            kms.describe_key.return_value = _key_metadata()
+        logs = MagicMock()
+        logs.describe_log_groups.return_value = {
+            "logGroups": [
+                {
+                    "logGroupName": "/aws/bedrock-agentcore/evaluations/batch",
+                    "retentionInDays": 30,
+                }
+            ]
+        }
+        with (
+            patch.object(agentcore_app, "agentcore_data_client", data),
+            patch.object(agentcore_app, "kms_client", kms),
+            patch.object(agentcore_app, "logs_client", logs),
+        ):
+            return agentcore_app.check_agentcore_evaluation_key_protection(), kms
+
+    @patch("agentcore_app.agentcore_client")
+    def test_an_evaluator_with_no_key_fails(self, mock_ac):
+        findings, _ = self._run(mock_ac, {"judge-1": {"evaluatorId": "judge-1"}})
+
+        assert len(findings) == 1
+        assert findings[0]["Status"] == "Failed"
+        assert (
+            "Custom evaluator judge-1 names no kmsKeyArn"
+            in (findings[0]["Finding_Details"])
+        )
+
+    @pytest.mark.parametrize(
+        "metadata, status",
+        [
+            (_key_metadata(), "Passed"),
+            (_key_metadata(manager="AWS"), "Failed"),
+            (_key_metadata(state="PendingDeletion"), "Failed"),
+        ],
+        ids=["customer-enabled", "aws-managed", "pending-deletion"],
+    )
+    @patch("agentcore_app.agentcore_client")
+    def test_an_evaluator_key_is_credited_only_by_describe_key(
+        self, mock_ac, metadata, status
+    ):
+        kms = MagicMock()
+        kms.describe_key.return_value = metadata
+        findings, _ = self._run(
+            mock_ac,
+            {"judge-1": {"evaluatorId": "judge-1", "kmsKeyArn": _EVAL_KEY}},
+            kms=kms,
+        )
+
+        assert findings[0]["Status"] == status
+        kms.describe_key.assert_called_once_with(KeyId=_EVAL_KEY)
+
+    @patch("agentcore_app.agentcore_client")
+    def test_an_unreadable_evaluator_and_key_are_na_with_the_action(self, mock_ac):
+        kms = MagicMock()
+        kms.describe_key.side_effect = _make_client_error("AccessDeniedException", "no")
+        _online = {
+            "judge-1": _make_client_error("AccessDeniedException", "no"),
+            "judge-2": {"evaluatorId": "judge-2", "kmsKeyArn": _EVAL_KEY},
+        }
+        findings, _ = self._run(mock_ac, _online, kms=kms)
+
+        assert [f["Status"] for f in findings] == ["N/A", "N/A"]
+        assert findings[0]["Resolution"] == (
+            "Grant bedrock-agentcore:GetEvaluator and retry."
+        )
+        assert (
+            "kms:DescribeKey failed with AccessDeniedException"
+            in (findings[1]["Finding_Details"])
+        )
+
+    @patch("agentcore_app.agentcore_client")
+    def test_each_batch_evaluation_key_and_results_group_is_judged(self, mock_ac):
+        batches = [
+            {
+                "batchEvaluationId": "be-1",
+                "batchEvaluationName": "nightly",
+                "kmsKeyArn": _BATCH_KEY,
+                "evaluators": [{"evaluatorId": "Builtin.Harmfulness"}],
+            },
+            {
+                "batchEvaluationId": "be-2",
+                "batchEvaluationName": "adhoc",
+                "evaluators": [{"evaluatorId": "judge-2"}],
+            },
+        ]
+        output = {
+            "outputConfig": {
+                "cloudWatchConfig": {
+                    "logGroupName": "/aws/bedrock-agentcore/evaluations/batch"
+                }
+            }
+        }
+        findings, _ = self._run(
+            mock_ac,
+            {"judge-2": {"evaluatorId": "judge-2", "kmsKeyArn": _EVAL_KEY}},
+            batches=batches,
+            batch_details={"be-1": output, "be-2": output},
+        )
+        rows = [(f["Status"], f["Finding_Details"]) for f in findings]
+
+        assert rows[0][0] == "Passed" and "Custom evaluator judge-2" in rows[0][1]
+        batch_keys = [
+            row for row in rows if "names no kmsKeyArn, so its output" in row[1]
+        ]
+        assert len(batch_keys) == 1 and "'adhoc' (be-2)" in batch_keys[0][1]
+        assert any(
+            status == "Passed" and "'nightly' (be-1) is encrypted" in text
+            for status, text in rows
+        )
+        # Both batch results groups carry no key, so each fails on its own row.
+        group_rows = [row for row in rows if "writes results to log group" in row[1]]
+        assert [row[0] for row in group_rows] == ["Failed", "Failed"]
+        assert "(be-1)" in group_rows[0][1] and "(be-2)" in group_rows[1][1]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_denied_batch_listing_is_na_naming_the_action(self, mock_ac):
+        findings, _ = self._run(
+            mock_ac,
+            {},
+            batches=_make_client_error("AccessDeniedException", "no"),
+        )
+
+        assert len(findings) == 1
+        assert findings[0]["Status"] == "N/A"
+        assert (
+            "ListBatchEvaluations failed with AccessDeniedException"
+            in (findings[0]["Finding_Details"])
+        )
+        assert findings[0]["Resolution"] == (
+            "Grant bedrock-agentcore:ListBatchEvaluations and retry."
+        )
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_denied_batch_read_is_na_naming_the_action(self, mock_ac):
+        batches = [{"batchEvaluationId": "be-1", "kmsKeyArn": _BATCH_KEY}]
+        data_error = _make_client_error("AccessDeniedException", "no")
+        _ac44_custom(mock_ac, {})
+        data = MagicMock()
+        data.list_batch_evaluations.return_value = {"batchEvaluations": batches}
+        data.get_batch_evaluation.side_effect = data_error
+        kms = MagicMock()
+        kms.describe_key.return_value = _key_metadata()
+        with (
+            patch.object(agentcore_app, "agentcore_data_client", data),
+            patch.object(agentcore_app, "kms_client", kms),
+        ):
+            findings = agentcore_app.check_agentcore_evaluation_key_protection()
+
+        assert [f["Status"] for f in findings] == ["Passed", "N/A"]
+        assert findings[1]["Resolution"] == (
+            "Grant bedrock-agentcore:GetBatchEvaluation and retry."
+        )
+
+    @patch("agentcore_app.agentcore_client")
+    def test_built_in_evaluators_only_and_no_batch_is_na(self, mock_ac):
+        _online_evaluation_client(mock_ac)
+        data = MagicMock()
+        data.list_batch_evaluations.return_value = {"batchEvaluations": []}
+        with (
+            patch.object(agentcore_app, "agentcore_data_client", data),
+            patch.object(agentcore_app, "kms_client", MagicMock()),
+        ):
+            findings = agentcore_app.check_agentcore_evaluation_key_protection()
+
+        assert [f["Status"] for f in findings] == ["N/A"]
+        mock_ac.get_evaluator.assert_not_called()
+
+
+_JUDGE_FM = "arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-3"
+_JUDGE_OTHER = "arn:aws:bedrock:us-east-1::foundation-model/meta.llama3"
+
+
+def _judge_evaluator(model_id, kind="llmAsAJudge"):
+    return {
+        "evaluatorId": "judge-1",
+        "evaluatorConfig": {
+            kind: {
+                "modelConfig": {"bedrockEvaluatorModelConfig": {"modelId": model_id}}
+            }
+        },
+    }
+
+
+def _ac44_custom(mock_ac, evaluators_by_id, configs=None):
+    """Attach custom evaluators to the configurations and serve GetEvaluator."""
+    configs = configs or [
+        _online_evaluation_detail(
+            evaluators=[
+                {"evaluatorId": evaluator_id} for evaluator_id in evaluators_by_id
+            ]
+        )
+    ]
+    _online_evaluation_client(mock_ac, configs)
+
+    def _get(evaluatorId, includedData):
+        found = evaluators_by_id[evaluatorId]
+        if isinstance(found, Exception):
+            raise found
+        return found
+
+    mock_ac.get_evaluator.side_effect = _get
+
+
+def _ac44_role(*resources, name="EvaluationRole"):
+    return {
+        name: _principal_with(
+            [
+                {
+                    "Effect": "Allow",
+                    "Action": ["bedrock:InvokeModel"],
+                    "Resource": list(resources),
+                }
+            ]
+        )
+    }
+
+
+class TestAC44JudgeModelsCalled:
+    """AC-44 compares each bounded model pattern to the models the judges call."""
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_pattern_no_evaluator_calls_fails(self, mock_ac):
+        _ac44_custom(mock_ac, {"judge-1": _judge_evaluator("anthropic.claude-3")})
+        cache = _v2_cache(roles=_ac44_role(_JUDGE_FM, _JUDGE_OTHER))
+
+        findings = agentcore_app.check_agentcore_evaluation_judge_model_scope(cache)
+
+        assert len(findings) == 1
+        assert findings[0]["Status"] == "Failed"
+        assert findings[0]["Finding"].endswith("Unused Grant")
+        assert (
+            f"none of its 1 custom evaluator(s) call: {_JUDGE_OTHER}."
+            in (findings[0]["Finding_Details"])
+        )
+        mock_ac.get_evaluator.assert_called_once_with(
+            evaluatorId="judge-1", includedData="METADATA_ONLY"
+        )
+
+    @pytest.mark.parametrize(
+        "model_id, kind",
+        [
+            ("anthropic.claude-3", "llmAsAJudge"),
+            ("global.anthropic.claude-3", "llmAsAJudge"),
+            ("anthropic.claude-3", "derived"),
+            (_JUDGE_FM, "llmAsAJudge"),
+        ],
+        ids=["model-id", "global-profile", "derived", "model-arn"],
+    )
+    @patch("agentcore_app.agentcore_client")
+    def test_a_pattern_the_judge_calls_passes_and_names_it(
+        self, mock_ac, model_id, kind
+    ):
+        _ac44_custom(mock_ac, {"judge-1": _judge_evaluator(model_id, kind)})
+        cache = _v2_cache(roles=_ac44_role(_JUDGE_FM))
+
+        findings = agentcore_app.check_agentcore_evaluation_judge_model_scope(cache)
+
+        assert findings[0]["Status"] == "Passed"
+        assert (
+            f"Each pattern reaches a model its 1 custom evaluator(s) call: {model_id}."
+            in findings[0]["Finding_Details"]
+        )
+
+    @patch("agentcore_app.agentcore_client")
+    def test_an_unreadable_evaluator_withholds_the_pass(self, mock_ac):
+        _ac44_custom(
+            mock_ac,
+            {"judge-1": _make_client_error("AccessDeniedException", "no")},
+        )
+        cache = _v2_cache(roles=_ac44_role(_JUDGE_FM))
+
+        findings = agentcore_app.check_agentcore_evaluation_judge_model_scope(cache)
+
+        assert findings[0]["Status"] == "N/A"
+        assert (
+            "GetEvaluator on judge-1 failed with AccessDeniedException"
+            in findings[0]["Finding_Details"]
+        )
+        assert findings[0]["Resolution"] == (
+            "Grant bedrock-agentcore:GetEvaluator on the attached evaluators and retry."
+        )
+
+    @patch("agentcore_app.agentcore_client")
+    def test_an_unbounded_grant_fails_without_reading_the_evaluators(self, mock_ac):
+        _ac44_custom(
+            mock_ac,
+            {"judge-1": _make_client_error("AccessDeniedException", "no")},
+        )
+        cache = _v2_cache(roles=_ac44_role("arn:aws:bedrock:*::foundation-model/*"))
+
+        findings = agentcore_app.check_agentcore_evaluation_judge_model_scope(cache)
+
+        assert findings[0]["Status"] == "Failed"
+        assert findings[0]["Finding"].endswith("Unbounded")
+        mock_ac.get_evaluator.assert_not_called()
+
+    @patch("agentcore_app.agentcore_client")
+    def test_built_in_evaluators_are_not_read(self, mock_ac):
+        _online_evaluation_client(mock_ac)
+        cache = _v2_cache(roles=_ac44_role(_JUDGE_FM))
+
+        findings = agentcore_app.check_agentcore_evaluation_judge_model_scope(cache)
+
+        assert findings[0]["Status"] == "Passed"
+        assert "attach no custom evaluator" in findings[0]["Finding_Details"]
+        mock_ac.get_evaluator.assert_not_called()
+
+    @patch("agentcore_app.agentcore_client")
+    def test_each_role_is_compared_to_its_own_evaluators(self, mock_ac):
+        second_arn = "arn:aws:iam::123456789012:role/SecondRole"
+        _ac44_custom(
+            mock_ac,
+            {
+                "judge-1": _judge_evaluator("anthropic.claude-3"),
+                "judge-2": _judge_evaluator("meta.llama3"),
+            },
+            configs=[
+                _online_evaluation_detail(evaluators=[{"evaluatorId": "judge-1"}]),
+                _online_evaluation_detail(
+                    onlineEvaluationConfigId="oec-2",
+                    onlineEvaluationConfigName="second",
+                    evaluationExecutionRoleArn=second_arn,
+                    evaluators=[{"evaluatorId": "judge-2"}],
+                ),
+            ],
+        )
+        # Each role grants the other role's judge model, so a comparison over
+        # the pooled evaluators would pass both.
+        cache = _v2_cache(
+            roles={
+                **_ac44_role(_JUDGE_FM),
+                **_ac44_role(_JUDGE_FM, name="SecondRole"),
+            }
+        )
+
+        findings = agentcore_app.check_agentcore_evaluation_judge_model_scope(cache)
+
+        assert [f["Status"] for f in findings] == ["Passed", "Failed"]
+        assert "SecondRole" in findings[1]["Finding_Details"]
+        assert "Its judges call meta.llama3." in findings[1]["Finding_Details"]
+
+
 @pytest.mark.usefixtures("shell_alarm")
 class TestAC45WholePopulation:
     """AC-45 reads tool roles by value and who can open a runtime shell."""

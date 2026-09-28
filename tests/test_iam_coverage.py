@@ -1147,6 +1147,17 @@ _VERIFIED_REMEDIATION_IAM_ACTIONS |= {"oam:ListLinks"}
 # bedrock-agentcore-control model, which defines the operation. AC-30 names it
 # when the versions a runtime's endpoints serve cannot be listed.
 _VERIFIED_REMEDIATION_IAM_ACTIONS |= {"bedrock-agentcore:ListAgentRuntimeEndpoints"}
+# Verified on 2026-09-28 against the bedrock-agentcore service reference JSON,
+# which lists GetEvaluator on the evaluator resource type, ListBatchEvaluations
+# with no resource type and GetBatchEvaluation on batch-evaluate, and botocore's
+# models: GetEvaluator is in bedrock-agentcore-control, the two batch reads in
+# the bedrock-agentcore data plane. AC-44 and AC-41 name them when an evaluator
+# or a batch evaluation cannot be read.
+_VERIFIED_REMEDIATION_IAM_ACTIONS |= {
+    "bedrock-agentcore:GetEvaluator",
+    "bedrock-agentcore:ListBatchEvaluations",
+    "bedrock-agentcore:GetBatchEvaluation",
+}
 
 _NON_IAM_REMEDIATION_TOKENS = {
     # SM-41 names the AWS IoT Core policy variables

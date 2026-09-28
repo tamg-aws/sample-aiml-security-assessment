@@ -53,6 +53,7 @@ bedrock_client = None
 xray_client = None
 ce_client = None
 s3control_client = None
+agentcore_data_client = None
 
 # Environment variables
 BUCKET_NAME = os.environ.get("AIML_ASSESSMENT_BUCKET_NAME")
@@ -20712,6 +20713,204 @@ def check_agentcore_evaluation_safety_coverage() -> List[Dict[str, Any]]:
     return findings
 
 
+def _evaluation_results_group_findings(
+    label: str, group_name: str, key_policy_cache: Dict[str, Any]
+) -> List[Dict[str, Any]]:
+    """Judge one evaluation results log group's retention, key and prefix.
+
+    Online evaluation configurations and batch evaluations both name a results
+    group in outputConfig, and both are judged here by the same rules.
+    """
+    findings: List[Dict[str, Any]] = []
+    try:
+        candidates = _paginate_aws_list(
+            logs_client,
+            "describe_log_groups",
+            "logGroups",
+            logGroupNamePrefix=group_name,
+        )
+    except Exception as error:
+        findings.append(
+            create_finding(
+                check_id="AC-41",
+                finding_name="AgentCore Evaluation Result Protection",
+                finding_details=(
+                    f"{label} writes results to log group '{group_name}', which "
+                    f"could not be read: {_assessment_error_label(error)}."
+                ),
+                resolution="Grant logs:DescribeLogGroups and retry.",
+                reference=LOGS_RETENTION_REFERENCE_URL,
+                severity=SeverityEnum.INFORMATIONAL,
+                status=StatusEnum.NA,
+            )
+        )
+        return findings
+
+    group = next(
+        (
+            candidate
+            for candidate in candidates
+            if candidate.get("logGroupName") == group_name
+        ),
+        None,
+    )
+    if group is None:
+        findings.append(
+            create_finding(
+                check_id="AC-41",
+                finding_name="AgentCore Evaluation Results Unprotected",
+                finding_details=(
+                    f"{label} writes results to log group '{group_name}', which "
+                    "does not exist in this region. CloudWatch Logs creates a "
+                    "log group on first write with no encryption key and no "
+                    "retention period, so the first results this configuration "
+                    "produces are stored under a key the account does not "
+                    "control and kept forever."
+                ),
+                resolution=(
+                    "Create the results log group before the next evaluation run "
+                    "with a customer managed key and a retention period, or "
+                    "point the configuration at a log group that already has "
+                    "both."
+                ),
+                reference=LOGS_RETENTION_REFERENCE_URL,
+                severity=SeverityEnum.MEDIUM,
+                status=StatusEnum.FAILED,
+            )
+        )
+        return findings
+
+    problems: List[str] = []
+    confirmations: List[str] = []
+    unread: List[str] = []
+
+    retention = group.get("retentionInDays")
+    if retention:
+        confirmations.append(f"expires results after {retention} day(s)")
+    else:
+        problems.append(
+            "has no retention period, so every scored prompt, response and "
+            "judge rationale is kept indefinitely"
+        )
+
+    key_id = group.get("kmsKeyId")
+    if key_id:
+        if key_id not in key_policy_cache:
+            try:
+                key_policy_cache[key_id] = kms_client.get_key_policy(KeyId=key_id)[
+                    "Policy"
+                ]
+            except Exception as error:
+                logger.warning(f"Could not read key policy for {key_id}: {error}")
+                key_policy_cache[key_id] = error
+        key_policy = key_policy_cache[key_id]
+        if isinstance(key_policy, Exception):
+            unread.append(
+                f"is encrypted with {key_id}, whose key policy could not be "
+                f"read: {_assessment_error_label(key_policy)}"
+            )
+        elif _kms_key_policy_allows_open_decrypt(key_policy):
+            problems.append(
+                f"is encrypted with {key_id}, whose key policy allows every "
+                "principal to decrypt with no condition binding the caller's "
+                "account, organization, principal ARN or source"
+            )
+        elif _kms_logs_service_grant_is_unbound(key_policy):
+            problems.append(
+                f"is encrypted with {key_id}, whose key policy lets the "
+                "CloudWatch Logs service decrypt with no "
+                "kms:EncryptionContext:aws:logs:arn or source condition "
+                "naming this account, so the key serves log groups in any "
+                "account"
+            )
+        else:
+            confirmations.append(
+                f"is encrypted with {key_id}, whose key policy grants decrypt "
+                "to no wildcard or NotPrincipal principal unless a condition "
+                "binds the caller's account, organization, principal ARN or "
+                "source, and binds the CloudWatch Logs service grant to this "
+                "account's log groups"
+            )
+    else:
+        problems.append(
+            "has no customer managed encryption key, so who can read the stored "
+            "results is bounded by CloudWatch Logs permissions alone and no key "
+            "policy can narrow it"
+        )
+
+    if group_name.startswith(AGENTCORE_LOG_GROUP_PREFIXES):
+        confirmations.append(
+            "sits under an AgentCore log group prefix, so AC-20 judges its "
+            "masking policy"
+        )
+    else:
+        problems.append(
+            "sits outside the AgentCore log group prefixes "
+            f"({', '.join(AGENTCORE_LOG_GROUP_PREFIXES)}), so the masking "
+            "control that sweeps log groups by name does not reach it"
+        )
+
+    if problems:
+        findings.append(
+            create_finding(
+                check_id="AC-41",
+                finding_name="AgentCore Evaluation Results Unprotected",
+                finding_details=(
+                    f"{label} writes results to log group '{group_name}', which "
+                    f"{' and '.join(problems + unread)}."
+                ),
+                resolution=(
+                    "Set a retention period matching the schedule this workload "
+                    "commits to, encrypt the group with a customer managed key "
+                    "whose decrypt grants are bound to the account, and keep the "
+                    "results under an AgentCore log group prefix so the masking "
+                    "control covers it."
+                ),
+                reference=LOGS_RETENTION_REFERENCE_URL,
+                severity=SeverityEnum.MEDIUM,
+                status=StatusEnum.FAILED,
+            )
+        )
+    elif unread:
+        findings.append(
+            create_finding(
+                check_id="AC-41",
+                finding_name="AgentCore Evaluation Result Protection",
+                finding_details=(
+                    f"{label} writes results to log group '{group_name}', which "
+                    f"{' and '.join(confirmations + unread)}, so who can "
+                    "decrypt the results is unknown."
+                ),
+                resolution="Grant kms:GetKeyPolicy on the key and retry.",
+                reference=KMS_KEY_POLICY_REFERENCE_URL,
+                severity=SeverityEnum.INFORMATIONAL,
+                status=StatusEnum.NA,
+            )
+        )
+    else:
+        findings.append(
+            create_finding(
+                check_id="AC-41",
+                finding_name="AgentCore Evaluation Result Protection",
+                finding_details=(
+                    f"{label} writes results to log group '{group_name}', which "
+                    f"{' and '.join(confirmations)}."
+                ),
+                resolution=(
+                    "No action required for this check. Tag values and the "
+                    "configuration's own description are free-form text this "
+                    "check cannot judge, so confirm neither carries personal "
+                    "data. Confirm the retention period matches the workload's "
+                    "schedule, which no API field states."
+                ),
+                reference=LOGS_RETENTION_REFERENCE_URL,
+                severity=SeverityEnum.MEDIUM,
+                status=StatusEnum.PASSED,
+            )
+        )
+    return findings
+
+
 def check_agentcore_evaluation_result_protection() -> List[Dict[str, Any]]:
     """AC-41: Judge the log group each online evaluation writes its results to.
 
@@ -20815,193 +21014,252 @@ def check_agentcore_evaluation_result_protection() -> List[Dict[str, Any]]:
             )
             continue
 
-        try:
-            candidates = _paginate_aws_list(
-                logs_client,
-                "describe_log_groups",
-                "logGroups",
-                logGroupNamePrefix=group_name,
-            )
-        except Exception as error:
-            findings.append(
-                create_finding(
-                    check_id="AC-41",
-                    finding_name="AgentCore Evaluation Result Protection",
-                    finding_details=(
-                        f"{label} writes results to log group '{group_name}', which "
-                        f"could not be read: {_assessment_error_label(error)}."
-                    ),
-                    resolution="Grant logs:DescribeLogGroups and retry.",
-                    reference=LOGS_RETENTION_REFERENCE_URL,
-                    severity=SeverityEnum.INFORMATIONAL,
-                    status=StatusEnum.NA,
-                )
-            )
-            continue
-
-        group = next(
-            (
-                candidate
-                for candidate in candidates
-                if candidate.get("logGroupName") == group_name
-            ),
-            None,
+        findings.extend(
+            _evaluation_results_group_findings(label, group_name, key_policy_cache)
         )
-        if group is None:
+    return findings
+
+
+def _evaluation_key_verdict(
+    key_arn: str, key_metadata_cache: Dict[str, Any]
+) -> Tuple[Any, str]:
+    """Judge one evaluation key by DescribeKey.
+
+    Returns the status and the fact behind it: a key is credited only when
+    DescribeKey reports KeyManager CUSTOMER and KeyState Enabled.
+    """
+    if key_arn not in key_metadata_cache:
+        try:
+            key_metadata_cache[key_arn] = (
+                kms_client.describe_key(KeyId=key_arn).get("KeyMetadata") or {}
+            )
+        except (BotoCoreError, ClientError) as error:
+            key_metadata_cache[key_arn] = error
+    metadata = key_metadata_cache[key_arn]
+    if isinstance(metadata, Exception):
+        return StatusEnum.NA, (
+            f"names key {key_arn}, which could not be read: kms:DescribeKey failed "
+            f"with {_assessment_error_label(metadata)}"
+        )
+    if metadata.get("KeyManager") != "CUSTOMER":
+        return StatusEnum.FAILED, (
+            f"names key {key_arn}, which DescribeKey reports as managed by "
+            f"{metadata.get('KeyManager') or 'an unknown party'}, so no key policy "
+            "the account writes limits who can decrypt"
+        )
+    if metadata.get("KeyState") != "Enabled":
+        return StatusEnum.FAILED, (
+            f"names customer managed key {key_arn}, which is "
+            f"{metadata.get('KeyState') or 'in an unknown state'}"
+        )
+    return StatusEnum.PASSED, f"is encrypted with customer managed key {key_arn}"
+
+
+def check_agentcore_evaluation_key_protection() -> List[Dict[str, Any]]:
+    """AC-41: Judge the keys of custom evaluators and of batch evaluations.
+
+    A custom evaluator's instructions and rating scale are encrypted with the
+    kmsKeyArn it names, and an online evaluation configuration takes no key of
+    its own, so each custom evaluator an online configuration or a batch
+    evaluation attaches is read with GetEvaluator. A batch evaluation's own
+    kmsKeyArn encrypts its output, and its outputConfig names a results log
+    group, which is judged by the rules the online results groups are. A key is
+    credited only when DescribeKey reports it customer managed and enabled. The
+    key policies' encryption context and kms:ViaService conditions are not read.
+    """
+    finding_name = "AgentCore Evaluation Key Protection"
+    if agentcore_client is None or kms_client is None:
+        return []
+    try:
+        details, _ = _online_evaluation_details()
+    except (BotoCoreError, ClientError):
+        # AC-41's online entry reports the failed listing.
+        details = []
+
+    batch_error = None
+    batches: List[Dict[str, Any]] = []
+    if agentcore_data_client is None:
+        batch_error = "was not called: no bedrock-agentcore client was available"
+    else:
+        try:
+            batches = [
+                batch
+                for batch in _paginate_aws_list(
+                    agentcore_data_client,
+                    "list_batch_evaluations",
+                    "batchEvaluations",
+                    "nextToken",
+                    "nextToken",
+                )
+                if isinstance(batch, dict)
+            ]
+        except (BotoCoreError, ClientError) as error:
+            batch_error = f"failed with {_assessment_error_label(error)}"
+
+    evaluator_ids = sorted(
+        set(_attached_custom_evaluator_ids(details))
+        | set(
+            _attached_custom_evaluator_ids(
+                [(batch.get("batchEvaluationId"), batch) for batch in batches]
+            )
+        )
+    )
+    evaluators, evaluator_errors = _custom_evaluator_details(evaluator_ids)
+
+    findings: List[Dict[str, Any]] = []
+    key_metadata_cache: Dict[str, Any] = {}
+    for evaluator_id in evaluator_ids:
+        label = f"Custom evaluator {evaluator_id}"
+        if evaluator_id in evaluator_errors:
+            status = StatusEnum.NA
+            details_text = (
+                f"{label} could not be read: GetEvaluator failed with "
+                f"{evaluator_errors[evaluator_id]}, so whether a customer managed "
+                "key encrypts its instructions and rating scale is unknown."
+            )
+            resolution = "Grant bedrock-agentcore:GetEvaluator and retry."
+        elif not evaluators[evaluator_id].get("kmsKeyArn"):
+            status = StatusEnum.FAILED
+            details_text = (
+                f"{label} names no kmsKeyArn, so its instructions and rating scale "
+                "are encrypted under a key the account does not control and no key "
+                "policy limits who can read them."
+            )
+            resolution = (
+                "Set kmsKeyArn on the evaluator with UpdateEvaluator to a customer "
+                "managed key."
+            )
+        else:
+            status, fact = _evaluation_key_verdict(
+                evaluators[evaluator_id]["kmsKeyArn"], key_metadata_cache
+            )
+            details_text = f"{label} {fact}."
+            resolution = {
+                StatusEnum.PASSED: "No action required for this check.",
+                StatusEnum.NA: "Grant kms:DescribeKey on the key and retry.",
+            }.get(
+                status,
+                "Set kmsKeyArn on the evaluator with UpdateEvaluator to an enabled "
+                "customer managed key.",
+            )
+        findings.append(
+            create_finding(
+                check_id="AC-41",
+                finding_name=finding_name,
+                finding_details=details_text,
+                resolution=resolution,
+                reference=AGENTCORE_EVALUATORS_REFERENCE_URL,
+                severity=(
+                    SeverityEnum.INFORMATIONAL
+                    if status == StatusEnum.NA
+                    else SeverityEnum.MEDIUM
+                ),
+                status=status,
+            )
+        )
+
+    if batch_error:
+        findings.append(
+            create_finding(
+                check_id="AC-41",
+                finding_name=finding_name,
+                finding_details=(
+                    f"Batch evaluations could not be listed: ListBatchEvaluations "
+                    f"{batch_error}, so the keys and results log groups of batch "
+                    "evaluations are not judged."
+                ),
+                resolution="Grant bedrock-agentcore:ListBatchEvaluations and retry.",
+                reference=AGENTCORE_EVALUATORS_REFERENCE_URL,
+                severity=SeverityEnum.INFORMATIONAL,
+                status=StatusEnum.NA,
+            )
+        )
+
+    key_policy_cache: Dict[str, Any] = {}
+    for batch in batches:
+        batch_id = batch.get("batchEvaluationId") or "unknown"
+        label = (
+            f"Batch evaluation '{batch.get('batchEvaluationName') or batch_id}' "
+            f"({batch_id})"
+        )
+        key_arn = batch.get("kmsKeyArn")
+        if key_arn:
+            status, fact = _evaluation_key_verdict(key_arn, key_metadata_cache)
+        else:
+            status, fact = (
+                StatusEnum.FAILED,
+                (
+                    "names no kmsKeyArn, so its output is encrypted under a key the "
+                    "account does not control"
+                ),
+            )
+        findings.append(
+            create_finding(
+                check_id="AC-41",
+                finding_name=finding_name,
+                finding_details=f"{label} {fact}.",
+                resolution={
+                    StatusEnum.PASSED: "No action required for this check.",
+                    StatusEnum.NA: "Grant kms:DescribeKey on the key and retry.",
+                }.get(
+                    status,
+                    "Start batch evaluations with kmsKeyArn set to an enabled "
+                    "customer managed key.",
+                ),
+                reference=AGENTCORE_EVALUATORS_REFERENCE_URL,
+                severity=(
+                    SeverityEnum.INFORMATIONAL
+                    if status == StatusEnum.NA
+                    else SeverityEnum.MEDIUM
+                ),
+                status=status,
+            )
+        )
+        try:
+            batch_details = agentcore_data_client.get_batch_evaluation(
+                batchEvaluationId=batch_id
+            )
+        except (BotoCoreError, ClientError) as error:
             findings.append(
                 create_finding(
                     check_id="AC-41",
-                    finding_name="AgentCore Evaluation Results Unprotected",
+                    finding_name=finding_name,
                     finding_details=(
-                        f"{label} writes results to log group '{group_name}', which "
-                        "does not exist in this region. CloudWatch Logs creates a "
-                        "log group on first write with no encryption key and no "
-                        "retention period, so the first results this configuration "
-                        "produces are stored under a key the account does not "
-                        "control and kept forever."
+                        f"{label} could not be read: GetBatchEvaluation failed with "
+                        f"{_assessment_error_label(error)}, so its results log group "
+                        "is not judged."
                     ),
-                    resolution=(
-                        "Create the results log group before the next evaluation run "
-                        "with a customer managed key and a retention period, or "
-                        "point the configuration at a log group that already has "
-                        "both."
-                    ),
-                    reference=LOGS_RETENTION_REFERENCE_URL,
-                    severity=SeverityEnum.MEDIUM,
-                    status=StatusEnum.FAILED,
-                )
-            )
-            continue
-
-        problems: List[str] = []
-        confirmations: List[str] = []
-        unread: List[str] = []
-
-        retention = group.get("retentionInDays")
-        if retention:
-            confirmations.append(f"expires results after {retention} day(s)")
-        else:
-            problems.append(
-                "has no retention period, so every scored prompt, response and "
-                "judge rationale is kept indefinitely"
-            )
-
-        key_id = group.get("kmsKeyId")
-        if key_id:
-            if key_id not in key_policy_cache:
-                try:
-                    key_policy_cache[key_id] = kms_client.get_key_policy(KeyId=key_id)[
-                        "Policy"
-                    ]
-                except Exception as error:
-                    logger.warning(f"Could not read key policy for {key_id}: {error}")
-                    key_policy_cache[key_id] = error
-            key_policy = key_policy_cache[key_id]
-            if isinstance(key_policy, Exception):
-                unread.append(
-                    f"is encrypted with {key_id}, whose key policy could not be "
-                    f"read: {_assessment_error_label(key_policy)}"
-                )
-            elif _kms_key_policy_allows_open_decrypt(key_policy):
-                problems.append(
-                    f"is encrypted with {key_id}, whose key policy allows every "
-                    "principal to decrypt with no condition binding the caller's "
-                    "account, organization, principal ARN or source"
-                )
-            elif _kms_logs_service_grant_is_unbound(key_policy):
-                problems.append(
-                    f"is encrypted with {key_id}, whose key policy lets the "
-                    "CloudWatch Logs service decrypt with no "
-                    "kms:EncryptionContext:aws:logs:arn or source condition "
-                    "naming this account, so the key serves log groups in any "
-                    "account"
-                )
-            else:
-                confirmations.append(
-                    f"is encrypted with {key_id}, whose key policy grants decrypt "
-                    "to no wildcard or NotPrincipal principal unless a condition "
-                    "binds the caller's account, organization, principal ARN or "
-                    "source, and binds the CloudWatch Logs service grant to this "
-                    "account's log groups"
-                )
-        else:
-            problems.append(
-                "has no customer managed encryption key, so who can read the stored "
-                "results is bounded by CloudWatch Logs permissions alone and no key "
-                "policy can narrow it"
-            )
-
-        if group_name.startswith(AGENTCORE_LOG_GROUP_PREFIXES):
-            confirmations.append(
-                "sits under an AgentCore log group prefix, so AC-20 judges its "
-                "masking policy"
-            )
-        else:
-            problems.append(
-                "sits outside the AgentCore log group prefixes "
-                f"({', '.join(AGENTCORE_LOG_GROUP_PREFIXES)}), so the masking "
-                "control that sweeps log groups by name does not reach it"
-            )
-
-        if problems:
-            findings.append(
-                create_finding(
-                    check_id="AC-41",
-                    finding_name="AgentCore Evaluation Results Unprotected",
-                    finding_details=(
-                        f"{label} writes results to log group '{group_name}', which "
-                        f"{' and '.join(problems + unread)}."
-                    ),
-                    resolution=(
-                        "Set a retention period matching the schedule this workload "
-                        "commits to, encrypt the group with a customer managed key "
-                        "whose decrypt grants are bound to the account, and keep the "
-                        "results under an AgentCore log group prefix so the masking "
-                        "control covers it."
-                    ),
-                    reference=LOGS_RETENTION_REFERENCE_URL,
-                    severity=SeverityEnum.MEDIUM,
-                    status=StatusEnum.FAILED,
-                )
-            )
-        elif unread:
-            findings.append(
-                create_finding(
-                    check_id="AC-41",
-                    finding_name="AgentCore Evaluation Result Protection",
-                    finding_details=(
-                        f"{label} writes results to log group '{group_name}', which "
-                        f"{' and '.join(confirmations + unread)}, so who can "
-                        "decrypt the results is unknown."
-                    ),
-                    resolution="Grant kms:GetKeyPolicy on the key and retry.",
-                    reference=KMS_KEY_POLICY_REFERENCE_URL,
+                    resolution="Grant bedrock-agentcore:GetBatchEvaluation and retry.",
+                    reference=AGENTCORE_EVALUATORS_REFERENCE_URL,
                     severity=SeverityEnum.INFORMATIONAL,
                     status=StatusEnum.NA,
                 )
             )
-        else:
-            findings.append(
-                create_finding(
-                    check_id="AC-41",
-                    finding_name="AgentCore Evaluation Result Protection",
-                    finding_details=(
-                        f"{label} writes results to log group '{group_name}', which "
-                        f"{' and '.join(confirmations)}."
-                    ),
-                    resolution=(
-                        "No action required for this check. Tag values and the "
-                        "configuration's own description are free-form text this "
-                        "check cannot judge, so confirm neither carries personal "
-                        "data. Confirm the retention period matches the workload's "
-                        "schedule, which no API field states."
-                    ),
-                    reference=LOGS_RETENTION_REFERENCE_URL,
-                    severity=SeverityEnum.MEDIUM,
-                    status=StatusEnum.PASSED,
-                )
+            continue
+        group_name = (
+            ((batch_details or {}).get("outputConfig") or {}).get("cloudWatchConfig")
+            or {}
+        ).get("logGroupName")
+        if group_name:
+            findings.extend(
+                _evaluation_results_group_findings(label, group_name, key_policy_cache)
             )
 
+    if not findings:
+        findings.append(
+            create_finding(
+                check_id="AC-41",
+                finding_name=finding_name,
+                finding_details=(
+                    "No custom evaluator is attached and no batch evaluation exists "
+                    "in this region, so no evaluation key is judged."
+                ),
+                resolution="No action required for this check.",
+                reference=AGENTCORE_EVALUATORS_REFERENCE_URL,
+                severity=SeverityEnum.INFORMATIONAL,
+                status=StatusEnum.NA,
+            )
+        )
     return findings
 
 
@@ -21630,6 +21888,81 @@ def _model_invocation_scope(
     return sorted(set(unbounded)), sorted(set(bounded)), unreadable
 
 
+def _custom_evaluator_details(
+    evaluator_ids: List[str],
+) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, str]]:
+    """Read each custom evaluator's metadata with GetEvaluator.
+
+    Built-in evaluators run on AWS-managed models and carry no customer key, so
+    only ids outside the Builtin. namespace are read. METADATA_ONLY returns the
+    model configuration and key without the instructions, so the read needs no
+    kms:Decrypt. Returns the details by id and an error label by id.
+    """
+    details: Dict[str, Dict[str, Any]] = {}
+    errors: Dict[str, str] = {}
+    for evaluator_id in evaluator_ids:
+        try:
+            response = agentcore_client.get_evaluator(
+                evaluatorId=evaluator_id, includedData="METADATA_ONLY"
+            )
+        except (BotoCoreError, ClientError) as error:
+            errors[evaluator_id] = _assessment_error_label(error)
+            continue
+        if isinstance(response, dict):
+            details[evaluator_id] = response
+        else:
+            errors[evaluator_id] = "an unreadable response"
+    return details, errors
+
+
+def _attached_custom_evaluator_ids(
+    details: List[Tuple[str, Dict[str, Any]]],
+) -> List[str]:
+    """Return the ids of the custom evaluators the given configurations attach."""
+    return sorted(
+        {
+            str(evaluator.get("evaluatorId"))
+            for _, detail in details
+            for evaluator in detail.get("evaluators") or []
+            if isinstance(evaluator, dict)
+            and evaluator.get("evaluatorId")
+            and not str(evaluator.get("evaluatorId")).startswith("Builtin.")
+        }
+    )
+
+
+def _evaluator_judge_models(detail: Dict[str, Any]) -> List[str]:
+    """Return the Bedrock model ids one evaluator's judge configuration calls."""
+    config = detail.get("evaluatorConfig") or {}
+    models = []
+    for kind in ("llmAsAJudge", "derived"):
+        model_config = (config.get(kind) or {}).get("modelConfig") or {}
+        model_id = (model_config.get("bedrockEvaluatorModelConfig") or {}).get(
+            "modelId"
+        )
+        if isinstance(model_id, str) and model_id:
+            models.append(model_id)
+    return models
+
+
+# The geographic and global cross-Region inference profile prefixes. A profile
+# id such as global.anthropic.claude-x routes to foundation-model/anthropic.
+# claude-x, so a grant on that foundation model serves the profile's evaluator.
+CROSS_REGION_PROFILE_PREFIXES = ("us.", "eu.", "apac.", "global.", "us-gov.")
+
+
+def _model_pattern_reaches(pattern: str, model_id: str) -> bool:
+    """Whether one bounded model Resource pattern reaches one judge model id."""
+    if model_id.startswith("arn:"):
+        return fnmatchcase(model_id, pattern)
+    tail = pattern.split(":", 5)[5] if pattern.count(":") >= 5 else pattern
+    candidates = [f"foundation-model/{model_id}", f"inference-profile/{model_id}"]
+    for prefix in CROSS_REGION_PROFILE_PREFIXES:
+        if model_id.startswith(prefix):
+            candidates.append(f"foundation-model/{model_id[len(prefix) :]}")
+    return any(fnmatchcase(candidate, tail) for candidate in candidates)
+
+
 def check_agentcore_evaluation_judge_model_scope(
     permission_cache: Dict[str, Any],
 ) -> List[Dict[str, Any]]:
@@ -21643,8 +21976,11 @@ def check_agentcore_evaluation_judge_model_scope(
     price, and puts the scored content in front of it.
 
     Which models a workload's judges are allowed to use is the workload owner's
-    decision, so this check asserts only that the grant names models at all and
-    reports the patterns it found for the owner to confirm.
+    decision, so this check asserts that the grant names models at all, and then
+    that every model pattern it names reaches a model one of the role's custom
+    evaluators calls, as GetEvaluator reports it. A pattern no attached evaluator
+    uses fails, and an evaluator that could not be read withholds the pass.
+    Built-in evaluators are not read.
     """
     if agentcore_client is None:
         return [
@@ -21834,6 +22170,98 @@ def check_agentcore_evaluation_judge_model_scope(
         elif unreadable:
             continue
         elif bounded:
+            evaluator_ids = _attached_custom_evaluator_ids(
+                [
+                    (label, detail)
+                    for label, detail in details
+                    if detail.get("evaluationExecutionRoleArn") == role_arn
+                ]
+            )
+            evaluators, evaluator_errors = _custom_evaluator_details(evaluator_ids)
+            if evaluator_errors:
+                findings.append(
+                    create_finding(
+                        check_id="AC-44",
+                        finding_name="AgentCore Evaluation Judge Model Scope",
+                        finding_details=(
+                            f"Evaluation execution role {role_name} can invoke a "
+                            f"model only through {len(bounded)} Resource pattern(s) "
+                            f"that name a model: {', '.join(bounded)}. "
+                            f"{len(evaluator_errors)} custom evaluator(s) it scores "
+                            "with could not be read: "
+                            + ", ".join(
+                                f"GetEvaluator on {evaluator_id} failed with {label}"
+                                for evaluator_id, label in sorted(
+                                    evaluator_errors.items()
+                                )
+                            )
+                            + ", so whether each pattern names a model its judges "
+                            f"call is unknown.{v1_note}"
+                        ),
+                        resolution=(
+                            "Grant bedrock-agentcore:GetEvaluator on the attached "
+                            "evaluators and retry."
+                        ),
+                        reference=AGENTCORE_EVALUATORS_REFERENCE_URL,
+                        severity=SeverityEnum.INFORMATIONAL,
+                        status=StatusEnum.NA,
+                    )
+                )
+                continue
+            called = sorted(
+                {
+                    model
+                    for evaluator in evaluators.values()
+                    for model in _evaluator_judge_models(evaluator)
+                }
+            )
+            unused = [
+                pattern
+                for pattern in bounded
+                if called
+                and not any(_model_pattern_reaches(pattern, model) for model in called)
+            ]
+            if unused:
+                findings.append(
+                    create_finding(
+                        check_id="AC-44",
+                        finding_name="AgentCore Evaluation Judge Model Unused Grant",
+                        finding_details=(
+                            f"Evaluation execution role {role_name} can invoke "
+                            f"{len(unused)} model pattern(s) that none of its "
+                            f"{len(evaluators)} custom evaluator(s) call: "
+                            f"{', '.join(unused)}. Its judges call "
+                            f"{', '.join(called)}. The judge prompt carries the "
+                            "agent output being scored, so each extra model is one "
+                            "that text can be sent to by a changed evaluator."
+                            f"{v1_note}"
+                        ),
+                        resolution=(
+                            "Remove the patterns no evaluator calls, keeping the "
+                            "foundation model and inference profile ARNs of the "
+                            "models the evaluators name."
+                        ),
+                        reference=AGENTCORE_EVALUATORS_REFERENCE_URL,
+                        severity=SeverityEnum.MEDIUM,
+                        status=StatusEnum.FAILED,
+                    )
+                )
+                continue
+            if called:
+                judge_note = (
+                    f" Each pattern reaches a model its {len(evaluators)} custom "
+                    f"evaluator(s) call: {', '.join(called)}."
+                )
+            elif evaluators:
+                judge_note = (
+                    f" Its {len(evaluators)} custom evaluator(s) name no Bedrock "
+                    "judge model, so the patterns are not compared to one."
+                )
+            else:
+                judge_note = (
+                    " Its configurations attach no custom evaluator, so no judge "
+                    "model was read to compare the patterns to."
+                )
             findings.append(
                 create_finding(
                     check_id="AC-44",
@@ -21841,7 +22269,7 @@ def check_agentcore_evaluation_judge_model_scope(
                     finding_details=(
                         f"Evaluation execution role {role_name} can invoke a model "
                         f"only through {len(bounded)} Resource pattern(s) that name "
-                        f"a model: {', '.join(bounded)}.{v1_note}"
+                        f"a model: {', '.join(bounded)}.{judge_note}{v1_note}"
                     ),
                     resolution=(
                         "No action required for this check. Confirm the named models "
@@ -26516,6 +26944,7 @@ def lambda_handler(event, context):
     global kms_client, organizations_client
     global wafv2_client, route53resolver_client, cognito_client, events_client
     global bedrock_client, xray_client, ce_client, s3control_client
+    global agentcore_data_client
     start_time = time.time()
 
     try:
@@ -26570,6 +26999,14 @@ def lambda_handler(event, context):
         s3control_client = boto3.client(
             "s3control", config=boto3_config, region_name=region
         )
+        # AC-41 lists batch evaluations, which only the data-plane API returns.
+        try:
+            agentcore_data_client = boto3.client(
+                "bedrock-agentcore", config=boto3_config, region_name=region
+            )
+        except BotoCoreError as e:
+            logger.warning(f"Could not create the bedrock-agentcore client: {e}")
+            agentcore_data_client = None
 
         # Collect all findings
         all_findings = []
@@ -27093,6 +27530,11 @@ def lambda_handler(event, context):
                 ["AC-46"],
                 "Runtime Cost Anomaly Alerting",
                 check_agentcore_runtime_cost_alerting,
+            ),
+            (
+                ["AC-41"],
+                "Evaluation Key Protection",
+                check_agentcore_evaluation_key_protection,
             ),
             (
                 ["AC-47"],

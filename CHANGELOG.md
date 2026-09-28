@@ -254,6 +254,14 @@ section.
   others. Without a `bedrock-agentcore:ListAgentRuntimeEndpoints` grant, which
   the assessment roles do not hold, a runtime that would pass is `N/A` naming
   it until it is added.
+- `AC-44` fails a bounded model pattern on an evaluation execution role that
+  reaches no model the role's custom evaluators call, as `GetEvaluator`
+  reports it. `AC-41` gains rows for the key of each custom evaluator and
+  batch evaluation, credited only by `DescribeKey`, and judges each batch
+  evaluation's results log group. The assessment roles hold no
+  `bedrock-agentcore:GetEvaluator`, `ListBatchEvaluations` or
+  `GetBatchEvaluation` grant, so those legs are `N/A` naming the action until
+  it is added.
 - `AC-45` judges each AgentCore runtime's own execution role by the rules it
   applies to a tool role. No check read a runtime role outside the AgentCore
   namespace, so one granting `s3:*` or every foundation model passed.
