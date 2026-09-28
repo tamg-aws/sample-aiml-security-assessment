@@ -630,7 +630,7 @@ A: Minimal ongoing costs:
 
 **Q: Can I customize which security checks are included?**
 
-A: Currently, all 159 core checks (57 Bedrock, 40 SageMaker AI, 52 AgentCore,
+A: Currently, all 160 core checks (57 Bedrock, 41 SageMaker AI, 52 AgentCore,
 and 10 AWS Agent Registry) and 39 Agentic AI Security checks run by default to
 provide comprehensive coverage. If `EnableResponsibleAIGRCAssessment` is
 enabled, the 64 optional Responsible AI GRC checks also run. If

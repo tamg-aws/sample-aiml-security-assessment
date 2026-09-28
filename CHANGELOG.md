@@ -12,6 +12,17 @@ section.
 
 ### Added
 
+- Added `SM-42` Batch Transform Creation Guardrail, growing the catalog from
+  274 to 275 checks (160 core). It runs the `SM-34` legs over `CreateModel`
+  and `CreateTransformJob` only, so AISF `AIR-SGM-EP-08` can cite a verdict
+  that a training or notebook gap does not fail. It runs in each scanned
+  Region, so its rows join the `SM-18` transform job rows on account and
+  Region.
+- `SM-34`, `SM-42` and `SM-09` give no credit to a negated condition operator
+  on `sagemaker:VpcSubnets` or `sagemaker:VpcSecurityGroupIds` with no
+  `ForAllValues` or `ForAnyValue` prefix, or to an Allow on either key with no
+  set operator. IAM defines a multivalued key only under a set operator, and
+  the row names the operator as undefined.
 - Added `BR-57` Agent Handoff Source Identity, growing the catalog from 273
   to 274 checks (159 core). It covers AISF `AIR-SLF-AGT-05`, which the ledger
   had marked `not_implementable`. It fails a Bedrock collaborator that runs as

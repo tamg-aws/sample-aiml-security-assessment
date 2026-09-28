@@ -13854,6 +13854,150 @@ class TestSM34ValuePinning:
         assert leg["principals"] == ["Role 'Bare'"]
 
 
+BATCH_SCP_DENIES = [
+    _scp_deny(
+        "sagemaker:CreateTransformJob",
+        "ArnNotEquals",
+        "sagemaker:VolumeKmsKeyArn",
+        [APPROVED_KEY],
+    ),
+    _scp_deny(
+        "sagemaker:CreateTransformJob",
+        "ArnNotEquals",
+        "sagemaker:OutputKmsKeyArn",
+        [APPROVED_KEY],
+    ),
+    _scp_deny("sagemaker:CreateModel", "Null", "sagemaker:VpcSubnets", "true"),
+    _scp_deny(
+        "sagemaker:CreateModel",
+        "ForAnyValue:StringNotEquals",
+        "sagemaker:VpcSubnets",
+        ["subnet-1"],
+    ),
+    _scp_deny(
+        "sagemaker:CreateModel",
+        "BoolIfExists",
+        "sagemaker:NetworkIsolation",
+        "false",
+    ),
+]
+
+
+class TestSM42BatchCreationGuardrails:
+    """AIR-SGM-EP-08: SM-42 judges CreateModel and CreateTransformJob alone."""
+
+    _sm34 = TestSM34CreationGuardrails()
+
+    def _run(self, inventory, cache=OPEN_CACHE, region="us-east-1", **kwargs):
+        clients = (
+            self._sm34._management_account_clients()
+            if kwargs.get("management")
+            else self._sm34._member_account_clients()
+        )
+        with patch("sagemaker_app.boto3.client", side_effect=clients):
+            return extract_csv_data(
+                sagemaker_app.check_sagemaker_batch_creation_guardrails(
+                    region=region, scp_inventory=inventory, permission_cache=cache
+                )
+            )
+
+    def _policies(self, *named_statements):
+        return self._sm34._inventory(
+            *(self._sm34._scp(name, stmts) for name, stmts in named_statements)
+        )
+
+    def test_a_training_gap_fails_sm34_but_not_sm42(self):
+        inventory = self._policies(("BatchGuard", BATCH_SCP_DENIES))
+        batch = self._run(inventory)
+        assert [f["Check_ID"] for f in batch] == ["SM-42"] * 3
+        assert [f["Status"] for f in batch] == ["Passed"] * 3
+        assert all("'BatchGuard'" in f["Finding_Details"] for f in batch)
+        sm34 = self._sm34._by_category(self._sm34._run(inventory))
+        assert {row["Status"] for row in sm34.values()} == {"Failed"}
+        assert "CreateTrainingJob" in sm34["encryption"]["Finding_Details"]
+
+    def test_a_batch_gap_fails_sm42_while_sm34_names_it_too(self):
+        # The output key Deny is missing, and the rest of the guard is split
+        # across two policies.
+        inventory = self._policies(
+            ("KeyGuard", BATCH_SCP_DENIES[:1]),
+            ("ModelGuard", BATCH_SCP_DENIES[2:]),
+        )
+        rows = self._sm34._by_category(self._run(inventory))
+        encryption = rows["encryption"]
+        assert encryption["Status"] == "Failed"
+        assert encryption["Check_ID"] == "SM-42"
+        assert "1 of 2 encryption requirements" in encryption["Finding_Details"]
+        assert (
+            "CreateTransformJob on sagemaker:OutputKmsKeyArn"
+            in (encryption["Finding_Details"])
+        )
+        assert "CreateTrainingJob" not in encryption["Finding_Details"]
+        assert "batch transform path" in encryption["Finding_Details"]
+        assert rows["approved network"]["Status"] == "Passed"
+        assert "'ModelGuard'" in rows["approved network"]["Finding_Details"]
+        assert rows["no direct internet access"]["Status"] == "Passed"
+
+    def test_a_guard_on_training_only_leaves_the_batch_path_failed(self):
+        training_only = [
+            _scp_deny(
+                "sagemaker:CreateTrainingJob",
+                "ArnNotEquals",
+                "sagemaker:VolumeKmsKeyArn",
+                [APPROVED_KEY],
+            ),
+            _scp_deny(
+                "sagemaker:CreateTrainingJob",
+                "BoolIfExists",
+                "sagemaker:NetworkIsolation",
+                "false",
+            ),
+        ]
+        batch = self._run(self._policies(("TrainingGuard", training_only)))
+        assert [f["Status"] for f in batch] == ["Failed"] * 3
+
+    def test_the_requirements_are_the_batch_subset_of_sm34(self):
+        batch = dict(sagemaker_app.SAGEMAKER_BATCH_CREATION_GUARDRAILS)
+        full = dict(sagemaker_app.SAGEMAKER_CREATION_GUARDRAILS)
+        assert list(batch) == list(full)
+        for category, requirements in batch.items():
+            assert requirements
+            assert {a for a, _ in requirements} <= {
+                "sagemaker:CreateModel",
+                "sagemaker:CreateTransformJob",
+            }
+            assert set(requirements) <= set(full[category])
+            assert [r for r in full[category] if r[0] in dict(requirements)] == list(
+                requirements
+            )
+        assert len(batch["encryption"]) == 2
+        assert len(batch["approved network"]) == 1
+        assert len(batch["no direct internet access"]) == 1
+
+    def test_rows_carry_the_scanned_region(self):
+        inventory = self._policies(("BatchGuard", BATCH_SCP_DENIES))
+        for region in ("us-east-1", "eu-west-1"):
+            assert {f["Region"] for f in self._run(inventory, region=region)} == {
+                region
+            }
+
+    def test_unassessed_when_neither_leg_can_be_read(self):
+        rows = self._run(self._policies(), cache=None, management=True)
+        assert len(rows) == 1
+        assert rows[0]["Check_ID"] == "SM-42"
+        assert rows[0]["Status"] == "N/A"
+        assert "were not assessed" in rows[0]["Finding_Details"]
+
+    def test_the_handler_runs_it_per_region(self):
+        source = open(os.path.join(_sm_dir, "app.py"), encoding="utf-8").read()
+        handler = source[source.index("def lambda_handler") :]
+        call_at = handler.index("check_sagemaker_batch_creation_guardrails(")
+        call = handler[call_at : handler.index(")", call_at)]
+        assert "region=region" in call
+        assert "permission_cache=permission_cache" in call
+        assert call_at > handler.index("check_sagemaker_transform_job_encryption(")
+
+
 def _hyperpod_inventory(groups):
     return {
         "items": [

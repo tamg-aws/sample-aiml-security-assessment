@@ -1,10 +1,10 @@
 # Security Checks Reference
 
-This document provides a comprehensive reference for all 274 security checks performed by the AI/ML Security Assessment framework (159 core checks across Amazon Bedrock, Amazon SageMaker AI, Amazon Bedrock AgentCore, and AWS Agent Registry, 39 Agentic AI Security checks, 64 Responsible AI GRC checks, and 12 OWASP Top 10 for LLM checks).
+This document provides a comprehensive reference for all 275 security checks performed by the AI/ML Security Assessment framework (160 core checks across Amazon Bedrock, Amazon SageMaker AI, Amazon Bedrock AgentCore, and AWS Agent Registry, 39 Agentic AI Security checks, 64 Responsible AI GRC checks, and 12 OWASP Top 10 for LLM checks).
 
 Sources differ by bucket and are not interchangeable: the core Bedrock, SageMaker, AgentCore, and AWS Agent Registry checks derive from the AWS Well-Architected **Generative AI Lens** security best practices (`gensec*`) and service security documentation; the Agentic AI Security checks from the AWS Well-Architected **Agentic AI Lens**; the `FS-*` **Responsible AI GRC** checks from the AWS GRC User Guide; and the `OW-*` checks from the OWASP Top 10 for LLM. The AWS Well-Architected **Responsible AI Lens** is not a source for any of them — see [Responsible AI GRC — scope, sources, and compatibility](RESPONSIBLE_AI_GRC_SCOPE.md).
 
-The 64 Responsible AI GRC checks occupy 69 `FS-*` numbers: 64 ship as standalone checks and 5 are merged into upstream Bedrock/SageMaker checks. The framework also emits `BR-00`, `SM-00`, `AC-00`, `AR-00`, `FS-00`, `OW-00`, and `AISF-00` operational marker rows at runtime; these are not controls and are excluded from the 274-check total. `AISF-01` through `AISF-08` are AWS AI Security Framework view rows: each one restates the verdict of a check already counted above under an AISF control id, so they are excluded from the 274-check total for the same reason ([AWS AI Security Framework (AISF) Checks](SECURITY_CHECKS_AISF.md)). Per-control provenance, including which controls are project extensions rather than guide-derived, is recorded in [`provenance.json`](../aiml-security-assessment/functions/security/responsible_ai_grc_assessments/provenance.json).
+The 64 Responsible AI GRC checks occupy 69 `FS-*` numbers: 64 ship as standalone checks and 5 are merged into upstream Bedrock/SageMaker checks. The framework also emits `BR-00`, `SM-00`, `AC-00`, `AR-00`, `FS-00`, `OW-00`, and `AISF-00` operational marker rows at runtime; these are not controls and are excluded from the 275-check total. `AISF-01` through `AISF-08` are AWS AI Security Framework view rows: each one restates the verdict of a check already counted above under an AISF control id, so they are excluded from the 275-check total for the same reason ([AWS AI Security Framework (AISF) Checks](SECURITY_CHECKS_AISF.md)). Per-control provenance, including which controls are project extensions rather than guide-derived, is recorded in [`provenance.json`](../aiml-security-assessment/functions/security/responsible_ai_grc_assessments/provenance.json).
 
 ## Table of Contents
 
@@ -13,7 +13,7 @@ The 64 Responsible AI GRC checks occupy 69 `FS-*` numbers: 64 ship as standalone
 - [Report Scoring](#report-scoring)
 - [Severity Levels](#severity-levels)
 - [Status Values](#status-values)
-- [Amazon SageMaker AI Security Checks (40)](#amazon-sagemaker-ai-security-checks-40)
+- [Amazon SageMaker AI Security Checks (41)](#amazon-sagemaker-ai-security-checks-41)
 - [Amazon Bedrock Security Checks (57)](#amazon-bedrock-security-checks-57)
 - [Amazon Bedrock AgentCore Security Checks (52)](#amazon-bedrock-agentcore-security-checks-52)
 - [AWS Agent Registry Security Checks (10)](#aws-agent-registry-security-checks-10)
@@ -45,7 +45,7 @@ Each security check has a unique identifier with a service prefix:
 
 | Prefix | Service | Example |
 | -------- | --------- | --------- |
-| **SM-XX** | Amazon SageMaker | SM-01, SM-41 (`SM-29` reserved) |
+| **SM-XX** | Amazon SageMaker | SM-01, SM-42 (`SM-29` reserved) |
 | **BR-XX** | Amazon Bedrock | BR-01, BR-57 |
 | **AC-XX** | Amazon Bedrock AgentCore | AC-01, AC-52 |
 | **AR-XX** | AWS Agent Registry | AR-01, AR-10 |
@@ -116,7 +116,7 @@ investigation and remediation.
 
 ---
 
-## Amazon SageMaker AI Security Checks (40)
+## Amazon SageMaker AI Security Checks (41)
 
 ### SM-01: Internet Access
 
@@ -338,6 +338,11 @@ investigation and remediation.
 
 - **Severity:** High
 - **Description:** For each AWS IoT policy attached to a certificate or other principal, fails an Allow statement that reaches `Publish`, `Subscribe`, `Receive` or `Connect` on `*`, on all topics, topic filters or client IDs, or through `NotResource`, unless the resource embeds `${iot:Connection.Thing.ThingName}`. `NotAction` Allow statements are expanded to the device actions they reach. A statement allowing `Connect` also needs a `Bool` condition requiring `iot:Connection.Thing.IsAttached` to be `true`. Unattached policies are skipped. No attached policy produces `N/A`.
+
+### SM-42: Batch Transform Creation Guardrail
+
+- **Severity:** Medium
+- **Description:** Applies the `SM-34` creation guardrail to the batch transform path only: `CreateTransformJob` on `sagemaker:VolumeKmsKeyArn` and `sagemaker:OutputKmsKeyArn`, and `CreateModel` on `sagemaker:VpcSubnets` or `sagemaker:VpcSecurityGroupIds` and on `sagemaker:NetworkIsolation`. A transform job takes its network posture from its model, so `CreateModel` carries the network keys. Each requirement is met by a service control policy Deny on this account's path to the root or by a condition in every identity policy that grants the action. A training, endpoint configuration or notebook gap does not fail this check. It emits one row per category in each scanned Region, so it shares an account and Region key with the `SM-18` transform job rows.
 
 ---
 
