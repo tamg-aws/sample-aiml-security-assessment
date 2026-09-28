@@ -11654,6 +11654,89 @@ def check_agentcore_policy_engine_key_scope() -> List[Dict[str, Any]]:
     return findings
 
 
+# policy-guardrails-in-policies.html: a guardrail returns one of these discrete
+# confidence scores, and a policy compares it with one of four operators.
+GUARDRAIL_SCORES = (0.0, 0.2, 0.4, 0.6, 0.8, 1.0)
+GUARDRAIL_SCORE_OPERATORS = {
+    "greaterThan": lambda score, threshold: score > threshold,
+    "greaterThanOrEqual": lambda score, threshold: score >= threshold,
+    "lessThan": lambda score, threshold: score < threshold,
+    "lessThanOrEqual": lambda score, threshold: score <= threshold,
+}
+GUARDRAIL_CALL_PATTERN = re.compile(
+    r"BedrockGuardrails::(\w+)\(\[([^\]]*)\],\[([^\]]*)\]\)"
+    r"(?:\[\"[^\"]*\"\])?"
+    r"\.(confidenceScore|maxConfidenceScore\(\)|minConfidenceScore\(\)|count\(\))"
+    r"(?:\.(\w+)\(decimal\(\"([^\"]*)\"\)\))?"
+)
+
+
+def _guardrail_scores_that_fire(operator: str, threshold: str) -> Optional[List[float]]:
+    """Return the discrete scores one comparison is true for, or None if unread."""
+    compare = GUARDRAIL_SCORE_OPERATORS.get(operator)
+    try:
+        value = float(threshold)
+    except (TypeError, ValueError):
+        return None
+    if compare is None:
+        return None
+    return [score for score in GUARDRAIL_SCORES if compare(score, value)]
+
+
+def _guardrail_policy_verdict(effect: str, conditions: str) -> Tuple[str, str]:
+    """Judge the guardrail calls of one Cedar policy by their values.
+
+    Returns ("inert", reason) when no score the guardrail can return changes the
+    decision, ("unread", reason) when a call or its comparison could not be
+    read, and ("scored", summary) otherwise. A forbid or suppressOutput acts
+    when its condition is true, so a comparison no discrete score satisfies,
+    such as greaterThan(decimal("1.0")), never acts; a permit acts regardless of
+    the score when every score satisfies it. A call whose categories or data
+    paths are an empty list scores nothing. The policy is inert only when every
+    call is, which holds under any combination of `&&` and `||`; a `!` could
+    invert that, so a condition carrying one is left unread.
+    """
+    flat = re.sub(r"\s+", "", conditions)
+    if re.search(r"!(?!=)", flat):
+        return "unread", "its guardrail condition is negated"
+    calls = list(GUARDRAIL_CALL_PATTERN.finditer(flat))
+    if not calls or len(calls) != flat.count("BedrockGuardrails::"):
+        return "unread", "a guardrail call could not be read"
+    inert: List[str] = []
+    summaries: List[str] = []
+    for call in calls:
+        safeguard, categories, paths, aggregate, operator, threshold = call.groups()
+        label = f"{safeguard}({categories or 'no category'})"
+        if not categories or not paths:
+            inert.append(f"{label} names no category or no data path")
+            continue
+        fires = (
+            _guardrail_scores_that_fire(operator, threshold)
+            if operator and not aggregate.startswith("count")
+            else None
+        )
+        if fires is None:
+            return "unread", f"the threshold of {label} could not be read"
+        if effect == "permit" and len(fires) == len(GUARDRAIL_SCORES):
+            inert.append(
+                f"{label} {operator}({threshold}) holds for every score, so the "
+                "permit applies whatever the guardrail returns"
+            )
+        elif effect != "permit" and not fires:
+            inert.append(
+                f"{label} {operator}({threshold}) holds for no score the "
+                "guardrail returns, so the policy never acts"
+            )
+        else:
+            summaries.append(
+                f"{label} on {paths} acts at score "
+                f"{', '.join(f'{score:g}' for score in fires)}"
+            )
+    if len(inert) == len(calls):
+        return "inert", "; ".join(inert)
+    return "scored", "; ".join(summaries + inert)
+
+
 def check_agentcore_policy_guardrail_wiring(
     permission_cache: Dict[str, Any],
 ) -> List[Dict[str, Any]]:
@@ -11667,6 +11750,15 @@ def check_agentcore_policy_guardrail_wiring(
     to score. Whether this workload's content-safety decisions belong at the
     authorization boundary at all is the workload owner's call; this check
     judges only the wiring of the guardrail policies that exist.
+
+    A guardrail policy is any enforcing policy whose condition calls
+    BedrockGuardrails, which takes in suppressOutput policies written with a
+    plain `when` block. Each call is read by value: its categories, its data
+    paths and the scores its threshold comparison acts on. A policy no score
+    can make act fails, and one whose threshold cannot be read is named without
+    a Passed. The role's grant counts only after its own Deny statements and
+    permissions boundary, and a role the IAM cache could not read, or one with
+    an unparseable policy, is never reported as wired.
     """
     if agentcore_client is None:
         return [
@@ -11725,6 +11817,14 @@ def check_agentcore_policy_guardrail_wiring(
             )
         ]
 
+    gap_labels, recorded = _cache_principal_read_gaps(permission_cache, ("role",))
+    unread_roles = {
+        str(entry.get("name", ""))
+        for entry in (permission_cache.get("principal_errors") or [])
+        if isinstance(entry, dict) and entry.get("type") == "role"
+    }
+    v1_note = "" if recorded else " " + IAM_CACHE_V1_NOTE
+
     policy_cache: Dict[str, List[Dict[str, Any]]] = {}
     findings = []
     for gateway in gateways:
@@ -11761,13 +11861,29 @@ def check_agentcore_policy_guardrail_wiring(
             continue
 
         guardrail_policies = []
+        inert_policies: List[str] = []
+        unread_policies: List[str] = []
+        scored_policies: List[str] = []
         for policy in policies:
-            for _, _, conditions in _cedar_policies(_policy_statement_text(policy)):
-                if CEDAR_GUARDRAIL_QUALIFIER in _cedar_condition_qualifiers(conditions):
-                    guardrail_policies.append(
-                        policy.get("name") or policy.get("policyId") or "unnamed"
-                    )
-                    break
+            policy_name = policy.get("name") or policy.get("policyId") or "unnamed"
+            for effect, _, conditions in _cedar_policies(
+                _policy_statement_text(policy)
+            ):
+                if (
+                    CEDAR_GUARDRAIL_QUALIFIER
+                    not in _cedar_condition_qualifiers(conditions)
+                    and "BedrockGuardrails::" not in conditions
+                ):
+                    continue
+                guardrail_policies.append(policy_name)
+                verdict, reason = _guardrail_policy_verdict(effect, conditions)
+                entry = f"{policy_name} ({effect}: {reason})"
+                if verdict == "inert":
+                    inert_policies.append(entry)
+                elif verdict == "unread":
+                    unread_policies.append(entry)
+                else:
+                    scored_policies.append(entry)
 
         if not guardrail_policies:
             findings.append(
@@ -11799,6 +11915,78 @@ def check_agentcore_policy_guardrail_wiring(
         role_arn = detail.get("roleArn") or ""
         role_name = role_arn.rsplit("/", 1)[-1]
         named = ", ".join(sorted(set(guardrail_policies)))
+        if inert_policies:
+            findings.append(
+                create_finding(
+                    check_id="AC-37",
+                    finding_name="AgentCore Policy Guardrail Inert",
+                    finding_details=(
+                        f"{label} enforces guardrail policies that no score the "
+                        "guardrail returns can make act, so the content safety "
+                        "they name is absent: "
+                        f"{'; '.join(sorted(inert_policies))}. Guardrails return "
+                        "only the scores 0, 0.2, 0.4, 0.6, 0.8 and 1.0."
+                    ),
+                    resolution=(
+                        "Set each threshold to a value a returned score can "
+                        'cross, for example greaterThanOrEqual(decimal("0.4")) '
+                        "for prompt attack detection, and name at least one "
+                        "category and one data path in every call."
+                    ),
+                    reference=AGENTCORE_POLICY_GUARDRAIL_REFERENCE_URL,
+                    severity=SeverityEnum.HIGH,
+                    status=StatusEnum.FAILED,
+                )
+            )
+        if unread_policies:
+            findings.append(
+                create_finding(
+                    check_id="AC-37",
+                    finding_name="AgentCore Policy Guardrail Wiring Incomplete",
+                    finding_details=(
+                        f"{label} enforces guardrail policies whose thresholds "
+                        "could not be read, so whether they can act is not "
+                        f"judged: {'; '.join(sorted(unread_policies))}."
+                    ),
+                    resolution=(
+                        "No action is required on the assessed workload based on "
+                        "this result. Review these policies by hand: each "
+                        "guardrail call needs a category, a data path and a "
+                        "confidence score comparison a returned score can cross."
+                    ),
+                    reference=AGENTCORE_POLICY_GUARDRAIL_REFERENCE_URL,
+                    severity=SeverityEnum.INFORMATIONAL,
+                    status=StatusEnum.NA,
+                )
+            )
+        if role_name in unread_roles:
+            findings.append(
+                create_finding(
+                    check_id="AC-37",
+                    finding_name="AgentCore Policy Guardrail Wiring Incomplete",
+                    finding_details=(
+                        f"{label} enforces guardrail policy {named}, and the IAM "
+                        f"permission cache could not read its execution role "
+                        f"'{role_name}', so the {GUARDRAIL_CHECK_ACTION} grant "
+                        "was not judged: "
+                        + ", ".join(
+                            gap
+                            for gap in gap_labels
+                            if gap.startswith(f"role {role_name} (")
+                        )
+                        + "."
+                    ),
+                    resolution=(
+                        "No action is required on the assessed workload based on "
+                        "this result. Grant the cache producer read access to the "
+                        "role's policies and rerun the assessment."
+                    ),
+                    reference=AGENTCORE_POLICY_GUARDRAIL_REFERENCE_URL,
+                    severity=SeverityEnum.INFORMATIONAL,
+                    status=StatusEnum.NA,
+                )
+            )
+            continue
         if role_name not in role_permissions:
             findings.append(
                 create_finding(
@@ -11822,10 +12010,7 @@ def check_agentcore_policy_guardrail_wiring(
             continue
 
         permissions = role_permissions[role_name]
-        documents = [
-            *(permissions.get("attached_policies") or []),
-            *(permissions.get("inline_policies") or []),
-        ]
+        documents = _principal_policies(permissions)
         granted = False
         unreadable_documents = 0
         for document in documents:
@@ -11837,7 +12022,14 @@ def check_agentcore_policy_guardrail_wiring(
             except Exception as error:
                 unreadable_documents += 1
                 logger.warning(f"Error parsing policy for role {role_name}: {error}")
+        granted = (
+            granted
+            and not unreadable_documents
+            and _grant_survives(permissions, GUARDRAIL_CHECK_ACTION_LOOKUP)
+        )
 
+        if granted and (inert_policies or unread_policies):
+            continue
         if granted:
             findings.append(
                 create_finding(
@@ -11847,7 +12039,12 @@ def check_agentcore_policy_guardrail_wiring(
                         f"{label} enforces guardrail policy {named}, and its "
                         f"execution role '{role_name}' grants "
                         f"{GUARDRAIL_CHECK_ACTION}, so the policy engine can "
-                        "score the content the policy names."
+                        "score the content the policy names: "
+                        f"{'; '.join(sorted(scored_policies))}. Service control "
+                        "policies and conditioned Deny statements are not "
+                        "evaluated, and one that denies this action to the role "
+                        f"would stop the guardrail call while this row reads "
+                        f"Passed.{v1_note}"
                     ),
                     resolution=(
                         "No action required. Confirm the safeguard categories and "

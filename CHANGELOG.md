@@ -269,6 +269,13 @@ section.
     command or open a shell in a runtime session through a grant that does not
     name `bedrock-agentcore:InvokeAgentRuntimeCommandShell` or
     `InvokeAgentRuntimeCommand`, or that reaches every runtime.
+  - `AC-37` reads each `BedrockGuardrails` call by value and fails a guardrail
+    policy that no returned score (0, 0.2, 0.4, 0.6, 0.8, 1.0) can make act,
+    or whose call names no category or data path. A `suppressOutput` policy
+    in a plain `when` block now counts, a threshold it cannot read is named
+    in an `N/A` row, and the gateway role's grant counts after its own Deny
+    and boundary. A readable grant beside an unparseable policy no longer
+    passes.
 
 ### Deployment impact
 

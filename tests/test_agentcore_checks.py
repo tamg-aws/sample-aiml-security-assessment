@@ -9440,7 +9440,10 @@ _GUARDRAIL_FORBID = (
     '  action == AgentCore::Action::"support___reply",\n'
     "  resource is AgentCore::Gateway\n"
     ") when guardrails {\n"
-    "  PromptAttack\n"
+    '  BedrockGuardrails::PromptAttack(["PROMPT_INJECTION"], [context.input.prompt])'
+    '["PROMPT_INJECTION"]\n'
+    "    .confidenceScore\n"
+    '    .greaterThanOrEqual(decimal("0.4"))\n'
     "};"
 )
 
@@ -10558,7 +10561,9 @@ class TestAC37PolicyGuardrailWiring:
         assert [finding["Status"] for finding in findings] == ["Passed"]
 
     @patch("agentcore_app.agentcore_client")
-    def test_a_grant_in_a_readable_document_outranks_an_unreadable_one(self, mock_ac):
+    def test_an_unreadable_document_beside_a_grant_withholds_the_pass(self, mock_ac):
+        # Stricter than before, when the readable grant outranked the broken
+        # document and passed: the broken document could hold a Deny.
         mock_ac.list_gateways.return_value = {"items": self._GATEWAYS}
         mock_ac.get_gateway.side_effect = self._gateway_detail
         mock_ac.list_policies.return_value = {
@@ -10580,7 +10585,7 @@ class TestAC37PolicyGuardrailWiring:
             }
         )
 
-        assert [finding["Status"] for finding in findings] == ["Passed"]
+        assert [finding["Status"] for finding in findings] == ["N/A"]
 
     @patch("agentcore_app.agentcore_client")
     def test_a_log_only_engine_reads_no_guardrail_policy(self, mock_ac):
@@ -20482,3 +20487,273 @@ class TestAC45WholePopulation:
         assert len(calls) == 1
         keywords = {kw.arg: ast.unparse(kw.value) for kw in calls[0].keywords}
         assert keywords == {"assess_shell": "is_primary_region"}
+
+
+def _guardrail_policy(effect, call):
+    return (
+        f"{effect}(\n"
+        "  principal,\n"
+        '  action == AgentCore::Action::"support___reply",\n'
+        "  resource is AgentCore::Gateway\n"
+        f") when guardrails {{\n  {call}\n}};"
+    )
+
+
+class TestAC37WholePopulation:
+    """AC-37 reads each guardrail call by value and the role after its Deny."""
+
+    _ROLE_ARN = "arn:aws:iam::123456789012:role/GatewayExecution"
+    _GRANT = {
+        "Effect": "Allow",
+        "Action": "bedrock:InvokeGuardrailChecks",
+        "Resource": "*",
+    }
+    _GOOD = (
+        'BedrockGuardrails::PromptAttack(["PROMPT_INJECTION"], [context.input.prompt])'
+        '["PROMPT_INJECTION"].confidenceScore.greaterThanOrEqual(decimal("0.4"))'
+    )
+
+    def _call(
+        self,
+        operator="greaterThanOrEqual",
+        threshold="0.4",
+        paths="context.input.prompt",
+        categories='"PROMPT_INJECTION"',
+    ):
+        return (
+            f"BedrockGuardrails::PromptAttack([{categories}], [{paths}])"
+            f'["PROMPT_INJECTION"].confidenceScore.{operator}(decimal("{threshold}"))'
+        )
+
+    def _run(self, mock_ac, policies, cache=None):
+        mock_ac.list_gateways.return_value = {
+            "items": [{"gatewayId": "gw-1", "name": "Support"}]
+        }
+        mock_ac.get_gateway.return_value = _policy_engine_gateway(
+            roleArn=self._ROLE_ARN
+        )
+        mock_ac.list_policies.return_value = {
+            "policies": [_cedar_policy(name, statement) for name, statement in policies]
+        }
+        if cache is None:
+            cache = _v2_cache(
+                roles={"GatewayExecution": _principal_with([self._GRANT])}
+            )
+        return agentcore_app.check_agentcore_policy_guardrail_wiring(cache)
+
+    @pytest.mark.parametrize(
+        ("operator", "threshold", "fires"),
+        [
+            ("greaterThan", "0.2", [0.4, 0.6, 0.8, 1.0]),
+            ("greaterThanOrEqual", "0.2", [0.2, 0.4, 0.6, 0.8, 1.0]),
+            ("greaterThan", "1.0", []),
+            ("greaterThanOrEqual", "1.5", []),
+            ("lessThan", "0", []),
+            ("lessThanOrEqual", "1", [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]),
+            ("equals", "0.4", None),
+            ("greaterThan", "high", None),
+        ],
+    )
+    def test_the_scores_a_comparison_acts_on(self, operator, threshold, fires):
+        assert agentcore_app._guardrail_scores_that_fire(operator, threshold) == fires
+
+    @pytest.mark.parametrize(
+        ("effect", "operator", "threshold"),
+        [
+            ("forbid", "greaterThan", "1.0"),
+            ("suppressOutput", "greaterThanOrEqual", "1.2"),
+            ("permit", "lessThanOrEqual", "1.0"),
+            ("forbid", "lessThan", "0.0"),
+        ],
+        ids=[
+            "forbid-above-top",
+            "suppress-above-top",
+            "permit-always",
+            "forbid-below-zero",
+        ],
+    )
+    @patch("agentcore_app.agentcore_client")
+    def test_a_policy_no_score_can_move_fails_beside_a_good_one(
+        self, mock_ac, effect, operator, threshold
+    ):
+        findings = self._run(
+            mock_ac,
+            [
+                ("good", _guardrail_policy("forbid", self._GOOD)),
+                ("inert", _guardrail_policy(effect, self._call(operator, threshold))),
+            ],
+        )
+
+        assert [f["Status"] for f in findings] == ["Failed"]
+        assert findings[0]["Finding"] == "AgentCore Policy Guardrail Inert"
+        assert "inert (" in findings[0]["Finding_Details"]
+        assert "good (" not in findings[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        ("paths", "categories"),
+        [("", '"PROMPT_INJECTION"'), ("context.input.prompt", "")],
+        ids=["no-data-path", "no-category"],
+    )
+    @patch("agentcore_app.agentcore_client")
+    def test_a_call_that_scores_nothing_is_inert(self, mock_ac, paths, categories):
+        findings = self._run(
+            mock_ac,
+            [
+                (
+                    "empty",
+                    _guardrail_policy(
+                        "forbid", self._call(paths=paths, categories=categories)
+                    ),
+                )
+            ],
+        )
+
+        assert [f["Status"] for f in findings] == ["Failed"]
+        assert "no category or no data path" in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_one_live_call_keeps_the_policy_scored(self, mock_ac):
+        # `||` of a dead and a live comparison still acts on the live one.
+        call = f"{self._call('greaterThan', '1.0')} || {self._GOOD}"
+        findings = self._run(mock_ac, [("mixed", _guardrail_policy("forbid", call))])
+
+        assert [f["Status"] for f in findings] == ["Passed"]
+        assert "acts at score 0.4, 0.6, 0.8, 1" in findings[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "call",
+        [
+            # A negated dead comparison acts on every score, so reading it as
+            # inert would be wrong; it is left unread.
+            '!(BedrockGuardrails::PromptAttack(["PROMPT_INJECTION"], [context.input.prompt])'
+            '["PROMPT_INJECTION"].confidenceScore.greaterThan(decimal("1.0")))',
+            'BedrockGuardrails::PromptAttack(["PROMPT_INJECTION"], [context.input.prompt]).count() > 0',
+            'BedrockGuardrails::PromptAttack(["PROMPT_INJECTION"], [context.input.prompt])'
+            '["PROMPT_INJECTION"].confidenceScore',
+        ],
+        ids=["negated", "count", "no-comparison"],
+    )
+    @patch("agentcore_app.agentcore_client")
+    def test_an_unreadable_threshold_withholds_the_pass(self, mock_ac, call):
+        findings = self._run(mock_ac, [("odd", _guardrail_policy("forbid", call))])
+
+        assert [f["Status"] for f in findings] == ["N/A"]
+        assert findings[0]["Finding"].endswith("Incomplete")
+        assert "odd (forbid:" in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_suppress_output_policy_in_a_plain_when_block_is_read(self, mock_ac):
+        statement = (
+            "suppressOutput(principal, action, resource) when {\n"
+            + self._call("greaterThan", "1.0", paths="context.output.text")
+            + "\n};"
+        )
+        findings = self._run(mock_ac, [("suppress", statement)])
+
+        assert [f["Status"] for f in findings] == ["Failed"]
+        assert "suppress (suppressOutput:" in findings[0]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_the_pass_names_what_each_call_scores(self, mock_ac):
+        findings = self._run(
+            mock_ac, [("good", _guardrail_policy("forbid", self._GOOD))]
+        )
+
+        assert [f["Status"] for f in findings] == ["Passed"]
+        details = findings[0]["Finding_Details"]
+        assert 'PromptAttack("PROMPT_INJECTION") on context.input.prompt' in details
+        assert "acts at score 0.4, 0.6, 0.8, 1" in details
+        assert "Service control policies" in details
+        assert agentcore_app.IAM_CACHE_V1_NOTE not in details
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_v1_cache_is_named_on_the_pass(self, mock_ac):
+        cache = {
+            "role_permissions": {"GatewayExecution": _principal_with([self._GRANT])}
+        }
+        findings = self._run(
+            mock_ac, [("good", _guardrail_policy("forbid", self._GOOD))], cache
+        )
+
+        assert [f["Status"] for f in findings] == ["Passed"]
+        assert findings[0]["Finding_Details"].endswith(agentcore_app.IAM_CACHE_V1_NOTE)
+
+    @pytest.mark.parametrize(
+        ("extra", "boundary", "status"),
+        [
+            (
+                [{"Effect": "Deny", "Action": "bedrock:*", "Resource": "*"}],
+                None,
+                "Failed",
+            ),
+            (
+                [
+                    {
+                        "Effect": "Deny",
+                        "Action": "bedrock:*",
+                        "Resource": "*",
+                        "Condition": {"Bool": {"aws:SecureTransport": "false"}},
+                    }
+                ],
+                None,
+                "Passed",
+            ),
+            (
+                [],
+                {"Statement": [{"Effect": "Allow", "Action": "s3:*", "Resource": "*"}]},
+                "Failed",
+            ),
+            (
+                [],
+                {
+                    "Statement": [
+                        {
+                            "Effect": "Allow",
+                            "Action": "bedrock:Invoke*",
+                            "Resource": "*",
+                        }
+                    ]
+                },
+                "Passed",
+            ),
+        ],
+        ids=["deny", "conditioned-deny", "boundary-excludes", "boundary-allows"],
+    )
+    @patch("agentcore_app.agentcore_client")
+    def test_the_grant_counts_after_deny_and_boundary(
+        self, mock_ac, extra, boundary, status
+    ):
+        cache = _v2_cache(
+            roles={"GatewayExecution": _principal_with([self._GRANT, *extra], boundary)}
+        )
+        findings = self._run(
+            mock_ac, [("good", _guardrail_policy("forbid", self._GOOD))], cache
+        )
+
+        assert [f["Status"] for f in findings] == [status]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_a_principal_error_on_the_role_withholds_the_verdict(self, mock_ac):
+        cache = _v2_cache(
+            roles={
+                "GatewayExecution": _principal_with([self._GRANT]),
+                "Other": _principal_with([]),
+            },
+            errors=[
+                {
+                    "type": "role",
+                    "name": "GatewayExecution",
+                    "stage": "list_attached_role_policies",
+                    "error": "AccessDenied",
+                }
+            ],
+        )
+        findings = self._run(
+            mock_ac, [("good", _guardrail_policy("forbid", self._GOOD))], cache
+        )
+
+        assert [f["Status"] for f in findings] == ["N/A"]
+        assert (
+            "role GatewayExecution (list_attached_role_policies"
+            in (findings[0]["Finding_Details"])
+        )
