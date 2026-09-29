@@ -30674,7 +30674,10 @@ class TestBR20ValueDepth:
             "DomainStatus": {"EncryptionAtRestOptions": {"Enabled": False}}
         }
         graph = MagicMock()
-        graph.get_graph.return_value = {"kmsKeyIdentifier": self.CMK}
+        graph.get_graph.return_value = {
+            "kmsKeyIdentifier": self.CMK,
+            "publicConnectivity": False,
+        }
         rows = self._run(
             {
                 "kb1": self._store_body(
@@ -30712,6 +30715,143 @@ class TestBR20ValueDepth:
             clients={"neptune-graph": graph},
         )
         assert [r["Status"] for r in rows] == ["Failed"]
+
+    def _domain_run(self, status_block):
+        domain = MagicMock()
+        domain.describe_domain.return_value = {
+            "DomainStatus": {
+                "EncryptionAtRestOptions": {"Enabled": True, "KmsKeyId": self.CMK},
+                **status_block,
+            }
+        }
+        return self._run(
+            {
+                "kb1": self._store_body(
+                    "OPENSEARCH_MANAGED_CLUSTER",
+                    "opensearchManagedClusterConfiguration",
+                    {"domainArn": f"arn:aws:es:us-east-1:{self.ACCOUNT}:domain/d1"},
+                )
+            },
+            clients={"opensearch": domain},
+        )
+
+    OPEN_DOMAIN_POLICY = json.dumps(
+        {
+            "Statement": [
+                {
+                    "Sid": "open",
+                    "Effect": "Allow",
+                    "Principal": {"AWS": "*"},
+                    "Action": "es:*",
+                    "Resource": "arn:aws:es:us-east-1:111122223333:domain/d1/*",
+                }
+            ]
+        }
+    )
+    NAMED_DOMAIN_POLICY = json.dumps(
+        {
+            "Statement": [
+                {
+                    "Effect": "Allow",
+                    "Principal": {"AWS": "arn:aws:iam::111122223333:role/kb"},
+                    "Action": "es:ESHttp*",
+                    "Resource": "arn:aws:es:us-east-1:111122223333:domain/d1/*",
+                }
+            ]
+        }
+    )
+
+    @pytest.mark.parametrize(
+        "status_block, expected, phrase",
+        [
+            ({"AccessPolicies": OPEN_DOMAIN_POLICY}, "Failed", "'open' admit"),
+            (
+                {
+                    "AccessPolicies": OPEN_DOMAIN_POLICY,
+                    "AdvancedSecurityOptions": {"Enabled": True},
+                },
+                "Passed",
+                "fine-grained access control is enabled",
+            ),
+            (
+                {
+                    "AccessPolicies": OPEN_DOMAIN_POLICY,
+                    "AdvancedSecurityOptions": {
+                        "Enabled": True,
+                        "AnonymousAuthEnabled": True,
+                    },
+                },
+                "Failed",
+                "AnonymousAuthEnabled is true",
+            ),
+            ({"AccessPolicies": NAMED_DOMAIN_POLICY}, "Passed", "names each"),
+            ({"AccessPolicies": ""}, "Passed", "has no domain access policy"),
+            ({}, "N/A", "returned no AccessPolicies"),
+            ({"AccessPolicies": "{not json"}, "N/A", "not a readable JSON"),
+        ],
+    )
+    def test_opensearch_domain_access_policy_is_judged(
+        self, status_block, expected, phrase
+    ):
+        rows = self._domain_run(status_block)
+        assert [r["Status"] for r in rows] == [expected]
+        assert phrase in rows[0]["Finding_Details"]
+        if expected == "Failed":
+            assert rows[0]["Resolution"] == bedrock_app.DOMAIN_ACCESS_RESOLUTION
+
+    def test_opensearch_domain_key_and_access_failures_both_resolve(self):
+        domain = MagicMock()
+        domain.describe_domain.return_value = {
+            "DomainStatus": {
+                "EncryptionAtRestOptions": {"Enabled": False},
+                "AccessPolicies": self.OPEN_DOMAIN_POLICY,
+            }
+        }
+        rows = self._run(
+            {
+                "kb1": self._store_body(
+                    "OPENSEARCH_MANAGED_CLUSTER",
+                    "opensearchManagedClusterConfiguration",
+                    {"domainArn": f"arn:aws:es:us-east-1:{self.ACCOUNT}:domain/d1"},
+                )
+            },
+            clients={"opensearch": domain},
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "EncryptionAtRestOptions.Enabled is False" in rows[0]["Finding_Details"]
+        assert "'open' admit" in rows[0]["Finding_Details"]
+        assert rows[0]["Resolution"].endswith(bedrock_app.DOMAIN_ACCESS_RESOLUTION)
+        assert rows[0]["Resolution"] != bedrock_app.DOMAIN_ACCESS_RESOLUTION
+
+    @pytest.mark.parametrize(
+        "graph_fields, expected, phrase",
+        [
+            ({"publicConnectivity": True}, "Failed", "has a public endpoint"),
+            ({"publicConnectivity": False}, "Passed", "no public endpoint"),
+            ({}, "N/A", "returned no publicConnectivity"),
+        ],
+    )
+    def test_neptune_public_connectivity_is_judged(
+        self, graph_fields, expected, phrase
+    ):
+        graph = MagicMock()
+        graph.get_graph.return_value = {"kmsKeyIdentifier": self.CMK, **graph_fields}
+        rows = self._run(
+            {
+                "kb1": self._store_body(
+                    "NEPTUNE_ANALYTICS",
+                    "neptuneAnalyticsConfiguration",
+                    {
+                        "graphArn": f"arn:aws:neptune-graph:us-east-1:{self.ACCOUNT}:graph/g-1"
+                    },
+                )
+            },
+            clients={"neptune-graph": graph},
+        )
+        assert [r["Status"] for r in rows] == [expected]
+        assert phrase in rows[0]["Finding_Details"]
+        if expected == "Failed":
+            assert rows[0]["Resolution"] == bedrock_app.NEPTUNE_ACCESS_RESOLUTION
 
     def _pinecone_body(self):
         return self._store_body(

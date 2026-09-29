@@ -49,9 +49,12 @@ AI_SUBJECT_ROWS = [
         "reaching the knowledge base's index whose collection segment or principal is "
         "a wildcard, since OpenSearch Serverless does not check a caller's KMS "
         "permission; an unread policy is N/A. For S3 Vectors it judges the bucket "
-        "policy. The access policies of Aurora, OpenSearch domain and Neptune "
-        "Analytics stores are not read, and whether access matches the source data's "
-        "is not compared",
+        "policy. For an OpenSearch Service domain it fails an Allow admitting an "
+        "unbounded principal unless fine-grained access control is on with anonymous "
+        "authentication off, and for Neptune Analytics it fails a graph with "
+        "publicConnectivity true; an absent field is N/A. Aurora access, which runs "
+        "through database credentials, is not judged, and whether access matches the "
+        "source data's is not compared",
         [],
         3,
     ),

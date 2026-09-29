@@ -11721,6 +11721,127 @@ def _aoss_index_access(
     }
 
 
+DOMAIN_ACCESS_RESOLUTION = (
+    "Remove every Allow statement whose principal is a wildcard or NotPrincipal "
+    "from the OpenSearch Service domain access policy, or enable fine-grained "
+    "access control with anonymous authentication off, so each request to the "
+    "knowledge base's index is authenticated."
+)
+NEPTUNE_ACCESS_RESOLUTION = (
+    "Set publicConnectivity to false on the Neptune Analytics graph (UpdateGraph) "
+    "so it is reachable only through a private graph endpoint in a VPC."
+)
+
+
+def _domain_access(status_block: Dict[str, Any]) -> Dict[str, str]:
+    """
+    Judge who can reach an OpenSearch Service domain for BR-20.
+
+    Reads DomainStatus.AccessPolicies and AdvancedSecurityOptions from the
+    DescribeDomain response the key leg already holds. An Allow that admits an
+    unbounded principal fails unless fine-grained access control is enabled
+    with anonymous authentication off, since that layer then authenticates
+    every request. An empty policy leaves access to identity policies.
+    """
+    if "AccessPolicies" not in status_block:
+        return {
+            "status": "N/A",
+            "detail": "DescribeDomain returned no AccessPolicies, so who can "
+            "reach the domain was not read.",
+        }
+    policy = status_block.get("AccessPolicies") or ""
+    if not policy:
+        return {
+            "status": "Passed",
+            "detail": "The domain has no domain access policy, so only "
+            "identity-based policies grant access to it.",
+        }
+    try:
+        statements = _policy_statements(policy)
+    except (TypeError, ValueError):
+        return {
+            "status": "N/A",
+            "detail": "The domain access policy is not a readable JSON policy "
+            "document, so its statements could not be evaluated.",
+        }
+    unbounded = [
+        f"'{statement['Sid']}'" if statement.get("Sid") else f"#{position}"
+        for position, statement in enumerate(statements, 1)
+        if str(statement.get("Effect", "")).upper() == "ALLOW"
+        and _allow_principal_is_unbounded(statement)
+    ]
+    counted = f"The domain access policy has {len(statements)} statement(s)"
+    if not unbounded:
+        return {
+            "status": "Passed",
+            "detail": f"{counted}, and every Allow names each principal it admits "
+            "or bounds it with an exact principal condition.",
+        }
+    admits = (
+        f"{counted}, and Allow statement(s) {', '.join(unbounded)} admit a "
+        "principal with a wildcard or NotPrincipal that no exact principal "
+        "condition bounds"
+    )
+    security = status_block.get("AdvancedSecurityOptions") or {}
+    if security.get("Enabled") is not True:
+        return {
+            "status": "Failed",
+            "detail": f"{admits}, and fine-grained access control is not enabled "
+            f"(AdvancedSecurityOptions.Enabled is {security.get('Enabled')}).",
+        }
+    if security.get("AnonymousAuthEnabled") is True:
+        return {
+            "status": "Failed",
+            "detail": f"{admits}, and fine-grained access control has "
+            "AnonymousAuthEnabled is true, so unauthenticated requests are "
+            "served.",
+        }
+    return {
+        "status": "Passed",
+        "detail": f"{admits}, but fine-grained access control is enabled with "
+        "anonymous authentication off, so each request is authenticated.",
+    }
+
+
+def _neptune_graph_access(graph: Dict[str, Any]) -> Dict[str, str]:
+    """Judge a Neptune Analytics graph's publicConnectivity for BR-20."""
+    public = graph.get("publicConnectivity")
+    if public is True:
+        return {
+            "status": "Failed",
+            "detail": "The graph has a public endpoint (publicConnectivity true), "
+            "so it is reachable from the internet; IAM still signs each request.",
+        }
+    if public is False:
+        return {
+            "status": "Passed",
+            "detail": "The graph has no public endpoint (publicConnectivity false).",
+        }
+    return {
+        "status": "N/A",
+        "detail": "GetGraph returned no publicConnectivity, so whether the graph "
+        "is reachable from the internet was not read.",
+    }
+
+
+def _store_with_access(
+    key_status: str, key_detail: str, access: Dict[str, str], resolution: str
+) -> Dict[str, str]:
+    """Join a store's key verdict with its access verdict, worst first."""
+    statuses = (key_status, access["status"])
+    verdict = _store_verdict(
+        "Failed" if "Failed" in statuses else "N/A" if "N/A" in statuses else "Passed",
+        f"{key_detail} {access['detail']}",
+    )
+    if access["status"] == "Failed":
+        verdict["resolution"] = (
+            resolution
+            if key_status != "Failed"
+            else f"{verdict['resolution']} {resolution}"
+        )
+    return verdict
+
+
 def _assess_storage_layer_encryption(
     storage_config: Dict[str, Any], storage_type: str, region: str
 ) -> Dict[str, str]:
@@ -11731,7 +11852,9 @@ def _assess_storage_layer_encryption(
     Aurora the cluster's StorageEncrypted and KmsKeyId (DescribeDBClusters),
     OpenSearch Service the domain's EncryptionAtRestOptions (DescribeDomain) and
     Neptune Analytics the graph's kmsKeyIdentifier (GetGraph). Each key is then
-    read with DescribeKey, so an AWS managed or disabled key fails. A
+    read with DescribeKey, so an AWS managed or disabled key fails. The domain
+    access policy and the graph's publicConnectivity, returned by the same
+    reads, are judged beside the key. A
     third-party store is judged on its credentials secret only, and never
     passes, because the vectors' own key is held by the provider.
     """
@@ -11883,21 +12006,25 @@ def _assess_storage_layer_encryption(
                 f"{_store_read_error(error, 'es:DescribeDomain', store_region)}.",
             )
         at_rest = status_block.get("EncryptionAtRestOptions") or {}
-        if at_rest.get("Enabled") is not True:
-            return _store_verdict(
-                "Failed",
-                f"uses {located}, whose EncryptionAtRestOptions.Enabled is "
-                f"{at_rest.get('Enabled')}, so the vectors are not encrypted at rest.",
-            )
         key = str(at_rest.get("KmsKeyId") or "")
-        if not key:
-            return _store_verdict(
-                "N/A",
-                f"uses {located}, which encrypts at rest, but DescribeDomain "
-                "returned no KmsKeyId, so whose key it is could not be read.",
+        if at_rest.get("Enabled") is not True:
+            status = "Failed"
+            key_detail = (
+                f"uses {located}, whose EncryptionAtRestOptions.Enabled is "
+                f"{at_rest.get('Enabled')}, so the vectors are not encrypted at rest."
             )
-        status, observed = _kms_key_verdict(key, store_region)
-        return _store_verdict(status, f"uses {located}, encrypted with {observed}.")
+        elif not key:
+            status = "N/A"
+            key_detail = (
+                f"uses {located}, which encrypts at rest, but DescribeDomain "
+                "returned no KmsKeyId, so whose key it is could not be read."
+            )
+        else:
+            status, observed = _kms_key_verdict(key, store_region)
+            key_detail = f"uses {located}, encrypted with {observed}."
+        return _store_with_access(
+            status, key_detail, _domain_access(status_block), DOMAIN_ACCESS_RESOLUTION
+        )
 
     if storage_type == "NEPTUNE_ANALYTICS":
         arn = (storage_config.get("neptuneAnalyticsConfiguration") or {}).get(
@@ -11924,13 +12051,20 @@ def _assess_storage_layer_encryption(
             )
         key = str(response.get("kmsKeyIdentifier") or "")
         if not key.startswith("arn:"):
-            return _store_verdict(
-                "Failed",
+            status = "Failed"
+            key_detail = (
                 f"uses {located}, whose kmsKeyIdentifier is '{key or 'absent'}', "
-                "not a customer managed KMS key ARN.",
+                "not a customer managed KMS key ARN."
             )
-        status, observed = _kms_key_verdict(key, store_region)
-        return _store_verdict(status, f"uses {located}, encrypted with {observed}.")
+        else:
+            status, observed = _kms_key_verdict(key, store_region)
+            key_detail = f"uses {located}, encrypted with {observed}."
+        return _store_with_access(
+            status,
+            key_detail,
+            _neptune_graph_access(response),
+            NEPTUNE_ACCESS_RESOLUTION,
+        )
 
     if storage_type in THIRD_PARTY_VECTOR_STORES:
         config = storage_config.get(THIRD_PARTY_VECTOR_STORES[storage_type]) or {}
