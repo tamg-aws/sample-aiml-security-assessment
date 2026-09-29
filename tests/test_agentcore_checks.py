@@ -4677,6 +4677,118 @@ class TestAC07MemoryConfiguration:
             KeyId=self._GOOD_KEY
         )
 
+    # --- AC-07 memory resource-based policy leg (AIR-ACR-MEM-01) ---
+
+    _MEMORY_ARN = (
+        "arn:aws:bedrock-agentcore:us-east-1:123456789012:memory/mem-123456789012"
+    )
+
+    @classmethod
+    def _policy_rows(cls, mock_ac, policy=None, error=None):
+        cls._one_memory(mock_ac, arn=cls._MEMORY_ARN)
+        if error is not None:
+            mock_ac.get_resource_policy.side_effect = error
+        else:
+            mock_ac.get_resource_policy.return_value = {"policy": policy}
+        findings = extract_csv_data(
+            agentcore_app.check_agentcore_memory_configuration()
+        )
+        return [
+            f
+            for f in findings
+            if f["Finding"] == "AgentCore Memory Resource-Based Policy"
+        ]
+
+    @staticmethod
+    def _policy(principal, condition=None):
+        statement = {
+            "Effect": "Allow",
+            "Principal": principal,
+            "Action": "bedrock-agentcore:RetrieveMemoryRecords",
+            "Resource": "*",
+        }
+        if condition:
+            statement["Condition"] = condition
+        return json.dumps({"Version": "2012-10-17", "Statement": [statement]})
+
+    @patch("agentcore_app.agentcore_client")
+    def test_ac07_a_memory_policy_open_to_everyone_fails(self, mock_ac):
+        rows = self._policy_rows(mock_ac, self._policy("*"))
+
+        assert [f["Status"] for f in rows] == ["Failed"]
+        assert rows[0]["Severity"] == "High"
+        assert "statement 1 (*)" in rows[0]["Finding_Details"]
+        mock_ac.get_resource_policy.assert_called_once_with(
+            resourceArn=self._MEMORY_ARN
+        )
+
+    @patch("agentcore_app.agentcore_client")
+    def test_ac07_a_memory_policy_bound_to_the_organization_passes(self, mock_ac):
+        rows = self._policy_rows(
+            mock_ac,
+            self._policy(
+                "*", {"StringEquals": {"aws:PrincipalOrgID": "o-exampleorgid"}}
+            ),
+        )
+
+        assert [f["Status"] for f in rows] == ["Passed"]
+        assert "no Allow statement" in rows[0]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_ac07_a_memory_without_a_policy_passes(self, mock_ac):
+        rows = self._policy_rows(
+            mock_ac, error=_make_client_error("ResourceNotFoundException")
+        )
+
+        assert [f["Status"] for f in rows] == ["Passed"]
+        assert "no resource-based policy" in rows[0]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_ac07_an_empty_memory_policy_passes_as_no_policy(self, mock_ac):
+        rows = self._policy_rows(mock_ac, "")
+
+        assert [f["Status"] for f in rows] == ["Passed"]
+        assert "no resource-based policy" in rows[0]["Finding_Details"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_ac07_a_denied_memory_policy_read_is_na_naming_the_action(self, mock_ac):
+        rows = self._policy_rows(
+            mock_ac, error=_make_client_error("AccessDeniedException", "denied")
+        )
+
+        assert [f["Status"] for f in rows] == ["N/A"]
+        assert "AccessDeniedException" in rows[0]["Finding_Details"]
+        assert "bedrock-agentcore:GetResourcePolicy" in rows[0]["Resolution"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_ac07_the_memory_policy_is_read_for_every_memory(self, mock_ac):
+        other_arn = self._MEMORY_ARN.replace("mem-123456789012", "mem-2")
+        mock_ac.list_memories.return_value = {
+            "memories": [
+                {"id": "mem-123456789012", "name": "TestMemory"},
+                {"id": "mem-2", "name": "Other"},
+            ]
+        }
+        mock_ac.get_memory.side_effect = [
+            {"memory": self._memory_detail(arn=self._MEMORY_ARN)},
+            {"memory": self._memory_detail(id="mem-2", arn=other_arn)},
+        ]
+        policies = {self._MEMORY_ARN: "", other_arn: self._policy("*")}
+        mock_ac.get_resource_policy.side_effect = lambda resourceArn: {
+            "policy": policies[resourceArn]
+        }
+
+        rows = [
+            f
+            for f in extract_csv_data(
+                agentcore_app.check_agentcore_memory_configuration()
+            )
+            if f["Finding"] == "AgentCore Memory Resource-Based Policy"
+        ]
+
+        assert [f["Status"] for f in rows] == ["Passed", "Failed"]
+        assert "'Other'" in rows[1]["Finding_Details"]
+
 
 # ===================================================================
 # AC-08: check_agentcore_vpc_endpoints

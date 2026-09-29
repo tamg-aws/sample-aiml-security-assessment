@@ -298,6 +298,17 @@ section.
 
 ### Fixed
 
+- `AC-07` reads each memory's resource-based policy. It called
+  `GetResourcePolicy` for runtimes and gateways only, so a memory whose policy
+  let any principal read its records passed on its namespaces alone. A new
+  `AgentCore Memory Resource-Based Policy` row per memory fails High on an
+  `Allow` statement that trusts `*` or an AWS service with no account or
+  organization condition, passes no policy or a bound one, and is `N/A` when
+  the read fails. The IAM policy simulator denies the existing `memory/*`
+  grant for this action, and the service authorization reference does not
+  list the memory resource type for it. A denied read is `N/A`, never
+  `Passed`.
+
 - `AC-26` log tamper guardrail probes the Bedrock model invocation log group
   of every assessed Region. It read the logging configuration of the primary
   Region only, so an SCP that left another Region's invocation log group

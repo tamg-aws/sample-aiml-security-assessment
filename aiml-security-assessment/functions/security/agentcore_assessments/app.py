@@ -8256,6 +8256,94 @@ def _memory_key_finding(
     )
 
 
+def _memory_resource_policy_finding(
+    memory_label: str, memory_arn: str
+) -> Dict[str, Any]:
+    """Judge whether a memory's resource-based policy opens it to anyone.
+
+    A memory holds the records AC-07 partitions per actor, so a statement that
+    trusts `*` or an AWS service with no account or organization condition lets
+    a caller outside the account read them whatever the namespaces say.
+    """
+    try:
+        policy = _get_agentcore_resource_policy(memory_arn)
+    except ClientError as e:
+        if e.response.get("Error", {}).get("Code") != "ResourceNotFoundException":
+            return create_finding(
+                check_id="AC-07",
+                finding_name="AgentCore Memory Resource-Based Policy",
+                finding_details=(
+                    f"The resource-based policy of memory {memory_label} could "
+                    f"not be read ({_assessment_error_label(e)}), so whether it "
+                    "opens the memory to callers outside this account was not "
+                    "judged."
+                ),
+                resolution=(
+                    "Grant the assessment role bedrock-agentcore:GetResourcePolicy "
+                    "on this memory, then rerun the assessment."
+                ),
+                reference=AGENTCORE_MEMORY_REFERENCE_URL,
+                severity=SeverityEnum.INFORMATIONAL,
+                status=StatusEnum.NA,
+            )
+        policy = ""
+
+    if not policy:
+        return create_finding(
+            check_id="AC-07",
+            finding_name="AgentCore Memory Resource-Based Policy",
+            finding_details=(
+                f"Memory {memory_label} has no resource-based policy, so no "
+                "caller outside this account is granted access to it by one."
+            ),
+            resolution="No action required",
+            reference=AGENTCORE_MEMORY_REFERENCE_URL,
+            severity=SeverityEnum.INFORMATIONAL,
+            status=StatusEnum.PASSED,
+        )
+
+    open_statements = _resource_policy_open_statements(
+        f"Memory {memory_label}", policy, memory_arn
+    )
+    if open_statements:
+        return create_finding(
+            check_id="AC-07",
+            finding_name="AgentCore Memory Resource-Based Policy",
+            finding_details=(
+                f"The resource-based policy of memory {memory_label} has "
+                f"{len(open_statements)} Allow statement(s) that trust every "
+                "principal or an AWS service with no aws:SourceAccount, "
+                "aws:SourceArn or aws:PrincipalAccount condition naming the "
+                "memory's account and no aws:PrincipalOrgID condition naming an "
+                f"organization: {'; '.join(open_statements)}."
+            ),
+            resolution=(
+                "Name the calling principals in each statement, or add a "
+                "condition that pins aws:PrincipalAccount or aws:SourceAccount to "
+                "this account or aws:PrincipalOrgID to your organization."
+            ),
+            reference=AGENTCORE_MEMORY_REFERENCE_URL,
+            severity=SeverityEnum.HIGH,
+            status=StatusEnum.FAILED,
+        )
+    return create_finding(
+        check_id="AC-07",
+        finding_name="AgentCore Memory Resource-Based Policy",
+        finding_details=(
+            f"The resource-based policy of memory {memory_label} has no Allow "
+            "statement that trusts every principal or an AWS service without an "
+            "aws:SourceAccount, aws:SourceArn or aws:PrincipalAccount condition "
+            "naming the memory's account or an aws:PrincipalOrgID condition "
+            "naming an organization. Principals it names explicitly were not "
+            "judged."
+        ),
+        resolution="No action required",
+        reference=AGENTCORE_MEMORY_REFERENCE_URL,
+        severity=SeverityEnum.INFORMATIONAL,
+        status=StatusEnum.PASSED,
+    )
+
+
 def check_agentcore_memory_configuration() -> List[Dict[str, Any]]:
     """
     Check Memory resource configuration.
@@ -8263,6 +8351,7 @@ def check_agentcore_memory_configuration() -> List[Dict[str, Any]]:
     Validates:
     - Encryption uses a key KMS reports as customer managed and Enabled
     - Long-term records are partitioned into a per-actor namespace
+    - The resource-based policy does not open the memory to anyone
 
     Returns:
         List of findings
@@ -8400,6 +8489,12 @@ def check_agentcore_memory_configuration() -> List[Dict[str, Any]]:
             findings.append(
                 _memory_namespace_scope_finding(memory_label, memory_details)
             )
+
+            memory_arn = memory_details.get("arn") or memory.get("arn")
+            if memory_arn:
+                findings.append(
+                    _memory_resource_policy_finding(memory_label, memory_arn)
+                )
 
     except Exception as e:
         logger.error(f"Error in memory configuration check: {e}")
