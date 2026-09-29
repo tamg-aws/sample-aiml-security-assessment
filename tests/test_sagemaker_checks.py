@@ -9206,6 +9206,63 @@ class TestSM40SecretsManagerRotation:
         )
         assert [r["Status"] for r in rows] == [expected]
 
+    @pytest.mark.parametrize(
+        "rules",
+        [
+            {"ScheduleExpression": "rate(365 days)"},
+            {"ScheduleExpression": "rate(2184 hours)"},
+            {"AutomaticallyAfterDays": 91},
+            {"ScheduleExpression": "cron(0 0 1 1 ? *)"},
+        ],
+    )
+    @pytest.mark.parametrize("long_first", [True, False])
+    @patch("sagemaker_app.boto3.client")
+    def test_a_schedule_longer_than_90_days_fails_only_its_secret(
+        self, mock_client, rules, long_first
+    ):
+        secrets = [
+            {
+                "Name": "yearly",
+                "RotationEnabled": True,
+                "LastRotatedDate": self._ago(1),
+                "RotationRules": rules,
+            },
+            {
+                "Name": "monthly",
+                "RotationEnabled": True,
+                "LastRotatedDate": self._ago(1),
+                "RotationRules": {"ScheduleExpression": "rate(30 days)"},
+            },
+        ]
+        if not long_first:
+            secrets.reverse()
+        rows = self._run(mock_client, [{"SecretList": secrets}])
+        assert [r["Status"] for r in rows] == ["Failed", "Passed"]
+        assert "Secret 'yearly'" in rows[0]["Finding_Details"]
+        assert "longer than 90 days" in rows[0]["Finding_Details"]
+        assert "SecretsManager.4" in rows[0]["Finding_Details"]
+        assert "monthly" in rows[1]["Finding_Details"]
+        assert "yearly" not in rows[1]["Finding_Details"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_a_90_day_schedule_passes(self, mock_client):
+        rows = self._run(
+            mock_client,
+            [
+                {
+                    "SecretList": [
+                        {
+                            "Name": "quarterly",
+                            "RotationEnabled": True,
+                            "LastRotatedDate": self._ago(1),
+                            "RotationRules": {"AutomaticallyAfterDays": 90},
+                        }
+                    ]
+                }
+            ],
+        )
+        assert [r["Status"] for r in rows] == ["Passed"]
+
     @patch("sagemaker_app.boto3.client")
     def test_naive_last_rotated_date_is_read_as_utc(self, mock_client):
         rows = self._run(
@@ -9519,8 +9576,38 @@ class TestSM40RotationHistoryAndPropagation:
                 **self._ecs_injecting(self.ARN),
             )
         )
-        assert [r["Status"] for r in prop] == ["Passed"]
+        # A target is listed, never read for what it does, so it earns no Passed.
+        assert [r["Status"] for r in prop] == ["N/A"]
         assert "1 injection(s) of a rotating secret" in prop[0]["Finding_Details"]
+        assert "rule(s) r1" in prop[0]["Finding_Details"]
+        assert "r0" not in prop[0]["Finding_Details"]
+        assert "whether a target redeploys" in prop[0]["Finding_Details"]
+
+    def test_a_rotation_rule_target_does_not_hide_a_parameter_store_injection(self):
+        ecs = self._ecs_injecting(self.ARN)
+        ecs["task_defs"]["td:1"] = self._task(
+            [
+                {
+                    "name": "app",
+                    "secrets": [
+                        {
+                            "name": "KEY",
+                            "valueFrom": "arn:aws:ssm:us-east-1:111122223333:"
+                            "parameter/key",
+                        }
+                    ],
+                }
+            ]
+        )
+        prop = self._propagation(
+            self._run(
+                rules=[({"source": ["aws.secretsmanager"]}, [{"Id": "t"}])], **ecs
+            )
+        )
+        assert [r["Status"] for r in prop] == ["Failed", "N/A"]
+        assert "ECS service planner" in prop[0]["Finding_Details"]
+        assert "from Parameter Store" in prop[0]["Finding_Details"]
+        assert "ECS service tools" in prop[1]["Finding_Details"]
 
     def test_rotation_rule_without_targets_or_on_other_events_does_not_cover(self):
         prop = self._propagation(

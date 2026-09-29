@@ -261,6 +261,13 @@ section.
 
 ### Fixed
 
+- `SM-40` fails a secret whose rotation schedule allows a gap longer than 90
+  days, the default of Security Hub control `SecretsManager.4`, so
+  `rate(365 days)` no longer passes. An ECS service that injects a rotating
+  secret and relies on an EventBridge rotation rule with a target is now
+  `N/A` naming the rule, where it passed without reading what the target
+  runs.
+
 - `SM-43` resolves an artifact bucket's default `KMSMasterKeyID` with
   `kms:DescribeKey` and fails a bucket whose key is AWS managed, such as
   `alias/aws/s3` named explicitly, which used to pass as a named key. A key

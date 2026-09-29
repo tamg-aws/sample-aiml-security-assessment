@@ -332,7 +332,7 @@ investigation and remediation.
 ### SM-40: Secrets Manager Rotation
 
 - **Severity:** Medium
-- **Description:** For each customer-managed secret, requires automatic rotation to be turned on and the last rotation to fall within the rotation schedule plus one day. A secret with rotation turned on that has never rotated fails. Schedules are read from `rate()` (hours or days), `cron()` (the longest gap between two scheduled dates), or `AutomaticallyAfterDays`; a `cron()` form this check does not interpret, such as `W`, is reported `N/A`. Secrets with `OwningService` set rotate under that service's control and are skipped and counted. Secret values are never read.
+- **Description:** For each customer-managed secret, requires automatic rotation to be turned on and the last rotation to fall within the rotation schedule plus one day. A secret with rotation turned on that has never rotated fails, as does one whose schedule allows a gap longer than 90 days, the default `maxDaysSinceRotation` of Security Hub control `SecretsManager.4`. Schedules are read from `rate()` (hours or days), `cron()` (the longest gap between two scheduled dates), or `AutomaticallyAfterDays`; a `cron()` form this check does not interpret, such as `W`, is reported `N/A`. Secrets with `OwningService` set rotate under that service's control and are skipped and counted. Secret values are never read.
 
 ### SM-41: AWS IoT Device-Scoped Policy
 

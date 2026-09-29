@@ -1769,7 +1769,9 @@ FOUNDATION_ROWS = [
         "SM-40 lists Secrets Manager secrets, skipping those another service "
         "owns, and passes a secret when rotation is enabled and the last rotation "
         "falls within its schedule plus one day. It fails a secret with rotation "
-        "off and one that has never rotated",
+        "off, one that has never rotated, and one whose schedule allows a gap "
+        "longer than 90 days, the default of Security Hub control "
+        "SecretsManager.4",
         [],
         6,
     ),

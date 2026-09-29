@@ -15729,12 +15729,16 @@ def _rotation_interval_days(rotation_rules: Dict[str, Any]) -> Optional[float]:
     return None
 
 
+# The default maxDaysSinceRotation of Security Hub control SecretsManager.4.
+SECRET_ROTATION_MAX_DAYS = 90
+
+
 def check_secrets_manager_rotation(region: str = "") -> Dict[str, Any]:
     """
-    SM-40: Verify customer-managed secrets rotate automatically on a schedule and
-    the last rotation happened within that schedule. Secrets owned by another
-    AWS service (OwningService set) rotate under that service's control and are
-    skipped.
+    SM-40: Verify customer-managed secrets rotate automatically on a schedule of
+    at most SECRET_ROTATION_MAX_DAYS and the last rotation happened within that
+    schedule. Secrets owned by another AWS service (OwningService set) rotate
+    under that service's control and are skipped.
     """
     logger.debug("Starting check for Secrets Manager rotation")
     findings = {"csv_data": []}
@@ -15806,6 +15810,13 @@ def check_secrets_manager_rotation(region: str = "") -> Dict[str, Any]:
         interval = _rotation_interval_days(secret.get("RotationRules") or {})
         if interval is None:
             uninterpretable.append(name)
+            continue
+        if interval > SECRET_ROTATION_MAX_DAYS:
+            failed.append(
+                f"Secret '{name}' rotates on a schedule with a gap of up to "
+                f"{interval:g} days, longer than {SECRET_ROTATION_MAX_DAYS} days, "
+                "the default maximum of Security Hub control SecretsManager.4."
+            )
             continue
         age_days = (now - last_rotated).total_seconds() / 86400
         if age_days > interval + 1:
@@ -16155,6 +16166,7 @@ def _propagation_and_plaintext_findings(
 
     rows = []
     stale = []
+    redeploy = None
     if injected:
         try:
             redeploy = _rotation_redeploy_rules(region)
@@ -16212,21 +16224,37 @@ def _propagation_and_plaintext_findings(
                 region,
             )
         )
-    elif not stale and not parameters:
-        wired = (
-            f" {len(injected)} injection(s) of a rotating secret are covered by an "
-            "EventBridge rotation rule with a target; whether that target "
-            "redeploys the service is not read."
-            if injected
-            else ""
-        )
+    elif redeploy:
+        shown = "; ".join(injected[:10])
         rows.append(
             create_finding(
                 check_id="SM-40",
                 finding_name=SECRET_PROPAGATION_FINDING,
                 finding_details=(
-                    f"No ECS task injects a rotating secret without a redeploy path, "
-                    f"and none injects from Parameter Store.{wired} Lambda functions "
+                    f"{len(injected)} injection(s) of a rotating secret rely on "
+                    f"ENABLED EventBridge rotation rule(s) {', '.join(redeploy[:10])} "
+                    "with a target: "
+                    f"{shown}. This check lists each target but does not read what "
+                    "it runs, so whether a target redeploys the service after a "
+                    "rotation was not assessed."
+                ),
+                resolution="Confirm that each rule's target forces a new "
+                "deployment of the services that inject the secret, or fetch the "
+                "secret from Secrets Manager at runtime.",
+                reference=SECRET_PROPAGATION_REFERENCE,
+                severity="Informational",
+                status="N/A",
+                region=region,
+            )
+        )
+    elif not stale and not parameters:
+        rows.append(
+            create_finding(
+                check_id="SM-40",
+                finding_name=SECRET_PROPAGATION_FINDING,
+                finding_details=(
+                    "No ECS task injects a rotating secret, and none injects from "
+                    "Parameter Store. Lambda functions "
                     "are not graded: no API shows whether a function re-fetches per "
                     "invocation or caches at init; "
                     f"{extension_users} of {len(functions)} use the Parameters and "
