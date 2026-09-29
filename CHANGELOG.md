@@ -261,6 +261,15 @@ section.
 
 ### Fixed
 
+- `SM-38` runtime monitoring coverage compares every running EC2 instance
+  (`ec2:DescribeInstances`, newly granted to the SageMaker function on `*`
+  because the action has no resource type) with the EC2 instances in
+  GuardDuty coverage, and fails an instance that is absent. An instance
+  tagged `eks:cluster-name` or `kubernetes.io/cluster/*` is left to its
+  cluster's covered-node count, and a Windows instance is not compared; both
+  counts are stated. An instance list that could not be read gives `N/A`. An
+  unenrolled standalone instance used to go uncounted.
+
 - `SM-38` runtime monitoring coverage adds a `GuardDuty EKS Audit Log
   Monitoring` row in each Region that has an EKS cluster. It passes only when
   the detector is `ENABLED` with its `EKS_AUDIT_LOGS` feature `ENABLED`, and

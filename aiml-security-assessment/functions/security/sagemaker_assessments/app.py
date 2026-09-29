@@ -15045,9 +15045,36 @@ def _runtime_coverage_findings(
             )
     except Exception as error:
         unread.append(f"ecs:ListClusters ({get_assessment_error_label(error)})")
+    instances = []
+    eks_nodes = 0
+    windows = 0
+    try:
+        ec2_client = boto3.client("ec2", config=boto3_config, region_name=region)
+        for page in ec2_client.get_paginator("describe_instances").paginate(
+            Filters=[{"Name": "instance-state-name", "Values": ["running"]}]
+        ):
+            for reservation in page.get("Reservations", []):
+                for instance in reservation.get("Instances", []):
+                    tag_keys = [
+                        tag.get("Key") or "" for tag in instance.get("Tags") or []
+                    ]
+                    if "eks:cluster-name" in tag_keys or any(
+                        key.startswith("kubernetes.io/cluster/") for key in tag_keys
+                    ):
+                        eks_nodes += 1
+                    elif instance.get("Platform") == "windows":
+                        windows += 1
+                    elif instance.get("InstanceId"):
+                        instances.append(instance["InstanceId"])
+    except Exception as error:
+        unread.append(f"ec2:DescribeInstances ({get_assessment_error_label(error)})")
+    excluded = (
+        f"{eks_nodes} EKS node instance(s) are judged by their cluster's node count "
+        f"and {windows} Windows instance(s) are not compared"
+    )
 
     problems = []
-    covered = {"EKS": set(), "ECS": set()}
+    covered = {"EKS": set(), "ECS": set(), "EC2": set()}
     healthy = []
     for resource in resources:
         details = resource.get("ResourceDetails") or {}
@@ -15089,6 +15116,11 @@ def _runtime_coverage_findings(
     for cluster in ecs_clusters:
         if cluster not in covered["ECS"]:
             problems.append(f"ECS cluster {cluster} has no Runtime Monitoring coverage")
+    for instance_id in instances:
+        if instance_id not in covered["EC2"]:
+            problems.append(
+                f"EC2 instance {instance_id} has no Runtime Monitoring coverage"
+            )
 
     states = {
         config.get("Name"): config.get("Status")
@@ -15100,7 +15132,13 @@ def _runtime_coverage_findings(
         if states.get(name) != "ENABLED"
     ]
     rows = []
-    if not resources and not eks_clusters and not ecs_clusters and not unread:
+    if (
+        not resources
+        and not eks_clusters
+        and not ecs_clusters
+        and not instances
+        and not unread
+    ):
         if unmanaged:
             problems.append(
                 "no host reports a Runtime Monitoring agent, and automated agent "
@@ -15113,9 +15151,8 @@ def _runtime_coverage_findings(
                     finding_name=RUNTIME_COVERAGE_FINDING,
                     finding_details=(
                         "Automated agent management is enabled for EKS, ECS Fargate "
-                        "and EC2, and no host is in coverage yet. The EC2 instance "
-                        "population is not compared against coverage, so an "
-                        "instance GuardDuty has not enrolled is not counted."
+                        "and EC2, no host is in coverage yet, and no running EC2 "
+                        f"instance was found outside coverage ({excluded})."
                     ),
                     resolution="No action required",
                     reference=RUNTIME_COVERAGE_REFERENCE,
@@ -15177,10 +15214,9 @@ def _runtime_coverage_findings(
                 finding_name=RUNTIME_COVERAGE_FINDING,
                 finding_details=(
                     f"All {len(healthy)} resource(s) in Runtime Monitoring coverage "
-                    f"are HEALTHY, including every EKS and ECS cluster listed: "
-                    f"{', '.join(healthy[:10])}. The EC2 instance population is not "
-                    "compared against coverage, so a standalone instance GuardDuty "
-                    "has not enrolled is not counted."
+                    "are HEALTHY, including every EKS and ECS cluster listed and "
+                    f"every running EC2 instance ({len(instances)}): "
+                    f"{', '.join(healthy[:10])}. {excluded}."
                 ),
                 resolution="No action required",
                 reference=RUNTIME_COVERAGE_REFERENCE,

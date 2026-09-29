@@ -8966,6 +8966,26 @@ class TestSM38RuntimeCoverageAndLambdaTier:
             "resourceMetadata": {"lambdaFunction": {"functionName": name}},
         }
 
+    @staticmethod
+    def _ec2(instance_id, status="HEALTHY"):
+        return {
+            "ResourceId": f"arn:aws:ec2:us-east-1:111122223333:instance/{instance_id}",
+            "CoverageStatus": status,
+            "ResourceDetails": {
+                "ResourceType": "EC2",
+                "Ec2InstanceDetails": {"InstanceId": instance_id},
+            },
+        }
+
+    @staticmethod
+    def _instance(instance_id, tags=None, platform=None):
+        instance = {"InstanceId": instance_id, "State": {"Name": "running"}}
+        if tags:
+            instance["Tags"] = [{"Key": k, "Value": v} for k, v in tags.items()]
+        if platform:
+            instance["Platform"] = platform
+        return instance
+
     def _run(
         self,
         detector,
@@ -8976,8 +8996,10 @@ class TestSM38RuntimeCoverageAndLambdaTier:
         fn_coverage=None,
         lambda_state=None,
         errors=None,
+        instances=None,
     ):
         errors = errors or {}
+        self.ec2_calls = []
         coverage = coverage or []
         functions = functions if functions is not None else [{"FunctionName": "fn"}]
         fn_coverage = (
@@ -9036,6 +9058,17 @@ class TestSM38RuntimeCoverageAndLambdaTier:
             elif service == "lambda":
                 client.get_paginator.side_effect = _pager(
                     {"list_functions": source("lambda", [{"Functions": functions}])}
+                )
+            elif service == "ec2":
+
+                def describe_instances(**kwargs):
+                    self.ec2_calls.append(kwargs)
+                    if "ec2" in errors:
+                        raise errors["ec2"]
+                    return [{"Reservations": [{"Instances": instances or []}]}]
+
+                client.get_paginator.side_effect = _pager(
+                    {"describe_instances": describe_instances}
                 )
             return client
 
@@ -9206,6 +9239,101 @@ class TestSM38RuntimeCoverageAndLambdaTier:
     def test_runtime_disabled_skips_coverage_leg(self):
         rows = self._run(self._detail(runtime="DISABLED"))
         assert self._named(rows, sagemaker_app.RUNTIME_COVERAGE_FINDING) == []
+
+    def test_running_instances_all_in_healthy_coverage_pass(self):
+        cov = self._named(
+            self._run(
+                self._detail(),
+                coverage=[self._ec2("i-a"), self._ec2("i-b")],
+                instances=[self._instance("i-a"), self._instance("i-b")],
+            ),
+            sagemaker_app.RUNTIME_COVERAGE_FINDING,
+        )
+        assert [r["Status"] for r in cov] == ["Passed"]
+        assert "every running EC2 instance (2)" in cov[0]["Finding_Details"]
+        assert "instance population is not compared" not in cov[0]["Finding_Details"]
+        assert self.ec2_calls == [
+            {"Filters": [{"Name": "instance-state-name", "Values": ["running"]}]}
+        ]
+
+    def test_one_unenrolled_instance_among_covered_ones_fails(self):
+        cov = self._named(
+            self._run(
+                self._detail(),
+                coverage=[self._ec2("i-a"), self._eks("prod")],
+                eks=["prod"],
+                instances=[self._instance("i-a"), self._instance("i-new")],
+            ),
+            sagemaker_app.RUNTIME_COVERAGE_FINDING,
+        )
+        assert [r["Status"] for r in cov] == ["Failed"]
+        assert (
+            "EC2 instance i-new has no Runtime Monitoring coverage"
+            in cov[0]["Finding_Details"]
+        )
+
+    def test_unenrolled_instance_with_no_coverage_at_all_fails(self):
+        # With nothing in coverage the leg used to read as "no host yet".
+        cov = self._named(
+            self._run(self._detail(), instances=[self._instance("i-new")]),
+            sagemaker_app.RUNTIME_COVERAGE_FINDING,
+        )
+        assert [r["Status"] for r in cov] == ["Failed"]
+        assert "EC2 instance i-new has no" in cov[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "tags",
+        [{"eks:cluster-name": "prod"}, {"kubernetes.io/cluster/prod": "owned"}],
+        ids=["managed-node-group", "self-managed"],
+    )
+    def test_eks_node_is_judged_by_its_cluster_not_as_an_instance(self, tags):
+        cov = self._named(
+            self._run(
+                self._detail(),
+                coverage=[self._eks("prod")],
+                eks=["prod"],
+                instances=[self._instance("i-node", tags=tags)],
+            ),
+            sagemaker_app.RUNTIME_COVERAGE_FINDING,
+        )
+        assert [r["Status"] for r in cov] == ["Passed"]
+        assert "1 EKS node instance(s)" in cov[0]["Finding_Details"]
+
+    def test_windows_instance_is_not_compared_and_is_named(self):
+        cov = self._named(
+            self._run(
+                self._detail(),
+                coverage=[self._ec2("i-a")],
+                instances=[
+                    self._instance("i-a"),
+                    self._instance("i-win", platform="windows"),
+                ],
+            ),
+            sagemaker_app.RUNTIME_COVERAGE_FINDING,
+        )
+        assert [r["Status"] for r in cov] == ["Passed"]
+        assert "1 Windows instance(s)" in cov[0]["Finding_Details"]
+
+    def test_instance_list_denied_withholds_passed(self):
+        cov = self._named(
+            self._run(
+                self._detail(),
+                coverage=[self._ec2("i-a")],
+                instances=[self._instance("i-a")],
+                errors={"ec2": _make_client_error("UnauthorizedOperation")},
+            ),
+            sagemaker_app.RUNTIME_COVERAGE_FINDING,
+        )
+        assert [r["Status"] for r in cov] == ["N/A"]
+        assert "ec2:DescribeInstances" in cov[0]["Finding_Details"]
+
+    def test_no_instance_and_no_host_na_names_the_instance_read(self):
+        cov = self._named(
+            self._run(self._detail()), sagemaker_app.RUNTIME_COVERAGE_FINDING
+        )
+        assert [r["Status"] for r in cov] == ["N/A"]
+        assert "no running EC2 instance" in cov[0]["Finding_Details"]
+        assert "instance population is not compared" not in cov[0]["Finding_Details"]
 
     def test_one_function_missing_from_inspector_coverage_fails(self):
         functions = [

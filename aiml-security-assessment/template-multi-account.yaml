@@ -995,13 +995,15 @@ Resources:
               Resource: '*'
             - Sid: EC2NetworkPostureInventory
               # SM-02, SM-11, SM-18 and SM-33 read interface VPC endpoints, SM-37
-              # reads flow logs and SM-39 reads workload security groups. None of
-              # these three actions has a resource type in IAM.
+              # reads flow logs, SM-39 reads workload security groups and SM-38
+              # compares running instances with Runtime Monitoring coverage. None
+              # of these four actions has a resource type in IAM.
               Effect: Allow
               Action:
                 - ec2:DescribeVpcEndpoints # SM-02, SM-11, SM-18, SM-33
                 - ec2:DescribeFlowLogs # SM-37
                 - ec2:DescribeSecurityGroups # SM-39
+                - ec2:DescribeInstances # SM-38
               Resource: '*'
             - Sid: ConformancePackInventory
               # SM-32 lists conformance packs. The action has no resource type.
