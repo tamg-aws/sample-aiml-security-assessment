@@ -4,7 +4,7 @@ import os
 import logging
 from datetime import datetime, timedelta, timezone
 import time
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 from io import StringIO
 import botocore.session
 from botocore.config import Config
@@ -16715,8 +16715,12 @@ GUARDRAIL_SIGNAL_CEILING = (
 )
 
 # InvocationsIntervened dimensions that count only a slice of the interventions
-# (monitoring-guardrails-cw-metrics). GuardrailArn and GuardrailVersion count
-# one guardrail version.
+# (monitoring-guardrails-cw-metrics). Operation has the one value ApplyGuardrail,
+# so Operation=ApplyGuardrail alone counts every intervention; beside another
+# dimension, or with another value, it is a slice. GuardrailArn and
+# GuardrailVersion count one guardrail version.
+GUARDRAIL_OPERATION_DIMENSIONS = {"Operation": "ApplyGuardrail"}
+
 GUARDRAIL_SLICE_DIMENSIONS = (
     "Operation",
     "GuardrailContentSource",
@@ -16952,6 +16956,66 @@ def _apply_guardrail_called(region: str = "") -> Optional[bool]:
     return bool(response.get("Events"))
 
 
+def _guardrail_version_population(
+    region: str,
+    guardrail_inventory: Dict[str, Any],
+    attachment_inventory: Dict[str, Any],
+) -> Tuple[Set[Tuple[str, str]], List[str]]:
+    """
+    Name every guardrail version defined or applied in this Region as
+    (GuardrailArn, GuardrailVersion), DRAFT included, and what was not read.
+    """
+    population = set()
+    errors = []
+    if guardrail_inventory.get("list_error") is not None:
+        errors.append(
+            "the guardrails in this Region were not listed with "
+            "bedrock:ListGuardrails ("
+            + get_assessment_error_label(guardrail_inventory["list_error"])
+            + ")"
+        )
+    errors.extend(str(error) for error in attachment_inventory.get("errors") or [])
+    local_arns = {}
+    client = boto3.client("bedrock", config=boto3_config, region_name=region)
+    for entry in list(guardrail_inventory.get("items") or []) + list(
+        guardrail_inventory.get("errors") or []
+    ):
+        summary = entry.get("summary") or {}
+        guardrail_id = summary.get("id")
+        if not guardrail_id:
+            continue
+        arn = str(summary.get("arn") or guardrail_id)
+        local_arns[str(guardrail_id)] = arn
+        try:
+            summaries = _list_all_items(
+                client,
+                "list_guardrails",
+                "guardrails",
+                guardrailIdentifier=guardrail_id,
+            )
+        except (ClientError, BotoCoreError, TypeError) as error:
+            errors.append(
+                f"the versions of guardrail {guardrail_id} were not listed with "
+                f"bedrock:ListGuardrails ({get_assessment_error_label(error)})"
+            )
+            continue
+        population.update(
+            (arn, str(item.get("version")))
+            for item in summaries
+            if isinstance(item, dict) and item.get("version")
+        )
+        population.add((arn, GUARDRAIL_DRAFT_VERSION))
+    for identifier, version in attachment_inventory.get("versions") or {}:
+        reference = _parse_guardrail_reference(str(identifier), region)
+        arn = (
+            reference["identifier"]
+            if str(identifier).startswith("arn:")
+            else local_arns.get(reference["id"], str(identifier))
+        )
+        population.add((arn, str(version)))
+    return population, errors
+
+
 def _guardrail_scope(
     guardrail_inventory: Dict[str, Any],
     attachment_inventory: Dict[str, Any],
@@ -17172,10 +17236,15 @@ def _guardrail_intervention_signal_finding(
     An acting alarm counts only when one intervention in one period raises it
     (_single_event_alarm_gap). On InvocationsIntervened, an alarm with no
     dimension is not credited, because the metric is published only under the
-    dimension sets GUARDRAIL_METRIC_DIMENSIONS_NOTE names. A slice dimension
-    counts part of the interventions and fails; an alarm scoped to one guardrail
-    version by GuardrailArn and GuardrailVersion keeps the row from Passed,
-    because which versions callers name is not read.
+    dimension sets GUARDRAIL_METRIC_DIMENSIONS_NOTE names. Operation=ApplyGuardrail
+    alone counts every guardrail evaluation, including those made during model
+    invocation, and passes. A slice dimension counts part of the interventions
+    and fails. Alarms scoped by GuardrailArn and GuardrailVersion pass only when
+    every version defined or applied in this Region, DRAFT included, has one.
+
+    A metric filter never passes alone: a direct ApplyGuardrail call reaches no
+    invocation log, and ApplyGuardrail is a CloudTrail data event, so
+    LookupEvents returning no call is not evidence that none is made.
     """
     finding_name = "Guardrail Intervention Monitoring Signal"
     reference = "https://docs.aws.amazon.com/bedrock/latest/userguide/guardrails-enforcements.html"
@@ -17208,7 +17277,7 @@ def _guardrail_intervention_signal_finding(
                 "N/A",
             )
         return row(
-            "No guardrail is defined in this Region, no agent, flow node or account-enforced configuration applies one, and event history holds no ApplyGuardrail call, so there is no intervention to monitor. A guardrail from another account passed per request to InvokeModel or Converse is not visible to this read.",
+            "No guardrail is defined in this Region, and no agent, flow node or account-enforced configuration applies one, so there is no intervention to monitor. A guardrail from another account passed per request to InvokeModel, Converse or ApplyGuardrail is not visible to these reads, and ApplyGuardrail is a CloudTrail data event, which cloudtrail:LookupEvents does not return.",
             "No action required",
             "Informational",
             "N/A",
@@ -17223,6 +17292,8 @@ def _guardrail_intervention_signal_finding(
     alarm_gaps = []
     version_scoped = []
     unjudged = []
+    operation_alarms = []
+    version_alarms = {}
     for alarm_name in metric_alarms:
         alarm = alarm_details.get(alarm_name) or {}
         gap = _single_event_alarm_gap(alarm)
@@ -17236,6 +17307,8 @@ def _guardrail_intervention_signal_finding(
             unjudged.append(gap)
         elif gap:
             alarm_gaps.append(gap)
+        elif dimensions == GUARDRAIL_OPERATION_DIMENSIONS:
+            operation_alarms.append(alarm_name)
         elif sliced:
             alarm_gaps.append(
                 "alarm {} counts only the interventions where {}".format(
@@ -17244,6 +17317,11 @@ def _guardrail_intervention_signal_finding(
                 )
             )
         elif dimensions:
+            if set(dimensions) == set(GUARDRAIL_VERSION_DIMENSIONS):
+                version_alarms.setdefault(
+                    (dimensions["GuardrailArn"], dimensions["GuardrailVersion"]),
+                    alarm_name,
+                )
             version_scoped.append(
                 "alarm {} counts only {}".format(
                     alarm_name,
@@ -17338,7 +17416,33 @@ def _guardrail_intervention_signal_finding(
             f"metric filter(s) on log group '{log_group_name}' selecting INTERVENED with an acting alarm: {', '.join(sorted(alarmed_filters))}"
         )
 
-    resolution = "Send model invocation logs to CloudWatch Logs, add a metric filter on amazon-bedrock-guardrailAction=INTERVENED (Converse: stopReason=guardrail_intervened), and alarm on the metric it emits with an enabled alarm action. Where ApplyGuardrail is called, alarm on InvocationsIntervened in the AWS/Bedrock/Guardrails namespace for each GuardrailArn and GuardrailVersion callers name. Forward the invocation logs to the SIEM."
+    resolution = "Alarm on InvocationsIntervened in the AWS/Bedrock/Guardrails namespace with the single dimension Operation=ApplyGuardrail, statistic Sum, threshold GreaterThanOrEqualToThreshold 1 and an enabled alarm action; it counts the interventions of direct ApplyGuardrail calls and of guardrails applied during model invocation. Forward the invocation logs to the SIEM."
+    metric_resolution = "Alarm on InvocationsIntervened in the AWS/Bedrock/Guardrails namespace with the single dimension Operation=ApplyGuardrail, or with GuardrailArn and GuardrailVersion for every guardrail version including DRAFT, each with statistic Sum, threshold GreaterThanOrEqualToThreshold 1 and an enabled alarm action."
+
+    if operation_alarms:
+        return row(
+            f"{scope_text} Guardrail interventions reach an acting alarm: alarm {', '.join(operation_alarms)} evaluates {GUARDRAIL_INTERVENTION_METRIC} under Operation ApplyGuardrail alone. ApplyGuardrail is the one Operation value {GUARDRAIL_METRIC_NAMESPACE} publishes, and AWS counts the guardrail evaluations made during model invocation as ApplyGuardrail calls (logging-using-cloudtrail), so the alarm counts the interventions of every guardrail evaluated in this Region.{gap_text}{forwarding}",
+            "No action required. Confirm the alarm action reaches the security monitoring destination that is reviewed.",
+            "Low",
+            "Passed",
+        )
+    if version_alarms:
+        population, version_errors = _guardrail_version_population(
+            region, guardrail_inventory, attachment_inventory
+        )
+        uncovered = sorted(population - set(version_alarms))
+        if population and not uncovered and not version_errors and not unjudged:
+            return row(
+                f"{scope_text} Guardrail interventions reach an acting alarm: every one of the {len(population)} guardrail version(s) defined or applied in this Region, DRAFT included, has an acting alarm on {GUARDRAIL_INTERVENTION_METRIC} with that GuardrailArn and GuardrailVersion ({', '.join(sorted(version_alarms[key] for key in population))}).{gap_text}{forwarding}",
+                "No action required. Add a per-version alarm whenever a guardrail version is created, or alarm on Operation=ApplyGuardrail instead.",
+                "Low",
+                "Passed",
+            )
+        version_scoped.extend(
+            f"no acting alarm counts {arn} version {version}"
+            for arn, version in uncovered
+        )
+        version_scoped.extend(version_errors)
 
     if alarmed_filters and text_delivery is None and apply_guardrail_called is not True:
         return row(
@@ -17347,17 +17451,13 @@ def _guardrail_intervention_signal_finding(
             "Informational",
             "N/A",
         )
-    if alarmed_filters and apply_guardrail_called is False:
-        return row(
-            f"{scope_text} Guardrail interventions reach an acting alarm through {' and '.join(observed)}.{gap_text}{forwarding}",
-            "No action required. Confirm the alarm action reaches the security monitoring destination that is reviewed.",
-            "Low",
-            "Passed",
+    if alarmed_filters and apply_guardrail_called is not True:
+        lookup_note = (
+            ", and the lookup itself failed" if apply_guardrail_called is None else ""
         )
-    if alarmed_filters and apply_guardrail_called is None:
         return row(
-            f"{scope_text} Interventions on the four logged inference APIs reach an acting alarm through {' and '.join(observed)}, but whether ApplyGuardrail is called here was not read (cloudtrail:LookupEvents), and its interventions reach no metric filter, so this is not reported as Passed.{gap_text}{forwarding}",
-            "Grant cloudtrail:LookupEvents and retry.",
+            f"{scope_text} Interventions on the four logged inference APIs reach an acting alarm through {' and '.join(observed)}, but an intervention raised by a direct ApplyGuardrail call reaches no metric filter, and whether ApplyGuardrail is called here is not visible: ApplyGuardrail is a CloudTrail data event, which cloudtrail:LookupEvents does not return{lookup_note}. No acting alarm counts every intervention on {GUARDRAIL_INTERVENTION_METRIC}, so this is not reported as Passed.{gap_text}{forwarding}",
+            metric_resolution,
             "Informational",
             "N/A",
         )
@@ -17365,9 +17465,9 @@ def _guardrail_intervention_signal_finding(
         return row(
             f"{scope_text} No acting alarm on {GUARDRAIL_METRIC_NAMESPACE} {GUARDRAIL_INTERVENTION_METRIC} counts every intervention and is judged to fire on one: "
             + "; ".join(version_scoped + unjudged)
-            + ". Which guardrail versions callers name is not read, and a metric math result is not evaluated, so this is not reported as Passed or Failed."
+            + ". Whether callers name a version left without an alarm is not read, and a metric math result is not evaluated, so this is not reported as Passed or Failed."
             + f"{gap_text}{forwarding}",
-            "Confirm that the per-version alarms cover every guardrail version callers name, each with statistic Sum, a threshold of GreaterThanOrEqualToThreshold 1 over one datapoint, and an enabled alarm action.",
+            metric_resolution,
             "Informational",
             "N/A",
         )

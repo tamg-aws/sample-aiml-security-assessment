@@ -18602,7 +18602,7 @@ class TestBR32CloudWatchAlarms:
             for f in findings
             if f["Finding"] == "Guardrail Intervention Monitoring Signal"
         ]
-        assert signal[0]["Status"] == "Passed"
+        assert signal[0]["Status"] == "N/A"
         assert (
             "metric filter(s) on log group '/aws/bedrock/invocations' selecting "
             "INTERVENED with an acting alarm: GuardrailIntervened (alarm "
@@ -18767,6 +18767,21 @@ def _intervened_filter(name, pattern, metric="Intervened"):
     }
 
 
+def _br32_guardrail_arn(guardrail_id):
+    return f"arn:aws:bedrock:us-east-1:123456789012:guardrail/{guardrail_id}"
+
+
+def _version_alarm(name, guardrail_id, version, **fields):
+    return _intervened_alarm(
+        name,
+        Dimensions=[
+            {"Name": "GuardrailArn", "Value": _br32_guardrail_arn(guardrail_id)},
+            {"Name": "GuardrailVersion", "Value": version},
+        ],
+        **fields,
+    )
+
+
 class TestBR32ActingIntervention:
     """AIR-BDR-GRD-04: an intervention signal counts only when it reaches an acting alarm."""
 
@@ -18803,6 +18818,7 @@ class TestBR32ActingIntervention:
         composites=None,
         logging_config=INVOCATION_LOGGING,
         subscriptions=None,
+        versions=None,
     ):
         cw_client = MagicMock()
         paginator = MagicMock()
@@ -18815,6 +18831,27 @@ class TestBR32ActingIntervention:
         bedrock_client.get_model_invocation_logging_configuration.return_value = {
             "loggingConfig": logging_config
         }
+
+        def list_versions(guardrailIdentifier, **kwargs):
+            listed = (versions or {}).get(guardrailIdentifier)
+            if listed is None:
+                raise ClientError(
+                    {"Error": {"Code": "AccessDeniedException", "Message": "x"}},
+                    "ListGuardrails",
+                )
+            return {
+                "guardrails": [
+                    {
+                        "id": guardrailIdentifier,
+                        "arn": _br32_guardrail_arn(guardrailIdentifier),
+                        "version": version,
+                    }
+                    for version in listed
+                ]
+            }
+
+        bedrock_client.list_guardrails.side_effect = list_versions
+        self.bedrock_client = bedrock_client
         logs_client = MagicMock()
         logs_client.describe_metric_filters.return_value = {
             "metricFilters": metric_filters or []
@@ -19063,7 +19100,7 @@ class TestBR32ActingIntervention:
             [INTERVENED_FILTER_ALARM],
             metric_filters=[_intervened_filter("Wide", pattern)],
         )
-        assert signal["Status"] == "Passed"
+        assert signal["Status"] == "N/A"
         assert "Wide (alarm intervened-spike)" in signal["Finding_Details"]
 
     @pytest.mark.parametrize(
@@ -19084,7 +19121,13 @@ class TestBR32ActingIntervention:
                 "body that metric filter(s) Wide (alarm intervened-spike) match "
                 "was not read",
             ),
-            (True, "Passed", "Wide (alarm intervened-spike)"),
+            (
+                True,
+                "N/A",
+                "reach an acting alarm through metric filter(s) on log group "
+                "'/aws/bedrock/invocations' selecting INTERVENED with an acting "
+                "alarm: Wide (alarm intervened-spike)",
+            ),
         ],
     )
     def test_a_filter_is_credited_only_when_text_output_is_logged(
@@ -19109,7 +19152,7 @@ class TestBR32ActingIntervention:
         assert signal["Status"] == status
         assert text in signal["Finding_Details"]
 
-    def test_one_alarmed_filter_among_unalarmed_ones_passes(self):
+    def test_one_alarmed_filter_among_unalarmed_ones_is_credited(self):
         _, signal = self._run(
             [INTERVENED_FILTER_ALARM],
             metric_filters=[
@@ -19123,7 +19166,7 @@ class TestBR32ActingIntervention:
                 ),
             ],
         )
-        assert signal["Status"] == "Passed"
+        assert signal["Status"] == "N/A"
         assert "Alarmed (alarm intervened-spike)" in signal["Finding_Details"]
         assert (
             "metric filter(s) Unalarmed match an intervention"
@@ -19221,6 +19264,177 @@ class TestBR32ActingIntervention:
             "alarm one-version counts only GuardrailArn arn:g, GuardrailVersion 1"
             in signal["Finding_Details"]
         )
+
+    @pytest.mark.parametrize("apply_called", [False, True, None])
+    def test_an_operation_alarm_counts_every_intervention(self, apply_called):
+        self.apply_called = apply_called
+        _, signal = self._run(
+            [
+                _intervened_alarm(
+                    "all",
+                    Dimensions=[{"Name": "Operation", "Value": "ApplyGuardrail"}],
+                )
+            ]
+        )
+        assert signal["Status"] == "Passed"
+        assert (
+            "alarm all evaluates InvocationsIntervened under Operation "
+            "ApplyGuardrail alone" in signal["Finding_Details"]
+        )
+
+    @pytest.mark.parametrize(
+        "dimensions, text",
+        [
+            (
+                [
+                    {"Name": "Operation", "Value": "ApplyGuardrail"},
+                    {"Name": "GuardrailContentSource", "Value": "Input"},
+                ],
+                "alarm part counts only the interventions where "
+                "GuardrailContentSource is Input and Operation is ApplyGuardrail",
+            ),
+            (
+                [{"Name": "Operation", "Value": "InvokeModel"}],
+                "alarm part counts only the interventions where Operation is "
+                "InvokeModel",
+            ),
+        ],
+    )
+    def test_an_operation_alarm_with_another_value_or_dimension_is_a_slice(
+        self, dimensions, text
+    ):
+        _, signal = self._run([_intervened_alarm("part", Dimensions=dimensions)])
+        assert signal["Status"] == "Failed"
+        assert text in signal["Finding_Details"]
+
+    @pytest.mark.parametrize("apply_called", [False, True, None])
+    def test_an_alarm_on_every_guardrail_version_passes(self, apply_called):
+        self.apply_called = apply_called
+        self.guardrails = {
+            "items": [{"summary": {"id": "gr-1", "arn": _br32_guardrail_arn("gr-1")}}],
+            "errors": [
+                {
+                    "summary": {"id": "gr-2", "arn": _br32_guardrail_arn("gr-2")},
+                    "error": RuntimeError("x"),
+                }
+            ],
+            "list_error": None,
+        }
+        self.attachments = {
+            "attachments": [],
+            "versions": {("gr-1", "1"): {}},
+            "errors": [],
+        }
+        _, signal = self._run(
+            [
+                _version_alarm("g1-draft", "gr-1", "DRAFT"),
+                _version_alarm("g1-v1", "gr-1", "1"),
+                _version_alarm("g2-draft", "gr-2", "DRAFT"),
+                _version_alarm("g2-v4", "gr-2", "4"),
+            ],
+            versions={"gr-1": ["DRAFT", "1"], "gr-2": ["DRAFT", "4"]},
+        )
+        assert signal["Status"] == "Passed"
+        assert (
+            "every one of the 4 guardrail version(s) defined or applied in this Region, DRAFT "
+            "included, has an acting alarm on InvocationsIntervened"
+            in signal["Finding_Details"]
+        )
+        listed = sorted(
+            call.kwargs["guardrailIdentifier"]
+            for call in self.bedrock_client.list_guardrails.call_args_list
+        )
+        assert listed == ["gr-1", "gr-2"]
+
+    def test_a_version_without_an_alarm_is_named_and_not_passed(self):
+        self.guardrails = {
+            "items": [
+                {"summary": {"id": "gr-1", "arn": _br32_guardrail_arn("gr-1")}},
+                {"summary": {"id": "gr-2", "arn": _br32_guardrail_arn("gr-2")}},
+            ],
+            "errors": [],
+            "list_error": None,
+        }
+        _, signal = self._run(
+            [
+                _version_alarm("g1-draft", "gr-1", "DRAFT"),
+                _version_alarm("g1-v1", "gr-1", "1"),
+                _version_alarm("g2-v4", "gr-2", "4"),
+                _version_alarm("g2-draft", "gr-2", "DRAFT", Threshold=50.0),
+            ],
+            versions={"gr-1": ["DRAFT", "1"], "gr-2": ["DRAFT", "4"]},
+        )
+        assert signal["Status"] == "N/A"
+        assert (
+            f"no acting alarm counts {_br32_guardrail_arn('gr-2')} version DRAFT"
+            in signal["Finding_Details"]
+        )
+        assert "gr-1 version" not in signal["Finding_Details"]
+
+    def test_an_attached_version_from_another_account_needs_its_own_alarm(self):
+        foreign = "arn:aws:bedrock:us-east-1:111122223333:guardrail/org"
+        self.attachments = {
+            "attachments": [],
+            "versions": {(foreign, "3"): {}},
+            "errors": [],
+        }
+        _, signal = self._run(
+            [
+                _version_alarm("g1-draft", "gr-1", "DRAFT"),
+                _version_alarm("g1-v1", "gr-1", "1"),
+            ],
+            versions={"gr-1": ["DRAFT", "1"]},
+        )
+        assert signal["Status"] == "N/A"
+        assert (
+            f"no acting alarm counts {foreign} version 3" in signal["Finding_Details"]
+        )
+
+    def test_draft_needs_an_alarm_when_the_listing_omits_it(self):
+        self.guardrails = {
+            "items": [{"summary": {"id": "gr-1", "arn": _br32_guardrail_arn("gr-1")}}],
+            "errors": [],
+            "list_error": None,
+        }
+        _, signal = self._run(
+            [_version_alarm("g1-v1", "gr-1", "1")],
+            versions={"gr-1": ["1"]},
+        )
+        assert signal["Status"] == "N/A"
+        assert (
+            f"no acting alarm counts {_br32_guardrail_arn('gr-1')} version DRAFT"
+            in signal["Finding_Details"]
+        )
+
+    def test_unlisted_guardrail_versions_are_not_passed(self):
+        _, signal = self._run(
+            [_version_alarm("g1-draft", "gr-1", "DRAFT")],
+            versions={},
+        )
+        assert signal["Status"] == "N/A"
+        assert (
+            "the versions of guardrail gr-1 were not listed with "
+            "bedrock:ListGuardrails (AccessDeniedException)"
+            in signal["Finding_Details"]
+        )
+
+    def test_a_metric_filter_alone_is_not_passed_for_unseen_apply_guardrail_calls(
+        self,
+    ):
+        _, signal = self._run(
+            [INTERVENED_FILTER_ALARM],
+            metric_filters=[
+                _intervened_filter(
+                    "Alarmed", '{ $.stopReason = "guardrail_intervened" }'
+                )
+            ],
+        )
+        assert signal["Status"] == "N/A"
+        assert (
+            "ApplyGuardrail is a CloudTrail data event, which cloudtrail:LookupEvents does "
+            "not return" in signal["Finding_Details"]
+        )
+        assert "Alarmed (alarm intervened-spike)" in signal["Finding_Details"]
 
     def test_a_metric_math_alarm_is_not_judged_either_way(self):
         alarm = _intervened_alarm("math")
