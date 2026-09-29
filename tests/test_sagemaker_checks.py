@@ -9046,6 +9046,66 @@ class TestSM38RuntimeCoverageAndLambdaTier:
     def _named(rows, name):
         return [r for r in rows if r["Finding"].startswith(name)]
 
+    def _audit(self, status, runtime="ENABLED", detector_status="ENABLED"):
+        detector = self._detail(runtime=runtime)
+        detector["detail"]["Status"] = detector_status
+        if status is not None:
+            detector["detail"]["Features"].append(
+                {"Name": "EKS_AUDIT_LOGS", "Status": status}
+            )
+        return detector
+
+    def test_eks_audit_logs_enabled_passes(self):
+        rows = self._run(
+            self._audit("ENABLED"),
+            coverage=[self._eks("a"), self._eks("b")],
+            eks=["a", "b"],
+        )
+        audit = self._named(rows, sagemaker_app.EKS_AUDIT_LOGS_FINDING)
+        assert [r["Status"] for r in audit] == ["Passed"]
+        assert "2 EKS cluster(s)" in audit[0]["Finding_Details"]
+
+    @pytest.mark.parametrize("status", ["DISABLED", None])
+    def test_eks_audit_logs_off_fails_with_clusters(self, status):
+        rows = self._run(
+            self._audit(status),
+            coverage=[self._eks("a"), self._eks("b")],
+            eks=["a", "b"],
+        )
+        audit = self._named(rows, sagemaker_app.EKS_AUDIT_LOGS_FINDING)
+        assert [r["Status"] for r in audit] == ["Failed"]
+        assert "a, b" in audit[0]["Finding_Details"]
+        assert (status or "absent") in audit[0]["Finding_Details"]
+
+    def test_eks_audit_logs_are_judged_when_runtime_monitoring_is_off(self):
+        rows = self._run(self._audit("DISABLED", runtime="DISABLED"), eks=["a"])
+        audit = self._named(rows, sagemaker_app.EKS_AUDIT_LOGS_FINDING)
+        assert [r["Status"] for r in audit] == ["Failed"]
+
+    def test_eks_audit_logs_on_a_disabled_detector_fails(self):
+        rows = self._run(
+            self._audit("ENABLED", detector_status="DISABLED"),
+            coverage=[self._eks("a")],
+            eks=["a"],
+        )
+        audit = self._named(rows, sagemaker_app.EKS_AUDIT_LOGS_FINDING)
+        assert [r["Status"] for r in audit] == ["Failed"]
+        assert "detector" in audit[0]["Finding_Details"]
+
+    def test_no_eks_cluster_adds_no_audit_log_row(self):
+        rows = self._run(self._audit("DISABLED"))
+        assert self._named(rows, sagemaker_app.EKS_AUDIT_LOGS_FINDING) == []
+
+    @pytest.mark.parametrize("status", ["ENABLED", "DISABLED"])
+    def test_eks_list_denied_withholds_the_audit_log_verdict(self, status):
+        rows = self._run(
+            self._audit(status),
+            errors={"eks": _make_client_error("AccessDeniedException")},
+        )
+        audit = self._named(rows, sagemaker_app.EKS_AUDIT_LOGS_FINDING)
+        assert [r["Status"] for r in audit] == ["N/A"]
+        assert "eks:ListClusters" in audit[0]["Finding_Details"]
+
     def test_healthy_coverage_for_every_cluster_passes(self):
         rows = self._run(
             self._detail(),

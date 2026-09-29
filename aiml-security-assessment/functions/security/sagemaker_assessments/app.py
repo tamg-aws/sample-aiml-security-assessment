@@ -15192,6 +15192,81 @@ def _runtime_coverage_findings(
     return rows
 
 
+EKS_AUDIT_LOGS_FINDING = "GuardDuty EKS Audit Log Monitoring"
+EKS_AUDIT_LOGS_REFERENCE = (
+    "https://docs.aws.amazon.com/guardduty/latest/ug/kubernetes-protection.html"
+)
+
+
+def _eks_audit_log_findings(
+    region: str, detail: Dict[str, Any]
+) -> List[Dict[str, Any]]:
+    """
+    Where EKS clusters exist, the detector must be ENABLED with its
+    EKS_AUDIT_LOGS feature ENABLED. No cluster yields no row.
+    """
+    try:
+        eks_client = boto3.client("eks", config=boto3_config, region_name=region)
+        clusters = []
+        for page in eks_client.get_paginator("list_clusters").paginate():
+            clusters.extend(page.get("clusters", []))
+    except Exception as error:
+        return [
+            _unread_resources_finding(
+                "SM-38",
+                EKS_AUDIT_LOGS_FINDING,
+                [f"eks:ListClusters ({get_assessment_error_label(error)})"],
+                "whether any EKS cluster needs audit log monitoring is unknown.",
+                EKS_AUDIT_LOGS_REFERENCE,
+                region,
+            )
+        ]
+    if not clusters:
+        return []
+    shown = ", ".join(sorted(clusters)[:10])
+    feature = _guardduty_feature(detail, "EKS_AUDIT_LOGS")
+    state = feature.get("Status") if feature else "absent"
+    if detail.get("Status") != "ENABLED":
+        problem = "the GuardDuty detector is not enabled"
+    elif state != "ENABLED":
+        problem = f"the detector's EKS_AUDIT_LOGS feature is {state}"
+    else:
+        return [
+            create_finding(
+                check_id="SM-38",
+                finding_name=EKS_AUDIT_LOGS_FINDING,
+                finding_details=(
+                    "GuardDuty EKS_AUDIT_LOGS is enabled on the detector for the "
+                    f"{len(clusters)} EKS cluster(s) in this Region: {shown}."
+                ),
+                resolution="No action required",
+                reference=EKS_AUDIT_LOGS_REFERENCE,
+                severity="High",
+                status="Passed",
+                region=region,
+            )
+        ]
+    return [
+        create_finding(
+            check_id="SM-38",
+            finding_name=EKS_AUDIT_LOGS_FINDING,
+            finding_details=(
+                f"{len(clusters)} EKS cluster(s) run in this Region ({shown}), but "
+                f"{problem}, so GuardDuty does not analyze their Kubernetes audit "
+                "logs."
+            ),
+            resolution=(
+                "Enable the GuardDuty detector and its EKS Protection "
+                "(EKS_AUDIT_LOGS) feature."
+            ),
+            reference=EKS_AUDIT_LOGS_REFERENCE,
+            severity="High",
+            status="Failed",
+            region=region,
+        )
+    ]
+
+
 def _lambda_runtime_tier_findings(
     region: str, detail: Dict[str, Any]
 ) -> List[Dict[str, Any]]:
@@ -15342,7 +15417,8 @@ def check_guardduty_runtime_monitoring_coverage(
 ) -> Dict[str, Any]:
     """
     SM-38: Read Runtime Monitoring coverage per resource against the EKS and ECS
-    cluster population, and the Lambda tier that stands in for a runtime agent.
+    cluster population, EKS audit log monitoring where EKS clusters exist, and
+    the Lambda tier that stands in for a runtime agent.
     A detector with every agent-management option off and no manual agent
     fails here, where the feature flag alone reads as enabled.
     """
@@ -15362,6 +15438,7 @@ def check_guardduty_runtime_monitoring_coverage(
             findings["csv_data"].extend(
                 _runtime_coverage_findings(region, inventory["detector_id"], runtime)
             )
+        findings["csv_data"].extend(_eks_audit_log_findings(region, detail))
         findings["csv_data"].extend(_lambda_runtime_tier_findings(region, detail))
     except Exception as error:
         findings["csv_data"].append(
