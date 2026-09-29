@@ -825,7 +825,7 @@ inventory is never treated as evidence of compliance.
 ### AC-32: Inbound JWT Issuer Conditions
 
 - **Severity:** High
-- **Description:** Fails any cached IAM role or user that can call `GetWorkloadAccessTokenForJWT` or `CompleteResourceTokenAuth` with no condition on the inbound token's issuer, audience, or client id, or with one whose `StringLike` value carries a `*` or `?` (`https://cognito-idp.*.amazonaws.com/*` admits every user pool), because the token-exchange APIs accept an end user's JWT directly and never pass through a gateway authorizer. AC-31 pins the issuer at the gateway's front door; this is the second path to the same workload token. An `Action` element of `"*"` is a service-agnostic administrator grant and is left to AC-02. An empty or unreadable permission cache is informational `N/A`. Reported once under the `Global` region.
+- **Description:** Fails any cached IAM role or user that can call `GetWorkloadAccessTokenForJWT` or `CompleteResourceTokenAuth` with no `InboundJwtClaim/iss` condition, or with one whose `StringLike` value carries a `*` or `?` (`https://cognito-idp.*.amazonaws.com/*` admits every user pool). An `aud` or `client_id` condition alone does not pass, because any identity provider can mint a token carrying the approved value. This applies because the token-exchange APIs accept an end user's JWT directly and never pass through a gateway authorizer. AC-31 pins the issuer at the gateway's front door; this is the second path to the same workload token. An `Action` element of `"*"` is a service-agnostic administrator grant and is left to AC-02. An empty or unreadable permission cache is informational `N/A`. Reported once under the `Global` region.
 
 ### AC-33: Token Issuance Scope
 

@@ -14779,21 +14779,23 @@ class TestAC32InboundJwtIssuerConditions:
             assert_finding_schema(finding)
 
     @pytest.mark.parametrize(
-        "condition_key",
+        "condition_key, status",
         [
-            "bedrock-agentcore:InboundJwtClaim/iss",
-            "bedrock-agentcore:InboundJwtClaim/aud",
-            "bedrock-agentcore:InboundJwtClaim/client_id",
+            ("bedrock-agentcore:InboundJwtClaim/iss", "Passed"),
+            # Inverted: these passed. Any issuer can mint a token carrying the
+            # approved aud or client_id, so neither alone pins the issuer.
+            ("bedrock-agentcore:InboundJwtClaim/aud", "Failed"),
+            ("bedrock-agentcore:InboundJwtClaim/client_id", "Failed"),
         ],
     )
-    def test_an_issuer_or_application_condition_passes(self, condition_key):
+    def test_only_an_issuer_condition_passes(self, condition_key, status):
         findings = agentcore_app.check_agentcore_inbound_jwt_issuer_conditions(
             self._cache(
                 ["bedrock-agentcore:GetWorkloadAccessTokenForJWT"],
                 condition={"StringEquals": {condition_key: "https://idp.example/"}},
             )
         )
-        assert [f["Status"] for f in findings] == ["Passed"]
+        assert [f["Status"] for f in findings] == [status]
         assert "role agent-role" in findings[0]["Finding_Details"]
 
     @pytest.mark.parametrize(
@@ -15070,6 +15072,79 @@ class TestAC32InboundJwtIssuerConditions:
         assert "pinned-role" not in failed[0]["Finding_Details"]
 
 
+class TestAC32IssuerMustBePinned:
+    """AC-32 counts an exchange as pinned only when the issuer is pinned."""
+
+    _EXCHANGE = "bedrock-agentcore:GetWorkloadAccessTokenForJWT"
+    _ISS = "bedrock-agentcore:InboundJwtClaim/iss"
+    _AUD = "bedrock-agentcore:InboundJwtClaim/aud"
+    _CLIENT = "bedrock-agentcore:InboundJwtClaim/client_id"
+
+    @classmethod
+    def _allow(cls, condition):
+        return {
+            "Effect": "Allow",
+            "Action": cls._EXCHANGE,
+            "Resource": "*",
+            "Condition": condition,
+        }
+
+    @pytest.mark.parametrize(
+        "condition",
+        [
+            {"StringEquals": {_AUD: "app-1"}},
+            {"ForAnyValue:StringEquals": {_AUD: "app-1"}},
+            {"StringEquals": {_CLIENT: "client-1"}},
+            {"StringEquals": {_AUD: "app-1", _CLIENT: "client-1"}},
+            {
+                "StringLike": {_ISS: "https://cognito-idp.*.amazonaws.com/*"},
+                "StringEquals": {_AUD: "app-1"},
+            },
+        ],
+        ids=["aud", "any-aud", "client-id", "aud-and-client-id", "wild-iss-and-aud"],
+    )
+    def test_an_audience_or_client_without_an_issuer_fails(self, condition):
+        # Any identity provider can mint a token whose aud or client_id carries
+        # the approved value, so only an iss condition keeps another issuer out.
+        findings = agentcore_app.check_agentcore_inbound_jwt_issuer_conditions(
+            _v2_cache(
+                roles={
+                    "wide": _principal_with([self._allow(condition)]),
+                    "narrow": _principal_with(
+                        [self._allow({"StringEquals": {self._ISS: "https://idp/"}})]
+                    ),
+                }
+            )
+        )
+        failed = [f for f in findings if f["Status"] == "Failed"]
+        passed = [f for f in findings if f["Status"] == "Passed"]
+        assert len(failed) == 1 and len(passed) == 1
+        assert "role wide" in failed[0]["Finding_Details"]
+        assert "role narrow" not in failed[0]["Finding_Details"]
+        assert "alone does not pin the issuer" in failed[0]["Finding_Details"]
+        assert "role narrow" in passed[0]["Finding_Details"]
+        assert "role wide" not in passed[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "condition",
+        [
+            {"StringEquals": {_ISS: "https://idp/", _AUD: "app-1"}},
+            {
+                "StringEquals": {_ISS: "https://idp/"},
+                "ForAnyValue:StringEquals": {_AUD: "app-1"},
+            },
+            {"StringEqualsIgnoreCase": {_ISS: "https://idp/"}},
+        ],
+        ids=["iss-and-aud", "iss-beside-any-aud", "iss-ignore-case"],
+    )
+    def test_an_issuer_condition_passes_with_or_without_an_audience(self, condition):
+        findings = agentcore_app.check_agentcore_inbound_jwt_issuer_conditions(
+            _v2_cache(roles={"role": _principal_with([self._allow(condition)])})
+        )
+        assert [f["Status"] for f in findings] == ["Passed"]
+        assert "issuer condition" in findings[0]["Finding_Details"]
+
+
 class TestAC32CheckRegistration:
     """AC-32 reads the global IAM cache, so it runs once and not per region."""
 
@@ -15127,10 +15202,10 @@ class TestAC32CheckRegistration:
     def test_the_condition_keys_are_matchable_and_exclude_the_weaker_claims(self):
         # _statement_condition_keys lowercases, so an uppercased entry here would
         # never match and every grant would read as unpinned.
-        keys = agentcore_app.INBOUND_JWT_ISSUER_CONDITION_KEYS
-        assert keys == tuple(key.lower() for key in keys)
-        assert "bedrock-agentcore:inboundjwtclaim/scope" not in keys
-        assert "bedrock-agentcore:inboundjwtclaim/sub" not in keys
+        # aud and client_id name the application, which any issuer can mint.
+        key = agentcore_app.INBOUND_JWT_ISSUER_KEY
+        assert key == key.lower()
+        assert key == "bedrock-agentcore:inboundjwtclaim/iss"
 
 
 _DIRECTORY_ARN = (
@@ -31998,7 +32073,15 @@ class TestAC32WholePopulation:
         assert len(passed) == 1
         assert "role narrow" in passed[0]["Finding_Details"]
 
-    def test_for_any_value_on_the_audience_pins(self):
+    @pytest.mark.parametrize(
+        "claim, status",
+        [
+            ("iss", "Passed"),
+            # Inverted: an audience alone passed. Any issuer can mint that aud.
+            ("aud", "Failed"),
+        ],
+    )
+    def test_for_any_value_pins_only_on_the_issuer(self, claim, status):
         findings = agentcore_app.check_agentcore_inbound_jwt_issuer_conditions(
             _v2_cache(
                 roles={
@@ -32008,7 +32091,9 @@ class TestAC32WholePopulation:
                                 self._EXCHANGE,
                                 {
                                     "ForAnyValue:StringEquals": {
-                                        "bedrock-agentcore:InboundJwtClaim/aud": "app-1"
+                                        f"bedrock-agentcore:InboundJwtClaim/{claim}": (
+                                            "app-1"
+                                        )
                                     }
                                 },
                             )
@@ -32017,7 +32102,7 @@ class TestAC32WholePopulation:
                 }
             )
         )
-        assert [f["Status"] for f in findings] == ["Passed"]
+        assert [f["Status"] for f in findings] == [status]
 
     @pytest.mark.parametrize(
         "statement",

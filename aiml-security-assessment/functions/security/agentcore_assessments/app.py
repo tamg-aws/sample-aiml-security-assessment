@@ -17505,16 +17505,12 @@ INBOUND_JWT_EXCHANGE_ACTIONS = (
     "getworkloadaccesstokenforjwt",
 )
 
-# The claims that bind which identity provider minted the token and which
-# application it was minted for. scope and sub bound what the token may ask for
-# and which end user it speaks for, so neither keeps a token from an unapproved
-# issuer out. client_id is available only when the JWT carries that claim under
-# that exact name, which is why the resolution names all three.
-INBOUND_JWT_ISSUER_CONDITION_KEYS = (
-    "bedrock-agentcore:inboundjwtclaim/aud",
-    "bedrock-agentcore:inboundjwtclaim/client_id",
-    "bedrock-agentcore:inboundjwtclaim/iss",
-)
+# The claim that binds which identity provider minted the token. scope and sub
+# bound what the token may ask for and which end user it speaks for, and any
+# identity provider can mint a token whose aud or client_id carries an approved
+# value, so none of them keeps a token from an unapproved issuer out. The
+# resolution still names aud and client_id to bind the application.
+INBOUND_JWT_ISSUER_KEY = "bedrock-agentcore:inboundjwtclaim/iss"
 
 
 # Operators under which an issuer condition keeps a token from another issuer
@@ -17524,9 +17520,11 @@ INBOUND_JWT_PIN_OPERATORS = {"stringequals", "stringequalsignorecase", "stringli
 
 
 def _statement_pins_inbound_jwt_issuer(statement: Dict[str, Any]) -> bool:
-    """Return whether one statement binds the exchange to named issuers or clients.
+    """Return whether one statement binds the exchange to named issuers.
 
-    The claim must sit under StringEquals or StringLike, optionally qualified
+    An aud or client_id condition names the application, and any issuer can
+    mint a token carrying that value, so only an iss condition pins. The claim
+    must sit under StringEquals or StringLike, optionally qualified
     with ForAnyValue, and every value must name something narrower than a
     wildcard. Under StringLike any `*` or `?` fails the pin, because a pattern
     such as `https://cognito-idp.*.amazonaws.com/*` admits every user pool.
@@ -17543,7 +17541,7 @@ def _statement_pins_inbound_jwt_issuer(statement: Dict[str, Any]) -> bool:
         if operator_name not in INBOUND_JWT_PIN_OPERATORS:
             continue
         for key, values in block.items():
-            if str(key).strip().lower() not in INBOUND_JWT_ISSUER_CONDITION_KEYS:
+            if str(key).strip().lower() != INBOUND_JWT_ISSUER_KEY:
                 continue
             if isinstance(values, str):
                 values = [values]
@@ -17689,9 +17687,11 @@ def check_agentcore_inbound_jwt_issuer_conditions(
                     finding_details=(
                         "The following principals can exchange an end user's JWT "
                         "for a workload access token with no condition on the "
-                        "token's issuer, audience or client id, so a token minted "
-                        "by any issuer the workload trusts is accepted: "
-                        f"{', '.join(unpinned)}. A condition under IfExists, "
+                        "token's issuer, so a token minted by any issuer the "
+                        f"workload trusts is accepted: {', '.join(unpinned)}. An "
+                        "audience or client id condition alone does not pin the "
+                        "issuer, because any identity provider can mint a token "
+                        "carrying that value. A condition under IfExists, "
                         "ForAllValues or a negated operator, or with a "
                         f"wildcard-only value, does not pin. {IAM_CACHE_SCP_NOTE}"
                     ),
@@ -17721,8 +17721,8 @@ def check_agentcore_inbound_jwt_issuer_conditions(
                     finding_name="AgentCore Inbound JWT Issuer Conditions",
                     finding_details=(
                         "The following principals exchange inbound JWTs only under "
-                        "an issuer, audience or client id condition that names a "
-                        "value under StringEquals or StringLike: "
+                        "an issuer condition that names a value under StringEquals "
+                        "or StringLike: "
                         f"{', '.join(pinned)}."
                     ),
                     resolution=(
