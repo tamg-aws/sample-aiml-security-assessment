@@ -298,6 +298,16 @@ section.
 
 ### Fixed
 
+- `AG-39` gateway WAF rule coverage and `AC-51` web ACL Anti-DDoS fail a
+  filter that runs after an `Allow` rule only when the `Allow` matches on the
+  same attack class: a SQL injection match ahead of SQL injection inspection,
+  a cross-site scripting match ahead of cross-site scripting inspection, or a
+  rate-based statement ahead of a rate-based rule. Behind any other `Allow`,
+  such as an IP set or a byte match, the filter is not judged, and a row whose
+  only gaps sit behind such an `Allow` moves from `Failed` to informational
+  `N/A` naming the rule. The check reads no `Allow` statement for how many
+  requests it lets through, so it cannot say whether those filters see them.
+
 - `SM-35` security service delegated administrator passes a service only
   when its principal also has trusted access in the organization, read with
   `organizations:ListAWSServiceAccessForOrganization` (newly granted to the

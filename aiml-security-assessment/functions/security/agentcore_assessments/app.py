@@ -28434,6 +28434,14 @@ WAF_SQLI_REQUIRED_SENSITIVITY = "HIGH"
 WAF_BODY_FIELDS = ("Body", "JsonBody")
 WAF_CORE_RULE_SET_BODY_SIZE_RULE = "SizeRestrictions_BODY"
 
+# The statement that puts an Allow rule in the same attack class as a filter it
+# runs ahead of. An Allow on any other statement is not judged for its reach.
+WAF_ATTACK_CLASS_STATEMENTS = (
+    ("sqli", "SqliMatchStatement"),
+    ("xss", "XssMatchStatement"),
+    ("rate", "RateBasedStatement"),
+)
+
 # AC-51 reads for the AWS managed Anti-DDoS rule group by its published name.
 # Its soft mitigation already challenges, so only an inner override to Count or
 # Allow, or an exclusion, stops a rule from mitigating.
@@ -28497,8 +28505,14 @@ def _waf_rule_coverage(web_acl: Dict[str, Any]) -> Dict[str, Any]:
     blocks nothing. Rules are read in the order given, which
     _web_acl_with_firewall_manager_rules sorts by Priority, and an Allow rule
     ends evaluation for the requests it matches, so a filter in a later rule is
-    listed under shadowed and not credited: the statement of the Allow is not
-    judged for how many requests it matches. Inside an AWS managed rule group, a rule overridden to any
+    not credited. The statement of the Allow is not judged for how many requests
+    it matches, so the filter is listed under shadowed only when the Allow
+    matches on the same attack class (a SQL injection match ahead of SQL
+    injection inspection, a cross-site scripting match ahead of cross-site
+    scripting inspection, a rate-based statement ahead of a rate-based rule).
+    Behind any other Allow, such as an IP set match, the filter is listed under
+    unjudged and its kind under unjudged_kinds, which the callers read as not
+    judged. Inside an AWS managed rule group, a rule overridden to any
     action but Block, or excluded, does not block, so a group is not credited
     with SQL injection or cross-site scripting inspection when a rule that
     provides it is overridden. The group's rule list is not read, so a group
@@ -28531,9 +28545,12 @@ def _waf_rule_coverage(web_acl: Dict[str, Any]) -> Dict[str, Any]:
         "anti_ddos_config": None,
         "weakened": [],
         "shadowed": [],
+        "unjudged": [],
+        "unjudged_kinds": set(),
         "evidence": {},
     }
-    allowed_by: List[str] = []
+    # Each Allow rule read so far, with the attack classes its statement matches.
+    allowed_by: List[Tuple[str, Set[str]]] = []
     labels = {
         "sqli": "SQL injection inspection",
         "xss": "cross-site scripting inspection",
@@ -28541,11 +28558,20 @@ def _waf_rule_coverage(web_acl: Dict[str, Any]) -> Dict[str, Any]:
 
     def credit(kind: str, evidence: str, what: str) -> bool:
         """Credit a filter unless an earlier Allow rule lets requests past it."""
-        if allowed_by:
+        same_class = [name for name, classes in allowed_by if kind in classes]
+        if same_class:
             coverage["shadowed"].append(
-                f"{what} in {evidence} runs after {', '.join(allowed_by)}, whose "
+                f"{what} in {evidence} runs after {', '.join(same_class)}, whose "
                 "Allow action lets a request it matches through uninspected"
             )
+            return False
+        if allowed_by:
+            coverage["unjudged"].append(
+                f"{what} in {evidence} runs after "
+                f"{', '.join(name for name, _ in allowed_by)}, whose Allow "
+                "statement is not judged for the requests it lets through"
+            )
+            coverage["unjudged_kinds"].add(kind)
             return False
         if not coverage[kind]:
             coverage[kind] = True
@@ -28700,7 +28726,17 @@ def _waf_rule_coverage(web_acl: Dict[str, Any]) -> Dict[str, Any]:
                 )
 
         if "Allow" in (rule.get("Action") or {}):
-            allowed_by.append(f"rule '{rule_name}'")
+            allowed_by.append(
+                (
+                    f"rule '{rule_name}'",
+                    {
+                        kind
+                        for node in _waf_statement_nodes(rule.get("Statement"))
+                        for kind, key in WAF_ATTACK_CLASS_STATEMENTS
+                        if key in node
+                    },
+                )
+            )
 
     for kind, evidence in no_match_pending:
         if not body_size_rule:
@@ -28794,6 +28830,18 @@ def _gateway_waf_rule_findings(
         ),
     ]
     missing = [name for name, present, _ in conditions if not present]
+    # A filter behind an Allow whose statement is not judged may or may not be
+    # reached, so only the other missing filters fail the row.
+    unjudged_names = {
+        "SQL injection inspection": "sqli",
+        "cross-site scripting inspection": "xss",
+        "a rate-based rule": "rate",
+    }
+    failed_missing = [
+        name
+        for name in missing
+        if unjudged_names.get(name) not in coverage["unjudged_kinds"]
+    ]
     applied = "; ".join(
         f"{name} from {why or 'the web ACL'}"
         for name, present, why in conditions
@@ -28818,16 +28866,22 @@ def _gateway_waf_rule_findings(
             if coverage["shadowed"]
             else ""
         )
+        + (
+            " Not judged because an earlier Allow rule may let requests past it: "
+            f"{'; '.join(coverage['unjudged'])}."
+            if coverage["unjudged"]
+            else ""
+        )
     )
     fails_open = (
         " The gateway's wafConfiguration failureMode is FAIL_OPEN, so the gateway "
         "allows a request when AWS WAF cannot be evaluated."
     )
 
-    if missing and not coverage["opaque"]:
+    if failed_missing and not coverage["opaque"]:
         reference = (
             WAF_BODY_INSPECTION_LIMIT_REFERENCE_URL
-            if not body_filters and len(missing) == 1
+            if not body_filters and len(failed_missing) == 1
             else WAF_RULE_ACTION_REFERENCE_URL
         )
         return [
@@ -28836,8 +28890,8 @@ def _gateway_waf_rule_findings(
                 finding_name="Agentic AI Gateway WAF Rule Coverage Gaps",
                 finding_details=(
                     f"{label} is associated with web ACL {acl_name}, which is "
-                    f"missing {len(missing)} of the five request filters this "
-                    f"check reads: {', '.join(missing)}. It applies "
+                    f"missing {len(failed_missing)} of the five request filters "
+                    f"this check reads: {', '.join(failed_missing)}. It applies "
                     f"{applied or 'none of the five'}.{overridden}"
                     f"{fails_open if failure_mode == 'FAIL_OPEN' else ''}"
                 ),
@@ -28893,6 +28947,28 @@ def _gateway_waf_rule_findings(
                 reference=AGENTCORE_GATEWAY_API_REFERENCE_URL,
                 severity=SeverityEnum.MEDIUM,
                 status=StatusEnum.FAILED,
+            )
+        ]
+
+    if missing and not coverage["opaque"]:
+        return [
+            create_finding(
+                check_id="AG-39",
+                finding_name="Agentic AI Gateway WAF Rule Coverage",
+                finding_details=(
+                    f"{label} is associated with web ACL {acl_name}, which runs "
+                    f"{', '.join(missing)} only after an Allow rule whose "
+                    "statement this check does not judge, so whether those "
+                    "filters see the requests the Allow lets through was not "
+                    f"judged.{overridden}"
+                ),
+                resolution=(
+                    "Confirm the earlier Allow rule matches only trusted "
+                    "requests, or move the filters ahead of it by Priority."
+                ),
+                reference=WAF_RULE_ACTION_REFERENCE_URL,
+                severity=SeverityEnum.INFORMATIONAL,
+                status=StatusEnum.NA,
             )
         ]
 
@@ -29200,6 +29276,14 @@ def check_agentcore_web_acl_anti_ddos() -> List[Dict[str, Any]]:
             f"{'; '.join(coverage['opaque'])}. Those groups may carry one, so the "
             "rate leg was not judged."
         )
+        unjudged = (
+            " Not judged because an earlier Allow rule may let requests past it: "
+            f"{'; '.join(coverage['unjudged'])}."
+        )
+        unjudged_resolution = (
+            "Confirm the earlier Allow rule matches only trusted requests, or "
+            "move the rule behind it ahead of the Allow by Priority."
+        )
         if coverage["anti_ddos"]:
             runs = (
                 f"{label} is associated with web ACL {acl_name}, which runs "
@@ -29217,6 +29301,15 @@ def check_agentcore_web_acl_anti_ddos() -> List[Dict[str, Any]]:
                         "No action required.",
                         SeverityEnum.MEDIUM,
                         StatusEnum.PASSED,
+                    )
+                )
+            elif "rate" in coverage["unjudged_kinds"]:
+                findings.append(
+                    finding(
+                        f"{runs}{unjudged}",
+                        unjudged_resolution,
+                        SeverityEnum.INFORMATIONAL,
+                        StatusEnum.NA,
                     )
                 )
             elif coverage["opaque"]:
@@ -29249,6 +29342,20 @@ def check_agentcore_web_acl_anti_ddos() -> List[Dict[str, Any]]:
             if coverage["anti_ddos_overridden"]
             else ""
         )
+        if "anti_ddos" in coverage["unjudged_kinds"]:
+            findings.append(
+                finding(
+                    f"{label} is associated with web ACL {acl_name}, which runs "
+                    f"{WAF_ANTI_DDOS_RULE_GROUP} only after an Allow rule whose "
+                    "statement this check does not judge, so whether the group "
+                    "sees the requests the Allow lets through was not judged."
+                    f"{unjudged}",
+                    unjudged_resolution,
+                    SeverityEnum.INFORMATIONAL,
+                    StatusEnum.NA,
+                )
+            )
+            continue
         findings.append(
             finding(
                 f"{label} is associated with web ACL {acl_name}, which does not "

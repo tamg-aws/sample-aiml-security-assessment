@@ -27873,16 +27873,18 @@ class TestAG39GatewayWafRuleCoverage:
         if action == "Allow":
             details = findings[0]["Finding_Details"]
             assert findings[0]["Status"] == "Failed"
-            # Every filter after the Allow loses credit: its statement is not
-            # judged for which requests it matches.
-            assert "missing 3 of the five" in details
-            assert (
-                "SQL injection inspection, cross-site scripting inspection, "
-                "a rate-based rule" in details.split("It applies")[0]
-            )
+            # The SQL injection Allow is the same attack class as the filter
+            # behind it, so that filter fails. The cross-site scripting and
+            # rate filters behind it are not judged: the Allow matches on SQL
+            # injection, not on their class.
+            assert "missing 1 of the five" in details
+            assert "this check reads: SQL injection inspection." in details
             assert (
                 "SQL injection inspection in rule 'sqli-block' runs after rule "
                 "'sqli-soft'" in details
+            )
+            assert "a rate-based rule in rule 'rate' runs after rule 'sqli-soft'" in (
+                details
             )
             return
         assert findings[0]["Status"] == "Passed"
@@ -42363,18 +42365,22 @@ class TestWafRuleOrderAndScope:
 
     @patch("agentcore_app.wafv2_client")
     @patch("agentcore_app.agentcore_client")
-    def test_an_allow_that_runs_first_fails_the_filters_behind_it(
+    def test_an_allow_that_runs_first_leaves_the_filters_behind_it_unjudged(
         self, mock_ac, mock_waf
     ):
-        # Listed last, run first: Priority decides, not the list position.
+        # Listed last, run first: Priority decides, not the list position. A
+        # byte match Allow is not judged for its reach, so the filters behind
+        # it are neither credited nor failed.
         rules = self._filters() + [_allow_every_path_rule(priority=0)]
         findings = self._base._ag39(mock_ac, mock_waf, self._base._acl(rules=rules))
 
-        assert [f["Status"] for f in findings] == ["Failed"]
+        assert [f["Status"] for f in findings] == ["N/A"]
         details = findings[0]["Finding_Details"]
-        assert "missing 3 of the five" in details
+        assert (
+            "runs SQL injection inspection, cross-site scripting inspection, "
+            "a rate-based rule only after an Allow rule" in details
+        )
         assert "rule 'allow-root'" in details
-        assert "Allow" in details
 
     @patch("agentcore_app.wafv2_client")
     @patch("agentcore_app.agentcore_client")
@@ -42397,13 +42403,15 @@ class TestWafRuleOrderAndScope:
         findings = self._base._ag39(mock_ac, mock_waf, self._base._acl(rules=rules))
 
         details = findings[0]["Finding_Details"]
-        assert findings[0]["Status"] == "Failed"
-        assert "missing 2 of the five" in details
-        assert "cross-site scripting inspection, a rate-based rule" in details
-        assert "SQL injection inspection from" in details
+        assert findings[0]["Status"] == "N/A"
+        assert (
+            "runs cross-site scripting inspection, a rate-based rule only after"
+            in details
+        )
+        assert "SQL injection inspection in" not in details
 
     @pytest.mark.parametrize(
-        "allow_priority, status", [(2, "Failed"), (99, "Passed")], ids=["first", "last"]
+        "allow_priority, status", [(2, "N/A"), (99, "Passed")], ids=["first", "last"]
     )
     @patch("agentcore_app.wafv2_client")
     @patch("agentcore_app.agentcore_client")
@@ -42425,9 +42433,9 @@ class TestWafRuleOrderAndScope:
         findings = self._base._ag39(mock_ac, mock_waf, self._base._acl(rules=rules))
 
         assert [f["Status"] for f in findings] == [status]
-        if status == "Failed":
+        if status == "N/A":
             details = findings[0]["Finding_Details"]
-            assert "missing 1 of the five" in details
+            assert "runs cross-site scripting inspection only after" in details
             assert (
                 "cross-site scripting inspection in rule 'xss-body' runs after "
                 "rule 'allow-root'" in details
@@ -42515,12 +42523,13 @@ class TestWafRuleOrderAndScope:
         findings = self._base._ag39(mock_ac, mock_waf, acl)
 
         details = findings[0]["Finding_Details"]
-        assert findings[0]["Status"] == "Failed"
-        assert "missing 1 of the five" in details
-        assert "a rate-based rule" in details.split("It applies")[0]
+        assert findings[0]["Status"] == "N/A"
+        assert "runs a rate-based rule only after an Allow rule" in details
+        assert "SQL injection inspection in" not in details
+        assert "cross-site scripting inspection in" not in details
 
     @pytest.mark.parametrize(
-        "allow_priority, status", [(0, "Failed"), (99, "Passed")], ids=["first", "last"]
+        "allow_priority, status", [(0, "N/A"), (99, "Passed")], ids=["first", "last"]
     )
     @patch("agentcore_app.wafv2_client")
     @patch("agentcore_app.agentcore_client")
@@ -42543,8 +42552,10 @@ class TestWafRuleOrderAndScope:
         findings = agentcore_app.check_agentcore_web_acl_anti_ddos()
 
         assert [f["Status"] for f in findings] == [status]
-        if status == "Failed":
-            assert "rule 'allow-root'" in findings[0]["Finding_Details"]
+        if status == "N/A":
+            details = findings[0]["Finding_Details"]
+            assert "AWSManagedRulesAntiDDoSRuleSet only after an Allow" in details
+            assert "rule 'allow-root'" in details
 
     @patch("agentcore_app.wafv2_client")
     @patch("agentcore_app.agentcore_client")
@@ -42567,7 +42578,114 @@ class TestWafRuleOrderAndScope:
 
         findings = agentcore_app.check_agentcore_web_acl_anti_ddos()
 
-        assert [f["Status"] for f in findings] == ["Failed"]
+        assert [f["Status"] for f in findings] == ["N/A"]
         details = findings[0]["Finding_Details"]
-        assert "rule 'rate'" in details
-        assert "rule 'allow-root'" in details
+        assert "a rate-based rule in rule 'rate' runs after rule 'allow-root'" in (
+            details
+        )
+        assert "not judged" in details
+
+    @pytest.mark.parametrize(
+        "allow_statement, status",
+        [
+            (
+                {
+                    "IPSetReferenceStatement": {
+                        "ARN": "arn:aws:wafv2:us-east-1:123456789012:regional/"
+                        "ipset/trusted/abc"
+                    }
+                },
+                "N/A",
+            ),
+            (
+                {"RateBasedStatement": {"Limit": 100, "AggregateKeyType": "IP"}},
+                "Failed",
+            ),
+        ],
+        ids=["ip-set", "same-class"],
+    )
+    @patch("agentcore_app.wafv2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_ac51_fails_a_rate_rule_only_behind_a_rate_class_allow(
+        self, mock_ac, mock_waf, allow_statement, status
+    ):
+        allow = {
+            "Name": "allow-first",
+            "Priority": 2,
+            "Action": {"Allow": {}},
+            "Statement": allow_statement,
+        }
+        _gateway_stub(
+            mock_ac,
+            mock_waf,
+            {"gw-1": "acl"},
+            {
+                "acl": {
+                    "Name": "acl",
+                    "Rules": [
+                        {**_anti_ddos_rule(), "Priority": 1},
+                        allow,
+                        {**_rate_rule(), "Priority": 3},
+                    ],
+                }
+            },
+        )
+
+        findings = agentcore_app.check_agentcore_web_acl_anti_ddos()
+
+        assert [f["Status"] for f in findings] == [status]
+        assert "rule 'allow-first'" in findings[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "allow_statement, status",
+        [
+            (
+                {
+                    "IPSetReferenceStatement": {
+                        "ARN": "arn:aws:wafv2:us-east-1:123456789012:regional/"
+                        "ipset/trusted/abc"
+                    }
+                },
+                "N/A",
+            ),
+            (
+                {
+                    "SqliMatchStatement": {
+                        "FieldToMatch": {"Body": {}},
+                        "TextTransformations": [{"Priority": 0, "Type": "NONE"}],
+                    }
+                },
+                "Failed",
+            ),
+        ],
+        ids=["ip-set", "same-class"],
+    )
+    @patch("agentcore_app.wafv2_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_an_earlier_allow_fails_only_its_own_attack_class(
+        self, mock_ac, mock_waf, allow_statement, status
+    ):
+        # The same four filters behind one Allow. An IP set Allow is not judged
+        # for which callers it lets past, so the row is N/A. A SQL injection
+        # match Allow lets SQL injection past the SQL injection filter, so the
+        # row fails on that filter alone and leaves the other two unjudged.
+        allow = {
+            "Name": "allow-first",
+            "Priority": 0,
+            "Action": {"Allow": {}},
+            "Statement": allow_statement,
+        }
+        rules = [allow] + self._filters()
+        findings = self._base._ag39(mock_ac, mock_waf, self._base._acl(rules=rules))
+
+        assert [f["Status"] for f in findings] == [status]
+        details = findings[0]["Finding_Details"]
+        assert "rule 'allow-first'" in details
+        if status == "Failed":
+            assert "missing 1 of the five" in details
+            assert "this check reads: SQL injection inspection." in details
+            assert (
+                "cross-site scripting inspection in AWSManagedRulesCommonRuleSet "
+                "in rule 'common' runs after rule 'allow-first', whose Allow "
+                "statement is not judged" in details
+            )
