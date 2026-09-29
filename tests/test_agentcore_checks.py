@@ -39999,6 +39999,176 @@ class TestAC20DeliveryDestinationGroups:
         assert self._by_group(findings) == {"/aws/bedrock-agentcore/x": "Failed"}
 
 
+class TestAC26DeliveryDestinationGroups:
+    """AIR-ACR-GW-10: AC-26 judges retention and key scope on a log group
+    outside the AgentCore prefixes that a delivery from an AgentCore source
+    writes to, the same population AC-20 reads."""
+
+    _wire = staticmethod(TestAC20DeliveryDestinationGroups._wire)
+    _source = staticmethod(TestAC20DeliveryDestinationGroups._source)
+    _delivery = staticmethod(TestAC20DeliveryDestinationGroups._delivery)
+    _destination = staticmethod(TestAC20DeliveryDestinationGroups._destination)
+    _KEY = TestAC26LogRetentionAndKeyScope._KEY
+
+    @staticmethod
+    def _by_group(findings):
+        for finding in findings:
+            assert finding["Check_ID"] == "AC-26"
+            assert_finding_schema(finding)
+        return {
+            f["Finding_Details"].split("'")[1]: f["Status"]
+            for f in findings
+            if f["Finding_Details"].startswith("Log group '")
+        }
+
+    def _scoped(self, mock_kms):
+        mock_kms.get_key_policy.return_value = {
+            "Policy": TestAC26LogRetentionAndKeyScope._SCOPED_KEY_POLICY
+        }
+
+    @patch("agentcore_app.kms_client")
+    @patch("agentcore_app.logs_client")
+    def test_delivered_groups_outside_the_prefixes_are_judged(
+        self, mock_logs, mock_kms
+    ):
+        self._scoped(mock_kms)
+        self._wire(
+            mock_logs,
+            {
+                "/aws/bedrock-agentcore/": [
+                    {
+                        "logGroupName": "/aws/bedrock-agentcore/runtimes/rt-1",
+                        "kmsKeyId": self._KEY,
+                        "retentionInDays": 30,
+                        "deletionProtectionEnabled": True,
+                    }
+                ],
+                "team/agent-logs": [
+                    {"logGroupName": "team/agent-logs"},
+                    {"logGroupName": "team/agent-logs-archive"},
+                ],
+                "team/kept-logs": [
+                    {
+                        "logGroupName": "team/kept-logs",
+                        "kmsKeyId": self._KEY,
+                        "retentionInDays": 90,
+                    }
+                ],
+                "team/other-logs": [{"logGroupName": "team/other-logs"}],
+            },
+            sources=[
+                self._source("gw-src"),
+                self._source("rt-src"),
+                self._source("mem-src"),
+                self._source("lambda-src", service="lambda"),
+            ],
+            deliveries=[
+                self._delivery("gw-src", "dd-arn-1"),
+                self._delivery("rt-src", "dd-arn-4"),
+                self._delivery("mem-src", "dd-arn-2", kind="S3"),
+                self._delivery("lambda-src", "dd-arn-3"),
+            ],
+            destinations=[
+                self._destination("dd-arn-4", "team/kept-logs"),
+                self._destination("dd-arn-1", "team/agent-logs"),
+                self._destination("dd-arn-2", "bucket", kind="S3"),
+                self._destination("dd-arn-3", "team/other-logs"),
+            ],
+        )
+        by_group = self._by_group(
+            agentcore_app.check_agentcore_log_retention_and_key_scope()
+        )
+        assert by_group == {
+            "/aws/bedrock-agentcore/runtimes/rt-1": "Passed",
+            "team/agent-logs": "Failed",
+            "team/kept-logs": "Passed",
+        }
+
+    @patch("agentcore_app.kms_client")
+    @patch("agentcore_app.logs_client")
+    def test_a_delivered_group_alone_is_judged_not_reported_absent(
+        self, mock_logs, mock_kms
+    ):
+        self._scoped(mock_kms)
+        self._wire(
+            mock_logs,
+            {"team/agent-logs": [{"logGroupName": "team/agent-logs"}]},
+            sources=[self._source("gw-src")],
+            deliveries=[self._delivery("gw-src", "dd-arn-1")],
+            destinations=[self._destination("dd-arn-1", "team/agent-logs")],
+        )
+        findings = agentcore_app.check_agentcore_log_retention_and_key_scope()
+        assert self._by_group(findings) == {"team/agent-logs": "Failed"}
+        assert "no retention period" in findings[0]["Finding_Details"]
+        assert not [
+            f for f in findings if "No AgentCore log groups" in f["Finding_Details"]
+        ]
+
+    @patch("agentcore_app.kms_client")
+    @patch("agentcore_app.logs_client")
+    def test_a_denied_destination_read_is_na_naming_the_action(
+        self, mock_logs, mock_kms
+    ):
+        self._scoped(mock_kms)
+        self._wire(
+            mock_logs,
+            {
+                "/aws/bedrock-agentcore/": [
+                    {"logGroupName": "/aws/bedrock-agentcore/runtimes/rt-1"},
+                    {
+                        "logGroupName": "/aws/bedrock-agentcore/runtimes/rt-2",
+                        "kmsKeyId": self._KEY,
+                        "retentionInDays": 30,
+                        "deletionProtectionEnabled": True,
+                    },
+                ]
+            },
+            sources=[self._source("gw-src")],
+            deliveries=[self._delivery("gw-src", "dd-arn-1")],
+            destinations=_make_client_error("AccessDeniedException", "denied"),
+        )
+        findings = agentcore_app.check_agentcore_log_retention_and_key_scope()
+        (na,) = [f for f in findings if f["Status"] == "N/A"]
+        assert "AccessDeniedException" in na["Finding_Details"]
+        assert "logs:DescribeDeliveryDestinations" in na["Resolution"]
+        assert self._by_group(findings) == {
+            "/aws/bedrock-agentcore/runtimes/rt-1": "Failed",
+            "/aws/bedrock-agentcore/runtimes/rt-2": "Passed",
+        }
+
+    @patch("agentcore_app.kms_client")
+    @patch("agentcore_app.logs_client")
+    def test_a_denied_read_with_no_prefix_group_is_still_na(self, mock_logs, mock_kms):
+        self._wire(
+            mock_logs,
+            {},
+            sources=[self._source("gw-src")],
+            deliveries=[self._delivery("gw-src", "dd-arn-1")],
+            destinations=_make_client_error("AccessDeniedException", "denied"),
+        )
+        findings = agentcore_app.check_agentcore_log_retention_and_key_scope()
+        assert [f["Status"] for f in findings] == ["N/A", "N/A"]
+        assert any(
+            "logs:DescribeDeliveryDestinations" in f["Resolution"] for f in findings
+        )
+
+    @patch("agentcore_app.kms_client")
+    @patch("agentcore_app.logs_client")
+    def test_a_delivered_group_under_a_prefix_is_not_judged_twice(
+        self, mock_logs, mock_kms
+    ):
+        name = "/aws/vendedlogs/bedrock-agentcore/gateway/g"
+        self._wire(
+            mock_logs,
+            {"/aws/vendedlogs/bedrock-agentcore/": [{"logGroupName": name}]},
+            sources=[self._source("gw-src")],
+            deliveries=[self._delivery("gw-src", "dd-arn-1")],
+            destinations=[self._destination("dd-arn-1", name)],
+        )
+        findings = agentcore_app.check_agentcore_log_retention_and_key_scope()
+        assert [f["Status"] for f in findings] == ["Failed"]
+
+
 class TestAC22TelemetryLinks:
     """AIR-ACR-OBS-06: an account with no sink is judged on the links it uses to
     share AgentCore telemetry with a monitoring account."""

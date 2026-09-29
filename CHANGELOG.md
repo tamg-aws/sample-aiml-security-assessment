@@ -298,6 +298,14 @@ section.
 
 ### Fixed
 
+- `AC-26` judges retention and key scope on a log group a `bedrock-agentcore`
+  delivery writes to outside the AgentCore prefixes. AC-20 already read those
+  groups through `DescribeDeliveryDestinations`, but AC-26 read only the
+  prefixed groups, so a custom-named delivery group with no retention and no
+  key passed GW-10 by absence. An unreadable delivery chain is an `N/A` row
+  naming the three `logs:Describe*` actions, and the prefixed groups are still
+  judged. No new IAM action: the three reads were granted for AC-20.
+
 - `AC-38` judges the gateway role's `GetWorkloadAccessToken` grant. The
   devguide states the Gateway mints a Workload Access Token to carry the
   session identity once temporal policy is active, and that without this grant

@@ -14441,6 +14441,10 @@ def check_agentcore_log_retention_and_key_scope() -> List[Dict[str, Any]]:
     investigation of the agent would start from. CloudWatch Logs leaves deletion
     protection off by default, so an absent deletionProtectionEnabled reads as
     off.
+
+    A log group outside the AgentCore prefixes that a delivery from an
+    AgentCore source writes to is judged as well, the same population AC-20
+    reads; when the delivery reads fail an N/A row names them.
     """
     if logs_client is None:
         return [
@@ -14467,8 +14471,44 @@ def check_agentcore_log_retention_and_key_scope() -> List[Dict[str, Any]]:
             )
         ]
 
+    findings = []
+    known_names = {group.get("logGroupName") for group in log_groups}
+    try:
+        for name in sorted(_agentcore_delivery_log_group_names() - known_names):
+            log_groups.extend(
+                group
+                for group in _paginate_aws_list(
+                    logs_client,
+                    "describe_log_groups",
+                    "logGroups",
+                    logGroupNamePrefix=name,
+                )
+                if group.get("logGroupName") == name
+            )
+    except (BotoCoreError, ClientError) as error:
+        findings.append(
+            create_finding(
+                check_id="AC-26",
+                finding_name="AgentCore Log Retention and Key Scope",
+                finding_details=(
+                    "The log groups outside the AgentCore prefixes that a delivery "
+                    "from an AgentCore resource writes to could not be read, so "
+                    "their retention and key were not judged: "
+                    f"{_assessment_error_label(error)}."
+                ),
+                resolution=(
+                    "Grant logs:DescribeDeliveryDestinations, "
+                    "logs:DescribeDeliveries and logs:DescribeDeliverySources "
+                    "and retry."
+                ),
+                reference=LOGS_RETENTION_REFERENCE_URL,
+                severity=SeverityEnum.INFORMATIONAL,
+                status=StatusEnum.NA,
+            )
+        )
+
     if not log_groups:
-        return [
+        return findings + [
             create_finding(
                 check_id="AC-26",
                 finding_name="AgentCore Log Retention and Key Scope",
@@ -14481,7 +14521,6 @@ def check_agentcore_log_retention_and_key_scope() -> List[Dict[str, Any]]:
         ]
 
     key_policy_cache: Dict[str, Any] = {}
-    findings = []
     for log_group in log_groups:
         log_group_name = log_group.get("logGroupName")
         if not log_group_name:

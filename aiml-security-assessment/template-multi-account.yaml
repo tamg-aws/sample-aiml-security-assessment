@@ -1338,8 +1338,8 @@ Resources:
                 - cloudtrail:ListTrails # AC-18, AC-26
                 # Formerly LogsDeliveryInventory
                 # AC-19 pairs each AgentCore delivery source with its delivery.
-                - logs:DescribeDeliverySources # AC-04, AC-19, AC-20, AC-46
-                - logs:DescribeDeliveries # AC-04, AC-19, AC-20, AC-46
+                - logs:DescribeDeliverySources # AC-04, AC-19, AC-20, AC-26, AC-46
+                - logs:DescribeDeliveries # AC-04, AC-19, AC-20, AC-26, AC-46
                 # Formerly LogsAccountPolicyInventory
                 - logs:DescribeAccountPolicies # AC-20
                 # Formerly ObservabilitySinkInventory
@@ -1358,7 +1358,7 @@ Resources:
                 # has a resource type in the service authorization reference, so
                 # each needs Resource '*'.
                 - xray:GetTraceSegmentDestination # AC-19
-                - logs:DescribeDeliveryDestinations # AC-20
+                - logs:DescribeDeliveryDestinations # AC-20, AC-26
                 - organizations:DescribeOrganization # AC-22
                 - oam:ListLinks # AC-22
                 - s3:GetAccountPublicAccessBlock # AC-06
