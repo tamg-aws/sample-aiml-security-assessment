@@ -14250,6 +14250,158 @@ class TestAC26LogTamperStreamsAndInvocationGroup:
         assert call.split(",", 1)[0].split("(", 1)[1].strip() == '"bedrock"'
 
 
+_WEST_GROUP = "west-invocations"
+_WEST_RESOURCES = [
+    f"arn:aws:logs:us-west-2:*:log-group:{_WEST_GROUP}",
+    f"arn:aws:logs:us-west-2:*:log-group:{_WEST_GROUP}:*",
+    f"arn:aws:logs:us-west-2:*:log-group:{_WEST_GROUP}:log-stream:*",
+]
+
+
+@pytest.mark.usefixtures("_member_account")
+class TestAC26LogTamperEveryRegionsInvocationGroup:
+    """AC-26 SCP leg: the invocation log group of every assessed Region."""
+
+    _REGIONS = ["us-east-1", "us-west-2", "eu-west-1"]
+
+    @pytest.fixture(autouse=True)
+    def bedrock(self):
+        with patch("agentcore_app.bedrock_client") as bedrock:
+            bedrock.meta.region_name = "us-east-1"
+            bedrock.get_model_invocation_logging_configuration.return_value = {
+                "loggingConfig": {
+                    "cloudWatchConfig": {"logGroupName": _INVOCATION_GROUP}
+                }
+            }
+            yield bedrock
+
+    def _regional(self, west=None, europe=None):
+        west_client = MagicMock()
+        if isinstance(west, Exception):
+            west_client.get_model_invocation_logging_configuration.side_effect = west
+        else:
+            west_client.get_model_invocation_logging_configuration.return_value = {
+                "loggingConfig": {
+                    "cloudWatchConfig": {"logGroupName": west or _WEST_GROUP}
+                }
+            }
+        europe_client = MagicMock()
+        europe_client.get_model_invocation_logging_configuration.side_effect = (
+            europe
+            or EndpointConnectionError(
+                endpoint_url="https://bedrock.eu-west-1.amazonaws.com"
+            )
+        )
+        return {"us-west-2": west_client, "eu-west-1": europe_client}
+
+    def _findings(self, mock_orgs, documents, clients, regions=None):
+        sts = MagicMock()
+        sts.get_caller_identity.return_value = {"Account": _MEMBER_ACCOUNT}
+        with (
+            patch("agentcore_app.boto3.client") as factory,
+            patch.object(
+                agentcore_app,
+                "_ac26_every_region",
+                lambda: agentcore_app.check_agentcore_log_tamper_scp(
+                    regions or self._REGIONS
+                ),
+                create=True,
+            ),
+        ):
+            factory.side_effect = lambda service, **kwargs: (
+                sts if service == "sts" else clients[kwargs["region_name"]]
+            )
+            findings = TestSCPAttachment._run(
+                self, mock_orgs, "_ac26_every_region", documents
+            )
+        return findings, [
+            call for call in factory.call_args_list if call.args != ("sts",)
+        ]
+
+    @patch("agentcore_app.organizations_client")
+    def test_a_deny_that_misses_another_regions_invocation_group_fails(self, mock_orgs):
+        findings, factory = self._findings(
+            mock_orgs,
+            {
+                "DenyLogTamper": _log_tamper_guard(
+                    resource=_AGENTCORE_LOG_RESOURCES + _INVOCATION_RESOURCES
+                )
+            },
+            self._regional(),
+        )
+
+        assert [f["Status"] for f in findings] == ["Failed"]
+        assert findings[0]["Finding"] == "Log Tamper Guardrail Missing"
+        assert sorted(call.kwargs["region_name"] for call in factory) == [
+            "eu-west-1",
+            "us-west-2",
+        ]
+        for call in factory:
+            assert call.args == ("bedrock",)
+
+    @patch("agentcore_app.organizations_client")
+    def test_a_deny_on_every_regions_invocation_group_passes(self, mock_orgs):
+        findings, _ = self._findings(
+            mock_orgs,
+            {
+                "DenyLogTamper": _log_tamper_guard(
+                    resource=_AGENTCORE_LOG_RESOURCES
+                    + _INVOCATION_RESOURCES
+                    + _WEST_RESOURCES
+                )
+            },
+            self._regional(),
+        )
+
+        assert [f["Status"] for f in findings] == ["Passed"]
+        assert (
+            "the Bedrock model invocation log group each assessed Region"
+            in (findings[0]["Finding_Details"])
+        )
+
+    @patch("agentcore_app.organizations_client")
+    def test_an_unread_other_region_turns_a_pass_into_na_naming_it(self, mock_orgs):
+        findings, _ = self._findings(
+            mock_orgs,
+            {
+                "DenyLogTamper": _log_tamper_guard(
+                    resource=_AGENTCORE_LOG_RESOURCES + _INVOCATION_RESOURCES
+                )
+            },
+            self._regional(west=_make_client_error("AccessDeniedException", "denied")),
+        )
+
+        assert [f["Status"] for f in findings] == ["N/A"]
+        assert findings[0]["Finding"] == "Log Tamper Guardrail Incomplete"
+        details = findings[0]["Finding_Details"]
+        assert "could not be read in us-west-2 (AccessDeniedException" in details
+        assert "eu-west-1" not in details.split("could not be read", 1)[1]
+
+    @patch("agentcore_app.organizations_client")
+    def test_an_opted_out_region_is_skipped(self, mock_orgs):
+        findings, _ = self._findings(
+            mock_orgs,
+            {
+                "DenyLogTamper": _log_tamper_guard(
+                    resource=_AGENTCORE_LOG_RESOURCES
+                    + _INVOCATION_RESOURCES
+                    + _WEST_RESOURCES
+                )
+            },
+            self._regional(
+                europe=_make_client_error("UnrecognizedClientException", "opt-in")
+            ),
+        )
+
+        assert [f["Status"] for f in findings] == ["Passed"]
+
+    def test_both_global_check_lists_pass_the_assessed_regions(self):
+        source = textwrap.dedent(inspect.getsource(agentcore_app.lambda_handler))
+
+        assert source.count("check_agentcore_log_tamper_scp(target_regions)") == 2
+        assert source.count("check_agentcore_log_tamper_scp,") == 0
+
+
 class TestAC26VendedLogDeletionProtection:
     """AC-26: vended-log groups are held to deletion protection."""
 

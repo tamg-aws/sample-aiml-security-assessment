@@ -298,6 +298,15 @@ section.
 
 ### Fixed
 
+- `AC-26` log tamper guardrail probes the Bedrock model invocation log group
+  of every assessed Region. It read the logging configuration of the primary
+  Region only, so an SCP that left another Region's invocation log group
+  open passed. The primary Region now reads each Region in `TargetRegions`
+  with its own Bedrock client, fails a deny that misses any of those groups,
+  and is `N/A` naming a Region whose configuration could not be read. A
+  Region with no Bedrock endpoint, or not opted in, is skipped. A row that
+  passed can now be `Failed` or `N/A`.
+
 - `AC-48` execution role sharing compares every assessed Region. An IAM
   role is global, so a runtime in one Region and a gateway in another could
   share a role while each Region's `Sharing` row passed. The state machine
@@ -1302,7 +1311,7 @@ section.
 
 **State machine definition.** `statemachine/assessments.asl.json` adds
 `TargetRegions` to the AgentCore task payload, so the deployment stack must
-be updated for `AC-48` to compare Regions. Until it is, the function
+be updated for `AC-48` and `AC-26` to compare Regions. Until it is, the function
 receives no `TargetRegions` and compares each Region on its own, as before.
 
 **AgentCore role grants.** The AgentCore assessment role gains seven

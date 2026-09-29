@@ -17134,22 +17134,21 @@ AGENTCORE_LOG_GROUP_PROBE_NAMES = (
 
 
 def _agentcore_log_group_probes(
-    context: Dict[str, str], action: str, invocation_log_group_arn: str = ""
+    context: Dict[str, str], action: str, invocation_log_group_arns: List[str] = ()
 ) -> List[str]:
     """Return the ARNs, in every Region, a tamper guardrail must reach for `action`.
 
     Each log-group name is probed with and without the trailing `:*` because the
     service authorization reference does not say which form each action is
     evaluated against. DeleteLogStream is authorized on the log-stream resource
-    type, so it is probed on `log-group:<name>:log-stream:*`. The Bedrock model
+    type, so it is probed on `log-group:<name>:log-stream:*`. Each Bedrock model
     invocation log group is probed in the Region its configuration came from.
     """
     groups = [
         f"arn:{context['partition']}:logs:*:{context['account']}:log-group:{name}"
         for name in AGENTCORE_LOG_GROUP_PROBE_NAMES
     ]
-    if invocation_log_group_arn:
-        groups.append(invocation_log_group_arn)
+    groups.extend(invocation_log_group_arns)
     if action == "logs:deletelogstream":
         return [f"{group}:log-stream:*" for group in groups]
     return [f"{group}{suffix}" for group in groups for suffix in ("", ":*")]
@@ -17210,7 +17209,56 @@ def _bedrock_invocation_log_group_arn(context: Dict[str, str]) -> Tuple[str, str
     )
 
 
-def check_agentcore_log_tamper_scp() -> List[Dict[str, Any]]:
+def _bedrock_invocation_log_group_arns(
+    context: Dict[str, str], target_regions: Optional[List[str]]
+) -> Tuple[List[str], List[Tuple[str, str]]]:
+    """Return the invocation log-group ARNs of every assessed Region, and the
+    (Region, reason) of each Region whose configuration was not read.
+
+    The primary Region is read with the handler's Bedrock client. A Region where
+    Bedrock has no endpoint, or that the account has not opted into, holds no
+    configuration and is skipped, as the handler skips it.
+    """
+    arns: List[str] = []
+    unread: List[Tuple[str, str]] = []
+    arn, reason = _bedrock_invocation_log_group_arn(context)
+    own = bedrock_client.meta.region_name if bedrock_client is not None else ""
+    if arn:
+        arns.append(arn)
+    if reason:
+        unread.append((own or "this Region", reason))
+    for region in target_regions or []:
+        if not region or region == own:
+            continue
+        try:
+            client = boto3.client("bedrock", config=boto3_config, region_name=region)
+            config = client.get_model_invocation_logging_configuration()
+        except EndpointConnectionError:
+            continue
+        except ClientError as error:
+            if error.response.get("Error", {}).get("Code", "") in (
+                REGION_UNAVAILABLE_ERROR_CODES
+            ):
+                continue
+            unread.append((region, _assessment_error_label(error)))
+            continue
+        except Exception as error:
+            unread.append((region, _assessment_error_label(error)))
+            continue
+        name = ((config.get("loggingConfig") or {}).get("cloudWatchConfig") or {}).get(
+            "logGroupName"
+        ) or ""
+        if name:
+            arns.append(
+                f"arn:{context['partition']}:logs:{region}:{context['account']}:"
+                f"log-group:{name}"
+            )
+    return arns, unread
+
+
+def check_agentcore_log_tamper_scp(
+    target_regions: Optional[List[str]] = None,
+) -> List[Dict[str, Any]]:
     """AC-26 preventive leg: an attached SCP denies tampering with AgentCore logs.
 
     Deletion protection on a log group stops a delete but not a caller who can
@@ -17218,22 +17266,25 @@ def check_agentcore_log_tamper_scp() -> List[Dict[str, Any]]:
     that forwards the events. This leg reads whether a service control policy
     that binds this account denies all five of those writes on every AgentCore
     log group in every Region, and on the Bedrock model invocation log group of
-    the Region it runs in, to every caller but principals named by ARN. An
-    unread invocation logging configuration keeps the leg from passing.
+    each assessed Region, to every caller but principals named by ARN. Without
+    `target_regions` only the Region it runs in is read. An unread invocation
+    logging configuration keeps the leg from passing.
     """
-    invocation_arns: Dict[str, Tuple[str, str]] = {}
+    invocation_arns: Dict[str, Tuple[List[str], List[Tuple[str, str]]]] = {}
 
-    def invocation_log_group(context: Dict[str, str]) -> Tuple[str, str]:
+    def invocation_log_groups(context: Dict[str, str]):
         key = f"{context['partition']}:{context['account']}"
         if key not in invocation_arns:
-            invocation_arns[key] = _bedrock_invocation_log_group_arn(context)
+            invocation_arns[key] = _bedrock_invocation_log_group_arns(
+                context, target_regions
+            )
         return invocation_arns[key]
 
     def denies(statement: Dict[str, Any], action: str, context: Dict[str, str]):
         if not _deny_binds_every_caller(statement):
             return False
         probes = _agentcore_log_group_probes(
-            context, action, invocation_log_group(context)[0]
+            context, action, invocation_log_groups(context)[0]
         )
         if action == "logs:deletelogstream":
             return _log_stream_resource_covers(statement, probes)
@@ -17249,8 +17300,8 @@ def check_agentcore_log_tamper_scp() -> List[Dict[str, Any]]:
                 "denies": denies,
                 "guard_text": (
                     "on the AgentCore log groups and aws/spans in every Region, "
-                    "and on the Bedrock model invocation log group this Region's "
-                    "logging configuration names, if any"
+                    "and on the Bedrock model invocation log group each assessed "
+                    "Region's logging configuration names, if any"
                 ),
                 "remediation": (
                     "Attach a service control policy that denies "
@@ -17266,18 +17317,19 @@ def check_agentcore_log_tamper_scp() -> List[Dict[str, Any]]:
             }
         ],
     )
-    unread = [reason for _arn, reason in invocation_arns.values() if reason]
+    unread = [entry for _arns, gaps in invocation_arns.values() for entry in gaps]
     if not unread:
         return findings
+    regions = ", ".join(f"{region} ({reason})" for region, reason in unread)
     return [
         create_finding(
             check_id="AC-26",
             finding_name="Log Tamper Guardrail Incomplete",
             finding_details=(
                 f"{finding['Finding_Details']} The Bedrock model invocation "
-                f"logging configuration could not be read ({unread[0]}), so "
-                "whether the guardrail reaches the invocation log group was not "
-                "judged."
+                f"logging configuration could not be read in {regions}, so "
+                "whether the guardrail reaches the invocation log group there "
+                "was not judged."
             ),
             resolution=(
                 "Grant bedrock:GetModelInvocationLoggingConfiguration and retry."
@@ -30965,7 +31017,7 @@ def lambda_handler(event, context):
                     (
                         ["AC-26"],
                         "Log Tamper Guardrail",
-                        check_agentcore_log_tamper_scp,
+                        lambda: check_agentcore_log_tamper_scp(target_regions),
                     ),
                 ]
             else:
@@ -31045,7 +31097,7 @@ def lambda_handler(event, context):
                     (
                         ["AC-26"],
                         "Log Tamper Guardrail",
-                        check_agentcore_log_tamper_scp,
+                        lambda: check_agentcore_log_tamper_scp(target_regions),
                     ),
                 ]
             for check_ids, check_name, check_func in global_checks:
