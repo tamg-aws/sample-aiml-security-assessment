@@ -310,12 +310,13 @@ section.
   or thing is `N/A` and named. The row used to be `N/A` for any thing group
   because those certificates were not listed.
 
-- `SM-23` Model Monitor alarm credits an alarm under either spelling AWS
-  documents. The data quality page names the namespace
+- `SM-23` Model Monitor alarm credits an alarm under any of the three
+  spellings AWS documents. The data quality page names the namespace
   `/aws/sagemaker/Endpoints/data-metric` with `EndpointName` and
-  `ScheduleName` dimensions, while the other monitoring pages name
+  `ScheduleName` dimensions, the bring-your-own-container page names
+  `/aws/sagemaker/Endpoint/data-metrics`, and the other monitoring pages name
   `aws/sagemaker/Endpoints/*-metrics` with `Endpoint` and
-  `MonitoringSchedule`. An alarm on the data quality page's spelling now
+  `MonitoringSchedule`. An alarm on either of the first two spellings now
   credits its schedule, so a row that failed for it can move to `Passed`.
   Alarms on other namespaces still do not credit, and the alarm threshold is
   still not judged.

@@ -8612,11 +8612,13 @@ MONITOR_CLOUDWATCH_REFERENCE = (
 )
 # Namespaces Model Monitor publishes schedule metrics to, one per monitoring type.
 # The AWS data quality page names /aws/sagemaker/Endpoints/data-metric with
-# EndpointName and ScheduleName dimensions, while the other monitoring pages name
-# aws/sagemaker/Endpoints/*-metrics with Endpoint and MonitoringSchedule, so both
-# spellings are credited.
+# EndpointName and ScheduleName dimensions, the bring-your-own-container page
+# names /aws/sagemaker/Endpoint/data-metrics, and the other monitoring pages name
+# aws/sagemaker/Endpoints/*-metrics with Endpoint and MonitoringSchedule, so all
+# three spellings are credited.
 MODEL_MONITOR_METRIC_NAMESPACES = (
     "/aws/sagemaker/Endpoints/data-metric",
+    "/aws/sagemaker/Endpoint/data-metrics",
     "aws/sagemaker/Endpoints/data-metrics",
     "aws/sagemaker/Endpoints/model-metrics",
     "aws/sagemaker/Endpoints/bias-metrics",

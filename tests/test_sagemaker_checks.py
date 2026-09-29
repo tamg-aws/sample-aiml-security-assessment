@@ -4661,6 +4661,18 @@ class TestSM23MonitorReportAndAlarm:
         rows = self._split_rows(mock_client, alarms)
         assert [r["Status"] for r in rows] == ["Passed"]
 
+    @patch("sagemaker_app.boto3.client")
+    def test_the_byoc_doc_spelling_credits_only_its_schedule(self, mock_client):
+        alarm = self._alarm("dq", "/aws/sagemaker/Endpoint/data-metrics")
+        alarm["Dimensions"] = [
+            {"Name": "Endpoint", "Value": "ep"},
+            {"Name": "MonitoringSchedule", "Value": "dq"},
+        ]
+        rows = self._split_rows(mock_client, [alarm])
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "'mq'" in rows[0]["Finding_Details"]
+        assert "'dq'" not in rows[0]["Finding_Details"]
+
     @pytest.mark.parametrize(
         "dimensions",
         [
@@ -4681,7 +4693,12 @@ class TestSM23MonitorReportAndAlarm:
 
     @pytest.mark.parametrize(
         "namespace",
-        ["/aws/sagemaker/Endpoints", "AWS/SageMaker", "/aws/sagemaker/Endpoints/x"],
+        [
+            "/aws/sagemaker/Endpoints",
+            "/aws/sagemaker/Endpoint",
+            "AWS/SageMaker",
+            "/aws/sagemaker/Endpoints/x",
+        ],
     )
     @patch("sagemaker_app.boto3.client")
     def test_an_endpoint_name_on_another_namespace_does_not_credit(
