@@ -261,6 +261,11 @@ section.
 
 ### Fixed
 
+- `SM-09` execution role privilege also judges each Studio domain's
+  `DefaultSpaceSettings.ExecutionRole`, the default execution role for spaces,
+  beside the domain's default user role and each user profile's role. A
+  broad grant on the space role used to go unread.
+
 - `SM-22` deployed model registration also judges the model each batch
   transform job ran, read from `DescribeTransformJob`, beside the models
   serving on endpoints. An unregistered or unapproved model used only by a

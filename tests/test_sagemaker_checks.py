@@ -14447,6 +14447,54 @@ class TestSM09ExecutionRolePrivilege:
         assert [r["Status"] for r in role_rows] == ["Failed"]
         assert "d-1/alice" in role_rows[0]["Finding_Details"]
 
+    WIDE_ROLE = "arn:aws:iam::123456789012:role/wide-role"
+
+    def _space_cache(self):
+        return _environment_cache(
+            {
+                "nb-role": [("scoped", "arn:aws:iam::1:policy/s", [_LEAST_PRIVILEGE])],
+                "wide-role": [
+                    (
+                        "AmazonSageMakerFullAccess",
+                        "arn:aws:iam::aws:policy/AmazonSageMakerFullAccess",
+                        [],
+                    )
+                ],
+            }
+        )
+
+    @pytest.mark.parametrize("wide", ["user", "space"])
+    def test_domain_default_space_role_is_read(self, wide):
+        user_role = self.WIDE_ROLE if wide == "user" else _NB_ROLE
+        space_role = self.WIDE_ROLE if wide == "space" else _NB_ROLE
+        rows = _sm09_rows(
+            notebooks={},
+            domains={
+                "d-1": {
+                    "DefaultUserSettings": {"ExecutionRole": user_role},
+                    "DefaultSpaceSettings": {"ExecutionRole": space_role},
+                }
+            },
+            cache=self._space_cache(),
+        )
+        role_rows = _by_finding(rows, self.ROLE)
+        assert [r["Status"] for r in role_rows] == ["Failed"]
+        details = role_rows[0]["Finding_Details"]
+        assert ("default space" in details) == (wide == "space")
+
+    def test_clean_default_space_role_passes(self):
+        rows = _sm09_rows(
+            notebooks={},
+            domains={
+                "d-1": {
+                    "DefaultUserSettings": {"ExecutionRole": _NB_ROLE},
+                    "DefaultSpaceSettings": {"ExecutionRole": _NB_ROLE},
+                }
+            },
+            cache=self._space_cache(),
+        )
+        assert _statuses_of(rows, self.ROLE) == ["Passed"]
+
     def test_role_missing_from_cache_is_incomplete(self):
         rows = _sm09_rows(cache=_environment_cache({}))
         assert _statuses_of(rows, self.ROLE) == ["N/A"]
