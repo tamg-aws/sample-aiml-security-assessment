@@ -10948,6 +10948,7 @@ class TestSM41IoTDeviceScopedPolicies:
                 "list_audit_findings": raising(
                     "list_audit_findings", [{"findings": audit_findings or []}]
                 ),
+                "list_role_aliases": [{"roleAliases": []}],
             }
         )
 
@@ -11106,6 +11107,139 @@ class TestSM41IoTDeviceScopedPolicies:
         rows = _rows(sagemaker_app.check_iot_device_scoped_policies("us-east-1"))
         assert len(rows) == 1
         assert_could_not_assess_finding(rows[0])
+
+
+_ALIAS_ROLE = "arn:aws:iam::123456789012:role/"
+_THING_SCOPED = {
+    "Effect": "Allow",
+    "Action": "s3:GetObject",
+    "Resource": "arn:aws:s3:::telemetry/${credentials-iot:ThingName}/*",
+}
+_FLEET_WIDE = {
+    "Effect": "Allow",
+    "Action": "s3:GetObject",
+    "Resource": "arn:aws:s3:::telemetry/*",
+}
+
+
+class TestSM41RoleAliasDeviceScope:
+    """AIR-PHY-EDG-01: a credentials-provider role alias scoped per device."""
+
+    def _run(self, aliases, cache, errors=None, policies=None):
+        errors = errors or {}
+        self.described = []
+        client = MagicMock()
+
+        def list_role_aliases(**kwargs):
+            if "list" in errors:
+                raise errors["list"]
+            return [{"roleAliases": []}, {"roleAliases": list(aliases)}]
+
+        client.get_paginator.side_effect = _pager(
+            {
+                "list_policies": [{"policies": policies or []}],
+                "list_role_aliases": list_role_aliases,
+            }
+        )
+
+        def describe_role_alias(roleAlias):
+            self.described.append(roleAlias)
+            if roleAlias in errors:
+                raise errors[roleAlias]
+            description = {"roleAlias": roleAlias}
+            if aliases[roleAlias]:
+                description["roleArn"] = _ALIAS_ROLE + aliases[roleAlias]
+            return {"roleAliasDescription": description}
+
+        client.describe_role_alias.side_effect = describe_role_alias
+        with patch("sagemaker_app.boto3.client", return_value=client):
+            rows = _rows(
+                sagemaker_app.check_iot_device_scoped_policies(
+                    "us-east-1", permission_cache=cache
+                )
+            )
+        return [
+            r
+            for r in rows
+            if r["Finding"].startswith(sagemaker_app.IOT_ROLE_ALIAS_FINDING)
+        ]
+
+    @staticmethod
+    def _cache(**roles):
+        return _environment_cache(
+            {
+                name: [(name, f"arn:aws:iam::123456789012:policy/{name}", stmts)]
+                for name, stmts in roles.items()
+            }
+        )
+
+    def test_every_alias_role_scoped_by_a_device_variable_passes(self):
+        condition_scoped = {
+            "Effect": "Allow",
+            "Action": "s3:ListBucket",
+            "Resource": "arn:aws:s3:::telemetry",
+            "Condition": {
+                "StringLike": {"s3:prefix": "${credentials-iot:AwsCertificateId}/*"}
+            },
+        }
+        rows = self._run(
+            {"a": "role-a", "b": "role-b"},
+            self._cache(**{"role-a": [_THING_SCOPED], "role-b": [condition_scoped]}),
+        )
+        assert [r["Status"] for r in rows] == ["Passed"]
+        assert "2 role alias(es)" in rows[0]["Finding_Details"]
+        assert self.described == ["a", "b"]
+
+    def test_one_fleet_wide_alias_role_among_scoped_ones_fails(self):
+        rows = self._run(
+            {"a": "role-a", "b": "role-b"},
+            self._cache(**{"role-a": [_THING_SCOPED], "role-b": [_FLEET_WIDE]}),
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "role alias 'b'" in rows[0]["Finding_Details"]
+        assert "role-b" in rows[0]["Finding_Details"]
+
+    def test_variable_only_in_a_deny_statement_does_not_scope(self):
+        deny = dict(_THING_SCOPED, Effect="Deny")
+        rows = self._run(
+            {"a": "role-a"}, self._cache(**{"role-a": [_FLEET_WIDE, deny]})
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+
+    def test_role_alias_is_judged_with_no_iot_policy_in_the_region(self):
+        rows = self._run({"a": "role-a"}, self._cache(**{"role-a": [_FLEET_WIDE]}))
+        assert [r["Status"] for r in rows] == ["Failed"]
+
+    def test_no_role_alias_adds_no_row(self):
+        assert self._run({}, self._cache()) == []
+
+    @pytest.mark.parametrize(
+        "case", ["no-cache", "role-missing", "describe-denied", "no-role-arn"]
+    )
+    def test_unread_alias_withholds_passed(self, case):
+        aliases = {"a": "role-a", "b": "role-b"}
+        cache = self._cache(**{"role-a": [_THING_SCOPED], "role-b": [_THING_SCOPED]})
+        errors = {}
+        if case == "no-cache":
+            cache = None
+        elif case == "role-missing":
+            cache = self._cache(**{"role-a": [_THING_SCOPED]})
+        elif case == "describe-denied":
+            errors = {"b": _make_client_error("AccessDeniedException")}
+        else:
+            aliases["b"] = None
+        rows = self._run(aliases, cache, errors=errors)
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert "role alias 'b'" in rows[0]["Finding_Details"]
+
+    def test_role_alias_list_denied_is_na(self):
+        rows = self._run(
+            {"a": "role-a"},
+            self._cache(**{"role-a": [_THING_SCOPED]}),
+            errors={"list": _make_client_error("AccessDeniedException")},
+        )
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert "iot:ListRoleAliases" in rows[0]["Finding_Details"]
 
 
 class TestSM41DeviceIdentityAndAudit:
@@ -11400,9 +11534,14 @@ class TestScope27HandlerWiring:
             "check_security_hub_ai_standard",
             "check_eks_vpc_cni_network_policy",
             "check_secrets_manager_rotation",
-            "check_iot_device_scoped_policies",
         ):
             assert f"{name}(region)" in handler or f"{name}(region=region)" in handler
+        # SM-41 judges each role alias's IAM role from the permissions cache.
+        assert (
+            "check_iot_device_scoped_policies(\n"
+            "                region=region, permission_cache=permission_cache\n"
+            "            )" in handler
+        )
         for name in (
             "check_guardduty_lambda_network_logs",
             "check_guardduty_runtime_monitoring",

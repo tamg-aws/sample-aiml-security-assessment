@@ -261,6 +261,15 @@ section.
 
 ### Fixed
 
+- `SM-41` AWS IoT device-scoped policy adds an `AWS IoT Role Alias Device
+  Scope` row. It lists and describes each credentials-provider role alias
+  (`iot:ListRoleAliases` on `*`, which has no resource type, and
+  `iot:DescribeRoleAlias` on `rolealias/*`, both newly granted to the
+  SageMaker function) and fails an alias whose IAM role, read from the
+  permissions cache, names no `credentials-iot:` policy variable in the
+  `Resource` or `Condition` of any Allow statement. The role a device assumes
+  through the credentials provider used to go unread.
+
 - `SM-26` GuardDuty AI Protection adds a `GuardDuty AI Protection
   Organization Auto-Enable` row for an `ENABLED` detector. It reads
   `guardduty:DescribeOrganizationConfiguration` (newly granted to the

@@ -372,6 +372,8 @@ _EXPECTED_ACTIONS = {
         "config:DescribeConformancePacks",
         "iot:DescribeAccountAuditConfiguration",
         "iot:ListAuditFindings",
+        "iot:ListRoleAliases",
+        "iot:DescribeRoleAlias",
         "inspector2:BatchGetAccountStatus",
         "lambda:ListFunctions",
         "cloudtrail:DescribeTrails",
@@ -1128,7 +1130,11 @@ def test_sagemaker_scope27_reads_wildcard_only_where_iam_has_no_resource_type(
         ("ConformancePackInventory", ("config:DescribeConformancePacks",)),
         (
             "IoTDeviceDefenderAuditRead",
-            ("iot:DescribeAccountAuditConfiguration", "iot:ListAuditFindings"),
+            (
+                "iot:DescribeAccountAuditConfiguration",
+                "iot:ListAuditFindings",
+                "iot:ListRoleAliases",
+            ),
         ),
         ("InspectorAccountStatusRead", ("inspector2:BatchGetAccountStatus",)),
         ("LambdaFunctionInventory", ("lambda:ListFunctions",)),
@@ -1158,6 +1164,11 @@ def test_sagemaker_scope27_reads_wildcard_only_where_iam_has_no_resource_type(
             "IoTPolicyRead",
             ("iot:GetPolicy", "iot:ListTargetsForPolicy"),
             ("iot:*:${AWS::AccountId}:policy/*",),
+        ),
+        (
+            "IoTRoleAliasRead",
+            ("iot:DescribeRoleAlias",),
+            ("iot:*:${AWS::AccountId}:rolealias/*",),
         ),
     ):
         statement = _statement_block(

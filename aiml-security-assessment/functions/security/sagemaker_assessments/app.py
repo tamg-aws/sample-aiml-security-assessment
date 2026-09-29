@@ -16984,6 +16984,10 @@ IOT_AUDIT_REFERENCE = (
     "device-defender-audit.html"
 )
 IOT_SHARED_CERTIFICATE_CHECK = "DEVICE_CERTIFICATE_SHARED_CHECK"
+IOT_ROLE_ALIAS_FINDING = "AWS IoT Role Alias Device Scope"
+IOT_ROLE_ALIAS_REFERENCE = (
+    "https://docs.aws.amazon.com/iot/latest/developerguide/authorizing-direct-aws.html"
+)
 IOT_AUDIT_FINDING_WINDOW_DAYS = 31
 
 
@@ -17075,11 +17079,148 @@ def _iot_policy_problems(document: Any) -> List[str]:
     return problems
 
 
-def check_iot_device_scoped_policies(region: str = "") -> Dict[str, Any]:
+def _iot_role_alias_findings(
+    iot_client, region: str, permission_cache: Optional[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+    """
+    SM-41: each credentials-provider role alias's IAM role scopes a device by a
+    credentials-iot policy variable in at least one Allow statement.
+    """
+    try:
+        aliases = []
+        for page in iot_client.get_paginator("list_role_aliases").paginate():
+            aliases.extend(page.get("roleAliases") or [])
+    except Exception as error:
+        return [
+            _unread_resources_finding(
+                "SM-41",
+                IOT_ROLE_ALIAS_FINDING,
+                [f"iot:ListRoleAliases ({get_assessment_error_label(error)})"],
+                "no role alias was read.",
+                IOT_ROLE_ALIAS_REFERENCE,
+                region,
+            )
+        ]
+    if not aliases:
+        return []
+    cached = (permission_cache or {}).get("role_permissions") or {}
+    unread_principals = (
+        set(_principal_read_errors(permission_cache) or [])
+        if permission_cache
+        else set()
+    )
+    scoped, unscoped, unread = [], [], []
+    for alias in aliases:
+        try:
+            description = (
+                iot_client.describe_role_alias(roleAlias=alias).get(
+                    "roleAliasDescription"
+                )
+                or {}
+            )
+        except Exception as error:
+            unread.append(f"role alias '{alias}' ({get_assessment_error_label(error)})")
+            continue
+        role_arn = description.get("roleArn")
+        name = _role_name_from_arn(role_arn) if role_arn else None
+        if not name:
+            unread.append(f"role alias '{alias}' (no roleArn returned)")
+        elif permission_cache is None:
+            unread.append(
+                f"role alias '{alias}' role {role_arn} (the IAM permissions cache "
+                "was not available)"
+            )
+        elif name not in cached:
+            unread.append(
+                f"role alias '{alias}' role {role_arn} (not in the IAM cache)"
+            )
+        elif any(p.startswith(f"role '{name}' ") for p in unread_principals):
+            unread.append(
+                f"role alias '{alias}' role {role_arn} (IAM cache read error)"
+            )
+        elif any(
+            str(statement.get("Effect", "")).upper() == "ALLOW"
+            and "credentials-iot:"
+            in json.dumps([statement.get("Resource"), statement.get("Condition")])
+            for policy in (cached[name].get("attached_policies") or [])
+            + (cached[name].get("inline_policies") or [])
+            for statement in _sm_policy_statements(policy.get("document"))
+        ):
+            scoped.append(alias)
+        else:
+            unscoped.append((alias, name))
+
+    def _row(details, resolution, severity, status):
+        return create_finding(
+            check_id="SM-41",
+            finding_name=IOT_ROLE_ALIAS_FINDING,
+            finding_details=details,
+            resolution=resolution,
+            reference=IOT_ROLE_ALIAS_REFERENCE,
+            severity=severity,
+            status=status,
+            region=region,
+        )
+
+    rows = []
+    for alias, name in unscoped[:20]:
+        rows.append(
+            _row(
+                f"AWS IoT role alias '{alias}' hands devices credentials for role "
+                f"'{name}', and no Allow statement of that role names a "
+                "credentials-iot policy variable in its Resource or Condition, so "
+                "every device that assumes the alias gets the same AWS access.",
+                "Scope the role's Resource or Condition to the calling device with "
+                "${credentials-iot:ThingName}, ${credentials-iot:ThingTypeName} or "
+                "${credentials-iot:AwsCertificateId}.",
+                "High",
+                "Failed",
+            )
+        )
+    if len(unscoped) > 20:
+        rows.append(
+            _row(
+                f"{len(unscoped)} role aliases hand out an unscoped role (the first "
+                "20 are reported individually above).",
+                "Scope each role to the calling device.",
+                "High",
+                "Failed",
+            )
+        )
+    if unread:
+        rows.append(
+            _unread_resources_finding(
+                "SM-41",
+                IOT_ROLE_ALIAS_FINDING,
+                unread,
+                f"{len(scoped) + len(unscoped)} role alias(es) were judged.",
+                IOT_ROLE_ALIAS_REFERENCE,
+                region,
+            )
+        )
+    elif scoped and not unscoped:
+        rows.append(
+            _row(
+                f"The roles of all {len(scoped)} role alias(es) name a "
+                "credentials-iot policy variable in the Resource or Condition of "
+                f"at least one Allow statement: {', '.join(sorted(scoped)[:5])}. "
+                "Whether every statement of the role is device-scoped is not "
+                "judged.",
+                "No action required",
+                "High",
+                "Passed",
+            )
+        )
+    return rows
+
+
+def check_iot_device_scoped_policies(
+    region: str = "", permission_cache: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
     """
     SM-41: Verify attached AWS IoT policies scope each device to its own topics
-    and client ID, and require the certificate to be attached to a thing
-    (AIR-PHY-EDG-01).
+    and client ID, require the certificate to be attached to a thing, and that
+    each role alias's IAM role is scoped per device (AIR-PHY-EDG-01).
     """
     logger.debug("Starting check for AWS IoT device-scoped policies")
     findings = {"csv_data": []}
@@ -17138,6 +17279,7 @@ def check_iot_device_scoped_policies(region: str = "") -> Dict[str, Any]:
         else:
             passed.append(name)
 
+    role_alias_rows = _iot_role_alias_findings(iot_client, region, permission_cache)
     if not failed and not passed and not errors:
         findings["csv_data"].append(
             _row(
@@ -17148,6 +17290,7 @@ def check_iot_device_scoped_policies(region: str = "") -> Dict[str, Any]:
                 "N/A",
             )
         )
+        findings["csv_data"].extend(role_alias_rows)
         return findings
 
     for name, problems in failed[:20]:
@@ -17191,6 +17334,7 @@ def check_iot_device_scoped_policies(region: str = "") -> Dict[str, Any]:
                 "N/A",
             )
         )
+    findings["csv_data"].extend(role_alias_rows)
     findings["csv_data"].append(
         _iot_unique_certificate_finding(
             iot_client, sorted(certificates), region, sorted(thing_groups)
@@ -17896,7 +18040,11 @@ def lambda_handler(event, context):
         )
 
         logger.info("Running AWS IoT device-scoped policy check (SM-41)")
-        all_findings.append(check_iot_device_scoped_policies(region=region))
+        all_findings.append(
+            check_iot_device_scoped_policies(
+                region=region, permission_cache=permission_cache
+            )
+        )
 
         logger.info("Running sagemaker.runtime VPC endpoint policy check (SM-02)")
         all_findings.append(check_sagemaker_runtime_endpoint_policy(region=region))

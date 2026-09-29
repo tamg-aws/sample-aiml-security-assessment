@@ -1015,11 +1015,13 @@ Resources:
               Resource: '*'
             - Sid: IoTDeviceDefenderAuditRead
               # SM-41 reads the Device Defender audit configuration and its
-              # findings. Neither action has a resource type.
+              # findings, and lists role aliases. None of these three actions
+              # has a resource type.
               Effect: Allow
               Action:
                 - iot:DescribeAccountAuditConfiguration # SM-41
                 - iot:ListAuditFindings # SM-41
+                - iot:ListRoleAliases # SM-41
               Resource: '*'
             - Sid: InspectorAccountStatusRead
               # SM-38 reads whether Inspector Lambda scanning is enabled. The
@@ -1060,6 +1062,11 @@ Resources:
               Action:
                 - iot:DescribeScheduledAudit # SM-41
               Resource: !Sub 'arn:${AWS::Partition}:iot:*:${AWS::AccountId}:scheduledaudit/*'
+            - Sid: IoTRoleAliasRead
+              Effect: Allow
+              Action:
+                - iot:DescribeRoleAlias # SM-41
+              Resource: !Sub 'arn:${AWS::Partition}:iot:*:${AWS::AccountId}:rolealias/*'
             - Sid: JobDataBucketProtectionRead
               # SM-03 and SM-18 read the default encryption and bucket policy of the
               # buckets training and transform jobs read from and write to; SM-43 reads
