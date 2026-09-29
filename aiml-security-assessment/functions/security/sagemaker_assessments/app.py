@@ -4511,6 +4511,13 @@ def check_sagemaker_notebook_root_access(
                 environment_roles.append(
                     (f"Studio domain '{domain_id}' default", default_role)
                 )
+            space_role = (domain_details.get("DefaultSpaceSettings") or {}).get(
+                "ExecutionRole"
+            )
+            if space_role:
+                environment_roles.append(
+                    (f"Studio domain '{domain_id}' default space", space_role)
+                )
             try:
                 profiles = []
                 for page in sagemaker_client.get_paginator(
