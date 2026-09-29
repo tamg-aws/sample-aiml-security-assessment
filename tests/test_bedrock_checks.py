@@ -3330,6 +3330,15 @@ INFERENCE_TYPES = (
     "AWS::Bedrock::InlineAgent",
 )
 KB_DATA_TYPE = "AWS::Bedrock::KnowledgeBase"
+MANTLE_TYPES = (
+    "AWS::BedrockMantle::Project",
+    "AWS::BedrockMantle::Reservation",
+    "AWS::BedrockMantle::CustomizedModel",
+    "AWS::BedrockMantle::Environment",
+    "AWS::BedrockMantle::Runtime",
+    "AWS::BedrockMantle::Skill",
+)
+MANTLE_ROW = "Bedrock Mantle Data Event Logging"
 COMPLETE_RECORD = {"logging": True, "text_delivery": True, "gaps": [], "unread": []}
 
 
@@ -3647,7 +3656,111 @@ class TestBR06SelectorValues:
         assert row["Status"] == "Passed"
         assert "AWS::Bedrock::Model by a" in row["Finding_Details"]
         assert "AWS::Bedrock::InlineAgent by b" in row["Finding_Details"]
-        assert "bedrock-mantle endpoint are not read" in row["Finding_Details"]
+        assert "bedrock-mantle endpoint are not read" not in row["Finding_Details"]
+        assert MANTLE_ROW in row["Finding_Details"]
+
+    def test_every_mantle_type_across_trails_passes(self):
+        rows = self._run(
+            {
+                "a": {"advanced": [_data(MANTLE_TYPES[:3])]},
+                "b": {"advanced": [_data(MANTLE_TYPES[3:])]},
+            }
+        )
+        row = rows[MANTLE_ROW]
+        assert row["Check_ID"] == "BR-06"
+        assert row["Status"] == "Passed"
+        assert "AWS::BedrockMantle::Project by a" in row["Finding_Details"]
+        assert "AWS::BedrockMantle::Skill by b" in row["Finding_Details"]
+        assert "CreateInference" in row["Finding_Details"]
+
+    def test_the_aws_example_mantle_selector_misses_three_types(self):
+        rows = self._run(
+            {
+                "a": {
+                    "advanced": [
+                        _data(
+                            [
+                                "AWS::BedrockMantle::Project",
+                                "AWS::BedrockMantle::CustomizedModel",
+                                "AWS::BedrockMantle::Reservation",
+                            ]
+                        )
+                    ]
+                }
+            }
+        )
+        row = rows[MANTLE_ROW]
+        assert row["Status"] == "Failed"
+        head = row["Finding_Details"].split("(observed")[0]
+        assert (
+            "AWS::BedrockMantle::Environment, AWS::BedrockMantle::Runtime, "
+            "AWS::BedrockMantle::Skill" in head
+        )
+        assert "AWS::BedrockMantle::Project" not in head
+        assert "AWS::BedrockMantle::Skill" in row["Resolution"]
+        assert "AWS::BedrockMantle::Project" not in row["Resolution"]
+
+    @pytest.mark.parametrize("missing", range(6))
+    def test_each_mantle_type_is_required(self, missing):
+        named = MANTLE_TYPES[:missing] + MANTLE_TYPES[missing + 1 :]
+        rows = self._run({"a": {"advanced": [_data(named)]}})
+        row = rows[MANTLE_ROW]
+        assert row["Status"] == "Failed"
+        assert MANTLE_TYPES[missing] in row["Finding_Details"].split("(observed")[0]
+
+    def test_bedrock_types_do_not_cover_the_mantle_endpoint(self):
+        rows = self._run(
+            {"a": {"advanced": [_data(INFERENCE_TYPES + (KB_DATA_TYPE,))]}}
+        )
+        assert rows["Bedrock Model Invocation Data Event Logging"]["Status"] == "Passed"
+        row = rows[MANTLE_ROW]
+        assert row["Status"] == "Failed"
+        assert "AWS::BedrockMantle::Project" in row["Finding_Details"]
+
+    def test_a_narrowed_mantle_selector_is_not_coverage(self):
+        rows = self._run(
+            {
+                "a": {
+                    "advanced": [
+                        _data(MANTLE_TYPES, eventName={"Equals": ["CreateInference"]})
+                    ]
+                }
+            }
+        )
+        row = rows[MANTLE_ROW]
+        assert row["Status"] == "Failed"
+        assert (
+            "AWS::BedrockMantle::Project is named only in selector(s) narrowed by "
+            "eventName" in row["Finding_Details"]
+        )
+
+    def test_an_unread_trail_leaves_the_mantle_row_unjudged(self):
+        rows = self._run(
+            {
+                "denied": {"error": "AccessDeniedException"},
+                "a": {"advanced": [_data(MANTLE_TYPES[:5])]},
+            }
+        )
+        row = rows[MANTLE_ROW]
+        assert row["Status"] == "N/A"
+        assert "denied (AccessDeniedException)" in row["Finding_Details"]
+
+    def test_an_event_data_store_covers_the_mantle_types(self):
+        arn = "arn:aws:cloudtrail:us-east-1:123:eventdatastore/eds-1"
+        rows = self._run(
+            {"a": {"advanced": [_management()]}},
+            event_data_stores=(
+                {"EventDataStores": [{"EventDataStoreArn": arn, "Name": "lake"}]},
+            ),
+            store_details={
+                arn: {
+                    "Status": "ENABLED",
+                    "MultiRegionEnabled": True,
+                    "AdvancedEventSelectors": [_data(MANTLE_TYPES)],
+                }
+            },
+        )
+        assert rows[MANTLE_ROW]["Status"] == "Passed"
 
     # --- CloudTrail Lake event data stores ------------------------------------
 

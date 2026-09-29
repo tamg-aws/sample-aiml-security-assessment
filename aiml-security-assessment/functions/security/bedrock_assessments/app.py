@@ -5053,6 +5053,23 @@ BEDROCK_INFERENCE_DATA_EVENT_TYPES = (
     "AWS::Bedrock::InlineAgent",
 )
 
+# The resource types bedrock-mantle CloudTrail events reference
+# (logging-cloudtrail-mantle). Inference on that endpoint is a data event, so
+# none of it is recorded until a selector names these types. AWS's example
+# selector names only the first three.
+BEDROCK_MANTLE_DATA_EVENT_TYPES = (
+    "AWS::BedrockMantle::Project",
+    "AWS::BedrockMantle::Reservation",
+    "AWS::BedrockMantle::CustomizedModel",
+    "AWS::BedrockMantle::Environment",
+    "AWS::BedrockMantle::Runtime",
+    "AWS::BedrockMantle::Skill",
+)
+
+BEDROCK_MANTLE_DATA_EVENT_FINDING = "Bedrock Mantle Data Event Logging"
+
+BEDROCK_MANTLE_CLOUDTRAIL_REFERENCE = "https://docs.aws.amazon.com/bedrock/latest/userguide/logging-cloudtrail-mantle.html"
+
 BEDROCK_EVENT_SOURCE = "bedrock.amazonaws.com"
 
 # bedrock-mantle calls carry their own eventSource (logging-cloudtrail-mantle),
@@ -5614,7 +5631,7 @@ def _bedrock_data_event_findings(
             create_finding(
                 check_id="BR-06",
                 finding_name="Bedrock Model Invocation Data Event Logging",
-                finding_details=f"Every inference data-event resource type is selected with no narrowing field ({coverage}), so bidirectional streaming, asynchronous, agent and inline agent invocations are attributable to the calling identity. Calls to the bedrock-mantle endpoint are not read by this check.",
+                finding_details=f"Every inference data-event resource type is selected with no narrowing field ({coverage}), so bidirectional streaming, asynchronous, agent and inline agent invocations are attributable to the calling identity. Calls to the bedrock-mantle endpoint are judged in the {BEDROCK_MANTLE_DATA_EVENT_FINDING} row.",
                 resolution="No action required. Continue retaining Bedrock data events for forensic reconstruction.",
                 reference="https://docs.aws.amazon.com/bedrock/latest/userguide/logging-using-cloudtrail.html",
                 severity="Medium",
@@ -5661,6 +5678,56 @@ def _bedrock_data_event_findings(
                 region=region,
             )
         )
+
+    mantle_missing = [
+        resource_type
+        for resource_type in BEDROCK_MANTLE_DATA_EVENT_TYPES
+        if not data_event_trails.get(resource_type)
+    ]
+    if not mantle_missing:
+        coverage = "; ".join(
+            f"{resource_type} by {', '.join(sorted(set(data_event_trails[resource_type])))}"
+            for resource_type in BEDROCK_MANTLE_DATA_EVENT_TYPES
+        )
+        mantle_row = (
+            f"Every bedrock-mantle data-event resource type is selected with no narrowing field ({coverage}), so CreateInference and the other inference and file calls on the bedrock-mantle endpoint are recorded with the calling identity.",
+            "No action required",
+            "Medium",
+            "Passed",
+        )
+    elif unread_trails:
+        mantle_row = (
+            f"No read trail selects {', '.join(mantle_missing)}, and not every trail was read, so bedrock-mantle data-event coverage could not be assessed.{unread_note}",
+            COULD_NOT_ASSESS_RESOLUTION,
+            "Informational",
+            "N/A",
+        )
+    elif store_unread:
+        mantle_row = (
+            f"No logging multi-region trail names {', '.join(mantle_missing)} in a resources.type field selector with no narrowing field (observed data-event resource types: {observed}), but {store_unread}{narrowed_note}",
+            COULD_NOT_ASSESS_RESOLUTION,
+            "Informational",
+            "N/A",
+        )
+    else:
+        mantle_row = (
+            f"No logging multi-region trail names {', '.join(mantle_missing)} in a resources.type field selector with no narrowing field, so inference and file calls on the bedrock-mantle endpoint that reference those types are not recorded: bedrock-mantle logs CreateInference as a data event, not a management event (observed data-event resource types: {observed}). AWS's example selector names only AWS::BedrockMantle::Project, CustomizedModel and Reservation. {store_note}{narrowed_note}",
+            CLOUDTRAIL_DATA_EVENT_RESOLUTION.format(", ".join(mantle_missing)),
+            "Medium",
+            "Failed",
+        )
+    data_event_findings.append(
+        create_finding(
+            check_id="BR-06",
+            finding_name=BEDROCK_MANTLE_DATA_EVENT_FINDING,
+            finding_details=mantle_row[0],
+            resolution=mantle_row[1],
+            reference=BEDROCK_MANTLE_CLOUDTRAIL_REFERENCE,
+            severity=mantle_row[2],
+            status=mantle_row[3],
+            region=region,
+        )
+    )
 
     if record["gaps"]:
         data_event_findings.append(

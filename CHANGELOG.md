@@ -12,6 +12,18 @@ section.
 
 ### Added
 
+- `BR-06` adds a `Bedrock Mantle Data Event Logging` row. Inference on the
+  `bedrock-mantle` endpoint (`CreateInference`) is a CloudTrail data event, so
+  a trail that selects only the `AWS::Bedrock::*` types recorded none of it,
+  and the inference row's `Passed` text said so without failing. The row
+  needs all six `AWS::BedrockMantle::*` resource types on a logging
+  multi-region trail or an enabled event data store, and a selector copied
+  from AWS's example, which names `Project`, `CustomizedModel` and
+  `Reservation`, fails naming `Environment`, `Runtime` and `Skill`. A
+  deployment whose trails selected only the Bedrock types gains a `Failed`
+  row. No new IAM grant: the row reads the trail and store selectors BR-06
+  already reads.
+
 - Added `AC-53` Inter-Agent Anomaly Alarms, growing the catalog from 276 to
   277 checks (162 core). It covers AISF `AIR-FND-DET-10`, which the ledger
   had marked `not_implementable`. Application Signals publishes an `Error`,

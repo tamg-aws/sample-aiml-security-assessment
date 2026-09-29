@@ -96,7 +96,8 @@ AI_SUBJECT_ROWS = [
         "BR-06 credits Bedrock management and data events from multi-region trails and "
         "from each ENABLED CloudTrail Lake event data store, whose advanced selectors "
         "it reads with cloudtrail:GetEventDataStore and judges as a trail's. A management "
-        "selector must admit both bedrock.amazonaws.com and bedrock-mantle.amazonaws.com. "
+        "selector must admit both bedrock.amazonaws.com and bedrock-mantle.amazonaws.com, "
+        "and a data-event row needs all six AWS::BedrockMantle:: resource types. "
         "An unread "
         "trail or store keeps a gap N/A. No record is traced end to end",
         [],
