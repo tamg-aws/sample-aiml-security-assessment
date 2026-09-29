@@ -11200,16 +11200,22 @@ class TestAC26LogRetentionAndKeyScope:
                 "/aws/bedrock-agentcore/": [
                     {
                         "logGroupName": "/aws/bedrock-agentcore/runtimes/rt-1",
+                        "kmsKeyId": TestAC26LogRetentionAndKeyScope._KEY,
                         "retentionInDays": 90,
                         "deletionProtectionEnabled": True,
                     },
                     {
                         "logGroupName": "/aws/bedrock-agentcore/runtimes/rt-2",
+                        "kmsKeyId": TestAC26LogRetentionAndKeyScope._KEY,
                         "deletionProtectionEnabled": True,
                     },
                 ]
             }
         )
+
+        mock_kms.get_key_policy.return_value = {
+            "Policy": TestAC26LogRetentionAndKeyScope._SCOPED_KEY_POLICY
+        }
 
         findings = agentcore_app.check_agentcore_log_retention_and_key_scope()
 
@@ -11385,6 +11391,91 @@ class TestAC26LogRetentionAndKeyScope:
             )
         )
         assert not agentcore_app._kms_key_policy_allows_open_decrypt("")
+
+    @patch("agentcore_app.kms_client")
+    @patch("agentcore_app.logs_client")
+    def test_a_group_with_no_customer_managed_key_fails(self, mock_logs, mock_kms):
+        mock_logs.describe_log_groups.side_effect = _log_group_side_effect(
+            {
+                "/aws/bedrock-agentcore/": [
+                    {
+                        "logGroupName": "/aws/bedrock-agentcore/runtimes/rt-1",
+                        "retentionInDays": 90,
+                        "deletionProtectionEnabled": True,
+                    }
+                ]
+            }
+        )
+
+        (finding,) = agentcore_app.check_agentcore_log_retention_and_key_scope()
+
+        assert finding["Status"] == "Failed"
+        assert "has no customer managed KMS key" in finding["Finding_Details"]
+        assert "customer managed key" in finding["Resolution"]
+        mock_kms.get_key_policy.assert_not_called()
+
+    @patch("agentcore_app.kms_client")
+    @patch("agentcore_app.logs_client")
+    def test_the_key_verdict_is_per_group(self, mock_logs, mock_kms):
+        mock_logs.describe_log_groups.side_effect = _log_group_side_effect(
+            {
+                "/aws/bedrock-agentcore/": [
+                    {
+                        "logGroupName": "/aws/bedrock-agentcore/runtimes/rt-1",
+                        "retentionInDays": 30,
+                        "kmsKeyId": self._KEY,
+                        "deletionProtectionEnabled": True,
+                    },
+                    {
+                        "logGroupName": "/aws/bedrock-agentcore/runtimes/rt-2",
+                        "retentionInDays": 30,
+                        "deletionProtectionEnabled": True,
+                    },
+                    {
+                        "logGroupName": "/aws/bedrock-agentcore/runtimes/rt-3",
+                        "retentionInDays": 30,
+                        "kmsKeyId": self._KEY,
+                        "deletionProtectionEnabled": True,
+                    },
+                ]
+            }
+        )
+        mock_kms.get_key_policy.return_value = {"Policy": self._SCOPED_KEY_POLICY}
+
+        findings = agentcore_app.check_agentcore_log_retention_and_key_scope()
+
+        statuses = {
+            finding["Finding_Details"].split("'")[1]: finding["Status"]
+            for finding in findings
+        }
+        assert statuses == {
+            "/aws/bedrock-agentcore/runtimes/rt-1": "Passed",
+            "/aws/bedrock-agentcore/runtimes/rt-2": "Failed",
+            "/aws/bedrock-agentcore/runtimes/rt-3": "Passed",
+        }
+        for finding in findings:
+            if finding["Status"] == "Passed":
+                assert "no customer managed KMS key" not in finding["Finding_Details"]
+
+    @patch("agentcore_app.kms_client")
+    @patch("agentcore_app.logs_client")
+    def test_no_key_and_no_retention_name_both(self, mock_logs, mock_kms):
+        mock_logs.describe_log_groups.side_effect = _log_group_side_effect(
+            {
+                "/aws/bedrock-agentcore/": [
+                    {
+                        "logGroupName": "/aws/bedrock-agentcore/runtimes/rt-1",
+                        "deletionProtectionEnabled": True,
+                    }
+                ]
+            }
+        )
+
+        (finding,) = agentcore_app.check_agentcore_log_retention_and_key_scope()
+
+        assert finding["Status"] == "Failed"
+        assert "has no retention period" in finding["Finding_Details"]
+        assert "has no customer managed KMS key" in finding["Finding_Details"]
 
     @patch("agentcore_app.logs_client", None)
     def test_no_client_is_na(self):
@@ -13861,16 +13952,22 @@ class TestAC26VendedLogDeletionProtection:
                 "/aws/vendedlogs/bedrock-agentcore/": [
                     {
                         "logGroupName": "/aws/vendedlogs/bedrock-agentcore/memory/m1",
+                        "kmsKeyId": TestAC26LogRetentionAndKeyScope._KEY,
                         "retentionInDays": 30,
                         "deletionProtectionEnabled": True,
                     },
                     {
                         "logGroupName": "/aws/vendedlogs/bedrock-agentcore/gateway/g1",
+                        "kmsKeyId": TestAC26LogRetentionAndKeyScope._KEY,
                         "retentionInDays": 30,
                     },
                 ]
             }
         )
+
+        mock_kms.get_key_policy.return_value = {
+            "Policy": TestAC26LogRetentionAndKeyScope._SCOPED_KEY_POLICY
+        }
 
         findings = agentcore_app.check_agentcore_log_retention_and_key_scope()
 
@@ -28324,17 +28421,23 @@ class TestAC26LogDeletionProtection:
                 "/aws/bedrock-agentcore/": [
                     {
                         "logGroupName": "/aws/bedrock-agentcore/runtimes/rt-1",
+                        "kmsKeyId": TestAC26LogRetentionAndKeyScope._KEY,
                         "retentionInDays": 30,
                         "deletionProtectionEnabled": True,
                     },
                     {
                         "logGroupName": "/aws/bedrock-agentcore/runtimes/rt-2",
+                        "kmsKeyId": TestAC26LogRetentionAndKeyScope._KEY,
                         "retentionInDays": 30,
                         "deletionProtectionEnabled": False,
                     },
                 ]
             }
         )
+
+        mock_kms.get_key_policy.return_value = {
+            "Policy": TestAC26LogRetentionAndKeyScope._SCOPED_KEY_POLICY
+        }
 
         findings = agentcore_app.check_agentcore_log_retention_and_key_scope()
 
@@ -28379,11 +28482,16 @@ class TestAC26LogDeletionProtection:
                 "/aws/bedrock-agentcore/": [
                     {
                         "logGroupName": "/aws/bedrock-agentcore/evaluations/e1",
+                        "kmsKeyId": TestAC26LogRetentionAndKeyScope._KEY,
                         "retentionInDays": 30,
                     }
                 ]
             }
         )
+
+        mock_kms.get_key_policy.return_value = {
+            "Policy": TestAC26LogRetentionAndKeyScope._SCOPED_KEY_POLICY
+        }
 
         findings = agentcore_app.check_agentcore_log_retention_and_key_scope()
 
@@ -28469,6 +28577,7 @@ class TestAC26LogDeletionProtection:
                 "/aws/bedrock-agentcore/": [
                     {
                         "logGroupName": "/aws/bedrock-agentcore/runtimes/rt-1",
+                        "kmsKeyId": TestAC26LogRetentionAndKeyScope._KEY,
                         "retentionInDays": 30,
                         "deletionProtectionEnabled": True,
                     }
@@ -28482,6 +28591,10 @@ class TestAC26LogDeletionProtection:
             return runtime_groups(**kwargs)
 
         mock_logs.describe_log_groups.side_effect = describe
+
+        mock_kms.get_key_policy.return_value = {
+            "Policy": TestAC26LogRetentionAndKeyScope._SCOPED_KEY_POLICY
+        }
 
         findings = agentcore_app.check_agentcore_log_retention_and_key_scope()
 

@@ -14090,9 +14090,10 @@ def check_agentcore_log_retention_and_key_scope() -> List[Dict[str, Any]]:
 
     A log group with no retention keeps agent prompts, tool arguments and memory
     records forever, which turns an investigation aid into a growing store of the
-    data the workload was careful about elsewhere. AC-20 asserts that a customer
-    managed key is set; this check asserts that the key policy behind it narrows
-    who can read through it.
+    data the workload was careful about elsewhere. A group with no customer
+    managed key fails here as well as in AC-20, because AIR-FND-DET-09 asks for
+    one and reads this check, not AC-20; with a key, this check asserts that the
+    key policy behind it narrows who can read through it.
 
     A runtime log group and the aws/spans group also need deletion protection:
     without it, a principal allowed to delete log groups erases the record an
@@ -14215,6 +14216,11 @@ def check_agentcore_log_retention_and_key_scope() -> List[Dict[str, Any]]:
                     "principal ARN or source, and binds the CloudWatch Logs "
                     "service grant to this account's log groups"
                 )
+        else:
+            problems.append(
+                "has no customer managed KMS key (no kmsKeyId), so no key policy "
+                "of this account decides who can read its events"
+            )
 
         if problems:
             findings.append(
@@ -14226,8 +14232,9 @@ def check_agentcore_log_retention_and_key_scope() -> List[Dict[str, Any]]:
                     ),
                     resolution=(
                         "Set a retention period on the log group that matches the "
-                        "investigation window this workload commits to, bind "
-                        "every wildcard-principal decrypt grant in the encryption "
+                        "investigation window this workload commits to, encrypt "
+                        "it with a customer managed key, bind every "
+                        "wildcard-principal decrypt grant in the encryption "
                         "key's policy with kms:CallerAccount, aws:PrincipalOrgID "
                         "or aws:PrincipalArn, and turn on deletion "
                         "protection for each runtime and vended-log group."
