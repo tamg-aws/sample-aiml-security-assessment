@@ -11533,18 +11533,35 @@ def check_agentcore_log_group_data_protection() -> List[Dict[str, Any]]:
 
 LOGS_UNMASK_ACTION = "logs:unmask"
 
+# The kinds of AgentCore log group under each prefix, and two resource ids no
+# customer names a group after. A pattern that matches the group names built
+# from both ids reaches every group of that kind, including ones created later.
+AGENTCORE_LOG_GROUP_KINDS = (
+    "",
+    "runtimes/",
+    "evaluations/results/",
+    "memory/",
+    "gateway/",
+    "code-interpreter/",
+    "browser/",
+)
+AGENTCORE_LOG_GROUP_PROBE_IDS = ("zq1x9k", "Kp7w2Tm4Rb8")
+
 
 def _logs_resource_is_unbounded(resource: str) -> bool:
-    """Return whether one logs Resource pattern reaches every AgentCore log group.
+    """Return whether one logs Resource pattern reaches a whole kind of
+    AgentCore log group.
 
     A log group name may contain `/`, so the generic ARN rule would read the
     prefix `log-group:/aws/bedrock-agentcore/*` as a whole resource type. Here
-    the name after `log-group:` is one component: it is unbounded when it is
-    made of wildcards alone, or when it is a literal head that every name under
-    an AgentCore prefix starts with followed by wildcards alone, so
-    `/aws/bedrock-agentcore/*` and `/aws/*` count as `*` does. A wildcard in
-    the partition, service, region or account segment, or in the resource
-    type, is unbounded as it is elsewhere.
+    the name after `log-group:` is one pattern, matched with IAM's `*` and `?`
+    against probe names: for each AgentCore prefix and kind, two names that
+    differ only in the resource id, with and without a runtime's `-DEFAULT`
+    endpoint suffix. A pattern matching both names of one pair reaches every
+    group of that kind, so `/aws/bedrock-agentcore/runtimes/*`, `*agentcore*`
+    and `/aws/*` count as `*` does, while `runtimes/myagent-*` names one
+    runtime's groups. A wildcard in the partition, service, region or account
+    segment, or in the resource type, is unbounded as it is elsewhere.
     """
     resource = str(resource).strip()
     parts = resource.split(":", 5)
@@ -11565,17 +11582,17 @@ def _logs_resource_is_unbounded(resource: str) -> bool:
     name = name.split(":log-stream", 1)[0]
     if name.endswith(":*"):
         name = name[:-2]
-    wildcard_at = min(
-        (index for index in (name.find("*"), name.find("?")) if index >= 0),
-        default=-1,
-    )
-    if wildcard_at < 0:
-        return not name
-    head, tail = name[:wildcard_at], name[wildcard_at:]
-    return (
-        "*" in tail
-        and set(tail) <= {"*", "?"}
-        and any(prefix.startswith(head) for prefix in AGENTCORE_LOG_GROUP_PREFIXES)
+    if not name:
+        return True
+    pattern = name.replace("[", "[[]")
+    return any(
+        all(
+            fnmatchcase(f"{prefix}{kind}{resource_id}{suffix}", pattern)
+            for resource_id in AGENTCORE_LOG_GROUP_PROBE_IDS
+        )
+        for prefix in AGENTCORE_LOG_GROUP_PREFIXES
+        for kind in AGENTCORE_LOG_GROUP_KINDS
+        for suffix in ("", "-DEFAULT")
     )
 
 
@@ -11717,8 +11734,9 @@ def check_agentcore_log_unmask_restriction(
                     finding_name="AgentCore Log Unmask Restriction",
                     finding_details=(
                         "The following principals can unmask the masked values of "
-                        "every AgentCore log group, through a resource of wildcards "
-                        "alone or a wildcard after an AgentCore log group prefix: "
+                        "every AgentCore log group of at least one kind, through a "
+                        "resource whose wildcards reach every resource id under an "
+                        "AgentCore log group prefix: "
                         f"{', '.join(unscoped)}. "
                         f"{IAM_CACHE_SCP_NOTE}"
                     ),
@@ -11740,12 +11758,15 @@ def check_agentcore_log_unmask_restriction(
                     check_id="AC-21",
                     finding_name="AgentCore Log Unmask Restriction",
                     finding_details=(
-                        "The following principals hold logs:Unmask only on named "
-                        f"log group resources: {', '.join(scoped)}."
+                        "The following principals hold logs:Unmask only on log "
+                        "group resources that stop short of a whole kind of "
+                        "AgentCore log group, such as one named group or one "
+                        f"runtime's groups: {', '.join(scoped)}."
                     ),
                     resolution=(
-                        "No action required. Confirm the named log groups are the "
-                        "ones this principal is authorized to unmask."
+                        "No action required. Confirm the log groups these "
+                        "resources reach are the ones this principal is "
+                        "authorized to unmask."
                     ),
                     reference=LOGS_DATA_PROTECTION_REFERENCE_URL,
                     severity=SeverityEnum.MEDIUM,
@@ -14741,6 +14762,22 @@ def _condition_values(raw: Any) -> List[str]:
     return [str(raw)]
 
 
+def _condition_string_matches(
+    pattern: str, value: str, like: bool, ignore_case: bool
+) -> bool:
+    """Return whether one condition value matches `value` under a String operator.
+
+    String operators compare case-sensitively unless the operator is an
+    IgnoreCase form. The Like forms read `*` and `?` as wildcards and nothing
+    else: IAM has no character class, so `[` is escaped before fnmatchcase.
+    """
+    if ignore_case:
+        pattern, value = pattern.casefold(), value.casefold()
+    if not like:
+        return pattern == value
+    return fnmatchcase(value, pattern.replace("[", "[[]"))
+
+
 def _statement_condition_denies_value(
     statement: Dict[str, Any], key: str, value: str
 ) -> bool:
@@ -14770,10 +14807,18 @@ def _statement_condition_denies_value(
         for entry_key, raw in entries.items():
             if str(entry_key).strip().lower() != key:
                 return False
-            values = {entry.strip().upper() for entry in _condition_values(raw)}
-            if name in SCP_DENY_VALUE_INCLUDES_OPERATORS and value in values:
+            matched = any(
+                _condition_string_matches(
+                    entry,
+                    value,
+                    like=name in ("stringlike", "stringnotlike"),
+                    ignore_case=name.endswith("ignorecase"),
+                )
+                for entry in _condition_values(raw)
+            )
+            if name in SCP_DENY_VALUE_INCLUDES_OPERATORS and matched:
                 fires = True
-            elif name in SCP_DENY_VALUE_EXCLUDES_OPERATORS and value not in values:
+            elif name in SCP_DENY_VALUE_EXCLUDES_OPERATORS and not matched:
                 fires = True
             else:
                 return False
@@ -18528,26 +18573,90 @@ def _cedar_condition_blocks(conditions: str) -> List[Tuple[str, str]]:
         position = index
 
 
+def _cedar_unwrap_parentheses(expression: str) -> str:
+    """Drop parentheses that wrap the whole expression, however many there are."""
+    expression = expression.strip()
+    while expression.startswith("(") and expression.endswith(")"):
+        inner = expression[1:-1]
+        depth = 0
+        balanced = True
+        for character in re.sub(r'"(?:[^"\\]|\\.)*"', '""', inner):
+            depth += {"(": 1, ")": -1}.get(character, 0)
+            if depth < 0:
+                balanced = False
+                break
+        if not balanced or depth:
+            break
+        expression = inner.strip()
+    return expression
+
+
+def _cedar_expression_reads_principal(expression: str) -> bool:
+    """Return whether every caller a when-block expression admits was read.
+
+    An `||` admits a caller when any branch holds, so each branch has to read
+    the principal; an `&&` admits one only when every conjunct holds, so one
+    conjunct that reads it is enough. A negated read (`!` or `!=`) admits every
+    caller but the one it names, `principal == principal` holds for every
+    caller, and `has principal` tests an attribute named principal.
+    """
+    expression = _cedar_unwrap_parentheses(expression)
+    disjuncts = [part for part in _cedar_split(expression, "|") if part.strip()]
+    if len(disjuncts) > 1:
+        return all(_cedar_expression_reads_principal(part) for part in disjuncts)
+    conjuncts = [part for part in _cedar_split(expression, "&") if part.strip()]
+    if len(conjuncts) > 1:
+        return any(_cedar_expression_reads_principal(part) for part in conjuncts)
+    if expression.startswith("!"):
+        return False
+    blanked = re.sub(r'"(?:[^"\\]|\\.)*"', '""', expression)
+    if "!=" in blanked:
+        return False
+    sides = blanked.split("==")
+    if len(sides) == 2 and sides[0].strip() == sides[1].strip():
+        return False
+    blanked = re.sub(r"\bhas\s+principal\b", "has _", blanked)
+    return bool(re.search(r"(?<![.\w])principal\b", blanked))
+
+
+def _cedar_expression_is_always_true(expression: str) -> bool:
+    """Return whether a when-block expression holds for every request.
+
+    Only the forms that need no attribute values are recognized: the literal
+    `true`, a term compared equal with itself, and `||` and `&&` built from
+    them. Anything else is taken as able to be false.
+    """
+    expression = _cedar_unwrap_parentheses(expression)
+    disjuncts = [part for part in _cedar_split(expression, "|") if part.strip()]
+    if len(disjuncts) > 1:
+        return any(_cedar_expression_is_always_true(part) for part in disjuncts)
+    conjuncts = [part for part in _cedar_split(expression, "&") if part.strip()]
+    if len(conjuncts) > 1:
+        return all(_cedar_expression_is_always_true(part) for part in conjuncts)
+    if expression == "true":
+        return True
+    sides = _cedar_split(expression, "=")
+    return len(sides) == 3 and not sides[1] and sides[0].strip() == sides[2].strip()
+
+
 def _cedar_principal_is_bounded(scope: List[str], conditions: str) -> bool:
     """Return whether a permit names the callers it admits.
 
     `principal is AgentCore::OAuthUser`, `principal == ...` and `principal in
     ...` name a type or an entity; the recommendation asks for a principal type.
     A bare `principal` admits every caller the gateway's authorizer lets
-    through, unless a `when` block reads the principal, as the attribute-based
-    pattern `principal.getTag(...)` does. An `unless` block only removes callers
-    from a permit that otherwise admits all of them, a word inside a string
-    literal is not a read, and `context.principal` is a context attribute. The
-    condition body is not evaluated: a `when` block that reads the principal is
-    taken as the bound it was written to be.
+    through, unless a `when` block admits only callers it reads, as the
+    attribute-based pattern `principal.getTag(...)` does. An `unless` block only
+    removes callers from a permit that otherwise admits all of them, a word
+    inside a string literal is not a read, and `context.principal` is a context
+    attribute. The when block is judged by its `||` and `&&` structure (see
+    _cedar_expression_reads_principal); the values it compares against are not
+    evaluated.
     """
     if len(scope[0].split()) > 1:
         return True
     return any(
-        keyword == "when"
-        and re.search(
-            r"(?<![.\w])principal\b", re.sub(r'"(?:[^"\\]|\\.)*"', '""', body)
-        )
+        keyword == "when" and _cedar_expression_reads_principal(body)
         for keyword, body in _cedar_condition_blocks(conditions)
     )
 
@@ -18571,7 +18680,9 @@ def _cedar_allow_all_permits(
     the ones whose text could not be read.
 
     Such a permit leaves the engine's default-deny nothing to decide, so an
-    engine in ENFORCE mode that holds one enforces nothing.
+    engine in ENFORCE mode that holds one enforces nothing. A permit whose only
+    conditions are plain when blocks that hold for every request, such as
+    `when { true }`, is unconditioned too.
     """
     allow_all: List[str] = []
     unreadable: List[str] = []
@@ -18586,7 +18697,16 @@ def _cedar_allow_all_permits(
         if any(
             effect == "permit"
             and _cedar_scope_is_unconstrained(scope, "action")
-            and not _cedar_condition_qualifiers(conditions)
+            and (
+                not _cedar_condition_qualifiers(conditions)
+                or (
+                    _cedar_condition_qualifiers(conditions) == {""}
+                    and all(
+                        keyword == "when" and _cedar_expression_is_always_true(body)
+                        for keyword, body in _cedar_condition_blocks(conditions)
+                    )
+                )
+            )
             for effect, scope, conditions in parsed
         ):
             allow_all.append(policy_name)
@@ -18837,9 +18957,11 @@ def check_agentcore_policy_tool_scope() -> List[Dict[str, Any]]:
                     finding_details=(
                         f"{label} enforces policy engine {policy_engine_id}, whose "
                         f"policy {', '.join(sorted(set(caller_wide)))} permits "
-                        "named tools to a bare principal and no condition reads "
-                        "the principal in a when block, so every caller the "
-                        "gateway authorizer accepts may call them."
+                        "named tools to a bare principal and nothing in a when "
+                        "block limits callers by the principal (a negated read, "
+                        "a principal compared with itself or an || branch that "
+                        "never reads it admits every caller), so every caller "
+                        "the gateway authorizer accepts may call them."
                     ),
                     resolution=(
                         "Name the caller population in the permit head, for "
@@ -19188,7 +19310,10 @@ def _kms_key_loss_alarm_leg() -> Tuple[str, List[str]]:
                     )
     alarm, alarm_unread = _metric_filter_alarm(
         lambda metric_filter: all(
-            event_name in str(metric_filter.get("filterPattern") or "")
+            _filter_pattern_selects_event(
+                metric_filter.get("filterPattern"),
+                {"eventSource": "kms.amazonaws.com", "eventName": event_name},
+            )
             for event_name in KMS_KEY_LOSS_EVENTS
         )
     )
@@ -19199,6 +19324,175 @@ def _kms_key_loss_alarm_leg() -> Tuple[str, List[str]]:
             [],
         )
     return "", unread + alarm_unread
+
+
+FILTER_PATTERN_COMPARISON = re.compile(
+    r"\$\.([A-Za-z0-9_.]+)\s*"
+    r'(?:(!=|=|<=|>=|<|>)\s*("(?:[^"\\]|\\.)*"|[^\s()&|"]+)'
+    r"|(NOT\s+EXISTS|IS\s+NULL|IS\s+TRUE|IS\s+FALSE)\b)"
+)
+FILTER_PATTERN_TERM = re.compile(r'"((?:[^"\\]|\\.)*)"|(\S+)')
+
+
+def _parse_json_filter_pattern(body: str) -> Any:
+    """Parse the inside of a `{ ... }` CloudWatch Logs JSON filter pattern.
+
+    Returns nested ("and"|"or", [terms]) and ("cmp", path, operator, value)
+    tuples. A level that mixes && and || without parentheses raises ValueError,
+    because the CloudWatch Logs pattern syntax page does not state which binds
+    tighter.
+    """
+    position = 0
+
+    def skip() -> None:
+        nonlocal position
+        while position < len(body) and body[position].isspace():
+            position += 1
+
+    def term() -> Any:
+        nonlocal position
+        skip()
+        if body.startswith("(", position):
+            position += 1
+            inner = expression()
+            skip()
+            if not body.startswith(")", position):
+                raise ValueError("unclosed parenthesis")
+            position += 1
+            return inner
+        match = FILTER_PATTERN_COMPARISON.match(body, position)
+        if not match:
+            raise ValueError(f"no comparison at {position}")
+        position = match.end()
+        path, operator, value, keyword = match.groups()
+        if keyword:
+            return ("cmp", path, " ".join(keyword.split()).upper(), "")
+        if value.startswith('"'):
+            value = value[1:-1]
+        return ("cmp", path, operator, value)
+
+    def expression() -> Any:
+        nonlocal position
+        terms = [term()]
+        joins = set()
+        while True:
+            skip()
+            join = body[position : position + 2]
+            if join not in ("&&", "||"):
+                break
+            position += 2
+            joins.add(join)
+            terms.append(term())
+        if len(joins) > 1:
+            raise ValueError("&& and || mixed at one level")
+        if not joins:
+            return terms[0]
+        return ("and" if joins == {"&&"} else "or", terms)
+
+    tree = expression()
+    skip()
+    if position != len(body):
+        raise ValueError(f"trailing text at {position}")
+    return tree
+
+
+def _json_filter_selects(tree: Any, event: Dict[str, str]) -> bool:
+    """Evaluate a parsed JSON filter pattern against a flat event.
+
+    A field the event does not carry fails every test except NOT EXISTS, so a
+    filter narrowed by a field outside the event is not credited. `=` and `!=`
+    read `*` as a wildcard, and ordering tests never match a string.
+    """
+    if tree[0] == "and":
+        return all(_json_filter_selects(part, event) for part in tree[1])
+    if tree[0] == "or":
+        return any(_json_filter_selects(part, event) for part in tree[1])
+    _, path, operator, value = tree
+    if path not in event:
+        return operator == "NOT EXISTS"
+    if operator in ("=", "!="):
+        matched = fnmatchcase(
+            event[path], value.replace("[", "[[]").replace("?", "[?]")
+        )
+        return matched if operator == "=" else not matched
+    return False
+
+
+def _plain_filter_terms(pattern: str) -> Optional[List[str]]:
+    """Return the terms of a term-matching filter pattern, or None when a term
+    excludes (`-term`), the terms mix `?` alternatives with required ones, or
+    the pattern is a space-delimited `[...]` one. Leading `?` is kept."""
+    if pattern.startswith("["):
+        return None
+    terms = []
+    for quoted, bare in FILTER_PATTERN_TERM.findall(pattern):
+        term = quoted if quoted else bare
+        if not quoted and term.startswith("-"):
+            return None
+        terms.append(term)
+    optional = {term.startswith("?") for term in terms}
+    if not terms or len(optional) > 1:
+        return None
+    return terms
+
+
+def _filter_pattern_selects_event(pattern: str, event: Dict[str, str]) -> bool:
+    """Return whether a metric filter pattern selects one CloudTrail event.
+
+    A JSON pattern is evaluated against the event's fields. A term pattern
+    matches when every term, or one `?` term, is a substring of the event's
+    JSON text. A pattern that cannot be read is not credited.
+    """
+    pattern = str(pattern or "").strip()
+    if not pattern:
+        return False
+    if pattern.startswith("{"):
+        if not pattern.endswith("}"):
+            return False
+        try:
+            tree = _parse_json_filter_pattern(pattern[1:-1])
+        except ValueError:
+            return False
+        return _json_filter_selects(tree, event)
+    terms = _plain_filter_terms(pattern)
+    if terms is None:
+        return False
+    line = json.dumps(event)
+    if terms[0].startswith("?"):
+        return any(term[1:] in line for term in terms)
+    return all(term in line for term in terms)
+
+
+def _filter_pattern_requires_word(pattern: str, word: str) -> bool:
+    """Return whether a filter pattern selects only lines carrying `word`.
+
+    For a log line whose shape is not documented: a term pattern whose required
+    terms, or every `?` term, contain the word, or a JSON pattern whose tests
+    all require it through `=`. Case is folded, as the line's wording is not
+    known either.
+    """
+    pattern = str(pattern or "").strip()
+    word = word.casefold()
+    if pattern.startswith("{") and pattern.endswith("}"):
+        try:
+            tree = _parse_json_filter_pattern(pattern[1:-1])
+        except ValueError:
+            return False
+
+        def requires(node: Any) -> bool:
+            if node[0] == "and":
+                return any(requires(part) for part in node[1])
+            if node[0] == "or":
+                return all(requires(part) for part in node[1])
+            return node[2] == "=" and word in node[3].casefold()
+
+        return requires(tree)
+    terms = _plain_filter_terms(pattern)
+    if terms is None:
+        return False
+    if terms[0].startswith("?"):
+        return all(word in term[1:].casefold() for term in terms)
+    return any(word in term.casefold() for term in terms)
 
 
 COMPOSITE_ALARM_TERM = re.compile(r'\bALARM\(\s*"?([^")]+?)"?\s*\)')
@@ -23035,18 +23329,25 @@ AGENTCORE_COMMAND_SHELL_EVENT = "InvokeAgentRuntimeCommandShell"
 def _command_shell_filter_matches(metric_filter: Dict[str, Any]) -> bool:
     """Return whether a metric filter counts shell connections.
 
-    A filter counts when its pattern names the InvokeAgentRuntimeCommandShell
-    event, as a filter on a CloudTrail log group would, or when it sits on an
-    AgentCore runtime log group and its pattern names a shell. The runtime log
-    line for a shell connection is not documented, so the second form is
-    matched by name and not against the line.
+    A filter counts when its pattern selects the InvokeAgentRuntimeCommandShell
+    CloudTrail event, as a filter on a CloudTrail log group would, or when it
+    sits on an AgentCore runtime log group and its pattern selects only lines
+    naming a shell. The runtime log line for a shell connection is not
+    documented, so the second form is matched by the word and not against the
+    line.
     """
-    pattern = str(metric_filter.get("filterPattern") or "")
-    if AGENTCORE_COMMAND_SHELL_EVENT in pattern:
+    pattern = metric_filter.get("filterPattern")
+    if _filter_pattern_selects_event(
+        pattern,
+        {
+            "eventSource": AGENTCORE_SERVICE_PRINCIPAL,
+            "eventName": AGENTCORE_COMMAND_SHELL_EVENT,
+        },
+    ):
         return True
     return str(metric_filter.get("logGroupName") or "").startswith(
         AGENTCORE_RUNTIME_LOG_GROUP_PREFIX
-    ) and ("shell" in pattern.lower())
+    ) and _filter_pattern_requires_word(pattern, "shell")
 
 
 def _command_shell_findings(permission_cache: Dict[str, Any]) -> List[Dict[str, Any]]:

@@ -11776,7 +11776,7 @@ class TestAC28GatewayAuthorizerSCP:
                         "Resource": "*",
                         "Condition": {
                             "ForAnyValue:StringEquals": {
-                                "bedrock-agentcore:gatewayauthorizertype": "none"
+                                "bedrock-agentcore:gatewayauthorizertype": "NONE"
                             }
                         },
                     }
@@ -12482,8 +12482,20 @@ class TestAC29RuntimeAuthorizerSCP:
         assert findings[0]["Status"] == "Passed"
         assert "DenyCreate, DenyUpdate" in findings[0]["Finding_Details"]
 
+    @pytest.mark.parametrize(
+        "operator, value, status",
+        [
+            # StringEquals is case-sensitive and IAM does not trim, so neither a
+            # lower-cased nor a padded value denies AWS_IAM.
+            ("StringEquals", " aws_iam ", "Failed"),
+            ("StringEquals", "aws_iam", "Failed"),
+            ("StringEqualsIgnoreCase", "aws_iam", "Passed"),
+        ],
+    )
     @patch("agentcore_app.organizations_client")
-    def test_the_value_match_ignores_case_and_padding(self, mock_orgs):
+    def test_the_value_match_is_case_sensitive_unless_the_operator_folds(
+        self, mock_orgs, operator, value, status
+    ):
         self._wire(
             mock_orgs,
             {
@@ -12492,7 +12504,7 @@ class TestAC29RuntimeAuthorizerSCP:
                         "Effect": "Deny",
                         "Action": _RUNTIME_WRITE,
                         "Resource": "*",
-                        "Condition": {"StringEquals": {_RUNTIME_KEY: " aws_iam "}},
+                        "Condition": {operator: {_RUNTIME_KEY: value}},
                     }
                 ]
             },
@@ -12500,7 +12512,7 @@ class TestAC29RuntimeAuthorizerSCP:
 
         findings = agentcore_app.check_agentcore_runtime_authorizer_scp()
 
-        assert findings[0]["Status"] == "Passed"
+        assert findings[0]["Status"] == status
 
     @patch("agentcore_app.organizations_client")
     def test_policies_are_read_from_every_page(self, mock_orgs):
@@ -30539,6 +30551,12 @@ class TestAC21PrefixWideUnmask:
             "/aws/*",
             "/aws/bedrock-agentcore*",
             "/aws/bedrock-agentcore/?*",
+            # A wildcard over one kind's resource ids reaches every group of
+            # that kind, including ones created after the grant.
+            "/aws/bedrock-agentcore/runtimes/*",
+            "/aws/bedrock-agentcore/runtimes/*-DEFAULT",
+            "/aws/vendedlogs/bedrock-agentcore/memory/*",
+            "*agentcore*",
         ],
     )
     def test_a_prefix_wide_grant_fails(self, name):
@@ -30553,7 +30571,8 @@ class TestAC21PrefixWideUnmask:
             "/aws/bedrock-agentcore/runtimes/rt-1-DEFAULT",
             "/aws/bedrock-agentcore/runtimes/rt-1-DEFAULT:*",
             "/aws/bedrock-agentcore/*/rt-1-DEFAULT",
-            "/aws/bedrock-agentcore/runtimes/*",
+            "/aws/bedrock-agentcore/runtimes/myagent-*",
+            "/aws/bedrock-agentcore/runtimes/rt-?-DEFAULT",
             "/aws/lambda/*",
         ],
     )
@@ -30575,6 +30594,21 @@ class TestAC21PrefixWideUnmask:
         assert "role vended, role wide" in by_status["Failed"]
         assert "role narrow" not in by_status["Failed"]
         assert "role narrow" in by_status["Passed"]
+
+    def test_only_the_runtime_family_role_fails(self):
+        # Two grants under the runtimes prefix: the one over every runtime id
+        # fails, the one over one runtime's endpoints does not.
+        findings = self._run(
+            family="/aws/bedrock-agentcore/runtimes/*",
+            onerun="/aws/bedrock-agentcore/runtimes/myagent-*",
+        )
+
+        by_status = {f["Status"]: f["Finding_Details"] for f in findings}
+        assert set(by_status) == {"Failed", "Passed"}
+        assert "role family" in by_status["Failed"]
+        assert "role onerun" not in by_status["Failed"]
+        assert "role onerun" in by_status["Passed"]
+        assert "named log group" not in by_status["Passed"]
 
 
 class TestAC23WholePopulation:
@@ -37985,3 +38019,394 @@ class TestAgentCoreCompositeAlarmCredit:
             "a-to-b (actioned through composite alarm rollup) on Fault"
             in findings[0]["Finding_Details"]
         )
+
+
+@pytest.mark.usefixtures("_member_account")
+class TestScpConditionValueMatching:
+    """AC-28 and AC-29 credit a Deny only when its condition fires for the
+    authorizer type it has to block. String operators compare case-sensitively,
+    the IgnoreCase forms fold case, and the Like forms read `*` and `?` as IAM
+    wildcards; a Like pattern is not a literal."""
+
+    _GW_KEY = "bedrock-agentcore:gatewayauthorizertype"
+
+    @staticmethod
+    def _deny(operator, values):
+        return {
+            "Effect": "Deny",
+            "Action": _GATEWAY_WRITE,
+            "Resource": "*",
+            "Condition": {
+                operator: {"bedrock-agentcore:GatewayAuthorizerType": values}
+            },
+        }
+
+    @pytest.mark.parametrize(
+        "operator, values, fires",
+        [
+            # Like patterns match NONE, so a NotLike that names them spares it.
+            ("StringNotLike", "*", False),
+            ("StringNotLike", "N*", False),
+            ("StringNotLike", "NON?", False),
+            ("StringNotLike", ["AWS_*", "CUSTOM_*"], True),
+            ("StringLike", "N*", True),
+            ("StringLike", "?ONE", True),
+            ("StringLike", "*", True),
+            ("StringLike", "AWS_*", False),
+            # IAM has no character class, so a bracket is a literal.
+            ("StringLike", "[N]ONE", False),
+            ("StringLike", "NONE", True),
+            # String operators are case-sensitive; IgnoreCase folds.
+            ("StringEquals", "none", False),
+            ("StringEquals", "NONE", True),
+            ("StringEqualsIgnoreCase", "none", True),
+            ("StringNotEquals", "none", True),
+            ("StringNotEqualsIgnoreCase", "none", False),
+        ],
+    )
+    def test_gateway_none_value(self, operator, values, fires):
+        statement = self._deny(operator, values)
+        assert (
+            agentcore_app._statement_condition_denies_value(
+                statement, self._GW_KEY, "NONE"
+            )
+            is fires
+        )
+
+    @pytest.mark.parametrize(
+        "operator, values, fires",
+        [
+            ("StringNotLike", "AWS_*", False),
+            ("StringEquals", "aws_iam", False),
+            ("StringLike", "AWS_*", True),
+            ("StringNotLike", "CUSTOM_*", True),
+        ],
+    )
+    def test_runtime_aws_iam_value(self, operator, values, fires):
+        statement = {
+            "Effect": "Deny",
+            "Action": _RUNTIME_WRITE,
+            "Resource": "*",
+            "Condition": {operator: {_RUNTIME_KEY: values}},
+        }
+        assert (
+            agentcore_app._statement_condition_denies_value(
+                statement, _RUNTIME_KEY.lower(), "AWS_IAM"
+            )
+            is fires
+        )
+
+    @pytest.mark.parametrize(
+        "operator, values",
+        [("StringNotLike", "*"), ("StringNotLike", "N*"), ("StringEquals", "none")],
+    )
+    @patch("agentcore_app.organizations_client")
+    def test_ac28_fails_an_scp_that_blocks_nothing(self, mock_orgs, operator, values):
+        TestAC28GatewayAuthorizerSCP()._wire(
+            mock_orgs, {"LooksGuarded": [self._deny(operator, values)]}
+        )
+
+        findings = agentcore_app.check_agentcore_gateway_authorizer_scp()
+
+        assert [f["Status"] for f in findings] == ["Failed"]
+
+    @patch("agentcore_app.organizations_client")
+    def test_ac28_passes_a_like_pattern_that_reaches_none(self, mock_orgs):
+        # The surprising direction: a wildcard that does match NONE still credits.
+        TestAC28GatewayAuthorizerSCP()._wire(
+            mock_orgs, {"DenyNoAuthorizer": [self._deny("StringLike", "N?NE")]}
+        )
+
+        findings = agentcore_app.check_agentcore_gateway_authorizer_scp()
+
+        assert [f["Status"] for f in findings] == ["Passed"]
+
+    @pytest.mark.parametrize(
+        "operator, values", [("StringNotLike", "AWS_*"), ("StringEquals", "aws_iam")]
+    )
+    @patch("agentcore_app.organizations_client")
+    def test_ac29_fails_an_scp_that_blocks_nothing(self, mock_orgs, operator, values):
+        TestAC29RuntimeAuthorizerSCP()._wire(
+            mock_orgs,
+            {
+                "LooksGuarded": [
+                    {
+                        "Effect": "Deny",
+                        "Action": _RUNTIME_WRITE,
+                        "Resource": "*",
+                        "Condition": {operator: {_RUNTIME_KEY: values}},
+                    }
+                ]
+            },
+        )
+
+        findings = agentcore_app.check_agentcore_runtime_authorizer_scp()
+
+        assert [f["Status"] for f in findings] == ["Failed"]
+
+
+class TestMetricFilterPatternSelectsTheEvent:
+    """AC-36 and AC-45 credit a metric filter only when its pattern selects the
+    CloudTrail event, not when the pattern merely names it: a `!=` names the
+    event and counts every other one."""
+
+    _SHELL_EVENT = {
+        "eventSource": "bedrock-agentcore.amazonaws.com",
+        "eventName": "InvokeAgentRuntimeCommandShell",
+    }
+
+    @pytest.mark.parametrize(
+        "pattern, selects",
+        [
+            ("{ $.eventName = InvokeAgentRuntimeCommandShell }", True),
+            ('{ $.eventName = "InvokeAgentRuntimeCommandShell" }', True),
+            ('{ $.eventName = "InvokeAgentRuntime*" }', True),
+            (
+                '{ ($.eventSource = "bedrock-agentcore.amazonaws.com") && '
+                '($.eventName = "InvokeAgentRuntimeCommandShell") }',
+                True,
+            ),
+            (
+                "{ ($.eventName = InvokeAgentRuntime) || "
+                "($.eventName = InvokeAgentRuntimeCommandShell) }",
+                True,
+            ),
+            ("{ ($.eventName = X) || ($.errorCode NOT EXISTS) }", True),
+            ("InvokeAgentRuntimeCommandShell", True),
+            ('"InvokeAgentRuntimeCommandShell"', True),
+            ('{ $.eventName != "InvokeAgentRuntimeCommandShell" }', False),
+            ("{ $.eventName = InvokeAgentRuntime }", False),
+            ('{ $.eventSource = "kms.amazonaws.com" }', False),
+            # A test on a field the synthetic event does not carry narrows the
+            # filter to some calls, so it is not credited.
+            (
+                "{ ($.eventName = InvokeAgentRuntimeCommandShell) && "
+                '($.errorCode = "AccessDenied") }',
+                False,
+            ),
+            # && and || at one level without parentheses: precedence is not
+            # documented, so the pattern is not credited.
+            (
+                "{ $.eventName = X || $.eventName = InvokeAgentRuntimeCommandShell "
+                "&& $.errorCode = Y }",
+                False,
+            ),
+            ("-InvokeAgentRuntimeCommandShell", False),
+            ("", False),
+            ("{ $.eventName = ", False),
+        ],
+    )
+    def test_the_pattern_selects_the_shell_event(self, pattern, selects):
+        assert (
+            agentcore_app._filter_pattern_selects_event(pattern, self._SHELL_EVENT)
+            is selects
+        )
+
+    @pytest.mark.parametrize(
+        "pattern",
+        [
+            '{ $.eventName != "InvokeAgentRuntimeCommandShell" }',
+            "{ $.eventName = InvokeAgentRuntimeCommandShellX }",
+        ],
+    )
+    def test_ac45_fails_a_filter_that_does_not_select_shells(self, pattern):
+        holder = TestAC45CommandShellAlarm()
+        rows = holder._rows(
+            holder._holder(),
+            *_shell_alarm_clients(({**_SHELL_FILTER, "filterPattern": pattern},)),
+        )
+
+        assert [f["Status"] for f in rows] == ["Failed"]
+
+    def test_ac45_fails_a_runtime_group_filter_that_excludes_shells(self):
+        holder = TestAC45CommandShellAlarm()
+        rows = holder._rows(
+            holder._holder(),
+            *_shell_alarm_clients(
+                (
+                    {
+                        **_SHELL_FILTER,
+                        "logGroupName": "/aws/bedrock-agentcore/runtimes/rt-1-DEFAULT",
+                        "filterPattern": "-shell",
+                    },
+                )
+            ),
+        )
+
+        assert [f["Status"] for f in rows] == ["Failed"]
+
+    @pytest.mark.parametrize(
+        "pattern, status",
+        [
+            (
+                "{ ($.eventName != DisableKey) && ($.eventName != ScheduleKeyDeletion) }",
+                "Failed",
+            ),
+            (
+                "{ ($.eventSource = kms.amazonaws.com) && ($.eventName = DisableKey) "
+                "&& ($.eventName = ScheduleKeyDeletion) }",
+                "Failed",
+            ),
+            (
+                "{ ($.eventName = DisableKey) || ($.eventName = ScheduleKeyDeletion) }",
+                "Passed",
+            ),
+        ],
+    )
+    @patch("agentcore_app.kms_client")
+    @patch("agentcore_app.agentcore_client")
+    def test_ac36_credits_only_a_filter_selecting_both_calls(
+        self, mock_ac, mock_kms, pattern, status
+    ):
+        base = TestAC36KeyLossAlarmAndServiceBounds()
+        findings = base._run(
+            mock_ac,
+            mock_kms,
+            events=_key_loss_events(),
+            logs=base._logs({**base._FILTER, "filterPattern": pattern}),
+            cloudwatch=base._cloudwatch(base._ALARM),
+        )
+
+        assert [f["Status"] for f in findings] == [status]
+
+
+class TestAC35WhenBlockBoundsTheCaller:
+    """AC-35 credits a when block with bounding a bare principal only when the
+    block admits no caller it does not read: every branch of an || has to read
+    the principal, one conjunct of an && is enough, and a tautology, a negation
+    or an attribute named `principal` reads nothing."""
+
+    @pytest.mark.parametrize(
+        "conditions",
+        [
+            "when { principal == principal };",
+            'when { true || principal.id == "a" };',
+            "when { context.input has principal };",
+            'when { principal != AgentCore::OAuthUser::"x" };',
+            'when { !(principal.hasTag("blocked")) };',
+            'when { principal.hasTag("a") || context.input.x == 1 };',
+            'when { (context.input.x == 1 || principal.hasTag("a")) };',
+        ],
+        ids=[
+            "tautology",
+            "or-true",
+            "has-attribute",
+            "not-equals",
+            "negation",
+            "or-input",
+            "parenthesized-or-input",
+        ],
+    )
+    @patch("agentcore_app.agentcore_client")
+    def test_a_block_that_admits_unread_callers_does_not_bound(
+        self, mock_ac, conditions
+    ):
+        findings = TestAC35CallerAndGatewayScope._run(
+            mock_ac,
+            {"gw-1": [TestAC35CallerAndGatewayScope._NAMED_GATEWAY_HEAD + conditions]},
+        )
+
+        assert [f["Finding"] for f in findings] == [
+            "AgentCore Policy Caller Scope Unbounded"
+        ]
+        assert findings[0]["Status"] == "Failed"
+
+    @pytest.mark.parametrize(
+        "conditions",
+        [
+            'when { (principal.hasTag("a") || principal.hasTag("b")) '
+            "&& context.input.amount < 100 };",
+            'when { context.input has principal && principal.getTag("t") == "p" };',
+            'when { true && principal in Team::"pay" };',
+            'when { context.input.x == 1 } when { principal.hasTag("a") };',
+        ],
+        ids=["or-of-reads", "has-then-read", "and-true", "second-block"],
+    )
+    @patch("agentcore_app.agentcore_client")
+    def test_a_block_that_reads_every_admitted_caller_bounds(self, mock_ac, conditions):
+        findings = TestAC35CallerAndGatewayScope._run(
+            mock_ac,
+            {"gw-1": [TestAC35CallerAndGatewayScope._NAMED_GATEWAY_HEAD + conditions]},
+        )
+
+        assert [f["Status"] for f in findings] == ["Passed"]
+
+    @patch("agentcore_app.agentcore_client")
+    def test_only_the_tautology_permit_fails(self, mock_ac):
+        head = TestAC35CallerAndGatewayScope._NAMED_GATEWAY_HEAD
+        findings = TestAC35CallerAndGatewayScope._run(
+            mock_ac,
+            {
+                "gw-1": [
+                    head + 'when { principal.hasTag("a") };',
+                    head + "when { principal == principal };",
+                ]
+            },
+        )
+
+        assert [f["Finding"] for f in findings] == [
+            "AgentCore Policy Caller Scope Unbounded"
+        ]
+        assert "policy p1 permits" in findings[0]["Finding_Details"]
+        assert "p0" not in findings[0]["Finding_Details"]
+
+
+class TestAG25AlwaysTrueConditionAllowsAll:
+    """A when block that holds for every request restricts nothing, so a
+    permit over every action carrying only such blocks allows all."""
+
+    @pytest.mark.parametrize(
+        "conditions",
+        [
+            "when { true }",
+            "when { principal == principal }",
+            'when { true || principal.id == "a" }',
+            "when { (true) } when { resource == resource }",
+        ],
+        ids=["true", "tautology", "or-true", "two-blocks"],
+    )
+    @patch("agentcore_app.agentcore_client")
+    def test_an_always_true_condition_allows_all(self, mock_ac, conditions):
+        findings = TestAG25EnforcingPolicyText._ag25(
+            mock_ac,
+            {"gw-1": _ag25_gateway("pe-1")},
+            {
+                "pe-1": [
+                    _cedar_policy("scoped", _SCOPED_PERMIT),
+                    _cedar_policy(
+                        "always", f"permit(principal, action, resource) {conditions};"
+                    ),
+                ]
+            },
+        )
+
+        assert [f["Status"] for f in findings] == ["Failed"]
+        assert findings[0]["Finding"].endswith("Allows All")
+        assert "always" in findings[0]["Finding_Details"]
+        assert "scoped" not in findings[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "conditions",
+        [
+            'when { true && principal.hasTag("a") }',
+            "when { true } unless { principal == principal }",
+            "when { true } when { context.input.x == 1 }",
+            "when temporal { true }",
+        ],
+        ids=["and-read", "unless", "second-block-reads", "qualified"],
+    )
+    @patch("agentcore_app.agentcore_client")
+    def test_a_condition_that_can_be_false_is_left_to_ac35(self, mock_ac, conditions):
+        findings = TestAG25EnforcingPolicyText._ag25(
+            mock_ac,
+            {"gw-1": _ag25_gateway("pe-1")},
+            {
+                "pe-1": [
+                    _cedar_policy(
+                        "cond", f"permit(principal, action, resource) {conditions};"
+                    )
+                ]
+            },
+        )
+
+        assert [f["Status"] for f in findings] == ["Passed"]
