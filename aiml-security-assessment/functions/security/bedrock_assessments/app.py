@@ -28919,7 +28919,8 @@ def check_agent_handoff_source_identity(
     """
     BR-57: Fail an identifiable agent-to-agent handoff with no checked caller
     binding. A Bedrock collaborator that runs as its supervisor's role acts
-    with the supervisor's authority. A role that an agent role can assume,
+    with the supervisor's authority, and two collaborators of one supervisor,
+    or two agents, that run as one role carry no distinct identity. A role that an agent role can assume,
     named in its trust policy or reached through an account trust and the
     agent role's sts:AssumeRole grant, fails unless the trust statement pins
     sts:SourceIdentity to named values.
@@ -28961,6 +28962,9 @@ def check_agent_handoff_source_identity(
             )
 
         failures = []
+        shared_roles = set()
+        # supervisor -> collaborator role -> the collaborators that run as it
+        collaborator_roles: Dict[str, Dict[str, List[str]]] = {}
         for pair in inventory["collaborations"]:
             roles = pair["collaborator_roles"]
             if roles is None:
@@ -28980,6 +28984,37 @@ def check_agent_handoff_source_identity(
                         pair["supervisor_role"],
                     )
                 )
+                shared_roles.add(pair["supervisor_role"])
+            for role_arn in roles:
+                names = collaborator_roles.setdefault(pair["supervisor"], {})
+                names.setdefault(role_arn, [])
+                if pair["collaborator"] not in names[role_arn]:
+                    names[role_arn].append(pair["collaborator"])
+        for supervisor, by_role in collaborator_roles.items():
+            for role_arn, names in sorted(by_role.items()):
+                if len(names) < 2 or role_arn in shared_roles:
+                    continue
+                failures.append(
+                    "collaborators {} of supervisor {} all run as role {}, so a "
+                    "handoff to one carries the identity of the others".format(
+                        " and ".join(f"'{name}'" for name in names),
+                        supervisor,
+                        role_arn,
+                    )
+                )
+                shared_roles.add(role_arn)
+        # A label is "<kind> '<name>' version <n>"; versions of one agent may
+        # share a role, and two agents may not.
+        for role_arn, labels in sorted(agent_roles.items()):
+            agents = sorted({label.rsplit(" version ", 1)[0] for label in labels})
+            if len(agents) < 2 or role_arn in shared_roles:
+                continue
+            failures.append(
+                "role {} is run by {} agents: {}, so a handoff between them "
+                "carries no distinct identity".format(
+                    role_arn, len(agents), ", ".join(agents)
+                )
+            )
 
         role_cache = (permission_cache or {}).get("role_permissions") or {}
         edges = []
@@ -29072,7 +29107,7 @@ def check_agent_handoff_source_identity(
                         "; ".join((failures + edges)[:10]),
                         AGENT_HANDOFF_SCOPE_NOTE,
                     ),
-                    "Give each collaborator its own agent resource role, and add a "
+                    "Give each agent and each collaborator its own role, and add a "
                     "StringEquals sts:SourceIdentity condition naming the calling "
                     "agent, with sts:SetSourceIdentity allowed, to every trust "
                     "statement an agent role can assume.",
@@ -29098,8 +29133,9 @@ def check_agent_handoff_source_identity(
             detail = (
                 "{} agent role(s) were read and {} role trust polic(ies) checked. "
                 "{} trust edge(s) from an agent role were found and each pins "
-                "sts:SourceIdentity{}, and {} Bedrock collaborator(s) run as a "
-                "role other than their supervisor's.".format(
+                "sts:SourceIdentity{}, {} Bedrock collaborator(s) run as a "
+                "role other than their supervisor's, and no two agents share a "
+                "role.".format(
                     len(agent_roles),
                     roles_read,
                     len(bound_edges),

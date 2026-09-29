@@ -32006,6 +32006,87 @@ class TestBR57AgentHandoffSourceIdentity:
         detail = failed[0]["Finding_Details"]
         assert "'same-role'" in detail and "'own-role'" not in detail
 
+    def test_two_collaborators_of_one_supervisor_sharing_a_role_fail(self):
+        """Two aliases of one agent: the per-agent role map cannot see this."""
+        tool = self._role_arn("tool")
+        cache = self._cache({"sup": _identity(), "tool": _identity()})
+        collaborations = [
+            {
+                "supervisor": "'sup' version DRAFT",
+                "supervisor_role": self._role_arn("sup"),
+                "collaborator": name,
+                "alias_arn": self._alias_arn("B", alias),
+                "collaborator_roles": [tool],
+            }
+            for name, alias in (("reader", "X"), ("writer", "Y"))
+        ]
+        result, rows, _ = self._run(
+            cache,
+            self._inventory(
+                {
+                    "sup": ["Bedrock agent 'sup' version DRAFT"],
+                    "tool": [
+                        "Bedrock agent 'b' version 1",
+                        "Bedrock agent 'b' version 2",
+                    ],
+                },
+                collaborations,
+            ),
+            {},
+        )
+        failed = self._status(rows, "Failed")
+        assert result["status"] == "WARN" and len(failed) == 1
+        detail = failed[0]["Finding_Details"]
+        assert "collaborators 'reader' and 'writer' of supervisor 'sup'" in detail
+        assert tool in detail
+        assert "1 agent handoff(s)" in detail
+        assert not self._status(rows, "Passed")
+
+    def test_two_agents_sharing_a_role_fail(self):
+        shared = self._role_arn("shared")
+        cache = self._cache({"shared": _identity(), "own": _identity()})
+        result, rows, _ = self._run(
+            cache,
+            self._inventory(
+                {
+                    "shared": [
+                        "Bedrock agent 'a' version DRAFT",
+                        "AgentCore runtime 'a' version 1",
+                    ],
+                    "own": ["Bedrock agent 'c' version DRAFT"],
+                }
+            ),
+            {},
+        )
+        failed = self._status(rows, "Failed")
+        assert result["status"] == "WARN" and len(failed) == 1
+        detail = failed[0]["Finding_Details"]
+        assert (
+            f"role {shared} is run by 2 agents: AgentCore runtime 'a', "
+            "Bedrock agent 'a'" in detail
+        )
+        assert "'c'" not in detail
+        assert not self._status(rows, "Passed")
+
+    def test_one_agent_across_versions_on_one_role_is_not_sharing(self):
+        cache = self._cache({"agent-a": _identity()})
+        result, rows, _ = self._run(
+            cache,
+            self._inventory(
+                {
+                    "agent-a": [
+                        "Bedrock agent 'a' version DRAFT",
+                        "Bedrock agent 'a' version 3",
+                    ]
+                }
+            ),
+            {},
+        )
+        assert result["status"] == "PASS"
+        passed = self._status(rows, "Passed")
+        assert len(passed) == 1
+        assert "no two agents share a role" in passed[0]["Finding_Details"]
+
     def test_unresolved_collaborator_is_na_not_passed(self):
         cache = self._cache({"sup": _identity()})
         collaborations = [
