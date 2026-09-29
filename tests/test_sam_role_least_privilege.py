@@ -155,6 +155,8 @@ _EXPECTED_ACTIONS = {
         "eks:ListClusters",
         "eks:ListPodIdentityAssociations",
         "events:ListTargetsByRule",
+        "iam:GetPolicy",
+        "iam:GetPolicyVersion",
         "sagemaker:DescribeEndpoint",
         "sagemaker:DescribeEndpointConfig",
         "sagemaker:DescribeInferenceComponent",
@@ -163,6 +165,8 @@ _EXPECTED_ACTIONS = {
         "sagemaker:ListDomains",
         "sagemaker:ListInferenceComponents",
         "sagemaker:ListTrainingJobs",
+        "sso:ListCustomerManagedPolicyReferencesInPermissionSet",
+        "sso:ListManagedPoliciesInPermissionSet",
     },
     "BedrockSecurityAssessmentFunction": {
         "aoss:BatchGetCollection",
@@ -839,6 +843,26 @@ def test_bedrock_managed_policy_holds_exactly_the_approved_grants(template):
                     }
                 ),
             ),
+            *(
+                (
+                    "Allow",
+                    action,
+                    json.dumps(
+                        [
+                            {"Fn::Sub": "arn:${AWS::Partition}:sso:::instance/*"},
+                            {
+                                "Fn::Sub": "arn:${AWS::Partition}:sso:::permissionSet/*/*"
+                            },
+                        ]
+                    ),
+                )
+                for action in (
+                    "sso:ListManagedPoliciesInPermissionSet",
+                    "sso:ListCustomerManagedPolicyReferencesInPermissionSet",
+                )
+            ),
+            scoped("iam:GetPolicy", "iam::aws:policy/*"),
+            scoped("iam:GetPolicyVersion", "iam::aws:policy/*"),
         ]
     )
     inline = _actions(template, "BedrockSecurityAssessmentFunction")

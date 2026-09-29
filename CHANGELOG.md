@@ -261,6 +261,16 @@ section.
 
 ### Fixed
 
+- `BR-51` reads the AWS managed policies attached to each IAM Identity Center
+  permission set, and fails a permission set whose inline or AWS managed
+  policies grant an AI write unless one of its policies carries the
+  `aws:PrincipalTag` Deny over every AI service granted. It had read only the
+  inline policy, so a permission set that granted `bedrock:*` through
+  `AmazonBedrockFullAccess` was never named. A permission set whose AWS managed
+  policy cannot be read keeps the row `N/A`. Customer managed policy
+  references are named and not read, because each resolves to a policy of that
+  name in every account the permission set is provisioned to, and a permission
+  set that has one is not judged.
 - `BR-32` `Passed` rows name, as an UNVERIFIED open edge, whether guardrail
   metrics for a guardrail that another account owns, or that the
   organization enforces, are emitted in this account.
@@ -1170,7 +1180,12 @@ AWS sources disagree here: the service authorization reference gives
 `ListTasks` the `container-instance` resource type, which a listing by
 cluster does not name, while the Amazon ECS developer guide's `ListTasks`
 example grants `*` under the `ecs:cluster` key. The grant follows the
-developer guide. All are read-only, and the same CodeBuild run applies them.
+developer guide. For `BR-51` it gains `sso:ListManagedPoliciesInPermissionSet`
+and `sso:ListCustomerManagedPolicyReferencesInPermissionSet` on the
+`instance/*` and `permissionSet/*/*` ARNs, and `iam:GetPolicy` and
+`iam:GetPolicyVersion` on `arn:${AWS::Partition}:iam::aws:policy/*`, so only
+AWS managed policy documents are readable. All are read-only, and the same
+CodeBuild run applies them.
 
 **Update the deployment stack first.** The CodeBuild and member deployment
 roles could attach only `AWSLambdaBasicExecutionRole` and could not create a

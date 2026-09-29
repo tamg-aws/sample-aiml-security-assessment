@@ -1753,12 +1753,15 @@ FOUNDATION_ROWS = [
         "listed and only the primary scan Region is read, the row is N/A. It "
         "passes only when every enabled Region was read and none returns an "
         "instance. That row "
-        "names each permission set whose inline policy grants an AI write "
-        "(sso:ListPermissionSets, sso:GetInlinePolicyForPermissionSet), and fails "
-        "each one whose inline policy carries no Deny keyed on one aws:PrincipalTag "
-        "value over every AI service it grants; managed policies attached to a "
-        "permission set, and the attributes for access control that set the tag, "
-        "are not read",
+        "names each permission set whose inline or AWS managed policies grant an "
+        "AI write (sso:ListPermissionSets, sso:GetInlinePolicyForPermissionSet, "
+        "sso:ListManagedPoliciesInPermissionSet, iam:GetPolicyVersion), and fails "
+        "each one where no policy of the permission set carries a Deny keyed on "
+        "one aws:PrincipalTag value over every AI service it grants. A permission "
+        "set whose AWS managed policy is unread is N/A. Customer managed policy "
+        "references resolve in each target account, so they are named and not "
+        "read, and that permission set is not judged; the attributes for access "
+        "control that set the tag are not read",
         [],
         6,
     ),

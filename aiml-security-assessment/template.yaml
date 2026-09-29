@@ -399,6 +399,26 @@ Resources:
             Condition:
               ArnLike:
                 ecs:cluster: !Sub 'arn:${AWS::Partition}:ecs:*:${AWS::AccountId}:cluster/*'
+          - Sid: SSOPermissionSetPolicyList
+            # BR-51 lists the AWS managed and customer managed policies of each
+            # permission set. The service authorization reference gives both
+            # actions the Instance and PermissionSet resource types.
+            Effect: Allow
+            Action:
+              - sso:ListManagedPoliciesInPermissionSet # BR-51
+              - sso:ListCustomerManagedPolicyReferencesInPermissionSet # BR-51
+            Resource:
+              - !Sub 'arn:${AWS::Partition}:sso:::instance/*'
+              - !Sub 'arn:${AWS::Partition}:sso:::permissionSet/*/*'
+          - Sid: AWSManagedPolicyRead
+            # BR-51 reads the default version of each AWS managed policy
+            # attached to a permission set. Only AWS managed policies, which
+            # live under the aws account segment, are read.
+            Effect: Allow
+            Action:
+              - iam:GetPolicy # BR-51
+              - iam:GetPolicyVersion # BR-51
+            Resource: !Sub 'arn:${AWS::Partition}:iam::aws:policy/*'
   BedrockSecurityAssessmentFunction:
     Type: AWS::Serverless::Function
     Properties:

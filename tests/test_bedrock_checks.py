@@ -26981,10 +26981,57 @@ class TestBR51AIUserConsoleMFA:
         permission_sets=None,
         inline=None,
         regions=None,
+        managed=None,
+        customer=None,
+        aws_policies=None,
     ):
+        """`managed` maps a permission set to the AWS managed policy ARNs
+        ListManagedPoliciesInPermissionSet returns (a dict of pages keyed by
+        NextToken, or an exception), `customer` to its customer managed
+        references, and `aws_policies` an AWS managed ARN to its default
+        document, or to an exception GetPolicyVersion raises."""
         iam = MagicMock()
         login = login or {}
         permission_sets = permission_sets or {}
+        managed = managed or {}
+        customer = customer or {}
+        aws_policies = aws_policies or {}
+
+        def list_managed(InstanceArn, PermissionSetArn, **kwargs):
+            outcome = managed.get(PermissionSetArn, [])
+            if isinstance(outcome, Exception):
+                raise outcome
+            if isinstance(outcome, dict):
+                page = dict(outcome[kwargs.get("NextToken")])
+                arns = page.pop("arns")
+            else:
+                page, arns = {}, outcome
+            page["AttachedManagedPolicies"] = [
+                {"Name": arn.rsplit("/", 1)[-1], "Arn": arn} for arn in arns
+            ]
+            return page
+
+        def list_customer(InstanceArn, PermissionSetArn, **kwargs):
+            outcome = customer.get(PermissionSetArn, [])
+            if isinstance(outcome, Exception):
+                raise outcome
+            return {"CustomerManagedPolicyReferences": outcome}
+
+        def get_policy(PolicyArn):
+            return {"Policy": {"Arn": PolicyArn, "DefaultVersionId": "v7"}}
+
+        def get_policy_version(PolicyArn, VersionId):
+            outcome = aws_policies[PolicyArn]
+            if isinstance(outcome, Exception):
+                raise outcome
+            return {"PolicyVersion": {"Document": outcome, "VersionId": VersionId}}
+
+        iam.list_managed_policies_in_permission_set.side_effect = list_managed
+        iam.list_customer_managed_policy_references_in_permission_set.side_effect = (
+            list_customer
+        )
+        iam.get_policy.side_effect = get_policy
+        iam.get_policy_version.side_effect = get_policy_version
         if regions is None:
             iam.list_regions.side_effect = _make_client_error("AccessDeniedException")
         else:
@@ -27253,7 +27300,10 @@ class TestBR51AIUserConsoleMFA:
         assert self.PS_WRITE in rows[1]["Finding_Details"]
         assert self.PS_LATE in rows[2]["Finding_Details"]
         details = rows[0]["Finding_Details"]
-        assert "2 permission set(s) grant AI writes in their inline policy" in details
+        assert (
+            "2 permission set(s) grant AI writes in their inline or AWS managed "
+            "policies" in details
+        )
         assert f"{self.PS_WRITE} (bedrock)" in details
         assert f"{self.PS_LATE} (sagemaker)" in details
         assert self.PS_READ not in details
@@ -27272,8 +27322,8 @@ class TestBR51AIUserConsoleMFA:
         )
         assert [r["Status"] for r in rows] == ["N/A"]
         assert (
-            "No permission set inline policy that was read grants AI writes."
-            in rows[0]["Finding_Details"]
+            "No permission set inline or AWS managed policy that was read grants "
+            "AI writes." in rows[0]["Finding_Details"]
         )
 
     def test_br51_an_unread_inline_policy_is_named_not_read_as_clean(self):
@@ -27330,14 +27380,14 @@ class TestBR51AIUserConsoleMFA:
         assert failed["Severity"] == "High"
         assert (
             f"permission set {self.PS_WRITE} grants AI writes (bedrock) in its "
-            "inline policy, and that policy carries no Deny keyed on an "
-            "aws:PrincipalTag authentication tag over bedrock"
+            "inline policy, and no policy of the permission set carries a Deny "
+            "keyed on an aws:PrincipalTag authentication tag over bedrock"
             in failed["Finding_Details"]
         )
-        assert (
-            "policies attached to the permission set are not read"
-            in (failed["Finding_Details"])
+        assert "not read" not in failed["Finding_Details"].replace(
+            bedrock_app.AI_USER_MFA_SCOPE_NOTE, ""
         )
+        assert "references no customer managed policy" in failed["Finding_Details"]
         assert "0 of them carry" in rows[0]["Finding_Details"]
 
     def test_br51_only_the_second_permission_set_without_the_deny_fails(self):
@@ -27468,6 +27518,165 @@ class TestBR51AIUserConsoleMFA:
         assert (
             f"sso:GetInlinePolicyForPermissionSet on {self.PS_LATE}"
             in (rows[0]["Finding_Details"])
+        )
+
+    BEDROCK_FULL = "arn:aws:iam::aws:policy/AmazonBedrockFullAccess"
+    SAGEMAKER_FULL = "arn:aws:iam::aws:policy/service-role/AmazonSageMakerFullAccess"
+    READ_ONLY = "arn:aws:iam::aws:policy/ReadOnlyAccess"
+
+    def test_br51_aws_managed_policy_grant_fails_without_the_deny(self):
+        _, rows = self._run_sets(
+            permission_sets={self.INSTANCE: [self.PS_WRITE, self.PS_READ]},
+            managed={
+                self.PS_WRITE: {
+                    None: {"arns": [self.READ_ONLY], "NextToken": "m2"},
+                    "m2": {"arns": [self.BEDROCK_FULL]},
+                },
+                self.PS_READ: [self.READ_ONLY],
+            },
+            aws_policies={
+                self.READ_ONLY: json.loads(self._policy("bedrock:Get*")),
+                self.BEDROCK_FULL: json.loads(self._policy("bedrock:*")),
+            },
+        )
+        assert [r["Status"] for r in rows] == ["N/A", "Failed"]
+        assert (
+            f"permission set {self.PS_WRITE} grants AI writes (bedrock) in AWS "
+            "managed policy AmazonBedrockFullAccess, and no policy of the "
+            "permission set carries a Deny" in rows[1]["Finding_Details"]
+        )
+        assert self.PS_READ not in rows[1]["Finding_Details"]
+        assert f"{self.PS_WRITE} (bedrock)" in rows[0]["Finding_Details"]
+        self.iam.list_managed_policies_in_permission_set.assert_has_calls(
+            [
+                call(
+                    InstanceArn=self.INSTANCE,
+                    PermissionSetArn=self.PS_WRITE,
+                    MaxResults=100,
+                ),
+                call(
+                    InstanceArn=self.INSTANCE,
+                    PermissionSetArn=self.PS_WRITE,
+                    MaxResults=100,
+                    NextToken="m2",
+                ),
+            ]
+        )
+        # ReadOnlyAccess is attached to both sets and read once.
+        assert sorted(
+            c.kwargs["PolicyArn"] for c in self.iam.get_policy.call_args_list
+        ) == [self.BEDROCK_FULL, self.READ_ONLY]
+        self.iam.get_policy_version.assert_any_call(
+            PolicyArn=self.BEDROCK_FULL, VersionId="v7"
+        )
+
+    def test_br51_inline_deny_covers_an_aws_managed_grant(self):
+        _, rows = self._run_sets(
+            permission_sets={self.INSTANCE: [self.PS_WRITE]},
+            inline={
+                self.PS_WRITE: json.dumps(
+                    {"Version": "2012-10-17", "Statement": [self._tag_deny()]}
+                )
+            },
+            managed={self.PS_WRITE: [self.BEDROCK_FULL, self.SAGEMAKER_FULL]},
+            aws_policies={
+                self.BEDROCK_FULL: json.loads(self._policy("bedrock:*")),
+                self.SAGEMAKER_FULL: json.loads(self._policy("sagemaker:*")),
+            },
+        )
+        assert [r["Status"] for r in rows] == ["N/A"]
+        details = rows[0]["Finding_Details"]
+        assert f"{self.PS_WRITE} (bedrock, sagemaker)" in details
+        assert "1 of them carry" in details
+
+    def test_br51_a_deny_over_one_service_fails_the_managed_grant_of_another(self):
+        _, rows = self._run_sets(
+            permission_sets={self.INSTANCE: [self.PS_WRITE]},
+            inline={
+                self.PS_WRITE: self._grant_with(self._tag_deny(actions=("bedrock:*",)))
+            },
+            managed={self.PS_WRITE: [self.SAGEMAKER_FULL]},
+            aws_policies={
+                self.SAGEMAKER_FULL: json.loads(self._policy("sagemaker:*")),
+            },
+        )
+        assert [r["Status"] for r in rows] == ["N/A", "Failed"]
+        details = rows[1]["Finding_Details"]
+        assert (
+            "grants AI writes (bedrock, sagemaker) in its inline policy and AWS "
+            "managed policy AmazonSageMakerFullAccess" in details
+        )
+        assert "authentication tag over sagemaker" in details
+
+    @pytest.mark.parametrize(
+        "managed, aws_policies, named",
+        [
+            (
+                ["BEDROCK_FULL"],
+                {"BEDROCK_FULL": "denied"},
+                "iam:GetPolicyVersion on arn:aws:iam::aws:policy/"
+                "AmazonBedrockFullAccess (AccessDeniedException)",
+            ),
+            (
+                "denied",
+                {},
+                "sso:ListManagedPoliciesInPermissionSet on "
+                "arn:aws:sso:::permissionSet/ssoins-1/ps-write (AccessDeniedException)",
+            ),
+        ],
+    )
+    def test_br51_an_unread_aws_managed_policy_leaves_the_set_unjudged(
+        self, managed, aws_policies, named
+    ):
+        denied = _make_client_error("AccessDeniedException")
+        _, rows = self._run_sets(
+            permission_sets={self.INSTANCE: [self.PS_WRITE]},
+            inline={self.PS_WRITE: self._grant_with()},
+            managed={
+                self.PS_WRITE: denied
+                if managed == "denied"
+                else [getattr(self, name) for name in managed]
+            },
+            aws_policies={getattr(self, name): denied for name in aws_policies},
+        )
+        # The inline grant alone would fail the set, but the unread policy may
+        # hold the Deny, so the set is named as not judged and never Failed.
+        assert [r["Status"] for r in rows] == ["N/A"]
+        assert named in rows[0]["Finding_Details"]
+
+    def test_br51_customer_managed_references_are_named_not_read(self):
+        _, rows = self._run_sets(
+            permission_sets={self.INSTANCE: [self.PS_WRITE, self.PS_LATE]},
+            inline={
+                self.PS_WRITE: self._grant_with(),
+                self.PS_LATE: self._grant_with(self._tag_deny()),
+            },
+            customer={
+                self.PS_WRITE: [{"Name": "MfaDeny", "Path": "/guard/"}],
+                self.PS_LATE: [{"Name": "Extra"}],
+            },
+        )
+        assert [r["Status"] for r in rows] == ["N/A"]
+        details = rows[0]["Finding_Details"]
+        assert (
+            f"2 permission set(s) reference customer managed policies, which "
+            "resolve to a policy of that name in each account the permission set "
+            "is provisioned to and are not read, so these are not judged: "
+            f"{self.PS_WRITE} (/guard/MfaDeny); {self.PS_LATE} (/Extra)" in details
+        )
+        assert "0 of them carry" in details
+        customer_sentence = details.split("reference customer managed")[1]
+        assert "ceiling" not in customer_sentence.split(". ")[0]
+
+    def test_br51_scope_note_names_the_managed_policy_reads(self):
+        assert "not granted" not in bedrock_app.AI_USER_MFA_SCOPE_NOTE
+        assert (
+            "AWS managed policies attached to a permission set are read"
+            in bedrock_app.AI_USER_MFA_SCOPE_NOTE
+        )
+        assert (
+            "customer managed policy references are named and not read"
+            in bedrock_app.AI_USER_MFA_SCOPE_NOTE
         )
 
     def test_br51_denied_permission_set_list_is_named(self):
