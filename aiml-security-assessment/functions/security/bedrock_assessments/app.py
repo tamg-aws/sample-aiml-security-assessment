@@ -7,6 +7,11 @@ import time
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 from io import StringIO
 import botocore.session
+import urllib.error
+import urllib.parse
+import urllib.request
+from botocore.auth import SigV4Auth
+from botocore.awsrequest import AWSRequest
 from botocore.config import Config
 from botocore.exceptions import BotoCoreError, ClientError, EndpointConnectionError
 import fnmatch
@@ -18726,14 +18731,249 @@ DATA_RETENTION_REFERENCE = (
     "https://docs.aws.amazon.com/bedrock/latest/userguide/data-retention.html"
 )
 
-# bedrock-mantle publishes the account mode and a per-project override behind
-# its own endpoint, and botocore has no client for it, so the scanner cannot
-# read either value. The finding text names this ceiling.
-DATA_RETENTION_MANTLE_CEILING = (
-    "The bedrock-mantle account mode, its per-project overrides and each "
-    "model's allowed_modes were not read: botocore has no bedrock-mantle client "
-    "and the bedrock API returns no allowed_modes field."
+# bedrock-mantle has no botocore client, so BR-37 signs its GETs with SigV4.
+# The host rejects any other signing name with "Credential should be scoped to
+# correct service: 'bedrock-mantle'".
+MANTLE_SIGNING_NAME = "bedrock-mantle"
+MANTLE_TIMEOUT_SECONDS = 20
+DATA_RETENTION_MODES = ("none", "default", "aws_review", "provider_data_share")
+MANTLE_PROJECT_RETENTION_FINDING = "Bedrock Mantle Project Data Retention"
+DATA_RETENTION_AWS_REVIEW_NOTE = (
+    "AWS requires aws_review for models such as Claude Fable 5, whose "
+    "allowed_modes are aws_review and provider_data_share, so even a deliberate "
+    "choice of aws_review is a retention mode, not zero retention."
 )
+
+
+class MantleRequestError(Exception):
+    """A bedrock-mantle GET that returned no usable JSON object."""
+
+    def __init__(self, label: str):
+        super().__init__(label)
+        self.label = label
+
+
+def _mantle_get(
+    region: str, path: str, params: Optional[Dict[str, str]] = None
+) -> Dict[str, Any]:
+    """GET a bedrock-mantle path in a Region, SigV4-signed as bedrock-mantle."""
+    url = f"https://bedrock-mantle.{region}.api.aws{path}"
+    if params:
+        url += "?" + urllib.parse.urlencode(params)
+    credentials = boto3.Session().get_credentials()
+    if credentials is None:
+        raise MantleRequestError("NoCredentialsError")
+    signed = AWSRequest(method="GET", url=url)
+    SigV4Auth(
+        credentials.get_frozen_credentials(), MANTLE_SIGNING_NAME, region
+    ).add_auth(signed)
+    request = urllib.request.Request(url, headers=dict(signed.headers), method="GET")
+    try:
+        with urllib.request.urlopen(
+            request, timeout=MANTLE_TIMEOUT_SECONDS
+        ) as response:
+            raw = response.read()
+    except urllib.error.HTTPError as error:
+        label = f"HTTP {error.code}"
+        try:
+            code = json.loads(error.read()).get("error", {}).get("code")
+        except (ValueError, AttributeError):
+            code = None
+        raise MantleRequestError(f"{label} {code}" if code else label) from error
+    except (urllib.error.URLError, OSError) as error:
+        raise MantleRequestError(type(error).__name__) from error
+    try:
+        body = json.loads(raw)
+    except ValueError as error:
+        raise MantleRequestError("invalid JSON") from error
+    if not isinstance(body, dict):
+        raise MantleRequestError("invalid JSON")
+    return body
+
+
+def _mantle_data_retention(region: str) -> Dict[str, Any]:
+    """Read the bedrock-mantle account mode and every project on every page."""
+    result = {"account_mode": None, "account_error": None, "projects": []}
+    result["projects_error"] = None
+    try:
+        result["account_mode"] = _mantle_get(region, "/v1/data_retention").get("mode")
+    except MantleRequestError as error:
+        result["account_error"] = (
+            f"bedrock-mantle:GetAccountDataRetention ({error.label})"
+        )
+    after = None
+    try:
+        while True:
+            page = _mantle_get(
+                region,
+                "/v1/organization/projects",
+                {"after": after} if after else None,
+            )
+            result["projects"].extend(page.get("data") or [])
+            if not page.get("has_more"):
+                break
+            if not page.get("last_id") or page.get("last_id") == after:
+                raise MantleRequestError("has_more with no new last_id")
+            after = page["last_id"]
+    except MantleRequestError as error:
+        result["projects_error"] = f"bedrock-mantle:ListProjects ({error.label})"
+    return result
+
+
+def _mantle_account_sentence(mantle: Dict[str, Any], control_mode: Any) -> str:
+    """Name the mantle account mode beside the control-plane mode."""
+    if mantle["account_error"]:
+        return (
+            f"The bedrock-mantle account mode was not read "
+            f"({mantle['account_error']}); mantle projects are judged in the "
+            f"{MANTLE_PROJECT_RETENTION_FINDING} rows."
+        )
+    account = mantle["account_mode"]
+    differs = (
+        f"; it differs from the control-plane mode {control_mode}, which applies "
+        "to bedrock-runtime"
+        if account != control_mode
+        else ""
+    )
+    return (
+        f"The bedrock-mantle account mode, which a project set to inherit takes, "
+        f"is {account}{differs}. Mantle projects are judged in the "
+        f"{MANTLE_PROJECT_RETENTION_FINDING} rows. Each model's allowed_modes are "
+        "not read by this check."
+    )
+
+
+def _mantle_project_findings(
+    mantle: Dict[str, Any], control_mode: Any, region: str
+) -> List[Dict[str, Any]]:
+    """One BR-37 row per bedrock-mantle project; only effective none passes."""
+
+    def row(details, resolution, severity, status):
+        return create_finding(
+            check_id="BR-37",
+            finding_name=MANTLE_PROJECT_RETENTION_FINDING,
+            finding_details=details,
+            resolution=resolution,
+            reference=DATA_RETENTION_REFERENCE,
+            severity=severity,
+            status=status,
+            region=region,
+        )
+
+    if mantle["projects_error"]:
+        return [
+            row(
+                f"The bedrock-mantle projects in {region} were not read "
+                f"({mantle['projects_error']}), so no project's data-retention "
+                "mode was judged.",
+                COULD_NOT_ASSESS_RESOLUTION,
+                "Informational",
+                "N/A",
+            )
+        ]
+    if not mantle["projects"]:
+        return [
+            row(
+                f"No bedrock-mantle project was listed in {region}, so no "
+                "project's data-retention mode was judged.",
+                "No action required",
+                "Informational",
+                "N/A",
+            )
+        ]
+    control_note = (
+        f" The control-plane mode {control_mode} does not apply to "
+        "bedrock-mantle projects."
+        if control_mode is not None
+        else ""
+    )
+    findings = []
+    for project in mantle["projects"]:
+        arn = project.get("arn") or project.get("id")
+        own = (project.get("data_retention") or {}).get("mode")
+        account = mantle["account_mode"]
+        if own != "inherit":
+            effective, scope = own, "project"
+        elif mantle["account_error"]:
+            findings.append(
+                row(
+                    f"Project {arn} is set to inherit and the bedrock-mantle "
+                    f"account mode was not read ({mantle['account_error']}), so "
+                    "its effective mode is unknown.",
+                    COULD_NOT_ASSESS_RESOLUTION,
+                    "Informational",
+                    "N/A",
+                )
+            )
+            continue
+        elif account != "inherit":
+            effective, scope = account, "bedrock-mantle account"
+        else:
+            effective, scope = "model default", None
+        if effective == "model default":
+            findings.append(
+                row(
+                    f"Project {arn} has effective mode model default: the project "
+                    "and the bedrock-mantle account are both inherit, so each "
+                    "model's own default applies and no scope pins zero "
+                    "retention. A model whose allowed_modes include none still "
+                    "retains nothing; per-model allowed_modes are not read."
+                    + control_note,
+                    "Set the project's data_retention mode, or the bedrock-mantle "
+                    "account mode (PUT /v1/data_retention), to none.",
+                    "High",
+                    "Failed",
+                )
+            )
+        elif effective not in DATA_RETENTION_MODES:
+            findings.append(
+                row(
+                    f"Project {arn} has an unknown data-retention mode at the "
+                    f"{scope} scope: {effective!r}.",
+                    "Review the current Bedrock data-retention documentation and rerun with an updated scanner.",
+                    "Informational",
+                    "N/A",
+                )
+            )
+        elif effective == "none":
+            findings.append(
+                row(
+                    f"Project {arn} has effective mode none, decided at the "
+                    f"{scope} scope.",
+                    "No action required",
+                    "High",
+                    "Passed",
+                )
+            )
+        else:
+            steps = DATA_RETENTION_MODES.index(effective)
+            explicit = (
+                f" The {scope} scope returns {effective}, an explicit mode and not "
+                "inherit."
+                if effective in {"default", "aws_review"}
+                else ""
+            )
+            review = (
+                f" {DATA_RETENTION_AWS_REVIEW_NOTE}"
+                if effective == "aws_review"
+                else ""
+            )
+            findings.append(
+                row(
+                    f"Project {arn} has effective mode {effective}, decided at the "
+                    f"{scope} scope, {steps} step(s) above none on the scale none "
+                    f"< default < aws_review < provider_data_share.{explicit}"
+                    f"{review}{control_note}",
+                    "Set the project's data_retention mode to none."
+                    if scope == "project"
+                    else "Set the bedrock-mantle account mode to none (PUT "
+                    "/v1/data_retention), or set the project's own mode to none.",
+                    "High",
+                    "Failed",
+                )
+            )
+    return findings
+
 
 # Each retention write action and the condition key it publishes. The mantle
 # actions do not carry bedrock:DataRetentionMode, so a Deny keyed on it never
@@ -18752,10 +18992,13 @@ def check_bedrock_account_data_retention(region: str = "") -> Dict[str, Any]:
     BR-37: Assess the regional Bedrock account data-retention mode.
 
     Only none passes. default applies each model's own retention and inherit
-    records no decision at this scope, so both fail.
+    records no decision at this scope, so both fail. The bedrock-mantle account
+    mode and each mantle project are judged on their own rows.
     """
     findings = {"csv_data": []}
     reference = DATA_RETENTION_REFERENCE
+    mantle = _mantle_data_retention(region)
+    mode = None
     try:
         client = boto3.client("bedrock", config=boto3_config, region_name=region)
         mode = client.get_account_data_retention().get("mode")
@@ -18772,6 +19015,18 @@ def check_bedrock_account_data_retention(region: str = "") -> Dict[str, Any]:
             severity = "High"
             detail = "Bedrock account data retention is configured as none."
             resolution = "No action required"
+        elif mode == "aws_review":
+            status = "Failed"
+            severity = "High"
+            detail = (
+                "Bedrock account data retention is aws_review, an explicit mode and "
+                "not inherit, so the account has not pinned zero data retention. "
+                f"{DATA_RETENTION_AWS_REVIEW_NOTE}"
+            )
+            resolution = (
+                "Set the account data-retention mode to none with "
+                "bedrock:PutAccountDataRetention."
+            )
         elif mode in {"default", "inherit"}:
             status = "Failed"
             severity = "High"
@@ -18798,7 +19053,7 @@ def check_bedrock_account_data_retention(region: str = "") -> Dict[str, Any]:
             create_finding(
                 check_id="BR-37",
                 finding_name="Bedrock Account Data Retention",
-                finding_details=f"{detail} {DATA_RETENTION_MANTLE_CEILING}",
+                finding_details=f"{detail} {_mantle_account_sentence(mantle, mode)}",
                 resolution=resolution,
                 reference=reference,
                 severity=severity,
@@ -18819,6 +19074,7 @@ def check_bedrock_account_data_retention(region: str = "") -> Dict[str, Any]:
                 region=region,
             )
         )
+    findings["csv_data"].extend(_mantle_project_findings(mantle, mode, region))
     return findings
 
 

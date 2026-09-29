@@ -12,6 +12,24 @@ section.
 
 ### Added
 
+- `BR-37` reads the `bedrock-mantle` data-retention scopes. It signs GET
+  requests to `https://bedrock-mantle.<region>.api.aws` with SigV4 under the
+  `bedrock-mantle` signing name, reads the mantle account mode
+  (`/v1/data_retention`) and every page of projects
+  (`/v1/organization/projects`), and adds one `Bedrock Mantle Project Data
+  Retention` row per project. A project's effective mode is its own value
+  unless it is `inherit`, then the mantle account value unless that is
+  `inherit`, and otherwise each model's default. Only `none` passes, and a
+  model default fails. A project that inherits takes the mantle account
+  mode, which is a separate setting from `bedrock:GetAccountDataRetention`:
+  in one account read on 2026-09-29 the control plane returned `none` and
+  mantle returned `aws_review`, so `BR-37` passed while the default project
+  ran at `aws_review`. The control-plane row names both values and says when
+  they differ. An unread project list, a failed connection or TLS error, or
+  an unread account mode under an inheriting project is `N/A`, never
+  `Passed`. The ceiling sentence that said these scopes could not be read is
+  gone.
+
 - `BR-06` adds a `Bedrock Mantle Data Event Logging` row. Inference on the
   `bedrock-mantle` endpoint (`CreateInference`) is a CloudTrail data event, so
   a trail that selects only the `AWS::Bedrock::*` types recorded none of it,
@@ -272,6 +290,11 @@ section.
     deletion protection and token revocation alone.
 
 ### Fixed
+
+- `BR-37` fails a control-plane mode of `aws_review`. It fell to the
+  unknown-mode branch and read `N/A`, although `aws_review` sits above
+  `default` on AWS's scale and `default` already failed. This is a verdict
+  change from `N/A` to `Failed`, at the incumbent `High` severity.
 
 - `BR-46` judges the AI source buckets by completed Amazon Comprehend PII
   detection jobs when Macie is not enabled in the Region. A source that no
@@ -1204,8 +1227,12 @@ developer guide. For `BR-51` it gains `sso:ListManagedPoliciesInPermissionSet`
 and `sso:ListCustomerManagedPolicyReferencesInPermissionSet` on the
 `instance/*` and `permissionSet/*/*` ARNs, and `iam:GetPolicy` and
 `iam:GetPolicyVersion` on `arn:${AWS::Partition}:iam::aws:policy/*`, so only
-AWS managed policy documents are readable. All are read-only, and the same
-CodeBuild run applies them.
+AWS managed policy documents are readable. For `BR-37` it gains
+`bedrock-mantle:ListProjects` on the account's `project/*` ARNs and
+`bedrock-mantle:GetAccountDataRetention` on `*`, which has no resource type
+in the IAM service authorization reference. All are read-only, and the same
+CodeBuild run applies them. The Bedrock function now also makes HTTPS calls
+to `bedrock-mantle.<region>.api.aws`.
 
 **Update the deployment stack first.** The CodeBuild and member deployment
 roles could attach only `AWSLambdaBasicExecutionRole` and could not create a

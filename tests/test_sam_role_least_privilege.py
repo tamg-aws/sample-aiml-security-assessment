@@ -146,6 +146,8 @@ _EXPECTED_ACTIONS = {
         "aoss:GetAccessPolicy",
         "aoss:ListAccessPolicies",
         "bedrock-agentcore:ListCodeInterpreters",
+        "bedrock-mantle:GetAccountDataRetention",
+        "bedrock-mantle:ListProjects",
         "bedrock:ListIngestionJobs",
         "cloudtrail:GetEventDataStore",
         "ecs:DescribeTasks",
@@ -863,6 +865,11 @@ def test_bedrock_managed_policy_holds_exactly_the_approved_grants(template):
             ),
             scoped("iam:GetPolicy", "iam::aws:policy/*"),
             scoped("iam:GetPolicyVersion", "iam::aws:policy/*"),
+            ("Allow", "bedrock-mantle:GetAccountDataRetention", '"*"'),
+            scoped(
+                "bedrock-mantle:ListProjects",
+                "bedrock-mantle:*:${AWS::AccountId}:project/*",
+            ),
         ]
     )
     inline = _actions(template, "BedrockSecurityAssessmentFunction")

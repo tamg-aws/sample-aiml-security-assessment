@@ -64,7 +64,10 @@ AI_SUBJECT_ROWS = [
         None,
         "bedrock_assessments",
         ["BR-37"],
-        "same GetAccountDataRetention call",
+        "BR-37 reads bedrock:GetAccountDataRetention for the control plane, and the "
+        "bedrock-mantle account mode plus every mantle project's data_retention mode "
+        "over SigV4-signed HTTPS; each project's effective mode is judged, and only "
+        "none passes",
         [],
         3,
     ),

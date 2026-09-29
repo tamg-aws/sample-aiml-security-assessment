@@ -21356,6 +21356,16 @@ class TestProposedBedrockChecks:
     """BR-34 through BR-40 proposal checks."""
 
     @pytest.fixture(autouse=True)
+    def _no_mantle_host(self):
+        # BR-37 reads the bedrock-mantle host over HTTPS; keep these tests off
+        # the network. TestBR37MantleDataRetention judges that leg.
+        with patch(
+            "bedrock_app._mantle_get",
+            side_effect=bedrock_app.MantleRequestError("URLError"),
+        ):
+            yield
+
+    @pytest.fixture(autouse=True)
     def _no_knowledge_bases(self):
         with patch(
             "bedrock_app.get_knowledge_base_screening_inventory",
@@ -21664,7 +21674,9 @@ class TestProposedBedrockChecks:
         assert "no mode is set at the account scope" in finding["Finding_Details"]
 
     @patch("bedrock_app.boto3.client")
-    def test_br37_zero_retention_names_the_mantle_ceiling(self, mock_client):
+    def test_br37_zero_retention_no_longer_claims_a_mantle_ceiling(self, mock_client):
+        # Ruling-driven (round 4, MDL-10 is not a ceiling): the mantle account
+        # mode and projects are read, so the row points at the project rows.
         mock_client.return_value.get_account_data_retention.return_value = {
             "mode": "none"
         }
@@ -21674,8 +21686,29 @@ class TestProposedBedrockChecks:
         )[0]
 
         assert finding["Status"] == "Passed"
-        assert "per-project overrides" in finding["Finding_Details"]
-        assert "were not read" in finding["Finding_Details"]
+        assert "per-project overrides" not in finding["Finding_Details"]
+        assert "botocore has no bedrock-mantle client" not in finding["Finding_Details"]
+        assert "Bedrock Mantle Project Data Retention" in finding["Finding_Details"]
+        assert (
+            "bedrock-mantle:GetAccountDataRetention (URLError)"
+            in finding["Finding_Details"]
+        )
+
+    @patch("bedrock_app.boto3.client")
+    def test_br37_aws_review_control_plane_fails(self, mock_client):
+        mock_client.return_value.get_account_data_retention.return_value = {
+            "mode": "aws_review"
+        }
+
+        finding = extract_csv_data(
+            bedrock_app.check_bedrock_account_data_retention("us-east-1")
+        )[0]
+
+        assert finding["Status"] == "Failed"
+        assert finding["Severity"] == "High"
+        assert "is aws_review" in finding["Finding_Details"]
+        assert "explicit mode" in finding["Finding_Details"]
+        assert "Claude Fable 5" in finding["Finding_Details"]
 
     @staticmethod
     def _retention_inventory(*policies, errors=None, management=False):
@@ -33906,3 +33939,380 @@ class TestBR57AgentRoleInventory:
             {}, runtime_error=_make_client_error("AccessDeniedException")
         )
         assert "bedrock-agentcore:ListAgentRuntimes" in inventory["runtime_error"]
+
+
+MANTLE_PROJECT_ROW = "Bedrock Mantle Project Data Retention"
+MANTLE_ARN = "arn:aws:bedrock-mantle:us-east-1:111122223333:project/"
+
+
+def _mantle_project(project_id, mode):
+    return {
+        "arn": MANTLE_ARN + project_id,
+        "id": project_id,
+        "name": project_id,
+        "object": "organization.project",
+        "status": "active",
+        "data_retention": {"mode": mode} if mode is not None else {},
+    }
+
+
+def _mantle_page(projects, has_more=False):
+    return {
+        "data": projects,
+        "first_id": projects[0]["id"] if projects else None,
+        "has_more": has_more,
+        "last_id": projects[-1]["id"] if projects else None,
+        "object": "list",
+    }
+
+
+class TestBR37MantleDataRetention:
+    """BR-37 bedrock-mantle leg: the mantle account mode and every project."""
+
+    @staticmethod
+    def _run(control_mode, account, pages, calls=None):
+        """account is a mode string or an exception; pages a list or exception."""
+
+        def fake_get(region, path, params=None):
+            if calls is not None:
+                calls.append((region, path, dict(params or {})))
+            if path == "/v1/data_retention":
+                if isinstance(account, Exception):
+                    raise account
+                return {"mode": account, "updated_at": 1789138967}
+            assert path == "/v1/organization/projects"
+            if isinstance(pages, Exception):
+                raise pages
+            index = 0
+            after = (params or {}).get("after")
+            if after is not None:
+                index = next(
+                    i + 1 for i, page in enumerate(pages) if page["last_id"] == after
+                )
+            return pages[index]
+
+        with (
+            patch("bedrock_app.boto3.client") as mock_client,
+            patch("bedrock_app._mantle_get", side_effect=fake_get),
+        ):
+            mock_client.return_value.get_account_data_retention.return_value = {
+                "mode": control_mode
+            }
+            rows = extract_csv_data(
+                bedrock_app.check_bedrock_account_data_retention("us-east-1")
+            )
+        control = [r for r in rows if r["Finding"] == "Bedrock Account Data Retention"]
+        projects = [r for r in rows if r["Finding"] == MANTLE_PROJECT_ROW]
+        assert len(control) == 1
+        assert len(rows) == 1 + len(projects)
+        return control[0], projects
+
+    def test_a_project_inherits_the_mantle_account_not_the_control_plane(self):
+        control, projects = self._run(
+            "aws_review",
+            "none",
+            [_mantle_page([_mantle_project("default", "inherit")])],
+        )
+        assert control["Status"] == "Failed"
+        assert [p["Status"] for p in projects] == ["Passed"]
+        assert MANTLE_ARN + "default" in projects[0]["Finding_Details"]
+        assert "bedrock-mantle account scope" in projects[0]["Finding_Details"]
+
+    def test_the_live_split_fails_the_inheriting_project(self):
+        control, projects = self._run(
+            "none",
+            "aws_review",
+            [_mantle_page([_mantle_project("default", "inherit")])],
+        )
+        assert control["Status"] == "Passed"
+        assert (
+            "bedrock-mantle account mode, which a project set to inherit takes, is aws_review"
+            in control["Finding_Details"]
+        )
+        assert "differs from the control-plane mode none" in control["Finding_Details"]
+        [project] = projects
+        assert project["Status"] == "Failed"
+        assert project["Severity"] == "High"
+        details = project["Finding_Details"]
+        assert MANTLE_ARN + "default" in details
+        assert "effective mode aws_review" in details
+        assert "decided at the bedrock-mantle account scope" in details
+        assert "explicit mode" in details
+        assert "Claude Fable 5" in details
+        assert "control-plane mode none does not apply" in details
+
+    def test_the_same_modes_are_not_called_different(self):
+        control, _ = self._run(
+            "none", "none", [_mantle_page([_mantle_project("default", "inherit")])]
+        )
+        assert "takes, is none" in control["Finding_Details"]
+        assert "differs" not in control["Finding_Details"]
+
+    def test_a_project_own_mode_decides_over_the_account(self):
+        _, projects = self._run(
+            "none", "none", [_mantle_page([_mantle_project("p1", "default")])]
+        )
+        [project] = projects
+        assert project["Status"] == "Failed"
+        assert "effective mode default" in project["Finding_Details"]
+        assert "decided at the project scope" in project["Finding_Details"]
+        assert "explicit mode" in project["Finding_Details"]
+        assert "Claude Fable 5" not in project["Finding_Details"]
+
+    def test_a_project_none_passes_over_an_account_provider_share(self):
+        _, projects = self._run(
+            "none",
+            "provider_data_share",
+            [_mantle_page([_mantle_project("p1", "none")])],
+        )
+        assert [p["Status"] for p in projects] == ["Passed"]
+        assert "decided at the project scope" in projects[0]["Finding_Details"]
+
+    def test_inherit_at_both_scopes_is_the_model_default_and_fails(self):
+        _, projects = self._run(
+            "none", "inherit", [_mantle_page([_mantle_project("p1", "inherit")])]
+        )
+        [project] = projects
+        assert project["Status"] == "Failed"
+        assert "effective mode model default" in project["Finding_Details"]
+        assert "allowed_modes are not read" in project["Finding_Details"]
+
+    def test_provider_data_share_fails(self):
+        _, projects = self._run(
+            "none",
+            "none",
+            [_mantle_page([_mantle_project("p1", "provider_data_share")])],
+        )
+        assert projects[0]["Status"] == "Failed"
+        assert "effective mode provider_data_share" in projects[0]["Finding_Details"]
+
+    def test_every_page_is_read(self):
+        calls = []
+        _, projects = self._run(
+            "none",
+            "none",
+            [
+                _mantle_page([_mantle_project("a", "none")], has_more=True),
+                _mantle_page([_mantle_project("b", "aws_review")]),
+            ],
+            calls,
+        )
+        assert [p["Status"] for p in projects] == ["Passed", "Failed"]
+        assert MANTLE_ARN + "b" in projects[1]["Finding_Details"]
+        list_calls = [c for c in calls if c[1] == "/v1/organization/projects"]
+        assert [c[2].get("after") for c in list_calls] == [None, "a"]
+        assert all(c[0] == "us-east-1" for c in calls)
+
+    def test_has_more_without_a_last_id_is_not_read(self):
+        page = _mantle_page([_mantle_project("a", "none")], has_more=True)
+        page["last_id"] = None
+        _, projects = self._run("none", "none", [page])
+        assert [p["Status"] for p in projects] == ["N/A"]
+        assert "bedrock-mantle:ListProjects" in projects[0]["Finding_Details"]
+
+    def test_an_unread_account_leaves_inherit_na_and_judges_an_own_mode(self):
+        _, projects = self._run(
+            "none",
+            bedrock_app.MantleRequestError("HTTP 403 AccessDeniedException"),
+            [
+                _mantle_page(
+                    [
+                        _mantle_project("inh", "inherit"),
+                        _mantle_project("own", "none"),
+                        _mantle_project("bad", "aws_review"),
+                    ]
+                )
+            ],
+        )
+        assert [p["Status"] for p in projects] == ["N/A", "Passed", "Failed"]
+        assert (
+            "bedrock-mantle:GetAccountDataRetention (HTTP 403 AccessDeniedException)"
+            in projects[0]["Finding_Details"]
+        )
+
+    def test_an_unread_project_list_is_na_never_passed(self):
+        _, projects = self._run(
+            "none", "none", bedrock_app.MantleRequestError("URLError")
+        )
+        [row] = projects
+        assert row["Status"] == "N/A"
+        assert "bedrock-mantle:ListProjects (URLError)" in row["Finding_Details"]
+        assert "us-east-1" in row["Finding_Details"]
+
+    def test_an_unknown_or_missing_mode_is_na(self):
+        _, projects = self._run(
+            "none",
+            "none",
+            [
+                _mantle_page(
+                    [
+                        _mantle_project("new", "future_mode"),
+                        _mantle_project("gap", None),
+                    ]
+                )
+            ],
+        )
+        assert [p["Status"] for p in projects] == ["N/A", "N/A"]
+        assert "'future_mode'" in projects[0]["Finding_Details"]
+
+    def test_an_unknown_account_mode_leaves_inherit_na(self):
+        _, projects = self._run(
+            "none", "future_mode", [_mantle_page([_mantle_project("p", "inherit")])]
+        )
+        assert [p["Status"] for p in projects] == ["N/A"]
+
+    def test_no_project_listed_is_not_a_pass(self):
+        _, projects = self._run("none", "none", [_mantle_page([])])
+        [row] = projects
+        assert row["Status"] == "N/A"
+        assert "No bedrock-mantle project was listed" in row["Finding_Details"]
+
+    def test_a_control_plane_error_still_reads_the_mantle_leg(self):
+        with (
+            patch("bedrock_app.boto3.client") as mock_client,
+            patch(
+                "bedrock_app._mantle_get",
+                side_effect=lambda region, path, params=None: (
+                    {"mode": "none"}
+                    if path == "/v1/data_retention"
+                    else _mantle_page([_mantle_project("p", "aws_review")])
+                ),
+            ),
+        ):
+            mock_client.return_value.get_account_data_retention.side_effect = (
+                ClientError({"Error": {"Code": "AccessDeniedException"}}, "Get")
+            )
+            rows = extract_csv_data(
+                bedrock_app.check_bedrock_account_data_retention("us-east-1")
+            )
+        assert [r["Status"] for r in rows] == ["N/A", "Failed"]
+
+
+class TestMantleGet:
+    """The SigV4 request BR-37 sends to the bedrock-mantle host."""
+
+    @staticmethod
+    def _credentials():
+        from botocore.credentials import Credentials
+
+        return Credentials("AKIDEXAMPLE", "secret-example")
+
+    @staticmethod
+    def _response(body):
+        response = MagicMock()
+        response.read.return_value = body
+        response.__enter__.return_value = response
+        return response
+
+    def test_signs_as_bedrock_mantle_for_the_region_host(self):
+        with (
+            patch("bedrock_app.boto3.Session") as session,
+            patch(
+                "bedrock_app.urllib.request.urlopen",
+                return_value=self._response(b'{"mode": "none"}'),
+            ) as urlopen,
+        ):
+            session.return_value.get_credentials.return_value = self._credentials()
+            body = bedrock_app._mantle_get(
+                "eu-west-1", "/v1/organization/projects", {"after": "p 1"}
+            )
+        assert body == {"mode": "none"}
+        request = urlopen.call_args.args[0]
+        assert request.full_url == (
+            "https://bedrock-mantle.eu-west-1.api.aws/v1/organization/projects?after=p+1"
+        )
+        assert request.get_method() == "GET"
+        auth = request.get_header("Authorization")
+        assert "/eu-west-1/bedrock-mantle/aws4_request" in auth
+        assert urlopen.call_args.kwargs["timeout"] > 0
+
+    def test_an_http_error_names_the_status_and_code(self):
+        import io
+        import urllib.error
+
+        error = urllib.error.HTTPError(
+            "https://x",
+            403,
+            "Forbidden",
+            {},
+            io.BytesIO(b'{"error": {"code": "AccessDeniedException"}}'),
+        )
+        with (
+            patch("bedrock_app.boto3.Session") as session,
+            patch("bedrock_app.urllib.request.urlopen", side_effect=error),
+        ):
+            session.return_value.get_credentials.return_value = self._credentials()
+            with pytest.raises(bedrock_app.MantleRequestError) as raised:
+                bedrock_app._mantle_get("us-east-1", "/v1/data_retention")
+        assert raised.value.label == "HTTP 403 AccessDeniedException"
+
+    def test_an_http_error_without_a_json_body_names_the_status(self):
+        import io
+        import urllib.error
+
+        error = urllib.error.HTTPError(
+            "https://x", 502, "Bad Gateway", {}, io.BytesIO(b"<html>")
+        )
+        with (
+            patch("bedrock_app.boto3.Session") as session,
+            patch("bedrock_app.urllib.request.urlopen", side_effect=error),
+        ):
+            session.return_value.get_credentials.return_value = self._credentials()
+            with pytest.raises(bedrock_app.MantleRequestError) as raised:
+                bedrock_app._mantle_get("us-east-1", "/v1/data_retention")
+        assert raised.value.label == "HTTP 502"
+
+    def test_a_connection_or_tls_error_is_a_request_error(self):
+        import ssl
+        import urllib.error
+
+        for error, label in (
+            (urllib.error.URLError("name resolution"), "URLError"),
+            (ssl.SSLError("bad cert"), "SSLError"),
+            (TimeoutError("slow"), "TimeoutError"),
+        ):
+            with (
+                patch("bedrock_app.boto3.Session") as session,
+                patch("bedrock_app.urllib.request.urlopen", side_effect=error),
+            ):
+                session.return_value.get_credentials.return_value = self._credentials()
+                with pytest.raises(bedrock_app.MantleRequestError) as raised:
+                    bedrock_app._mantle_get("us-east-1", "/v1/data_retention")
+            assert raised.value.label == label
+
+    def test_a_body_that_is_not_json_is_a_request_error(self):
+        with (
+            patch("bedrock_app.boto3.Session") as session,
+            patch(
+                "bedrock_app.urllib.request.urlopen",
+                return_value=self._response(b"<html>"),
+            ),
+        ):
+            session.return_value.get_credentials.return_value = self._credentials()
+            with pytest.raises(bedrock_app.MantleRequestError) as raised:
+                bedrock_app._mantle_get("us-east-1", "/v1/data_retention")
+        assert raised.value.label == "invalid JSON"
+
+    def test_a_body_that_is_not_an_object_is_a_request_error(self):
+        with (
+            patch("bedrock_app.boto3.Session") as session,
+            patch(
+                "bedrock_app.urllib.request.urlopen",
+                return_value=self._response(b"[1]"),
+            ),
+        ):
+            session.return_value.get_credentials.return_value = self._credentials()
+            with pytest.raises(bedrock_app.MantleRequestError) as raised:
+                bedrock_app._mantle_get("us-east-1", "/v1/data_retention")
+        assert raised.value.label == "invalid JSON"
+
+    def test_no_credentials_is_a_request_error(self):
+        with (
+            patch("bedrock_app.boto3.Session") as session,
+            patch("bedrock_app.urllib.request.urlopen") as urlopen,
+        ):
+            session.return_value.get_credentials.return_value = None
+            with pytest.raises(bedrock_app.MantleRequestError) as raised:
+                bedrock_app._mantle_get("us-east-1", "/v1/data_retention")
+        assert raised.value.label == "NoCredentialsError"
+        urlopen.assert_not_called()

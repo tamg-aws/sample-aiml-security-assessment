@@ -419,6 +419,23 @@ Resources:
               - iam:GetPolicy # BR-51
               - iam:GetPolicyVersion # BR-51
             Resource: !Sub 'arn:${AWS::Partition}:iam::aws:policy/*'
+          - Sid: BedrockMantleProjectList
+            # BR-37 lists every bedrock-mantle project to read its data_retention
+            # mode. The service authorization reference gives ListProjects the
+            # project resource type.
+            Effect: Allow
+            Action:
+              - bedrock-mantle:ListProjects # BR-37
+            Resource: !Sub 'arn:${AWS::Partition}:bedrock-mantle:*:${AWS::AccountId}:project/*'
+          - Sid: BedrockMantleAccountRetentionRead
+            # BR-37 reads the bedrock-mantle account data-retention mode that a
+            # project set to inherit takes. The service authorization reference
+            # lists no resource type for GetAccountDataRetention, so the
+            # resource must be '*'.
+            Effect: Allow
+            Action:
+              - bedrock-mantle:GetAccountDataRetention # BR-37
+            Resource: '*'
   BedrockSecurityAssessmentFunction:
     Type: AWS::Serverless::Function
     Properties:
