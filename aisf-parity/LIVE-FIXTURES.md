@@ -227,14 +227,17 @@ negligible. The CMK is the only recurring charge in either fixture.
 
 ## AISF-03: an invoke grant bound to one guardrail version
 
-- Guardrail `aisf-fixture-br10-guardrail` (`9mls97oibka9`), version `1`, one content
-  filter (`HATE` at `HIGH` on input and output). It is referenced and never invoked.
+- Guardrail `aisf-fixture-br10-guardrail` (`9mls97oibka9`), version `2`, five content
+  filters (`SEXUAL`, `VIOLENCE`, `HATE`, `INSULTS` and `MISCONDUCT`, each at `HIGH`
+  with action `BLOCK` on input and output). BR-10 credits a side only when all five
+  block on it, so version `1`, which carried `HATE` alone, now fails. It is referenced
+  and never invoked.
 - `aisf-fixture-br10-bound`, trust for `bedrock.amazonaws.com` under an
   `aws:SourceAccount` condition. One inline policy, `br10-guardrail-bound`, allows
   `bedrock:InvokeModel` and `bedrock:InvokeModelWithResponseStream` on the single
   foundation model `anthropic.claude-3-haiku-20240307-v1:0` in us-east-1, conditioned
   `StringEquals bedrock:GuardrailIdentifier` on
-  `arn:aws:bedrock:us-east-1:ACCOUNT_ID:guardrail/9mls97oibka9:1`. BR-10 credits a
+  `arn:aws:bedrock:us-east-1:ACCOUNT_ID:guardrail/9mls97oibka9:2`. BR-10 credits a
   binding only under a positive operator with no `IfExists` or `ForAllValues:` form
   and a value with no wildcard (`_guardrail_allow_binding`), so this is the narrowest
   shape it reads as bound.
