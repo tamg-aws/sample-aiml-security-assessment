@@ -4621,6 +4621,80 @@ class TestSM23MonitorReportAndAlarm:
         assert [r["Status"] for r in rows] == ["Failed"]
         assert "'mq'" in rows[0]["Finding_Details"]
 
+    DOC_DATA_NAMESPACE = "/aws/sagemaker/Endpoints/data-metric"
+
+    def _doc_alarm(self, schedule, endpoint, namespace=DOC_DATA_NAMESPACE):
+        alarm = self._alarm(schedule, namespace)
+        alarm["Dimensions"] = [
+            {"Name": "EndpointName", "Value": endpoint},
+            {"Name": "ScheduleName", "Value": schedule},
+        ]
+        return alarm
+
+    def _split_rows(self, mock_client, alarms):
+        return self._rows(
+            mock_client,
+            sagemaker_app.MONITOR_ALARM_FINDING,
+            schedules=[
+                self._schedule("dq", "DataQuality"),
+                self._schedule("mq", "ModelQuality", endpoint="ep2"),
+            ],
+            endpoints=("ep", "ep2"),
+            details={"dq": self._detail(1), "mq": self._detail(1)},
+            alarms=alarms,
+        )
+
+    @pytest.mark.parametrize("doc_first", [True, False])
+    @patch("sagemaker_app.boto3.client")
+    def test_the_data_quality_doc_spelling_credits_its_schedule(
+        self, mock_client, doc_first
+    ):
+        # One schedule alarmed under each documented spelling.
+        existing = self._alarm("mq", "aws/sagemaker/Endpoints/model-metrics")
+        existing["Dimensions"] = [
+            {"Name": "Endpoint", "Value": "ep2"},
+            {"Name": "MonitoringSchedule", "Value": "mq"},
+        ]
+        alarms = [self._doc_alarm("dq", "ep"), existing]
+        if not doc_first:
+            alarms.reverse()
+        rows = self._split_rows(mock_client, alarms)
+        assert [r["Status"] for r in rows] == ["Passed"]
+
+    @pytest.mark.parametrize(
+        "dimensions",
+        [
+            [{"Name": "ScheduleName", "Value": "dq"}],
+            [{"Name": "EndpointName", "Value": "ep"}],
+        ],
+    )
+    @patch("sagemaker_app.boto3.client")
+    def test_either_doc_dimension_alone_credits_only_its_schedule(
+        self, mock_client, dimensions
+    ):
+        alarm = self._doc_alarm("dq", "ep")
+        alarm["Dimensions"] = dimensions
+        rows = self._split_rows(mock_client, [alarm])
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "'mq'" in rows[0]["Finding_Details"]
+        assert "'dq'" not in rows[0]["Finding_Details"]
+
+    @pytest.mark.parametrize(
+        "namespace",
+        ["/aws/sagemaker/Endpoints", "AWS/SageMaker", "/aws/sagemaker/Endpoints/x"],
+    )
+    @patch("sagemaker_app.boto3.client")
+    def test_an_endpoint_name_on_another_namespace_does_not_credit(
+        self, mock_client, namespace
+    ):
+        rows = self._split_rows(
+            mock_client,
+            [self._doc_alarm("dq", "ep"), self._doc_alarm("mq", "ep2", namespace)],
+        )
+        assert [r["Status"] for r in rows] == ["Failed"]
+        assert "'mq'" in rows[0]["Finding_Details"]
+        assert "'dq'" not in rows[0]["Finding_Details"]
+
     @patch("sagemaker_app.boto3.client")
     def test_alarm_without_action_does_not_count(self, mock_client):
         silent = self._alarm("mq")
@@ -7450,6 +7524,34 @@ class TestSM35TrustedAccess:
         assert "Enable trusted access" in guardduty[0]["Resolution"]
         assert all(
             [r["Status"] for r in v] == ["Passed"] for v in by_principal.values()
+        )
+
+    @patch("sagemaker_app.boto3.client")
+    def test_an_unconfirmed_principal_name_is_named_on_its_failure(self, mock_client):
+        unconfirmed = (
+            "macie.amazonaws.com",
+            "detective.amazonaws.com",
+            "fms.amazonaws.com",
+            "auditmanager.amazonaws.com",
+        )
+        rows = self._rows(
+            mock_client, self._enabled("guardduty.amazonaws.com", *unconfirmed)
+        )
+        by_principal = self._service_rows(rows)
+        for principal in unconfirmed:
+            (row,) = by_principal[principal]
+            assert row["Status"] == "Failed"
+            assert (
+                f"The trusted-access principal name {principal} is not confirmed "
+                "by a live read" in row["Finding_Details"]
+            )
+        (guardduty,) = by_principal["guardduty.amazonaws.com"]
+        assert guardduty["Status"] == "Failed"
+        assert "not confirmed by a live read" not in guardduty["Finding_Details"]
+        # A principal the read returned is confirmed by that read.
+        passed = self._service_rows(self._rows(mock_client, self._enabled()))
+        assert (
+            "not confirmed" not in passed["macie.amazonaws.com"][0]["Finding_Details"]
         )
 
     @patch("sagemaker_app.boto3.client")
@@ -11410,13 +11512,32 @@ class TestSM41IoTDeviceScopedPolicies:
         scheduled=None,
         audit_findings=None,
         errors=None,
+        group_things=None,
+        thing_principals=None,
     ):
         client = MagicMock()
         errors = errors or {}
         principal_things = principal_things or {}
+        group_things = group_things or {}
+        thing_principals = thing_principals or {}
+        client.group_things_calls = []
 
         def list_targets(policyName):
             return targets[policyName]
+
+        def list_things_in_thing_group(thingGroupName, recursive=False):
+            client.group_things_calls.append((thingGroupName, recursive))
+            if thingGroupName in errors:
+                raise errors[thingGroupName]
+            things = group_things.get(thingGroupName, [])
+            # Two pages, so a reader that keeps only the first page misses one.
+            return [{"things": things[:1]}, {"things": things[1:]}]
+
+        def list_thing_principals(thingName):
+            if thingName in errors:
+                raise errors[thingName]
+            principals = thing_principals.get(thingName, [])
+            return [{"principals": principals[:1]}, {"principals": principals[1:]}]
 
         def list_principal_things(principal):
             if principal in errors:
@@ -11436,6 +11557,8 @@ class TestSM41IoTDeviceScopedPolicies:
                 "list_policies": policies_pages,
                 "list_targets_for_policy": list_targets,
                 "list_principal_things": list_principal_things,
+                "list_things_in_thing_group": list_things_in_thing_group,
+                "list_thing_principals": list_thing_principals,
                 "list_scheduled_audits": raising(
                     "list_scheduled_audits",
                     [
@@ -11852,27 +11975,99 @@ class TestSM41DeviceIdentityAndAudit:
         assert "q" in passed[0]["Finding_Details"]
 
     THING_GROUP = "arn:aws:iot:us-east-1:123456789012:thinggroup/fleet"
+    OTHER_GROUP = "arn:aws:iot:us-east-1:123456789012:thinggroup/spare"
+    CERT_C = "arn:aws:iot:us-east-1:123456789012:cert/" + "c" * 64
+    CERT_D = "arn:aws:iot:us-east-1:123456789012:cert/" + "d" * 64
+    COGNITO = "us-east-1:11111111-2222-3333-4444-555555555555"
 
-    @pytest.mark.parametrize("group_first", [True, False])
+    def _group_run(self, mock_client, **kwargs):
+        kwargs.setdefault(
+            "targets",
+            {
+                "p": [{"targets": [self.CERT_A]}],
+                "q": [{"targets": [self.THING_GROUP, self.OTHER_GROUP]}],
+            },
+        )
+        kwargs.setdefault(
+            "group_things", {"fleet": ["dev-1", "dev-2"], "spare": ["dev-3"]}
+        )
+        kwargs.setdefault(
+            "thing_principals",
+            {
+                "dev-1": [self.CERT_C],
+                "dev-2": [self.COGNITO, self.CERT_D],
+                "dev-3": [self.CERT_A],
+            },
+        )
+        by_name, rows = self._run(mock_client, **kwargs)
+        return by_name, rows, mock_client.return_value
+
     @patch("sagemaker_app.boto3.client")
-    def test_a_policy_on_a_thing_group_withholds_the_certificate_pass(
-        self, mock_client, group_first
-    ):
-        q_targets = [self.CERT_B, self.THING_GROUP]
-        if group_first:
-            q_targets.reverse()
-        by_name, _ = self._run(
+    def test_a_thing_group_certificate_on_two_things_fails(self, mock_client):
+        # CERT_D arrives on the second ListThingPrincipals page of the second
+        # thing of the first group, behind a Cognito identity.
+        by_name, _, client = self._group_run(
             mock_client,
-            targets={"p": [{"targets": [self.CERT_A]}], "q": [{"targets": q_targets}]},
+            principal_things={self.CERT_D: ["dev-2", "dev-9"]},
+        )
+        row = by_name[sagemaker_app.IOT_UNIQUE_CERTIFICATE_FINDING]
+        assert row["Status"] == "Failed"
+        assert "1 of 3 device certificate(s)" in row["Finding_Details"]
+        assert "d" * 64 in row["Finding_Details"]
+        assert "c" * 64 not in row["Finding_Details"]
+        assert self.COGNITO not in row["Finding_Details"]
+        assert client.group_things_calls == [("fleet", True), ("spare", True)]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_thing_group_certificates_on_one_thing_each_pass(self, mock_client):
+        by_name, _, _ = self._group_run(mock_client)
+        row = by_name[sagemaker_app.IOT_UNIQUE_CERTIFICATE_FINDING]
+        assert row["Status"] == "Passed"
+        # CERT_A is both a direct target and a principal of dev-3: counted once.
+        assert "Each of the 3 certificate(s)" in row["Finding_Details"]
+        assert "through 2 thing group(s) (fleet, spare)" in row["Finding_Details"]
+        assert "not granted" not in row["Finding_Details"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_an_unread_thing_group_is_incomplete(self, mock_client):
+        by_name, _, _ = self._group_run(
+            mock_client, errors={"spare": _make_client_error("AccessDeniedException")}
+        )
+        row = by_name[sagemaker_app.IOT_UNIQUE_CERTIFICATE_FINDING]
+        assert row["Status"] == "N/A"
+        assert "thing group spare (AccessDeniedException)" in row["Finding_Details"]
+        assert "thing group fleet (" not in row["Finding_Details"]
+        assert "1 read(s) failed" in row["Finding_Details"]
+        assert "3 certificate(s) read" in row["Finding_Details"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_an_unread_thing_principal_list_is_incomplete(self, mock_client):
+        by_name, _, _ = self._group_run(
+            mock_client, errors={"dev-2": _make_client_error("AccessDeniedException")}
         )
         row = by_name[sagemaker_app.IOT_UNIQUE_CERTIFICATE_FINDING]
         assert row["Status"] == "N/A"
         assert (
-            "thing group(s) an attached policy is attached to (fleet)"
+            "thing dev-2 in thing group fleet (AccessDeniedException)"
             in row["Finding_Details"]
         )
-        assert "iot:ListThingsInThingGroup" in row["Finding_Details"]
-        assert "b" * 64 not in row["Finding_Details"]
+        assert "thing dev-1" not in row["Finding_Details"]
+        assert "2 certificate(s) read" in row["Finding_Details"]
+
+    @patch("sagemaker_app.boto3.client")
+    def test_unread_group_and_certificate_count_apart(self, mock_client):
+        by_name, _, _ = self._group_run(
+            mock_client,
+            errors={
+                "dev-1": _make_client_error("AccessDeniedException"),
+                self.CERT_D: _make_client_error("AccessDeniedException"),
+            },
+        )
+        row = by_name[sagemaker_app.IOT_UNIQUE_CERTIFICATE_FINDING]
+        assert row["Status"] == "N/A"
+        assert "2 read(s) failed" in row["Finding_Details"]
+        # CERT_A and CERT_D are listed, and CERT_D's things were not read.
+        assert "1 certificate(s) read" in row["Finding_Details"]
 
     @patch("sagemaker_app.boto3.client")
     def test_a_thing_group_does_not_hide_a_shared_certificate(self, mock_client):
@@ -11889,20 +12084,20 @@ class TestSM41DeviceIdentityAndAudit:
         assert "b" * 64 in row["Finding_Details"]
 
     @patch("sagemaker_app.boto3.client")
-    def test_only_thing_group_targets_are_not_read_as_no_certificate(self, mock_client):
+    def test_empty_thing_groups_leave_no_certificate(self, mock_client):
         by_name, _ = self._run(
             mock_client,
             targets={
                 "p": [{"targets": [self.THING_GROUP]}],
                 "q": [{"targets": []}],
             },
+            group_things={"fleet": ["dev-1"]},
+            thing_principals={"dev-1": [self.COGNITO]},
         )
         row = by_name[sagemaker_app.IOT_UNIQUE_CERTIFICATE_FINDING]
         assert row["Status"] == "N/A"
-        assert (
-            "thing group(s) an attached policy is attached to (fleet)"
-            in row["Finding_Details"]
-        )
+        assert "no certificate" in row["Finding_Details"]
+        assert "1 thing group(s) (fleet)" in row["Finding_Details"]
 
     @patch("sagemaker_app.boto3.client")
     def test_every_certificate_on_one_thing_passes(self, mock_client):

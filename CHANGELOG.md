@@ -298,6 +298,36 @@ section.
 
 ### Fixed
 
+- `SM-41` judges the certificates a device policy reaches through a thing
+  group. For each thing group an attached policy is attached to, it lists
+  the group's things with child groups included
+  (`iot:ListThingsInThingGroup` with `recursive`) and each thing's
+  certificate principals (`iot:ListThingPrincipals`), both newly granted to
+  the SageMaker function in `SageMakerAssessmentReadsPolicy`, and judges
+  each certificate like one attached directly. A group certificate attached
+  to more than one thing now fails, and a deployment whose policies were on
+  thing groups can move from `N/A` to `Passed` or `Failed`. An unread group
+  or thing is `N/A` and named. The row used to be `N/A` for any thing group
+  because those certificates were not listed.
+
+- `SM-23` Model Monitor alarm credits an alarm under either spelling AWS
+  documents. The data quality page names the namespace
+  `/aws/sagemaker/Endpoints/data-metric` with `EndpointName` and
+  `ScheduleName` dimensions, while the other monitoring pages name
+  `aws/sagemaker/Endpoints/*-metrics` with `Endpoint` and
+  `MonitoringSchedule`. An alarm on the data quality page's spelling now
+  credits its schedule, so a row that failed for it can move to `Passed`.
+  Alarms on other namespaces still do not credit, and the alarm threshold is
+  still not judged.
+
+- `SM-35` names the trusted-access principal as not confirmed by a live
+  read when Amazon Macie (`macie.amazonaws.com`), Amazon Detective
+  (`detective.amazonaws.com`), AWS Firewall Manager (`fms.amazonaws.com`) or
+  AWS Audit Manager (`auditmanager.amazonaws.com`) fails for missing trusted
+  access. No live read of `ListAWSServiceAccessForOrganization` has returned
+  these four names, so the failure may come from a name the service does
+  not use. The verdict is unchanged.
+
 - `SM-35` security service delegated administrator passes a service only
   when its principal also has trusted access in the organization, read with
   `organizations:ListAWSServiceAccessForOrganization` (newly granted to the
@@ -1402,7 +1432,9 @@ has no resource type and moves out of the inline
 `ec2:DescribeManagedPrefixLists` on `*`, which has no resource type, and
 `ec2:GetManagedPrefixListEntries` on `prefix-list/*` with the account
 segment open, because a list can be shared through AWS RAM from another
-account (`SM-39`). All are read-only. The deployment role permissions added
+account (`SM-39`), and `iot:ListThingsInThingGroup` on the account's
+`thinggroup/*` ARNs and `iot:ListThingPrincipals` on its `thing/*` ARNs
+(`SM-41`). All are read-only. The deployment role permissions added
 for `BedrockAssessmentReadsPolicy` cover this policy too.
 `BedrockAssessmentReadsPolicy` gains, in both SAM templates:
 `account:ListRegions` on the account ARN (`BR-51`),

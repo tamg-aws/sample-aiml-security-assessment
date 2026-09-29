@@ -8611,7 +8611,12 @@ MONITOR_CLOUDWATCH_REFERENCE = (
     "model-monitor-interpreting-cloudwatch.html"
 )
 # Namespaces Model Monitor publishes schedule metrics to, one per monitoring type.
+# The AWS data quality page names /aws/sagemaker/Endpoints/data-metric with
+# EndpointName and ScheduleName dimensions, while the other monitoring pages name
+# aws/sagemaker/Endpoints/*-metrics with Endpoint and MonitoringSchedule, so both
+# spellings are credited.
 MODEL_MONITOR_METRIC_NAMESPACES = (
+    "/aws/sagemaker/Endpoints/data-metric",
     "aws/sagemaker/Endpoints/data-metrics",
     "aws/sagemaker/Endpoints/model-metrics",
     "aws/sagemaker/Endpoints/bias-metrics",
@@ -8925,8 +8930,19 @@ def _monitor_report_and_alarm_findings(
     for alarm in alarms:
         for namespace, _, dimensions in _alarm_metric_dimensions(alarm):
             if namespace in MODEL_MONITOR_METRIC_NAMESPACES:
-                alarmed.add(("schedule", dimensions.get("MonitoringSchedule")))
-                alarmed.add(("endpoint", dimensions.get("Endpoint")))
+                alarmed.add(
+                    (
+                        "schedule",
+                        dimensions.get("MonitoringSchedule")
+                        or dimensions.get("ScheduleName"),
+                    )
+                )
+                alarmed.add(
+                    (
+                        "endpoint",
+                        dimensions.get("Endpoint") or dimensions.get("EndpointName"),
+                    )
+                )
     unalarmed = [
         schedule
         for schedule in schedules
@@ -13203,6 +13219,16 @@ SECURITY_SERVICE_PRINCIPALS = (
     ("AWS Audit Manager", "auditmanager.amazonaws.com"),
 )
 SECURITY_SERVICE_LIST_TEXT = ", ".join(name for name, _ in SECURITY_SERVICE_PRINCIPALS)
+# Principal names no live ListAWSServiceAccessForOrganization read has returned,
+# so an absent one may be a name the service does not use for trusted access.
+UNCONFIRMED_TRUSTED_ACCESS_PRINCIPALS = frozenset(
+    {
+        "macie.amazonaws.com",
+        "detective.amazonaws.com",
+        "fms.amazonaws.com",
+        "auditmanager.amazonaws.com",
+    }
+)
 DELEGATED_ADMIN_CONSOLIDATION_FINDING = (
     "Security Service Delegated Administrator Consolidation"
 )
@@ -13343,12 +13369,19 @@ def check_security_service_delegated_admin(region: str = "") -> Dict[str, Any]:
                 )
             )
         elif dedicated and principal not in enabled_principals:
+            unconfirmed = (
+                f" The trusted-access principal name {principal} is not confirmed "
+                "by a live read, so the service may enable trusted access under "
+                "another name."
+                if principal in UNCONFIRMED_TRUSTED_ACCESS_PRINCIPALS
+                else ""
+            )
             findings["csv_data"].append(
                 _row(
                     f"{administered} Trusted access for {principal} is not "
                     "enabled: the principal is absent from the organization's "
                     "enabled service principals "
-                    "(ListAWSServiceAccessForOrganization).",
+                    f"(ListAWSServiceAccessForOrganization).{unconfirmed}",
                     f"Enable trusted access for {service_name} in AWS "
                     "Organizations so the delegated administrator can act "
                     "across member accounts.",
@@ -17541,9 +17574,9 @@ def _iot_unique_certificate_finding(
     """
     SM-41: each certificate a device policy is attached to serves one thing.
 
-    A policy attached to a thing group reaches the certificates of the group's
-    things, which iot:ListThingsInThingGroup and iot:ListThingPrincipals would
-    list. The role holds neither, so each such group withholds the Passed.
+    A policy attached to a thing group reaches the certificates of the things
+    in the group and in its child groups, so each group's things are listed
+    recursively and each thing's certificate principals are judged too.
     """
 
     def _row(details, resolution, severity, status):
@@ -17567,6 +17600,31 @@ def _iot_unique_certificate_finding(
             "N/A",
         )
     shared, unread = [], []
+    certificates = set(certificates)
+    group_names = [g.rsplit("/", 1)[-1] for g in thing_groups]
+    for group in group_names:
+        try:
+            things = []
+            paginator = iot_client.get_paginator("list_things_in_thing_group")
+            for page in paginator.paginate(thingGroupName=group, recursive=True):
+                things.extend(page.get("things") or [])
+        except Exception as error:
+            unread.append(f"thing group {group} ({get_assessment_error_label(error)})")
+            continue
+        for thing in things:
+            try:
+                paginator = iot_client.get_paginator("list_thing_principals")
+                for page in paginator.paginate(thingName=thing):
+                    certificates.update(
+                        p for p in page.get("principals") or [] if ":cert/" in str(p)
+                    )
+            except Exception as error:
+                unread.append(
+                    f"thing {thing} in thing group {group} "
+                    f"({get_assessment_error_label(error)})"
+                )
+    certificates = sorted(certificates)
+    listing_errors = len(unread)
     for certificate in certificates:
         certificate_id = certificate.rsplit("/", 1)[-1]
         try:
@@ -17593,12 +17651,10 @@ def _iot_unique_certificate_finding(
     )
     groups = ""
     if thing_groups:
-        names = ", ".join(g.rsplit("/", 1)[-1] for g in thing_groups[:10])
         groups = (
-            f" {len(thing_groups)} thing group(s) an attached policy is attached "
-            f"to ({names}) reach the certificates of their things, which were not "
-            "listed: iot:ListThingsInThingGroup and iot:ListThingPrincipals are "
-            "not granted, so those certificates are not assessed."
+            " The certificates include those of the things reached through "
+            f"{len(thing_groups)} thing group(s) ({', '.join(group_names[:10])}) "
+            "an attached policy is attached to, child groups included."
         )
     if shared:
         return _row(
@@ -17615,29 +17671,24 @@ def _iot_unique_certificate_finding(
             "SM-41",
             IOT_UNIQUE_CERTIFICATE_FINDING,
             unread,
-            f"{len(certificates) - len(unread)} certificate(s) read are each "
-            "attached to at most one thing." + groups + ceiling,
+            f"{len(certificates) - (len(unread) - listing_errors)} certificate(s) "
+            "read are each attached to at most one thing." + groups + ceiling,
             IOT_UNIQUE_CERTIFICATE_REFERENCE,
             region,
         )
-    if thing_groups:
-        direct = (
-            f"Each of the {len(certificates)} certificate(s) that an attached AWS "
-            "IoT policy is attached to directly is attached to at most one thing."
-            if certificates
-            else "No attached AWS IoT policy is attached to a certificate directly."
-        )
+    if not certificates:
         return _row(
-            direct + groups + ceiling,
-            "Attach device policies to certificates, or grant "
-            "iot:ListThingsInThingGroup and iot:ListThingPrincipals so the "
-            "certificates of each thing group can be assessed.",
+            "No attached AWS IoT policy is attached to a certificate directly, "
+            f"and the things of the {len(thing_groups)} thing group(s) "
+            f"({', '.join(group_names[:10])}) an attached policy is attached to "
+            "hold no certificate, so there is no device certificate to assess.",
+            "No action required",
             "Informational",
             "N/A",
         )
     return _row(
         f"Each of the {len(certificates)} certificate(s) that an attached AWS IoT "
-        "policy is attached to is attached to at most one thing." + ceiling,
+        "policy reaches is attached to at most one thing." + groups + ceiling,
         "No action required",
         "High",
         "Passed",

@@ -1816,8 +1816,9 @@ FOUNDATION_ROWS = [
         "device the reach of every thing whose name starts or ends with its "
         "own. It also fails a Connect Allow with no "
         "iot:Connection.Thing.IsAttached condition. A policy attached to a "
-        "thing group withholds the unique-certificate Passed, since the "
-        "certificates of the group's things are not listed",
+        "thing group reaches the certificates of the group's things, child "
+        "groups included, and each is judged like a certificate attached "
+        "directly",
         [],
         6,
     ),

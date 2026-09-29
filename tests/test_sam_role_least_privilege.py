@@ -304,6 +304,8 @@ _EXPECTED_ACTIONS = {
     "SageMakerAssessmentReadsPolicy": {
         "ec2:DescribeManagedPrefixLists",
         "ec2:GetManagedPrefixListEntries",
+        "iot:ListThingPrincipals",
+        "iot:ListThingsInThingGroup",
         "organizations:ListAWSServiceAccessForOrganization",
         "sagemaker:DescribeModelBiasJobDefinition",
         "sagemaker:DescribeModelExplainabilityJobDefinition",
@@ -935,6 +937,20 @@ _SAGEMAKER_MANAGED_GRANTS = [
         "Allow",
         "ec2:GetManagedPrefixListEntries",
         json.dumps({"Fn::Sub": "arn:${AWS::Partition}:ec2:*:*:prefix-list/*"}),
+    ),
+    (
+        "Allow",
+        "iot:ListThingsInThingGroup",
+        json.dumps(
+            {"Fn::Sub": "arn:${AWS::Partition}:iot:*:${AWS::AccountId}:thinggroup/*"}
+        ),
+    ),
+    (
+        "Allow",
+        "iot:ListThingPrincipals",
+        json.dumps(
+            {"Fn::Sub": "arn:${AWS::Partition}:iot:*:${AWS::AccountId}:thing/*"}
+        ),
     ),
     *(
         ("Allow", action, _SAGEMAKER_MONITORING_JOB_DEFINITIONS)
